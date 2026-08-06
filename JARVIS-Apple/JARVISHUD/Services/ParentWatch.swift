@@ -45,6 +45,18 @@
 
 import Foundation
 
+/// `@MainActor`, not `nonisolated(unsafe)`.
+///
+/// Swift 6 flags `source` as unprotected global mutable state, and it is right
+/// to. The honest answer is that this type is genuinely main-bound and always
+/// was: its dispatch source is created on `.main`, and the only thing it does on
+/// firing is terminate the app, which AppKit requires on the main thread. The
+/// isolation was already a fact of the design and merely undeclared.
+///
+/// `nonisolated(unsafe)` would have silenced the diagnostic by asserting the
+/// opposite of what is true, and left a genuine data race available to any
+/// future caller who armed this from a background queue.
+@MainActor
 enum ParentWatch {
 
     /// pid 1. Any process reparented here has already lost its original parent.
@@ -91,9 +103,15 @@ enum ParentWatch {
             eventMask: .exit,
             queue: .main
         )
+        // The source's queue IS `.main`, so this handler always runs on the main
+        // thread — but Swift 6 cannot infer main-actor isolation from a queue.
+        // `assumeIsolated` states the fact and is checked at runtime, so if the
+        // premise ever stops holding it traps here rather than racing silently.
         src.setEventHandler {
-            print("[ParentWatch] launcher (\(parentName)) exited — leaving rather than orphaning")
-            onOrphaned()
+            MainActor.assumeIsolated {
+                print("[ParentWatch] launcher (\(parentName)) exited — leaving rather than orphaning")
+                onOrphaned()
+            }
         }
         src.resume()
         source = src
@@ -111,17 +129,32 @@ enum ParentWatch {
     }
 
     /// Best-effort name for a pid, for logging only.
+    ///
+    /// Uses the byte count `proc_pidpath` returns rather than scanning for a
+    /// NUL. `String(cString:)` is deprecated precisely because it trusts a
+    /// terminator the caller has not verified; here the length is authoritative,
+    /// so there is nothing to trust.
     private static func processName(of pid: pid_t) -> String? {
-        var buffer = [CChar](repeating: 0, count: 4096)
-        // proc_pidpath is in libproc; declared here rather than importing the
-        // whole header to keep this file self-contained.
-        let size = proc_pidpath_shim(pid, &buffer, UInt32(buffer.count))
+        // proc_pidpath requires a buffer of at least PROC_PIDPATHINFO_MAXSIZE
+        // (4 * PATH_MAX) or it fails outright. Derived from PATH_MAX rather than
+        // written as 4096, so it tracks the platform instead of a guess about it.
+        var buffer = [UInt8](repeating: 0, count: 4 * Int(PATH_MAX))
+
+        let size = buffer.withUnsafeMutableBytes { raw -> Int32 in
+            guard let base = raw.baseAddress else { return 0 }
+            return proc_pidpath_shim(pid, base, UInt32(raw.count))
+        }
         guard size > 0 else { return nil }
-        let path = String(cString: buffer)
+
+        let path = String(decoding: buffer.prefix(Int(size)), as: UTF8.self)
         return (path as NSString).lastPathComponent
     }
 }
 
 // `proc_pidpath` lives in libproc.dylib and is not surfaced by Foundation.
+// Its C signature takes `void *`, so a raw pointer is the faithful spelling --
+// declaring it as `UnsafeMutablePointer<CChar>` would force every caller through
+// a CChar buffer and back, which is what made the deprecated String(cString:)
+// look necessary in the first place.
 @_silgen_name("proc_pidpath")
-private func proc_pidpath_shim(_ pid: pid_t, _ buffer: UnsafeMutablePointer<CChar>, _ size: UInt32) -> Int32
+private func proc_pidpath_shim(_ pid: pid_t, _ buffer: UnsafeMutableRawPointer, _ size: UInt32) -> Int32
