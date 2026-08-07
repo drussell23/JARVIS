@@ -299,7 +299,12 @@ class AdvancedBiometricVerifier:
         )
 
         # Unpack results with error handling
-        embedding_sim = results[0] if not isinstance(results[0], Exception) else 0.5
+        # 0.0, NOT 0.5. Stage 0 is the primary biometric comparison; if it
+        # could not be computed there is no evidence this is the speaker, and a
+        # neutral 0.5 would carry a FAILED comparison into the fused score as
+        # though it were a middling match. A fault must not become a verdict —
+        # the same defect this chain has produced at every other layer.
+        embedding_sim = results[0] if not isinstance(results[0], Exception) else 0.0
         mahal_distance = results[1] if not isinstance(results[1], Exception) else 0.5
         acoustic_score = results[2] if not isinstance(results[2], Exception) else 0.5
         physics_score = results[3] if not isinstance(results[3], Exception) else 0.8
@@ -438,6 +443,38 @@ class AdvancedBiometricVerifier:
             test_emb, enrolled_emb, speaker_model
         )
 
+    @staticmethod
+    def _as_similarity_vector(embedding) -> "Optional[np.ndarray]":
+        """Coerce an embedding to a flat float32 vector, or None.
+
+        Mirrors `SpeechBrainEngine._as_host_vector`. The duplication is REAL and
+        deliberate rather than hidden: that method lives on the engine class,
+        and importing it here would pull the whole SpeechBrain module — torch,
+        speechbrain, model registry — into a verification path that otherwise
+        needs none of it, on a process already starved for event-loop time.
+
+        The honest resolution is a shared `voice/embedding_ops` module that both
+        import, which is a refactor of two call sites in two layers and is named
+        here as follow-up rather than done unverified at the end of a long
+        session.
+
+        dtype and device are representation differences and are cast. Shape is
+        not, and is the caller's to reject.
+        """
+        try:
+            if embedding is None:
+                return None
+            if hasattr(embedding, "detach") and hasattr(embedding, "cpu"):
+                embedding = embedding.detach().cpu().numpy()
+            vec = np.asarray(embedding)
+            if vec.size == 0:
+                return None
+            return vec.flatten().astype(np.float32, copy=False)
+        except Exception as exc:  # noqa: BLE001 — never raise into a verdict
+            logger.error("Embedding coercion failed (%s: %s)",
+                         type(exc).__name__, exc)
+            return None
+
     def _compute_embedding_similarity_sync(
         self,
         test_emb: np.ndarray,
@@ -445,6 +482,36 @@ class AdvancedBiometricVerifier:
         speaker_model: "SpeakerModel"
     ) -> float:
         """Sync embedding similarity computation."""
+        # SHAPE FIRST. `np.dot` of a (1, 192) encoder output against a (192,)
+        # stored profile yields a SIZE-1 1-D array, not a scalar — and
+        # `float()` on that raises under numpy 2.x:
+        #
+        #     Verification stage 0 failed: only 0-dimensional arrays can be
+        #     converted to Python scalars
+        #
+        # measured 2026-08-06 23:22:17. The function assumed 1-D vectors and
+        # never enforced it; ECAPA emits (1, 192) and SQLite returns (192,).
+        test_emb = self._as_similarity_vector(test_emb)
+        enrolled_emb = self._as_similarity_vector(enrolled_emb)
+        if test_emb is None or enrolled_emb is None:
+            logger.error(
+                "Embedding similarity: an embedding could not be coerced to a "
+                "vector — refusing to score"
+            )
+            return 0.0
+
+        # A 192D voiceprint against a differently-shaped vector is NOT a weak
+        # match, it is not a comparison. Computing anyway would produce a
+        # plausible number for arithmetic that never validly happened.
+        if test_emb.shape[0] != enrolled_emb.shape[0]:
+            logger.error(
+                "Embedding similarity: ShapeMismatch %dD vs %dD — the live "
+                "embedding came from a different encoder than the enrolled "
+                "voiceprint. Refusing to score.",
+                test_emb.shape[0], enrolled_emb.shape[0],
+            )
+            return 0.0
+
         # Cosine similarity (fast, baseline)
         test_norm = np.linalg.norm(test_emb)
         enrolled_norm = np.linalg.norm(enrolled_emb)
