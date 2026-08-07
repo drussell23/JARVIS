@@ -6065,6 +6065,19 @@ class SpeakerVerificationService:
         if not self.initialized:
             return (False, "not_initialized")
 
+        # An absent scoring engine is a FAULT, and it must not be reported as a
+        # missing voiceprint. Measured 2026-08-06 22:11:30: one profile was
+        # loaded, `speechbrain_engine` was None, verification crashed, and the
+        # operator was told "I don't have a voiceprint for you on this Mac yet"
+        # — advice that would have him re-enrol a voice that was already there.
+        #
+        # Checked BEFORE the profile check on purpose: with no engine, whether a
+        # profile exists is not the reason the answer is no.
+        if getattr(self, "speechbrain_engine", None) is None and not getattr(
+            self, "_use_registry_encoder", False
+        ):
+            return (False, "no_scoring_engine")
+
         profiles = getattr(self, "speaker_profiles", None) or {}
         if not profiles:
             # The enrollment STORE may well hold a voiceprint; this says the
@@ -6335,6 +6348,40 @@ class SpeakerVerificationService:
                     logger.info(f"  ✅ Pre-extracted embedding via {'registry/cloud' if self._use_registry_encoder else 'local'}")
                 else:
                     logger.warning(f"  ⚠️ Pre-extraction failed, will use local fallback")
+
+                # THE "LOCAL FALLBACK" IS THIS ENGINE, AND IT MAY NOT EXIST.
+                #
+                # Measured 2026-08-06 22:11:30::
+                #
+                #     ⚠️ Pre-extraction failed, will use local fallback
+                #     ERROR Speaker verification error:
+                #         'NoneType' object has no attribute 'verify_speaker'
+                #     NOT authorised (I don't have a voiceprint for you...)
+                #
+                # and 66 seconds earlier the service had already said::
+                #
+                #     SpeechBrain engine not initialized — cannot detect dimension
+                #
+                # The line above promises a fallback to `speechbrain_engine`, then
+                # this line calls a method on it. When it is None the promise was
+                # a claim the code never checked — and the crash was caught
+                # upstream and reported as "I don't have a voiceprint", which is
+                # false: the voiceprint was loaded (1 profile) and the ENGINE was
+                # missing. A fault wearing a refusal's clothes, for the fourth
+                # time in this chain.
+                #
+                # Raising a typed error rather than returning a verdict: the
+                # caller's handler turns exceptions into UNAVAILABLE, which is
+                # what an absent engine actually is. Returning `verified=False`
+                # here would re-create the exact conflation being removed.
+                if self.speechbrain_engine is None:
+                    raise RuntimeError(
+                        "speaker verification engine unavailable: speechbrain_engine "
+                        "is None, so neither the registry/cloud extraction nor the "
+                        "local fallback can score this utterance. The enrolled "
+                        "voiceprint is NOT the problem — this is an engine "
+                        "initialisation failure."
+                    )
 
                 is_verified, confidence = await self.speechbrain_engine.verify_speaker(
                     audio_data, known_embedding, threshold=adaptive_threshold,
