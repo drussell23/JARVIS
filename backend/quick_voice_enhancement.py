@@ -67,6 +67,7 @@ import asyncio
 import io
 import json
 import logging
+import math
 import sys
 import time
 from dataclasses import dataclass, field
@@ -82,7 +83,9 @@ import soundfile as sf
 sys.path.insert(0, str(Path(__file__).parent))
 
 from intelligence.learning_database import get_learning_database
+from voice.biological_bounds import UNMEASURED, MeasuredAggregator, default_validator
 from voice.engines.speechbrain_engine import SpeechBrainEngine
+from voice.formant_estimation import estimate_formants
 from voice.stt_config import ModelConfig, STTEngine
 
 # Configure logging with colors
@@ -91,6 +94,14 @@ logging.basicConfig(
     format="%(message)s",
 )
 logger = logging.getLogger(__name__)
+
+_VALIDATOR = default_validator()
+
+# Reductions that skip samples nothing measured. Shared with enroll_voice via
+# biological_bounds rather than reimplemented here — the two enrolment paths
+# writing to the same columns with different ideas of how to average them is
+# how the columns disagreed in the first place.
+_agg = MeasuredAggregator(_VALIDATOR)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -705,39 +716,31 @@ class AdvancedVoiceAnalyzer:
             return {'mean': 150.0, 'std': 20.0, 'range': 50.0, 'median': 150.0}
 
     def _analyze_formants_lpc(self, audio: np.ndarray) -> List[float]:
-        """Formant estimation using Linear Predictive Coding (simplified)"""
-        # Use spectral peaks as formant estimates
-        fft = np.fft.rfft(audio)
-        magnitude = np.abs(fft)
-        freqs = np.fft.rfftfreq(len(audio), 1 / self.sample_rate)
+        """
+        Formant estimation by linear prediction.
 
-        # Apply pre-emphasis
-        emphasized = np.append(audio[0], audio[1:] - 0.97 * audio[:-1])
-        fft_emph = np.fft.rfft(emphasized)
-        magnitude_emph = np.abs(fft_emph)
+        THIS FUNCTION WROTE THE PROFILE ON THIS MACHINE. Despite the name it
+        contained no linear prediction at all — it peak-picked the magnitude
+        spectrum and took ``peaks[:4]``, the four LOWEST peaks by frequency,
+        which in a desk recording are DC offset, mains hum and low harmonics.
+        The four values it stored for the operator were 42.9, 80.0, 102.8 and
+        107.4 Hz: an ascending run of rumble, every one of them below the F1 of
+        any human being.
 
-        # Find peaks in formant regions
-        from scipy.signal import find_peaks
+        It failed three further ways, all now gone:
 
-        peaks, properties = find_peaks(
-            magnitude_emph,
-            height=np.max(magnitude_emph) * 0.15,
-            distance=30
-        )
+          * ``[500, 1500, 2500, 3500]`` on fewer than four peaks — the textbook
+            male average, written into a specific speaker's profile;
+          * ``formants[-1] + 1000.0`` padding, inventing a resonance from the
+            previous invented resonance;
+          * silence about all of it, so the profile looked complete.
 
-        if len(peaks) >= 4:
-            # Take first 4 peaks as F1-F4
-            peak_freqs = freqs[peaks[:4]]
-            formants = [float(f) for f in peak_freqs]
-        else:
-            # Default formants (male voice)
-            formants = [500.0, 1500.0, 2500.0, 3500.0]
-
-        # Ensure we have exactly 4 formants
-        while len(formants) < 4:
-            formants.append(formants[-1] + 1000.0 if formants else 500.0)
-
-        return formants[:4]
+        It is the third copy of this same defect (with ``enroll_voice`` and
+        ``advanced_feature_extraction``); all three now call one estimator that
+        fits an all-pole model to voiced frames and reports UNMEASURED for any
+        formant it cannot resolve.
+        """
+        return estimate_formants(audio, self.sample_rate, n_formants=4)
 
     def _analyze_spectral_features(self, audio: np.ndarray) -> Dict[str, float]:
         """Comprehensive spectral feature extraction"""
@@ -771,10 +774,21 @@ class AdvancedVoiceAnalyzer:
         zero_crossings = np.sum(np.abs(np.diff(np.sign(audio)))) / 2
         zcr = zero_crossings / len(audio)
 
-        # Estimate speech rate (words per minute)
+        # Estimate speech rate (words per minute).
+        #
+        # With no transcription this used to yield 0.0 — a speaker who said
+        # nothing, stored as one who speaks at zero words per minute and then
+        # differenced against the live speaker. With a short clip it yields an
+        # arbitrarily high figure; 7 words over 1.0 s is exactly the 420 wpm in
+        # this machine's profile. Neither is a measurement of how fast this
+        # person speaks, so neither is reported as one.
         duration_seconds = len(audio) / self.sample_rate
         word_count = len(transcription.split()) if transcription else 0
-        speech_rate = (word_count / duration_seconds) * 60 if duration_seconds > 0 else 0.0
+        if word_count == 0 or duration_seconds <= 0:
+            speech_rate = UNMEASURED
+        else:
+            speech_rate = _VALIDATOR.coerce(
+                'speaking_rate_wpm', (word_count / duration_seconds) * 60)
 
         # Pause ratio (estimate from energy)
         frame_size = self.sample_rate // 20
@@ -1350,72 +1364,113 @@ class QuickVoiceEnhancement:
             spectral_centroids.append(vc.spectral_centroid_hz)
             spectral_rolloffs.append(vc.spectral_rolloff_hz)
             spectral_fluxes.append(vc.spectral_flux)
-            spectral_entropies.append(getattr(vc, 'spectral_entropy', 0.5))  # Default if missing
+            spectral_entropies.append(getattr(vc, 'spectral_entropy', UNMEASURED))
 
             # Temporal
             speaking_rates.append(vc.speech_rate_wpm)
             pause_ratios.append(vc.pause_ratio)
 
-            # Voice quality (use sample quality metrics if not in VoiceCharacteristics)
-            jitters.append(getattr(vc, 'jitter', 0.01))  # Default 1%
-            shimmers.append(getattr(vc, 'shimmer', 0.05))  # Default 5%
-            hnrs.append(getattr(vc, 'harmonic_to_noise_ratio', 15.0))  # Default 15 dB
+            # Voice quality.
+            #
+            # These defaults were 0.01 / 0.05 / 15.0 — "1%", "5%", "15 dB", a
+            # healthy adult voice, substituted whenever the attribute was
+            # ABSENT. Multiplied by 100 on the way to the database below, they
+            # are exactly the 1.0 and 5.0 sitting in this machine's profile, and
+            # the 15.0 HNR beside them. A missing attribute became a clean bill
+            # of vocal health for a sample nobody had analysed.
+            #
+            # UNMEASURED instead. `_agg.mean` drops it, and if no sample
+            # carried the attribute the column is written NULL rather than
+            # describing a voice that was never measured.
+            jitters.append(getattr(vc, 'jitter', UNMEASURED))
+            shimmers.append(getattr(vc, 'shimmer', UNMEASURED))
+            hnrs.append(getattr(vc, 'harmonic_to_noise_ratio', UNMEASURED))
 
             # Energy
             energies.append(vc.rms_energy)
 
-        # Compute aggregate statistics
+        # Compute aggregate statistics.
+        #
+        # Every reduction below goes through _agg, which averages only the
+        # samples that were actually measured. Two failure modes it removes:
+        # a single NaN sample used to make the whole column NaN via np.mean,
+        # discarding nineteen good samples; and an out-of-band value used to be
+        # averaged in at full weight, dragging the enrolled figure toward a
+        # number no vocal tract produces. A quantity with nothing measurable
+        # left comes out UNMEASURED and is written NULL.
+        flatness = [getattr(s.voice_characteristics, 'spectral_flatness',
+                            s.quality_metrics.spectral_flatness)
+                    for s in self.samples]
+        mean_rate = _agg.mean('speaking_rate_wpm', speaking_rates)
+        mean_pause = _agg.mean('pause_ratio', pause_ratios)
+
         features = {
             # Pitch features
-            'pitch_mean_hz': float(np.mean(pitch_means)),
-            'pitch_std_hz': float(np.std(pitch_means)),
-            'pitch_range_hz': float(np.mean(pitch_ranges)),
-            'pitch_min_hz': float(np.min(pitch_means)),
-            'pitch_max_hz': float(np.max(pitch_means)),
+            'pitch_mean_hz': _agg.mean('pitch_mean_hz', pitch_means),
+            'pitch_std_hz': _agg.std('pitch_mean_hz', pitch_means),
+            'pitch_range_hz': _agg.mean('pitch_range_hz', pitch_ranges),
+            'pitch_min_hz': _agg.min('pitch_mean_hz', pitch_means),
+            'pitch_max_hz': _agg.max('pitch_mean_hz', pitch_means),
 
             # Formant features (mean and variance across samples)
-            'formant_f1_hz': float(np.mean(formant_f1s)),
-            'formant_f1_std': float(np.std(formant_f1s)),
-            'formant_f2_hz': float(np.mean(formant_f2s)),
-            'formant_f2_std': float(np.std(formant_f2s)),
-            'formant_f3_hz': float(np.mean(formant_f3s)),
-            'formant_f3_std': float(np.std(formant_f3s)),
-            'formant_f4_hz': float(np.mean(formant_f4s)),
-            'formant_f4_std': float(np.std(formant_f4s)),
+            'formant_f1_hz': _agg.mean('formant_f1_hz', formant_f1s),
+            'formant_f1_std': _agg.std('formant_f1_hz', formant_f1s),
+            'formant_f2_hz': _agg.mean('formant_f2_hz', formant_f2s),
+            'formant_f2_std': _agg.std('formant_f2_hz', formant_f2s),
+            'formant_f3_hz': _agg.mean('formant_f3_hz', formant_f3s),
+            'formant_f3_std': _agg.std('formant_f3_hz', formant_f3s),
+            'formant_f4_hz': _agg.mean('formant_f4_hz', formant_f4s),
+            'formant_f4_std': _agg.std('formant_f4_hz', formant_f4s),
 
             # Spectral features
-            'spectral_centroid_hz': float(np.mean(spectral_centroids)),
-            'spectral_centroid_std': float(np.std(spectral_centroids)),
-            'spectral_rolloff_hz': float(np.mean(spectral_rolloffs)),
-            'spectral_rolloff_std': float(np.std(spectral_rolloffs)),
-            'spectral_flux': float(np.mean(spectral_fluxes)),
-            'spectral_flux_std': float(np.std(spectral_fluxes)),
-            'spectral_entropy': float(np.mean(spectral_entropies)),
-            'spectral_entropy_std': float(np.std(spectral_entropies)),
-            'spectral_flatness': float(np.mean([getattr(s.voice_characteristics, 'spectral_flatness', s.quality_metrics.spectral_flatness) for s in self.samples])),
-            'spectral_bandwidth_hz': float(np.std(spectral_centroids) * 2),  # Approximate bandwidth
+            'spectral_centroid_hz': _agg.mean('spectral_centroid_hz', spectral_centroids),
+            'spectral_centroid_std': _agg.std('spectral_centroid_hz', spectral_centroids),
+            'spectral_rolloff_hz': _agg.mean('spectral_rolloff_hz', spectral_rolloffs),
+            'spectral_rolloff_std': _agg.std('spectral_rolloff_hz', spectral_rolloffs),
+            'spectral_flux': _agg.mean('spectral_flux', spectral_fluxes),
+            'spectral_flux_std': _agg.std('spectral_flux', spectral_fluxes),
+            'spectral_entropy': _agg.mean('spectral_entropy', spectral_entropies),
+            'spectral_entropy_std': _agg.std('spectral_entropy', spectral_entropies),
+            'spectral_flatness': _agg.mean('spectral_flatness', flatness),
+            'spectral_bandwidth_hz': _agg.std('spectral_centroid_hz', spectral_centroids) * 2,
 
             # Temporal features
-            'speaking_rate_wpm': float(np.mean(speaking_rates)),
-            'speaking_rate_std': float(np.std(speaking_rates)),
-            'pause_ratio': float(np.mean(pause_ratios)),
-            'pause_ratio_std': float(np.std(pause_ratios)),
-            'syllable_rate': float(np.mean(speaking_rates) / 60.0 * 2.5),  # Approximate syllables
-            'articulation_rate': float(np.mean(speaking_rates) / (1.0 - np.mean(pause_ratios)) if np.mean(pause_ratios) < 1.0 else 0.0),
+            'speaking_rate_wpm': mean_rate,
+            'speaking_rate_std': _agg.std('speaking_rate_wpm', speaking_rates),
+            'pause_ratio': mean_pause,
+            'pause_ratio_std': _agg.std('pause_ratio', pause_ratios),
+            # Derived from the rate, so they inherit its absence rather than
+            # computing a syllable count from a speaking rate nobody measured.
+            'syllable_rate': mean_rate / 60.0 * 2.5,
+            'articulation_rate': (mean_rate / (1.0 - mean_pause)
+                                  if math.isfinite(mean_pause) and mean_pause < 1.0
+                                  else UNMEASURED),
 
             # Energy features
-            'energy_mean': float(np.mean(energies)),
-            'energy_std': float(np.std(energies)),
-            'energy_dynamic_range_db': float(20 * np.log10((np.max(energies) / (np.min(energies) + 1e-10)) + 1e-10)),
+            'energy_mean': _agg.mean('energy_mean', energies),
+            'energy_std': _agg.std('energy_mean', energies),
+            'energy_dynamic_range_db': _agg.dynamic_range_db(energies),
 
-            # Voice quality features
-            'jitter_percent': float(np.mean(jitters) * 100),
-            'jitter_std': float(np.std(jitters) * 100),
-            'shimmer_percent': float(np.mean(shimmers) * 100),
-            'shimmer_std': float(np.std(shimmers) * 100),
-            'harmonic_to_noise_ratio_db': float(np.mean(hnrs)),
-            'hnr_std': float(np.std(hnrs)),
+            # Voice quality features. The *100 makes these PERCENT, which is why
+            # `jitter_percent` carries a different band from the in-memory
+            # `jitter` fraction — see biological_bounds.BOUNDS.
+            'jitter_percent': _agg.mean('jitter', jitters) * 100,
+            'jitter_std': _agg.std('jitter', jitters) * 100,
+            'shimmer_percent': _agg.mean('shimmer', shimmers) * 100,
+            'shimmer_std': _agg.std('shimmer', shimmers) * 100,
+            'harmonic_to_noise_ratio_db': _agg.mean('harmonic_to_noise_ratio_db', hnrs),
+            'hnr_std': _agg.std('harmonic_to_noise_ratio_db', hnrs),
         }
+
+        # THE WRITE GATE. Last stop before these become a stored profile that
+        # every future verification is judged against: anything outside its
+        # biological band is written NULL rather than compared against for
+        # months. NaN is converted to None here too — SQLite would happily
+        # store a NaN, and it would read back as a float that no `IS NULL`
+        # check catches.
+        sanitized = _VALIDATOR.sanitize(features, label="enrolled profile")
+        features = {k: (None if isinstance(v, float) and not math.isfinite(v) else v)
+                    for k, v in sanitized.clean.items()}
 
         # Compute covariance matrix for Mahalanobis distance
         # Extract feature vectors for covariance computation

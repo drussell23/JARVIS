@@ -35,7 +35,9 @@ import soundfile as sf
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from intelligence.learning_database import JARVISLearningDatabase
+from voice.biological_bounds import UNMEASURED, MeasuredAggregator, default_validator
 from voice.engines.speechbrain_engine import SpeechBrainEngine
+from voice.formant_estimation import estimate_formants
 from voice.stt_config import ModelConfig, STTEngine
 
 logging.basicConfig(
@@ -50,6 +52,21 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
+# Enrolment writes the profile every later verification is judged against, so
+# this is the highest-stakes place in the system for an unmeasured value to be
+# stored as a measurement. It is also where 42.9 Hz / 80.0 Hz / 420 wpm came in.
+_VALIDATOR = default_validator()
+
+# Shared with quick_voice_enhancement, the other path that writes these same
+# columns. Two enrolment paths averaging the same quantities by different rules
+# is how the stored profile came to disagree with itself.
+_AGG = MeasuredAggregator(_VALIDATOR)
+
+
+def _fmt_hz(value: float) -> str:
+    """Render a possibly-absent measurement for the operator, never as a number."""
+    return f"{value:.1f} Hz" if np.isfinite(value) else "unmeasured"
 
 
 @dataclass
@@ -416,40 +433,48 @@ class VoiceCharacteristicsAnalyzer:
                             pitches.append(pitch)
 
         if pitches:
-            pitch_mean = float(np.mean(pitches))
-            pitch_std = float(np.std(pitches))
-            pitch_range = float(np.max(pitches) - np.min(pitches))
+            pitch_mean = _VALIDATOR.coerce("pitch_mean_hz", float(np.mean(pitches)))
+            pitch_std = _VALIDATOR.coerce("pitch_std_hz", float(np.std(pitches)))
+            pitch_range = _VALIDATOR.coerce(
+                "pitch_range_hz", float(np.max(pitches) - np.min(pitches)))
         else:
-            pitch_mean = 150.0  # Default
-            pitch_std = 20.0
-            pitch_range = 50.0
+            # No frame yielded a period. This used to enrol 150/20/50 Hz — an
+            # invented average male voice — as THIS speaker's pitch, against
+            # which he would then be compared for the life of the profile.
+            logger.warning(
+                "[Enroll] no voiced frame yielded a pitch period — enrolling "
+                "pitch as unmeasured rather than as a default voice"
+            )
+            pitch_mean = pitch_std = pitch_range = UNMEASURED
 
         return pitch_mean, pitch_std, pitch_range
 
     def _analyze_formants(self, audio_data: np.ndarray) -> Tuple[float, float]:
-        """Estimate formant frequencies F1 and F2"""
-        # Apply LPC (Linear Predictive Coding) for formant estimation
-        # Simplified approach: use spectral peaks
+        """
+        Estimate F1 and F2 by linear prediction.
 
-        # Compute power spectrum
-        fft = np.fft.rfft(audio_data)
-        magnitude = np.abs(fft)
-        freqs = np.fft.rfftfreq(len(audio_data), 1 / self.sample_rate)
+        THIS IS THE FUNCTION THAT WROTE 42.9 Hz AND 80.0 Hz. It claimed LPC in a
+        comment and performed spectral peak-picking::
 
-        # Find peaks in magnitude spectrum
-        from scipy.signal import find_peaks
-
-        peaks, _ = find_peaks(magnitude, height=np.max(magnitude) * 0.1, distance=20)
-
-        if len(peaks) >= 2:
-            # First two peaks are approximations of F1 and F2
-            f1 = float(freqs[peaks[0]])
+            peaks, _ = find_peaks(magnitude, height=np.max(magnitude)*0.1, distance=20)
+            f1 = float(freqs[peaks[0]])   # "first two peaks approximate F1 and F2"
             f2 = float(freqs[peaks[1]])
-        else:
-            # Default formants (male voice approximation)
-            f1 = 500.0
-            f2 = 1500.0
 
+        ``peaks`` is ordered by frequency, so ``peaks[0]`` and ``peaks[1]`` are
+        the two LOWEST spectral peaks in the recording — DC offset, mains hum and
+        desk rumble, never vowel resonances. With ``rfftfreq`` over a multi-second
+        sample the bins are sub-Hz apart and ``distance=20`` excludes only ~4 Hz,
+        so both "peaks" came out of the same low-frequency lobe. The values it
+        stored for the operator, 42.9 Hz and 80.03 Hz, are an order of magnitude
+        below the F1 of any human being.
+
+        A formant is a pole of the vocal tract filter, not a peak of the signal
+        spectrum — which is dominated by the glottal source. The shared estimator
+        fits an all-pole model to voiced frames and reads the pole angles, and
+        reports UNMEASURED rather than the old ``(500.0, 1500.0)`` textbook male
+        average when it cannot resolve one.
+        """
+        f1, f2, _, _ = estimate_formants(audio_data, self.sample_rate, n_formants=4)
         return f1, f2
 
     def _calculate_spectral_centroid(self, audio_data: np.ndarray) -> float:
@@ -883,9 +908,17 @@ class VoiceEnrollment:
         formant_f1s = [s.voice_characteristics.formant_f1_hz for s in real_samples]
         formant_f2s = [s.voice_characteristics.formant_f2_hz for s in real_samples]
 
-        avg_pitch = np.mean(pitches)
-        avg_f1 = np.mean(formant_f1s)
-        avg_f2 = np.mean(formant_f2s)
+        # NaN-aware, and per-quantity. A single sample whose formants could not
+        # be resolved must cost that one sample's contribution, not the whole
+        # enrolment: plain ``np.mean`` over a list holding one NaN returns NaN
+        # for every speaker, which would convert the honest per-sample absence
+        # introduced above into a total enrolment failure. ``MeasuredAggregator``
+        # drops the absent entries, and reports UNMEASURED only when nothing
+        # measurable is left — the one case where there is genuinely nothing to
+        # average.
+        avg_pitch = _AGG.mean("pitch_mean_hz", pitches)
+        avg_f1 = _AGG.mean("formant_f1_hz", formant_f1s)
+        avg_f2 = _AGG.mean("formant_f2_hz", formant_f2s)
 
         # Display comprehensive statistics
         print(f"\n📊 Enrollment Statistics:")
@@ -897,11 +930,20 @@ class VoiceEnrollment:
         print(f"   Average quality: {avg_quality:.2%}")
         print(f"   Final confidence: {confidence:.2%}")
 
+        # Printed via _fmt_hz so an unmeasured characteristic reads as
+        # "unmeasured" rather than as "nan Hz" — the operator is the last line
+        # of defence against a bad enrolment, and can only act on what the
+        # summary actually tells them.
+        measured_pitches = [p for p in pitches if np.isfinite(p)]
         print(f"\n🎵 Voice Characteristics:")
-        print(f"   Average pitch: {avg_pitch:.1f} Hz")
-        print(f"   Pitch range: {np.min(pitches):.1f} - {np.max(pitches):.1f} Hz")
-        print(f"   Formant F1: {avg_f1:.0f} Hz")
-        print(f"   Formant F2: {avg_f2:.0f} Hz")
+        print(f"   Average pitch: {_fmt_hz(avg_pitch)}")
+        if measured_pitches:
+            print(f"   Pitch range: {np.min(measured_pitches):.1f} - "
+                  f"{np.max(measured_pitches):.1f} Hz")
+        else:
+            print(f"   Pitch range: unmeasured")
+        print(f"   Formant F1: {_fmt_hz(avg_f1)}")
+        print(f"   Formant F2: {_fmt_hz(avg_f2)}")
 
         print(f"\n📈 Quality Breakdown:")
         snr_values = [s.quality_metrics.snr_db for s in real_samples]

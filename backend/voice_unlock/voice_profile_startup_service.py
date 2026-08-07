@@ -493,7 +493,24 @@ class VoiceProfileStartupService:
                     asyncio.gather(*tasks, return_exceptions=True),
                     timeout=timeout / 3  # 1/3 of timeout for setup
                 )
-                
+
+                # Remove biologically impossible values from the store BEFORE
+                # loading from it.
+                #
+                # Ordering is load-bearing here. `_load_from_sqlite` reads the
+                # profile table directly and so does NOT pass through the
+                # bounds gate in `learning_database.get_all_speaker_profiles`;
+                # sanitising afterwards would leave this service's in-memory
+                # copy holding the very values just cleaned off disk, and that
+                # copy is what the verifier compares against.
+                #
+                # It does not block the event loop — the sqlite3 work runs on
+                # async_offload's dedicated pool — and it cannot delay boot: the
+                # measured sweep is ~12ms, the timeout is a small fraction of
+                # the setup budget, and every failure path leaves the profiles
+                # untouched rather than unloadable.
+                await self._sanitize_profiles_before_load()
+
                 # Load profiles with priority cascade
                 loaded = await self._load_profiles_with_priority(
                     timeout=timeout * 2 / 3  # 2/3 of timeout for loading
@@ -539,6 +556,64 @@ class VoiceProfileStartupService:
                 # ALWAYS reset loading flag so retries can work
                 self._loading_in_progress = False
     
+    async def _sanitize_profiles_before_load(self) -> None:
+        """
+        Strip impossible acoustic values from the local store, fail-soft.
+
+        Never raises and never propagates a timeout. A sanitiser that can fail
+        the boot is worse than the data it cleans: the read gate in
+        `learning_database` already prevents impossible stored values reaching a
+        verdict, so this pass is hygiene, and hygiene may not cost the operator
+        their voice authentication.
+
+        The budget is env-tunable (`JARVIS_VOICE_PROFILE_SANITIZE_TIMEOUT_S`)
+        because a database on a slow or contended volume should defer the sweep,
+        not stall behind it.
+        """
+        if not _get_env_bool("JARVIS_VOICE_PROFILE_SANITIZE_ENABLED", True):
+            return
+
+        budget = _get_env_float("JARVIS_VOICE_PROFILE_SANITIZE_TIMEOUT_S", 5.0)
+        try:
+            from voice.voice_profile_sanitizer import sanitize_voice_profiles
+        except ImportError:
+            try:
+                from backend.voice.voice_profile_sanitizer import sanitize_voice_profiles
+            except ImportError:
+                logger.debug("Voice profile sanitizer unavailable — skipping")
+                return
+
+        try:
+            # This service's OWN configured path, not the sanitiser's default.
+            # Both resolve JARVIS_DATA_DIR the same way today; passing it makes
+            # it impossible for them to drift apart and clean a file nobody
+            # reads.
+            report = await asyncio.wait_for(
+                sanitize_voice_profiles(self._config.learning_db_path),
+                timeout=budget,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "⏱️ Voice profile sanitiser exceeded %.1fs — proceeding with "
+                "profiles as stored (the bounds gate still refuses to reason "
+                "from impossible values)", budget,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 — hygiene may not break the boot
+            logger.warning("Voice profile sanitiser failed (%s: %s) — proceeding",
+                           type(exc).__name__, exc)
+            return
+
+        if report.changed:
+            logger.warning(
+                "🧪 Voice profile sanitiser: %s. Re-enrol %s to restore full "
+                "acoustic verification — the voiceprint itself is intact and "
+                "unlock still works on it.",
+                report.describe(), ", ".join(report.flagged_for_reenrollment),
+            )
+        elif report.skipped_reason:
+            logger.debug("Voice profile sanitiser skipped: %s", report.skipped_reason)
+
     async def _check_cloudsql_availability(self) -> bool:
         """Check if CloudSQL is available and configured."""
         try:

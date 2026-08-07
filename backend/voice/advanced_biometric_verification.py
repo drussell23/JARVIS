@@ -42,6 +42,20 @@ try:
 except ImportError:
     _HAS_MANAGED_EXECUTOR = False
 
+# The measurability bands and the one ``is this a measurement`` predicate.
+#
+# This module is imported both as ``backend.voice.…`` and as ``voice.…``
+# depending on which root is on sys.path — the same reason the executor import
+# above is guarded. ``biological_bounds`` and ``embedding_ops`` pull in nothing
+# heavier than numpy, so neither costs this path the SpeechBrain import it is
+# careful to avoid.
+try:  # pragma: no cover - exercised by whichever root the process happens to use
+    from backend.voice.biological_bounds import BOUNDS, is_measured
+    from backend.voice.embedding_ops import coerce_vector
+except ImportError:  # pragma: no cover
+    from voice.biological_bounds import BOUNDS, is_measured
+    from voice.embedding_ops import coerce_vector
+
 logger = logging.getLogger(__name__)
 
 # Shared thread pool for CPU-intensive biometric computations
@@ -180,15 +194,36 @@ class PhysicsConstraints:
     # speech is 110-180) and formants of 42.9 Hz / 80.0 Hz (F1 is ~500 Hz, F2
     # ~1500 Hz — these are off by an order of magnitude and are not formants).
     # Compared against, they made the operator's own voice look synthetic.
-    min_formant_f1_hz: float = 150.0
-    max_formant_f1_hz: float = 1200.0
-    min_formant_f2_hz: float = 500.0
-    max_formant_f2_hz: float = 3500.0
-    min_speaking_rate_wpm: float = 40.0
-    max_speaking_rate_wpm: float = 300.0
-    min_pitch_std_hz: float = 0.5
-    max_pitch_std_hz: float = 200.0
-    max_hnr_db: float = 45.0
+    #
+    # The numbers live in ``biological_bounds.BOUNDS``, which is also what the
+    # *extractors* gate on before writing. Sourcing the defaults from there
+    # rather than restating them is what keeps the write side and the read side
+    # from drifting into two different opinions of "possible" — the enrolled
+    # 420 wpm passed the writer precisely because the writer had no opinion.
+    # The env override namespace is unchanged and unified: each band has exactly
+    # one knob, ``JARVIS_VOICE_PHYSICS_{MIN,MAX}_<NAME>``, honoured identically
+    # by ``from_env`` below and by ``BiologicalBoundsValidator.from_env``.
+    min_formant_f1_hz: float = BOUNDS["formant_f1_hz"].low
+    max_formant_f1_hz: float = BOUNDS["formant_f1_hz"].high
+    min_formant_f2_hz: float = BOUNDS["formant_f2_hz"].low
+    max_formant_f2_hz: float = BOUNDS["formant_f2_hz"].high
+    min_speaking_rate_wpm: float = BOUNDS["speaking_rate_wpm"].low
+    max_speaking_rate_wpm: float = BOUNDS["speaking_rate_wpm"].high
+    min_pitch_std_hz: float = BOUNDS["pitch_std_hz"].low
+    max_pitch_std_hz: float = BOUNDS["pitch_std_hz"].high
+    max_hnr_db: float = BOUNDS["harmonic_to_noise_ratio_db"].high
+
+    # Measurability floor for HNR, distinct from ``min_hnr_db`` above.
+    #
+    # ``min_hnr_db`` (5.0) is a *plausibility* threshold — below it a voice
+    # scores poorly on the harmonic check. Using it as the measurability gate
+    # too, as the first version of this did, means a genuinely noisy but
+    # perfectly real 3 dB capture reads as "never measured" and the check
+    # abstains instead of scoring the evidence it has. The two bands answer
+    # different questions and must be two fields.
+    min_hnr_db_measurable: float = BOUNDS["harmonic_to_noise_ratio_db"].low
+    min_pitch_hz_measurable: float = BOUNDS["pitch_mean_hz"].low
+    max_pitch_hz_measurable: float = BOUNDS["pitch_mean_hz"].high
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "PhysicsConstraints":
@@ -223,23 +258,18 @@ class PhysicsConstraints:
         """
         True when ``value`` is a real measurement inside its plausible band.
 
-        ``None``, non-numeric, non-finite, and out-of-band all read as NOT
-        measured. Zero is excluded by every band below, which is deliberate:
-        an unset float field defaults to 0.0, and 0 Hz is not a formant.
+        ``None``, NaN, infinity, non-numeric and out-of-band all read as NOT
+        measured. Zero is excluded by every band below, which is deliberate: an
+        unset float field defaults to 0.0, and 0 Hz is not a formant.
 
-        The type check is strict on purpose. ``float("500")`` succeeds, so a
-        permissive version accepts a feature field holding a *string* — but a
-        numeric field that arrived as text was not produced by the measurement
-        path, and quietly parsing it is the same leniency that let unset zeros
-        become spoofing findings. ``bool`` is excluded explicitly because it is
-        a subclass of ``int``, and ``float(True)`` is 1.0 — a silent 1 Hz.
+        This is a thin delegate to ``biological_bounds.is_measured``, which is
+        the one predicate the extractors, the anti-spoofing stage and the
+        plausibility scorer all share. It stays here because callers hold a
+        ``PhysicsConstraints`` and their bands live on it; it must not grow a
+        second implementation, or the write side and the read side can once
+        again disagree about what "measured" means.
         """
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return False
-        numeric = float(value)
-        if not math.isfinite(numeric):
-            return False
-        return low <= numeric <= high
+        return is_measured(value, low, high)
 
 
 @dataclass
@@ -265,6 +295,55 @@ class SpoofingAssessment:
         fired = ", ".join(f"{n}:{p}" for n, p in self.indicators) or "none"
         skipped = ", ".join(self.abstained) or "none"
         return f"score={self.score:.2f} fired=[{fired}] abstained=[{skipped}]"
+
+
+@dataclass
+class PlausibilityAssessment:
+    """
+    What the physics stage scored, and what it could not look at.
+
+    The twin of :class:`SpoofingAssessment`, deliberately the same shape: both
+    stages read raw features, both can be handed quantities nothing measured,
+    and both previously turned that into a confident number. Keeping the two
+    result types symmetric is what stops one of them being fixed and the other
+    quietly regressing — which is exactly what happened between #70426 and this
+    change.
+
+    ``score`` alone cannot distinguish "I checked and every component passed"
+    from "I could not check anything", so the components that ran are kept by
+    name alongside the ones that abstained.
+    """
+
+    score: float = 1.0
+    components: Dict[str, float] = field(default_factory=dict)
+    abstained: List[str] = field(default_factory=list)
+
+    @property
+    def evidence_complete(self) -> bool:
+        return not self.abstained
+
+    def finalize(self) -> "PlausibilityAssessment":
+        """
+        Set ``score`` to the mean of the components that actually ran.
+
+        With no component measurable the score is 1.0 — NEUTRAL, not zero. This
+        stage is a veto on impossible voices; with no evidence it must veto
+        nothing and say so via ``abstained``. Scoring 0.0 here would convert a
+        broken feature extractor into a rejection of the speaker, which is the
+        precise defect this change exists to remove. The fused verdict is not
+        thereby weakened: the embedding comparison is the primary gate and a
+        failed one already scores 0.0 on its own.
+        """
+        if self.components:
+            self.score = float(np.clip(np.mean(list(self.components.values())), 0.0, 1.0))
+        else:
+            self.score = 1.0
+        return self
+
+    def describe(self) -> str:
+        ran = ", ".join(f"{n}:{v:.2f}" for n, v in self.components.items()) or "none"
+        skipped = ", ".join(self.abstained) or "none"
+        return f"score={self.score:.2f} scored=[{ran}] abstained=[{skipped}]"
 
 
 @dataclass
@@ -435,10 +514,21 @@ class AdvancedBiometricVerifier:
         # neutral 0.5 would carry a FAILED comparison into the fused score as
         # though it were a middling match. A fault must not become a verdict —
         # the same defect this chain has produced at every other layer.
-        embedding_sim = results[0] if not isinstance(results[0], Exception) else 0.0
-        mahal_distance = results[1] if not isinstance(results[1], Exception) else 0.5
-        acoustic_score = results[2] if not isinstance(results[2], Exception) else 0.5
-        physics_score = results[3] if not isinstance(results[3], Exception) else 0.8
+        embedding_sim = float(results[0]) if not isinstance(results[0], BaseException) else 0.0
+        mahal_distance = float(results[1]) if not isinstance(results[1], BaseException) else 0.5
+        acoustic_score = float(results[2]) if not isinstance(results[2], BaseException) else 0.5
+
+        # Physics returns an assessment, not a bare number: the score alone
+        # cannot say which components were unmeasurable, and that distinction is
+        # the whole point of the stage. A raised exception yields an assessment
+        # that abstained on everything — neutral score, evidence incomplete —
+        # rather than the old bare 0.8, which was a fabricated near-pass.
+        if isinstance(results[3], BaseException):
+            physics = PlausibilityAssessment(
+                abstained=[f"stage_failed({type(results[3]).__name__})"]).finalize()
+        else:
+            physics = results[3]
+        physics_score = physics.score
 
         # Log any exceptions
         for i, r in enumerate(results):
@@ -513,6 +603,14 @@ class AdvancedBiometricVerifier:
             warnings.append(f"High uncertainty ({uncertainty:.1%})")
         if physics_score < 0.7:
             warnings.append("Voice physics constraints violated")
+        if not physics.evidence_complete:
+            # Symmetric with the anti-spoofing warning below, and for the same
+            # reason: a plausibility score reached by skipping components is not
+            # the same claim as one reached by passing them.
+            warnings.append(
+                f"Physics evidence incomplete: {len(physics.abstained)} "
+                f"component(s) abstained ({'; '.join(physics.abstained)})"
+            )
         if spoofing_score < 0.8:
             warnings.append("Spoofing indicators detected")
         if not spoof.evidence_complete:
@@ -586,33 +684,20 @@ class AdvancedBiometricVerifier:
     def _as_similarity_vector(embedding) -> "Optional[np.ndarray]":
         """Coerce an embedding to a flat float32 vector, or None.
 
-        Mirrors `SpeechBrainEngine._as_host_vector`. The duplication is REAL and
-        deliberate rather than hidden: that method lives on the engine class,
-        and importing it here would pull the whole SpeechBrain module — torch,
-        speechbrain, model registry — into a verification path that otherwise
-        needs none of it, on a process already starved for event-loop time.
+        This used to re-implement `SpeechBrainEngine._as_host_vector` here, on
+        the argument that importing the engine would pull torch, speechbrain and
+        the model registry into a verification path that needs none of them. The
+        argument was sound; the conclusion — copy the coercion — was not, and it
+        is why a `list` (the one form `get_all_speaker_profiles` actually
+        returns) fell through every branch of the third copy on 2026-08-06.
 
-        The honest resolution is a shared `voice/embedding_ops` module that both
-        import, which is a refactor of two call sites in two layers and is named
-        here as follow-up rather than done unverified at the end of a long
-        session.
-
-        dtype and device are representation differences and are cast. Shape is
-        not, and is the caller's to reject.
+        The follow-up this docstring named is now done: `voice/embedding_ops`
+        exists, costs nothing but numpy, and is the single answer all three
+        layers call. dtype and device are representation differences and are
+        cast; shape is not, and remains the caller's to reject — which is why
+        this asks for no `expected_dim`.
         """
-        try:
-            if embedding is None:
-                return None
-            if hasattr(embedding, "detach") and hasattr(embedding, "cpu"):
-                embedding = embedding.detach().cpu().numpy()
-            vec = np.asarray(embedding)
-            if vec.size == 0:
-                return None
-            return vec.flatten().astype(np.float32, copy=False)
-        except Exception as exc:  # noqa: BLE001 — never raise into a verdict
-            logger.error("Embedding coercion failed (%s: %s)",
-                         type(exc).__name__, exc)
-            return None
+        return coerce_vector(embedding)
 
     def _compute_embedding_similarity_sync(
         self,
@@ -630,9 +715,13 @@ class AdvancedBiometricVerifier:
         #
         # measured 2026-08-06 23:22:17. The function assumed 1-D vectors and
         # never enforced it; ECAPA emits (1, 192) and SQLite returns (192,).
-        test_emb = self._as_similarity_vector(test_emb)
-        enrolled_emb = self._as_similarity_vector(enrolled_emb)
-        if test_emb is None or enrolled_emb is None:
+        # Bound to new names rather than reassigned: the parameters are declared
+        # non-optional, and rebinding them to an Optional makes a type checker
+        # treat the None guard below as dead code — a warning that would sit in
+        # the file forever right next to the guard it wrongly indicts.
+        test_vec = self._as_similarity_vector(test_emb)
+        enrolled_vec = self._as_similarity_vector(enrolled_emb)
+        if test_vec is None or enrolled_vec is None:
             logger.error(
                 "Embedding similarity: an embedding could not be coerced to a "
                 "vector — refusing to score"
@@ -642,26 +731,26 @@ class AdvancedBiometricVerifier:
         # A 192D voiceprint against a differently-shaped vector is NOT a weak
         # match, it is not a comparison. Computing anyway would produce a
         # plausible number for arithmetic that never validly happened.
-        if test_emb.shape[0] != enrolled_emb.shape[0]:
+        if test_vec.shape[0] != enrolled_vec.shape[0]:
             logger.error(
                 "Embedding similarity: ShapeMismatch %dD vs %dD — the live "
                 "embedding came from a different encoder than the enrolled "
                 "voiceprint. Refusing to score.",
-                test_emb.shape[0], enrolled_emb.shape[0],
+                test_vec.shape[0], enrolled_vec.shape[0],
             )
             return 0.0
 
         # Cosine similarity (fast, baseline)
-        test_norm = np.linalg.norm(test_emb)
-        enrolled_norm = np.linalg.norm(enrolled_emb)
+        test_norm = np.linalg.norm(test_vec)
+        enrolled_norm = np.linalg.norm(enrolled_vec)
 
         if test_norm == 0 or enrolled_norm == 0:
             return 0.0
 
-        cosine_sim = np.dot(test_emb, enrolled_emb) / (test_norm * enrolled_norm)
+        cosine_sim = np.dot(test_vec, enrolled_vec) / (test_norm * enrolled_norm)
 
         # Euclidean distance (normalized)
-        euclidean_dist = np.linalg.norm(test_emb - enrolled_emb)
+        euclidean_dist = np.linalg.norm(test_vec - enrolled_vec)
         euclidean_sim = 1.0 / (1.0 + euclidean_dist)
 
         # Weighted combination (learned)
@@ -776,7 +865,7 @@ class AdvancedBiometricVerifier:
     async def _check_physics_plausibility(
         self,
         features: VoiceBiometricFeatures
-    ) -> float:
+    ) -> "PlausibilityAssessment":
         """Check if voice features are physically plausible (thread pool)."""
         return await self._run_in_executor(
             self._check_physics_plausibility_sync,
@@ -786,59 +875,134 @@ class AdvancedBiometricVerifier:
     def _check_physics_plausibility_sync(
         self,
         features: VoiceBiometricFeatures
-    ) -> float:
-        """Sync physics plausibility check."""
-        plausibility_scores = []
+    ) -> "PlausibilityAssessment":
+        """
+        Sync physics plausibility check — a component scores only on a measurement.
 
-        # 1. Pitch range check
-        if self.physics.min_pitch_male <= features.pitch_mean <= self.physics.max_pitch_female:
-            pitch_plausibility = 1.0
-        else:
-            if features.pitch_mean < self.physics.min_pitch_male:
-                deviation = (self.physics.min_pitch_male - features.pitch_mean) / self.physics.min_pitch_male
+        This is the anti-spoofing stage's twin, and carried the identical defect
+        after that one was fixed. Every component below reads a feature and
+        compares it to a threshold; the comparison is arithmetically valid even
+        when nothing measured the feature, which is exactly the trap:
+
+          * an unset 0.0 formant gives ``0.0 / max(0.0, 1.0) = 0.0``, falls
+            outside the F1/F2 ratio band, and scores that component **0.5**;
+          * an unset 0.0 HNR gives ``0.0 / 5.0`` and scores it **0.0**.
+
+        Two of five components pinned low by quantities nobody looked at, then
+        averaged. On 2026-08-06 that produced ``physics_score < 0.7`` and the
+        warning "Voice physics constraints violated" alongside the spoofing
+        finding, against the enrolled operator's own voice.
+
+        So each component is gated on its input being *measurable*, and a
+        component whose input was not measured ABSTAINS: it is excluded from the
+        mean entirely rather than contributing a low score, and it is recorded
+        by name. Excluding rather than substituting a neutral 1.0 matters — a
+        neutral value still dilutes a genuine finding from a component that did
+        run, which would weaken the check exactly when evidence is thinnest.
+
+        Measurability is not typicality, and the two bands are deliberately
+        different. ``pitch_mean`` is *measurable* over 50-500 Hz while the
+        typical band scored here is 85-255 Hz: a genuine 260 Hz speaker is a
+        real measurement that scores below 1.0, not missing evidence. Narrowing
+        the first band to the second would silently discard real speakers, and
+        widening the second to the first would stop the check discriminating.
+
+        Abstaining costs nothing in security terms. Physics plausibility is a
+        veto on *impossible* voices, not a proxy for extractor health, and the
+        primary gate is untouched: a failed embedding comparison already scores
+        0.0 and cannot be rescued here.
+        """
+        physics = self.physics
+        assessment = PlausibilityAssessment()
+
+        def scores(name: str, value: float) -> None:
+            assessment.components[name] = float(np.clip(value, 0.0, 1.0))
+
+        def abstain(name: str, why: str) -> None:
+            assessment.abstained.append(f"{name}({why})")
+
+        # 1. Pitch — typical-range scoring, gated on a measurable f0.
+        if physics.measured(features.pitch_mean,
+                            physics.min_pitch_hz_measurable,
+                            physics.max_pitch_hz_measurable):
+            if physics.min_pitch_male <= features.pitch_mean <= physics.max_pitch_female:
+                scores("pitch", 1.0)
+            elif features.pitch_mean < physics.min_pitch_male:
+                deviation = (physics.min_pitch_male - features.pitch_mean) / physics.min_pitch_male
+                scores("pitch", float(np.exp(-deviation * 5.0)))
             else:
-                deviation = (features.pitch_mean - self.physics.max_pitch_female) / self.physics.max_pitch_female
-            pitch_plausibility = np.exp(-deviation * 5.0)
-
-        plausibility_scores.append(pitch_plausibility)
-
-        # 2. Formant relationship check
-        f1_f2_ratio = features.formant_f1 / max(features.formant_f2, 1.0)
-
-        if self.physics.f1_f2_min_ratio <= f1_f2_ratio <= self.physics.f1_f2_max_ratio:
-            formant_plausibility = 1.0
+                deviation = (features.pitch_mean - physics.max_pitch_female) / physics.max_pitch_female
+                scores("pitch", float(np.exp(-deviation * 5.0)))
         else:
-            formant_plausibility = 0.5
+            abstain("pitch", "pitch_mean unmeasured")
 
-        plausibility_scores.append(formant_plausibility)
-
-        # 3. Harmonic-to-Noise Ratio check
-        if features.harmonic_to_noise_ratio >= self.physics.min_hnr_db:
-            hnr_plausibility = 1.0
+        # 2. Formant relationship — needs BOTH formants, and the ratio is only
+        #    meaningful when each is a formant. The old ``max(f2, 1.0)`` guard
+        #    protected the division and nothing else: it turned an unmeasured
+        #    pair into the well-defined, entirely fictional ratio 0.0.
+        f1_ok = physics.measured(features.formant_f1,
+                                 physics.min_formant_f1_hz, physics.max_formant_f1_hz)
+        f2_ok = physics.measured(features.formant_f2,
+                                 physics.min_formant_f2_hz, physics.max_formant_f2_hz)
+        if f1_ok and f2_ok:
+            ratio = features.formant_f1 / features.formant_f2
+            in_band = physics.f1_f2_min_ratio <= ratio <= physics.f1_f2_max_ratio
+            scores("formants", 1.0 if in_band else 0.5)
         else:
-            hnr_plausibility = features.harmonic_to_noise_ratio / self.physics.min_hnr_db
+            missing = "F1" if not f1_ok else ""
+            missing += ("+" if missing and not f2_ok else "") + ("F2" if not f2_ok else "")
+            abstain("formants", f"{missing} outside human range")
 
-        plausibility_scores.append(hnr_plausibility)
-
-        # 4. Jitter check
-        if features.jitter <= self.physics.max_jitter:
-            jitter_plausibility = 1.0
+        # 3. Harmonic-to-Noise Ratio — measurability floor, not the plausibility
+        #    floor. A real 3 dB capture is noisy evidence, not absent evidence.
+        if physics.measured(features.harmonic_to_noise_ratio,
+                            physics.min_hnr_db_measurable, physics.max_hnr_db):
+            hnr = features.harmonic_to_noise_ratio
+            if hnr >= physics.min_hnr_db:
+                scores("hnr", 1.0)
+            else:
+                # Below the plausibility floor the score falls off toward zero.
+                # ``max(min_hnr_db, ε)`` guards a zeroed override, not a missing
+                # measurement — that case abstained above.
+                scores("hnr", hnr / max(physics.min_hnr_db, 1e-6))
         else:
-            jitter_plausibility = self.physics.max_jitter / features.jitter
+            abstain("hnr", "harmonic_to_noise_ratio unmeasured")
 
-        plausibility_scores.append(jitter_plausibility)
-
-        # 5. Shimmer check
-        if features.shimmer <= self.physics.max_shimmer:
-            shimmer_plausibility = 1.0
+        # 4/5. Jitter and shimmer — perturbation fractions. Zero IS a legitimate
+        #      reading here (a perfectly steady synthetic tone is 0.0 jitter and
+        #      that is a finding), so these bands admit it and only a non-finite
+        #      or out-of-range value abstains.
+        jitter_bound = BOUNDS["jitter"]
+        if physics.measured(features.jitter, jitter_bound.low, jitter_bound.high):
+            if features.jitter <= physics.max_jitter:
+                scores("jitter", 1.0)
+            else:
+                scores("jitter", physics.max_jitter / features.jitter)
         else:
-            shimmer_plausibility = self.physics.max_shimmer / features.shimmer
+            abstain("jitter", "jitter unmeasured")
 
-        plausibility_scores.append(shimmer_plausibility)
+        shimmer_bound = BOUNDS["shimmer"]
+        if physics.measured(features.shimmer, shimmer_bound.low, shimmer_bound.high):
+            if features.shimmer <= physics.max_shimmer:
+                scores("shimmer", 1.0)
+            else:
+                scores("shimmer", physics.max_shimmer / features.shimmer)
+        else:
+            abstain("shimmer", "shimmer unmeasured")
 
-        plausibility = np.mean(plausibility_scores)
+        assessment.finalize()
 
-        return float(np.clip(plausibility, 0.0, 1.0))
+        if assessment.abstained:
+            # Never silent. A plausibility score obtained by not looking is not
+            # a plausibility score, and the operator is entitled to know which
+            # components did not run.
+            logger.warning(
+                "[Physics] %d component(s) ABSTAINED — inputs were not "
+                "measurable, so they were excluded from the mean rather than "
+                "scored: %s", len(assessment.abstained), assessment.describe(),
+            )
+
+        return assessment
 
     async def _detect_spoofing(
         self,
