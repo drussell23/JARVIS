@@ -34,7 +34,19 @@ try:
 except ImportError:
     _HAS_MANAGED_EXECUTOR = False
 
+# The bounds gate and the one formant estimator. Guarded the same way as the
+# executor import above because this module is reached under both roots.
+try:  # pragma: no cover - depends on which root is on sys.path
+    from backend.voice.biological_bounds import BOUNDS, UNMEASURED, default_validator
+    from backend.voice.formant_estimation import estimate_formants
+except ImportError:  # pragma: no cover
+    from voice.biological_bounds import BOUNDS, UNMEASURED, default_validator
+    from voice.formant_estimation import estimate_formants
+
 logger = logging.getLogger(__name__)
+
+_VALIDATOR = default_validator()
+_HNR_BAND = BOUNDS["harmonic_to_noise_ratio_db"]
 
 # Shared thread pool for CPU-intensive feature extraction
 # Using a dedicated pool prevents blocking the main event loop
@@ -118,48 +130,82 @@ class AdvancedFeatureExtractor:
 
         pitch_features, formants, spectral_features, temporal_features, quality_features = results
 
-        # Handle any exceptions with safe defaults
-        if isinstance(pitch_features, Exception):
-            logger.warning(f"Pitch extraction failed: {pitch_features}")
-            pitch_features = {'mean': 150.0, 'std': 20.0, 'range': 50.0}
+        # A stage that raised produced NO measurement. It used to produce a
+        # textbook one — pitch 150/20/50, formants [500, 1500, 2500, 3500],
+        # jitter 0.01, shimmer 0.05, HNR 15.0 — which is an average adult male
+        # voice, emitted from a failure path, carrying the units and the type of
+        # real data and nothing to mark it apart from real data. Compared
+        # against an enrolled profile it is a confident statement about a voice
+        # that was never analysed.
+        #
+        # Every substitute below is UNMEASURED instead, and the failure is
+        # logged at WARNING with the exception type so a persistently broken
+        # stage is visible rather than inferred from a suspiciously average
+        # profile months later.
+        if isinstance(pitch_features, BaseException):
+            logger.warning("[Features] pitch stage failed (%s: %s) — pitch unmeasured",
+                           type(pitch_features).__name__, pitch_features)
+            pitch_features = {'mean': UNMEASURED, 'std': UNMEASURED, 'range': UNMEASURED}
 
-        if isinstance(formants, Exception):
-            logger.warning(f"Formant extraction failed: {formants}")
-            formants = [500.0, 1500.0, 2500.0, 3500.0]
+        if isinstance(formants, BaseException):
+            logger.warning("[Features] formant stage failed (%s: %s) — formants unmeasured",
+                           type(formants).__name__, formants)
+            formants = [UNMEASURED] * 4
 
-        if isinstance(spectral_features, Exception):
-            logger.warning(f"Spectral extraction failed: {spectral_features}")
-            spectral_features = {'centroid': 1000.0, 'rolloff': 2000.0, 'flux': 0.1, 'entropy': 0.5}
+        if isinstance(spectral_features, BaseException):
+            logger.warning("[Features] spectral stage failed (%s: %s) — spectra unmeasured",
+                           type(spectral_features).__name__, spectral_features)
+            spectral_features = {'centroid': UNMEASURED, 'rolloff': UNMEASURED,
+                                 'flux': UNMEASURED, 'entropy': UNMEASURED}
 
-        if isinstance(temporal_features, Exception):
-            logger.warning(f"Temporal extraction failed: {temporal_features}")
-            temporal_features = {'rate': 0.0, 'pause_ratio': 0.3, 'energy': np.zeros(100)}
+        if isinstance(temporal_features, BaseException):
+            logger.warning("[Features] temporal stage failed (%s: %s) — rate unmeasured",
+                           type(temporal_features).__name__, temporal_features)
+            temporal_features = {'rate': UNMEASURED, 'pause_ratio': UNMEASURED,
+                                 'energy': np.zeros(0)}
 
-        if isinstance(quality_features, Exception):
-            logger.warning(f"Quality extraction failed: {quality_features}")
-            quality_features = {'jitter': 0.01, 'shimmer': 0.05, 'hnr': 15.0}
+        if isinstance(quality_features, BaseException):
+            logger.warning("[Features] quality stage failed (%s: %s) — jitter/shimmer/HNR unmeasured",
+                           type(quality_features).__name__, quality_features)
+            quality_features = {'jitter': UNMEASURED, 'shimmer': UNMEASURED, 'hnr': UNMEASURED}
 
-        # Create feature object
+        # Formant lists shorter than 4 are padded with absence, never with the
+        # next textbook value, so positional indexing below stays safe.
+        formants = list(formants) + [UNMEASURED] * max(0, 4 - len(formants))
+
+        # THE GATE. Every DSP scalar crosses the biological bounds on its way
+        # into the feature object, so a value that no human vocal tract can
+        # produce becomes UNMEASURED here rather than being stored, compared
+        # against, and eventually reported as a spoofing indicator.
+        #
+        # It is deliberately applied at the assembly point rather than inside
+        # each extractor: this is the single seam every feature passes through,
+        # so a stage added later is gated by construction instead of by its
+        # author remembering to. The extractors above ALSO refuse to fabricate,
+        # which is not redundancy — they catch what a band cannot, namely a
+        # value that is unmeasured yet physically legal (an unset 0.0 jitter
+        # sits squarely inside its band and would sail through this gate).
+        measure = _VALIDATOR.coerce
         features = VoiceBiometricFeatures(
             embedding=embedding,
             embedding_confidence=0.9,
-            pitch_mean=pitch_features['mean'],
-            pitch_std=pitch_features['std'],
-            pitch_range=pitch_features['range'],
-            formant_f1=formants[0],
-            formant_f2=formants[1],
-            formant_f3=formants[2],
-            formant_f4=formants[3],
-            spectral_centroid=spectral_features['centroid'],
-            spectral_rolloff=spectral_features['rolloff'],
+            pitch_mean=measure('pitch_mean_hz', pitch_features['mean']),
+            pitch_std=measure('pitch_std_hz', pitch_features['std']),
+            pitch_range=measure('pitch_range_hz', pitch_features['range']),
+            formant_f1=measure('formant_f1_hz', formants[0]),
+            formant_f2=measure('formant_f2_hz', formants[1]),
+            formant_f3=measure('formant_f3_hz', formants[2]),
+            formant_f4=measure('formant_f4_hz', formants[3]),
+            spectral_centroid=measure('spectral_centroid_hz', spectral_features['centroid']),
+            spectral_rolloff=measure('spectral_rolloff_hz', spectral_features['rolloff']),
             spectral_flux=spectral_features['flux'],
             spectral_entropy=spectral_features['entropy'],
-            speaking_rate=temporal_features['rate'],
-            pause_ratio=temporal_features['pause_ratio'],
+            speaking_rate=measure('speaking_rate_wpm', temporal_features['rate']),
+            pause_ratio=measure('pause_ratio', temporal_features['pause_ratio']),
             energy_contour=temporal_features['energy'],
-            jitter=quality_features['jitter'],
-            shimmer=quality_features['shimmer'],
-            harmonic_to_noise_ratio=quality_features['hnr'],
+            jitter=measure('jitter', quality_features['jitter']),
+            shimmer=measure('shimmer', quality_features['shimmer']),
+            harmonic_to_noise_ratio=measure('harmonic_to_noise_ratio_db', quality_features['hnr']),
             duration_seconds=len(audio_np) / self.sample_rate,
             sample_rate=self.sample_rate
         )
@@ -226,34 +272,36 @@ class AdvancedFeatureExtractor:
                 'std': float(np.std(pitches)),
                 'range': float(np.max(pitches) - np.min(pitches))
             }
-        else:
-            return {'mean': 150.0, 'std': 20.0, 'range': 50.0}
+
+        # No frame produced a periodic peak: this recording has no trackable f0.
+        # It used to return {'mean': 150.0, 'std': 20.0, 'range': 50.0} — an
+        # invented average male voice, indistinguishable downstream from a
+        # measured one, and scored against the enrolled speaker as if real.
+        logger.warning(
+            "[Features] no voiced frame yielded a pitch period across %d "
+            "samples — reporting pitch unmeasured", len(audio),
+        )
+        return {'mean': UNMEASURED, 'std': UNMEASURED, 'range': UNMEASURED}
 
     def _extract_formants_sync(self, audio: np.ndarray) -> list:
-        """Extract formant frequencies using LPC (CPU-intensive)."""
-        try:
-            # Pre-emphasis
-            emphasized = np.append(audio[0], audio[1:] - 0.97 * audio[:-1])
+        """
+        Extract formant frequencies using LPC (CPU-intensive).
 
-            # FFT
-            fft = np.fft.rfft(emphasized)
-            magnitude = np.abs(fft)
-            freqs = np.fft.rfftfreq(len(audio), 1 / self.sample_rate)
+        This function used to claim LPC and perform spectral peak-picking: it
+        took ``find_peaks`` over the whole-utterance magnitude spectrum and
+        returned ``freqs[peaks[:4]]`` — the four LOWEST peaks by frequency,
+        which in any real recording are DC offset, mains hum and f0 harmonics.
+        Its sibling in ``enroll_voice`` did the same and wrote the result to
+        this machine's profile: F1 = 42.9 Hz, F2 = 80.0 Hz.
 
-            # Find peaks
-            from scipy.signal import find_peaks
-            peaks, _ = find_peaks(magnitude, height=np.max(magnitude) * 0.1, distance=20)
-
-            if len(peaks) >= 4:
-                formants = [float(freqs[p]) for p in peaks[:4]]
-            else:
-                formants = [500.0, 1500.0, 2500.0, 3500.0]
-
-            return formants
-
-        except Exception as e:
-            logger.debug(f"Formant extraction failed: {e}")
-            return [500.0, 1500.0, 2500.0, 3500.0]
+        Both are now the one estimator in ``voice/formant_estimation``, which
+        fits an all-pole model per voiced frame and reads the pole angles. The
+        constants that used to be returned on failure are gone: an unresolvable
+        formant is NaN, because ``[500, 1500, 2500, 3500]`` is the textbook male
+        average and writing it into a specific speaker's profile as though it
+        had been measured is the defect, not the mitigation.
+        """
+        return estimate_formants(audio, self.sample_rate, n_formants=4)
 
     def _extract_spectral_features_sync(self, audio: np.ndarray) -> dict:
         """Extract spectral features (CPU-intensive FFT operations)."""
@@ -289,9 +337,37 @@ class AdvancedFeatureExtractor:
         """Extract temporal features (CPU-intensive)."""
         duration = len(audio) / self.sample_rate
 
-        # Speaking rate (words per minute)
+        # Speaking rate (words per minute).
+        #
+        # This is where 420 wpm came from. Two ways, both of which used to be
+        # reported as a rate:
+        #
+        #   * No transcription. ``word_count`` is 0, the rate is 0.0 wpm, and a
+        #     speaker who said nothing is stored as one who speaks at zero words
+        #     per minute — then differenced against the live speaker and found
+        #     to be inconsistent. Callers that pass ``transcription=""`` (the
+        #     acoustic-only path in ``speaker_verification_service``) hit this
+        #     on every single sample.
+        #   * A short clip. Words counted over a window trimmed to the speech
+        #     segment divides by a duration far smaller than the utterance took,
+        #     and 7 words over 1.0 s is exactly 420 wpm.
+        #
+        # Neither is a measurement of how fast this person speaks, so neither is
+        # reported as one. The band check catches the second case; only the
+        # explicit absence check can catch the first, because 0.0 is a perfectly
+        # well-formed float that no downstream consumer can distinguish from a
+        # measurement.
         word_count = len(transcription.split()) if transcription else 0
-        speaking_rate = (word_count / duration) * 60 if duration > 0 else 0.0
+        if word_count == 0 or duration <= 0:
+            logger.debug(
+                "[Features] speaking rate needs words and a duration "
+                "(words=%d, duration=%.2fs) — reporting unmeasured",
+                word_count, duration,
+            )
+            speaking_rate = UNMEASURED
+        else:
+            speaking_rate = _VALIDATOR.coerce(
+                "speaking_rate_wpm", (word_count / duration) * 60)
 
         # Energy contour (frame-based)
         frame_size = self.sample_rate // 20
@@ -369,12 +445,23 @@ class AdvancedFeatureExtractor:
             if len(periods) > 1:
                 diffs = np.abs(np.diff(periods))
                 jitter = np.mean(diffs) / np.mean(periods)
-                return min(jitter, 0.1)
+                return float(min(jitter, 0.1))
 
-            return 0.01
+            # Jitter is a cycle-TO-CYCLE ratio; with fewer than two periods
+            # there is no pair to compare. The 0.01 this used to return is a
+            # healthy-voice value, so an unanalysable recording scored as a
+            # clean one — and unlike the formants, 0.01 is inside the plausible
+            # band, so no downstream gate can catch it. Only the extractor can.
+            logger.warning(
+                "[Features] jitter needs 2+ pitch periods, found %d — "
+                "reporting unmeasured", len(periods),
+            )
+            return UNMEASURED
 
-        except Exception:
-            return 0.01
+        except Exception as exc:  # noqa: BLE001 — a failed measurement is not a value
+            logger.warning("[Features] jitter computation failed (%s: %s) — "
+                           "reporting unmeasured", type(exc).__name__, exc)
+            return UNMEASURED
 
     def _compute_shimmer_sync(self, audio: np.ndarray) -> float:
         """Compute shimmer (amplitude variation)."""
@@ -389,14 +476,28 @@ class AdvancedFeatureExtractor:
                 peaks.append(peak)
 
             if len(peaks) > 1:
+                mean_peak = float(np.mean(peaks))
+                if mean_peak <= 0:
+                    # Every frame peaked at zero: silence, not a steady voice.
+                    # The +1e-10 guard below used to turn this into shimmer 0.0,
+                    # a perfect score for a recording with no signal in it.
+                    logger.warning("[Features] shimmer: all frames are silent — "
+                                   "reporting unmeasured")
+                    return UNMEASURED
                 diffs = np.abs(np.diff(peaks))
-                shimmer = np.mean(diffs) / (np.mean(peaks) + 1e-10)
-                return min(shimmer, 0.5)
+                shimmer = np.mean(diffs) / mean_peak
+                return float(min(shimmer, 0.5))
 
-            return 0.05
+            logger.warning(
+                "[Features] shimmer needs 2+ frames, found %d — reporting "
+                "unmeasured", len(peaks),
+            )
+            return UNMEASURED
 
-        except Exception:
-            return 0.05
+        except Exception as exc:  # noqa: BLE001 — a failed measurement is not a value
+            logger.warning("[Features] shimmer computation failed (%s: %s) — "
+                           "reporting unmeasured", type(exc).__name__, exc)
+            return UNMEASURED
 
     def _compute_hnr_sync(self, audio: np.ndarray) -> float:
         """Compute Harmonic-to-Noise Ratio.
@@ -424,19 +525,39 @@ class AdvancedFeatureExtractor:
                     peak_value = correlation[peak_idx]
 
                     noise_floor = np.median(correlation[min_lag:max_lag])
-                    hnr_linear = peak_value / (noise_floor + 1e-10)
-                    hnr_db = 10 * np.log10(hnr_linear + 1e-10)
+                    if noise_floor <= 0:
+                        logger.warning("[Features] HNR: no positive noise floor "
+                                       "— reporting unmeasured")
+                        return UNMEASURED
+                    hnr_linear = peak_value / noise_floor
+                    if hnr_linear <= 0:
+                        return UNMEASURED
+                    hnr_db = 10 * np.log10(hnr_linear)
 
-                    # Handle NaN (can occur with noise-only audio)
-                    if np.isnan(hnr_db):
-                        return 15.0
+                    # NaN here means the arithmetic could not be completed — it
+                    # used to become 15.0, a healthy-voice HNR, on exactly the
+                    # noise-only audio the comment names. Keep it as NaN.
+                    if not np.isfinite(hnr_db):
+                        logger.warning("[Features] HNR is not finite — "
+                                       "reporting unmeasured")
+                        return UNMEASURED
 
-                    return float(np.clip(hnr_db, 0.0, 40.0))
+                    # Clipped to the measurable band rather than to [0, 40]: the
+                    # old lower clip at 0.0 silently converted every negative
+                    # HNR (noise louder than harmonics — a real, informative
+                    # reading) into the boundary value.
+                    return float(np.clip(hnr_db, _HNR_BAND.low, _HNR_BAND.high))
 
-            return 15.0
+            logger.warning(
+                "[Features] HNR: no usable autocorrelation lag in %d samples — "
+                "reporting unmeasured", len(audio),
+            )
+            return UNMEASURED
 
-        except Exception:
-            return 15.0
+        except Exception as exc:  # noqa: BLE001 — a failed measurement is not a value
+            logger.warning("[Features] HNR computation failed (%s: %s) — "
+                           "reporting unmeasured", type(exc).__name__, exc)
+            return UNMEASURED
 
 
 def shutdown_feature_executor():

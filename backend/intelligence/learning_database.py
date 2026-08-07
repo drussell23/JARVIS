@@ -70,7 +70,58 @@ except Exception:
     RobustFileLock = None  # type: ignore[assignment]
     ROBUST_FILE_LOCK_AVAILABLE = False
 
+# Biological bounds for the acoustic columns. Imported at module scope
+# deliberately: `biological_bounds` depends on nothing beyond the standard
+# library — no numpy, no torch, no scipy — so it adds no module-lock contention
+# to a boot path that PR #70425 had to rescue from exactly that.
+try:  # pragma: no cover - depends on which root is on sys.path
+    from backend.voice.biological_bounds import default_validator as _voice_bounds
+except ImportError:  # pragma: no cover
+    try:
+        from voice.biological_bounds import default_validator as _voice_bounds
+    except ImportError:
+        _voice_bounds = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
+
+#: Columns of ``speaker_profiles`` that describe the voice itself. Only these
+#: are bounds-checked on read; identifiers, counters, blobs and timestamps are
+#: not measurements and have no physiological range.
+_ACOUSTIC_COLUMNS = (
+    "pitch_mean_hz", "pitch_std_hz", "pitch_range_hz", "pitch_min_hz", "pitch_max_hz",
+    "formant_f1_hz", "formant_f2_hz", "formant_f3_hz", "formant_f4_hz",
+    "spectral_centroid_hz", "spectral_rolloff_hz",
+    "speaking_rate_wpm", "speech_rate_wpm", "average_pitch_hz", "pause_ratio",
+    "jitter_percent", "shimmer_percent", "harmonic_to_noise_ratio_db",
+)
+
+
+def _sanitize_profile_acoustics(profile: Dict[str, Any]) -> List[str]:
+    """
+    NULL out every stored acoustic value that no human voice can produce.
+
+    Mutates ``profile`` in place and returns a description of each value
+    dropped, empty when the profile is clean.
+
+    Absent columns are left alone — a profile that never recorded a formant is
+    incomplete, not corrupt, and only a value that is *present* and impossible
+    means something wrote a fabrication. Returning NULL rather than deleting the
+    key matters: downstream readers use ``.get()`` and treat NULL as "abstain",
+    while a missing key would take a different branch in several of them.
+    """
+    if _voice_bounds is None:  # bounds module unavailable — do not guess
+        return []
+    validator = _voice_bounds()
+    dropped: List[str] = []
+    for column in _ACOUSTIC_COLUMNS:
+        if column not in profile or profile[column] is None:
+            continue
+        violation = validator.check(column, profile[column])
+        if violation is None:
+            continue
+        profile[column] = None
+        dropped.append(violation.describe())
+    return dropped
 
 # Canonicalize module identity so `intelligence.learning_database` and
 # `backend.intelligence.learning_database` share one singleton state.
@@ -7876,6 +7927,40 @@ class JARVISLearningDatabase:
                 if not has_embedding:
                     logger.debug(f"⏭️  Skipping profile '{profile['speaker_name']}' - no embedding (incomplete enrollment)")
                     continue
+
+                # THE READ GATE. Acoustic columns are validated against the
+                # biological bounds on their way OUT of the store, and anything
+                # impossible is returned as NULL.
+                #
+                # This sits here, at the one seam every stored profile crosses
+                # to reach the verifier, because the poison already on disk was
+                # written by four different code paths over months and a gate on
+                # any one writer would leave the other three. It is a read-side
+                # complement to the extractor gates, not a substitute: the
+                # extractors stop new fabrications being created, this stops
+                # existing ones being reasoned from, and the boot-time
+                # sanitiser (`voice_profile_sanitizer`) removes them for good.
+                #
+                # Measured on this machine 2026-08-06: formant_f1_hz = 42.9,
+                # formant_f2_hz = 80.03, speaking_rate_wpm = 420.0, all read
+                # back and compared against the operator's live voice.
+                dropped = _sanitize_profile_acoustics(profile)
+                if dropped:
+                    logger.warning(
+                        "🧪 Profile '%s': %d stored acoustic value(s) are "
+                        "biologically impossible and were read as NULL — %s. "
+                        "Re-enrolment will replace them.",
+                        profile.get('speaker_name'), len(dropped),
+                        "; ".join(dropped),
+                    )
+                    # Recompute: a profile whose only "acoustic features" were
+                    # the impossible ones has none, and must not be logged as
+                    # enhanced.
+                    has_acoustic = any([
+                        profile.get("pitch_mean_hz"),
+                        profile.get("formant_f1_hz"),
+                        profile.get("spectral_centroid_hz"),
+                    ])
 
                 if has_acoustic:
                     logger.debug(f"✅ Profile '{profile['speaker_name']}' has enhanced acoustic features")
