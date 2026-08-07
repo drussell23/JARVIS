@@ -6073,9 +6073,8 @@ class SpeakerVerificationService:
                 model_path="speechbrain/asr-wav2vec2-commonvoice-en",
             )
             self.speechbrain_engine = _SpeechBrainEngine(model_config)
-            logger.warning(
-                "✅ SpeechBrain engine constructed (weights load lazily on first use)"
-            )
+            logger.warning("✅ SpeechBrain engine constructed — pre-warming encoder")
+            self._schedule_encoder_prewarm()
         except Exception as exc:  # noqa: BLE001
             # LOUD, with a traceback. A construction failure was previously
             # indistinguishable from "nobody built one", and both presented
@@ -6087,6 +6086,82 @@ class SpeakerVerificationService:
                 "will report no_scoring_engine, NOT a missing voiceprint",
                 type(exc).__name__, exc, exc_info=True,
             )
+
+    def _schedule_encoder_prewarm(self) -> None:
+        """Pre-load the ECAPA speaker encoder in the background, off the unlock path.
+
+        WHY A DAEMON AND NOT A LAZY LOAD
+        --------------------------------
+        `ensure_speaker_encoder_ready()` loads on first use — and first use is an
+        unlock, on a loop measured at 33-55% availability. Paying a model load
+        there is how "unlock my screen" turns into a timeout the operator reads
+        as a refusal.
+
+        DRY: this does NOT reimplement fetching. `ensure_speaker_encoder_ready()`
+        already owns the download, the cache, the loading lock, and the
+        deliberate CPU pinning (MPS lacks the FFT ops ECAPA needs). This only
+        decides WHEN it happens. A second fetcher would be a second opinion
+        about which model and which device, which is exactly the divergence that
+        left `initialize()` without an engine.
+
+        NEVER WEDGES BOOT
+        -----------------
+        Bounded by a timeout, so a partitioned network or a HuggingFace
+        `filelock` held by another JARVIS process degrades to a warning and a
+        lazy load later, rather than a boot that never finishes. Fire-and-forget:
+        nothing awaits this, and the unlock path still calls
+        `ensure_speaker_encoder_ready()` itself — the daemon makes that call fast,
+        it does not replace it.
+
+        The loader's blocking work already runs off-loop inside the engine, so
+        this task never holds the event loop for the download.
+        """
+        if getattr(self, "_encoder_prewarm_task", None) is not None:
+            return
+
+        engine = getattr(self, "speechbrain_engine", None)
+        if engine is None or not hasattr(engine, "ensure_speaker_encoder_ready"):
+            return
+
+        try:
+            timeout_s = float(
+                os.environ.get("JARVIS_ENCODER_PREWARM_TIMEOUT_S", "180") or 180
+            )
+        except (TypeError, ValueError):
+            timeout_s = 180.0
+
+        async def _prewarm() -> None:
+            import time as _t
+            started = _t.monotonic()
+            try:
+                await asyncio.wait_for(
+                    engine.ensure_speaker_encoder_ready(), timeout=timeout_s
+                )
+                logger.warning(
+                    "✅ [EncoderPrewarm] speaker encoder ready in %.1fs — the first "
+                    "unlock will not pay for the model load",
+                    _t.monotonic() - started,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "⚠️ [EncoderPrewarm] encoder not ready within %.0fs — falling "
+                    "back to lazy load on first use. Common causes: a partitioned "
+                    "network, or a HuggingFace filelock held by another process.",
+                    timeout_s,
+                )
+            except Exception as exc:  # noqa: BLE001 — a warm must never break boot
+                logger.warning(
+                    "⚠️ [EncoderPrewarm] pre-warm failed (%s: %s) — lazy load "
+                    "remains available",
+                    type(exc).__name__, exc,
+                )
+
+        try:
+            self._encoder_prewarm_task = asyncio.get_running_loop().create_task(_prewarm())
+        except RuntimeError:
+            # No running loop (sync construction path). The lazy load still
+            # works; a pre-warm that cannot be scheduled is not a failure.
+            logger.debug("[EncoderPrewarm] no running loop — skipping pre-warm")
 
     def verification_capability(self, speaker_name: Optional[str] = None) -> Tuple[bool, str]:
         """

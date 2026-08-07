@@ -3411,6 +3411,45 @@ __all__ = ["EncoderDecoderASR"]
                 embedding2[:common_dim]
             )
 
+    @staticmethod
+    def _as_host_vector(embedding) -> "Optional[np.ndarray]":
+        """Coerce an embedding to a flat float32 numpy vector in host memory.
+
+        dtype and device are REPRESENTATION differences, not semantic ones: the
+        same voiceprint stored as float64 in SQLite and produced as float32 by
+        the encoder is the same vector twice. Casting is the correct response;
+        refusing would reject a valid comparison over a storage detail.
+
+        A torch tensor is detached and moved to CPU first — cosine similarity
+        here is numpy arithmetic, and a tensor still on an accelerator raises
+        rather than converting. `.detach()` because an embedding carrying a grad
+        graph into a comparison is a memory leak in a loop that runs per unlock.
+
+        Returns None when the input cannot be coerced at all, so the caller
+        refuses rather than scoring something it does not understand.
+        """
+        try:
+            if embedding is None:
+                return None
+
+            # torch tensors: detach, host, numpy. Guarded by duck-typing so this
+            # module does not require torch to be importable to run.
+            if hasattr(embedding, "detach") and hasattr(embedding, "cpu"):
+                embedding = embedding.detach().cpu().numpy()
+
+            vec = np.asarray(embedding)
+            if vec.size == 0:
+                return None
+
+            # float32 is the encoder's native precision; float64 profiles cast
+            # down losslessly for a direction-only measure like cosine.
+            return vec.flatten().astype(np.float32, copy=False)
+        except Exception as exc:  # noqa: BLE001 — never raise into a verdict
+            logger.error(
+                "❌ Embedding coercion failed (%s: %s)", type(exc).__name__, exc
+            )
+            return None
+
     def _compute_cosine_similarity(self, embedding1: np.ndarray, embedding2: np.ndarray) -> float:
         """Compute cosine similarity between two embeddings.
 
@@ -3424,18 +3463,45 @@ __all__ = ["EncoderDecoderASR"]
             Cosine similarity score (0.0-1.0, higher is more similar)
         """
         try:
-            # Flatten embeddings in case they have extra dimensions
-            emb1 = embedding1.flatten()
-            emb2 = embedding2.flatten()
-
-            # Handle dimension mismatch
-            if emb1.shape[0] != emb2.shape[0]:
-                logger.warning(
-                    f"⚠️  Embedding dimension mismatch: {emb1.shape[0]} vs {emb2.shape[0]}"
+            # ---- Omni-Validator: align what is alignable, refuse what is not ----
+            #
+            # dtype and device are REPRESENTATION differences. A float64 profile
+            # from SQLite compared against a float32 tensor from the encoder is
+            # the same vector twice, and casting is lossless in the direction
+            # that matters. A torch tensor on any device is brought to host
+            # memory as numpy, because numpy is what this function's arithmetic
+            # is written against.
+            emb1 = self._as_host_vector(embedding1)
+            emb2 = self._as_host_vector(embedding2)
+            if emb1 is None or emb2 is None:
+                logger.error(
+                    "❌ Cosine similarity: embedding could not be coerced to a "
+                    "host vector — refusing to score"
                 )
-                logger.info("   Applying dimension adaptation...")
-                emb1, emb2 = self._adapt_embedding_dimensions(emb1, emb2)
-                logger.info(f"   Adapted to common dimension: {emb1.shape[0]}")
+                return 0.0
+
+            # SHAPE IS NOT A REPRESENTATION DIFFERENCE. IT IS A DIFFERENT VECTOR.
+            #
+            # This used to call `_adapt_embedding_dimensions()` — padding or
+            # truncating until the arithmetic ran — and return a score. That is
+            # worse than crashing: a 192D ECAPA voiceprint compared against a
+            # differently-shaped vector is not a weak match, it is NOT A
+            # COMPARISON, and adaptation turns that into a plausible-looking
+            # confidence number in the one place that decides whether someone is
+            # you. Both false accepts and false rejects become invisible.
+            #
+            # Same defect class as every other one in this chain: a fault
+            # presented as a verdict. Here it is at the arithmetic.
+            if emb1.shape[0] != emb2.shape[0]:
+                logger.error(
+                    "❌ ShapeMismatchError: %dD vs %dD — these are different "
+                    "vectors, not a weak match. Refusing to fabricate a "
+                    "similarity score; returning 0.0. A stored ECAPA voiceprint "
+                    "is 192D, so a mismatch means the live embedding came from "
+                    "the wrong encoder, not that the speaker is wrong.",
+                    emb1.shape[0], emb2.shape[0],
+                )
+                return 0.0
 
             # Compute cosine similarity
             dot_product = np.dot(emb1, emb2)
