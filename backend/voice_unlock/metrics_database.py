@@ -2116,6 +2116,95 @@ class MetricsDatabase:
             logger.error(f"Failed to store typing session: {e}", exc_info=True)
             return None
 
+
+    @staticmethod
+    def _reconcile_table_schema(conn, table: str, create_sql: str) -> None:
+        """Bring an existing table up to the schema this module declares.
+
+        WHY THIS EXISTS
+        ---------------
+        `CREATE TABLE IF NOT EXISTS` is a no-op against a table that already
+        exists. A column added to the declaration later never reaches a database
+        created before it, and the table stays old for the life of the machine.
+
+        Measured 2026-08-06::
+
+            declared: ... hour_of_day, audio_quality, embedding_json, environment ...
+            live:     id attempt_id speaker_name confidence success duration_ms
+                      timestamp method created_at
+
+            🧠 [LEARNING-ENGINE] Could not load samples: no such column: embedding_json
+
+        The learning engine was reading the RIGHT database. The column had simply
+        never been added to a table created by an older schema.
+
+        THE DECLARATION IS THE SOURCE OF TRUTH
+        --------------------------------------
+        The expected columns are not listed here. They are obtained by executing
+        the SAME create statement into an in-memory database and reading its
+        PRAGMA — SQLite parses its own DDL, so a hand-maintained column list
+        cannot drift from the declaration it is supposed to mirror. Adding a
+        column to the CREATE above is all that is ever required; this follows.
+
+        ADDITIVE ONLY
+        -------------
+        Columns are added, never dropped, retyped or reordered. A migration that
+        can delete data is not one to run unattended on every call, and the
+        failure being fixed is an absent column, not a wrong one.
+
+        NEVER RAISES. A reconciliation failure degrades to the pre-existing
+        behaviour — a query that fails on a missing column — rather than taking
+        down the caller that was only trying to record telemetry.
+        """
+        import sqlite3 as _sqlite3
+
+        try:
+            live = {row[1] for row in conn.execute(
+                f"PRAGMA table_info({table})"
+            ).fetchall()}
+            if not live:
+                return  # table absent entirely; the CREATE above owns that case
+
+            # Let SQLite parse the declaration rather than reimplementing DDL
+            # parsing. The probe table is named differently so the statement can
+            # run in isolation regardless of IF NOT EXISTS semantics.
+            probe_name = f"__schema_probe_{table}"
+            probe_sql = create_sql.replace(table, probe_name, 1)
+            declared: dict = {}
+            with _sqlite3.connect(":memory:") as probe:
+                probe.execute(probe_sql)
+                for row in probe.execute(f"PRAGMA table_info({probe_name})"):
+                    declared[row[1]] = row[2] or "TEXT"
+
+            missing = [c for c in declared if c not in live]
+            if not missing:
+                return
+
+            for column in missing:
+                try:
+                    # No DEFAULT and no NOT NULL: SQLite forbids adding a
+                    # NOT NULL column without one, and inventing a default would
+                    # write a value the caller never supplied into existing rows.
+                    conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {declared[column]}"
+                    )
+                except Exception as exc:  # noqa: BLE001 — one column must not stop the rest
+                    logger.warning(
+                        "[SchemaReconcile] %s.%s could not be added (%s: %s)",
+                        table, column, type(exc).__name__, exc,
+                    )
+            conn.commit()
+            logger.warning(
+                "[SchemaReconcile] %s: added %d column(s) missing from an older "
+                "table — %s",
+                table, len(missing), ", ".join(sorted(missing)),
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry must never break a caller
+            logger.warning(
+                "[SchemaReconcile] %s reconciliation skipped (%s: %s)",
+                table, type(exc).__name__, exc,
+            )
+
     def _record_attempt_sync(self, attempt_data: Dict[str, Any]) -> Optional[int]:
         """
         Synchronous method to record unlock attempt (runs in executor).
@@ -2138,8 +2227,12 @@ class MetricsDatabase:
             with self._safe_sqlite() as conn:
                 cursor = conn.cursor()
 
-                # Ensure table exists with ENHANCED schema for continuous learning
-                cursor.execute("""
+                # Ensure the table exists AND that an older one is brought
+                # up to this declaration. `CREATE TABLE IF NOT EXISTS` is a
+                # no-op against a table that already exists, so a schema
+                # declared here but created before those columns existed
+                # stays old forever.
+                _vbi_create_sql = """
                     CREATE TABLE IF NOT EXISTS vbi_unlock_attempts (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         attempt_id INTEGER UNIQUE,
@@ -2188,7 +2281,11 @@ class MetricsDatabase:
                         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                         updated_at TEXT DEFAULT CURRENT_TIMESTAMP
                     )
-                """)
+                """
+                cursor.execute(_vbi_create_sql)
+                self._reconcile_table_schema(
+                    conn, "vbi_unlock_attempts", _vbi_create_sql
+                )
 
                 # Create indexes for fast queries
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_vbi_date ON vbi_unlock_attempts(date)")
