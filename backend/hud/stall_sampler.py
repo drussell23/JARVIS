@@ -60,6 +60,7 @@ STALL_SAMPLER_SCHEMA_VERSION: str = "stall_sampler.v1"
 
 #: Master switch. Default TRUE — it costs one float read per interval while
 #: the loop is healthy, and the thing it catches is otherwise uncatchable.
+ENV_DUMP_PATH = "JARVIS_STALL_DUMP_PATH"
 ENV_ENABLED: str = "JARVIS_STALL_SAMPLER_ENABLED"
 
 #: How stale the heartbeat must be before the loop counts as wedged NOW.
@@ -102,6 +103,34 @@ def min_gap_s() -> float:
 
 def max_dumps() -> int:
     return int(_f(ENV_MAX_DUMPS, 8.0, 1.0))
+
+
+
+def _now_iso() -> str:
+    """Timestamp for a dump header. NEVER raises."""
+    try:
+        from datetime import datetime
+        return datetime.now().isoformat(timespec="seconds")
+    except Exception:  # noqa: BLE001
+        return "unknown-time"
+
+
+def _dump_path():
+    """Where stall stacks are written so they outlive the process.
+
+    Env-overridable; defaults alongside the other JARVIS logs so an operator
+    looking for "what was the loop stuck on" finds it where the boot log lives.
+    Returns None if a path cannot be resolved, and the caller falls back to
+    stderr rather than losing the dump.
+    """
+    try:
+        from pathlib import Path as _Path
+        raw = (os.environ.get(ENV_DUMP_PATH, "") or "").strip()
+        if raw:
+            return _Path(raw).expanduser()
+        return _Path.home() / "Library" / "Logs" / "JARVIS" / "loop-stalls.log"
+    except Exception:  # noqa: BLE001
+        return None
 
 
 class StallSampler:
@@ -198,17 +227,63 @@ class StallSampler:
             "stacks (dump %d/%d). The frames below are what the loop is "
             "stuck on, not what it ran afterwards.",
             stale_for, self._dumps, max_dumps())
+        # WRITE THE FRAMES WHERE THEY CAN BE READ AFTERWARDS.
+        #
+        # `dump_all_threads()` defaults to sys.stderr, and the brainstem console
+        # filters the backend's output to a whitelist of prefixes. A raw
+        # faulthandler traceback matches none of them, so the stacks this
+        # sampler exists to capture have been discarded at the console for every
+        # run — the message "the frames below are what the loop is stuck on"
+        # was followed by nothing the operator could see.
+        #
+        # That is why loop starvation is the one defect still open after the
+        # rest of this chain was fixed: the instrument built to name the starver
+        # was writing to a stream nobody reads. Same lesson as BootLogFile on
+        # the Swift side, and as the four other observability findings in this
+        # arc — a measurement that cannot be recovered is not a measurement.
+        #
+        # The dump goes to a file that outlives the process. stderr is kept as
+        # well: a developer watching live should not lose what they had.
+        dump_target = None
+        try:
+            path = _dump_path()
+            if path is not None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                dump_target = path.open("a", encoding="utf-8")
+                dump_target.write(
+                    f"\n===== STALL DUMP {self._dumps}/{max_dumps()} — "
+                    f"loop wedged {stale_for:.2f}s — "
+                    f"{_now_iso()} =====\n"
+                )
+                dump_target.flush()
+                logger.warning("[StallSampler] frames -> %s", path)
+        except Exception:  # noqa: BLE001 — a witness never dies of a fault
+            dump_target = None
+
         try:
             from backend.core.ouroboros.battle_test.oob_diagnostics import (
                 dump_all_threads,
             )
-            if dump_all_threads():
+            # The file first: it is the copy that survives. stderr second, for
+            # whoever is attached right now.
+            wrote = False
+            if dump_target is not None:
+                wrote = bool(dump_all_threads(file=dump_target))
+            if dump_all_threads() or wrote:
                 return
         except Exception:  # noqa: BLE001
             logger.debug("[StallSampler] oob dump unavailable", exc_info=True)
-        # Fallback: straight to stderr. Less convenient than the log file the
-        # oob module maintains, and infinitely better than nothing at the one
-        # moment the answer exists.
+        finally:
+            if dump_target is not None:
+                try:
+                    dump_target.flush()
+                    dump_target.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # Fallback: faulthandler direct. Writes from the C signal handler, so it
+        # still works on a thread blocked inside a C call running no bytecode —
+        # which is precisely the case being investigated.
         try:
             import faulthandler
             faulthandler.dump_traceback(all_threads=True)
