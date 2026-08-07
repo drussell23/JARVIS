@@ -8104,25 +8104,102 @@ class JARVISLearningDatabase:
                         await conn.commit()
 
             # Local SQLite storage
-            # v259.0: Use RETURNING for PostgreSQL, lastrowid for SQLite
-            _vs_sql = """
-                INSERT INTO voice_samples (
-                    speaker_name, audio_data, embedding,
-                    verification_confidence, verification_result,
-                    command, transcription, environment_type,
-                    quality_score, metadata
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """
+            #
+            # TWO DATABASES, TWO `voice_samples` SCHEMAS, ONE INSERT
+            # ------------------------------------------------------
+            # The CloudSQL block above writes the CLOUD schema
+            # (speaker_name, embedding, verification_confidence, ...) and is
+            # correct for it. This block used to reuse that identical column
+            # list against LOCAL SQLite, whose `voice_samples` is a different
+            # table entirely -- created by this very module at the
+            # `CREATE TABLE IF NOT EXISTS voice_samples` above:
+            #
+            #     speaker_id INTEGER NOT NULL, audio_hash TEXT NOT NULL,
+            #     audio_data, audio_fingerprint, mfcc_features,
+            #     duration_ms REAL NOT NULL, transcription, pitch_*, energy_mean,
+            #     recording_timestamp TIMESTAMP NOT NULL, quality_score,
+            #     background_noise, used_for_training
+            #
+            # Measured 2026-08-06 23:22:24::
+            #
+            #     Failed to store voice sample:
+            #         table voice_samples has no column named speaker_name
+            #
+            # Not a missing migration: the canonical CREATE in this file has
+            # never had `speaker_name` or `embedding`, and the live database
+            # matches it exactly. The writer contradicted the schema its own
+            # module defines. Migrating the table to match the cloud would
+            # rewrite a table that is correct and populated; the INSERT is what
+            # was wrong.
+            #
+            # The local schema keys on speaker_id with a foreign key into
+            # speaker_profiles, so the name is resolved to an id here using the
+            # same lookup the rest of this module uses.
+            speaker_row = None
+            if not self._is_cloud_db:
+                async with self.db.execute(
+                    "SELECT speaker_id FROM speaker_profiles WHERE speaker_name = ?",
+                    (speaker_name,),
+                ) as _sid_cursor:
+                    speaker_row = await _sid_cursor.fetchone()
+
+            if not self._is_cloud_db and speaker_row is None:
+                # A sample with no owner cannot satisfy the foreign key, and
+                # inventing a profile here would create an unenrolled speaker as
+                # a side effect of storing telemetry.
+                logger.warning(
+                    "Voice sample not stored: no speaker_profiles row for %r "
+                    "(the local schema keys samples by speaker_id)",
+                    speaker_name,
+                )
+                return -1
+
+            _speaker_id = speaker_row[0] if speaker_row else None
+
+            # audio_hash and duration_ms are NOT NULL in the local schema.
+            # Derived from the payload rather than defaulted, so a sample is
+            # addressable by content and its duration is real.
+            _audio_hash = hashlib.sha256(audio_data or b"").hexdigest()
+            _duration_ms = float((metadata or {}).get("duration_ms") or 0.0)
+
+            # `self.db` is not always SQLite: `_is_cloud_db` means this handle
+            # speaks the CLOUD schema, and the local column list would be just
+            # as wrong there as the cloud list was here. Each branch writes the
+            # schema its own connection actually has -- that is the whole defect
+            # being fixed, and hardcoding one shape for both would recreate it
+            # pointing the other way.
             if self._is_cloud_db:
-                _vs_sql += " RETURNING sample_id"
-            async with self.db.execute(
-                _vs_sql,
-                (
+                _vs_sql = """
+                    INSERT INTO voice_samples (
+                        speaker_name, audio_data, embedding,
+                        verification_confidence, verification_result,
+                        command, transcription, environment_type,
+                        quality_score, metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING sample_id
+                """
+                _vs_params = (
                     speaker_name, audio_data, embedding_bytes,
                     confidence, verified, command, transcription,
                     environment_type, quality_score,
-                    json.dumps(metadata) if metadata else None
+                    json.dumps(metadata) if metadata else None,
                 )
+            else:
+                _vs_sql = """
+                    INSERT INTO voice_samples (
+                        speaker_id, audio_hash, audio_data, duration_ms,
+                        transcription, recording_timestamp, quality_score,
+                        used_for_training
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """
+                _vs_params = (
+                    _speaker_id, _audio_hash, audio_data, _duration_ms,
+                    transcription, datetime.now().isoformat(),
+                    quality_score, 1 if verified else 0,
+                )
+
+            async with self.db.execute(
+                _vs_sql,
+                _vs_params
             ) as cursor:
                 await self.db.commit()
                 if self._is_cloud_db:
