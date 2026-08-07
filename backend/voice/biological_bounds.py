@@ -76,7 +76,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -90,9 +90,13 @@ __all__ = [
     "is_absent",
     "BiologicalBoundsValidator",
     "MeasuredAggregator",
+    "PerturbationCaps",
+    "PerturbationTolerance",
     "SanitizeResult",
     "Violation",
     "default_validator",
+    "fold_measurement",
+    "renormalized_weighted_mean",
 ]
 
 
@@ -536,6 +540,219 @@ class BiologicalBoundsValidator:
             if violation is not None:
                 violations.append(violation)
         return violations
+
+
+def renormalized_weighted_mean(contributions: Sequence[Tuple[float, float]]) -> float:
+    """
+    Weighted mean over the terms that ran, with the weights renormalised.
+
+    THIS IS WHAT "A NEUTRAL PRIOR" MEANS IN A WEIGHTED FUSION, and the
+    distinction is the whole point:
+
+      * substituting 0.5 for an absent term drags the result toward 0.5 —
+        it penalises a high score and inflates a low one;
+      * substituting 1.0 (or the model's own mean, which maximises a Gaussian
+        likelihood) inflates unconditionally, and would let a stage that
+        measured NOTHING vouch for the speaker;
+      * DROPPING the term and renormalising the remaining weights leaves the
+        posterior exactly where the surviving evidence puts it. That is the
+        only operation that neither penalises nor inflates, and it is the same
+        discipline the physics scorer applies by excluding a component from its
+        mean rather than scoring it.
+
+    Returns ``UNMEASURED`` when nothing survives — there is no answer to give,
+    and the caller must drop its own term in turn rather than invent one.
+    """
+    usable = [(float(v), float(w)) for v, w in contributions
+              if not is_absent(v) and not is_absent(w) and float(w) > 0.0]
+    if not usable:
+        return UNMEASURED
+    total_weight = sum(w for _, w in usable)
+    if total_weight <= 0.0:
+        return UNMEASURED
+    return sum(v * w for v, w in usable) / total_weight
+
+
+def fold_measurement(
+    current: Any,
+    observed: Any,
+    alpha: float,
+    *,
+    quantity: str = "",
+    validator: Optional["BiologicalBoundsValidator"] = None,
+    label: str = "",
+) -> float:
+    """
+    Exponential-moving-average update that REFUSES an unmeasured observation.
+
+    An EMA is ``(1-a)*current + a*observed``. Feed it one NaN and the running
+    value is NaN forever — there is no subsequent observation that can pull it
+    back, because every future update multiplies the NaN through. When the
+    running value is a speaker's adaptive pitch model, one unmeasurable sample
+    permanently corrupts the model every later verification is judged against.
+
+    Worse, the update in ``advanced_biometric_verification`` runs only on a
+    SUCCESSFUL verification, so the poisoning is seeded by the success path —
+    the one nobody watches for corruption.
+
+    So an observation that is absent, non-finite, or outside its band leaves
+    ``current`` untouched and is logged. Refusing to learn from a
+    non-measurement is not a lost update; it is the only correct one.
+    """
+    if is_absent(current):
+        # The running value is already unusable — adopt a good observation to
+        # recover rather than propagating the corruption forever.
+        if not is_absent(observed) and (
+            validator is None or not quantity or validator.measured(quantity, observed)
+        ):
+            logger.warning(
+                "[Bounds] %s: running value was not finite — reseeding from a "
+                "measured observation", label or quantity or "EMA",
+            )
+            return float(observed)
+        return UNMEASURED
+
+    if is_absent(observed):
+        logger.info(
+            "[Bounds] %s: observation was not measured — leaving the running "
+            "value unchanged rather than folding NaN into it",
+            label or quantity or "EMA",
+        )
+        return float(current)
+
+    if validator is not None and quantity and not validator.measured(quantity, observed):
+        logger.warning(
+            "[Bounds] %s: observation %r is outside its biological band — not "
+            "folding it into the running value",
+            label or quantity, observed,
+        )
+        return float(current)
+
+    rate = float(alpha)
+    if not math.isfinite(rate) or not (0.0 <= rate <= 1.0):
+        logger.warning("[Bounds] %s: alpha %r is not a rate in [0,1] — not updating",
+                       label or quantity or "EMA", alpha)
+        return float(current)
+
+    return (1.0 - rate) * float(current) + rate * float(observed)
+
+
+@dataclass(frozen=True)
+class PerturbationCaps:
+    """The jitter and shimmer a recording of this quality can be held to."""
+
+    jitter: float
+    shimmer: float
+    snr_db: Optional[float]
+    scale: float
+    basis: str
+
+    def describe(self) -> str:
+        measured = f"{self.snr_db:.1f} dB" if self.snr_db is not None else "unknown SNR"
+        return (f"jitter<={self.jitter:.3f} shimmer<={self.shimmer:.3f} "
+                f"(x{self.scale:.2f} from {measured} via {self.basis})")
+
+
+class PerturbationTolerance:
+    """
+    Jitter and shimmer limits scaled to the quality of the actual recording.
+
+    The fixed 0.02 / 0.10 caps are CLINICAL figures. They come from voice
+    pathology work using a head-mounted microphone in a treated room, where
+    cycle-to-cycle perturbation is dominated by the larynx. Applied to a laptop
+    array in a room with a fan, they are measuring the room: the operator's own
+    verified sample scored ``jitter:0.27 shimmer:0.33`` against them, dragging
+    a stage that was otherwise clean down to 0.65.
+
+    Perturbation estimates degrade predictably as the noise floor rises — noise
+    perturbs the period and amplitude estimates directly — so the tolerance is
+    derived from measured SNR rather than assumed. A clean capture is still
+    held to the clinical figure; a noisy one is held to what a noisy capture
+    can actually support; below a floor the measurement carries no information
+    and the caller is told to abstain instead of being handed a limit so wide
+    it would pass anything.
+
+    Every constant is env-overridable (``JARVIS_VOICE_PERTURBATION_*``): these
+    are properties of the microphone and room, and the right values for a
+    headset are not the right values for a MacBook across a desk.
+    """
+
+    def __init__(
+        self,
+        base_jitter: float = 0.02,
+        base_shimmer: float = 0.10,
+        clean_snr_db: float = 30.0,
+        floor_snr_db: float = 5.0,
+        max_scale: float = 6.0,
+        unknown_scale: float = 3.0,
+    ) -> None:
+        self.base_jitter = base_jitter
+        self.base_shimmer = base_shimmer
+        self.clean_snr_db = clean_snr_db
+        self.floor_snr_db = floor_snr_db
+        self.max_scale = max_scale
+        self.unknown_scale = unknown_scale
+
+    @classmethod
+    def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "PerturbationTolerance":
+        source = os.environ if env is None else env
+        defaults = cls()
+        return cls(
+            base_jitter=_env_float("JARVIS_VOICE_PERTURBATION_BASE_JITTER",
+                                   defaults.base_jitter, source),
+            base_shimmer=_env_float("JARVIS_VOICE_PERTURBATION_BASE_SHIMMER",
+                                    defaults.base_shimmer, source),
+            clean_snr_db=_env_float("JARVIS_VOICE_PERTURBATION_CLEAN_SNR_DB",
+                                    defaults.clean_snr_db, source),
+            floor_snr_db=_env_float("JARVIS_VOICE_PERTURBATION_FLOOR_SNR_DB",
+                                    defaults.floor_snr_db, source),
+            max_scale=_env_float("JARVIS_VOICE_PERTURBATION_MAX_SCALE",
+                                 defaults.max_scale, source),
+            unknown_scale=_env_float("JARVIS_VOICE_PERTURBATION_UNKNOWN_SCALE",
+                                     defaults.unknown_scale, source),
+        )
+
+    def informative(self, snr_db: Any) -> bool:
+        """
+        False only when the capture is MEASURED and too noisy to inform.
+
+        "We measured 2 dB" and "we do not know the SNR" are different facts and
+        must not collapse into one answer. Below the floor, perturbation
+        estimates are dominated by noise and carry no speaker information, so
+        the component abstains. With SNR simply unknown, ``caps_for`` has
+        already widened the limits by ``unknown_scale`` to cover the
+        uncertainty — abstaining as well would discard a component twice for
+        the same reason, and would silently disable jitter and shimmer on every
+        caller that does not happen to pass an ``audio_quality`` block.
+        """
+        if not is_measured(snr_db, None, None):
+            return True  # unknown: scored against the widened caps
+        return float(snr_db) >= self.floor_snr_db
+
+    def caps_for(self, snr_db: Any = None) -> PerturbationCaps:
+        """
+        Caps for a recording at ``snr_db``.
+
+        Unknown SNR gets a fixed middling widening rather than either extreme:
+        assuming studio conditions would penalise every real capture (the bug
+        being fixed), and assuming the worst would disable the check.
+        """
+        if not is_measured(snr_db, None, None):
+            scale = max(1.0, self.unknown_scale)
+            return PerturbationCaps(self.base_jitter * scale, self.base_shimmer * scale,
+                                    None, scale, "unmeasured-SNR default")
+
+        snr = float(snr_db)
+        span = self.clean_snr_db - self.floor_snr_db
+        if span <= 0:
+            scale = 1.0
+        else:
+            # 1.0 at clean_snr_db, rising linearly to max_scale at the floor.
+            deficit = (self.clean_snr_db - snr) / span
+            scale = 1.0 + max(0.0, deficit) * (self.max_scale - 1.0)
+        scale = float(min(max(scale, 1.0), self.max_scale))
+        return PerturbationCaps(self.base_jitter * scale, self.base_shimmer * scale,
+                                snr, scale, "measured SNR")
 
 
 class MeasuredAggregator:

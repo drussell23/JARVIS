@@ -50,11 +50,24 @@ except ImportError:
 # heavier than numpy, so neither costs this path the SpeechBrain import it is
 # careful to avoid.
 try:  # pragma: no cover - exercised by whichever root the process happens to use
-    from backend.voice.biological_bounds import BOUNDS, is_measured
+    from backend.voice.biological_bounds import (
+        BOUNDS, UNMEASURED, PerturbationCaps, PerturbationTolerance,
+        default_validator, fold_measurement, is_measured,
+        renormalized_weighted_mean,
+    )
     from backend.voice.embedding_ops import coerce_vector
 except ImportError:  # pragma: no cover
-    from voice.biological_bounds import BOUNDS, is_measured
+    from voice.biological_bounds import (
+        BOUNDS, UNMEASURED, PerturbationCaps, PerturbationTolerance,
+        default_validator, fold_measurement, is_measured,
+        renormalized_weighted_mean,
+    )
     from voice.embedding_ops import coerce_vector
+
+#: Shared with the extractors and the sanitiser — the adaptive model must judge
+#: an observation by the same bands the writer used, or it will learn from a
+#: value the writer would have refused.
+_BOUNDS_VALIDATOR = default_validator()
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +311,63 @@ class SpoofingAssessment:
 
 
 @dataclass
+class AcousticAssessment:
+    """
+    What the acoustic stage compared, and what it could not.
+
+    The third sibling of :class:`SpoofingAssessment` and
+    :class:`PlausibilityAssessment`. All three read raw features, all three can
+    be handed quantities nothing measured, and all three turned that into a
+    confident number until they were fixed one at a time — which is the
+    argument for their result types being the same shape. A future reader
+    adding a fourth stage should find three identical patterns, not three
+    different ones.
+
+    ``weights`` carries the model's learned weight for each component that ran,
+    so the mean can renormalise over survivors instead of assuming all four
+    contributed.
+    """
+
+    score: float = UNMEASURED
+    components: Dict[str, float] = field(default_factory=dict)
+    weights: Dict[str, float] = field(default_factory=dict)
+    abstained: List[str] = field(default_factory=list)
+    partial: List[str] = field(default_factory=list)
+
+    @property
+    def evidence_complete(self) -> bool:
+        return not self.abstained and not self.partial
+
+    @property
+    def has_evidence(self) -> bool:
+        """True when at least one component actually compared something."""
+        return bool(self.components) and is_measured(self.score, 0.0, 1.0)
+
+    def finalize(self) -> "AcousticAssessment":
+        """
+        Weighted mean over the components that ran, weights renormalised.
+
+        With nothing measurable the score stays ``UNMEASURED`` — deliberately
+        NOT a neutral 0.5. This stage must then be DROPPED from the fusion
+        rather than contribute a fabricated middle value, and ``has_evidence``
+        is how the fusion knows. Naming the absence is what lets the caller do
+        the neutral thing; naming a number would force it to do the wrong one.
+        """
+        contributions = [(score, self.weights.get(name, 1.0))
+                         for name, score in self.components.items()]
+        self.score = renormalized_weighted_mean(contributions)
+        if is_measured(self.score, None, None):
+            self.score = float(np.clip(self.score, 0.0, 1.0))
+        return self
+
+    def describe(self) -> str:
+        ran = ", ".join(f"{n}:{v:.2f}" for n, v in self.components.items()) or "none"
+        skipped = ", ".join(self.abstained + self.partial) or "none"
+        shown = f"{self.score:.2f}" if is_measured(self.score, None, None) else "unmeasured"
+        return f"score={shown} scored=[{ran}] abstained=[{skipped}]"
+
+
+@dataclass
 class PlausibilityAssessment:
     """
     What the physics stage scored, and what it could not look at.
@@ -317,6 +387,10 @@ class PlausibilityAssessment:
     score: float = 1.0
     components: Dict[str, float] = field(default_factory=dict)
     abstained: List[str] = field(default_factory=list)
+    #: The jitter/shimmer limits this recording was actually held to, so a log
+    #: line can say WHICH caps produced a low score rather than leaving the
+    #: reader to assume the clinical ones.
+    perturbation_caps: Optional[PerturbationCaps] = None
 
     @property
     def evidence_complete(self) -> bool:
@@ -436,6 +510,11 @@ class AdvancedBiometricVerifier:
         # Physics constraints — every band overridable per deployment.
         self.physics = PhysicsConstraints.from_env()
 
+        # Perturbation limits scaled to the recording, not to a clinic. The
+        # 0.02/0.10 constants this replaces are head-mounted-microphone figures
+        # and they penalised the operator's own verified sample by 0.27/0.33.
+        self._perturbation = PerturbationTolerance.from_env()
+
         # Anti-spoofing trip points. Read from the environment rather than
         # written into the checks, so a mic or codec that shifts the noise
         # floor can be accommodated without editing a security decision.
@@ -503,7 +582,8 @@ class AdvancedBiometricVerifier:
                 speaker_model
             ),
             self._check_physics_plausibility(
-                test_features
+                test_features,
+                context
             ),
             return_exceptions=True
         )
@@ -516,7 +596,18 @@ class AdvancedBiometricVerifier:
         # the same defect this chain has produced at every other layer.
         embedding_sim = float(results[0]) if not isinstance(results[0], BaseException) else 0.0
         mahal_distance = float(results[1]) if not isinstance(results[1], BaseException) else 0.5
-        acoustic_score = float(results[2]) if not isinstance(results[2], BaseException) else 0.5
+
+        # Acoustic returns an assessment for the same reason physics does: the
+        # score alone cannot say whether any component actually compared
+        # anything. A raised stage yields an assessment that abstained on
+        # everything rather than the old bare 0.5, which was a fabricated
+        # middling match manufactured by a crash.
+        if isinstance(results[2], BaseException):
+            acoustic = AcousticAssessment(
+                abstained=[f"stage_failed({type(results[2]).__name__})"]).finalize()
+        else:
+            acoustic = results[2]
+        acoustic_score = acoustic.score
 
         # Physics returns an assessment, not a bare number: the score alone
         # cannot say which components were unmeasurable, and that distinction is
@@ -603,6 +694,17 @@ class AdvancedBiometricVerifier:
             warnings.append(f"High uncertainty ({uncertainty:.1%})")
         if physics_score < 0.7:
             warnings.append("Voice physics constraints violated")
+        if not acoustic.has_evidence:
+            warnings.append(
+                "Acoustic comparison had no evidence: every component abstained "
+                f"({'; '.join(acoustic.abstained) or 'no components'}) — the "
+                "term was dropped from the fusion rather than scored"
+            )
+        elif not acoustic.evidence_complete:
+            warnings.append(
+                f"Acoustic evidence incomplete: {len(acoustic.abstained + acoustic.partial)} "
+                f"component(s) reduced ({'; '.join(acoustic.abstained + acoustic.partial)})"
+            )
         if not physics.evidence_complete:
             # Symmetric with the anti-spoofing warning below, and for the same
             # reason: a plausibility score reached by skipping components is not
@@ -653,6 +755,11 @@ class AdvancedBiometricVerifier:
         # Track verification
         self.verification_history.append(result)
         await self._update_performance_metrics(result)
+
+        # Escalate anything the fusion guard intercepted. This is the async
+        # side of that guard: the fusion runs in a worker thread and cannot
+        # await, so it records the anomaly and this drains it.
+        await self._escalate_authorization_anomaly(speaker_model, speaker_name)
 
         logger.info(
             f"🎯 Verification: {speaker_name} | "
@@ -810,12 +917,77 @@ class AdvancedBiometricVerifier:
             distance = np.linalg.norm(test_vector - enrolled_vector)
             return float(np.exp(-distance))
 
+    async def _escalate_authorization_anomaly(
+        self,
+        speaker_model: "SpeakerModel",
+        speaker_name: str,
+    ) -> None:
+        """
+        Hand a non-finite authorization value to the runtime health sensor.
+
+        A NaN reaching the authorization tensor is not a voice problem, it is a
+        RUNTIME problem: something upstream produced a value that is not a
+        number and every guard between there and here failed to notice. It must
+        be visible to the organism that fixes such things, not buried in a log
+        line inside a thread pool.
+
+        Uses the sensor's existing push entry point — the same one
+        ``TaskHarvester`` and ``LoopSentinel`` use — so this adds a reporter,
+        not a second sensor. Registration rather than import, so a verifier
+        running before the intake layer is up simply finds nothing and moves on.
+
+        NEVER raises. A failure to report a fault must not become a second
+        fault on the authorization path, and the verdict has already been
+        decided (deny) by the time this runs.
+        """
+        debug = getattr(speaker_model, "last_fusion_debug", None)
+        if not isinstance(debug, dict):
+            return
+        anomaly = debug.pop("authorization_anomaly", None)
+        if not anomaly:
+            return
+
+        try:
+            try:
+                from backend.core.ouroboros.governance.intake.sensors.runtime_health_sensor import (
+                    HealthFinding, get_runtime_health_sensor,
+                )
+            except ImportError:
+                from core.ouroboros.governance.intake.sensors.runtime_health_sensor import (  # type: ignore
+                    HealthFinding, get_runtime_health_sensor,
+                )
+
+            sensor = get_runtime_health_sensor()
+            if sensor is None:
+                logger.critical(
+                    "🚨 [Verify] authorization anomaly with no runtime health "
+                    "sensor registered to receive it: %s", anomaly,
+                )
+                return
+
+            await sensor.report(HealthFinding(
+                category="authorization_integrity",
+                severity="critical",
+                summary=(
+                    f"Non-finite value reached the voice authorization tensor "
+                    f"({anomaly.get('kind', 'unknown')}) — verification failed "
+                    f"closed for '{speaker_name}'"
+                ),
+                details=dict(anomaly, speaker=speaker_name),
+                target_files=("backend/voice/advanced_biometric_verification.py",),
+            ))
+        except Exception:  # noqa: BLE001 — reporting a fault may not create one
+            logger.critical(
+                "🚨 [Verify] authorization anomaly could not be reported: %s",
+                anomaly, exc_info=True,
+            )
+
     async def _compute_acoustic_match(
         self,
         test_features: VoiceBiometricFeatures,
         enrolled_features: VoiceBiometricFeatures,
         speaker_model: "SpeakerModel"
-    ) -> float:
+    ) -> "AcousticAssessment":
         """Compute acoustic feature matching score (thread pool)."""
         return await self._run_in_executor(
             self._compute_acoustic_match_sync,
@@ -827,54 +999,179 @@ class AdvancedBiometricVerifier:
         test_features: VoiceBiometricFeatures,
         enrolled_features: VoiceBiometricFeatures,
         speaker_model: "SpeakerModel"
-    ) -> float:
-        """Sync acoustic matching computation."""
-        scores = []
+    ) -> "AcousticAssessment":
+        """
+        Sync acoustic matching — a component contributes only when BOTH sides
+        were measured.
 
-        # Pitch matching (with tolerance for natural variation)
-        pitch_diff = abs(test_features.pitch_mean - enrolled_features.pitch_mean)
-        pitch_tolerance = speaker_model.pitch_std * 2.0
-        pitch_score = np.exp(-pitch_diff / max(pitch_tolerance, 10.0))
-        scores.append(pitch_score)
+        The third of the three fused stages, and the last to get this. Every
+        comparison below is a difference between a test feature and an enrolled
+        one; ``abs(NaN - x)`` is NaN, ``exp(-NaN)`` is NaN, and ``np.average``
+        of anything containing NaN is NaN. Once the enrolled formants were
+        NULLed as biologically impossible, this stage emitted NaN into the
+        fusion on every single verification.
 
-        # Formant matching (speaker-specific resonances)
-        formant_diffs = [
-            abs(test_features.formant_f1 - enrolled_features.formant_f1),
-            abs(test_features.formant_f2 - enrolled_features.formant_f2),
-            abs(test_features.formant_f3 - enrolled_features.formant_f3)
-        ]
-        formant_score = np.mean([np.exp(-diff / 200.0) for diff in formant_diffs])
-        scores.append(formant_score)
+        It did not corrupt the verdict, and the reason is worse than if it had:
+        the Bayesian block that consumes it discards its own result (see
+        ``_bayesian_verification_sync``). The channel is SEVERED, not safe. A
+        NaN guard placed only there would guard nothing, and the moment anyone
+        reconnects the fusion the bomb arms itself.
 
-        # Spectral matching
-        spectral_diff = abs(test_features.spectral_centroid - enrolled_features.spectral_centroid)
-        spectral_score = np.exp(-spectral_diff / 1000.0)
-        scores.append(spectral_score)
+        BOTH sides must be measured, not just one. Comparing a live formant
+        against an absent enrolled one is not a weak match — it is not a
+        comparison, and scoring it produces a number for arithmetic that never
+        validly happened. That is the same rule ``_compute_embedding_similarity``
+        applies to a dimension mismatch.
 
-        # Speaking rate (temporal characteristic)
-        rate_diff = abs(test_features.speaking_rate - enrolled_features.speaking_rate)
-        rate_score = np.exp(-rate_diff / 50.0)
-        scores.append(rate_score)
+        Surviving components are combined with the model's learned weights
+        RENORMALISED over them, which is the only mathematically neutral way to
+        drop a term: substituting 0.5 would penalise a good match and inflate a
+        bad one, and substituting the model's own mean would maximise the
+        Gaussian likelihood downstream — a stage that measured nothing vouching
+        for the speaker.
+        """
+        assessment = AcousticAssessment()
+        physics = self.physics
+        # Learned weights, positionally aligned with the four components below.
+        weights = list(getattr(speaker_model, "acoustic_weights", []) or [])
+        while len(weights) < 4:
+            weights.append(1.0)
 
-        # Weighted average (learned weights)
-        weights = speaker_model.acoustic_weights
-        acoustic_score = np.average(scores, weights=weights)
+        def both_measured(name: str, low: float, high: float) -> bool:
+            t = getattr(test_features, name)
+            e = getattr(enrolled_features, name)
+            return physics.measured(t, low, high) and physics.measured(e, low, high)
 
-        return float(np.clip(acoustic_score, 0.0, 1.0))
+        # 1. Pitch — tolerance from the speaker's own learned spread.
+        if both_measured("pitch_mean", physics.min_pitch_hz_measurable,
+                         physics.max_pitch_hz_measurable):
+            pitch_diff = abs(test_features.pitch_mean - enrolled_features.pitch_mean)
+            tolerance = speaker_model.pitch_std * 2.0
+            if not is_measured(tolerance, 1e-6, None):
+                # A model whose learned spread is unusable falls back to the
+                # floor the original code used, rather than dividing by NaN.
+                tolerance = 10.0
+            assessment.components["pitch"] = float(np.exp(-pitch_diff / max(tolerance, 10.0)))
+            assessment.weights["pitch"] = weights[0]
+        else:
+            assessment.abstained.append("pitch(unmeasured on one or both sides)")
+
+        # 2. Formants — per-formant, so one absent formant costs that formant
+        #    rather than the whole component. F1+F2 carry most of the speaker
+        #    information; requiring all three would abstain far too often.
+        formant_scores = []
+        missing = []
+        for index, (name, low, high) in enumerate((
+            ("formant_f1", physics.min_formant_f1_hz, physics.max_formant_f1_hz),
+            ("formant_f2", physics.min_formant_f2_hz, physics.max_formant_f2_hz),
+            ("formant_f3", BOUNDS["formant_f3_hz"].low, BOUNDS["formant_f3_hz"].high),
+        )):
+            if both_measured(name, low, high):
+                diff = abs(getattr(test_features, name) - getattr(enrolled_features, name))
+                formant_scores.append(float(np.exp(-diff / 200.0)))
+            else:
+                missing.append(f"F{index + 1}")
+        if formant_scores:
+            assessment.components["formants"] = float(np.mean(formant_scores))
+            assessment.weights["formants"] = weights[1]
+            if missing:
+                assessment.partial.append(f"formants({'+'.join(missing)} unmeasured)")
+        else:
+            assessment.abstained.append("formants(none measurable on both sides)")
+
+        # 3. Spectral centroid
+        if both_measured("spectral_centroid", BOUNDS["spectral_centroid_hz"].low,
+                         BOUNDS["spectral_centroid_hz"].high):
+            diff = abs(test_features.spectral_centroid - enrolled_features.spectral_centroid)
+            assessment.components["spectral"] = float(np.exp(-diff / 1000.0))
+            assessment.weights["spectral"] = weights[2]
+        else:
+            assessment.abstained.append("spectral(unmeasured on one or both sides)")
+
+        # 4. Speaking rate — the enrolled side of this was 420 wpm.
+        if both_measured("speaking_rate", physics.min_speaking_rate_wpm,
+                         physics.max_speaking_rate_wpm):
+            diff = abs(test_features.speaking_rate - enrolled_features.speaking_rate)
+            assessment.components["rate"] = float(np.exp(-diff / 50.0))
+            assessment.weights["rate"] = weights[3]
+        else:
+            assessment.abstained.append("rate(unmeasured on one or both sides)")
+
+        assessment.finalize()
+
+        if assessment.abstained:
+            logger.warning(
+                "[Acoustic] %d component(s) ABSTAINED — one or both sides were "
+                "not measured, so they were dropped and the remaining weights "
+                "renormalised: %s", len(assessment.abstained), assessment.describe(),
+            )
+
+        return assessment
 
     async def _check_physics_plausibility(
         self,
-        features: VoiceBiometricFeatures
+        features: VoiceBiometricFeatures,
+        context: Optional[Dict] = None,
     ) -> "PlausibilityAssessment":
         """Check if voice features are physically plausible (thread pool)."""
         return await self._run_in_executor(
             self._check_physics_plausibility_sync,
-            features
+            features, context
         )
+
+    @property
+    def _tolerance(self) -> PerturbationTolerance:
+        """
+        The perturbation tolerance, built on first use.
+
+        Resolved lazily rather than read straight off ``__init__`` so that a
+        verifier reached through any construction path — a partially built
+        instance in a test, a subclass that overrides ``__init__``, an object
+        restored from a pickle — still scores instead of raising
+        ``AttributeError`` from inside a thread pool, where the traceback would
+        surface as "verification stage 3 failed" and be substituted with a
+        fabricated score. The scorer must not depend on construction order.
+        """
+        tolerance = getattr(self, "_perturbation", None)
+        if tolerance is None:
+            tolerance = PerturbationTolerance.from_env()
+            self._perturbation = tolerance
+        return tolerance
+
+    def _perturbation_caps(
+        self,
+        features: VoiceBiometricFeatures,
+        context: Optional[Dict] = None,
+    ) -> "PerturbationCaps":
+        """
+        Jitter/shimmer limits for this recording, from its measured SNR.
+
+        SNR is taken from the caller's ``context['audio_quality']`` when the
+        capture path measured it — the same block the anti-spoofing stage
+        already reads, so there is one source of truth for recording quality
+        rather than two that can disagree. Absent that, the tolerance falls back
+        to its unknown-SNR default rather than assuming studio conditions.
+
+        Deliberately NOT derived from ``energy_contour`` as a substitute: signal
+        energy is not signal-to-noise, and a loud recording in a loud room would
+        read as clean. Guessing an SNR to satisfy a parameter is the same error
+        as guessing a formant.
+        """
+        snr = None
+        if isinstance(context, dict):
+            quality = context.get("audio_quality")
+            if isinstance(quality, dict):
+                snr = quality.get("snr_db")
+            elif is_measured(quality, None, None):
+                # Some callers pass a bare quality scalar; it is not an SNR and
+                # must not be read as one.
+                snr = None
+        return self._tolerance.caps_for(snr)
 
     def _check_physics_plausibility_sync(
         self,
-        features: VoiceBiometricFeatures
+        features: VoiceBiometricFeatures,
+        context: Optional[Dict] = None,
     ) -> "PlausibilityAssessment":
         """
         Sync physics plausibility check — a component scores only on a measurement.
@@ -968,27 +1265,38 @@ class AdvancedBiometricVerifier:
         else:
             abstain("hnr", "harmonic_to_noise_ratio unmeasured")
 
-        # 4/5. Jitter and shimmer — perturbation fractions. Zero IS a legitimate
-        #      reading here (a perfectly steady synthetic tone is 0.0 jitter and
-        #      that is a finding), so these bands admit it and only a non-finite
-        #      or out-of-range value abstains.
-        jitter_bound = BOUNDS["jitter"]
-        if physics.measured(features.jitter, jitter_bound.low, jitter_bound.high):
-            if features.jitter <= physics.max_jitter:
-                scores("jitter", 1.0)
-            else:
-                scores("jitter", physics.max_jitter / features.jitter)
-        else:
-            abstain("jitter", "jitter unmeasured")
+        # 4/5. Jitter and shimmer — perturbation fractions, held to what THIS
+        #      recording can support.
+        #
+        #      The fixed 0.02 / 0.10 caps are clinical figures from voice
+        #      pathology work: head-mounted microphone, treated room, where
+        #      cycle-to-cycle perturbation is dominated by the larynx. Applied
+        #      to a laptop array in a room with a fan they measure the room. The
+        #      operator's own VERIFIED sample scored jitter:0.27 shimmer:0.33
+        #      against them and dragged an otherwise clean stage to 0.65.
+        #
+        #      So the caps scale with the measured noise floor. Below the
+        #      informative floor the estimates carry no speaker information at
+        #      all and the components abstain — a limit wide enough to pass
+        #      anything is not a check, it is a check-shaped hole.
+        caps = self._perturbation_caps(features, context)
+        assessment.perturbation_caps = caps
 
-        shimmer_bound = BOUNDS["shimmer"]
-        if physics.measured(features.shimmer, shimmer_bound.low, shimmer_bound.high):
-            if features.shimmer <= physics.max_shimmer:
-                scores("shimmer", 1.0)
+        for name, value, cap in (
+            ("jitter", features.jitter, caps.jitter),
+            ("shimmer", features.shimmer, caps.shimmer),
+        ):
+            bound = BOUNDS[name]
+            if not physics.measured(value, bound.low, bound.high):
+                abstain(name, f"{name} unmeasured")
+            elif not self._tolerance.informative(caps.snr_db):
+                # Only reachable with a MEASURED sub-floor SNR, so snr_db is a
+                # number here; unknown SNR scores against the widened caps.
+                abstain(name, f"SNR {caps.snr_db:.1f} dB below informative floor")
+            elif value <= cap:
+                scores(name, 1.0)
             else:
-                scores("shimmer", physics.max_shimmer / features.shimmer)
-        else:
-            abstain("shimmer", "shimmer unmeasured")
+                scores(name, cap / value)
 
         assessment.finalize()
 
@@ -1170,10 +1478,57 @@ class AdvancedBiometricVerifier:
         acoustic_score: float,
         physics_score: float
     ) -> Tuple[float, str, Dict[str, any]]:
-        """Sync owner-aware anti-spoof fusion."""
+        """
+        Sync owner-aware anti-spoof fusion — THE authorization tensor.
+
+        This, not ``_bayesian_verification_sync``, is what decides an unlock:
+        that function computes a full Bayesian posterior and then overwrites it
+        with this function's ``final_auth_score`` on the next line. Every guard
+        that matters therefore belongs here.
+
+        Only two inputs reach the score: ``owner_match_score`` (the embedding
+        similarity) and ``spoof_prob``. ``acoustic_score`` and ``physics_score``
+        are recorded in the debug block and do not influence the decision.
+
+        NaN is intercepted on the way in and on the way out, and it fails
+        CLOSED. A NaN comparison is False, so an unguarded NaN would fall
+        through every ``>=`` branch to whichever else-clause it happened to
+        reach — a verdict decided by control flow rather than by evidence. The
+        anomaly is recorded in the debug block for the async caller to escalate
+        to the runtime health sensor; this runs in a worker thread and cannot
+        await, and a watchdog that shares a lock with what it guards is not a
+        watchdog.
+        """
         OWNER_STRONG_MATCH_THRESHOLD = speaker_model.owner_strong_threshold
         OWNER_OVERRIDABLE_SPOOF_LIMIT = speaker_model.spoof_override_limit
         BASE_UNLOCK_THRESHOLD = speaker_model.decision_threshold
+
+        # ── NaN interceptor: inputs ──────────────────────────────────────
+        corrupt = [name for name, value in (
+            ("owner_match_score", owner_match_score),
+            ("spoof_prob", spoof_prob),
+            ("decision_threshold", BASE_UNLOCK_THRESHOLD),
+            ("owner_strong_threshold", OWNER_STRONG_MATCH_THRESHOLD),
+            ("spoof_override_limit", OWNER_OVERRIDABLE_SPOOF_LIMIT),
+        ) if not is_measured(value, None, None)]
+        if corrupt:
+            logger.critical(
+                "🚨 [Fusion] NON-FINITE INPUT to the authorization tensor: %s — "
+                "DENYING. A NaN compares False against every threshold, so an "
+                "unguarded one decides the verdict by control flow.",
+                ", ".join(corrupt),
+            )
+            return 0.0, "deny", {
+                "decision": "deny",
+                "rule_applied": "nan_input_fail_closed",
+                "final_auth_score": 0.0,
+                "authorization_anomaly": {
+                    "kind": "non_finite_fusion_input",
+                    "fields": corrupt,
+                    "owner_match_score": repr(owner_match_score),
+                    "spoof_prob": repr(spoof_prob),
+                },
+            }
 
         if is_owner:
             OWNER_WEIGHT = 0.75
@@ -1229,6 +1584,26 @@ class AdvancedBiometricVerifier:
             else:
                 decision = "deny"
 
+        # ── NaN interceptor: output ──────────────────────────────────────
+        # The inputs were finite, so an infinite output means the arithmetic
+        # between them produced one — a corrupted threshold, a poisoned
+        # confidence boost. Fail closed and say so rather than clip a NaN into
+        # a plausible-looking number.
+        anomaly = None
+        if not is_measured(final_auth_score, None, None):
+            logger.critical(
+                "🚨 [Fusion] authorization tensor evaluated to %r from finite "
+                "inputs (owner=%r spoof=%r rule=%s) — DENYING",
+                final_auth_score, owner_match_score, spoof_prob, rule_applied,
+            )
+            anomaly = {
+                "kind": "non_finite_fusion_output",
+                "rule_applied": rule_applied,
+                "owner_match_score": float(owner_match_score),
+                "spoof_prob": float(spoof_prob),
+            }
+            final_auth_score, decision, rule_applied = 0.0, "deny", "nan_output_fail_closed"
+
         debug_info = {
             "owner_match_score": float(owner_match_score),
             "spoof_prob": float(spoof_prob),
@@ -1240,12 +1615,20 @@ class AdvancedBiometricVerifier:
             "decision": decision,
             "rule_applied": rule_applied,
             "embedding_sim": float(embedding_sim),
+            # Recorded, NOT decisive — neither of these reaches final_auth_score.
+            # They are reported as-is, including NaN, because an absent stage is
+            # a fact worth seeing in the debug block rather than a 0.0 that
+            # reads like a measured failure.
             "acoustic_score": float(acoustic_score),
             "physics_score": float(physics_score),
+            "acoustic_is_evidence": bool(is_measured(acoustic_score, 0.0, 1.0)),
+            "physics_is_evidence": bool(is_measured(physics_score, 0.0, 1.0)),
             "threshold": float(BASE_UNLOCK_THRESHOLD),
             "owner_strong_threshold": float(OWNER_STRONG_MATCH_THRESHOLD),
             "spoof_override_limit": float(OWNER_OVERRIDABLE_SPOOF_LIMIT),
         }
+        if anomaly is not None:
+            debug_info["authorization_anomaly"] = anomaly
 
         return final_auth_score, decision, debug_info
 
@@ -1276,7 +1659,37 @@ class AdvancedBiometricVerifier:
         fusion_weights: Dict[str, float],
         speaker_model: "SpeakerModel"
     ) -> Tuple[float, float]:
-        """Sync Bayesian verification."""
+        """
+        Sync verification — returns the owner-aware fusion score and uncertainty.
+
+        NAMED "BAYESIAN", AND IT WAS NOT. This function used to compute a full
+        Bayesian posterior — prior, per-stage Gaussian likelihoods, weighted
+        likelihood, normaliser — and then discard every bit of it::
+
+            posterior = unnormalized_posterior / max(normalizer, 1e-10)
+            posterior = float(np.clip(final_auth_score, 0.0, 1.0))   # <- overwrite
+
+        The second line overwrote the first. The verdict has always come from
+        ``_owner_aware_antispoof_fusion_sync``; the Bayesian block burned CPU on
+        every verification and, far worse, made the file read as though physics
+        and acoustic scores influenced authorization when they never did.
+
+        That misreading had a cost. It is why a NaN from the acoustic stage
+        looked harmless: it flowed only into arithmetic whose result was thrown
+        away. The channel was severed, not safe — and a NaN guard installed on
+        that block would have guarded nothing while looking like diligence.
+
+        The dead computation is removed rather than repaired, because repairing
+        it means WIRING IT IN, and wiring it in changes what authorises an
+        unlock (physics and acoustic would begin to move the verdict). That is
+        a security-semantics decision for the operator, not a tidy-up. What
+        remains is honest about being a thin wrapper.
+
+        ``fusion_weights`` is retained in the signature: it still shapes
+        ``_compute_fusion_weights``' contract and the caller's reporting, and
+        removing a parameter to reflect dead code would hide the fact that the
+        weights are currently advisory.
+        """
         spoof_prob = 1.0 - spoofing_score
         is_owner = speaker_model.is_primary_owner
         owner_match_score = embedding_sim
@@ -1297,37 +1710,26 @@ class AdvancedBiometricVerifier:
         uncertainty = max(0.1, 1.0 - (distance_from_threshold * 2.0))
         uncertainty = np.clip(uncertainty, 0.0, 1.0)
 
-        prior = speaker_model.prior_probability
-        likelihoods = []
-
-        if fusion_weights.get('embedding', 0) > 0:
-            emb_likelihood = self._score_to_likelihood(embedding_sim, speaker_model.embedding_mean, speaker_model.embedding_std)
-            likelihoods.append((emb_likelihood, fusion_weights['embedding']))
-
-        if fusion_weights.get('mahalanobis', 0) > 0:
-            mahal_likelihood = self._score_to_likelihood(mahal_distance, 0.8, 0.15)
-            likelihoods.append((mahal_likelihood, fusion_weights['mahalanobis']))
-
-        if fusion_weights.get('acoustic', 0) > 0:
-            acoustic_likelihood = self._score_to_likelihood(acoustic_score, speaker_model.acoustic_mean, speaker_model.acoustic_std)
-            likelihoods.append((acoustic_likelihood, fusion_weights['acoustic']))
-
-        if fusion_weights.get('physics', 0) > 0:
-            likelihoods.append((physics_score, fusion_weights['physics']))
-
-        if fusion_weights.get('spoofing', 0) > 0:
-            live_speech_score = 1.0 - spoof_prob
-            likelihoods.append((live_speech_score, fusion_weights['spoofing']))
-
-        weighted_likelihood = sum(l * w for l, w in likelihoods) / max(sum(w for _, w in likelihoods), 1.0)
-
-        unnormalized_posterior = weighted_likelihood * prior
-        impostor_prior = 1.0 - prior
-        impostor_likelihood = 1.0 - weighted_likelihood
-        normalizer = unnormalized_posterior + (impostor_likelihood * impostor_prior)
-
-        posterior = unnormalized_posterior / max(normalizer, 1e-10)
         posterior = float(np.clip(final_auth_score, 0.0, 1.0))
+
+        # Last line of defence. The fusion already fails closed on a non-finite
+        # score, so reaching this means a NaN was introduced between there and
+        # here — a case no test covers precisely because nothing should be able
+        # to do it. Deny, and surface it: the anomaly rides back in the debug
+        # block, which the async caller drains to the runtime health sensor.
+        if not is_measured(posterior, 0.0, 1.0):
+            logger.critical(
+                "🚨 [Verify] posterior is %r after the fusion guard — DENYING",
+                posterior,
+            )
+            debug = getattr(speaker_model, "last_fusion_debug", None)
+            if isinstance(debug, dict):
+                debug["authorization_anomaly"] = {
+                    "kind": "non_finite_posterior",
+                    "posterior": repr(posterior),
+                    "final_auth_score": repr(final_auth_score),
+                }
+            posterior = 0.0
 
         return posterior, float(uncertainty)
 
@@ -1469,18 +1871,64 @@ class AdvancedBiometricVerifier:
                     speaker_model.embedding_mean = np.mean(sims)
                     speaker_model.embedding_std = np.std(sims)
 
-        speaker_model.pitch_mean = (1 - alpha) * speaker_model.pitch_mean + alpha * new_features.pitch_mean
-        speaker_model.pitch_std = np.sqrt(
-            (1 - alpha) * speaker_model.pitch_std**2 +
-            alpha * (new_features.pitch_mean - speaker_model.pitch_mean)**2
+        # THE ADAPTIVE MODEL MAY ONLY LEARN FROM MEASUREMENTS.
+        #
+        # These are exponential moving averages over PERSISTENT state, and an
+        # EMA cannot recover from NaN: `(1-a)*NaN + a*x` is NaN, and so is every
+        # update after it. One unmeasurable pitch permanently corrupts the model
+        # that every later verification is judged against.
+        #
+        # And this runs only when `verified` is True — so the poisoning would be
+        # seeded by the SUCCESS path, the one nobody inspects for corruption. It
+        # became reachable the moment the extractors started honestly reporting
+        # NaN instead of substituting 150.0 Hz, which is exactly the kind of
+        # second-order consequence that makes a partial fix worse than none.
+        #
+        # `fold_measurement` refuses a non-measurement and leaves the running
+        # value alone. Skipping an update costs one sample of adaptation;
+        # accepting one costs the model.
+        previous_pitch_mean = speaker_model.pitch_mean
+        speaker_model.pitch_mean = fold_measurement(
+            speaker_model.pitch_mean, new_features.pitch_mean, alpha,
+            quantity="pitch_mean_hz", validator=_BOUNDS_VALIDATOR,
+            label="speaker_model.pitch_mean",
         )
 
-        feature_vector = self._features_to_vector(new_features)
-        speaker_model.feature_samples.append(feature_vector)
+        # Only update the spread if the mean actually moved — otherwise the
+        # deviation term is measured against a mean that ignored this sample.
+        if speaker_model.pitch_mean != previous_pitch_mean and is_measured(
+            new_features.pitch_mean, None, None
+        ):
+            variance = ((1 - alpha) * speaker_model.pitch_std ** 2 +
+                        alpha * (new_features.pitch_mean - speaker_model.pitch_mean) ** 2)
+            if is_measured(variance, 0.0, None):
+                speaker_model.pitch_std = float(np.sqrt(variance))
 
-        if len(speaker_model.feature_samples) > 10:
-            feature_samples = speaker_model.feature_samples[-50:]
-            speaker_model.covariance_matrix = np.cov(np.array(feature_samples).T)
+        # The covariance matrix feeds Mahalanobis distance. One NaN row makes
+        # every entry NaN, so a sample carrying any unmeasured feature is not
+        # admitted to the sample set at all rather than being admitted and
+        # poisoning the matrix on the next recompute.
+        feature_vector = self._features_to_vector(new_features)
+        if np.all(np.isfinite(feature_vector)):
+            speaker_model.feature_samples.append(feature_vector)
+
+            if len(speaker_model.feature_samples) > 10:
+                feature_samples = speaker_model.feature_samples[-50:]
+                covariance = np.cov(np.array(feature_samples).T)
+                if np.all(np.isfinite(covariance)):
+                    speaker_model.covariance_matrix = covariance
+                else:
+                    logger.warning(
+                        "[SpeakerModel] recomputed covariance is not finite — "
+                        "keeping the previous matrix rather than poisoning "
+                        "Mahalanobis distance for every future verification"
+                    )
+        else:
+            unmeasured = int(np.sum(~np.isfinite(feature_vector)))
+            logger.info(
+                "[SpeakerModel] sample has %d unmeasured feature(s) — not "
+                "admitted to the covariance sample set", unmeasured,
+            )
 
     async def _update_performance_metrics(self, result: VerificationResult):
         """Track performance metrics."""
