@@ -8447,10 +8447,17 @@ class JARVISLearningDatabase:
             if self.cloud_adapter:
                 async with self.cloud_adapter.get_connection() as conn:
                     async with conn.cursor() as cursor:
+                        # voice_samples is keyed by speaker_id (FK to
+                        # speaker_profiles) and has never carried speaker_name —
+                        # see its CREATE above. Filtering on a column the table
+                        # does not declare raised `no such column: speaker_name`
+                        # on every auto-learning check. The name lives one join
+                        # away, which is where it is read from.
                         await cursor.execute(
                             """
-                            SELECT COUNT(*) FROM voice_samples
-                            WHERE speaker_name = %s AND used_for_training = FALSE
+                            SELECT COUNT(*) FROM voice_samples vs
+                            JOIN speaker_profiles sp ON sp.speaker_id = vs.speaker_id
+                            WHERE sp.speaker_name = %s AND vs.used_for_training = FALSE
                             """,
                             (speaker_name,)
                         )
@@ -8458,8 +8465,9 @@ class JARVISLearningDatabase:
             else:
                 async with self.db.execute(
                     """
-                    SELECT COUNT(*) FROM voice_samples
-                    WHERE speaker_name = ? AND used_for_training = 0
+                    SELECT COUNT(*) FROM voice_samples vs
+                    JOIN speaker_profiles sp ON sp.speaker_id = vs.speaker_id
+                    WHERE sp.speaker_name = ? AND vs.used_for_training = 0
                     """,
                     (speaker_name,)
                 ) as cursor:
