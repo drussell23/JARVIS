@@ -3994,6 +3994,44 @@ class SpeakerVerificationService:
         except Exception as e:
             logger.warning(f"⚠️ [INIT] EcapaFacade error: {e} - falling back to local engine")
 
+        # LOAD THE VOICEPRINTS. This path never did.
+        #
+        # There are two initialisers. `initialize_fast()` calls
+        # `_load_speaker_profiles()`; this one -- the one `voice_identity.py`
+        # actually invokes -- did not. So the service declared itself ready with
+        # an empty profile table and every verification compared against
+        # nothing:
+        #
+        #     ✅ Speaker Verification Service ready (0 profiles loaded)
+        #     ⚠️ No speaker match found. Primary user: None, Best confidence: 0.00%
+        #     'unlock_screen' NOT authorised (I don't have a voiceprint...)
+        #
+        # measured 2026-08-06 21:19:24. Deterministic, every boot, for as long
+        # as this path has existed.
+        #
+        # It is why nothing upstream helped. The profile was on disk the whole
+        # time ("Derek J. Russell", 768-byte embedding, 272 samples,
+        # is_primary_user=1). Local-first SQLite did not help because the query
+        # never ran. The retry-on-empty did not fire because the function
+        # containing it was never called. The 15s database timeout was real but
+        # irrelevant to THIS symptom. Four fixes upstream of a call that was
+        # simply absent.
+        #
+        # Awaited, not backgrounded: `self.initialized = True` immediately
+        # follows, and a service that announces readiness while its profiles are
+        # still loading is how "ready (0 profiles)" becomes true again by a
+        # different route. If the load fails it schedules its own retry
+        # (5342e1b8e5) rather than raising -- readiness with zero profiles is
+        # then honest and recoverable rather than silent and permanent.
+        try:
+            await self._load_speaker_profiles()
+        except Exception as e:  # noqa: BLE001 — never block readiness on this
+            logger.warning(
+                "⚠️ [INIT] Speaker profile load failed (%s: %s) — the service will "
+                "report 0 profiles and retry in the background",
+                type(e).__name__, e,
+            )
+
         self.initialized = True
         # WARNING, not INFO. This module is filtered to WARNING+ in the
         # brainstem console, so the ONE line that answers "did the
