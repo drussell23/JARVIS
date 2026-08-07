@@ -2567,6 +2567,45 @@ async def parallel_lifespan(app: FastAPI):
                 except Exception as _ce:  # noqa: BLE001
                     logger.error("[HUD] consent bridge install failed: %s", _ce)
 
+                # START WARMING THE VOICE AUTHORITY NOW, NOT ON FIRST USE.
+                #
+                # `VoiceIdentity.start_warming()` had exactly two callers, both
+                # on REQUEST paths: inside `identify()` and inside the
+                # enrollment handler. Nothing warmed it at boot — `main.py` did
+                # not reference voice_identity at all.
+                #
+                # So the speaker model began loading only when someone asked for
+                # an unlock, which makes the first unlock after every boot a
+                # guaranteed NOT_READY:
+                #
+                #   21:30:20  backend starts
+                #   21:31:25  'unlock_screen' NOT authorised
+                #             (I'm still loading my voice recognition...)
+                #   21:31:33  same
+                #   21:31:40  ✅ Speaker Verification Service ready (1 profiles)
+                #
+                # measured 2026-08-06. The operator is told to "give me a moment
+                # and ask again" for a load their request had just started.
+                #
+                # This is the same defect 532801531c fixed for the model import
+                # ("the model now loads at boot, not when you ask it to unlock")
+                # — that moved the import; the WARM stayed lazy, so the symptom
+                # survived at a different layer.
+                #
+                # `start_warming()` is idempotent and non-blocking by contract:
+                # it spawns a background task and returns. Boot is not delayed,
+                # and the request-path callers remain as the safety net for any
+                # path that reaches identify() before this ran.
+                try:
+                    from backend.hud.voice_identity import get_voice_identity
+                    get_voice_identity().start_warming()
+                    logger.warning(
+                        "[HUD] voice authority warming started at boot — the "
+                        "first unlock no longer pays for the model load"
+                    )
+                except Exception as _ve:  # noqa: BLE001 — never block boot on a warm
+                    logger.error("[HUD] voice authority warm failed to start: %s", _ve)
+
                 # Tell the HUD when JARVIS is speaking, so it can mute its own
                 # microphone. `UnifiedSpeechStateManager` has always known;
                 # its `register_websocket_broadcaster` had zero callers, so
