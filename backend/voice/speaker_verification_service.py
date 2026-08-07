@@ -5443,12 +5443,35 @@ class SpeakerVerificationService:
             )
 
             if loaded_count == 0 and len(profiles) == 0 and not self.speaker_profiles:
+                # ZERO PROFILES IS A FAULT, NOT AN ANSWER.
+                #
+                # This branch used to log "will require enrollment" and stop.
+                # Only the `except` path below scheduled a retry — so an
+                # exception was recoverable and an empty result was permanent,
+                # which is backwards: an empty result is exactly what a degraded
+                # database returns when it times out without raising.
+                #
+                # Measured 2026-08-06:
+                #
+                #   17:18:40  SQLite-first init timed out (15s)
+                #   17:19:48  No speaker match found. Primary user: None
+                #
+                # 68 seconds apart, with a profile sitting on disk the whole
+                # time — "Derek J. Russell", 768-byte embedding, 272 samples,
+                # is_primary_user=1, in the very file this service opens. The
+                # load ran once during the worst contention window of boot,
+                # came back empty, and nothing ever asked again.
+                #
+                # So schedule the SAME retry an exception would. The mechanism
+                # already exists; it was simply never wired to the failure mode
+                # that actually happens.
                 logger.warning(
-                    "⚠️ No speaker profiles available - voice authentication will require enrollment"
+                    "⚠️ No speaker profiles loaded — scheduling retry. The store "
+                    "may hold profiles this attempt could not reach (a timed-out "
+                    "database returns empty without raising); enrollment is only "
+                    "required if the retries also come back empty."
                 )
-                logger.info("💡 To create a speaker profile, use voice commands like:")
-                logger.info("   - 'Learn my voice as Derek'")
-                logger.info("   - 'Create speaker profile for Derek'")
+                self._schedule_deferred_profile_load()
             elif loaded_count == 0 and len(profiles) > 0:
                 logger.error(
                     f"❌ Found {len(profiles)} profiles in database but failed to load any - check logs above for errors"
@@ -5495,7 +5518,10 @@ class SpeakerVerificationService:
 
             for attempt in range(1, max_retries + 1):
                 delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
-                logger.info(
+                # WARNING, not INFO: the brainstem console filters this
+                # module to WARNING and above, so an INFO-level retry log is
+                # invisible exactly when someone is asking "is it retrying?".
+                logger.warning(
                     f"🔄 [ProfileRetry] Attempt {attempt}/{max_retries} "
                     f"in {delay:.0f}s..."
                 )
@@ -5518,9 +5544,21 @@ class SpeakerVerificationService:
                                 f"{count} profiles loaded on attempt {attempt}"
                             )
                         else:
-                            logger.info(
-                                "✅ [ProfileRetry] Database connected but "
-                                "0 profiles found (enrollment needed)"
+                            # NOT a "✅". The database answering is not the same
+                            # as the answer being right, and this branch cannot
+                            # tell "nobody is enrolled" from "the store did not
+                            # give us what it holds". Retrying forever on a
+                            # genuinely empty store would be wrong, so it stops
+                            # — but it stops SAYING SO, at a level the console
+                            # actually shows, instead of reporting success.
+                            logger.warning(
+                                "⚠️ [ProfileRetry] Database connected but returned "
+                                "0 profiles on attempt %s — giving up. If a "
+                                "voiceprint exists on disk, this is a fault, not "
+                                "an empty store: check "
+                                "~/.jarvis/learning/jarvis_learning.db "
+                                "(select count(*) from speaker_profiles).",
+                                attempt,
                             )
                         return  # Success — stop retrying
                     else:
