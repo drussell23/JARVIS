@@ -9,6 +9,8 @@ If governance fails, HUD still serves API and CU tasks.
 import asyncio
 import logging
 import os
+
+from backend.core.async_offload import import_off_loop
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -52,9 +54,12 @@ async def start_hud_governance(project_root: Path) -> HudGovernanceContext:
 
     # Step 1: GovernanceStack
     try:
-        from backend.core.ouroboros.governance.integration import (
-            GovernanceConfig,
-            create_governance_stack,
+        # Off-loop: this graph reaches semantic_guardian, whose module body was
+        # caught holding the loop for 2.34s on an import lock (stall dump 1).
+        GovernanceConfig, create_governance_stack = await import_off_loop(
+            "backend.core.ouroboros.governance.integration",
+            "GovernanceConfig",
+            "create_governance_stack",
         )
         _gov_config = GovernanceConfig.from_env_and_args(None)
         stack = await asyncio.wait_for(
@@ -73,9 +78,14 @@ async def start_hud_governance(project_root: Path) -> HudGovernanceContext:
 
     # Step 2: GovernedLoopService (Zone 6.8)
     try:
-        from backend.core.ouroboros.governance.governed_loop_service import (
-            GovernedLoopConfig,
-            GovernedLoopService,
+        # Off-loop: the worst measured stall in the process. This import pulls
+        # governed_loop_service:89 -> oracle.py:73 -> networkx, and blocked the
+        # loop for 12.38s waiting on a module lock a background thread already
+        # held (stall dump 2).
+        GovernedLoopConfig, GovernedLoopService = await import_off_loop(
+            "backend.core.ouroboros.governance.governed_loop_service",
+            "GovernedLoopConfig",
+            "GovernedLoopService",
         )
         _loop_config = GovernedLoopConfig.from_env(project_root=project_root)
 

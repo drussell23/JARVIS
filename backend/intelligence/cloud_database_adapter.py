@@ -1417,7 +1417,13 @@ async def get_database_adapter() -> CloudDatabaseAdapter:
     # ── Initialise adapter (with timeout safety net) ──────────────────
     _init_timeout = float(os.getenv("JARVIS_DB_ADAPTER_INIT_TIMEOUT", "15.0"))
 
-    _adapter = CloudDatabaseAdapter()
+    # Off-loop: __init__ reaches secret_manager.get_db_password(), which builds a
+    # SecretManagerServiceClient; google.auth resolves the project by shelling out
+    # to `gcloud` via subprocess.check_output with no timeout. That held the loop
+    # for 4.40s (stall dump 3, 2026-08-06).
+    from backend.core.async_offload import call_off_loop
+
+    _adapter = await call_off_loop(CloudDatabaseAdapter)
 
     if _force_sqlite:
         # Bypass Cloud SQL entirely — direct SQLite init
