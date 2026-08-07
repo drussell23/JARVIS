@@ -2795,8 +2795,11 @@ async def parallel_lifespan(app: FastAPI):
         # ── HUD Governance Boot (Sub-project E) ──────────────────────────
         if HUD_MODE and os.environ.get("JARVIS_HUD_GOVERNANCE_ENABLED", "1").strip().lower() not in ("0", "false", "no"):
             try:
-                from backend.core.ouroboros.governance.hud_governance_boot import (
-                    start_hud_governance,
+                from backend.core.async_offload import import_off_loop
+
+                start_hud_governance = await import_off_loop(
+                    "backend.core.ouroboros.governance.hud_governance_boot",
+                    "start_hud_governance",
                 )
                 app.state.hud_gov_ctx = await start_hud_governance(
                     project_root=Path.cwd(),
