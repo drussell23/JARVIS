@@ -1276,11 +1276,128 @@ async def prepare_audio_for_stt_async(audio_data: Any) -> bytes:
     return pcm_bytes
 
 
+#: Fraction of the trimmed result that must survive for a trim to be accepted.
+#: Below this the recording is almost entirely silence and trimming would be
+#: throwing away the only thing that might carry a voice.
+ENV_TRIM_MIN_KEEP_RATIO = "JARVIS_AUDIO_TRIM_MIN_KEEP_RATIO"
+DEFAULT_TRIM_MIN_KEEP_RATIO = 0.02
+
+#: Silence kept either side of the speech, so a trim never clips an onset or a
+#: trailing consonant. Speaker embeddings are sensitive to both.
+ENV_TRIM_MARGIN_MS = "JARVIS_AUDIO_TRIM_MARGIN_MS"
+DEFAULT_TRIM_MARGIN_MS = 120.0
+
+ENV_TRIM_ENABLED = "JARVIS_AUDIO_TRIM_ENABLED"
+
+
+def _trim_config() -> Tuple[bool, float, float]:
+    """Resolve trim tunables. NEVER raises."""
+    def _f(key: str, default: float, lo: float, hi: float) -> float:
+        try:
+            raw = (os.environ.get(key, "") or "").strip()
+            return min(max(float(raw), lo), hi) if raw else default
+        except (TypeError, ValueError):
+            return default
+
+    enabled = (os.environ.get(ENV_TRIM_ENABLED, "true") or "").strip().lower() \
+        not in ("0", "false", "no", "off")
+    return (
+        enabled,
+        _f(ENV_TRIM_MIN_KEEP_RATIO, DEFAULT_TRIM_MIN_KEEP_RATIO, 0.001, 1.0),
+        _f(ENV_TRIM_MARGIN_MS, DEFAULT_TRIM_MARGIN_MS, 0.0, 1000.0),
+    )
+
+
+def trim_silence(pcm_bytes: bytes, sample_rate: int) -> bytes:
+    """
+    Remove leading and trailing silence from 16-bit mono PCM.
+
+    WHY THIS EXISTS
+    ---------------
+    `analyze_pcm_audio` already computes ``silence_ratio`` against a -40dB
+    threshold and, when it exceeds 90%, appends the string
+    ``"Audio is 91% silence"``. That measurement was then DISCARDED: nothing
+    acted on it, so the speaker embedding was computed over a buffer that was
+    overwhelmingly room tone.
+
+    Measured 2026-08-06 21:11:11, on a real unlock::
+
+        ⚠️ Audio issue: Audio is 91% silence
+        ⚠️ No speaker match found. Best confidence: 0.00%
+
+    An embedding of mostly-silence is an embedding of the room, not the speaker.
+    Comparing it to an enrolled voiceprint cannot succeed, and the failure
+    presents as "that wasn't you" — a fault wearing a refusal's clothes, which
+    is the shape this whole arc keeps producing.
+
+    The threshold is the SAME one the analysis uses. Two silence definitions
+    that could drift apart is how a trim starts disagreeing with the warning
+    that motivated it.
+
+    NEVER makes the audio worse: on any error, on a result below the keep-ratio,
+    or on audio that is already dense, the original bytes are returned unchanged.
+    """
+    enabled, min_keep_ratio, margin_ms = _trim_config()
+    if not enabled or not pcm_bytes or sample_rate <= 0:
+        return pcm_bytes
+
+    try:
+        import numpy as _np
+
+        samples = _np.frombuffer(pcm_bytes, dtype=_np.int16).astype(_np.float32) / 32768.0
+        if samples.size == 0:
+            return pcm_bytes
+
+        # Same -40dB definition as analyze_pcm_audio. Derived, not duplicated.
+        silence_threshold = 10 ** (-40 / 20)
+        voiced = _np.abs(samples) >= silence_threshold
+        if not voiced.any():
+            # Entirely below threshold. Trimming would yield nothing, and the
+            # caller's analysis will already be reporting ~100% silence.
+            return pcm_bytes
+
+        first = int(_np.argmax(voiced))
+        last = int(len(voiced) - _np.argmax(voiced[::-1]))
+
+        margin = int((margin_ms / 1000.0) * sample_rate)
+        start = max(0, first - margin)
+        end = min(len(samples), last + margin)
+
+        if end <= start:
+            return pcm_bytes
+
+        kept_ratio = (end - start) / len(samples)
+        if kept_ratio >= 0.999:
+            return pcm_bytes  # already dense; nothing to remove
+        if kept_ratio < min_keep_ratio:
+            # What survives is too small to trust as a whole utterance. Hand
+            # back the original so the caller's own quality gate decides, rather
+            # than silently substituting a fragment.
+            logger.warning(
+                "[AudioTrim] refusing to trim: only %.1f%% of the buffer is above "
+                "the silence floor (min %.1f%%) — returning the original",
+                kept_ratio * 100.0, min_keep_ratio * 100.0,
+            )
+            return pcm_bytes
+
+        trimmed = samples[start:end]
+        logger.info(
+            "[AudioTrim] %.0fms -> %.0fms (removed %.0f%% silence)",
+            len(samples) / sample_rate * 1000.0,
+            len(trimmed) / sample_rate * 1000.0,
+            (1.0 - kept_ratio) * 100.0,
+        )
+        return (trimmed * 32768.0).astype(_np.int16).tobytes()
+
+    except Exception as exc:  # noqa: BLE001 — audio must never fail on cleanup
+        logger.warning("[AudioTrim] trim failed (%s: %s) — using original audio",
+                       type(exc).__name__, exc)
+        return pcm_bytes
+
+
 def prepare_audio_with_analysis(audio_data: Any) -> Tuple[bytes, AudioAnalysis]:
     """
-    Prepare audio and return quality analysis.
-
-    Useful for checking audio quality before voice verification.
+    Prepare audio, trim its silence, and return analysis OF WHAT IS RETURNED.
 
     Args:
         audio_data: Audio in any format
@@ -1294,7 +1411,34 @@ def prepare_audio_with_analysis(audio_data: Any) -> Tuple[bytes, AudioAnalysis]:
     if not audio_bytes or isinstance(audio_bytes, str):
         return b'', AudioAnalysis(issues=["Invalid input"])
 
-    return converter.ensure_pcm_format(audio_bytes, analyze=True)
+    # `ensure_pcm_format` returns bytes OR (bytes, analysis) depending on
+    # `analyze`. Unpacking the union blind would raise the day that contract
+    # shifts — and this sits on the consent path, where an exception reads as a
+    # refusal. Checked, not assumed.
+    def _split(result: Any) -> Tuple[bytes, AudioAnalysis]:
+        if isinstance(result, tuple) and len(result) == 2:
+            data, info = result
+            if isinstance(data, (bytes, bytearray)) and isinstance(info, AudioAnalysis):
+                return bytes(data), info
+        if isinstance(result, (bytes, bytearray)):
+            return bytes(result), AudioAnalysis(issues=["analysis unavailable"])
+        return b'', AudioAnalysis(issues=[f"unexpected converter result: {type(result).__name__}"])
+
+    pcm, analysis = _split(converter.ensure_pcm_format(audio_bytes, analyze=True))
+    if not pcm:
+        return pcm, analysis
+
+    trimmed = trim_silence(pcm, analysis.sample_rate or 0)
+    if len(trimmed) == len(pcm):
+        return pcm, analysis
+
+    # RE-ANALYSE. Returning the pre-trim analysis alongside post-trim bytes
+    # would describe audio the caller does not have — the caller would read
+    # "91% silence" about a buffer that is no longer 91% silence, or worse,
+    # read a clean report about audio that was never cleaned. An analysis must
+    # describe the thing it is handed back with.
+    _, retrimmed_analysis = _split(converter.ensure_pcm_format(trimmed, analyze=True))
+    return trimmed, retrimmed_analysis
 
 
 # Legacy compatibility
