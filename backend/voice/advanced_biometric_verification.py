@@ -22,11 +22,13 @@ License: MIT
 
 import asyncio
 import logging
+import math
+import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 from scipy import stats
@@ -118,6 +120,28 @@ class VoiceBiometricFeatures:
     timestamp: datetime = field(default_factory=datetime.now)
 
 
+def _env_float(name: str, default: float) -> float:
+    """
+    A tunable read from the environment, defaulting on anything unreadable.
+
+    A malformed override must not reach a security decision: silently keeping
+    the default is correct, and the warning says which knob was ignored so a
+    typo does not quietly persist as "the feature is not working".
+    """
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("[AntiSpoof] %s=%r is not a number — keeping %s", name, raw, default)
+        return default
+    if not math.isfinite(value):
+        logger.warning("[AntiSpoof] %s=%r is not finite — keeping %s", name, raw, default)
+        return default
+    return value
+
+
 @dataclass
 class PhysicsConstraints:
     """Physics-based constraints for human voice"""
@@ -144,6 +168,103 @@ class PhysicsConstraints:
     min_hnr_db: float = 5.0  # Harmonic-to-Noise Ratio
     max_jitter: float = 0.02  # 2%
     max_shimmer: float = 0.10  # 10%
+
+    # ── Measurability bands ──────────────────────────────────────────────
+    # The range each quantity occupies in real human speech. A value outside
+    # its band was not measured — a feature extractor that failed, a unit that
+    # is not the one declared, or a default that was never filled in. It is NOT
+    # a strange but genuine voice, and must not be scored as one.
+    #
+    # These exist because the enrolled profile on this machine carries
+    # speaking_rate_wpm = 420.0 (no human sustains 420 wpm; conversational
+    # speech is 110-180) and formants of 42.9 Hz / 80.0 Hz (F1 is ~500 Hz, F2
+    # ~1500 Hz — these are off by an order of magnitude and are not formants).
+    # Compared against, they made the operator's own voice look synthetic.
+    min_formant_f1_hz: float = 150.0
+    max_formant_f1_hz: float = 1200.0
+    min_formant_f2_hz: float = 500.0
+    max_formant_f2_hz: float = 3500.0
+    min_speaking_rate_wpm: float = 40.0
+    max_speaking_rate_wpm: float = 300.0
+    min_pitch_std_hz: float = 0.5
+    max_pitch_std_hz: float = 200.0
+    max_hnr_db: float = 45.0
+
+    @classmethod
+    def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "PhysicsConstraints":
+        """
+        Build constraints from the environment, field by field.
+
+        Defaults are the phonetics-literature values above. Every field is
+        overridable as ``JARVIS_VOICE_PHYSICS_<FIELD>`` so a different mic,
+        codec or extractor version can be accommodated without a code change —
+        and so the bands can be widened in the field if one proves too tight.
+
+        A malformed override keeps the default rather than propagating a
+        garbage bound into a security decision.
+        """
+        source = os.environ if env is None else env
+        values = {}
+        for f in fields(cls):
+            key = f"JARVIS_VOICE_PHYSICS_{f.name.upper()}"
+            raw = str(source.get(key, "")).strip()
+            if not raw:
+                continue
+            try:
+                values[f.name] = type(f.default)(raw)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "[Physics] %s=%r is not a %s — keeping default %r",
+                    key, raw, type(f.default).__name__, f.default,
+                )
+        return cls(**values)
+
+    def measured(self, value: Any, low: float, high: float) -> bool:
+        """
+        True when ``value`` is a real measurement inside its plausible band.
+
+        ``None``, non-numeric, non-finite, and out-of-band all read as NOT
+        measured. Zero is excluded by every band below, which is deliberate:
+        an unset float field defaults to 0.0, and 0 Hz is not a formant.
+
+        The type check is strict on purpose. ``float("500")`` succeeds, so a
+        permissive version accepts a feature field holding a *string* — but a
+        numeric field that arrived as text was not produced by the measurement
+        path, and quietly parsing it is the same leniency that let unset zeros
+        become spoofing findings. ``bool`` is excluded explicitly because it is
+        a subclass of ``int``, and ``float(True)`` is 1.0 — a silent 1 Hz.
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            return False
+        return low <= numeric <= high
+
+
+@dataclass
+class SpoofingAssessment:
+    """
+    What the anti-spoofing stage concluded, and what it could not look at.
+
+    ``score`` alone cannot distinguish "I checked and found nothing" from "I
+    could not check", and collapsing those two was the defect: unmeasurable
+    inputs produced indicators that fired, penalties that accumulated, and a
+    verdict of synthetic speech against the enrolled operator.
+    """
+
+    score: float = 1.0
+    indicators: List[Tuple[str, float]] = field(default_factory=list)
+    abstained: List[str] = field(default_factory=list)
+
+    @property
+    def evidence_complete(self) -> bool:
+        return not self.abstained
+
+    def describe(self) -> str:
+        fired = ", ".join(f"{n}:{p}" for n, p in self.indicators) or "none"
+        skipped = ", ".join(self.abstained) or "none"
+        return f"score={self.score:.2f} fired=[{fired}] abstained=[{skipped}]"
 
 
 @dataclass
@@ -233,8 +354,18 @@ class AdvancedBiometricVerifier:
         # Adaptive parameters (learned over time, no hardcoding!)
         self.speaker_models: Dict[str, "SpeakerModel"] = {}
 
-        # Physics constraints
-        self.physics = PhysicsConstraints()
+        # Physics constraints — every band overridable per deployment.
+        self.physics = PhysicsConstraints.from_env()
+
+        # Anti-spoofing trip points. Read from the environment rather than
+        # written into the checks, so a mic or codec that shifts the noise
+        # floor can be accommodated without editing a security decision.
+        self._replay_max_snr_db = _env_float("JARVIS_ANTISPOOF_MAX_SNR_DB", 50.0)
+        self._replay_min_noise = _env_float("JARVIS_ANTISPOOF_MIN_BACKGROUND", 0.001)
+        self._replay_max_quality = _env_float("JARVIS_ANTISPOOF_MAX_QUALITY", 0.95)
+        self._synthesis_min_pitch_std = _env_float("JARVIS_ANTISPOOF_MIN_PITCH_STD", 5.0)
+        self._synthesis_max_hnr_db = _env_float("JARVIS_ANTISPOOF_MAX_HNR_DB", 40.0)
+        self._conversion_max_rate_diff = _env_float("JARVIS_ANTISPOOF_MAX_RATE_DIFF", 100.0)
 
         # Performance tracking
         self.verification_history: List[VerificationResult] = []
@@ -315,13 +446,14 @@ class AdvancedBiometricVerifier:
                 logger.warning(f"Verification stage {i} failed: {r}")
 
         # Stage 5: Anti-spoofing detection
-        spoofing_score = 1.0
+        spoof = SpoofingAssessment()
         if self.enable_anti_spoofing:
-            spoofing_score = await self._detect_spoofing(
+            spoof = await self._detect_spoofing(
                 test_features,
                 enrolled_features,
                 context
             )
+        spoofing_score = spoof.score
 
         # Stage 6: Multi-modal fusion with dynamic weights
         fusion_weights = await self._compute_fusion_weights(
@@ -383,6 +515,13 @@ class AdvancedBiometricVerifier:
             warnings.append("Voice physics constraints violated")
         if spoofing_score < 0.8:
             warnings.append("Spoofing indicators detected")
+        if not spoof.evidence_complete:
+            # A clean anti-spoofing score obtained by not looking is not a
+            # clean score. Say so, at the same level as a positive finding.
+            warnings.append(
+                f"Anti-spoofing evidence incomplete: {len(spoof.abstained)} "
+                f"check(s) abstained ({'; '.join(spoof.abstained)})"
+            )
 
         # Update speaker model (adaptive learning)
         if self.enable_adaptive_learning and verified:
@@ -706,7 +845,7 @@ class AdvancedBiometricVerifier:
         test_features: VoiceBiometricFeatures,
         enrolled_features: VoiceBiometricFeatures,
         context: Optional[Dict]
-    ) -> float:
+    ) -> SpoofingAssessment:
         """Detect spoofing attacks (thread pool)."""
         return await self._run_in_executor(
             self._detect_spoofing_sync,
@@ -718,49 +857,127 @@ class AdvancedBiometricVerifier:
         test_features: VoiceBiometricFeatures,
         enrolled_features: VoiceBiometricFeatures,
         context: Optional[Dict]
-    ) -> float:
-        """Sync spoofing detection."""
-        spoofing_indicators = []
+    ) -> SpoofingAssessment:
+        """
+        Sync spoofing detection — an indicator fires only on a real measurement.
 
-        # 1. Replay attack detection
+        Every check below reads a feature and compares it to a bound. If the
+        feature was never measured, the comparison is still arithmetically
+        valid and still produces a boolean, which is exactly the trap: an
+        unset 0.0 formant gives ``0.0/1.0 = 0.0``, trips ``< 0.1``, and lands a
+        0.5 penalty labelled "unnatural_formants" — a confident statement about
+        a voice nobody looked at.
+
+        Measured on 2026-08-06 against the enrolled operator: formants
+        42.9/80.0 Hz and an enrolled speaking rate of 420 wpm produced
+        ``[('unnatural_formants', 0.5), ('inconsistent_rate', 0.2)]``, a
+        spoofing score of 0.3, and "That didn't sound like you" for the person
+        the profile belongs to.
+
+        So each check is gated on its inputs being inside the physically
+        possible band for that quantity. Outside it, the check ABSTAINS: it
+        contributes no penalty and is recorded by name, because a detector that
+        silently skips work is as dishonest as one that invents findings.
+
+        Abstaining costs nothing in security terms. Anti-spoofing is a veto on
+        POSITIVE evidence of an attack, not a proxy for extractor health, and
+        the primary biometric gate is untouched — a failed embedding comparison
+        already scores 0.0 and cannot be rescued by this stage.
+        """
+        assessment = SpoofingAssessment()
+        physics = self.physics
+
+        def fires(name: str, penalty: float) -> None:
+            assessment.indicators.append((name, penalty))
+
+        def abstain(name: str, why: str) -> None:
+            assessment.abstained.append(f"{name}({why})")
+
+        # 1. Replay attack detection — only when quality is a shape we can read.
         if context and 'audio_quality' in context:
             quality = context['audio_quality']
-
             if isinstance(quality, dict):
-                if quality.get('snr_db', 0) > 50:
-                    spoofing_indicators.append(("perfect_quality", 0.3))
-                if quality.get('background_noise', 0) < 0.001:
-                    spoofing_indicators.append(("no_background", 0.2))
-            elif isinstance(quality, (int, float)):
-                if quality > 0.95:
-                    spoofing_indicators.append(("perfect_quality", 0.2))
+                snr = quality.get('snr_db')
+                if isinstance(snr, (int, float)) and math.isfinite(snr):
+                    if snr > self._replay_max_snr_db:
+                        fires("perfect_quality", 0.3)
+                else:
+                    abstain("perfect_quality", "snr_db unmeasured")
+                noise = quality.get('background_noise')
+                if isinstance(noise, (int, float)) and math.isfinite(noise):
+                    if noise < self._replay_min_noise:
+                        fires("no_background", 0.2)
+                else:
+                    abstain("no_background", "background_noise unmeasured")
+            elif isinstance(quality, (int, float)) and math.isfinite(quality):
+                if quality > self._replay_max_quality:
+                    fires("perfect_quality", 0.2)
+            else:
+                # A string, as seen in the field ("Invalid quality score type:
+                # <class 'str'>") — not a number, so not evidence either way.
+                abstain("perfect_quality", f"quality is {type(quality).__name__}")
 
         # 2. Synthesis detection
-        if test_features.pitch_std < 5.0:
-            spoofing_indicators.append(("low_pitch_variation", 0.4))
+        if physics.measured(test_features.pitch_std,
+                            physics.min_pitch_std_hz, physics.max_pitch_std_hz):
+            if test_features.pitch_std < self._synthesis_min_pitch_std:
+                fires("low_pitch_variation", 0.4)
+        else:
+            abstain("low_pitch_variation", "pitch_std unmeasured")
 
-        f1_f2_ratio = test_features.formant_f1 / max(test_features.formant_f2, 1.0)
-        if f1_f2_ratio < 0.1 or f1_f2_ratio > 0.9:
-            spoofing_indicators.append(("unnatural_formants", 0.5))
+        f1_ok = physics.measured(test_features.formant_f1,
+                                 physics.min_formant_f1_hz, physics.max_formant_f1_hz)
+        f2_ok = physics.measured(test_features.formant_f2,
+                                 physics.min_formant_f2_hz, physics.max_formant_f2_hz)
+        if f1_ok and f2_ok:
+            ratio = test_features.formant_f1 / test_features.formant_f2
+            if ratio < physics.f1_f2_min_ratio or ratio > physics.f1_f2_max_ratio:
+                fires("unnatural_formants", 0.5)
+        else:
+            missing = "F1" if not f1_ok else ""
+            missing += ("+" if missing and not f2_ok else "") + ("F2" if not f2_ok else "")
+            abstain("unnatural_formants", f"{missing} outside human range")
 
-        if test_features.harmonic_to_noise_ratio > 40.0:
-            spoofing_indicators.append(("perfect_harmonics", 0.3))
+        if physics.measured(test_features.harmonic_to_noise_ratio,
+                            physics.min_hnr_db, physics.max_hnr_db):
+            if test_features.harmonic_to_noise_ratio > self._synthesis_max_hnr_db:
+                fires("perfect_harmonics", 0.3)
+        else:
+            abstain("perfect_harmonics", "HNR unmeasured")
 
-        # 3. Voice conversion detection
-        rate_diff = abs(test_features.speaking_rate - enrolled_features.speaking_rate)
-        if rate_diff > 100.0:
-            spoofing_indicators.append(("inconsistent_rate", 0.2))
+        # 3. Voice conversion detection — needs BOTH sides to be real rates.
+        # The enrolled side is the one that failed here: a stored 420 wpm is
+        # not a speaking rate, and differencing against it guarantees a miss
+        # for the very speaker the profile describes.
+        test_rate_ok = physics.measured(
+            test_features.speaking_rate,
+            physics.min_speaking_rate_wpm, physics.max_speaking_rate_wpm)
+        enrolled_rate_ok = physics.measured(
+            enrolled_features.speaking_rate,
+            physics.min_speaking_rate_wpm, physics.max_speaking_rate_wpm)
+        if test_rate_ok and enrolled_rate_ok:
+            if abs(test_features.speaking_rate
+                   - enrolled_features.speaking_rate) > self._conversion_max_rate_diff:
+                fires("inconsistent_rate", 0.2)
+        else:
+            side = "test" if not test_rate_ok else "enrolled"
+            abstain("inconsistent_rate", f"{side} speaking_rate implausible")
 
-        if not spoofing_indicators:
-            return 1.0
+        total_penalty = sum(penalty for _, penalty in assessment.indicators)
+        assessment.score = float(max(0.0, 1.0 - total_penalty))
 
-        total_penalty = sum(penalty for _, penalty in spoofing_indicators)
-        spoofing_score = max(0.0, 1.0 - total_penalty)
+        if assessment.indicators:
+            logger.warning("⚠️  Spoofing indicators detected: %s", assessment.indicators)
+        if assessment.abstained:
+            # Never silent. A check that did not run is a hole in the evidence
+            # and the operator is entitled to know which one.
+            logger.warning(
+                "[AntiSpoof] %d check(s) ABSTAINED — inputs were not measurable, "
+                "so they contributed no penalty: %s",
+                len(assessment.abstained), assessment.describe(),
+            )
 
-        if spoofing_score < 0.8:
-            logger.warning(f"⚠️  Spoofing indicators detected: {spoofing_indicators}")
-
-        return float(spoofing_score)
+        return assessment
 
     async def _owner_aware_antispoof_fusion(
         self,

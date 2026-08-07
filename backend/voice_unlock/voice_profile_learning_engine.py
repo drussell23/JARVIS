@@ -38,6 +38,7 @@ from collections import defaultdict
 import os
 
 from backend.core.async_safety import LazyAsyncLock
+from backend.voice.embedding_ops import require_vector
 
 logger = logging.getLogger(__name__)
 
@@ -256,17 +257,59 @@ class VoiceProfileLearningEngine:
             profiles = await db.get_all_speaker_profiles()
             for profile in profiles:
                 if self.speaker_name.lower() in profile.get('speaker_name', '').lower():
-                    embedding_data = profile.get('embedding')
-                    if embedding_data:
-                        if isinstance(embedding_data, (bytes, bytearray)):
-                            self._reference_embedding = np.frombuffer(embedding_data, dtype=np.float32)
-                        elif isinstance(embedding_data, str):
-                            self._reference_embedding = np.array(json.loads(embedding_data), dtype=np.float32)
-                        logger.info(f"🧠 [LEARNING-ENGINE] Loaded reference embedding: {self._reference_embedding.shape}")
+                    # `get_all_speaker_profiles` decodes the stored BLOB and
+                    # returns `embedding_array.tolist()` — a list, which the
+                    # previous bytes/str isinstance chain did not cover, so the
+                    # vector stayed None and the next line raised on `.shape`.
+                    # One coercion now handles every form these layers exchange.
+                    embedding_data = (profile.get('embedding')
+                                      or profile.get('voiceprint_embedding'))
+                    vec = require_vector(
+                        embedding_data,
+                        expected_dim=profile.get('embedding_dimension') or None,
+                        label=f"reference embedding for {profile.get('speaker_name')}",
+                    )
+                    if vec is not None:
+                        self._reference_embedding = vec
+                        logger.info(
+                            f"🧠 [LEARNING-ENGINE] Loaded reference embedding: {vec.shape}"
+                        )
+                    else:
+                        # Explicit: the profile exists but carries no usable
+                        # embedding. Silence here previously read as "loaded".
+                        logger.warning(
+                            "🧠 [LEARNING-ENGINE] Profile '%s' has no usable "
+                            "embedding — continuous learning has no baseline",
+                            profile.get('speaker_name'),
+                        )
                     break
 
         except Exception as e:
             logger.warning(f"🧠 [LEARNING-ENGINE] Could not load profile: {e}")
+
+    def _ensure_metrics_schema(self, conn) -> None:
+        """
+        Let the module that DECLARES vbi_unlock_attempts migrate it.
+
+        `MetricsDatabase._reconcile_table_schema` derives the expected columns
+        by executing the module's own CREATE into an in-memory database and
+        reading its PRAGMA, so it cannot drift from the declaration. Reproducing
+        that logic here would recreate exactly the divergence that caused
+        `no such column: embedding_json`.
+
+        Best-effort by design: if the owner cannot be imported or its reconciler
+        changes shape, the adaptive column selection below still runs and simply
+        learns from fewer columns. A telemetry migration may not break a load.
+        """
+        try:
+            from backend.voice_unlock.metrics_database import MetricsDatabase
+            create_sql = getattr(MetricsDatabase, "_VBI_ATTEMPTS_CREATE_SQL", None)
+            if create_sql:
+                MetricsDatabase._reconcile_table_schema(
+                    conn, "vbi_unlock_attempts", create_sql
+                )
+        except Exception as exc:  # noqa: BLE001 — a migration may not break a read
+            logger.debug(f"🧠 [LEARNING-ENGINE] metrics schema reconcile skipped: {exc}")
 
     async def _load_recent_samples(self):
         """Load recent high-quality samples for learning."""
@@ -275,34 +318,87 @@ class VoiceProfileLearningEngine:
                 return
 
             conn = sqlite3.connect(self.config.metrics_db_path)
-            cursor = conn.cursor()
+            try:
+                # `MetricsDatabase` owns this table's declaration and carries the
+                # additive reconciler that brings an older file up to it. This
+                # engine had been opening the file directly and querying columns
+                # the on-disk table never received, so every read failed with
+                # `no such column: embedding_json` while the owning module's
+                # migration sat unused. Ask the owner first; it is idempotent.
+                self._ensure_metrics_schema(conn)
 
-            # Get recent successful VBI attempts with embeddings
-            cursor.execute("""
-                SELECT
-                    embedding_json, confidence, timestamp, hour_of_day,
-                    day_of_week, audio_quality, attempt_id
-                FROM vbi_unlock_attempts
-                WHERE speaker_name LIKE ?
-                    AND success = 1
-                    AND confidence >= ?
-                    AND embedding_json IS NOT NULL
-                ORDER BY timestamp DESC
-                LIMIT ?
-            """, (
-                f"%{self.speaker_name.split()[0]}%",
-                self.config.min_confidence_for_learning,
-                self.config.max_samples_per_update * 2
-            ))
+                cursor = conn.cursor()
 
-            rows = cursor.fetchall()
-            conn.close()
+                # Select only what this database actually has. A telemetry table
+                # that predates a column should cost us that column's signal, not
+                # the entire learning corpus — and hard-coding the column list
+                # here is what let the two drift apart to begin with.
+                available = {
+                    row[1] for row in cursor.execute(
+                        "PRAGMA table_info(vbi_unlock_attempts)"
+                    ).fetchall()
+                }
+                if not available:
+                    logger.info(
+                        "🧠 [LEARNING-ENGINE] vbi_unlock_attempts absent — no "
+                        "history to learn from yet"
+                    )
+                    return
+                required = {"embedding_json", "confidence", "timestamp", "speaker_name", "success"}
+                missing_required = required - available
+                if missing_required:
+                    logger.warning(
+                        "🧠 [LEARNING-ENGINE] metrics table is missing %s even "
+                        "after reconciliation — skipping sample load",
+                        ", ".join(sorted(missing_required)),
+                    )
+                    return
+
+                optional = ["hour_of_day", "day_of_week", "audio_quality", "attempt_id"]
+                present = [c for c in optional if c in available]
+                if len(present) != len(optional):
+                    logger.info(
+                        "🧠 [LEARNING-ENGINE] optional metrics columns absent: %s",
+                        ", ".join(c for c in optional if c not in available),
+                    )
+
+                select_cols = ["embedding_json", "confidence", "timestamp", *present]
+                cursor.execute(f"""
+                    SELECT {', '.join(select_cols)}
+                    FROM vbi_unlock_attempts
+                    WHERE speaker_name LIKE ?
+                        AND success = 1
+                        AND confidence >= ?
+                        AND embedding_json IS NOT NULL
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                """, (
+                    f"%{self.speaker_name.split()[0]}%",
+                    self.config.min_confidence_for_learning,
+                    self.config.max_samples_per_update * 2
+                ))
+
+                # Re-key by column name so an absent optional column reads as
+                # None instead of shifting every value one position left.
+                rows = [dict(zip(select_cols, raw)) for raw in cursor.fetchall()]
+            finally:
+                conn.close()
 
             for row in rows:
                 try:
-                    embedding_json, conf, ts, hour, dow, quality, sample_id = row
+                    embedding_json = row.get("embedding_json")
+                    conf = row.get("confidence")
+                    ts = row.get("timestamp")
+                    hour = row.get("hour_of_day")
+                    dow = row.get("day_of_week")
+                    quality = row.get("audio_quality")
+                    sample_id = row.get("attempt_id")
                     if embedding_json:
-                        embedding = np.array(json.loads(embedding_json), dtype=np.float32)
+                        embedding = require_vector(
+                            embedding_json, label="metrics sample embedding"
+                        )
+                        if embedding is None:
+                            continue
 
                         # Calculate learning weight based on confidence
                         weight = self._calculate_sample_weight(conf, quality)

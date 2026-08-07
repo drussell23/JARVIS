@@ -494,6 +494,61 @@ class MetricsDatabase:
     - Transaction batching for efficiency
     - Health monitoring and automatic recovery
     """
+    #: The ONE declaration of vbi_unlock_attempts. Held as a class constant so
+    #: the reconciler and any other module that must bring an older file up to
+    #: this schema read the SAME statement -- a second copy is how the live
+    #: table and the declaration drifted into `no such column: embedding_json`.
+    _VBI_ATTEMPTS_CREATE_SQL = """
+                    CREATE TABLE IF NOT EXISTS vbi_unlock_attempts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        attempt_id INTEGER UNIQUE,
+                        speaker_name TEXT,
+
+                        -- Confidence metrics (for ML/continuous learning)
+                        confidence REAL,
+                        confidence_pct REAL,  -- Confidence as percentage (0-100)
+                        threshold REAL DEFAULT 0.85,
+                        above_threshold INTEGER,
+
+                        -- Success/failure
+                        success INTEGER,
+                        error_reason TEXT,
+
+                        -- Timing metrics
+                        duration_ms REAL,
+                        verification_time_ms REAL,
+                        unlock_time_ms REAL,
+
+                        -- Date/Time fields (for DB Browser SQLite viewing)
+                        timestamp TEXT,
+                        date TEXT,            -- YYYY-MM-DD format
+                        time TEXT,            -- HH:MM:SS format
+                        day_of_week TEXT,     -- Monday, Tuesday, etc.
+                        hour_of_day INTEGER,  -- 0-23
+
+                        -- Method and handler info
+                        method TEXT,
+                        handler TEXT,
+
+                        -- Audio/Embedding data for continuous learning
+                        audio_duration_sec REAL,
+                        audio_quality TEXT,   -- 'excellent', 'good', 'fair', 'poor'
+                        embedding_json TEXT,  -- 192-dim ECAPA embedding as JSON
+
+                        -- Environment context
+                        environment TEXT,     -- 'quiet', 'noisy', 'unknown'
+                        microphone TEXT,
+
+                        -- ML Learning flags
+                        used_for_training INTEGER DEFAULT 0,
+                        learning_quality_score REAL,
+
+                        -- System timestamps
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    )
+                """
+
 
     def __init__(self, sqlite_path: str = None, use_cloud_sql: bool = True):
         """
@@ -2232,56 +2287,7 @@ class MetricsDatabase:
                 # no-op against a table that already exists, so a schema
                 # declared here but created before those columns existed
                 # stays old forever.
-                _vbi_create_sql = """
-                    CREATE TABLE IF NOT EXISTS vbi_unlock_attempts (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        attempt_id INTEGER UNIQUE,
-                        speaker_name TEXT,
-
-                        -- Confidence metrics (for ML/continuous learning)
-                        confidence REAL,
-                        confidence_pct REAL,  -- Confidence as percentage (0-100)
-                        threshold REAL DEFAULT 0.85,
-                        above_threshold INTEGER,
-
-                        -- Success/failure
-                        success INTEGER,
-                        error_reason TEXT,
-
-                        -- Timing metrics
-                        duration_ms REAL,
-                        verification_time_ms REAL,
-                        unlock_time_ms REAL,
-
-                        -- Date/Time fields (for DB Browser SQLite viewing)
-                        timestamp TEXT,
-                        date TEXT,            -- YYYY-MM-DD format
-                        time TEXT,            -- HH:MM:SS format
-                        day_of_week TEXT,     -- Monday, Tuesday, etc.
-                        hour_of_day INTEGER,  -- 0-23
-
-                        -- Method and handler info
-                        method TEXT,
-                        handler TEXT,
-
-                        -- Audio/Embedding data for continuous learning
-                        audio_duration_sec REAL,
-                        audio_quality TEXT,   -- 'excellent', 'good', 'fair', 'poor'
-                        embedding_json TEXT,  -- 192-dim ECAPA embedding as JSON
-
-                        -- Environment context
-                        environment TEXT,     -- 'quiet', 'noisy', 'unknown'
-                        microphone TEXT,
-
-                        -- ML Learning flags
-                        used_for_training INTEGER DEFAULT 0,
-                        learning_quality_score REAL,
-
-                        -- System timestamps
-                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-                    )
-                """
+                _vbi_create_sql = self._VBI_ATTEMPTS_CREATE_SQL
                 cursor.execute(_vbi_create_sql)
                 self._reconcile_table_schema(
                     conn, "vbi_unlock_attempts", _vbi_create_sql
