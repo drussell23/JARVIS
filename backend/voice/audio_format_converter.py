@@ -1289,6 +1289,38 @@ DEFAULT_TRIM_MARGIN_MS = 120.0
 
 ENV_TRIM_ENABLED = "JARVIS_AUDIO_TRIM_ENABLED"
 
+#: VAD analysis frame. Short enough to resolve word boundaries, long enough that
+#: a single glitch does not read as speech.
+ENV_VAD_FRAME_MS = "JARVIS_AUDIO_VAD_FRAME_MS"
+DEFAULT_VAD_FRAME_MS = 20.0
+
+#: Silence shorter than this is kept — it is a pause INSIDE an utterance, and
+#: removing it would splice words together and change the prosody an ECAPA
+#: embedding is partly built from.
+ENV_VAD_HANGOVER_MS = "JARVIS_AUDIO_VAD_HANGOVER_MS"
+DEFAULT_VAD_HANGOVER_MS = 250.0
+
+#: Voiced runs shorter than this are discarded as transients: a key click, a
+#: chair, a breath. Keeping them is how "speech detected" becomes "noise kept".
+ENV_VAD_MIN_SEGMENT_MS = "JARVIS_AUDIO_VAD_MIN_SEGMENT_MS"
+DEFAULT_VAD_MIN_SEGMENT_MS = 120.0
+
+
+def _vad_config() -> Tuple[float, float, float]:
+    """Resolve VAD framing tunables. NEVER raises."""
+    def _f(key: str, default: float, lo: float, hi: float) -> float:
+        try:
+            raw = (os.environ.get(key, "") or "").strip()
+            return min(max(float(raw), lo), hi) if raw else default
+        except (TypeError, ValueError):
+            return default
+
+    return (
+        _f(ENV_VAD_FRAME_MS, DEFAULT_VAD_FRAME_MS, 5.0, 100.0),
+        _f(ENV_VAD_HANGOVER_MS, DEFAULT_VAD_HANGOVER_MS, 0.0, 2000.0),
+        _f(ENV_VAD_MIN_SEGMENT_MS, DEFAULT_VAD_MIN_SEGMENT_MS, 0.0, 2000.0),
+    )
+
 
 def _trim_config() -> Tuple[bool, float, float]:
     """Resolve trim tunables. NEVER raises."""
@@ -1310,32 +1342,47 @@ def _trim_config() -> Tuple[bool, float, float]:
 
 def trim_silence(pcm_bytes: bytes, sample_rate: int) -> bytes:
     """
-    Remove leading and trailing silence from 16-bit mono PCM.
+    Keep the speech, drop the room — by SEGMENT, not by edge.
 
-    WHY THIS EXISTS
-    ---------------
-    `analyze_pcm_audio` already computes ``silence_ratio`` against a -40dB
-    threshold and, when it exceeds 90%, appends the string
-    ``"Audio is 91% silence"``. That measurement was then DISCARDED: nothing
-    acted on it, so the speaker embedding was computed over a buffer that was
-    overwhelmingly room tone.
-
-    Measured 2026-08-06 21:11:11, on a real unlock::
+    WHY EDGE TRIMMING WAS NOT ENOUGH
+    --------------------------------
+    The first version removed leading and trailing silence. Measured
+    2026-08-06 22:13:227 it changed nothing, and the analysis still reported::
 
         ⚠️ Audio issue: Audio is 91% silence
-        ⚠️ No speaker match found. Best confidence: 0.00%
 
-    An embedding of mostly-silence is an embedding of the room, not the speaker.
-    Comparing it to an enrolled voiceprint cannot succeed, and the failure
-    presents as "that wasn't you" — a fault wearing a refusal's clothes, which
-    is the shape this whole arc keeps producing.
+    because the silence was DISTRIBUTED, not padded. A capture window holding a
+    cough at the start, the phrase in the middle and a chair at the end spans
+    first-voiced to last-voiced across nearly the whole buffer, so an edge trim
+    computes "already dense" and correctly declines. 91% silence spread through
+    a recording is a different problem from 91% silence around it, and only the
+    second is an edge problem.
 
-    The threshold is the SAME one the analysis uses. Two silence definitions
-    that could drift apart is how a trim starts disagreeing with the warning
-    that motivated it.
+    An ECAPA embedding computed over that buffer is an embedding of the room.
 
-    NEVER makes the audio worse: on any error, on a result below the keep-ratio,
-    or on audio that is already dense, the original bytes are returned unchanged.
+    HOW IT DECIDES
+    --------------
+    Frame-wise energy against the SAME -40dB threshold `analyze_pcm_audio` uses
+    — one silence definition, so the trim cannot disagree with the warning that
+    motivated it.
+
+    Then three shaping rules, all env-tunable, each guarding a specific failure:
+
+      * hangover — silence shorter than this is KEPT. It is a pause inside an
+        utterance, and closing it would splice words together and alter the
+        prosody the embedding is partly built from.
+      * min segment — voiced runs shorter than this are dropped as transients:
+        a key click, a breath, a chair.
+      * margin — kept either side of each surviving segment so an onset or a
+        trailing consonant is never clipped.
+
+    NEVER MAKES THE AUDIO WORSE
+    ---------------------------
+    Original bytes are returned unchanged on any exception, on audio already
+    dense, on audio entirely below the floor, and on a result below the
+    keep-ratio floor. The last case matters most here: segment extraction can
+    discard far more than an edge trim, and handing back a fragment would
+    substitute a guess for the caller's own quality gate.
     """
     enabled, min_keep_ratio, margin_ms = _trim_config()
     if not enabled or not pcm_bytes or sample_rate <= 0:
@@ -1348,43 +1395,79 @@ def trim_silence(pcm_bytes: bytes, sample_rate: int) -> bytes:
         if samples.size == 0:
             return pcm_bytes
 
+        frame_ms, hangover_ms, min_segment_ms = _vad_config()
+        frame = max(1, int((frame_ms / 1000.0) * sample_rate))
+        n_frames = samples.size // frame
+        if n_frames < 2:
+            return pcm_bytes  # too short to segment meaningfully
+
         # Same -40dB definition as analyze_pcm_audio. Derived, not duplicated.
         silence_threshold = 10 ** (-40 / 20)
-        voiced = _np.abs(samples) >= silence_threshold
+
+        # Peak per frame: a frame is voiced if ANY sample in it clears the
+        # floor. RMS would smear a short plosive below threshold and drop the
+        # start of a word.
+        usable = samples[: n_frames * frame].reshape(n_frames, frame)
+        voiced = _np.abs(usable).max(axis=1) >= silence_threshold
         if not voiced.any():
-            # Entirely below threshold. Trimming would yield nothing, and the
-            # caller's analysis will already be reporting ~100% silence.
+            return pcm_bytes  # nothing above the floor; caller's gate decides
+
+        # --- close short gaps (hangover) ---
+        hangover_frames = int(round(hangover_ms / frame_ms))
+        idx = _np.flatnonzero(voiced)
+        segments = []
+        seg_start = idx[0]
+        prev = idx[0]
+        for i in idx[1:]:
+            if i - prev - 1 > hangover_frames:
+                segments.append((seg_start, prev))
+                seg_start = i
+            prev = i
+        segments.append((seg_start, prev))
+
+        # --- drop transients (min segment) ---
+        min_segment_frames = max(1, int(round(min_segment_ms / frame_ms)))
+        segments = [
+            (a, b) for (a, b) in segments if (b - a + 1) >= min_segment_frames
+        ]
+        if not segments:
+            logger.warning(
+                "[AudioTrim] every voiced run was shorter than %.0fms — returning "
+                "the original; this is noise, not speech",
+                min_segment_ms,
+            )
             return pcm_bytes
 
-        first = int(_np.argmax(voiced))
-        last = int(len(voiced) - _np.argmax(voiced[::-1]))
-
+        # --- expand by margin, in samples, then merge overlaps ---
         margin = int((margin_ms / 1000.0) * sample_rate)
-        start = max(0, first - margin)
-        end = min(len(samples), last + margin)
+        spans = []
+        for (a, b) in segments:
+            lo = max(0, a * frame - margin)
+            hi = min(samples.size, (b + 1) * frame + margin)
+            if spans and lo <= spans[-1][1]:
+                spans[-1] = (spans[-1][0], max(spans[-1][1], hi))
+            else:
+                spans.append((lo, hi))
 
-        if end <= start:
-            return pcm_bytes
+        kept = int(sum(hi - lo for lo, hi in spans))
+        kept_ratio = kept / samples.size
 
-        kept_ratio = (end - start) / len(samples)
         if kept_ratio >= 0.999:
             return pcm_bytes  # already dense; nothing to remove
         if kept_ratio < min_keep_ratio:
-            # What survives is too small to trust as a whole utterance. Hand
-            # back the original so the caller's own quality gate decides, rather
-            # than silently substituting a fragment.
             logger.warning(
-                "[AudioTrim] refusing to trim: only %.1f%% of the buffer is above "
-                "the silence floor (min %.1f%%) — returning the original",
+                "[AudioTrim] refusing to trim: only %.1f%% of the buffer survives "
+                "segmentation (min %.1f%%) — returning the original",
                 kept_ratio * 100.0, min_keep_ratio * 100.0,
             )
             return pcm_bytes
 
-        trimmed = samples[start:end]
+        trimmed = _np.concatenate([samples[lo:hi] for lo, hi in spans])
         logger.info(
-            "[AudioTrim] %.0fms -> %.0fms (removed %.0f%% silence)",
-            len(samples) / sample_rate * 1000.0,
-            len(trimmed) / sample_rate * 1000.0,
+            "[AudioTrim] %.0fms -> %.0fms across %d segment(s) (removed %.0f%% silence)",
+            samples.size / sample_rate * 1000.0,
+            trimmed.size / sample_rate * 1000.0,
+            len(spans),
             (1.0 - kept_ratio) * 100.0,
         )
         return (trimmed * 32768.0).astype(_np.int16).tobytes()
