@@ -3456,28 +3456,11 @@ class SpeakerVerificationService:
                 "JARVIS_ENABLE_SLIM_MODE", ""
             ).lower() in ("true", "1", "yes", "on")
 
-        if not _slim_skip_speechbrain:
-            # Create SpeechBrain engine but DON'T initialize it yet (deferred to background)
-            # Lazy load the ML components
-            _init_ml_components()
-            model_config = _ModelConfig(
-                name="speechbrain-wav2vec2",
-                engine=_STTEngine.SPEECHBRAIN,
-                disk_size_mb=380,
-                ram_required_gb=2.0,
-                vram_required_gb=1.8,
-                expected_accuracy=0.96,
-                avg_latency_ms=150,
-                supports_fine_tuning=True,
-                model_path="speechbrain/asr-wav2vec2-commonvoice-en",
-            )
-            self.speechbrain_engine = _SpeechBrainEngine(model_config)
-        else:
-            self.speechbrain_engine = None
-            logger.info(
-                "⚡ [FAST-INIT] SpeechBrain SKIPPED (SLIM mode — "
-                "cloud ECAPA via GCP handles voice verification)"
-            )
+        # One definition, both initialisers. This used to be an inline copy of
+        # the construction below; `initialize()` had the config and not the
+        # instantiation, which is exactly the drift a shared constructor
+        # prevents. SLIM mode is handled inside it.
+        self._ensure_speechbrain_engine()
 
         # Load speaker profiles from database
         await self._load_speaker_profiles()
@@ -4023,6 +4006,12 @@ class SpeakerVerificationService:
         # different route. If the load fails it schedules its own retry
         # (5342e1b8e5) rather than raising -- readiness with zero profiles is
         # then honest and recoverable rather than silent and permanent.
+        # Construct the scoring engine. `initialize_fast()` did this; this path
+        # never did, so `speechbrain_engine` stayed None and every verification
+        # crashed on it. Shared constructor, so the two initialisers cannot
+        # disagree about how the engine is built.
+        self._ensure_speechbrain_engine()
+
         try:
             await self._load_speaker_profiles()
         except Exception as e:  # noqa: BLE001 — never block readiness on this
@@ -6029,6 +6018,75 @@ class SpeakerVerificationService:
                 # Fallback: return original data (may cause issues downstream)
                 logger.warning("   ⚠️ Returning original audio data (may not be PCM!)")
                 return audio_data
+
+    def _ensure_speechbrain_engine(self) -> None:
+        """Construct the local scoring engine, once, for whichever initialiser ran.
+
+        `initialize_fast()` built the engine. `initialize()` -- the path
+        `voice_identity.py` actually calls -- built the IDENTICAL model config
+        and then never instantiated anything with it, leaving
+        `self.speechbrain_engine` at its constructor default of None.
+
+        Measured 2026-08-06 22:11:30::
+
+            ⚠️ Pre-extraction failed, will use local fallback
+            ERROR 'NoneType' object has no attribute 'verify_speaker'
+
+        Not a Metal binding failure, not a tensor timeout, not a silent
+        exception during instantiation: NOTHING EVER INSTANTIATED IT. This is
+        the third piece of setup `initialize()` was missing, after
+        `_load_speaker_profiles()`.
+
+        Two initialisers that must agree about how the engine is built will
+        drift, and the drift stays invisible until the one that runs is the one
+        that is wrong. One definition, both callers.
+
+        Idempotent: an existing engine is left alone, so calling this from both
+        initialisers -- or twice -- costs nothing and never replaces a live
+        engine mid-flight.
+        """
+        if getattr(self, "speechbrain_engine", None) is not None:
+            return
+
+        # SLIM mode is a deliberate operator choice: cloud ECAPA scores, and no
+        # local engine is wanted. Absent by choice is not absent by accident,
+        # and `verification_capability()` already separates them by consulting
+        # `_use_registry_encoder`.
+        if (os.environ.get("JARVIS_ENABLE_SLIM_MODE", "") or "").lower() in (
+            "true", "1", "yes", "on"
+        ):
+            self.speechbrain_engine = None
+            logger.info("SpeechBrain SKIPPED (SLIM mode — cloud ECAPA verifies)")
+            return
+
+        try:
+            _init_ml_components()
+            model_config = _ModelConfig(
+                name="speechbrain-wav2vec2",
+                engine=_STTEngine.SPEECHBRAIN,
+                disk_size_mb=380,
+                ram_required_gb=2.0,
+                vram_required_gb=1.8,
+                expected_accuracy=0.96,
+                avg_latency_ms=150,
+                supports_fine_tuning=True,
+                model_path="speechbrain/asr-wav2vec2-commonvoice-en",
+            )
+            self.speechbrain_engine = _SpeechBrainEngine(model_config)
+            logger.warning(
+                "✅ SpeechBrain engine constructed (weights load lazily on first use)"
+            )
+        except Exception as exc:  # noqa: BLE001
+            # LOUD, with a traceback. A construction failure was previously
+            # indistinguishable from "nobody built one", and both presented
+            # downstream as a missing voiceprint. The traceback is what tells
+            # those two apart.
+            self.speechbrain_engine = None
+            logger.error(
+                "❌ SpeechBrain engine construction FAILED (%s: %s) — verification "
+                "will report no_scoring_engine, NOT a missing voiceprint",
+                type(exc).__name__, exc, exc_info=True,
+            )
 
     def verification_capability(self, speaker_name: Optional[str] = None) -> Tuple[bool, str]:
         """
