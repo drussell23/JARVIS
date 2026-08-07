@@ -3486,7 +3486,14 @@ class SpeakerVerificationService:
         ecapa_status = "ECAPA ready" if self._use_registry_encoder else (
             "cloud ECAPA (SLIM)" if _slim_skip_speechbrain else "SpeechBrain fallback"
         )
-        logger.info(
+        # WARNING, not INFO. This module is filtered to WARNING+ in the
+        # brainstem console, so the ONE line that answers "did the
+        # voiceprint load?" has been invisible for this entire
+        # investigation. Four separate fixes were made without ever
+        # being able to read whether the profile count was 0 or 1 --
+        # which is not debugging, it is guessing with extra steps.
+        # A readiness line nobody can see is not a readiness line.
+        logger.warning(
             f"✅ Speaker Verification Service ready - {len(self.speaker_profiles)} profiles loaded ({ecapa_status})"
         )
 
@@ -3988,7 +3995,14 @@ class SpeakerVerificationService:
             logger.warning(f"⚠️ [INIT] EcapaFacade error: {e} - falling back to local engine")
 
         self.initialized = True
-        logger.info(
+        # WARNING, not INFO. This module is filtered to WARNING+ in the
+        # brainstem console, so the ONE line that answers "did the
+        # voiceprint load?" has been invisible for this entire
+        # investigation. Four separate fixes were made without ever
+        # being able to read whether the profile count was 0 or 1 --
+        # which is not debugging, it is guessing with extra steps.
+        # A readiness line nobody can see is not a readiness line.
+        logger.warning(
             f"✅ Speaker Verification Service ready ({len(self.speaker_profiles)} profiles loaded)"
         )
         if self._use_registry_encoder:
@@ -5438,7 +5452,8 @@ class SpeakerVerificationService:
                     await self._auto_create_owner_profile_from_macos()
 
             # Summary
-            logger.info(
+            # WARNING for the same reason: this is the decisive count.
+            logger.warning(
                 f"✅ Speaker profile loading complete: {loaded_count} loaded, {skipped_count} skipped"
             )
 
