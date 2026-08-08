@@ -444,6 +444,150 @@ _rc "an unreadable report directory is distinguished from no crashes" 1 "${_e}"
 
 # =============================================================================
 echo
+echo "login-rights guard"
+# =============================================================================
+JARVIS_SYSTEM_AUTH_TEMPLATE="${JARVIS_SYSTEM_AUTH_TEMPLATE_DEFAULT}"
+if [ -r "${JARVIS_SYSTEM_AUTH_TEMPLATE}" ]; then
+    for _r in system.login.console system.login.filevault system.login.fus; do
+        jarvis_right_performs_login "${_r}" \
+            && _ok "${_r} is protected" \
+            || _no "${_r} is protected"
+    done
+
+    # THE discrimination that matters. system.login.screensaver.unlock's sole
+    # mechanism is CryptoTokenKit:login -- it contains the substring "login" and
+    # is NOT a login mechanism. A guard that banned its own target would be
+    # removed by the first person it inconvenienced.
+    for _r in system.login.screensaver.unlock system.restart system.disk.unlock; do
+        jarvis_right_performs_login "${_r}" \
+            && _no "${_r} is allowed" \
+            || _ok "${_r} is allowed"
+    done
+
+    jarvis_right_performs_login "no.such.right.at.all" \
+        && _ok "an unknown right fails closed (protected)" \
+        || _no "an unknown right fails closed (protected)"
+
+    jarvis_right_performs_login "${JARVIS_RIGHT_NAMESPACE}probe.lifecycle" \
+        && _no "a right in our own namespace is exempt" \
+        || _ok "a right in our own namespace is exempt"
+
+    JARVIS_SYSTEM_AUTH_TEMPLATE="${WORK}/absent.plist" \
+        jarvis_right_performs_login system.restart \
+        && _ok "an unreadable schema fails closed (protected)" \
+        || _no "an unreadable schema fails closed (protected)"
+    JARVIS_SYSTEM_AUTH_TEMPLATE="${JARVIS_SYSTEM_AUTH_TEMPLATE_DEFAULT}"
+fi
+
+# The chokepoint. Only the refusal branch is exercised directly -- the accepting
+# branch ends in a real `security authorizationdb write`, which a test suite must
+# never perform.
+_ours="$(_fixture ours '
+    <key>class</key><string>evaluate-mechanisms</string>
+    <key>mechanisms</key><array><string>JARVISUnlock:grant,privileged</string></array>')"
+_e=0; jarvis_authdb_write system.login.console "${_ours}" >/dev/null 2>&1 || _e=$?
+_rc "writing OUR mechanism into a login right is refused" 1 "${_e}"
+
+# Recovery must not be collateral damage. A rule that does NOT name us is allowed
+# through even for a protected right, because restoring a backup and writing a
+# stripped chain both look exactly like this -- and a guard that blocks the
+# recovery path strands someone at a lock screen.
+#
+# The stub stands in ONLY for the final exec. No logic is faked: everything the
+# guard decides has already run by the time it is reached.
+mkdir -p "${WORK}/stub"
+cat > "${WORK}/stub/security" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$*" >> "${JARVIS_TEST_SECURITY_CALLS}"
+exit 0
+STUB
+chmod +x "${WORK}/stub/security"
+export JARVIS_TEST_SECURITY_CALLS="${WORK}/security-calls"
+: > "${JARVIS_TEST_SECURITY_CALLS}"
+
+_e=0; PATH="${WORK}/stub:${PATH}" jarvis_authdb_write system.login.console "${DELEGATING}" >/dev/null 2>&1 || _e=$?
+_rc "writing a rule WITHOUT our mechanism into a login right is allowed" 0 "${_e}"
+grep -q 'authorizationdb write system.login.console' "${JARVIS_TEST_SECURITY_CALLS}" \
+    && _ok "and it actually reached the database call" \
+    || _no "and it actually reached the database call"
+
+# =============================================================================
+echo
+echo "dead man's switch"
+# =============================================================================
+# Behavioural, not structural: the switch is the last thing standing between a
+# probe that dies mid-run and a machine left mutated, so "it detaches and the
+# command runs" has to be observed rather than assumed.
+_marker="${WORK}/deadman-fired"
+_dm_log="${WORK}/deadman.log"
+_dm_pid="$(jarvis_arm_deadman 1 "${_dm_log}" "/usr/bin/touch '${_marker}'" "touch ${_marker}")"
+case "${_dm_pid}" in
+    ''|*[!0-9]*) _no "arming returns a pid" "got [${_dm_pid}]" ;;
+    *)           _ok "arming returns a pid" ;;
+esac
+[ ! -e "${_marker}" ] && _ok "it has not fired yet" || _no "it has not fired yet"
+
+_waited=0
+while [ ! -e "${_marker}" ] && [ "${_waited}" -lt 60 ]; do sleep 0.2; _waited=$(( _waited + 1 )); done
+[ -e "${_marker}" ] && _ok "it fires after its window" || _no "it fires after its window"
+grep -q 'dead-man recovery OK' "${_dm_log}" 2>/dev/null \
+    && _ok "and it records that it fired" || _no "and it records that it fired"
+
+# =============================================================================
+echo
+echo "sentinel installability"
+# =============================================================================
+# install.sh copies these to a system path and refuses to continue if one is
+# missing. Catching that here costs nothing; catching it at install time means a
+# half-installed machine.
+for _tool in ${JARVIS_SYSTEM_TOOLS}; do
+    [ -f "${_here}/${_tool}" ] \
+        && _ok "${_tool} is present to install" \
+        || _no "${_tool} is present to install"
+done
+for _script in sentinel.sh probe_mechanism_lifecycle.sh; do
+    bash -n "${_here}/${_script}" 2>/dev/null \
+        && _ok "${_script} parses" || _no "${_script} parses"
+done
+
+# The sentinel must never be able to put the mechanism BACK. Its only write is a
+# revert; a sentinel that could install would be a second installer with no gates
+# in front of it.
+grep -qE 'jarvis_compose_mechanism_rule|jarvis_record_sanctioned_shape' "${_here}/sentinel.sh" \
+    && _no "the sentinel cannot compose or sanction" \
+    || _ok "the sentinel cannot compose or sanction"
+
+# Run without privileges. This pins two bugs found by doing exactly that:
+#
+#   - every _say emitted a shell-level permission error alongside its message,
+#     because a redirection to an unwritable path is reported before the command
+#     runs and 2>/dev/null on the printf cannot suppress it.
+#
+#   - mkdir failing for a MISSING PARENT was read as "a lock is held", so the
+#     script announced a stale lock and rm -rf'd a path it had never created.
+#     The same path, with an existing-but-unreadable lock, would have broken a
+#     LIVE lock and let two reverts race on one rule.
+if [ "$(id -u)" -ne 0 ]; then
+    _sent_out="$("${_here}/sentinel.sh" 2>&1)"; _sent_rc=$?
+    _rc "the sentinel exits 0 without privileges" 0 "${_sent_rc}"
+    case "${_sent_out}" in
+        *"needs root"*) _ok "and says why" ;;
+        *)              _no "and says why" "got [${_sent_out}]" ;;
+    esac
+    case "${_sent_out}" in
+        *"breaking a stale lock"*) _no "and does not invent a stale lock" ;;
+        *)                         _ok "and does not invent a stale lock" ;;
+    esac
+    case "${_sent_out}" in
+        *"Permission denied"*) _no "and emits no shell-level permission noise" ;;
+        *)                     _ok "and emits no shell-level permission noise" ;;
+    esac
+else
+    printf '  skip sentinel no-privilege path (running as root)\n'
+fi
+
+# =============================================================================
+echo
 echo "restore-point provenance"
 # =============================================================================
 # The pointer file records a path and nothing else, and the target right has

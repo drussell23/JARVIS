@@ -34,71 +34,51 @@ _jarvis_log "starting removal"
 # =============================================================================
 # 1. RESTORE THE AUTHORIZATION RULE  (first -- this is what unwedges a machine)
 # =============================================================================
-restore_auth_rule() {
-    # The backup-pointer restore lives in common.sh because install.sh needs the
-    # identical operation when it has to abandon a half-finished install. Two
-    # copies of "how do we put the authorization rule back" is the last thing
-    # this system should have -- they would drift, and the one that drifted would
-    # be discovered by someone whose screen will not unlock.
-    #
-    # Every path this function can take is a REPAIR, so it degrades rather than
-    # aborting: a failed restore falls through to stripping our mechanism out of
-    # whatever rule is live.
-    if jarvis_restore_auth_rule_from_pointer; then
-        _jarvis_log "authorization rule restored from backup"
-        return
-    fi
+# The whole operation -- restore from the backup pointer, falling back to
+# stripping our mechanism out of whatever is live -- lives in common.sh. It moved
+# there when the sentinel needed the identical repair. Two implementations of
+# "how do we get our mechanism out of the lock screen" would drift, and the copy
+# that drifted would be discovered by whoever it failed, at a machine that will
+# not unlock.
+if ! jarvis_revert_auth_rule; then
+    _note_failure "could not remove ${JARVIS_PLUGIN_NAME} from ${JARVIS_AUTH_RIGHT}"
+fi
 
-    _jarvis_warn "no usable backup (absent pointer, missing file, or unparseable plist)"
-    _remove_mechanism_in_place
-}
-
-# Fallback: no usable backup. Strip only our own mechanism from whatever rule is
-# currently live, leaving every other entry untouched. Never invents a rule.
-_remove_mechanism_in_place() {
-    local current
-    if ! current="$(jarvis_authdb_read "${JARVIS_AUTH_RIGHT}")"; then
-        _note_failure "cannot read ${JARVIS_AUTH_RIGHT}; leaving it alone"
-        return
-    fi
-
-    if ! printf '%s' "${current}" | grep -q "${JARVIS_PLUGIN_NAME}"; then
-        _jarvis_log "${JARVIS_AUTH_RIGHT} does not reference ${JARVIS_PLUGIN_NAME}; nothing to strip"
-        return
-    fi
-
-    local scratch
-    scratch="$(mktemp -t jarvis-authdb)" || { _note_failure "mktemp failed"; return; }
-    printf '%s' "${current}" > "${scratch}"
-
-    # Delete every mechanisms[] entry whose value mentions our plugin.
-    #
-    # The walk itself lives in common.sh alongside the composition that creates
-    # these entries. They are inverses of one another, and an inverse pair that
-    # drifts apart is how a removal leaves behind exactly the entry it was run to
-    # remove -- on a machine whose screen will not unlock.
-    local removed
-    removed="$(jarvis_rule_strip_mechanism "${scratch}" "${JARVIS_PLUGIN_NAME}")"
-
-    if [ "${removed}" -eq 0 ]; then
-        # The rule mentions us somewhere plutil found nothing to delete: a
-        # different key, or a shape this function does not understand. Writing it
-        # back unchanged would be a no-op reported as a repair.
-        _note_failure "${JARVIS_AUTH_RIGHT} names ${JARVIS_PLUGIN_NAME} but no mechanism entry matched; leaving it alone"
-        _jarvis_warn "  inspect: security authorizationdb read ${JARVIS_AUTH_RIGHT}"
-        rm -f "${scratch}"
-        return
-    fi
-
-    if jarvis_authdb_write "${JARVIS_AUTH_RIGHT}" "${scratch}"; then
-        _jarvis_log "stripped ${removed} ${JARVIS_PLUGIN_NAME} mechanism(s) from ${JARVIS_AUTH_RIGHT}"
+# =============================================================================
+# 1b. DISARM THE SENTINEL
+# =============================================================================
+# After the rule is clean, never before. The sentinel's whole purpose is to pull
+# our mechanism out of a chain it should not be in; removing it first would open
+# exactly the unwatched window this uninstall is walking through.
+#
+# The sanctioned-shape record goes too. Leaving it behind would tell a future
+# sentinel that a rule naming us had been proven, when nothing had.
+remove_sentinel() {
+    if launchctl print "system/${JARVIS_SENTINEL_LABEL}" >/dev/null 2>&1; then
+        _jarvis_log "disarming ${JARVIS_SENTINEL_LABEL}"
+        launchctl bootout "system/${JARVIS_SENTINEL_LABEL}" 2>/dev/null \
+            || _note_failure "could not unload ${JARVIS_SENTINEL_LABEL}"
+        jarvis_wait_for_service_gone "${JARVIS_SENTINEL_LABEL}" || true
     else
-        _note_failure "could not write stripped rule for ${JARVIS_AUTH_RIGHT}"
+        _jarvis_log "${JARVIS_SENTINEL_LABEL} is not loaded"
     fi
-    rm -f "${scratch}"
+
+    rm -f "${JARVIS_SENTINEL_PLIST}" "${JARVIS_SANCTIONED_SHAPE_FILE}" 2>/dev/null || true
+
+    # The tools directory last, and only its own files: it holds the copy of
+    # uninstall.sh that may be the very script running right now. Deleting a
+    # running bash script is safe on macOS -- the interpreter holds the inode --
+    # but removing the directory wholesale would take verify.sh with it before
+    # anyone could use it to check this removal worked.
+    if [ -d "${JARVIS_SYSTEM_TOOLS_DIR}" ]; then
+        for _tool in ${JARVIS_SYSTEM_TOOLS}; do
+            rm -f "${JARVIS_SYSTEM_TOOLS_DIR}/${_tool}" 2>/dev/null || true
+        done
+        rmdir "${JARVIS_SYSTEM_TOOLS_DIR}" 2>/dev/null || true
+    fi
 }
 
-restore_auth_rule
+remove_sentinel
 
 # =============================================================================
 # 2. STOP AND REMOVE THE GRANT BROKER

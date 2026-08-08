@@ -345,6 +345,7 @@ else
     rm -f "${DAEMON_TMP}"
     chown -R root:wheel "${JARVIS_PLUGIN_PATH}"
 
+
     # A failure from here on can leave the rule pointing at a mechanism whose
     # broker is down. That is fail-open safe -- the mechanism yields and
     # builtin:authenticate prompts -- but it is a half-installed system, which is
@@ -363,6 +364,82 @@ else
         fi
         _jarvis_die "$1"
     }
+
+    # ------------------------------------------------------------------
+    # 6a. THE SENTINEL  -- installed BEFORE the rule, on purpose
+    # ------------------------------------------------------------------
+    # It watches for the states no installer gate can prevent: the mechanism
+    # crashing its host, an OS update rewriting the right, the bundle going away
+    # underneath a chain that still names it, and a rule edited by hand. Any of
+    # those and it takes our mechanism back out, with no human in the loop.
+    #
+    # Before the rule because a sentinel that starts watching afterwards has a
+    # window in which the very thing it guards against is unobserved. It costs
+    # nothing to run early: with no mechanism in the chain it exits immediately.
+    _jarvis_log "installing the sentinel"
+    mkdir -p "${JARVIS_SYSTEM_TOOLS_DIR}"
+    chown root:wheel "${JARVIS_SYSTEM_TOOLS_DIR}"
+    chmod 755 "${JARVIS_SYSTEM_TOOLS_DIR}"
+    for _tool in ${JARVIS_SYSTEM_TOOLS}; do
+        [ -f "${_here}/${_tool}" ] || _abort_incoherent "missing ${_tool}; cannot install the sentinel"
+        install -m 755 -o root -g wheel "${_here}/${_tool}" "${JARVIS_SYSTEM_TOOLS_DIR}/${_tool}"
+    done
+
+    SENTINEL_TMP="$(mktemp -t jarvis-sentinel-plist)"
+    cat > "${SENTINEL_TMP}" <<SENTINEL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${JARVIS_SENTINEL_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${JARVIS_SENTINEL_BIN}</string>
+    </array>
+    <!-- Boot. The first thing that runs after a crash, an update, or a power cut. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- kqueue-backed. launchd wakes the script on a change; between changes
+         there is no process at all, so idle cost is zero and there is nothing
+         resident that could crash. -->
+    <key>WatchPaths</key>
+    <array>
+        <string>${JARVIS_CRASH_REPORTS_DIR}</string>
+        <string>${JARVIS_PLUGIN_DIR}</string>
+        <string>${JARVIS_AUTHDB_FILE}</string>
+    </array>
+    <!-- Backstop ONLY. Insurance against a coalesced kqueue event or a machine
+         that was asleep; deliberately long enough that it is never what notices
+         first. If this is what catches something, the watches need looking at. -->
+    <key>StartInterval</key>
+    <integer>${JARVIS_SENTINEL_BACKSTOP_S:-3600}</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <!-- No KeepAlive. This is a short-lived script, not a daemon: relaunching it
+         on exit would mean running it in a tight loop forever. -->
+    <key>StandardErrorPath</key>
+    <string>${JARVIS_STATE_DIR}/sentinel.err.log</string>
+</dict>
+</plist>
+SENTINEL
+    plutil -lint "${SENTINEL_TMP}" >/dev/null 2>&1 \
+        || { rm -f "${SENTINEL_TMP}"; _abort_incoherent "generated sentinel plist is malformed"; }
+    install -m 644 -o root -g wheel "${SENTINEL_TMP}" "${JARVIS_SENTINEL_PLIST}"
+    rm -f "${SENTINEL_TMP}"
+
+    launchctl bootout "system/${JARVIS_SENTINEL_LABEL}" >/dev/null 2>&1 || true
+    jarvis_wait_for_service_gone "${JARVIS_SENTINEL_LABEL}" || true
+    if launchctl bootstrap system "${JARVIS_SENTINEL_PLIST}" 2>/dev/null; then
+        _jarvis_log "sentinel armed (watching ${JARVIS_PLUGIN_DIR}, ${JARVIS_CRASH_REPORTS_DIR}, ${JARVIS_AUTHDB_FILE})"
+    else
+        # Fail closed. Installing the mechanism with nothing watching it is the
+        # state this whole layer exists to make impossible, and it is strictly
+        # worse than not installing at all.
+        _abort_incoherent "sentinel did not load; refusing to continue without it"
+    fi
 
     _jarvis_log "loading ${JARVIS_BROKER_LABEL}"
     launchctl bootout "system/${JARVIS_BROKER_LABEL}" >/dev/null 2>&1 || true
@@ -678,6 +755,14 @@ if [ "${_compose_rc}" -eq 0 ]; then
        && [ "$(jarvis_rule_shape "${_live_tmp}" 2>/dev/null || true)" = "${_shape}" ]; then
         _jarvis_log "verified: the live rule is the shape that was measured"
         rm -f "${_live_tmp}"
+
+        # Hand the sentinel its baseline. Written only here -- after the gates
+        # passed, the write landed, and the live rule read back as the shape that
+        # was measured. Anything the sentinel later sees that is not this is
+        # drift, and the record has to mean "someone proved this", not "someone
+        # wrote this".
+        jarvis_record_sanctioned_shape "${_shape}" \
+            || _jarvis_warn "could not record the sanctioned shape; the sentinel will treat the rule as unsanctioned"
     else
         rm -f "${_live_tmp}"
         _jarvis_warn "the live rule does not read back as the shape that was written"

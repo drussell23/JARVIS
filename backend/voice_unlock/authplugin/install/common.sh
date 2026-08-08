@@ -49,7 +49,35 @@ JARVIS_BROKER_LABEL="com.jarvis.unlockbroker"
 #
 # Apple's own comment on this right is "Do not modify." That is not decoration:
 # it means unsupported, and it means an OS update may rewrite it without notice.
-JARVIS_AUTH_RIGHT="system.login.screensaver.unlock"
+#
+# Selectable so the lifecycle probe can exercise a synthetic right of our own.
+# That does NOT reopen the original defect: the installer's gate asks the schema
+# what CLASS a right is, never what it is CALLED, so pointing this back at
+# system.login.screensaver is still refused. A name-based check is the kind that
+# rots; this one cannot.
+JARVIS_AUTH_RIGHT="${JARVIS_AUTH_RIGHT:-system.login.screensaver.unlock}"
+
+# Rights in our own reverse-DNS namespace are ones we created. Nothing in macOS
+# consults them, so they are exempt from the login-rights guard below -- which
+# otherwise fails closed on any right absent from Apple's schema.
+JARVIS_RIGHT_NAMESPACE="com.jarvis."
+
+# --- Sentinel ----------------------------------------------------------------
+# The recovery scripts are installed to a fixed system path, not run from the
+# repository. A machine that will not unlock is a bad time to discover that the
+# checkout lives in a cloud-synced directory that has not mounted yet, and the
+# sentinel launchd invokes must not hold a path into someone's home directory.
+JARVIS_SYSTEM_TOOLS_DIR="/usr/local/libexec/jarvis-authplugin"
+JARVIS_SENTINEL_LABEL="com.jarvis.unlocksentinel"
+JARVIS_SENTINEL_BIN="${JARVIS_SYSTEM_TOOLS_DIR}/sentinel.sh"
+JARVIS_SENTINEL_PLIST="/Library/LaunchDaemons/${JARVIS_SENTINEL_LABEL}.plist"
+# Scripts copied to JARVIS_SYSTEM_TOOLS_DIR. sentinel needs common; uninstall and
+# verify are there so recovery and diagnosis work from a bare SSH session.
+JARVIS_SYSTEM_TOOLS="common.sh sentinel.sh uninstall.sh verify.sh"
+# The authorization database itself. Watched so a rule edited BY HAND -- the way
+# this machine got into trouble in the first place -- is noticed like any other
+# drift. No installer gate can cover that path; only something watching can.
+JARVIS_AUTHDB_FILE="${JARVIS_AUTHDB_FILE:-/var/db/auth.db}"
 
 # --- Filesystem layout ------------------------------------------------------
 JARVIS_PLUGIN_DIR="/Library/Security/SecurityAgentPlugins"
@@ -88,9 +116,29 @@ jarvis_authdb_read() {
 }
 
 # Write a rule plist (path) into the authorization database for a right.
+#
+# THE MUTATION CHOKEPOINT. install, probe, uninstall-restore and uninstall-strip
+# all pass through here, which is why the login-rights guard lives here and not
+# in any of them. A guard replicated at four call sites is a guard with four
+# chances to be forgotten by the fifth.
 jarvis_authdb_write() {
     local right="$1" plist="$2"
     [ -f "$plist" ] || _jarvis_die "rule plist not found: $plist"
+
+    # Refuse to place OUR MECHANISM into a right that performs login.
+    #
+    # Scoped to rules that name us, deliberately. Restoring a backup and writing
+    # a stripped rule both pass, because both REMOVE us -- and a safety check
+    # that blocks the recovery path is how someone ends up stranded at a lock
+    # screen holding a script that will not help them.
+    if grep -q "${JARVIS_PLUGIN_NAME}" "${plist}" 2>/dev/null \
+       && jarvis_right_performs_login "${right}"; then
+        _jarvis_warn "refusing to place ${JARVIS_PLUGIN_NAME} into ${right}"
+        _jarvis_warn "  its stock chain runs a ${JARVIS_LOGIN_PLUGIN_PREFIX} mechanism, so this right"
+        _jarvis_warn "  performs LOGIN. A defect there costs you the machine, not the lock screen."
+        return 1
+    fi
+
     security authorizationdb write "$right" < "$plist"
 }
 
@@ -222,6 +270,16 @@ jarvis_rule_references_plugin() {
 # be a one-variable bypass of the only check standing between a template literal
 # and the lock screen.
 JARVIS_MECHANISM_HOST_CLASS="evaluate-mechanisms"
+
+# The plugin that performs login. A right whose STOCK chain runs one of its
+# mechanisms is a login right, whatever it happens to be named.
+#
+# The colon is part of the prefix and is load-bearing. Matching the substring
+# "login" would classify CryptoTokenKit:login as a login mechanism -- and that is
+# the sole entry in system.login.screensaver.unlock, the right we actually want.
+# A guard that bans its own target is worse than no guard: it gets removed.
+# (Same shape as `"lock" in "unlock my screen"` being true.)
+JARVIS_LOGIN_PLUGIN_PREFIX="loginwindow:"
 
 # The authoritative schema for what every right's stock definition is. Overridable
 # ONLY so the self-tests can point the classifier at a fixture; install.sh pins it
@@ -358,6 +416,45 @@ jarvis_right_hosts_mechanisms() {
     local stock
     stock="$(jarvis_stock_rule_class "$1")" || return 1
     [ "${stock}" = "${JARVIS_MECHANISM_HOST_CLASS}" ] || return 2
+    return 0
+}
+
+# Does this right perform LOGIN, as opposed to unlock or anything else?
+#
+# Derived from the stock chain rather than from a list of names, so a login right
+# introduced by a future macOS is protected the day it ships and nobody has to
+# remember to add it. Verified against the live schema in both directions:
+#
+#   protected  system.login.console / .filevault / .fus   -- all run loginwindow:
+#   allowed    system.login.screensaver.unlock            -- CryptoTokenKit:login
+#   allowed    system.restart / system.disk.unlock        -- no loginwindow:
+#
+# Returns 0 (protected) for a right that is not in the schema at all. An unknown
+# right could be anything, and this is the one question where a guess costs you
+# the machine. Rights in our own namespace are exempt -- we created them, so
+# their provenance is not in doubt.
+jarvis_right_performs_login() {
+    local right="$1" key bucket count idx mech
+
+    case "${right}" in "${JARVIS_RIGHT_NAMESPACE}"*) return 1 ;; esac
+    [ -r "${JARVIS_SYSTEM_AUTH_TEMPLATE}" ] || return 0
+
+    key="$(_jarvis_plist_escape_key "${right}")"
+    for bucket in rights rules; do
+        jarvis_plist_value "${JARVIS_SYSTEM_AUTH_TEMPLATE}" "${bucket}.${key}.class" >/dev/null 2>&1 \
+            || continue
+
+        count="$(jarvis_plist_value "${JARVIS_SYSTEM_AUTH_TEMPLATE}" "${bucket}.${key}.mechanisms" || true)"
+        case "${count}" in ''|*[!0-9]*) return 1 ;; esac
+
+        idx=0
+        while [ "${idx}" -lt "${count}" ]; do
+            mech="$(jarvis_plist_value "${JARVIS_SYSTEM_AUTH_TEMPLATE}" "${bucket}.${key}.mechanisms.${idx}" || true)"
+            case "${mech}" in "${JARVIS_LOGIN_PLUGIN_PREFIX}"*) return 0 ;; esac
+            idx=$(( idx + 1 ))
+        done
+        return 1
+    done
     return 0
 }
 
@@ -581,6 +678,141 @@ jarvis_chain_preserves_backup() {
 ${backlist}
 EOF
     return 0
+}
+
+# =============================================================================
+# REVERT -- the one way out, used by uninstall AND the sentinel
+# =============================================================================
+# uninstall.sh owned this. The sentinel needs the identical operation, and a
+# second implementation of "how do we get our mechanism out of the lock screen"
+# would be discovered by whoever the drifted copy failed, at a machine that will
+# not unlock. So it moved here, unchanged in behaviour.
+#
+# Every path is a REPAIR, so it degrades rather than aborting: a failed restore
+# falls through to stripping our mechanism out of whatever is live.
+
+# Strip our mechanism from the live rule, leaving every other entry untouched.
+# Never invents a rule. Echoes nothing; returns 0 if the rule no longer names us.
+jarvis_strip_mechanism_in_place() {
+    local current scratch removed
+
+    if ! current="$(jarvis_authdb_read "${JARVIS_AUTH_RIGHT}")"; then
+        _jarvis_warn "cannot read ${JARVIS_AUTH_RIGHT}; leaving it alone"
+        return 1
+    fi
+
+    if ! printf '%s' "${current}" | grep -q "${JARVIS_PLUGIN_NAME}"; then
+        _jarvis_log "${JARVIS_AUTH_RIGHT} does not reference ${JARVIS_PLUGIN_NAME}; nothing to strip"
+        return 0
+    fi
+
+    scratch="$(mktemp -t jarvis-authdb)" || { _jarvis_warn "mktemp failed"; return 1; }
+    printf '%s' "${current}" > "${scratch}"
+
+    removed="$(jarvis_rule_strip_mechanism "${scratch}" "${JARVIS_PLUGIN_NAME}")"
+    if [ "${removed}" -eq 0 ]; then
+        # The rule mentions us somewhere plutil found nothing to delete: a
+        # different key, or a shape this function does not understand. Writing it
+        # back unchanged would be a no-op reported as a repair.
+        _jarvis_warn "${JARVIS_AUTH_RIGHT} names ${JARVIS_PLUGIN_NAME} but no mechanism entry matched"
+        _jarvis_warn "  inspect: security authorizationdb read ${JARVIS_AUTH_RIGHT}"
+        rm -f "${scratch}"
+        return 1
+    fi
+
+    if jarvis_authdb_write "${JARVIS_AUTH_RIGHT}" "${scratch}"; then
+        _jarvis_log "stripped ${removed} ${JARVIS_PLUGIN_NAME} mechanism(s) from ${JARVIS_AUTH_RIGHT}"
+        rm -f "${scratch}"
+        return 0
+    fi
+    _jarvis_warn "could not write stripped rule for ${JARVIS_AUTH_RIGHT}"
+    rm -f "${scratch}"
+    return 1
+}
+
+# Get our mechanism out, by whichever route works. 0 if the rule no longer names
+# us when this returns.
+jarvis_revert_auth_rule() {
+    if jarvis_restore_auth_rule_from_pointer; then
+        _jarvis_log "authorization rule restored from backup"
+        return 0
+    fi
+    _jarvis_warn "no usable backup (absent pointer, wrong right, missing file, or unparseable plist)"
+    jarvis_strip_mechanism_in_place
+}
+
+# =============================================================================
+# DEAD MAN'S SWITCH
+# =============================================================================
+# A detached timer holding nothing but a duration and a command. It observes
+# NOTHING about whether its caller is alive, healthy, or finished, which is the
+# entire point: a watchdog that shares state with the thing it guards is not a
+# watchdog. It survives the caller crashing, the terminal closing, the SSH
+# session dropping, and the parent being SIGKILLed -- none of those are
+# conditions it can see.
+#
+# Extracted here when a second probe needed one. Two implementations of "put the
+# machine back if I die" would differ in the details that matter at 3am.
+#
+# Echoes the detached pid.
+jarvis_arm_deadman() {   # <window_s> <logfile> <recovery-command> <manual-hint>
+    local window="$1" logfile="$2" cmd="$3" hint="$4" pid
+    mkdir -p "$(dirname "${logfile}")" 2>/dev/null || true
+    nohup bash -c "
+        sleep ${window}
+        for attempt in 1 2 3; do
+            if ${cmd} 2>/dev/null; then
+                printf '%s dead-man recovery OK (attempt %s)\n' \"\$(date -u +%FT%TZ)\" \"\$attempt\" >> '${logfile}'
+                exit 0
+            fi
+            sleep 2
+        done
+        printf '%s DEAD-MAN RECOVERY FAILED -- by hand: %s\n' \"\$(date -u +%FT%TZ)\" '${hint}' >> '${logfile}'
+    " >/dev/null 2>&1 &
+    pid=$!
+    disown "${pid}" 2>/dev/null || true
+    printf '%s' "${pid}"
+}
+
+# =============================================================================
+# SANCTIONED STATE -- what the installer proved, for the sentinel to check
+# =============================================================================
+# The installer measured a shape, gated it on evidence, and wrote it. The
+# sentinel's job is to notice when the live rule stops being that. Without a
+# record of what was sanctioned, "has it drifted" is not answerable, and a
+# sentinel that cannot answer it would have to guess.
+JARVIS_SANCTIONED_SHAPE_FILE="${JARVIS_STATE_DIR}/sanctioned-shape"
+
+jarvis_record_sanctioned_shape() {
+    printf '%s' "$1" > "${JARVIS_SANCTIONED_SHAPE_FILE}" || return 1
+    chmod 600 "${JARVIS_SANCTIONED_SHAPE_FILE}" 2>/dev/null || true
+}
+
+jarvis_sanctioned_shape() {
+    [ -r "${JARVIS_SANCTIONED_SHAPE_FILE}" ] || return 1
+    cat "${JARVIS_SANCTIONED_SHAPE_FILE}" 2>/dev/null
+}
+
+# Is an authorization currently being evaluated, or the console locked?
+#
+# Two independent signals because they answer slightly different questions and
+# either alone has a blind spot: SecurityAgent is the process that evaluates the
+# chain, and IOConsoleLocked is the console's own state. Used to DEFER a
+# non-urgent repair, never to defer an urgent one -- a lock screen is exactly
+# when a stuck user needs the repair to happen, and a guard that waits for the
+# guarded system to become idle is the deadlock Slice 47 retired.
+jarvis_authentication_in_flight() {
+    pgrep -qx SecurityAgent 2>/dev/null && return 0
+
+    local tmp rc=1
+    tmp="$(mktemp -t jarvis-console)" || return 1
+    if ioreg -n Root -d1 -a > "${tmp}" 2>/dev/null; then
+        case "$(jarvis_plist_value "${tmp}" IOConsoleLocked || true)" in
+            true|1|YES) rc=0 ;;
+        esac
+    fi
+    rm -f "${tmp}"
+    return "${rc}"
 }
 
 # Wait for a system service to be fully gone.

@@ -189,20 +189,9 @@ printf '%s' "${BACKUP}" > "${JARVIS_AUTHDB_BACKUP_POINTER}"
 # Holds only a duration and a path. Reads nothing about whether the probe is
 # alive, healthy, or finished -- so nothing the probe does can wedge it.
 mkdir -p "$(dirname "${PROBE_LOG}")"
-nohup bash -c "
-    sleep ${PROBE_WINDOW_S}
-    for attempt in 1 2 3; do
-        if /usr/bin/security authorizationdb write '${JARVIS_AUTH_RIGHT}' < '${BACKUP}' 2>/dev/null; then
-            printf '%s dead-man revert OK (attempt %s)\n' \"\$(date -u +%FT%TZ)\" \"\$attempt\" >> '${PROBE_LOG}'
-            exit 0
-        fi
-        sleep 2
-    done
-    printf '%s DEAD-MAN REVERT FAILED -- restore by hand: security authorizationdb write %s < %s\n' \
-        \"\$(date -u +%FT%TZ)\" '${JARVIS_AUTH_RIGHT}' '${BACKUP}' >> '${PROBE_LOG}'
-" >/dev/null 2>&1 &
-REVERTER_PID=$!
-disown "${REVERTER_PID}" 2>/dev/null || true
+REVERTER_PID="$(jarvis_arm_deadman "${PROBE_WINDOW_S}" "${PROBE_LOG}" \
+    "/usr/bin/security authorizationdb write '${JARVIS_AUTH_RIGHT}' < '${BACKUP}'" \
+    "sudo security authorizationdb write ${JARVIS_AUTH_RIGHT} < ${BACKUP}")"
 _jarvis_log "dead man's switch armed (pid ${REVERTER_PID}, fires in ${PROBE_WINDOW_S}s)"
 
 # Layer 2: instant revert on Ctrl-C or normal exit. The timer remains the backstop.
