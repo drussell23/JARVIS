@@ -470,11 +470,26 @@ def render_preflight(
             print_fn(
                 f"  [{mark}] {label:<30s} [muted]{detail}[/muted]"
             )
-        rounds = os.environ.get("JARVIS_GOVERNED_TOOL_MAX_ROUNDS", "10")
-        print_fn(
-            f"\n[muted]  Tool rounds: {rounds} "
-            "(deadline-based, safety ceiling)[/muted]"
-        )
+        # READ the ceiling, never re-derive it.
+        #
+        # This resolved the same variable with its own default of 10 while the
+        # engine used 15, so with the variable unset — the default case — this
+        # panel announced a ceiling that was not the one governing the loop.
+        # A display that re-derives a limit is a second authority, and the
+        # operator only ever sees the second one.
+        #
+        # If the authority cannot be reached, the line is omitted rather than
+        # printed with a guess: an unmeasured ceiling is not a ceiling.
+        try:
+            from backend.core.ouroboros.governance.governed_loop_service import (
+                configured_max_tool_rounds,
+            )
+            print_fn(
+                f"\n[muted]  Tool rounds: {configured_max_tool_rounds()} "
+                "(deadline-based, safety ceiling)[/muted]"
+            )
+        except Exception:  # noqa: BLE001 — a boot panel is never fatal
+            pass
         # API-key warnings (matches the legacy script's behavior).
         has_dw = bool(os.environ.get("DOUBLEWORD_API_KEY"))
         has_claude = bool(os.environ.get("ANTHROPIC_API_KEY"))

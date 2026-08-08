@@ -779,6 +779,31 @@ class ServiceState(Enum):
 # ---------------------------------------------------------------------------
 
 
+MAX_TOOL_ROUNDS_ENV = "JARVIS_GOVERNED_TOOL_MAX_ROUNDS"
+
+#: The tool-loop safety ceiling, in ONE place.
+#:
+#: This was resolved independently by the engine (default 15) and by the boot
+#: panel that reports it to the operator (default 10). With the variable unset
+#: — the default case — the panel announced a ceiling of 10 while the loop
+#: allowed 15, so the number an operator read was not the number that governed
+#: them. A display that re-derives a limit instead of reading it is a second
+#: authority, and the operator only ever sees the second one.
+_MAX_TOOL_ROUNDS_DEFAULT = 15
+
+
+def configured_max_tool_rounds() -> int:
+    """The live tool-round ceiling. NEVER raises; malformed input defaults."""
+    raw = str(os.environ.get(MAX_TOOL_ROUNDS_ENV, "")).strip()
+    if not raw:
+        return _MAX_TOOL_ROUNDS_DEFAULT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _MAX_TOOL_ROUNDS_DEFAULT
+    return value if value > 0 else _MAX_TOOL_ROUNDS_DEFAULT
+
+
 @dataclass(frozen=True)
 class OperationResult:
     """Stable result contract returned by submit().
@@ -893,7 +918,7 @@ class GovernedLoopConfig:
     # L1 tool-use settings (Manifesto §6: tools enabled by default under
     # governance — Iron Gate + risk engine + approval gates are the safety net)
     tool_use_enabled: bool = True
-    max_tool_rounds: int = 15
+    max_tool_rounds: int = _MAX_TOOL_ROUNDS_DEFAULT
     tool_timeout_s: float = 30.0
     max_concurrent_tools: int = 2
     # Budget-derived tool-loop timing (fixes bt-2026-04-10-045911 where
@@ -999,7 +1024,7 @@ class GovernedLoopConfig:
                 _cfg("pipeline_timeout_s", "JARVIS_PIPELINE_TIMEOUT_S", "600.0")
             ),
             tool_use_enabled=os.environ.get("JARVIS_GOVERNED_TOOL_USE_ENABLED", "true").lower() == "true",
-            max_tool_rounds=int(os.environ.get("JARVIS_GOVERNED_TOOL_MAX_ROUNDS", "15")),
+            max_tool_rounds=configured_max_tool_rounds(),
             tool_timeout_s=float(os.environ.get("JARVIS_GOVERNED_TOOL_TIMEOUT_S", "30")),
             max_concurrent_tools=int(os.environ.get("JARVIS_GOVERNED_TOOL_MAX_CONCURRENT", "2")),
             tool_min_per_round_s=(
