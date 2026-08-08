@@ -278,6 +278,21 @@ def clean_stale_socket(path: Path) -> bool:
         return False
 
 
+
+def _cockpit_cost_cap() -> "tuple[str, str]":
+    """The session ceiling and its basis. Degrades to the historical literal
+    only if the estimator itself is unavailable — a boot must never fail over
+    a budget."""
+    try:
+        from backend.core.ouroboros.battle_test.session_economics import (
+            cockpit_cost_cap,
+        )
+        return cockpit_cost_cap()
+    except Exception:  # noqa: BLE001
+        import os as _os
+        return (_os.environ.get("JARVIS_COCKPIT_COST_CAP", "2.50"),
+                "unmeasured — estimator unavailable")
+
 # ---------------------------------------------------------------------------
 # Detached cold boot
 # ---------------------------------------------------------------------------
@@ -367,10 +382,15 @@ def spawn_daemon(
         env = dict(os.environ)
         # The resident organism serves cockpits — give it the cockpit
         # session economics unless the operator overrode them.
-        env.setdefault(
-            "OUROBOROS_BATTLE_COST_CAP",
-            os.environ.get("JARVIS_COCKPIT_COST_CAP", "2.50"),
-        )
+        # DERIVED, not declared. This used to be a hardcoded dollar figure,
+        # written here and again in the launchd agent — two copies of a
+        # budget, which
+        # means the effective one is whichever nobody remembered to change.
+        # The ceiling now comes from the sessions that actually spent money,
+        # and it carries the basis it rests on.
+        _cap, _cap_basis = _cockpit_cost_cap()
+        env.setdefault("OUROBOROS_BATTLE_COST_CAP", _cap)
+        logger.debug("[ov] session ceiling $%s — %s", _cap, _cap_basis)
         env.setdefault("OUROBOROS_BATTLE_IDLE_TIMEOUT", os.environ.get(
             "JARVIS_OV_DAEMON_IDLE_TIMEOUT_S", "86400",
         ))
@@ -717,9 +737,8 @@ def build_agent_plist() -> dict:
         "StandardOutPath": str(log_dir / "ov-daemon.out.log"),
         "StandardErrorPath": str(log_dir / "ov-daemon.err.log"),
         "EnvironmentVariables": {
-            "OUROBOROS_BATTLE_COST_CAP": os.environ.get(
-                "JARVIS_COCKPIT_COST_CAP", "2.50",
-            ),
+            # Same single definition the detached spawn uses.
+            "OUROBOROS_BATTLE_COST_CAP": _cockpit_cost_cap()[0],
             "OUROBOROS_BATTLE_IDLE_TIMEOUT": os.environ.get(
                 "JARVIS_OV_DAEMON_IDLE_TIMEOUT_S", "86400",
             ),
