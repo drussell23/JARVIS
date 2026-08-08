@@ -220,9 +220,21 @@ def test_list_alphabetical_stable(fresh_registry) -> None:
 # ===========================================================================
 
 
-def test_three_seed_gatherers_registered(fresh_registry) -> None:
+def test_every_default_claim_kind_has_a_gatherer(fresh_registry) -> None:
+    """Was `test_three_seed_gatherers_registered`, and three was the bug.
+
+    `cost_contract_bg_op_did_not_use_claude` is attached to every op as
+    must_hold and had no gatherer, so the dispatcher fell through to the
+    legacy hardcoded paths — which know only `test_passes` and `key_present`
+    — and the claim returned INSUFFICIENT_EVIDENCE 4,637 consecutive times.
+    A test that pinned the count at three made the omission look deliberate.
+
+    Pinning the SET rather than the number, so adding a default claim without
+    a way to settle it fails here instead of quietly joining the unjudgeable.
+    """
     kinds = sorted(g.kind for g in list_evidence_gatherers())
     assert kinds == [
+        "cost_contract_bg_op_did_not_use_claude",
         "file_parses_after_change",
         "no_new_credential_shapes",
         "test_set_hash_stable",
