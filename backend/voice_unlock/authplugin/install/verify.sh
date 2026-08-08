@@ -40,6 +40,18 @@ _ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 _bad()  { printf '  \033[31m✗\033[0m %s\n' "$*"; _problems=$(( _problems + 1 )); }
 _gone() { printf '  \033[33m-\033[0m %s\n' "$*"; _missing=$(( _missing + 1 )); }
 
+# A valid state that is not a deficiency, reported without being counted.
+#
+# These were _gone, and the difference is not cosmetic. `--skip-authdb` leaves
+# the rule deliberately unwired -- the safe, documented, recommended state -- and
+# counting it as an absent component made verify report "partially installed,
+# 1 component(s) absent" with every component present, then prescribe
+# `install.sh` as the repair. That is the rule rewrite: the one irreversible
+# step, offered as the fix for a machine that was exactly where it should be.
+# A check that reports the safe state as a fault, and names the dangerous action
+# as its remedy, is worse than no check.
+_state() { printf '  \033[33m-\033[0m %s\n' "$*"; }
+
 # Reads a binary or bundle's designated requirement. Same parse as install.sh,
 # including the leading "# " that codesign puts on the line -- omitting it yields
 # an empty string that compares equal to another empty string, which would make
@@ -145,17 +157,141 @@ echo
 echo "authorization rule (${JARVIS_AUTH_RIGHT})"
 if jarvis_rule_references_plugin; then
     _ok "references ${JARVIS_PLUGIN_NAME}"
-    # The stock authenticator must remain in the chain. Without it a failure in
-    # our mechanism has nothing to fall through to, and the fail-open guarantee
-    # -- the entire reason this is safe to install -- would be a comment rather
-    # than a property.
-    if jarvis_authdb_read "${JARVIS_AUTH_RIGHT}" 2>/dev/null | grep -q "builtin:authenticate"; then
-        _ok "builtin:authenticate still present (fail-open path intact)"
+
+    # Nothing the incumbent chain had may have gone missing.
+    #
+    # This used to be `grep -q builtin:authenticate` -- a literal describing one
+    # particular chain, and the wrong one. system.login.screensaver.unlock has no
+    # builtin:authenticate in it; it has CryptoTokenKit:login, which is how
+    # smartcard unlock works. The named check would have failed a CORRECT install
+    # and, worse, passed a chain that had quietly dropped smartcard support.
+    #
+    # The question is not which mechanisms are present. It is whether we took
+    # anything away -- and the only artifact that knows what was there before us
+    # is the backup this install wrote.
+    _pointer_backup=""
+    [ -f "${JARVIS_AUTHDB_BACKUP_POINTER}" ] \
+        && _pointer_backup="$(cat "${JARVIS_AUTHDB_BACKUP_POINTER}" 2>/dev/null || true)"
+
+    if [ -n "${_pointer_backup}" ] && [ -f "${_pointer_backup}" ]; then
+        _chain_live="$(mktemp -t jarvis-verify-chain)"
+        if jarvis_authdb_read "${JARVIS_AUTH_RIGHT}" > "${_chain_live}" 2>/dev/null \
+           && jarvis_chain_preserves_backup "${_chain_live}" "${_pointer_backup}"; then
+            _ok "every mechanism the rule had before the install is still in it"
+        else
+            _bad "the live chain has LOST a mechanism that was there before the install"
+            printf '      before: %s\n' "$(jarvis_rule_mechanisms "${_pointer_backup}" 2>/dev/null | tr '\n' ' ')"
+            printf '      now   : %s\n' "$(jarvis_rule_mechanisms "${_chain_live}" 2>/dev/null | tr '\n' ' ')"
+            printf '      Recover:  sudo %s/uninstall.sh\n' "${_here}"
+        fi
+        rm -f "${_chain_live}"
     else
-        _bad "builtin:authenticate is MISSING -- nothing to fall through to. Run uninstall.sh"
+        # Not a failure. Without the backup there is no baseline, and inventing
+        # one -- by naming a mechanism we expect to see -- is the mistake this
+        # check was rewritten to remove.
+        _state "no restore point recorded; cannot prove the incumbent chain survived"
     fi
 else
-    _gone "stock rule; the plugin is installed but not wired in"
+    _wired=0
+    _state "stock rule; the plugin is installed but not wired in"
+fi
+
+# --- Rule shape vs Apple's schema -------------------------------------------
+# The check that would have caught the black screen, and the reason every other
+# check in this section was not enough.
+#
+# Those above ask whether the rule names the right things. This one asks whether
+# the rule is a KIND the right is allowed to be. system.login.screensaver ships
+# as class=rule pointing at use-login-window-ui, which delegates the whole lock
+# screen -- panel, password field, and the session resume that re-attaches
+# WindowServer -- to loginwindow. Converting it to a mechanism chain replaces an
+# authenticator AND a user interface with an authenticator alone. Every check
+# above stays green through that, because the chain it finds is coherent. It just
+# has nothing to draw with.
+#
+# Consulted against the stock schema, never the live rule: after the conversion
+# the live rule IS a mechanism chain, so a live-rule check would confirm its own
+# damage.
+echo
+echo "rule shape"
+_live_rule="$(mktemp -t jarvis-verify-rule)"
+if jarvis_authdb_read "${JARVIS_AUTH_RIGHT}" > "${_live_rule}" 2>/dev/null; then
+    _live_shape="$(jarvis_rule_shape "${_live_rule}" 2>/dev/null || true)"
+    _live_class="$(jarvis_rule_class "${_live_rule}" 2>/dev/null || true)"
+    printf '      live: %s\n' "${_live_shape:-<unreadable>}"
+
+    _shape_rc=0
+    jarvis_right_hosts_mechanisms "${JARVIS_AUTH_RIGHT}" || _shape_rc=$?
+
+    if [ "${_shape_rc}" -eq 0 ]; then
+        _ok "${JARVIS_AUTH_RIGHT} is a mechanism host in Apple's schema"
+    elif [ "${_live_class}" = "${JARVIS_MECHANISM_HOST_CLASS}" ]; then
+        _bad "${JARVIS_AUTH_RIGHT} has been CONVERTED into a mechanism chain"
+        jarvis_stock_rule_summary "${JARVIS_AUTH_RIGHT}" 2>/dev/null | sed 's/^/      stock /' || true
+        printf '      This is the black-screen configuration: authentication succeeds\n'
+        printf '      and nothing paints the lock screen or resumes the session.\n'
+        printf '      Recover now:  sudo %s/uninstall.sh\n' "${_here}"
+    else
+        _ok "${JARVIS_AUTH_RIGHT} is not a mechanism host, and has not been converted"
+    fi
+else
+    _bad "cannot read ${JARVIS_AUTH_RIGHT}"
+fi
+rm -f "${_live_rule}"
+
+# --- Crash history ----------------------------------------------------------
+# The check that was missing when it mattered.
+#
+# A use-after-free in the mechanism segfaulted authorizationhosthelper 27 times
+# across two days while every check above reported "coherent" -- because every
+# check above is STATIC. It compares hashes and plist keys, none of which change
+# when the mechanism dies at runtime. The mechanism runs inside a process we do
+# not own, so its deaths land in DiagnosticReports rather than anywhere this
+# script was looking, and the operator saw only a black lock screen.
+#
+# A crash here is strictly worse than a hash mismatch. A mismatch fails CLOSED
+# to a password prompt, which is the designed-for outcome. A host that dies
+# before calling SetResult means nothing in the chain ever answers -- including
+# the builtin:authenticate that the section above just confirmed was present, and
+# which never gets reached. That is the black screen, and it is invisible to
+# every other check in this file.
+echo
+echo "crash history (authorizationhosthelper)"
+# The walk and the symbol extraction live in common.sh, because the probe asks
+# the identical question about its own measurement window. Two implementations of
+# "did the host crash" would be two opinions about one machine.
+#
+# Only reports newer than the installed bundle. Older ones belong to a build that
+# is no longer on disk, and counting them would make a fixed install look
+# permanently broken -- a check that cannot go green is a check the operator
+# learns to ignore.
+_since=0
+if [ -e "${JARVIS_PLUGIN_PATH}" ]; then
+    _since="$(stat -f %m "${JARVIS_PLUGIN_PATH}" 2>/dev/null || echo 0)"
+fi
+
+if ! _reports="$(jarvis_crash_reports_since "${_since}")"; then
+    _gone "cannot read ${JARVIS_CRASH_REPORTS_DIR} (needs membership in _analyticsusers)"
+elif [ -z "${_reports}" ]; then
+    _ok "no crashes since this bundle was installed"
+else
+    _crashes="$(printf '%s\n' "${_reports}" | grep -c .)"
+    _newest="$(printf '%s\n' "${_reports}" | sed -n '$p')"
+    _bad "${_crashes} crash(es) since install -- the lock screen's plugin host is DYING"
+
+    # Whether it is OUR bug is decidable from the report, so decide it here
+    # rather than leaving the operator to interpret a stack trace at a machine
+    # that will not unlock.
+    if /usr/bin/grep -q "${JARVIS_PLUGIN_NAME}" "${_newest}" 2>/dev/null; then
+        printf '      the newest report NAMES %s -- this is our defect\n' "${JARVIS_PLUGIN_NAME}"
+    else
+        printf '      the newest report does not name %s\n' "${JARVIS_PLUGIN_NAME}"
+    fi
+
+    _sym="$(jarvis_crash_faulting_symbol "${_newest}" 2>/dev/null || true)"
+    [ -n "${_sym}" ] && printf '      faulting frame: %s\n' "${_sym}"
+    printf '      report: %s\n' "${_newest}"
+    printf '      Remove now, diagnose after:  sudo %s/uninstall.sh\n' "${_here}"
 fi
 
 # --- Verdict ----------------------------------------------------------------
@@ -176,10 +312,26 @@ if [ "${_missing}" -gt 0 ]; then
     exit 2
 fi
 
+if [ "${_wired:-1}" -eq 0 ]; then
+    printf '\033[32mcoherent, and deliberately not wired in.\033[0m\n'
+    echo
+    echo "Every component is present and agrees about every peer. ${JARVIS_AUTH_RIGHT}"
+    echo "is untouched, so nothing here can affect your ability to unlock."
+    echo
+    echo "This is the state --skip-authdb produces and it is the correct place to"
+    echo "stop. The next step is NOT install.sh: it would refuse, because no run"
+    echo "has yet measured the shape it would write. Measure it first --"
+    echo
+    echo "  sudo ${_here}/probe_mechanism_lifecycle.sh   # the mechanism survives its own lifecycle"
+    echo "  sudo ${_here}/probe_screensaver_rule.sh      # a yield still reaches a password prompt"
+    echo
+    exit 0
+fi
+
 printf '\033[32mcoherent.\033[0m Every component agrees about every peer.\n'
 echo
 echo "Not proven here: that SecurityAgent loads the mechanism. It loads only when"
-echo "the screensaver right is evaluated, so lock the screen once, then:"
-echo "  log show --predicate 'subsystem == \"com.jarvis.unlockplugin\"' --last 15m"
+echo "${JARVIS_AUTH_RIGHT} is evaluated, so lock the screen once, then:"
+echo "  log show --predicate 'subsystem == \"${JARVIS_LOG_SUBSYSTEM_PLUGIN}\"' --last 15m"
 echo
 exit 0

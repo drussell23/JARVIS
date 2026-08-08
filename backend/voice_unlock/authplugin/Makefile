@@ -23,9 +23,10 @@ ifneq ($(SDK),)
 CFLAGS   += -isysroot $(SDK)
 endif
 
-SRC      := src
-BUILD    := build
-DIST     := dist
+SRC         := src
+BUILD       := build
+DIST        := dist
+INSTALL_DIR := install
 
 # --- Components -------------------------------------------------------------
 # JARVISGrantProtocol.m is linked by all three: it defines the symbols the
@@ -94,6 +95,12 @@ verify: all ## Assert structural invariants on the built artifacts
 	@env -i $(abspath $(HELPER_BIN)) probe >/dev/null 2>&1; \
 		test $$? -eq 78 && echo "  ✓ helper refuses without config (EX_CONFIG)" \
 		|| { echo "  FATAL: helper ran without configuration"; exit 1; }
+	@# The authorization rule layer. Not an artifact check, but it belongs to the
+	@# same guarantee: install.sh runs `make verify` as its first step, so the code
+	@# that decides whether a right may be converted into a mechanism chain is
+	@# exercised before any install can reach it. That decision was previously a
+	@# template literal with no test of any kind, and it black-screened the machine.
+	@$(INSTALL_DIR)/test_rule_shape.sh
 	@echo "all structural invariants hold"
 
 clean: ## Remove build artifacts
