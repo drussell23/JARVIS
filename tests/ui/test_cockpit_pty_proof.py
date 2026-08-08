@@ -41,9 +41,7 @@ assumptions are how a green suite hides a real failure.
 from __future__ import annotations
 
 import os
-import re
 import signal
-import subprocess
 import sys
 import time
 
@@ -56,163 +54,47 @@ from pty_input import (  # noqa: E402
     mouse_click,
     mouse_drag,
     mouse_scroll,
-    set_winsize,
 )
+# The pty driver and the escape-stripper both live in pty_console, shared with
+# the attach-surface suite. `clean` in particular must have ONE definition: two
+# regexes disagreeing about what counts as styling is two suites disagreeing
+# about what the terminal drew.
+from pty_console import PtyProcess, REPO, clean  # noqa: E402,F401
 
 pytestmark = pytest.mark.timeout(120)
-
-REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 #: Wide enough that the deck does not fold, tall enough that the viewport has
 #: rows to scroll. Both matter: several of these features are no-ops on a
 #: screen too small to show what they changed.
-COLS, ROWS = 110, 34
+COLS, ROWS = PtyProcess.DEFAULT_COLS, PtyProcess.DEFAULT_ROWS
 
 ALT_SCREEN_ENTER = "\x1b[?1049h"
 ALT_SCREEN_LEAVE = "\x1b[?1049l"
 SGR_MOUSE_ON = "\x1b[?1006h"
 
-_ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
-                   r"|\x1b[=>()][A-Za-z0-9]?")
 
-
-def clean(text: str) -> str:
-    """The printable text a terminal would have drawn, styling removed."""
-    return _ANSI.sub("", text or "")
-
-
-class CockpitSession:
+class CockpitSession(PtyProcess):
     """A real terminal running the real cockpit.
 
-    Deliberately NOT a subclass of `PtySession`: that harness owns a
-    fixed-size pty and a text-only `send`, and the cockpit needs a declared
-    window size and byte input. Reusing its drain-on-a-thread design without
-    inheriting its constraints keeps both honest.
+    The pty driver itself lives in ``pty_console.PtyProcess`` — extracted when
+    the attach-surface suite needed the identical one. Two copies of "spawn
+    under a pty and drain it" would drift in exactly the details that make a
+    terminal test trustworthy (drain-before-exec, mark/delta attribution,
+    wait-never-sleep), and the copy that drifted would be the one reporting
+    green.
 
-    `mark`/`since` are the load-bearing addition. Asserting on the WHOLE
-    buffer after a keystroke proves nothing — the boot output already
-    contains most words the cockpit knows. A delta taken from a mark is the
-    only way to attribute new bytes to the key that was just pressed.
+    What remains here is the only thing genuinely specific to this suite: the
+    argv, and a demo that must never reach for a daemon or a provider.
     """
 
     def __init__(self, *args: str, env: "dict | None" = None,
                  cols: int = COLS, rows: int = ROWS) -> None:
-        import pty
-        import threading
-
-        self._master, slave = pty.openpty()
-        set_winsize(self._master, cols, rows)
-        base = dict(os.environ)
-        base.update({
-            "TERM": "xterm-256color",
-            "COLUMNS": str(cols),
-            "LINES": str(rows),
-            "PYTHONUNBUFFERED": "1",
-            # Never let a demo terminal try to reach a daemon or a provider.
-            "JARVIS_OV_NO_DAEMON": "1",
-        })
-        base.update(env or {})
-        self.proc = subprocess.Popen(
+        merged = {"JARVIS_OV_NO_DAEMON": "1"}
+        merged.update(env or {})
+        super().__init__(
             [sys.executable, "-m", "backend.core.ouroboros.cli.ov", *args],
-            stdin=slave, stdout=slave, stderr=slave,
-            env=base, cwd=REPO, start_new_session=True,
+            env=merged, cols=cols, rows=rows,
         )
-        os.close(slave)
-        self._chunks: "list[str]" = []
-        self._lock = threading.Lock()
-        self._drain = threading.Thread(target=self._pump, daemon=True)
-        self._drain.start()
-
-    def _pump(self) -> None:
-        while True:
-            try:
-                data = os.read(self._master, 65536)
-            except OSError:
-                return
-            if not data:
-                return
-            with self._lock:
-                self._chunks.append(data.decode("utf-8", "replace"))
-
-    # -- reading ---------------------------------------------------------
-    @property
-    def output(self) -> str:
-        with self._lock:
-            return "".join(self._chunks)
-
-    def mark(self) -> int:
-        """A cursor into the stream. Everything after it is attributable."""
-        return len(self.output)
-
-    def since(self, at: int) -> str:
-        return self.output[at:]
-
-    def wait_for(self, needle: str, *, timeout: float = 25.0,
-                 after: int = 0) -> bool:
-        """Poll until `needle` appears in the CLEANED stream after `at`."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if needle in clean(self.since(after)):
-                return True
-            if self.proc.poll() is not None:
-                # One last look: the text may have arrived in the same
-                # breath the process exited.
-                return needle in clean(self.since(after))
-            time.sleep(0.05)
-        return False
-
-    def wait_for_change(self, at: int, *, minimum: int = 32,
-                        timeout: float = 8.0) -> str:
-        """Wait until at least `minimum` new bytes arrive; return them.
-
-        A repaint is many bytes. The floor rejects the stray single-byte
-        cursor report that would otherwise make any keystroke look handled.
-        """
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            delta = self.since(at)
-            if len(delta) >= minimum:
-                return delta
-            time.sleep(0.05)
-        return self.since(at)
-
-    # -- writing ---------------------------------------------------------
-    def send(self, data: "bytes | str") -> None:
-        if isinstance(data, str):
-            data = data.encode()
-        os.write(self._master, data)
-
-    def press(self, *names: str) -> None:
-        for n in names:
-            self.send(key(n))
-            time.sleep(0.06)      # let the event loop turn between keys
-
-    def signal(self, sig: int) -> None:
-        os.killpg(os.getpgid(self.proc.pid), sig)
-
-    # -- lifecycle -------------------------------------------------------
-    def close(self, *, timeout: float = 5.0) -> None:
-        try:
-            if self.proc.poll() is None:
-                self.signal(signal.SIGTERM)
-                try:
-                    self.proc.wait(timeout=timeout)
-                except subprocess.TimeoutExpired:
-                    self.signal(signal.SIGKILL)
-                    self.proc.wait(timeout=timeout)
-        except Exception:  # noqa: BLE001
-            pass
-        finally:
-            try:
-                os.close(self._master)
-            except OSError:
-                pass
-
-    def __enter__(self) -> "CockpitSession":
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.close()
 
 
 def _require_pty() -> None:
