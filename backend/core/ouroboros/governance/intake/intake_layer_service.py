@@ -257,6 +257,11 @@ class IntakeLayerService:
         self._cross_repo_drift_sensor: Optional[Any] = None
         # Slice 6 — PerformanceRegressionSensor handle for CI webhook route.
         self._performance_regression_sensor: Optional[Any] = None
+        # MetaSensor handle. Declared here rather than only assigned inside
+        # ``_build_components`` so a construction failure leaves a readable
+        # ``None`` instead of a missing attribute — an alarm that raises
+        # AttributeError when consulted is worse than one that says "absent".
+        self._meta_sensor: Optional[Any] = None
         self._event_channel_server: Optional[Any] = None
         # Stage-2 Task 2 -- organism-owned mTLS WS bus host. Populated in
         # ``_maybe_start_organism_bus_host`` only when the
@@ -1112,6 +1117,39 @@ class IntakeLayerService:
             logger.info("[IntakeLayer] ProactiveExplorationSensor added (curiosity-driven)")
         except Exception as exc:
             logger.debug("[IntakeLayer] ProactiveExplorationSensor skipped: %s", exc)
+
+        # ---- MetaSensor (Priority B: the degenerate-loop dormancy alarm) ----
+        # Every other sensor watches the world; this one watches O+V watching
+        # the world, and fires when a subsystem has gone silently inert —
+        # postmortems arriving with total_claims=0 being the seed detector.
+        #
+        # It was merged with JARVIS_META_SENSOR_ENABLED defaulting TRUE and
+        # zero import statements anywhere in the tree, tests included: the
+        # alarm for silent inertness was itself silently inert, which is the
+        # single most quotable row in the 2026-08-08 reachability audit.
+        #
+        # Registered unconditionally for lifecycle, following WorkOrderSensor:
+        # `start()` and `scan_once()` both consult the master flag themselves,
+        # so the flag governs BEHAVIOUR and the mount governs REACHABILITY.
+        # Gating the construction on the flag would recreate the defect in its
+        # subtler form — dark whenever the flag happens to be off, and no
+        # longer distinguishable from dead-by-omission.
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.meta_sensor import (
+                MetaSensor,
+            )
+            _meta_sensor = MetaSensor(
+                repo="jarvis",
+                router=self._router,
+                # No interval argument on purpose. `meta_sensor_interval_s()`
+                # is the single authority for that number; resolving the env
+                # here would put a second default beside the constructor's.
+            )
+            self._sensors.append(_meta_sensor)
+            self._meta_sensor = _meta_sensor
+            logger.info("[IntakeLayer] MetaSensor added (degenerate-loop dormancy alarm)")
+        except Exception as exc:
+            logger.debug("[IntakeLayer] MetaSensor skipped: %s", exc)
 
         # ---- IntentDiscoverySensor (Manifesto §1: intent-driven exploration) ----
         # Connects StrategicDirection + DreamEngine + Oracle + DW to explore

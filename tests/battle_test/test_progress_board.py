@@ -180,14 +180,43 @@ class TestHelpers:
         assert _module_name("backend/core/__init__.py") == "backend.core"
 
     @pytest.mark.parametrize("rel", [
-        "tests/x.py", "backend/tests/y.py", "backend/test_z.py",
-        "backend/conftest.py",
+        "tests/x.py", "backend/tests/y.py", "backend/conftest.py",
+        "conftest.py",          # the ROOT conftest, which "/conftest.py" missed
+        "test_actual_voice.py",  # root-level: pytest.ini names `test_*.py`
     ])
     def test_test_paths_are_recognised(self, rel):
         assert _is_test_path(rel)
 
-    def test_production_paths_are_not(self):
-        assert not _is_test_path("backend/core/ouroboros/orchestrator.py")
+    @pytest.mark.parametrize("rel", [
+        "backend/core/ouroboros/orchestrator.py",
+        # These four match a test NAME and are production. `_is_test_path`
+        # used to call all of them tests, which made every module reachable
+        # only through them read DARK — including the two flags the
+        # 2026-08-08 reachability audit wrongly listed as unwired.
+        "scripts/ouroboros_battle_test.py",
+        "backend/core/ouroboros/governance/test_runner.py",
+        "backend/core/ouroboros/governance/intent/test_watcher.py",
+        "backend/core/ouroboros/governance/intake/sensors/test_failure_sensor.py",
+    ])
+    def test_production_paths_are_not(self, rel):
+        assert not _is_test_path(rel)
+
+    def test_the_rule_comes_from_the_project_not_from_a_convention(self):
+        """`backend/test_z.py` USED to assert True here.
+
+        It is not collected by this repository's pytest — `testpaths` is
+        `tests test_*.py`, so a `test_*.py` nested under `backend/` is never
+        run — and the convention it encoded is the one that misclassified the
+        four production modules above. The rule now reads the project's own
+        configuration, so it moves when `pytest.ini` moves.
+        """
+        from backend.core.ouroboros.battle_test.progress_board import (
+            test_collection_config,
+        )
+        testpaths, python_files = test_collection_config()
+        assert "tests" in testpaths
+        assert "test_*.py" in python_files
+        assert not _is_test_path("backend/test_z.py")
 
 
 class TestEntryPoints:
