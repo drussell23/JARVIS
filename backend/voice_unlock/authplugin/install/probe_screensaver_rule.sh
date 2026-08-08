@@ -60,11 +60,36 @@ jarvis_require_root
 # unlock, return to the terminal. A 60s window fit about three of those five
 # steps, so the first run measured nothing.
 PROBE_WINDOW_S="${JARVIS_PROBE_WINDOW_S:-180}"
-# The SecurityAgent-evaluated rule we swap in. Named by the stock rule's own
+
+# HOW THIS PROBE MUTATES IS DERIVED, NOT CONFIGURED.
+#
+#   mechanism host -> COMPOSE. Insert our mechanism at the head of the live
+#                     chain, by the same function install.sh uses. This is the
+#                     only mode that produces evidence install.sh can accept,
+#                     because the shape applied IS the shape install.sh writes.
+#                     Anything less is the substitution that caused the incident.
+#
+#   anything else  -> RULE SWAP. Point the right at a named SecurityAgent rule.
+#                     Measures whether SecurityAgent evaluation works at all, and
+#                     produces a shape that can never authorise a mechanism
+#                     install -- which is correct, not a shortcoming.
+#
+# Deliberately not overridable. A flag that forced COMPOSE onto a delegating
+# right would be a supported way to perform the exact conversion that
+# black-screened this machine, and the evidence it produced could never be spent
+# anyway: install.sh refuses that right at gate 7a regardless.
+_probe_host_rc=0
+jarvis_right_hosts_mechanisms "${JARVIS_AUTH_RIGHT}" || _probe_host_rc=$?
+case "${_probe_host_rc}" in
+    0) PROBE_MODE="compose" ;;
+    2) PROBE_MODE="rule-swap" ;;
+    *) _jarvis_die "cannot classify ${JARVIS_AUTH_RIGHT} against the system schema; refusing to probe blind" ;;
+esac
+
+# Only consulted in rule-swap mode. Named by the stock screensaver rule's own
 # comment as the supported alternative to use-login-window-ui.
 PROBE_RULE_NAME="${JARVIS_PROBE_RULE:-authenticate-session-owner-or-admin}"
-# The marker that proves the live rule is the stock, loginwindow-owned one.
-STOCK_MARKER="${JARVIS_PROBE_STOCK_MARKER:-use-login-window-ui}"
+[ "${PROBE_MODE}" = "compose" ] && PROBE_RULE_NAME="compose:${JARVIS_MECHANISM}"
 
 PROBE_LOG="${JARVIS_STATE_DIR}/probe.log"
 
@@ -101,24 +126,57 @@ if ! plutil -lint "${BACKUP}" >/dev/null 2>&1; then
     _jarvis_die "aborting without touching the system"
 fi
 
-if ! grep -q "${STOCK_MARKER}" "${BACKUP}"; then
-    _jarvis_warn "live rule does not contain '${STOCK_MARKER}'."
-    _jarvis_warn "current rule:"
-    sed 's/^/    /' "${BACKUP}" >&2
-    _jarvis_warn "the machine is not in the stock configuration this probe knows how to restore."
+# The baseline must be a rule we do not already appear in. If it names us, this
+# is not a probe of a clean machine -- it is a measurement of an install, and
+# reverting "to the backup" afterwards would restore our own mechanism while
+# calling it stock.
+if grep -q "${JARVIS_PLUGIN_NAME}" "${BACKUP}" 2>/dev/null; then
+    _jarvis_warn "the live rule already names ${JARVIS_PLUGIN_NAME}; this is not a clean baseline"
+    _jarvis_warn "  remove the install first:  sudo ${_here}/uninstall.sh"
+    rm -f "${BACKUP}"
     _jarvis_die "aborting without touching the system"
 fi
 
+# COMPOSE MODE HARD GUARD: the bundle has to be on disk.
+#
+# Writing a chain that names a mechanism whose bundle is absent is the one state
+# uninstall.sh calls strictly worse than either the installed or the stock
+# configuration: SecurityAgent cannot load what is not there, so the chain fails
+# before anything in it can answer. On a tries=1 right with no in-chain password
+# fallback, that is a lockout with a 3-minute dead man's switch as the only way
+# back. The probe must not create it.
+if [ "${PROBE_MODE}" = "compose" ] && ! jarvis_plugin_bundle_present; then
+    _jarvis_warn "${JARVIS_PLUGIN_PATH} is not installed."
+    _jarvis_warn "  A composed chain would name a mechanism that cannot be loaded, and this"
+    _jarvis_warn "  right has tries=1 with no password mechanism behind us."
+    _jarvis_warn ""
+    _jarvis_warn "  Install everything EXCEPT the rule first -- it leaves the lock screen"
+    _jarvis_warn "  completely untouched and proves the XPC channel works:"
+    _jarvis_warn "    sudo ${_here}/install.sh --skip-authdb"
+    rm -f "${BACKUP}"
+    _jarvis_die "aborting without touching the system"
+fi
+
+# The shape we must be able to get back to. Everything downstream compares
+# against this rather than against a marker string, so the probe stays correct on
+# any right, on any macOS, whatever the stock rule happens to be called.
+STOCK_SHAPE="$(jarvis_rule_shape "${BACKUP}" 2>/dev/null || true)"
+[ -n "${STOCK_SHAPE}" ] || { rm -f "${BACKUP}"; _jarvis_die "cannot compute the shape of the live rule; aborting without mutating"; }
+
 # Prove the restore path works on this exact file BEFORE relying on it: write the
 # backup back over the identical live value. A no-op if it succeeds, and if it
-# fails we learn that now rather than 60 seconds from now.
+# fails we learn that now rather than 180 seconds from now.
 _jarvis_log "pre-flight: verifying the restore path with a no-op write"
 if ! jarvis_authdb_write "${JARVIS_AUTH_RIGHT}" "${BACKUP}" >/dev/null 2>&1; then
     rm -f "${BACKUP}"
     _jarvis_die "restore path does not work on this machine; aborting without mutating"
 fi
 
-if ! jarvis_authdb_read "${JARVIS_AUTH_RIGHT}" | grep -q "${STOCK_MARKER}"; then
+_noop_check="$(mktemp -t jarvis-probe-noop)"
+jarvis_authdb_read "${JARVIS_AUTH_RIGHT}" > "${_noop_check}" 2>/dev/null || true
+_noop_shape="$(jarvis_rule_shape "${_noop_check}" 2>/dev/null || true)"
+rm -f "${_noop_check}"
+if [ "${_noop_shape}" != "${STOCK_SHAPE}" ]; then
     _jarvis_die "no-op restore changed the rule unexpectedly; STOP. Restore by hand from ${BACKUP}"
 fi
 
@@ -179,23 +237,57 @@ trap _revert_now EXIT
 # =============================================================================
 # 4. MUTATE
 # =============================================================================
-_jarvis_log "switching ${JARVIS_AUTH_RIGHT} -> ${PROBE_RULE_NAME}"
-if ! security authorizationdb write "${JARVIS_AUTH_RIGHT}" "${PROBE_RULE_NAME}"; then
-    _jarvis_die "mutation failed; trap and dead-man switch will restore the stock rule"
-fi
+# Everything below this point runs with the dead man's switch already armed.
+#
+# The measurement baseline is taken FIRST, before the mutation, so the crash and
+# log windows cannot miss an event that happens the instant the rule lands.
+PROBE_T0_EPOCH="$(date +%s)"
+PROBE_T0_LOG="$(date '+%Y-%m-%d %H:%M:%S')"
+PROBE_CRASHES_BEFORE="$(jarvis_crash_reports_since 0 2>/dev/null | grep -c . || true)"
+
+case "${PROBE_MODE}" in
+    compose)
+        # The SAME function install.sh calls. Not a reimplementation of it, and
+        # not an approximation of it -- if these two ever composed differently,
+        # the probe would be measuring a configuration the installer never
+        # writes, which is the failure this whole design exists to prevent.
+        _jarvis_log "composing ${JARVIS_MECHANISM} into ${JARVIS_AUTH_RIGHT}"
+        PROBE_RULE_TMP="$(mktemp -t jarvis-probe-rule)"
+        _probe_compose_rc=0
+        jarvis_compose_mechanism_rule "${BACKUP}" "${PROBE_RULE_TMP}" "${JARVIS_MECHANISM}" \
+            || _probe_compose_rc=$?
+        case "${_probe_compose_rc}" in
+            0) : ;;
+            2) rm -f "${PROBE_RULE_TMP}"; _jarvis_die "the live chain already names ${JARVIS_MECHANISM}; nothing to measure" ;;
+            3) rm -f "${PROBE_RULE_TMP}"; _jarvis_die "${JARVIS_AUTH_RIGHT} is not a mechanism chain live; refusing to author one" ;;
+            *) rm -f "${PROBE_RULE_TMP}"; _jarvis_die "could not compose a probe rule; nothing mutated" ;;
+        esac
+        plutil -lint "${PROBE_RULE_TMP}" >/dev/null 2>&1 \
+            || { rm -f "${PROBE_RULE_TMP}"; _jarvis_die "composed probe rule is malformed; nothing mutated"; }
+
+        _jarvis_log "chain to be measured: $(jarvis_rule_mechanisms "${PROBE_RULE_TMP}" | tr '\n' ' ')"
+        if ! jarvis_authdb_write "${JARVIS_AUTH_RIGHT}" "${PROBE_RULE_TMP}"; then
+            rm -f "${PROBE_RULE_TMP}"
+            _jarvis_die "mutation failed; trap and dead-man switch will restore the stock rule"
+        fi
+        rm -f "${PROBE_RULE_TMP}"
+        ;;
+    rule-swap)
+        _jarvis_log "switching ${JARVIS_AUTH_RIGHT} -> ${PROBE_RULE_NAME}"
+        if ! security authorizationdb write "${JARVIS_AUTH_RIGHT}" "${PROBE_RULE_NAME}"; then
+            _jarvis_die "mutation failed; trap and dead-man switch will restore the stock rule"
+        fi
+        ;;
+esac
 
 # Capture the shape that is actually live, from the database rather than from
-# what we asked for. `security authorizationdb write <right> <rulename>` is a
-# request; the rule the engine will evaluate is the answer, and the answer is
-# what the measurement has to be labelled with.
+# what we asked for. A write is a request; the rule the engine will evaluate is
+# the answer, and the answer is what the measurement has to be labelled with.
 LIVE_RULE="$(mktemp -t jarvis-probe-live)"
 jarvis_authdb_read "${JARVIS_AUTH_RIGHT}" > "${LIVE_RULE}" 2>/dev/null \
     || _jarvis_die "could not read back ${JARVIS_AUTH_RIGHT} after the write; trap and dead-man switch will restore the stock rule"
 
 PROBE_SHAPE="$(jarvis_rule_shape "${LIVE_RULE}" 2>/dev/null || true)"
-STOCK_SHAPE="$(jarvis_rule_shape "${BACKUP}" 2>/dev/null || true)"
-rm -f "${LIVE_RULE}"
-
 [ -n "${PROBE_SHAPE}" ] || _jarvis_die "could not compute the shape of the live rule; nothing is being measured"
 
 # Structural rather than a marker match. "Did the rule change" is answered by
@@ -204,6 +296,14 @@ rm -f "${LIVE_RULE}"
 if [ "${PROBE_SHAPE}" = "${STOCK_SHAPE}" ]; then
     _jarvis_die "the live rule is unchanged after the write; probe is not measuring anything"
 fi
+
+# In compose mode we ADDED to a chain. If anything the chain already had is now
+# missing, we have not probed our mechanism -- we have probed a machine with
+# smartcard unlock removed, and any result would be about the wrong system.
+if [ "${PROBE_MODE}" = "compose" ] && ! jarvis_chain_preserves_backup "${LIVE_RULE}" "${BACKUP}"; then
+    _jarvis_die "the composed chain dropped a mechanism the rule already had; reverting"
+fi
+rm -f "${LIVE_RULE}"
 
 _jarvis_log "measuring shape: ${PROBE_SHAPE}"
 
@@ -215,16 +315,30 @@ cat <<BANNER
 ================================================================================
   PROBE ACTIVE -- ${PROBE_WINDOW_S} SECONDS
 ================================================================================
-  system.login.screensaver is now: ${PROBE_RULE_NAME}
-  (SecurityAgent-evaluated -- the configuration a plugin would need)
+  ${JARVIS_AUTH_RIGHT}
+  mode:  ${PROBE_MODE}
+  shape: ${PROBE_SHAPE}
+
+  THE FAIL-OPEN TEST IS THE POINT OF THIS RUN.
+
+  No grant has been deposited, so JARVIS will find nothing and YIELD -- which is
+  kAuthorizationResultAllow, "I am satisfied, continue", NOT Deny. Deny would
+  fail the whole right and lock you out, and there is deliberately no code path
+  in the mechanism that can produce it. So the yield you are about to trigger is
+  the mechanism's ordinary behaviour, not a special test mode, and what it
+  proves is whether a yield on THIS right still reaches a password prompt.
+
+  That matters here and did not before: this chain has no builtin:authenticate
+  behind us, and tries=1. Nothing retries.
 
   GO TEST NOW, in this order:
 
     1. Lock the screen            (Ctrl-Cmd-Q)
-    2. Does TOUCH ID prompt/work?          -> yes / no
-    3. Does APPLE WATCH auto-unlock work?  -> yes / no
-    4. Does your PASSWORD still unlock?    -> yes / no   <- must be yes
-    5. Unlock and come back here
+    2. Wait for the prompt to appear at all -> yes / no   <- the fail-open test
+    3. Does TOUCH ID prompt/work?          -> yes / no
+    4. Does APPLE WATCH auto-unlock work?  -> yes / no
+    5. Does your PASSWORD still unlock?    -> yes / no   <- must be yes
+    6. Unlock and come back here
 
   The rule reverts automatically when the timer fires, even if this window
   closes, this script dies, or your SSH session drops.
@@ -273,6 +387,73 @@ else
 fi
 
 # =============================================================================
+# 6b. THE FAIL-OPEN BATTERY  -- decided from evidence, not from the operator
+# =============================================================================
+# Run AFTER the revert, on purpose. Reading the unified log takes seconds and
+# parsing crash reports takes longer; doing either while the machine is still
+# mutated would extend the exposure window for no reason. The evidence is
+# already on disk by then -- it does not expire.
+#
+# Three questions, none of which a human at a lock screen can answer reliably:
+#
+#   Did the mechanism host DIE?   The 27-crash failure mode. A dead host never
+#                                 calls SetResult, so nothing in the chain ever
+#                                 answers -- which on tries=1 is the black screen
+#                                 and is invisible to every static check.
+#   Did our mechanism RUN?        Distinguishes "fail-open works" from "the
+#                                 screen was never locked", which otherwise look
+#                                 identical from the operator's side.
+#   Did it YIELD rather than grant?  A yield is the fail-open path. A grant would
+#                                 mean a stale grant was sitting in the broker,
+#                                 and the run measured the wrong thing.
+PROBE_FAILOPEN="inconclusive"
+PROBE_EVIDENCE_LOG="${JARVIS_STATE_DIR}/probe-window-${_stamp}.log"
+
+_crashes_now="$(jarvis_crash_reports_since "${PROBE_T0_EPOCH}" 2>/dev/null || true)"
+_crash_count="$(printf '%s' "${_crashes_now}" | grep -c . || true)"
+
+_window_log=""
+if _window_log="$(jarvis_unlock_log_since "${PROBE_T0_LOG}" 2>/dev/null)"; then :; fi
+printf '%s\n' "${_window_log}" > "${PROBE_EVIDENCE_LOG}" 2>/dev/null || true
+chmod 600 "${PROBE_EVIDENCE_LOG}" 2>/dev/null || true
+
+_mech_lines="$(printf '%s\n' "${_window_log}" | grep -c "${JARVIS_LOG_SUBSYSTEM_PLUGIN}" || true)"
+_yielded="$(printf '%s\n' "${_window_log}" | grep -ci 'yield' || true)"
+_granted="$(printf '%s\n' "${_window_log}" | grep -ci 'grant ' || true)"
+
+echo
+echo "fail-open battery"
+if [ "${_crash_count}" -gt 0 ]; then
+    PROBE_FAILOPEN="crashed"
+    _jarvis_warn "  the mechanism host CRASHED ${_crash_count} time(s) during the window"
+    _newest_crash="$(printf '%s\n' "${_crashes_now}" | sed -n '$p')"
+    if grep -q "${JARVIS_PLUGIN_NAME}" "${_newest_crash}" 2>/dev/null; then
+        _jarvis_warn "  the newest report NAMES ${JARVIS_PLUGIN_NAME} -- this is our defect"
+    fi
+    _sym="$(jarvis_crash_faulting_symbol "${_newest_crash}" 2>/dev/null || true)"
+    [ -n "${_sym}" ] && _jarvis_warn "  faulting frame: ${_sym}"
+    _jarvis_warn "  DO NOT INSTALL. A host that dies on a tries=1 right is a lockout."
+elif [ "${_mech_lines}" -eq 0 ]; then
+    # Zero lines is genuinely ambiguous and must not be read as either answer:
+    # the screen may never have been locked, or the log may not have been
+    # readable. The probe says so rather than picking the convenient reading.
+    PROBE_FAILOPEN="not-reached"
+    _jarvis_warn "  our mechanism produced no log output during the window"
+    _jarvis_warn "  either the screen was never locked, or the chain never reached us"
+elif [ "${_granted}" -gt 0 ]; then
+    PROBE_FAILOPEN="granted-not-yield"
+    _jarvis_warn "  the mechanism GRANTED -- a stale grant was in the broker"
+    _jarvis_warn "  this run measured the unlock path, not the fail-open path; re-run"
+elif [ "${_yielded}" -gt 0 ]; then
+    PROBE_FAILOPEN="yielded"
+    _jarvis_log "  our mechanism ran and YIELDED, and the host survived"
+    _jarvis_log "  whether a prompt followed is yours to confirm below"
+else
+    _jarvis_warn "  our mechanism ran but neither granted nor yielded in the log"
+fi
+_jarvis_log "  window log: ${PROBE_EVIDENCE_LOG}"
+
+# =============================================================================
 # 7. CAPTURE THE MEASUREMENT  (a result that lives only in a terminal is not a
 #    result -- the first run reverted cleanly and recorded nothing)
 # =============================================================================
@@ -283,6 +464,7 @@ PROBE_RESULTS="${JARVIS_PROBE_RESULTS_LOG}"
 
 # Every answer defaults to the honest one for a run that did not ask.
 _locked="not-tested"; _touchid="not-tested"; _watch="not-tested"; _password="not-tested"
+_prompted="not-tested"
 
 if [ -t 0 ]; then
     printf '\n[jarvis-authplugin] recording the measurement (Enter to skip any answer)\n' >&2
@@ -304,11 +486,27 @@ if [ -t 0 ]; then
         _jarvis_warn "  sudo JARVIS_PROBE_WINDOW_S=${PROBE_WINDOW_S} $0"
     fi
 
+    _prompted="$(_ask 'Did an authentication PROMPT appear at all (not a black screen)?')"
     _touchid="$(_ask 'Did TOUCH ID work?')"
     _watch="$(_ask 'Did APPLE WATCH auto-unlock work?')"
     _password="$(_ask 'Did your PASSWORD unlock?')"
 else
     _jarvis_log "non-interactive; no answers collected"
+fi
+
+# PROVEN requires both halves and neither is sufficient alone.
+#
+# The log proves our mechanism ran, yielded, and did not take the host down with
+# it. Only the operator can say a prompt actually appeared and accepted a
+# password -- the 27 crashes produced a black screen that no amount of log
+# reading would have called a success, and a clean yield into a chain that then
+# draws nothing is exactly the failure this right's tries=1 makes unrecoverable.
+if [ "${PROBE_FAILOPEN}" = "yielded" ] \
+   && [ "${_locked}" = "yes" ] && [ "${_prompted}" = "yes" ] && [ "${_password}" = "yes" ]; then
+    PROBE_FAILOPEN="proven"
+    _jarvis_log "fail-open PROVEN: mechanism yielded, host survived, prompt appeared, password worked"
+elif [ "${PROBE_FAILOPEN}" = "yielded" ]; then
+    PROBE_FAILOPEN="yielded-unconfirmed"
 fi
 
 # Written on BOTH paths. A run that asked nothing still proves the shape was
@@ -319,9 +517,9 @@ fi
 # label, and is deliberately NOT what the gate reads: it is a request, whereas
 # shape is what the authorization engine was actually left holding.
 {
-    printf '%s rule=%s shape=%s window=%ss locked=%s touchid=%s watch=%s password=%s\n' \
+    printf '%s rule=%s shape=%s window=%ss locked=%s prompted=%s touchid=%s watch=%s password=%s failopen=%s\n' \
         "$(date -u +%FT%TZ)" "${PROBE_RULE_NAME}" "${PROBE_SHAPE}" "${PROBE_WINDOW_S}" \
-        "${_locked}" "${_touchid}" "${_watch}" "${_password}"
+        "${_locked}" "${_prompted}" "${_touchid}" "${_watch}" "${_password}" "${PROBE_FAILOPEN}"
 } >> "${PROBE_RESULTS}"
 
 _jarvis_log "recorded to ${PROBE_RESULTS}"

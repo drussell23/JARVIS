@@ -18,10 +18,38 @@ JARVIS_MECHANISM="${JARVIS_PLUGIN_NAME}:grant,privileged"
 JARVIS_BROKER_LABEL="com.jarvis.unlockbroker"
 
 # --- Authorization right we participate in ----------------------------------
-# Only the screensaver right. system.login.console is deliberately NEVER
-# touched: a defect there costs you login, not just unlock, and the difference
-# is the difference between "annoying" and "boot from Recovery".
-JARVIS_AUTH_RIGHT="system.login.screensaver"
+# system.login.console is deliberately NEVER touched: a defect there costs you
+# login, not just unlock, and the difference is the difference between
+# "annoying" and "boot from Recovery".
+#
+# NOT system.login.screensaver either, which is what this used to be. That right
+# is class=rule delegating to use-login-window-ui -- it hands the whole lock
+# screen to loginwindow, panel and password field and the session resume that
+# re-attaches WindowServer. Converting it to a mechanism chain replaced a user
+# interface with an authenticator and black-screened the machine.
+#
+# loginwindow, in turn, evaluates system.login.screensaver.unlock -- and THAT is
+# a real evaluate-mechanisms chain, shipping CryptoTokenKit:login, which is how
+# smartcard unlock already works. It is the supported host, one level below the
+# delegator the previous design was destroying.
+#
+# TWO PROPERTIES OF THIS RIGHT MAKE IT UNFORGIVING, AND BOTH ARE LOAD-BEARING:
+#
+#   tries = 1        One attempt. Nothing retries on our behalf.
+#
+#   no builtin:authenticate in the chain
+#                    The old design put the stock authenticator directly behind
+#                    us, so "we yield and it prompts" was a property of the
+#                    chain itself. Here it is not. Whatever password path exists
+#                    belongs to loginwindow, OUTSIDE this chain, and whether it
+#                    is reached is a MEASUREMENT -- see probe_screensaver_rule.sh
+#                    and its fail-open battery. Do not assume it. It has to be
+#                    proven on the machine, under the dead man's switch, before
+#                    an install is allowed anywhere near it.
+#
+# Apple's own comment on this right is "Do not modify." That is not decoration:
+# it means unsupported, and it means an OS update may rewrite it without notice.
+JARVIS_AUTH_RIGHT="system.login.screensaver.unlock"
 
 # --- Filesystem layout ------------------------------------------------------
 JARVIS_PLUGIN_DIR="/Library/Security/SecurityAgentPlugins"
@@ -85,6 +113,30 @@ jarvis_restore_auth_rule_from_pointer() {
     # authorization database is the one way recovery could make things worse
     # than it found them.
     plutil -lint "${backup}" >/dev/null 2>&1 || return 1
+
+    # The backup has to be a backup OF THIS RIGHT.
+    #
+    # The pointer file records a path and nothing else, and the target right has
+    # already changed once -- from system.login.screensaver to
+    # system.login.screensaver.unlock. A pointer left behind by an install of the
+    # old target would be restored, faithfully and with a success message, into
+    # the NEW right: writing a class=rule delegating definition over a mechanism
+    # chain. That is not a restore, it is a second conversion, performed by the
+    # recovery path, on a machine already in trouble.
+    #
+    # Every backup this system writes embeds the right in its filename, so the
+    # provenance is already recorded; it was simply never checked.
+    # The timestamp is part of the pattern, not decoration. Matching on
+    # "<right>.*" alone would let a backup of system.login.screensaver.unlock
+    # satisfy a check for system.login.screensaver, because the longer name has
+    # the shorter one as a prefix -- the wrong direction of the same mistake.
+    case "$(basename "${backup}")" in
+        "${JARVIS_AUTH_RIGHT}."[0-9]*) : ;;
+        *)
+            _jarvis_warn "restore point is not for ${JARVIS_AUTH_RIGHT}: ${backup}"
+            return 1
+            ;;
+    esac
 
     # A backup that already names the plugin is not a restore point.
     #
@@ -409,22 +461,126 @@ jarvis_rule_strip_mechanism() {
 # evidence -- which is the entire class of mistake this gate exists to stop.
 # locked=yes is required because a probe run in which the operator never locked
 # the screen measured nothing, and the probe records that fact honestly.
+# A shape that actually contains OUR mechanism has to clear a higher bar:
+# failopen=proven. Derived from the shape itself rather than passed in, so a
+# caller cannot ask the easier question by accident.
+#
+# The reason is specific to system.login.screensaver.unlock. The old right had
+# builtin:authenticate directly behind us, so "we yield and the stock
+# authenticator prompts" was a property of the chain. This one has no password
+# mechanism in it and tries=1 -- whatever prompt exists belongs to loginwindow,
+# outside the chain, and whether a yield reaches it is not derivable from the
+# configuration. Only a run that yielded, survived, and still got a password
+# prompt establishes it. A shape that merely swaps in a named rule keeps the old
+# bar, because it has no mechanism of ours to fail open FROM.
 jarvis_probe_evidence_for_shape() {
-    local shape="$1"
+    local shape="$1" need_failopen=0
     [ -n "${shape}" ] || return 1
     [ -r "${JARVIS_PROBE_RESULTS_LOG}" ] || return 1
-    awk -v want="shape=${shape}" '
+    case "${shape}" in *"${JARVIS_MECHANISM}"*) need_failopen=1 ;; esac
+    awk -v want="shape=${shape}" -v needfo="${need_failopen}" '
         {
-            s = 0; p = 0; l = 0
+            s = 0; p = 0; l = 0; f = 0
             for (i = 1; i <= NF; i++) {
-                if ($i == want)           s = 1
-                if ($i == "password=yes") p = 1
-                if ($i == "locked=yes")   l = 1
+                if ($i == want)             s = 1
+                if ($i == "password=yes")   p = 1
+                if ($i == "locked=yes")     l = 1
+                if ($i == "failopen=proven") f = 1
             }
-            if (s && p && l) last = $0
+            if (s && p && l && (needfo != "1" || f)) last = $0
         }
         END { if (last != "") { print last; exit 0 } exit 1 }
     ' "${JARVIS_PROBE_RESULTS_LOG}"
+}
+
+# =============================================================================
+# RUNTIME EVIDENCE
+# =============================================================================
+# Everything above this line inspects CONFIGURATION. None of it can see a
+# mechanism that loads correctly and then dies, which is precisely what happened:
+# 27 segfaults across two days while every static check reported the install
+# coherent, because the mechanism runs inside a process we do not own and its
+# corpses land in DiagnosticReports rather than anywhere anyone was looking.
+#
+# These are the primitives for asking what actually HAPPENED. Defined here, not
+# in verify.sh, because the probe needs the identical questions -- and a probe
+# that measured "did it crash" differently from the verifier would be two
+# opinions about one machine.
+
+JARVIS_LOG_SUBSYSTEM_PLUGIN="com.jarvis.unlockplugin"
+JARVIS_CRASH_REPORTS_DIR="${JARVIS_CRASH_REPORTS_DIR:-/Library/Logs/DiagnosticReports}"
+# The process that hosts a SecurityAgent mechanism. Ours dying means THIS dying.
+JARVIS_AUTH_HOST_PROCESS="${JARVIS_AUTH_HOST_PROCESS:-authorizationhosthelper}"
+
+jarvis_plugin_bundle_present() { [ -d "${JARVIS_PLUGIN_PATH}" ]; }
+
+# Paths of host crash reports modified at or after <epoch>, one per line.
+# Emits nothing (rc 0) when there are none; rc 1 only if the directory is
+# unreadable, which needs membership in _analyticsusers and is a different fact
+# from "there were no crashes".
+jarvis_crash_reports_since() {
+    local since="$1" rep mtime
+    [ -r "${JARVIS_CRASH_REPORTS_DIR}" ] || return 1
+    for rep in "${JARVIS_CRASH_REPORTS_DIR}/${JARVIS_AUTH_HOST_PROCESS}"*.ips; do
+        [ -e "${rep}" ] || continue
+        mtime="$(stat -f %m "${rep}" 2>/dev/null || echo 0)"
+        [ "${mtime}" -ge "${since}" ] || continue
+        printf '%s\n' "${rep}"
+    done
+    return 0
+}
+
+# The faulting symbol of a crash report: the top frame of the TRIGGERED thread.
+#
+# Both narrowing steps are load-bearing. Without "triggered":true you get thread
+# 0's idle runloop frame, which every report has and which means nothing.
+# Without "frames":[ you get a symbol out of the preceding threadState, where the
+# crash reporter annotates register VALUES that happen to land on known
+# addresses -- the first draft of this reported OBJC_CLASS_$___NSTaggedDate,
+# which was the contents of x14 and not a stack frame at all.
+jarvis_crash_faulting_symbol() {
+    local report="$1"
+    [ -r "${report}" ] || return 1
+    tr -d '\n' < "${report}" 2>/dev/null \
+        | sed -e 's/.*"triggered":true//' -e 's/.*"frames":\[//' \
+        | grep -o '"symbol":"[^"]*"' \
+        | head -1 | cut -d'"' -f4
+}
+
+# Unified-log lines from our subsystems and from the mechanism host, since a
+# `log show`-formatted start time ("YYYY-MM-DD HH:MM:SS").
+#
+# Needs root. A non-root caller gets zero lines with no error, which reads
+# exactly like "nothing happened" -- so callers must decide whether they are
+# entitled to the answer before they interpret an empty one.
+jarvis_unlock_log_since() {
+    local since="$1"
+    log show --style compact --start "${since}" --predicate \
+        "subsystem == \"${JARVIS_LOG_SUBSYSTEM_PLUGIN}\" OR process == \"${JARVIS_AUTH_HOST_PROCESS}\"" \
+        2>/dev/null
+}
+
+# Does the live chain still contain every mechanism the backup had?
+#
+# The question verify.sh used to ask as `grep -q builtin:authenticate`, which was
+# a literal describing one particular chain. On system.login.screensaver.unlock
+# there is no builtin:authenticate -- there is CryptoTokenKit:login -- so the
+# named check would fail a CORRECT install and pass a chain that had silently
+# lost smartcard unlock. What matters is not which mechanisms are there but that
+# we took nothing away, and the only thing that knows what was there is the
+# backup.
+jarvis_chain_preserves_backup() {
+    local live="$1" backup="$2" want livelist backlist
+    livelist="$(jarvis_rule_mechanisms "${live}")" || return 1
+    backlist="$(jarvis_rule_mechanisms "${backup}")" || return 1
+    [ -n "${backlist}" ] || return 0
+    while IFS= read -r want; do
+        [ -n "${want}" ] || continue
+        _jarvis_lines_contain "${livelist}" "${want}" || return 1
+    done <<EOF
+${backlist}
+EOF
+    return 0
 }
 
 # Wait for a system service to be fully gone.

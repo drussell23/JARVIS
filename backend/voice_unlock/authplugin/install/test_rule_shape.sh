@@ -327,14 +327,156 @@ echo "this machine (against the real schema)"
 # always refuse would pass every test above.
 JARVIS_SYSTEM_AUTH_TEMPLATE="${JARVIS_SYSTEM_AUTH_TEMPLATE_DEFAULT}"
 if [ -r "${JARVIS_SYSTEM_AUTH_TEMPLATE}" ]; then
+    # The right the previous design targeted. Pinned as still refused, so a
+    # future edit cannot quietly point the installer back at the delegator.
+    _h=0; jarvis_right_hosts_mechanisms system.login.screensaver >/dev/null 2>&1 || _h=$?
+    _rc "system.login.screensaver stays refused (class $(jarvis_stock_rule_class system.login.screensaver 2>/dev/null || echo '?'))" 2 "${_h}"
+
+    # The right we now target: the chain loginwindow evaluates one level below it.
     _h=0; jarvis_right_hosts_mechanisms "${JARVIS_AUTH_RIGHT}" >/dev/null 2>&1 || _h=$?
-    _rc "${JARVIS_AUTH_RIGHT} is refused on this OS (class $(jarvis_stock_rule_class "${JARVIS_AUTH_RIGHT}" 2>/dev/null || echo '?'))" 2 "${_h}"
+    _rc "${JARVIS_AUTH_RIGHT} is a mechanism host (class $(jarvis_stock_rule_class "${JARVIS_AUTH_RIGHT}" 2>/dev/null || echo '?'))" 0 "${_h}"
 
     _h=0; jarvis_right_hosts_mechanisms system.login.console >/dev/null 2>&1 || _h=$?
     _rc "system.login.console is accepted (the classifier is not just refusing)" 0 "${_h}"
+
+    # The installer must never be pointed at the login right, whatever else
+    # changes. A defect there costs login, not unlock.
+    if [ "${JARVIS_AUTH_RIGHT}" = "system.login.console" ]; then
+        _no "the target right is system.login.console -- a defect there costs LOGIN"
+    else
+        _ok "the target right is not system.login.console"
+    fi
 else
     printf '  skip system schema unreadable at %s\n' "${JARVIS_SYSTEM_AUTH_TEMPLATE}"
 fi
+
+# =============================================================================
+echo
+echo "incumbent chain preservation"
+# =============================================================================
+# What verify.sh asks instead of grepping for a mechanism name it expects. On
+# system.login.screensaver.unlock the expected name would have been wrong: there
+# is no builtin:authenticate, there is CryptoTokenKit:login.
+_c=0; jarvis_compose_mechanism_rule "${HOSTED}" "${WORK}/pres.plist" "${MECH}" >/dev/null 2>&1 || _c=$?
+jarvis_chain_preserves_backup "${WORK}/pres.plist" "${HOSTED}" \
+    && _ok "a composed chain preserves the incumbent" \
+    || _no "a composed chain preserves the incumbent"
+
+# Drop one of the incumbent's mechanisms and it must be caught. This is the
+# regression that would mean smartcard unlock had been silently removed.
+cp "${WORK}/pres.plist" "${WORK}/lossy.plist"
+_dropped="$(jarvis_rule_strip_mechanism "${WORK}/lossy.plist" "loginwindow:login")"
+_is "the fixture actually lost a mechanism" "1" "${_dropped}"
+jarvis_chain_preserves_backup "${WORK}/lossy.plist" "${HOSTED}" \
+    && _no "a chain that dropped an incumbent mechanism is caught" \
+    || _ok "a chain that dropped an incumbent mechanism is caught"
+
+jarvis_chain_preserves_backup "${HOSTED}" "${DELEGATING}" \
+    && _ok "a backup with no mechanisms demands nothing" \
+    || _no "a backup with no mechanisms demands nothing"
+
+# =============================================================================
+echo
+echo "fail-open evidence (the tries=1 bar)"
+# =============================================================================
+# A shape naming OUR mechanism must clear failopen=proven. A shape that does not
+# keeps the old bar, because it has no mechanism of ours to fail open from.
+JARVIS_PROBE_RESULTS_LOG="${WORK}/failopen.log"
+MECH_SHAPE="class=evaluate-mechanisms;mechanisms=${MECH}|CryptoTokenKit:login"
+
+{
+    printf 'T1 shape=%s locked=yes prompted=yes touchid=yes watch=no password=yes failopen=yielded-unconfirmed\n' "${MECH_SHAPE}"
+    printf 'T2 shape=%s locked=yes prompted=no  touchid=no  watch=no password=yes failopen=crashed\n'             "${MECH_SHAPE}"
+    printf 'T3 shape=%s locked=yes prompted=no  touchid=no  watch=no password=yes failopen=not-reached\n'         "${MECH_SHAPE}"
+} > "${JARVIS_PROBE_RESULTS_LOG}"
+_e=0; jarvis_probe_evidence_for_shape "${MECH_SHAPE}" >/dev/null 2>&1 || _e=$?
+_rc "password=yes alone does NOT authorise a mechanism shape" 1 "${_e}"
+
+printf 'T4 shape=%s locked=yes prompted=yes touchid=yes watch=no password=yes failopen=proven\n' \
+    "${MECH_SHAPE}" >> "${JARVIS_PROBE_RESULTS_LOG}"
+_e=0; _rec="$(jarvis_probe_evidence_for_shape "${MECH_SHAPE}")" || _e=$?
+_rc "failopen=proven authorises a mechanism shape" 0 "${_e}"
+case "${_rec}" in T4*) _ok "the proven record is the one returned" ;;
+                  *)   _no "the proven record is the one returned" "got [${_rec}]" ;; esac
+
+# A crashed run must never become permission, however many times it is repeated.
+{
+    printf 'C1 shape=%s locked=yes prompted=yes touchid=yes watch=no password=yes failopen=crashed\n' "${MECH_SHAPE}"
+    printf 'C2 shape=%s locked=yes prompted=yes touchid=yes watch=no password=yes failopen=crashed\n' "${MECH_SHAPE}"
+} > "${JARVIS_PROBE_RESULTS_LOG}"
+_e=0; jarvis_probe_evidence_for_shape "${MECH_SHAPE}" >/dev/null 2>&1 || _e=$?
+_rc "a crashed run is never permission" 1 "${_e}"
+
+# Non-mechanism shapes keep the old bar: there is nothing of ours to fail open.
+NONMECH_SHAPE="class=user;mechanisms="
+printf 'R1 shape=%s locked=yes prompted=yes touchid=yes watch=no password=yes\n' \
+    "${NONMECH_SHAPE}" > "${JARVIS_PROBE_RESULTS_LOG}"
+_e=0; jarvis_probe_evidence_for_shape "${NONMECH_SHAPE}" >/dev/null 2>&1 || _e=$?
+_rc "a shape without our mechanism does not need failopen" 0 "${_e}"
+
+# =============================================================================
+echo
+echo "crash-report walk"
+# =============================================================================
+JARVIS_CRASH_REPORTS_DIR="${WORK}/reports"
+JARVIS_AUTH_HOST_PROCESS="fakehost"
+mkdir -p "${JARVIS_CRASH_REPORTS_DIR}"
+_is "an empty report directory yields nothing" "" "$(jarvis_crash_reports_since 0)"
+
+printf '{"triggered":true,"frames":[{"symbol":"JARVISDeliver"}]}\n' \
+    > "${JARVIS_CRASH_REPORTS_DIR}/fakehost.arm64-old.ips"
+touch -t 200001010000 "${JARVIS_CRASH_REPORTS_DIR}/fakehost.arm64-old.ips"
+_is "a report older than the cutoff is excluded" "" "$(jarvis_crash_reports_since "$(date +%s)")"
+_is "and included when the cutoff precedes it" \
+    "${JARVIS_CRASH_REPORTS_DIR}/fakehost.arm64-old.ips" "$(jarvis_crash_reports_since 0)"
+
+# The parse that must not read a register annotation as a stack frame.
+_is "the faulting symbol comes from the triggered thread" \
+    "JARVISDeliver" "$(jarvis_crash_faulting_symbol "${JARVIS_CRASH_REPORTS_DIR}/fakehost.arm64-old.ips")"
+
+printf '{"threadState":{"x14":{"symbol":"OBJC_CLASS_$___NSTaggedDate"}},"triggered":true,"frames":[{"symbol":"realFrame"}]}\n' \
+    > "${JARVIS_CRASH_REPORTS_DIR}/fakehost.arm64-reg.ips"
+_is "a register annotation is not mistaken for a frame" \
+    "realFrame" "$(jarvis_crash_faulting_symbol "${JARVIS_CRASH_REPORTS_DIR}/fakehost.arm64-reg.ips")"
+
+_e=0; JARVIS_CRASH_REPORTS_DIR="${WORK}/nonexistent" jarvis_crash_reports_since 0 >/dev/null 2>&1 || _e=$?
+_rc "an unreadable report directory is distinguished from no crashes" 1 "${_e}"
+
+# =============================================================================
+echo
+echo "restore-point provenance"
+# =============================================================================
+# The pointer file records a path and nothing else, and the target right has
+# already changed once. A pointer left by an install of the OLD right would
+# otherwise be restored into the NEW one -- a class=rule delegating definition
+# written over a mechanism chain, by the recovery path, on a machine already in
+# trouble. Only the refusal is exercised here: the accepting path writes to the
+# authorization database and needs root, which a test suite must not require.
+JARVIS_AUTHDB_BACKUP_POINTER="${WORK}/pointer"
+
+_wrong="${WORK}/system.login.screensaver.20260807-000000.install.plist"
+cp "${DELEGATING}" "${_wrong}"
+printf '%s' "${_wrong}" > "${JARVIS_AUTHDB_BACKUP_POINTER}"
+_e=0; jarvis_restore_auth_rule_from_pointer >/dev/null 2>&1 || _e=$?
+_rc "a backup taken for a DIFFERENT right is refused" 1 "${_e}"
+
+# The prefix trap in the other direction: system.login.screensaver.unlock has
+# system.login.screensaver as a prefix, so a bare "<right>.*" match would accept
+# the longer name for the shorter right.
+_longer="${WORK}/system.login.screensaver.unlock.20260807-000000.install.plist"
+cp "${DELEGATING}" "${_longer}"
+printf '%s' "${_longer}" > "${JARVIS_AUTHDB_BACKUP_POINTER}"
+_e=0; JARVIS_AUTH_RIGHT="system.login.screensaver" \
+    jarvis_restore_auth_rule_from_pointer >/dev/null 2>&1 || _e=$?
+_rc "a longer right name cannot satisfy a shorter one" 1 "${_e}"
+
+printf '%s' "${WORK}/absent-backup.plist" > "${JARVIS_AUTHDB_BACKUP_POINTER}"
+_e=0; jarvis_restore_auth_rule_from_pointer >/dev/null 2>&1 || _e=$?
+_rc "a pointer naming a missing file is refused" 1 "${_e}"
+
+rm -f "${JARVIS_AUTHDB_BACKUP_POINTER}"
+_e=0; jarvis_restore_auth_rule_from_pointer >/dev/null 2>&1 || _e=$?
+_rc "no pointer at all is refused" 1 "${_e}"
 
 # =============================================================================
 echo

@@ -145,14 +145,39 @@ echo
 echo "authorization rule (${JARVIS_AUTH_RIGHT})"
 if jarvis_rule_references_plugin; then
     _ok "references ${JARVIS_PLUGIN_NAME}"
-    # The stock authenticator must remain in the chain. Without it a failure in
-    # our mechanism has nothing to fall through to, and the fail-open guarantee
-    # -- the entire reason this is safe to install -- would be a comment rather
-    # than a property.
-    if jarvis_authdb_read "${JARVIS_AUTH_RIGHT}" 2>/dev/null | grep -q "builtin:authenticate"; then
-        _ok "builtin:authenticate still present (fail-open path intact)"
+
+    # Nothing the incumbent chain had may have gone missing.
+    #
+    # This used to be `grep -q builtin:authenticate` -- a literal describing one
+    # particular chain, and the wrong one. system.login.screensaver.unlock has no
+    # builtin:authenticate in it; it has CryptoTokenKit:login, which is how
+    # smartcard unlock works. The named check would have failed a CORRECT install
+    # and, worse, passed a chain that had quietly dropped smartcard support.
+    #
+    # The question is not which mechanisms are present. It is whether we took
+    # anything away -- and the only artifact that knows what was there before us
+    # is the backup this install wrote.
+    _pointer_backup=""
+    [ -f "${JARVIS_AUTHDB_BACKUP_POINTER}" ] \
+        && _pointer_backup="$(cat "${JARVIS_AUTHDB_BACKUP_POINTER}" 2>/dev/null || true)"
+
+    if [ -n "${_pointer_backup}" ] && [ -f "${_pointer_backup}" ]; then
+        _chain_live="$(mktemp -t jarvis-verify-chain)"
+        if jarvis_authdb_read "${JARVIS_AUTH_RIGHT}" > "${_chain_live}" 2>/dev/null \
+           && jarvis_chain_preserves_backup "${_chain_live}" "${_pointer_backup}"; then
+            _ok "every mechanism the rule had before the install is still in it"
+        else
+            _bad "the live chain has LOST a mechanism that was there before the install"
+            printf '      before: %s\n' "$(jarvis_rule_mechanisms "${_pointer_backup}" 2>/dev/null | tr '\n' ' ')"
+            printf '      now   : %s\n' "$(jarvis_rule_mechanisms "${_chain_live}" 2>/dev/null | tr '\n' ' ')"
+            printf '      Recover:  sudo %s/uninstall.sh\n' "${_here}"
+        fi
+        rm -f "${_chain_live}"
     else
-        _bad "builtin:authenticate is MISSING -- nothing to fall through to. Run uninstall.sh"
+        # Not a failure. Without the backup there is no baseline, and inventing
+        # one -- by naming a mechanism we expect to see -- is the mistake this
+        # check was rewritten to remove.
+        _gone "no restore point recorded; cannot prove the incumbent chain survived"
     fi
 else
     _gone "stock rule; the plugin is installed but not wired in"
@@ -219,60 +244,41 @@ rm -f "${_live_rule}"
 # every other check in this file.
 echo
 echo "crash history (authorizationhosthelper)"
-_reports_dir="/Library/Logs/DiagnosticReports"
-if [ ! -r "${_reports_dir}" ]; then
-    _gone "cannot read ${_reports_dir} (needs membership in _analyticsusers)"
+# The walk and the symbol extraction live in common.sh, because the probe asks
+# the identical question about its own measurement window. Two implementations of
+# "did the host crash" would be two opinions about one machine.
+#
+# Only reports newer than the installed bundle. Older ones belong to a build that
+# is no longer on disk, and counting them would make a fixed install look
+# permanently broken -- a check that cannot go green is a check the operator
+# learns to ignore.
+_since=0
+if [ -e "${JARVIS_PLUGIN_PATH}" ]; then
+    _since="$(stat -f %m "${JARVIS_PLUGIN_PATH}" 2>/dev/null || echo 0)"
+fi
+
+if ! _reports="$(jarvis_crash_reports_since "${_since}")"; then
+    _gone "cannot read ${JARVIS_CRASH_REPORTS_DIR} (needs membership in _analyticsusers)"
+elif [ -z "${_reports}" ]; then
+    _ok "no crashes since this bundle was installed"
 else
-    # Only reports newer than the installed bundle. Older ones belong to a build
-    # that is no longer on disk, and counting them would make a fixed install
-    # look permanently broken -- a check that cannot go green is a check the
-    # operator learns to ignore.
-    _since=0
-    if [ -e "${JARVIS_PLUGIN_PATH}" ]; then
-        _since="$(stat -f %m "${JARVIS_PLUGIN_PATH}" 2>/dev/null || echo 0)"
-    fi
+    _crashes="$(printf '%s\n' "${_reports}" | grep -c .)"
+    _newest="$(printf '%s\n' "${_reports}" | sed -n '$p')"
+    _bad "${_crashes} crash(es) since install -- the lock screen's plugin host is DYING"
 
-    _crashes=0
-    _newest=""
-    for _rep in "${_reports_dir}"/authorizationhosthelper*.ips; do
-        [ -e "${_rep}" ] || continue
-        _mtime="$(stat -f %m "${_rep}" 2>/dev/null || echo 0)"
-        [ "${_mtime}" -ge "${_since}" ] || continue
-        _crashes=$(( _crashes + 1 ))
-        _newest="${_rep}"
-    done
-
-    if [ "${_crashes}" -eq 0 ]; then
-        _ok "no crashes since this bundle was installed"
+    # Whether it is OUR bug is decidable from the report, so decide it here
+    # rather than leaving the operator to interpret a stack trace at a machine
+    # that will not unlock.
+    if /usr/bin/grep -q "${JARVIS_PLUGIN_NAME}" "${_newest}" 2>/dev/null; then
+        printf '      the newest report NAMES %s -- this is our defect\n' "${JARVIS_PLUGIN_NAME}"
     else
-        _bad "${_crashes} crash(es) since install -- the lock screen's plugin host is DYING"
-
-        # Whether it is OUR bug is decidable from the report, so decide it here
-        # rather than leaving the operator to interpret a stack trace at a
-        # machine that will not unlock.
-        if /usr/bin/grep -q "${JARVIS_PLUGIN_NAME}" "${_newest}" 2>/dev/null; then
-            printf '      the newest report NAMES %s -- this is our defect\n' "${JARVIS_PLUGIN_NAME}"
-        else
-            printf '      the newest report does not name %s\n' "${JARVIS_PLUGIN_NAME}"
-        fi
-
-        # Faulting symbol: the top frame of the TRIGGERED thread.
-        #
-        # Both narrowing steps are load-bearing. Without "triggered":true you
-        # get thread 0's idle runloop frame, which every report has and which
-        # means nothing. Without "frames":[ you get a symbol out of the
-        # preceding threadState, where the crash reporter annotates register
-        # VALUES that happen to land on known addresses -- the first draft of
-        # this reported OBJC_CLASS_$___NSTaggedDate, which was the contents of
-        # x14, not a stack frame at all.
-        _sym="$(tr -d '\n' < "${_newest}" 2>/dev/null \
-                | /usr/bin/sed -e 's/.*"triggered":true//' -e 's/.*"frames":\[//' \
-                | /usr/bin/grep -o '"symbol":"[^"]*"' \
-                | head -1 | cut -d'"' -f4)"
-        [ -n "${_sym}" ] && printf '      faulting frame: %s\n' "${_sym}"
-        printf '      report: %s\n' "${_newest}"
-        printf '      Remove now, diagnose after:  sudo %s/uninstall.sh\n' "${_here}"
+        printf '      the newest report does not name %s\n' "${JARVIS_PLUGIN_NAME}"
     fi
+
+    _sym="$(jarvis_crash_faulting_symbol "${_newest}" 2>/dev/null || true)"
+    [ -n "${_sym}" ] && printf '      faulting frame: %s\n' "${_sym}"
+    printf '      report: %s\n' "${_newest}"
+    printf '      Remove now, diagnose after:  sudo %s/uninstall.sh\n' "${_here}"
 fi
 
 # --- Verdict ----------------------------------------------------------------
