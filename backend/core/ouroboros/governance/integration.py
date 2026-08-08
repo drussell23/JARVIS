@@ -105,6 +105,55 @@ _MODE_MAP = {
     "safe": GovernanceMode.SANDBOX,  # alias
 }
 
+GOVERNANCE_MODE_ENV = "JARVIS_GOVERNANCE_MODE"
+
+#: The mode assumed when nobody has said otherwise.
+#:
+#: SANDBOX, and the direction matters more than the value: `"safe"` is an alias
+#: for SANDBOX in the map above, so this is the CONSERVATIVE mode. Falling back
+#: to "governed" would have a surface claim the organism is under governance it
+#: may not be under, and over-claiming governance is the one direction that
+#: cannot be walked back by a reader.
+_DEFAULT_GOVERNANCE_MODE = "sandbox"
+
+#: The mode actually in effect, published when a config is built.
+#:
+#: Registered rather than re-derived because `from_env_and_args` resolves a CLI
+#: argument BEFORE the environment — so a run started with
+#: `--governance-mode governed` is invisible to anything reading the env, and
+#: every reporting surface was reading the env. The status endpoint could
+#: therefore announce "sandbox" for a process running GOVERNED, with nothing
+#: anywhere disagreeing.
+#:
+#: Same shape as `set_default_intake_router` / `set_active_bridge`: last write
+#: wins, never raises, and holds a plain string rather than the config so a
+#: reader cannot reach through it into governance state.
+_ACTIVE_GOVERNANCE_MODE: "Optional[str]" = None
+
+
+def set_active_governance_mode(mode: "Optional[str]") -> None:
+    """Publish the mode a built config resolved to. NEVER raises."""
+    global _ACTIVE_GOVERNANCE_MODE
+    _ACTIVE_GOVERNANCE_MODE = str(mode) if mode else None
+
+
+def configured_governance_mode() -> str:
+    """The governance mode in effect, for anything that REPORTS it.
+
+    Precedence mirrors `from_env_and_args` exactly, most authoritative first:
+    the mode a config actually resolved to, then the environment, then the
+    conservative default. A value outside `_MODE_MAP` is not repeated back —
+    the constructor rejects it, so a reporter must not present it as live.
+    """
+    active = _ACTIVE_GOVERNANCE_MODE
+    if active and active in _MODE_MAP:
+        return active
+    raw = str(os.environ.get(GOVERNANCE_MODE_ENV, "")).strip().lower()
+    if raw in _MODE_MAP:
+        return raw
+    return _DEFAULT_GOVERNANCE_MODE
+
+
 
 @dataclass(frozen=True)
 class GovernanceConfig:
@@ -147,7 +196,12 @@ class GovernanceConfig:
         skip = getattr(args, "skip_governance", False)
         mode_str = (
             getattr(args, "governance_mode", None)
-            or os.environ.get("JARVIS_GOVERNANCE_MODE", "sandbox")
+            # The resolver, not a second reading of the environment. Writing
+            # the env lookup here again gave this variable two defaults inside
+            # ONE file — the precise defect the resolver was added to end,
+            # reintroduced three lines from it, and caught only because the
+            # architecture pin was watching.
+            or configured_governance_mode()
         )
 
         if skip:
@@ -159,6 +213,10 @@ class GovernanceConfig:
                     f"Valid: {list(_MODE_MAP.keys())}"
                 )
             initial_mode = _MODE_MAP[mode_str]
+            # Publish what was actually resolved, so every reporting surface
+            # reads the live mode instead of re-deriving one that cannot see
+            # the CLI argument above.
+            set_active_governance_mode(mode_str)
 
         ledger_dir = Path(
             os.environ.get(

@@ -452,7 +452,19 @@ class HealthCortex:
     @staticmethod
     def _poll_trust() -> TrustHealth:
         """Read trust tier from env; return governed/0.0 when not configured."""
-        tier = os.getenv("JARVIS_GOVERNANCE_MODE", "governed")
+        # The authority's answer, not a second one. This defaulted to
+        # "governed" while the governance stack itself defaults to "sandbox",
+        # so with nothing configured the health report claimed the organism
+        # was under governance it was not under. `"safe"` is an alias for
+        # SANDBOX in the mode map, which settles which direction is
+        # conservative — and a health surface must never be the optimistic one.
+        try:
+            from backend.core.ouroboros.governance.integration import (
+                configured_governance_mode,
+            )
+            tier = configured_governance_mode()
+        except Exception:  # noqa: BLE001 — health polling is never fatal
+            tier = "sandbox"
         try:
             progress = float(os.getenv("JARVIS_TRUST_GRADUATION_PROGRESS", "0.0"))
         except (ValueError, TypeError):
