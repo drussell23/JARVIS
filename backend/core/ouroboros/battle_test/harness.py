@@ -3344,6 +3344,12 @@ class BattleTestHarness:
                     cost_tracker=self._cost_tracker,
                     idle_watchdog=self._idle_watchdog,
                     governed_loop_service=self._governed_loop_service,
+                    # A CALLABLE, not the service: intake is assigned several
+                    # hundred lines below this point, so passing the attribute
+                    # here would capture None for the life of the process and
+                    # the status line would report ARMING forever.
+                    intake_service=lambda: getattr(
+                        self, "_intake_service", None),
                 )
                 register_status_line_builder(_status_builder)
                 logger.info("[Harness] StatusLineBuilder registered")

@@ -272,10 +272,25 @@ class StatusLineBuilder:
         idle_watchdog: Any = None,
         governed_loop_service: Any = None,
         repair_engine: Any = None,
+        intake_service: Any = None,
     ) -> None:
         self._cost = cost_tracker
         self._idle = idle_watchdog
         self._gls = governed_loop_service
+        # The intake layer, so "IDLE" can stop meaning two opposite things.
+        #
+        # This builder used to sample ONLY the orchestrator's live FSM
+        # contexts, and returned IDLE whenever there were none. But work
+        # exists before an op does: sensors arm, sweep, and enqueue signals
+        # for a minute or more before the first FSM context is created. An
+        # operator watching a real boot saw `IDLE · $0.00` for two minutes
+        # while four genuine test failures sat queued behind it, and
+        # reasonably concluded the organism was broken.
+        #
+        # Read-only and zero-authority — the same pull model the attach
+        # bridge's providers use. Consulted fresh at every sample so the
+        # counts are current rather than cached at construction.
+        self._intake = intake_service
         # Repair engine may be passed explicitly (tests, direct wiring)
         # OR resolved lazily from ``gls._orchestrator._config.repair_engine``
         # during each snapshot — preferred because the harness doesn't
@@ -489,12 +504,79 @@ class StatusLineBuilder:
         extras = max(0, total - 1)
         return (primary or "", extras)
 
+    def _sample_intake_state(self) -> tuple:
+        """Return (phase, detail) describing the intake layer.
+
+        The state BELOW the orchestrator, and the reason this exists: an op
+        is the last thing to happen, not the first. Sensors register, sweep,
+        and enqueue signals well before any FSM context is created, and until
+        now every moment of that was rendered ``IDLE`` — the same word used
+        for an organism with genuinely nothing to do.
+
+        Precedence is most-actionable first, and every branch is decided by a
+        live count rather than a clock. Nothing here waits, sleeps, or guesses
+        at how long a boot "should" take:
+
+          queued > 0        WORK EXISTS and no op has claimed it yet. This is
+                            the state that was invisible: four real test
+                            failures sat here for two minutes reading IDLE.
+          sensors armed     Genuinely nothing to do — but SAY so, with the
+                            count, so an operator can tell "quiet" from
+                            "nothing is watching".
+          nothing yet       Still arming. Distinguished from idle because a
+                            sensor that has not registered cannot find
+                            anything, and reporting that as idle is the
+                            failure this whole change is about.
+
+        Degrades to the historical ``("IDLE", "")`` whenever intake is absent
+        or unreadable — a status line must never be the reason a cockpit
+        raises.
+        """
+        # Resolved at SAMPLE time, never at construction — the same lazy
+        # discipline this file already applies to the repair engine, and for
+        # the same reason: the builder is constructed early in the boot and
+        # the intake layer is assigned later. Capturing it in __init__ would
+        # freeze a permanent None and this whole state machine would report
+        # ARMING forever, which is a more confident lie than the IDLE it
+        # replaces. A callable is therefore accepted as well as an object.
+        intake = self._intake
+        if callable(intake):
+            try:
+                intake = intake()
+            except Exception:  # noqa: BLE001
+                intake = None
+        if intake is None:
+            return ("IDLE", "")
+
+        try:
+            sensors = len(getattr(intake, "_sensors", ()) or ())
+        except Exception:  # noqa: BLE001
+            sensors = 0
+
+        queued = None
+        try:
+            router = getattr(intake, "_router", None)
+            depth = getattr(router, "intake_queue_depth", None)
+            if callable(depth):
+                queued = int(depth())
+        except Exception:  # noqa: BLE001
+            queued = None
+
+        if queued:
+            return ("QUEUED", f"{queued} signal{'' if queued == 1 else 's'}")
+        if sensors:
+            # Deliberately still "IDLE" — the word is correct here. What was
+            # missing was the evidence beside it.
+            return ("IDLE", f"{sensors} sensors")
+        return ("ARMING", "")
+
     def _sample_phase_and_detail(self) -> tuple:
         """Return (phase, phase_detail).
 
         Sub-detail resolution order (first match wins):
           1. L2 Repair iteration (``repair_engine.is_running``)
           2. FSM phase name of the primary op + elapsed-in-phase
+          3. Intake state — sensors arming / signals queued / idle-with-count
         """
         # L2 Repair has highest-priority detail — it's the only phase
         # where operators explicitly asked for an iter/max breakdown.
@@ -515,14 +597,14 @@ class StatusLineBuilder:
                 pass
 
         if self._gls is None:
-            return ("IDLE", "")
+            return self._sample_intake_state()
 
         try:
             fsm_contexts = getattr(self._gls, "_fsm_contexts", None) or {}
         except Exception:  # noqa: BLE001
             fsm_contexts = {}
         if not fsm_contexts:
-            return ("IDLE", "")
+            return self._sample_intake_state()
 
         # Pick the most-recently-entered phase across all ops (same
         # selector as _sample_ops for consistency).
@@ -544,7 +626,7 @@ class StatusLineBuilder:
                 continue
 
         if not primary_phase:
-            return ("IDLE", "")
+            return self._sample_intake_state()
 
         # Elapsed-in-phase sub-detail (compact, e.g. "47s"). Only show
         # for phases where "how long has this been running?" is useful —
