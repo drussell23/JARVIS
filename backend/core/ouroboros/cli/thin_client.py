@@ -279,19 +279,26 @@ def clean_stale_socket(path: Path) -> bool:
 
 
 
-def _cockpit_cost_cap() -> "tuple[str, str]":
-    """The session ceiling and its basis. Degrades to the historical literal
-    only if the estimator itself is unavailable — a boot must never fail over
-    a budget."""
+def _cockpit_cost_cap() -> "tuple[str | None, str]":
+    """The session ceiling and its basis, or ``(None, reason)``.
+
+    ``None`` means "do not assert a ceiling" — the caller then leaves
+    OUROBOROS_BATTLE_COST_CAP unset and the harness applies its own default.
+
+    That is deliberate, and this pin caught the alternative: an earlier version
+    fell back to a literal of its own, which made this a SECOND default for the
+    same variable — the exact defect the estimator was written to end,
+    reintroduced in the code that ended it. If we cannot compute a ceiling we
+    do not invent one; we defer to the layer that already has an answer.
+    """
     try:
         from backend.core.ouroboros.battle_test.session_economics import (
             cockpit_cost_cap,
         )
         return cockpit_cost_cap()
     except Exception:  # noqa: BLE001
-        import os as _os
-        return (_os.environ.get("JARVIS_COCKPIT_COST_CAP", "2.50"),
-                "unmeasured — estimator unavailable")
+        return (None, "not asserted — estimator unavailable, harness default "
+                      "applies")
 
 # ---------------------------------------------------------------------------
 # Detached cold boot
@@ -389,8 +396,10 @@ def spawn_daemon(
         # The ceiling now comes from the sessions that actually spent money,
         # and it carries the basis it rests on.
         _cap, _cap_basis = _cockpit_cost_cap()
-        env.setdefault("OUROBOROS_BATTLE_COST_CAP", _cap)
-        logger.debug("[ov] session ceiling $%s — %s", _cap, _cap_basis)
+        if _cap is not None:
+            env.setdefault("OUROBOROS_BATTLE_COST_CAP", _cap)
+        logger.debug("[ov] session ceiling %s — %s",
+                     f"${_cap}" if _cap else "(not asserted)", _cap_basis)
         env.setdefault("OUROBOROS_BATTLE_IDLE_TIMEOUT", os.environ.get(
             "JARVIS_OV_DAEMON_IDLE_TIMEOUT_S", "86400",
         ))
@@ -737,8 +746,10 @@ def build_agent_plist() -> dict:
         "StandardOutPath": str(log_dir / "ov-daemon.out.log"),
         "StandardErrorPath": str(log_dir / "ov-daemon.err.log"),
         "EnvironmentVariables": {
-            # Same single definition the detached spawn uses.
-            "OUROBOROS_BATTLE_COST_CAP": _cockpit_cost_cap()[0],
+            # Same single definition the detached spawn uses. An unresolvable
+            # ceiling yields "" so the agent carries no assertion and the
+            # harness default applies, rather than a competing literal.
+            "OUROBOROS_BATTLE_COST_CAP": _cockpit_cost_cap()[0] or "",
             "OUROBOROS_BATTLE_IDLE_TIMEOUT": os.environ.get(
                 "JARVIS_OV_DAEMON_IDLE_TIMEOUT_S", "86400",
             ),
