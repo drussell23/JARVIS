@@ -2754,7 +2754,18 @@ class BattleTestHarness:
             and getattr(_gls, "_config", None) is not None
             and getattr(_gls._config, "tool_use_enabled", False)
         )
-        _has_l2 = bool(os.environ.get("JARVIS_L2_ENABLED", "").lower() == "true")
+        # READ the capability, never re-derive it. This resolved the same
+        # variable with a default of "" and an `== "true"` test, so with the
+        # variable unset — the documented default — the engine ran L2 and this
+        # panel reported it absent. They also disagreed about `1`, `yes` and
+        # `on`. An unreadable authority reports absent rather than guessing.
+        try:
+            from backend.core.ouroboros.governance.repair_engine import (
+                l2_enabled as _l2_enabled,
+            )
+            _has_l2 = bool(_l2_enabled())
+        except Exception:  # noqa: BLE001 — a boot panel is never fatal
+            _has_l2 = False
         _has_bg_pool = (
             _gls is not None
             and getattr(_gls, "_bg_pool", None) is not None
