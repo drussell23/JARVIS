@@ -139,6 +139,44 @@ def pytest_report_header(config):
     ]
 
 
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Say out loud when the terminal-dependent suite did not run.
+
+    Thirty-one tests — the whole proof that the cockpit answers a keystroke —
+    skip when ``pty.openpty()`` raises, which it does in every sandboxed or
+    containerised runner. The run then reports green, and the cockpit's
+    interactive behaviour gets described as "never verified" while a suite
+    proving it sits in the repository passing in 80 seconds on any machine
+    with a terminal.
+
+    A skip is an honest answer. A skip nobody can see is not, and this repo has
+    already paid for that once: a suite that cannot collect reports no
+    failures. So the summary states the count, the consequence, and the way to
+    make it fatal.
+    """
+    try:
+        from tests.pty_gate import REQUIRED_ENV_VAR, SKIPPED
+    except Exception:  # noqa: BLE001 — a reporting aid must never break a run
+        return
+    if not SKIPPED:
+        return
+
+    write = terminalreporter.write_line
+    write("")
+    write(f"⚠️  {len(SKIPPED)} terminal-dependent test(s) DID NOT RUN — "
+          f"no pseudo-terminal was available.", yellow=True, bold=True)
+    write("   The cockpit's interactive behaviour is UNPROVEN by this run: "
+          "keybindings, mouse", yellow=True)
+    write("   negotiation, alt-screen handling and the slash palette were all "
+          "skipped, not passed.", yellow=True)
+    write(f"   Make this fatal where a terminal is expected:  "
+          f"{REQUIRED_ENV_VAR}=1", yellow=True)
+    reasons = {reason for _, reason in SKIPPED}
+    for reason in sorted(reasons):
+        write(f"   cause: {reason}", yellow=True)
+    write("")
+
+
 @pytest.fixture(autouse=True)
 def _isolate_fsm_checkpoint_dir(tmp_path, monkeypatch):
     """Point the FSM suspend/resume checkpoint ledger at a per-test tmp dir.

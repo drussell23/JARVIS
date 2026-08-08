@@ -216,13 +216,11 @@ class CockpitSession:
 
 
 def _require_pty() -> None:
-    import pty
-    try:
-        m, s = pty.openpty()
-    except OSError:
-        pytest.skip("out of pty devices")
-    os.close(m)
-    os.close(s)
+    """Delegates to the ONE gate, which records the skip so the terminal
+    summary can say the cockpit went unproven. A local copy of this check is
+    how thirty-one tests came to disappear from a green run."""
+    from tests.pty_gate import require_pty
+    require_pty("test_cockpit_pty_proof")
 
 
 @pytest.fixture()
