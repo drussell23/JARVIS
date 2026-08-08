@@ -41,13 +41,17 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import (
+    Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple,
+)
 
 logger = logging.getLogger("Ouroboros.ProgressBoard")
 
@@ -55,6 +59,7 @@ __all__ = [
     "FeatureState", "FeatureRow", "BoardReading", "ProgressBoard", "ENTRY",
     "DYNAMIC_LIVE",
     "board_enabled", "scan_roots",
+    "cache_enabled", "cache_path", "scan_budget_s", "CACHE_SCHEMA",
 ]
 
 #: States a feature can be in. Ordered worst-news-first for display: an
@@ -157,6 +162,138 @@ _EXCLUDE_DIRS = frozenset({
 
 #: The prefix that marks a knob as ours. Read from env so a fork with a
 #: different prefix is configurably right rather than silently empty.
+#: Bumped whenever a change to THIS module could change a reading.
+#:
+#: A cache keyed only on the scanned tree would keep serving the old verdict
+#: after the board itself is corrected — a surface reporting a state it no
+#: longer measures, which is the exact defect this file exists to name. The
+#: board's own source hash is folded into the key for the same reason, so this
+#: constant is a belt to that braces: it lets a deliberate semantic change
+#: invalidate every cache in every checkout in one edit.
+CACHE_SCHEMA = "progress_board.cache.v1"
+
+
+def cache_enabled() -> bool:
+    """Default ON.
+
+    The cache changes only how long a reading takes, never what it says: a
+    hit requires every input to be byte-identical. Off is for proving that —
+    the regression spine reads both ways and asserts they agree.
+    """
+    return os.environ.get(
+        "JARVIS_PROGRESS_BOARD_CACHE", "1",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def scan_budget_s() -> float:
+    """Worst-case wall time for a COLD reading, as the instrument's own claim.
+
+    Measured on this tree: ~162 s to `ast.parse` 7,333 files / 143 MB. The
+    warm path is ~1.3 s, but a budget sized for the warm path is a budget that
+    fails the first time anyone touches a file.
+
+    This lives here rather than in the tests that need it because the board is
+    the only thing that knows what a board scan costs, and the alternative had
+    already gone wrong: `test_progress_board_relative` recorded "around 110
+    seconds" in a docstring when it was written, never re-derived it, and by
+    today's 162 s was passing or timing out depending on how warm the page
+    cache happened to be. Two test modules now need this number, which is
+    exactly when a number must stop being written down twice.
+
+    A budget, not a promise. `ProgressBoard` never raises and has no internal
+    deadline; this is what a CALLER should allow before concluding something
+    is wrong.
+    """
+    raw = os.environ.get("JARVIS_PROGRESS_BOARD_BUDGET_S", "").strip()
+    try:
+        got = float(raw)
+    except ValueError:
+        got = 0.0
+    # ~5x headroom over the measurement, so a slower disk or a CI runner under
+    # contention produces a slow pass rather than a flake that reads like a
+    # finding.
+    return got if got > 0 else 900.0
+
+
+def cache_path(repo_root: Optional[Path] = None) -> Path:
+    """Where a reading is remembered.
+
+    Under ``.jarvis/`` — which is already in :data:`_EXCLUDE_DIRS`, so the
+    cache cannot appear in the scan that produced it. A cache that perturbs
+    its own key never hits, and would have been a slow, silent no-op.
+    """
+    raw = os.environ.get("JARVIS_PROGRESS_BOARD_CACHE_PATH", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    root = Path(repo_root) if repo_root else _default_root()
+    return root / ".jarvis" / "progress_board_cache.json"
+
+
+def _tree_digest(repo_root: Path, roots: Sequence[str]) -> str:
+    """Identity of the source tree, at the granularity the reading depends on.
+
+    ``(relative path, mtime_ns, size)`` per file. Content hashing 143 MB of
+    source would be the only stricter answer and costs ~40x more than the walk
+    it would be protecting; mtime+size is what every build system in existence
+    trusts for the same reason.
+
+    Deliberately reuses :func:`_iter_source_files` rather than walking again —
+    the fingerprint must cover EXACTLY the files the scan will parse. Two
+    walks with independently-maintained exclusion rules would drift, and the
+    drift would show up as a cache that is confidently stale about whichever
+    files only one of them could see.
+    """
+    digest = hashlib.sha256()
+    for rel, path in _iter_source_files(repo_root, roots):
+        try:
+            stat = path.stat()
+        except OSError:
+            # Raced away between walk and stat. Feed the path alone: the file
+            # is part of the tree's identity even when unreadable, and the
+            # next run will see a different state and miss — correctly.
+            digest.update(f"{rel}\0?\0?\n".encode("utf-8", "replace"))
+            continue
+        digest.update(
+            f"{rel}\0{stat.st_mtime_ns}\0{stat.st_size}\n".encode(
+                "utf-8", "replace"),
+        )
+    return digest.hexdigest()
+
+
+def _environ_digest() -> str:
+    """The flag environment, which decides `off` versus `dark`.
+
+    ``_resolve_enabled`` reads the LIVE environment, so two processes with
+    different ``JARVIS_*`` settings legitimately produce different readings
+    from an identical tree. Keying on the tree alone would let one operator's
+    ``JARVIS_META_SENSOR_ENABLED=0`` session poison another's — a row reported
+    ``off`` when it is in fact ``dark``, which is the more comfortable of the
+    two lies and therefore the more dangerous.
+
+    The whole family is hashed rather than the flags a reading happened to
+    touch: which flags matter is only known AFTER the scan, and a key that
+    depends on its own result is not a key.
+    """
+    prefix = flag_prefix()
+    digest = hashlib.sha256()
+    for name in sorted(k for k in os.environ if k.startswith(prefix)):
+        digest.update(f"{name}\0{os.environ[name]}\n".encode("utf-8", "replace"))
+    return digest.hexdigest()
+
+
+def _board_source_digest() -> str:
+    """This module's own bytes. A fixed board must re-read a stale tree."""
+    try:
+        return hashlib.sha256(
+            Path(__file__).read_bytes(),
+        ).hexdigest()
+    except OSError:
+        # Unreadable source (zipimport, a stripped install). Fall back to a
+        # value that can never collide with a real digest, so the cache misses
+        # rather than trusting a key it could not fully compute.
+        return "unreadable"
+
+
 def flag_prefix() -> str:
     return os.environ.get("JARVIS_PROGRESS_BOARD_PREFIX", "JARVIS_").strip() or "JARVIS_"
 
@@ -278,12 +415,29 @@ def _is_test_path(rel: str) -> bool:
     A module whose ONLY importers are tests is inert in production — that is
     precisely the state this board exists to surface, so test importers must
     not be allowed to launder a dark module into a live one.
+
+    Matched on SEGMENTS, not substrings. The first version tested
+    ``"/test" in lowered``, which is true of ``voice_unlock/testing/`` and of
+    ``scripts/testrunner_streaming_livefire.py`` — production modules whose
+    flags then never entered the board's universe and whose imports never
+    vouched for anything. It also tested ``"/conftest.py" in lowered``, which
+    the repository-root ``conftest.py`` does not contain, so the one conftest
+    every session loads counted as a PRODUCTION importer.
+
+    Both directions of that error are the same mistake: deciding a path's role
+    from a substring of its spelling. A segment is what a directory actually
+    is, so that is what is compared. Measured on this tree, the two rules
+    disagree about exactly four files and each of the four is now on the
+    correct side.
     """
     lowered = rel.replace("\\", "/").lower()
+    parts = lowered.split("/")
+    name = parts[-1] if parts else lowered
     return (
-        lowered.startswith("test") or "/test" in lowered
-        or "/tests/" in lowered or Path(lowered).name.startswith("test_")
-        or lowered.endswith("_test.py") or "/conftest.py" in lowered
+        any(segment in ("test", "tests") for segment in parts[:-1])
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+        or name == "conftest.py"
     )
 
 
@@ -338,6 +492,33 @@ class FeatureRow:
             "value": self.value,
         }
 
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "FeatureRow":
+        """Inverse of :meth:`to_dict`, tolerant of a row written by an older
+        build.
+
+        Missing keys take the field default rather than raising: a cache is a
+        performance artefact and must never be the thing that breaks the
+        reader. Round-trip fidelity is proven by test, not assumed here —
+        ``kind`` and ``is_actionable`` are DERIVED properties, so a row that
+        restores its eight stored fields restores its behaviour too.
+        """
+        def _text(key: str) -> str:
+            got = raw.get(key)
+            return got if isinstance(got, str) else ""
+
+        return cls(
+            flag=_text("flag"),
+            state=_text("state") or UNKNOWN,
+            module=_text("module"),
+            category=_text("category"),
+            enabled=raw.get("enabled") if isinstance(
+                raw.get("enabled"), bool) else None,
+            importers=int(raw.get("importers") or 0),
+            reason=_text("reason"),
+            value=raw.get("value"),
+        )
+
 
 @dataclass
 class BoardReading:
@@ -352,6 +533,14 @@ class BoardReading:
     #: found none'. Collapsing the two rendered an unprimed registry
     #: as 'verbs primed 0', which reads as 'this cockpit has no verbs'.
     verbs_primed: bool = False
+    #: The inputs this reading was derived from — tree + environment + roots
+    #: + board source. Empty when the reading was not fingerprinted.
+    fingerprint: str = ""
+    #: Whether the rows were restored rather than scanned. Provenance, in the
+    #: same spirit as `advisor_locality`'s blast_provenance: a consumer that
+    #: cannot tell a measurement from a recollection will eventually present
+    #: one as the other.
+    from_cache: bool = False
 
     def by_state(self, state: str) -> List[FeatureRow]:
         return [r for r in self.rows if r.state == state]
@@ -589,6 +778,159 @@ class ProgressBoard:
         except AttributeError:  # pragma: no cover — <3.9 safety
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(None, self.read)
+
+    # -- cached reading ----------------------------------------------------
+
+    def fingerprint(self) -> str:
+        """Everything a reading depends on, as one hex string.
+
+        Four inputs, because a reading is a function of exactly four things:
+        the source tree, the ``JARVIS_*`` environment, the scan roots, and the
+        board's own logic. Omitting any one produces a cache that is stale in
+        a way its consumer cannot detect.
+        """
+        roots = tuple(scan_roots())
+        parts = (
+            CACHE_SCHEMA,
+            str(self._repo_root),
+            ",".join(roots),
+            "1" if board_enabled() else "0",
+            _board_source_digest(),
+            _environ_digest(),
+            _tree_digest(self._repo_root, roots),
+        )
+        return hashlib.sha256(
+            "\0".join(parts).encode("utf-8", "replace"),
+        ).hexdigest()
+
+    def cached_read(self) -> BoardReading:
+        """:meth:`read`, memoised on :meth:`fingerprint`. NEVER raises.
+
+        The scan is ~157 s on this repository and the walk that identifies it
+        is ~1.2 s, so a hit is two orders of magnitude cheaper than a miss.
+        That ratio is the whole point: an invariant nobody runs because it is
+        slow catches nothing, and the honest way to make a check fast is to
+        avoid repeating work whose inputs have not moved — not to look at
+        fewer files.
+
+        What is NOT restored from cache, deliberately:
+
+        ``verbs`` / ``verbs_primed`` come from a runtime registry, not from
+        the tree. They describe THIS process — whether discovery has run yet —
+        and are re-read live on every call, hit or miss. Caching them would
+        let a reading assert that a cockpit had primed its verbs because some
+        earlier process did.
+
+        ``duration_s`` reports how long THIS call took, so a hit reports the
+        hit. A cache that reported the original scan's 157 s would be lying
+        about the only thing the operator can verify with a stopwatch.
+        """
+        started = time.monotonic()
+        if not cache_enabled():
+            return self.read()
+
+        try:
+            key = self.fingerprint()
+        except Exception:  # noqa: BLE001
+            logger.debug("[ProgressBoard] fingerprint failed", exc_info=True)
+            return self.read()
+
+        restored = self._load_cache(key)
+        if restored is not None:
+            # Live, never restored — see the docstring.
+            restored.verbs, restored.verbs_primed = self._load_verbs()
+            restored.fingerprint = key
+            restored.from_cache = True
+            restored.duration_s = time.monotonic() - started
+            return restored
+
+        reading = self.read()
+        reading.fingerprint = key
+        reading.from_cache = False
+        # A degraded reading is a reading of something other than the tree —
+        # a disabled board, an unavailable registry, an exception mid-scan.
+        # Storing it would serve that transient failure back for as long as
+        # nothing in the tree moves.
+        if not reading.degraded:
+            self._store_cache(key, reading)
+        return reading
+
+    async def cached_read_async(self) -> BoardReading:
+        """:meth:`cached_read` off the event loop. Both the fingerprint walk
+        and the scan it may trigger are blocking filesystem work."""
+        try:
+            return await asyncio.to_thread(self.cached_read)
+        except AttributeError:  # pragma: no cover — <3.9 safety
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self.cached_read)
+
+    def _load_cache(self, key: str) -> Optional[BoardReading]:
+        """The stored reading if it was taken under `key`, else None."""
+        path = cache_path(self._repo_root)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        except Exception:  # noqa: BLE001
+            logger.debug("[ProgressBoard] cache unreadable", exc_info=True)
+            return None
+        if not isinstance(payload, dict):
+            return None
+        # Both guards matter. `schema` catches a payload written by a build
+        # whose ROW SHAPE differs — where `fingerprint` might coincidentally
+        # match because the tree did not move across the upgrade.
+        if payload.get("schema") != CACHE_SCHEMA:
+            return None
+        if payload.get("fingerprint") != key:
+            return None
+        raw_rows = payload.get("rows")
+        if not isinstance(raw_rows, list):
+            return None
+        try:
+            rows = [FeatureRow.from_dict(r) for r in raw_rows
+                    if isinstance(r, Mapping)]
+        except Exception:  # noqa: BLE001
+            logger.debug("[ProgressBoard] cache rows unusable", exc_info=True)
+            return None
+        if len(rows) != len(raw_rows):
+            # A row that would not restore means the file is not what it
+            # claims. Rescan rather than serve a reading with holes in it.
+            return None
+        return BoardReading(
+            rows=rows,
+            scanned_files=int(payload.get("scanned_files") or 0),
+        )
+
+    def _store_cache(self, key: str, reading: BoardReading) -> None:
+        """Write the reading. NEVER raises — a cache miss is not an error, and
+        an unwritable cache must not break the board."""
+        path = cache_path(self._repo_root)
+        payload = {
+            "schema": CACHE_SCHEMA,
+            "fingerprint": key,
+            "scanned_files": reading.scanned_files,
+            "rows": [row.to_dict() for row in reading.rows],
+        }
+        # Temp-then-replace, in the SAME directory so the rename is atomic on
+        # POSIX. A reader concurrent with a write sees the whole old file or
+        # the whole new one, never a truncated payload it would then have to
+        # decide how much to trust. `os.getpid()` keeps two concurrent
+        # writers off each other's temp file; the losing rename is harmless
+        # because both wrote the same bytes for the same key.
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(
+                json.dumps(payload, separators=(",", ":"), default=str),
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
+        except Exception:  # noqa: BLE001
+            logger.debug("[ProgressBoard] cache not written", exc_info=True)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     # -- internals ---------------------------------------------------------
 
@@ -1310,8 +1652,14 @@ def render_board(reading: BoardReading, *, width: Optional[int] = None,
                 f"dynamic {counts.get(DYNAMIC_LIVE, 0)}   "
                 f"entry {counts.get(ENTRY, 0)}   off {counts.get(OFF, 0)}")
         out: List[str] = [head[:cols]]
+        # Provenance on the same line as the cost, because they answer one
+        # question: is this a measurement or a recollection? `ov_demo` used to
+        # refuse caching outright on the grounds that "the operator cannot
+        # tell which they are looking at" — which was the right objection to
+        # an untagged cache, and is answered by saying so here.
+        origin = "cached" if reading.from_cache else "scanned"
         out.append(f"  ({reading.scanned_files} files, "
-                   f"{reading.duration_s:.1f}s)"[:cols])
+                   f"{reading.duration_s:.1f}s, {origin})"[:cols])
         if reading.degraded:
             out.append(f"  ⚠ degraded: {reading.degraded}"[:cols])
 

@@ -113,10 +113,19 @@ def _markup(console: Any, text: str = "") -> None:
 def scene_board(console: Any, argv: Sequence[str] = ()) -> int:
     """Where `ov` stands, derived from the tree rather than from a checklist.
 
-    The scan is real (thousands of `ast.parse` calls, a few seconds). It is not
-    cached across invocations on purpose: a status view that shows yesterday's
-    answer is worse than one that takes four seconds, because the operator
-    cannot tell which they are looking at.
+    The scan is real: 7,333 files and ~162 seconds of `ast.parse` on this
+    tree — not the "few seconds" this docstring used to claim.
+
+    It WAS uncached on purpose, and the reason given was exactly right for the
+    cache that was being refused: "a status view that shows yesterday's answer
+    is worse than one that takes four seconds, because the operator cannot
+    tell which they are looking at." Both halves of that are now answered
+    rather than argued with. `cached_read` is keyed on the source tree, the
+    `JARVIS_*` environment, the scan roots and the board's own source, so it
+    cannot serve yesterday's answer for a tree that has moved; and the count
+    line says `scanned` or `cached`, so the operator can tell. What is left is
+    1.3 seconds instead of 162 — which is the difference between a status view
+    that gets consulted and one that gets avoided.
     """
     try:
         from backend.core.ouroboros.battle_test.progress_board import (
@@ -128,7 +137,7 @@ def scene_board(console: Any, argv: Sequence[str] = ()) -> int:
 
     _ensure_primed()
     _rule(console, "where ov stands")
-    reading = ProgressBoard().read()
+    reading = ProgressBoard().cached_read()
     for line in render_board(reading, limit=_limit(argv)):
         _say(console, line)
 
