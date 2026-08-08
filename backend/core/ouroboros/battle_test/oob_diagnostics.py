@@ -101,30 +101,55 @@ def dump_all_threads(file: Any = None) -> bool:
         return False
 
 
+def crash_log_handle(path: Optional[Path] = None) -> Any:
+    """The append handle every stack dump in this process writes to.
+
+    ONE descriptor, opened once and held for the process lifetime, shared by
+    every producer: the SIGUSR1 trap, and the loop watchdog's C-level timer.
+    That sharing is not tidiness — ``faulthandler`` writes from contexts that
+    cannot open a file, resolve a path, or take a lock (a C signal handler, and
+    a watchdog thread firing while the GIL is held elsewhere), so the
+    descriptor MUST already exist and stay valid. A second producer opening its
+    own would interleave two independent buffers into one file.
+
+    Returns None if the log cannot be opened; callers degrade to stderr.
+    """
+    global _LOG_HANDLE
+    if _LOG_HANDLE is not None:
+        return _LOG_HANDLE
+    try:
+        target = path if path is not None else _log_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Line-buffered append. A wedged process is usually killed eventually,
+        # and a buffered dump dies with it.
+        _LOG_HANDLE = target.open("a", buffering=1, encoding="utf-8")
+        _LOG_HANDLE.write(
+            f"\n{'=' * 72}\n"
+            f"[oob] stack-dump log opened — pid {os.getpid()}\n"
+            f"{'=' * 72}\n"
+        )
+        _LOG_HANDLE.flush()
+        return _LOG_HANDLE
+    except Exception:  # noqa: BLE001
+        logger.debug("[OOB] could not open the crash log", exc_info=True)
+        return None
+
+
 def install_oob_stack_dump(path: Optional[Path] = None) -> bool:
     """Arm ``kill -USR1``. Returns True if the trap is live. NEVER raises.
 
     Idempotent, and a no-op on platforms without SIGUSR1 (Windows), where the
     absence of the signal is not an error — just an unavailable facility.
     """
-    global _LOG_HANDLE
     if OOB_SIGNAL is None:
         return False
     try:
         import faulthandler
 
         target = path if path is not None else _log_path()
-        if _LOG_HANDLE is None:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            # Line-buffered append. A wedged process is usually killed
-            # eventually, and a buffered dump dies with it.
-            _LOG_HANDLE = target.open("a", buffering=1, encoding="utf-8")
-            _LOG_HANDLE.write(
-                f"\n{'=' * 72}\n"
-                f"[oob] stack-dump trap armed — kill -USR1 {os.getpid()}\n"
-                f"{'=' * 72}\n"
-            )
-            _LOG_HANDLE.flush()
+        handle = crash_log_handle(path)
+        if handle is None:
+            return False
 
         # chain=False, and this is load-bearing.
         #
@@ -138,7 +163,7 @@ def install_oob_stack_dump(path: Optional[Path] = None) -> bool:
         # handler — does not apply: nothing else handles SIGUSR1 here, and
         # what would be preserved is a fatal default.
         faulthandler.register(
-            OOB_SIGNAL, file=_LOG_HANDLE, all_threads=True, chain=False,
+            OOB_SIGNAL, file=handle, all_threads=True, chain=False,
         )
         logger.info(
             "[OOB] stack-dump trap armed on SIGUSR1 (pid=%d) -> %s",

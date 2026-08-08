@@ -2417,6 +2417,28 @@ async def _split_plane_loop(
                 console.print(_glyph("detail", "-") + f" {hint}", markup=False, highlight=False)
     except Exception:  # noqa: BLE001 — a missing debugger must not stop a boot
         pass
+    # …and the automatic half of the same instrument.
+    #
+    # `kill -USR1` needs a human present at the moment of the wedge, so it can
+    # only ever catch a TOTAL freeze — the sub-second stalls that precede one
+    # are invisible, and those are where the cause is still legible.
+    #
+    # The watchdog samples this loop's scheduling delay, builds a rolling
+    # baseline, and re-arms a C-level dump deadline on every healthy tick. A
+    # loop that keeps ticking keeps postponing its own autopsy; a loop that
+    # wedges stops postponing and the stacks land in the SAME crash log the
+    # signal writes to, without anyone being awake to ask.
+    #
+    # Deliberately after the mount hint and before the prompt loop, so it
+    # covers the surface that actually hosts the reported freeze.
+    _loop_watchdog = None
+    try:
+        from backend.core.ouroboros.battle_test.loop_watchdog import (
+            install_loop_watchdog,
+        )
+        _loop_watchdog = install_loop_watchdog()
+    except Exception:  # noqa: BLE001 — diagnostics never block an attach
+        _loop_watchdog = None
     # This surface has no container to float the palette into, so it draws it
     # in the toolbar. The cockpit floats it and must NOT opt in, or it renders
     # twice.
