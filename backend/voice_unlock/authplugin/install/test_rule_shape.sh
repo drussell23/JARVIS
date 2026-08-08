@@ -588,6 +588,50 @@ fi
 
 # =============================================================================
 echo
+echo "verify.sh does not prescribe the dangerous action"
+# =============================================================================
+# A live run after --skip-authdb reported "partially installed. 1 component(s)
+# absent." with every component present -- the "absent" thing was the rule being
+# deliberately unwired -- and offered `install.sh` as the repair. That is the
+# rule rewrite: the one irreversible step, prescribed as the fix for a machine
+# that was exactly where it should be.
+bash -n "${_here}/verify.sh" 2>/dev/null && _ok "verify.sh parses" || _no "verify.sh parses"
+
+grep -q '^_state()' "${_here}/verify.sh" \
+    && _ok "a valid state is reportable without being counted as absent" \
+    || _no "a valid state is reportable without being counted as absent"
+
+grep -q '_state "stock rule; the plugin is installed but not wired in"' "${_here}/verify.sh" \
+    && _ok "the unwired rule is a state, not a missing component" \
+    || _no "the unwired rule is a state, not a missing component"
+
+# The load-bearing one: the unwired verdict must not send the operator to
+# install.sh. It would refuse anyway -- no shape has been measured -- so the
+# advice was both dangerous and wrong.
+_verdict="$(sed -n '/_wired:-1/,/^fi/p' "${_here}/verify.sh")"
+[ -n "${_verdict}" ] \
+    && _ok "there is a distinct verdict for coherent-but-unwired" \
+    || _no "there is a distinct verdict for coherent-but-unwired"
+# "Prescribe" means offering it as a runnable command, not naming it. The
+# verdict SHOULD say why install.sh is not the next step -- that sentence is the
+# correction. What it must never contain is a `sudo .../install.sh` line an
+# operator can paste.
+case "${_verdict}" in
+    *'sudo ${_here}/install.sh'*|*"sudo ${_here}/install.sh"*)
+        _no "and it does not offer install.sh as a command" ;;
+    *)  _ok "and it does not offer install.sh as a command" ;;
+esac
+case "${_verdict}" in
+    *"NOT install.sh"*) _ok "and says explicitly why it is not the next step" ;;
+    *)                  _no "and says explicitly why it is not the next step" ;;
+esac
+case "${_verdict}" in
+    *probe_mechanism_lifecycle.sh*) _ok "and it points at the measurement instead" ;;
+    *)                              _no "and it points at the measurement instead" ;;
+esac
+
+# =============================================================================
+echo
 echo "restore-point provenance"
 # =============================================================================
 # The pointer file records a path and nothing else, and the target right has
