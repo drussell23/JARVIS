@@ -1,16 +1,26 @@
 """Architecture pin: a switch that is ON must be reachable.
 
-``JARVIS_META_SENSOR_ENABLED`` defaults to true. The PRD records it as
-"graduated default-true (§25 Priority B)". ``meta_sensor.py`` is on disk, has
-tests, and has **zero import statements anywhere in the tree**. The sensor
-whose job is to notice that O+V has stopped learning is itself the thing
-nobody noticed.
+``JARVIS_META_SENSOR_ENABLED`` defaults to true. The PRD recorded it as
+"graduated default-true (§25 Priority B)". ``meta_sensor.py`` was on disk,
+had tests, and had **zero import statements anywhere in the tree**. The
+sensor whose job is to notice that O+V has stopped learning was itself the
+thing nobody noticed. It is now mounted, and
+``test_the_dormancy_alarm_stays_reachable`` below defends that.
 
-It is not alone. A full board scan on 2026-08-08 found 37 switches in that
+It was not alone. A full board scan on 2026-08-08 found 37 switches in that
 state, and they are not scattered — 12 are the adaptive immune system
 (``governance/adaptation/``), 6 are closed-loop verification and replay
 (``governance/verification/``), 3 are temporal observability. Those are
 precisely the tiers the PRD grades A, A− and A+.
+
+Two of the 37 were never dark at all: ``replay_from_record`` and
+``multi_op_renderer`` are imported by ``scripts/ouroboros_battle_test.py``,
+and ``_is_test_path`` was classifying THE entry point that boots the
+six-layer stack as a test file because its name ends ``_test.py``. So did
+``governance/test_runner.py``, ``intent/test_watcher.py`` and
+``intake/sensors/test_failure_sensor.py``. That is fixed at the root — the
+board now asks pytest's own ``testpaths``/``python_files`` configuration
+whether a file would be collected — and the count is 34 with the alarm wired.
 
 So the defect is not any one dark module. It is that **this repository
 measures merges and reports them as capability.** A merge is evidence that
@@ -108,12 +118,6 @@ _WAIVED: Dict[str, str] = {
     # The feedback edge. These six are why O+V cannot learn across ops, and
     # they must be wired BEFORE the adaptive tier below — Pass C's tighteners
     # consume this signal, so adapting first would adapt on noise.
-    "JARVIS_META_SENSOR_ENABLED": (
-        "TIER 1. The degenerate-loop alarm: fires when postmortems go empty, "
-        "i.e. when the organism has stopped learning. Zero import statements "
-        "in the entire tree, tests included. Wiring this one first is what "
-        "would let O+V find the rest of this list without a human."
-    ),
     "JARVIS_POSTMORTEM_INJECTION_ENABLED": (
         "TIER 1. Injects prior postmortems into the generation prompt. "
         "Without it every operation reasons from a blank slate about failures "
@@ -133,15 +137,12 @@ _WAIVED: Dict[str, str] = {
         "urgency alone. The PRD grades 'Confidence-Aware Execution CLOSED "
         "2026-04-29'; the import graph disagrees."
     ),
-    "JARVIS_CAUSALITY_REPLAY_FROM_RECORD_ENABLED": (
-        "TIER 1. Deterministic replay of a recorded decision — the "
-        "time-travel debugging the roadmap asks for, already written. "
-        "Imported by scripts/ouroboros_battle_test.py alone, so it is "
-        "reachable in a soak and dark in `ov`."
-    ),
     "JARVIS_REPLAY_HOOK_ENABLED": (
-        "TIER 1. The orchestrator-side hook replay_from_record needs to "
-        "capture from. Dark for the same reason and fixed by the same change."
+        "TIER 1. replay_orchestrator_hook — `record_session_replay()`, the "
+        "surface that feeds the replay pipeline after a session completes. "
+        "Genuinely unimported: unlike replay_from_record beside it, not even "
+        "the soak harness calls this one, so nothing ever records a session "
+        "for the replay machinery to fork from."
     ),
     "JARVIS_CIGW_COLLECTOR_ENABLED": (
         "TIER 1. gradient_collector — gathers the per-op signal the "
@@ -210,11 +211,6 @@ _WAIVED: Dict[str, str] = {
     ),
 
     # ---- Tier 3: temporal observability + Order-2 -------------------------
-    "JARVIS_PHASE8_MULTI_OP_RENDERER_ENABLED": (
-        "TIER 3. multi_op_renderer — the synchronized multi-op timeline. "
-        "Imported by the soak harness only. It also has nowhere to draw: the "
-        "cockpit has no live region, which is the separate renderer defect."
-    ),
     "JARVIS_PHASE8_IDE_OBSERVABILITY_ENABLED": (
         "TIER 3. observability/ide_routes — the Phase 8 GET surface. Distinct "
         "from ide_observability.py, which IS live; this is the temporal one."
@@ -501,7 +497,11 @@ def test_the_self_cleaning_check_fails_on_a_waiver_that_outlived_its_defect(
     then stale, and it must say so."""
     with pytest.raises(AssertionError) as caught:
         test_every_waiver_still_excuses_a_dark_switch(_reading_with())
-    assert "JARVIS_META_SENSOR_ENABLED" in str(caught.value)
+    # Every waiver is stale against an empty reading, so the message must
+    # enumerate them rather than say "34 stale waivers" — a count sends the
+    # reader back to a cold scan to find out which.
+    for flag in _WAIVED:
+        assert flag in str(caught.value), flag
 
 
 def test_the_ceiling_fails_when_the_backlog_grows() -> None:
@@ -799,19 +799,92 @@ def test_the_cache_cannot_perturb_its_own_key(isolated) -> None:
 # the findings this pin was built from, as regressions
 # ---------------------------------------------------------------------------
 
-def test_meta_sensor_is_still_the_headline(reading: BoardReading) -> None:
-    """The single most quotable row. When this fails, it is either because
-    meta_sensor was wired — delete this test and its waiver — or because the
-    board stopped seeing it, which is far more serious."""
+def test_the_dormancy_alarm_stays_reachable(reading: BoardReading) -> None:
+    """meta_sensor was the headline finding and is now wired. This defends it.
+
+    It is the one module on the list whose absence hides the others: a sensor
+    that fires when postmortems arrive empty is how O+V would notice a
+    subsystem had gone inert WITHOUT a human running an audit. Losing it again
+    would cost more than the row itself.
+
+    A regression here means the mount in `intake_layer_service._build_
+    components` was removed or the import moved somewhere the graph cannot
+    see. Both are silent in every other test.
+    """
     rows = {r.flag: r for r in reading.rows}
     got = rows.get("JARVIS_META_SENSOR_ENABLED")
     assert got is not None, "the flag vanished from the board entirely"
-    assert got.state in (DARK, "live"), got.state
-    if got.state != DARK:
-        pytest.fail(
-            "meta_sensor is reachable now — delete this test and its waiver, "
-            "and lower the ceiling in test_the_backlog_is_shrinking_not_growing"
-        )
+    assert got.state != DARK, (
+        "the dormancy alarm is unreachable again — check that "
+        "intake_layer_service still constructs MetaSensor and appends it to "
+        "self._sensors"
+    )
+    assert got.importers >= 1, got.reason
+
+
+def test_the_alarm_is_mounted_for_lifecycle_not_gated_on_its_own_flag(
+) -> None:
+    """Reachability and behaviour are different questions.
+
+    The flag governs whether the sensor DOES anything — `start()` and
+    `scan_once()` both consult `meta_sensor_enabled()` themselves. The mount
+    governs whether it EXISTS. Wrapping the construction in a flag check would
+    reintroduce the defect in its subtler form: dark whenever the flag is off,
+    and no longer distinguishable from dead-by-omission.
+    """
+    import inspect
+    from backend.core.ouroboros.governance.intake import intake_layer_service
+
+    src = inspect.getsource(intake_layer_service)
+    idx = src.index("MetaSensor(")
+    # The construction and the append must sit together with no flag between.
+    window = src[idx:idx + 400]
+    assert "self._sensors.append(_meta_sensor)" in window
+    assert "meta_sensor_enabled" not in src, (
+        "the mount consults the master flag — that gates REACHABILITY on a "
+        "behaviour switch and puts the sensor back in the dark when it is off"
+    )
+
+
+def test_the_alarm_has_one_authority_for_its_interval() -> None:
+    """The wiring must not reintroduce the defect the sibling pin catches.
+
+    `MetaSensor.__init__` already carried 1800.0. Resolving
+    `JARVIS_META_SENSOR_INTERVAL_S` at the construction site — which is what
+    every other sensor in that file does — would have made two defaults for
+    one number, in the act of wiring the sensor that watches for exactly this
+    class of silent wrongness.
+    """
+    import inspect
+    from backend.core.ouroboros.governance.intake import intake_layer_service
+    from backend.core.ouroboros.governance.intake.sensors import meta_sensor
+
+    import ast as _ast
+    import textwrap
+
+    mount = inspect.getsource(intake_layer_service)
+    idx = mount.index("MetaSensor(")
+    assert "JARVIS_META_SENSOR_INTERVAL_S" not in mount[idx - 600:idx + 400], (
+        "the mount resolves the interval itself"
+    )
+
+    ctor = inspect.getsource(meta_sensor.MetaSensor.__init__)
+    assert "meta_sensor_interval_s()" in ctor, (
+        "the constructor no longer defers to the resolver"
+    )
+    # A substring search for "1800" would match this test's own explanation of
+    # why 1800 must not appear — and it did, on the first version of this
+    # assertion. Comments are not code; only a literal in the AST is a second
+    # default.
+    tree = _ast.parse(textwrap.dedent(ctor))
+    literals = {
+        node.value for node in _ast.walk(tree)
+        if isinstance(node, _ast.Constant) and isinstance(node.value, (int, float))
+        and not isinstance(node.value, bool)
+    }
+    assert 1800 not in literals and 1800.0 not in literals, (
+        f"the constructor carries a second default: {sorted(literals)}"
+    )
 
 
 def test_the_dark_tiers_are_still_where_the_audit_found_them(

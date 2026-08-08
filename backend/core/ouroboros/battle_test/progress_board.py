@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import fnmatch
 import hashlib
 import json
 import logging
@@ -244,6 +245,18 @@ def _tree_digest(repo_root: Path, roots: Sequence[str]) -> str:
     files only one of them could see.
     """
     digest = hashlib.sha256()
+    # The pytest configuration is an input to the reading and is not a `.py`
+    # file, so the walk below cannot see it. Editing `testpaths` changes which
+    # files count as production importers and therefore which flags are dark;
+    # a key blind to that would serve the old verdict under the new rule.
+    for name in ("pytest.ini", "setup.cfg", "pyproject.toml"):
+        try:
+            stat = (repo_root / name).stat()
+            digest.update(
+                f"cfg:{name}\0{stat.st_mtime_ns}\0{stat.st_size}\n".encode(
+                    "utf-8", "replace"))
+        except OSError:
+            digest.update(f"cfg:{name}\0absent\n".encode("utf-8"))
     for rel, path in _iter_source_files(repo_root, roots):
         try:
             stat = path.stat()
@@ -409,36 +422,161 @@ def _iter_source_files(repo_root: Path,
                 yield rel, path
 
 
-def _is_test_path(rel: str) -> bool:
+#: Where tests live, and what a test file is called, when the repository does
+#: not say. Only a fallback — :func:`test_collection_config` prefers the
+#: project's own pytest configuration, which is the sole authority on the
+#: question "would this file be collected as a test".
+_FALLBACK_TESTPATHS = ("tests",)
+_FALLBACK_PYTHON_FILES = ("test_*.py", "*_test.py")
+
+
+def _parse_pytest_config(repo_root: Path) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """``(testpaths, python_files)`` as the project declares them.
+
+    Reads ``pytest.ini``, then ``setup.cfg`` (``[tool:pytest]``), then
+    ``pyproject.toml`` (``[tool.pytest.ini_options]``) — pytest's own
+    precedence. Returns the fallbacks when nothing declares them.
+
+    NEVER raises: an unparseable config yields the fallback, because a status
+    view must not be the thing that breaks on a malformed ini.
+    """
+    import configparser
+
+    def _split(raw: str) -> Tuple[str, ...]:
+        return tuple(p for p in raw.replace("\n", " ").split(" ") if p.strip())
+
+    for name, section in (("pytest.ini", "pytest"),
+                          ("setup.cfg", "tool:pytest")):
+        path = repo_root / name
+        try:
+            if not path.is_file():
+                continue
+            parser = configparser.ConfigParser()
+            parser.read(path, encoding="utf-8")
+            if not parser.has_section(section):
+                continue
+            paths = _split(parser.get(section, "testpaths", fallback=""))
+            files = _split(parser.get(section, "python_files", fallback=""))
+            if paths or files:
+                return (paths or _FALLBACK_TESTPATHS,
+                        files or _FALLBACK_PYTHON_FILES)
+        except Exception:  # noqa: BLE001
+            logger.debug("[ProgressBoard] %s unreadable", name, exc_info=True)
+
+    try:
+        import tomllib  # py3.11+
+        path = repo_root / "pyproject.toml"
+        if path.is_file():
+            table = tomllib.loads(path.read_text(encoding="utf-8"))
+            opts = table.get("tool", {}).get("pytest", {}).get(
+                "ini_options", {})
+            paths = tuple(opts.get("testpaths") or ())
+            files = tuple(opts.get("python_files") or ())
+            if paths or files:
+                return (paths or _FALLBACK_TESTPATHS,
+                        files or _FALLBACK_PYTHON_FILES)
+    except Exception:  # noqa: BLE001
+        logger.debug("[ProgressBoard] pyproject unreadable", exc_info=True)
+
+    return _FALLBACK_TESTPATHS, _FALLBACK_PYTHON_FILES
+
+
+def test_collection_config(
+        repo_root: Optional[Path] = None,
+) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """The project's own answer to "what is a test", cached per root."""
+    root = Path(repo_root) if repo_root else _default_root()
+    key = str(root)
+    got = _TEST_CONFIG_CACHE.get(key)
+    if got is None:
+        got = _parse_pytest_config(root)
+        _TEST_CONFIG_CACHE[key] = got
+    return got
+
+
+_TEST_CONFIG_CACHE: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {}
+
+
+def _is_test_path(rel: str, repo_root: Optional[Path] = None) -> bool:
     """Tests import things without making them live.
 
     A module whose ONLY importers are tests is inert in production — that is
     precisely the state this board exists to surface, so test importers must
     not be allowed to launder a dark module into a live one.
 
-    Matched on SEGMENTS, not substrings. The first version tested
-    ``"/test" in lowered``, which is true of ``voice_unlock/testing/`` and of
-    ``scripts/testrunner_streaming_livefire.py`` — production modules whose
-    flags then never entered the board's universe and whose imports never
-    vouched for anything. It also tested ``"/conftest.py" in lowered``, which
-    the repository-root ``conftest.py`` does not contain, so the one conftest
-    every session loads counted as a PRODUCTION importer.
+    THE HARD PART IS THAT A NAME IS NOT A ROLE
+    ------------------------------------------
+    Two rules were tried before this one and both decided a file's role from
+    the spelling of its path.
 
-    Both directions of that error are the same mistake: deciding a path's role
-    from a substring of its spelling. A segment is what a directory actually
-    is, so that is what is compared. Measured on this tree, the two rules
-    disagree about exactly four files and each of the four is now on the
-    correct side.
+    The first matched substrings. ``"/test" in path`` is true of
+    ``voice_unlock/testing/`` and ``scripts/testrunner_streaming_livefire.py``,
+    so those production modules' flags never entered the board's universe;
+    and ``"/conftest.py"`` is false of the repository-ROOT ``conftest.py``, so
+    the one conftest every session loads counted as a production importer.
+
+    The second matched segments, which fixed those four and left the deeper
+    error in place: a bare ``name.endswith("_test.py")`` classifies
+    ``scripts/ouroboros_battle_test.py`` — THE entry point that boots the
+    six-layer stack, the thing :func:`scan_roots` was widened to include
+    precisely because it "is how this system actually runs" — as a test. So
+    did ``governance/test_runner.py``, ``intent/test_watcher.py``,
+    ``intake/sensors/test_failure_sensor.py`` and
+    ``intent/test_source_attribution.py``: production modules named for the
+    thing they OPERATE ON rather than for what they are. Everything reachable
+    only through them read DARK.
+
+    SO ASK THE PROJECT
+    ------------------
+    pytest already answers this question, in configuration, for this exact
+    repository::
+
+        testpaths    = tests test_*.py
+        python_files = test_*.py *_test.py
+
+    A file is a test iff pytest would collect it: it matches ``python_files``
+    AND lies under a declared ``testpaths`` entry. ``governance/test_runner.py``
+    matches the name pattern and is under neither, so pytest never collects
+    it and neither does this. The rule now tracks the project's own
+    definition and moves when it moves, rather than restating a convention
+    that a hundred and sixty-seven files in this tree do not follow.
+
+    Two belts stay on top of that, both conservative in the safe direction —
+    over-classifying as test costs a visible false DARK, under-classifying
+    launders a dark module into live:
+
+    * any ``test``/``tests`` DIRECTORY segment, wherever it sits;
+    * ``conftest.py`` anywhere, since it is loaded by collection and never by
+      production.
     """
     lowered = rel.replace("\\", "/").lower()
     parts = lowered.split("/")
     name = parts[-1] if parts else lowered
-    return (
-        any(segment in ("test", "tests") for segment in parts[:-1])
-        or name.startswith("test_")
-        or name.endswith("_test.py")
-        or name == "conftest.py"
-    )
+
+    if name == "conftest.py":
+        return True
+    if any(segment in ("test", "tests") for segment in parts[:-1]):
+        return True
+
+    testpaths, python_files = test_collection_config(repo_root)
+    if not any(fnmatch.fnmatch(name, pat) for pat in python_files):
+        return False
+
+    for entry in testpaths:
+        cleaned = entry.strip("/").lower()
+        if not cleaned:
+            continue
+        if "*" in cleaned or "?" in cleaned:
+            # A bare glob in `testpaths` addresses files at the root — pytest
+            # resolves testpaths relative to the rootdir, and fnmatch's `*`
+            # would otherwise cross directory boundaries and re-swallow
+            # `scripts/ouroboros_battle_test.py` through the back door.
+            if len(parts) == 1 and fnmatch.fnmatch(name, cleaned):
+                return True
+            continue
+        if lowered == cleaned or lowered.startswith(f"{cleaned}/"):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -667,7 +805,7 @@ class ProgressBoard:
                 root_prefix = f"{root}."
                 if self_mod.startswith(root_prefix):
                     aliases.setdefault(self_mod[len(root_prefix):], self_mod)
-            is_test = _is_test_path(rel)
+            is_test = _is_test_path(rel, self._repo_root)
             if not is_test:
                 for name in _imported_modules(
                         tree, self_mod, rel.endswith("__init__.py")):

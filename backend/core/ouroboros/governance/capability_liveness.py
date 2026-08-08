@@ -116,13 +116,40 @@ def _snapshot_ttl_s() -> float:
 
 
 def _is_test_path(rel: str) -> bool:
-    """Test-path exclusion, consistent with reverse_dep_resolver semantics."""
-    r = rel.replace("\\", "/")
-    parts = r.split("/")
-    if any(p in ("tests", "test") for p in parts):
-        return True
-    base = parts[-1] if parts else r
-    return base.startswith("test_") or base == "conftest.py" or base.endswith("_test.py")
+    """Test-path exclusion. Delegates to the board's rule.
+
+    This module and ``progress_board`` are asking the SAME question — "does
+    this file count as production for reachability purposes" — and until now
+    each answered it with its own copy of a naming convention. Both copies
+    were wrong the same way: a bare ``endswith("_test.py")`` classifies
+    ``scripts/ouroboros_battle_test.py`` (THE entry point that boots the
+    six-layer stack) as a test, along with ``governance/test_runner.py``,
+    ``intent/test_watcher.py`` and ``intake/sensors/test_failure_sensor.py``.
+    Anything reachable only through those read as unreferenced.
+
+    Two authorities for one question is the defect this repository keeps
+    shipping, so there is now one. The board derives the answer from the
+    project's own pytest ``testpaths``/``python_files``, which is the only
+    thing that actually decides whether a file is collected as a test.
+
+    Falls back to the previous local rule if the board is unimportable — this
+    module must keep working in a stripped install, and a conservative
+    over-classification (a production file treated as a test) costs a visible
+    false severance rather than a silently laundered one.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.progress_board import (
+            _is_test_path as _board_is_test_path,
+        )
+        return _board_is_test_path(rel)
+    except Exception:  # noqa: BLE001
+        r = rel.replace("\\", "/")
+        parts = r.split("/")
+        if any(p in ("tests", "test") for p in parts):
+            return True
+        base = parts[-1] if parts else r
+        return (base.startswith("test_") or base == "conftest.py"
+                or base.endswith("_test.py"))
 
 
 def _public_symbols(source: str) -> Tuple[str, ...]:

@@ -83,6 +83,31 @@ def meta_sensor_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def meta_sensor_interval_s() -> float:
+    """Seconds between dormancy sweeps. Default 1800 (30 min).
+
+    Lives here beside the other knobs rather than at the construction site,
+    which is where every other sensor resolves its interval. The difference
+    matters: ``MetaSensor.__init__`` already carried ``1800.0`` as a keyword
+    default, so an ``os.environ.get(..., "1800")`` written next to the
+    constructor call would have made two authorities for one number — the
+    defect ``tests/architecture/test_env_default_single_authority.py`` exists
+    to catch, reintroduced in the act of wiring the sensor that watches for
+    exactly this class of silent inertness.
+
+    Dormancy is a slow signal: it is computed over a rolling window of
+    ``empty_postmortem_window()`` postmortems, so sweeping faster than the
+    ledger changes costs disk reads and tells nobody anything new. Floored at
+    one minute so a mistyped value cannot turn an alarm into a busy-loop.
+    """
+    raw = os.environ.get("JARVIS_META_SENSOR_INTERVAL_S", "1800")
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return 1800.0
+    return max(60.0, val)
+
+
 def empty_postmortem_threshold() -> float:
     """Fraction of recent postmortems with ``total_claims=0`` above
     which the detector fires. Default 0.7 (70%) per PRD §25.5.2."""
@@ -410,11 +435,17 @@ class MetaSensor:
         self,
         repo: str,
         router: Any,
-        poll_interval_s: float = 1800.0,  # 30 min default
+        poll_interval_s: Optional[float] = None,
     ) -> None:
         self._repo = repo
         self._router = router
-        self._poll_interval_s = poll_interval_s
+        # `None` means "ask the resolver", which is the only place the 1800
+        # lives. An explicit value still wins, so every existing caller and
+        # test behaves exactly as before.
+        self._poll_interval_s = (
+            meta_sensor_interval_s() if poll_interval_s is None
+            else float(poll_interval_s)
+        )
         self._running = False
         self._task: Optional[asyncio.Task] = None
         # Dedup by (detector_kind, summary) — when severity / sample
@@ -571,6 +602,7 @@ __all__ = [
     "empty_postmortem_window",
     "list_dormancy_detectors",
     "meta_sensor_enabled",
+    "meta_sensor_interval_s",
     "register_dormancy_detector",
     "reset_registry_for_tests",
     "unregister_dormancy_detector",
