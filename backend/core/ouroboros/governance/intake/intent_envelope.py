@@ -171,6 +171,14 @@ _EMPTY_TARGET_FILES_EXEMPT_SOURCES = frozenset({
     # A resumed op may re-localize from its preserved exploration context rather
     # than a pinned target list (the checkpoint carries tool/exploration history).
     "fsm_resume",
+    # A goal TYPED at the cockpit is a sentence, not a work item: "make the
+    # attach handshake honest" names an intent, not a path. Demanding
+    # target_files of it is demanding the operator do the localization the
+    # exploration-first Iron Gate exists to force the model to do — the same
+    # reasoning that exempts ``swe_bench_pro`` above and operator ``/attach``
+    # uploads below. Its spoken twin (``voice_human``) is NOT exempt only
+    # because the voice pipeline resolves paths upstream before emitting.
+    "operator_chat",
 })
 
 

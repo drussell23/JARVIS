@@ -83,6 +83,14 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 #: unconditionally regardless of what happens here.
 _AWAKENING_FATAL_ABORT_BOUND_S = 3.0
 
+#: How long a typed goal waits for intake's verdict before the cockpit falls
+#: back to filing it. Bounded because the operator is watching a prompt, and
+#: generous because the alternative to waiting is CLAIMING an acceptance we
+#: have not got. Spent on a `to_thread` worker, never on the event loop.
+_OPERATOR_GOAL_INGEST_TIMEOUT_S = float(
+    os.environ.get("JARVIS_OPERATOR_GOAL_INGEST_TIMEOUT_S", "10") or 10,
+)
+
 
 def _boot_mark(name: str) -> None:
     """Defensive boot-timing mark. NEVER raises into boot path.
@@ -5069,6 +5077,18 @@ class BattleTestHarness:
                             from backend.core.ouroboros.governance.chat_repl_backlog_executor import (  # noqa: E501
                                 set_operator_dispatcher,
                             )
+                            # The chat executor is invoked through
+                            # `asyncio.to_thread` (chat_text_bridge._run), so
+                            # the submitter runs on a WORKER thread with no
+                            # running loop of its own. Capture the loop here,
+                            # where we are on it, or the submitter has no way
+                            # to reach intake at all.
+                            try:
+                                self._operator_goal_loop = (
+                                    asyncio.get_running_loop()
+                                )
+                            except RuntimeError:
+                                self._operator_goal_loop = None
                             set_operator_dispatcher(self._submit_operator_goal)
                         except Exception:  # noqa: BLE001
                             pass
@@ -5195,8 +5215,52 @@ class BattleTestHarness:
         Returns None rather than raising when intake is unreachable: the
         caller then FILES the goal and says so. A queued goal is a
         degradation; a dropped one is a betrayal.
+
+        WHY THIS IS BUILT FROM ``make_envelope`` AND NOT ``IntentEnvelope``
+
+        It used to call the raw dataclass constructor with four of its
+        fifteen required fields, so EVERY invocation raised ``TypeError``
+        before reaching intake — caught one frame down, logged at DEBUG,
+        returned None. The executor read None as "intake declined", filed the
+        goal in backlog.json, and the cockpit honestly reported it queued.
+        The feature was merged, flagged on, armed at boot, covered by fifteen
+        tests, and dead at the first statement of its own body: every test
+        either injected a fake submitter returning a literal ``"op-…"`` or
+        asserted on the SOURCE TEXT of this function
+        (``assert 'source="operator_chat"' in src``). String assertions pass
+        against code that cannot run.
+
+        ``make_envelope`` is the factory every sensor already uses. It mints
+        the ids, stamps the schema version and computes the dedup key, so
+        this path cannot drift from the sensor path by forgetting a field.
+
+        WHY THE VERDICT IS AWAITED
+
+        ``ingest`` returns ``enqueued`` / ``pending_ack`` / ``deduplicated``
+        / ``backpressure`` — a verdict, never an id. Reporting an ``op-``
+        receipt on ``backpressure`` would claim acceptance intake refused,
+        which is the exact dishonesty the receipt vocabulary exists to
+        prevent. We can afford to wait for the real answer because the chat
+        executor is invoked through ``asyncio.to_thread`` — this runs on a
+        WORKER thread, so a bounded ``run_coroutine_threadsafe`` blocks
+        nothing but the turn the operator is already waiting on. (The old
+        ``asyncio.ensure_future`` here would itself have raised
+        ``RuntimeError: no running event loop`` for the same reason — a
+        second fatal bug on the same line, reached only if the first were
+        fixed.)
         """
+        origin_id = ""
         try:
+            from backend.core.ouroboros.governance.operation_id import (
+                generate_operation_id,
+            )
+            from backend.core.ouroboros.governance.intake.intent_envelope import (  # noqa: E501
+                make_envelope,
+            )
+            from backend.core.ouroboros.governance.intake.unified_intake_router import (  # noqa: E501
+                get_default_intake_router,
+            )
+
             gls = getattr(self, "_governed_loop_service", None)
             router = None
             for _attr in ("_intake_router", "intake_router", "_router"):
@@ -5204,6 +5268,17 @@ class BattleTestHarness:
                 if router is not None:
                     break
             if router is None:
+                # The process-wide singleton the router registers on its own
+                # construction — the same handle the voice side uses. Without
+                # this, a deployment that never attached the router to the GLS
+                # files every typed goal while a live router sits one import
+                # away.
+                router = get_default_intake_router()
+            if router is None:
+                logger.warning(
+                    "[OperatorGoal] no intake router reachable — goal will "
+                    "be FILED, not run",
+                )
                 return None
             submit = (
                 getattr(router, "submit_envelope", None)
@@ -5211,14 +5286,29 @@ class BattleTestHarness:
                 or getattr(router, "emit", None)
             )
             if submit is None:
+                logger.warning(
+                    "[OperatorGoal] router %s exposes no submit seam — goal "
+                    "will be FILED, not run", type(router).__name__,
+                )
                 return None
 
-            from backend.core.ouroboros.governance.intake.intent_envelope import (  # noqa: E501
-                IntentEnvelope,
-            )
-            envelope = IntentEnvelope(
+            # causal_id == signal_id: the keystroke IS the origin event,
+            # exactly as VoiceCommandSensor treats the utterance ("vox").
+            origin_id = generate_operation_id("chat")
+            envelope = make_envelope(
                 source="operator_chat",
                 description=str(message),
+                # A sentence names an intent, not a path. `operator_chat` is
+                # exempt from the non-empty demand so the Iron Gate's
+                # exploration-first rule does the localization.
+                target_files=(),
+                # The literal every emitter in `intake_layer_service` uses.
+                # `repo` is a short origin LABEL ("jarvis"/"prime"/"reactor"),
+                # not a path — the harness holds no such attribute to read.
+                repo="jarvis",
+                # The operator typed it. There is no STT channel to be
+                # uncertain about.
+                confidence=1.0,
                 # HIGH, not critical: the operator is waiting, but a typed
                 # goal is not an emergency and must not outrank a genuine
                 # runtime alarm. IMMEDIATE eligibility comes from the SOURCE
@@ -5230,30 +5320,86 @@ class BattleTestHarness:
                     "turn_id": str(getattr(turn, "turn_id", "") or ""),
                     "session_id": str(getattr(turn, "session_id", "") or ""),
                     "origin": "cockpit_chat",
+                    "signature": str(message)[:64],
                 },
+                # The human IS the origin — there is nobody left to ack to.
+                requires_human_ack=False,
+                causal_id=origin_id,
+                signal_id=origin_id,
             )
+
             # Record it BEFORE dispatch resolves: Esc must be able to target
             # an op the moment the operator sees "dispatched", not after
             # intake finishes accepting it.
             try:
-                _oid = str(getattr(envelope, "op_id", "") or
-                           getattr(envelope, "envelope_id", "") or "")
-                if _oid and hasattr(gls, "note_operator_op"):
-                    gls.note_operator_op(_oid)
+                if hasattr(gls, "note_operator_op"):
+                    gls.note_operator_op(origin_id)
             except Exception:  # noqa: BLE001
                 pass
+
             result = submit(envelope)
             if asyncio.iscoroutine(result):
-                # The caller is synchronous (the chat executor). Schedule and
-                # report the id we already hold, rather than blocking the loop
-                # waiting for intake to accept.
-                asyncio.ensure_future(result)
-                return str(getattr(envelope, "op_id", "") or
-                           getattr(envelope, "envelope_id", "") or "") or None
-            return str(result) if result else None
+                loop = getattr(self, "_operator_goal_loop", None)
+                if loop is None:
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = None
+                if loop is None:
+                    # Close the coroutine explicitly — an un-awaited coroutine
+                    # leaks and warns, and the goal must fall back cleanly.
+                    result.close()
+                    logger.warning(
+                        "[OperatorGoal] no loop to dispatch on — goal will be "
+                        "FILED, not run",
+                    )
+                    return None
+                verdict = asyncio.run_coroutine_threadsafe(result, loop).result(
+                    timeout=_OPERATOR_GOAL_INGEST_TIMEOUT_S,
+                )
+            else:
+                verdict = result
+
+            return self._operator_goal_receipt(verdict, origin_id)
         except Exception:  # noqa: BLE001
-            logger.debug("[OperatorGoal] immediate dispatch degraded",
-                         exc_info=True)
+            # WARNING, not DEBUG. This is the operator's primary input path;
+            # when it dies the goal silently degrades to a backlog file, and
+            # a failure nobody can see is how this one survived twelve days.
+            logger.warning(
+                "[OperatorGoal] immediate dispatch failed (op=%s) — goal "
+                "will be FILED, not run", origin_id or "?", exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _operator_goal_receipt(verdict: Any, origin_id: str) -> Optional[str]:
+        """Intake's verdict → the receipt the cockpit renders. NEVER raises.
+
+        ``op-`` means "intake accepted it and a worker has it". Only the two
+        verdicts that are actually that may mint one:
+
+          * ``enqueued``      — on the priority queue
+          * ``pending_ack``   — parked, but intake HOLDS it; it is not lost
+                                and the backlog is not where it lives
+
+        ``deduplicated`` and ``backpressure`` return None, so the executor
+        files the goal and the reply says queued — which is then true.
+        Returning an id for those would report acceptance intake refused.
+        """
+        try:
+            v = str(verdict or "").strip().lower()
+            if v in ("enqueued", "pending_ack"):
+                logger.info(
+                    "[OperatorGoal] op=%s verdict=%s (source=operator_chat)",
+                    origin_id, v,
+                )
+                return origin_id or None
+            logger.warning(
+                "[OperatorGoal] op=%s intake declined (verdict=%s) — goal "
+                "will be FILED, not run", origin_id, v or "<empty>",
+            )
+            return None
+        except Exception:  # noqa: BLE001
             return None
 
     def _qos_note_override(self, kind: str = "sigint") -> None:
