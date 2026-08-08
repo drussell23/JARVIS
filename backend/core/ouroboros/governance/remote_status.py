@@ -30,6 +30,19 @@ _ENABLED = os.environ.get(
 ).lower() in ("true", "1", "yes")
 
 
+def _governance_mode() -> str:
+    """The live governance mode. Falls back to the conservative one rather
+    than to an optimistic guess: over-claiming governance is the direction a
+    reader cannot walk back. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.integration import (
+            configured_governance_mode,
+        )
+        return configured_governance_mode()
+    except Exception:  # noqa: BLE001 — a status endpoint never fails on this
+        return "sandbox"
+
+
 class RemoteStatusAPI:
     """HTTP API for remote monitoring of the Ouroboros pipeline.
 
@@ -96,11 +109,18 @@ class RemoteStatusAPI:
             "uptime_s": round(time.time() - self._boot_time),
         })
 
+
     async def _handle_status(self, request: Any) -> Any:
         from aiohttp import web
         status: Dict[str, Any] = {
             "uptime_s": round(time.time() - self._boot_time),
-            "governance_mode": os.environ.get("JARVIS_GOVERNANCE_MODE", "sandbox"),
+            # READ the mode, never re-derive it. This resolved the env
+            # directly, and `GovernanceConfig.from_env_and_args` honours a CLI
+            # argument BEFORE the env — so a process started with
+            # `--governance-mode governed` was reported here as "sandbox",
+            # with nothing anywhere disagreeing. An externally-visible status
+            # endpoint is the last place that should be guessing.
+            "governance_mode": _governance_mode(),
             "python_version": "",
         }
 

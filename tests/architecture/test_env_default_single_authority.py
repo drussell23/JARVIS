@@ -120,14 +120,6 @@ _WAIVED: Dict[str, str] = {
     # Waived so this pin stays green for NEW regressions. Every entry here is
     # a to-do, and the self-cleaning check above deletes it the day it is
     # fixed. None of these were introduced by the work that added this file.
-    "JARVIS_GOVERNANCE_MODE": (
-        "KNOWN DEFECT. health_cortex defaults to 'governed' while "
-        "remote_status and integration default to 'sandbox'. Unset, the "
-        "health cortex believes one tier while the surface that REPORTS "
-        "governance mode externally announces the other. The most "
-        "safety-relevant instance found; needs an owner to decide which is "
-        "correct before a resolver can be written."
-    ),
     "JARVIS_PRIME_API_KEY": (
         "KNOWN DEFECT. engine.py defaults to 'sk-local-jarvis-key'; "
         "integration.py defaults to 'sk-local-jarvis' in two places. If "
