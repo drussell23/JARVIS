@@ -2,7 +2,35 @@
 
 A sophisticated voice-based authentication system for macOS that provides hands-free screen unlocking through voice commands. Perfect for users who don't have an Apple Watch but want the same convenient unlock experience. Built with a hybrid Objective-C and Python architecture for optimal performance and security.
 
-> **Status**: ✅ Fully integrated with JARVIS startup. Voice Unlock starts automatically when you launch JARVIS and processes commands like "unlock my mac" directly without giving instructions.
+> ## ⏸️ STATUS — read this before the rest of the document
+>
+> **Updated 2026-08-07. Screen UNLOCK is on hold and is not wired in.** Much of
+> what follows describes intent rather than current behaviour; it has not been
+> rewritten, so treat any unlock claim below as unverified unless this block
+> says otherwise.
+>
+> | capability | state |
+> |---|---|
+> | **Locking** the screen by voice | ✅ live-proven end to end (#70386–#70389) |
+> | **Unlocking** the screen by voice | ⏸️ **ON HOLD — deliberately not wired in** |
+> | Grant broker + signed XPC channel | ✅ proven working (25/25 lifecycles, 0 crashes) |
+>
+> The unlock path requires placing a mechanism into
+> `system.login.screensaver.unlock` — the only right on macOS 26 that can host
+> one. Apple labels it **"Do not modify"**, it has `tries: 1`, and it has no
+> password mechanism behind us. Whether a yield still reaches a password prompt
+> there could only be answered by putting a real lock screen into a state nobody
+> has observed on this OS. **That trade was declined.**
+>
+> An earlier attempt at this converted `system.login.screensaver` — a
+> *delegating* rule that hands the entire lock screen to loginwindow — into a
+> mechanism chain, and the machine authenticated into a black screen with a live
+> cursor. That is fixed, structurally and with 106 regression tests, and the
+> authorization database is now untouched.
+>
+> **📖 Full record: [`authplugin/README.md`](authplugin/README.md)** — root
+> cause, the five layers built, exactly what was proven and what was not, how to
+> remove it, and how to resume if that day comes.
 
 ## Features
 
