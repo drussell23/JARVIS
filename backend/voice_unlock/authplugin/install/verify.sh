@@ -158,6 +158,123 @@ else
     _gone "stock rule; the plugin is installed but not wired in"
 fi
 
+# --- Rule shape vs Apple's schema -------------------------------------------
+# The check that would have caught the black screen, and the reason every other
+# check in this section was not enough.
+#
+# Those above ask whether the rule names the right things. This one asks whether
+# the rule is a KIND the right is allowed to be. system.login.screensaver ships
+# as class=rule pointing at use-login-window-ui, which delegates the whole lock
+# screen -- panel, password field, and the session resume that re-attaches
+# WindowServer -- to loginwindow. Converting it to a mechanism chain replaces an
+# authenticator AND a user interface with an authenticator alone. Every check
+# above stays green through that, because the chain it finds is coherent. It just
+# has nothing to draw with.
+#
+# Consulted against the stock schema, never the live rule: after the conversion
+# the live rule IS a mechanism chain, so a live-rule check would confirm its own
+# damage.
+echo
+echo "rule shape"
+_live_rule="$(mktemp -t jarvis-verify-rule)"
+if jarvis_authdb_read "${JARVIS_AUTH_RIGHT}" > "${_live_rule}" 2>/dev/null; then
+    _live_shape="$(jarvis_rule_shape "${_live_rule}" 2>/dev/null || true)"
+    _live_class="$(jarvis_rule_class "${_live_rule}" 2>/dev/null || true)"
+    printf '      live: %s\n' "${_live_shape:-<unreadable>}"
+
+    _shape_rc=0
+    jarvis_right_hosts_mechanisms "${JARVIS_AUTH_RIGHT}" || _shape_rc=$?
+
+    if [ "${_shape_rc}" -eq 0 ]; then
+        _ok "${JARVIS_AUTH_RIGHT} is a mechanism host in Apple's schema"
+    elif [ "${_live_class}" = "${JARVIS_MECHANISM_HOST_CLASS}" ]; then
+        _bad "${JARVIS_AUTH_RIGHT} has been CONVERTED into a mechanism chain"
+        jarvis_stock_rule_summary "${JARVIS_AUTH_RIGHT}" 2>/dev/null | sed 's/^/      stock /' || true
+        printf '      This is the black-screen configuration: authentication succeeds\n'
+        printf '      and nothing paints the lock screen or resumes the session.\n'
+        printf '      Recover now:  sudo %s/uninstall.sh\n' "${_here}"
+    else
+        _ok "${JARVIS_AUTH_RIGHT} is not a mechanism host, and has not been converted"
+    fi
+else
+    _bad "cannot read ${JARVIS_AUTH_RIGHT}"
+fi
+rm -f "${_live_rule}"
+
+# --- Crash history ----------------------------------------------------------
+# The check that was missing when it mattered.
+#
+# A use-after-free in the mechanism segfaulted authorizationhosthelper 27 times
+# across two days while every check above reported "coherent" -- because every
+# check above is STATIC. It compares hashes and plist keys, none of which change
+# when the mechanism dies at runtime. The mechanism runs inside a process we do
+# not own, so its deaths land in DiagnosticReports rather than anywhere this
+# script was looking, and the operator saw only a black lock screen.
+#
+# A crash here is strictly worse than a hash mismatch. A mismatch fails CLOSED
+# to a password prompt, which is the designed-for outcome. A host that dies
+# before calling SetResult means nothing in the chain ever answers -- including
+# the builtin:authenticate that the section above just confirmed was present, and
+# which never gets reached. That is the black screen, and it is invisible to
+# every other check in this file.
+echo
+echo "crash history (authorizationhosthelper)"
+_reports_dir="/Library/Logs/DiagnosticReports"
+if [ ! -r "${_reports_dir}" ]; then
+    _gone "cannot read ${_reports_dir} (needs membership in _analyticsusers)"
+else
+    # Only reports newer than the installed bundle. Older ones belong to a build
+    # that is no longer on disk, and counting them would make a fixed install
+    # look permanently broken -- a check that cannot go green is a check the
+    # operator learns to ignore.
+    _since=0
+    if [ -e "${JARVIS_PLUGIN_PATH}" ]; then
+        _since="$(stat -f %m "${JARVIS_PLUGIN_PATH}" 2>/dev/null || echo 0)"
+    fi
+
+    _crashes=0
+    _newest=""
+    for _rep in "${_reports_dir}"/authorizationhosthelper*.ips; do
+        [ -e "${_rep}" ] || continue
+        _mtime="$(stat -f %m "${_rep}" 2>/dev/null || echo 0)"
+        [ "${_mtime}" -ge "${_since}" ] || continue
+        _crashes=$(( _crashes + 1 ))
+        _newest="${_rep}"
+    done
+
+    if [ "${_crashes}" -eq 0 ]; then
+        _ok "no crashes since this bundle was installed"
+    else
+        _bad "${_crashes} crash(es) since install -- the lock screen's plugin host is DYING"
+
+        # Whether it is OUR bug is decidable from the report, so decide it here
+        # rather than leaving the operator to interpret a stack trace at a
+        # machine that will not unlock.
+        if /usr/bin/grep -q "${JARVIS_PLUGIN_NAME}" "${_newest}" 2>/dev/null; then
+            printf '      the newest report NAMES %s -- this is our defect\n' "${JARVIS_PLUGIN_NAME}"
+        else
+            printf '      the newest report does not name %s\n' "${JARVIS_PLUGIN_NAME}"
+        fi
+
+        # Faulting symbol: the top frame of the TRIGGERED thread.
+        #
+        # Both narrowing steps are load-bearing. Without "triggered":true you
+        # get thread 0's idle runloop frame, which every report has and which
+        # means nothing. Without "frames":[ you get a symbol out of the
+        # preceding threadState, where the crash reporter annotates register
+        # VALUES that happen to land on known addresses -- the first draft of
+        # this reported OBJC_CLASS_$___NSTaggedDate, which was the contents of
+        # x14, not a stack frame at all.
+        _sym="$(tr -d '\n' < "${_newest}" 2>/dev/null \
+                | /usr/bin/sed -e 's/.*"triggered":true//' -e 's/.*"frames":\[//' \
+                | /usr/bin/grep -o '"symbol":"[^"]*"' \
+                | head -1 | cut -d'"' -f4)"
+        [ -n "${_sym}" ] && printf '      faulting frame: %s\n' "${_sym}"
+        printf '      report: %s\n' "${_newest}"
+        printf '      Remove now, diagnose after:  sudo %s/uninstall.sh\n' "${_here}"
+    fi
+fi
+
 # --- Verdict ----------------------------------------------------------------
 echo
 if [ "${_problems}" -gt 0 ]; then

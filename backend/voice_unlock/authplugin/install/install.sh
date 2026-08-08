@@ -465,6 +465,24 @@ stopped before the authorization rule.
     helper   ${HELPER_REQ}
 
 STOPPED
+    # Report the rule pre-flight even though this mode will not act on it.
+    # "Next: sudo $0" is a promise, and on a machine whose right cannot host a
+    # mechanism it is a promise the next run will refuse to keep. Finding that
+    # out here costs nothing; finding it out after a full install is how a
+    # half-configured system gets blamed on the wrong step. Needs no privileges
+    # -- it reads Apple's schema, not the live database.
+    _preflight_rc=0
+    jarvis_right_hosts_mechanisms "${JARVIS_AUTH_RIGHT}" || _preflight_rc=$?
+    if [ "${_preflight_rc}" -eq 0 ]; then
+        echo "  authorization pre-flight: ${JARVIS_AUTH_RIGHT} can host a mechanism."
+    else
+        echo "  authorization pre-flight: ${JARVIS_AUTH_RIGHT} CANNOT host a mechanism."
+        jarvis_stock_rule_summary "${JARVIS_AUTH_RIGHT}" 2>/dev/null | sed 's/^/      /' || true
+        echo "      A full install will refuse this right. See common.sh,"
+        echo "      AUTHORIZATION RULE SHAPE."
+    fi
+    echo
+
     if [ "${DRY_RUN}" -eq 1 ]; then
         # ${DIST} has been reassigned to the staging directory by now, and
         # naming it here would under-report: the build also wrote ${_root}/dist.
@@ -476,11 +494,62 @@ STOPPED
         echo "  Next: sudo $0 --skip-authdb   (installs, and proves the XPC channel works)"
     else
         echo "  The deposit path is installed and self-tested."
-        echo "  Next: sudo $0                 (rewrites the rule; reversible via uninstall.sh)"
+        if [ "${_preflight_rc}" -eq 0 ]; then
+            echo "  Next: sudo $0                 (amends the rule; reversible via uninstall.sh)"
+        else
+            echo "  There is no next step on this right. A full install would refuse."
+        fi
     fi
     echo
     exit 0
 fi
+
+# -----------------------------------------------------------------------------
+# 7a. CAN THIS RIGHT HOST A MECHANISM AT ALL?
+# -----------------------------------------------------------------------------
+# Asked first, before a single byte is written anywhere -- a refusal here leaves
+# no backup file, no pointer, and no trace.
+#
+# The classifier is pinned to the system schema rather than allowed to read
+# JARVIS_SYSTEM_AUTH_TEMPLATE, which exists for the self-tests. A check whose
+# oracle can be swapped by an environment variable is a check with an off switch,
+# and this is the one that stands between a template literal and the lock screen.
+if [ "${JARVIS_SYSTEM_AUTH_TEMPLATE}" != "${JARVIS_SYSTEM_AUTH_TEMPLATE_DEFAULT}" ]; then
+    _jarvis_die "JARVIS_SYSTEM_AUTH_TEMPLATE is set to ${JARVIS_SYSTEM_AUTH_TEMPLATE}; the installer classifies rights against the system schema only"
+fi
+
+_host_rc=0
+jarvis_right_hosts_mechanisms "${JARVIS_AUTH_RIGHT}" || _host_rc=$?
+
+if [ "${_host_rc}" -ne 0 ]; then
+    _jarvis_warn "${JARVIS_AUTH_RIGHT} cannot host an authorization mechanism."
+    _jarvis_warn ""
+    if [ "${_host_rc}" -eq 2 ]; then
+        _jarvis_warn "  stock definition, per ${JARVIS_SYSTEM_AUTH_TEMPLATE_DEFAULT}:"
+        jarvis_stock_rule_summary "${JARVIS_AUTH_RIGHT}" 2>/dev/null | sed 's/^/      /' >&2 || true
+        _jarvis_warn ""
+        _jarvis_warn "  A right of that class DELEGATES. A mechanism chain only AUTHENTICATES."
+        _jarvis_warn "  Converting one into the other removes the delegation, and with it the"
+        _jarvis_warn "  lock screen's own UI and the session resume that follows a successful"
+        _jarvis_warn "  authentication -- so the machine authenticates into a black screen with"
+        _jarvis_warn "  a live cursor and no way back."
+        _jarvis_warn ""
+        _jarvis_warn "  This is not a hypothetical. It is what the previous version of this"
+        _jarvis_warn "  script did, and it is why this check exists. See the AUTHORIZATION RULE"
+        _jarvis_warn "  SHAPE section of common.sh."
+    else
+        _jarvis_warn "  ${JARVIS_AUTH_RIGHT} is not present in ${JARVIS_SYSTEM_AUTH_TEMPLATE_DEFAULT},"
+        _jarvis_warn "  or that file could not be read. The stock shape of this right is therefore"
+        _jarvis_warn "  unknown, and an unknown is not a yes."
+    fi
+    _jarvis_warn ""
+    _jarvis_warn "  Nothing about unlocking has changed. Everything else IS installed and"
+    _jarvis_warn "  self-tested -- \`sudo $0 --skip-authdb\` reaches the same state without"
+    _jarvis_warn "  this refusal."
+    _jarvis_die "refusing to convert ${JARVIS_AUTH_RIGHT}"
+fi
+
+_jarvis_log "${JARVIS_AUTH_RIGHT} is class ${JARVIS_MECHANISM_HOST_CLASS} in the system schema; it can host a mechanism"
 
 _stamp="$(date +%Y%m%d-%H%M%S)"
 BACKUP="${JARVIS_AUTHDB_BACKUP_DIR}/${JARVIS_AUTH_RIGHT}.${_stamp}.install.plist"
@@ -489,47 +558,150 @@ jarvis_authdb_read "${JARVIS_AUTH_RIGHT}" > "${BACKUP}" \
     || _jarvis_die "could not read ${JARVIS_AUTH_RIGHT}; nothing changed"
 plutil -lint "${BACKUP}" >/dev/null 2>&1 \
     || _jarvis_die "backup of ${JARVIS_AUTH_RIGHT} is not a valid plist; refusing to proceed"
-printf '%s' "${BACKUP}" > "${JARVIS_AUTHDB_BACKUP_POINTER}"
-_jarvis_log "backed up ${JARVIS_AUTH_RIGHT} -> ${BACKUP}"
 
+# Advance the pointer ONLY if this capture is a genuine restore point.
+#
+# On a reinstall the live rule already names us, so this capture reproduces the
+# installed state. Overwriting the pointer with it destroys the only artifact
+# that can undo the install -- which is how uninstall.sh came to "restore" the
+# plugin onto a machine whose bundle it had just deleted.
+#
+# The capture is still written and retained for audit; it is only disqualified
+# from being the thing uninstall trusts.
+if grep -q "${JARVIS_PLUGIN_NAME}" "${BACKUP}" 2>/dev/null; then
+    _jarvis_warn "live rule already names ${JARVIS_PLUGIN_NAME} -- reinstall detected"
+    if [ -f "${JARVIS_AUTHDB_BACKUP_POINTER}" ]; then
+        _jarvis_log "keeping existing restore point: $(cat "${JARVIS_AUTHDB_BACKUP_POINTER}")"
+    else
+        # No pristine artifact exists and the live rule is already modified. We
+        # cannot manufacture one, and proceeding would install over a state we
+        # could never reverse. uninstall.sh strips in place without a backup, so
+        # the recovery path is real -- take it before installing again.
+        _jarvis_die "no pristine restore point and the live rule is already modified; run uninstall.sh first"
+    fi
+else
+    printf '%s' "${BACKUP}" > "${JARVIS_AUTHDB_BACKUP_POINTER}"
+    _jarvis_log "backed up ${JARVIS_AUTH_RIGHT} -> ${BACKUP}"
+fi
+
+# -----------------------------------------------------------------------------
+# 7b. DERIVE THE RULE FROM THE ONE THAT IS LIVE
+# -----------------------------------------------------------------------------
+# This used to be a heredoc: a complete rule, written from a literal in this
+# file, that replaced whatever it found. It dropped every key it had no opinion
+# about, invented values for the ones it did, and could not have known what it
+# was destroying because it never read it.
+#
+# It is now an amendment to the incumbent bytes. See common.sh, AUTHORIZATION
+# RULE SHAPE.
 RULE_TMP="$(mktemp -t jarvis-authrule)"
-cat > "${RULE_TMP}" <<RULE
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>class</key>
-    <string>evaluate-mechanisms</string>
-    <key>comment</key>
-    <string>JARVIS voice unlock. Restore with backend/voice_unlock/authplugin/install/uninstall.sh</string>
-    <key>mechanisms</key>
-    <array>
-        <!-- Ours runs first and either grants or yields; it never denies. -->
-        <string>${JARVIS_MECHANISM}</string>
-        <!-- The stock authenticator still runs and still prompts. Touch ID was
-             measured working under a SecurityAgent-evaluated rule before this
-             design was committed to. -->
-        <string>builtin:authenticate,privileged</string>
-    </array>
-    <key>tries</key>
-    <integer>10000</integer>
-    <key>version</key>
-    <integer>1</integer>
-</dict>
-RULE
-echo "</plist>" >> "${RULE_TMP}"
+_cleanup_rule_tmp() { rm -f "${RULE_TMP}"; }
 
-plutil -lint "${RULE_TMP}" >/dev/null 2>&1 || _jarvis_die "generated authorization rule is malformed; nothing changed"
+_compose_rc=0
+jarvis_compose_mechanism_rule "${BACKUP}" "${RULE_TMP}" "${JARVIS_MECHANISM}" || _compose_rc=$?
 
-_jarvis_log "writing ${JARVIS_AUTH_RIGHT}"
-jarvis_authdb_write "${JARVIS_AUTH_RIGHT}" "${RULE_TMP}" \
-    || _jarvis_die "failed to write ${JARVIS_AUTH_RIGHT}; restore: security authorizationdb write ${JARVIS_AUTH_RIGHT} < ${BACKUP}"
-rm -f "${RULE_TMP}"
+case "${_compose_rc}" in
+    0)
+        _jarvis_log "composed: ${JARVIS_MECHANISM} ahead of $(jarvis_rule_mechanisms "${BACKUP}" | grep -c . || true) existing mechanism(s), every other key preserved"
+        ;;
+    2)
+        # The live rule already runs us. There is no shape change to make, so
+        # there is nothing to write and nothing for the evidence gate to guard.
+        _cleanup_rule_tmp
+        _jarvis_log "${JARVIS_AUTH_RIGHT} already names ${JARVIS_MECHANISM}; rule left exactly as it is"
+        _jarvis_log "  (the bundle and broker were reinstalled and self-tested above)"
+        _rule_written=0
+        ;;
+    3)
+        _cleanup_rule_tmp
+        _jarvis_warn "${JARVIS_AUTH_RIGHT} is class '$(jarvis_rule_class "${BACKUP}" 2>/dev/null || echo unreadable)' live, but the system schema calls it ${JARVIS_MECHANISM_HOST_CLASS}."
+        _jarvis_warn "  Something has already changed this right. Amending a rule we do not"
+        _jarvis_warn "  recognise would be authoring one, which is the defect this path exists"
+        _jarvis_warn "  to prevent. The live rule is backed up at:"
+        _jarvis_warn "    ${BACKUP}"
+        _jarvis_die "refusing to compose over an unrecognised rule; nothing changed"
+        ;;
+    *)
+        _cleanup_rule_tmp
+        _jarvis_die "could not derive a rule from ${BACKUP}; nothing changed"
+        ;;
+esac
+
+if [ "${_compose_rc}" -eq 0 ]; then
+    plutil -lint "${RULE_TMP}" >/dev/null 2>&1 \
+        || { _cleanup_rule_tmp; _jarvis_die "derived authorization rule is malformed; nothing changed"; }
+
+    # -------------------------------------------------------------------------
+    # 7c. HAS THIS EXACT SHAPE EVER BEEN MEASURED HERE?
+    # -------------------------------------------------------------------------
+    # The last gate, and the one that would have stopped the original defect on
+    # its own. Every other check in this script asks whether the configuration is
+    # COHERENT. This one asks whether it has ever been RUN.
+    #
+    # There is no override flag, on purpose. A flag would be the shortest path
+    # back to spending one configuration's measurement on another.
+    _shape="$(jarvis_rule_shape "${RULE_TMP}")" \
+        || { _cleanup_rule_tmp; _jarvis_die "could not compute the shape of the derived rule; nothing changed"; }
+
+    _evidence=""
+    if _evidence="$(jarvis_probe_evidence_for_shape "${_shape}")"; then
+        _jarvis_log "shape measured on this machine:"
+        _jarvis_log "  ${_evidence}"
+    else
+        _jarvis_warn "this rule shape has never been measured on this machine:"
+        _jarvis_warn "    ${_shape}"
+        _jarvis_warn ""
+        _jarvis_warn "  ${JARVIS_PROBE_RESULTS_LOG} holds no run that applied this exact shape,"
+        _jarvis_warn "  locked the screen, and confirmed the password still worked."
+        _jarvis_warn ""
+        _jarvis_warn "  A measurement of a DIFFERENT shape does not transfer. That substitution"
+        _jarvis_warn "  is what put this machine behind a black lock screen: a rule of class"
+        _jarvis_warn "  'user' was probed, and the result was spent authorising a mechanism"
+        _jarvis_warn "  chain nobody had ever run."
+        _jarvis_warn ""
+        _jarvis_warn "  Measure it, inside a window that reverts itself:"
+        _jarvis_warn "    sudo ${_here}/probe_screensaver_rule.sh"
+        _cleanup_rule_tmp
+        _jarvis_die "refusing to write an unmeasured rule shape; nothing changed"
+    fi
+
+    _jarvis_log "writing ${JARVIS_AUTH_RIGHT}"
+    jarvis_authdb_write "${JARVIS_AUTH_RIGHT}" "${RULE_TMP}" \
+        || { _cleanup_rule_tmp; _jarvis_die "failed to write ${JARVIS_AUTH_RIGHT}; restore: security authorizationdb write ${JARVIS_AUTH_RIGHT} < ${BACKUP}"; }
+    _cleanup_rule_tmp
+    _rule_written=1
+
+    # Read back what actually landed. A write that returns 0 is a claim about
+    # `security`; the shape of the live rule is a claim about the lock screen.
+    _live_tmp="$(mktemp -t jarvis-authlive)"
+    if jarvis_authdb_read "${JARVIS_AUTH_RIGHT}" > "${_live_tmp}" 2>/dev/null \
+       && [ "$(jarvis_rule_shape "${_live_tmp}" 2>/dev/null || true)" = "${_shape}" ]; then
+        _jarvis_log "verified: the live rule is the shape that was measured"
+        rm -f "${_live_tmp}"
+    else
+        rm -f "${_live_tmp}"
+        _jarvis_warn "the live rule does not read back as the shape that was written"
+        _jarvis_warn "  restoring the rule you started with:"
+        if jarvis_restore_auth_rule_from_pointer; then
+            _jarvis_warn "  restored -- your lock screen is back to how it was"
+        else
+            _jarvis_warn "  COULD NOT restore automatically. Run: sudo ${_here}/uninstall.sh"
+        fi
+        _jarvis_die "post-write verification failed"
+    fi
+fi
+
+if [ "${_rule_written:-0}" -eq 1 ]; then
+    _rule_state="amended -- ${JARVIS_MECHANISM} now runs first in the existing chain"
+else
+    _rule_state="unchanged -- it already named ${JARVIS_MECHANISM}"
+fi
 
 cat <<DONE
 
 installed.
 
+  rule     ${JARVIS_AUTH_RIGHT}: ${_rule_state}
   plugin   ${JARVIS_PLUGIN_PATH}
   broker   ${JARVIS_BROKER_BIN}  (${JARVIS_BROKER_LABEL})
   helper   ${HELPER_INSTALL_PATH}

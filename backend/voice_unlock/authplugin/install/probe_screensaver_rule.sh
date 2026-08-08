@@ -1,20 +1,30 @@
 #!/bin/bash
 # JARVIS -- Ephemeral Probe for the system.login.screensaver authorization rule.
 #
-# WHAT THIS MEASURES
-# ------------------
+# WHAT THIS MEASURES -- AND, JUST AS IMPORTANTLY, WHAT IT DOES NOT
+# ----------------------------------------------------------------
 # Your lock screen currently uses:
 #
 #     class = rule
 #     rule  = ( use-login-window-ui )
 #
-# which means loginwindow owns authentication and there is no mechanism chain an
-# Authorization Plugin could join. Switching the right to a SecurityAgent-
-# evaluated rule is the only way to host a plugin -- but it may sever the
-# loginwindow-native paths for Touch ID and Apple Watch unlock.
+# which means loginwindow owns authentication. This script swaps in a different
+# rule for a bounded window so you can test Touch ID, Watch unlock and your
+# password under it yourself, then puts it back.
 #
-# Nobody should guess at that. This script switches the rule for a bounded
-# window so you can test Touch ID and Watch unlock yourself, then puts it back.
+# IT MEASURES THE SHAPE IT APPLIES, AND NOTHING ELSE. That sentence is here
+# because an earlier version of this file did not respect it. It probed
+# authenticate-session-owner-or-admin -- class = user, a SecurityAgent-evaluated
+# rule with no mechanisms array at all -- reported that Touch ID and the password
+# survived, and closed by advising that the plugin was therefore viable "against
+# evaluate-mechanisms". Those are two different configurations. The one that was
+# measured worked; the one that was installed black-screened the machine, because
+# converting a delegating rule into a mechanism chain removes the delegation, and
+# loginwindow is what draws the lock screen and resumes the session.
+#
+# So this script now records the EXACT shape it applied, as a shape identity that
+# install.sh matches on. A measurement of one shape cannot be spent on another --
+# not by a comment, not by an argument about equivalence, and not by a flag.
 #
 # WHY IT CANNOT LEAVE YOUR MACHINE MUTATED
 # ----------------------------------------
@@ -174,10 +184,28 @@ if ! security authorizationdb write "${JARVIS_AUTH_RIGHT}" "${PROBE_RULE_NAME}";
     _jarvis_die "mutation failed; trap and dead-man switch will restore the stock rule"
 fi
 
-_live_now="$(jarvis_authdb_read "${JARVIS_AUTH_RIGHT}" | tr -d '\n')"
-if printf '%s' "${_live_now}" | grep -q "${STOCK_MARKER}"; then
-    _jarvis_die "rule still reads as stock after the write; probe is not measuring anything"
+# Capture the shape that is actually live, from the database rather than from
+# what we asked for. `security authorizationdb write <right> <rulename>` is a
+# request; the rule the engine will evaluate is the answer, and the answer is
+# what the measurement has to be labelled with.
+LIVE_RULE="$(mktemp -t jarvis-probe-live)"
+jarvis_authdb_read "${JARVIS_AUTH_RIGHT}" > "${LIVE_RULE}" 2>/dev/null \
+    || _jarvis_die "could not read back ${JARVIS_AUTH_RIGHT} after the write; trap and dead-man switch will restore the stock rule"
+
+PROBE_SHAPE="$(jarvis_rule_shape "${LIVE_RULE}" 2>/dev/null || true)"
+STOCK_SHAPE="$(jarvis_rule_shape "${BACKUP}" 2>/dev/null || true)"
+rm -f "${LIVE_RULE}"
+
+[ -n "${PROBE_SHAPE}" ] || _jarvis_die "could not compute the shape of the live rule; nothing is being measured"
+
+# Structural rather than a marker match. "Did the rule change" is answered by
+# comparing the live shape to the shape we backed up -- which stays true on any
+# macOS, for any right, whatever the stock rule happens to be called.
+if [ "${PROBE_SHAPE}" = "${STOCK_SHAPE}" ]; then
+    _jarvis_die "the live rule is unchanged after the write; probe is not measuring anything"
 fi
+
+_jarvis_log "measuring shape: ${PROBE_SHAPE}"
 
 # =============================================================================
 # 5. THE MEASUREMENT WINDOW
@@ -227,8 +255,16 @@ fi
 _revert_now
 
 _jarvis_log "final state of ${JARVIS_AUTH_RIGHT}:"
-if jarvis_authdb_read "${JARVIS_AUTH_RIGHT}" | grep -q "${STOCK_MARKER}"; then
-    _jarvis_log "  STOCK (${STOCK_MARKER}) -- machine is back to how it started"
+# Compared by shape against the file we backed up, not by a marker string. The
+# question is "is the machine back to how it started", and the only thing that
+# answers it exactly is the state it started in.
+_after_revert="$(mktemp -t jarvis-probe-after)"
+jarvis_authdb_read "${JARVIS_AUTH_RIGHT}" > "${_after_revert}" 2>/dev/null || true
+_after_shape="$(jarvis_rule_shape "${_after_revert}" 2>/dev/null || true)"
+rm -f "${_after_revert}"
+
+if [ -n "${_after_shape}" ] && [ "${_after_shape}" = "${STOCK_SHAPE}" ]; then
+    _jarvis_log "  back to the shape it started with: ${STOCK_SHAPE}"
     rm -f "${JARVIS_AUTHDB_BACKUP_POINTER}"
 else
     _jarvis_warn "  NOT STOCK. Restore by hand:"
@@ -240,7 +276,13 @@ fi
 # 7. CAPTURE THE MEASUREMENT  (a result that lives only in a terminal is not a
 #    result -- the first run reverted cleanly and recorded nothing)
 # =============================================================================
-PROBE_RESULTS="${JARVIS_STATE_DIR}/probe-results.log"
+# The path is defined in common.sh, because install.sh reads this file to decide
+# whether a shape may be written. A producer and a consumer holding two literals
+# for one path is a gate that silently never fires.
+PROBE_RESULTS="${JARVIS_PROBE_RESULTS_LOG}"
+
+# Every answer defaults to the honest one for a run that did not ask.
+_locked="not-tested"; _touchid="not-tested"; _watch="not-tested"; _password="not-tested"
 
 if [ -t 0 ]; then
     printf '\n[jarvis-authplugin] recording the measurement (Enter to skip any answer)\n' >&2
@@ -265,32 +307,52 @@ if [ -t 0 ]; then
     _touchid="$(_ask 'Did TOUCH ID work?')"
     _watch="$(_ask 'Did APPLE WATCH auto-unlock work?')"
     _password="$(_ask 'Did your PASSWORD unlock?')"
-
-    {
-        printf '%s rule=%s window=%ss locked=%s touchid=%s watch=%s password=%s\n' \
-            "$(date -u +%FT%TZ)" "${PROBE_RULE_NAME}" "${PROBE_WINDOW_S}" \
-            "${_locked}" "${_touchid}" "${_watch}" "${_password}"
-    } >> "${PROBE_RESULTS}"
-
-    _jarvis_log "recorded to ${PROBE_RESULTS}"
-
-    if [ "${_password}" = "no" ]; then
-        _jarvis_warn "PASSWORD FAILED under SecurityAgent. Do not build the plugin."
-    fi
 else
-    _jarvis_log "non-interactive; skipping capture. Record answers in ${PROBE_RESULTS}"
+    _jarvis_log "non-interactive; no answers collected"
 fi
 
-cat <<'NEXT'
+# Written on BOTH paths. A run that asked nothing still proves the shape was
+# applied on this machine and at what time, and a log that only contains
+# successful interactive runs is a log that cannot show you a gap.
+#
+# shape= is the field install.sh matches on. rule= is retained as the human
+# label, and is deliberately NOT what the gate reads: it is a request, whereas
+# shape is what the authorization engine was actually left holding.
+{
+    printf '%s rule=%s shape=%s window=%ss locked=%s touchid=%s watch=%s password=%s\n' \
+        "$(date -u +%FT%TZ)" "${PROBE_RULE_NAME}" "${PROBE_SHAPE}" "${PROBE_WINDOW_S}" \
+        "${_locked}" "${_touchid}" "${_watch}" "${_password}"
+} >> "${PROBE_RESULTS}"
 
-Report back with the four yes/no answers. They decide the architecture:
+_jarvis_log "recorded to ${PROBE_RESULTS}"
 
-  Touch ID + Watch SURVIVE  -> the plugin is viable; build it against
-                               evaluate-mechanisms with no biometric cost.
-  Touch ID or Watch BREAK   -> hosting a plugin costs you native biometrics.
-                               That is a real price, and it is your call
-                               whether voice unlock is worth paying it.
-  PASSWORD fails            -> stop entirely; the SecurityAgent handoff is not
-                               safe on this machine and no plugin gets built.
+if [ "${_password}" = "no" ]; then
+    _jarvis_warn "PASSWORD FAILED under this shape. It must never be installed."
+fi
+
+cat <<NEXT
+
+WHAT THIS RUN DOES AND DOES NOT LICENSE
+
+  measured shape:  ${PROBE_SHAPE}
+
+  Those answers describe THAT shape. They describe no other. install.sh matches
+  on the shape string above, so this measurement can only ever authorise the
+  configuration it was taken under -- which is the point, and is the guarantee
+  that was missing when a class=user probe was used to justify installing a
+  mechanism chain.
+
+  Touch ID + Watch SURVIVE  -> this shape is usable, at no biometric cost.
+  Touch ID or Watch BREAK   -> this shape costs you native biometrics. A real
+                               price, and your call whether it is worth paying.
+  PASSWORD fails            -> this shape must never be installed. install.sh
+                               will not accept this record as permission.
+
+  Note that a usable shape is still not an installable one: install.sh also
+  requires that the right can host a mechanism in Apple's schema at all. A right
+  whose stock class delegates -- system.login.screensaver is class=rule pointing
+  at use-login-window-ui -- is refused no matter how well it probes, because
+  probing measures authentication and what conversion destroys is the lock
+  screen's UI and its session resume.
 
 NEXT

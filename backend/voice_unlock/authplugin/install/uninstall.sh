@@ -71,25 +71,27 @@ _remove_mechanism_in_place() {
     scratch="$(mktemp -t jarvis-authdb)" || { _note_failure "mktemp failed"; return; }
     printf '%s' "${current}" > "${scratch}"
 
-    # Delete every mechanisms[] entry whose value mentions our plugin. Uses
-    # PlistBuddy (present in the base OS and in Recovery) rather than python,
-    # which Recovery does not ship.
-    local idx entry
-    idx=0
-    while entry="$(/usr/libexec/PlistBuddy -c "Print :mechanisms:${idx}" "${scratch}" 2>/dev/null)"; do
-        case "${entry}" in
-            *"${JARVIS_PLUGIN_NAME}"*)
-                /usr/libexec/PlistBuddy -c "Delete :mechanisms:${idx}" "${scratch}" >/dev/null 2>&1 || true
-                # Do not advance: entries shift down after a delete.
-                ;;
-            *)
-                idx=$((idx + 1))
-                ;;
-        esac
-    done
+    # Delete every mechanisms[] entry whose value mentions our plugin.
+    #
+    # The walk itself lives in common.sh alongside the composition that creates
+    # these entries. They are inverses of one another, and an inverse pair that
+    # drifts apart is how a removal leaves behind exactly the entry it was run to
+    # remove -- on a machine whose screen will not unlock.
+    local removed
+    removed="$(jarvis_rule_strip_mechanism "${scratch}" "${JARVIS_PLUGIN_NAME}")"
+
+    if [ "${removed}" -eq 0 ]; then
+        # The rule mentions us somewhere plutil found nothing to delete: a
+        # different key, or a shape this function does not understand. Writing it
+        # back unchanged would be a no-op reported as a repair.
+        _note_failure "${JARVIS_AUTH_RIGHT} names ${JARVIS_PLUGIN_NAME} but no mechanism entry matched; leaving it alone"
+        _jarvis_warn "  inspect: security authorizationdb read ${JARVIS_AUTH_RIGHT}"
+        rm -f "${scratch}"
+        return
+    fi
 
     if jarvis_authdb_write "${JARVIS_AUTH_RIGHT}" "${scratch}"; then
-        _jarvis_log "stripped ${JARVIS_PLUGIN_NAME} from ${JARVIS_AUTH_RIGHT}"
+        _jarvis_log "stripped ${removed} ${JARVIS_PLUGIN_NAME} mechanism(s) from ${JARVIS_AUTH_RIGHT}"
     else
         _note_failure "could not write stripped rule for ${JARVIS_AUTH_RIGHT}"
     fi
