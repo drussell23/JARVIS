@@ -158,6 +158,20 @@ def mirror_stream_enabled() -> bool:
     ).strip().lower() not in ("0", "false", "no", "off")
 
 
+def local_echo_enabled() -> bool:
+    """Default ON. Whether a foreground run echoes the stream to its OWN
+    terminal when no cockpit is attached over the bridge.
+
+    Off restores the previous behaviour exactly: the generation is visible
+    only to a remote `ov attach` client, and invisible in the in-process
+    foreground run that is how `ov` actually boots the harness. That was the
+    state this exists to end. NEVER raises.
+    """
+    return os.environ.get(
+        "JARVIS_STREAM_LOCAL_ECHO_ENABLED", "1",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
 def find_commit_boundary(text: str, start: int = 0) -> int:
     """Return the index up to which ``text`` can be safely committed to
     scrollback: just past the LAST complete blank line that sits OUTSIDE
@@ -761,9 +775,6 @@ class StreamRenderer:
                 self._mirrored_offset = end
                 return
 
-            from backend.core.ouroboros.battle_test.cockpit_attach import (
-                publish_markup_global,
-            )
             from rich.markup import escape
 
             lines = chunk.splitlines()
@@ -784,7 +795,7 @@ class StreamRenderer:
                     self._mirror_opened = True
                 else:
                     lead = f"  {body}"
-                if publish_markup_global(lead):
+                if self._emit_deck_line(lead):
                     sent_any = True
             self._mirrored_offset = end
         except Exception:  # noqa: BLE001 — a mirror must not break a stream
@@ -792,6 +803,82 @@ class StreamRenderer:
                 "[StreamRender] op=%s mirror degraded", self._op_id,
                 exc_info=True,
             )
+
+    def _emit_deck_line(self, lead: str) -> bool:
+        """One composed deck line to whoever can actually see it.
+
+        WHY THE STREAM WAS STILL INVISIBLE
+        ----------------------------------
+        `_mirror_completed_lines` correctly concluded that the Rich `Live`
+        widget "is the thing that does not fit" and routed the generation
+        into the cockpit's line-oriented deck instead. It then sent it with
+        `publish_markup_global`, which returns False unless
+        `attached_cockpits() > 0` — a client connected over the BRIDGE.
+
+        `ov` boots the harness IN-PROCESS (`ov.py` → `battle_main`), with a
+        SerpentREPL holding the operator's terminal. There is no bridge
+        client in that shape, so every line was composed, escaped, offered,
+        and dropped. The mirror published to everyone except the operator who
+        was sitting in front of it.
+
+        `cockpit_attach.operator_present()` already draws exactly this
+        distinction, and already documents it: "a cockpit is ATTACHED over
+        the bridge, or this process owns a real terminal (a foreground run
+        with its own REPL, where the operator is looking straight at it)."
+        It was written because Karen kept narrating to an empty room. This is
+        the same defect in mirror image — text falling silent for the LOCAL
+        operator for the same reason speech did for the remote one — and the
+        concept did not need inventing, only consulting.
+
+        WHY THIS IS SAFE WHERE `Live` WAS NOT
+        --------------------------------------
+        `print_fit` writes through the Rich console, which under
+        prompt_toolkit's `patch_stdout` is coordinated with the prompt: the
+        line lands in scrollback ABOVE the input and the prompt redraws
+        below it. That is what `serpent_flow._emit_fit` has always done while
+        the REPL is active. `Live` bypasses that with direct cursor
+        manipulation, which is why it had to be skipped and why re-enabling
+        it would still be wrong.
+
+        Bridge first, local second, and never both for one line: a foreground
+        run that ALSO has an attached client would otherwise print each line
+        twice on the same terminal.
+        """
+        try:
+            from backend.core.ouroboros.battle_test.cockpit_attach import (
+                publish_markup_global,
+            )
+            if publish_markup_global(lead):
+                return True
+        except Exception:  # noqa: BLE001 — bridge unavailable; try local
+            logger.debug("[StreamRender] bridge publish degraded",
+                         exc_info=True)
+
+        if not local_echo_enabled():
+            return False
+        try:
+            from backend.core.ouroboros.battle_test.presentation_restraint import (
+                print_fit,
+                real_stdout_isatty,
+            )
+            # `real_stdout_isatty` reads `sys.__stdout__`, not `sys.stdout`.
+            # Under `patch_stdout(raw=True)` the proxy reports False, and
+            # testing the proxy is the load-bearing bug that made
+            # `should_render()` blind in the presentation-restraint arc. The
+            # same trap sits here: the ONE mode this fix exists for is the
+            # one where the naive check is wrong.
+            if not real_stdout_isatty():
+                return False
+            console = self._console
+            if console is None:
+                from rich.console import Console
+                console = Console()
+                self._console = console
+            print_fit(console, lead)
+            return True
+        except Exception:  # noqa: BLE001 — a mirror must not break a stream
+            logger.debug("[StreamRender] local echo degraded", exc_info=True)
+            return False
 
     def _render_buffer_safe(self) -> None:
         """Swap the Markdown renderable on Live. Rich handles the
