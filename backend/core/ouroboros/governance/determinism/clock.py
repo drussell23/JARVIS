@@ -48,6 +48,10 @@ Key invariants (pinned by tests):
 """
 from __future__ import annotations
 
+from backend.core.ouroboros.governance.determinism.session_identity import (
+    resolve_session_id,
+)
+
 import asyncio
 import logging
 import os
@@ -449,9 +453,7 @@ def clock_for_session(
     """
     safe_op = (str(op_id).strip() if op_id else "") or "unknown"
     if session_id is None or not session_id.strip():
-        session_id = os.environ.get(
-            "OUROBOROS_BATTLE_SESSION_ID", "",
-        ).strip() or "default"
+        session_id = resolve_session_id()
 
     resolved_mode = _resolve_mode(mode)
 
@@ -501,9 +503,7 @@ def reset_for_op(
     fresh. NEVER raises."""
     safe_op = (str(op_id).strip() if op_id else "") or "unknown"
     if session_id is None or not session_id.strip():
-        session_id = os.environ.get(
-            "OUROBOROS_BATTLE_SESSION_ID", "",
-        ).strip() or "default"
+        session_id = resolve_session_id()
     with _clock_cache_lock:
         _clock_cache.pop((session_id, safe_op), None)
 
