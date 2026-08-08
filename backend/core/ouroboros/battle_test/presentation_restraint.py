@@ -1184,6 +1184,7 @@ def format_idle_breadcrumb(
     cost_budget: float = 0.0,
     posture: str = "",
     op_id: str = "",
+    detail: str = "",
 ) -> str:
     """One-line breadcrumb for the IDLE phase — replaces the silent
     empty status line that today leaves operators wondering whether
@@ -1197,7 +1198,21 @@ def format_idle_breadcrumb(
     Format: ``IDLE · main · $0.04/$0.50 · EXPLORE`` — only includes
     fields the caller supplies. NEVER raises.
     """
+    # "IDLE" plus the evidence for it, when the caller has any.
+    #
+    # This used to be the bare literal, and the literal was the bug: the
+    # sampler upstream had already worked out that the organism was idle with
+    # 17 sensors armed, or that 4 signals were queued and no op had claimed
+    # them — and every word of that was discarded here, because this function
+    # re-asserted the state instead of rendering the one it was handed.
+    #
+    # An operator watching a real boot therefore read `IDLE` for two minutes
+    # while four genuine test failures sat in the queue, and could not tell it
+    # apart from an organism with nothing to do. The detail IS the difference
+    # between those two, which makes dropping it the whole defect.
     parts: List[str] = ["IDLE"]
+    if isinstance(detail, str) and detail:
+        parts[0] = f"IDLE · {detail}"
     if isinstance(branch, str) and branch:
         parts.append(branch)
     if cost_budget > 0.0:
