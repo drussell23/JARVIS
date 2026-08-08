@@ -4121,6 +4121,56 @@ class SerpentFlow:
         """Update whether the session requires a pre-run plan review."""
         self._plan_review_mode = enabled
 
+    def note_intake_signal(self, payload: Dict[str, Any]) -> None:
+        """Render ONE newly-enqueued signal — what was found, before an op.
+
+        CC-shaped, because the whole point of that shape is already stated in
+        this file: *the ARGUMENT is the point*. ``⏺ TestFailure()`` says a
+        sensor fired; ``⏺ TestFailure(test_topological_sort_tiebreak.py)``
+        says which failure, which is the only version worth reading at 3am.
+
+        Dimmed, and deliberately: a queued signal is subordinate to a running
+        op. It renders through the same mirror every ⏺/⎿ line uses, so an
+        attached cockpit and the local console cannot disagree about it.
+
+        Zero-authority display. Nothing here dispatches, prioritises, or
+        touches the queue — it is told what happened and draws it.
+        NEVER raises.
+        """
+        try:
+            source = str(payload.get("source") or "").strip()
+            targets = tuple(payload.get("target_files") or ())
+
+            # Humanised from the source itself rather than a lookup table: a
+            # sensor added tomorrow renders correctly without anyone editing a
+            # map, and a map that fell behind would silently show a raw
+            # snake_case token to an operator.
+            verb = "".join(p[:1].upper() + p[1:] for p in source.split("_") if p)
+            verb = verb or "Signal"
+
+            arg = ""
+            if targets:
+                first = str(targets[0])
+                arg = first.rsplit("/", 1)[-1] or first
+                if len(targets) > 1:
+                    arg = f"{arg} +{len(targets) - 1}"
+            if not arg:
+                # No target is a real state (a goal, a scheduled sweep), not a
+                # reason to render an empty pair of brackets.
+                desc = str(payload.get("description") or "").strip()
+                arg = desc[:48] + "…" if len(desc) > 48 else desc
+
+            dim = _SEM["dim"]
+            head = f"{self._action_glyph()} {verb}"
+            body = f"([{_SEM['file']}]{arg}[/{_SEM['file']}])" if arg else ""
+            line = f"[{dim}]{head}[/{dim}]{body}  [{dim}]queued[/{dim}]"
+
+            self._mirror_markup(line)
+            if self._borderless():
+                self._emit_fit(line)
+        except Exception:  # noqa: BLE001 — a deck line must never break intake
+            pass
+
     def update_sensors(self, count: int) -> None:
         """Update active sensor count (tracked for status bar).
 
