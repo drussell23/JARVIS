@@ -5339,12 +5339,11 @@ class BattleTestHarness:
 
             result = submit(envelope)
             if asyncio.iscoroutine(result):
-                loop = getattr(self, "_operator_goal_loop", None)
-                if loop is None:
-                    try:
-                        loop = asyncio.get_running_loop()
-                    except RuntimeError:
-                        loop = None
+                try:
+                    running = asyncio.get_running_loop()
+                except RuntimeError:
+                    running = None          # the normal case: a to_thread worker
+                loop = getattr(self, "_operator_goal_loop", None) or running
                 if loop is None:
                     # Close the coroutine explicitly — an un-awaited coroutine
                     # leaks and warns, and the goal must fall back cleanly.
@@ -5354,13 +5353,35 @@ class BattleTestHarness:
                         "FILED, not run",
                     )
                     return None
+                if running is not None and running is loop:
+                    # ON the loop the coroutine must run on. Blocking here
+                    # would wedge the whole event loop for the timeout and
+                    # then fail anyway — the caller is the only thing that
+                    # could drive the coroutine it is waiting for.
+                    #
+                    # Production never lands here (`chat_text_bridge._run`
+                    # dispatches this executor through `asyncio.to_thread`),
+                    # but "never" was also true of the envelope contract this
+                    # function got wrong, so it is enforced rather than
+                    # assumed. File the goal instead of deadlocking, and say
+                    # so loudly — a caller on the wrong thread is a wiring
+                    # bug, not a runtime condition to absorb silently.
+                    result.close()
+                    logger.warning(
+                        "[OperatorGoal] submitter called ON the event loop "
+                        "(expected a to_thread worker) — cannot await intake "
+                        "without deadlocking it; goal will be FILED, not run",
+                    )
+                    return None
                 verdict = asyncio.run_coroutine_threadsafe(result, loop).result(
                     timeout=_OPERATOR_GOAL_INGEST_TIMEOUT_S,
                 )
             else:
                 verdict = result
 
-            return self._operator_goal_receipt(verdict, origin_id)
+            return self._operator_goal_receipt(
+                verdict, origin_id, router=router, envelope=envelope,
+            )
         except Exception:  # noqa: BLE001
             # WARNING, not DEBUG. This is the operator's primary input path;
             # when it dies the goal silently degrades to a backlog file, and
@@ -5372,7 +5393,13 @@ class BattleTestHarness:
             return None
 
     @staticmethod
-    def _operator_goal_receipt(verdict: Any, origin_id: str) -> Optional[str]:
+    def _operator_goal_receipt(
+        verdict: Any,
+        origin_id: str,
+        *,
+        router: Any = None,
+        envelope: Any = None,
+    ) -> Optional[str]:
         """Intake's verdict → the receipt the cockpit renders. NEVER raises.
 
         ``op-`` means "intake accepted it and a worker has it". Only the two
@@ -5382,9 +5409,19 @@ class BattleTestHarness:
           * ``pending_ack``   — parked, but intake HOLDS it; it is not lost
                                 and the backlog is not where it lives
 
-        ``deduplicated`` and ``backpressure`` return None, so the executor
-        files the goal and the reply says queued — which is then true.
-        Returning an id for those would report acceptance intake refused.
+        ``deduplicated`` is DISTINCT from a refusal and must not be reported
+        as one. Collapsing it into ``None`` — the same value returned when
+        intake is unreachable — is what made the cockpit say "queued … the
+        Backlog sensor will pick it up" about a goal that was dropped because
+        the operator had already asked for it. True, and unactionable.
+
+        So the collision travels as a receipt of its own, built from the facts
+        the router ALREADY holds (`describe_dedup_collision` — no second
+        tracker). This layer only carries them; `chat_response_style` decides
+        how they read.
+
+        ``backpressure`` and anything else still return None: intake refused
+        the goal outright, the executor files it, and "queued" is then true.
         """
         try:
             v = str(verdict or "").strip().lower()
@@ -5394,11 +5431,62 @@ class BattleTestHarness:
                     origin_id, v,
                 )
                 return origin_id or None
+            if v == "deduplicated":
+                receipt = BattleTestHarness._dedup_receipt(router, envelope)
+                if receipt:
+                    logger.info(
+                        "[OperatorGoal] op=%s deduplicated (%s) — the earlier "
+                        "goal stands; filing as a safety net",
+                        origin_id, receipt,
+                    )
+                    return receipt
+                # The collision is real but its detail is unavailable (an
+                # older router with no accessor). Fall through to the filing
+                # path rather than invent an age we did not measure.
+                logger.info(
+                    "[OperatorGoal] op=%s deduplicated (no collision detail) "
+                    "— goal will be FILED", origin_id,
+                )
+                return None
             logger.warning(
                 "[OperatorGoal] op=%s intake declined (verdict=%s) — goal "
                 "will be FILED, not run", origin_id, v or "<empty>",
             )
             return None
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _dedup_receipt(router: Any, envelope: Any) -> Optional[str]:
+        """Encode the router's own account of the collision. NEVER raises.
+
+        Returns None — not a fabricated one — when the router cannot explain
+        itself (no accessor, or the entry expired between the verdict and this
+        read). An unexplained collision falls back to the filing path, which
+        is honest; a receipt carrying an age nobody measured would be the
+        fabrication class this arc exists to kill.
+        """
+        try:
+            if router is None or envelope is None:
+                return None
+            describe = getattr(router, "describe_dedup_collision", None)
+            if not callable(describe):
+                return None
+            collision = describe(envelope)
+            if collision is None:
+                return None
+            from backend.core.ouroboros.governance.chat_response_style import (
+                make_dedup_receipt,
+            )
+            return make_dedup_receipt(
+                collision.short_hash,
+                collision.age_s,
+                collision.window_s,
+                # The submitter cannot know whether the backlog write later
+                # succeeds. The executor re-stamps this via `with_filed`; it
+                # starts false so an unfiled goal is never claimed as filed.
+                filed=False,
+            )
         except Exception:  # noqa: BLE001
             return None
 

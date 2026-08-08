@@ -1025,6 +1025,41 @@ def _compute_priority(
     return priority, alignment
 
 
+#: Size at which `_prune_dedup` sweeps expired entries. Not a cap — the dict
+#: may legitimately exceed it between sweeps; it is the point where an O(n)
+#: pass is cheap relative to the leak it prevents.
+_DEDUP_PRUNE_THRESHOLD: int = 512
+
+
+@dataclass(frozen=True)
+class DedupCollision:
+    """Why an envelope deduplicated, in facts the registry already holds.
+
+    Deliberately does NOT claim the colliding op is still running. The
+    registry stores one thing — the monotonic time a dedup_key was last
+    accepted — so an op that has since COMPLETED or FAILED still collides
+    inside the window. "Already in flight" would be a state nothing here
+    measures; `age_s` and `retry_after_s` are measured, and a renderer can
+    say something true from them.
+    """
+
+    dedup_key: str
+    age_s: float
+    window_s: float
+
+    @property
+    def short_hash(self) -> str:
+        """The distinguishing head of the sha256. The key is already a
+        digest, so its PREFIX distinguishes (unlike a UUIDv7 op id, whose
+        tail does)."""
+        return str(self.dedup_key)[:12]
+
+    @property
+    def retry_after_s(self) -> float:
+        """Seconds until this key is accepted again. Never negative."""
+        return max(0.0, float(self.window_s) - float(self.age_s))
+
+
 @dataclass(frozen=True)
 class IntakeRouterConfig:
     project_root: Path
@@ -2989,13 +3024,19 @@ class UnifiedIntakeRouter:
     # Deduplication
     # ------------------------------------------------------------------
 
-    def _is_duplicate(self, envelope: IntentEnvelope) -> bool:
-        """Return True if the envelope's dedup_key was seen within its window."""
-        window = (
+    def _dedup_window_s(self, envelope: IntentEnvelope) -> float:
+        """The window that governs THIS envelope. One definition, two readers
+        (`_is_duplicate` decides; `describe_dedup_collision` explains) — so a
+        verdict and its explanation can never disagree about the rule."""
+        return (
             self._config.voice_dedup_window_s
             if envelope.source == "voice_human"
             else self._config.dedup_window_s
         )
+
+    def _is_duplicate(self, envelope: IntentEnvelope) -> bool:
+        """Return True if the envelope's dedup_key was seen within its window."""
+        window = self._dedup_window_s(envelope)
         # Window of 0.0 effectively disables dedup
         if window <= 0.0:
             return False
@@ -3004,9 +3045,82 @@ class UnifiedIntakeRouter:
             return False
         return (time.monotonic() - last) < window
 
+    def describe_dedup_collision(
+        self, envelope: IntentEnvelope,
+    ) -> Optional["DedupCollision"]:
+        """Read-only: WHY this envelope deduplicated. ``None`` if it did not.
+
+        The verdict `ingest` returns is the bare string ``"deduplicated"``,
+        which tells a caller that the goal was dropped but nothing a human
+        could act on — so a cockpit reporting it had to either stay silent or
+        invent a reason. This exposes the facts the registry ALREADY holds
+        (the key, and when it was last seen) without adding a second tracker,
+        a cache, or any writable surface.
+
+        NOT an authority: it reads `self._dedup` and returns; it never
+        registers, evicts, or influences a verdict. Callers must treat a
+        ``None`` return as "no collision recorded", never as an error.
+        """
+        try:
+            window = self._dedup_window_s(envelope)
+            if window <= 0.0:
+                return None
+            last = self._dedup.get(envelope.dedup_key)
+            if last is None:
+                return None
+            age = max(0.0, time.monotonic() - last)
+            if age >= window:
+                return None            # expired — not the reason it dropped
+            return DedupCollision(
+                dedup_key=str(envelope.dedup_key),
+                age_s=age,
+                window_s=float(window),
+            )
+        except Exception:  # noqa: BLE001 — explanation is never load-bearing
+            return None
+
     def _register_dedup(self, envelope: IntentEnvelope) -> None:
         """Record the current monotonic time for the envelope's dedup_key."""
         self._dedup[envelope.dedup_key] = time.monotonic()
+        self._prune_dedup()
+
+    def _prune_dedup(self) -> None:
+        """Drop entries no window can still consider a duplicate.
+
+        `self._dedup` was append-only: one entry per distinct dedup_key, kept
+        for the life of the process. Every distinct signature an operator ever
+        types, every distinct sensor signature, forever — unbounded growth on
+        the intake hot path.
+
+        Provably semantics-preserving: an entry is evicted only once it is
+        older than the LONGEST configured window, at which point
+        `_is_duplicate` would already have returned False for it under any
+        source. So pruning can never turn a duplicate into an accepted
+        envelope.
+
+        Amortized: the O(n) sweep runs only when the dict crosses a
+        threshold, so steady-state ingest stays O(1). NEVER raises — a
+        housekeeping failure must not drop a signal.
+        """
+        try:
+            if len(self._dedup) < _DEDUP_PRUNE_THRESHOLD:
+                return
+            horizon = max(
+                float(self._config.dedup_window_s),
+                float(self._config.voice_dedup_window_s),
+                0.0,
+            )
+            now = time.monotonic()
+            stale = [k for k, t in self._dedup.items() if (now - t) >= horizon]
+            for k in stale:
+                self._dedup.pop(k, None)
+            if stale:
+                logger.debug(
+                    "[IntakeRouter] dedup prune evicted=%d remaining=%d",
+                    len(stale), len(self._dedup),
+                )
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     # Advisory file lock

@@ -180,6 +180,46 @@ def get_operator_dispatcher() -> Optional[Callable[[str, Any], Optional[str]]]:
     return _OPERATOR_DISPATCH
 
 
+# ---------------------------------------------------------------------------
+# Receipt grammar — read from its owner, never restated
+# ---------------------------------------------------------------------------
+#
+# `chat_response_style` owns what a receipt MEANS (it already reads the
+# `op-` and `logged-` prefixes off the receipt to decide how a turn renders).
+# This executor needs one bit of that vocabulary — "is this a dedup
+# collision?" — to know whether it must still write the backlog safety net.
+#
+# Imported lazily through a helper rather than restated as a literal here,
+# exactly as `chat_response_style._logging_prefix()` reads its marker off
+# THIS module's executor: two copies of a grammar are two grammars, and the
+# second one drifts silently.
+
+
+def _is_dedup_receipt(receipt: Any) -> bool:
+    """True iff the submitter reported a dedup collision (not a dispatch).
+    Fail-soft: an unavailable renderer means we treat the token as a normal
+    dispatch receipt, which is the pre-existing behaviour."""
+    try:
+        from backend.core.ouroboros.governance.chat_response_style import (
+            is_dedup_receipt,
+        )
+        return bool(is_dedup_receipt(str(receipt)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _stamp_filed(receipt: str, filed: bool) -> str:
+    """Record on the receipt whether the backlog safety net was written.
+    Degrades to the unstamped receipt rather than losing it."""
+    try:
+        from backend.core.ouroboros.governance.chat_response_style import (
+            with_filed,
+        )
+        return str(with_filed(receipt, filed))
+    except Exception:  # noqa: BLE001
+        return receipt
+
+
 class BacklogChatActionExecutor:
     """Concrete ChatActionExecutor that wires `dispatch_backlog`
     against the real `.jarvis/backlog.json` writer.
@@ -242,11 +282,28 @@ class BacklogChatActionExecutor:
         # every autonomous op uses.
         # Explicit injection wins (tests, callers that know better); the
         # registry is the daemon's standing answer.
+        # A dedup collision is carried, not returned: the goal must ALSO be
+        # filed (below) so a failed earlier run is still recoverable by the
+        # Backlog sensor. Held here across the write so the receipt can be
+        # stamped with whether that write actually succeeded.
+        dedup_receipt: Optional[str] = None
+
         submitter = self._submit_now or get_operator_dispatcher()
         if submitter is not None and msg_clipped.strip():
             try:
                 op_id = submitter(msg_clipped, turn)
-                if op_id:
+                if op_id and _is_dedup_receipt(op_id):
+                    # NOT a dispatch. Intake dropped this as a duplicate, so
+                    # returning now would skip the safety net and leave the
+                    # operator's goal existing only as an earlier run that may
+                    # already have failed.
+                    dedup_receipt = str(op_id)
+                    logger.info(
+                        "[BacklogChatExecutor] turn=%s DEDUPLICATED (%s) — "
+                        "filing anyway as a safety net",
+                        turn.turn_id, dedup_receipt,
+                    )
+                elif op_id:
                     self.calls.append(str(op_id))
                     logger.info(
                         "[BacklogChatExecutor] turn=%s dispatched IMMEDIATE "
@@ -290,11 +347,31 @@ class BacklogChatActionExecutor:
         backlog_path = _backlog_path(self._project_root)
         ok = _append_to_backlog_json(backlog_path, entry)
         if not ok:
-            token = f"error-append-failed-{turn.turn_id}"
-            self.calls.append(token)
             logger.warning(
                 "[BacklogChatExecutor] turn=%s append to %s failed",
                 turn.turn_id, backlog_path,
+            )
+            if dedup_receipt is not None:
+                # The collision is still the headline fact — but the safety
+                # net does NOT exist, and the receipt must say so rather than
+                # letting `f=0` be mistaken for "not attempted".
+                token = _stamp_filed(dedup_receipt, False)
+                self.calls.append(token)
+                return token
+            token = f"error-append-failed-{turn.turn_id}"
+            self.calls.append(token)
+            return token
+
+        if dedup_receipt is not None:
+            # Filed AND deduplicated. The receipt reports both, because
+            # either alone misleads: "queued" hides that an identical goal is
+            # already accepted, and "deduplicated" alone hides the safety net.
+            token = _stamp_filed(dedup_receipt, True)
+            self.calls.append(token)
+            logger.info(
+                "[BacklogChatExecutor] turn=%s deduplicated + filed "
+                "task_id=%s (safety net for a failed earlier run)",
+                turn.turn_id, entry["task_id"],
             )
             return token
 
