@@ -1667,6 +1667,29 @@ class BattleTestHarness:
                 if _intake is not None:
                     n_sensors = len(getattr(_intake, "_sensors", []))
                     self._serpent_flow.update_sensors(n_sensors)
+
+                # Give intake a voice on the deck.
+                #
+                # Until now the deck rendered ops, and an op is the LAST thing
+                # to happen — a sensor fires, a signal queues, and only later
+                # does an FSM context exist. Four real test failures once sat
+                # queued for two minutes behind a blank deck, indistinguishable
+                # from an organism with nothing to do.
+                #
+                # Wired here, beside update_sensors, because this is already
+                # the seam where the flow learns about intake. Zero-authority:
+                # the sink is told, never asked.
+                try:
+                    from backend.core.ouroboros.governance.intake.unified_intake_router import (  # noqa: E501
+                        set_intake_announce_sink,
+                    )
+                    _flow = self._serpent_flow
+                    set_intake_announce_sink(_flow.note_intake_signal)
+                except Exception:  # noqa: BLE001 — display wiring is never fatal
+                    logger.debug(
+                        "[Harness] intake announce sink not wired",
+                        exc_info=True,
+                    )
                 await self._serpent_flow.start()
 
                 # Boot non-blocking REPL (prompt_toolkit) — runs alongside

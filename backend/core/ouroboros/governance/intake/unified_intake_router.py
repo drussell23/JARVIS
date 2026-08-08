@@ -1812,6 +1812,11 @@ class UnifiedIntakeRouter:
             (priority, envelope.submitted_at, next(_HEAP_TIE_SEQ), envelope),
         )
 
+        # Announce AFTER the put, never before: a line claiming a signal was
+        # queued must not appear if the put itself raised. The operator's view
+        # follows the queue's truth rather than predicting it.
+        _announce_enqueued(envelope)
+
         # F1 Slice 2 — mirror to IntakePriorityQueue when wired.
         # Primary mode (master on): this queue becomes the source of truth
         # for dispatch; legacy _queue still receives puts for WAL/back-compat
@@ -3188,6 +3193,62 @@ class UnifiedIntakeRouter:
 # that don't construct an IntakeLayer), ``get_default_intake_router``
 # returns ``None`` — S2's ``_peek_high_prio_queued`` treats this as
 # "no signal" and emits nothing. NEVER raises.
+
+# ---------------------------------------------------------------------------
+# Intake announcement — what the organism FOUND, before it acts on it
+# ---------------------------------------------------------------------------
+# The cockpit's deck renders ops. An op is the LAST thing to happen: a sensor
+# fires, a signal is enqueued, and only later does an FSM context exist. On a
+# real boot four genuine test failures sat in this queue for two minutes while
+# the deck stayed blank and the status line read IDLE — the organism was doing
+# exactly its job and the operator could not tell it apart from a dead one.
+#
+# A sink, not a bus subscription: `set_operator_dispatcher`,
+# `set_degradation_sink` and `markup_mirror` are all wired this way already, and
+# a sink has no dependency on a TrinityEventBus existing — which it need not,
+# per this module's own docstring.
+#
+# ZERO AUTHORITY. The sink is told; it is never asked. Nothing about dispatch,
+# priority or admission consults it, so a slow or broken cockpit cannot change
+# what the organism does — only what an operator can see.
+_ANNOUNCE_SINK: Optional[Callable[[Dict[str, Any]], None]] = None
+
+
+def set_intake_announce_sink(
+    sink: Optional[Callable[[Dict[str, Any]], None]],
+) -> None:
+    """Register the surface that renders newly-enqueued signals.
+
+    Idempotent, last-write-wins, ``None`` to detach. NEVER raises.
+    """
+    global _ANNOUNCE_SINK
+    _ANNOUNCE_SINK = sink
+
+
+def _announce_enqueued(envelope: Any) -> None:
+    """Tell the operator surface what was just found. NEVER raises, never
+    blocks, and never touches the envelope.
+
+    Called on the ingest path only. Requeues and retries deliberately do not
+    announce: the operator cares that a failure was FOUND, not that it was
+    moved between queues, and a line per internal transition would bury the
+    one that mattered.
+    """
+    sink = _ANNOUNCE_SINK
+    if sink is None:
+        return
+    try:
+        targets = tuple(getattr(envelope, "target_files", ()) or ())
+        sink({
+            "source": str(getattr(envelope, "source", "") or ""),
+            "description": str(getattr(envelope, "description", "") or ""),
+            "target_files": targets,
+            "urgency": str(getattr(envelope, "urgency", "") or ""),
+            "signal_id": str(getattr(envelope, "signal_id", "") or ""),
+        })
+    except Exception:  # noqa: BLE001 — a display fault must never reach intake
+        logger.debug("[Router] announce sink raised", exc_info=True)
+
 
 _DEFAULT_INTAKE_ROUTER: Optional["UnifiedIntakeRouter"] = None
 _DEFAULT_INTAKE_ROUTER_LOCK = threading.Lock()
