@@ -60,6 +60,10 @@ Authority invariants pinned by tests:
 """
 from __future__ import annotations
 
+from backend.core.ouroboros.governance.determinism.session_identity import (
+    resolve_session_id,
+)
+
 import asyncio
 import json
 import logging
@@ -1112,9 +1116,7 @@ def runtime_for_session(
 
     NEVER raises."""
     if session_id is None or not str(session_id).strip():
-        session_id = os.environ.get(
-            "OUROBOROS_BATTLE_SESSION_ID", "",
-        ).strip() or "default"
+        session_id = resolve_session_id()
     sid = str(session_id)
     with _runtime_cache_lock:
         cached = _runtime_cache.get(sid)

@@ -60,6 +60,10 @@ COST CONTRACT PRESERVATION (§26.6):
 """
 from __future__ import annotations
 
+from backend.core.ouroboros.governance.determinism.session_identity import (
+    resolve_session_id,
+)
+
 import json
 import logging
 import os
@@ -675,9 +679,7 @@ def build_dag(
         # Resolve session_id
         sid = session_id
         if sid is None or not str(sid).strip():
-            sid = os.environ.get(
-                "OUROBOROS_BATTLE_SESSION_ID", "",
-            ).strip() or "default"
+            sid = resolve_session_id()
         sid = str(sid).strip()
 
         # Resolve path

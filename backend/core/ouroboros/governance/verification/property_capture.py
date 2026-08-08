@@ -82,6 +82,10 @@ AUTHORITY INVARIANTS (pinned by tests):
 """
 from __future__ import annotations
 
+from backend.core.ouroboros.governance.determinism.session_identity import (
+    resolve_session_id,
+)
+
 import json
 import logging
 import os
@@ -274,9 +278,7 @@ def _derive_claim_id(
         )
         sid = session_id
         if sid is None or not str(sid).strip():
-            sid = os.environ.get(
-                "OUROBOROS_BATTLE_SESSION_ID", "",
-            ).strip() or "default"
+            sid = resolve_session_id()
         se = get_session_entropy()
         session_seed = se.seed_for_session(sid)
         op_seed = _derive_op_seed(
@@ -560,9 +562,7 @@ def _ledger_path_for_session(session_id: Optional[str] = None) -> Path:
     1.2's storage layout. NEVER raises."""
     sid = (str(session_id).strip() if session_id else "")
     if not sid:
-        sid = os.environ.get(
-            "OUROBOROS_BATTLE_SESSION_ID", "",
-        ).strip() or "default"
+        sid = resolve_session_id()
     base = os.environ.get(
         "JARVIS_DETERMINISM_LEDGER_DIR",
         ".jarvis/determinism",

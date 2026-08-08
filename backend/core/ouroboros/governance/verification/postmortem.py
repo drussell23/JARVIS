@@ -100,6 +100,10 @@ AUTHORITY INVARIANTS (pinned by tests):
 """
 from __future__ import annotations
 
+from backend.core.ouroboros.governance.determinism.session_identity import (
+    resolve_session_id,
+)
+
 import json
 import logging
 import os
@@ -600,9 +604,7 @@ async def produce_verification_postmortem(
     # Resolve session_id (mirrors Slice 2.3 reader's resolution)
     sid = session_id
     if sid is None or not str(sid).strip():
-        sid = os.environ.get(
-            "OUROBOROS_BATTLE_SESSION_ID", "",
-        ).strip() or "default"
+        sid = resolve_session_id()
 
     if not postmortem_enabled():
         return VerificationPostmortem(
@@ -781,9 +783,7 @@ def _ledger_path_for_session(session_id: Optional[str] = None) -> Path:
     1.2 + 2.3 conventions. NEVER raises."""
     sid = (str(session_id).strip() if session_id else "")
     if not sid:
-        sid = os.environ.get(
-            "OUROBOROS_BATTLE_SESSION_ID", "",
-        ).strip() or "default"
+        sid = resolve_session_id()
     base = os.environ.get(
         "JARVIS_DETERMINISM_LEDGER_DIR",
         ".jarvis/determinism",

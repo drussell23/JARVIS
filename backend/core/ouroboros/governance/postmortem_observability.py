@@ -43,6 +43,10 @@ surfaces in O+V have the same ergonomics.
 """
 from __future__ import annotations
 
+from backend.core.ouroboros.governance.determinism.session_identity import (
+    resolve_session_id,
+)
+
 import enum
 import json
 import logging
@@ -151,9 +155,7 @@ def _ledger_path_for_session(
     Slice 1.3 / 2.3 / 2.4 reader convention. NEVER raises."""
     sid = (str(session_id).strip() if session_id else "")
     if not sid:
-        sid = os.environ.get(
-            "OUROBOROS_BATTLE_SESSION_ID", "",
-        ).strip() or "default"
+        sid = resolve_session_id()
     base = os.environ.get(
         "JARVIS_DETERMINISM_LEDGER_DIR",
         ".jarvis/determinism",

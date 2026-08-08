@@ -52,6 +52,10 @@ Authority invariants (pinned by tests):
 """
 from __future__ import annotations
 
+from backend.core.ouroboros.governance.determinism.session_identity import (
+    resolve_session_id,
+)
+
 import hashlib
 import json
 import logging
@@ -460,9 +464,7 @@ def entropy_for(
 
     # Determine session_id
     if session_id is None or not session_id.strip():
-        session_id = os.environ.get(
-            "OUROBOROS_BATTLE_SESSION_ID", "",
-        ).strip() or "default"
+        session_id = resolve_session_id()
 
     cache_key = (session_id, safe_op)
     with _op_entropy_lock:
@@ -490,9 +492,7 @@ def reset_for_op(
     stream prefix. NEVER raises."""
     safe_op = (str(op_id).strip() if op_id else "") or "unknown"
     if session_id is None or not session_id.strip():
-        session_id = os.environ.get(
-            "OUROBOROS_BATTLE_SESSION_ID", "",
-        ).strip() or "default"
+        session_id = resolve_session_id()
     with _op_entropy_lock:
         _op_entropy_cache.pop((session_id, safe_op), None)
 
