@@ -354,28 +354,53 @@ def _evaluate_empty_postmortem_rate() -> Optional[DormancyFinding]:
         pms = list_recent_postmortems(limit=window)
     except Exception:  # noqa: BLE001
         return None
-    if len(pms) < min_records:
+    # Only ops that got PAST the claim-capture phase belong in this rate.
+    #
+    # The first version of this detector divided by every postmortem in the
+    # window. Measured on the live ledger the day the alarm was first heard:
+    # 3,333 of 5,644 empty records were ops that terminated at CLASSIFY,
+    # before PLAN exists to capture anything, and 100% of routed ops with a
+    # postmortem HAD captured claims. So the alarm sat at a permanent 71%,
+    # named the wrong subsystem, and pointed the operator at wiring that was
+    # working — while the real signal (claims captured and then unjudgeable)
+    # went unreported for months.
+    #
+    # `claims_were_applicable` is derived from the enclosing ledger record's
+    # phase against the FSM's own canonical ordering. `unknown` provenance is
+    # excluded from BOTH numerator and denominator rather than assumed
+    # either way.
+    applicable = [pm for pm in pms if getattr(pm, "claims_were_applicable", True)]
+    if len(applicable) < min_records:
+        # Not enough ops reached the capture phase to say anything. Silence
+        # here is a measurement, not an all-clear — a window in which almost
+        # nothing routes is its own signal, and belongs to a detector that
+        # names THAT rather than being smuggled in under this one.
         return None
     empty_count = sum(
-        1 for pm in pms if getattr(pm, "total_claims", 0) == 0
+        1 for pm in applicable if getattr(pm, "total_claims", 0) == 0
     )
-    rate = empty_count / max(1, len(pms))
+    rate = empty_count / max(1, len(applicable))
     if rate < threshold:
         return None
+    skipped = len(pms) - len(applicable)
     return DormancyFinding(
         detector_kind="empty_postmortem_rate",
         severity="p1",
         summary=(
             f"VERIFICATION LOOP IS NOT EXERCISING — "
-            f"{empty_count}/{len(pms)} ({rate:.0%}) of recent "
-            f"postmortems have total_claims=0. Phase 2 is recording "
-            f"terminations but not predictions. Check Priority A "
+            f"{empty_count}/{len(applicable)} ({rate:.0%}) of ops that "
+            f"reached the claim-capture phase have total_claims=0. "
+            f"({skipped} of {len(pms)} records excluded: the op stopped "
+            f"before PLAN, where zero claims is correct.) Phase 2 is "
+            f"recording terminations but not predictions. Check Priority A "
             f"claim-capture wiring at every PLAN exit."
         ),
         evidence=(
             ("detector_kind", "empty_postmortem_rate"),
             ("empty_count", empty_count),
-            ("total_count", len(pms)),
+            ("total_count", len(applicable)),
+            ("records_read", len(pms)),
+            ("excluded_not_applicable", skipped),
             ("rate", rate),
             ("threshold", threshold),
             ("window", window),
@@ -398,6 +423,138 @@ def _evaluate_empty_postmortem_rate() -> Optional[DormancyFinding]:
     )
 
 
+def unjudgeable_claim_threshold() -> float:
+    """Fraction of evaluated claims returning INSUFFICIENT_EVIDENCE above
+    which the loop is judged non-exercising. Default 0.5.
+
+    Lower than the empty-postmortem threshold on purpose. A claim that cannot
+    be judged is strictly worse than one that was never made: it costs a
+    ledger write, it appears in the count, and it reads as coverage.
+    """
+    raw = os.environ.get("JARVIS_META_UNJUDGEABLE_CLAIM_THRESHOLD", "0.5")
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return 0.5
+    return max(0.0, min(1.0, val))
+
+
+def unjudgeable_min_claims() -> int:
+    """Minimum evaluated claims before the unjudgeable detector speaks."""
+    raw = os.environ.get("JARVIS_META_UNJUDGEABLE_MIN_CLAIMS", "50")
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return 50
+    return max(1, val)
+
+
+def _evaluate_unjudgeable_claim_rate() -> Optional[DormancyFinding]:
+    """Claims are being MADE and cannot be JUDGED.
+
+    The signal that was hiding behind the empty-postmortem alarm. On the
+    ledger the day the alarm was first heard: of 18,414 claims recorded at
+    COMPLETE, 13,911 (76%) returned INSUFFICIENT_EVIDENCE and **zero ever
+    returned FAILED** — across 151,612 claims all-time. Three default claims
+    accounted for the insufficiency in exactly equal counts (4,637 each),
+    which is the signature of properties attached to every op whose required
+    evidence is never supplied:
+
+        provider_route, is_read_only, providers_used
+        diff_text
+        test_files_pre, test_files_post
+
+    A ``must_hold`` claim that always evaluates INSUFFICIENT is not a safety
+    property. It is a comment with a ledger write attached, and because
+    INSUFFICIENT is not FAILED it never blocks and never surfaces. The
+    postmortem reports ``total_claims`` going up and the verification loop
+    reads as healthy while deciding nothing.
+
+    This detector measures whether verdicts are being REACHED, which is the
+    question ``empty_postmortem_rate`` was always meant to be asking.
+
+    NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.governance.verification import (
+            list_recent_postmortems,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    window = empty_postmortem_window()
+    threshold = unjudgeable_claim_threshold()
+    min_claims = unjudgeable_min_claims()
+    try:
+        pms = list_recent_postmortems(limit=window)
+    except Exception:  # noqa: BLE001
+        return None
+
+    total = sum(int(getattr(pm, "total_claims", 0) or 0) for pm in pms)
+    if total < min_claims:
+        return None
+    insufficient = sum(
+        int(getattr(pm, "insufficient_count", 0) or 0) for pm in pms
+    )
+    errored = sum(int(getattr(pm, "error_count", 0) or 0) for pm in pms)
+    undecided = insufficient + errored
+    rate = undecided / max(1, total)
+    if rate < threshold:
+        return None
+
+    # Name the evidence keys actually responsible rather than making the
+    # operator re-derive them: the reason strings are already on the
+    # outcomes, and a finding that says "76% unjudgeable" without saying
+    # WHICH property sends them back to a ledger walk.
+    reasons: Dict[str, int] = {}
+    for pm in pms:
+        for outcome in getattr(pm, "outcomes", ()) or ():
+            try:
+                verdict = outcome.verdict
+                if verdict.verdict.value == "passed":
+                    continue
+                key = str(verdict.property_name or verdict.kind or "?")
+                reasons[key] = reasons.get(key, 0) + 1
+            except Exception:  # noqa: BLE001 — malformed outcome, skip
+                continue
+    top = sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+    top_repr = "; ".join(f"{name}={count}" for name, count in top) or "n/a"
+
+    return DormancyFinding(
+        detector_kind="unjudgeable_claim_rate",
+        severity="p1",
+        summary=(
+            f"CLAIMS ARE MADE BUT NOT JUDGED — {undecided}/{total} "
+            f"({rate:.0%}) of recorded claims returned "
+            f"INSUFFICIENT_EVIDENCE or evaluator error. A must_hold claim "
+            f"that cannot be evaluated never blocks, so the loop reports "
+            f"coverage while deciding nothing. Worst properties: {top_repr}"
+        ),
+        evidence=(
+            ("detector_kind", "unjudgeable_claim_rate"),
+            ("total_claims", total),
+            ("insufficient_count", insufficient),
+            ("error_count", errored),
+            ("rate", rate),
+            ("threshold", threshold),
+            ("window", window),
+            ("top_properties", top_repr),
+            ("remediation", (
+                "For each property above, compare its evidence_required "
+                "tuple against what the evidence collector actually "
+                "supplies at evaluation time. Either the collector must "
+                "produce those keys or the property must declare "
+                "requirements it can be judged on — a claim nobody can "
+                "settle should not carry must_hold severity."
+            )),
+        ),
+        target_files=(
+            "backend/core/ouroboros/governance/verification/evidence_collectors.py",
+            "backend/core/ouroboros/governance/verification/default_claims.py",
+            "backend/core/ouroboros/governance/verification/property_oracle.py",
+        ),
+    )
+
+
 def _register_seed_detectors() -> None:
     register_dormancy_detector(
         DormancyDetector(
@@ -409,6 +566,19 @@ def _register_seed_detectors() -> None:
                 "PLAN-time claim capture has silently disabled itself."
             ),
             evaluate=_evaluate_empty_postmortem_rate,
+        ),
+    )
+    register_dormancy_detector(
+        DormancyDetector(
+            detector_kind="unjudgeable_claim_rate",
+            severity="p1",
+            description=(
+                "Fires when >threshold of recorded claims return "
+                "INSUFFICIENT_EVIDENCE or evaluator error — the loop is "
+                "making predictions it has no evidence to settle, so it "
+                "reports coverage while deciding nothing."
+            ),
+            evaluate=_evaluate_unjudgeable_claim_rate,
         ),
     )
 

@@ -104,7 +104,7 @@ import json
 import logging
 import os
 import time as _time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _replace
 from pathlib import Path
 from typing import (
     Any, Awaitable, Callable, List, Mapping, Optional, Tuple,
@@ -195,6 +195,12 @@ class ClaimOutcome:
         )
 
 
+#: The phase at whose exit default claims are captured
+#: (``plan_runner._capture_default_claims_at_plan_exit``). Named once here
+#: rather than spelled at each comparison site.
+_CLAIM_CAPTURE_PHASE = "PLAN"
+
+
 @dataclass(frozen=True)
 class VerificationPostmortem:
     """Structured postmortem record of all claim verifications for
@@ -235,6 +241,15 @@ class VerificationPostmortem:
     started_unix: float = 0.0
     completed_unix: float = 0.0
     schema_version: str = VERIFICATION_POSTMORTEM_SCHEMA_VERSION
+    #: Which ledger record this reading came from and where the op stopped.
+    #:
+    #: Both are properties of the ENCLOSING record, not of the payload, so
+    #: they are stamped by the reader rather than serialised by the writer —
+    #: which also means every historical record acquires them for free.
+    #: Empty means the reading did not come through a reader that knows
+    #: (a freshly built postmortem, a hand-constructed one in a test).
+    record_kind: str = ""
+    terminated_at_phase: str = ""
 
     @property
     def total_failed(self) -> int:
@@ -249,6 +264,60 @@ class VerificationPostmortem:
     def total_passed(self) -> int:
         """All PASSED verdicts (any severity)."""
         return sum(1 for o in self.outcomes if o.passed)
+
+    @property
+    def claims_provenance(self) -> str:
+        """WHY ``total_claims`` is what it is. Never a guess.
+
+        ``total_claims == 0`` had four different meanings and one spelling,
+        and the MetaSensor's empty-postmortem alarm was reading all four as
+        the same defect. Measured on this repository's ledger the day the
+        alarm was first heard: of 8,288 postmortem records, 5,644 were empty
+        — and 3,333 of those were ops that terminated at CLASSIFY, before the
+        phase where claims are captured. Those records are CORRECT. Pooling
+        them into a rate produced a permanent 71% alarm pointing at
+        claim-capture wiring that was working at 100%.
+
+        An alarm that cannot be cleared is an alarm that gets ignored, so the
+        rate has to be taken over the population that could have claimed.
+        This is the same discipline `advisor_locality` established for blast
+        radius: a state that cannot be measured is reported as unknown, and a
+        measurement carries where it came from.
+
+        * ``evaluated``      — claims were found and judged.
+        * ``not_applicable`` — the op stopped before the claim-capture phase,
+          so zero is the right answer and not a finding.
+        * ``none_recorded``  — the op got past that point and this record
+          still has no claims. States the fact, asserts no cause: PLAN may
+          have been skipped by policy for a trivial op, or capture may have
+          failed. Both deserve a look; neither is assumed.
+        * ``unknown``        — the record did not come through a reader that
+          knows where the op stopped. Never counted either way.
+        """
+        if self.total_claims > 0:
+            return "evaluated"
+        phase = (self.terminated_at_phase or "").strip().upper()
+        if not phase:
+            return "unknown"
+        try:
+            from backend.core.ouroboros.governance.phase_cost import (
+                CANONICAL_PHASE_ORDER,
+            )
+            order = list(CANONICAL_PHASE_ORDER)
+            # Claims are captured at PLAN exit; anything strictly earlier in
+            # the canonical sequence never reached the capture site. Asking
+            # the FSM's own ordering rather than restating it keeps this
+            # correct when a phase is inserted.
+            here, plan = order.index(phase), order.index(_CLAIM_CAPTURE_PHASE)
+        except Exception:  # noqa: BLE001 — unknown phase, or no ordering
+            return "unknown"
+        return "not_applicable" if here < plan else "none_recorded"
+
+    @property
+    def claims_were_applicable(self) -> bool:
+        """True iff this record belongs in the denominator of a
+        claim-capture-health rate."""
+        return self.claims_provenance in ("evaluated", "none_recorded")
 
     @property
     def is_clean(self) -> bool:
@@ -770,6 +839,18 @@ def list_recent_postmortems(
                     continue
                 pm = VerificationPostmortem.from_dict(pm_dict)
                 if pm is not None:
+                    # Stamp the ENCLOSING record's identity onto the reading.
+                    # Both values were already parsed two lines above and
+                    # then dropped, and dropping them is what made
+                    # `total_claims == 0` unreadable: a CLASSIFY termination
+                    # and a COMPLETE with no claims arrived here identical.
+                    # Carrying them costs nothing and needs no migration —
+                    # every historical record acquires provenance on read.
+                    pm = _replace(
+                        pm,
+                        record_kind=str(record.get("kind") or ""),
+                        terminated_at_phase=str(record.get("phase") or ""),
+                    )
                     pms.append(pm)
     except OSError as exc:
         logger.debug(
