@@ -234,7 +234,6 @@ jobs:
           pip install --upgrade pip
           pip install pytest pytest-asyncio pytest-timeout pytest-mock
           pip install numpy scipy librosa soundfile
-          pip install google-cloud-sql-python-connector
           echo "✅ Dependencies installed"
 
       - name: 🧪 Run Edge Case Test - ${{ matrix.edge_case.name }}

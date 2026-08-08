@@ -238,19 +238,56 @@ jobs:
         with:
           python-version: '3.10'
 
+      # ONE declaration of what this job depends on, as `pip-name=import-name`
+      # pairs. The install step and the verification step both read it, so the
+      # thing installed and the thing proven importable cannot drift apart —
+      # which is precisely how this job came to assert three successful imports
+      # it never performed.
       - name: Install Dependencies
+        env:
+          DB_DEPS: "sqlalchemy=sqlalchemy psycopg2-binary=psycopg2"
         run: |
-          pip install sqlalchemy psycopg2-binary google-cloud-sql-python-connector
+          echo "DB_DEPS=$DB_DEPS" >> "$GITHUB_ENV"
+          pip install $(echo "$DB_DEPS" | tr ' ' '\n' | cut -d= -f1 | tr '\n' ' ')
+
+      # `google-cloud-sql-python-connector` used to be installed here. It does
+      # not exist on PyPI (404 — the published package is named differently),
+      # so this job failed at dependency resolution on every run and never
+      # reached a single assertion. Nothing in this repository imports a Cloud
+      # SQL connector: the e2e suite imports the repo's own
+      # `intelligence.cloud_database_adapter`, and this job imports nothing at
+      # all. Renaming it would have installed a package no code uses — fixing
+      # the exit code while preserving the reason it was wrong.
 
       - name: Dry Run Connection Test
         run: |
-          python3 << 'EOF'
-          print("\n🧪 Running database connection dry run...")
-          print("✅ SQLAlchemy imported successfully")
-          print("✅ psycopg2 imported successfully")
-          print("✅ Google Cloud SQL connector imported successfully")
-          print("\n💡 Actual connection test requires valid credentials")
-          print("   This dry run validates that all required libraries are available")
+          python3 - <<'EOF'
+          import importlib, os, sys
+
+          # Derived from the same declaration the install step used, never a
+          # hand-written list of things to congratulate ourselves about. The
+          # previous version of this step printed three "imported successfully"
+          # lines and contained no import statement, so it reported success
+          # whatever was actually installed.
+          pairs = [p for p in os.environ.get("DB_DEPS", "").split() if "=" in p]
+          if not pairs:
+              sys.exit("DB_DEPS was not propagated; nothing was verified")
+
+          print("\n🧪 Verifying the libraries this job claims to need...")
+          failed = []
+          for pair in pairs:
+              package, module = pair.split("=", 1)
+              try:
+                  importlib.import_module(module)
+                  print(f"✅ {module} imported successfully (from {package})")
+              except Exception as exc:
+                  failed.append(f"{module} (from {package}): {exc}")
+                  print(f"❌ {module} FAILED to import (from {package}): {exc}")
+
+          if failed:
+              sys.exit("libraries missing: " + "; ".join(failed))
+          print("\n💡 An actual connection still requires valid credentials.")
+          print("   This step proves the libraries are importable — nothing more.")
           EOF
 
       - name: Connection Test Summary

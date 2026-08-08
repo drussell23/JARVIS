@@ -238,7 +238,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install pytest pytest-asyncio pytest-timeout pytest-mock aiohttp asyncio-pool numpy scipy
-          pip install google-cloud-sql-python-connector google-cloud-speech
+          pip install google-cloud-speech
           echo "✅ Dependencies installed"
 
       - name: Verify Test Script Exists
