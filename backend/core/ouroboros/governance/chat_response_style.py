@@ -61,6 +61,13 @@ __all__ = [
     "compose_reply",
     "acknowledge",
     "trace_lines",
+    # The dedup receipt grammar. Public because this module OWNS what a
+    # receipt means, and the submitter (harness) and the executor both have
+    # to speak it — importing from here is what stops a second, drifting copy.
+    "make_dedup_receipt",
+    "is_dedup_receipt",
+    "with_filed",
+    "dedup_lines",
 ]
 
 #: What each routing action MEANS, said the way a colleague would say it.
@@ -147,6 +154,152 @@ def _was_discarded(receipt: str) -> bool:
     return str(receipt or "").strip().startswith(_logging_prefix())
 
 
+# ---------------------------------------------------------------------------
+# The deduplication receipt
+# ---------------------------------------------------------------------------
+#
+# `router.ingest` answers `deduplicated` when a goal's dedup_key was accepted
+# inside the window. Before this, that verdict was collapsed into None by the
+# submitter, which is the same value it returns when intake is UNREACHABLE —
+# so the renderer could not tell "you already asked for this" from "nothing is
+# listening", and said "queued … the Backlog sensor will pick it up" about
+# both. True, and useless: it explains nothing an operator can act on.
+#
+# The fix is a state chain, not a string. The router exposes the facts it
+# already holds (`describe_dedup_collision` → key, age, window — no second
+# tracker), the submitter encodes them, the executor stamps whether the goal
+# was ALSO filed, and this module — which already owns receipt interpretation
+# — is the only layer that decides how any of it reads.
+#
+# Grammar is key=value rather than positional so a missing, extra or reordered
+# field degrades one fact instead of misaligning all of them:
+#
+#     dedup:h=<sha256[:12]>;a=<age_s>;w=<window_s>;f=<0|1>
+#
+# Both producers import these helpers rather than restating the format, for
+# the same reason `_logging_prefix()` reads its marker off the executor: two
+# copies of a grammar are two grammars.
+
+_DEDUP_PREFIX = "dedup:"
+
+
+def make_dedup_receipt(
+    short_hash: str, age_s: float, window_s: float, filed: bool = False,
+) -> str:
+    """Encode a deduplication collision as a receipt token. NEVER raises."""
+    try:
+        return (
+            f"{_DEDUP_PREFIX}h={str(short_hash)[:12]};"
+            f"a={float(age_s):.1f};w={float(window_s):.1f};"
+            f"f={1 if filed else 0}"
+        )
+    except Exception:  # noqa: BLE001
+        return f"{_DEDUP_PREFIX}h=;a=;w=;f={1 if filed else 0}"
+
+
+def is_dedup_receipt(receipt: str) -> bool:
+    """True iff this receipt reports a dedup collision rather than a dispatch
+    or a filing. The executor asks this to decide whether it must STILL write
+    the backlog safety net."""
+    return str(receipt or "").strip().startswith(_DEDUP_PREFIX)
+
+
+def with_filed(receipt: str, filed: bool) -> str:
+    """Re-stamp the ``f`` flag. The submitter mints the collision but cannot
+    know whether the backlog write later succeeded; the executor can, and
+    only it may answer that. Non-dedup receipts pass through untouched."""
+    if not is_dedup_receipt(receipt):
+        return receipt
+    fields = _parse_dedup(receipt)
+    return make_dedup_receipt(
+        fields.get("h", ""),
+        _as_float(fields.get("a")), _as_float(fields.get("w")),
+        filed=filed,
+    )
+
+
+def _as_float(raw: Any) -> float:
+    try:
+        return float(str(raw))
+    except (TypeError, ValueError):
+        return -1.0
+
+
+def _parse_dedup(receipt: str) -> dict:
+    """Tolerant parse. An unreadable field is absent, never fatal."""
+    out: dict = {}
+    try:
+        body = str(receipt or "").strip()[len(_DEDUP_PREFIX):]
+        for part in body.split(";"):
+            if "=" in part:
+                k, _, v = part.partition("=")
+                out[k.strip()] = v.strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _humanize(seconds: float) -> str:
+    """A duration said the way a person says it. Negative/unknown → ''."""
+    try:
+        s = float(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if s < 0:
+        return ""
+    if s < 2:
+        return "moments"
+    if s < 60:
+        return f"{int(s)}s"
+    if s < 3600:
+        m, rem = divmod(int(s), 60)
+        return f"{m}m{rem:02d}s" if rem else f"{m}m"
+    h, rem = divmod(int(s), 3600)
+    m = rem // 60
+    return f"{h}h{m:02d}m" if m else f"{h}h"
+
+
+def dedup_lines(receipt: str) -> List[str]:
+    """Render a dedup collision as op chrome. Adaptive: every clause appears
+    only when the fact behind it is actually known.
+
+    Says "accepted", never "in flight". The registry stores ONE thing — when
+    a key was last accepted — so a goal that has since completed or failed
+    still collides. Claiming the earlier op is still running would be a state
+    nothing measures, which is the defect class this whole arc exists to kill.
+    """
+    f = _parse_dedup(receipt)
+    age, window = _as_float(f.get("a")), _as_float(f.get("w"))
+    h = str(f.get("h", "") or "")
+
+    bits: List[str] = ["Status: Deduplicated"]
+    ago = _humanize(age)
+    bits.append(
+        f"an identical goal was accepted {ago} ago" if ago
+        else "an identical goal was already accepted"
+    )
+    retry = _humanize(window - age) if (window >= 0 and age >= 0) else ""
+    if retry:
+        bits.append(f"re-runnable in {retry}")
+    line = " · ".join(bits)
+    if h:
+        line += f" [hash: {h}]"
+
+    out = [f"⎿ {line}"]
+    # The safety net, stated only when it actually exists.
+    if str(f.get("f", "")) == "1":
+        out.append(
+            "⎿ filed to the backlog as well — if that first run failed, the "
+            "Backlog sensor still collects this one"
+        )
+    else:
+        out.append(
+            "⎿ NOT filed — this goal exists only as the earlier run; if that "
+            "one failed, ask again after the window"
+        )
+    return out
+
+
 def _queue_note(action: str, receipt: str = "") -> Optional[str]:
     """Say plainly what happened to the work. NEVER guess.
 
@@ -172,6 +325,12 @@ def _queue_note(action: str, receipt: str = "") -> Optional[str]:
     """
     _phrase, deferred = _voice(action)
     if not deferred or _dispatched_now(receipt):
+        return None
+    if is_dedup_receipt(receipt):
+        # A FOURTH reality, and the one this note would lie about hardest:
+        # the goal was dropped as a duplicate, not filed-and-waiting. Handled
+        # by `dedup_lines` in compose_reply; saying "queued" here would be the
+        # same defect as the `logged-` case above.
         return None
     if _was_discarded(receipt):
         # Name the flag. An operator who has just watched their request
@@ -259,6 +418,12 @@ def compose_reply(
                 lines.append("⏺ on it")
                 lines.append(f"  ⎿ dispatched {_short_ref(receipt)} · "
                              f"immediate · watching")
+            elif is_dedup_receipt(receipt):
+                # Neither started nor merely filed. The head names what the
+                # operator actually did — asked twice — because "adding that
+                # to the backlog" would describe the safety net as if it were
+                # the outcome.
+                lines.append("⏺ you have already asked for this")
             else:
                 head = acknowledge(action, message)
                 if head:
@@ -272,7 +437,14 @@ def compose_reply(
             note = _queue_note(action, receipt)
             if _dispatched_now(receipt):
                 note = None                      # already said above
-            if note:
+            if is_dedup_receipt(receipt):
+                # The collision IS the op chrome for this turn — status,
+                # measured age, when it becomes re-runnable, and whether the
+                # backlog safety net exists. Rendered from the receipt's own
+                # fields, so a fact absent from the receipt is absent here
+                # rather than guessed.
+                lines.extend(f"  {ln}" for ln in dedup_lines(receipt))
+            elif note:
                 lines.append(f"  {note.lstrip()}")
             elif receipt and action != "noop" and not _dispatched_now(receipt):
                 # Not repeated when dispatched: the ref is already on the
