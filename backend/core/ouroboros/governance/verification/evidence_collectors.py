@@ -253,7 +253,8 @@ async def _gather_file_parses_after_change(
     INSUFFICIENT_EVIDENCE — honest about the gap)."""
     try:
         # Priority 1 — pre-stamped (future Slice F2 wiring)
-        stamped = getattr(ctx, "target_files_post", None)
+        stamped = _from_ctx_or_ledger(
+            ctx, "target_files_post").get("target_files_post")
         if stamped is not None:
             return {"target_files_post": list(stamped)}
 
@@ -284,6 +285,108 @@ async def _gather_file_parses_after_change(
         return {}
 
 
+def _from_ctx_or_ledger(ctx: Any, *keys: str) -> Dict[str, Any]:
+    """Resolve evidence keys from the ctx first, then from the ledger.
+
+    The ctx is the fast path — same object, no I/O — and it is also the one
+    that does not survive. ``test_files_pre``, ``test_files_post``,
+    ``diff_text`` and ``target_files_post`` are stamped with
+    ``object.__setattr__`` and are not declared fields of the frozen
+    ``OperationContext``, so ``dataclasses.replace(ctx, ...)`` — called at
+    more than ten sites for ordinary reasons — rebuilds without them.
+
+    That single fact accounts for 13,911 of 18,414 claims returning
+    INSUFFICIENT_EVIDENCE, and for why exactly one of the three Priority A
+    gatherers worked: ``file_parses_after_change`` falls back to
+    ``ctx.target_files``, which IS declared.
+
+    Reading the ledger second is not a fallback in the "try something worse"
+    sense — it is the durable copy, written beside the claim it settles and
+    keyed by the same op_id the claim is read back by. NEVER raises; a key
+    that resolves nowhere is simply absent, which the Oracle reports as
+    INSUFFICIENT_EVIDENCE, honestly.
+    """
+    out: Dict[str, Any] = {}
+    missing = []
+    for key in keys:
+        got = getattr(ctx, key, None)
+        if got is None:
+            missing.append(key)
+        else:
+            out[key] = got
+    if not missing:
+        return out
+    op_id = str(getattr(ctx, "op_id", "") or "").strip()
+    if not op_id:
+        return out
+    try:
+        from backend.core.ouroboros.governance.verification.evidence_ledger import (
+            recorded_evidence,
+        )
+        recorded = recorded_evidence(op_id=op_id)
+    except Exception:  # noqa: BLE001 — reader unavailable; ctx-only
+        logger.debug("[EvidenceCollectors] ledger read failed", exc_info=True)
+        return out
+    for key in missing:
+        got = recorded.get(key)
+        if got is not None:
+            out[key] = got
+    return out
+
+
+async def _gather_cost_contract_bg_op_did_not_use_claude(
+    claim: Any, ctx: Any,
+) -> Mapping[str, Any]:
+    """Evidence for the cost-contract claim, which had no gatherer at all.
+
+    It is attached to every op as ``must_hold`` and returned
+    INSUFFICIENT_EVIDENCE every single time — 4,637 of them — because its
+    kind was never registered, so the dispatcher fell through to the legacy
+    hardcoded paths, which know only ``test_passes`` and ``key_present``.
+
+    Nothing had to be built to settle it. Two of its three required keys,
+    ``provider_route`` and ``is_read_only``, are DECLARED fields of the
+    context and therefore survive every copy. The third, ``providers_used``,
+    appears nowhere in the codebase — but ``provider_selection`` records
+    carrying ``provider_name`` have been written on every GENERATE all along;
+    2,220 of them were sitting on this repository's ledger while the claim
+    that needed them went unjudged.
+
+    Absent evidence stays absent. A route that was never assigned is not the
+    same as a BG route, and guessing one would let a claim about cost
+    discipline pass on an op whose dispatch nobody recorded.
+
+    NEVER raises.
+    """
+    try:
+        out: Dict[str, Any] = {}
+        route = getattr(ctx, "provider_route", None)
+        if route is not None and str(route).strip():
+            out["provider_route"] = str(route).strip()
+        read_only = getattr(ctx, "is_read_only", None)
+        if isinstance(read_only, bool):
+            out["is_read_only"] = read_only
+
+        op_id = str(getattr(ctx, "op_id", "") or "").strip()
+        if op_id:
+            try:
+                from backend.core.ouroboros.governance.verification.evidence_ledger import (  # noqa: E501
+                    recorded_providers_used,
+                )
+                # An op that dispatched to nobody legitimately used no
+                # providers, and the empty tuple is the correct evidence for
+                # that — distinct from the key being absent, which means the
+                # ledger could not be read.
+                out["providers_used"] = list(
+                    recorded_providers_used(op_id=op_id))
+            except Exception:  # noqa: BLE001
+                logger.debug("[EvidenceCollectors] providers_used unavailable",
+                             exc_info=True)
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 async def _gather_test_set_hash_stable(
     claim: Any, ctx: Any,
 ) -> Mapping[str, Any]:
@@ -299,8 +402,9 @@ async def _gather_test_set_hash_stable(
 
     NEVER raises."""
     try:
-        pre = getattr(ctx, "test_files_pre", None)
-        post = getattr(ctx, "test_files_post", None)
+        resolved = _from_ctx_or_ledger(ctx, "test_files_pre", "test_files_post")
+        pre = resolved.get("test_files_pre")
+        post = resolved.get("test_files_post")
         if pre is not None and post is not None:
             return {
                 "test_files_pre": list(pre),
@@ -350,7 +454,7 @@ async def _gather_no_new_credential_shapes(
 
     NEVER raises."""
     try:
-        diff = getattr(ctx, "diff_text", None)
+        diff = _from_ctx_or_ledger(ctx, "diff_text").get("diff_text")
         if diff is None:
             return {}
         # Coerce to string defensively
@@ -375,6 +479,19 @@ def _register_seed_gatherers() -> None:
                 "from disk."
             ),
             gather=_gather_file_parses_after_change,
+        ),
+    )
+    register_evidence_gatherer(
+        EvidenceGatherer(
+            kind="cost_contract_bg_op_did_not_use_claude",
+            description=(
+                "Gathers provider_route + is_read_only from the ctx's "
+                "DECLARED fields and providers_used from the "
+                "provider_selection records already on the ledger. Was "
+                "never registered, so the claim evaluated "
+                "INSUFFICIENT_EVIDENCE on every op it was attached to."
+            ),
+            gather=_gather_cost_contract_bg_op_did_not_use_claude,
         ),
     )
     register_evidence_gatherer(

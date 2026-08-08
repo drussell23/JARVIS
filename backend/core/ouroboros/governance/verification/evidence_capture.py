@@ -59,7 +59,7 @@ import difflib
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -544,6 +544,88 @@ def stamp_apply_evidence_post(
 # ---------------------------------------------------------------------------
 
 
+async def persist_evidence_snapshot(
+    ctx: Any, payload: Mapping[str, Any], *, phase: str,
+) -> bool:
+    """Record an evidence snapshot to the per-session decision ledger.
+
+    The stamps this module writes go onto ``ctx`` with
+    ``object.__setattr__``, and none of the four keys is a declared field of
+    the frozen ``OperationContext``. ``dataclasses.replace(ctx, ...)`` — used
+    at more than ten sites for ordinary reasons like a provider override or a
+    scoped target list — rebuilds from declared fields only, so every stamp
+    is silently dropped at the next transition. Measured:
+
+        after stamp     : ['a.py', 'b.py']
+        after replace() : ABSENT
+
+    That is why 13,911 of 18,414 claims returned INSUFFICIENT_EVIDENCE, and
+    why exactly one of the three Priority A claims worked:
+    ``file_parses_after_change`` falls back to ``ctx.target_files``, which IS
+    a declared field.
+
+    The ctx stamp is kept — it is the fast path, same object, no I/O — and
+    this adds the durable one beside it. Claims already work this way: a
+    ``PropertyClaim`` is recorded at PLAN and read back at COMPLETE by op_id,
+    never carried. Evidence is the other half of that transaction and now has
+    the same lifecycle.
+
+    Uses ``capture_phase_decision`` so the record inherits canonical hashing
+    and the flock-protected atomic append, exactly as ``persist_postmortem``
+    does. Returns True on success. NEVER raises — a snapshot that fails to
+    persist leaves the ctx stamp working as before.
+    """
+    if not evidence_capture_enabled() or ctx is None or not payload:
+        return False
+    op_id = str(getattr(ctx, "op_id", "") or "").strip()
+    if not op_id:
+        return False
+    try:
+        from backend.core.ouroboros.governance.verification.evidence_ledger import (
+            EVIDENCE_SNAPSHOT_KIND,
+            evidence_ledger_enabled,
+        )
+        if not evidence_ledger_enabled():
+            return False
+        from backend.core.ouroboros.governance.determinism.phase_capture import (
+            capture_phase_decision,
+        )
+    except Exception:  # noqa: BLE001 — substrate unavailable
+        logger.debug("[EvidenceCapture] ledger substrate unavailable",
+                     exc_info=True)
+        return False
+
+    # Drop absences rather than recording them. A null overwriting a real
+    # earlier value on merge would turn a partial later snapshot into data
+    # loss — the reader guards this too, and both ends should hold.
+    body = {str(k): v for k, v in payload.items() if v is not None}
+    if not body:
+        return False
+
+    try:
+        async def _emit() -> Any:
+            return body
+
+        await capture_phase_decision(
+            op_id=op_id,
+            phase=str(phase),
+            kind=EVIDENCE_SNAPSHOT_KIND,
+            ctx=ctx,
+            compute=_emit,
+            # Sizes, not payloads. `extra_inputs` feeds the canonical input
+            # hash; a 40 KB diff there would make every record's hash depend
+            # on content the decision did not turn on.
+            extra_inputs={f"{k}_len": (
+                len(v) if hasattr(v, "__len__") else 1
+            ) for k, v in body.items()},
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug("[EvidenceCapture] snapshot persist failed op=%s",
+                     op_id, exc_info=True)
+        return False
+
+
 async def stamp_test_files_pre_async(
     ctx: Any, *, target_dir: Optional[str] = None,
 ) -> int:
@@ -561,9 +643,17 @@ async def stamp_test_files_pre_async(
         inv = await _offload_fs(capture_test_files_inventory, target_dir)
         if inv is None:
             inv = ()  # same neutral as the sync internal-failure path
-        return stamp_test_files_pre(
+        count = stamp_test_files_pre(
             ctx, target_dir=target_dir, inventory=tuple(inv),
         )
+        # The ctx stamp above does not survive the next
+        # `dataclasses.replace`. Record it beside the claims it exists to
+        # settle, keyed by op_id, where nothing can copy it away.
+        await persist_evidence_snapshot(
+            ctx, {"test_files_pre": list(getattr(ctx, "test_files_pre", ()) or ())},
+            phase="PLAN",
+        )
+        return count
     except Exception:  # noqa: BLE001 — defensive envelope preserved
         return 0
 
@@ -598,12 +688,20 @@ async def stamp_apply_evidence_post_async(
         targets = tuple(getattr(ctx, "target_files", None) or ())
         snap = await _offload_fs(snapshot_target_files, targets) if targets else ()
         inv = await _offload_fs(capture_test_files_inventory, target_dir)
-        return stamp_apply_evidence_post(
+        diag = stamp_apply_evidence_post(
             ctx,
             target_dir=target_dir,
             test_inventory=tuple(inv) if inv is not None else (),
             target_snapshot=tuple(snap) if snap is not None else (),
         )
+        # Same reason as the PLAN stamp: all three of these keys are
+        # undeclared attributes on a frozen ctx and die at the next copy.
+        await persist_evidence_snapshot(ctx, {
+            "target_files_post": getattr(ctx, "target_files_post", None),
+            "test_files_post": getattr(ctx, "test_files_post", None),
+            "diff_text": getattr(ctx, "diff_text", None),
+        }, phase="APPLY")
+        return diag
     except Exception:  # noqa: BLE001
         return {"enabled": 1}
 
@@ -621,6 +719,7 @@ __all__ = [
     "capture_test_files_inventory",
     "compute_unified_diff",
     "evidence_capture_enabled",
+    "persist_evidence_snapshot",
     "snapshot_target_files",
     "stamp_apply_evidence_post",
     "stamp_apply_evidence_post_async",

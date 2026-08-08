@@ -533,10 +533,15 @@ async def ctx_evidence_collector(
                 # (those have honest INSUFFICIENT_EVIDENCE semantics
                 # we don't want to mask with a false-positive legacy
                 # signal).
+                # Kinds whose gatherers return honest INSUFFICIENT rather
+                # than nothing-to-say. Letting the legacy hardcoded paths
+                # answer for these would substitute a false positive for a
+                # real absence.
                 priority_a_kinds = {
                     "file_parses_after_change",
                     "test_set_hash_stable",
                     "no_new_credential_shapes",
+                    "cost_contract_bg_op_did_not_use_claude",
                 }
                 if kind in priority_a_kinds:
                     return {}
