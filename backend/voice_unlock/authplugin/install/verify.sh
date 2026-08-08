@@ -40,6 +40,18 @@ _ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 _bad()  { printf '  \033[31m✗\033[0m %s\n' "$*"; _problems=$(( _problems + 1 )); }
 _gone() { printf '  \033[33m-\033[0m %s\n' "$*"; _missing=$(( _missing + 1 )); }
 
+# A valid state that is not a deficiency, reported without being counted.
+#
+# These were _gone, and the difference is not cosmetic. `--skip-authdb` leaves
+# the rule deliberately unwired -- the safe, documented, recommended state -- and
+# counting it as an absent component made verify report "partially installed,
+# 1 component(s) absent" with every component present, then prescribe
+# `install.sh` as the repair. That is the rule rewrite: the one irreversible
+# step, offered as the fix for a machine that was exactly where it should be.
+# A check that reports the safe state as a fault, and names the dangerous action
+# as its remedy, is worse than no check.
+_state() { printf '  \033[33m-\033[0m %s\n' "$*"; }
+
 # Reads a binary or bundle's designated requirement. Same parse as install.sh,
 # including the leading "# " that codesign puts on the line -- omitting it yields
 # an empty string that compares equal to another empty string, which would make
@@ -177,10 +189,11 @@ if jarvis_rule_references_plugin; then
         # Not a failure. Without the backup there is no baseline, and inventing
         # one -- by naming a mechanism we expect to see -- is the mistake this
         # check was rewritten to remove.
-        _gone "no restore point recorded; cannot prove the incumbent chain survived"
+        _state "no restore point recorded; cannot prove the incumbent chain survived"
     fi
 else
-    _gone "stock rule; the plugin is installed but not wired in"
+    _wired=0
+    _state "stock rule; the plugin is installed but not wired in"
 fi
 
 # --- Rule shape vs Apple's schema -------------------------------------------
@@ -299,10 +312,26 @@ if [ "${_missing}" -gt 0 ]; then
     exit 2
 fi
 
+if [ "${_wired:-1}" -eq 0 ]; then
+    printf '\033[32mcoherent, and deliberately not wired in.\033[0m\n'
+    echo
+    echo "Every component is present and agrees about every peer. ${JARVIS_AUTH_RIGHT}"
+    echo "is untouched, so nothing here can affect your ability to unlock."
+    echo
+    echo "This is the state --skip-authdb produces and it is the correct place to"
+    echo "stop. The next step is NOT install.sh: it would refuse, because no run"
+    echo "has yet measured the shape it would write. Measure it first --"
+    echo
+    echo "  sudo ${_here}/probe_mechanism_lifecycle.sh   # the mechanism survives its own lifecycle"
+    echo "  sudo ${_here}/probe_screensaver_rule.sh      # a yield still reaches a password prompt"
+    echo
+    exit 0
+fi
+
 printf '\033[32mcoherent.\033[0m Every component agrees about every peer.\n'
 echo
 echo "Not proven here: that SecurityAgent loads the mechanism. It loads only when"
-echo "the screensaver right is evaluated, so lock the screen once, then:"
-echo "  log show --predicate 'subsystem == \"com.jarvis.unlockplugin\"' --last 15m"
+echo "${JARVIS_AUTH_RIGHT} is evaluated, so lock the screen once, then:"
+echo "  log show --predicate 'subsystem == \"${JARVIS_LOG_SUBSYSTEM_PLUGIN}\"' --last 15m"
 echo
 exit 0

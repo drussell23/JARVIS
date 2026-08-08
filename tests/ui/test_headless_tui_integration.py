@@ -54,13 +54,13 @@ _REPO = Path(__file__).resolve().parents[2]
 
 
 def _require_pty():
-    """Allocate a pty pair or skip. Returns (master_fd, slave_fd)."""
-    import pty
+    """Allocate a pty pair or skip. Returns (master_fd, slave_fd).
 
-    try:
-        return pty.openpty()
-    except OSError as exc:                      # "out of pty devices"
-        pytest.skip(f"pty allocation unavailable in this environment: {exc}")
+    Delegates to the ONE gate in ``tests/pty_gate``. This used to be a second,
+    independently written copy of the same decision — and two copies of "may
+    this suite run" is how the skip stayed invisible in both."""
+    from tests.pty_gate import open_pty
+    return open_pty("test_headless_tui_integration")
 
 
 class PtySession:
