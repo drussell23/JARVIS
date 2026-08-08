@@ -216,6 +216,13 @@ def _statusline_payload(snapshot: Any = None) -> str:
             # things an O+V operator most wants on a status line, so they
             # ride alongside rather than being contorted into CC's shape.
             payload["phase"] = getattr(snap, "phase", "") or "IDLE"
+            # The qualifier travels WITH the phase or it does not travel at
+            # all. "IDLE" and "IDLE, 17 sensors armed" are different claims,
+            # and a payload carrying only the first forces every downstream
+            # surface to render the ambiguous one.
+            _detail = getattr(snap, "phase_detail", "") or ""
+            if _detail:
+                payload["phase_detail"] = _detail
             if getattr(snap, "route", ""):
                 payload["route"] = snap.route
             # `.model.id` must be the MODEL. This reported `snap.provider`,
@@ -841,6 +848,11 @@ def _format_plain(snap: StatusSnapshot, *, compact: bool) -> str:
                 cost_spent=snap.cost_spent_usd,
                 cost_budget=snap.cost_budget_usd,
                 op_id=snap.primary_op_id or "",
+                # The sampler already worked out WHY it is idle — how many
+                # sensors are armed, or that nothing has registered yet.
+                # Not forwarding it meant the breadcrumb re-asserted a bare
+                # "IDLE" over an answer that had already been computed.
+                detail=getattr(snap, "phase_detail", "") or "",
             )
             # A dry provider runway is MOST relevant while idle — the
             # organism may be idle BECAUSE it is dry. The one exception
