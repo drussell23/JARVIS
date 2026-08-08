@@ -103,12 +103,23 @@ def test_max_backlog_description_chars_pinned():
     assert MAX_BACKLOG_DESCRIPTION_CHARS == 1024
 
 
-def test_master_flag_default_false_pre_graduation(monkeypatch):
-    """Pin: this concrete executor ships default-OFF until its own
-    graduation. Operator opts in via env knob; legacy fallback to
-    LoggingChatActionExecutor remains the safe-default."""
+def test_master_flag_graduated_default_true(monkeypatch):
+    """Was `test_master_flag_default_false_pre_graduation`. This IS that
+    graduation, 2026-08-08.
+
+    Default-OFF meant an operator typing a real request into the cockpit had
+    it routed to `backlog_dispatch`, handed to `LoggingChatActionExecutor`,
+    logged, and dropped — while the surface replied "adding that to the
+    backlog … queued … the Backlog sensor will pick it up". Verified on the
+    live tree: `.jarvis/backlog.json` was last touched in April and held no
+    chat entries at all.
+
+    The renderer's half is fixed in `chat_response_style` and is what makes
+    this safe: a `logged-` receipt now reports NOT queued, so "off" is
+    visibly off rather than indistinguishable from success.
+    """
     monkeypatch.delenv("JARVIS_CHAT_EXECUTOR_BACKLOG_ENABLED", raising=False)
-    assert is_enabled() is False
+    assert is_enabled() is True
 
 
 def test_master_flag_truthy_variants(monkeypatch):
@@ -118,9 +129,19 @@ def test_master_flag_truthy_variants(monkeypatch):
 
 
 def test_master_flag_falsy_variants(monkeypatch):
-    for val in ("0", "false", "no", "off", "", "garbage"):
+    """`""` is no longer here: an unset variable now means the graduated
+    default, which is the whole point of the flip. Every EXPLICIT falsy
+    spelling must still switch the executor off."""
+    for val in ("0", "false", "no", "off", "garbage"):
         monkeypatch.setenv("JARVIS_CHAT_EXECUTOR_BACKLOG_ENABLED", val)
         assert is_enabled() is False, f"value {val!r} should be falsy"
+
+
+def test_an_unset_flag_is_the_graduated_default_not_falsy(monkeypatch):
+    """The one behaviour the old `""` case was asserting, restated so the
+    distinction between "unset" and "explicitly off" cannot be lost again."""
+    monkeypatch.setenv("JARVIS_CHAT_EXECUTOR_BACKLOG_ENABLED", "")
+    assert is_enabled() is True
 
 
 # ===========================================================================

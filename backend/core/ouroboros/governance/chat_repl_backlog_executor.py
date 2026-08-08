@@ -97,20 +97,44 @@ _DEFAULT_CHAT_BACKLOG_PRIORITY: int = 3
 
 
 def is_enabled() -> bool:
-    """Master flag — ``JARVIS_CHAT_EXECUTOR_BACKLOG_ENABLED`` (default
-    false until graduation).
+    """Master flag — ``JARVIS_CHAT_EXECUTOR_BACKLOG_ENABLED``.
 
-    When off, the factory falls back to the safe-default
-    `LoggingChatActionExecutor` for ALL four methods (zero behavior
-    change vs the post-graduation Slice 4 wiring).
+    **Graduated default-TRUE 2026-08-08.** Off, the factory falls back to the
+    safe-default `LoggingChatActionExecutor` for ALL four methods; on, this
+    module's `dispatch_backlog` writes to `.jarvis/backlog.json` while the
+    other three still delegate until their own executors land.
 
-    When on, the factory wires `BacklogChatActionExecutor` so the
-    `dispatch_backlog` method writes to `.jarvis/backlog.json`; the
-    other three methods still delegate to LoggingChatActionExecutor
-    until their own concrete executors land in subsequent PRs."""
-    return os.environ.get(
+    WHY IT GRADUATED
+
+    Default-false meant an operator typing a real request into the cockpit
+    had it routed to `backlog_dispatch`, handed to the logging executor,
+    logged, and dropped — while the surface replied "adding that to the
+    backlog … queued … the Backlog sensor will pick it up on its next
+    sweep". Verified on the live tree the day this flipped:
+    `.jarvis/backlog.json` was last modified in April and held no chat
+    entries at all. Three false claims in one line, about the operator's own
+    work.
+
+    The renderer's half of that is fixed separately and is what makes this
+    flip safe to reason about: a `logged-` receipt is now reported as NOT
+    queued, so "off" is visibly off rather than indistinguishable from
+    success. But an executor that is correct, tested, and disabled is the
+    reachability defect this codebase keeps shipping — merged and inert —
+    and the cost of leaving it off is that the system silently discards the
+    highest-signal input it can receive.
+
+    The authority surface is why the flip is small: exactly one file written,
+    the same `.jarvis/backlog.json` that `/backlog auto-proposed approve`
+    already appends to, bounded at MAX_BACKLOG_DESCRIPTION_CHARS, and
+    deduped by `chat:{turn_id}` so a retried turn is structurally idempotent
+    at the sensor. No subprocess, no network, no env mutation.
+    """
+    raw = os.environ.get(
         "JARVIS_CHAT_EXECUTOR_BACKLOG_ENABLED", "",
-    ).strip().lower() in _TRUTHY
+    ).strip().lower()
+    if raw == "":
+        return True  # graduated default
+    return raw in _TRUTHY
 
 
 def _backlog_path(project_root: Path) -> Path:

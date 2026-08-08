@@ -122,16 +122,63 @@ def _dispatched_now(receipt: str) -> bool:
     return bool(ref) and (ref.startswith("op-") or ref.startswith("op_"))
 
 
-def _queue_note(action: str, receipt: str = "") -> Optional[str]:
-    """Say plainly when work is queued rather than started.
+def _logging_prefix() -> str:
+    """The marker the safe-default executor stamps on a receipt for work it
+    did NOT do. Read from the executor rather than restated here, so the two
+    cannot drift into disagreeing about what "logged" looks like."""
+    try:
+        from backend.core.ouroboros.governance.chat_repl_dispatcher import (
+            LoggingChatActionExecutor,
+        )
+        return str(getattr(LoggingChatActionExecutor, "LABEL_PREFIX", "logged-"))
+    except Exception:  # noqa: BLE001 — dispatcher unavailable
+        return "logged-"
 
-    ``backlog_dispatch`` hands the goal to a sensor that polls. "logged" hides
-    that; silence hides it worse. An operator staring at an unchanged screen
-    needs to know whether to wait or to worry.
+
+def _was_discarded(receipt: str) -> bool:
+    """Did the executor decline to do anything at all?
+
+    ``LoggingChatActionExecutor`` — the safe default wired whenever
+    ``JARVIS_CHAT_EXECUTOR_BACKLOG_ENABLED`` is off — logs the message and
+    returns a synthetic token it deliberately prefixes ``logged-``. That
+    prefix is the executor saying, in the only channel it has, "I did not do
+    this."
+    """
+    return str(receipt or "").strip().startswith(_logging_prefix())
+
+
+def _queue_note(action: str, receipt: str = "") -> Optional[str]:
+    """Say plainly what happened to the work. NEVER guess.
+
+    ``backlog_dispatch`` has THREE outcomes and this used to render two:
+
+      * an ``op-`` receipt — intake accepted it, a worker has it
+      * a ``chat:`` receipt — filed in backlog.json for the sensor to collect
+      * a ``logged-`` receipt — the executor is the safe-default logger and
+        NOTHING happened
+
+    The third fell through to the second, so an operator who typed a real
+    request was told "queued — the Backlog sensor will pick it up on its next
+    sweep" about an entry that was never written. Verified against the live
+    tree: ``.jarvis/backlog.json`` was last modified in April and contained
+    no chat entries at all.
+
+    Three claims in one line, all false, about the operator's own work. The
+    receipt already carried the truth; the renderer had two branches for
+    three realities, which is the same defect as every other one in this
+    arc — a surface reporting a state it did not measure — with the sharpest
+    possible consequence, because this one eats the request and says thank
+    you.
     """
     _phrase, deferred = _voice(action)
     if not deferred or _dispatched_now(receipt):
         return None
+    if _was_discarded(receipt):
+        # Name the flag. An operator who has just watched their request
+        # vanish should not have to grep for why.
+        return ("⎿ NOT queued — the chat executor is the safe-default "
+                "logger, so nothing was written. Set "
+                "JARVIS_CHAT_EXECUTOR_BACKLOG_ENABLED=1 to make this real.")
     ref = f" ({receipt})" if receipt else ""
     return (f"⎿ queued{ref} — the Backlog sensor will pick it up on its "
             f"next sweep")
