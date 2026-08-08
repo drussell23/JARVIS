@@ -27,19 +27,40 @@ from backend.core.ouroboros.battle_test.progress_board import (
 
 import pytest
 
+from backend.core.ouroboros.battle_test.progress_board import scan_budget_s
+
+#: A COLD reading is ~162 s against pytest.ini's 120 s ceiling, so this file
+#: was passing or timing out depending on how warm the page cache was. The
+#: budget comes from the board rather than from a number typed here, for the
+#: reason the fixture docstring below gives.
+pytestmark = pytest.mark.timeout(scan_budget_s())
+
 
 @pytest.fixture(scope="module")
 def board_rows():
     """One tree scan for the whole file.
 
     Every assertion here is a read-only question about the SAME reading, and
-    the scan is the slowest thing this instrument does — around 110 seconds
-    across ~4,200 flags. Seven independent `read()` calls turned a
-    two-minute file into a fifteen-minute one, which is how a correctness
-    test quietly becomes the reason nobody runs the suite.
+    the scan is the slowest thing this instrument does. Seven independent
+    `read()` calls turned a two-minute file into a fifteen-minute one, which
+    is how a correctness test quietly becomes the reason nobody runs the
+    suite.
+
+    That reasoning stands; the NUMBER in it did not. "Around 110 seconds" was
+    measured when this fixture was written and is now ~162 s, so the cost had
+    drifted past pytest's 120 s per-test ceiling and this file was passing or
+    timing out depending on how warm the page cache happened to be. A recorded
+    measurement that nothing re-derives is the defect
+    `tests/architecture/test_reachability_single_authority.py` exists to name,
+    and it had grown one here.
+
+    `cached_read` is keyed on the source tree, the `JARVIS_*` environment, the
+    scan roots and the board's own source, so it returns byte-identical rows
+    or rescans — there is no state in which it can answer a question here
+    differently from `read()`. Warm, that is ~1.3 s.
     """
     from backend.core.ouroboros.battle_test.progress_board import ProgressBoard
-    return ProgressBoard().read().rows
+    return ProgressBoard().cached_read().rows
 
 
 
