@@ -88,3 +88,60 @@ def test_the_panel_omits_the_line_rather_than_guessing() -> None:
     idx = src.index("configured_max_tool_rounds")
     window = src[idx:idx + 400]
     assert "except Exception" in window and "pass" in window
+
+
+# ---------------------------------------------------------------------------
+# JARVIS_L2_ENABLED — the same defect, found by the same sweep
+# ---------------------------------------------------------------------------
+
+from backend.core.ouroboros.governance.repair_engine import (  # noqa: E402
+    L2_ENABLED_ENV,
+    l2_enabled,
+)
+
+
+@pytest.fixture()
+def _clean_l2(monkeypatch):
+    monkeypatch.delenv(L2_ENABLED_ENV, raising=False)
+
+
+def test_l2_defaults_to_enabled(_clean_l2) -> None:
+    """The documented default, and the one the boot panel got wrong: it
+    compared against "" and reported L2 absent while the engine ran it."""
+    assert l2_enabled() is True
+
+
+@pytest.mark.parametrize("truthy", ["true", "TRUE", "1", "yes", "on", "  "])
+def test_l2_truthy_grammars_agree(monkeypatch, truthy) -> None:
+    """The panel used `== "true"`, so `1`, `yes` and `on` read as DISABLED to
+    it and ENABLED to the engine. One grammar now."""
+    monkeypatch.setenv(L2_ENABLED_ENV, truthy)
+    assert l2_enabled() is True
+
+
+@pytest.mark.parametrize("falsy", ["false", "FALSE", "0", "no", "off"])
+def test_l2_opt_out_is_honoured(monkeypatch, falsy) -> None:
+    monkeypatch.setenv(L2_ENABLED_ENV, falsy)
+    assert l2_enabled() is False
+
+
+def test_the_engine_builds_its_budget_from_the_resolver() -> None:
+    import inspect
+    from backend.core.ouroboros.governance import repair_engine
+
+    src = inspect.getsource(repair_engine)
+    assert "enabled = l2_enabled()" in src
+    assert src.count(f'"{L2_ENABLED_ENV}"') == 1, (
+        "the variable is resolved in more than one place again"
+    )
+
+
+def test_the_boot_panel_reads_the_authority() -> None:
+    import inspect
+    from backend.core.ouroboros.battle_test import harness
+
+    src = inspect.getsource(harness)
+    assert "_l2_enabled()" in src, "the panel is not reading the authority"
+    assert f'"{L2_ENABLED_ENV}"' not in src, (
+        "the panel still resolves the variable independently"
+    )

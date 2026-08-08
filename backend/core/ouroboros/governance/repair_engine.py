@@ -61,6 +61,26 @@ _logger = logging.getLogger(__name__)
 __firing_ledgers__ = ("repair_tree",)
 
 
+L2_ENABLED_ENV = "JARVIS_L2_ENABLED"
+
+
+def l2_enabled() -> bool:
+    """Is L2 iterative repair enabled? The ONE answer to that question.
+
+    L2 defaults to ENABLED (Manifesto §6 — the self-repair loop is load-bearing
+    for the Ouroboros cycle); explicit "false"/"0"/"no"/"off" opts out.
+
+    Public because the boot panel resolved the same variable itself, with a
+    default of "" and an `== "true"` comparison. Unset — the documented default
+    — the engine ran L2 and the panel reported it absent, and the two also
+    disagreed about `1`, `yes` and `on`. A reporter that re-derives a
+    capability is a second authority, and the operator only ever sees the
+    second one. NEVER raises.
+    """
+    raw = str(os.environ.get(L2_ENABLED_ENV, "true")).strip().lower()
+    return raw not in ("false", "0", "no", "off")
+
+
 def _l2_test_threading_enabled() -> bool:
     return os.environ.get(
         "JARVIS_L2_TEST_TARGET_THREADING_ENABLED", "true",
@@ -218,8 +238,7 @@ class RepairBudget:
         # Boolean parsing: L2 defaults to enabled (Manifesto §6 — the
         # self-repair loop is load-bearing for the Ouroboros cycle).
         # Accept explicit "false" / "0" / "no" to opt out.
-        enabled_str = os.environ.get("JARVIS_L2_ENABLED", "true").lower()
-        enabled = enabled_str not in ("false", "0", "no", "off")
+        enabled = l2_enabled()
 
         # Integer parsing
         max_iterations = int(os.environ.get("JARVIS_L2_MAX_ITERS", "5"))
