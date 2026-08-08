@@ -147,6 +147,12 @@ class VoiceBiometricFeatures:
     timestamp: datetime = field(default_factory=datetime.now)
 
 
+#: Smallest representable step. Used where a divisor is derived from configured
+#: values that a determined operator could set equal, which would otherwise be a
+#: ZeroDivisionError inside a thread pool.
+_EPS = float(np.finfo(np.float64).eps)
+
+
 def _env_float(name: str, default: float) -> float:
     """
     A tunable read from the environment, defaulting on anything unreadable.
@@ -518,6 +524,14 @@ class AdvancedBiometricVerifier:
         # Anti-spoofing trip points. Read from the environment rather than
         # written into the checks, so a mic or codec that shifts the noise
         # floor can be accommodated without editing a security decision.
+        # How far a degraded capture re-weights the fusion. Applied against the
+        # degradation ratio PerturbationTolerance already computes (0 at the
+        # clean anchor, 1 at the floor), so these say how MUCH to lean, never at
+        # what SNR to start leaning — that anchor has exactly one definition in
+        # this file and it is not here.
+        self._noise_embedding_gain = _env_float("JARVIS_FUSION_NOISE_EMBEDDING_GAIN", 0.30)
+        self._noise_perturbation_loss = _env_float("JARVIS_FUSION_NOISE_PERTURBATION_LOSS", 0.30)
+
         self._replay_max_snr_db = _env_float("JARVIS_ANTISPOOF_MAX_SNR_DB", 50.0)
         self._replay_min_noise = _env_float("JARVIS_ANTISPOOF_MIN_BACKGROUND", 0.001)
         self._replay_max_quality = _env_float("JARVIS_ANTISPOOF_MAX_QUALITY", 0.95)
@@ -562,6 +576,62 @@ class AdvancedBiometricVerifier:
 
         # Get or create speaker model
         speaker_model = await self._get_speaker_model(speaker_name, enrolled_features)
+
+        # ── Dead capture ────────────────────────────────────────────────────
+        # Refused BEFORE the stages run, because a dead tensor does not fail
+        # loudly — it produces plausible-looking numbers. A zero-magnitude
+        # embedding gives a 0/0 cosine, and every stage downstream then reports
+        # a score computed from silence.
+        #
+        # macOS TCC makes this a live path rather than a hypothetical. The
+        # microphone is gated per-client, and the client at a lock screen is not
+        # this process: SecurityAgent and the broker daemon each need their own
+        # grant, and a daemon has no UI in which to be asked for one. A denial
+        # while locked therefore does not raise — it hands back a buffer of
+        # zeros, which is exactly the input this refuses.
+        #
+        # "Fail secure" and "fail open" are the same action here and it is worth
+        # being explicit about why: this returns UNVERIFIED, so no grant is
+        # deposited, so the mechanism yields, so loginwindow's own password
+        # prompt handles the unlock. Denying the biometric IS opening the door
+        # to the normal authenticator. What would fail closed in the dangerous
+        # sense is raising — an exception inside a worker thread surfaces as a
+        # stage fault, and this chain has substituted fabricated scores for
+        # stage faults at every previous layer.
+        dead_capture = self._dead_capture_reason(test_features)
+        if dead_capture is not None:
+            logger.error(
+                "🔇 [Verify] no usable capture for %s (%s) — UNVERIFIED. If the "
+                "screen is locked, check the microphone grant for SecurityAgent "
+                "and %s; a TCC denial returns silence, not an error.",
+                speaker_name, dead_capture, "the unlock broker",
+            )
+            return VerificationResult(
+                verified=False,
+                confidence=0.0,
+                threshold=float(speaker_model.decision_threshold),
+                # UNMEASURED, not 0.0. A zero here would read downstream as a
+                # comparison that ran and scored nothing, which is the precise
+                # confusion between a fault and a verdict this file exists to
+                # keep out of the authorization path.
+                embedding_similarity=UNMEASURED,
+                mahalanobis_distance=UNMEASURED,
+                acoustic_match_score=UNMEASURED,
+                physics_plausibility=UNMEASURED,
+                anti_spoofing_score=UNMEASURED,
+                # The decision, by contrast, IS known: nothing was verified.
+                posterior_probability=0.0,
+                uncertainty=1.0,
+                confidence_interval=(0.0, 0.0),
+                fusion_weights={},
+                feature_contributions={},
+                decision_factors=[f"No usable capture: {dead_capture}"],
+                warnings=[
+                    "Microphone produced no signal; falling through to the "
+                    "system password prompt",
+                ],
+                processing_time_ms=(datetime.now() - start_time).total_seconds() * 1000.0,
+            )
 
         # Run all verification stages in parallel using thread pool
         # This prevents blocking and allows true parallelism
@@ -672,21 +742,48 @@ class AdvancedBiometricVerifier:
         decision_factors = []
         feature_contributions = {}
 
-        if embedding_sim * fusion_weights.get('embedding', 0.4) > 0.2:
+        # Reporting only — none of this reaches the verdict, which
+        # _owner_aware_antispoof_fusion_sync decides. It still must not invent
+        # numbers or raise.
+        #
+        # Two defects here. The `.get(name, <literal>)` guards paired with a bare
+        # `fusion_weights[name]` on the very next line: the guard admitted the
+        # key might be absent and the assignment then indexed it anyway, so an
+        # absent weight was a KeyError inside a verification, not a fallback. And
+        # the literals themselves were a second, unrelated set of weights that
+        # nothing had measured — a stage whose weight went missing was reported
+        # as though someone had chosen 0.4 for it.
+        #
+        # An absent weight now means the contribution is not reported. A
+        # contribution computed from a made-up weight is not a smaller
+        # measurement; it is a different one.
+        def _contribution(name: str, score: float) -> Optional[float]:
+            weight = fusion_weights.get(name)
+            if not is_measured(weight, 0.0, None) or not is_measured(score, None, None):
+                return None
+            return float(score) * float(weight)
+
+        _embedding_contribution = _contribution('embedding', embedding_sim)
+        if _embedding_contribution is not None and _embedding_contribution > 0.2:
             decision_factors.append(f"Strong embedding match ({embedding_sim:.1%})")
-            feature_contributions['embedding'] = embedding_sim * fusion_weights['embedding']
+            feature_contributions['embedding'] = _embedding_contribution
 
-        if acoustic_score * fusion_weights.get('acoustic', 0.3) > 0.15:
+        _acoustic_contribution = _contribution('acoustic', acoustic_score)
+        if _acoustic_contribution is not None and _acoustic_contribution > 0.15:
             decision_factors.append(f"Acoustic features match ({acoustic_score:.1%})")
-            feature_contributions['acoustic'] = acoustic_score * fusion_weights['acoustic']
+            feature_contributions['acoustic'] = _acoustic_contribution
 
-        if physics_score < 0.8:
+        if is_measured(physics_score, None, None) and physics_score < 0.8:
             decision_factors.append(f"⚠️  Physics plausibility low ({physics_score:.1%})")
-        feature_contributions['physics'] = physics_score * fusion_weights.get('physics', 0.1)
+        _physics_contribution = _contribution('physics', physics_score)
+        if _physics_contribution is not None:
+            feature_contributions['physics'] = _physics_contribution
 
-        if spoofing_score < 0.9:
+        if is_measured(spoofing_score, None, None) and spoofing_score < 0.9:
             decision_factors.append(f"⚠️  Possible spoofing detected ({spoofing_score:.1%})")
-        feature_contributions['anti_spoofing'] = spoofing_score * fusion_weights.get('spoofing', 0.2)
+        _spoofing_contribution = _contribution('spoofing', spoofing_score)
+        if _spoofing_contribution is not None:
+            feature_contributions['anti_spoofing'] = _spoofing_contribution
 
         # Warnings
         warnings = []
@@ -1733,6 +1830,35 @@ class AdvancedBiometricVerifier:
 
         return posterior, float(uncertainty)
 
+    def _dead_capture_reason(self, features: "VoiceBiometricFeatures") -> Optional[str]:
+        """
+        Why this capture carries no biometric evidence, or ``None`` if it does.
+
+        Scoped to the embedding on purpose. It is the ONLY channel that reaches
+        the verdict — ``_owner_aware_antispoof_fusion_sync`` scores
+        ``owner_match_score`` (the embedding similarity) and ``spoof_prob``, and
+        records everything else without letting it influence the result. A gate
+        that also demanded live scalar features would be refusing captures over
+        evidence that cannot change the answer.
+
+        Magnitude, not just finiteness. Cosine similarity divides by the norms,
+        so an all-zero vector is 0/0: numpy returns NaN with a RuntimeWarning
+        nobody reads, and NaN then compares False against every threshold — a
+        verdict decided by which else-clause it reaches. The zero vector is also
+        the specific shape a TCC-denied microphone produces, which is what makes
+        this the likely case rather than the paranoid one.
+        """
+        vector = coerce_vector(getattr(features, "embedding", None))
+        if vector is None or vector.size == 0:
+            return "embedding absent"
+        if not bool(np.all(np.isfinite(vector))):
+            return "embedding contains non-finite values"
+
+        norm = float(np.linalg.norm(vector))
+        if not math.isfinite(norm) or norm <= _EPS:
+            return f"embedding has zero magnitude (norm={norm:.3g})"
+        return None
+
     def _score_to_likelihood(self, score: float, mean: float, std: float) -> float:
         """Convert similarity score to likelihood using Gaussian."""
         likelihood = stats.norm.pdf(score, loc=mean, scale=max(std, 0.01))
@@ -1744,22 +1870,73 @@ class AdvancedBiometricVerifier:
         speaker_model: "SpeakerModel",
         context: Optional[Dict]
     ) -> Dict[str, float]:
-        """Compute dynamic fusion weights based on context."""
-        weights = speaker_model.fusion_weights.copy()
+        """
+        Fusion weights adjusted for capture quality, renormalised over the ones
+        that survive.
 
-        if context:
-            if context.get('snr_db', 30) < 15:
-                weights['embedding'] *= 1.3
-                weights['acoustic'] *= 0.7
+        THE UNMEASURED-SNR DEFAULT WAS BACKWARDS. This read
+        ``context.get('snr_db', 30)`` twice. 30 dB is above the clean anchor, so
+        a capture whose SNR was never measured took the ``> 25`` branch and had
+        its acoustic and physics weights INFLATED — the two channels noise
+        degrades first. An absent measurement was promoting exactly the evidence
+        least able to survive its absence, and it did so silently, because a
+        default in a ``.get`` looks like a measurement everywhere downstream.
 
-            if context.get('snr_db', 30) > 25:
-                weights['acoustic'] *= 1.2
-                weights['physics'] *= 1.1
+        ``PerturbationTolerance`` in this same file already refuses that error
+        for jitter and shimmer: "assuming studio conditions would penalise every
+        real capture". Two functions in one file cannot hold opposite opinions
+        about what an unknown SNR means, so this now asks the same object. An
+        unmeasured SNR produces NO adjustment at all — not a guessed one.
+
+        The adjustment is continuous rather than two step functions, taken from
+        the degradation ratio the tolerance already computes: 0.0 at the clean
+        anchor, 1.0 at the floor. One SNR model for the whole file.
+
+        Weights that are not measurements are DROPPED and the remainder
+        renormalised — the discipline ``renormalized_weighted_mean`` documents.
+        Substituting a value for an absent weight would let a stage that
+        measured nothing vote. An empty dict is a legitimate return: it means no
+        weight survived, and the caller must drop its own term rather than
+        invent one.
+        """
+        weights = {
+            name: float(value)
+            for name, value in (speaker_model.fusion_weights or {}).items()
+            if is_measured(value, 0.0, None)
+        }
+        if not weights:
+            logger.warning(
+                "⚠️  [Fusion] no measured fusion weights on the speaker model; "
+                "contributions will be reported as unweighted"
+            )
+            return {}
+
+        caps = self._tolerance.caps_for((context or {}).get('snr_db'))
+
+        # caps.snr_db is None exactly when the SNR was not measured. No opinion
+        # is the honest adjustment; the caps object has already widened its own
+        # limits to compensate, and doing it twice would be double-counting.
+        if caps.snr_db is not None:
+            span = max(self._tolerance.max_scale - 1.0, _EPS)
+            degradation = float(np.clip((caps.scale - 1.0) / span, 0.0, 1.0))
+
+            for name, factor in (
+                ('embedding', 1.0 + degradation * self._noise_embedding_gain),
+                ('acoustic',  1.0 - degradation * self._noise_perturbation_loss),
+                ('physics',   1.0 - degradation * self._noise_perturbation_loss),
+            ):
+                if name in weights:
+                    weights[name] = max(weights[name] * factor, 0.0)
 
         total = sum(weights.values())
-        weights = {k: v / total for k, v in weights.items()}
+        if not is_measured(total, None, None) or total <= 0.0:
+            logger.warning(
+                "⚠️  [Fusion] weights summed to %r after adjustment; abstaining "
+                "rather than renormalising by a non-positive total", total,
+            )
+            return {}
 
-        return weights
+        return {name: value / total for name, value in weights.items()}
 
     async def _get_adaptive_threshold(
         self,
