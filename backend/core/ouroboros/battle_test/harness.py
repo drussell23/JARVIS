@@ -4657,6 +4657,55 @@ class BattleTestHarness:
                     f"  {name}: {tok_txt} · {reset_txt} · "
                     f"status: {status} · runway: {verdict}"
                 )
+                # THE missing column. Every field above measures QUOTA; none
+                # of them can express "the account has no money", so on
+                # 2026-08-08 this rendered "5,000,000 tokens · status: 200 ·
+                # runway: ok" while a live probe returned 402 and every op
+                # died at GENERATE. Composed, not stored — `economic_view`
+                # reads the row `record_quota_exhaustion` already owns.
+                try:
+                    from backend.core.ouroboros.governance.economic_state import (  # noqa: E501
+                        ECONOMIC,
+                        RATE_LIMITED,
+                        UNKNOWN,
+                        economic_view,
+                    )
+                    ev = economic_view(name)
+                    st = ev.get("state")
+                    if st == ECONOMIC and ev.get("hard_open"):
+                        secs = int(ev.get("expires_in_s") or 0)
+                        lines.append(
+                            f"      ⛔ funding: OUT OF CREDIT (hard-open, "
+                            f"re-probes in {secs}s)"
+                        )
+                    elif st == RATE_LIMITED and ev.get("hard_open"):
+                        secs = int(ev.get("expires_in_s") or 0)
+                        lines.append(
+                            f"      ⏳ quota outage (self-healing in {secs}s)"
+                        )
+                    elif ev.get("unverified_since"):
+                        # The TTL lapsed. That is proof time passed, NOT proof
+                        # the wallet was topped up — money does not return on
+                        # a timer. Routing keeps its fail-open optimism; the
+                        # display stops calling that optimism knowledge.
+                        when = time.strftime(
+                            "%H:%M", time.localtime(ev["unverified_since"]),
+                        )
+                        lines.append(
+                            f"      ⚠️ funding: UNVERIFIED since {when} "
+                            f"(economic flag lapsed on a timer, not a probe)"
+                        )
+                    elif st == UNKNOWN and ev.get("reason"):
+                        lines.append("      ⚠️ funding: unknown")
+                    if ev.get("reason"):
+                        lines.append(f"      ↳ {str(ev['reason'])[:118]}")
+                    if ev.get("stale_clock"):
+                        lines.append(
+                            "      ⚠️ reset horizon unreliable — recorded_unix "
+                            "failed the plausibility guard (stale/fixture row)"
+                        )
+                except Exception:  # noqa: BLE001 — a column must not eat the view
+                    pass
             lines.append(
                 f"  floor: {min_tokens_floor():,} tokens · "
                 f"exhausted: {'yes' if any_runway_exhausted() else 'no'}"
@@ -4665,6 +4714,48 @@ class BattleTestHarness:
                     if any_runway_exhausted() else ""
                 )
             )
+            # BLAST RADIUS — who absorbs the traffic, and whether they CAN.
+            #
+            # Naming a fallback without checking it is worse than silence: it
+            # reports a successful handoff into a lane that may be just as
+            # dead. On 2026-08-08 the generator logged "IMMEDIATE reroute → DW"
+            # and "DW AUTARKY ENGAGED" seconds before failing, because DW was
+            # also out of credit. A handoff into a dead lane is a CASCADING
+            # ROUTE FAILURE, and the dashboard now says so.
+            try:
+                from backend.core.ouroboros.governance.economic_state import (
+                    blast_radius,
+                )
+                br = blast_radius()
+                if br.get("lanes"):
+                    lines.append("  blast radius:")
+                    for lane, info in sorted(br["lanes"].items()):
+                        if info.get("viable"):
+                            lines.append(
+                                f"    {lane}: viable ({info.get('reason') or 'ok'})"
+                            )
+                            continue
+                        absorbed = info.get("absorbed_by") or []
+                        why = info.get("reason") or info.get("economic") or "down"
+                        if absorbed:
+                            lines.append(
+                                f"    {lane}: DOWN ({why}) → absorbed by "
+                                f"{', '.join(absorbed)}"
+                            )
+                        else:
+                            lines.append(
+                                f"    {lane}: DOWN ({why}) → ⛔ CASCADING ROUTE "
+                                f"FAILURE — no viable lane is absorbing this"
+                            )
+                    if br.get("cascading"):
+                        lines.append(
+                            "    ⛔ every fallback for "
+                            f"{', '.join(sorted(br['cascading']))} is itself "
+                            "economically or quota-exhausted — generation "
+                            "cannot succeed on any lane"
+                        )
+            except Exception:  # noqa: BLE001 — optional surface
+                pass
             # Lease economy — best-effort (pool may not be constructed).
             try:
                 from backend.core.ouroboros.governance.liquidity_pool import (

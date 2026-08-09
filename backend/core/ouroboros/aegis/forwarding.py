@@ -708,11 +708,35 @@ async def forward_request(
                 provider_for_upstream,
                 record_headers,
             )
+            _liq_provider = provider_for_upstream(str(request.path))
             record_headers(
-                provider_for_upstream(str(request.path)),
+                _liq_provider,
                 dict(upstream_resp.headers),
                 status=upstream_resp.status,
             )
+            # ECONOMIC fold. `record_headers` above returns early when the
+            # response declares no rate-limit telemetry — and an economic
+            # refusal never does, because the problem is not quota. So the one
+            # response that proves a lane is dead is exactly the one the
+            # ledger discarded: on 2026-08-08 DoubleWord returned 402
+            # "Account balance too low" and never appeared in the ledger at
+            # all, while the dashboard showed the other lane at "runway: ok".
+            #
+            # Classified here because this is the ONE chokepoint every
+            # upstream response crosses. Synchronous by design (pure CPU over
+            # values already in hand) so the proxy hot path grows no await.
+            # Fail-soft: telemetry must never break forwarding.
+            try:
+                from backend.core.ouroboros.governance.economic_state import (  # noqa: E501,PLC0415
+                    fold_economic_state,
+                )
+                fold_economic_state(
+                    _liq_provider,
+                    status=upstream_resp.status,
+                    headers=dict(upstream_resp.headers),
+                )
+            except Exception:  # noqa: BLE001
+                pass
             for _hk, _hv in upstream_resp.headers.items():
                 _lk = _hk.lower()
                 if (_lk.startswith("anthropic-ratelimit-")
