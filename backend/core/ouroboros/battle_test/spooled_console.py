@@ -203,7 +203,48 @@ def make_spooled_console(
     spooler = ConsoleSpooler(sink)
 
     class SpooledConsole(Console):  # type: ignore[misc]
-        """A Console that also mirrors to whoever ran the command."""
+        """A Console that also mirrors to whoever ran the command — at the
+        width of the terminal that will actually display it.
+
+        `size` is overridden rather than each consumer being converted, for
+        the same reason this class exists at all: `print_fit` reads
+        ``console.width``, Rich derives wrapping and table layout from
+        ``console.size``, and the diff formatters ask the console how much
+        room they have. Every one of them becomes capability-aware by
+        changing the object they already hold — no call site moves.
+
+        Before this, the daemon rendered every mirrored line at a literal 120
+        columns no matter who was watching: an 80-column cockpit got wrapped
+        diffs and a broken gutter, a 200-column one got two-thirds of a
+        screen. `terminal_capabilities` knows the real answer per subscriber;
+        this is where that answer is spent.
+        """
+
+        @property
+        def size(self):  # type: ignore[override]
+            """Live dimensions for THIS render. NEVER raises.
+
+            Read per access, not cached: a SIGWINCH between two prints must
+            take effect on the second one. Falls through to Rich's own
+            detection when nothing has declared, so a foreground daemon on a
+            real terminal keeps behaving exactly as it did.
+            """
+            try:
+                from rich.console import ConsoleDimensions
+
+                from backend.core.ouroboros.battle_test.terminal_capabilities import (  # noqa: E501
+                    current_capabilities,
+                )
+                caps = current_capabilities()
+                if caps is not None and caps.cols > 0:
+                    return ConsoleDimensions(caps.cols, max(1, caps.rows))
+            except Exception:  # noqa: BLE001 — never break a render path
+                pass
+            try:
+                return super().size
+            except Exception:  # noqa: BLE001
+                from rich.console import ConsoleDimensions
+                return ConsoleDimensions(width, 24)
 
         def print(self, *args: Any, **kwargs: Any) -> None:  # noqa: A003
             # LOCAL RENDER FIRST, and unconditionally. A daemon running in the
@@ -213,7 +254,11 @@ def make_spooled_console(
             except Exception:  # noqa: BLE001
                 pass
             try:
-                text = _render_to_text(args, kwargs, width=width)
+                # Rendered for the cockpit this line is ADDRESSED to —
+                # `current_session()` is read below for routing, and the
+                # width must come from the same subscriber or the text is
+                # wrapped for a terminal that will never see it.
+                text = _render_to_text(args, kwargs, width=_mirror_width(width))
                 if text.strip():
                     from backend.core.ouroboros.battle_test.attach_session import (
                         current_session,
@@ -231,6 +276,23 @@ def make_spooled_console(
         force_terminal=getattr(base, "is_terminal", False) or None,
     )
     return console, spooler
+
+
+def _mirror_width(fallback: int) -> int:
+    """Columns to render a MIRRORED line at. NEVER raises.
+
+    Resolves through `terminal_capabilities`, which answers per-subscriber
+    for addressed output and with the minimum across live cockpits for
+    ambient. `fallback` is the caller's literal and is reached only when no
+    display has ever declared — a foreground daemon with no cockpit attached.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.terminal_capabilities import (
+            effective_width,
+        )
+        return int(effective_width(fallback))
+    except Exception:  # noqa: BLE001
+        return int(fallback)
 
 
 def _render_to_text(args: Any, kwargs: Any, *, width: int) -> str:
