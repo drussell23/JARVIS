@@ -287,3 +287,97 @@ def test_the_lag_notice_is_coalesced_not_per_drop() -> None:
     first = sp._lag_notice()
     assert first is not None and "dropped" in first
     assert sp._lag_notice() is None, "announced the same drops twice"
+
+
+# --------------------------------------------------------------------------
+# 7. the channel is CONSUMED — the half that was missing
+# --------------------------------------------------------------------------
+#
+# The first cut of this work shipped the measurement and no consumer:
+# `effective_width()` had zero production callers and `chrome_color()` never
+# consulted the theme. A capability channel talking to nobody is precisely the
+# wired-but-inert defect this codebase keeps paying for, so these pin the
+# CONSUMPTION rather than the plumbing.
+
+
+def _console():
+    from backend.core.ouroboros.battle_test.spooled_console import (
+        make_spooled_console,
+    )
+    con, _sp = make_spooled_console(lambda _s, _t: None)
+    return con
+
+
+def test_the_console_adapts_to_the_attached_cockpit() -> None:
+    """ONE seam converts every consumer. `print_fit` reads `console.width`,
+    Rich derives table layout and wrapping from `console.size`, and the diff
+    formatters ask the console how much room they have — so overriding the
+    object they already hold beats converting N call sites."""
+    con = _console()
+    declare("narrow", TerminalCapabilities(cols=80, rows=24))
+    declare("wide", TerminalCapabilities(cols=200, rows=50))
+    assert con.width == 80, "ambient must render at the MINIMUM"
+
+
+def test_addressed_output_renders_at_that_cockpits_width() -> None:
+    from backend.core.ouroboros.battle_test.attach_session import session_scope
+
+    con = _console()
+    declare("narrow", TerminalCapabilities(cols=80, rows=24))
+    declare("wide", TerminalCapabilities(cols=200, rows=50))
+    with session_scope("wide"):
+        assert con.width == 200
+    with session_scope("narrow"):
+        assert con.width == 80
+
+
+def test_the_console_falls_back_when_nothing_is_attached() -> None:
+    """A foreground daemon with no cockpit must behave exactly as before —
+    this is additive, never a redirect."""
+    con = _console()
+    assert con.width > 0
+
+
+def test_the_width_is_read_per_access_not_cached() -> None:
+    """A SIGWINCH between two prints must take effect on the second one."""
+    con = _console()
+    declare("s", TerminalCapabilities(cols=100, rows=24))
+    assert con.width == 100
+    declare("s", TerminalCapabilities(cols=160, rows=24))   # resize
+    assert con.width == 160, "the console cached a stale width"
+
+
+def test_a_poisoned_registry_cannot_break_a_render() -> None:
+    con = _console()
+    tc._CAPS["bad"] = "not-capabilities"  # type: ignore[assignment]
+    try:
+        assert con.width > 0
+    finally:
+        tc._CAPS.pop("bad", None)
+
+
+def test_chrome_demotes_bright_only_on_a_DECLARED_light_terminal() -> None:
+    """bright green on white is near-unreadable, and it is the colour
+    reserved for OUTCOMES. `unknown` must change nothing — a guess would
+    repaint every foreground daemon on no evidence."""
+    import os
+
+    from backend.core.ouroboros.battle_test.presentation_restraint import (
+        chrome_color,
+    )
+
+    prev = os.environ.get("JARVIS_PRESENTATION_RESTRAINT_ENABLED")
+    os.environ["JARVIS_PRESENTATION_RESTRAINT_ENABLED"] = "false"
+    try:
+        assert chrome_color("bright_green") == "bright_green"   # unknown
+        declare("light", TerminalCapabilities(cols=100, rows=24, theme="light"))
+        assert chrome_color("bright_green") == "green"
+        forget("light")
+        declare("dark", TerminalCapabilities(cols=100, rows=24, theme="dark"))
+        assert chrome_color("bright_green") == "bright_green"
+        assert chrome_color("cyan") == "cyan", "non-bright colours untouched"
+    finally:
+        if prev is None:
+            os.environ.pop("JARVIS_PRESENTATION_RESTRAINT_ENABLED", None)
+        else:
+            os.environ["JARVIS_PRESENTATION_RESTRAINT_ENABLED"] = prev

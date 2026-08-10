@@ -1059,7 +1059,34 @@ def chrome_color(default: str = "bright_green") -> str:
     """
     if is_restraint_enabled():
         return "dim"
-    return default
+    return _theme_adapted(default)
+
+
+def _theme_adapted(color: str) -> str:
+    """Adjust a colour for the terminal that will actually display it.
+
+    The daemon picked this palette against an assumed dark background, and
+    until `terminal_capabilities` existed there was no way to know better.
+    ``bright_*`` on a light terminal is the specific failure: bright green on
+    white is close to unreadable, and it is the colour reserved for OUTCOMES —
+    the one an operator most needs to see.
+
+    Only ``bright_`` is demoted, and only on a terminal that DECLARED itself
+    light. ``unknown`` changes nothing: a guess here would repaint every
+    foreground daemon on no evidence, and "I was not told" is not "it is
+    light". NEVER raises — a colour lookup on a render path must not be able
+    to fail.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.terminal_capabilities import (
+            effective_theme,
+        )
+        if effective_theme() != "light":
+            return color
+        c = str(color)
+        return c.replace("bright_", "", 1) if c.startswith("bright_") else c
+    except Exception:  # noqa: BLE001
+        return color
 
 
 def real_stdout_isatty() -> bool:
