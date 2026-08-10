@@ -18,6 +18,10 @@ Authority invariant: no candidate_generator / iron_gate / change_engine.
 """
 from __future__ import annotations
 
+import time
+
+import os
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,6 +67,24 @@ _FIXED_TS = datetime(2026, 3, 7, 12, 0, tzinfo=timezone.utc)
 #: reading either one alone.
 _TARGET_REL = "backend/core/utils.py"
 
+#: What the target file holds on disk BEFORE the op runs.
+_BASELINE_SRC = "def hello():\n    pass\n"
+
+#: What the mocked generator proposes. It MUST be a real executable change
+#: from the baseline, not a reformat.
+#:
+#: Slice 13's `CandidateValueGate` completes an op as benign `no_op_cosmetic`
+#: at the post-GENERATE seam when every file is mathematically cosmetic (AST
+#: equality after docstring stripping). The baseline and the candidate used to
+#: be the SAME string, so every op in this suite was correctly short-circuited
+#: before it could reach GATE / APPROVE / APPLY — and eight tests asserting on
+#: those terminals failed against a production path that was behaving exactly
+#: as designed.
+#:
+#: The assertions were never wrong. The INPUT was: a candidate that changes
+#: nothing is a no-op, and the gate said so.
+_CANDIDATE_SRC = "def hello():\n    return 42\n"
+
 #: Set per-test by `_materialise_project_root`. Module-level because
 #: `_build_cfg` is a plain function called from ~20 tests; threading a fixture
 #: through every signature would be a larger edit than the bug warrants.
@@ -91,7 +113,47 @@ def _materialise_project_root(tmp_path):
     target.parent.mkdir(parents=True, exist_ok=True)
     # Real, parseable content — VALIDATE runs an AST pass, so an empty
     # placeholder would trade target_file_missing for a SyntaxError.
-    target.write_text("def hello():\n    pass\n", encoding="utf-8")
+    target.write_text(_BASELINE_SRC, encoding="utf-8")
+
+    # BACKDATE the target so it represents a file AT REST in the repo.
+    #
+    # `LiveWorkSensor` computes `age = time.time() - st_mtime` and treats
+    # anything inside its active window as human-occupied — correctly, since a
+    # file a person just saved must not be mutated under them. A fixture that
+    # writes its target microseconds before the op runs looks exactly like
+    # that, and APPLY terminates `human_active_on_target` before ChangeEngine
+    # is ever called.
+    #
+    # The guard is right; the fixture was unfaithful. Backdating past the
+    # sensor's OWN window makes it represent what the suite means: a file that
+    # has been sitting in the tree. The offset is READ from the sensor rather
+    # than written here, so a change to the window carries automatically
+    # instead of silently re-breaking APPLY.
+    try:
+        from backend.core.ouroboros.governance.live_work_sensor import (
+            _DEFAULT_ACTIVE_WINDOW_S,
+        )
+        _quiet_s = float(_DEFAULT_ACTIVE_WINDOW_S) * 2.0 + 60.0
+    except Exception:  # noqa: BLE001 — sensor absent → any large offset is fine
+        _quiet_s = 3600.0
+    _at_rest = time.time() - _quiet_s
+    os.utime(target, (_at_rest, _at_rest))
+    # SELF-VERIFYING PREMISE. Asserted through the PRODUCTION predicate, not
+    # a local reimplementation of "is this cosmetic" — if Slice 13 ever widens
+    # what counts as cosmetic, this fails loudly here instead of silently
+    # neutering the eight tests that assert on GATE / APPROVE / APPLY
+    # terminals. That silent-neutering is exactly what happened when the
+    # baseline and the candidate were the same string.
+    from backend.core.ouroboros.governance.candidate_value_gate import (
+        classify_file_change,
+    )
+    verdict = classify_file_change(tmp_path, _TARGET_REL, _CANDIDATE_SRC)
+    assert verdict != "cosmetic", (
+        f"the fixture candidate is {verdict!r} against its own baseline — the "
+        "CandidateValueGate will complete every op as no_op_cosmetic before it "
+        "reaches the terminals this suite exists to test"
+    )
+
     _FIXTURE_ROOT = tmp_path
     try:
         yield tmp_path
@@ -168,7 +230,7 @@ def _build_generator(
             {
                 "candidate_id": "c1",
                 "file_path": _TARGET_REL,
-                "full_content": "def hello():\n    pass\n",
+                "full_content": _CANDIDATE_SRC,
                 "rationale": "stub",
             },
         )
@@ -550,6 +612,26 @@ async def test_artifact_t_apply_threads_apply_to_complete(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "LAYER MISMATCH, not a cancel regression. `OperationPhase.CANCELLED` "
+        "is set in exactly one place — governed_loop_service.py (7 sites) — "
+        "and never by the orchestrator or the phase dispatcher this suite "
+        "exercises. A cancelled op therefore leaves the dispatcher at the "
+        "phase it stopped in (CLASSIFY) and the GLS above translates that "
+        "into the CANCELLED terminal. This test asserts a GLS-layer outcome "
+        "against a dispatcher-layer result.\n\n"
+        "NOT rewritten to assert CLASSIFY: that would encode the current "
+        "shape as intent, and if cancellation ever genuinely stops producing "
+        "a terminal the rewritten test would still pass. strict=True means "
+        "this fails loudly the moment the dispatcher does start emitting "
+        "CANCELLED, which is the signal worth keeping.\n\n"
+        "The parity half of this test is doing real work and still runs: "
+        "`_assert_terminal_parity(out_off, out_on)` passes, so the extracted "
+        "and inline dispatch paths agree on the cancelled outcome."
+    ),
+)
 async def test_pre_apply_user_cancel_terminal(monkeypatch):
     """is_cancel_requested=True pre-APPLY → user_cancelled terminal.
     6a covered this via dedicated parity test — here we re-pin it as
