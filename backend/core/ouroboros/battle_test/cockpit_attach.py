@@ -1274,7 +1274,27 @@ class CockpitAttachBridge:
                 _sid = str(frame.get("session", "")).strip()
                 if _sid:
                     self.bind_session(_sid, writer)
-                if ftype == "input":
+                if ftype == "caps":
+                    # The display describing itself. Handled BEFORE `input`
+                    # because a cockpit declares at handshake and again on
+                    # every SIGWINCH — the very first render addressed to it
+                    # must already know its width, or the operator's opening
+                    # frame is the one that wraps.
+                    #
+                    # Fail-soft and per-client: a malformed declaration is
+                    # dropped and the composite continues to answer for this
+                    # subscriber. One bad cockpit cannot narrow the others.
+                    try:
+                        from backend.core.ouroboros.battle_test.terminal_capabilities import (  # noqa: E501
+                            TerminalCapabilities,
+                            declare,
+                        )
+                        _caps = TerminalCapabilities.from_wire(frame)
+                        if _caps is not None and _sid:
+                            declare(_sid, _caps)
+                    except Exception:  # noqa: BLE001
+                        pass
+                elif ftype == "input":
                     text = str(frame.get("text", "")).strip()
                     if text:
                         self.stats["inputs_received"] += 1
@@ -1346,6 +1366,19 @@ class CockpitAttachBridge:
             pass
         finally:
             self._drop(writer)
+            # Retire this display's declaration. Ambient renders take the
+            # MINIMUM width across live subscribers, so a departed 40-column
+            # terminal would otherwise squeeze every future broadcast for the
+            # life of the daemon — a dead cockpit constraining live ones.
+            try:
+                from backend.core.ouroboros.battle_test.terminal_capabilities import (  # noqa: E501
+                    forget,
+                )
+                for _sid, _w in list(getattr(self, "_sessions", {}).items()):
+                    if _w is writer:
+                        forget(_sid)
+            except Exception:  # noqa: BLE001
+                pass
             logger.info(
                 "[CockpitAttach] terminal detached (subscribers=%d)",
                 len(self._clients),
@@ -1472,6 +1505,15 @@ class CockpitAttachClient:
                 self._read_loop(),
             )
             self.connected = True
+            # Declare this display IMMEDIATELY. The daemon renders for a
+            # terminal it cannot see, so the very first frame it sends back
+            # must already be sized correctly — a cockpit that declares late
+            # has its opening render wrapped.
+            try:
+                self.send_caps()
+                self.install_resize_listener()
+            except Exception:  # noqa: BLE001
+                pass
             return "ok"
         except asyncio.TimeoutError:
             await self.close()
@@ -1483,6 +1525,117 @@ class CockpitAttachClient:
         except Exception:  # noqa: BLE001
             await self.close()
             return "dead"
+
+    @staticmethod
+    def _wcwidth_available() -> bool:
+        """True iff this client can reason about double-width glyphs.
+
+        Presence of `wcwidth` is the honest proxy: with it, the client's
+        renderer and the daemon's agree on how many columns an emoji occupies;
+        without it, both are guessing and the safe report is narrow.
+        """
+        try:
+            import wcwidth  # noqa: F401
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def send_caps(self) -> bool:
+        """Tell the daemon what this display actually is. NEVER raises.
+
+        The daemon renders every table, diff and gutter for a terminal it
+        cannot see. This is the only frame that closes that gap, so it is sent
+        at handshake AND on every resize — a cockpit that declares once and
+        then gets dragged wider spends the rest of its life being rendered for
+        a window that no longer exists.
+
+        Measured, never assumed: width/height come from `os.get_terminal_size`
+        on the real TTY. `COLORFTERM`/`TERM` answer colour depth. Theme comes
+        from `COLORFGBG` when the terminal sets it and is reported "unknown"
+        otherwise — a guess here paints grey on white for every light-terminal
+        operator, and "unknown" routes the renderer to its theme-agnostic path
+        instead.
+        """
+        try:
+            w = self._writer
+            if not self.connected or w is None or w.is_closing():
+                return False
+
+            cols = rows = 0
+            try:
+                size = os.get_terminal_size()
+                cols, rows = int(size.columns), int(size.lines)
+            except Exception:  # noqa: BLE001 — not a TTY (piped `ov`)
+                cols = rows = 0
+            if cols <= 0:
+                return False           # nothing measured → declare nothing
+
+            # COLORFGBG is "fg;bg"; bg 0-6 and 8 are dark, 7 and 9-15 light.
+            theme = "unknown"
+            try:
+                raw = os.environ.get("COLORFGBG", "")
+                if ";" in raw:
+                    bg = int(raw.rsplit(";", 1)[-1].strip())
+                    theme = "dark" if (bg <= 6 or bg == 8) else "light"
+            except (TypeError, ValueError):
+                theme = "unknown"
+
+            depth = 0
+            _term = os.environ.get("TERM", "")
+            if os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit"):
+                depth = 16_777_216
+            elif "256" in _term:
+                depth = 256
+            elif _term:
+                depth = 8
+
+            frame = {
+                "type": "caps",
+                "session": self.session_id,
+                "cols": cols, "rows": rows,
+                "theme": theme,
+                # Terminals disagree about emoji/CJK advance width and only
+                # the client can answer. `wcwidth` present → trust the
+                # double-width prediction; absent → report narrow, because an
+                # aligned ASCII gutter beats a misaligned pretty one.
+                "wide_glyphs": self._wcwidth_available(),
+                "color_depth": depth,
+            }
+            w.write((json.dumps(frame, separators=(",", ":")) + "\n").encode())
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def install_resize_listener(self) -> bool:
+        """Re-declare on SIGWINCH. NEVER raises; False where unsupported.
+
+        Chained, not replaced: another handler may already own SIGWINCH
+        (prompt_toolkit installs one to reflow its own layout), and clobbering
+        it would fix the daemon's width while breaking the client's.
+        """
+        try:
+            import signal
+            if not hasattr(signal, "SIGWINCH"):
+                return False            # Windows / no job control
+            prior = signal.getsignal(signal.SIGWINCH)
+
+            def _on_resize(signum, frame) -> None:
+                try:
+                    self.send_caps()
+                except Exception:  # noqa: BLE001
+                    pass
+                if callable(prior):
+                    try:
+                        prior(signum, frame)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            signal.signal(signal.SIGWINCH, _on_resize)
+            return True
+        except (ValueError, OSError, AttributeError):
+            # `signal.signal` off the main thread raises ValueError — a real
+            # scenario for an embedded cockpit, and not an error.
+            return False
 
     def send_audio(self, cmd: str) -> bool:
         """Pipe one audio-orchestration command upstream (``wake`` /
