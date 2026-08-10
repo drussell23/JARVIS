@@ -62,6 +62,9 @@ class ConsoleSpooler:
         )
         self._task: Optional["asyncio.Task[None]"] = None
         self.dropped = 0
+        #: How many drops have already been announced, so the notice is
+        #: coalesced per window instead of once per lost line.
+        self._lag_reported = 0
         self.spooled = 0
 
     def offer(self, session_id: Optional[str], text: str) -> bool:
@@ -90,12 +93,51 @@ class ConsoleSpooler:
         except Exception:  # noqa: BLE001 — output must never raise into a verb
             return False
 
+    def _lag_notice(self) -> Optional[str]:
+        """One line naming what this cockpit did NOT receive, or None.
+
+        `self.dropped` has counted drop-oldest evictions since this spooler
+        was built and nothing has ever read it. A bounded queue that silently
+        discards is correct engineering and dishonest reporting: the operator
+        sees a continuous transcript with holes in it and has no way to know.
+
+        Coalesced, not per-drop — under load the notice would otherwise become
+        the thing crowding the queue. Emitted once per window on the same
+        principle as the SSE broker's single `stream_lag` per window, so the
+        two backpressure surfaces say the same thing the same way.
+        """
+        try:
+            total = int(self.dropped)
+            if total <= self._lag_reported:
+                return None
+            missed = total - self._lag_reported
+            self._lag_reported = total
+            return (
+                f"[dim]⎿ {missed} line(s) dropped — this cockpit fell behind; "
+                f"the daemon's log has the full record[/dim]"
+            )
+        except Exception:  # noqa: BLE001
+            return None
+
     async def _drain(self) -> None:
         while True:
             try:
                 session_id, text = await self._queue.get()
             except asyncio.CancelledError:
                 return
+            # Announce the hole BEFORE the frame that follows it, so the
+            # notice appears where the gap actually is rather than after the
+            # next unrelated block.
+            notice = self._lag_notice()
+            if notice is not None:
+                try:
+                    _r = self._sink(session_id, notice)
+                    if asyncio.iscoroutine(_r):
+                        await _r
+                except asyncio.CancelledError:
+                    return
+                except Exception:  # noqa: BLE001
+                    pass
             try:
                 result = self._sink(session_id, text)
                 if asyncio.iscoroutine(result):
