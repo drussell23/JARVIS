@@ -571,7 +571,7 @@ class OpBlockBuffer:
                 from backend.core.ouroboros.battle_test.transcript_spine import (
                     record_event,
                 )
-                record_event("op_block", ref)
+                record_event("op_block", ref, op_id=op_id_safe)
             except Exception:  # noqa: BLE001
                 pass
             self._next_seq += 1

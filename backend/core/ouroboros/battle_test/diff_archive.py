@@ -490,7 +490,7 @@ class DiffArchive:
                 from backend.core.ouroboros.battle_test.transcript_spine import (
                     record_event,
                 )
-                record_event("diff", ref)
+                record_event("diff", ref, op_id=op_safe)
             except Exception:  # noqa: BLE001
                 pass
             self._next_seq += 1
