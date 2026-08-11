@@ -387,6 +387,16 @@ class NarrativeChannel:
                 if existing is not None and existing.state is FrameState.BUFFERING:
                     return existing
             ref = f"{REF_PREFIX}{self._next_seq}"
+            # Transcript spine: one ordered sequence across all four
+            # namespaces, so "what happened next" has an answer and eviction
+            # is uniform. Fail-soft — never blocks admission.
+            try:
+                from backend.core.ouroboros.battle_test.transcript_spine import (
+                    record_event,
+                )
+                record_event("narrative", ref)
+            except Exception:  # noqa: BLE001
+                pass
             self._next_seq += 1
             frame = NarrativeFrame(
                 ref=ref,
