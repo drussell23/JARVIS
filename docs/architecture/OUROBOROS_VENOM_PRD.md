@@ -2736,3 +2736,188 @@ These are cheap to state and were expensive to learn. They generalise past voice
    thing it proved was that the pipeline was fine.
 
 ---
+
+## 25. Cockpit Fidelity — the Audit Surface *(NEW 2026-08-11)*
+
+The daemon renders; a detached `ov` client displays. Everything in this section
+follows from that split, and from one observation: **the process holding the
+paintbrush could not see the canvas.**
+
+### 25.1 The capability channel
+
+A grep for `width` / `COLUMNS` / `get_terminal_size` / `SIGWINCH` across
+`cockpit_attach.py` and `attach_session.py` returned nothing. The daemon
+formatted every table, diff and `⏺`/`⎿` gutter for a terminal whose size,
+theme and glyph metrics it had never been told.
+
+`terminal_capabilities.py` carries the display's self-description upstream —
+`{cols, rows, theme, wide_glyphs, color_depth}` — declared at handshake and on
+every SIGWINCH. Three design rules:
+
+* **Ambient renders to the MINIMUM width across live cockpits.** Two
+  subscribers at different widths have no width correct for both; wrapping
+  destroys gutter alignment, margin is cosmetic. The asymmetry is deliberate.
+* **Theme collapses to `unknown` unless every cockpit agrees**, and `unknown`
+  routes to the theme-agnostic path. "I was not told" is not "it is light".
+* **`wide_glyphs` is the AND.** One ASCII terminal degrades the shared line;
+  an aligned ASCII gutter beats a misaligned pretty one.
+
+Consumers were converted at **one seam each**, never N call sites:
+`SpooledConsole.size` (carries `print_fit`, Rich table layout, the diff
+formatters) and `theme.supports_unicode()` (carries `mark()` and
+`ouroboros_frame()`). A departing subscriber is forgotten, or one dead
+40-column terminal constrains every future broadcast.
+
+### 25.2 The adaptive flush valve
+
+`StreamMirror` batched cockpit frames on three literals — 160 chars, 0.35s,
+8192 cap. Each was a guess about something measurable. The rule is now a
+comparison **across two measured domains**:
+
+```
+idle >  drain + jitter   generator slower than sink -> sink STARVING -> send
+idle <= drain + jitter   generator outruns sink     -> would flood   -> accumulate to C = W
+```
+
+`C` = the subscriber's columns; ring cap = its screenful; both re-read per
+decision so SIGWINCH retargets with nothing to invalidate.
+
+**No smoothing constant.** `AdaptiveSignal` derives its own weight,
+`alpha = residual / (residual + deviation)` — a normalised innovation, the
+shape of a Kalman gain. No `tau`, no cold-start seed.
+
+Four earlier formulations are pinned as regression tests, because each is a
+design someone will re-propose. The fourth is the important one: **the
+measured token gap silently included the mirror's own drain time.** Every
+flush inflated the next gap by exactly one drain period, guaranteeing
+`idle > T` forever. Three correct rules were debugged against a contaminated
+input. *The observer cannot be part of its own observation.*
+
+### 25.3 The transcript spine
+
+Four bounded rings (`o-`/`d-`/`t-`/`n-`) with four capacities and four
+independent evictions produced two structural defects: **dangling references**
+(`o-12` outliving the `t-7` it mentions) and **no cross-namespace order**
+(nothing knew whether `t-7` preceded `n-4`).
+
+`transcript_spine.py` is one append-only sequence the four become views of.
+They keep their types and rendering; **order and retention** move to the spine.
+
+* Append-only is the *concurrency* answer, not a storage choice: a record is
+  never rewritten, so a reader's snapshot cannot be invalidated and the read
+  path takes no lock.
+* Capacity is the **sum of the four stores' own caps**, discovered by
+  convention (`*_SIZE_ENV_VAR` + `_DEFAULT_*_SIZE`). One knob, no second copy.
+* Eviction is uniform, oldest `seq` first — which is what makes a dangling
+  reference *structurally impossible* rather than gracefully handled.
+* `was_evicted()` separates "aged out" from "never existed".
+
+### 25.4 Honesty surfaces
+
+The through-line of this arc is that **a surface must not report a state it
+did not measure**:
+
+| Surface | Was | Now |
+|---|---|---|
+| typed goal | "queued… next sweep" about a dead path | `on it` + a real op id |
+| duplicate goal | same "queued" as an unreachable intake | `Deduplicated`, measured age, real hash |
+| `/liquidity` | `5,000,000 tokens · status 200 · runway: ok` while both lanes were out of credit | funding column + cascading-route-failure |
+| dropped frames | counted, never surfaced | one coalesced notice, in the surface's own unit |
+
+### 25.5 What remains
+
+Durability (spine slice 2), memory tiering (slice 3), `/why <ref>`, scrollback
+search, and text extraction. §26 states what the cockpit must show before the
+actuators are unthrottled.
+
+---
+
+## 26. The Trust Boundary *(NEW 2026-08-11)*
+
+O+V is **proactive in sensing and reactive in effecting**. Sixteen sensors run
+continuously; almost nothing they produce may change the operator's tree:
+
+| Actuator | Default | Consequence |
+|---|---|---|
+| `JARVIS_REVIEW_SUBAGENT_ENFORCE` | false | a REVIEW verdict is computed every op and cannot reach the GATE |
+| `JARVIS_PLAN_SUBAGENT_ENFORCE` | false | the DAG is stashed; the flat plan stays authoritative |
+| `JARVIS_WORKSPACE_PROMOTION_ENABLED` | false | verified work lands in quarantine, never the operator tree |
+| `JARVIS_COMMAND_BUS_BRIDGE_ENABLED` | false | (#69632, open since June) |
+
+**These defaults are false because nobody decided otherwise. That is not a
+decision.** This section makes it one.
+
+### 26.1 The principle
+
+Autonomy is granted against **evidence of alignment**, never against elapsed
+time or operator fatigue. The evidence must be (a) collected while the surface
+runs in shadow, (b) falsifiable, and (c) revocable by a breaker that does not
+require a human to notice.
+
+### 26.2 Gate 1 — REVIEW → authoritative
+
+Flip `JARVIS_REVIEW_SUBAGENT_ENFORCE` when **all** hold over a rolling window:
+
+* **Alignment `N ≥ 50` consecutive ops** where the shadow verdict equals what
+  the GATE actually did (block vs allow). `N` is env-tunable; 50 is the
+  smallest window in which a 2% divergence is observable.
+* **Zero false-BLOCKs.** A shadow that would have blocked work the human
+  allowed is the expensive error; one resets the counter to 0.
+* **False-ALLOWs are counted, not fatal** — REVIEW composes strictest-wins
+  with existing gates, so a missed block degrades to today's behaviour.
+* **Breaker:** 3 consecutive post-graduation divergences, or any malformed
+  aggregate, reverts to shadow and emits `AGENT_DEGRADATION`.
+
+### 26.3 Gate 2 — PLAN → authoritative
+
+Flip `JARVIS_PLAN_SUBAGENT_ENFORCE` when, over `N ≥ 50`:
+
+* the DAG covers **100%** of the legacy flat plan's tasks (no silent drops);
+* the DAG is **acyclic** and owned paths are **disjoint** (no two units
+  claiming one file);
+* **Breaker:** any cyclic or empty DAG, or CRITICAL memory pressure,
+  pre-emptively trips to the legacy plan.
+
+### 26.4 Gate 3 — promotion and the command bus
+
+Requires Gates 1 and 2 graduated **and**:
+
+* a **24h soak with zero unexplained terminal states** — every op ends in a
+  state the ledger can name;
+* **promotion dry-run parity**: what promotion *would* have landed equals what
+  a human approved, over `N ≥ 20` Orange-tier ops.
+
+Promotion and the command bus graduate together: authority to act and
+authority to reach across processes are one trust decision, not two.
+
+### 26.5 The thundering herd
+
+When a flag flips, ops already in flight were admitted under the old regime.
+Three compounding protections, all reusing existing machinery:
+
+1. **Seq-gated, never retroactive.** Authority applies only to ops admitted
+   *after* the flip, keyed on the same monotonic sequence the spine uses. An
+   op is judged under the regime it entered.
+2. **Existing concurrency caps stand.** `BackgroundAgentPool` (3 workers, 16
+   slots) and `SensorGovernor`'s weighted per-hour cap already bound the rate;
+   graduation changes what an op may *do*, never how many run.
+3. **Ramped admission.** The fraction of eligible ops granted authority starts
+   at the inverse of the window (`1/N`) and doubles on each clean interval,
+   halving on any divergence. The first authoritative op is one op.
+
+### 26.6 Absence is not refusal
+
+`ReviewCoordinator` parks an APPROVAL_REQUIRED op on a per-op `asyncio.Event`
+with a wall-clock timeout — no polling, correct as far as it goes. But the
+default is **300s → auto-REJECT**, and that makes a detached operator's
+*absence* indistinguishable from their *refusal*.
+
+The review clock must measure **opportunity to answer**, not wall time: it
+runs only while a cockpit is attached (`CockpitAttachBridge.client_count()`),
+and pauses otherwise. A pending decision is part of the hydration payload, so
+a reattaching operator sees what is waiting before anything expires.
+
+An op discarded because nobody was watching is the same defect class as a
+receipt that says "queued" about work that was thrown away.
+
+---
