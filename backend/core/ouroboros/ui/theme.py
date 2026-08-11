@@ -103,14 +103,60 @@ def _forced_tier_from_env() -> Optional[ColorTier]:
         return None
 
 
-def supports_unicode(env: Optional[Mapping[str, str]] = None) -> bool:
-    """True when the locale advertises a UTF-8 codec.
+def _declared_glyph_support() -> Optional[bool]:
+    """What the terminal THAT WILL DISPLAY THIS declared, or ``None``.
 
-    Purely locale-env based so it is deterministic and testable: pass an
-    explicit ``env`` mapping in tests. In production (``env=None``) it reads
-    ``os.environ``. An env with no UTF-8 locale hint yields ``False`` -- the
-    conservative choice that degrades glyphs to ASCII.
+    Tri-state on purpose. ``supports_wide_glyphs()`` collapses "nothing
+    attached" into ``True`` because a renderer needs an answer; here the
+    difference is load-bearing — "no cockpit declared" must fall through to
+    the locale, while "a cockpit declared narrow" must override a UTF-8
+    daemon locale.
+
+    Lazy + fail-soft: `ui/` sits below `battle_test/`, so this is a runtime
+    consultation rather than a module-level dependency. Absent the capability
+    layer — the client process, a bare import, a test — it returns ``None``
+    and `supports_unicode` behaves exactly as it did before.
     """
+    try:
+        from backend.core.ouroboros.battle_test.terminal_capabilities import (
+            current_capabilities,
+        )
+        caps = current_capabilities()
+        return None if caps is None else bool(caps.wide_glyphs)
+    except Exception:  # noqa: BLE001 — glyph choice must never raise
+        return None
+
+
+def supports_unicode(env: Optional[Mapping[str, str]] = None) -> bool:
+    """True when the terminal that will DISPLAY this can render the glyph.
+
+    The daemon renders for a terminal it does not own. Consulting its own
+    ``LC_ALL``/``LANG`` answers the wrong question: a daemon launched under
+    ``LANG=C`` degrades every glyph to ASCII while the operator watches a
+    UTF-8 cockpit, and a UTF-8 daemon emits ``⏺``/``⎿`` into an ASCII
+    terminal as mojibake — which is worse, because a misrendered gutter
+    misaligns every line beneath it.
+
+    Resolution order, measured before assumed:
+
+    1. **An explicit ``env`` always wins.** Callers passing a mapping are
+       asking a deterministic question about a locale, and this stays a pure
+       function of that mapping — the existing test contract is unchanged.
+    2. **The attached cockpit's declaration**, when one exists. Per-subscriber
+       for addressed output; for ambient output `terminal_capabilities`
+       already ANDs across live cockpits, so one ASCII terminal degrades the
+       shared line — an aligned ASCII gutter beats a misaligned pretty one.
+    3. **The local locale**, unchanged. This is the answer in the CLIENT
+       process (which owns a real terminal and has no subscribers) and in a
+       foreground daemon with nothing attached.
+
+    An env with no UTF-8 hint still yields ``False`` — the conservative
+    choice that degrades glyphs to ASCII. NEVER raises.
+    """
+    if env is None:
+        declared = _declared_glyph_support()
+        if declared is not None:
+            return declared
     e = os.environ if env is None else env
     for key in ("LC_ALL", "LC_CTYPE", "LANG"):
         val = e.get(key, "") or ""
