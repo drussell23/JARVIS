@@ -96,6 +96,11 @@ class StreamMirror:
         self._size = 0
         self._last_flush = self._clock()
         self._last_token_at: Optional[float] = None
+        #: Seconds spent INSIDE our own sink since the last token arrived.
+        #: Subtracted from the next measured gap so the generator's idle time
+        #: is not inflated by our own draining — the observer must not appear
+        #: in its own observation.
+        self._self_time_s = 0.0
         self.frames_emitted = 0
         self.chars_dropped = 0
         #: Watermark for the coalesced drop notice — see backpressure_notice.
@@ -145,7 +150,16 @@ class StreamMirror:
                 # should go out now. A trickle therefore emits per token
                 # while a burst accumulates — from one measurement, with no
                 # timer task and no idle-poll loop to schedule.
-                idle = 0.0 if prev_token_at is None else (now - prev_token_at)
+                # The wall gap minus the time WE spent draining. Without
+                # this subtraction a flush inflates the next measured gap by
+                # exactly one drain period, which forces `idle > T_drain`
+                # forever and collapses the policy to one frame per token.
+                # The observer's own cost cannot be part of the measurement.
+                idle = (
+                    0.0 if prev_token_at is None
+                    else max(0.0, (now - prev_token_at) - self._self_time_s)
+                )
+                self._self_time_s = 0.0
                 decision = self._policy.evaluate(
                     self._size, now - self._last_flush, idle_s=idle,
                 )
@@ -206,8 +220,10 @@ class StreamMirror:
                 # backpressure the socket is applying right now.
                 started = self._clock()
                 sink(head)
+                elapsed = self._clock() - started
+                self._self_time_s += elapsed
                 if self._policy is not None:
-                    self._policy.observe_drain(self._clock() - started)
+                    self._policy.observe_drain(elapsed)
                 self.frames_emitted += 1
         except Exception:  # noqa: BLE001
             logger.debug("[StreamMirror] flush degraded", exc_info=True)

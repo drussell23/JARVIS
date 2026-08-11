@@ -312,26 +312,34 @@ class FlushPolicy:
         # -> accumulate. Slow stream -> eta large -> emit promptly. No rate
         # threshold anywhere: the crossover is wherever the two measured
         # quantities happen to meet.
-        # A PARTIAL line past the drain floor. Sending it is right only if
-        # the rest is not about to arrive — otherwise a fast stream becomes
-        # one frame per token, which is the flood this module prevents.
+        # A PARTIAL line past the drain floor. Whether to send it is the
+        # question that governs everything, and the answer is a comparison
+        # BETWEEN THE TWO MEASURED DOMAINS rather than within either one.
         #
-        # "About to arrive" is measurable without a latency constant: the
-        # stream has STALLED when the wait since the last token exceeds the
-        # gap this stream normally shows, plus its jitter.
+        #     idle_s  = the gap the generator just left between tokens
+        #     t       = drain + jitter, what the sink needs per frame
         #
-        #     stalled  <=>  idle_s > gap.mean + gap.deviation
+        # Both are times, so the comparison is dimensionally honest, and it
+        # asks the only question that matters: can the sink keep up?
         #
-        # Mid-burst the gap is tiny, so a partial line is never stalled and
-        # the buffer fills to C. When the model pauses — end of a sentence,
-        # a tool round, the end of the reply — the gap blows past its own
-        # envelope immediately and the text goes out. Both sides measured;
-        # the crossover is wherever this stream's own rhythm puts it.
-        if idle_s > self.gap.upper and self.gap.samples > 0:
-            return FlushDecision(True, "stalled", c, t, cap)
+        #   idle_s > t   the generator is slower than the sink. The socket is
+        #                STARVING — there is no congestion to cause, so a
+        #                partial line costs nothing and waiting only makes
+        #                the operator watch a still screen. Send it.
+        #
+        #   idle_s <= t  the generator is outrunning the sink. Flushing now
+        #                queues frames faster than they drain, which is the
+        #                flood. Accumulate to C instead.
+        #
+        # Earlier attempts compared idle against the TOKEN envelope, which a
+        # uniform stream can never exceed — a regular 200ms trickle is never
+        # surprising to itself, so it never emitted. The gap has to be judged
+        # against the sink, not against its own history.
+        if idle_s > t:
+            return FlushDecision(True, "sink_starving", c, t, cap)
         if c <= 0:
-            # No declared width: no line to fill, so there is nothing to wait
-            # for and the drain floor alone governs.
+            # No declared width: no line to accumulate toward, so the drain
+            # floor alone governs and there is nothing to wait for.
             return FlushDecision(True, "no_line_target", c, t, cap)
         return FlushDecision(False, "filling", c, t, cap)
 
