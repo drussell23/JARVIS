@@ -107,15 +107,16 @@ class ConsoleSpooler:
         two backpressure surfaces say the same thing the same way.
         """
         try:
-            total = int(self.dropped)
-            if total <= self._lag_reported:
-                return None
-            missed = total - self._lag_reported
-            self._lag_reported = total
-            return (
-                f"[dim]⎿ {missed} line(s) dropped — this cockpit fell behind; "
-                f"the daemon's log has the full record[/dim]"
+            from backend.core.ouroboros.battle_test.backpressure_notice import (
+                coalesced_drop_notice,
             )
+            notice, self._lag_reported = coalesced_drop_notice(
+                self.dropped, self._lag_reported,
+                unit="line",
+                detail=("this cockpit fell behind; the daemon's log has the "
+                        "full record"),
+            )
+            return notice
         except Exception:  # noqa: BLE001
             return None
 
