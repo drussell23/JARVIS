@@ -467,3 +467,8 @@ Derek J. Russell - Resume*.pdf
 
 # Slice 25 — fastembed ONNX weight cache (durable, not committed)
 .jarvis/fastembed_cache/
+
+# Local wiki working tree — deploy-wiki.sh clones the GitHub wiki here.
+# Tracked as an orphan gitlink until now, which broke `git submodule` and
+# any CI checkout that walks submodules.
+JARVIS-AI.wiki/
