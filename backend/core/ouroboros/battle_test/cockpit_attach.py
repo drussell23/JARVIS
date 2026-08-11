@@ -519,6 +519,32 @@ class CockpitAttachBridge:
     def client_count(self) -> int:
         return len(self._clients)
 
+    def _publish_presence(self) -> None:
+        """Republish operator attention from the ONE authority for it —
+        ``_clients`` — to the process-wide ledger that gates operator
+        clocks (the review window, principally).
+
+        A COUNT, never a delta: a missed detach cannot leak a phantom
+        attendee and a double-drop cannot underflow, because the ledger
+        is told the current truth rather than asked to derive it. Called
+        at exactly the two transitions of ``_clients`` — post-hydration
+        add, and ``_drop`` — so a socket that connected but died before
+        its hydration frame landed is correctly never counted as
+        attention. Best-effort: a degraded ledger must never break the
+        transport."""
+        try:
+            from backend.core.ouroboros.governance.attention_ledger import (
+                SOURCE_COCKPIT,
+                get_attention_ledger,
+            )
+            get_attention_ledger().set_count(
+                SOURCE_COCKPIT, len(self._clients),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[CockpitAttach] presence publish degraded", exc_info=True,
+            )
+
     # ---- hydration ----
 
     def _hydration_payload(self) -> Dict[str, Any]:
@@ -1213,6 +1239,7 @@ class CockpitAttachBridge:
         if w in self._clients:
             self.stats["dropped"] += 1
         self._clients.discard(w)
+        self._publish_presence()
         for sid, sw in list(self._sessions.items()):
             if sw is w:
                 del self._sessions[sid]
@@ -1252,6 +1279,11 @@ class CockpitAttachBridge:
             except Exception:  # noqa: BLE001
                 pass
             self._clients.add(writer)
+            # Attention begins where hydration LANDED, not where the
+            # socket connected: a client that never received the payload
+            # never saw the pending review, and must not be counted as
+            # having looked at it.
+            self._publish_presence()
             self.stats["connects"] += 1
             logger.info(
                 "[CockpitAttach] terminal attached (subscribers=%d)",

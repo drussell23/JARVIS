@@ -47,16 +47,23 @@ class _StubRegistry:
         self.registered.append(spec)
 
 
-def test_register_flags_seeds_four_specs():
+def test_register_flags_seeds_the_arc_specs():
+    """The four Slice-6 flags, plus the four the attention path added
+    (2026-08-11) when the review clock stopped spending wall-clock
+    seconds against a detached cockpit."""
     reg = _StubRegistry()
     count = register_flags(reg)
-    assert count == 4
+    assert count == 8
     names = {spec.name for spec in reg.registered}
     assert names == {
         "JARVIS_REVIEW_BRANCH_ENABLED",
         "JARVIS_REVIEW_TIMEOUT_S",
         "JARVIS_DIFF_ARCHIVE_SIZE",
         "JARVIS_REVIEW_BRANCH_GIT_TIMEOUT_S",
+        "JARVIS_REVIEW_ATTENTION_GATE_ENABLED",
+        "JARVIS_REVIEW_ATTENTION_MAX_WALL_MULT",
+        "JARVIS_REVIEW_CANCEL_POLL_S",
+        "JARVIS_ATTENTION_FLAP_GRACE_S",
     }
 
 
