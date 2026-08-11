@@ -381,3 +381,127 @@ def test_chrome_demotes_bright_only_on_a_DECLARED_light_terminal() -> None:
             os.environ.pop("JARVIS_PRESENTATION_RESTRAINT_ENABLED", None)
         else:
             os.environ["JARVIS_PRESENTATION_RESTRAINT_ENABLED"] = prev
+
+
+# --------------------------------------------------------------------------
+# 8. glyphs follow the DISPLAY, not the daemon's locale (polish gap 3)
+# --------------------------------------------------------------------------
+#
+# `theme.supports_unicode()` read the daemon's own LC_ALL/LANG. The daemon
+# renders for a terminal it does not own, so that answered the wrong question:
+# a daemon launched under LANG=C degraded every glyph while the operator
+# watched a UTF-8 cockpit, and a UTF-8 daemon emitted ⏺/⎿ into an ASCII
+# terminal as mojibake — worse, because a misrendered gutter misaligns every
+# line beneath it.
+#
+# ONE seam again: `mark()` and `ouroboros_frame()` both route through
+# `supports_unicode()`, so converting it carries every glyph with no call site
+# moved.
+
+
+def _utf8_daemon(monkeypatch: Any) -> None:
+    for k in ("LC_ALL", "LC_CTYPE"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+
+
+def test_an_ascii_cockpit_degrades_a_utf8_daemons_glyphs(monkeypatch: Any) -> None:
+    """THE defect. The daemon's locale said unicode; the terminal said no."""
+    from backend.core.ouroboros.ui.theme import mark, supports_unicode
+
+    _utf8_daemon(monkeypatch)
+    assert supports_unicode() is True and mark("check") == "✓"
+
+    declare("ascii", TerminalCapabilities(cols=80, rows=24, wide_glyphs=False))
+    assert supports_unicode() is False
+    assert mark("check") == "OK", "a UTF-8 daemon painted ✓ into an ASCII terminal"
+
+
+def test_a_utf8_cockpit_LIFTS_an_ascii_daemon(monkeypatch: Any) -> None:
+    """The inverse, and the reason this is a capability rather than a floor:
+    a daemon launched under LANG=C must not strip glyphs from a terminal that
+    can render them."""
+    from backend.core.ouroboros.ui.theme import mark, supports_unicode
+
+    monkeypatch.setenv("LANG", "C")
+    for k in ("LC_ALL", "LC_CTYPE"):
+        monkeypatch.delenv(k, raising=False)
+    assert supports_unicode() is False
+
+    declare("utf8", TerminalCapabilities(cols=120, rows=40, wide_glyphs=True))
+    assert supports_unicode() is True
+    assert mark("check") == "✓"
+
+
+def test_addressed_output_uses_THAT_terminals_glyph_support(monkeypatch: Any) -> None:
+    from backend.core.ouroboros.battle_test.attach_session import session_scope
+    from backend.core.ouroboros.ui.theme import mark
+
+    _utf8_daemon(monkeypatch)
+    declare("utf8", TerminalCapabilities(cols=120, rows=40, wide_glyphs=True))
+    declare("ascii", TerminalCapabilities(cols=80, rows=24, wide_glyphs=False))
+    with session_scope("utf8"):
+        assert mark("check") == "✓"
+    with session_scope("ascii"):
+        assert mark("check") == "OK"
+
+
+def test_ambient_degrades_if_ANY_cockpit_is_ascii(monkeypatch: Any) -> None:
+    """A shared line has one rendering. An aligned ASCII gutter beats a
+    misaligned pretty one, so the AND is the safe composition."""
+    from backend.core.ouroboros.ui.theme import supports_unicode
+
+    _utf8_daemon(monkeypatch)
+    declare("utf8", TerminalCapabilities(cols=120, rows=40, wide_glyphs=True))
+    assert supports_unicode() is True
+    declare("ascii", TerminalCapabilities(cols=80, rows=24, wide_glyphs=False))
+    assert supports_unicode() is False
+    forget("ascii")
+    assert supports_unicode() is True, "a departed cockpit still degraded the living"
+
+
+def test_an_explicit_env_stays_a_PURE_function(monkeypatch: Any) -> None:
+    """The existing contract: callers passing a mapping are asking a
+    deterministic question about a locale. A declared cockpit must not leak
+    into that answer or every locale test becomes order-dependent."""
+    from backend.core.ouroboros.ui.theme import supports_unicode
+
+    declare("ascii", TerminalCapabilities(cols=80, rows=24, wide_glyphs=False))
+    assert supports_unicode({"LANG": "en_US.UTF-8"}) is True
+    assert supports_unicode({"LANG": "C"}) is False
+
+
+def test_no_cockpit_falls_through_to_the_locale(monkeypatch: Any) -> None:
+    """The CLIENT process owns a real terminal and has no subscribers; a
+    foreground daemon with nothing attached is the same case. Both must
+    behave exactly as before this change."""
+    from backend.core.ouroboros.ui.theme import supports_unicode
+
+    _utf8_daemon(monkeypatch)
+    assert supports_unicode() is True
+    monkeypatch.setenv("LANG", "C")
+    assert supports_unicode() is False
+
+
+def test_the_spinner_follows_the_same_seam(monkeypatch: Any) -> None:
+    """`ouroboros_frame()` routes through `supports_unicode()` too, so the
+    organism's identity glyph degrades with everything else rather than being
+    the one thing that mojibakes."""
+    from backend.core.ouroboros.ui.theme import ouroboros_frame
+
+    _utf8_daemon(monkeypatch)
+    assert ouroboros_frame(0.0) == "🐍"
+    declare("ascii", TerminalCapabilities(cols=80, rows=24, wide_glyphs=False))
+    assert ouroboros_frame(0.0) == "~"
+
+
+def test_a_poisoned_registry_cannot_break_glyph_choice(monkeypatch: Any) -> None:
+    from backend.core.ouroboros.ui.theme import mark, supports_unicode
+
+    _utf8_daemon(monkeypatch)
+    tc._CAPS["bad"] = "not-capabilities"  # type: ignore[assignment]
+    try:
+        assert isinstance(supports_unicode(), bool)
+        assert isinstance(mark("check"), str)
+    finally:
+        tc._CAPS.pop("bad", None)
