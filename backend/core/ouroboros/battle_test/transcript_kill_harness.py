@@ -292,7 +292,51 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
+def _child_durable(args: argparse.Namespace) -> int:
+    """Drive the REAL :class:`DurableLogWriter` to the seam.
+
+    Without this mode the oracle would only ever have proved the raw
+    framing, and "the writer passes the kill test" would be an inference
+    rather than a measurement. The split is installed by replacing the
+    module-level ``_write_all`` the writer already calls — production
+    code is untouched, and the tear lands inside the writer's own append
+    path rather than beside it.
+    """
+    from backend.core.ouroboros.battle_test import transcript_writer as tw
+
+    seam = str(args.seam or "")
+    signal_fd = int(args.signal_fd)
+    split = max(0, int(args.split_bytes))
+    original = tw._write_all
+    frames = {"n": 0}
+
+    def _patched(fd: int, data: bytes) -> None:
+        frames["n"] += 1
+        n = frames["n"]
+        if seam == seam_mid_record(n):
+            cut = min(split or max(1, len(data) // 2), len(data) - 1)
+            original(fd, data[:cut])
+            _emit_and_block(signal_fd, seam)
+        original(fd, data)
+        if seam == seam_after_record(n):
+            _emit_and_block(signal_fd, seam)
+
+    tw._write_all = _patched          # type: ignore[assignment]
+    writer = tw.DurableLogWriter(
+        str(args.path), sync_every_n=int(args.sync_every) or 1000,
+    )
+    writer.start()
+    for record in build_records(int(args.records)):
+        writer.submit(record)
+    writer.barrier(timeout=30)
+    os.write(signal_fd, b"__never__\n")
+    return 3
+
+
 def _child_main(args: argparse.Namespace) -> int:
+    if str(args.writer) == "durable":
+        return _child_durable(args)
+
     from backend.core.ouroboros.battle_test.transcript_log import encode_record
     from backend.core.ouroboros.governance.durable_io import fsync_file
 

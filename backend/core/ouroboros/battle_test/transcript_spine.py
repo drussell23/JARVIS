@@ -96,6 +96,11 @@ def known_prefixes() -> Dict[str, str]:
         ("diff", "diff_archive"),
         ("tool_body", "tool_render_store"),
         ("narrative", "narrative_channel"),
+        # Slice 2: APPLY / VERIFY / commit milestones, arriving through
+        # the existing ops-digest fan-out. A fifth vocabulary, so `m-4`
+        # resolves and `was_evicted` can tell "aged out" from "never
+        # existed" for it too.
+        ("milestone", "transcript_milestones"),
     ):
         try:
             mod = __import__(
@@ -163,6 +168,12 @@ def _derived_capacity() -> int:
         _store_capacity(m) for m in (
             "op_block_buffer", "diff_archive",
             "tool_render_store", "narrative_channel",
+            # A fifth producer that added no capacity would make the
+            # spine evict SOONER than the union it promises. Milestones
+            # publish their own budget under the same convention, so the
+            # invariant "nothing that fits today is evicted tomorrow"
+            # survives their arrival.
+            "transcript_milestones",
         )
     )
 
@@ -192,7 +203,19 @@ class SpineRecord:
         if include_payload and self.payload is not None:
             try:
                 fn = getattr(self.payload, "to_dict", None)
-                out["payload"] = fn() if callable(fn) else str(self.payload)
+                if callable(fn):
+                    out["payload"] = fn()
+                elif isinstance(
+                    self.payload, (dict, list, tuple, str, int, float, bool),
+                ):
+                    # Already representable. The previous unconditional
+                    # ``str()`` turned a dict payload into a PYTHON REPR
+                    # — lossy, and unparseable by anything downstream.
+                    # Harmless while this was render-only; a real defect
+                    # the moment a payload is persisted and read back.
+                    out["payload"] = self.payload
+                else:
+                    out["payload"] = str(self.payload)
             except Exception:  # noqa: BLE001
                 out["payload"] = "<unrenderable>"
         return out
@@ -215,6 +238,10 @@ class TranscriptSpine:
     #: "never existed" from "aged out" — different answers to an operator.
     _evicted_through: int = 0
     evicted_total: int = 0
+    #: Slice 2 durability tap. Invoked INSIDE the append lock — see
+    #: :meth:`attach_sink` for why that is load-bearing rather than lazy.
+    _sink: Optional[Any] = field(default=None, repr=False)
+    sink_failures: int = 0
 
     # -- write path ---------------------------------------------------------
 
@@ -241,10 +268,44 @@ class TranscriptSpine:
                 # must resolve to what the store would.
                 self._by_ref[r] = rec
                 self._retain_locked()
+                self._emit_to_sink_locked(rec)
                 return rec
         except Exception:  # noqa: BLE001 — the transcript must never break a render
             logger.debug("[Spine] append degraded", exc_info=True)
             return None
+
+    def attach_sink(self, sink: Optional[Any]) -> None:
+        """Tap every append, for durability. ``None`` detaches.
+
+        The sink is called **inside the append lock**, and that is the
+        whole design rather than an oversight to optimise away. ``seq``
+        is minted under this lock; if the sink were called outside it,
+        two concurrent appends could reach the log in the opposite order
+        to their sequence numbers, and ``recover_log`` would correctly
+        report ``NON_MONOTONIC_SEQ`` and end the trustworthy prefix
+        there — losing the transcript to a race that only ever existed
+        because the notification escaped the lock that ordered it.
+
+        The contract that makes this safe: a sink MUST be O(1) and
+        non-blocking. :meth:`DurableLogWriter.submit` is a queue put; a
+        sink that touched a disk here would serialise every render
+        behind it.
+        """
+        with self._lock:
+            self._sink = sink
+
+    def _emit_to_sink_locked(self, rec: "SpineRecord") -> None:
+        """Fail-soft by construction: a transcript that cannot be
+        PERSISTED must not stop it being RECORDED. Failures are counted
+        so "durability is off" never has to be inferred from silence."""
+        sink = self._sink
+        if sink is None:
+            return
+        try:
+            sink(rec)
+        except Exception:  # noqa: BLE001
+            self.sink_failures += 1
+            logger.debug("[Spine] durability sink degraded", exc_info=True)
 
     def _retain_locked(self) -> None:
         """Uniform eviction, oldest sequence first. Caller holds the lock.
