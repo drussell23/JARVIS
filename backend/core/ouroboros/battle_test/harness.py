@@ -1584,6 +1584,44 @@ class BattleTestHarness:
         except Exception:  # noqa: BLE001
             logger.debug("register_ops_digest_observer(boot) failed", exc_info=True)
 
+        # Transcript slice 2 — durability + the milestone vocabulary.
+        # Both are OFF unless JARVIS_TRANSCRIPT_DURABLE_ENABLED is set, so
+        # this costs a flag read on every other boot. Wired HERE because
+        # the spine and its five producers live in THIS process: the
+        # `ov attach` client is a different process holding no spine, so
+        # attaching a sink there would persist nothing.
+        #
+        # Milestones ride the additive listener seam — SessionRecorder
+        # keeps the primary slot registered just above, unchanged.
+        self._transcript_writer = None
+        self._transcript_flusher = None
+        try:
+            from backend.core.ouroboros.battle_test.transcript_writer import (
+                durable_enabled as _tx_enabled,
+                install_durable_transcript as _tx_install,
+            )
+            if _tx_enabled():
+                from backend.core.ouroboros.battle_test import (
+                    transcript_milestones as _tx_milestones,
+                )
+                _tx_path = Path(self._session_dir) / "transcript.log"
+                # start() blocks on recovery + open; keep it off the loop.
+                self._transcript_writer = await asyncio.to_thread(
+                    _tx_install, _tx_path,
+                )
+                if self._transcript_writer is not None:
+                    _tx_milestones.install()
+                    self._transcript_flusher = asyncio.create_task(
+                        self._transcript_writer.run_flusher(),
+                    )
+                    logger.info(
+                        "[Harness] durable transcript at %s (%s)",
+                        _tx_path,
+                        self._transcript_writer.snapshot_stats().get("health"),
+                    )
+        except Exception:  # noqa: BLE001
+            logger.debug("durable transcript wiring failed", exc_info=True)
+
         _boot_mark("harness_run_pre_boot_done")
         try:
             try:
@@ -10275,6 +10313,28 @@ class BattleTestHarness:
             reset_ops_digest_observer()
         except Exception:
             logger.debug("reset_ops_digest_observer(clear) failed", exc_info=True)
+
+        # Transcript slice 2: symmetric teardown. close(sync=True) forces a
+        # final barrier, so a CLEAN exit leaves durable_through_seq == the
+        # last record rather than whatever the last group commit reached.
+        # An UNCLEAN exit is the oracles' business, not this path's.
+        try:
+            _tx_task, self._transcript_flusher = self._transcript_flusher, None
+            if _tx_task is not None:
+                _tx_task.cancel()
+            from backend.core.ouroboros.battle_test import (
+                transcript_milestones as _tx_milestones,
+            )
+            _tx_milestones.uninstall()
+            _tx_writer, self._transcript_writer = self._transcript_writer, None
+            if _tx_writer is not None:
+                await asyncio.to_thread(_tx_writer.close)
+                logger.info(
+                    "[Harness] transcript sealed cleanly: %s",
+                    _tx_writer.snapshot_stats(),
+                )
+        except Exception:
+            logger.debug("transcript teardown failed", exc_info=True)
         # The clean path completed, so the reaper is no longer needed. NOT
         # disarmed anywhere else: an exit that cannot confirm it finished
         # should be forced, not trusted.
