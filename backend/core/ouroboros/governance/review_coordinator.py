@@ -58,13 +58,18 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Optional, Sequence, Tuple
+from typing import Callable, Dict, Optional, Sequence, Set, Tuple
 
 from backend.core.ouroboros.battle_test.diff_archive import (
     ArchivedDiff,
     DiffArchive,
     DiffOutcome,
     get_default_archive,
+)
+from backend.core.ouroboros.governance.attention_ledger import (
+    get_attention_ledger,
+    read_env_seconds,
+    read_flap_grace_s,
 )
 from backend.core.ouroboros.governance.review_branch_manager import (
     AcceptOutcome,
@@ -86,11 +91,31 @@ REVIEW_COORDINATOR_SCHEMA_VERSION: str = "review_coordinator.v1"
 MASTER_FLAG_ENV_VAR: str = "JARVIS_REVIEW_BRANCH_ENABLED"
 TIMEOUT_ENV_VAR: str = "JARVIS_REVIEW_TIMEOUT_S"
 
+#: Attention gate (2026-08-11). When enabled the review budget is spent
+#: in ATTENDED seconds rather than wall-clock ones.
+ATTENTION_GATE_ENV_VAR: str = "JARVIS_REVIEW_ATTENTION_GATE_ENABLED"
+#: Absolute ceiling, expressed as a MULTIPLE of the attended budget, so
+#: there is no second magic number to keep in sync with the first.
+WALL_MULT_ENV_VAR: str = "JARVIS_REVIEW_ATTENTION_MAX_WALL_MULT"
+#: Cadence of the (pre-existing) ``/cancel`` poll.
+CANCEL_POLL_ENV_VAR: str = "JARVIS_REVIEW_CANCEL_POLL_S"
+
 
 # Default 300s (5 min). Operators set ``=0`` to bypass review entirely
 # and restore the legacy auto-apply behavior. Anything > 0 is the
-# wall-clock window for operator decision.
+# decision window — measured in ATTENDED seconds once the attention gate
+# has armed itself (see :meth:`ReviewCoordinator._wait_with_cancel`).
 _DEFAULT_TIMEOUT_S: float = 300.0
+
+#: A paused review must still be bounded, or the fix for "discarded while
+#: nobody watched" becomes "pinned forever because nobody watched" — the
+#: same silent loss through a different door. 4× the operator's own
+#: configured patience; ``0`` opts into a genuinely unbounded pause.
+_DEFAULT_WALL_MULT: float = 4.0
+
+#: Unchanged from the original 1s literal, now a knob so an operator who
+#: never uses ``/cancel`` can make a paused review cost nothing at all.
+_DEFAULT_CANCEL_POLL_S: float = 1.0
 
 
 def is_master_flag_enabled() -> bool:
@@ -107,18 +132,36 @@ def is_master_flag_enabled() -> bool:
 
 def read_timeout_s() -> float:
     """Resolve :data:`TIMEOUT_ENV_VAR`. ``0`` means "skip review entirely
-    (legacy auto-apply)"; positive means the wall-clock window before
-    auto-EXPIRE. Negative / garbage falls back to the default."""
-    raw = os.environ.get(TIMEOUT_ENV_VAR, "").strip()
-    if not raw:
-        return _DEFAULT_TIMEOUT_S
-    try:
-        parsed = float(raw)
-    except (TypeError, ValueError):
-        return _DEFAULT_TIMEOUT_S
-    if parsed < 0:
-        return _DEFAULT_TIMEOUT_S
-    return parsed
+    (legacy auto-apply)"; positive means the decision window before
+    auto-EXPIRE. Negative / garbage / non-finite falls back to the
+    default (shared parser — a knob must never become an unbounded
+    deadline)."""
+    return read_env_seconds(TIMEOUT_ENV_VAR, _DEFAULT_TIMEOUT_S)
+
+
+def attention_gate_enabled() -> bool:
+    """Read :data:`ATTENTION_GATE_ENV_VAR`. **Default true.**
+
+    Note this flag alone does not change behavior: the gate is also
+    self-arming, and stays inert for the life of any process no operator
+    has ever attached to (headless soaks, CI, daemons). Flip ``=false``
+    for an unconditional return to wall-clock expiry. NEVER raises."""
+    raw = os.environ.get(ATTENTION_GATE_ENV_VAR, "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def read_wall_multiplier() -> float:
+    """Resolve :data:`WALL_MULT_ENV_VAR` — the absolute wall-clock ceiling
+    on a paused review as a multiple of the attended budget. ``0`` = no
+    ceiling (unbounded pause, explicit opt-in)."""
+    return read_env_seconds(WALL_MULT_ENV_VAR, _DEFAULT_WALL_MULT)
+
+
+def read_cancel_poll_s() -> float:
+    """Resolve :data:`CANCEL_POLL_ENV_VAR` — the ``/cancel`` poll cadence.
+    ``0`` disables cancel polling entirely, which makes a paused review a
+    pure suspension with zero wakeups."""
+    return read_env_seconds(CANCEL_POLL_ENV_VAR, _DEFAULT_CANCEL_POLL_S)
 
 
 # ===========================================================================
@@ -177,6 +220,12 @@ class CoordinatedReview:
     decision: ReviewDecision
     elapsed_s: float
     error: str = ""
+    #: Of ``elapsed_s``, the portion an operator was actually attached
+    #: for. Additive + independently measured — ``elapsed_s`` remains the
+    #: wall-clock authority and is never re-derived from this. The pair
+    #: is what makes an EXPIRED honest: ``elapsed=900.0s attended=12.0s``
+    #: says "they glanced at it", not "they considered it for 15 minutes".
+    attended_s: float = 0.0
     schema_version: str = REVIEW_COORDINATOR_SCHEMA_VERSION
 
 
@@ -298,9 +347,12 @@ class ReviewCoordinator:
           2. Archive the diff (Slice 1) → record archive ref.
           3. Create the preview branch (Slice 2) → record branch name.
              On failure (BLOCKED / COLLISION / FAILED), return :data:`FAILED`.
-          4. Wait for operator decision via per-op
-             ``asyncio.Event`` with ``timeout_s`` wall-clock cap.
-             ``cancel_check`` is polled every 1s (lets the existing
+          4. Wait for operator decision via per-op ``asyncio.Event``.
+             ``timeout_s`` is spent in ATTENDED seconds once the
+             attention gate has armed — a review raised while the cockpit
+             is detached does not burn its budget against an empty
+             socket. ``cancel_check`` is polled on the
+             ``JARVIS_REVIEW_CANCEL_POLL_S`` cadence (lets the existing
              ``/cancel`` REPL verb still work).
           5. Map outcome → :class:`ReviewDecision`.
 
@@ -410,8 +462,10 @@ class ReviewCoordinator:
         with self._lock:
             self._pending[op_id] = (event, result_box)
 
+        attended_s = 0.0
+        reason = ""
         try:
-            decision = await self._wait_with_cancel(
+            decision, reason, attended_s = await self._wait_with_cancel(
                 event, eff_timeout, cancel_check,
             )
         finally:
@@ -420,19 +474,31 @@ class ReviewCoordinator:
 
         # If no decision was recorded but we exited the wait, it's a
         # timeout-equivalent (cancel_check fired or timeout elapsed
-        # without explicit accept/reject).
+        # without explicit accept/reject). ``reason`` keeps WHICH clock
+        # ran out on the record — an EXPIRED that burned an attended
+        # budget is an operator who declined to answer; one that hit the
+        # ceiling is an operator who was never there to be asked.
         if decision is None:
             decision = ReviewDecision.EXPIRED
 
         # --- Step 5: act on decision via the branch manager
         await self._apply_decision(op_id, decision)
 
+        elapsed_s = time.monotonic() - started
+        if decision is ReviewDecision.EXPIRED:
+            logger.info(
+                "[ReviewCoordinator] op=%s EXPIRED reason=%s elapsed=%.1fs "
+                "attended=%.1fs", op_id, reason, elapsed_s, attended_s,
+            )
+
         return CoordinatedReview(
             op_id=op_id,
             archive_ref=archived.ref,
             branch_name=branch_name,
             decision=decision,
-            elapsed_s=time.monotonic() - started,
+            elapsed_s=elapsed_s,
+            error=reason if decision is ReviewDecision.EXPIRED else "",
+            attended_s=attended_s,
         )
 
     # ---- decision recording (called by REPL/HTTP/SSE handlers) --------
@@ -494,41 +560,144 @@ class ReviewCoordinator:
         event: asyncio.Event,
         timeout_s: float,
         cancel_check: Optional[Callable[[], bool]],
-    ) -> Optional[ReviewDecision]:
-        """Wait for either the decision event or timeout. Polls
-        ``cancel_check`` every 1s — when it returns True, treat as
-        a synthetic REJECTED (operator hit /cancel)."""
-        deadline = time.monotonic() + timeout_s
-        poll_s = 1.0
+    ) -> Tuple[Optional[ReviewDecision], str, float]:
+        """Wait for the operator's decision against an **attention-gated**
+        budget. Returns ``(decision, reason, attended_s)``; a ``None``
+        decision is an EXPIRE whose ``reason`` says which clock ran out.
 
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None  # timeout
-            wait_for = min(poll_s, remaining)
-            try:
-                await asyncio.wait_for(event.wait(), timeout=wait_for)
-                # Event fired — read the decision from the result box
-                # (set by _record_decision).
-                op_id = self._find_op_id_for_event(event)
-                if op_id is None:
-                    return None
-                with self._lock:
-                    entry = self._pending.get(op_id)
-                    if entry is not None:
-                        _, box = entry
-                        if box:
-                            return box[-1]
-                return None
-            except asyncio.TimeoutError:
-                # Poll for cancel.
+        The budget is spent in seconds the operator was *attached*, not
+        seconds of wall-clock. Mechanics:
+
+        * **Ledger, not accumulator.** ``timeout_s`` is measured against a
+          mark taken on the process-wide monotone attended-time counter
+          (:mod:`attention_ledger`). This coroutine keeps no private
+          clock, so it cannot drift from — or disagree with — any other
+          waiter. Deltas come from ``time.monotonic()`` at transitions,
+          never from summed sleep durations, so event-loop lateness is
+          structurally uncountable.
+
+        * **Suspend on edges, not on polls.** While paused we await a
+          presence-change *future* alongside the decision task. Nothing
+          samples ``client_count``. With ``cancel_check`` absent (or
+          ``JARVIS_REVIEW_CANCEL_POLL_S=0``) and no ceiling configured,
+          the timeout is ``None`` — a true suspension costing zero
+          wakeups until an operator returns or decides.
+
+        * **Flapping.** A detach only pauses the *state machine* after
+          ``JARVIS_ATTENTION_FLAP_GRACE_S``, so a reconnecting terminal
+          never thrashes the waiter. The grace is not billable: the
+          ledger stopped charging at the disconnect instant regardless,
+          so the budget neither resets nor accrues phantom delta across
+          any number of flaps. The two concerns — when to switch awaits,
+          and what to charge — are deliberately separate authorities.
+
+        * **Self-arming.** Pausing requires ``snap.armed`` — some
+          operator has attached at least once in this process. A headless
+          soak keeps exact legacy behavior; the gate cannot convert an
+          unattended session into an indefinitely-pinned one.
+
+        * **Bounded pause.** An absolute wall ceiling (``timeout_s ×
+          JARVIS_REVIEW_ATTENTION_MAX_WALL_MULT``) still expires the
+          review, reported as ``unattended_ceiling`` so the outcome is
+          never confused with a considered rejection. Like the harness
+          watchdog, it reads only raw clocks — it is never extended by
+          any liveness signal from the thing it bounds.
+        """
+        presence = get_attention_ledger()
+        gate_on = attention_gate_enabled()
+        grace_s = read_flap_grace_s()
+        poll_s = read_cancel_poll_s()
+        can_cancel = cancel_check is not None and poll_s > 0
+        mult = read_wall_multiplier()
+        ceiling = timeout_s * mult if mult > 0 else 0.0
+
+        wall_started = time.monotonic()
+        start_mark = presence.snapshot().attended_elapsed
+
+        decision_task: "asyncio.Future" = asyncio.ensure_future(event.wait())
+        change: Optional["asyncio.Future"] = None
+        try:
+            while True:
+                wall = time.monotonic() - wall_started
+                snap = presence.snapshot()
+                attended = snap.attended_elapsed - start_mark
+
+                if ceiling > 0 and wall >= ceiling:
+                    return None, "unattended_ceiling", attended
+
+                # WHICH CLOCK. Until the gate arms, the budget is spent in
+                # wall-clock seconds — byte-for-byte the legacy behavior,
+                # and the reason a headless process cannot be pinned by
+                # a budget that could never be spent. Once armed, it is
+                # spent in attended seconds. The switch is monotone-safe:
+                # attended <= wall always, so arming can only ever GRANT
+                # remaining time, never cause a surprise expiry. An
+                # operator who arrives mid-review gets a full window to
+                # look — nobody had seen it before them — and the wall
+                # ceiling still bounds the total.
+                gated = gate_on and snap.armed
+                spent = attended if gated else wall
+                remaining = timeout_s - spent
+                if remaining <= 0:
+                    return None, (
+                        "attended_budget" if gated else "wall_budget"
+                    ), attended
+
+                # Paused iff the gate is live, nobody is attached, and the
+                # absence has outlived the flap debounce.
+                paused = (
+                    gated and snap.count == 0
+                    and snap.unattended_for > grace_s
+                )
+
+                tick: Optional[float]
+                if paused:
+                    tick = poll_s if can_cancel else None
+                else:
+                    tick = min(poll_s, remaining) if can_cancel else remaining
+                    if gated and snap.count == 0:
+                        # Inside the debounce: wake exactly at its expiry
+                        # rather than one poll interval later.
+                        tick = min(tick, max(0.0, grace_s - snap.unattended_for))
+                if ceiling > 0:
+                    left = max(0.0, ceiling - wall)
+                    tick = left if tick is None else min(tick, left)
+
+                waiters: Set["asyncio.Future"] = {decision_task}
+                if paused:
+                    if change is None or change.done():
+                        # Snapshot-keyed: resolves immediately if the edge
+                        # passed while we were deciding to wait for it.
+                        change = presence.change_future(snap.epoch)
+                    waiters.add(change)
+
+                await asyncio.wait(
+                    waiters,
+                    timeout=None if tick is None else max(0.0, tick),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                if decision_task.done():
+                    op_id = self._find_op_id_for_event(event)
+                    if op_id is not None:
+                        with self._lock:
+                            entry = self._pending.get(op_id)
+                            if entry is not None and entry[1]:
+                                return entry[1][-1], "operator", attended
+                    return None, "signalled_without_decision", attended
+
                 if cancel_check is not None:
                     try:
                         if cancel_check():
-                            return ReviewDecision.REJECTED
+                            return ReviewDecision.REJECTED, "cancelled", attended
                     except Exception:  # noqa: BLE001
                         pass
-                # Loop back to check remaining timeout.
+        finally:
+            # No background task outlives this wait; a cancelled presence
+            # waiter self-evicts from the ledger via its done-callback.
+            decision_task.cancel()
+            if change is not None:
+                change.cancel()
 
     def _find_op_id_for_event(
         self, event: asyncio.Event,
@@ -659,15 +828,21 @@ def reset_default_coordinator_for_tests() -> None:
 
 
 __all__ = [
+    "ATTENTION_GATE_ENV_VAR",
+    "CANCEL_POLL_ENV_VAR",
     "CoordinatedReview",
     "MASTER_FLAG_ENV_VAR",
     "REVIEW_COORDINATOR_SCHEMA_VERSION",
     "ReviewCoordinator",
     "ReviewDecision",
     "TIMEOUT_ENV_VAR",
+    "WALL_MULT_ENV_VAR",
+    "attention_gate_enabled",
     "get_default_coordinator",
     "is_master_flag_enabled",
+    "read_cancel_poll_s",
     "read_timeout_s",
+    "read_wall_multiplier",
     "register_flags",
     "register_shipped_invariants",
     "reset_default_coordinator_for_tests",
@@ -747,6 +922,84 @@ def register_flags(registry) -> int:
             ),
             example="30",
             since="Gap #4 Slice 6 (2026-05-04)",
+        ),
+        FlagSpec(
+            name=ATTENTION_GATE_ENV_VAR,
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Spend the review budget in ATTENDED seconds (an operator "
+                "attached to a cockpit) instead of wall-clock seconds. "
+                "Closes the attention-path defect where a review raised "
+                "while detached burned its window against an empty socket "
+                "and auto-EXPIRED verified work. SELF-ARMING: inert for "
+                "the life of any process no operator has ever attached "
+                "to, so headless soaks / CI keep exact legacy behavior. "
+                "Set false for an unconditional wall-clock rollback."
+            ),
+            category=Category.SAFETY,
+            source_file=(
+                "backend/core/ouroboros/governance/review_coordinator.py"
+            ),
+            example="true",
+            since="Attention path (2026-08-11)",
+        ),
+        FlagSpec(
+            name=WALL_MULT_ENV_VAR,
+            type=FlagType.FLOAT,
+            default=_DEFAULT_WALL_MULT,
+            description=(
+                "Absolute wall-clock ceiling on a PAUSED review, as a "
+                "multiple of JARVIS_REVIEW_TIMEOUT_S — so the bound "
+                "tracks the operator's own configured patience rather "
+                "than a second magic number. Hitting it EXPIREs with "
+                "reason=unattended_ceiling (distinguishable from a "
+                "considered rejection). ``0`` = unbounded pause. NOTE "
+                "for soaks: the resulting ceiling should sit under "
+                "--max-wall-seconds or a paused review can consume the "
+                "session's margin."
+            ),
+            category=Category.TIMING,
+            source_file=(
+                "backend/core/ouroboros/governance/review_coordinator.py"
+            ),
+            example="4",
+            since="Attention path (2026-08-11)",
+        ),
+        FlagSpec(
+            name=CANCEL_POLL_ENV_VAR,
+            type=FlagType.FLOAT,
+            default=_DEFAULT_CANCEL_POLL_S,
+            description=(
+                "Cadence (seconds) of the /cancel poll inside the review "
+                "wait. Was a 1.0s literal. ``0`` disables cancel polling, "
+                "making a paused review a pure edge-triggered suspension "
+                "with zero wakeups."
+            ),
+            category=Category.TIMING,
+            source_file=(
+                "backend/core/ouroboros/governance/review_coordinator.py"
+            ),
+            example="1",
+            since="Attention path (2026-08-11)",
+        ),
+        FlagSpec(
+            name="JARVIS_ATTENTION_FLAP_GRACE_S",
+            type=FlagType.FLOAT,
+            default=2.0,
+            description=(
+                "Debounce on the attended→paused transition, so a "
+                "reconnecting `ov attach` does not thrash waiters. NOT "
+                "billable: the attention ledger stops charging at the "
+                "disconnect instant regardless, so no number of flaps "
+                "can reset the budget or accrue phantom delta."
+            ),
+            category=Category.TIMING,
+            source_file=(
+                "backend/core/ouroboros/governance/attention_ledger.py"
+            ),
+            example="2",
+            since="Attention path (2026-08-11)",
         ),
         FlagSpec(
             name="JARVIS_REVIEW_BRANCH_GIT_TIMEOUT_S",

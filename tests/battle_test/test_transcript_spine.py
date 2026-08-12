@@ -33,6 +33,10 @@ _CAPS = (
     "JARVIS_DIFF_ARCHIVE_SIZE",
     "JARVIS_TOOL_RENDER_STORE_SIZE",
     "JARVIS_NARRATIVE_BUFFER_SIZE",
+    # Slice 2 added milestones as a fifth vocabulary; a producer that
+    # did not contribute capacity would make the spine evict sooner
+    # than the union it promises.
+    "JARVIS_MILESTONE_BUFFER_SIZE",
 )
 
 
@@ -59,6 +63,7 @@ def test_the_prefixes_come_from_the_stores() -> None:
     assert known_prefixes() == {
         "o-": "op_block", "d-": "diff",
         "t-": "tool_body", "n-": "narrative",
+        "m-": "milestone",
     }
 
 
@@ -75,9 +80,9 @@ def test_capacity_is_the_union_of_the_stores_own_caps(monkeypatch: Any) -> None:
     """Not a new limit: exactly what the four rings could hold between them,
     so unifying retention cannot evict anything that survives today."""
     _tiny(monkeypatch, 5)
-    assert ts._derived_capacity() == 20
+    assert ts._derived_capacity() == 25
     monkeypatch.setenv("JARVIS_DIFF_ARCHIVE_SIZE", "11")
-    assert ts._derived_capacity() == 26, "the spine did not follow the store"
+    assert ts._derived_capacity() == 31, "the spine did not follow the store"
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +104,7 @@ def test_eviction_is_uniform_so_dangling_is_impossible(monkeypatch: Any) -> None
         "the surviving window has a hole — a live record could reference an "
         "evicted one"
     )
-    assert len(s) == 12
+    assert len(s) == 15
 
 
 def test_an_aged_out_ref_is_distinguishable_from_a_bogus_one(

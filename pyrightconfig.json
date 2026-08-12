@@ -1,9 +1,9 @@
 {
-  "venvPath": "./backend",
-  "venv": "venv",
+  "pythonVersion": "3.11",
   "exclude": [
     "**/venv/**",
     "**/.venv/**",
+    "**/site-packages/**",
     "**/__pycache__/**",
     "**/node_modules/**",
     "**/build/**",
@@ -15,6 +15,10 @@
     "**/.ruff_cache/**",
     "**/.hypothesis/**",
     "**/.jarvis/**",
+    ".worktrees/**",
+    ".ouroboros/**",
+    ".pycache/**",
+    "test-results/**",
     "backend/data/**",
     "backend/logs/**",
     "backend/checkpoints/**",

@@ -300,7 +300,7 @@ class BoundedBodyStore:
                 from backend.core.ouroboros.battle_test.transcript_spine import (
                     record_event,
                 )
-                record_event("tool_body", ref)
+                record_event("tool_body", ref, op_id=op_id_safe)
             except Exception:  # noqa: BLE001
                 pass
             self._next_seq += 1
