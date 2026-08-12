@@ -3429,9 +3429,37 @@ class CandidateGenerator:
             "[CandidateGenerator] EXHAUSTION %s", log_parts,
         )
 
+        # Rehearsal tier: classify this exhaustion ONCE, here, where the
+        # evidence already exists. Every op that follows can then read the
+        # verdict instead of re-walking the cascade to rediscover it —
+        # detection and consumption were disconnected, which is why
+        # bt-2026-08-11-230412 paid the full chain eight times for an
+        # outage the ledger recorded on the first.
+        #
+        # Deliberately does NOT alter control flow: this helper is typed
+        # NoReturn and every caller depends on that. The verdict rides on
+        # the report and the exception so downstream surfaces can act on
+        # it without a second classifier.
+        _rehearsal = None
+        try:
+            from backend.core.ouroboros.governance.rehearsal_tier import (
+                get_rehearsal_tier as _get_rehearsal_tier,
+            )
+            _rehearsal = _get_rehearsal_tier().consult(
+                str(getattr(context, "op_id", "") or ""),
+                report=report,
+                target_files=tuple(getattr(context, "target_files", ()) or ()),
+                route=str(report.get("route", "") or ""),
+            )
+            report["rehearsal"] = _rehearsal.to_dict()
+        except Exception:  # noqa: BLE001 — never mask the raise
+            pass
+
         err = RuntimeError(f"all_providers_exhausted:{cause}")
         try:
             setattr(err, "exhaustion_report", report)
+            if _rehearsal is not None:
+                setattr(err, "rehearsal", _rehearsal)
         except Exception:
             pass  # attribute attachment is best-effort — never mask the raise
         if fallback_exc is not None:
