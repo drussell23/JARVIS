@@ -92,10 +92,21 @@ print("=" * 78)
 print("D. ENV-VAR DEFAULTS — README table rows vs the literal in code")
 print("=" * 78)
 rows = re.findall(r"^\| `(JARVIS_[A-Z0-9_]+)` \| `([^`]*)` \|", README, re.M)
-pat = re.compile(r'"(JARVIS_[A-Z0-9_]+)"\s*,\s*"([^"]*)"')
+
+# ANCHORED to the actual read. An unanchored `"FLAG", "value"` pattern
+# also matches adjacent entries in a LIST of flag names —
+#     _FLAGS = ["JARVIS_VOICE_ENABLED", "JARVIS_AUDIO_BUS_ENABLED"]
+# reads as "JARVIS_VOICE_ENABLED defaults to 'jarvis_audio_bus_enabled'".
+# That produced 11 phantom "divergent" flags on first run: a verifier
+# manufacturing the defect it was written to detect.
+pat = re.compile(
+    r'(?:environ\.get|getenv)\(\s*"(JARVIS_[A-Z0-9_]+)"\s*,\s*"([^"]*)"'
+)
 code_defaults: dict[str, set[str]] = defaultdict(set)
 for rel in files:
-    if rel.startswith(".worktrees/"):
+    # Tests set values to exercise branches; a monkeypatched literal is
+    # not a production default and must not be read as one.
+    if rel.startswith((".worktrees/", "tests/")):
         continue
     try:
         txt = (ROOT / rel).read_text(encoding="utf-8", errors="ignore")
@@ -104,15 +115,32 @@ for rel in files:
     for m in pat.finditer(txt):
         code_defaults[m.group(1)].add(m.group(2).lower())
 
-ok = mism = unk = 0
+ok = mism = unk = split = 0
 for flag, claimed in rows:
     have = code_defaults.get(flag)
     if not have:
         unk += 1
         print(f"  ?        {flag:44s} claims {claimed!r} (no literal default)")
-    elif claimed.lower() in have:
+        continue
+    # A flag whose call sites DISAGREE is a finding on its own, whatever
+    # the README says. Testing `claimed in have` alone would pass as soon
+    # as ONE site matched — accepting a flag that means different things
+    # in different modules, which is the exact defect this file exists to
+    # surface. Report the divergence first, then the README's accuracy.
+    if len(have) > 1:
+        split += 1
+        agrees = "README agrees with one" if claimed.lower() in have \
+            else f"README {claimed!r} matches NONE"
+        print(f"  DIVERGENT {flag:43s} code has {sorted(have)} — {agrees}")
+        if claimed.lower() not in have:
+            mism += 1
+        continue
+    if claimed.lower() in have:
         ok += 1
     else:
         mism += 1
         print(f"  MISMATCH {flag:44s} README {claimed!r} vs code {sorted(have)}")
-print(f"\n  OK={ok}  MISMATCH={mism}  UNVERIFIABLE={unk}")
+print(f"\n  OK={ok}  MISMATCH={mism}  DIVERGENT={split}  UNVERIFIABLE={unk}")
+if split:
+    print("  (DIVERGENT = one flag, several literal defaults across call "
+          "sites. Unset, it means different things in different modules.)")
