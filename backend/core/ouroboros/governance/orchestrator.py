@@ -4776,10 +4776,22 @@ class GovernedOrchestrator:
                     except (asyncio.TimeoutError, Exception):  # noqa: BLE001 — never block GENERATE
                         pass
                 except Exception as exc:
+                    # exc_info is load-bearing, not decoration. This handler
+                    # spans ~130 lines and eight injected capabilities, so
+                    # the message alone ("'bool' object is not callable")
+                    # names a TYPE and no site — and because the op then
+                    # CONTINUES to GENERATE with degraded context, the
+                    # failure is invisible in every downstream artifact.
+                    # Observed live 3-for-3 in bt-2026-08-11-230412: every
+                    # op ran without expansion and nothing surfaced it.
+                    # A swallowed exception that changes behaviour must at
+                    # minimum say where it came from.
                     logger.warning(
-                        "[Orchestrator] Context expansion failed for op=%s: %s; "
-                        "continuing to GENERATE",
-                        ctx.op_id, exc,
+                        "[Orchestrator] Context expansion failed for op=%s: "
+                        "%s: %s; continuing to GENERATE with UNEXPANDED "
+                        "context",
+                        ctx.op_id, type(exc).__name__, exc,
+                        exc_info=True,
                     )
 
                 # ---- ModuleContextRouter: architecture memory injection (MEM-2, inline path) ----
