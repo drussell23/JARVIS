@@ -209,12 +209,18 @@ def test_the_legacy_reader_does_not_adopt_surfaces_as_a_bucket():
 
 
 async def test_evidence_is_reachable_by_typing_it():
-    """`source_assertion_audit` shipped complete, tested, and uncallable."""
-    from backend.core.ouroboros.governance import repl_verb_cage as cage
+    """`source_assertion_audit` shipped complete, tested, and uncallable.
 
-    result = await cage.dispatch_async("/evidence help")
-    assert result is not None, "/evidence is not mounted"
-    assert "source assertion" in result.text.lower()
+    Verified through the REAL dispatch path — `repl_dispatch_registry` is
+    what the daemon awaits — not by grepping for the verb's name. A dynamic
+    mount is invisible to grep by construction, which is exactly how a
+    mounted verb got mistaken for an orphan once already.
+    """
+    from backend.core.ouroboros.battle_test import repl_dispatch_registry as rd
+
+    outcome = await rd.try_dispatch("/evidence help")
+    assert outcome is not None and outcome.matched, "/evidence is not routed"
+    assert "source assertion" in outcome.text.lower()
 
 
 async def test_the_verb_measures_the_real_repository():
@@ -258,7 +264,7 @@ def test_registration_is_discovered_not_listed():
     """A hardcoded list is a thing to forget — which is how
     `reach_repl.run_watchdog` shipped with zero production callers."""
     code = code_of(ar, "registered_ratchets")
-    assert "repl_verb_cage" in code
+    assert "repl_dispatch_registry" in code
     assert "reach" not in code and "evidence" not in code
 
 
