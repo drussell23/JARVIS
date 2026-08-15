@@ -29,7 +29,11 @@ from autonomy.email_triage.extraction import (
 _conftest_dir = os.path.dirname(__file__)
 if _conftest_dir not in sys.path:
     sys.path.insert(0, _conftest_dir)
-from conftest import make_raw_email, make_triage_config
+# Package-qualified: `tests/e2e/email_triage/` has an `__init__.py`,
+# so a bare `from conftest import …` resolves against the ROOT
+# conftest.py — which does not define these — rather than the sibling
+# that does. The bare form is not merely fragile, it is wrong here.
+from tests.e2e.email_triage.conftest import make_raw_email, make_triage_config
 
 
 class TestContractValidation:

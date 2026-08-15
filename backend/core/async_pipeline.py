@@ -655,8 +655,27 @@ class AdvancedAsyncPipeline:
         self._agi_voice = None
         self._agi_owner_service = None
 
+        # A CONSTRUCTOR MUST NOT REQUIRE A RUNNING LOOP.
+        #
+        # `asyncio.create_task` raises RuntimeError("no running event loop")
+        # when there is none, and constructing this class is exactly what
+        # importing `backend.api.unified_vision_handler` does at module
+        # scope. The result was that the module could not be IMPORTED
+        # outside a live loop — which took every test that touches it to a
+        # collection error, i.e. to zero coverage rather than a red test.
+        #
+        # Scheduled when a loop is running (the production path, unchanged);
+        # deferred to `_pending_agi_init` otherwise, so a synchronous
+        # importer gets a constructed object and the integration still
+        # starts on the first async entry point rather than being lost.
+        self._pending_agi_init = False
         if self.agi_os_enabled:
-            asyncio.create_task(self._init_agi_os_integration())
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                self._pending_agi_init = True
+            else:
+                asyncio.create_task(self._init_agi_os_integration())
 
         # ═══════════════════════════════════════════════════════════════
         # VBI Health Monitor Integration - Advanced Health Tracking
@@ -664,8 +683,17 @@ class AdvancedAsyncPipeline:
         self._vbi_health_monitor = None
         self._health_monitor_enabled = self.config.get("vbi_health_monitor_enabled", True)
 
+        # Same constructor-requires-a-loop defect as the AGI init above, in
+        # the same __init__ — fixing one and not the other would have left
+        # the module still unimportable while looking repaired.
+        self._pending_health_init = False
         if self._health_monitor_enabled:
-            asyncio.create_task(self._init_vbi_health_monitor())
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                self._pending_health_init = True
+            else:
+                asyncio.create_task(self._init_vbi_health_monitor())
 
         # ═══════════════════════════════════════════════════════════════════
         # BACKGROUND TASKS REGISTRY - Prevents Garbage Collection

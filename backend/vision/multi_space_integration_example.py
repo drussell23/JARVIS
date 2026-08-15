@@ -6,7 +6,7 @@ Shows how to integrate all the multi-space components together
 
 import asyncio
 import logging
-from typing import Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 from datetime import datetime
 
 # Import the enhanced components

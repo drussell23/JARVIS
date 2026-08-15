@@ -8,6 +8,7 @@ This file contains:
 """
 
 import asyncio
+import logging as _logging
 import pytest
 import re
 import sys
@@ -459,3 +460,177 @@ def _live_state_tripwire(request):
             "test wrote the operator's live .jarvis/ state: "
             + ", ".join(offenders)
         )
+
+
+# ===========================================================================
+# Git-aware collection boundary
+# ===========================================================================
+#
+# THE ROOT CAUSE. Untracked OS artifacts bleed into the execution
+# environment. Finder and iCloud resolve a name collision by appending
+# " 2" — producing `tests/functional/vision 2/`, which the repository
+# already refuses to track (`.gitignore: * [0-9].*`) but pytest happily
+# walked, because pytest reads the FILESYSTEM and git reads the INDEX.
+#
+# The cost was never noise. A duplicate shares its BASENAME with the
+# original, so importing `test_jarvis_vision` became ambiguous and pytest
+# errored BOTH copies — the artifact deleted the real file's coverage.
+#
+# WHY NOT A STRING PATTERN. Two mechanisms were tried and both are
+# structurally incapable:
+#
+#   * `norecursedirs` splits its value on WHITESPACE, so a pattern
+#     containing a space is impossible to express — `* [0-9]` parsed as two
+#     patterns, and the bare `*` matched every directory, collapsing
+#     collection to zero tests.
+#   * a regex hook encodes today's artifact spelling. " 2" is Finder's;
+#     another tool picks another suffix and the filter silently stops
+#     working, in the direction that looks like success.
+#
+# So the boundary is the INDEX ITSELF. "Is this file part of the
+# repository" has exactly one authority, and it is git. That is exact
+# rather than heuristic, immune to spaces and to any future artifact
+# naming, and it needs no maintenance when the next tool invents a suffix.
+
+_TRACKED_PATHS: "Optional[frozenset]" = None
+_TRACKED_ROOT: "Optional[Path]" = None
+
+
+def _tracked_files(root: "Path") -> "Optional[frozenset]":
+    """Every path git tracks, as repo-relative POSIX strings. NEVER raises.
+
+    ONE subprocess per session, cached: the alternative — `git check-ignore`
+    per collected path — is thousands of forks across a 50k-test suite.
+    NUL-delimited (`-z`) because a path containing a space is the entire
+    reason this exists, and a newline-delimited reader would corrupt on the
+    first quoted name.
+
+    ``None`` means "git could not answer" — no repository, git absent, a
+    timeout. The caller then ABSTAINS and collects everything, because a
+    test runner that silently collects nothing because git was unavailable
+    is a far worse failure than one that collects an artifact.
+    """
+    global _TRACKED_PATHS, _TRACKED_ROOT
+    if _TRACKED_PATHS is not None and _TRACKED_ROOT == root:
+        return _TRACKED_PATHS
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["git", "ls-files", "-z"], cwd=str(root), timeout=60,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+        if out.returncode != 0:
+            return None
+        names = out.stdout.decode("utf-8", errors="replace").split("\0")
+        tracked = frozenset(n for n in names if n)
+    except Exception:  # noqa: BLE001 — collection must never die here
+        return None
+    if not tracked:
+        return None
+    _TRACKED_PATHS, _TRACKED_ROOT = tracked, root
+    return tracked
+
+
+def pytest_ignore_collect(collection_path=None, path=None, config=None):
+    """Refuse anything git does not track. NEVER raises.
+
+    Directories are kept when they CONTAIN a tracked file, so an untracked
+    `__pycache__` sibling of real tests cannot prune the tests with it.
+
+    Both parameter spellings are accepted: pytest renamed ``path`` to
+    ``collection_path``, and hard-coding one name would disable this hook
+    silently on the other version — failing in the direction that looks
+    like everything is fine, which is the failure mode this whole hook
+    exists to eliminate.
+    """
+    from pathlib import Path as _P
+
+    target = collection_path if collection_path is not None else path
+    if target is None or config is None:
+        return None
+    try:
+        root = _P(str(config.rootpath))
+        tracked = _tracked_files(root)
+        if tracked is None:
+            return None                      # git unavailable → abstain
+        # `os.path.relpath` over REALPATHS, not `Path.relative_to`.
+        #
+        # This checkout exists twice — `JARVIS-AI-Agent.nosync` and a
+        # symlinked `JARVIS-AI-Agent` — so `rootpath` and the collected path
+        # can resolve through different links. `relative_to` raises on that
+        # mismatch, the hook abstains, and every artifact is collected while
+        # the code looks correct. `relpath` computes the relation without
+        # requiring one to be a textual prefix of the other.
+        import os as _os
+        p = _P(str(target))
+        rel = _os.path.relpath(_os.path.realpath(str(p)),
+                               _os.path.realpath(str(root)))
+        rel = _P(rel).as_posix()
+        if rel.startswith(".."):
+            return None                      # genuinely outside the repo
+    except Exception:  # noqa: BLE001 — unresolvable
+        return None
+    if not rel or rel == ".":
+        return None
+    if p.is_dir():
+        prefix = rel + "/"
+        return None if any(t.startswith(prefix) for t in tracked) else True
+    return None if rel in tracked else True
+
+
+def pytest_collection_modifyitems(session, config, items):
+    """Amputate untracked items after traversal. NEVER raises.
+
+    `pytest_ignore_collect` above is the right hook and its logic is proven
+    correct in isolation, but it was observed NOT to fire in this repo —
+    plugin hierarchy or pluggy ordering preempts it. Rather than depend on a
+    hook that may or may not be invoked, this runs at a point pytest
+    guarantees: after the whole tree is walked, with the final item list in
+    hand and mutable.
+
+    Belt AND braces, deliberately. The two hooks are not redundant, they fail
+    differently: `ignore_collect` prevents an untracked file from ever being
+    IMPORTED (which is what stops a basename collision from erroring the real
+    file), while this one guarantees nothing untracked EXECUTES even when the
+    first hook is bypassed. Keeping only the second would leave the collision
+    class open; keeping only the first leaves it dependent on hook wiring.
+
+    Mutates `items` IN PLACE — pytest reads the same list object afterwards,
+    so rebinding the name would be silently ignored.
+    """
+    if not items:
+        return
+    try:
+        from pathlib import Path as _P
+        import os as _os
+
+        root = _P(str(config.rootpath))
+        tracked = _tracked_files(root)
+        if tracked is None:
+            return                            # git unavailable → abstain
+        real_root = _os.path.realpath(str(root))
+
+        def _is_tracked(item) -> bool:
+            try:
+                raw = getattr(item, "path", None) or item.fspath
+                rel = _os.path.relpath(_os.path.realpath(str(raw)), real_root)
+                rel = _P(rel).as_posix()
+                # Outside the repo entirely: not this hook's business. Keep,
+                # so an intentional out-of-tree suite is never amputated.
+                return True if rel.startswith("..") else rel in tracked
+            except Exception:  # noqa: BLE001
+                return True                   # unresolvable → keep
+        keep = [i for i in items if _is_tracked(i)]
+        dropped = len(items) - len(keep)
+        if dropped:
+            # MUTATE FIRST, report second. The reverse order cost this hook
+            # its entire effect once already: `logger` was undefined in this
+            # module, the NameError fired before the assignment, and the
+            # blanket `except` below swallowed it — leaving a hook that ran,
+            # failed, and reported nothing. Diagnostics must never sit on the
+            # path of the thing they describe.
+            items[:] = keep
+            _logging.getLogger(__name__).warning(
+                "[tests-conftest] dropped %d collected item(s) from untracked "
+                "paths — OS artifacts are not part of the repository", dropped)
+    except Exception:  # noqa: BLE001 — collection must never die here
+        return
