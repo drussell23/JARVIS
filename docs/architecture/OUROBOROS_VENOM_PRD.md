@@ -196,6 +196,22 @@
 24. [Voice I/O — the `ov` Conversational Loop](#24-voice-io--the-ov-conversational-loop-new-2026-07-26)
     - [24.4 Root problems, ranked](#244-root-problems-ranked)
     - [24.6 Roadmap](#246-roadmap)
+25. [Cockpit Fidelity — the Audit Surface](#25-cockpit-fidelity--the-audit-surface-new-2026-08-11)
+26. [The Trust Boundary](#26-the-trust-boundary-new-2026-08-11)
+27. [Initiative and Steering — the Operator's Half of Autonomy](#27-initiative-and-steering--the-operators-half-of-autonomy-new-2026-08-13)
+    - [27.2 The operator is an editor, not an initiator](#272-the-operator-is-an-editor-not-an-initiator)
+    - [27.3 Attention is the metered resource](#273-attention-is-the-metered-resource)
+    - [27.4 The five frames](#274-the-five-frames)
+    - [27.5 The steering grammar](#275-the-steering-grammar)
+    - [27.6 The trust ladder as the progression surface](#276-the-trust-ladder-as-the-progression-surface)
+    - [27.8 Edge cases and nuances](#278-edge-cases-and-nuances)
+    - [27.10 Build plan](#2710-build-plan)
+28. [The Cockpit as Control Surface — Implementation Audit](#28-the-cockpit-as-control-surface--implementation-audit-new-2026-08-13)
+    - [28.2 What the audit found excellent — and promotes to standards](#282-what-the-audit-found-excellent--and-promotes-to-standards)
+    - [28.3 Findings that survived verification](#283-findings-that-survived-verification)
+    - [28.4 Findings withdrawn under verification](#284-findings-withdrawn-under-verification)
+    - [28.5 Measured affordance costs](#285-measured-affordance-costs)
+    - [28.6 Remediation, ranked by leverage per line changed](#286-remediation-ranked-by-leverage-per-line-changed)
 
 ## 1. Executive Summary
 
@@ -2919,5 +2935,847 @@ a reattaching operator sees what is waiting before anything expires.
 
 An op discarded because nobody was watching is the same defect class as a
 receipt that says "queued" about work that was thrown away.
+
+---
+
+## 27. Initiative and Steering — the Operator's Half of Autonomy *(NEW 2026-08-13)*
+
+> **Operator binding (verbatim, 2026-08-13)**: *"CC's first run teaches you to ask,
+> but we want O+V to be able to demonstrate initiative and teach you to steer."*
+
+### 27.0 What this section owns — and what it deliberately does not restate
+
+Four prior sections touch this ground. §27 is written **after** a reconciliation
+pass against all four, in the discipline §38.11.5a established: one canonical
+owner per surface, no duplicated substrate, no second data contract.
+
+| Prior § | What it owns | §27's relationship |
+|---|---|---|
+| **§38.11** | 12 proactive-only *visibility* features (curiosity surfacing, dream log, graduation ticker, memory diff, risk-tier light, time-of-presence) + sequencing A–F | **Consumes.** §27 introduces no new read surface. Where §27 names a frame, it names which §38.11 producer fills it. |
+| **§39 #12** | "Proactive context preview" — the session-start anchor | **§27.4.2 (Handover) is declared the canonical render of this row.** §39 #12 gains a spec; it does not gain a second implementation. |
+| **§41.3** | 27 UX gaps graded against Claude Code parity | **Critiques the ruler** (§27.1). Does not re-list the gaps; all 27 remain valid floor work. |
+| **§25** | Cockpit fidelity — the daemon can now see the canvas; the spine gives order a home | **Depends on.** §27 is unbuildable without §25's capability channel and transcript spine. |
+| **§26** | The trust boundary — *when* the organism may act, and the evidence required | **Renders it** (§27.6). §26 stays the authority; §27 makes its state legible and its evidence honest. |
+| **§24** | Voice I/O | Orthogonal. Every §27 frame has a spoken form, deferred until §24's RP-1 clears. |
+
+**The gap §27 closes.** §38.11 makes the organism's inner life *visible*.
+§41.3 makes the CLI *comfortable*. §26 defines when the organism *may act*.
+Nowhere in this PRD is there a specification for **how a human redirects work
+they did not initiate**, or for **what the first ten seconds of contact teach a
+new operator**. Visibility is not control, and comfort is not competence.
+§27 is the control model and the first-contact contract.
+
+---
+
+### 27.1 The ruler problem — parity with a reactive tool cannot express initiative
+
+§41.3 enumerates 27 UX gaps and grades each against Claude Code. Every one of
+them is a reactive-tool affordance: tab completion, welcome banner, typo
+suggestion, per-command `--help`, conversation export, bookmark/star turns.
+Shipping all 27 yields an excellent reactive CLI.
+
+**A parity metric cannot contain an initiative metric**, because there is no CC
+behaviour to be at parity *with*. §41.3 is not wrong — it measures the floor,
+and the floor matters. §27 measures the ceiling.
+
+The same defect sits in §6's target-state table, in the one row that touches
+operator experience:
+
+> `Operator UX — < 30s from "I want X" → "X is being worked on"`
+
+That sentence begins with *the human wanting*. It is Claude Code's stopwatch
+transcribed into an autonomy PRD. For an organism whose entire thesis is that
+it works when nobody is wanting anything, it measures the wrong interval.
+§27.7 proposes the four signals that measure the right ones.
+
+---
+
+### 27.2 The operator is an editor, not an initiator
+
+Claude Code runs **one** loop: ask → answer. Every UI decision descends from it
+— the transcript is a conversation, the caret is an invitation, and the scarce
+resource being managed on screen is the *model's context*.
+
+O+V runs **three** loops concurrently, and the operator is inside only one:
+
+```
+  sense → hypothesize → generate → validate → gate → apply → verify   (16 sensors, continuous)
+  judge → tier → escalate → breaker                                   (Iron Gate, SemanticGuardian, risk ladder)
+  observe → steer                                                     ← the operator's loop, and only this one
+```
+
+The product that follows is therefore **not a chat window with autonomy bolted
+on**. It is a feed with brakes. And the governing economics invert:
+
+> **Initiative economics.** In a reactive tool the cheapest act must be
+> *asking*. In a proactive organism the cheapest act must be **declining**.
+
+The corollary is load-bearing, and it is the single sentence in §27 most likely
+to be violated under implementation pressure:
+
+> Any design in which refusing costs the operator more keystrokes than the
+> organism spent proposing will train the operator to stop watching.
+
+Assent-by-silence is the operator's structural default — they are frequently
+detached, and §26.6 has already established that absence must not be read as
+refusal. If silence grants, then reversing silence must be the cheapest
+interaction in the product. The affordance budget:
+
+| Operator act | Target cost | Today |
+|---|---|---|
+| Decline the thing on screen | **1 key** | **2+ keys through a line router.** The decision *channel* exists and is well built — `FocusShield` renders an addressed `[y/n]` gate and `CockpitAttachBridge.send_input(text, prompt_id)` tags the verdict with the gate it was written for, so a deferred answer cannot land on whichever op is armed now. But it is a **line** channel: `y` + Enter through `_route_operator_line`, with an operator echo. `/reject` during a `NOTIFY_APPLY` window is eight. The gap is the input model, not a missing feature. |
+| Ask why it did that | **1 verb** | **unbuilt** (§25.5 lists `/why <ref>` as remaining) |
+| Redirect to something adjacent | 1 short line of plain text | partial — `/chat` classifies, but nothing binds a turn to a live op |
+| Grant standing preference | 1 line | built (`UserPreferenceMemory`, 6 kinds, post-rejection auto-extraction) |
+| Initiate work explicitly | 1 line | built (intent classifier → backlog) |
+
+Note the shape: O+V has already built the *expensive* end of that table and
+left the cheap end empty. That is the exact inverse of what initiative
+economics requires.
+
+---
+
+### 27.3 Attention is the metered resource
+
+`attention_ledger.py` (landed `a5dd8b777f`, 2026-08-11) is the first primitive
+in this repository that treats **the operator's presence as a measurable,
+monotone quantity**. It was built to fix one bug — a review budget burning
+against an empty socket — but its significance is larger: it is the meter for
+the resource this entire section spends.
+
+CC manages context. Context is compactable, purchasable, and provider-bounded.
+**Operator attention is none of those things.** It is bursty, non-transferable,
+and strictly finite per day. Any proactive system that spends it carelessly
+degrades to noise within a week.
+
+Three consequences, all normative:
+
+**27.3.1 — Every operator-facing deadline is denominated in attended seconds.**
+Not wall time. `ReviewCoordinator` already does this; the rule generalizes to
+`ask_human`, proposal countdowns, and any future affordance with an expiry.
+The rendered form must say so: *"240s of your attention left"*, never *"240s"*.
+
+**27.3.2 — Absence produces no evidence.** This is the deepest rule in §27 and
+it composes directly with §26. An expiry that occurred while no cockpit was
+attached must:
+
+* **not** feed `UserPreferenceMemory` post-rejection extraction — the organism
+  would be learning the operator's preferences from the operator's *sleep*;
+* **not** count toward any §26 trust window, in either direction — neither as
+  alignment nor as divergence;
+* **not** be recorded in POSTMORTEM as a rejection — it is a *lapse*, a
+  distinct terminal that the ledger must be able to name.
+
+An organism that learns from absence will converge on a model of an operator
+who is never there. That is a self-fulfilling failure mode, and it is cheap to
+prevent exactly once, at the ledger.
+
+**27.3.3 — Attended expiry is a real signal.** The operator who saw the
+proposal, said nothing, and let it lapse *has* decided. That is a **weak
+reject**: it feeds preference extraction at reduced weight and it counts toward
+§26 windows. Distinguishing the two expiries is now possible for the first
+time, and doing so is the whole point of having built the ledger.
+
+**27.3.4 — Nuance: never let the decision clock hold the resources.** An
+attention-gated budget that can never be spent pins the process forever — a
+detached operator would accumulate parked ops indefinitely. The resolution is
+**two clocks, never one**: the *decision* clock is attended and may pause
+indefinitely; the *resource* clock is wall-time and is short. On resource
+expiry the op **parks** — releases its `BackgroundAgentPool` worker, drops to a
+durable record in the spine, surrenders its file locks — while its decision
+remains pending and answerable on reattach. Parking is cheap; waiting is not.
+
+---
+
+### 27.4 The five frames
+
+`ov` today has one frame — a state readout — doing the work of five. The
+composition is specified below; each frame names the canonical producer that
+fills it, and no frame introduces a new one.
+
+#### 27.4.1 First contact — the initiative demonstration
+
+The operator has typed one word and knows nothing. Within ten seconds they must
+see the organism **choose something specific about *this* repository and begin**,
+with refusal costing one key.
+
+```
+O+V v0.1.0 · first run in JARVIS-AI-Agent
+
+  ⎿ oracle indexing ······················· 6,593 files · 4.1s
+  ⎿ 16 sensors armed · 4 event-primary · 12 polling
+
+  Three things stood out:
+  ⎿ 41 TODOs · 6 older than 90 days
+  ⎿ tests/governance/ · 3 files with no assertions
+  ⎿ attention_ledger.py · 107 tests, never exercised live
+
+  Taking the stale TODOs.
+  ⎿ in 8s     [enter] now     [tab] something else     [esc] just watch
+
+  ⏺ read  backend/core/ouroboros/governance/orchestrator.py:2140     (1/2 explore)
+  ⏺ grep  "TODO(2026-0[1-5]" → 6 hits in 4 files                     (2/2 explore ✓)
+  🗣 the oldest guards a retry path that no longer exists — checking callers
+  ⏺ get_callers  _legacy_retry_guard                                 → 0
+```
+
+Three elements are doing product work, and one of them is a safety property:
+
+* **The countdown** makes initiative the default and refusal a reflex. It
+  requires no vocabulary — the new operator's first successful interaction can
+  be *not pressing a key*.
+* **The `(1/2 explore)` counter** is not decoration. The Iron Gate's
+  exploration-first rule already *requires* ≥2 `read_file`/`search_code`/
+  `get_callers` before a patch may exist, and `ExplorationLedger` enforces
+  diversity across 5 categories. Rendering that ledger live means the "watching
+  it search your codebase" experience is a **governance invariant reporting
+  itself**, not an animation. It cannot desynchronize from reality because it
+  *is* the gate.
+* **`[esc] just watch`** is the permanent escape hatch. There must always be a
+  mode in which the organism narrates and touches nothing.
+
+> **27.4.1.1 — The countdown buys an EXPLORE, never an APPLY.**
+> Initiative granted by *silence* is bounded to read-only work. A countdown may
+> auto-start exploration, planning, or analysis. It may **never** auto-start a
+> mutation, regardless of risk tier, regardless of `JARVIS_MIN_RISK_TIER`.
+> Mutations follow the §26 ladder and the risk-tier floor exactly as they do
+> today. This single rule is what makes auto-start defensible rather than
+> reckless, and it must be an AST-pinned invariant, not a convention.
+
+Producer map: proposal ranking is §38.11-E's `proactive_proposal_emitted`
+contract (`proactive_curiosity_reader` + `OpportunityMinerSensor` +
+`CapabilityGapSensor` + `TodoScanner`) — **§27 adds no new proposal source.**
+The exploration line is `ExplorationLedger`. The 🗣 line is
+`NarrativeChannel`'s existing `TOOL_PREAMBLE`.
+
+#### 27.4.2 Handover — the returning operator
+
+Canonical render of §39 #12, composed with §38.11-B (cross-session memory diff).
+Three blocks, three tenses, under one second, **zero tokens**:
+
+```
+● dormant · 4h 12m since last op · main @ f70a397
+
+  While you were gone
+  ⎿ 3 ops · 1 applied · 1 rejected (Yellow — expired, nobody attached) · 1 dry
+  ⎿ hibernated 16:11 — every provider lane out of credit
+
+  Needs you
+  ⎿ d-7  attention_ledger.py  +18/−4   240s of your attention left  →  /review d-7
+
+  Watching   16 sensors · nothing queued · $0.00 this hour
+```
+
+"While you were gone" is the block Claude Code structurally cannot have; it is
+the most concentrated expression of proactivity in the product. Every input
+exists today: `LastSessionSummary`, the spine's `m-` milestones,
+`ReviewCoordinator`'s pending set, the liquidity table, `AttentionLedger`.
+**Nothing composes them.**
+
+Note *"expired, nobody attached"* rather than *"rejected"*. That is §26.6 and
+§27.3.2 surfacing in the operator's first frame instead of dying in a ledger.
+
+#### 27.4.3 Ambient — the idle contract
+
+`_ignition_line`'s implementation comment already states the principle
+precisely: *a blank deck during a cold boot is indistinguishable from a healthy
+idle organism with nothing to say — and from a dead socket.* §27 promotes it:
+
+> **Idle must be narrated, and narration must be free.** A proactive agent that
+> goes quiet reads as broken. Narration that costs tokens turns idling into
+> burning. Therefore the always-on idle surface is **deterministic** — no LLM
+> call, ever — and carries a heartbeat age so a frozen line is visibly frozen.
+
+```
+  ⎿ watching · TestWatcher 30s · last sensor fire 2m ago · $0.00/hr · ♥ 3s
+```
+
+`NarrativeChannel`'s `💭` INTENT surface stays reserved for moments where
+reasoning genuinely occurs. This is a boundary, not a preference: the ambient
+line is the *liveness* channel and must never fail for provider reasons.
+
+#### 27.4.4 Interrupt — how the organism asks
+
+> **An interruption may take the bottom of the screen. It may never take the
+> cursor.**
+
+`ask_human`, Yellow `NOTIFY_APPLY` diffs, Orange approvals: all render as a
+bottom affordance carrying a ref, never a modal, never a reflow of the input
+line the operator is mid-way through typing. Concurrent interrupts **coalesce
+into a count**, they do not stack. Priority ordering follows the existing risk
+ladder (Orange > Yellow > `ask_human`).
+
+#### 27.4.5 Detach — the farewell
+
+`Ctrl+C detaches, the organism keeps running` is currently a fragment of a hint
+line. It is the deepest single divergence from CC — **quitting Claude ends the
+work; quitting `ov` does not** — and it earns a frame:
+
+```
+  detached · 2 ops in flight · organism continues · 'ov' to rejoin
+```
+
+Composes §38.11 #12 (time-of-presence), corrected per §27.3.1 to report
+*attended* duration.
+
+---
+
+### 27.5 The steering grammar
+
+Four acts, specified in strict cost order. The ordering *is* the specification.
+
+| # | Act | Cost | Semantics | Substrate |
+|---|---|---|---|---|
+| 1 | **decline** — `esc` / `n` | 1 key | strong reject on the focused proposal; extraction at full weight | `UserPreferenceMemory` post-rejection hook (built) |
+| 2 | **`/why <ref>`** | 1 verb | the causal account of a decision | `transcript_timeline` causal join (`63cb4344b3`) over the spine — **unbuilt** |
+| 3 | **redirect** — plain text while a ref is focused | 1 line | "not that, this" — reject + seed a successor signal | intent classifier + `ConversationBridge` (built, unbound to ops) |
+| 4 | **standing preference** — plain text | 1 line | carried across sessions | `UserPreferenceMemory` STYLE / PROJECT / FORBIDDEN_PATH (built) |
+
+**27.5.1 — `/why` is the load-bearing missing verb.** For a proactive agent,
+*"why did you do that"* is the primary human question. In CC the question never
+arises, because the human asked. Without `/why`, every proactive act is
+trusted blindly or refused blindly, and **neither outcome teaches anybody
+anything** — not the operator, and not the preference memory.
+
+**27.5.2 — `/why` must be answerable deterministically.** The causal chain is
+already recorded: sensor → signal → attribution → plan → tool rounds → gate
+verdict → risk tier → terminal. `transcript_timeline`'s causal join over the
+spine can render it with **zero model calls**. Model-authored prose is optional
+garnish, never the mechanism. Two properties follow, both required:
+
+* `/why` works when every provider lane is dry — which is precisely the state
+  in which an operator most wants to ask it;
+* `/why` cannot hallucinate a rationale, because it is a projection of the
+  ledger rather than a generation from it.
+
+**27.5.3 — Refusals are explainable too.** `/why` over a *rejection* must
+report which stored preference, gate, or tier caused it. A preference memory
+that cannot be interrogated becomes an invisible cage the operator built by
+accident three weeks earlier.
+
+---
+
+### 27.6 The trust ladder as the progression surface
+
+§26 specifies four gates with hard evidence criteria. Today they exist only as
+prose plus four `false` flags. §27 renders them as **the operator's progression
+system** — the same data, made motivating:
+
+```
+  Trust                                                promotion: off
+
+  REVIEW    ████████████░░░░░░░░  31/50 aligned · 0 false-blocks
+  PLAN      ███░░░░░░░░░░░░░░░░░   8/50 · DAG coverage 100%
+  PROMOTE   ░░░░░░░░░░░░░░░░░░░░  locked — needs REVIEW + PLAN
+  BUS       ░░░░░░░░░░░░░░░░░░░░  locked — graduates with PROMOTE
+
+  ⎿ REVIEW graduates in ~3 days at current cadence          /trust why
+```
+
+This does four jobs simultaneously: it makes the honest present state (**O+V
+cannot currently touch your tree**) legible instead of concealed; it converts a
+wait into visible progress; it gives the operator a reason to run sessions; and
+it makes `/trust why` the natural home for "what evidence is being collected."
+
+Two hardening rules, both novel to §27 and both load-bearing:
+
+> **27.6.1 — Only attended decisions count toward a trust window.** A window
+> filled while nobody was watching measures the auto-reject timeout, not
+> operator alignment. Per §27.3.2, unattended lapses are excluded from the
+> numerator *and* the denominator. This composes `AttentionLedger` with §26's
+> counters and is the difference between evidence and noise.
+
+> **27.6.2 — The counter must be diversity-weighted.** A bare "N consecutive
+> agreements" window is gameable by an optimizing agent: propose only trivially
+> agreeable ops and the bar fills without any evidence about the hard cases.
+> Reuse the `ExplorationLedger` category concept — a window requires alignment
+> across *distinct op classes* (risk tier × file count × sensor source), not 50
+> instances of the cheapest one.
+
+**27.6.3 — Demotion must be as visible as promotion.** §26's breakers revert to
+shadow on 3 consecutive divergences. That reversion renders — the bar visibly
+drops with a reason. A silently-emptied bar reads as a bug and destroys trust
+in the surface that exists to build trust.
+
+**27.6.4 — The ladder is skippable, explicitly.** It is the operator's tree.
+`/trust grant REVIEW --unproven` must exist, must record who granted what and
+when, and must be revocable in one verb. A safety ladder with no override is a
+ladder operators route around silently, which is strictly worse.
+
+---
+
+### 27.7 Four A-level signals to add to §6
+
+§6's target-state table has no row that measures steering. Proposed additions,
+all computable from substrate that exists today:
+
+| Signal | Definition | A-level target | Instrument |
+|---|---|---|---|
+| **Time-to-first-initiative (TTFI)** | cold `ov` in an unseen repo → first specific, repo-grounded proposal rendered | **< 10s** | Oracle index + §38.11-E proposal contract |
+| **Steer cost** | median keystrokes to redirect or kill an in-flight op | **≤ 3** | verb dispatcher instrumentation |
+| **Attended-decision ratio** | Yellow/Orange ops decided while attended ÷ all such ops reaching terminal | **≥ 90%** | `AttentionLedger` + `ReviewCoordinator` |
+| **Unattended yield** | verified commits per unattended hour | **> 0, trending** | `AutoCommitter` + `AttentionLedger` |
+
+Unattended yield is the product promise stated as a number. It is currently
+**zero**, honestly so: §26's four actuators are `false` and every provider lane
+is dry. Publishing it as a metric is how the zero stops being invisible.
+
+---
+
+### 27.8 Edge cases and nuances
+
+The frames above are the happy path. What follows is the specification that
+actually governs implementation.
+
+#### 27.8.1 First contact
+
+| # | Case | Required behaviour |
+|---|---|---|
+| 1 | **Index not finished** — 6,593 files, TTFI budget expires mid-walk | Propose from the partial index and **say so**: "from 1,200 of 6,593 files so far." A bounded honest proposal beats a complete late one. Never present partial coverage as complete. |
+| 2 | **Nothing to propose** — clean repo, no TODOs, no red tests | "Nothing stands out yet" is a **sentence**, not an empty block. Follow with what will be watched. Never fabricate a proposal to fill the frame. |
+| 3 | **Every lane dry** (today's literal state) | **The countdown must not start.** Degrade to: "I can see, but I can't act — every provider lane is out of credit." Offer `/liquidity`. A countdown that expires into an exhaustion error teaches the operator that the surface lies. |
+| 4 | **Not a git repo / empty dir** | Refuse to propose mutations. Offer to watch. `ov doctor` is the suggested next step. |
+| 5 | **Foreign repository** — a clone the operator does not own | First contact proposes **read-only** analysis only, and asks for scope before any mutation class is offered. Composes `UserPreferenceMemory` FORBIDDEN_PATH. |
+| 6 | **Not a TTY** (piped, CI, `ov run`) | No countdown, no keys, no frame. Falls through to existing `--headless` semantics. The countdown is a TTY affordance and must be gated on `real_stdout_isatty` — the load-bearing lesson from the Presentation Restraint arc, where `sys.stdout.isatty()` fails under `patch_stdout(raw=True)`. |
+| 7 | **Accidental `[enter]`** | The started work is cancellable at the next phase boundary via existing cooperative cancellation. The affordance line must survive one beat after start so the operator can reverse a mis-key. |
+| 8 | **Single-flight collision** — a second `ov` in another repo | Existing `EX_TEMPFAIL` (75) path renders as a frame, not a stack trace: "another organism holds the lock — attaching instead." |
+| 9 | **Operator idles through the countdown mid-read** | Acceptable **only** because of §27.4.1.1: what auto-started is read-only. This is why that rule is the safety property and not a preference. |
+
+#### 27.8.2 Handover
+
+| # | Case | Required behaviour |
+|---|---|---|
+| 10 | **Nothing happened** | Distinguish the three causes — idle (no signals), hibernated (exhaustion), or dead daemon. "Nothing happened" without a cause is indistinguishable from a broken sensor layer. |
+| 11 | **Too much happened** — 200 ops | The handover is a **digest that never scrolls**. Hard cap of 3 lines per block; depth lives behind `/why` and `/expand`. A handover that requires scrolling is a log, and the operator will stop reading it. |
+| 12 | **Daemon is dead** | Facts must be marked historical, not live. The existing unreachable path (`JARVIS_IGNITION_TIMEOUT_S`, default 10s) governs the transition. |
+| 13 | **Long absence** — 12 days | Relative time degrades gracefully; any pending decision older than its resource clock is shown as **lapsed**, never as actionable. Offering `/accept` on a dead decision is a lie the operator can act on. |
+| 14 | **Pending diff whose base drifted** | `state_drift.file_sha256` already answers this. Render "stale — the file changed underneath" and refuse the accept path. Never offer an apply that will fail. |
+| 15 | **Two cockpits attached** | The handover is **per-client**; the attention ledger is **process-wide**. A decision taken in cockpit A must retract the affordance in cockpit B within one frame. Per §25.1, ambient content renders to the minimum width across live cockpits. |
+| 16 | **Different branch/worktree than the run** | Say which. `main @ f70a397` in the header is not decoration — a handover about work done on another branch is actively misleading without it. |
+
+#### 27.8.3 Attention and interrupts
+
+| # | Case | Required behaviour |
+|---|---|---|
+| 17 | **Attended expiry vs unattended lapse** | Two distinct terminals with two distinct evidence weights (§27.3.2 / §27.3.3). This must be a ledger-level distinction, not a rendering one. |
+| 18 | **Attention flaps** — operator attaches/detaches repeatedly | Hysteresis debounces the **state machine**, never the **ledger**. A debounce applied to accounting turns grace periods into billable time. (Recorded verbatim from the arc that built the ledger.) |
+| 19 | **Two interrupts at once** | Coalesce to a count with the highest-tier one focused. Never stack. Never modal. |
+| 20 | **Detach mid-interrupt** | Decision clock pauses; resource clock continues; on resource expiry the op **parks** (§27.3.4) and appears in the next handover's "Needs you". |
+| 21 | **Decision clock can never be spent** | Guaranteed non-pinning by §27.3.4's two-clock split. This is the failure mode that would otherwise accumulate parked workers until the pool starves. |
+| 22 | **Interrupt during typing** | Bottom-anchored render only; the input line neither reflows nor loses its buffer. |
+
+#### 27.8.4 Steering and learning
+
+| # | Case | Required behaviour |
+|---|---|---|
+| 23 | **`/why` on an evicted ref** | Post-spine, uniform eviction makes dangling refs structurally impossible (§25.3). Pre-spine refs answer honestly: "before the transcript spine — not recorded." |
+| 24 | **`/why` with lanes dry** | Must still work — deterministic projection, zero model calls (§27.5.2). |
+| 25 | **Ambiguous `decline`** — no focused ref | **Refuse, never guess.** Ask which, or require an explicit ref. The `ov doctor` unknown-flag path (`EX_USAGE` 64) is the established precedent. |
+| 26 | **Preference poisoning** — 3 rejections of a kind silence it forever | Extracted preferences need decay, must be inspectable (`/why` on a refusal), and must be revocable in one verb. An invisible permanent cage assembled from three bad afternoons is a real risk. |
+| 27 | **Rejection during APPLY** | Cooperative cancellation at phase boundaries; mid-write is protected by the existing op-scoped freeze / 2PC. A steering act must never be able to corrupt a partially-applied multi-file batch. |
+| 28 | **Redirect with no successor** | "Not that" alone is a valid, complete act. It must not demand a replacement suggestion — demanding one raises the cost of declining, which violates §27.2. |
+
+#### 27.8.5 Trust ladder
+
+| # | Case | Required behaviour |
+|---|---|---|
+| 29 | **Window filled unattended** | Excluded from numerator and denominator (§27.6.1). |
+| 30 | **Trivial-op gaming** | Diversity-weighted windows (§27.6.2). |
+| 31 | **Post-graduation regression** | Breaker reverts; bar visibly drops with reason (§27.6.3). |
+| 32 | **Operator overrides the ladder** | Explicit, recorded, revocable (§27.6.4). |
+| 33 | **Thundering herd on flip** | Already specified in §26.5 — seq-gated, caps stand, ramped `1/N` admission. §27 renders the ramp: "first authoritative op: 1 of 12 eligible." |
+
+---
+
+### 27.9 Scenarios
+
+**Scenario A — Day 0, new operator, funded lane.** `ov` in an unseen repo.
+Crest at ~0.4s. Index streams. At 6s three findings render; at 8s the organism
+begins exploring the stale TODOs; the exploration counter reaches 2/2 and a
+plan appears. The operator does nothing — which was a decision, and a
+read-only one. At the first mutation the risk ladder stops the op cold and
+raises a Yellow diff. **The operator's first mutation-facing interaction is a
+review, not a prompt.** They have learned the product's actual grammar without
+reading a word of documentation.
+
+**Scenario B — Day 0, today's real conditions.** Same command; DW returns 402,
+Claude's preflight refuses at `est $0.50 > session_remaining $0.175`. **No
+countdown starts.** The frame reads: "I can see, but I can't act — every
+provider lane is out of credit," with `/liquidity` and the funding column.
+Indexing and sensors continue; `/why` and `/expand` work. The operator learns
+the surface tells the truth in the worst case, which is the only case where
+that lesson is worth anything.
+
+**Scenario C — Day 12, returning.** Handover: 14 ops while away, 2 applied, 1
+Yellow **lapsed unattended** (excluded from all evidence), 1 pending whose base
+has since drifted (rendered stale, accept refused). Trust panel: REVIEW 31/50,
+0 false-blocks, ~3 days at current cadence. The operator answers the one live
+decision, and that decision — attended — is the 32nd sample.
+
+**Scenario D — Day 40, first authoritative op.** REVIEW graduates. Ramped
+admission: 1 of 12 eligible ops carries authority. The panel renders exactly
+that. The first authoritative op is one op, and the operator can see that it is
+one op — which is the difference between a graduation and a leap of faith.
+
+---
+
+### 27.10 Build plan
+
+Seven slices, each composing existing canonical substrate, each default-`false`
+until its §33.1 graduation contract is satisfied, each with AST pins enforcing
+composition rather than duplication.
+
+| Slice | Ships | Composes | Flag | Blocked by |
+|---|---|---|---|---|
+| **1 — Prototype frames** | `ov demo handover` + `ov demo firstcontact` scenes | `ov_demo.py` real-renderer harness (5 existing scenes) | — (demo) | **nothing** |
+| **2 — `/why <ref>`** | deterministic causal account | `transcript_timeline` join + spine | `JARVIS_WHY_VERB_ENABLED` | slice 1 informs shape |
+| **3 — Attention-gated evidence** | attended/unattended terminal split; extraction + §26 counters suppressed on lapse | `AttentionLedger`, `UserPreferenceMemory`, `ReviewCoordinator` | `JARVIS_ATTENDED_EVIDENCE_ONLY` | nothing |
+| **4 — Handover composer** | the three-block frame on real data | `LastSessionSummary` + `m-` milestones + pending set + liquidity | `JARVIS_HANDOVER_FRAME_ENABLED` | slice 3 (lapse rendering) |
+| **5 — First-contact runtime** | TTFI instrumentation, explore-only countdown, live exploration counter | §38.11-E proposal contract + `ExplorationLedger` | `JARVIS_FIRST_CONTACT_ENABLED` | a funded lane |
+| **6 — Trust panel + `/trust`** | §26 counters accumulated, diversity-weighted, rendered | §26 gates + §38.11 #4 graduation ticker | `JARVIS_TRUST_PANEL_ENABLED` | slice 3 |
+| **7 — Steering metrics** | the four §27.7 signals into `/metrics` | Phase 4 metrics suite | — | slices 3–6 |
+
+**Sequencing rationale.** Slice 1 is the only work in the entire section that
+is **not blocked on provider credit** — `ov_demo` drives the real renderers
+with synthetic events, so both frames can be built, watched, and iterated
+without a daemon or a dollar. Start there; it de-risks slices 4 and 5 before
+either becomes expensive. Slices 2 and 3 are pure-composition and unblocked.
+Slices 5–7 need ops, which need a funded lane.
+
+**Invariant pins required** (AST, per §33.1):
+
+1. no countdown path can reach a mutation phase (§27.4.1.1);
+2. no unattended terminal can reach `UserPreferenceMemory` or a §26 counter
+   (§27.3.2);
+3. `/why` imports no provider client (§27.5.2);
+4. the ambient idle line imports no provider client (§27.4.3);
+5. the trust panel is read-only with respect to every §26 flag — rendering
+   authority is never write authority (the `ide_observability.py` precedent).
+
+---
+
+### 27.11 Anti-goals
+
+Extends §38.11.4; these are specific to initiative and steering.
+
+| Pattern | Why §27 rejects it |
+|---|---|
+| A "start working" button | Reintroduces the reactive loop as the primary affordance. The organism starts; the operator stops. |
+| Notifications outside the terminal for routine proposals | Attention is metered (§27.3). Push escalation is reserved for Orange and breaker events. |
+| An LLM-authored handover | The frame must be free and must work when lanes are dry. Prose is garnish. |
+| A confidence percentage on every proposal | Uncalibrated numbers read as measurement. §27 surfaces *evidence* (2/2 explored, 0 callers), never a fabricated score. This is the §25.4 honesty discipline. |
+| Auto-accepting Yellow after a timeout | Absence is not consent, exactly as absence is not refusal (§26.6). Both directions of that error are the same error. |
+| A dedicated onboarding wizard | §41.3 already shipped `/tutorial` + setup walkthrough. First contact teaches by *doing*; a wizard teaches by reading, which is CC's model. |
+
+---
+
+### 27.12 Open questions for operator decision
+
+1. **Countdown default** — is first contact `[esc] to stop` (initiative by
+   default) or `[enter] to start` (consent by default) on the very first run in
+   an unseen repo? *(Recommend: initiative by default, given §27.4.1.1 bounds
+   it to read-only work; consent-by-default on the first **mutation** class.)*
+2. **TTFI budget** — 10s target, or slower with richer findings? *(Recommend:
+   10s with partial-index honesty per edge case #1; a fast honest proposal
+   beats a slow complete one.)*
+3. **Weak-reject weight** — what fraction of a strong reject does an attended
+   expiry carry into preference extraction? *(Recommend: 0.5, env-tunable,
+   with decay — and revisit once slice 3 produces data.)*
+4. **Trust window diversity dimensions** — risk tier × file count × sensor
+   source, or a narrower set? *(Recommend: start with risk tier × sensor
+   source; add file count if gaming is observed.)*
+5. **`/why` depth default** — one hop (what caused this op) or the full chain
+   to the sensor? *(Recommend: one hop, with `/why <ref> --full` for the
+   chain — steering acts must stay cheap to read.)*
+
+---
+
+## 28. The Cockpit as Control Surface — Implementation Audit *(NEW 2026-08-13)*
+
+§27 specifies the control model O+V needs in order to be steered rather than
+merely watched. §28 audits what `ov` **actually implements today** against it,
+so the build plan in §27.10 starts from measured ground rather than assumption.
+
+### 28.0 Method, and the scope limits that bound every claim below
+
+Read in full or in the regions that carry the behaviour: `cli/ov.py` (4,765
+lines), `battle_test/cockpit_attach.py` (1,940), `cockpit_fsm.py` (213),
+`focus_shield.py` (347), `pending_apply.py` (191), `keymap.py` (953),
+`operator_prompt_bridge.py`, `cli/thin_client.py` (840), `cli/ov_demo.py`
+(2,325). Counts are measured with `grep -c`, not estimated.
+
+**Three limits the reader must carry into every finding:**
+
+1. **This is a static read. Nothing here was observed on a screen.** No claim
+   in §28 has been live-proven, and per this repository's own repeated lesson
+   (`feedback_per_slice_e2e_livefire`; the typed-goal path that raised
+   `TypeError` on every call for twelve days beneath fifteen green tests) a
+   rendering path is *easier* to be wrong about than a logic path. Findings
+   are code-evidenced, not eye-confirmed.
+2. **Coverage is partial.** 123 modules live in `battle_test/`; roughly a
+   dozen were read. A surface not named here was not audited and must not be
+   read as absent.
+3. **Two findings from the first pass were withdrawn under verification**
+   (§28.4). They are documented rather than deleted, because the *rate* at
+   which confident structural claims about this cockpit fail verification is
+   itself an audit result — and the correction mechanism is the only reason
+   the surviving findings are trustworthy.
+
+---
+
+### 28.1 Verdict
+
+> **The `ov` cockpit is an outstanding observability instrument for an
+> autonomous system, and is not yet a control surface for one.**
+
+Ten surfaces render above the caret — pulse, flash, agent roster, deck rows,
+status line, stream tail, forensic rows, panic rows, queue rows, search rows.
+**All ten report state.** Two afford decisions (the Iron Gate queue and the
+`NOTIFY_APPLY` window), and both are reactive to an op that already exists and
+is already mid-pipeline.
+
+The gap is not craft. The craft is, in places, better than the product it
+serves. The gap is that **the surface was designed around the question "what is
+happening?" and full autonomy is governed through the question "what should I
+allow?"**
+
+---
+
+### 28.2 What the audit found excellent — and promotes to standards
+
+These are not compliments. Each is a pattern the rest of the product should be
+held to, and each has a named failure it prevents.
+
+**28.2.1 — One definition of "lost contact"** (`ov.py:1387`,
+`_heartbeat_age`). The pulse, roster, status line, apply countdown and
+forensic strip all retire on a single clock. Its docstring names the failure
+exactly: *"if the daemon dies mid-dispatch, the last frame this process holds
+says three agents are running, phase is GENERATE and the border should be
+moving — and it will say that forever."*
+
+> **Standard**: a confident, coherent, wrong picture of a dead organism is the
+> most dangerous thing a proactive cockpit can render. Every surface fed by a
+> remote snapshot retires on ONE clock, never its own.
+
+**28.2.2 — Verdicts are addressed, not broadcast** (`cockpit_attach.py:1759`,
+`send_input(text, prompt_id)`): *"a deferred verdict can outlive the slot it
+was meant for, and the daemon refuses a mismatch rather than landing 'y' on
+whichever op happens to be armed now."* This closes the single most dangerous
+bug class in any autonomous approval path.
+
+**28.2.3 — The deferral FSM refuses to stack** (`focus_shield.py`). Gates
+queue rather than pile up — *"or one unanswered gate becomes a queue of
+itself"* — carry a live `pending_count` that **excludes expired gates**
+(*"a badge that advertises a dead approval is worse than no badge"*), render a
+persistent toolbar badge (`⚠ N pending approvals · ctrl-p`, consumed at
+`ov.py:1833`), and are re-surfaceable on demand via the `gate:review` action.
+This is a complete, correct implementation of §27.4.4's interrupt discipline,
+built before §27 specified it.
+
+**28.2.4 — A sentence is a goal; a word is a verdict**
+(`operator_prompt_bridge.py:93`). Under `strict_verdicts_enabled()` a
+multi-word answer is refused as a verdict — *"Punctuation is tolerated ('y.' /
+'no!') — an extra WORD is what disqualifies."* An elegant, zero-cost
+disambiguation between steering and answering on one shared input line.
+
+**28.2.5 — The keymap is finished infrastructure** (`keymap.py`, 953 lines):
+remappable via `keybindings.json`, action namespaces with aliases to CC's
+vocabulary, per-context filters, `/keys` introspection, and the binding
+contract *"every action ALSO reachable as a typed verb so keystroke and verb
+are one code path."* Eleven actions are bound in the cockpit today.
+
+---
+
+### 28.3 Findings that survived verification
+
+#### C1 — The organism's proposals have no cockpit consumer *(load-bearing)*
+
+**Evidence, exact:**
+
+| Layer | State |
+|---|---|
+| Producer | `governance/proactive_proposal_surface.py` — exists |
+| Signal source | `governance/proactive_curiosity_reader.py` — exists |
+| Event type | `proactive_proposal_emitted`, registered at `ide_observability_stream.py:840` |
+| Operator verb | `governance/proposals_repl.py` — exists, **daemon-side** |
+| **Cockpit client** | **`grep -c proposal ov.py` → `0`** |
+
+The single most proactive artifact O+V produces — *"I noticed X across five
+files, want me to explore?"* — has a producer, an event type, a graduation
+contract and a REPL verb, and **no home in the operator's window.** It is
+reachable only by typing a daemon-side verb, whose output travels the exact
+path C3 documents as broken.
+
+This is §27's entire thesis confirmed from the code side rather than the
+document side: §38.11-E built the proposal *substrate*; nothing ever built the
+proposal *surface*.
+
+**Required**: a cockpit consumer for `proactive_proposal_emitted` with a
+per-proposal affordance. This is §27.10 slice 5 and it is the difference
+between an organism that proposes and an operator who can hear it.
+
+#### C2 — The decision channel is complete except for the answer key
+
+The channel is queued, badged, addressed, re-surfaceable, and parsed with
+strict single-token discipline (§28.2.2–28.2.4). One vocabulary item is
+missing: **there is no action that answers a gate.**
+
+Bound cockpit actions: `app:cycleTrust`, `app:dismissPanic`, `app:help`,
+`chat:externalEditor`, `chat:interrupt`, `deck:{open,next,previous,focus,escape}`,
+`gate:review`. `gate:review` (Ctrl+P) **surfaces** a deferred gate; nothing
+**answers** one. Answering is a typed line through `_route_operator_line`,
+which also echoes the operator's text into the transcript.
+
+Measured cost to decline a pending gate: notice badge → `Ctrl+P` → type `n` →
+`Enter`. Against §27.2's target of one key, and against a proposal the
+organism made for zero.
+
+> **This is a two-`bind_action`-call gap in finished infrastructure**, not a
+> missing feature: `gate:approve` / `gate:decline`, routed through the same
+> `send_input(text, prompt_id)` that already addresses verdicts correctly, and
+> filtered on "a gate is on screen" exactly as the deck actions filter on
+> `in_select`. The initiative economics of §27.2 are one afternoon away.
+
+#### C3 — Process ownership is a manual chain, and its failure is pre-diagnosed
+
+`_daemon_owns()` (`ov.py:223`) plus an `if/elif` ladder in
+`_route_operator_line` (`ov.py:2152`) decides per verb which side of the socket
+executes. The comment on the `/tasks` branch already names the open defect
+verbatim:
+
+> *"The two-process trap: a verb that runs on the wrong side of the socket
+> reports success and changes nothing the operator can see."*
+
+The repository diagnosed its own live bug in prose and left the structure that
+generates it. Every new verb is a fresh opportunity to choose wrong, and the
+failure mode is **silent success** — which, for a proactive tool, is
+indistinguishable from the organism ignoring the operator. That is the worst
+available failure on a steering path, and per C1 it is also the path the
+proposal verb currently depends on.
+
+**Required**: one console seam. Client/daemon placement becomes an
+implementation detail of a single dispatcher rather than a per-verb decision.
+
+#### C4 — The cockpit is honest about the daemon and blind to itself
+
+Measured in `cli/ov.py`:
+
+| Quantity | Count |
+|---|---|
+| `except Exception:  # noqa: BLE001` | **169** |
+| `NEVER raises` contracts | **61** |
+| Render-failure counters, of any kind | **0** |
+
+Every individual swallow is correct — chrome must not kill the cockpit.
+Collectively they mean that if `_status_rows` begins throwing, the status line
+silently vanishes and **nothing anywhere records that it did.** A dead surface
+is indistinguishable from an empty one.
+
+That is precisely the failure class `_ignition_line` was written to kill —
+*"a blank deck is indistinguishable from a healthy idle organism with nothing
+to say, and from a dead socket"* — reappearing one level up and aimed at the
+instrument itself. §25.4's honesty doctrine is applied rigorously to the
+organism and not at all to the window through which the organism is seen.
+
+**Required**: one process-wide render-degradation counter, surfaced in the idle
+breadcrumb (`⚠ 3 surfaces degraded`) with the list behind a verb. Roughly
+thirty lines. For a product whose only operator channel is this window, silent
+degradation of the window is a first-tier risk, and it is currently unobservable
+by construction.
+
+---
+
+### 28.4 Findings withdrawn under verification
+
+Documented because the method is part of the result.
+
+| Withdrawn claim | Why it was wrong |
+|---|---|
+| *"Keybindings total two (`s-tab`, `c-t`) — decisions are lines because there is no keymap."* | A `grep` for literal `kb.add` missed `keymap.bind_action`, the actual binding seam. There is a 953-line remappable keymap with eleven bound cockpit actions. **The infrastructure claim was inverted**; the surviving narrow finding is C2. |
+| *"The higher-severity Iron Gate prompt renders transiently to scrollback and scrolls away while its clock runs, while the lower-severity `NOTIFY_APPLY` row persists — the severity tiers have inverted persistence."* | `FocusShield.badge()` renders `⚠ N pending approvals · ctrl-p` persistently and is consumed at `ov.py:1833`; expired gates are excluded; `gate:review` re-surfaces on demand. **Persistence is handled.** A related claim — that no rule governs the proactive interrupt direction — falls with it: `FocusShield` *is* that rule. |
+
+**The lesson the audit takes from its own errors.** Both failures share one
+shape: a structural conclusion drawn from a grep that did not cover the seam
+where the behaviour actually lives. In a codebase that composes through named
+registries and injected publishers rather than direct calls, **absence of a
+literal is not absence of a capability** — the same trap as
+`memory/project_ov_dark_code_audit_2026_08_01.md`'s retraction (*"being NAMED
+by a registry ≠ being MOUNTED by one"*), inverted. Before any future claim that
+this cockpit lacks a capability: find the registry, then the consumer, then the
+flag default — three checks, in that order.
+
+---
+
+### 28.5 Measured affordance costs
+
+The §27.2 initiative-economics table, filled in with what the code actually
+costs today.
+
+| Operator act | §27 target | Measured today | Gap |
+|---|---|---|---|
+| Decline the gate on screen | 1 key | badge → `Ctrl+P` → `n` → `Enter` | **C2** — no `gate:decline` action |
+| Approve the gate on screen | 1 key | badge → `Ctrl+P` → `y` → `Enter` | **C2** |
+| Reject a `NOTIFY_APPLY` in its window | 1 key | `/reject` + `Enter` (8 keys) | **C2** |
+| Hear a proactive proposal at all | ambient | **not possible in the cockpit** | **C1** |
+| Ask why the organism did something | 1 verb | **unbuilt** (§25.5) | §27.10 slice 2 |
+| Raise the session risk floor | 1 key | `Shift+Tab` → `/trust cycle` | ✅ shipped |
+| Surface a deferred gate | 1 key | `Ctrl+P` | ✅ shipped |
+| Interrupt a live turn | 1 key | `chat:interrupt` | ✅ shipped |
+
+Note what the shape of that table says: **every act the operator performs
+*about the interface* is one key, and every act the operator performs *about
+the work* is a typed line.** The cockpit is optimized for navigating itself.
+
+> **Nuance — two different dials both called "trust."** `Shift+Tab` →
+> `app:cycleTrust` → `/trust cycle` raises the **session risk floor**
+> (`risk_tier_floor`), and it ships today. §27.6's trust ladder renders §26's
+> **graduation evidence**, and does not exist. Same word, different objects:
+> one bounds what this session may do, the other records what the organism has
+> earned. §27.10 slice 6 must not collide with the shipped verb — recommend
+> `/trust` for the ladder with the existing dial demoted to `/trust floor`.
+
+---
+
+### 28.6 Remediation, ranked by leverage per line changed
+
+| # | Change | Closes | Size | Blocked by |
+|---|---|---|---|---|
+| 1 | `gate:approve` / `gate:decline` actions via `bind_action`, filtered on gate-visible, routed through existing `send_input(text, prompt_id)` | **C2** | ~2 call sites | nothing |
+| 2 | Render-degradation counter + breadcrumb surface | **C4** | ~30 lines | nothing |
+| 3 | Cockpit consumer for `proactive_proposal_emitted` + per-proposal affordance reusing the `FocusShield` queue/badge/pop machinery | **C1** | one consumer | nothing (render); a funded lane to *populate* it |
+| 4 | Collapse `_daemon_owns` + the routing ladder to one console seam | **C3** | structural | nothing |
+| 5 | Extract the `AttachUI` class out of `ov.py` | maintainability | structural | do after 1–4 |
+
+Items 1–3 are small, independent, and **unblocked by provider credit**. Item 3
+reuses the deferral FSM wholesale rather than building a second one — a
+proposal and a gate are the same shape of object (addressed, expiring,
+queued, badged), and §28.2.3 already built the correct machinery for it.
+
+---
+
+### 28.7 Invariants worth pinning
+
+1. Every surface fed by the daemon snapshot retires on `_heartbeat_age()` — no
+   surface may introduce a second staleness clock (§28.2.1).
+2. Every verdict crossing the bridge carries a `prompt_id` (§28.2.2).
+3. No render path may swallow an exception without incrementing the
+   degradation counter (C4's fix, pinned so it cannot rot back).
+4. Every new operator action is registered through `bind_action` and is
+   reachable as a typed verb — the existing contract, made a pin.
+5. No verb decides its own execution side; placement is the dispatcher's
+   (C3's fix).
+
+---
+
+### 28.8 What this audit did not examine
+
+Named so the gaps are not mistaken for clean bills of health: the bipartite
+cockpit surface and its Float/overlay arbiter; `serpent_flow.py`'s 30
+daemon-side handlers; the audio plane (oscilloscope, PTT protocol probe,
+`ov.py` §24 surfaces); `ov_doctor`'s 8-edge matrix; the Sublime / JetBrains /
+VS Code extensions; and the five `ov demo` scenes as *rendered output* rather
+than as source. The `/`-key freeze recorded in operator memory was not
+reproduced or root-caused here — `_transcript_search_rows` and
+`transcript_hatches` are the indicated starting points and remain unaudited.
 
 ---

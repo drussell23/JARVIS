@@ -421,12 +421,67 @@ class ComputeClassMismatch(RuntimeError):
 
 
 def _check_compute_admission(brain_cfg: dict, capability: dict) -> None:
-    """Hard-fail if VM compute_class < brain min_compute_class.
+    """Hard-fail if this host cannot carry the brain's memory requirement.
 
-    Raises ComputeClassMismatch if VM rank < brain minimum rank.
+    Two authorities, in priority order, because the question being asked is
+    about BYTES and only one of them can answer it in bytes.
+
+    **Measured (preferred).** ``compute_topology`` probes the accelerator and
+    reports capacity. The brain states a requirement as ``min_vram_gb`` or —
+    for policy written before that field existed — as a legacy
+    ``min_compute_class`` name, which ``bytes_for_requirement`` interprets as
+    the capacity that name implies. Admission then compares capacity to
+    requirement directly. A card nobody enumerated needs no new rung: a
+    32 GiB consumer GPU outranks ``gpu_l4`` because 32 > 24, which is the
+    fact the name-ranked table was standing in for all along.
+
+    **Ordinal (fallback).** When the probe is disabled, or the host cannot be
+    resolved, the legacy ``_COMPUTE_RANK`` comparison runs unchanged. This is
+    not a degraded mode — it is byte-for-byte the pre-existing behaviour, and
+    it is what an ``UNKNOWN`` topology is *for*: an unresolved host may not
+    have a capacity claim invented on its behalf in either direction.
+
+    **Locality is proven, never assumed.** ``capability`` is fetched over
+    HTTP from a J-Prime endpoint that may be a GCP VM on another continent.
+    A local accelerator reading describes only this machine, so the measured
+    path engages solely when ``describes_this_host`` positively matches the
+    payload's host against this machine. Anything else — a remote brain, an
+    absent host field, a malformed payload — takes the ordinal path.
+    Authorizing a remote route with a local GPU reading would be the same
+    wrong-resource error this work exists to remove, wearing new clothes.
     """
     vm_class = capability.get("compute_class", "cpu")
     min_class = brain_cfg.get("min_compute_class", "cpu")
+    min_vram_gb = brain_cfg.get("min_vram_gb")
+
+    try:
+        from backend.core.ouroboros.governance import compute_topology as _ct
+
+        required = _ct.bytes_for_requirement(
+            min_compute_class=min_class, min_vram_gb=min_vram_gb,
+        )
+        local = _ct.describes_this_host(capability)
+        reading = _ct.resolve_sync() if local else None
+        if reading is not None and reading.measured and required > 0:
+            if reading.usable_bytes >= required:
+                return
+            raise ComputeClassMismatch(
+                f"host {reading.resolved_class!r} "
+                f"({reading.usable_bytes / (1024 ** 3):.1f} GiB usable, "
+                f"topology={reading.topology.value}, source={reading.source}) "
+                f"cannot carry brain requirement "
+                f"{required / (1024 ** 3):.1f} GiB "
+                f"(min_vram_gb={min_vram_gb!r} min_compute_class={min_class!r}). "
+                f"Route is denied. Select a lower-tier brain or a larger host."
+            )
+    except ComputeClassMismatch:
+        raise
+    except Exception as exc:  # noqa: BLE001 — measurement never blocks admission
+        logger.debug(
+            "[ComputeAdmission] measured path unavailable (%s); "
+            "falling back to ordinal comparison", exc,
+        )
+
     vm_rank = _COMPUTE_RANK.get(vm_class, 0)
     min_rank = _COMPUTE_RANK.get(min_class, 0)
     if vm_rank < min_rank:
@@ -1671,6 +1726,35 @@ class GovernedLoopService:
                                         _boot_brain_cfg = {k: v for k, v in _e.items() if k not in ("brain_id", "id")}
                                         break
                             if _boot_brain_cfg:
+                                # Resolve this host's accelerator ONCE, here, before
+                                # the first admission question is asked. Load-bearing,
+                                # not an optimisation: _check_compute_admission runs
+                                # inside this running loop, and compute_topology's
+                                # sync facade refuses to block a loop (§3) — so with
+                                # no cache the measured path would never engage and
+                                # the whole gate would be wired-but-inert. Bounded and
+                                # fail-soft: a wedged driver costs its budget, then
+                                # admission falls back to the ordinal comparison.
+                                try:
+                                    from backend.core.ouroboros.governance import (
+                                        compute_topology as _ct_boot,
+                                    )
+                                    if _ct_boot.is_enabled():
+                                        _ct_reading = await _ct_boot.prewarm()
+                                        logger.info(
+                                            "[GLS] compute topology: %s %s "
+                                            "(%.1f GiB usable, source=%s)",
+                                            _ct_reading.topology.value,
+                                            _ct_reading.resolved_class,
+                                            _ct_reading.usable_bytes / (1024 ** 3),
+                                            _ct_reading.source,
+                                        )
+                                except Exception:  # noqa: BLE001
+                                    logger.debug(
+                                        "[GLS] compute topology prewarm skipped",
+                                        exc_info=True,
+                                    )
+
                                 # Boot-time: only gate on compute class (does VM have
                                 # the minimum GPU tier?).  Artifact integrity is checked
                                 # per-operation in _preflight_check() where we know

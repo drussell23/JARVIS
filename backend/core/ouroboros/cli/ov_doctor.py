@@ -266,6 +266,58 @@ def _verdicts_from_hydration(
     return out
 
 
+async def probe_edge_compute() -> EdgeVerdict:
+    """Edge 9 — what this host can actually load, and which pool it lands in.
+
+    Deliberately INDEPENDENT of the socket. This is the edge an operator
+    needs most on a machine the organism has never run on: a fresh box where
+    the daemon is not up yet, and the first question is whether the hardware
+    is even visible. Every other hydration-derived edge goes SKIPPED there;
+    this one still answers.
+
+    Reports the accelerator reading and the admission ceiling together,
+    because a refusal is unreadable without both — an operator who sees
+    "deferred" on a 64 GB machine, with no accelerator half to explain it,
+    turns the gate off. NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.governance import compute_topology as ct
+        if not ct.is_enabled():
+            return EdgeVerdict(
+                "9 compute", EdgeState.SKIPPED,
+                "topology probe disabled (JARVIS_COMPUTE_TOPOLOGY_ENABLED)")
+        reading = await asyncio.wait_for(
+            ct.resolve(), timeout=_edge_timeout_s() * 4)
+    except asyncio.TimeoutError:
+        return EdgeVerdict("9 compute", EdgeState.DEGRADED,
+                           "topology probe timed out — driver may be wedged")
+    except Exception as exc:  # noqa: BLE001
+        return EdgeVerdict("9 compute", EdgeState.DEGRADED,
+                           f"topology unavailable ({type(exc).__name__})")
+
+    if not getattr(reading, "measured", False):
+        return EdgeVerdict(
+            "9 compute", EdgeState.DEGRADED,
+            f"host unresolved ({reading.source}) — admission falls back to "
+            f"the host bound with the unverified ceiling")
+
+    gib = 1024 ** 3
+    detail = (f"{reading.topology.value} {reading.resolved_class} · "
+              f"{reading.usable_bytes / gib:.1f} GiB usable · "
+              f"src={reading.source}")
+    if not getattr(reading, "free_is_measured", True):
+        detail += " · free derived from host RAM"
+    try:
+        from backend.core.ouroboros.governance import local_model_admission as lma
+        snap = lma.snapshot()
+        ooms = sum((snap.get("observed_ooms") or {}).values())
+        if ooms:
+            detail += f" · {ooms} recent OOM(s) raising the margin"
+    except Exception:  # noqa: BLE001 — the reading alone is still useful
+        pass
+    return EdgeVerdict("9 compute", EdgeState.OK, detail)
+
+
 async def _http_get(path: str) -> Tuple[Optional[int], Optional[Any]]:
     """Minimal bounded HTTP/1.1 GET → (status_code, parsed_json|None).
 
@@ -398,35 +450,42 @@ async def run_matrix() -> DoctorReport:
     report.verdicts.append(v2)
 
     if sock_state == "live":
-        (hyd, lh), (v5, l5), (v7, l7), (v8, l8) = await asyncio.gather(
+        (hyd, lh), (v5, l5), (v7, l7), (v8, l8), (v9, l9) = await asyncio.gather(
             _timed(_read_hydration()),
             _timed(probe_edge_sensors()),
             _timed(probe_edge_liveness()),
             _timed(probe_edge_mcp()),
+            _timed(probe_edge_compute()),
         )
         hydration_verdicts = _verdicts_from_hydration(hyd)
         for v in hydration_verdicts:
             v.latency_ms = lh / max(1, len(hydration_verdicts))
         v5.latency_ms, v7.latency_ms, v8.latency_ms = l5, l7, l8
-        # canonical edge order: 3,4,5,6,7,8
+        v9.latency_ms = l9
+        # canonical edge order: 3,4,5,6,7,8,9
         e3, e4, e6 = hydration_verdicts
-        report.verdicts.extend([e3, e4, v5, e6, v7, v8])
+        report.verdicts.extend([e3, e4, v5, e6, v7, v8, v9])
     else:
         # chain severed at the socket — probe the independent HTTP/static
         # edges anyway (they may localize the fault), skip the UDS-bound ones.
-        (v5, l5), (v7, l7), (v8, l8) = await asyncio.gather(
+        (v5, l5), (v7, l7), (v8, l8), (v9, l9) = await asyncio.gather(
             _timed(probe_edge_sensors()),
             _timed(probe_edge_liveness()),
             _timed(probe_edge_mcp()),
+            # Socket-independent BY DESIGN: on a machine the organism has
+            # never run on, "can this host load anything?" is the first
+            # question and the daemon is not up to answer it.
+            _timed(probe_edge_compute()),
         )
         v5.latency_ms, v7.latency_ms, v8.latency_ms = l5, l7, l8
+        v9.latency_ms = l9
         report.verdicts.extend([
             EdgeVerdict("3 hydration", EdgeState.SKIPPED, "socket not serving"),
             EdgeVerdict("4 hive fabrics", EdgeState.SKIPPED,
                         "socket not serving"),
             v5,
             EdgeVerdict("6 providers", EdgeState.SKIPPED, "socket not serving"),
-            v7, v8,
+            v7, v8, v9,
         ])
     return report
 

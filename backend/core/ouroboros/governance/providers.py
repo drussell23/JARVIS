@@ -5539,11 +5539,51 @@ class PrimeProvider:
         18 GB model load and the 37 ms voice path.
         """
         _adm = None
+        # Bound HERE, not inside the try below: `_generate_raw` closes over
+        # this name, and a lazily-bound name read from a closure becomes a
+        # bare NameError the moment the binding block raises early — a fault
+        # on the dispatch path that reads as a generation failure rather than
+        # as the telemetry wiring it actually is (PR #70386's class).
+        _brain_for_adm: Optional[str] = None
+        # A one-slot cell rather than a bare name: `_generate_raw` closes over
+        # it and must see the id assigned AFTER the closure was defined.
+        _adm_reservation: list = [None]
         try:
             from backend.core.ouroboros.governance import (
                 local_model_admission as _lma,
             )
-            _adm = _lma.assess()
+            # Resolve what this dispatch will actually WEIGH, so the
+            # accelerator bound has something to bind against. Without a
+            # stated footprint `assess` uses the host bound alone — correct,
+            # but on a discrete-GPU host that is the pre-v2 blindness: 64 GB
+            # of free system RAM says nothing about a 32 GB card.
+            #
+            # The brain comes from the routing intent already on `context`
+            # (the same `ri.brain_id` this method reads further down for
+            # TaskProfile), and its declared footprint from the module that
+            # owns the policy. Nothing is inferred: an unstated weight
+            # resolves to 0 and skips the bound rather than guessing.
+            _weight_bytes = 0
+            try:
+                _tel = getattr(context, "telemetry", None)
+                _ri = getattr(_tel, "routing_intent", None) if _tel else None
+                _brain_for_adm = getattr(_ri, "brain_id", None) if _ri else None
+                if _brain_for_adm:
+                    from backend.core.ouroboros.governance.brain_selector import (
+                        footprint_bytes_for as _footprint,
+                    )
+                    _weight_bytes = _footprint(_brain_for_adm)
+            except Exception:  # noqa: BLE001 — an unresolved brain is not a fault
+                _brain_for_adm, _weight_bytes = None, 0
+
+            # JIT: re-read the accelerator's free bytes now rather than
+            # trusting a cached reading. We are inside a running loop and
+            # about to allocate, which is exactly the case `assess_async`
+            # exists for.
+            _adm = await _lma.assess_async(
+                weight_bytes=_weight_bytes, model_id=_brain_for_adm,
+            )
+            _adm_reservation[0] = getattr(_adm, "reservation_id", None)
             if not _adm.proceeds:
                 _lma.report(_adm, what="J-Prime generation")
                 logger.warning("[PrimeProvider] %s %s",
@@ -5773,14 +5813,48 @@ class PrimeProvider:
         _eff_temperature = 0.2 if temperature is None else float(temperature)
 
         async def _generate_raw(p: str) -> str:
-            resp = await self._client.generate(
-                prompt=p,
-                system_prompt=_CODEGEN_SYSTEM_PROMPT + _a1_exploration_addendum(),
-                max_tokens=_retry_max_tokens,
-                temperature=_eff_temperature,
-                model_name=_brain_model,
-                task_profile=_task_profile,
-            )
+            # The load is the authority no probe can be. Contiguous VRAM is
+            # not observable from outside the allocator, so a fit cannot be
+            # proven in advance — it can only be attempted and OBSERVED. This
+            # is the one seam where the attempt actually happens, so it is
+            # where the admission ledger learns: an OOM here raises this
+            # brain's margin, a clean load retires a prior one. Purely
+            # additive — the recording never alters control flow.
+            try:
+                resp = await self._client.generate(
+                    prompt=p,
+                    system_prompt=_CODEGEN_SYSTEM_PROMPT + _a1_exploration_addendum(),
+                    max_tokens=_retry_max_tokens,
+                    temperature=_eff_temperature,
+                    model_name=_brain_model,
+                    task_profile=_task_profile,
+                )
+            except BaseException as _load_err:
+                try:
+                    from backend.core.ouroboros.governance import (
+                        local_model_admission as _lma_out,
+                    )
+                    _lma_out.record_load_outcome(
+                        _brain_for_adm, ok=False, error=_load_err)
+                    # Hand back the soft claim on the failure path too. The
+                    # ledger self-heals if we don't, but only after a settle
+                    # window during which every other worker is throttled by
+                    # memory this one has definitively stopped wanting.
+                    _lma_out.release_reservation(_adm_reservation[0])
+                except Exception:  # noqa: BLE001 — telemetry never masks a fault
+                    pass
+                raise
+            try:
+                from backend.core.ouroboros.governance import (
+                    local_model_admission as _lma_out,
+                )
+                _lma_out.record_load_outcome(_brain_for_adm, ok=True)
+                # The allocation is now resident and visible to the OS probe;
+                # continuing to subtract it would double-count one set of
+                # bytes against every subsequent worker.
+                _lma_out.release_reservation(_adm_reservation[0])
+            except Exception:  # noqa: BLE001
+                pass
             _last_response[0] = resp
             raw_content = resp.content or ""
             logger.warning(

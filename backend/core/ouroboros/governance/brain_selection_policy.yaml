@@ -48,6 +48,11 @@ brains:
       compute_class: "cpu"
       min_compute_class: "cpu"
       model_artifact: "Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+      # Measured admission (compute_topology): capacity this brain
+      # NEEDS, independent of any GPU model name. min_vram_gb wins
+      # over min_compute_class; weight_gb is the resident footprint.
+      min_vram_gb: 0.0
+      weight_gb: 1.5
 
     - brain_id: "qwen_coder"
       provider: "gcp_prime"
@@ -65,6 +70,11 @@ brains:
       compute_class: "gpu_t4"
       min_compute_class: "gpu_t4"
       model_artifact: "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+      # Measured admission (compute_topology): capacity this brain
+      # NEEDS, independent of any GPU model name. min_vram_gb wins
+      # over min_compute_class; weight_gb is the resident footprint.
+      min_vram_gb: 6.0
+      weight_gb: 5.0
 
     - brain_id: "qwen_coder_14b"
       provider: "gcp_prime"
@@ -82,6 +92,11 @@ brains:
       compute_class: "gpu_l4"
       min_compute_class: "gpu_t4"
       model_artifact: "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf"
+      # Measured admission (compute_topology): capacity this brain
+      # NEEDS, independent of any GPU model name. min_vram_gb wins
+      # over min_compute_class; weight_gb is the resident footprint.
+      min_vram_gb: 11.0
+      weight_gb: 9.5
 
     - brain_id: "qwen_coder_32b"
       provider: "gcp_prime"
@@ -99,6 +114,11 @@ brains:
       compute_class: "gpu_l4"
       min_compute_class: "gpu_l4"
       model_artifact: "Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf"
+      # Measured admission (compute_topology): capacity this brain
+      # NEEDS, independent of any GPU model name. min_vram_gb wins
+      # over min_compute_class; weight_gb is the resident footprint.
+      min_vram_gb: 22.0
+      weight_gb: 20.0
 
     - brain_id: "deepseek_r1"
       provider: "gcp_prime"
@@ -116,6 +136,11 @@ brains:
       compute_class: "gpu_t4"
       min_compute_class: "gpu_t4"
       model_artifact: "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf"
+      # Measured admission (compute_topology): capacity this brain
+      # NEEDS, independent of any GPU model name. min_vram_gb wins
+      # over min_compute_class; weight_gb is the resident footprint.
+      min_vram_gb: 6.0
+      weight_gb: 5.0
 
   optional:
     - brain_id: "mistral_7b_fallback"
@@ -133,6 +158,11 @@ brains:
       compute_class: "gpu_t4"
       min_compute_class: "gpu_t4"
       model_artifact: "mistral-7b-instruct-v0.2.Q4_K_M.gguf"
+      # Measured admission (compute_topology): capacity this brain
+      # NEEDS, independent of any GPU model name. min_vram_gb wins
+      # over min_compute_class; weight_gb is the resident footprint.
+      min_vram_gb: 6.0
+      weight_gb: 4.5
 
 allowlist:
   allow_unlisted_runtime_brains: false
