@@ -29,6 +29,7 @@ from typing import Any, Callable, List, Optional, Sequence
 from backend.core.ouroboros.ui.theme import build_console
 
 _VERBS = {"cockpit", "run", "daemon", "status", "attach", "system", "hive",
+          "link",
           "doctor", "demo", "restart", "version"}
 _HELP_TOKENS = {"help", "--help", "-h"}
 _VERSION_TOKENS = {"version", "--version", "-V"}
@@ -380,6 +381,8 @@ _HELP_TEXT = """ov -- Ouroboros + Venom, autonomous engineering organism
   ov doctor [--live]  8-edge connectivity matrix; --live fires the
                       trace-isolated synthetic tool probe end-to-end
   ov demo [scene]     watch the cockpit with synthetic events
+  ov link ...         the Body/Engine bridge -- issue certs, serve, connect
+                      (`ov link --help` for the full set)
   ov attach           attach this terminal to the running organism
   ov version          version + milestone
   ov help             this message
@@ -440,6 +443,8 @@ def resolve(argv: Optional[Sequence[str]] = None) -> Invocation:
         return Invocation("hive")
     if verb == "doctor":
         return Invocation("doctor", list(rest))
+    if verb == "link":
+        return Invocation("link", list(rest))
     if verb == "demo":
         return Invocation("demo", list(rest))
     if verb == "restart":
@@ -4664,6 +4669,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             console.print(f"ov demo unavailable: {exc}", markup=False)
             return 1
         return run_demo(console, inv.delegate_argv)
+    if inv.action == "link":
+        # Lazy, like `doctor`: `link` pulls in TLS and the transport stack,
+        # and a fault there must not be able to break `ov` itself.
+        try:
+            from backend.core.ouroboros.cli.ov_link import run_link
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"ov link unavailable: {exc}", markup=False)
+            return 1
+        return run_link(console, inv.delegate_argv)
     if inv.action == "doctor":
         try:
             from backend.core.ouroboros.cli.ov_doctor import run_doctor
