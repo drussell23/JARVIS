@@ -198,28 +198,103 @@ class BrokerSink:
         return delivered
 
 
+def _producer_retry_s() -> float:
+    """``JARVIS_GOVERNANCE_BUS_PRODUCER_RETRY_S`` — default 5s."""
+    try:
+        return max(0.5, min(60.0, float(
+            (os.environ.get("JARVIS_GOVERNANCE_BUS_PRODUCER_RETRY_S") or "").strip()
+            or 5.0)))
+    except Exception:  # noqa: BLE001
+        return 5.0
+
+
+def _producer_deadline_s() -> float:
+    """``JARVIS_GOVERNANCE_BUS_PRODUCER_WAIT_S`` — default 600s.
+
+    Bounded because a retry with no end is a task that outlives the reason
+    it was started; if the bus has not appeared in ten minutes, something is
+    wrong that a quieter loop will not fix, and the operator should be told
+    once rather than never.
+    """
+    try:
+        return max(0.0, min(3600.0, float(
+            (os.environ.get("JARVIS_GOVERNANCE_BUS_PRODUCER_WAIT_S") or "").strip()
+            or 600.0)))
+    except Exception:  # noqa: BLE001
+        return 600.0
+
+
 async def install_governance_bus_producer(
-    *, broker: Any = None,
+    *, broker: Any = None, wait_for_bus: bool = True,
 ) -> Optional[Any]:
     """`ov` side: forward O+V activity onto the bus. NEVER raises.
 
-    Returns the installed bridge, or None when disabled or when the bus is
-    not up yet (the caller may retry — ``install`` is idempotent).
+    WAITS for the bus rather than assuming it. Measured on a live boot:
+
+        15:52:18  [GLS] proactive dial hydrated     <- installed here
+        15:53:22  [TrinityEventBus] Started         <- 64s LATER
+
+    ``GovernanceSSEBridge.install()`` returns ``False`` — not an error —
+    when the bus is absent, so a fixed install point that loses that race
+    produces no exception, no log line, and a permanently inert forwarder.
+    That is the failure mode this repo has paid for repeatedly, and it is
+    not fixed by moving to a different fixed point: the next boot reorders
+    and the race comes back. It is fixed by installing when the DEPENDENCY
+    is ready instead of when the caller happens to run.
+
+    Returns the bridge if it installed immediately, else the retry Task
+    (truthy, so a caller can await or cancel it), else None.
     """
     if not bridge_enabled() or not _loop_is_remote():
         return None
     try:
         from backend.api.governance_sse_bridge import GovernanceSSEBridge
         bridge = GovernanceSSEBridge(sink=BrokerSink(broker))
-        if not await bridge.install():
+        if await bridge.install():
+            logger.info(
+                "[GovBus] producer installed — O+V activity forwards onto "
+                "the bus as %r frames", "governance_forward")
+            return bridge
+        if not wait_for_bus or _producer_deadline_s() <= 0:
             return None
         logger.info(
-            "[GovBus] producer installed — O+V activity forwards onto the "
-            "bus as %r frames",
-            "governance_forward")
-        return bridge
+            "[GovBus] producer waiting for TrinityEventBus (retry %.0fs, "
+            "up to %.0fs) — install is idempotent",
+            _producer_retry_s(), _producer_deadline_s())
+        return asyncio.get_event_loop().create_task(
+            _install_producer_when_bus_arrives(bridge),
+            name="governance-bus-producer-wait")
     except Exception:  # noqa: BLE001
         logger.debug("[GovBus] producer install degraded", exc_info=True)
+        return None
+
+
+async def _install_producer_when_bus_arrives(bridge: Any) -> Optional[Any]:
+    """Retry until the bus exists or the deadline passes. NEVER raises."""
+    deadline = asyncio.get_event_loop().time() + _producer_deadline_s()
+    try:
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(_producer_retry_s())
+            try:
+                if await bridge.install():
+                    logger.info(
+                        "[GovBus] producer installed — O+V activity forwards "
+                        "onto the bus as %r frames", "governance_forward")
+                    return bridge
+            except Exception:  # noqa: BLE001
+                logger.debug("[GovBus] producer retry degraded", exc_info=True)
+        # Said ONCE, at a level an operator sees: a forwarder that never
+        # installed is indistinguishable from a quiet organism, and that
+        # ambiguity is exactly what this whole arc exists to remove.
+        logger.warning(
+            "[GovBus] producer never installed — TrinityEventBus did not "
+            "appear within %.0fs; O+V activity will not reach the HUD",
+            _producer_deadline_s())
+        return None
+    except asyncio.CancelledError:
+        return None
+    except Exception:  # noqa: BLE001
+        logger.debug("[GovBus] producer wait ended", exc_info=True)
         return None
 
 
