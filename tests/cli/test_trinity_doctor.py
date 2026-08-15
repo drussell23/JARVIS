@@ -222,3 +222,71 @@ def test_doctor_main_exit_code(monkeypatch):
         return r
     monkeypatch.setattr(doc, "run_doctor", _clean)
     assert doc.doctor_main(_C()) == 0
+
+
+class TestPythonRuntimeChecksTheRightProcess:
+    """`doctor` and the backend are different processes and can be
+    different Pythons. On 2026-08-15 this check reported
+    ``READY — Python 3.11.10`` while every ``trinity up`` was dying under a
+    3.9.6 interpreter — it had validated the interpreter running the check
+    instead of the one about to run the service. A preflight that inspects
+    the wrong process only ever agrees with itself.
+    """
+
+    @staticmethod
+    def _fake_interpreter(tmp_path: Path, reports: str) -> Path:
+        """An executable that answers the version probe with *reports*.
+
+        A real file with a real exec bit, because the check RUNS it — the
+        version is asked of the binary, never inferred from its path, since
+        a venv is a symlink farm and a directory name is not evidence.
+        """
+        fake = tmp_path / "python-fake"
+        fake.write_text(f"#!/bin/sh\necho '{reports}'\n")
+        fake.chmod(0o755)
+        return fake
+
+    def test_it_fails_on_a_service_interpreter_below_the_floor(
+            self, tmp_path, monkeypatch):
+        fake = self._fake_interpreter(tmp_path, "3 8 0")
+        monkeypatch.setattr(
+            "backend.core.ouroboros.cli.trinity_launcher._service_python",
+            lambda: str(fake))
+        r = doc.check_python_runtime()
+        assert r.status is doc.Status.FAIL
+        assert "3.8" in r.detail and str(fake) in r.detail
+
+    def test_it_reports_the_service_interpreter_it_validated(
+            self, tmp_path, monkeypatch):
+        fake = self._fake_interpreter(tmp_path, "3 11 10")
+        monkeypatch.setattr(
+            "backend.core.ouroboros.cli.trinity_launcher._service_python",
+            lambda: str(fake))
+        r = doc.check_python_runtime()
+        assert r.status is doc.Status.READY
+        assert str(fake) in r.detail, "an operator must see WHICH python passed"
+
+    def test_an_unrunnable_service_interpreter_is_a_failure(
+            self, tmp_path, monkeypatch):
+        """The case that matters most: the path exists in config and cannot
+        execute. Reporting READY here is how a boot loop stays invisible."""
+        monkeypatch.setattr(
+            "backend.core.ouroboros.cli.trinity_launcher._service_python",
+            lambda: str(tmp_path / "does-not-exist"))
+        r = doc.check_python_runtime()
+        assert r.status is doc.Status.FAIL
+
+    def test_it_never_raises_when_the_launcher_is_unavailable(
+            self, monkeypatch):
+        """A diagnostic that crashes is worse than useless."""
+        import builtins
+        real = builtins.__import__
+
+        def _boom(name, *a, **k):
+            if "trinity_launcher" in name:
+                raise ImportError("simulated")
+            return real(name, *a, **k)
+
+        monkeypatch.setattr(builtins, "__import__", _boom)
+        r = doc.check_python_runtime()
+        assert r.status in (doc.Status.READY, doc.Status.FAIL)

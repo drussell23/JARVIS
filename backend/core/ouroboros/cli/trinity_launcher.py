@@ -94,6 +94,22 @@ def _service_env() -> dict:
     env["JARVIS_SERVICE_MODE"] = "1"
     env["JARVIS_FRONTEND_AUTOLAUNCH"] = "0"
     env["OUROBOROS_BATTLE_HEADLESS"] = "1"
+    # `_service_python` has ALREADY chosen the interpreter, and the child
+    # would otherwise choose a different one: `unified_supervisor.
+    # _ensure_venv_python()` re-execs into the first `venv/` or `.venv/` it
+    # finds beside the script, discarding what it was launched with. That
+    # mechanism predates this launcher — it exists to rescue a bare
+    # `python3 unified_supervisor.py`, which is exactly the case where
+    # nobody has chosen — and two authorities on one question means the
+    # loser is whichever ran first.
+    #
+    # Observed 2026-08-15: a Python 3.9.6 `.venv` left in the repo in March
+    # captured every `trinity up`. The supervisor re-exec'd into it and died
+    # in 1.9s on `ModuleNotFoundError: uuid6`, while the interpreter this
+    # function had selected could import everything. `trinity status` then
+    # reported ZOMBIE/DEADLOCKED, because from outside a process that never
+    # bound its transports and one that wedged look identical.
+    env["JARVIS_SKIP_VENV_CHECK"] = "1"
     return env
 
 

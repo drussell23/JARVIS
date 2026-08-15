@@ -44,7 +44,7 @@ import subprocess
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 class Status(str, Enum):
@@ -187,17 +187,62 @@ def _is_placeholder(val: str) -> bool:
 
 
 def check_python_runtime() -> CheckResult:
+    """Validate the interpreter that will RUN the service, not this one.
+
+    These are different processes and can be different Pythons: `doctor`
+    runs under whatever invoked ``trinity``, while the backend runs under
+    ``_service_python()``. Checking the wrong one is worse than not
+    checking — on 2026-08-15 this reported ``READY — Python 3.11.10`` while
+    every ``trinity up`` was dying in under two seconds under a 3.9.6
+    interpreter that could not import ``uuid6``. A preflight that passes
+    for a process nobody will start is a preflight that only ever agrees.
+
+    The version is asked of that interpreter by RUNNING it rather than
+    inferred from its path: a venv is a symlink farm, and the name of a
+    directory is not evidence about the binary inside it.
+    """
     import sys
-    v = sys.version_info
+
+    try:
+        from backend.core.ouroboros.cli.trinity_launcher import _service_python
+        service = _service_python()
+    except Exception:  # noqa: BLE001 — fall back to this interpreter
+        service = sys.executable
+
+    same = os.path.realpath(service) == os.path.realpath(sys.executable)
+    if same:
+        v = sys.version_info
+        got: Tuple[int, int, int] = (v.major, v.minor, v.micro)
+    else:
+        try:
+            probe = subprocess.run(
+                [service, "-c",
+                 "import sys;print('%d %d %d' % sys.version_info[:3])"],
+                capture_output=True, text=True, timeout=20)
+            if probe.returncode != 0:
+                return CheckResult(
+                    "python-runtime", Status.FAIL,
+                    detail=(f"service interpreter {service} is not runnable: "
+                            f"{(probe.stderr or '').strip()[:120]}"),
+                )
+            got = tuple(int(p) for p in probe.stdout.split())  # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            return CheckResult(
+                "python-runtime", Status.FAIL,
+                detail=f"could not probe {service}: {type(exc).__name__}",
+            )
+
     # Repo mandate: Python 3.9+ (no asyncio.timeout).
-    if (v.major, v.minor) < (3, 9):
+    if got[:2] < (3, 9):
         return CheckResult(
             "python-runtime", Status.FAIL,
-            detail=f"Python {v.major}.{v.minor} < 3.9 required",
+            detail=f"service Python {got[0]}.{got[1]} < 3.9 required "
+                   f"({service})",
         )
+    where = "" if same else f" — service interpreter {service}"
     return CheckResult(
         "python-runtime", Status.READY,
-        detail=f"Python {v.major}.{v.minor}.{v.micro}",
+        detail=f"Python {got[0]}.{got[1]}.{got[2]}{where}",
     )
 
 

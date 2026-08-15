@@ -80539,6 +80539,49 @@ class JarvisSystemKernel:
         finally:
             await session.close()  # R2-#5: Clean up the single session
 
+    def _owns_governance_loop(self) -> bool:
+        """Does THIS process own the O+V lifecycle? NEVER raises.
+
+        The single predicate both governed-loop construction sites consult —
+        this one and the Trinity-window path below. Asking the question two
+        ways is how the dual ownership arose: `ov` boots the same
+        GovernedLoopService in its own process, and the loser was whichever
+        boot path happened to run first.
+
+        Answered by `governance.lifecycle_ownership`, which is also readable
+        by `ov`, so the two processes cannot hold different beliefs about who
+        is in charge. Fails OPEN to the historical behaviour: an unreadable
+        ownership declaration must not be able to take governance away from a
+        deployment that has always had it here.
+        """
+        try:
+            from backend.core.ouroboros.governance.lifecycle_ownership import (
+                OWNER_SUPERVISOR, bypass_note, governance_owner,
+                supervisor_owns_governance,
+            )
+        except Exception:  # noqa: BLE001
+            self.logger.debug("[Kernel] ownership module unavailable",
+                              exc_info=True)
+            return True
+        try:
+            if supervisor_owns_governance():
+                return True
+            # INFO, once, naming the owner — a supervisor log that never
+            # mentions governance again should say where it went, not leave
+            # the operator to conclude it broke.
+            if not getattr(self, "_governance_bypass_logged", False):
+                self.logger.info("[Kernel] %s", bypass_note(OWNER_SUPERVISOR))
+                self._governance_bypass_logged = True
+            # Not a failure and not "pending" — leaving the reason at its
+            # startup default would tell a later reader governance is still
+            # coming. It is not coming, on purpose, and the field should say
+            # which process has it.
+            self._governance_init_reason = f"owned_by_{governance_owner()}"
+            return False
+        except Exception:  # noqa: BLE001
+            self.logger.debug("[Kernel] ownership check degraded", exc_info=True)
+            return True
+
     async def _ensure_governance_pipeline(self) -> None:
         """Initialize the Ouroboros governance pipeline independently of Trinity.
 
@@ -80579,6 +80622,25 @@ class JarvisSystemKernel:
                 return
 
         # Step 2: GovernedLoopService (Zone 6.8)
+        #
+        # ---- Lifecycle ownership (2026-08-15) ----------------------------
+        # `ov` boots the same GovernedLoopService in its own process, in
+        # seconds, importing nothing from this file. Two owners meant the
+        # loser was whichever ran first: this path hydrated the operator's
+        # dial, blew its 30s budget by 1.8s, and was abandoned by `wait_for`
+        # while `shield` kept it running — an orphaned governed loop inside a
+        # process that then held `_governed_loop = None` and reported the
+        # failure as an empty string (`TimeoutError` stringifies to "").
+        #
+        # Only the LOOP is gated. The GovernanceStack above stays: it is the
+        # policy/gate machinery other supervisor surfaces read, and skipping
+        # it would decouple more than the one thing that was contended.
+        #
+        # Bypass is NOT degradation — no warning, no init_reason, no mode
+        # change. Warning about intended behaviour is how an operator learns
+        # to ignore warnings.
+        if not self._owns_governance_loop():
+            return
         if self._governance_stack and self._governance_stack._started and self._governed_loop is None:
             try:
                 from backend.core.ouroboros.governance.governed_loop_service import (
@@ -82702,7 +82764,14 @@ class JarvisSystemKernel:
 
                             # ---- Zone 6.8: Governed Self-Programming Loop ----
                             # v400.0: Skip if fallback path already initialized GLS
-                            if self._governance_stack and self._governance_stack._started and self._governed_loop is None:
+                            # ---- Lifecycle ownership (2026-08-15): the OTHER owner ----
+                            # The Trinity-window twin of the fallback below. `ov` boots the
+                            # same GovernedLoopService in its own process; gating only one
+                            # of the two sites would leave the race intact on whichever
+                            # path won that boot. Same predicate, so they cannot disagree.
+                            if not self._owns_governance_loop():
+                                pass
+                            elif self._governance_stack and self._governance_stack._started and self._governed_loop is None:
                                 try:
                                     from backend.core.ouroboros.governance.governed_loop_service import (
                                         GovernedLoopConfig,
