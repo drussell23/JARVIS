@@ -139,6 +139,56 @@ class AutoCommitEvidenceVerdict(str, enum.Enum):
     EVIDENCE_INSUFFICIENT = "evidence_insufficient"
     NO_GIT_HISTORY = "no_git_history"
     MASTER_OFF = "master_off"
+    #: Every soak short of READY is short only because a rewrite made its
+    #: evidence unreadable. Distinct from EVIDENCE_INSUFFICIENT because the
+    #: operator's remedy is different — re-soak or point the gate at the
+    #: pre-squash ref, rather than "AutoCommitter never fired".
+    EVIDENCE_LOST_TO_SQUASH = "evidence_lost_to_squash"
+
+
+class GraduationBlocker(str, enum.Enum):
+    """WHY the gate is not READY, structurally. Closed taxonomy.
+
+    A surface that renders a bare "locked" teaches an operator nothing and
+    invites them to flip the flag to find out. Every non-READY verdict
+    carries at least one of these, and each maps to a sentence naming the
+    missing evidence and what would supply it.
+    """
+
+    INSUFFICIENT_CLEAN_SOAKS = "insufficient_clean_soaks"
+    MISSING_YELLOW_TIER_SIGNATURE = "missing_yellow_tier_signature"
+    VERIFICATION_LOST_VIA_SQUASH = "verification_lost_via_squash"
+    NO_GIT_HISTORY = "no_git_history"
+    LEDGER_UNAVAILABLE = "ledger_unavailable"
+    WINDOWS_UNRECONSTRUCTABLE = "windows_unreconstructable"
+    GATE_DISABLED = "gate_disabled"
+
+
+#: Operator-facing sentence per blocker. The UI renders these verbatim, so
+#: they name the missing EVIDENCE and the action that would supply it —
+#: never the internal state that produced them.
+BLOCKER_REASON: Dict[GraduationBlocker, str] = {
+    GraduationBlocker.INSUFFICIENT_CLEAN_SOAKS:
+        "Insufficient clean soaks — the generic ledger floor is not met yet",
+    GraduationBlocker.MISSING_YELLOW_TIER_SIGNATURE:
+        "Missing git cryptographic signature — one or more counted clean "
+        "soaks produced no O+V commit carrying the Yellow-tier marker, so "
+        "the unattended-apply path was never exercised",
+    GraduationBlocker.VERIFICATION_LOST_VIA_SQUASH:
+        "Verification lost via squash — commits existed in these soaks and "
+        "were rewritten off the branch; re-soak or point the gate at the "
+        "pre-squash ref",
+    GraduationBlocker.NO_GIT_HISTORY:
+        "No readable git history — the evidence cannot be checked at all",
+    GraduationBlocker.LEDGER_UNAVAILABLE:
+        "Graduation ledger unavailable — no clean-soak baseline to build on",
+    GraduationBlocker.WINDOWS_UNRECONSTRUCTABLE:
+        "Ledger reports eligible but no soak windows could be rebuilt from "
+        "its session rows",
+    GraduationBlocker.GATE_DISABLED:
+        "Evidence gate disabled — set "
+        "JARVIS_AUTOCOMMIT_GRADUATION_GATE_ENABLED=true to measure",
+}
 
 
 # ===========================================================================
@@ -157,6 +207,11 @@ class SoakCommitEvidence:
     other_tier_count: int
     sample_yellow_hashes: Tuple[str, ...]
     is_first_soak_bounded: bool  # True → window start is lookback-bounded
+    #: How membership was established — see `Provenance`. Reported so the
+    #: operator can tell proof from inference at a glance; a number that
+    #: cannot be proven must never look like one that can.
+    provenance: str = ""
+    provenance_reason: str = ""
 
     @property
     def has_evidence(self) -> bool:
@@ -172,6 +227,8 @@ class SoakCommitEvidence:
             "sample_yellow_hashes": list(self.sample_yellow_hashes),
             "is_first_soak_bounded": self.is_first_soak_bounded,
             "has_evidence": self.has_evidence,
+            "provenance": self.provenance,
+            "provenance_reason": self.provenance_reason,
         }
 
     @classmethod
@@ -190,6 +247,8 @@ class SoakCommitEvidence:
             is_first_soak_bounded=bool(
                 payload.get("is_first_soak_bounded", False)
             ),
+            provenance=str(payload.get("provenance", "")),
+            provenance_reason=str(payload.get("provenance_reason", "")),
         )
 
 
@@ -209,6 +268,20 @@ class AutoCommitGraduationReport:
     per_soak_evidence: Tuple[SoakCommitEvidence, ...]
     diagnostic: str
     generated_at_unix: float
+    #: The third state. Neither evidence nor failure — see the squash
+    #: reasoning in `autocommit_evidence_attribution`.
+    soaks_unverifiable: int = 0
+    #: Structural WHY. Empty iff READY.
+    blockers: Tuple[GraduationBlocker, ...] = ()
+
+    @property
+    def is_ready(self) -> bool:
+        return self.verdict is AutoCommitEvidenceVerdict.READY
+
+    @property
+    def blocker_reasons(self) -> Tuple[str, ...]:
+        """Operator-facing sentences. What a surface renders."""
+        return tuple(blocker_reason(b) for b in self.blockers)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -226,6 +299,9 @@ class AutoCommitGraduationReport:
             ],
             "diagnostic": self.diagnostic[:512],
             "generated_at_unix": round(self.generated_at_unix, 3),
+            "soaks_unverifiable": self.soaks_unverifiable,
+            "blockers": [b.value for b in self.blockers],
+            "blocker_reasons": list(self.blocker_reasons),
         }
 
     @classmethod
@@ -259,6 +335,12 @@ class AutoCommitGraduationReport:
             diagnostic=str(payload.get("diagnostic", "")),
             generated_at_unix=float(
                 payload.get("generated_at_unix", 0.0)
+            ),
+            soaks_unverifiable=int(payload.get("soaks_unverifiable", 0)),
+            blockers=tuple(
+                GraduationBlocker(str(b))
+                for b in payload.get("blockers", ())
+                if str(b) in {m.value for m in GraduationBlocker}
             ),
         )
 
@@ -549,6 +631,7 @@ def _master_off_report(target_flag: str) -> AutoCommitGraduationReport:
             f"{_ENV_MASTER}=false; no evidence computed"
         ),
         generated_at_unix=time.time(),
+        blockers=(GraduationBlocker.GATE_DISABLED,),
     )
 
 
@@ -582,6 +665,7 @@ async def evaluate_graduation_evidence() -> AutoCommitGraduationReport:
                 "clean-soak baseline; not ready (fail-closed)"
             ),
             generated_at_unix=time.time(),
+            blockers=(GraduationBlocker.LEDGER_UNAVAILABLE,),
         )
     clean_n, required, runner_n, eligible = prog
 
@@ -604,6 +688,7 @@ async def evaluate_graduation_evidence() -> AutoCommitGraduationReport:
                 "AutoCommitter-specific evidence is evaluated."
             ),
             generated_at_unix=time.time(),
+            blockers=(GraduationBlocker.INSUFFICIENT_CLEAN_SOAKS,),
         )
 
     lookback = _lookback_days()
@@ -626,6 +711,7 @@ async def evaluate_graduation_evidence() -> AutoCommitGraduationReport:
                 "prove AutoCommitter fired; not ready (fail-closed)"
             ),
             generated_at_unix=time.time(),
+            blockers=(GraduationBlocker.WINDOWS_UNRECONSTRUCTABLE,),
         )
 
     earliest_start = min(w[1] for w in windows)
@@ -657,39 +743,67 @@ async def evaluate_graduation_evidence() -> AutoCommitGraduationReport:
                 f"git={'ok' if git_records is not None else 'unavailable'}"
             ),
             generated_at_unix=time.time(),
+            blockers=(GraduationBlocker.NO_GIT_HISTORY,),
         )
 
+    # ATTRIBUTION, not windowing. `autocommit_evidence_attribution` owns the
+    # question "does this commit belong to this soak"; this module keeps
+    # owning "is this an O+V Yellow-tier commit" and injects that classifier.
+    #
+    # Identity first: a commit carrying `Session: <sid>` says which soak it
+    # belongs to, so no clock is consulted. The window survives only as a
+    # labelled fallback for history predating the trailer, and is reported
+    # as an INFERENCE rather than borrowing the authority of a proof.
+    from backend.core.ouroboros.governance import (  # noqa: PLC0415
+        autocommit_evidence_attribution as _attr,
+    )
+
+    def _classify(body: str) -> "CommitEvidenceKind":
+        return classify_commit_body(
+            body, ov_marker=ov_marker, yellow_marker=yellow_marker)
+
+    attributions: List[Any] = []
+    for sid, w_start, w_end, _fb in windows:
+        attributions.append(_attr.attribute(
+            sid, git_records, window=(w_start, w_end), classify=_classify))
+
+    # The reflog is read ONCE, and only when something is unaccounted for —
+    # a squash that erased nothing costs nothing to rule out.
+    if any(a.provenance is _attr.Provenance.ABSENT for a in attributions):
+        reflog = await _attr.read_reflog(timeout_s=_git_timeout_s())
+        attributions = [
+            _attr.resolve_squash(a, reflog, git_records,
+                                 window=(w[1], w[2]), classify=_classify)
+            for a, w in zip(attributions, windows)
+        ]
+
     per_soak: List[SoakCommitEvidence] = []
-    for sid, w_start, w_end, first_bounded in windows:
-        yellow = 0
-        other = 0
-        samples: List[str] = []
-        for chash, cepoch, body in git_records:
-            if not (w_start <= cepoch <= w_end):
-                continue
-            kind = classify_commit_body(
-                body, ov_marker=ov_marker, yellow_marker=yellow_marker
-            )
-            if kind is CommitEvidenceKind.YELLOW_TIER:
-                yellow += 1
-                if len(samples) < _MAX_SAMPLE_HASHES:
-                    samples.append(chash[:12])
-            elif kind is CommitEvidenceKind.OTHER_TIER:
-                other += 1
+    for (sid, w_start, w_end, first_bounded), att in zip(
+            windows, attributions):
         per_soak.append(
             SoakCommitEvidence(
                 session_id=sid,
                 window_start_epoch=w_start,
                 window_end_epoch=w_end,
-                yellow_tier_count=yellow,
-                other_tier_count=other,
-                sample_yellow_hashes=tuple(samples),
+                yellow_tier_count=att.yellow_count,
+                other_tier_count=len(att.other_hashes),
+                sample_yellow_hashes=tuple(
+                    h[:12] for h in att.yellow_hashes[:_MAX_SAMPLE_HASHES]),
                 is_first_soak_bounded=first_bounded,
+                provenance=att.provenance.value,
+                provenance_reason=att.reason,
             )
         )
 
-    with_ev = sum(1 for e in per_soak if e.has_evidence)
-    missing_ev = len(per_soak) - with_ev
+    # THREE STATES, because two force a lie. A soak whose commits were
+    # squashed away has evidence that is UNREADABLE, not absent — counting
+    # it as missing would reset an operator's hard-won soak count for
+    # following ordinary PR hygiene. It never counts as evidence either: a
+    # gate must not pass on something it could not read.
+    with_ev = sum(1 for a in attributions if a.counts_as_evidence)
+    unverifiable = sum(1 for a in attributions
+                       if a.provenance.is_unverifiable)
+    missing_ev = len(attributions) - with_ev - unverifiable
 
     if missing_ev == 0:
         verdict = AutoCommitEvidenceVerdict.READY
@@ -706,6 +820,22 @@ async def evaluate_graduation_evidence() -> AutoCommitGraduationReport:
                 f"({lookback}d) — its evidence is necessary-floor, not "
                 "prior-bounded."
             )
+    elif missing_ev == 0 and unverifiable:
+        # Everything that could be read passed; the only shortfall is
+        # unreadable. A DISTINCT verdict because the operator's remedy is
+        # different, and because folding it into EVIDENCE_INSUFFICIENT would
+        # accuse a clean soak of never having fired AutoCommitter.
+        verdict = AutoCommitEvidenceVerdict.EVIDENCE_LOST_TO_SQUASH
+        lost = sorted(e.session_id for e in per_soak
+                      if e.provenance == "squash_lost")
+        diag = (
+            f"EVIDENCE_LOST_TO_SQUASH: {with_ev}/{len(per_soak)} counted "
+            f"clean soak(s) carry Yellow-tier O+V commits and "
+            f"{unverifiable} had their commits rewritten off the branch. "
+            "The soak count is NOT reset — this is unreadable evidence, "
+            f"not absent evidence. Affected: {lost[:10]}. "
+            "Re-soak, or point the gate at the pre-squash ref."
+        )
     else:
         verdict = AutoCommitEvidenceVerdict.EVIDENCE_INSUFFICIENT
         bare = sorted(
@@ -732,10 +862,51 @@ async def evaluate_graduation_evidence() -> AutoCommitGraduationReport:
         ledger_eligible=True,
         soaks_with_evidence=with_ev,
         soaks_missing_evidence=missing_ev,
+        soaks_unverifiable=unverifiable,
         per_soak_evidence=tuple(per_soak),
         diagnostic=diag,
         generated_at_unix=time.time(),
+        blockers=_blockers_for(verdict, missing_ev, unverifiable),
     )
+
+
+def blocker_reason(blocker: "GraduationBlocker") -> str:
+    """Operator sentence for one blocker, with the marker DERIVED.
+
+    The Yellow-tier marker is spelled in exactly one place
+    (:func:`_yellow_marker`, itself derived from
+    ``RiskTier.NOTIFY_APPLY.name``). Writing it literally into operator
+    prose would create a second authority for it — and the sentence would
+    keep naming ``NOTIFY_APPLY`` after the tier was renamed, telling the
+    operator to look for a marker no commit carries. An AST pin forbids the
+    literal here precisely so that cannot happen.
+    """
+    text = BLOCKER_REASON.get(blocker, blocker.value)
+    if blocker is GraduationBlocker.MISSING_YELLOW_TIER_SIGNATURE:
+        marker = _yellow_marker()
+        if marker:
+            text = text.replace("the Yellow-tier marker", f"`{marker}`")
+    return text
+
+
+def _blockers_for(
+    verdict: AutoCommitEvidenceVerdict, missing: int, unverifiable: int,
+) -> Tuple[GraduationBlocker, ...]:
+    """The structural WHY for a computed verdict. Pure.
+
+    Derived from the counts rather than stamped at each branch, so a verdict
+    and its stated reason cannot disagree — the class of bug where a surface
+    says "insufficient soaks" while the report says the signatures were
+    squashed.
+    """
+    if verdict is AutoCommitEvidenceVerdict.READY:
+        return ()
+    out: List[GraduationBlocker] = []
+    if missing > 0:
+        out.append(GraduationBlocker.MISSING_YELLOW_TIER_SIGNATURE)
+    if unverifiable > 0:
+        out.append(GraduationBlocker.VERIFICATION_LOST_VIA_SQUASH)
+    return tuple(out) or (GraduationBlocker.MISSING_YELLOW_TIER_SIGNATURE,)
 
 
 async def evidence_summary() -> Dict[str, Any]:
@@ -815,6 +986,26 @@ def register_shipped_invariants() -> list:
         "evidence_insufficient",
         "no_git_history",
         "master_off",
+        # Added deliberately, with the pin updated in the same change —
+        # which is the workflow this pin exists to force. A squashed soak's
+        # evidence is UNREADABLE, and folding that into
+        # `evidence_insufficient` would accuse a clean soak of never having
+        # fired AutoCommitter. Different cause, different remedy, therefore
+        # a different verdict.
+        "evidence_lost_to_squash",
+    }
+
+    #: Blockers are a closed taxonomy for the same reason verdicts are: a
+    #: surface renders these sentences verbatim, so an unpinned addition
+    #: could put unreviewed text in front of an operator.
+    _EXPECTED_BLOCKER = {
+        "insufficient_clean_soaks",
+        "missing_yellow_tier_signature",
+        "verification_lost_via_squash",
+        "no_git_history",
+        "ledger_unavailable",
+        "windows_unreconstructable",
+        "gate_disabled",
     }
 
     def _enum_values(tree: ast.AST, class_name: str) -> set:
@@ -999,6 +1190,17 @@ def register_shipped_invariants() -> list:
             ),
             validate=_mk_taxonomy(
                 "AutoCommitEvidenceVerdict", _EXPECTED_VERDICT
+            ),
+        ),
+        ShippedCodeInvariant(
+            invariant_name="autocommit_grad_blocker_taxonomy_closed",
+            target_file=target,
+            description=(
+                "GraduationBlocker is a closed 7-value taxonomy — every "
+                "value renders verbatim on an operator surface."
+            ),
+            validate=_mk_taxonomy(
+                "GraduationBlocker", _EXPECTED_BLOCKER
             ),
         ),
         ShippedCodeInvariant(

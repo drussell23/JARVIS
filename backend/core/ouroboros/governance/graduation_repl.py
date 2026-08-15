@@ -65,7 +65,8 @@ _HELP = (
     "\n"
     "Subcommands:\n"
     "  /graduation                    alias for /graduation status\n"
-    "  /graduation status             per-verdict summary\n"
+    "  /graduation autocommit — AutoCommitter unattended-apply evidence\n"
+        "  /graduation status             per-verdict summary\n"
     "  /graduation ready              gates marked READY\n"
     "  /graduation failed             gates with EVIDENCE_FAILED\n"
     "  /graduation details [N]        full per-row table\n"
@@ -131,7 +132,7 @@ def _matches(line: str) -> bool:
     )
 
 
-def dispatch_graduation_command(
+async def dispatch_graduation_command(
     line: str,
 ) -> GraduationReplDispatchResult:
     """Show which capabilities have graduated and which are pending.
@@ -156,6 +157,9 @@ def dispatch_graduation_command(
         )
     args = tokens[1:] if tokens else []
     head = (args[0].lower() if args else "status")
+
+    if head == "autocommit":
+        return await _render_autocommit()
 
     if head in ("help", "?"):
         return GraduationReplDispatchResult(
@@ -199,6 +203,53 @@ def dispatch_graduation_command(
                 f"{type(exc).__name__}: {str(exc)[:200]}"
             ),
         )
+
+
+async def _render_autocommit(
+    gate=None,
+) -> GraduationReplDispatchResult:
+    """The AutoCommitter unattended-apply evidence gate. §41.11.4.
+
+    INJECTED, never global. ``gate`` defaults to the canonical evaluator,
+    resolved at call time; nothing is cached and no module state is touched.
+
+    Renders the structural WHY rather than a bare verdict. "Not ready" tells
+    an operator nothing and invites them to flip the flag to find out; the
+    report's closed blocker taxonomy names the missing evidence and the act
+    that would supply it.
+    """
+    try:
+        if gate is None:
+            from backend.core.ouroboros.governance.auto_commit_graduation_gate import (  # noqa: E501
+                evaluate_graduation_evidence,
+            )
+            gate = evaluate_graduation_evidence
+        report = await gate()
+    except Exception as exc:  # noqa: BLE001
+        return GraduationReplDispatchResult(
+            ok=False,
+            text=f"  autocommit evidence unavailable ({type(exc).__name__})")
+
+    lines = [
+        "  AutoCommitter — unattended apply (Yellow tier)",
+        f"    verdict     {report.verdict.value}",
+        f"    clean soaks {report.ledger_clean_count}/"
+        f"{report.ledger_required}",
+        f"    evidence    {report.soaks_with_evidence} proven · "
+        f"{report.soaks_missing_evidence} missing · "
+        f"{report.soaks_unverifiable} unverifiable",
+    ]
+    if report.is_ready:
+        lines.append("    READY — every counted clean soak carries a "
+                     "Yellow-tier O+V commit.")
+    for reason in report.blocker_reasons:
+        lines.append(f"    ⨯ {reason}")
+    # Provenance per soak: proof and inference must not look alike.
+    for ev in report.per_soak_evidence[:8]:
+        if ev.provenance_reason:
+            lines.append(f"      {ev.session_id[:24]}  {ev.provenance} — "
+                         f"{ev.provenance_reason}")
+    return GraduationReplDispatchResult(ok=True, text="\n".join(lines))
 
 
 def _parse_limit(args) -> Optional[int]:
