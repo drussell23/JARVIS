@@ -149,10 +149,20 @@ def reassembly_capacity() -> int:
 
 
 def tls_dir() -> Path:
-    """Where the mTLS material lives. Never a hardcoded path in logic."""
+    """Where the LINK's mTLS material lives. Never a hardcoded path in logic.
+
+    Deliberately NOT ``.jarvis/brain_mtls`` — that directory belongs to the
+    J-Prime brain channel, carries a CA whose leaf SANs name ``jarvis-brain``,
+    and is rotated on that subsystem's schedule. Two trust domains sharing one
+    directory means rotating either one silently re-keys the other, and a leaf
+    issued for one peer would be accepted by the other's verifier.
+
+    Separate directory, separate CA, separate lifetime. The link's identity is
+    its own.
+    """
     return Path(_env_str(
         "JARVIS_LINK_TLS_DIR",
-        str(Path(_env_str("JARVIS_PROJECT_ROOT", ".")) / ".jarvis" / "brain_mtls"),
+        str(Path(_env_str("JARVIS_PROJECT_ROOT", ".")) / ".jarvis" / "link_mtls"),
     ))
 
 
