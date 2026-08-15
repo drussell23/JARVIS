@@ -555,6 +555,17 @@ _PROTECTED_PATH_SUBSTRINGS: Tuple[str, ...] = (
     "ouroboros/governance/orchestrator",            # the 11-phase FSM
     "ouroboros/governance/governed_loop_service",   # the main loop
     "ouroboros/governance/intake/unified_intake_router",
+    # The measuring instruments, for the same reason as the enforcing ones.
+    # `audit_drift_sensor` turns a regression against an accepted floor into
+    # an op, which makes the audit an obstacle in that op's way — and the
+    # cheapest way past an obstacle is to remove it. Weakening the detector
+    # would close the finding and pass VERIFY, because the only test of a
+    # measurement is the measurement. `.jarvis/` above already denies the
+    # baseline FILE; these deny the code that reads it.
+    "ouroboros/governance/audit_ratchet",
+    "ouroboros/battle_test/surface_reachability",
+    "ouroboros/battle_test/source_assertion_audit",
+    "ouroboros/governance/intake/sensors/audit_drift_sensor",
 )
 
 

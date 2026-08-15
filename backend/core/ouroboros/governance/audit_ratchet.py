@@ -56,7 +56,8 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import (Any, Awaitable, Callable, Dict, Iterable, List, Mapping,
                     Optional, Tuple)
@@ -71,6 +72,15 @@ def _env_flag(name: str, default: bool = True) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _env_num(name: str, default: float, lo: float, hi: float) -> float:
+    """A clamped numeric knob. NEVER raises."""
+    try:
+        return min(hi, max(lo, float((os.environ.get(name) or "").strip()
+                                     or default)))
+    except Exception:  # noqa: BLE001
+        return min(hi, max(lo, default))
 
 
 @dataclass(frozen=True)
@@ -374,12 +384,17 @@ def spawn_registered_watchdogs() -> Optional["asyncio.Task"]:
     The boot seam calls this and moves on. A watchdog that delayed startup
     by the length of its own scan would be traded away the first time
     somebody profiled boot — and then the instrument is gone again.
+
+    Goes through :func:`sweep` rather than straight to
+    :func:`run_registered_watchdogs`, so the reading this produces is the
+    same object every other consumer sees. Boot is the earliest and
+    cheapest moment to take it; anything that asks in the following TTL
+    gets it for free instead of paying for the scans a second time.
     """
     if not watchdogs_enabled():
         return None
     try:
-        return asyncio.get_running_loop().create_task(
-            run_registered_watchdogs())
+        return asyncio.get_running_loop().create_task(sweep())
     except RuntimeError:
         # No loop — a synchronous context (a script, a test collection).
         # Not an error: there is simply nothing to schedule onto.
@@ -390,13 +405,205 @@ def spawn_registered_watchdogs() -> Optional["asyncio.Task"]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# The shared reading — one scan, N consumers
+# ---------------------------------------------------------------------------
+
+
+AUDIT_SWEEP_SCHEMA_VERSION: str = "audit_sweep.1"
+
+
+@dataclass(frozen=True)
+class Sweep:
+    """Every declared instrument's drift, from ONE pass.
+
+    Exists because the reading is expensive and there is now more than one
+    consumer: the boot watchdog logs it, and ``audit_drift_sensor`` turns it
+    into work. Measured on this checkout the two shipped instruments cost
+    ~12s and ~29s of parsing; a second consumer that re-ran them would not
+    merely double the cost, it would make two consumers capable of DISAGREEING
+    about the same repository — the operator told one thing by the log and
+    another by the deck, with no way to tell which reading was stale.
+    """
+
+    drifts: Mapping[str, Drift] = field(default_factory=dict)
+    #: ``time.monotonic()`` when this reading completed. Monotonic because
+    #: freshness is an interval, and a wall clock that steps backwards over
+    #: an NTP correction would make a cached reading immortal.
+    completed_at: float = 0.0
+    #: True when this call performed the scan; False when it was served from
+    #: the cache or joined one already in flight. Reported, never inferred —
+    #: a consumer that thinks it forced a scan and did not would draw
+    #: conclusions from a reading of a repository that has since changed.
+    fresh: bool = False
+
+    @property
+    def regressed(self) -> bool:
+        return any(d.regressed for d in self.drifts.values())
+
+    def age_s(self, now: Optional[float] = None) -> float:
+        if not self.completed_at:
+            return float("inf")
+        return max(0.0, (time.monotonic() if now is None else now)
+                   - self.completed_at)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": AUDIT_SWEEP_SCHEMA_VERSION,
+            "drifts": {k: v.to_dict() for k, v in self.drifts.items()},
+            "regressed": self.regressed,
+            "age_s": round(self.age_s(), 3),
+            "fresh": self.fresh,
+        }
+
+
+def sweep_ttl_s() -> float:
+    """How long a reading stays serviceable. ``JARVIS_AUDIT_SWEEP_TTL_S``.
+
+    Default 15 minutes: long enough that boot and the first sensor scan share
+    one pass, short enough that a consumer never reasons about a repository
+    an hour out of date. ``0`` disables reuse entirely.
+    """
+    return _env_num("JARVIS_AUDIT_SWEEP_TTL_S", 900.0, 0.0, 86400.0)
+
+
+#: The cached reading and the scan currently producing one. Module-level
+#: because the point is to be shared across every caller in the process.
+_last_sweep: Optional[Sweep] = None
+_inflight: Optional["asyncio.Future"] = None
+
+
+def _inflight_for_this_loop() -> Optional["asyncio.Future"]:
+    """The in-flight scan, IF it belongs to the running loop.
+
+    A future from another loop can never complete for this caller — awaiting
+    it deadlocks. Tests create a fresh loop per case and daemons re-enter on
+    reconnect, so this is a live condition rather than a theoretical one.
+    """
+    fut = _inflight
+    if fut is None or fut.done():
+        return None
+    try:
+        return fut if fut.get_loop() is asyncio.get_running_loop() else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def sweep(*, force: bool = False,
+                max_age_s: Optional[float] = None) -> Sweep:
+    """ONE reading of every declared instrument, shared. NEVER raises.
+
+    Three callers, one scan:
+
+    * **cache** — a reading younger than the TTL is returned as-is. The boot
+      watchdog pays for the scans; a sensor waking up inside the window is
+      free.
+    * **single flight** — a caller arriving while a scan is running JOINS it
+      rather than starting a second. Without this, boot and a sensor tick
+      landing together would run four audits concurrently over the same
+      files, and the loop would feel it.
+    * **force** — an operator asking a verb for the current state means
+      *current*, and must not be answered from a cache they cannot see.
+
+    Joined callers ``shield`` the shared scan: one consumer being cancelled
+    (a REPL Ctrl-C, a sensor shutting down) must not cancel a reading every
+    other consumer is waiting on, and the cache still fills for whoever asks
+    next.
+    """
+    if not watchdogs_enabled():
+        return Sweep()
+    try:
+        ttl = sweep_ttl_s() if max_age_s is None else max(0.0, float(max_age_s))
+    except Exception:  # noqa: BLE001
+        ttl = sweep_ttl_s()
+
+    if not force:
+        cached = _last_sweep
+        if cached is not None and cached.completed_at and cached.age_s() <= ttl:
+            # Re-stamped rather than returned as-is: the first consumer took
+            # a live reading and every later one did not, and a cached object
+            # that still claims ``fresh`` would let the second consumer report
+            # the repository's state as of a scan it never ran.
+            return replace(cached, fresh=False)
+        joined = _inflight_for_this_loop()
+        if joined is not None:
+            try:
+                return await asyncio.shield(joined)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                return Sweep()
+
+    return await _start_sweep()
+
+
+async def _start_sweep() -> Sweep:
+    """Own the scan for this loop, and let everyone else join it."""
+    global _inflight  # noqa: PLW0603
+    loop = asyncio.get_running_loop()
+    task = loop.create_task(_sweep_once())
+    _inflight = task
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # The scan keeps running and still fills the cache — the work is
+        # already paid for, and discarding it would make a cancelled REPL
+        # command cost the next consumer a fresh 40 seconds.
+        raise
+    except Exception:  # noqa: BLE001
+        return Sweep()
+    finally:
+        if _inflight is task and task.done():
+            _inflight = None
+
+
+async def _sweep_once() -> Sweep:
+    """Run every watchdog and cache the result. NEVER raises.
+
+    Deliberately does NOT clear ``_inflight``: two overlapping scans (a
+    forced one over a cadence one) would otherwise have the first to finish
+    unregister the second, and a third caller would start a needless fourth
+    audit. Registration is cleared by whoever owns it, and a finished future
+    left behind is inert — :func:`_inflight_for_this_loop` refuses a done
+    one.
+    """
+    global _last_sweep  # noqa: PLW0603
+    try:
+        drifts = await run_registered_watchdogs()
+    except Exception as exc:  # noqa: BLE001 — a diagnostic never propagates
+        logger.debug("[AuditRatchet] sweep failed: %s", exc, exc_info=True)
+        drifts = {}
+    result = Sweep(drifts=drifts, completed_at=time.monotonic(), fresh=True)
+    _last_sweep = result
+    return result
+
+
+def last_sweep() -> Optional[Sweep]:
+    """The cached reading, or None. Does NOT scan — for health projections
+    and operator surfaces that must stay free to call."""
+    return _last_sweep
+
+
+def reset_sweep_cache() -> None:
+    """Forget the cached reading and any in-flight scan. Test-only."""
+    global _inflight, _last_sweep  # noqa: PLW0603
+    _last_sweep = None
+    _inflight = None
+
+
 __all__ = [
     "AUDIT_RATCHET_SCHEMA_VERSION",
+    "AUDIT_SWEEP_SCHEMA_VERSION",
     "AuditRatchet",
     "Drift",
     "Instrument",
+    "Sweep",
+    "last_sweep",
     "registered_ratchets",
+    "reset_sweep_cache",
     "run_registered_watchdogs",
     "spawn_registered_watchdogs",
+    "sweep",
+    "sweep_ttl_s",
     "watchdogs_enabled",
 ]

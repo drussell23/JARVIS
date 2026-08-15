@@ -60,6 +60,15 @@ _VALID_SOURCES = frozenset({
     # names the rule as the fix. Clustered + token-bucketed at the sensor so
     # a runaway worker cannot flood the intake through this door.
     "cage_hygiene",
+    # AuditDriftSensor (2026-08-15) — an accepted audit FLOOR regressed. Not
+    # capability_severance (a snapshot of what is declared and unreachable)
+    # and not meta_dormancy_alarm (a subsystem disabling itself): this is a
+    # DELTA against a state a human accepted, which is why it can be trusted
+    # to be actionable rather than merely true. Clustered by locus and
+    # token-bucketed at the sensor; registered in urgency_router.
+    # _BACKGROUND_SOURCES too, because repo-wide static analysis on the
+    # Claude tier is the burn the 2026-04-12 comment above records.
+    "audit_regression",
     # LivenessSensor (2026-07-31) — the organism reporting capabilities it
     # DECLARES and cannot reach. Distinct from runtime_health (the OS layer)
     # and meta_dormancy_alarm (a subsystem disabling itself): this is a

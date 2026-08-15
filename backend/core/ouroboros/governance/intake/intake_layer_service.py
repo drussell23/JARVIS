@@ -1055,6 +1055,26 @@ class IntakeLayerService:
         except Exception as exc:
             logger.debug("[IntakeLayer] LivenessSensor skipped: %s", exc)
 
+        # ---- AuditDriftSensor (an accepted audit floor regressed) ----
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.audit_drift_sensor import (
+                AuditDriftSensor, sensor_enabled as _audit_drift_enabled,
+            )
+            _audit_drift_sensor = AuditDriftSensor(
+                repo="jarvis",
+                router=self._router,
+                project_root=self._config.project_root,
+            )
+            self._sensors.append(_audit_drift_sensor)
+            self._audit_drift_sensor = _audit_drift_sensor
+            logger.info(
+                "[IntakeLayer] AuditDriftSensor registered enabled=%s "
+                "(set JARVIS_AUDIT_DRIFT_SENSOR_ENABLED=1)",
+                _audit_drift_enabled(),
+            )
+        except Exception as exc:
+            logger.debug("[IntakeLayer] AuditDriftSensor skipped: %s", exc)
+
         # ---- CageHygieneSensor (synthesized worker cages report on themselves) ----
         try:
             from backend.core.ouroboros.governance.intake.sensors.cage_hygiene_sensor import (
