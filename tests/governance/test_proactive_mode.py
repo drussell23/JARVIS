@@ -715,3 +715,176 @@ def test_the_chip_survives_proactive_mode_being_absent(monkeypatch):
     monkeypatch.delenv("JARVIS_PROACTIVE_MODE_ENABLED", raising=False)
     monkeypatch.setenv("JARVIS_MIN_RISK_TIER", "notify_apply")
     assert t.floor_chip() == "🟡⛨ notify_apply"
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 — the Body never renders a rung it cannot vouch for
+# ---------------------------------------------------------------------------
+
+
+def _mode_frame(position="watch", **kw):
+    f = {"kind": "mode", "seq": 1, "lamport": 1, "node_id": "engine",
+         "position": position}
+    f.update(kw)
+    return f
+
+
+def test_a_fresh_view_renders_unknown_not_a_guess():
+    """A stale rung on a screen is worse than no rung: the operator reads a
+    guarantee that is not in force and stops watching accordingly."""
+    v = pm.RemoteModeView(clock=FakeClock())
+    assert v.renderable() is None
+    assert "unknown" in v.chip()
+
+
+def test_a_confirmed_rung_renders():
+    v = pm.RemoteModeView(clock=FakeClock())
+    v.on_connected()
+    assert v.confirm(_mode_frame("explore")) is True
+    assert v.renderable().name == "explore"
+    assert "explore" in v.chip()
+
+
+def test_a_reconnect_voids_every_prior_confirmation():
+    """THE slice-5 regression: carrying a rung across a gap the Body cannot
+    vouch for."""
+    v = pm.RemoteModeView(clock=FakeClock())
+    v.on_connected()
+    v.confirm(_mode_frame("watch"))
+    v.on_connected()
+    assert v.renderable() is None, "a rung survived a reconnect"
+
+
+def test_a_drop_unconfirms_without_advancing_the_epoch():
+    """A park is a pause. Advancing the epoch would let an in-flight frame
+    from this connection confirm the next one."""
+    v = pm.RemoteModeView(clock=FakeClock())
+    v.on_connected()
+    v.confirm(_mode_frame("watch"))
+    before = v.snapshot()["epoch"]
+    v.on_disconnected()
+    assert v.renderable() is None
+    assert v.snapshot()["epoch"] == before
+
+
+def test_an_unknown_rung_is_refused_not_echoed():
+    """A Body echoing a name it cannot interpret shows the operator a word
+    rather than a state."""
+    v = pm.RemoteModeView(clock=FakeClock())
+    v.on_connected()
+    assert v.confirm(_mode_frame("turbo_mode")) is False
+    assert v.renderable() is None
+
+
+def test_a_malformed_frame_is_refused():
+    v = pm.RemoteModeView(clock=FakeClock())
+    v.on_connected()
+    for junk in (None, "mode", {}, {"kind": "telemetry", "position": "watch"},
+                 {"kind": "mode"}):
+        assert v.confirm(junk) is False
+
+
+def test_the_view_cannot_decide_a_rung_only_report_one():
+    """Not a second dial — authority stays where the enforcement is."""
+    assert not hasattr(pm.RemoteModeView, "request")
+    assert not hasattr(pm.RemoteModeView, "cycle")
+
+
+def test_refused_renders_are_counted_for_the_operator():
+    v = pm.RemoteModeView(clock=FakeClock())
+    v.renderable(); v.renderable()
+    assert v.snapshot()["stale_renders_refused"] >= 2
+
+
+# -- the frame ------------------------------------------------------------
+
+
+def test_the_mode_frame_carries_the_composition(monkeypatch):
+    """The Body renders 'composed' from the Engine's fact rather than
+    inferring who is attached to a machine it cannot see."""
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+    c = pm.get_controller()
+    c.request("mac", "watch")
+    c.request("desktop", "safe_auto")
+    f = pm.build_mode_frame(seq=7, node_id="engine")
+    assert f["kind"] == "mode" and f["position"] == "watch"
+    assert f["composed"] is True and f["distinct"] == 2
+
+
+def test_mode_is_a_known_frame_kind():
+    from backend.core.ouroboros.governance import link_transport as tx
+    assert tx.is_known_kind(tx.KIND_MODE)
+
+
+def test_mode_is_not_carried_on_the_lossy_lane():
+    """Telemetry drops its oldest under pressure, and a dropped mode frame
+    leaves the Body rendering an autonomy level the Engine has left."""
+    from backend.core.ouroboros.governance import link_session as ls
+    assert "mode" not in {k for k in ls.ORDERED_KINDS}
+    import inspect
+    assert "put_high" in inspect.getsource(ls.LinkSessionLoop.publish_mode)
+
+
+# -- session integration --------------------------------------------------
+
+
+def _loop(node="engine"):
+    from backend.core.ouroboros.governance import link_session as ls
+    return ls.LinkSessionLoop(
+        ls.SessionConfig(node_id=node, session_id="s-1"))
+
+
+def test_publishing_is_edge_triggered(monkeypatch):
+    """A rung is a state, not a measurement — restating it spends the
+    link's budget on a fact the peer already holds."""
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+    pm.get_controller().request("mac", "explore")
+    loop = _loop()
+    assert loop.publish_mode() is True
+    assert loop.publish_mode() is False
+    pm.get_controller().request("mac", "watch")
+    assert loop.publish_mode() is True
+
+
+def test_a_fresh_connection_forces_a_republish(monkeypatch):
+    """The peer has invalidated everything and is rendering unknown."""
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+    pm.get_controller().request("mac", "explore")
+    loop = _loop()
+    loop.publish_mode()
+    loop.on_established()
+    assert loop.publish_mode(force=True) is True
+
+
+def test_an_inbound_mode_frame_confirms_the_view():
+    loop = _loop("body")
+    loop.on_established()
+    loop.dispatch(_mode_frame("approval_required"))
+    assert loop.remote_mode.renderable().name == "approval_required"
+
+
+def test_a_park_unconfirms_the_peers_rung():
+    loop = _loop("body")
+    loop.on_established()
+    loop.dispatch(_mode_frame("watch"))
+    loop.park("wifi dropped")
+    assert loop.remote_mode.renderable() is None
+
+
+def test_reconnecting_voids_then_reconfirms():
+    loop = _loop("body")
+    loop.on_established()
+    loop.dispatch(_mode_frame("watch"))
+    loop.park("drop")
+    loop.on_established()
+    assert loop.remote_mode.renderable() is None
+    loop.dispatch(_mode_frame("safe_auto"))
+    assert loop.remote_mode.renderable().name == "safe_auto"
+
+
+def test_the_session_snapshot_reports_the_remote_view():
+    import json
+    loop = _loop("body")
+    snap = loop.snapshot()
+    json.dumps(snap)
+    assert "remote_mode" in snap

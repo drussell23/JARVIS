@@ -76,6 +76,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from backend.core.ouroboros.governance import link_protocol as proto
+from backend.core.ouroboros.governance import proactive_mode as proto_mode
 from backend.core.ouroboros.governance import link_transport as tx
 from backend.core.ouroboros.governance.link_outbox import LinkOutbox
 
@@ -334,6 +335,11 @@ class LinkSessionLoop:
         self._handshake_in_flight: Optional[Tuple[int, str]] = None
         self._resyncs = 0
         self._parks = 0
+        #: §30 slice 5 — what the PEER's dial says. Confirmation-gated, so a
+        #: reconnect invalidates it until the Engine speaks again. Owned here
+        #: rather than globally because it is a property of THIS session.
+        self.remote_mode = proto_mode.RemoteModeView()
+        self._last_mode_sent: Optional[str] = None
 
     # -- state -----------------------------------------------------------
 
@@ -483,6 +489,13 @@ class LinkSessionLoop:
         seq = record.get("seq")
         if not isinstance(seq, int):
             return []
+        if kind == tx.KIND_MODE:
+            # Confirmed BEFORE the control return below, so a mode frame can
+            # never be counted as seen without also being applied — the two
+            # would drift and the Body would show a rung it had received and
+            # discarded.
+            self.remote_mode.confirm(record)
+            return [record]
         if kind not in ORDERED_KINDS:
             # Control: acknowledged by having been seen, never ordered and
             # never applied. Returning it lets a caller react (a heartbeat
@@ -526,6 +539,34 @@ class LinkSessionLoop:
         record["node_id"] = self.config.node_id
         self.outbox.put(record)
         self.queue.put_high(record)
+
+    def publish_mode(self, *, force: bool = False) -> bool:
+        """Announce the effective rung to the peer. True when a frame was sent.
+
+        EDGE-TRIGGERED, not periodic. A rung is a state, not a measurement,
+        so re-sending an unchanged one would spend the link's budget
+        restating a fact the peer already holds. ``force`` exists for the
+        one case where the peer's knowledge is genuinely void: a fresh
+        connection, where the Body has invalidated everything and is
+        rendering *unknown* until told.
+
+        Sent on the HIGH lane: a mode frame is governance, not telemetry.
+        The lossy lane would drop it under exactly the pressure that makes
+        an accurate autonomy display matter most.
+        """
+        try:
+            frame = proto_mode.build_mode_frame(
+                seq=self.next_seq(), node_id=self.config.node_id,
+                lamport=(self._session.clock.tick() if self._session else 0),
+            )
+            if not force and frame["position"] == self._last_mode_sent:
+                return False
+            self.queue.put_high(frame)
+            self._last_mode_sent = str(frame["position"])
+            return True
+        except Exception:  # noqa: BLE001 — the dial never breaks the link
+            logger.debug("[LinkSession] mode publish degraded", exc_info=True)
+            return False
 
     def send_telemetry(self, payload: Dict[str, Any]) -> bool:
         """Queue a telemetry frame. Lossy by contract, never durable."""
@@ -624,6 +665,10 @@ class LinkSessionLoop:
         """
         self.registry.detach(self.config.session_id)
         self._handshake_in_flight = None
+        # The peer's rung is no longer confirmable. NOT void — a park is a
+        # pause, and advancing the epoch here would let an in-flight frame
+        # from this connection confirm the next one.
+        self.remote_mode.on_disconnected()
         self._transition(SessionState.PARKED, reason)
 
     def reconnect_delay_s(self) -> float:
@@ -636,6 +681,11 @@ class LinkSessionLoop:
         return proto.backoff_delay_s(self._attempt)
 
     def on_established(self) -> None:
+        # A new connection voids every prior confirmation: the Body renders
+        # *unknown* until the Engine speaks, rather than carrying a rung
+        # across a gap it cannot vouch for.
+        self.remote_mode.on_connected()
+        self._last_mode_sent = None
         self._attempt = 0
         self.breaker.on_established(self.config.node_id)
 
@@ -655,6 +705,7 @@ class LinkSessionLoop:
             "outbox": self.outbox.stats().to_dict(),
             "liveness": self.liveness.snapshot(),
             "reassembly": self.reassembly.snapshot(),
+            "remote_mode": self.remote_mode.snapshot(),
             "registry": self.registry.snapshot(),
             "breaker": self.breaker.snapshot(),
         }

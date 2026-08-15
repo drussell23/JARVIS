@@ -86,11 +86,20 @@ KIND_COMMAND = "command"
 KIND_VERDICT = "verdict"
 KIND_RESUME = "resume"
 KIND_RESUME_PLAN = "resume_plan"
+#: PRD §30 slice 5 — the Engine's effective proactive-mode rung.
+#:
+#: Its own kind rather than a telemetry payload, for two reasons. Telemetry
+#: is LOSSY by contract (§29.4): the lane drops its oldest under pressure,
+#: and a dropped mode frame would leave the Body rendering an autonomy level
+#: the Engine has left. And a mode frame must be legible to the reader
+#: BEFORE any dispatch — it changes what the operator is being told the
+#: organism may do, which is not a thing to discover after a queue.
+KIND_MODE = "mode"
 
 _KNOWN_KINDS = frozenset({
     KIND_HELLO, KIND_WELCOME, KIND_HEARTBEAT, KIND_HEARTBEAT_ACK,
     KIND_TELEMETRY, KIND_COMMAND, KIND_VERDICT, KIND_RESUME,
-    KIND_RESUME_PLAN,
+    KIND_RESUME_PLAN, KIND_MODE,
 })
 
 
