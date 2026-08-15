@@ -27,9 +27,36 @@ __verb_help__ = {
 
 _ENV_MIN_TIER = "JARVIS_MIN_RISK_TIER"
 
-#: The dial's positions, loosest → strictest. ``safe_auto`` is the
-#: no-floor resting state (green ops auto-apply as classified).
-_CYCLE = ("safe_auto", "notify_apply", "approval_required")
+#: The dial POSITION, distinct from the floor it asserts. Two rungs may
+#: assert one floor (`explore` and `watch` both floor at approval_required)
+#: and must still be distinguishable to the operator.
+_ENV_DIAL_POSITION = "JARVIS_PROACTIVE_MODE_POSITION"
+
+#: The dial's positions. When PRD §30's ladder is enabled these come from
+#: `proactive_mode.reachable()` — computed from live capability, so a rung
+#: the host cannot honour is never offered. Master-off, the shipped three
+#: remain, byte-identically.
+#:
+#: NOT a second vocabulary: `proactive_mode.LADDER` is the single source and
+#: this is a projection of it. Two tuples that could disagree is how the dial
+#: and the gate start meaning different things by the same word.
+_LEGACY_CYCLE = ("safe_auto", "notify_apply", "approval_required")
+
+
+def _cycle_positions() -> tuple:
+    """Reachable rung names, loosest → strictest. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance import proactive_mode as _pm
+        if _pm.is_enabled():
+            return tuple(p.name for p in _pm.reachable())
+    except Exception:  # noqa: BLE001 — the dial must survive §30 being absent
+        pass
+    return _LEGACY_CYCLE
+
+
+#: Retained for the module's own membership checks; the LIVE set is
+#: `_cycle_positions()`.
+_CYCLE = _LEGACY_CYCLE
 
 _GLYPH = {
     "safe_auto": "🟢",
@@ -64,8 +91,12 @@ class TrustReplDispatchResult:
 
 def current_floor() -> str:
     """The dial's position, normalized. NEVER raises."""
+    positions = _cycle_positions()
+    dial = os.environ.get(_ENV_DIAL_POSITION, "").strip().lower()
+    if dial in positions:
+        return dial
     raw = os.environ.get(_ENV_MIN_TIER, "").strip().lower()
-    return raw if raw in _CYCLE else "safe_auto"
+    return raw if raw in positions else "safe_auto"
 
 
 def floor_chip() -> str:
@@ -74,10 +105,13 @@ def floor_chip() -> str:
     tier = current_floor()
     if tier == "safe_auto":
         return ""
-    return f"{_GLYPH.get(tier, '')}⛨ {tier}"
+    return f"{_glyph_for(tier)}⛨ {tier}"
 
 
 def _describe(tier: str) -> str:
+    rung = _rung(tier)
+    if rung is not None:
+        return rung.summary
     return {
         "safe_auto": "no floor — green auto-applies, yellow previews, "
                      "orange waits for you",
@@ -88,13 +122,46 @@ def _describe(tier: str) -> str:
     }.get(tier, tier)
 
 
+def _rung(name: str):
+    """The ladder rung for a dial position, or None. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance import proactive_mode as _pm
+        if _pm.is_enabled():
+            return _pm.position(name)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _glyph_for(tier: str) -> str:
+    rung = _rung(tier)
+    return rung.glyph if rung is not None else _GLYPH.get(tier, "")
+
+
 def _set_floor(tier: str) -> str:
-    if tier == "safe_auto":
+    """Move the dial. Writes the rung's RISK FLOOR, never its name.
+
+    Load-bearing distinction. `explore` and `watch` are ladder positions, not
+    risk tiers — `risk_tier_floor` accepts only
+    ``safe_auto|notify_apply|approval_required``, so writing "explore" into
+    ``JARVIS_MIN_RISK_TIER`` would leave the floor UNPARSEABLE and silently
+    resolve to no floor at all: the strictest rungs on the dial would become
+    the loosest in effect. `Position.risk_floor` exists exactly to carry this
+    mapping, and both new rungs assert ``approval_required``.
+    """
+    rung = _rung(tier)
+    floor = rung.risk_floor if rung is not None else (
+        None if tier == "safe_auto" else tier)
+    if floor is None:
         os.environ.pop(_ENV_MIN_TIER, None)
     else:
-        os.environ[_ENV_MIN_TIER] = tier
-    logger.info("[Trust] risk-tier floor -> %s", tier)
-    return f"{_GLYPH.get(tier, '')} trust dial → {tier}: {_describe(tier)}"
+        os.environ[_ENV_MIN_TIER] = floor
+    # The dial's own position is remembered separately from the floor it
+    # asserts, so `explore` and `approval_required` stay distinguishable
+    # even though they assert the same floor.
+    os.environ[_ENV_DIAL_POSITION] = tier
+    logger.info("[Trust] dial -> %s (risk floor %s)", tier, floor or "none")
+    return f"{_glyph_for(tier)} trust dial → {tier}: {_describe(tier)}"
 
 
 def dispatch_trust_command(line: str) -> TrustReplDispatchResult:
@@ -111,11 +178,26 @@ def dispatch_trust_command(line: str) -> TrustReplDispatchResult:
             return TrustReplDispatchResult(ok=True, text=_HELP)
 
         if sub == "cycle":
-            here = _CYCLE.index(current_floor())
-            nxt = _CYCLE[(here + 1) % len(_CYCLE)]
-            return TrustReplDispatchResult(ok=True, text=_set_floor(nxt))
+            # CLAMPED, never wrapped (PRD §30.11 Q2, operator decision).
+            # Wrapping means one accidental keypress moves from maximum
+            # caution to maximum autonomy; a dial whose worst misfire is
+            # "nothing happened" is strictly better than one whose worst
+            # misfire is "everything is permitted".
+            positions = _cycle_positions()
+            here = (positions.index(current_floor())
+                    if current_floor() in positions else 0)
+            if here >= len(positions) - 1:
+                tier = positions[here]
+                return TrustReplDispatchResult(
+                    ok=True,
+                    text=(f"{_glyph_for(tier)} trust: already at the "
+                          f"strictest position ({tier}) — cycle does not "
+                          f"wrap. Set a looser one by name."),
+                )
+            return TrustReplDispatchResult(
+                ok=True, text=_set_floor(positions[here + 1]))
 
-        if sub in _CYCLE:
+        if sub in _cycle_positions():
             return TrustReplDispatchResult(ok=True, text=_set_floor(sub))
 
         if sub in ("", "status"):
@@ -135,7 +217,7 @@ def dispatch_trust_command(line: str) -> TrustReplDispatchResult:
             tail = f"  ({', '.join(extras)})" if extras else ""
             return TrustReplDispatchResult(
                 ok=True,
-                text=(f"{_GLYPH.get(tier, '')} trust: {tier} — "
+                text=(f"{_glyph_for(tier)} trust: {tier} — "
                       f"{_describe(tier)}{tail}"),
             )
 
