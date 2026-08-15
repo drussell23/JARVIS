@@ -85,3 +85,44 @@ class TestTrinityRouting:
                "backend/core/ouroboros/cli/trinity_launcher.py").read_text()
         assert "os.system(" not in src           # no os.system CALL
         assert "start_new_session=True" in src   # detached, no orphan
+
+
+class TestInterpreterAuthority:
+    """Whoever launches the child decides which Python runs it.
+
+    Observed 2026-08-15: a Python 3.9.6 `.venv` left in the repo in March
+    captured every `trinity up`. `_service_python()` correctly selected the
+    hermetic 3.11.10 interpreter, `unified_supervisor._ensure_venv_python()`
+    re-exec'd out of it into the stale one, and the backend died in 1.9s on
+    `ModuleNotFoundError: uuid6`. From outside, `trinity status` could only
+    say ZOMBIE/DEADLOCKED — a process that never bound its transports and one
+    that wedged are indistinguishable.
+    """
+
+    def test_the_service_env_disables_the_childs_own_venv_reexec(self):
+        """Two authorities on one question means the loser is whoever ran
+        first. The launcher has already chosen, so the child must not."""
+        assert tl._service_env().get("JARVIS_SKIP_VENV_CHECK") == "1"
+
+    def test_the_hermetic_interpreter_is_preferred_when_it_exists(
+            self, tmp_path, monkeypatch):
+        """Executed against a real file on disk, not a mocked predicate:
+        `venv_exists` tests for an executable bit, and a fake that answers
+        True for a path with no binary would prove nothing."""
+        fake = tmp_path / "bin" / "python"
+        fake.parent.mkdir(parents=True)
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o755)
+        monkeypatch.setattr(
+            "backend.core.ouroboros.cli.trinity_env.venv_dir",
+            lambda: tmp_path)
+        assert tl._service_python() == str(fake)
+
+    def test_it_falls_back_to_the_current_interpreter_when_absent(
+            self, tmp_path, monkeypatch):
+        """A missing hermetic venv is not a reason to refuse to boot."""
+        import sys
+        monkeypatch.setattr(
+            "backend.core.ouroboros.cli.trinity_env.venv_dir",
+            lambda: tmp_path / "nope")
+        assert tl._service_python() == sys.executable
