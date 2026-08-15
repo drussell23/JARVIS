@@ -507,6 +507,82 @@ class ProactiveModeController:
 
 
 @dataclass(frozen=True)
+class Composition:
+    """How the effective rung was arrived at, for the operator to read.
+
+    The AMBIENT surfaces render the effective rung, because that is the
+    truth about the organism. Whether a given operator is being overridden
+    is a fact about THEIR screen, not about the organism, so it is answered
+    per-cockpit by :func:`override_notice` rather than baked into the shared
+    line — the same split §25.1 draws when it renders ambient content to the
+    minimum width while each cockpit keeps its own.
+    """
+
+    effective: str
+    glyph: str
+    #: Distinct rungs requested across live cockpits. >1 means composed.
+    distinct: int
+    #: Live requests, attached or within grace.
+    voters: int
+    composed: bool
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"effective": self.effective, "glyph": self.glyph,
+                "distinct": self.distinct, "voters": self.voters,
+                "composed": self.composed}
+
+
+def composition() -> Composition:
+    """Summarise how the current rung was decided. NEVER raises."""
+    try:
+        ctl = get_controller()
+        eff = ctl.effective()
+        names = {r["name"] for r in ctl.requests()}
+        return Composition(
+            effective=eff.name, glyph=eff.glyph,
+            distinct=len(names), voters=len(ctl.requests()),
+            composed=len(names) > 1,
+        )
+    except Exception:  # noqa: BLE001
+        return Composition("safe_auto", "", 0, 0, False)
+
+
+def override_notice(cockpit_id: str) -> str:
+    """What THIS cockpit should be told about its own request, or "".
+
+    Empty when the cockpit is not being overridden — the common case, and a
+    surface that shouted on every frame would be ignored by the third frame.
+
+    Non-empty when this operator asked for something LOOSER than the
+    organism is running. That is the case §30.6 exists for: today the last
+    writer wins silently, so an operator can tighten the organism and have a
+    colleague loosen it with neither seeing. Being told "your request is not
+    what is in force, and here is what is" is the whole difference between a
+    dial an operator trusts and one they stop touching.
+
+    The inverse — this cockpit is the STRICTEST and is therefore what
+    everyone else is getting — is deliberately silent. It is not news to the
+    operator who asked for it, and saying so on every frame would spend the
+    line's attention budget on a non-event.
+    """
+    try:
+        ctl = get_controller()
+        cid = str(cockpit_id or "?")
+        mine = next((r for r in ctl.requests()
+                     if r["cockpit_id"] == cid), None)
+        if mine is None:
+            return ""
+        eff = ctl.effective()
+        asked = position(mine["name"])
+        if asked.rank >= eff.rank:
+            return ""
+        return (f"{eff.glyph} {eff.name} in force "
+                f"(you asked {asked.glyph} {asked.name})")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+@dataclass(frozen=True)
 class MutationVerdict:
     """Whether the current rung permits a candidate to reach VALIDATE."""
 
