@@ -6706,6 +6706,46 @@ class GovernedLoopService:
                     exc_info=True,
                 )
 
+            # PRD §30.11 Q4: READ the dial this checkout persisted.
+            #
+            # `ProactiveModeStore.remember()` wrote `.jarvis/proactive_mode.
+            # json` and NOTHING read it back — a write surface with no read
+            # surface. The operator set a rung, the file recorded it, and the
+            # controller kept answering with its in-memory default. Enabling
+            # the ladder therefore resolved to `safe_auto` (grants mutation)
+            # while the persisted judgement said `explore` (withholds it):
+            # the dial appeared to work and inverted its own meaning.
+            #
+            # Hydrated HERE because this is where the organism acquires the
+            # authority the dial governs. Registered as a standing voter
+            # rather than assigned, so it composes through the same
+            # strictest-wins path every cockpit uses — one composition rule,
+            # not a privileged back door. To loosen it an operator sets the
+            # dial, which persists, which moves this floor; the loop closes
+            # through the surface that already exists.
+            #
+            # Before `_bg_pool` can emit: a rung that withholds INITIATIVE
+            # must be in force before anything can take any.
+            try:
+                from backend.core.ouroboros.governance.proactive_mode_store import (  # noqa: E501,PLC0415
+                    get_store as _pm_store,
+                )
+                from backend.core.ouroboros.governance.proactive_mode import (  # noqa: E501,PLC0415
+                    PERSISTED_DIAL_VOTER_ID as _pm_voter,
+                    get_controller as _pm_controller,
+                )
+                _rung = await _pm_store().hydrate()
+                _eff = _pm_controller().request(_pm_voter, _rung)
+                logger.info(
+                    "[GLS] proactive dial hydrated: persisted=%s effective=%s",
+                    _rung, getattr(_eff, "name", _eff))
+            except Exception:  # noqa: BLE001 — a dial fault must not block boot
+                # Degrades to the controller default, which is the behaviour
+                # that shipped before this hydrate existed. Never to a LOOSER
+                # rung than the file asked for by guessing.
+                logger.debug(
+                    "[GLS] proactive dial hydrate skipped", exc_info=True)
+
             # PRD §27.5: bind the in-flight op registry for `/why`.
             #
             # An operator asks about the op they are WATCHING, which is by

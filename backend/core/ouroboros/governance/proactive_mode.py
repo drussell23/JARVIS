@@ -810,6 +810,20 @@ _singleton: Optional[ProactiveModeController] = None
 _singleton_lock = threading.Lock()
 
 
+#: Voter id for the rung this CHECKOUT persisted, hydrated at boot.
+#:
+#: A named constant rather than a literal at the call site because two
+#: spellings would register two voters — and under strictest-wins a stale
+#: duplicate can only ever make the organism quieter than the operator asked
+#: for, which is the failure that hides itself.
+#:
+#: Distinct from any cockpit id so the standing judgement and a live
+#: cockpit's request compose instead of overwriting each other: the file says
+#: what this repository is allowed to do, the cockpit says what the person
+#: watching wants right now, and the stricter of the two wins.
+PERSISTED_DIAL_VOTER_ID: str = "__persisted_dial__"
+
+
 def get_controller() -> ProactiveModeController:
     global _singleton
     with _singleton_lock:
