@@ -3779,3 +3779,172 @@ reproduced or root-caused here — `_transcript_search_rows` and
 `transcript_hatches` are the indicated starting points and remain unaudited.
 
 ---
+
+## 29. The Distributed Body/Engine Link *(NEW 2026-08-15)*
+
+> **Operator binding (2026-08-15)**: *"The Body (audio/vision/UI handling
+> CoreAudio and AppKit) will remain live on the Mac as the sensor edge node,
+> while the Engine runs entirely on the remote Windows WSL2 compute cluster.
+> This is strictly a distributed, two-machine architecture traversing an
+> external network."*
+
+### 29.1 Why the split falls where it does
+
+It is not a preference. §28's dependency audit measured it: **Quartz 151
+files, AppKit 82, CoreAudio 62, sounddevice 41, ApplicationServices 35.**
+Those are macOS frameworks with no Windows counterpart under any strategy —
+not a port, a rewrite. Meanwhile the engine's POSIX coupling is **11 files
+importing `fcntl`, 7 using Unix sockets, 9 referencing `SIGHUP`**, and 4 of
+those `fcntl` importers are the lock primitives themselves.
+
+So one half of this system cannot leave the Mac and the other half is
+already portable. The Trinity splits along the seam CLAUDE.md drew for it —
+`JARVIS (Body) <--HTTP/WS--> J-Prime (Mind)` — because that is where the
+dependency mass actually divides.
+
+The physical asymmetry makes the same case: a 16 GB M1 with unified memory
+shares one pool between the model, the CoreAudio graph and the vision
+pipeline (§27's `local_model_admission` exists because of it). A 32 GB
+discrete accelerator with 64 GB of host RAM beside it does not. The Body
+belongs where the sensors are; the weights belong where the VRAM is.
+
+### 29.2 What the link is not
+
+**Not a filesystem share.** No remote mount, no synced directory. The Body
+sends intent and receives verdicts; the repository is cloned on both ends and
+reconciled by git, as it always was.
+
+**Not a request/response RPC.** O+V is proactive: the Engine originates work
+from 16 sensors without being asked. A protocol shaped around "the Body
+calls, the Engine answers" would have no way to express the majority of what
+crosses this link.
+
+**Not one channel.** §29.4 splits it into three, because the three kinds of
+traffic want contradictory guarantees and a uniform channel would have to
+pick a loser.
+
+### 29.3 The two problems that make this hard
+
+Both are consequences of the machines being genuinely separate, and both are
+invisible on a loopback socket — which is why the local `cockpit_attach`
+transport, correct as it is, cannot simply be pointed at a remote host.
+
+**The clocks are not comparable.** A WSL2 guest's wall clock drifts against
+its host, and against the Mac, and re-syncs on its own schedule after
+suspend/resume. Any rule of the form "reject frames older than N seconds"
+evaluated across that boundary is a random number generator.
+
+> **Rule.** A timestamp that crosses a machine boundary is **data, never a
+> clock.** Ordering uses a Lamport clock; durations use each side's own
+> `time.monotonic()` and are never differenced against the peer's. A remote
+> wall-clock stamp may be *displayed* and may never reach a decision.
+
+**Availability is nobody's to assume.** A laptop on Wi-Fi roams between
+access points; an overlay network re-keys; a host sleeps. §26.6 already
+established that a detached operator's *absence* must not read as *refusal*
+— across a network that principle acquires teeth, because now the link
+itself can produce absence.
+
+> **Rule.** A partition is a **pause**, never a rejection and never a loss.
+> Both ends park; neither infers a verdict from silence.
+
+### 29.4 Three lanes, three contracts
+
+| Lane | Traffic | Contract | Substrate |
+|---|---|---|---|
+| **Telemetry** | phase, cost, deck rows, token stream | **Lossy, latest-wins** — drop oldest, coalesce, *count and surface* the drop | `ide_observability_stream` — bounded broker, `Last-Event-ID` replay, drop-oldest → one `stream_lag`, heartbeat |
+| **Command / verdict** | approve, reject, `ask_human` answers, op verdicts | **At-least-once delivery + idempotent application** = exactly-once *effect* | `durable_io` (`atomic_replace` + fsync discipline) under a per-side outbox; `link_protocol.DeliveryLedger` at the sink |
+| **Evidence** | postmortems, spine milestones, attention accounting | **Durable, ordered, eventually consistent** | transcript spine `seq` — pull by range, idempotent by construction |
+
+Exactly-once *delivery* is unachievable over an unreliable link and is not
+attempted. Exactly-once *effect* is achievable and is the difference between
+a protocol that works and one that hopes.
+
+### 29.5 `link_protocol.py` — the shared core
+
+Pure logic: clocks, sequence arithmetic, admission decisions, resume
+planning. No socket, no asyncio, no transport. Both ends import the **same**
+module, so the two sides cannot drift apart on the rules by being written
+twice. A distributed protocol whose correctness can only be observed by
+running two machines is one that will be debugged in production; this is the
+half that is provable at a desk.
+
+**`LogicalClock`** — Lamport. Local events tick; received frames set
+`max(local, remote) + 1`. Guarantees the only ordering that survives drift:
+if A caused B then `A.lamport < B.lamport`. The converse deliberately does
+not hold — concurrency is a real property of a distributed system, and a
+protocol that totally orders genuinely-concurrent events has invented
+information. Ties break on `node_id` so both ends render one history
+identically without either wall clock.
+
+**`SessionRegistry`** — session identity is separate from connection
+identity. This is the *root-cause* fix for flapping, and the breaker below is
+only damage control. Fifty reconnects exhaust an Engine solely because each
+*connection* allocates a session, a queue and a task. If a reconnect
+allocates nothing — same session, same ledger, same clock, resumed by
+sequence — flapping stops being a resource question and becomes a latency
+one. Detached sessions are held for an idle window, so a Wi-Fi drop is a
+pause: the op stays parked, the verdict stays queued. Expiry is lazy, because
+a reaper task is one more thing to keep alive on a loop with real work.
+
+**`FlapBreaker`** — per-identity rolling-window admission, decided **before**
+any resource is committed. Client-side backoff is necessary and insufficient:
+it is advice the client may fail to follow, and a client already misbehaving
+is precisely the one that will not. `retry_after_s` is returned so a
+cooperative peer converges instead of guessing. Bounded by a hard identity
+cap, not only by staleness — a peer cycling session ids produces thousands of
+*fresh* entries inside one window, none stale, and an unbounded map on a
+network-reachable service is a memory-exhaustion vector reached by the exact
+traffic pattern the class exists to survive.
+
+**`plan_resume`** — four outcomes, and the third is what keeps the link
+honest. `CONTINUE` (current), `REPLAY` (gap inside retention), **`RESYNC`**
+(gap older than anything retained — the Engine *cannot* close it, and
+resuming from the oldest retained record would silently drop everything
+before it, so the Body is told to rebuild from a snapshot), `REJECT` (the
+peer claims to have applied more than the Engine emitted — a stale session id
+after a restart, or two Bodies sharing an identity; serving it corrupts
+both).
+
+**`DeliveryLedger`** — idempotent application, and the **contiguous**
+applied watermark. Tracking the highest sequence *seen* would advance past a
+hole; the resume would never ask for it; the loss would be permanent and
+invisible — the worst shape a data-loss bug can take. A handler that raises
+leaves the frame unrecorded so redelivery retries it, because recording
+before running converts a transient fault into silent loss.
+
+### 29.6 Transport and trust
+
+No hardcoded addresses or ports — pinned by test. The Engine binds a
+port supplied by configuration and the Body resolves the peer by **name**
+over the overlay network (Tailscale/ZeroTier), which is what makes the pair
+portable between premises without either end learning an IP.
+
+mTLS is not optional here. One end of this link is an autonomous agent that
+mutates code and runs `bash`; the certificate material already exists at
+`.jarvis/brain_mtls/` (`ca.pem`, `client-{cert,key}.pem`,
+`server-{cert,key}.pem`). The overlay network provides the tunnel; mTLS
+provides the *identity*, and only the second one answers "which Body is
+this?" after a session id is replayed.
+
+Payload limits are negotiated at handshake rather than declared: both ends
+advertise a maximum frame size and the **minimum wins** — the same asymmetry
+§25.1 applies to terminal width, and for the same reason. A ceiling one side
+cannot honour is not a limit, it is a fault waiting for a large frame.
+
+### 29.7 What remains
+
+`link_protocol.py` is the provable half. The transport half — a wire codec
+over the mTLS channel, the per-side durable outbox on `durable_io`, the SSE
+lane bridged to a remote subscriber, and the handshake that negotiates limits
+— is the next slice, and it is the half that cannot be finished honestly
+until both machines exist. Master switch `JARVIS_LINK_BRIDGE_ENABLED`,
+default false.
+
+The fault-injection spine follows §28's discipline: kill the link mid-verdict
+and assert exactly-once *effect*; partition during a live review and assert
+the op **parks** with no evidence recorded in either direction (§27.3.2);
+force a replay gap wider than retention and assert `RESYNC` rather than a
+silent partial resume.
+
+---

@@ -1,0 +1,44 @@
+# Line endings — normalise in the repository, check out LF everywhere.
+#
+# This repo is developed on macOS and Linux (WSL2) simultaneously. Without
+# this file a checkout made by Git-for-Windows at `core.autocrlf=true`
+# rewrites every file with CRLF, which breaks shebangs (`#!/usr/bin/env
+# python3\r` is not an interpreter), shell scripts, and any test that
+# compares file bytes. The failure is silent at checkout and loud at run
+# time, on a machine that has not yet run anything successfully.
+#
+# `text=auto eol=lf` normalises on commit and checks out LF on every
+# platform, so the working tree is byte-identical on the Mac and in WSL2.
+* text=auto eol=lf
+
+# Binary — never touched, never diffed as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.whl binary
+*.gguf binary
+*.onnx binary
+*.npz binary
+*.pt binary
+*.pth binary
+*.bin binary
+*.dylib binary
+*.so binary
+*.dll binary
+*.pyc binary
+*.wav binary
+*.mp3 binary
+*.mp4 binary
+*.mov binary
+
+# Windows-native scripts keep CRLF — cmd.exe and PowerShell require it.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
