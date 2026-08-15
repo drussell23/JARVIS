@@ -172,6 +172,11 @@ class _Scan:
 
 #: Where the package DECLARES its console entry points. Read rather than
 #: transcribed: a script added tomorrow becomes a root with no edit here.
+#: The dispatch registry's own naming convention — named once,
+#: because the audit and the registry must agree about what a verb
+#: module looks like or the audit invents orphans out of them.
+_REPL_SUFFIX = "_repl"
+
 _PYPROJECT = "pyproject.toml"
 
 #: Scripts invoked directly rather than imported. The battle-test harness is
@@ -284,34 +289,55 @@ def _is_run_guard(test: ast.AST) -> bool:
     return "__name__" in names and _RUN_GUARD_LITERAL in literals
 
 
-def _cage_mounted(index: Mapping[str, "Path"]) -> List[str]:
-    """Modules the naming cage mounts as REPL verbs. NEVER raises.
+def _dispatch_mounted(index: Mapping[str, "Path"],
+                      scan: Optional["_Scan"] = None) -> List[str]:
+    """Modules `repl_dispatch_registry` routes a verb to. NEVER raises.
 
-    THE BLIND SPOT THIS INSTRUMENT WOULD OTHERWISE HAVE ACQUIRED. A
-    ``governance/<verb>_repl.py`` that exports ``__verb_help__`` and
-    ``dispatch_<verb>_command`` is the verb ``/<verb>``, and the cage reaches
-    it with ``importlib.import_module`` — an edge no AST walker can see. The
-    fix that made those modules reachable by a human therefore made them
-    unreachable by this audit, and every one of them, plus its whole
-    subtree, would have started reporting as an orphan.
+    THE BLIND SPOT THIS AUDIT WOULD OTHERWISE HAVE. The registry discovers
+    every module-level ``dispatch_<verb>_command`` by filename convention and
+    reaches it with a dynamic import — an edge no AST walker can see. Without
+    this, all 88 routed verbs and their whole subtrees read as orphans, and
+    the instrument would report the cockpit's largest mounted surface as dead
+    code.
 
-    That is the fourth import shape this audit could not spell, after entry
+    It is the fourth import shape this audit could not spell, after entry
     points, ``scripts/`` and relative imports — and the same disease each
     time: an edge the extractor cannot see becomes an absence it reports as
-    a finding.
+    a finding. It is also the shape that fooled ME: grepping for a verb's
+    name found nothing and I concluded the verb was unmounted, when a dynamic
+    mount is invisible to grep by construction.
 
-    A dynamic import is legible here only because the cage DECLARES its
-    mounts: ``discover()`` is a static AST scan that imports nothing, so
-    this asks the cage what it will mount rather than guessing. A dynamic
-    import with no declaration remains invisible, and correctly so — nothing
-    in the repo could see it either.
+    DETECTED, NOT ASKED. Importing the registry would prime it, which imports
+    every verb module — and this audit's contract is that it never imports
+    the code it measures, precisely so it stays safe against a module that
+    would explode on import. So the registry's own documented convention is
+    matched statically: for ``X_repl.py`` the verb is ``X``, for
+    ``pkg/repl.py`` it is ``pkg``, and a module-level ``dispatch_<verb>_
+    command`` is what makes it routed. Filename-gated first, so this parses
+    ~70 candidates rather than the whole package.
     """
-    try:
-        from backend.core.ouroboros.governance.repl_verb_cage import discover
-
-        return [spec.module for spec in discover() if spec.module in index]
-    except Exception:  # noqa: BLE001 — an absent cage is not a finding
-        return []
+    scan = scan or _Scan()
+    out: List[str] = []
+    for module, path in index.items():
+        stem = path.stem
+        if stem == "repl":
+            verb = path.parent.name
+        elif stem.endswith(_REPL_SUFFIX):
+            verb = stem[: -len(_REPL_SUFFIX)]
+        else:
+            continue
+        if not verb:
+            continue
+        tree = scan.tree(path)
+        if tree is None:
+            continue
+        want = f"dispatch_{verb}_command"
+        for stmt in getattr(tree, "body", ()):
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+                    stmt.name == want):
+                out.append(module)
+                break
+    return out
 
 
 def _script_reached(base: "Path", index: Mapping[str, "Path"],
@@ -365,7 +391,7 @@ def derived_entries(base: "Path",
         ("script", _pyproject_entry_modules(base)),
         ("runnable", _main_guarded(index, scan)),
         ("soak", _script_reached(base, index, scan)),
-        ("verb", _cage_mounted(index)),
+        ("verb", _dispatch_mounted(index, scan)),
     ):
         for module in modules:
             if module in index and module not in seen:

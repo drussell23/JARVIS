@@ -254,17 +254,20 @@ class TestTheInstrumentMeasuresTheGraphItReportsOn:
         orphans = {m.short for m in reading.orphans()}
         assert "transcript_timeline" not in orphans
 
-    def test_a_cage_mounted_verb_counts_as_an_entry_point(self):
-        """A dynamic import is legible because the cage DECLARES it.
+    def test_a_routed_verb_counts_as_an_entry_point(self):
+        """`repl_dispatch_registry` reaches 88 verbs by dynamic import.
 
-        Making those modules reachable by a human made them unreachable by
-        this audit: `importlib.import_module` is an edge no AST walker can
-        see, so every cage-mounted verb and its whole subtree would have
-        started reporting as an orphan.
+        That is an edge no AST walker can see, so without this the whole
+        routed cockpit surface — and every subtree under it — reports as
+        orphaned. It is also the shape that produced a false "unmounted"
+        diagnosis: grep cannot see a dynamic mount.
         """
         graph = sr._index((sr.traversal_root(),))
-        mounted = sr._cage_mounted(graph)
+        mounted = sr._dispatch_mounted(graph, sr._Scan())
         assert any(m.endswith("why_repl") for m in mounted), mounted
+        assert len(mounted) > 50, (
+            f"only {len(mounted)} routed verb modules detected — the "
+            f"registry routes ~88")
         labels = {label for label, _ in sr.derived_entries(
             sr._repo_root(), graph, sr._Scan())}
         assert "verb" in labels
@@ -339,3 +342,59 @@ class TestTheAuditStaysOffTheLoop:
         # off the loop is how one of them ends up not doing it. Read as
         # CODE: the comment saying so would satisfy a raw substring match.
         assert "to_thread" not in code_of(rr.run_watchdog)
+
+
+class TestTheAuditNeverImportsWhatItMeasures:
+    """The contract that makes it safe against a module that would explode.
+
+    Also the reason routed-verb detection is STATIC: asking
+    `repl_dispatch_registry` would prime it, which imports every verb module.
+    """
+
+    def test_routed_verb_detection_parses_rather_than_imports(self):
+        from tests.source_probe import code_of
+
+        code = code_of(sr, "_dispatch_mounted")
+        assert "import_module" not in code
+        assert "prime_registry" not in code
+        assert "ast." in code or "scan.tree" in code
+
+
+class TestAMountedVerbIsProvenByExecution:
+    """The pin that would have caught the false-orphan diagnosis.
+
+    `/reach` and `/why` were declared unmounted on the strength of a grep
+    that found no caller. They were routed the whole time by
+    `repl_dispatch_registry.try_dispatch`, whose mount is dynamic and
+    therefore invisible to grep. "No caller" is an EXECUTION result, never a
+    search result — so this asserts by dispatching.
+    """
+
+    async def test_every_routed_verb_module_answers_its_own_help(self):
+        import inspect
+
+        from backend.core.ouroboros.battle_test import (
+            repl_dispatch_registry as rd,
+        )
+
+        rd.prime_registry()
+        checked = 0
+        for verb, fn in sorted(rd._VERB_TO_DISPATCHER.items()):
+            module = inspect.getmodule(fn)
+            authored = getattr(module, "__verb_help__", None)
+            if not isinstance(authored, dict) or verb not in authored:
+                continue          # only verbs that CLAIM an operator surface
+            outcome = await rd.try_dispatch(f"/{verb} help")
+            assert outcome is not None and outcome.matched, (
+                f"/{verb} declares operator help and is not routed")
+            checked += 1
+        assert checked >= 3, f"only {checked} verbs declare authored help"
+
+    async def test_the_registry_is_awaited_by_the_daemon_surface(self):
+        """A routed table nobody calls is the same defect one level up."""
+        from tests.source_probe import code_of
+
+        from backend.core.ouroboros.battle_test import serpent_flow as sf
+
+        code = code_of(sf)
+        assert "try_dispatch" in code, "the dispatch registry has no caller"

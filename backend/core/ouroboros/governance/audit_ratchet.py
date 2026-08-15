@@ -41,7 +41,8 @@ DECLARING A RATCHET MOUNTS ITS WATCHDOG
 ---------------------------------------
 A ``*_repl`` module that exposes a module-level ``RATCHET`` has its watchdog
 run at boot by :func:`run_registered_watchdogs`, discovered through the same
-naming cage that mounts the verb itself. That is deliberate: ``reach_repl``
+``repl_dispatch_registry`` that routes the verb itself. That is deliberate:
+``reach_repl``
 shipped a correct ``run_watchdog`` with **zero production callers** — the
 ratchet built to catch unmounted features was itself unmounted. Making the
 declaration the registration is the only fix that does not depend on somebody
@@ -298,30 +299,34 @@ def _write_atomic(path: Path, payload: Dict[str, Any]) -> None:
 def registered_ratchets() -> List[AuditRatchet]:
     """Every ratchet a mounted verb declares. NEVER raises.
 
-    Discovered through the naming cage rather than a list here: the cage
-    already knows which ``*_repl`` modules are real verbs, and a second
-    registry would be a second thing to forget. A verb opts in by exposing a
-    module-level ``RATCHET`` — one declaration, the same shape as
-    ``__verb_help__``.
+    Asked of ``repl_dispatch_registry`` — THE verb table the daemon actually
+    routes to — rather than of a list here or of a second discovery pass. A
+    verb opts in by exposing a module-level ``RATCHET``: one declaration,
+    beside the ``__verb_help__`` the same registry already reads.
 
-    Imports only the verb modules that exist, which is a handful; the cage's
-    own discovery stays import-free.
+    The registry has primed itself by the time this runs, so the modules are
+    already imported; this reads an attribute off each one and imports
+    nothing new.
     """
-    import importlib
+    import sys
 
     out: List[AuditRatchet] = []
     try:
-        from backend.core.ouroboros.governance.repl_verb_cage import discover
+        from backend.core.ouroboros.battle_test.repl_dispatch_registry import (
+            _VERB_TO_DISPATCHER,
+            prime_registry,
+        )
+        prime_registry()
     except Exception:  # noqa: BLE001
+        logger.debug("[AuditRatchet] verb registry unavailable", exc_info=True)
         return out
-    for spec in discover():
-        try:
-            module = importlib.import_module(spec.module)
-        except Exception:  # noqa: BLE001
-            logger.debug("[AuditRatchet] %s unimportable", spec.module,
-                         exc_info=True)
+    seen = set()
+    for _verb, fn in sorted(_VERB_TO_DISPATCHER.items()):
+        name = getattr(fn, "__module__", "") or ""
+        if not name or name in seen:
             continue
-        ratchet = getattr(module, "RATCHET", None)
+        seen.add(name)
+        ratchet = getattr(sys.modules.get(name), "RATCHET", None)
         if isinstance(ratchet, AuditRatchet):
             out.append(ratchet)
     return out
