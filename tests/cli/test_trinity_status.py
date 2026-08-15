@@ -90,15 +90,30 @@ async def test_down_no_pid_no_transport(tmp_path):
     assert "install" in report.recommendation or "up" in report.recommendation
 
 
+def _row(name, state, **kw):
+    return st.DaemonHealth(name=name, title=kw.pop("title", name), state=state,
+                           **kw)
+
+
+def _fleet(*rows):
+    async def _f(*a, **k):
+        return st.FleetHealth(daemons=tuple(rows))
+    return _f
+
+
 def test_status_main_exit_code_nonzero_on_zombie(monkeypatch):
-    """status_main is SYNC (it owns asyncio.run) — so this test is sync."""
+    """status_main is SYNC (it owns asyncio.run) — so this test is sync.
+
+    Seam moved from `active_health_handshake` to `assess_fleet` when status
+    stopped assuming a monolith; the CONTRACT it pins is unchanged — a
+    present-and-wrong daemon exits non-zero and is named on screen.
+    """
     class _C:
         def __init__(self): self.lines = []
         def print(self, t, **k): self.lines.append(str(t))
-    async def _zombie():
-        return st.HealthReport(state=st.Health.ZOMBIE, pid=5,
-                               detail="wedged", recommendation="tail log")
-    monkeypatch.setattr(st, "active_health_handshake", lambda **k: _zombie())
+    monkeypatch.setattr(st, "assess_fleet", _fleet(
+        _row("supervisor", st.Health.ZOMBIE, pid=5, detail="wedged",
+             recommendation="tail log")))
     c = _C()
     rc = st.status_main(c)
     assert rc == 1                           # non-zero on unhealthy
@@ -108,10 +123,37 @@ def test_status_main_exit_code_nonzero_on_zombie(monkeypatch):
 def test_status_main_exit_zero_on_healthy(monkeypatch):
     class _C:
         def print(self, t, **k): pass
-    async def _ok():
-        return st.HealthReport(state=st.Health.HEALTHY, pid=5, detail="ok")
-    monkeypatch.setattr(st, "active_health_handshake", lambda **k: _ok())
+    monkeypatch.setattr(st, "assess_fleet", _fleet(
+        _row("supervisor", st.Health.HEALTHY, pid=5, detail="ok")))
     assert st.status_main(_C()) == 0
+
+
+def test_a_down_engine_is_not_a_failure(monkeypatch):
+    """The multi-daemon consequence: a deployment may legitimately run only
+    the supervisor. DOWN is a fact; ZOMBIE/DEGRADED is a fault."""
+    class _C:
+        def __init__(self): self.lines = []
+        def print(self, t, **k): self.lines.append(str(t))
+    monkeypatch.setattr(st, "assess_fleet", _fleet(
+        _row("supervisor", st.Health.HEALTHY, pid=5, detail="ok"),
+        _row("ov", st.Health.DOWN, detail="not running")))
+    c = _C()
+    assert st.status_main(c) == 0
+    assert any("DOWN" in l for l in c.lines), "still REPORTED, just not fatal"
+
+
+def test_both_daemons_are_rendered_separately(monkeypatch):
+    """The point of the matrix: one row cannot borrow the other's verdict."""
+    class _C:
+        def __init__(self): self.lines = []
+        def print(self, t, **k): self.lines.append(str(t))
+    monkeypatch.setattr(st, "assess_fleet", _fleet(
+        _row("supervisor", st.Health.HEALTHY, title="supervisor", detail="a"),
+        _row("ov", st.Health.ZOMBIE, title="O+V engine", pid=9, detail="b")))
+    c = _C()
+    assert st.status_main(c) == 1
+    joined = "\n".join(c.lines)
+    assert "supervisor" in joined and "O+V engine" in joined
 
 
 # ---------------------------------------------------------------------------
@@ -216,3 +258,225 @@ async def test_probe_http_refused_on_dead_port():
     from backend.core.ouroboros.cli.thin_client import probe_http
     s = socket.socket(); s.bind(("127.0.0.1", 0)); free = s.getsockname()[1]; s.close()
     assert await probe_http("127.0.0.1", free, 1.0) == "refused"
+
+
+# ---------------------------------------------------------------------------
+# Multi-daemon matrix — a daemon is judged by ITS OWN transports
+# ---------------------------------------------------------------------------
+
+
+class TestOneDaemonCannotBorrowAnothersVerdict:
+    """THE regression. `trinity status` reported
+    `ZOMBIE/DEADLOCKED (tcp=live, uds=stale)` about a supervisor that was
+    serving HTTP 200 — because the `uds` it folded in was the COCKPIT's
+    socket, which `ov` owns since it took the governed loop.
+    """
+
+    def test_the_supervisor_row_no_longer_probes_the_cockpit_socket(
+            self, monkeypatch):
+        monkeypatch.delenv("JARVIS_SUPERVISOR_IPC_SOCKET", raising=False)
+        monkeypatch.setenv("JARVIS_ATTACH_IPC_SOCKET", "/tmp/cockpit-owned.sock")
+        assert st._attach_socket() is None, "the cockpit socket is not the supervisor's"
+        assert str(st.engine_socket()) == "/tmp/cockpit-owned.sock"
+
+    def test_a_supervisor_with_a_live_port_is_healthy_whatever_the_cockpit_does(
+            self):
+        """tcp live + no uds of its own = HEALTHY. This exact state was
+        being reported ZOMBIE."""
+        assert st.classify(True, {"tcp": "live", "uds": "absent"}) is st.Health.HEALTHY
+
+    def test_a_dedicated_supervisor_socket_is_honoured_when_declared(
+            self, monkeypatch):
+        monkeypatch.setenv("JARVIS_SUPERVISOR_IPC_SOCKET", "/tmp/sup.sock")
+        assert str(st._attach_socket()) == "/tmp/sup.sock"
+
+    async def test_each_row_probes_only_its_own_transports(self):
+        seen = []
+
+        def _t(label, value):
+            def _r():
+                seen.append(label)
+                return value
+            return st.Transport("tcp", label, _r)
+
+        a = st.DaemonSpec(name="a", title="A", pid_source=lambda: None,
+                          transports=(_t("a-tcp", ("127.0.0.1", 1)),))
+        b = st.DaemonSpec(name="b", title="B", pid_source=lambda: None,
+                          transports=(_t("b-tcp", ("127.0.0.1", 2)),))
+        fleet = await st.assess_fleet((a, b), timeout=0.05)
+        assert {d.name for d in fleet.daemons} == {"a", "b"}
+        assert set(fleet.by_name("a").transports) == {"a-tcp"}
+        assert set(fleet.by_name("b").transports) == {"b-tcp"}
+
+
+class TestTheVerdictRuleIsSharedNotCopied:
+    def test_down_zombie_healthy_degraded(self):
+        assert st.classify(False, {"tcp": "refused"}) is st.Health.DOWN
+        assert st.classify(True, {"tcp": "refused"}) is st.Health.ZOMBIE
+        assert st.classify(True, {"tcp": "live"}) is st.Health.HEALTHY
+        assert st.classify(True, {"tcp": "live", "uds": "stale"}) is st.Health.DEGRADED
+
+    def test_it_never_raises(self):
+        assert st.classify(True, None) in tuple(st.Health)
+
+
+class TestDynamicDiscovery:
+    """Zero hardcoded addresses: every probe target is read from the SAME
+    configuration the daemons bind with, at probe time."""
+
+    def test_the_supervisor_endpoint_follows_the_backend_env(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_BACKEND_HOST", "127.0.0.1")
+        monkeypatch.setenv("JARVIS_BACKEND_PORT", "9111")
+        assert st.supervisor_endpoint() == ("127.0.0.1", 9111)
+
+    def test_the_engine_bus_follows_the_channel_env(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_CHANNEL_HOST", "127.0.0.1")
+        monkeypatch.setenv("JARVIS_CHANNEL_PORT", "9199")
+        assert st.engine_endpoint() == ("127.0.0.1", 9199)
+
+    def test_the_cockpit_socket_comes_from_the_cockpit_contract(
+            self, monkeypatch):
+        monkeypatch.setenv("JARVIS_ATTACH_IPC_SOCKET", "/tmp/x.sock")
+        assert str(st.engine_socket()) == "/tmp/x.sock"
+
+    def test_the_engine_pid_comes_from_the_lock_the_engine_writes(
+            self, tmp_path):
+        """A NON-socket source, so a wedged socket cannot mask a live
+        process — the O+V parallel to launchctl for the supervisor."""
+        import json
+        import os as _os
+        (tmp_path / ".jarvis").mkdir()
+        (tmp_path / ".jarvis" / "intake_router.lock").write_text(
+            json.dumps({"pid": _os.getpid()}))
+        assert st.engine_pid(root=tmp_path) == _os.getpid()
+
+    def test_a_stale_lock_is_not_a_daemon(self, tmp_path):
+        import json
+        (tmp_path / ".jarvis").mkdir()
+        (tmp_path / ".jarvis" / "intake_router.lock").write_text(
+            json.dumps({"pid": 2_000_000}))       # cannot exist
+        assert st.engine_pid(root=tmp_path) is None
+
+    def test_a_missing_lock_is_not_an_error(self, tmp_path):
+        assert st.engine_pid(root=tmp_path) is None
+
+
+class TestTheDiagnosticNeverHangs:
+    """A tool that freezes while reporting on a frozen daemon has become the
+    problem it was run to describe."""
+
+    def test_probe_timeouts_are_sub_second_by_default(self, monkeypatch):
+        monkeypatch.delenv("JARVIS_FLEET_PROBE_TIMEOUT_S", raising=False)
+        assert st.fleet_probe_timeout_s() < 1.0
+
+    async def test_a_hanging_probe_is_reported_not_awaited(self):
+        async def _never(*_a, **_k):
+            await asyncio.sleep(3600)
+
+        import backend.core.ouroboros.cli.thin_client as tc
+        real = tc.probe_http
+        tc.probe_http = _never
+        try:
+            spec = st.DaemonSpec(
+                name="wedged", title="wedged", pid_source=lambda: 4242,
+                transports=(st.Transport("tcp", "tcp",
+                                         lambda: ("127.0.0.1", 1)),))
+            row = await asyncio.wait_for(
+                st.assess_daemon(spec, timeout=0.05), timeout=5)
+            assert row.transports["tcp"] == "timeout"
+            assert row.state is st.Health.ZOMBIE
+            assert "UNRESPONSIVE" in row.detail
+        finally:
+            tc.probe_http = real
+
+    async def test_the_whole_matrix_is_bounded_even_if_a_row_overruns(self):
+        async def _slow(*_a, **_k):
+            await asyncio.sleep(30)
+
+        import backend.core.ouroboros.cli.thin_client as tc
+        real = tc.probe_http
+        tc.probe_http = _slow
+        try:
+            spec = st.DaemonSpec(
+                name="slow", title="slow", pid_source=lambda: None,
+                transports=(st.Transport("tcp", "tcp",
+                                         lambda: ("127.0.0.1", 1)),))
+            fleet = await asyncio.wait_for(
+                st.assess_fleet((spec,), timeout=10, deadline=0.3), timeout=5)
+            assert fleet.daemons[0].state is st.Health.UNKNOWN
+            assert "deadline" in fleet.daemons[0].detail
+        finally:
+            tc.probe_http = real
+
+    async def test_an_exploding_resolver_never_escapes(self):
+        def _boom():
+            raise RuntimeError("config exploded")
+
+        spec = st.DaemonSpec(name="x", title="x", pid_source=_boom,
+                             transports=(st.Transport("tcp", "tcp", _boom),))
+        row = await st.assess_daemon(spec, timeout=0.05)
+        assert row.transports["tcp"] == "error"
+
+
+class TestAnOptionalTransportIsReportedNotFatal:
+    """The cockpit socket is attach-on-demand — `ov daemon` runs headless and
+    nobody is attached most of the time. Degrading a healthy engine for it is
+    the same error as judging the supervisor by the cockpit's socket."""
+
+    async def test_a_stale_cockpit_does_not_degrade_a_serving_engine(self):
+        spec = st.DaemonSpec(
+            name="ov", title="O+V", pid_source=lambda: 4242,
+            transports=(
+                st.Transport("uds", "cockpit", lambda: None, optional=True),
+                st.Transport("tcp", "event-bus",
+                             lambda: ("127.0.0.1", 1)),
+            ))
+
+        async def _live(*_a, **_k):
+            return "live"
+
+        import backend.core.ouroboros.cli.thin_client as tc
+        real_http, real_sock = tc.probe_http, tc.probe_socket
+
+        async def _stale(*_a, **_k):
+            return "stale"
+
+        tc.probe_http, tc.probe_socket = _live, _stale
+        try:
+            spec = st.DaemonSpec(
+                name="ov", title="O+V", pid_source=lambda: 4242,
+                transports=(
+                    st.Transport("uds", "cockpit", lambda: Path("/tmp/x.sock"),
+                                 optional=True),
+                    st.Transport("tcp", "event-bus",
+                                 lambda: ("127.0.0.1", 1)),
+                ))
+            row = await st.assess_daemon(spec, timeout=0.2)
+            assert row.state is st.Health.HEALTHY, row.detail
+            assert "cockpit=stale" in row.detail, "still REPORTED"
+        finally:
+            tc.probe_http, tc.probe_socket = real_http, real_sock
+
+    async def test_a_required_transport_still_degrades(self):
+        import backend.core.ouroboros.cli.thin_client as tc
+        real = tc.probe_http
+
+        async def _refused(*_a, **_k):
+            return "refused"
+
+        tc.probe_http = _refused
+        try:
+            spec = st.DaemonSpec(
+                name="ov", title="O+V", pid_source=lambda: 4242,
+                transports=(st.Transport("tcp", "event-bus",
+                                         lambda: ("127.0.0.1", 1)),))
+            row = await st.assess_daemon(spec, timeout=0.2)
+            assert row.state is st.Health.ZOMBIE
+        finally:
+            tc.probe_http = real
+
+    def test_each_daemon_points_at_its_own_log(self):
+        sup, ov = st.default_fleet()
+        assert "supervisor.err.log" in sup.log_hint()
+        hint = ov.log_hint()
+        assert hint == "" or "sessions" in hint, hint
