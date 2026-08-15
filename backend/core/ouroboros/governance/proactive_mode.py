@@ -582,6 +582,139 @@ def override_notice(cockpit_id: str) -> str:
         return ""
 
 
+class RemoteModeView:
+    """What the BODY may say about a rung it does not own. §30 slice 5.
+
+    The Engine holds the dial; the Body renders it. Across §29's link that
+    creates a failure the local cockpit cannot have: **a stale rung on a
+    screen.** A Body showing 🟠 while the Engine runs 🟢 is worse than a Body
+    showing nothing, because the operator reads a guarantee that is not in
+    force and stops watching accordingly.
+
+    So the view is CONFIRMATION-GATED, not merely cached. A rung is
+    renderable only while it has been confirmed since the current connection
+    began; a reconnect invalidates it until the Engine says so again. The
+    gap between reconnecting and confirming renders as *unknown*, which is
+    the honest state and the one every other surface in this codebase
+    already prefers — the same choice ``_ignition_line`` makes when it
+    refuses to let a blank deck mean three different things.
+
+    Not a second dial. The Body cannot decide a rung from this class; it can
+    only report one, or report that it does not know. Authority stays where
+    the enforcement is.
+    """
+
+    def __init__(self, clock: Optional[Callable[[], float]] = None) -> None:
+        self._clock = clock or time.monotonic
+        self._lock = threading.Lock()
+        self._name: Optional[str] = None
+        self._confirmed_at: Optional[float] = None
+        #: Bumped on every reconnect. A confirmation carrying an older epoch
+        #: belongs to a previous connection and is refused — the same
+        #: seq-gating §26.5 uses so an op is judged under the regime it
+        #: entered.
+        self._epoch: int = 0
+        self._confirmed_epoch: int = -1
+        self._stale_renders_refused = 0
+
+    def on_connected(self) -> None:
+        """A new connection. Every prior confirmation is void."""
+        with self._lock:
+            self._epoch += 1
+            self._confirmed_epoch = -1
+            self._name = None
+            self._confirmed_at = None
+
+    def on_disconnected(self) -> None:
+        """The link dropped. The rung is no longer confirmable.
+
+        Distinct from :meth:`on_connected`: a drop does not advance the
+        epoch, so a frame still in flight from the old connection cannot be
+        mistaken for a confirmation of the next one.
+        """
+        with self._lock:
+            self._confirmed_epoch = -1
+            self._confirmed_at = None
+
+    def confirm(self, frame: Any) -> bool:
+        """Accept a MODE frame from the Engine. True when it was taken.
+
+        Refuses anything that is not a well-formed mode frame naming a rung
+        this side knows. An unknown rung is NOT rendered as itself: a Body
+        that echoed a name it could not interpret would be showing the
+        operator a word rather than a state, and the closed ladder exists
+        precisely so both ends mean the same thing by it.
+        """
+        try:
+            if not isinstance(frame, dict):
+                return False
+            if str(frame.get("kind") or "") != "mode":
+                return False
+            name = str(frame.get("position") or "").strip().lower()
+            if name not in _BY_NAME:
+                logger.warning(
+                    "[ProactiveMode] peer reported unknown rung %r — not "
+                    "rendering it", name)
+                return False
+            with self._lock:
+                self._name = name
+                self._confirmed_at = self._clock()
+                self._confirmed_epoch = self._epoch
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def renderable(self) -> Optional[Position]:
+        """The rung the Body may display, or None for *unknown*."""
+        with self._lock:
+            fresh = (self._confirmed_epoch == self._epoch
+                     and self._name is not None)
+            name = self._name
+            if not fresh:
+                self._stale_renders_refused += 1
+        return position(name) if fresh else None
+
+    def chip(self) -> str:
+        """The Body's chip. Explicitly *unknown* rather than silent.
+
+        Silence would be read as "nothing to report", and the whole point is
+        that there IS something to report and this side cannot currently
+        vouch for it.
+        """
+        rung = self.renderable()
+        if rung is None:
+            return "⛨ mode unknown (awaiting engine)"
+        return f"{rung.glyph}⛨ {rung.name}"
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            age = (None if self._confirmed_at is None
+                   else round(self._clock() - self._confirmed_at, 2))
+            return {
+                "position": self._name,
+                "confirmed": self._confirmed_epoch == self._epoch,
+                "confirmed_age_s": age,
+                "epoch": self._epoch,
+                "stale_renders_refused": self._stale_renders_refused,
+            }
+
+
+def build_mode_frame(seq: int, node_id: str, lamport: int = 0) -> Dict[str, Any]:
+    """The Engine's MODE frame for the current effective rung.
+
+    Carries the composition too, so the Body can render "composed" without
+    holding a second opinion about who is attached to the Engine — that is
+    the Engine's fact, and shipping it is cheaper and more honest than
+    inferring it.
+    """
+    comp = composition()
+    return {
+        "kind": "mode", "seq": int(seq), "lamport": int(lamport),
+        "node_id": str(node_id), "position": comp.effective,
+        "composed": comp.composed, "distinct": comp.distinct,
+    }
+
+
 @dataclass(frozen=True)
 class MutationVerdict:
     """Whether the current rung permits a candidate to reach VALIDATE."""
