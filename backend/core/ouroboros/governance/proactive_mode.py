@@ -506,6 +506,58 @@ class ProactiveModeController:
         }
 
 
+@dataclass(frozen=True)
+class MutationVerdict:
+    """Whether the current rung permits a candidate to reach VALIDATE."""
+
+    permitted: bool
+    position: str
+    reason: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"permitted": self.permitted, "position": self.position,
+                "reason": self.reason}
+
+
+def mutation_permitted() -> MutationVerdict:
+    """May a generated candidate proceed toward APPLY? NEVER raises.
+
+    **Why this is a separate question from the risk floor.** The floor decides
+    *how* a mutation lands — auto, after a diff, or only with a human. It
+    always assumes one is landing. The ``explore`` rung says something the
+    floor cannot: that generation may continue and mutation may not, so the
+    organism can read, search, plan and reason without any patch reaching
+    disk.
+
+    **Why a veto and not a retry.** The Iron Gate's existing refusal —
+    ``ExplorationInsufficientError`` — routes through ``GENERATE_RETRY`` with
+    targeted feedback, and that is correct there: the model *can* fix
+    insufficient exploration by exploring more. It cannot fix the operator's
+    dial. Retrying a mode veto would burn the retry budget on a condition no
+    generation can satisfy, then fail the op for a reason that was never the
+    model's fault. So a veto is a **benign terminal**, not a retry and not a
+    failure — the same shape ``candidate_value_gate`` uses when it proves a
+    candidate cosmetic.
+
+    Fails OPEN. A mode subsystem that cannot answer must not be able to halt
+    every mutation in the organism; that would convert a fault here into a
+    total outage, which is the posture ``local_model_admission`` already
+    argues for on the same grounds.
+    """
+    try:
+        if not is_enabled():
+            return MutationVerdict(True, "disabled", "proactive mode off")
+        eff = get_controller().effective()
+        if eff.initiative in (Initiative.ACT,):
+            return MutationVerdict(True, eff.name, "rung permits mutation")
+        return MutationVerdict(
+            False, eff.name,
+            f"{eff.glyph} {eff.name}: {eff.summary}")
+    except Exception as exc:  # noqa: BLE001 — fail OPEN, never halt the organism
+        logger.debug("[ProactiveMode] mutation check degraded: %s", exc)
+        return MutationVerdict(True, "unknown", "mode unavailable")
+
+
 #: The thing that can withhold initiative. INJECTED at boot, never imported.
 #:
 #: The pool is an instance ``GovernedLoopService`` owns (``_bg_pool``), and a

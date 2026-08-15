@@ -426,3 +426,145 @@ def test_the_glyph_table_is_not_duplicated(monkeypatch):
     monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
     for rung in pm.LADDER:
         assert t._glyph_for(rung.name) == rung.glyph
+
+
+# ---------------------------------------------------------------------------
+# Slice 3 — the explore rung's mutation veto
+# ---------------------------------------------------------------------------
+
+
+def test_act_rungs_permit_mutation(monkeypatch):
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+    for name in ("safe_auto", "notify_apply", "approval_required"):
+        pm.get_controller().request("mac", name)
+        assert pm.mutation_permitted().permitted is True, name
+
+
+def test_explore_vetoes_mutation_while_permitting_generation(monkeypatch):
+    """The rung the risk floor could not express: generation continues, no
+    patch reaches disk."""
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+    pm.get_controller().request("mac", "explore")
+    v = pm.mutation_permitted()
+    assert v.permitted is False
+    assert v.position == "explore"
+
+
+def test_watch_vetoes_mutation_too(monkeypatch):
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+    pm.get_controller().request("mac", "watch")
+    assert pm.mutation_permitted().permitted is False
+
+
+def test_master_off_never_vetoes(monkeypatch):
+    """Off is the pre-§30 status quo, not a degraded mode."""
+    monkeypatch.delenv("JARVIS_PROACTIVE_MODE_ENABLED", raising=False)
+    pm.get_controller().request("mac", "watch")
+    assert pm.mutation_permitted().permitted is True
+
+
+def test_the_veto_fails_open_on_any_internal_fault(monkeypatch):
+    """A mode subsystem that cannot answer must not halt every mutation in
+    the organism — that converts a fault here into a total outage."""
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+
+    def _boom():
+        raise RuntimeError("controller exploded")
+
+    monkeypatch.setattr(pm, "get_controller", _boom)
+    v = pm.mutation_permitted()
+    assert v.permitted is True
+    assert v.position == "unknown"
+
+
+def test_a_veto_is_a_terminal_not_a_retry():
+    """ExplorationInsufficientError routes through GENERATE_RETRY because a
+    model CAN fix insufficient exploration. It cannot fix the operator's
+    dial, so retrying would burn the budget then fail the op for something
+    that was never the model's fault."""
+    import inspect
+    from backend.core.ouroboros.governance import orchestrator as orch
+    src = inspect.getsource(orch.Orchestrator._maybe_complete_cosmetic_candidate)
+    assert "no_op_mode_veto" in src
+    assert "OperationPhase.COMPLETE" in src
+    assert "ExplorationInsufficientError" not in src
+
+
+def test_the_veto_rides_the_seam_both_callers_share():
+    """Run-24 proved the inline seam alone is never reached on the live
+    route. A gate wired only there is wired and inert."""
+    import inspect
+    from backend.core.ouroboros.governance import orchestrator as orch
+    from backend.core.ouroboros.governance import phase_dispatcher as pd
+    helper = "_maybe_complete_cosmetic_candidate"
+    assert helper in inspect.getsource(pd)
+    assert "mutation_permitted" in inspect.getsource(
+        orch.Orchestrator._maybe_complete_cosmetic_candidate)
+
+
+def test_the_veto_precedes_the_value_gate():
+    """A vetoed candidate must not first be walked for cosmetic-ness: the
+    mode already decided, and the walk costs an AST parse per file.
+
+    Compared over the EXECUTABLE body with the docstring stripped — the
+    docstring names the value-gate flag before any code runs, and a raw
+    text index cannot tell an explanation from a use. Same lesson as the
+    earlier DRY audits."""
+    import ast
+    import inspect
+    import textwrap
+    from backend.core.ouroboros.governance import orchestrator as orch
+    src = textwrap.dedent(
+        inspect.getsource(orch.Orchestrator._maybe_complete_cosmetic_candidate))
+    fn = ast.parse(src).body[0]
+    body = fn.body[1:] if isinstance(fn.body[0], ast.Expr) else fn.body
+    code = "\n".join(ast.unparse(stmt) for stmt in body)
+    assert "mutation_permitted" in code
+    assert code.index("mutation_permitted") < code.index(
+        "JARVIS_CANDIDATE_VALUE_GATE_ENABLED")
+
+
+# ---------------------------------------------------------------------------
+# The sink — registered, or honestly absent
+# ---------------------------------------------------------------------------
+
+
+def test_the_pool_is_registered_as_the_sink_at_boot():
+    """Without this the ladder floors the AUTHORITY axis correctly and
+    `watch` silently degrades to approval_required — wired but inert on
+    exactly one of its two axes."""
+    import inspect
+    from backend.core.ouroboros.governance import governed_loop_service as gls
+    src = inspect.getsource(gls)
+    assert "set_emission_sink as _pm_set_sink" in src
+    assert "_pm_set_sink(self._bg_pool)" in src
+
+
+def test_the_sink_is_registered_after_the_pool_starts():
+    """A sink handed a pool that has not started would pause something with
+    no workers, and `watch` would report a hold it had not achieved."""
+    import inspect
+    from backend.core.ouroboros.governance import governed_loop_service as gls
+    src = inspect.getsource(gls)
+    assert src.index("await self._bg_pool.start()") < src.index(
+        "_pm_set_sink(self._bg_pool)")
+
+
+def test_the_controller_never_imports_the_orchestrator():
+    """A mode controller reaching into GovernedLoopService for _bg_pool
+    would invert the authority boundary every governance module observes."""
+    import pathlib
+    src = pathlib.Path(pm.__file__).read_text(encoding="utf-8")
+    for banned in ("governed_loop_service", "orchestrator", "background_agent_pool"):
+        assert f"import {banned}" not in src
+        assert f"governance.{banned}" not in src
+
+
+def test_a_registered_sink_is_used_without_an_explicit_pool():
+    pool = _Pool()
+    pm.set_emission_sink(pool)
+    c = pm.ProactiveModeController(clock=FakeClock())
+    c.request("mac", "watch")
+    out = c.apply_effects()
+    assert out["emission"] == "paused"
+    assert pool.paused is True

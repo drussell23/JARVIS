@@ -6661,6 +6661,35 @@ class GovernedLoopService:
                 on_op_active_unregister=_bg_unregister_active,
             )
             await self._bg_pool.start()
+
+            # PRD §30: register the pool as the proactive-mode emission sink.
+            #
+            # The `watch` rung withholds INITIATIVE, and this pool is the only
+            # thing that can grant or withhold it. Injected here rather than
+            # imported there because a mode controller reaching into this
+            # service for `_bg_pool` would invert the authority boundary every
+            # governance module observes — the same reason `markup_mirror` and
+            # `set_prompt_publisher` are injected at their own boot seams.
+            #
+            # Registered AFTER start(): a sink handed a pool that has not
+            # started would pause something with no workers to pause, and
+            # `watch` would report an initiative hold it had not achieved.
+            #
+            # Without this line the ladder still floors the AUTHORITY axis
+            # correctly, and `watch` silently degrades to
+            # `approval_required` — wired but inert on exactly one of its two
+            # axes, which is the failure mode this codebase names most often.
+            try:
+                from backend.core.ouroboros.governance.proactive_mode import (  # noqa: PLC0415
+                    set_emission_sink as _pm_set_sink,
+                )
+                _pm_set_sink(self._bg_pool)
+                logger.debug("[GLS] proactive-mode emission sink registered")
+            except Exception:  # noqa: BLE001 — never block boot on the dial
+                logger.debug(
+                    "[GLS] proactive-mode sink registration skipped",
+                    exc_info=True,
+                )
             # Dynamic Fleet Registry Service Discovery: lanes TRACK the mesh.
             # While sovereign endpoints serve, the worker count locks to the
             # node count (one GPU = one lane; an N-node fleet = N lanes);
