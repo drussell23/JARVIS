@@ -250,6 +250,46 @@ class LinkFrame:
             return None
 
 
+def ensure_frame_envelope(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Return ``record`` conforming to the shared frame contract, or raise.
+
+    **One validator, both directions, both media.** The wire codec and the
+    spill file are the same encoder (``transcript_log``), and that encoder
+    enforces an envelope — ``v``/``seq``/``kind``/``ref``, with ``seq``
+    a positive integer. A record that skips it encodes cleanly and is
+    rejected only later: on the peer's reader, or worse, by ``recover_log``
+    after a restart, which loses exactly the verdicts durability existed to
+    protect.
+
+    So the check lives HERE, in the module both ends import, and is called
+    by the outbox before it spills and by the transport before it writes.
+    Validating in two places with two opinions is how the two sides of a
+    link start disagreeing about what a frame is.
+
+    ``seq`` is never invented. It is load-bearing for resume arithmetic, and
+    a fabricated one would put a hole in a range the peer will later ask to
+    replay. ``seq=0`` is refused because the codec reserves it, and because
+    :func:`plan_resume` reads 0 as "this peer has applied nothing" — one
+    value cannot mean both.
+
+    Raises ``ValueError``; callers catch at their boundary so the fault
+    lands on the side that can still do something about it.
+    """
+    if not isinstance(record, dict):
+        raise ValueError(f"frame must be a mapping, got {type(record).__name__}")
+    out = dict(record)
+    kind = out.get("kind")
+    if not kind or not isinstance(kind, str):
+        raise ValueError("frame requires a non-empty string 'kind'")
+    seq = out.get("seq")
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+        raise ValueError(
+            f"frame requires an integer seq >= 1 (got {seq!r}); "
+            "seq=0 is reserved for 'nothing yet'")
+    out.setdefault("ref", f"l-{seq}")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 2. Flap admission — the socket is disposable, the session is not
 # ---------------------------------------------------------------------------
