@@ -37,12 +37,13 @@ Python 3.9+, ``from __future__ import annotations``.
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+
+from backend.core.ouroboros.governance import audit_ratchet as _ratchet
+from typing import Any, Dict, List, Tuple
 
 logger = logging.getLogger("Ouroboros.ReachRepl")
 
@@ -71,19 +72,51 @@ _HELP = (
 )
 
 
+def _findings(reading: Any) -> Dict[str, Tuple[str, ...]]:
+    """Reachability's two buckets, as stable keys."""
+    return {
+        "asymmetric": tuple(m.module for m in reading.asymmetric()),
+        "orphans": tuple(m.module for m in reading.orphans()),
+    }
+
+
+def _legacy_buckets(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Read a baseline accepted before this verb adopted the ratchet.
+
+    The old file was flat — ``{"asymmetric": [...], "orphans": [...],
+    "surfaces": [...], "scanned": N}``. Named explicitly rather than inferred
+    from "every key holding a list of strings", because that rule would also
+    adopt ``surfaces`` as a bucket and then report a renamed surface label as
+    a regression.
+    """
+    return {"asymmetric": list(data.get("asymmetric") or ()),
+            "orphans": list(data.get("orphans") or ())}
+
+
+#: Declared, therefore mounted: `audit_ratchet.run_registered_watchdogs`
+#: finds this through the naming cage. The previous `run_watchdog` was
+#: correct, tested, and had zero production callers — the ratchet built to
+#: catch unmounted features was itself unmounted.
+RATCHET = _ratchet.AuditRatchet(_ratchet.Instrument(
+    name="reach",
+    run=lambda: _audit(),
+    findings=_findings,
+    scanned=lambda r: r.scanned,
+    # Unchanged on purpose: adopting the ratchet must not orphan a baseline
+    # an operator already accepted.
+    baseline_filename="surface_reachability_baseline.json",
+    legacy_buckets=_legacy_buckets,
+))
+
+
 def baseline_path() -> Path:
     """Where the accepted state lives. Per-repository, never global."""
-    root = Path(os.environ.get("JARVIS_PROJECT_ROOT", "."))
-    return Path(os.environ.get(
-        "JARVIS_REACH_BASELINE_PATH",
-        str(root / ".jarvis" / "surface_reachability_baseline.json"),
-    ))
+    return RATCHET.baseline_path()
 
 
 def watchdog_enabled() -> bool:
     """Boot-time drift check. Default TRUE — it is silent at steady state."""
-    return (os.environ.get("JARVIS_REACH_WATCHDOG_ENABLED", "true")
-            or "").strip().lower() not in ("0", "false", "no", "off")
+    return RATCHET.watchdog_enabled()
 
 
 @dataclass(frozen=True)
@@ -100,6 +133,22 @@ class ReachDrift:
     @property
     def regressed(self) -> bool:
         return bool(self.new_asymmetric or self.new_orphans)
+
+    @classmethod
+    def of(cls, d: "_ratchet.Drift") -> "ReachDrift":
+        """Project the generic drift onto this verb's vocabulary.
+
+        Kept rather than replaced by `Drift`: `new_asymmetric` and
+        `new_orphans` are what the operator and this module's spine both
+        speak, and a generic `new["asymmetric"]` at every call site would
+        make the ratchet's shape the REPL's problem.
+        """
+        return cls(
+            new_asymmetric=d.bucket("asymmetric"),
+            new_orphans=d.bucket("orphans"),
+            resolved=d.resolved, baseline_exists=d.baseline_exists,
+            scanned=d.scanned, error=d.error,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -128,54 +177,22 @@ async def _audit() -> Any:
     return await audit_async()
 
 
-def _load_baseline() -> Optional[Dict[str, Any]]:
-    """The accepted state, or None. NEVER raises.
-
-    A corrupt baseline is treated as ABSENT rather than as an empty one:
-    an empty baseline would report every asymmetric module as newly
-    regressed, burying a real regression under a hundred false ones on the
-    first boot after a disk fault.
-    """
-    try:
-        raw = baseline_path().read_text(encoding="utf-8")
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            return None
-        return data
-    except (OSError, ValueError):
-        return None
-
-
 async def accept_baseline() -> Dict[str, Any]:
     """Record the current state as accepted. NEVER raises.
 
-    Written through ``durable_io.atomic_replace``: a baseline half-written
-    by a crash would be read as corrupt on the next boot, which degrades to
-    "no baseline" and floods the operator exactly when they are already
-    recovering from something.
+    Atomicity, degradation policy and the per-repository location all live
+    in `audit_ratchet` now — one implementation for every instrument, so a
+    fix to the persistence lands for all of them at once.
     """
-    try:
-        reading = await _audit()
-        payload = {
-            "schema_version": REACH_REPL_SCHEMA_VERSION,
-            "asymmetric": sorted(m.module for m in reading.asymmetric()),
-            "orphans": sorted(m.module for m in reading.orphans()),
-            "surfaces": list(reading.surface_labels),
-            "scanned": reading.scanned,
-        }
-        path = baseline_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True),
-                       encoding="utf-8")
-        from backend.core.ouroboros.governance.durable_io import atomic_replace
-        atomic_replace(tmp, path)
-        logger.info("[Reach] baseline accepted — %d asymmetric, %d orphan(s)",
-                    len(payload["asymmetric"]), len(payload["orphans"]))
+    payload = await RATCHET.accept()
+    if "error" in payload:
         return payload
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("[Reach] baseline write failed: %s", exc, exc_info=True)
-        return {"error": str(exc)}
+    # Flattened for this verb's own render, which speaks buckets by name.
+    buckets = payload.get("buckets") or {}
+    return {"schema_version": REACH_REPL_SCHEMA_VERSION,
+            "asymmetric": list(buckets.get("asymmetric") or ()),
+            "orphans": list(buckets.get("orphans") or ()),
+            "scanned": payload.get("scanned", 0)}
 
 
 async def drift() -> ReachDrift:
@@ -186,64 +203,20 @@ async def drift() -> ReachDrift:
     measured — and reporting the whole standing list as new would be the
     4:1 false-positive flood this design exists to avoid.
     """
-    try:
-        reading = await _audit()
-    except Exception as exc:  # noqa: BLE001
-        return ReachDrift(error=f"{type(exc).__name__}: {exc}")
-    now_asym = {m.module for m in reading.asymmetric()}
-    now_orph = {m.module for m in reading.orphans()}
-    base = _load_baseline()
-    if base is None:
-        return ReachDrift(baseline_exists=False, scanned=reading.scanned)
-    was_asym = set(base.get("asymmetric") or ())
-    was_orph = set(base.get("orphans") or ())
-    return ReachDrift(
-        new_asymmetric=tuple(sorted(now_asym - was_asym)),
-        new_orphans=tuple(sorted(now_orph - was_orph)),
-        resolved=tuple(sorted((was_asym | was_orph) - (now_asym | now_orph))),
-        scanned=reading.scanned,
-    )
+    return ReachDrift.of(await RATCHET.drift())
 
 
 async def run_watchdog() -> ReachDrift:
     """Boot-time drift check, off the event loop. NEVER raises.
 
-    The audit walks the module tree and parses every file, which is far too
-    much work for the loop that also runs the organism — `_audit` puts it on
-    a thread for every caller. Bounded by the caller's own supervision rather
-    than a timer here: a scan that overran would be a scan worth noticing,
-    and killing it silently would hide that.
+    Mounted by DECLARATION: `RATCHET` above is what
+    `audit_ratchet.run_registered_watchdogs` discovers. This function stays
+    as the named entry point for anything that wants just this instrument.
 
     Silent at steady state, by construction: with nothing new since the
     baseline there is no line to print.
     """
-    if not watchdog_enabled():
-        return ReachDrift(baseline_exists=False)
-    try:
-        # No `to_thread` here any more: `_audit` owns the offload, and two
-        # places deciding how to get off the loop is how one of them ends up
-        # not doing it.
-        result = await drift()
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("[Reach] watchdog degraded: %s", exc)
-        return ReachDrift(error=str(exc))
-    if result.error:
-        logger.debug("[Reach] watchdog could not audit: %s", result.error)
-    elif not result.baseline_exists:
-        logger.info(
-            "[Reach] no reachability baseline — run `/reach accept` to "
-            "record the current surface topology as expected")
-    elif result.regressed:
-        # WARNING, not INFO: a capability that shipped unreachable is the
-        # defect class this detector exists for, and it has landed six times.
-        logger.warning(
-            "[Reach] surface reachability REGRESSED — new asymmetric: %s; "
-            "new orphans: %s. A module reachable from fewer surfaces than "
-            "before is the shape every unmounted feature had.",
-            ", ".join(result.new_asymmetric) or "-",
-            ", ".join(result.new_orphans) or "-",
-        )
-    return result
+    return ReachDrift.of(await RATCHET.watchdog())
 
 
 @dataclass(frozen=True)

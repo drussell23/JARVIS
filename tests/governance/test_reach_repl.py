@@ -129,12 +129,31 @@ async def test_a_baseline_that_is_not_an_object_is_treated_as_absent(monkeypatch
     assert (await rr.drift()).baseline_exists is False
 
 
-def test_the_baseline_is_published_atomically():
+async def test_the_baseline_is_published_atomically(monkeypatch):
     """A baseline half-written by a crash reads as corrupt on the next
     boot, which degrades to 'no baseline' and floods the operator exactly
-    when they are already recovering."""
-    import inspect
-    assert "atomic_replace" in inspect.getsource(rr.accept_baseline)
+    when they are already recovering.
+
+    OBSERVED, not spelt. This asserted that `accept_baseline`'s SOURCE
+    mentions `atomic_replace` — a SOURCE_ONLY test in the exact sense
+    `source_assertion_audit` measures. It passed while saying nothing about
+    whether the write was atomic, and it broke when the implementation
+    correctly moved to the shared ratchet even though the property held.
+    """
+    from backend.core.ouroboros.governance import durable_io
+
+    seen = []
+    real = durable_io.atomic_replace
+    monkeypatch.setattr(durable_io, "atomic_replace",
+                        lambda tmp, dst: (seen.append((tmp, dst)),
+                                          real(tmp, dst))[1])
+    monkeypatch.setattr(rr, "_audit", _fake_audit(asym=("a",)))
+    await rr.accept_baseline()
+    assert seen, "the baseline was published without atomic_replace"
+    tmp, dst = seen[0]
+    assert dst == rr.baseline_path()
+    assert not tmp.exists(), "the temp file survived the publish"
+    assert json.loads(dst.read_text())["buckets"]["asymmetric"] == ["a"]
 
 
 async def test_a_failing_audit_degrades_rather_than_raising(monkeypatch):
@@ -172,9 +191,28 @@ async def test_the_watchdog_warns_on_regression(monkeypatch, caplog):
 @pytest.mark.asyncio
 async def test_the_watchdog_runs_off_the_event_loop():
     """The audit walks the module tree and parses every file — far too much
-    work for the loop that also runs the organism."""
-    import inspect
-    assert "to_thread" in inspect.getsource(rr.run_watchdog)
+    work for the loop that also runs the organism.
+
+    MEASURED, not spelt. The old assertion looked for `to_thread` in the
+    source and would have kept passing had the call been deleted from a
+    branch it never took — and it broke when the offload correctly moved to
+    `surface_reachability.audit_async`, though the property was intact.
+    Here the loop must actually keep ticking.
+    """
+    import asyncio
+
+    ticks = 0
+
+    async def heartbeat():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    hb = asyncio.create_task(heartbeat())
+    await rr.run_watchdog()
+    hb.cancel()
+    assert ticks > 5, "the loop stalled for the length of the audit"
 
 
 @pytest.mark.asyncio

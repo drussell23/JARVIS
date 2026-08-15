@@ -3500,6 +3500,74 @@ Master switch `JARVIS_REPL_VERB_CAGE_ENABLED`, default **true**.
 
 ---
 
+### 27.5.7 The audit ratchet — declaring one mounts its watchdog
+
+The cage made a verb reachable by a human. This makes an *instrument*
+reachable by the organism, and it exists because the same defect recurred
+one level up: `reach_repl.run_watchdog` was written, tested, documented —
+and had **zero production callers**. The ratchet built to catch capabilities
+that ship unreachable was itself unreachable.
+
+`/reach` found two real orphans. One of them, `source_assertion_audit`, is
+the instrument that measures *how many tests cannot fail for a behavioural
+reason* — the mechanism that hid every inert capability the other detectors
+later found. It shipped complete, with a full test file, and nothing an
+operator could type ever reached it. Its own docstring anticipated the risk
+on the wrong axis: being covered did not save it.
+
+**One ratchet, N instruments.** Every instrument needs the same four things,
+none of which is about what it measures:
+
+| | |
+|---|---|
+| accepted baseline | what the operator has already seen and allowed |
+| drift | what is new since then, and what got fixed |
+| accept | pin the current state as the new floor |
+| boot watchdog | say so, once, when the number gets worse |
+
+`audit_ratchet.Instrument` carries a name, an async `run`, a `findings`
+function returning `{bucket: [stable key]}`, and nothing else. The ratchet
+never learns what a finding *means* — it compares sets of strings. That is
+what lets one implementation serve a reachability graph and a test-quality
+scan, and what lets the third instrument arrive as a declaration rather
+than a copy of ~130 lines of persistence and degradation policy.
+
+**Registration is declaration.** A `*_repl` module exposing a module-level
+`RATCHET` has its watchdog run at boot, discovered through the same naming
+cage that mounts its verb. The boot seam in `GovernedLoopService` names no
+instrument — wiring the two by hand would have re-created the defect for the
+third. The sweep is spawned, never awaited: a watchdog that delayed startup
+by the length of its own scan is one somebody deletes the first time they
+profile boot, and then the instrument is gone again. Both teardown paths
+cancel it.
+
+**Design choices that are load-bearing:**
+
+- **The floor ratchets rather than alarms.** An instrument that reports its
+  whole standing list on every boot is muted within a week, and a muted
+  instrument is worse than none because it looks like coverage. Only the
+  delta against an accepted state speaks.
+- **No baseline reports nothing, not everything.** A fresh checkout has not
+  regressed; it has not been measured.
+- **A corrupt baseline is absent, not empty.** Reading it as `{}` would
+  report every standing finding as newly regressed — a hundred false
+  positives arriving exactly when someone is recovering from a disk fault.
+- **`Instrument.legacy_buckets`** lets an instrument read the format it used
+  before the ratchet existed. Adopting a shared abstraction must not
+  silently discard a floor an operator accepted. Owned by the instrument,
+  because it is the instrument's own history.
+- **Buckets compared independently.** "A new orphan" and "a newly asymmetric
+  module" are different news and must stay distinguishable.
+- **`/evidence` watches the SET, not the rate.** A rate that improves
+  because tests were deleted is not progress; one that worsens because the
+  suite grew is not a regression. A newly source-only test is.
+
+Verbs: `/reach` (surface reachability), `/evidence` (what the tests can
+actually observe). Masters `JARVIS_AUDIT_WATCHDOGS_ENABLED` and
+per-instrument `JARVIS_<NAME>_WATCHDOG_ENABLED`, all default **true**.
+
+---
+
 ### 27.11 Anti-goals
 
 Extends §38.11.4; these are specific to initiative and steering.

@@ -1439,6 +1439,10 @@ class GovernedLoopService:
         # `/why` racing a failed boot finds an attribute rather than a
         # traceback.
         self._why_live_reader: Optional[Callable[[], Dict[str, Any]]] = None
+        # PRD §28: the background audit-watchdog sweep, held so teardown can
+        # cancel it. A scan outliving the service it reports on would keep
+        # parsing thousands of files against a tree nobody is serving.
+        self._audit_watchdog_task: Optional[Any] = None
         self._active_file_ops: Set[str] = set()  # canonical file paths currently in-flight
         self._completed_ops: Dict[str, OperationResult] = {}
         # Cooperative cancellation: op_ids requested for cancel via REPL /cancel
@@ -2883,6 +2887,7 @@ class GovernedLoopService:
         # while ops are still finishing they genuinely are in flight, and
         # unbinding early would make `/why` claim disk-only about work that
         # is still running.
+        self._cancel_audit_watchdogs()
         self._release_why_live_source()
         self._detach_from_stack()
         self._state = ServiceState.INACTIVE
@@ -6738,6 +6743,30 @@ class GovernedLoopService:
                 logger.debug(
                     "[GLS] /why live-source binding skipped", exc_info=True)
 
+            # PRD §28: run every declared audit watchdog once, in background.
+            #
+            # `reach_repl.run_watchdog` was written, tested, and had ZERO
+            # production callers — the ratchet built to catch capabilities
+            # that ship unreachable was itself unreachable. Wiring the two
+            # instruments by name here would have re-created that defect for
+            # the third, so the sweep asks `audit_ratchet` which verbs
+            # DECLARE a ratchet: a new instrument mounts by declaration, and
+            # this line never changes again.
+            #
+            # Fire-and-forget, and deliberately not awaited: the scans parse
+            # thousands of files, and a watchdog that delayed boot by the
+            # length of its own audit is a watchdog somebody deletes the
+            # first time they profile startup — and then the instrument is
+            # gone again. Each audit already runs off the loop.
+            try:
+                from backend.core.ouroboros.governance.audit_ratchet import (  # noqa: PLC0415
+                    spawn_registered_watchdogs as _spawn_audits,
+                )
+                self._audit_watchdog_task = _spawn_audits()
+            except Exception:  # noqa: BLE001 — a diagnostic never blocks boot
+                logger.debug(
+                    "[GLS] audit watchdog sweep not scheduled", exc_info=True)
+
             # Dynamic Fleet Registry Service Discovery: lanes TRACK the mesh.
             # While sovereign endpoints serve, the worker count locks to the
             # node count (one GPU = one lane; an N-node fleet = N lanes);
@@ -7329,6 +7358,27 @@ class GovernedLoopService:
         # StrategicDirection holder on the orchestrator.
         self._stack.governed_loop_service = self
 
+    def _cancel_audit_watchdogs(self) -> None:
+        """Stop the background audit sweep. NEVER raises. §28.
+
+        Called on BOTH teardown paths. The sweep is fire-and-forget by
+        design, which makes cancelling it a teardown OBLIGATION rather than
+        an optimisation: an audit that outlives its service keeps parsing
+        the tree and logs a regression about a repo nobody is watching.
+
+        Cancellation only, never awaited — teardown must not block for the
+        length of a scan it has just decided it no longer needs.
+        """
+        task = getattr(self, "_audit_watchdog_task", None)
+        if task is None:
+            return
+        self._audit_watchdog_task = None
+        try:
+            if not task.done():
+                task.cancel()
+        except Exception:  # noqa: BLE001
+            logger.debug("[GLS] audit watchdog cancel skipped", exc_info=True)
+
     def _release_why_live_source(self) -> None:
         """Take back the `/why` live reader this instance lent out. §27.5.
 
@@ -7603,6 +7653,7 @@ class GovernedLoopService:
         self._orchestrator = None
         self._generator = None
         self._approval_provider = None
+        self._cancel_audit_watchdogs()
         self._release_why_live_source()
         self._detach_from_stack()
 

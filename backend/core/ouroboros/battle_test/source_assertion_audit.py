@@ -382,6 +382,21 @@ def audit(*, roots: Optional[Sequence[str]] = None) -> AuditReading:
     return reading
 
 
+async def audit_async(*, roots: Optional[Sequence[str]] = None
+                      ) -> AuditReading:
+    """:func:`audit`, off the event loop. NEVER raises.
+
+    Same offload, same reason, same place as
+    ``surface_reachability.audit_async``: the scan parses every test file in
+    the repo, and Principle 3 has no exception for diagnostics. It lives in
+    the module that knows the work is heavy so no caller has to remember —
+    the omission that let `/reach` freeze the daemon for its own audit.
+    """
+    import asyncio
+
+    return await asyncio.to_thread(audit, roots=roots)
+
+
 def render(reading: AuditReading, *, limit: int = 20) -> List[str]:
     """Operator-readable summary. NEVER raises."""
     try:
