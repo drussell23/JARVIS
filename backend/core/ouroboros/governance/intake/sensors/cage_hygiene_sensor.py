@@ -72,6 +72,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from backend.core.ouroboros.governance.intake.sensors.emission_control import (
+    TokenBucket,
+)
+
 logger = logging.getLogger("Ouroboros.CageHygieneSensor")
 
 CAGE_HYGIENE_SCHEMA_VERSION: str = "cage_hygiene.1"
@@ -245,37 +249,18 @@ def classify_cluster(cluster: DenialCluster) -> str:
 # ---------------------------------------------------------------------------
 
 
-class _TokenBucket:
-    """Classic bucket. Bounds emissions per unit TIME.
+def _new_bucket() -> TokenBucket:
+    """This sensor's bucket, over the shared arithmetic.
 
     Complements aggregation rather than duplicating it: aggregation collapses
     a burst of the SAME cluster, the bucket bounds a drip of DISTINCT ones.
     Either alone leaves the other attack open.
+
+    The limits stay here as this sensor's own env vocabulary; only the
+    arithmetic is shared, because a third copy of it had begun to drift from
+    the other two.
     """
-
-    def __init__(self) -> None:
-        self._tokens = _bucket_capacity()
-        self._last = time.monotonic()
-
-    def take(self) -> bool:
-        """Consume one token. NEVER raises."""
-        try:
-            now = time.monotonic()
-            self._tokens = min(
-                _bucket_capacity(),
-                self._tokens + (now - self._last) * _bucket_refill_per_s(),
-            )
-            self._last = now
-            if self._tokens >= 1.0:
-                self._tokens -= 1.0
-                return True
-            return False
-        except Exception:  # noqa: BLE001
-            return False
-
-    @property
-    def tokens(self) -> float:
-        return self._tokens
+    return TokenBucket(_bucket_capacity, _bucket_refill_per_s)
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +333,7 @@ class _Aggregator:
 
 
 _aggregator = _Aggregator()
-_bucket = _TokenBucket()
+_bucket = _new_bucket()
 
 
 def note_denials(signature: str, denied_tools: Tuple[str, ...],
@@ -379,7 +364,7 @@ def reset_for_tests() -> None:
     """Clear the aggregator and refill the bucket. Test-only."""
     global _aggregator, _bucket  # noqa: PLW0603
     _aggregator = _Aggregator()
-    _bucket = _TokenBucket()
+    _bucket = _new_bucket()
 
 
 # ---------------------------------------------------------------------------

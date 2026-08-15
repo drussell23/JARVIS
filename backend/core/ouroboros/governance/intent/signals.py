@@ -100,6 +100,11 @@ class SignalSource(str, Enum):
     # A declared capability with no reachable caller — the reachability
     # bottleneck made autonomic.
     CAPABILITY_SEVERANCE = "capability_severance"
+    # An audit floor the operator ACCEPTED, regressed against. Distinct from
+    # capability_severance: that is a standing measurement, this is a delta
+    # against consent, which is what makes it actionable without a human
+    # first deciding whether it matters.
+    AUDIT_REGRESSION = "audit_regression"
     AUTO_PROPOSED = "auto_proposed"
     VISION_SENSOR = "vision_sensor"
     CADENCE_SYNTHETIC = "cadence_synthetic"

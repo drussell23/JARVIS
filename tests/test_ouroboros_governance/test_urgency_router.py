@@ -313,6 +313,11 @@ class TestEnvelopeSourceSchemaCoverage:
             "cross_repo_drift": ProviderRoute.STANDARD,
             "security_advisory": ProviderRoute.STANDARD,
             "web_intelligence": ProviderRoute.STANDARD,
+            # An audit floor regressing is a chore with no deadline, and the
+            # floor holds the finding until it is fixed — so DW rates are
+            # right even for the wholesale case, where the correct first
+            # action is a human deciding rather than a model generating.
+            "audit_regression": ProviderRoute.BACKGROUND,
         }
 
         missing = _VALID_SOURCES - expected.keys()

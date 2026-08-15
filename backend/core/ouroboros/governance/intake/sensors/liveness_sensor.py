@@ -56,6 +56,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from backend.core.ouroboros.governance.intake.sensors.emission_control import (
+    TokenBucket,
+)
+
 logger = logging.getLogger("Ouroboros.LivenessSensor")
 
 LIVENESS_SENSOR_SCHEMA_VERSION: str = "liveness_sensor.1"
@@ -146,33 +150,25 @@ def _debounce_s() -> float:
     return _num("JARVIS_LIVENESS_DEBOUNCE_S", 60.0, 0.0, 3600.0)
 
 
-class _TokenBucket:
+def _bucket_capacity() -> float:
+    """Burst allowance. ``JARVIS_LIVENESS_BUCKET_CAPACITY``."""
+    return _num("JARVIS_LIVENESS_BUCKET_CAPACITY", 2.0, 1.0, 50.0)
+
+
+def _bucket_refill_per_s() -> float:
+    """Sustained rate. ``JARVIS_LIVENESS_BUCKET_REFILL_PER_S`` — one finding
+    an hour. Severance is archaeology; a backlog that took a year to
+    accumulate does not need reporting faster than it can be read."""
+    return _num("JARVIS_LIVENESS_BUCKET_REFILL_PER_S",
+                1.0 / 3600.0, 1.0 / 604800.0, 10.0)
+
+
+def _new_bucket() -> TokenBucket:
     """Bounds emissions per unit TIME — the same primitive the cage sensor
     uses, for the same reason: the per-scan cap bounds a burst, this bounds a
-    sustained drip of distinct findings."""
-
-    def __init__(self) -> None:
-        self._tokens = _num("JARVIS_LIVENESS_BUCKET_CAPACITY", 2.0, 1.0, 50.0)
-        self._last = time.monotonic()
-
-    def take(self) -> bool:
-        try:
-            now = time.monotonic()
-            refill = _num("JARVIS_LIVENESS_BUCKET_REFILL_PER_S",
-                          1.0 / 3600.0, 1.0 / 604800.0, 10.0)
-            cap = _num("JARVIS_LIVENESS_BUCKET_CAPACITY", 2.0, 1.0, 50.0)
-            self._tokens = min(cap, self._tokens + (now - self._last) * refill)
-            self._last = now
-            if self._tokens >= 1.0:
-                self._tokens -= 1.0
-                return True
-            return False
-        except Exception:  # noqa: BLE001
-            return False
-
-    @property
-    def tokens(self) -> float:
-        return self._tokens
+    sustained drip of distinct findings. The arithmetic is shared; the limits
+    stay this sensor's own."""
+    return TokenBucket(_bucket_capacity, _bucket_refill_per_s)
 
 
 @dataclass(frozen=True)
@@ -316,7 +312,7 @@ class LivenessSensor:
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._seen: Dict[str, float] = {}
-        self._bucket = _TokenBucket()
+        self._bucket = _new_bucket()
         self._scans = 0
         self._emitted = 0
         self._throttled = 0

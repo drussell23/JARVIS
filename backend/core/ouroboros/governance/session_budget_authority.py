@@ -524,6 +524,16 @@ _BACKGROUND_TIER_SIGNAL_SOURCES: frozenset = frozenset({
     "architecture",
     "todo_scanner",
     "doc_staleness",
+    # The four proactive self-inspection sensors, added 2026-07-30 →
+    # 2026-08-15. They were registered as BACKGROUND in urgency_router and
+    # never mirrored here, so the pin below had been failing and — the part
+    # that matters — their ops were not counted against the background spend
+    # ceiling at all. A sensor whose cost is invisible to the reservation is
+    # exactly the starvation window Slice 12Y was built to close.
+    "memory_hygiene",
+    "cage_hygiene",
+    "capability_severance",
+    "audit_regression",
     # _SPECULATIVE_SOURCES mirror.
     "intent_discovery",
 })

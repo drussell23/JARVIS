@@ -162,6 +162,12 @@ _BACKGROUND_SOURCES = frozenset({
     # stays BACKGROUND: escalating the route would put repo-wide static
     # analysis on the Claude tier, and severity rides in the evidence.
     "capability_severance",
+    # An audit floor regressing is a chore with no deadline — the floor holds
+    # the finding until it is fixed, so nothing is lost by paying DW rates
+    # for it. A storm-classified regression stays here too: a wholesale move
+    # is the LEAST urgent thing to route expensively, because the right first
+    # action is a human deciding, not a model generating.
+    "audit_regression",
 })
 
 # Sources that produce SPECULATIVE-eligible signals
