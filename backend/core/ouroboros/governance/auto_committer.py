@@ -823,6 +823,35 @@ class AutoCommitter:
         risk_str = self._format_risk_tier(risk_tier)
         body_parts.append(f"Risk: {risk_str}")
 
+        # The graduation gate's ONLY clock-independent anchor.
+        #
+        # Without it, proving "this soak produced a Yellow-tier auto-commit"
+        # means asking whether the commit's timestamp falls inside a window
+        # built from ledger timestamps — two clocks that must agree. Across
+        # the Body/Engine split they are different machines, and a few
+        # seconds of drift moves the evidence to the wrong soak or to none.
+        #
+        # A trailer makes membership an exact string match with no clock on
+        # either side. It also survives the squash merges that otherwise
+        # erase the evidence, because both `git merge --squash` and GitHub's
+        # squash button concatenate the original bodies by default.
+        #
+        # Spelled from `autocommit_evidence_attribution` so the writer and
+        # the reader cannot drift apart about the one anchor the whole
+        # verification rests on. Absent session → no line, never a
+        # placeholder: a `Session: unknown` trailer would match nothing and
+        # would read, later, as a session that no longer exists.
+        try:
+            from backend.core.ouroboros.governance.autocommit_evidence_attribution import (  # noqa: E501,PLC0415
+                session_trailer_line,
+            )
+            _session_line = session_trailer_line(
+                os.environ.get("JARVIS_OUROBOROS_SESSION_ID", "") or "")
+            if _session_line:
+                body_parts.append(_session_line)
+        except Exception:  # noqa: BLE001 — never block a commit on a trailer
+            logger.debug("[AutoCommit] session trailer skipped", exc_info=True)
+
         if provider_name:
             cost_str = f" (${generation_cost:.4f})" if generation_cost > 0 else ""
             body_parts.append(f"Provider: {provider_name}{cost_str}")

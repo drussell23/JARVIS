@@ -382,10 +382,11 @@ def pins():
 
 class TestAstPinsCanonicalPass:
     def test_6_pins_registered(self, pins):
-        assert len(pins) == 6
+        assert len(pins) == 7
         assert {p.invariant_name for p in pins} == {
             "autocommit_grad_kind_taxonomy_closed",
             "autocommit_grad_verdict_taxonomy_closed",
+            "autocommit_grad_blocker_taxonomy_closed",
             "autocommit_grad_authority_asymmetry",
             "autocommit_grad_no_shell_subprocess",
             "autocommit_grad_no_hardcoded_markers",
@@ -431,6 +432,7 @@ class TestAstPinsSyntheticRegression:
             "    EVIDENCE_INSUFFICIENT = 'evidence_insufficient'\n"
             "    NO_GIT_HISTORY = 'no_git_history'\n"
             "    MASTER_OFF = 'master_off'\n"
+            "    EVIDENCE_LOST_TO_SQUASH = 'evidence_lost_to_squash'\n"
             "    SNEAKY = 'sneaky'\n"
         )
         v = _pin(

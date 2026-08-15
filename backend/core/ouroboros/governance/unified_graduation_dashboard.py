@@ -86,6 +86,7 @@ the contract requires explicit scope-doc + pin update.
 """
 from __future__ import annotations
 
+import asyncio
 import enum
 import json
 import logging
@@ -93,7 +94,8 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
+from typing import (Any, Awaitable, Callable, Dict, FrozenSet, List,
+                    Mapping, Optional, Tuple)
 
 logger = logging.getLogger(__name__)
 
@@ -709,6 +711,122 @@ def aggregate_dashboard(
         aggregated_at_unix=started,
         rows=tuple(rows),
         elapsed_s=time.monotonic() - t0,
+    )
+
+
+#: AutoCommit evidence verdict → the dashboard's operator-facing taxonomy.
+#: Exhaustive and explicit: an unmapped verdict lands on
+#: EVIDENCE_INSUFFICIENT with its raw value visible, so a verdict added
+#: without updating this table is loud at runtime rather than absorbed.
+_AUTOCOMMIT_VERDICT_MAP: Dict[str, UnifiedGraduationVerdict] = {
+    "ready": UnifiedGraduationVerdict.READY,
+    "ledger_not_eligible": UnifiedGraduationVerdict.EVIDENCE_GATHERING,
+    "evidence_insufficient": UnifiedGraduationVerdict.EVIDENCE_INSUFFICIENT,
+    # Unreadable, not failed. EVIDENCE_GATHERING says "keep going" —
+    # EVIDENCE_FAILED would accuse a clean soak of having gone wrong when
+    # the operator only squashed a PR.
+    "evidence_lost_to_squash": UnifiedGraduationVerdict.EVIDENCE_GATHERING,
+    "no_git_history": UnifiedGraduationVerdict.EVIDENCE_INSUFFICIENT,
+    "master_off": UnifiedGraduationVerdict.DISABLED,
+}
+
+AUTOCOMMIT_ROW_NAME: str = "autocommit_unattended_apply"
+
+
+def autocommit_row_from_report(report: Any) -> DashboardRow:
+    """Project an AutoCommit evidence report onto a dashboard row. Pure.
+
+    THE DIAGNOSTIC IS STRUCTURAL, NEVER "LOCKED". A row that says only
+    "not ready" teaches an operator nothing and invites them to flip the
+    flag to find out what is missing. The report carries a closed blocker
+    taxonomy; this renders those sentences verbatim, so the surface names
+    the missing evidence — "Insufficient clean soaks", "Missing git
+    cryptographic signature", "Verification lost via squash" — and what
+    would supply it.
+
+    NEVER raises: a malformed report yields an INSUFFICIENT row rather than
+    taking the whole dashboard down, which is the same posture every other
+    adapter here takes.
+    """
+    try:
+        raw = str(getattr(getattr(report, "verdict", None), "value", ""))
+        verdict = _AUTOCOMMIT_VERDICT_MAP.get(
+            raw, UnifiedGraduationVerdict.EVIDENCE_INSUFFICIENT)
+        reasons = tuple(getattr(report, "blocker_reasons", ()) or ())
+        counts = (
+            f"clean={getattr(report, 'ledger_clean_count', 0)}"
+            f"/{getattr(report, 'ledger_required', 0)} "
+            f"evidence={getattr(report, 'soaks_with_evidence', 0)} "
+            f"missing={getattr(report, 'soaks_missing_evidence', 0)} "
+            f"unverifiable={getattr(report, 'soaks_unverifiable', 0)}"
+        )
+        diagnostic = counts if not reasons else f"{counts} · " + " · ".join(
+            reasons)
+        return DashboardRow(
+            name=AUTOCOMMIT_ROW_NAME,
+            source="contract",
+            verdict=verdict,
+            raw_verdict=raw,
+            diagnostic=diagnostic[:512],
+        )
+    except Exception as exc:  # noqa: BLE001 — defensive, like every adapter
+        return DashboardRow(
+            name=AUTOCOMMIT_ROW_NAME, source="contract",
+            verdict=UnifiedGraduationVerdict.EVIDENCE_INSUFFICIENT,
+            raw_verdict="", diagnostic=f"adapter_error:{type(exc).__name__}")
+
+
+async def aggregate_dashboard_async(
+    *,
+    now_unix: Optional[float] = None,
+    autocommit_gate: Optional[Callable[[], Awaitable[Any]]] = None,
+) -> DashboardSnapshot:
+    """:func:`aggregate_dashboard` plus the AutoCommit evidence row.
+
+    DEPENDENCY INJECTION, not a global. ``autocommit_gate`` is the async
+    evaluator; the caller supplies it, and when absent the canonical one is
+    resolved lazily at the call site. Nothing is stored, no module state is
+    mutated, and no singleton is overridden — a test injects a stub and a
+    second concurrent caller is unaffected, because there is nothing shared
+    to affect.
+
+    Separate from the sync :func:`aggregate_dashboard` rather than replacing
+    it: the eight contract adapters are synchronous and cheap, this one
+    shells out to ``git``, and forcing every existing caller onto an event
+    loop to gain one row would be the tail wagging the dog. The sync
+    function is COMPOSED here, never duplicated.
+    """
+    snapshot = aggregate_dashboard(now_unix=now_unix)
+    gate = autocommit_gate
+    if gate is None:
+        try:
+            from backend.core.ouroboros.governance.auto_commit_graduation_gate import (  # noqa: E501
+                evaluate_graduation_evidence,
+            )
+            gate = evaluate_graduation_evidence
+        except Exception as exc:  # noqa: BLE001
+            return DashboardSnapshot(
+                aggregated_at_unix=snapshot.aggregated_at_unix,
+                rows=snapshot.rows + (DashboardRow(
+                    name=AUTOCOMMIT_ROW_NAME, source="contract",
+                    verdict=UnifiedGraduationVerdict.EVIDENCE_INSUFFICIENT,
+                    diagnostic=f"gate_unavailable:{type(exc).__name__}"),),
+                elapsed_s=snapshot.elapsed_s,
+            )
+    try:
+        report = await gate()
+        row = autocommit_row_from_report(report)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — one gate never fails the board
+        row = DashboardRow(
+            name=AUTOCOMMIT_ROW_NAME, source="contract",
+            verdict=UnifiedGraduationVerdict.EVIDENCE_INSUFFICIENT,
+            diagnostic=f"gate_error:{type(exc).__name__}")
+    return DashboardSnapshot(
+        aggregated_at_unix=snapshot.aggregated_at_unix,
+        rows=snapshot.rows + (row,),
+        elapsed_s=snapshot.elapsed_s,
     )
 
 

@@ -294,83 +294,83 @@ def test_dashboard_snapshot_to_dict_has_summary():
 # ---------------------------------------------------------------------------
 
 
-def test_repl_unmatched_returns_matched_false():
+async def test_repl_unmatched_returns_matched_false():
     from backend.core.ouroboros.governance.graduation_repl import (
         dispatch_graduation_command,
     )
-    r = dispatch_graduation_command("/something_else")
+    r = (await dispatch_graduation_command("/something_else"))
     assert r.matched is False
 
 
-def test_repl_help_works_master_off():
+async def test_repl_help_works_master_off():
     """`/graduation help` MUST work even with master flag off
     (discoverability)."""
     from backend.core.ouroboros.governance.graduation_repl import (
         dispatch_graduation_command,
     )
-    r = dispatch_graduation_command("/graduation help")
+    r = (await dispatch_graduation_command("/graduation help"))
     assert r.ok is True
     assert "Unified Graduation Dashboard" in r.text
 
 
-def test_repl_status_blocks_master_off():
+async def test_repl_status_blocks_master_off():
     from backend.core.ouroboros.governance.graduation_repl import (
         dispatch_graduation_command,
     )
-    r = dispatch_graduation_command("/graduation status")
+    r = (await dispatch_graduation_command("/graduation status"))
     assert r.ok is False
     assert "disabled" in r.text.lower()
 
 
-def test_repl_status_works_master_on(monkeypatch):
+async def test_repl_status_works_master_on(monkeypatch):
     monkeypatch.setenv(
         "JARVIS_UNIFIED_GRADUATION_DASHBOARD_ENABLED", "true",
     )
     from backend.core.ouroboros.governance.graduation_repl import (
         dispatch_graduation_command,
     )
-    r = dispatch_graduation_command("/graduation status")
+    r = (await dispatch_graduation_command("/graduation status"))
     assert r.ok is True
     assert "total gates" in r.text
 
 
-def test_repl_no_subcommand_aliases_to_status(monkeypatch):
+async def test_repl_no_subcommand_aliases_to_status(monkeypatch):
     monkeypatch.setenv(
         "JARVIS_UNIFIED_GRADUATION_DASHBOARD_ENABLED", "true",
     )
     from backend.core.ouroboros.governance.graduation_repl import (
         dispatch_graduation_command,
     )
-    r = dispatch_graduation_command("/graduation")
+    r = (await dispatch_graduation_command("/graduation"))
     assert r.ok is True
     assert "total gates" in r.text
 
 
-def test_repl_unknown_subcommand(monkeypatch):
+async def test_repl_unknown_subcommand(monkeypatch):
     monkeypatch.setenv(
         "JARVIS_UNIFIED_GRADUATION_DASHBOARD_ENABLED", "true",
     )
     from backend.core.ouroboros.governance.graduation_repl import (
         dispatch_graduation_command,
     )
-    r = dispatch_graduation_command("/graduation gibberish")
+    r = (await dispatch_graduation_command("/graduation gibberish"))
     assert r.ok is False
     assert "unknown subcommand" in r.text.lower()
 
 
-def test_repl_contract_requires_name(monkeypatch):
+async def test_repl_contract_requires_name(monkeypatch):
     monkeypatch.setenv(
         "JARVIS_UNIFIED_GRADUATION_DASHBOARD_ENABLED", "true",
     )
     from backend.core.ouroboros.governance.graduation_repl import (
         dispatch_graduation_command,
     )
-    r = dispatch_graduation_command("/graduation contract")
+    r = (await dispatch_graduation_command("/graduation contract"))
     assert r.ok is False
     assert "name required" in r.text.lower()
 
 
-def test_repl_contract_lookup_substring_match(monkeypatch):
+async def test_repl_contract_lookup_substring_match(monkeypatch):
     """Contract lookup matches substring case-insensitively."""
     monkeypatch.setenv(
         "JARVIS_UNIFIED_GRADUATION_DASHBOARD_ENABLED", "true",
@@ -379,45 +379,45 @@ def test_repl_contract_lookup_substring_match(monkeypatch):
         dispatch_graduation_command,
     )
     # `phase10_purge` is one of the 8 contract names.
-    r = dispatch_graduation_command(
+    r = await dispatch_graduation_command(
         "/graduation contract phase10_purge",
     )
     assert r.ok is True
     assert "phase10_purge" in r.text
 
 
-def test_repl_contract_unknown_returns_not_found(monkeypatch):
+async def test_repl_contract_unknown_returns_not_found(monkeypatch):
     monkeypatch.setenv(
         "JARVIS_UNIFIED_GRADUATION_DASHBOARD_ENABLED", "true",
     )
     from backend.core.ouroboros.governance.graduation_repl import (
         dispatch_graduation_command,
     )
-    r = dispatch_graduation_command(
+    r = await dispatch_graduation_command(
         "/graduation contract zzz_does_not_exist",
     )
     assert r.ok is False
     assert "not found" in r.text.lower()
 
 
-def test_repl_details_with_limit(monkeypatch):
+async def test_repl_details_with_limit(monkeypatch):
     monkeypatch.setenv(
         "JARVIS_UNIFIED_GRADUATION_DASHBOARD_ENABLED", "true",
     )
     from backend.core.ouroboros.governance.graduation_repl import (
         dispatch_graduation_command,
     )
-    r = dispatch_graduation_command("/graduation details 3")
+    r = (await dispatch_graduation_command("/graduation details 3"))
     assert r.ok is True
     # Header line + 3 rows minimum.
     assert r.text.count("\n") >= 3
 
 
-def test_repl_parse_error_handled():
+async def test_repl_parse_error_handled():
     from backend.core.ouroboros.governance.graduation_repl import (
         dispatch_graduation_command,
     )
-    r = dispatch_graduation_command("/graduation 'unclosed")
+    r = (await dispatch_graduation_command("/graduation 'unclosed"))
     assert r.ok is False
     assert "parse error" in r.text.lower()
 
@@ -651,7 +651,7 @@ def test_register_flags_none_registry():
 # ---------------------------------------------------------------------------
 
 
-def test_repl_ready_renders_real_data(monkeypatch):
+async def test_repl_ready_renders_real_data(monkeypatch):
     """End-to-end: REPL `/graduation ready` composes the
     substrate aggregator and produces operator-readable output."""
     monkeypatch.setenv(
@@ -660,7 +660,7 @@ def test_repl_ready_renders_real_data(monkeypatch):
     from backend.core.ouroboros.governance.graduation_repl import (
         dispatch_graduation_command,
     )
-    r = dispatch_graduation_command("/graduation ready")
+    r = (await dispatch_graduation_command("/graduation ready"))
     assert r.ok is True
     # Either lists READY gates or says none are READY — both valid.
     assert (
@@ -669,12 +669,12 @@ def test_repl_ready_renders_real_data(monkeypatch):
     )
 
 
-def test_repl_failed_renders_real_data(monkeypatch):
+async def test_repl_failed_renders_real_data(monkeypatch):
     monkeypatch.setenv(
         "JARVIS_UNIFIED_GRADUATION_DASHBOARD_ENABLED", "true",
     )
     from backend.core.ouroboros.governance.graduation_repl import (
         dispatch_graduation_command,
     )
-    r = dispatch_graduation_command("/graduation failed")
+    r = (await dispatch_graduation_command("/graduation failed"))
     assert r.ok is True
