@@ -568,3 +568,150 @@ def test_a_registered_sink_is_used_without_an_explicit_pool():
     out = c.apply_effects()
     assert out["emission"] == "paused"
     assert pool.paused is True
+
+
+# ---------------------------------------------------------------------------
+# Slice 4 — the operator sees which request is in force
+# ---------------------------------------------------------------------------
+
+
+def test_a_single_cockpit_chip_is_unchanged(monkeypatch):
+    from backend.core.ouroboros.governance import trust_repl as t
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+    pm.get_controller().request("mac", "approval_required")
+    assert t.floor_chip() == "🟠⛨ approval_required"
+
+
+def test_the_chip_says_composed_when_cockpits_disagree(monkeypatch):
+    """Silence is right for a dial nobody touched and wrong for one two
+    people are pulling in different directions."""
+    from backend.core.ouroboros.governance import trust_repl as t
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+    c = pm.get_controller()
+    c.request("mac", "approval_required")
+    c.request("desktop", "safe_auto")
+    chip = t.floor_chip()
+    assert "approval_required" in chip and "composed" in chip
+
+
+def test_a_composed_chip_renders_even_at_the_resting_rung(monkeypatch):
+    """The operator whose request lost needs to know a negotiation happened
+    at all — the resting rung is not evidence that nothing did."""
+    from backend.core.ouroboros.governance import trust_repl as t
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+    c = pm.get_controller()
+    c.request("mac", "safe_auto")
+    assert t.floor_chip() == ""
+    c.request("desktop", "notify_apply")
+    assert t.floor_chip() != ""
+
+
+def test_agreement_is_not_reported_as_composition(monkeypatch):
+    from backend.core.ouroboros.governance import trust_repl as t
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+    c = pm.get_controller()
+    c.request("mac", "watch")
+    c.request("desktop", "watch")
+    assert "composed" not in t.floor_chip()
+
+
+def test_the_shared_chip_never_names_a_cockpit(monkeypatch):
+    """This line is mirrored to every surface. Naming one operator here
+    tells the others something false about themselves."""
+    from backend.core.ouroboros.governance import trust_repl as t
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+    c = pm.get_controller()
+    c.request("mac", "watch")
+    c.request("desktop", "safe_auto")
+    chip = t.floor_chip()
+    assert "mac" not in chip and "desktop" not in chip
+
+
+def test_the_chip_reads_the_controller_not_the_env_knob(monkeypatch):
+    """The knob records the LAST write; the effective rung is the strictest
+    across live cockpits. Reading the knob reintroduces the race."""
+    from backend.core.ouroboros.governance import trust_repl as t
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+    c = pm.get_controller()
+    c.request("mac", "watch")
+    c.request("desktop", "safe_auto")
+    monkeypatch.setenv("JARVIS_MIN_RISK_TIER", "safe_auto")
+    assert "watch" in t.floor_chip(), "the chip believed the last writer"
+
+
+def test_an_overridden_cockpit_is_told_what_is_in_force(monkeypatch):
+    """§30.6 — an operator whose tightening is invisibly discarded stops
+    tightening."""
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+    c = pm.get_controller()
+    c.request("mac", "approval_required")
+    c.request("desktop", "safe_auto")
+    notice = pm.override_notice("desktop")
+    assert "approval_required" in notice and "safe_auto" in notice
+
+
+def test_the_strictest_cockpit_is_told_nothing(monkeypatch):
+    """Not news to the operator who asked for it; saying so every frame
+    spends the line's attention budget on a non-event."""
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+    c = pm.get_controller()
+    c.request("mac", "approval_required")
+    c.request("desktop", "safe_auto")
+    assert pm.override_notice("mac") == ""
+
+
+def test_agreeing_cockpits_get_no_notice(monkeypatch):
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+    c = pm.get_controller()
+    c.request("mac", "watch")
+    c.request("desktop", "watch")
+    assert pm.override_notice("desktop") == ""
+
+
+def test_an_unknown_cockpit_gets_no_notice(monkeypatch):
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+    pm.get_controller().request("mac", "watch")
+    assert pm.override_notice("never-attached") == ""
+    assert pm.override_notice("") == ""
+
+
+def test_a_notice_clears_when_the_stricter_cockpit_leaves(monkeypatch):
+    """Deliberate exit is consent, so the override genuinely ends."""
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+    c = pm.get_controller()
+    c.request("mac", "watch")
+    c.request("desktop", "safe_auto")
+    assert pm.override_notice("desktop") != ""
+    c.release("mac")
+    assert pm.override_notice("desktop") == ""
+
+
+def test_a_notice_persists_while_the_stricter_cockpit_is_merely_detached(
+        monkeypatch):
+    """Absence is not consent — the notice must not clear on a Wi-Fi drop,
+    because the override has not actually ended."""
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+    c = pm.get_controller()
+    c.request("mac", "watch")
+    c.request("desktop", "safe_auto")
+    c.detach("mac")
+    assert pm.override_notice("desktop") != ""
+
+
+def test_composition_and_notice_never_raise(monkeypatch):
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "1")
+
+    def _boom():
+        raise RuntimeError("controller exploded")
+
+    monkeypatch.setattr(pm, "get_controller", _boom)
+    assert pm.composition().composed is False
+    assert pm.override_notice("mac") == ""
+
+
+def test_the_chip_survives_proactive_mode_being_absent(monkeypatch):
+    """Master-off must be the pre-§30 chip, byte-identically."""
+    from backend.core.ouroboros.governance import trust_repl as t
+    monkeypatch.delenv("JARVIS_PROACTIVE_MODE_ENABLED", raising=False)
+    monkeypatch.setenv("JARVIS_MIN_RISK_TIER", "notify_apply")
+    assert t.floor_chip() == "🟡⛨ notify_apply"

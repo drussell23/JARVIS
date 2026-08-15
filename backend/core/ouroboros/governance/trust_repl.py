@@ -101,11 +101,44 @@ def current_floor() -> str:
 
 def floor_chip() -> str:
     """The status-line chip: empty at rest so the line stays calm, loud
-    when the operator has raised the floor. NEVER raises."""
+    when the operator has raised the floor. NEVER raises.
+
+    §30.6 — when more than one cockpit has asked for a different rung, the
+    chip says the position is COMPOSED. It does not say whose request won,
+    because that is a fact about a particular screen rather than about the
+    organism, and this line is mirrored to every surface: naming one
+    operator here would tell the others something false about themselves.
+    ``proactive_mode.override_notice`` answers the per-cockpit question
+    where the cockpit's own identity is known.
+
+    A composed chip renders even at the resting rung. Silence is the right
+    default for a dial nobody has touched; it is the wrong default for a
+    dial two people are pulling in different directions, because the
+    operator whose request lost needs to know a negotiation happened at all.
+    """
     tier = current_floor()
-    if tier == "safe_auto":
+    comp = None
+    try:
+        from backend.core.ouroboros.governance import proactive_mode as _pm
+        if _pm.is_enabled():
+            comp = _pm.composition()
+            # The controller is authoritative when it holds requests: the
+            # env knob records the LAST write, and the effective rung is the
+            # strictest across live cockpits. Reading the knob here would
+            # reintroduce the last-writer-wins race the controller exists to
+            # remove.
+            if comp.voters:
+                tier = comp.effective
+    except Exception:  # noqa: BLE001
+        comp = None
+
+    composed = bool(comp and comp.composed)
+    if tier == "safe_auto" and not composed:
         return ""
-    return f"{_glyph_for(tier)}⛨ {tier}"
+    chip = f"{_glyph_for(tier)}⛨ {tier}"
+    if composed:
+        chip = f"{chip} (composed ×{comp.distinct})"
+    return chip
 
 
 def _describe(tier: str) -> str:
