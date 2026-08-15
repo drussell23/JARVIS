@@ -288,12 +288,18 @@ class TestTheLinkIsDerivedNotRestated:
         monkeypatch.setenv("JARVIS_CHANNEL_PORT", "9001")
         assert gxp.bus_url() == "ws://127.0.0.1:9001/ws/trinity-bus"
 
-    def test_tls_is_never_quietly_downgraded_by_url_building(self, monkeypatch):
-        """The scheme follows the transport's own posture. A loopback link
-        is not a reason to invent plaintext."""
+    def test_the_scheme_follows_THIS_links_posture(self, monkeypatch):
+        """Written against the brain link's knob originally, which was the
+        bug: that knob is shared with the cross-host brain transport. The
+        scheme must follow the posture derived for THIS link, and the brain
+        link's setting must not move it in either direction."""
         monkeypatch.delenv("JARVIS_GOVERNANCE_BUS_URL", raising=False)
         monkeypatch.setenv("JARVIS_BRAIN_WS_TLS_ENABLED", "true")
-        assert gxp.bus_url().startswith("wss://")
+        monkeypatch.setenv("JARVIS_CHANNEL_HOST", "127.0.0.1")
+        monkeypatch.delenv("JARVIS_GOVERNANCE_BUS_TLS_ENABLED", raising=False)
+        assert gxp.bus_url().startswith("ws://"), "loopback stays plaintext"
+        monkeypatch.setenv("JARVIS_CHANNEL_HOST", "10.0.0.5")
+        assert gxp.bus_url().startswith("wss://"), "routable requires TLS"
 
     def test_an_explicit_url_wins(self, monkeypatch):
         monkeypatch.setenv("JARVIS_GOVERNANCE_BUS_URL", "ws://host:1/x")
@@ -360,3 +366,148 @@ class TestTheServerMountsByDeclaring:
 
         gbs.register_routes(_Hostile())   # must not raise
         assert gbs.get_server_bus() is None
+
+
+# ---------------------------------------------------------------------------
+# The TLS posture — derived, not inherited
+# ---------------------------------------------------------------------------
+
+
+class TestTheTlsPostureIsDerivedFromReachability:
+    """`TransportConfig.from_env` reads `JARVIS_BRAIN_WS_*`, which
+    `brain_keeper` and `organism_bus_host` also read for the CROSS-HOST brain
+    link. Turning TLS off there to make a loopback telemetry socket
+    convenient would silently downgrade that link too — a security
+    regression bought with an unrelated convenience. So this link decides for
+    itself, from the only fact that matters: can the socket leave the host.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean(self, monkeypatch):
+        monkeypatch.delenv("JARVIS_GOVERNANCE_BUS_TLS_ENABLED", raising=False)
+        yield
+
+    def test_loopback_runs_plaintext(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_CHANNEL_HOST", "127.0.0.1")
+        assert gxp.link_tls_enabled() is False
+        assert gxp.link_refusal() == ""
+
+    def test_a_routable_host_requires_tls_without_being_told(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_CHANNEL_HOST", "10.0.0.5")
+        assert gxp.link_tls_enabled() is True
+        assert gxp.link_refusal() == ""
+
+    def test_wildcard_bind_is_not_loopback(self, monkeypatch):
+        """`0.0.0.0` is the shape that looks local and is not."""
+        monkeypatch.setenv("JARVIS_CHANNEL_HOST", "0.0.0.0")
+        assert gxp.is_loopback("0.0.0.0") is False
+        assert gxp.link_tls_enabled() is True
+
+    def test_plaintext_on_a_routable_host_is_REFUSED_not_served(
+            self, monkeypatch):
+        """The one combination that fails closed. An override may relax the
+        derivation; it cannot relax this."""
+        monkeypatch.setenv("JARVIS_CHANNEL_HOST", "0.0.0.0")
+        monkeypatch.setenv("JARVIS_GOVERNANCE_BUS_TLS_ENABLED", "0")
+        assert gxp.link_refusal() != ""
+
+    def test_an_operator_may_demand_tls_on_loopback(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_CHANNEL_HOST", "127.0.0.1")
+        monkeypatch.setenv("JARVIS_GOVERNANCE_BUS_TLS_ENABLED", "1")
+        assert gxp.link_tls_enabled() is True
+        assert gxp.bus_url().startswith("wss://")
+
+    def test_the_brain_links_knob_is_left_alone(self, monkeypatch):
+        """The whole reason this is derived: the shared config must come back
+        untouched apart from the one field with a different threat model."""
+        monkeypatch.setenv("JARVIS_CHANNEL_HOST", "127.0.0.1")
+        monkeypatch.setenv("JARVIS_BRAIN_WS_TLS_ENABLED", "true")
+        from backend.core.ouroboros.governance.transport.transport_config import (
+            TransportConfig,
+        )
+        shared = TransportConfig.from_env(role="client")
+        ours = gxp.link_transport_config("client")
+        assert shared.tls_enabled is True, "the brain link keeps its TLS"
+        assert ours.tls_enabled is False, "ours is derived for loopback"
+        assert ours.queue_maxsize == shared.queue_maxsize
+        assert ours.reconnect_base_s == shared.reconnect_base_s
+        assert ours.reconnect_jitter == shared.reconnect_jitter
+
+    async def test_a_refused_link_starts_no_client(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_CHANNEL_HOST", "0.0.0.0")
+        monkeypatch.setenv("JARVIS_GOVERNANCE_BUS_TLS_ENABLED", "0")
+        assert await gxp.start_bus_client() is None
+
+
+# ---------------------------------------------------------------------------
+# The socket itself — a real loopback WebSocket, two brokers
+# ---------------------------------------------------------------------------
+
+
+class TestTheLinkCarriesAFrameOverARealSocket:
+    """Proven live between two OS processes on 2026-08-15
+    (``ws://127.0.0.1:8123/ws/trinity-bus`` → ``channel=governance``). This
+    is that proof made repeatable: two SEPARATE brokers, a real aiohttp
+    server, a real client dialling loopback. One broker on both ends would
+    prove nothing about the wire.
+    """
+
+    async def test_a_frame_published_on_one_broker_reaches_the_other(
+            self, monkeypatch, stream, unused_tcp_port_factory=None):
+        import socket as _socket
+
+        from aiohttp import web
+
+        from backend.core.ouroboros.governance import governance_bus_server as gbs
+
+        monkeypatch.setenv("JARVIS_GOVERNANCE_BUS_BRIDGE_ENABLED", "1")
+        monkeypatch.setenv("JARVIS_GOVERNANCE_OWNER", "ov")
+        monkeypatch.setenv("JARVIS_CHANNEL_HOST", "127.0.0.1")
+        monkeypatch.delenv("JARVIS_GOVERNANCE_BUS_URL", raising=False)
+        monkeypatch.delenv("JARVIS_GOVERNANCE_BUS_TLS_ENABLED", raising=False)
+
+        sock = _socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        monkeypatch.setenv("JARVIS_CHANNEL_PORT", str(port))
+
+        server_broker = StreamEventBroker()
+        client_broker = StreamEventBroker()
+
+        gbs.reset_for_tests()
+        monkeypatch.setattr(
+            "backend.core.ouroboros.governance.ide_observability_stream."
+            "get_default_broker", lambda: server_broker)
+
+        app = web.Application()
+        gbs.register_routes(app)
+        assert gbs.get_server_bus() is not None
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", port)
+        await site.start()
+
+        consumer = gxp.GovernanceBusConsumer(client_broker)
+        assert await consumer.start()
+        bus = await gxp.start_bus_client(broker=client_broker)
+        assert bus is not None
+        try:
+            sink = gxp.BrokerSink(server_broker)
+            deadline = asyncio.get_event_loop().time() + 20
+            while asyncio.get_event_loop().time() < deadline and not stream.seen:
+                await sink([FRAME])       # republish while the link settles
+                await asyncio.sleep(0.25)
+            assert stream.seen, (
+                f"nothing crossed the socket; consumer={consumer.health()}")
+            channel, payload = stream.seen[0]
+            assert channel == "governance"
+            assert payload["narration_text"] == FRAME["narration_text"]
+        finally:
+            await consumer.stop()
+            try:
+                await bus.stop()
+            except Exception:
+                pass
+            await runner.cleanup()
+            gbs.reset_for_tests()

@@ -27,14 +27,21 @@ broker; outbound frames are drained from it. This module chooses a role and
 hands over — a second transport would be a second thing to keep correct
 while the first is load-bearing.
 
-TLS IS NOT WEAKENED HERE
-------------------------
-``TransportConfig`` defaults ``tls_enabled=True``, and this module does not
-override it. A loopback link between two local daemons still needs either the
-mTLS material this repo already provisions under ``.jarvis/brain_mtls/`` or
-an explicit ``JARVIS_BRAIN_WS_TLS_ENABLED=false`` from the operator.
-Silently downgrading a link because both ends happen to be on one host is
-how a development convenience becomes a deployment default.
+THE TLS POSTURE IS DERIVED, AND NOT INHERITED
+---------------------------------------------
+``TransportConfig.from_env`` reads ``JARVIS_BRAIN_WS_*`` — the same knobs
+``brain_keeper`` and ``organism_bus_host`` read for the CROSS-HOST brain
+link. Turning TLS off there to make a loopback telemetry socket convenient
+would have silently downgraded that link too: a security regression bought
+with an unrelated convenience.
+
+So this link decides for itself, from the only fact that matters — whether
+the socket can leave the machine. Bound to loopback, it runs plaintext;
+reachable off-host, it requires TLS; and reachable off-host WITHOUT TLS is
+refused outright rather than served. That is the rule
+``ide_observability`` already enforces for its router, applied to a
+transport. ``JARVIS_GOVERNANCE_BUS_TLS_ENABLED`` overrides the derivation in
+either direction; it cannot override the refusal.
 
 Python 3.9+, ``from __future__ import annotations``.
 """
@@ -88,24 +95,33 @@ def register_routes(
         if _bus is not None:
             return                      # idempotent; registry may re-walk
 
+        from backend.api.governance_cross_process import (
+            link_host, link_refusal, link_transport_config,
+        )
+        # Fails CLOSED on exactly one combination — reachable off-host AND
+        # plaintext. Checked at BOTH ends, so neither can be talked into the
+        # unsafe posture by the other's configuration.
+        refusal = link_refusal()
+        if refusal:
+            logger.warning("[GovBusServer] %s", refusal)
+            return
+
         from backend.core.ouroboros.governance.ide_observability_stream import (
             get_default_broker,
         )
         from backend.core.ouroboros.governance.transport.distributed_event_bus import (  # noqa: E501
             DistributedEventBus,
         )
-        from backend.core.ouroboros.governance.transport.transport_config import (
-            TransportConfig,
-        )
 
-        cfg = TransportConfig.from_env(role="server")
+        cfg = link_transport_config("server")
         bus = DistributedEventBus(get_default_broker(), cfg, role="server")
         bus.register_server_routes(app)
         _bus = bus
         logger.info(
-            "[GovBusServer] mounted at %s — O+V activity is now reachable by "
-            "the supervisor's HUD bridge (tls=%s)",
-            cfg.path, cfg.tls_enabled,
+            "[GovBusServer] mounted at %s on %s — O+V activity is now "
+            "reachable by the supervisor's HUD bridge (tls=%s, derived from "
+            "reachability, NOT inherited from the brain link's shared knob)",
+            cfg.path, link_host(), cfg.tls_enabled,
         )
     except Exception:  # noqa: BLE001 — a telemetry link never blocks a boot
         logger.debug("[GovBusServer] mount degraded", exc_info=True)

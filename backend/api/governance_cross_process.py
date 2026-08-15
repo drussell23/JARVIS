@@ -75,6 +75,11 @@ __all__ = [
     "install_governance_bus_consumer",
     "install_governance_bus_producer",
     "bus_url",
+    "link_transport_config",
+    "link_refusal",
+    "link_tls_enabled",
+    "is_loopback",
+    "link_host",
     "reset_for_tests",
     "start_bus_client",
 ]
@@ -350,6 +355,88 @@ class GovernanceBusConsumer:
         }
 
 
+#: Addresses the kernel will not route off this host. A link that cannot
+#: leave the machine has a different threat model from one that can, and that
+#: difference is the ONLY thing this module lets decide the TLS posture.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "127.0.1.1"})
+
+
+def link_host() -> str:
+    """Where the `ov` end is reachable. The server binds it, the client
+    dials it, and the TLS posture is derived from it — one value, so the two
+    ends cannot hold different beliefs about how exposed the link is."""
+    return (os.environ.get("JARVIS_CHANNEL_HOST") or "127.0.0.1").strip()
+
+
+def is_loopback(host: str) -> bool:
+    """NEVER raises. Unknown shapes are treated as ROUTABLE — the safe
+    direction, since guessing 'probably local' is what turns a development
+    convenience into an exposed plaintext socket."""
+    try:
+        return (host or "").strip().lower() in _LOOPBACK_HOSTS
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def link_tls_enabled() -> bool:
+    """The posture for THIS link. NEVER raises.
+
+    DERIVED from reachability rather than inherited, because the inherited
+    knob is shared: ``TransportConfig.from_env`` reads ``JARVIS_BRAIN_WS_*``,
+    which ``brain_keeper`` and ``organism_bus_host`` also read for the
+    CROSS-HOST brain link. Setting ``JARVIS_BRAIN_WS_TLS_ENABLED=false`` to
+    make a loopback telemetry socket convenient would have silently
+    downgraded that one too — a security regression bought with an
+    unrelated convenience.
+
+    So: a socket the kernel will not route off this host runs plaintext; a
+    socket that can leave the machine requires TLS. Same rule the
+    ``ide_observability`` surface already lives by, applied to a transport
+    instead of a router. ``JARVIS_GOVERNANCE_BUS_TLS_ENABLED`` overrides in
+    either direction — an operator may demand TLS on loopback, and
+    :func:`link_refusal` still refuses the unsafe combination.
+    """
+    raw = (os.environ.get("JARVIS_GOVERNANCE_BUS_TLS_ENABLED") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return not is_loopback(link_host())
+
+
+def link_refusal() -> str:
+    """Why this link must NOT be established, or "". NEVER raises.
+
+    Fails CLOSED on exactly one combination: reachable off-host AND
+    plaintext. Both ends call it, so neither can be talked into the unsafe
+    posture by the other's configuration.
+    """
+    host = link_host()
+    if not is_loopback(host) and not link_tls_enabled():
+        return (f"refusing a plaintext governance link on non-loopback host "
+                f"{host!r} — set JARVIS_GOVERNANCE_BUS_TLS_ENABLED=1 (and "
+                f"provision certs) or bind JARVIS_CHANNEL_HOST to loopback")
+    return ""
+
+
+def link_transport_config(role: str) -> Any:
+    """``TransportConfig`` for this link, with the posture applied.
+
+    Everything else — ``queue_maxsize``, heartbeat, the reconnect
+    base/max/jitter — is inherited untouched from the shared env, because
+    those are transport tuning and are correct for any link. Only the TLS
+    decision is overridden, and only because sharing it would couple two
+    links with different threat models.
+    """
+    from dataclasses import replace
+
+    from backend.core.ouroboros.governance.transport.transport_config import (
+        TransportConfig,
+    )
+    cfg = TransportConfig.from_env(role=role)
+    return replace(cfg, tls_enabled=link_tls_enabled())
+
+
 def bus_url() -> str:
     """Where the supervisor dials `ov`. NEVER raises.
 
@@ -367,17 +454,13 @@ def bus_url() -> str:
     if explicit:
         return explicit
     try:
-        from backend.core.ouroboros.governance.transport.transport_config import (
-            TransportConfig,
-        )
-        cfg = TransportConfig.from_env(role="client")
+        cfg = link_transport_config("client")
         path = cfg.path or "/ws/trinity-bus"
         scheme = "wss" if getattr(cfg, "tls_enabled", True) else "ws"
     except Exception:  # noqa: BLE001
         path, scheme = "/ws/trinity-bus", "wss"
-    host = (os.environ.get("JARVIS_CHANNEL_HOST") or "127.0.0.1").strip()
     port = (os.environ.get("JARVIS_CHANNEL_PORT") or "8099").strip()
-    return f"{scheme}://{host}:{port}{path}"
+    return f"{scheme}://{link_host()}:{port}{path}"
 
 
 async def start_bus_client(*, broker: Any = None,
@@ -399,17 +482,19 @@ async def start_bus_client(*, broker: Any = None,
         from backend.core.ouroboros.governance.transport.distributed_event_bus import (  # noqa: E501
             DistributedEventBus,
         )
-        from backend.core.ouroboros.governance.transport.transport_config import (
-            TransportConfig,
-        )
-        cfg = TransportConfig.from_env(role="client")
+        refusal = link_refusal()
+        if refusal:
+            logger.warning("[GovBus] %s", refusal)
+            return None
+        cfg = link_transport_config("client")
         bus = DistributedEventBus(broker or get_default_broker(), cfg,
                                   role="client")
         target = url or bus_url()
         asyncio.get_event_loop().create_task(
             bus.start_client(target), name="governance-bus-client")
-        logger.info("[GovBus] client dialling %s (reconnect base=%.1fs "
-                    "max=%.1fs jitter=%.2f)", target, cfg.reconnect_base_s,
+        logger.info("[GovBus] client dialling %s (tls=%s, reconnect "
+                    "base=%.1fs max=%.1fs jitter=%.2f)", target,
+                    cfg.tls_enabled, cfg.reconnect_base_s,
                     cfg.reconnect_max_s, cfg.reconnect_jitter)
         return bus
     except Exception:  # noqa: BLE001
