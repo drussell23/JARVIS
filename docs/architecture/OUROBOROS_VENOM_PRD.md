@@ -3614,7 +3614,34 @@ proposal *surface*.
 per-proposal affordance. This is §27.10 slice 5 and it is the difference
 between an organism that proposes and an operator who can hear it.
 
-#### C2 — The decision channel is complete except for the answer key
+#### C2 — REVISED 2026-08-15: not missing, mounted on one surface of two
+
+> **Correction.** C2 originally read "there is no action that answers a
+> gate." That is false. `menu_bindings.install_confirm_actions` binds
+> `confirm:yes` → `y`/`enter` → `/accept` and `confirm:no` → `n` →
+> `/reject`, filtered on an empty prompt. Single-key answering exists and
+> was built before this audit ran.
+>
+> **What is actually true is narrower and worse.** Those bindings are
+> imported at exactly one site — `bipartite_layout.py:1495` — and never by
+> `cli/ov.py`, which is the surface `ov attach` and bare `ov` actually
+> mount. So the capability exists, works, and is unreachable from the
+> cockpit an operator uses.
+>
+> This is not a new observation about the codebase; it is the same one
+> `ov.py:toolbar()` already records in prose about a different feature:
+> *"the page-style palette shipped in #70123 reached the bipartite cockpit
+> and never reached the surface `ov` actually attaches with."* Two
+> presentation surfaces, one of which receives every new affordance,
+> silently diverging. **Surface parity is the defect class**, and C2 is one
+> instance of it rather than a missing feature.
+>
+> This is also the third confident structural claim about this cockpit to
+> fail verification (see §28.4). The pattern is now established well enough
+> to state as a rule: in this codebase, *absence of a call site in `ov.py`
+> means the feature is unmounted there, never that it does not exist.*
+
+The original finding, with the correction above applied:
 
 The channel is queued, badged, addressed, re-surfaceable, and parsed with
 strict single-token discipline (§28.2.2–28.2.4). One vocabulary item is
@@ -3932,19 +3959,427 @@ advertise a maximum frame size and the **minimum wins** — the same asymmetry
 §25.1 applies to terminal width, and for the same reason. A ceiling one side
 cannot honour is not a limit, it is a fault waiting for a large frame.
 
-### 29.7 What remains
+### 29.7 What is built *(revised 2026-08-15 — the link is complete)*
 
-`link_protocol.py` is the provable half. The transport half — a wire codec
-over the mTLS channel, the per-side durable outbox on `durable_io`, the SSE
-lane bridged to a remote subscriber, and the handshake that negotiates limits
-— is the next slice, and it is the half that cannot be finished honestly
-until both machines exist. Master switch `JARVIS_LINK_BRIDGE_ENABLED`,
-default false.
+When §29 was first written only `link_protocol.py` existed and the rest was
+described as "the next slice". All of it landed the same day, across PRs
+#70482 and #70483. This subsection replaces the forward-looking text with
+what is actually on `main` at `bcd57b3744`.
 
-The fault-injection spine follows §28's discipline: kill the link mid-verdict
-and assert exactly-once *effect*; partition during a live review and assert
-the op **parks** with no evidence recorded in either direction (§27.3.2);
-force a replay gap wider than retention and assert `RESYNC` rather than a
-silent partial resume.
+| Module | Role | Tests |
+|---|---|---|
+| `link_protocol.py` | Lamport clock, `plan_resume`, `FlapBreaker`, `DeliveryLedger`, `SessionRegistry`, `ensure_frame_envelope` | 34 |
+| `link_transport.py` | Framing over the transcript codec, `negotiate`, `RttEstimator`, `LivenessMonitor`, `ReassemblyBuffer`, `AdaptiveBatcher`, mTLS contexts | 37 |
+| `link_outbox.py` | Bounded memory → durable spill via `durable_io`, FIFO across both tiers, restart recovery | (in transport suite) |
+| `link_session.py` | The state machine: handshake, collision resolution, resume, park, `PriorityWriteQueue`, SSE bridge | 33 |
+| `link_runner.py` | Connection supervision, reconnect cycle, `serve_link`, `tls_connector` | 22 |
+| `link_certs.py` | Private CA + two leaves, atomic publish, issuance lock, expiry inspection | (in runner suite) |
+| `cli/ov_link.py` | `ov link --issue-certs / --serve / --connect / --status` | 32 |
+
+**269 tests.** Master switch `JARVIS_LINK_BRIDGE_ENABLED`, default false.
+
+#### 29.7.1 Decisions worth recording
+
+**One codec, not two.** `transcript_log.encode_record` emits
+`<crc32-hex>\t<json>\n`. Self-delimiting by newline means it frames a
+*stream* exactly as it frames a *file*, so a verdict spilled to disk and the
+same verdict on the socket are byte-identical and there is no
+serialise/deserialise seam where a schema could drift. Pinned by a test
+asserting neither module contains a second encoder.
+
+Reusing a codec means accepting its **contract**, not only its bytes — a
+lesson learned three times over. Records need `v`/`seq`/`kind`/`ref`, and
+`seq` must be ≥ 1 because the codec reserves 0 and :func:`plan_resume` reads
+0 as "this peer has applied nothing". One value cannot mean both.
+`ensure_frame_envelope` now lives in `link_protocol` and both the outbox and
+the transport call it: validating in two places with two opinions is how two
+sides of a link start disagreeing about what a frame is.
+
+**MTU is deliberately not consulted.** TCP owns path-MTU discovery and
+segments the stream; sizing application frames to it computes a number that
+changes nothing — a fabricated measurement in the same family as a blast
+radius nobody scanned. Implemented instead: a negotiated ceiling (minimum
+wins), backpressure through `drain()` so buffer bloat is not merely
+relocated from the socket into Python where `ss` cannot see it, and a batch
+size following observed drain latency.
+
+**Half-open detection is RTT-derived.** A peer that loses power sends no FIN
+and the socket stays ESTABLISHED until OS keepalive fires — two hours on
+Linux, indistinguishable from idle. `SO_KEEPALIVE` is set as defence in
+depth but not trusted; the detector is an application heartbeat whose
+deadline comes from Jacobson/Karels smoothed RTT, because a constant is too
+tight on a congested café link and too loose on a fast one. One miss is not
+a death.
+
+**Re-keying needed no code.** Session state lives in the registry, never in
+the connection, so certificate rotation is a reconnect with a different SSL
+context and the state machine cannot distinguish it from a Wi-Fi drop. A
+test asserts no hot-swap path exists — a second way to do what resume
+already does correctly is a second thing to keep correct.
+
+**Deadlock under backpressure is removed, not managed.** Two producers
+wanting one writer must serialise somehow; a lock serialises by *blocking*,
+and a producer blocked while holding anything else is how an event loop
+deadlocks. One task owns the socket and both producers enqueue into
+`PriorityWriteQueue`. A test asserts no lock is held across an `await`
+anywhere in the module.
+
+#### 29.7.2 Defects the spine caught
+
+Recorded because each was invisible to inspection and found only by a test
+that named a failure rather than a spelling.
+
+* **Control and data shared one sequence space.** The handshake consumed
+  seq 1, so the first verdict was seq 2 and the peer's reassembly waited
+  forever for a frame that would never exist. Worse, a dropped heartbeat
+  would have holed a range `plan_resume` is defined over. Two counters now,
+  with control kinds bypassing reassembly entirely.
+* **The flap map pruned only *stale* entries.** A peer cycling session ids
+  produces thousands of *fresh* entries inside one window — a
+  memory-exhaustion vector on a network-reachable service, reached by the
+  exact traffic pattern the class exists to survive. Hard-capped with LRU
+  eviction.
+* **`engine:9000` was accepted as a certificate name.** A colon is wrong in
+  a host:port pair and correct in an IPv6 literal, so the value is handed to
+  `ipaddress` rather than pattern-matched.
+
+#### 29.7.3 Identity
+
+`.jarvis/brain_mtls/` could not be reused, established by inspecting it:
+**expired five weeks earlier on a seven-day validity**, leaves issued to
+`jarvis-brain`, and belonging to the J-Prime trust domain. `tls_dir()` now
+defaults to `.jarvis/link_mtls` — one directory shared by two trust domains
+means rotating either silently re-keys the other.
+
+Seven days was the real defect. A link between two houses cannot require a
+physical visit every week, which is the same reason Tailscale key expiry
+must be disabled on the Engine. Now 825 days with `notBefore` backdated 24h,
+because §29.3's clock-drift problem applies to certificate validity too and
+a cert valid from "now" is rejected by a peer a few minutes behind.
+
+Issuance details that are load-bearing rather than ceremonial: IP literals
+become `iPAddress` SANs (a tailnet `100.x` in a DNSName verifies against
+nothing); the CA carries `path_length=0`; leaves carry narrow EKU so a
+compromised Body cannot impersonate the Engine to itself; keys are created
+at mode 0600 at `open()` rather than chmod'ed after; files publish through
+`durable_io.atomic_replace` so a reader building an SSL context never sees a
+half-written PEM; concurrent issuance is serialised by an `O_EXCL` lock; and
+the CA private key is excluded from the peer bundle, because copying it
+would let each end mint identities for the other.
+
+#### 29.7.4 Proven, and not
+
+**Proven.** A real mTLS handshake — TLS 1.3, `TLS_AES_256_GCM_SHA384`,
+hostname verified against the SAN, both sides presenting certificates. Two
+separate processes established a live link through the CLI
+(`peer connected: ('127.0.0.1', 54064)`). The pull-the-plug cycle runs in
+process end to end — handshake, deliver, park mid-work, keep working while
+parked, reconnect, replay — asserting every verdict arrives exactly once in
+order. An unauthenticated client exchanges no data, asserted as "exchanges
+nothing" rather than "raises on connect" because under TLS 1.3 the server
+evaluates the client certificate after its own Finished, and asserting an
+exception would be asserting a protocol version's timing rather than the
+guarantee.
+
+**Not proven.** Nothing has crossed a real network. Tailnet DNS resolution,
+WSL2's NAT behaviour under `networkingMode=mirrored`, latency under a real
+partition, and whether a DERP relay is selected instead of a direct path all
+need both machines. That is the ten minutes at the Engine's keyboard no
+amount of local testing substitutes for.
+
+### 29.8 Operator surface
+
+```
+ov link --issue-certs --server-name <tailnet-name> --server-name <100.x>
+ov link --status
+ov link --serve --host <tailnet-addr> --port <N>      # Engine
+ov link --connect <tailnet-name> --port <N>           # Body
+```
+
+Validation is at the entry point because both mistakes on this path fail far
+from their cause: a wrong SAN fails at the handshake as a *trust* error,
+reading as "certificates are broken" rather than "you typed a URL", and
+`--connect` without a reachable host produces a connection error every
+backoff interval forever. `EX_USAGE` (64) for an argument the operator can
+fix; `EX_CONFIG` (78) for state on disk that needs a decision —
+re-issuing over live material is not a typo. `EADDRINUSE` reports the port,
+the platform's own diagnostic command and both remedies, never a retry loop:
+asyncio sets `SO_REUSEADDR` on POSIX but deliberately not on Windows, where
+it permits hijacking an active listener, so the Engine is exactly the host
+where a stale bind is reachable.
+
+`--status` reports days remaining rather than a boolean, so rotation is seen
+coming instead of discovered as an outage — which is precisely how the brain
+material failed.
+
+---
+
+## 30. Proactive Mode *(NEW 2026-08-15)*
+
+> **Operator binding (2026-08-15)**: *"We know Claude Code is an interactive
+> mode, but for O+V it should be a proactive mode — the total opposite."*
+
+### 30.0 Why this is a mode and not a flag
+
+Claude Code publishes a document called *Interactive mode*. It is not a
+feature list; it is the **contract of a session** — what the caret means,
+what a keystroke does, how history is recalled, when a suggestion appears.
+Read its section list and one property holds across every entry:
+
+> **The human is the initiator, and the mode exists to make initiating cheap
+> and expressive.**
+
+Shortcuts edit *your* prompt. History recalls *your* prompts. Suggestions
+predict *your* next prompt. `/btw` asks *your* side question. Even the
+transcript viewer reviews a conversation *you* drove.
+
+O+V's session contract is the inverse and has never been written down. The
+consequence is not missing features — §28's inventory found O+V ahead of CC
+on interactive richness (37 `transcript:*` actions against CC's five viewer
+keys). The consequence is that **the organism's autonomy is configured
+rather than operated**: expressed as environment variables read at boot,
+scattered across `JARVIS_MIN_RISK_TIER`, `JARVIS_SENSOR_GOVERNOR_*`,
+`JARVIS_AUTO_APPLY_QUIET_HOURS` and four §26 actuator flags, with no single
+thing an operator can look at and say *"that is how autonomous it is right
+now."*
+
+A mode is that thing.
+
+### 30.1 The dial that already exists, and what it cannot say
+
+`trust_repl.py` is closer to this than anything else in the tree, and its
+own docstring frames it correctly: *"the operator's autonomy dial, one
+keystroke away."* `Shift+Tab` → `app:cycleTrust` → `/trust cycle` walks
+`safe_auto → notify_apply → approval_required`, writing
+`JARVIS_MIN_RISK_TIER`, which every gate re-reads per operation.
+
+That is **the same gesture Claude Code binds its permission-mode cycle to**,
+with inverted semantics: CC's cycle bounds what the agent may do *when
+asked*; O+V's bounds what it may do *on its own initiative*. The alignment
+is not coincidence — it is the correct gesture for the concept, arrived at
+twice.
+
+But the dial answers one question, and the operator has two:
+
+* **May it apply?** — the dial answers this, in three positions.
+* **May it start?** — nothing answers this.
+
+At `approval_required`, the strictest position the dial can express, sixteen
+sensors still fire, ops still enter the queue, CONTEXT_EXPANSION still runs
+and tokens are still spent. The dial stops the *landing*, never the
+*taking off*. So the request an operator most often has on first contact
+with an unfamiliar repository — *"observe, and touch nothing"* — is
+inexpressible on a dial whose every position assumes work is being
+generated.
+
+**That conflation is the root cause**, and §30 fixes it by separating the
+axes rather than by adding a fourth position to a dial that measures the
+wrong thing.
+
+### 30.2 Two axes, one dial
+
+Proactive mode is a pair:
+
+```
+    initiative ∈ { none, observe, explore, act }
+    authority  ∈ { propose, notify, auto, promote }
+```
+
+**Initiative** is the right to *begin* — to emit a signal, admit an op, spend
+a token. **Authority** is the right to *conclude* — to apply a patch, commit,
+push. They are genuinely independent: an organism may explore exhaustively
+and apply nothing (a research posture), or apply freely but only what a human
+queued (a batch posture).
+
+Presenting a 2-D space as a 1-D dial is a deliberate simplification, and the
+justification is the gesture: `Shift+Tab` must remain one keystroke. So the
+dial walks a **monotone path** through the space — every step is
+unambiguously less autonomous than the last, in both coordinates at once.
+That is what makes "cycle" meaningful; a path that traded one axis against
+the other would leave the operator unable to say whether they had just
+loosened or tightened.
+
+### 30.3 The ladder
+
+Loosest → strictest, matching `trust_repl._CYCLE`'s existing direction. The
+three shipped positions sit unchanged in the middle; `PROMOTE` is the §26
+Gate 3 endpoint; `EXPLORE` and `WATCH` are new.
+
+| # | Position | Initiative | Authority | The organism may |
+|---|---|---|---|---|
+| 0 | 🔵 `promote` | act | promote | land verified work on the operator tree (§26 Gate 3) |
+| 1 | 🟢 `safe_auto` | act | auto | apply as classified — Green auto, Yellow after its window |
+| 2 | 🟡 `notify_apply` | act | notify | apply only after showing a diff and waiting |
+| 3 | 🟠 `approval_required` | act | propose | generate and propose; every apply parks for a human |
+| 4 | 🔍 `explore` | explore | propose | read, search, plan, reason — **no mutation reaches VALIDATE** |
+| 5 | ⏸ `watch` | none | propose | narrate only; sensors observe, nothing is admitted |
+
+**`explore` is the position §27.4.1.1 requires.** That rule — *a countdown
+buys an EXPLORE, never an APPLY* — is what makes auto-starting work on a
+timer defensible rather than reckless, and it needs a mode in which
+"exploration is permitted, mutation is not" is a state of the system rather
+than a property of one op.
+
+**`watch` is the position first contact requires**, and the one `[esc] just
+watch` in §27.4.1 promises. It is also the honest state for an unfamiliar or
+borrowed repository.
+
+### 30.4 What each position binds to — composition, not new machinery
+
+Every position is expressed through primitives that already exist and are
+already graduated. §30 adds a vocabulary and a composition law; it adds no
+enforcement path, because a second enforcement path is a second thing to
+keep correct and the first one is already load-bearing.
+
+| Position | Emission lever | Authority lever |
+|---|---|---|
+| `promote` | — | `JARVIS_WORKSPACE_PROMOTION_ENABLED` (§26 Gate 3) |
+| `safe_auto` | — | `risk_tier_floor` ← `JARVIS_MIN_RISK_TIER` |
+| `notify_apply` | — | same |
+| `approval_required` | — | same |
+| `explore` | — | risk floor + **mutation veto at the Iron Gate** |
+| `watch` | `BackgroundAgentPool.pause(reason=)` + `SensorGovernor` cap → 0 | floor at `approval_required` |
+
+`BackgroundAgentPool.pause()` already exists and is already exercised — the
+hibernation path calls it, which is how the Aug 11 session logged
+`Background agent pool PAUSED`. `SensorGovernor` already caps global
+emission per hour. `watch` is those two primitives named together, not a new
+suppression mechanism.
+
+**The `explore` veto is the one genuinely new enforcement**, and it belongs
+at the Iron Gate rather than anywhere downstream: the gate already sits
+post-GENERATE and pre-VALIDATE, already routes rejections through
+`GENERATE_RETRY` with targeted feedback, and already distinguishes
+exploration tool calls from patches for the exploration-first rule. A
+mutation arriving under `explore` is refused there with the same machinery
+that refuses an under-explored one.
+
+### 30.5 The composition law
+
+> **Strictest wins, across every source, always.**
+
+This is not a new rule — `risk_tier_floor` already composes three inputs
+this way (`JARVIS_MIN_RISK_TIER`, `JARVIS_PARANOIA_MODE`,
+`JARVIS_AUTO_APPLY_QUIET_HOURS`) and `memory_pressure_gate` composes its
+dimensions the same way. §30 states it once so the sources cannot grow a
+second convention.
+
+Sources, all of which compose:
+
+1. the dial (`/trust cycle`, `Shift+Tab`)
+2. quiet hours — a *time-based* mode, already implemented
+3. `JARVIS_PARANOIA_MODE`
+4. per-sensor floors (`JARVIS_VISION_SENSOR_RISK_FLOOR`)
+5. memory pressure (`MemoryPressureGate` CRITICAL clamps fan-out)
+6. **every attached cockpit** — see §30.6
+
+The direction matters and is easy to get wrong. An operator who sets
+`watch` at 02:00 must not find that quiet hours has *loosened* the organism
+by asserting `notify_apply`; a floor only ever raises.
+
+### 30.6 Multi-cockpit: the dial is global, the operators are not
+
+`JARVIS_MIN_RISK_TIER` is process-global on the Engine. Two attached
+cockpits therefore share one dial, and today **the last writer wins,
+silently** — an operator can tighten the organism and have a colleague
+loosen it without either seeing that it happened.
+
+§25.1 already ruled on this shape for a different resource: *ambient renders
+to the MINIMUM width across live cockpits*, because two subscribers at
+different widths have no width correct for both. Autonomy is the same shape
+with higher stakes.
+
+> **Rule.** The effective position is the **strictest** requested by any live
+> cockpit. Releasing a request (detaching, or cycling back) restores the
+> strictest of what remains. Every cockpit shows the effective position AND,
+> when it differs from its own request, that it is being overridden.
+
+An operator whose tightening is invisibly discarded will stop tightening.
+
+### 30.7 Nuances and edge cases
+
+| # | Case | Required behaviour |
+|---|---|---|
+| 1 | **Mode changes mid-flight** | §26.5 already answers: seq-gated, *"an op is judged under the regime it entered."* Stated here so it is not re-derived. Tightening does **not** retroactively kill in-flight work; it stops the next admission. |
+| 2 | **Tightening during a parked review** | The parked op keeps the tier it entered under. A `watch` set while a Yellow diff waits does not silently convert it to a rejection — that would be §26.6's error in a new place. |
+| 3 | **Mode must survive detach** | Set `watch`, close the laptop, reconnect — the organism must not have silently re-armed. The dial is Engine-side env, so it persists; the requirement is that reconnection **re-asserts** the cockpit's request rather than clearing it. |
+| 4 | **Mode across the §29 link** | The Engine holds the dial; the Body displays it. A partition must not let the two disagree, and the Body must never render a position it has not confirmed since the last reconnect — a stale 🟠 on a screen while the Engine runs 🟢 is worse than showing nothing. |
+| 5 | **`watch` with work already queued** | Pausing the pool does not drain it. Queued ops stay queued and resume on the next loosening — `watch` is a pause, not a cancel, for the same reason a partition is a pause (§29.3). |
+| 6 | **`explore` and cost** | Exploration is not free: it spends tokens. `watch` is the only position with a zero-cost guarantee, and the mode line must not imply otherwise. |
+| 7 | **Silence means something different in every position** | In `watch` silence is correct; in `explore` it may mean a countdown is running; at 🟢 it may mean the link is down. §27.4.3's always-on deterministic breadcrumb is what disambiguates, and is therefore load-bearing rather than decorative. |
+| 8 | **Hibernation vs `watch`** | Both pause the pool, and they are *not* the same state. Hibernation is the organism's own decision on provider exhaustion (Aug 11: `consecutive_exhaustion=3`); `watch` is the operator's. Rendering them identically would tell an operator they had caused an outage they did not. |
+| 9 | **A position the host cannot honour** | `promote` on a host where §26's gates have not graduated must be refused at the dial with the reason, not accepted and silently ignored. |
+| 10 | **Mode in headless / soak runs** | `--headless` has no cockpit to hold a request, so the dial reduces to its env value. The composition law is unchanged; the multi-cockpit source is simply empty. |
+
+### 30.8 Scenarios
+
+**A borrowed repository.** You clone something unfamiliar and run `ov`.
+Today the strictest expressible state still fires sixteen sensors and spends
+tokens on a codebase you may not have the right to mutate. Under §30 the
+first-contact default for an unrecognised repository is `watch`: it indexes,
+narrates what it notices, and initiates nothing until you cycle up.
+
+**Overnight.** You want `explore` plus 🟡 until 08:00, then 🟠 while you are
+in meetings. Today that is two env vars set before boot and a restart to
+change. Under §30 it is the dial plus quiet hours, composing strictest-wins,
+adjustable from an attached cockpit without touching the process.
+
+**Two people watching.** You attach from a laptop at 🟠 while a colleague
+attaches from a desktop at 🟢. The effective position is 🟠, both screens say
+so, and the colleague's screen shows that their request is being overridden
+rather than silently losing.
+
+**The demo.** `ov` in an unseen repo, `watch` by default, and the operator
+presses `Shift+Tab` once — the organism visibly begins exploring. That single
+keystroke is the product's thesis: **autonomy is granted, not assumed, and
+granting it is one gesture.**
+
+### 30.9 Build plan
+
+Five slices, each default-off until its §33.1 graduation contract is met,
+each composing existing primitives.
+
+| # | Slice | Composes | Blocked by |
+|---|---|---|---|
+| 1 | Extend `trust_repl._CYCLE` to the six-position ladder; `/trust` renders the effective position and its source | `risk_tier_floor`, `trust_repl` | nothing |
+| 2 | `watch` binds `BackgroundAgentPool.pause()` + `SensorGovernor` cap 0; distinguishable from hibernation in the status line | both, already graduated | nothing |
+| 3 | `explore` mutation veto at the Iron Gate, routed through `GENERATE_RETRY` with targeted feedback | Iron Gate, exploration ledger | nothing |
+| 4 | Multi-cockpit strictest-wins with per-cockpit override display | `CockpitAttachBridge`, §25.1's width precedent | nothing |
+| 5 | Mode as a §29 frame kind; Body renders only a position confirmed since reconnect | `link_transport` closed kind vocabulary | §29 link live |
+
+Slices 1–4 need no hardware and no provider credit. Slice 3 is the one that
+makes §27.4.1's countdown shippable.
+
+**Invariant pins required.** (a) A floor may only ever raise, never lower —
+pinned across every composing source. (b) No mutation may reach VALIDATE
+under `explore`. (c) A mode change never retroactively re-tiers an in-flight
+op (§26.5). (d) `watch` and hibernation render distinguishably.
+
+### 30.10 Anti-goals
+
+| Pattern | Why §30 rejects it |
+|---|---|
+| A second enforcement path for modes | The gates already enforce. A mode that enforced independently would be a second authority for a decision the operator sees once. |
+| Per-sensor mode dials | Sixteen dials is a configuration file with a UI, not a mode. Per-sensor floors already exist for the rare case. |
+| A mode that unlocks §26's actuators | Graduation is evidence-gated (§26.1). A dial that could grant what evidence has not earned would make the ladder a bypass. |
+| Auto-loosening on idle | "It has been quiet, so relax" is exactly backwards: quiet is the state in which nobody is watching. |
+| Modes with timeouts that expire *looser* | A mode may expire toward strict. Never away from it. |
+
+### 30.11 Open questions for operator decision
+
+1. **First-contact default in an unrecognised repository** — `watch`, or
+   `explore`? *(Recommend `watch`: §27.4.1.1 bounds the countdown to
+   read-only work, but a repository the operator has not vouched for should
+   not spend tokens before they look.)*
+2. **Does `Shift+Tab` wrap** from strictest back to loosest, or stop? *(Recommend
+   stop, with a second keystroke required to cross back into `promote` —
+   wrapping means one accidental keypress moves from maximum caution to
+   maximum autonomy.)*
+3. **Should `watch` drain the queue or hold it?** *(Recommend hold, per
+   §30.7 case 5 — a pause that discards is a cancel wearing a pause's name.)*
+4. **Per-repository persistence** — should the dial remember its position per
+   repository? *(Recommend yes, in `.jarvis/`, since "this repo is one I let
+   run" is exactly the kind of standing judgement §27.5's preference memory
+   already stores.)*
 
 ---

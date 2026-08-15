@@ -12547,6 +12547,73 @@ class GovernedOrchestrator:
         reasoning logged on every evaluation (Slice 14 — never silent).
         Master: ``JARVIS_CANDIDATE_VALUE_GATE_ENABLED`` (default true).
         """
+        # ── PRD §30 slice 3: the `explore` rung's mutation veto ──────────
+        #
+        # Placed HERE, on the shared helper, for the reason this method's own
+        # docstring records: Run-24 proved the inline seam alone is never
+        # reached on the live route, so a gate wired only there is wired and
+        # inert. Both callers — the legacy inline seam and dispatch_pipeline's
+        # GENERATE→VALIDATE transition — pass through this one method, which
+        # makes it the only placement that cannot silently miss the shipping
+        # path.
+        #
+        # A veto is a benign TERMINAL, not a retry: `ExplorationInsufficient`
+        # routes through GENERATE_RETRY because a model can fix insufficient
+        # exploration by exploring more, and it cannot fix the operator's
+        # dial. Retrying here would burn the retry budget on a condition no
+        # generation can satisfy and then fail the op for something that was
+        # never the model's fault.
+        _veto = None
+        try:
+            from backend.core.ouroboros.governance.proactive_mode import (
+                mutation_permitted as _pm_mutation_permitted,
+            )
+            _veto = _pm_mutation_permitted()
+        except Exception:  # noqa: BLE001 — fail OPEN, never halt the organism
+            _veto = None
+        if _veto is not None and not _veto.permitted:
+            _n_cands = len(getattr(generation, "candidates", None) or ())
+            logger.info(
+                "[ProactiveMode] op=%s vetoed %d candidate(s) — %s; "
+                "completing as no_op_mode_veto, skipping "
+                "VALIDATE/APPLY/VERIFY",
+                ctx.op_id, _n_cands, _veto.reason,
+            )
+            try:
+                await self._stack.comm.emit_postmortem(
+                    op_id=ctx.op_id,
+                    root_cause="no_op_mode_veto",
+                    failed_phase=None,
+                    next_safe_action="none",
+                )
+            except Exception:
+                logger.debug(
+                    "[ProactiveMode] postmortem emit failed", exc_info=True,
+                )
+            _v_ctx = ctx.advance(
+                OperationPhase.COMPLETE,
+                generation=generation,
+                terminal_reason_code="no_op_mode_veto",
+            )
+            try:
+                # Same ledger shape the cosmetic terminal writes, so an
+                # operator reading the ledger sees one vocabulary for "the
+                # op completed without mutating" rather than two.
+                await self._record_ledger(
+                    _v_ctx,
+                    OperationState.APPLIED,
+                    {
+                        "reason": "no_op_mode_veto",
+                        "position": _veto.position,
+                        "candidates": _n_cands,
+                    },
+                )
+            except Exception:
+                logger.debug(
+                    "[ProactiveMode] ledger record failed", exc_info=True,
+                )
+            return _v_ctx
+
         if os.environ.get(
             "JARVIS_CANDIDATE_VALUE_GATE_ENABLED", "true",
         ).strip().lower() not in ("1", "true", "yes", "on"):
