@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import logging
 import os
 import random
@@ -300,5 +301,31 @@ async def serve_link(
         finally:
             loop.park("peer disconnected")
 
-    return await asyncio.start_server(
-        _on_client, host or tx.bind_host(), port or tx.bind_port(), ssl=ctx)
+    bind = host or tx.bind_host()
+    listen = tx.bind_port() if port is None else port
+    try:
+        return await asyncio.start_server(_on_client, bind, listen, ssl=ctx)
+    except OSError as exc:
+        if exc.errno not in (errno.EADDRINUSE, errno.EACCES):
+            raise
+        # An ungraceful termination leaves the previous socket in TIME_WAIT.
+        # asyncio sets SO_REUSEADDR on POSIX but deliberately NOT on Windows,
+        # where that option permits hijacking an active listener rather than
+        # merely reclaiming a dead one — so the Engine is exactly the host
+        # where this is reachable.
+        #
+        # Not retried in a loop: if another Engine is genuinely running,
+        # silently waiting for it to exit would be indistinguishable from a
+        # hang, and stealing the port would be worse. The operator is told
+        # what holds it and how to check.
+        remedy = (
+            f"lsof -nP -iTCP:{listen} -sTCP:LISTEN"
+            if os.name != "nt"
+            else f'netstat -ano | findstr ":{listen}"')
+        raise ConnectionError(
+            f"cannot bind {bind}:{listen} — {exc.strerror}. Either an Engine "
+            f"is already running, or a previous one left the socket in "
+            f"TIME_WAIT. Check with:  {remedy}\n"
+            f"Set JARVIS_LINK_PORT to a different port, or wait for the "
+            f"kernel to release it."
+        ) from exc

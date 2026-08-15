@@ -53,6 +53,7 @@ Python 3.9+, ``from __future__ import annotations``.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import ipaddress
 import logging
@@ -177,19 +178,79 @@ def _san_entries(names: Sequence[str]) -> List[Any]:
     return out
 
 
-def _write_secret(path: Path, data: bytes) -> None:
-    """Write a private key readable only by its owner.
+def _publish(path: Path, data: bytes, *, secret: bool) -> None:
+    """Write ``data`` to ``path`` atomically and durably.
 
-    Created with the mode already applied rather than chmod'ed afterwards:
-    between ``open`` and ``chmod`` the key is world-readable, and on a shared
-    machine that window is the whole vulnerability.
+    **Why atomic matters here specifically.** A reader of this directory is
+    an SSL context being built at connection time, and a half-written PEM is
+    not a recoverable partial read — OpenSSL rejects it, and the operator
+    sees a trust failure with no hint that the cause was a concurrent writer.
+    So every file is written to a temp in the SAME directory (a rename is
+    only atomic within a filesystem) and published with
+    ``durable_io.atomic_replace``, which already sequences fsync-data →
+    rename → fsync-dir. Reusing it means the certificate directory gets the
+    same durability guarantee as the transcript log rather than a second,
+    weaker one written here.
+
+    Secrets are created with mode 0600 applied at ``open`` rather than
+    chmod'ed afterwards: between the two calls the key is world-readable,
+    and on a shared machine that window is the whole vulnerability. The temp
+    carries the mode too, since a temp file in a readable directory is just
+    as exposed as the final name.
     """
+    from backend.core.ouroboros.governance.durable_io import atomic_replace
+
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    mode = (stat.S_IRUSR | stat.S_IWUSR) if secret else 0o644
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    fd = os.open(str(path), flags, stat.S_IRUSR | stat.S_IWUSR)
+    fd = os.open(str(tmp), flags, mode)
     try:
         os.write(fd, data)
     finally:
         os.close(fd)
+    try:
+        atomic_replace(tmp, path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
+@contextlib.contextmanager
+def _issuance_lock(directory: Path):
+    """Serialise concurrent issuance. Fails fast; never waits.
+
+    Two ``--issue-certs`` runs interleaving would produce a CA from one and
+    leaves from the other — material that is individually well-formed and
+    collectively unverifiable, which is a far worse failure than a refusal.
+    An ``O_EXCL`` create is the mutex because it is atomic on every
+    filesystem this runs on, including over SMB on the Windows box.
+
+    Fails fast rather than blocking: a second issuer is a mistake, not a
+    queue, and telling the operator immediately is more useful than making
+    them wait for a lock whose holder may have died. A stale lock names its
+    owning pid so the remedy is obvious.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    lock = directory / ".issue.lock"
+    try:
+        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        try:
+            holder = lock.read_text(encoding="utf-8").strip()
+        except OSError:
+            holder = "unknown"
+        raise FileExistsError(
+            f"another issuance is in progress (holder pid {holder}). If no "
+            f"such process exists, remove {lock} and retry."
+        ) from None
+    try:
+        os.write(fd, str(os.getpid()).encode("ascii"))
+        os.close(fd)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            lock.unlink()
 
 
 def existing_material(directory: Optional[Path] = None) -> Dict[str, bool]:
@@ -386,12 +447,17 @@ def issue_link_material(
     client_key, client_cert = _leaf(cli, cli[0], server=False)
 
     pem = serialization.Encoding.PEM
-    (base / CA_CERT).write_bytes(ca_cert.public_bytes(pem))
-    (base / SERVER_CERT).write_bytes(server_cert.public_bytes(pem))
-    (base / CLIENT_CERT).write_bytes(client_cert.public_bytes(pem))
-    _write_secret(base / CA_KEY, _pem_key(ca_key))
-    _write_secret(base / SERVER_KEY, _pem_key(server_key))
-    _write_secret(base / CLIENT_KEY, _pem_key(client_key))
+    # Published under the issuance lock so two concurrent runs cannot
+    # interleave a CA from one with leaves from the other.
+    with _issuance_lock(base):
+        _publish(base / CA_CERT, ca_cert.public_bytes(pem), secret=False)
+        _publish(base / SERVER_CERT, server_cert.public_bytes(pem),
+                 secret=False)
+        _publish(base / CLIENT_CERT, client_cert.public_bytes(pem),
+                 secret=False)
+        _publish(base / CA_KEY, _pem_key(ca_key), secret=True)
+        _publish(base / SERVER_KEY, _pem_key(server_key), secret=True)
+        _publish(base / CLIENT_KEY, _pem_key(client_key), secret=True)
 
     logger.info(
         "[LinkCerts] issued link material in %s — server SAN %s, valid %dd",
