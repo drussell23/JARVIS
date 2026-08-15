@@ -48,11 +48,13 @@ because those are exactly the ones worth auditing.
 from __future__ import annotations
 
 import ast
+import keyword
 import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Mapping, Optional, Set, Tuple
+from typing import (Dict, FrozenSet, Iterable, List, Mapping, Optional,
+                    Set, Tuple, Union)
 
 logger = logging.getLogger("Ouroboros.SurfaceReachability")
 
@@ -61,6 +63,7 @@ SURFACE_REACHABILITY_SCHEMA_VERSION = "surface_reachability.v1"
 MASTER_FLAG_ENV_VAR = "JARVIS_SURFACE_AUDIT_ENABLED"
 SURFACES_ENV_VAR = "JARVIS_SURFACE_AUDIT_SURFACES"
 ROOTS_ENV_VAR = "JARVIS_SURFACE_AUDIT_ROOTS"
+TRAVERSAL_ENV_VAR = "JARVIS_SURFACE_AUDIT_TRAVERSAL"
 
 #: surface label → entry module. The three places `ov` draws from.
 #:
@@ -80,6 +83,91 @@ _DEFAULT_ROOTS: Tuple[str, ...] = (
     "backend/core/ouroboros/ui",
     "backend/core/ouroboros/cli",
 )
+
+
+def traversal_root() -> str:
+    """Where EDGES may run, as distinct from where findings are REPORTED.
+
+    These were one scope, and conflating them severed the graph. ``_reach``
+    follows an edge only when the target is indexed, so any import that left
+    the three reported roots and came back was invisible —
+    ``transcript_timeline`` was called an orphan while ``why_engine`` imports
+    it, because ``why_engine`` lives in ``governance/`` and governance was
+    not indexed. The audit was measuring a subgraph and reporting about the
+    graph.
+
+    Reporting scope stays narrow on purpose: reachability into the governance
+    core is a different question with a different answer, and answering it
+    here would bury the surface finding under a thousand rows. But a
+    TRAVERSAL that stops at the same boundary manufactures orphans out of
+    round trips, which is the strictly worse error — it invents deaths.
+
+    Derived from this module's own location rather than written down, so a
+    package move cannot leave a stale literal behind.
+    """
+    raw = os.environ.get(TRAVERSAL_ENV_VAR, "").strip()
+    if raw:
+        return raw
+    try:
+        return Path(__file__).resolve().parent.parent.relative_to(
+            _repo_root()).as_posix()
+    except Exception:  # noqa: BLE001
+        return "backend/core/ouroboros"
+
+
+def _is_importable(module: str) -> bool:
+    """Can any ``import`` statement in any file spell this name?
+
+    ``audio_pump 2.py`` — a Finder/iCloud duplicate — indexes as the module
+    ``…ui.audio_pump 2``, which contains a space. No import statement can
+    name it, so its unreachability is a TAUTOLOGY rather than a finding, and
+    five of eight reported orphans were files of exactly this kind.
+
+    Filtering on the property that makes them unreachable, rather than on the
+    string that happens to produce them today, is what keeps this general: a
+    ``copy.py``, a ``foo-bar.py``, a leading-digit name and a name colliding
+    with a keyword all fail for the same structural reason and are all
+    excluded by the same test.
+
+    Deliberately NOT a gitignore query. An ignored-but-importable module is
+    still importable, so excluding it would hide a real edge; and measured
+    against this tree the ignore rules add exactly zero exclusions the
+    identifier test does not already make. A subprocess, a timeout and a
+    degraded mode for zero cases is machinery, not rigour.
+    """
+    parts = module.split(".")
+    return bool(parts) and all(
+        p.isidentifier() and not keyword.iskeyword(p) for p in parts)
+
+
+@dataclass
+class _Scan:
+    """One audit's parse and edge memo. Created per call; never shared.
+
+    ``_edges`` is pure over file content, and the audit calls it once per
+    node per entry walk. Widening traversal to the whole package takes that
+    from ~800 parses to ~30,000, so the memo is what makes an honest
+    traversal scope affordable rather than a trade against it.
+
+    Per-call rather than module-level: a cache that outlived the call would
+    answer tomorrow's audit with yesterday's source, and an audit that cannot
+    see an edit is worse than a slow one. It is also the reason this needs no
+    lock — two concurrent audits share nothing.
+    """
+
+    trees: Dict[Path, Optional[ast.AST]] = field(default_factory=dict)
+    edges: Dict[Tuple[str, str], FrozenSet[str]] = field(default_factory=dict)
+
+    def tree(self, path: Path) -> Optional[ast.AST]:
+        if path in self.trees:
+            return self.trees[path]
+        try:
+            parsed: Optional[ast.AST] = ast.parse(
+                path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:  # noqa: BLE001 — a file that will not parse has none
+            parsed = None
+        self.trees[path] = parsed
+        return parsed
 
 
 #: Where the package DECLARES its console entry points. Read rather than
@@ -132,32 +220,102 @@ def _pyproject_entry_modules(base: "Path") -> List[str]:
     return out
 
 
-def _main_guarded(index: Mapping[str, "Path"]) -> List[str]:
+def _main_guarded(index: Mapping[str, "Path"],
+                  scan: Optional["_Scan"] = None) -> List[str]:
     """Modules with an ``if __name__ == "__main__":`` block.
 
     A module that can be run is a module that can be entered, and nothing
     in-tree needs to import it for that to be true.
+
+    Two-stage, and the first stage is EXACT rather than a heuristic: a run
+    guard is a comparison against the literal ``"__main__"``, which cannot be
+    written without those bytes appearing in the source. So a file lacking
+    them provably has no guard, and reading 1522 files to reject 1489 of them
+    costs a fraction of parsing 1522 to find 28 — the difference between an
+    honest whole-package traversal being affordable and being a 15-second
+    stall. Survivors are still confirmed by the AST; the bytes only narrow.
+
+    The obvious pre-filter — ``__name__`` — is worthless here and measuring
+    said so: 883 of 1522 files contain it, because
+    ``logging.getLogger(__name__)`` is in almost every module. The literal
+    that makes a module RUNNABLE is ``__main__``, and that is in 33.
+
+    Matching that literal also TIGHTENS the AST test, which previously
+    accepted any ``__name__ ==`` comparison. "This module can be run" means
+    the interpreter set ``__name__`` to ``"__main__"``; a comparison against
+    anything else is not that claim.
     """
+    scan = scan or _Scan()
     out: List[str] = []
     for module, path in index.items():
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
-        except Exception:  # noqa: BLE001
+            if _RUN_GUARD_LITERAL.encode() not in path.read_bytes():
+                continue
+        except OSError:
+            continue
+        tree = scan.tree(path)
+        if tree is None:
             continue
         for node in ast.walk(tree):
             if not isinstance(node, ast.If):
                 continue
-            try:
-                test = ast.unparse(node.test).replace(" ", "")
-            except Exception:  # noqa: BLE001
-                continue
-            if test.startswith("__name__=="):
+            if _is_run_guard(node.test):
                 out.append(module)
                 break
     return out
 
 
-def _script_reached(base: "Path", index: Mapping[str, "Path"]) -> List[str]:
+#: What the interpreter sets ``__name__`` to for the module it was asked to
+#: run. Named once: the byte pre-filter and the AST confirmation must agree,
+#: and two copies of a magic string are two chances for them to diverge.
+_RUN_GUARD_LITERAL = "__main__"
+
+
+def _is_run_guard(test: ast.AST) -> bool:
+    """``__name__ == "__main__"``, in either order. NEVER raises."""
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1:
+        return False
+    if not isinstance(test.ops[0], ast.Eq):
+        return False
+    sides = (test.left, test.comparators[0])
+    names = {n.id for n in sides if isinstance(n, ast.Name)}
+    literals = {n.value for n in sides
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    return "__name__" in names and _RUN_GUARD_LITERAL in literals
+
+
+def _cage_mounted(index: Mapping[str, "Path"]) -> List[str]:
+    """Modules the naming cage mounts as REPL verbs. NEVER raises.
+
+    THE BLIND SPOT THIS INSTRUMENT WOULD OTHERWISE HAVE ACQUIRED. A
+    ``governance/<verb>_repl.py`` that exports ``__verb_help__`` and
+    ``dispatch_<verb>_command`` is the verb ``/<verb>``, and the cage reaches
+    it with ``importlib.import_module`` — an edge no AST walker can see. The
+    fix that made those modules reachable by a human therefore made them
+    unreachable by this audit, and every one of them, plus its whole
+    subtree, would have started reporting as an orphan.
+
+    That is the fourth import shape this audit could not spell, after entry
+    points, ``scripts/`` and relative imports — and the same disease each
+    time: an edge the extractor cannot see becomes an absence it reports as
+    a finding.
+
+    A dynamic import is legible here only because the cage DECLARES its
+    mounts: ``discover()`` is a static AST scan that imports nothing, so
+    this asks the cage what it will mount rather than guessing. A dynamic
+    import with no declaration remains invisible, and correctly so — nothing
+    in the repo could see it either.
+    """
+    try:
+        from backend.core.ouroboros.governance.repl_verb_cage import discover
+
+        return [spec.module for spec in discover() if spec.module in index]
+    except Exception:  # noqa: BLE001 — an absent cage is not a finding
+        return []
+
+
+def _script_reached(base: "Path", index: Mapping[str, "Path"],
+                    scan: Optional["_Scan"] = None) -> List[str]:
     """Modules imported by a top-level ``scripts/*.py``.
 
     THE case that dominated this audit. ``scripts/ouroboros_battle_test.py``
@@ -176,7 +334,7 @@ def _script_reached(base: "Path", index: Mapping[str, "Path"]) -> List[str]:
         if not directory.is_dir():
             return []
         for path in sorted(directory.glob("*.py")):
-            for edge in _edges(path):
+            for edge in _edges(path, scan=scan):
                 if edge in index:
                     out.append(edge)
     except Exception:  # noqa: BLE001
@@ -185,7 +343,9 @@ def _script_reached(base: "Path", index: Mapping[str, "Path"]) -> List[str]:
 
 
 def derived_entries(base: "Path",
-                    index: Mapping[str, "Path"]) -> Tuple[Tuple[str, str], ...]:
+                    index: Mapping[str, "Path"],
+                    scan: Optional["_Scan"] = None,
+                    ) -> Tuple[Tuple[str, str], ...]:
     """Entry points DISCOVERED rather than transcribed. NEVER raises.
 
     The audit measured three RENDERING surfaces, which is a fair question and
@@ -203,8 +363,9 @@ def derived_entries(base: "Path",
     seen = set()
     for label, modules in (
         ("script", _pyproject_entry_modules(base)),
-        ("runnable", _main_guarded(index)),
-        ("soak", _script_reached(base, index)),
+        ("runnable", _main_guarded(index, scan)),
+        ("soak", _script_reached(base, index, scan)),
+        ("verb", _cage_mounted(index)),
     ):
         for module in modules:
             if module in index and module not in seen:
@@ -350,13 +511,20 @@ def _index(roots: Tuple[str, ...]) -> Dict[str, Path]:
                 from backend.core.ouroboros.battle_test.progress_board import (
                     _module_name,
                 )
-                out[_module_name(rel)] = path
+                module = _module_name(rel)
             except Exception:  # noqa: BLE001
                 continue
+            # A name no import statement can spell is unreachable by
+            # construction, so reporting it is a tautology rather than a
+            # finding. See `_is_importable`.
+            if not _is_importable(module):
+                continue
+            out[module] = path
     return out
 
 
-def _edges(path: Path, module: str = "") -> Set[str]:
+def _edges(path: Path, module: str = "",
+           scan: Optional["_Scan"] = None) -> Set[str]:
     """Modules this file imports — module-level AND inside functions.
 
     Reuses the canonical extractor rather than writing a second one: two AST
@@ -366,10 +534,18 @@ def _edges(path: Path, module: str = "") -> Set[str]:
     ``module`` is the importing module's dotted name, required to resolve
     relative imports against its package.
     """
-    try:
-        source = path.read_text(encoding="utf-8", errors="replace")
-        tree = ast.parse(source)
-    except Exception:  # noqa: BLE001 — a file that will not parse has no edges
+    key = (path.as_posix(), module)
+    if scan is not None:
+        memo = scan.edges.get(key)
+        if memo is not None:
+            return set(memo)
+    tree = (scan or _Scan()).tree(path)
+    if tree is None:
+        # A file that will not parse has no edges. Memoised too — a broken
+        # file is re-visited once per entry walk, and re-reading it each time
+        # is the same wasted work as re-parsing a good one.
+        if scan is not None:
+            scan.edges[key] = frozenset()
         return set()
     try:
         # `reverse_dep_resolver` calls itself "THE single import extractor"
@@ -387,24 +563,36 @@ def _edges(path: Path, module: str = "") -> Set[str]:
         from backend.core.ouroboros.governance.reverse_dep_resolver import (
             extract_module_imports,
         )
-        return set(extract_module_imports(
+        found = set(extract_module_imports(
             tree, module, path.name == "__init__.py"))
     except Exception:  # noqa: BLE001
         try:
             from backend.core.ouroboros.battle_test.progress_board import (
                 _imported_modules,
             )
-            return set(_imported_modules(tree))
+            found = set(_imported_modules(tree))
         except Exception:  # noqa: BLE001
-            return set()
+            found = set()
+    if scan is not None:
+        scan.edges[key] = frozenset(found)
+    return found
 
 
 def _reach(
-    entry: str,
+    entry: "Union[str, Iterable[str]]",
     index: Mapping[str, Path],
     barriers: FrozenSet[str] = frozenset(),
+    scan: Optional["_Scan"] = None,
 ) -> Set[str]:
     """Modules reachable from ``entry`` WITHOUT passing through a barrier.
+
+    ``entry`` may be one module or many. MANY IS NOT A CONVENIENCE: the
+    orphan question is the union of the closures from 228 discovered entry
+    points, and computing it one entry at a time re-walks a 1500-node graph
+    228 times for an answer a single multi-source walk gives exactly — the
+    seeded frontier IS the union, by definition of reachability. That is a
+    complexity fix (O(V+E) rather than O(entries·(V+E))), not a cache trick,
+    and it is what makes an honest whole-package traversal affordable.
 
     The barriers are the other surfaces, and they are the whole reason this
     function is not a plain transitive closure.
@@ -425,8 +613,11 @@ def _reach(
     Iterative with an explicit stack: the graph is cyclic even after the cuts,
     and a recursive walk would blow the stack on the first loop.
     """
+    seeds: Tuple[str, ...] = (
+        (entry,) if isinstance(entry, str) else tuple(entry))
+    seed_set = frozenset(seeds)
     seen: Set[str] = set()
-    stack: List[str] = [entry]
+    stack: List[str] = list(seeds)
     while stack:
         current = stack.pop()
         if current in seen:
@@ -434,13 +625,14 @@ def _reach(
         seen.add(current)
         # A barrier is REACHED but never traversed: knowing the cockpit
         # imports `ov` is true; inheriting everything `ov` imports is what
-        # destroyed the signal.
-        if current in barriers and current != entry:
+        # destroyed the signal. A seed is never its own barrier — otherwise
+        # a surface would stop at its own front door.
+        if current in barriers and current not in seed_set:
             continue
         path = index.get(current)
         if path is None:
             continue
-        for target in _edges(path, current):
+        for target in _edges(path, current, scan):
             # Only follow edges that stay in scope. Third-party and
             # governance-core imports are real, and out of this question.
             if target in index and target not in seen:
@@ -448,18 +640,24 @@ def _reach(
     return seen
 
 
-def _roots(index: Mapping[str, Path], entries: FrozenSet[str]) -> Set[str]:
+def _roots(index: Mapping[str, Path], entries: FrozenSet[str],
+           scan: Optional["_Scan"] = None) -> Set[str]:
     """Modules that import a SURFACE — boot paths, not orphans.
 
     `harness` reaches every surface; nothing reaches `harness`. Listing it as
     unreachable would be technically true and would bury the real orphans
     under the entry points of the program.
+
+    Scoped to the REPORTED index rather than the traversal graph, because the
+    only consumer is ``orphans()``, which iterates reported rows. Classifying
+    a governance module as a boot path answers a question nobody asks, at the
+    cost of an edge extraction over a thousand modules.
     """
     out: Set[str] = set()
     for module, path in index.items():
         if module in entries:
             continue
-        if _edges(path, module) & entries:
+        if _edges(path, module, scan) & entries:
             out.add(module)
     return out
 
@@ -480,7 +678,24 @@ def audit(
         if not audit_enabled():
             return reading
         scope = roots or audit_roots()
+        scan = _Scan()
+        # TWO SCOPES, deliberately different (see `traversal_root`).
+        #
+        # `graph` is where edges may run — the whole package, so an import
+        # that leaves the reported roots and comes back is followed rather
+        # than severed. `index` is what gets a row, and stays narrow so the
+        # surface finding is not buried under a thousand governance modules.
+        #
+        # Fused, they manufactured orphans out of round trips. Widening the
+        # REPORT instead would have been the other error: it answers a
+        # different question loudly and drowns this one.
+        graph = _index((traversal_root(),))
         index = _index(scope)
+        # Reported rows must be walkable. Normally a superset; if an operator
+        # points `JARVIS_SURFACE_AUDIT_ROOTS` outside the package, the union
+        # keeps those rows measurable instead of silently all-orphan.
+        for module, path in index.items():
+            graph.setdefault(module, path)
         # SURFACES ONLY. Entry points are deliberately NOT added here.
         #
         # `_reach` treats every other surface as a BARRIER — reached but not
@@ -509,28 +724,26 @@ def audit(
         reach: Dict[str, Set[str]] = {}
         entry_set = frozenset(entry for _, entry in table)
         for label, entry in table:
-            if entry not in index:
+            if entry not in graph:
                 # An entry outside the scanned roots cannot be walked. Said
                 # out loud rather than silently contributing an empty set —
                 # which would mark every module unreachable from it and read
                 # as a catastrophic finding.
                 missing.append(f"{label}={entry}")
                 continue
-            reach[label] = _reach(entry, index, barriers=entry_set)
+            reach[label] = _reach(entry, graph, barriers=entry_set, scan=scan)
         reading.unresolved_entries = tuple(missing)
-        reading.roots = frozenset(_roots(index, entry_set))
+        reading.roots = frozenset(_roots(index, entry_set, scan))
 
         # ORPHANHOOD, computed separately and WITHOUT barriers. A module is
         # dead only if no entry point reaches it at all; which particular
         # surface got there first is the asymmetry question, answered above.
         entry_reachable: Set[str] = set()
         try:
-            for _, entry in derived_entries(_repo_root(), index):
-                entry_reachable |= _reach(entry, index, barriers=frozenset())
-            for _, entry in table:
-                if entry in index:
-                    entry_reachable |= _reach(
-                        entry, index, barriers=frozenset())
+            seeds = [e for _, e in derived_entries(_repo_root(), graph, scan)]
+            seeds += [e for _, e in table if e in graph]
+            entry_reachable = _reach(
+                seeds, graph, barriers=frozenset(), scan=scan)
         except Exception:  # noqa: BLE001 — a failed walk must not invent deaths
             entry_reachable = set()
         # A PACKAGE is reachable if any of its modules is. Nothing imports
@@ -560,6 +773,29 @@ def audit(
     except Exception:  # noqa: BLE001
         logger.debug("[SurfaceReach] audit degraded", exc_info=True)
         return reading
+
+
+async def audit_async(
+    *,
+    roots: Optional[Tuple[str, ...]] = None,
+    entries: Optional[Tuple[Tuple[str, str], ...]] = None,
+) -> SurfaceReading:
+    """:func:`audit`, off the event loop. NEVER raises.
+
+    The walk parses roughly a thousand files and takes seconds — far too
+    much for the loop that also runs the organism, and Principle 3 does not
+    have an exception for diagnostics. The offload lives HERE, in the module
+    that knows the work is heavy, rather than in each caller: `run_watchdog`
+    remembered to wrap it in a thread and the `/reach` REPL path did not, so
+    typing the verb froze the daemon for the duration of its own audit.
+
+    ``to_thread`` rather than a process: the cost is `ast.parse`, which holds
+    the GIL, so this buys RESPONSIVENESS rather than parallelism — the loop
+    keeps serving while the scan runs. That is the property being bought.
+    """
+    import asyncio
+
+    return await asyncio.to_thread(audit, roots=roots, entries=entries)
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +865,7 @@ __all__ = [
     "ModuleReach",
     "SurfaceReading",
     "audit",
+    "audit_async",
     "audit_enabled",
     "audit_roots",
     "render",

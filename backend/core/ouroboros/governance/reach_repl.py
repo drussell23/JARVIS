@@ -113,10 +113,19 @@ class ReachDrift:
         }
 
 
-def _audit() -> Any:
-    """Run the canonical audit. Raises only what the caller will catch."""
-    from backend.core.ouroboros.battle_test.surface_reachability import audit
-    return audit()
+async def _audit() -> Any:
+    """Run the canonical audit, off the loop. Raises what callers catch.
+
+    THE one seam. The offload was previously in `run_watchdog` alone, so
+    every path that reached the audit through the REPL blocked the daemon's
+    event loop for the whole scan — the watchdog was correct and the verb an
+    operator actually types was not. Putting it here means no future caller
+    can forget: reaching the audit at all goes through this function.
+    """
+    from backend.core.ouroboros.battle_test.surface_reachability import (
+        audit_async,
+    )
+    return await audit_async()
 
 
 def _load_baseline() -> Optional[Dict[str, Any]]:
@@ -137,7 +146,7 @@ def _load_baseline() -> Optional[Dict[str, Any]]:
         return None
 
 
-def accept_baseline() -> Dict[str, Any]:
+async def accept_baseline() -> Dict[str, Any]:
     """Record the current state as accepted. NEVER raises.
 
     Written through ``durable_io.atomic_replace``: a baseline half-written
@@ -146,7 +155,7 @@ def accept_baseline() -> Dict[str, Any]:
     recovering from something.
     """
     try:
-        reading = _audit()
+        reading = await _audit()
         payload = {
             "schema_version": REACH_REPL_SCHEMA_VERSION,
             "asymmetric": sorted(m.module for m in reading.asymmetric()),
@@ -169,7 +178,7 @@ def accept_baseline() -> Dict[str, Any]:
         return {"error": str(exc)}
 
 
-def drift() -> ReachDrift:
+async def drift() -> ReachDrift:
     """What regressed since the baseline. NEVER raises.
 
     With NO baseline this reports nothing rather than everything. A first
@@ -178,7 +187,7 @@ def drift() -> ReachDrift:
     4:1 false-positive flood this design exists to avoid.
     """
     try:
-        reading = _audit()
+        reading = await _audit()
     except Exception as exc:  # noqa: BLE001
         return ReachDrift(error=f"{type(exc).__name__}: {exc}")
     now_asym = {m.module for m in reading.asymmetric()}
@@ -200,10 +209,10 @@ async def run_watchdog() -> ReachDrift:
     """Boot-time drift check, off the event loop. NEVER raises.
 
     The audit walks the module tree and parses every file, which is far too
-    much work for the loop that also runs the organism — so it goes to a
-    thread. Bounded by the caller's own supervision rather than a timer
-    here: a scan that overran would be a scan worth noticing, and killing
-    it silently would hide that.
+    much work for the loop that also runs the organism — `_audit` puts it on
+    a thread for every caller. Bounded by the caller's own supervision rather
+    than a timer here: a scan that overran would be a scan worth noticing,
+    and killing it silently would hide that.
 
     Silent at steady state, by construction: with nothing new since the
     baseline there is no line to print.
@@ -211,8 +220,10 @@ async def run_watchdog() -> ReachDrift:
     if not watchdog_enabled():
         return ReachDrift(baseline_exists=False)
     try:
-        import asyncio
-        result = await asyncio.to_thread(drift)
+        # No `to_thread` here any more: `_audit` owns the offload, and two
+        # places deciding how to get off the loop is how one of them ends up
+        # not doing it.
+        result = await drift()
     except Exception as exc:  # noqa: BLE001
         logger.debug("[Reach] watchdog degraded: %s", exc)
         return ReachDrift(error=str(exc))
@@ -251,7 +262,7 @@ def _fmt(names: List[str], cap: int = 12) -> str:
     return "\n".join(f"  {n}" for n in shown) + tail
 
 
-def dispatch_reach_command(line: str) -> ReachReplDispatchResult:
+async def dispatch_reach_command(line: str) -> ReachReplDispatchResult:
     """Surface-reachability audit.
 
     Operator: find capabilities that shipped complete and unreachable.
@@ -264,7 +275,7 @@ def dispatch_reach_command(line: str) -> ReachReplDispatchResult:
             return ReachReplDispatchResult(ok=True, text=_HELP)
 
         if sub == "accept":
-            payload = accept_baseline()
+            payload = (await accept_baseline())
             if "error" in payload:
                 return ReachReplDispatchResult(
                     ok=False, text=f"could not write baseline: {payload['error']}")
@@ -277,7 +288,7 @@ def dispatch_reach_command(line: str) -> ReachReplDispatchResult:
             )
 
         if sub in ("", "drift"):
-            d = drift()
+            d = (await drift())
             if d.error:
                 return ReachReplDispatchResult(
                     ok=False, text=f"audit unavailable: {d.error}")
@@ -303,7 +314,7 @@ def dispatch_reach_command(line: str) -> ReachReplDispatchResult:
             return ReachReplDispatchResult(ok=True, text="\n".join(parts))
 
         if sub in ("all", "asymmetric"):
-            reading = _audit()
+            reading = await _audit()
             rows = [f"{m.module}  ({len(m.reached_by)}/"
                     f"{len(reading.surface_labels)})"
                     for m in reading.asymmetric()]
@@ -313,7 +324,7 @@ def dispatch_reach_command(line: str) -> ReachReplDispatchResult:
                       f"{reading.scanned}):\n{_fmt(rows, cap=30)}"))
 
         if sub == "orphans":
-            reading = _audit()
+            reading = await _audit()
             rows = [m.module for m in reading.orphans()]
             return ReachReplDispatchResult(
                 ok=True,
@@ -323,7 +334,7 @@ def dispatch_reach_command(line: str) -> ReachReplDispatchResult:
         # Anything else is treated as a module name. Matched loosely on the
         # tail so an operator can type `menu_bindings` rather than the full
         # dotted path — the path is an implementation detail of the tree.
-        reading = _audit()
+        reading = await _audit()
         needle = sub.strip().lower()
         hits = [m for m in reading.modules
                 if needle in m.module.lower()]

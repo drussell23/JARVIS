@@ -21,6 +21,25 @@ def _isolated(tmp_path, monkeypatch):
     yield
 
 
+def _as_audit(reading):
+    """Wrap any reading in the async shape `_audit` now has."""
+    async def _run():
+        return reading
+    return _run
+
+
+def _fake_audit(**kw):
+    """An async stand-in for `_audit`, which is now off-loop.
+
+    Mirrors the real contract rather than the old one: a sync fake against
+    an async seam raises TypeError inside the code under test, and every
+    assertion then fails for a reason unrelated to what it measures.
+    """
+    async def _run():
+        return _reading(**kw)
+    return _run
+
+
 def _reading(asym=(), orph=(), scanned=100):
     class _M:
         def __init__(self, name): self.module = name; self.reached_by = ("attach",)
@@ -36,78 +55,78 @@ def _reading(asym=(), orph=(), scanned=100):
 # -- the ratchet -----------------------------------------------------------
 
 
-def test_no_baseline_reports_nothing_rather_than_everything(monkeypatch):
+async def test_no_baseline_reports_nothing_rather_than_everything(monkeypatch):
     """A first run has not regressed — it has not yet been measured.
     Reporting the standing list as new is the 4:1 false-positive flood this
     design exists to avoid."""
-    monkeypatch.setattr(rr, "_audit", lambda: _reading(asym=("a", "b", "c")))
-    d = rr.drift()
+    monkeypatch.setattr(rr, "_audit", _fake_audit(asym=("a", "b", "c")))
+    d = (await rr.drift())
     assert d.baseline_exists is False
     assert d.new_asymmetric == () and d.new_orphans == ()
 
 
-def test_steady_state_is_silent(monkeypatch):
-    monkeypatch.setattr(rr, "_audit", lambda: _reading(asym=("a",)))
-    rr.accept_baseline()
-    d = rr.drift()
+async def test_steady_state_is_silent(monkeypatch):
+    monkeypatch.setattr(rr, "_audit", _fake_audit(asym=("a",)))
+    (await rr.accept_baseline())
+    d = (await rr.drift())
     assert d.regressed is False
-    assert "unchanged" in rr.dispatch_reach_command("/reach").text
+    assert "unchanged" in (await rr.dispatch_reach_command("/reach")).text
 
 
-def test_a_newly_asymmetric_module_is_loud(monkeypatch):
+async def test_a_newly_asymmetric_module_is_loud(monkeypatch):
     """The shape every unmounted feature had."""
-    monkeypatch.setattr(rr, "_audit", lambda: _reading(asym=("a",)))
-    rr.accept_baseline()
-    monkeypatch.setattr(rr, "_audit", lambda: _reading(asym=("a", "newcomer")))
-    d = rr.drift()
+    monkeypatch.setattr(rr, "_audit", _fake_audit(asym=("a",)))
+    (await rr.accept_baseline())
+    monkeypatch.setattr(rr, "_audit", _fake_audit(asym=("a", "newcomer")))
+    d = (await rr.drift())
     assert d.regressed is True
     assert d.new_asymmetric == ("newcomer",)
 
 
-def test_a_newly_orphaned_module_is_loud(monkeypatch):
-    monkeypatch.setattr(rr, "_audit", lambda: _reading())
-    rr.accept_baseline()
-    monkeypatch.setattr(rr, "_audit", lambda: _reading(orph=("dead",)))
-    assert rr.drift().new_orphans == ("dead",)
+async def test_a_newly_orphaned_module_is_loud(monkeypatch):
+    monkeypatch.setattr(rr, "_audit", _fake_audit())
+    (await rr.accept_baseline())
+    monkeypatch.setattr(rr, "_audit", _fake_audit(orph=("dead",)))
+    assert (await rr.drift()).new_orphans == ("dead",)
 
 
-def test_a_fixed_module_is_reported_as_resolved(monkeypatch):
-    monkeypatch.setattr(rr, "_audit", lambda: _reading(asym=("a", "b")))
-    rr.accept_baseline()
-    monkeypatch.setattr(rr, "_audit", lambda: _reading(asym=("a",)))
-    d = rr.drift()
+async def test_a_fixed_module_is_reported_as_resolved(monkeypatch):
+    monkeypatch.setattr(rr, "_audit", _fake_audit(asym=("a", "b")))
+    (await rr.accept_baseline())
+    monkeypatch.setattr(rr, "_audit", _fake_audit(asym=("a",)))
+    d = (await rr.drift())
     assert d.resolved == ("b",) and d.regressed is False
 
 
-def test_accepting_moves_the_ratchet(monkeypatch):
-    monkeypatch.setattr(rr, "_audit", lambda: _reading(asym=("a",)))
-    rr.accept_baseline()
-    monkeypatch.setattr(rr, "_audit", lambda: _reading(asym=("a", "b")))
-    assert rr.drift().regressed is True
-    rr.accept_baseline()
-    assert rr.drift().regressed is False
+async def test_accepting_moves_the_ratchet(monkeypatch):
+    monkeypatch.setattr(rr, "_audit", _fake_audit(asym=("a",)))
+    (await rr.accept_baseline())
+    monkeypatch.setattr(rr, "_audit", _fake_audit(asym=("a", "b")))
+    assert (await rr.drift()).regressed is True
+    (await rr.accept_baseline())
+    assert (await rr.drift()).regressed is False
 
 
 # -- baseline failure modes ------------------------------------------------
 
 
-def test_a_corrupt_baseline_is_treated_as_absent_not_empty(monkeypatch):
+async def test_a_corrupt_baseline_is_treated_as_absent_not_empty(monkeypatch):
     """An empty baseline would report every asymmetric module as newly
     regressed, burying a real regression under a hundred false ones on the
     first boot after a disk fault."""
     rr.baseline_path().parent.mkdir(parents=True, exist_ok=True)
     rr.baseline_path().write_text("{not json", encoding="utf-8")
-    monkeypatch.setattr(rr, "_audit", lambda: _reading(asym=("a", "b", "c")))
-    d = rr.drift()
+    monkeypatch.setattr(rr, "_audit", _fake_audit(asym=("a", "b", "c")))
+    d = (await rr.drift())
     assert d.baseline_exists is False
     assert d.new_asymmetric == ()
 
 
-def test_a_baseline_that_is_not_an_object_is_treated_as_absent(monkeypatch):
+async def test_a_baseline_that_is_not_an_object_is_treated_as_absent(monkeypatch):
     rr.baseline_path().parent.mkdir(parents=True, exist_ok=True)
     rr.baseline_path().write_text("[1,2,3]", encoding="utf-8")
-    monkeypatch.setattr(rr, "_audit", lambda: _reading(asym=("a",)))
-    assert rr.drift().baseline_exists is False
+    monkeypatch.setattr(rr, "_audit", _fake_audit(asym=("a",)))
+    assert (await rr.drift()).baseline_exists is False
 
 
 def test_the_baseline_is_published_atomically():
@@ -118,13 +137,13 @@ def test_the_baseline_is_published_atomically():
     assert "atomic_replace" in inspect.getsource(rr.accept_baseline)
 
 
-def test_a_failing_audit_degrades_rather_than_raising(monkeypatch):
-    def _boom():
+async def test_a_failing_audit_degrades_rather_than_raising(monkeypatch):
+    async def _boom():
         raise RuntimeError("tree walk exploded")
     monkeypatch.setattr(rr, "_audit", _boom)
-    d = rr.drift()
+    d = (await rr.drift())
     assert d.error and d.regressed is False
-    assert rr.dispatch_reach_command("/reach").ok is False
+    assert (await rr.dispatch_reach_command("/reach")).ok is False
 
 
 # -- the watchdog ----------------------------------------------------------
@@ -132,8 +151,8 @@ def test_a_failing_audit_degrades_rather_than_raising(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_the_watchdog_is_silent_at_steady_state(monkeypatch, caplog):
-    monkeypatch.setattr(rr, "_audit", lambda: _reading(asym=("a",)))
-    rr.accept_baseline()
+    monkeypatch.setattr(rr, "_audit", _fake_audit(asym=("a",)))
+    (await rr.accept_baseline())
     caplog.clear()
     await rr.run_watchdog()
     assert not [r for r in caplog.records if r.levelname == "WARNING"]
@@ -141,9 +160,9 @@ async def test_the_watchdog_is_silent_at_steady_state(monkeypatch, caplog):
 
 @pytest.mark.asyncio
 async def test_the_watchdog_warns_on_regression(monkeypatch, caplog):
-    monkeypatch.setattr(rr, "_audit", lambda: _reading(asym=("a",)))
-    rr.accept_baseline()
-    monkeypatch.setattr(rr, "_audit", lambda: _reading(asym=("a", "newcomer")))
+    monkeypatch.setattr(rr, "_audit", _fake_audit(asym=("a",)))
+    (await rr.accept_baseline())
+    monkeypatch.setattr(rr, "_audit", _fake_audit(asym=("a", "newcomer")))
     caplog.clear()
     await rr.run_watchdog()
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
@@ -182,11 +201,11 @@ def test_the_verb_is_auto_discoverable():
     assert "reach" in rr.__verb_help__
 
 
-def test_help_is_reachable():
-    assert "reachability" in rr.dispatch_reach_command("/reach help").text
+async def test_help_is_reachable():
+    assert "reachability" in (await rr.dispatch_reach_command("/reach help")).text
 
 
-def test_a_module_query_names_its_surfaces(monkeypatch):
+async def test_a_module_query_names_its_surfaces(monkeypatch):
     class _M:
         module = "backend.x.menu_bindings"
         reached_by = ("attach", "cockpit")
@@ -198,14 +217,14 @@ def test_a_module_query_names_its_surfaces(monkeypatch):
         scanned = 1
         def asymmetric(self): return [_M()]
         def orphans(self): return []
-    monkeypatch.setattr(rr, "_audit", lambda: _R())
-    out = rr.dispatch_reach_command("/reach menu_bindings")
+    monkeypatch.setattr(rr, "_audit", _as_audit(_R()))
+    out = (await rr.dispatch_reach_command("/reach menu_bindings"))
     assert out.ok and "attach" in out.text and "cockpit" in out.text
 
 
-def test_an_unknown_module_refuses_rather_than_returning_nothing(monkeypatch):
-    monkeypatch.setattr(rr, "_audit", lambda: _reading())
-    out = rr.dispatch_reach_command("/reach no_such_module_xyz")
+async def test_an_unknown_module_refuses_rather_than_returning_nothing(monkeypatch):
+    monkeypatch.setattr(rr, "_audit", _fake_audit())
+    out = (await rr.dispatch_reach_command("/reach no_such_module_xyz"))
     assert out.ok is False and "no module matching" in out.text
 
 
@@ -214,7 +233,14 @@ def test_the_verb_adds_no_analysis_of_its_own():
     implementation would be a second opinion about the same tree."""
     import pathlib
     src = pathlib.Path(rr.__file__).read_text(encoding="utf-8")
-    assert "surface_reachability import audit" in src
+    # Structural, not spelt: the delegation is that `_audit` — the ONE seam
+    # every path here reaches the numbers through — resolves out of
+    # `surface_reachability`. Asserting the exact import line made this a
+    # test of spelling, and it failed the moment the seam went async while
+    # the property it names stayed true.
+    assert "surface_reachability" in src
+    import inspect
+    assert "surface_reachability" in inspect.getsource(rr._audit)
     for banned in ("ast.parse", "importlib", "os.walk"):
         assert banned not in src
 

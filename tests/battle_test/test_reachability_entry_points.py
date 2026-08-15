@@ -40,6 +40,8 @@ They are computed separately now, and both are asserted below.
 """
 from __future__ import annotations
 
+import ast
+
 import pytest
 
 from backend.core.ouroboros.battle_test import surface_reachability as sr
@@ -208,3 +210,132 @@ class TestTheOneRealFinding:
         reached = sr._reach("pkg.entry", index, barriers=frozenset())
         assert "pkg.used" in reached
         assert "pkg.dead" not in reached
+
+
+class TestTheInstrumentMeasuresTheGraphItReportsOn:
+    """Five of eight orphans were the instrument, again.
+
+    The first correction (39 → 3) fixed the ROOT SET. These fix the INDEX
+    and the TRAVERSAL: what counts as a module at all, and how far an edge
+    is allowed to run before the walk gives up and calls the target dead.
+    """
+
+    def test_a_name_no_import_can_spell_is_not_a_finding(self):
+        """`audio_pump 2.py` is unreachable by construction, not by defect.
+
+        Five of eight reported orphans were Finder/iCloud duplicates whose
+        module name contains a space. No import statement can name them, so
+        reporting them is a tautology dressed as a discovery.
+        """
+        assert not sr._is_importable("pkg.audio_pump 2")
+        assert not sr._is_importable("pkg.foo-bar")
+        assert not sr._is_importable("pkg.2fast")
+        assert not sr._is_importable("pkg.class")     # a keyword
+        assert sr._is_importable("pkg.audio_pump")
+
+    def test_the_index_excludes_them(self):
+        index = sr._index(sr.audit_roots())
+        assert all(sr._is_importable(m) for m in index)
+
+    def test_an_edge_that_leaves_the_reported_roots_is_still_followed(self):
+        """The traversal scope and the reporting scope are different.
+
+        `transcript_timeline` was called an orphan while `why_engine`
+        imports it — `why_engine` lives in `governance/`, which was not
+        indexed, so the edge dangled and the target read as dead. A walk
+        that stops at the reporting boundary INVENTS deaths, which is the
+        strictly worse error.
+        """
+        graph = sr._index((sr.traversal_root(),))
+        assert "backend.core.ouroboros.governance.why_engine" in graph
+        assert len(graph) > len(sr._index(sr.audit_roots()))
+
+    def test_transcript_timeline_is_not_an_orphan(self, reading):
+        orphans = {m.short for m in reading.orphans()}
+        assert "transcript_timeline" not in orphans
+
+    def test_a_cage_mounted_verb_counts_as_an_entry_point(self):
+        """A dynamic import is legible because the cage DECLARES it.
+
+        Making those modules reachable by a human made them unreachable by
+        this audit: `importlib.import_module` is an edge no AST walker can
+        see, so every cage-mounted verb and its whole subtree would have
+        started reporting as an orphan.
+        """
+        graph = sr._index((sr.traversal_root(),))
+        mounted = sr._cage_mounted(graph)
+        assert any(m.endswith("why_repl") for m in mounted), mounted
+        labels = {label for label, _ in sr.derived_entries(
+            sr._repo_root(), graph, sr._Scan())}
+        assert "verb" in labels
+
+    def test_many_seeds_give_exactly_the_union_of_one_seed_each(self):
+        """The orphan question is a union over 228 entries.
+
+        Walking them one at a time re-walks a 1500-node graph 228 times for
+        an answer a single multi-source walk gives exactly.
+        """
+        graph = sr._index((sr.traversal_root(),))
+        scan = sr._Scan()
+        seeds = [e for _, e in sr.surfaces() if e in graph]
+        one_at_a_time = set()
+        for s in seeds:
+            one_at_a_time |= sr._reach(s, graph, frozenset(), scan)
+        assert sr._reach(seeds, graph, frozenset(), scan) == one_at_a_time
+
+    def test_a_seed_is_never_its_own_barrier(self):
+        """Or a surface would stop at its own front door."""
+        graph = sr._index((sr.traversal_root(),))
+        entries = frozenset(e for _, e in sr.surfaces())
+        for _, entry in sr.surfaces():
+            if entry in graph:
+                assert len(sr._reach(entry, graph, entries)) > 1
+
+    def test_a_run_guard_is_the_main_literal_not_any_name_comparison(self):
+        """The byte pre-filter and the AST test must agree exactly.
+
+        `__name__` is worthless as a filter — `logging.getLogger(__name__)`
+        puts it in 883 of 1522 files. `__main__` is in 33.
+        """
+        yes = ast.parse('if __name__ == "__main__":\n    pass').body[0]
+        flipped = ast.parse('if "__main__" == __name__:\n    pass').body[0]
+        no = ast.parse('if __name__ == "__mp_main__":\n    pass').body[0]
+        assert sr._is_run_guard(yes.test)
+        assert sr._is_run_guard(flipped.test)
+        assert not sr._is_run_guard(no.test)
+        assert sr._RUN_GUARD_LITERAL.encode() not in b'if __name__ == "__mp_main__"'
+
+
+class TestTheAuditStaysOffTheLoop:
+    """Principle 3 has no exception for diagnostics."""
+
+    async def test_audit_async_does_not_block_the_event_loop(self):
+        import asyncio
+
+        ticks = 0
+
+        async def heartbeat():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        hb = asyncio.create_task(heartbeat())
+        await sr.audit_async()
+        hb.cancel()
+        assert ticks > 5, (
+            "the loop stalled for the length of the audit — a verb that "
+            "parses a thousand files must not run on the loop that also "
+            "runs the organism")
+
+    def test_the_offload_lives_at_the_one_seam(self):
+        """`run_watchdog` remembered to thread it; the REPL path did not."""
+        from tests.source_probe import code_of
+
+        from backend.core.ouroboros.governance import reach_repl as rr
+
+        assert "audit_async" in code_of(rr._audit)
+        # No caller may offload on its own — two places deciding how to get
+        # off the loop is how one of them ends up not doing it. Read as
+        # CODE: the comment saying so would satisfy a raw substring match.
+        assert "to_thread" not in code_of(rr.run_watchdog)

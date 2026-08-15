@@ -49,6 +49,7 @@ Python 3.9+, ``from __future__ import annotations``.
 from __future__ import annotations
 
 import ast
+import inspect
 import logging
 import os
 import threading
@@ -214,6 +215,12 @@ def dispatch(line: str) -> Optional[Any]:
     name it. An import failure returns a REFUSAL rather than None, because
     ``/why`` existing-but-broken and ``/why`` not existing call for different
     operator responses, and collapsing them into "did you mean…" hides a bug.
+
+    A verb may be ``async def``: its coroutine is returned unawaited, and the
+    seam awaits it (see :func:`dispatch_async`). Verbs that do real work —
+    ``/reach`` parses a thousand files — MUST be async, or typing them
+    freezes the loop that runs the organism. The discovery scan already
+    accepts ``AsyncFunctionDef``, so being async costs a verb nothing.
     """
     spec = find(line)
     if spec is None:
@@ -238,6 +245,29 @@ def dispatch(line: str) -> Optional[Any]:
             f"{spec.slash_form} failed to load ({type(exc).__name__}: {exc})")
 
 
+async def dispatch_async(line: str) -> Optional[Any]:
+    """:func:`dispatch`, awaiting an async verb's result. NEVER raises.
+
+    The seam every async caller uses. Sync verbs pass through untouched, so
+    a verb author chooses `def` or `async def` on the merits of the work and
+    neither choice needs a second code path at the call site.
+
+    An un-awaited coroutine would render as ``<coroutine object …>`` and
+    leak a "never awaited" warning — the verb would look mounted, print
+    garbage, and do nothing. That is the unmounted class wearing a disguise,
+    so the await belongs in the cage rather than in each REPL.
+    """
+    result = dispatch(line)
+    if inspect.isawaitable(result):
+        try:
+            return await result
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[VerbCage] async verb failed", exc_info=True)
+            return _Refusal(
+                f"{line.split()[0]} failed ({type(exc).__name__}: {exc})")
+    return result
+
+
 @dataclass(frozen=True)
 class _Refusal:
     """A mounted verb that could not run — never a silent fall-through."""
@@ -253,6 +283,7 @@ __all__ = [
     "cage_enabled",
     "discover",
     "dispatch",
+    "dispatch_async",
     "find",
     "reset_cache",
 ]
