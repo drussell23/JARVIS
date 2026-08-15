@@ -6,7 +6,7 @@ Brings together all components for seamless proactive monitoring
 
 import logging
 import asyncio
-from typing import Dict, Any, Optional, Callable
+from typing import Any, Callable, Dict, List, Optional
 from datetime import datetime
 
 from .proactive_vision_intelligence import ProactiveVisionIntelligence, ScreenChange, Priority

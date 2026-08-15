@@ -5,6 +5,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 import pytest
 
+# `pyautogui` is an UNDECLARED optional dependency pulled in transitively
+# by the vision action loop. It is absent from requirements, so on a
+# headless machine this module raised ModuleNotFoundError at COLLECTION
+# and took the whole `tests/core` directory to zero tests — an import
+# error is not a test failure, it is the absence of testing.
+# `importorskip` is pytest's own mechanism for exactly this: the suite
+# reports SKIPPED (visible, countable) instead of ERROR (fatal, silent).
+pytest.importorskip("pyautogui")
+
 from backend.core.runtime_task_orchestrator import (
     RuntimeTaskOrchestrator,
     StopReason,
