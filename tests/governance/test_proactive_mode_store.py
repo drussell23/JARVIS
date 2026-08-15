@@ -250,3 +250,67 @@ def test_the_snapshot_is_serialisable(repo):
         await s.hydrate(repo)
         return s.snapshot()
     json.dumps(asyncio.run(_go()))
+
+
+# -- the boot hydrate: a write surface needs a read surface ----------------
+
+
+async def test_the_persisted_rung_is_read_back_at_boot(monkeypatch, tmp_path):
+    """`remember()` wrote and NOTHING read it back.
+
+    The controller kept answering with its in-memory default, so enabling
+    the ladder resolved to `safe_auto` — which GRANTS mutation — while the
+    file said `explore`, which withholds it. The dial appeared to work and
+    inverted its own meaning, which is worse than not having one.
+    """
+    from backend.core.ouroboros.governance import proactive_mode as pm
+
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_STATE_PATH",
+                       str(tmp_path / "dial.json"))
+    st.reset_store()
+    store = st.get_store()
+    assert await store.remember("explore")
+
+    controller = pm.ProactiveModeController()
+    controller.request(pm.PERSISTED_DIAL_VOTER_ID, await store.hydrate())
+    eff = controller.effective()
+    assert eff.name == "explore"
+    assert eff.authority is pm.Authority.PROPOSE, "apply rights not withheld"
+
+
+async def test_a_cockpit_cannot_loosen_past_the_persisted_floor(
+        monkeypatch, tmp_path):
+    """The file says what this checkout may do; the cockpit says what the
+    person wants now. The STRICTER wins, or a standing judgement would be
+    one keystroke from being discarded."""
+    from backend.core.ouroboros.governance import proactive_mode as pm
+
+    monkeypatch.setenv("JARVIS_PROACTIVE_MODE_ENABLED", "true")
+    controller = pm.ProactiveModeController()
+    controller.request(pm.PERSISTED_DIAL_VOTER_ID, "explore")
+    assert controller.request("cockpit-A", "promote").name == "explore"
+
+
+def test_the_boot_seam_actually_hydrates():
+    """A hydrate with no caller is the defect this fixes, one level up."""
+    from tests.source_probe import code_of
+
+    from backend.core.ouroboros.governance import governed_loop_service as gls
+
+    code = code_of(gls)
+    assert "hydrate()" in code, "the persisted dial is never read at boot"
+    assert "PERSISTED_DIAL_VOTER_ID" in code
+
+
+def test_the_voter_id_is_named_once():
+    """Two spellings register two voters, and under strictest-wins a stale
+    duplicate can only make the organism quieter than asked — silently."""
+    from backend.core.ouroboros.governance import proactive_mode as pm
+
+    from tests.source_probe import code_of
+
+    assert pm.PERSISTED_DIAL_VOTER_ID
+    assert '"__persisted_dial__"' not in code_of(
+        __import__("backend.core.ouroboros.governance.governed_loop_service",
+                   fromlist=["x"]))
