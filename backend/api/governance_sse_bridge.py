@@ -96,8 +96,22 @@ class GovernanceSSEBridge:
     channel. One instance per backend process. Every method NEVER
     raises."""
 
-    def __init__(self, *, clock=time.monotonic) -> None:
+    def __init__(self, *, clock=time.monotonic, sink=None) -> None:
         self._clock = clock
+        # ---- Destination (2026-08-15) ------------------------------------
+        # Default None = the EventStream, byte-identically to before.
+        #
+        # A sink exists because the SAME forwarding is now needed toward two
+        # places: the EventStream (supervisor, where the HUD is) and the
+        # cross-process bus (`ov`, which owns the loop and has no
+        # EventStream at all). The subscription, the bounded queue, the
+        # pump and the conflation guard are the parts worth having once —
+        # a second forwarder would be a second place for the backpressure
+        # policy to drift.
+        #
+        # Signature: ``async (frames: List[Dict]) -> int`` returning how
+        # many were delivered. NEVER raises out of the pump.
+        self._sink = sink
         self._sub_ids: List[str] = []
         self._bus: Any = None
         self._installed = False
@@ -218,6 +232,27 @@ class GovernanceSSEBridge:
         """Broadcast a drained batch. ≤ threshold → 1:1; > threshold →
         ONE conflated summary frame (buffer-bloat guard). NEVER raises."""
         try:
+            # Conflation is computed BEFORE the destination is chosen: it is
+            # a property of the batch, not of where the batch is going, and
+            # a cross-process link deserves the buffer-bloat guard at least
+            # as much as a local one — every conflated frame is a WebSocket
+            # write that never happens.
+            frames: List[Dict[str, Any]]
+            if len(batch) > threshold:
+                # Conflate: one summary + a pointer to the latest op.
+                self.stats["conflated"] += len(batch)
+                frames = [self._conflated_frame(batch)]
+            else:
+                frames = batch
+
+            if self._sink is not None:
+                self.stats["batches"] += 1
+                delivered = int(await self._sink(frames) or 0)
+                self.stats["forwarded"] += max(0, delivered)
+                self.stats["dropped_no_stream"] += max(
+                    0, len(frames) - max(0, delivered))
+                return
+
             from backend.core.event_stream import (
                 get_event_stream_if_initialized,
             )
@@ -226,13 +261,6 @@ class GovernanceSSEBridge:
                 self.stats["dropped_no_stream"] += len(batch)
                 return
             self.stats["batches"] += 1
-            frames: List[Dict[str, Any]]
-            if len(batch) > threshold:
-                # Conflate: one summary + a pointer to the latest op.
-                self.stats["conflated"] += len(batch)
-                frames = [self._conflated_frame(batch)]
-            else:
-                frames = batch
             for payload in frames:
                 sent = await es.broadcast_event(_SSE_CHANNEL, payload)
                 if sent > 0:

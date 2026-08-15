@@ -37,6 +37,19 @@ READY_TOPIC = "ouroboros.system"
 async def _load_governance_bridge() -> None:
     from backend.api.governance_sse_bridge import install_governance_sse_bridge
     await install_governance_sse_bridge()
+    # The local bridge above forwards a governed loop running in THIS
+    # process. Since `ov` owns the loop, that subscription sees nothing —
+    # TrinityEventBus drops `source == local_repo`, and both processes are
+    # RepoType.JARVIS. The consumer dials `ov` and republishes its frames
+    # onto the same EventStream channel. Self-gating: no-op when the loop is
+    # local or the bridge is disabled.
+    try:
+        from backend.api.governance_cross_process import (
+            install_governance_bus_consumer,
+        )
+        await install_governance_bus_consumer()
+    except Exception:  # noqa: BLE001 — telemetry never blocks a boot
+        pass
 
 
 def _build_ouroboros_daemon() -> Any:
