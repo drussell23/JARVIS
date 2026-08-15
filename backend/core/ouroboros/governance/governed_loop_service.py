@@ -6746,6 +6746,28 @@ class GovernedLoopService:
                 logger.debug(
                     "[GLS] proactive dial hydrate skipped", exc_info=True)
 
+            # ---- The HUD's wire, after the process split (2026-08-15) ----
+            #
+            # This loop's activity used to reach JARVIS-Apple because the
+            # loop and the EventStream shared a process. `ov` owns the loop
+            # now, and TrinityEventBus cannot carry the gap: its receive
+            # loop drops `event.source == self.local_repo`, and both
+            # processes are RepoType.JARVIS — the transport is cross-REPO,
+            # not cross-PROCESS. Nothing errors; the phone just goes quiet.
+            #
+            # Installed HERE because this is the moment the loop exists and
+            # its bus is up. Self-gating (disabled by default, and a no-op
+            # when the loop is not remote), so a supervisor-owned deployment
+            # is byte-identical.
+            try:
+                from backend.api.governance_cross_process import (  # noqa: E501,PLC0415
+                    install_governance_bus_producer as _gx_producer,
+                )
+                await _gx_producer()
+            except Exception:  # noqa: BLE001 — telemetry never blocks a boot
+                logger.debug("[GLS] governance bus producer skipped",
+                             exc_info=True)
+
             # PRD §27.5: bind the in-flight op registry for `/why`.
             #
             # An operator asks about the op they are WATCHING, which is by

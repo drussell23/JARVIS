@@ -3131,6 +3131,14 @@ async def event_stream_device(device_id: str, request: Request):
             install_governance_sse_bridge,
         )
         await install_governance_sse_bridge()
+        # `ov` owns the governed loop, so the subscription above sees an
+        # empty bus (TrinityEventBus drops `source == local_repo`, and both
+        # processes are RepoType.JARVIS). This dials `ov` and republishes
+        # its frames onto the same channel. Self-gating and idempotent.
+        from backend.api.governance_cross_process import (
+            install_governance_bus_consumer,
+        )
+        await install_governance_bus_consumer()
     except Exception:  # noqa: BLE001 — never block the stream on the bridge
         pass
 

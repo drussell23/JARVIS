@@ -1490,7 +1490,30 @@ imperative-injection (or fails CLOSED). Payload: op_id + reason +
 schema_version. Reason carries the disposition (strip / drop / fail_closed:*)
 but NEVER the offending content. Authority-free anti-jailbreak telemetry."""
 
+# Imported, not spelled twice: the producer publishes with this constant and
+# this frozenset validates against it, so a rename cannot leave one side
+# silently dropping every frame the other sends.
+#
+# The envelope lives in `governance/`, NOT `governance/transport/`: that
+# package's __init__ eagerly imports `distributed_event_bus`, which imports
+# THIS module, so a transport-side constant would close an import cycle.
+# A wire contract with stdlib-only imports has no business behind a package
+# init that drags in aiohttp either.
+from backend.core.ouroboros.governance.governance_envelope import (
+    GOVERNANCE_FORWARD_EVENT_TYPE as _GOVERNANCE_FORWARD_EVENT_TYPE,
+)
+
 _VALID_EVENT_TYPES = frozenset({
+    # The ONE type O+V's whole open topic set crosses a process boundary in
+    # (2026-08-15). Once `ov` owns the governed loop, the supervisor's HUD
+    # bridge subscribes to a TrinityEventBus that will never carry those
+    # events: its receive loop drops `event.source == self.local_repo`, and
+    # both processes are RepoType.JARVIS — the transport is cross-REPO, not
+    # cross-PROCESS. Registered here rather than one type per topic exactly
+    # because THIS frozenset is where a missing entry vanishes silently.
+    # Sourced from `transport.governance_envelope` so the two spellings
+    # cannot drift; a literal would be a second definition of the same name.
+    _GOVERNANCE_FORWARD_EVENT_TYPE,
     "provider_generation_succeeded",
     "audio_level_changed",
     "mic_state_changed",
