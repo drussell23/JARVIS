@@ -904,6 +904,15 @@ class ParallelInitializer:
         self._add_component("jarvis_voice_api", priority=30, is_interactive=True, stale_threshold=20.0)
         # WebSocket is CRITICAL for interactive use - fastest threshold
         self._add_component("unified_websocket", priority=30, is_interactive=True, stale_threshold=15.0)
+        # What a backend owes anyone talking to it as a SERVICE: the device
+        # SSE routes and the O+V telemetry bridge. Gated on
+        # JARVIS_SERVICE_MODE (which `trinity up` already asserts), NOT on
+        # `--headless` — keying surfaces off a CLI spelling is why the bridge
+        # had never installed on this path. Depends on the websocket router
+        # being mounted first, since it hydrates what those routes feed.
+        self._add_component("service_surface", priority=31, is_interactive=False,
+                            soft_dependencies=["unified_websocket"],
+                            stale_threshold=30.0)
 
         # Phase 4: Intelligence Systems (parallel, can be slow but non-blocking)
         # These are NOT interactive - can complete in background after startup
@@ -3887,21 +3896,58 @@ class ParallelInitializer:
         except Exception as e:
             logger.warning(f"JARVIS voice API failed: {e}")
 
+    async def _init_service_surface(self):
+        """Mount the SERVICE surfaces when this process is running as one.
+
+        Reuses `converged_headless.default_subsystems()` — the same hydration
+        DAG (`O+V telemetry bridge` -> `OuroborosDaemon`) the converged app
+        runs — rather than restating it. A second list would drift from the
+        first the moment either was extended.
+
+        No-op unless `service_mode_active()`, so an interactive desktop boot
+        is byte-identical to before.
+        """
+        try:
+            from backend.api.service_surface import (
+                mount_service_surface, service_mode_active,
+            )
+            if not service_mode_active():
+                logger.info("   ⏭️  Service surface skipped (not service mode)")
+                return
+            if await mount_service_surface(self.app):
+                logger.info("   ✅ Service surface mounted (device SSE + O+V bridge)")
+            else:
+                logger.info("   ⚠️  Service surface not mounted")
+        except Exception as e:  # noqa: BLE001 — never block the boot
+            logger.warning(f"Service surface init failed: {e}")
+
     async def _init_unified_websocket(self):
         """Initialize unified WebSocket for frontend communication"""
         try:
             from api.unified_websocket import router as unified_ws_router
+            from backend.api.service_surface import include_router_once
 
-            # Check if already mounted - look for exact /ws path in WebSocket routes
-            existing = any(
-                hasattr(r, 'path') and r.path == '/ws'
-                for r in self.app.routes
-            )
-            if not existing:
-                self.app.include_router(unified_ws_router, tags=["websocket"])
-                logger.info("   ✅ Unified WebSocket mounted at /ws")
+            # Idempotent by ROUTER IDENTITY, not by path.
+            #
+            # This check used to be `any(route.path == '/ws')`, which asks
+            # "is /ws taken?" while meaning "is THIS router mounted?".
+            # `observability_gateway` also registers a /ws websocket, so the
+            # answer was yes and this router — which owns /ws AND the device
+            # SSE routes at /api/stream/* — was skipped whole. The measured
+            # consequence: /api/stream/{device_id} answered 404 on this path
+            # and 200 under --headless, and the O+V→HUD bridge (installed by
+            # that route's handler) never ran. `rg -c GovernanceSSE` over the
+            # entire backend log returned 0, across every boot.
+            #
+            # A shared path is now reported rather than silently shadowing
+            # the whole mount; FastAPI dispatches first-match-wins, so the
+            # earlier registration keeps serving /ws.
+            if include_router_once(self.app, unified_ws_router,
+                                   name="unified_websocket",
+                                   tags=["websocket"]):
+                logger.info("   ✅ Unified WebSocket + device SSE routes mounted")
             else:
-                logger.info("   ✅ Unified WebSocket /ws already mounted")
+                logger.info("   ✅ Unified WebSocket router already mounted")
 
         except ImportError as e:
             logger.warning(f"   Could not import unified WebSocket router: {e}")
