@@ -267,3 +267,197 @@ def test_dispatch_never_raises_on_a_broken_engine(monkeypatch):
 def test_the_explanation_is_serialisable():
     _seed()
     json.dumps(we.explain("o-1").to_dict())
+
+
+# -- the boot binding: DI, not a singleton ---------------------------------
+
+
+class _FakeGLS:
+    """Stands in for GovernedLoopService: an `_active_ops` set, nothing more."""
+
+    def __init__(self, ops=()):
+        self._active_ops = set(ops)
+
+
+def _code_of(module, *names):
+    """Executable source only — docstrings stripped.
+
+    Prose that EXPLAINS a mechanism reads identically to the mechanism when
+    grepped, so a docstring saying "we do not use os.access" satisfies a
+    search for os.access. Assertions here must see code.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(module))
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if names and node.name not in names:
+            continue
+        body = list(node.body)
+        if (body and isinstance(body[0], ast.Expr)
+                and isinstance(getattr(body[0], "value", None), ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            body = body[1:]
+        out.extend(ast.unparse(stmt) for stmt in body)
+    return "\n".join(out)
+
+
+def test_a_set_registry_is_adapted_without_the_engine_knowing_its_shape():
+    svc = _FakeGLS({"op-a", "op-b"})
+    assert we.weak_live_source(svc)() == {"op-a": {}, "op-b": {}}
+
+
+def test_a_mapping_registry_passes_through_unchanged():
+    svc = _FakeGLS()
+    svc._active_ops = {"op-a": {"phase": "GENERATE"}}
+    assert we.weak_live_source(svc)()["op-a"]["phase"] == "GENERATE"
+
+
+def test_a_collected_service_yields_disk_only_not_a_frozen_snapshot():
+    import gc
+
+    svc = _FakeGLS({"op-a"})
+    read = we.weak_live_source(svc)
+    assert read() == {"op-a": {}}
+    del svc
+    gc.collect()
+    # The dangling pointer: a strong closure would still answer {"op-a": {}}
+    # for a service nobody else can reach.
+    assert read() == {}
+
+
+def test_the_reader_is_weak_so_binding_does_not_prolong_the_service():
+    import gc
+    import weakref
+
+    svc = _FakeGLS()
+    ref = weakref.ref(svc)
+    we.set_live_source(we.weak_live_source(svc))
+    del svc
+    gc.collect()
+    assert ref() is None
+
+
+def test_a_missing_registry_degrades_rather_than_raising():
+    assert we.weak_live_source(_FakeGLS(), "_nope")() == {}
+
+
+def test_an_unweakrefable_service_is_refused_not_pinned_strongly():
+    """Falling back to a strong ref would silently restore the bug."""
+    assert we.weak_live_source(object())() == {}
+
+
+def test_a_stopping_instance_cannot_unbind_its_successor():
+    old, new = _FakeGLS({"old"}), _FakeGLS({"new"})
+    old_read, new_read = we.weak_live_source(old), we.weak_live_source(new)
+    we.set_live_source(old_read)
+    we.set_live_source(new_read)          # successor binds first
+    assert we.release_live_source(old_read) is False   # predecessor stops
+    assert we._live_ops() == {"new": {}}   # successor still visible
+
+
+def test_an_instance_releases_the_reader_it_actually_lent():
+    svc = _FakeGLS({"op-a"})
+    read = we.weak_live_source(svc)
+    we.set_live_source(read)
+    assert we.release_live_source(read) is True
+    assert we._live_ops() == {}
+
+
+def test_releasing_twice_is_not_an_error():
+    read = we.weak_live_source(_FakeGLS())
+    we.set_live_source(read)
+    assert we.release_live_source(read) is True
+    assert we.release_live_source(read) is False
+
+
+def test_why_survives_being_spammed_while_the_binding_churns():
+    """Boot-time thread safety: bind/release racing reads, no NoneType."""
+    import threading
+
+    svc = _FakeGLS({"op-a"})
+    stop = threading.Event()
+    errors = []
+
+    def churn():
+        while not stop.is_set():
+            read = we.weak_live_source(svc)
+            we.set_live_source(read)
+            we.release_live_source(read)
+
+    def ask():
+        while not stop.is_set():
+            try:
+                we._live_ops()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+    threads = [threading.Thread(target=churn), threading.Thread(target=ask),
+               threading.Thread(target=ask)]
+    for t in threads:
+        t.start()
+    stop.wait(0.4)
+    stop.set()
+    for t in threads:
+        t.join(timeout=5)
+    assert not errors
+
+
+def test_a_registry_mutating_under_the_read_does_not_drop_the_live_half():
+    """A busy organism is exactly when `/why` is asked."""
+    import threading
+
+    svc = _FakeGLS({f"op-{i}" for i in range(200)})
+    stop = threading.Event()
+    read = we.weak_live_source(svc)
+    errors, empties = [], []
+
+    def mutate():
+        i = 0
+        while not stop.is_set():
+            svc._active_ops.add(f"x-{i}")
+            svc._active_ops.discard(f"x-{i - 50}")
+            i += 1
+
+    def sample():
+        while not stop.is_set():
+            try:
+                if not read():
+                    empties.append(1)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+    threads = [threading.Thread(target=mutate), threading.Thread(target=sample)]
+    for t in threads:
+        t.start()
+    stop.wait(0.4)
+    stop.set()
+    for t in threads:
+        t.join(timeout=5)
+    assert not errors and not empties
+
+
+def test_the_engine_never_reaches_into_the_orchestrator():
+    """DI direction: the projection must not import the service."""
+    import inspect
+
+    src = inspect.getsource(we)
+    assert "governed_loop_service" not in src
+    assert "orchestrator" not in _code_of(we)
+
+
+def test_the_boot_seam_binds_and_both_teardowns_release():
+    """The wired-but-inert trap: a binding nobody calls is not a binding."""
+    from backend.core.ouroboros.governance import governed_loop_service as gls
+
+    code = _code_of(gls)
+    assert "set_live_source" in code, "boot seam never binds /why"
+    assert "weak_live_source" in code, "boot seam binds a STRONG reader"
+
+    for seam in ("stop", "_teardown_partial"):
+        assert "_release_why_live_source" in _code_of(gls, seam), (
+            f"{seam}() leaves the /why reader dangling")
+    assert "release_live_source" in _code_of(gls, "_release_why_live_source")

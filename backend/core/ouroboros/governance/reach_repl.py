@@ -49,7 +49,11 @@ logger = logging.getLogger("Ouroboros.ReachRepl")
 REACH_REPL_SCHEMA_VERSION: str = "reach_repl.1"
 
 __verb_help__ = {
-    "reach": "which surfaces can reach a module — the unmounted-feature audit",
+    # Leads with a verb, not "which": the palette's description arbiter
+    # classifies a fragment head as RESIDUE, and a residue row loses to any
+    # mined candidate — so the shipped prose would have been replaced by a
+    # scrape of this module's own subcommand names.
+    "reach": "audit module reachability — find features nothing can call",
 }
 
 _HELP = (

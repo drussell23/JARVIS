@@ -1433,6 +1433,12 @@ class GovernedLoopService:
 
         # Concurrency & dedup
         self._active_ops: Set[str] = set()
+        # PRD §27.5: the reader `start()` lends to `why_engine`, held so
+        # teardown can take back exactly what this instance gave — see
+        # `_release_why_live_source`. Assigned here, before `start()`, so a
+        # `/why` racing a failed boot finds an attribute rather than a
+        # traceback.
+        self._why_live_reader: Optional[Callable[[], Dict[str, Any]]] = None
         self._active_file_ops: Set[str] = set()  # canonical file paths currently in-flight
         self._completed_ops: Dict[str, OperationResult] = {}
         # Cooperative cancellation: op_ids requested for cancel via REPL /cancel
@@ -2873,7 +2879,11 @@ class GovernedLoopService:
                     exc_info=True,
                 )
 
-        # Detach from stack
+        # Detach from stack. `/why` released LAST, after the drain above:
+        # while ops are still finishing they genuinely are in flight, and
+        # unbinding early would make `/why` claim disk-only about work that
+        # is still running.
+        self._release_why_live_source()
         self._detach_from_stack()
         self._state = ServiceState.INACTIVE
         logger.info("[GovernedLoop] Stopped")
@@ -6690,6 +6700,44 @@ class GovernedLoopService:
                     "[GLS] proactive-mode sink registration skipped",
                     exc_info=True,
                 )
+
+            # PRD §27.5: bind the in-flight op registry for `/why`.
+            #
+            # An operator asks about the op they are WATCHING, which is by
+            # definition the one least likely to have reached disk. Without
+            # this binding `/why o-12` answers "not found" for the thing on
+            # screen — useless at exactly the moment it is most wanted.
+            #
+            # Injected, not imported: `why_engine` is a read-only projection
+            # over the transcript, and a projection that reached into this
+            # service for `_active_ops` would invert the same authority
+            # boundary the sink above is placed to preserve. The engine holds
+            # no registry and constructs nothing; it is handed a reader and
+            # gives it back at teardown.
+            #
+            # `weak_live_source` holds this service WEAKLY. A GLS that is
+            # replaced or crashes without reaching `stop()` would otherwise
+            # stay alive inside a closure here and keep answering `/why` from
+            # its frozen final state — a dangling pointer that reports live
+            # data about a service that has stopped. Weak + explicit unbind
+            # in `stop()`/`_teardown_partial()`: the unbind covers the clean
+            # path immediately, the weakref covers the crash path without
+            # waiting on anyone to remember.
+            try:
+                from backend.core.ouroboros.governance.why_engine import (  # noqa: PLC0415
+                    set_live_source as _why_set_live,
+                    weak_live_source as _why_weak,
+                )
+                # Held so teardown can release BY IDENTITY. Releasing by
+                # `set_live_source(None)` would let a stopping instance
+                # unbind its own successor during an overlapping restart.
+                self._why_live_reader = _why_weak(self, "_active_ops")
+                _why_set_live(self._why_live_reader)
+                logger.debug("[GLS] /why live source bound (weak)")
+            except Exception:  # noqa: BLE001 — `/why` degrades to disk-only
+                logger.debug(
+                    "[GLS] /why live-source binding skipped", exc_info=True)
+
             # Dynamic Fleet Registry Service Discovery: lanes TRACK the mesh.
             # While sovereign endpoints serve, the worker count locks to the
             # node count (one GPU = one lane; an N-node fleet = N lanes);
@@ -7281,6 +7329,35 @@ class GovernedLoopService:
         # StrategicDirection holder on the orchestrator.
         self._stack.governed_loop_service = self
 
+    def _release_why_live_source(self) -> None:
+        """Take back the `/why` live reader this instance lent out. §27.5.
+
+        Called on BOTH teardown paths — clean `stop()` and the partial
+        teardown a failed boot runs — because a boot that dies after the
+        binding and before the loop is exactly the case where a stale reader
+        would answer `/why` with in-flight state for a service that never
+        ran.
+
+        Released by IDENTITY, so an instance that is stopping while its
+        replacement has already bound leaves the successor's binding intact.
+        Never raises: teardown must not fail on a diagnostic surface.
+        """
+        reader = getattr(self, "_why_live_reader", None)
+        if reader is None:
+            return
+        self._why_live_reader = None
+        try:
+            from backend.core.ouroboros.governance.why_engine import (  # noqa: PLC0415
+                release_live_source as _why_release,
+            )
+            if not _why_release(reader):
+                logger.debug(
+                    "[GLS] /why live source already rebound by a successor "
+                    "— leaving it in place")
+        except Exception:  # noqa: BLE001
+            logger.debug("[GLS] /why live-source release skipped",
+                         exc_info=True)
+
     def _detach_from_stack(self) -> None:
         """Detach governed loop components from GovernanceStack."""
         if self._stack is None:
@@ -7526,6 +7603,7 @@ class GovernedLoopService:
         self._orchestrator = None
         self._generator = None
         self._approval_provider = None
+        self._release_why_live_source()
         self._detach_from_stack()
 
     # ------------------------------------------------------------------

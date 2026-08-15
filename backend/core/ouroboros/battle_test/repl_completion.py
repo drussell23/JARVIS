@@ -2326,6 +2326,33 @@ def unified_registry(repl_instance: object = None) -> VerbRegistry:
                 arg_spec=base.arg_spec or d.arg_spec,
                 category=d.category if d.handler_method else base.category,
             )
+        # Third source: the naming cage. A `governance/<verb>_repl.py` module
+        # exporting `__verb_help__` + `dispatch_<verb>_command` IS the verb
+        # `/<verb>`, and SerpentREPL routes it without a `_handle_*` method —
+        # so neither source above can see it, and the palette would deny a
+        # verb the REPL accepts.
+        #
+        # Merged HERE rather than inside `discover_verbs` because this is the
+        # one place verb sources are composed, and because the kill switch
+        # above must restore the legacy split completely. Lowest precedence:
+        # a hand-written branch that also carries doc-tags keeps its richer
+        # metadata; the cage only fills what nothing else claims.
+        try:
+            from backend.core.ouroboros.governance.repl_verb_cage import (
+                discover as _cage_discover,
+            )
+            for _mv in _cage_discover():
+                if _mv.slash_form in merged:
+                    continue
+                merged[_mv.slash_form] = VerbDescriptor(
+                    slash_form=_mv.slash_form,
+                    handler_method=_mv.dispatch_name,
+                    description=_mv.description,
+                )
+        except Exception:  # noqa: BLE001 — palette degrades, never fails
+            logger.debug("[Completion] verb cage merge skipped",
+                         exc_info=True)
+
         return VerbRegistry(
             verbs=tuple(sorted(merged.values(), key=lambda v: v.slash_form))
         )

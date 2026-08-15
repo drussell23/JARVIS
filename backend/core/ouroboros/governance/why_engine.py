@@ -49,6 +49,7 @@ from __future__ import annotations
 import enum
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -178,24 +179,132 @@ def _live_ops() -> Dict[str, Any]:
     read-only projection would invert the authority boundary — the same
     reason ``proactive_mode`` takes its pool through a sink.
     """
+    # ONE atomic read, bound to a local before use. Reading the global twice
+    # — once to test, once to call — is a TOCTOU: `stop()` can unbind
+    # between the two, and the second read raises NoneType. An operator
+    # spamming `/why` while the service is booting or tearing down hits that
+    # window, which is exactly when they are least able to interpret a
+    # traceback.
+    source = _LIVE_SOURCE
+    if source is None:
+        return {}
     try:
-        return dict(_LIVE_SOURCE() or {}) if _LIVE_SOURCE else {}
+        return dict(source() or {})
     except Exception:  # noqa: BLE001
+        # A dead weakref, a half-built service, a registry mid-mutation —
+        # all degrade to disk-only. `/why` says so; it never guesses.
         return {}
 
 
 _LIVE_SOURCE: Optional[Callable[[], Dict[str, Any]]] = None
+_live_lock = threading.Lock()
 
 
 def set_live_source(source: Optional[Callable[[], Dict[str, Any]]]) -> None:
-    """Register the in-flight op registry. NEVER raises.
+    """Bind the in-flight op registry, or unbind with ``None``. NEVER raises.
 
-    Absent, ``/why`` answers from disk alone and says so — a degraded answer
-    that names its own limit, rather than a confident one that is missing
-    the live half.
+    **Not a singleton.** This is a binding point, not an owner: the engine
+    holds no registry, constructs nothing, and cannot reach the service. The
+    caller injects a reader and takes it back at teardown. That is the same
+    seam ``markup_mirror``, ``set_operator_dispatcher`` and
+    ``set_prompt_publisher`` already use, and it exists precisely so a
+    read-only projection never imports the orchestrator.
+
+    **The dangling-pointer race.** A GLS that crashes and restarts would
+    otherwise leave a closure here holding the dead instance alive and
+    answering from its frozen state. Callers are expected to pass a
+    weakref-backed reader (see :func:`weak_live_source`) AND to unbind at
+    teardown — belt and braces, because a hard crash never reaches teardown
+    and a clean stop should not wait for a garbage collector.
+
+    Rebinding is last-writer-wins by design: a restarted service is the
+    authority on its own liveness, and refusing its bind because a dead one
+    got there first would leave `/why` permanently disk-only.
     """
     global _LIVE_SOURCE
-    _LIVE_SOURCE = source
+    with _live_lock:
+        _LIVE_SOURCE = source
+
+
+def release_live_source(source: Callable[[], Dict[str, Any]]) -> bool:
+    """Unbind ``source`` IFF it is still the bound one. NEVER raises.
+
+    Compare-and-clear, not clear. Teardown overlaps startup: a service that
+    is stopping while its replacement has already bound would, with a plain
+    ``set_live_source(None)``, unbind the LIVE service on its way out — and
+    `/why` would answer disk-only about a running organism for the rest of
+    the session, with nothing in the logs to say why.
+
+    The old instance may only take back what it put there. Returns True when
+    it did, False when someone else now holds the binding — which is not an
+    error, it is the successor having won.
+    """
+    global _LIVE_SOURCE
+    with _live_lock:
+        if _LIVE_SOURCE is not source:
+            return False
+        _LIVE_SOURCE = None
+        return True
+
+
+def weak_live_source(service: Any, attr: str = "_active_ops") -> Callable[
+        [], Dict[str, Any]]:
+    """A reader that cannot keep a dead service alive.
+
+    Holds the service by weak reference, so a collected GLS yields ``{}``
+    rather than a frozen snapshot of an instance nobody else can reach. The
+    engine then reports disk-only, which is true, instead of reporting live
+    state from a service that has stopped.
+
+    Adapts the registry's SHAPE here rather than in the engine: `_active_ops`
+    is a set of ids today and could gain per-op detail tomorrow, and the
+    engine should not have to know which. A set becomes ``{id: {}}``; a
+    mapping is passed through.
+    """
+    import weakref
+
+    try:
+        ref = weakref.ref(service)
+    except TypeError:
+        # Not every object can be weakly referenced — `__slots__` without
+        # `__weakref__`, and most C types. Falling back to a STRONG reference
+        # would satisfy the call and reintroduce exactly the dangling pointer
+        # this function exists to prevent, silently. Refuse instead: `/why`
+        # is honestly disk-only, and the reason is in the log.
+        logger.warning(
+            "[Why] %s cannot be weakly referenced — the live half of /why "
+            "stays unbound rather than pinning it", type(service).__name__)
+        return lambda: {}
+
+    def _read() -> Dict[str, Any]:
+        svc = ref()
+        if svc is None:
+            return {}
+        raw = getattr(svc, attr, None)
+        if raw is None:
+            # Boot-time. The attribute is assigned in `__init__`, long before
+            # the binding is made in `start()`, so this is reachable only if
+            # a caller binds something half-built. Disk-only is the honest
+            # answer; a NoneType traceback in the operator's face is not.
+            return {}
+        # Snapshot in ONE builtin call. `set.copy()` and `dict.copy()` run
+        # entirely in C, so no other thread's `add`/`discard` can interleave.
+        # A comprehension over the live container would iterate at Python
+        # level and raise "changed size during iteration" whenever the
+        # organism is busy — which is exactly when `/why` is asked, so the
+        # live half would drop out precisely when it matters.
+        try:
+            snap = raw.copy()
+        except AttributeError:
+            try:
+                snap = list(raw)
+            except TypeError:
+                return {}
+        if isinstance(snap, dict):
+            return snap
+        return {str(op): {} for op in snap}
+
+    return _read
 
 
 def _resolve_ref(ref: str) -> Tuple[str, Optional[Any], bool]:

@@ -3450,7 +3450,53 @@ Slices 5–7 need ops, which need a funded lane.
 3. `/why` imports no provider client (§27.5.2);
 4. the ambient idle line imports no provider client (§27.4.3);
 5. the trust panel is read-only with respect to every §26 flag — rendering
-   authority is never write authority (the `ide_observability.py` precedent).
+   authority is never write authority (the `ide_observability.py` precedent);
+6. every module honouring the naming cage is reachable by typing its verb
+   (§27.5.6) — the pin that makes "shipped and untypeable" a red build.
+
+---
+
+### 27.5.6 The naming cage — a `*_repl` module IS its verb
+
+`/why` and `/reach` both shipped importable, tested, documented, and
+**untypeable**. Their dispatchers were correct; their renderers were correct;
+their spines were green. Nothing anywhere asserted that a human could reach
+them, because reaching them required somebody to remember to add a branch to
+an `if line.startswith(...)` ladder in `serpent_flow`. Three of the five
+governance modules honouring the contract had a branch; two did not.
+
+That is the §27 defect class in its purest form, and the fix is not a sixth
+branch. It is to make the mount **structural**:
+
+> A module `governance/<verb>_repl.py` that exports BOTH `__verb_help__` and
+> `dispatch_<verb>_command` **is** the verb `/<verb>`. The filesystem is the
+> registration. There is no table to drift.
+
+Both halves are required because either alone is ambiguous — a dispatcher
+with no help is undiscoverable, and help with no dispatcher is a promise with
+no mechanism.
+
+Discovery is `ast` over the package directory: ~0.16s for 68 candidates and
+**zero imports**, against ~0.47s and 68 import side effects for the obvious
+alternative. Descriptions come from `ast.literal_eval` of the dict literal, so
+the palette is fully populated before a single module loads. Dispatch then
+imports exactly the one module the operator named.
+
+Three seams, each load-bearing:
+
+| Seam | Placement | Why there |
+|---|---|---|
+| Routing (`serpent_flow`) | after the explicit ladder, before the unknown-verb handler | hand-written branches keep priority and stay byte-identical; only lines that would fall through to "did you mean…" reach the cage |
+| Palette (`unified_registry`) | lowest precedence in the one composer | a verb that works and is invisible is half a verb; merged here, not in `discover_verbs`, so the unified kill switch restores the legacy split completely |
+| Quality (cage spine) | asserts each declared description survives `verb_description.assess` | a residue description loses its palette row to a scrape of the module's own subcommand names — caught where it is declared, not in a distant red |
+
+`None` from the cage means "no module claims this" and must fall through; a
+result that merely answered *no* must not. An import failure returns a stated
+refusal rather than `None`, because *exists-but-broken* and *does not exist*
+call for different operator responses, and collapsing them hides the bug
+behind a spelling suggestion.
+
+Master switch `JARVIS_REPL_VERB_CAGE_ENABLED`, default **true**.
 
 ---
 
