@@ -3032,6 +3032,46 @@ def _client_extra_bindings(ui: Any, client: Any) -> Any:
             install_completion_arbiter(kb)
         except Exception:  # noqa: BLE001
             pass
+
+        # PRD §28 C2 — single-key gate answering, on the surface `ov attach`
+        # actually mounts.
+        #
+        # `install_confirm_actions` has existed and worked since it shipped,
+        # imported at exactly ONE site: bipartite_layout. The capability was
+        # never missing; it was unreachable from this cockpit. Mounted at
+        # THIS builder for the reason the arbiter above states in its own
+        # comment — "this builder is the one action set both attach surfaces
+        # share; binding it at either call site would fix the surface that
+        # was looked at and leave the other one dead."
+        #
+        # `submit` routes through `_route_operator_line`, the same path a
+        # typed `/accept` takes, so the risk tier, the audit trail and the
+        # countdown clear identically. A key that bypassed the verb would be
+        # a second approval path, and approval is the one surface where two
+        # paths that disagree is a governance problem rather than a UI one.
+        #
+        # CONCURRENCY: no lock is added here, deliberately. The pending gate
+        # is a fact about the ORGANISM, not about a screen — both cockpits
+        # should see the same one — and `pending_apply` already guards its
+        # state with a `threading.Lock` while `snapshot()` returns a copy, so
+        # a reader never sees a torn row. Two cockpits answering at once are
+        # separated where it matters: `send_input` tags every verdict with
+        # its `prompt_id` and the daemon refuses a mismatch rather than
+        # landing "y" on whichever op happens to be armed. A lock here would
+        # serialise two reads that were never in conflict.
+        try:
+            from backend.core.ouroboros.battle_test.menu_bindings import (
+                install_confirm_actions,
+            )
+            _n_confirm = install_confirm_actions(
+                kb, submit=lambda _text: _route_operator_line(
+                    client, ui, _text),
+            )
+            logger.debug(
+                "[ov] mounted %d confirm action(s) on the attach surface",
+                _n_confirm)
+        except Exception:  # noqa: BLE001
+            logger.debug("[ov] confirm actions unavailable", exc_info=True)
         return kb
     except Exception:  # noqa: BLE001
         return None
