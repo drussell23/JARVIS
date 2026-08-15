@@ -28,20 +28,10 @@ def _src() -> str:
 
 
 def _code_of(fn_name: str) -> str:
-    """A function's CODE, with its docstring removed.
-
-    Every structural check here must read code, not prose. The docstrings
-    deliberately NAME the things being avoided — "the partial-summary
-    write", "the last phase reached", "the extend-condition" — so a
-    substring match over the whole function flags the explanation as if it
-    were the offence. That mistake has now cost four tests this session;
-    stripping the docstring is the fix that generalises.
-    """
-    src = _src()
-    node = next(
-        n for n in ast.walk(ast.parse(src))
-        if isinstance(n, ast.FunctionDef) and n.name == fn_name
-    )
+    """That module's function, as CODE. See tests.source_probe."""
+    from tests.source_probe import code_of
+    from backend.core.ouroboros.battle_test import harness
+    return code_of(harness, fn_name)
     body = list(node.body)
     if (body and isinstance(body[0], ast.Expr)
             and isinstance(body[0].value, ast.Constant)

@@ -85,10 +85,31 @@ def test_why_is_reachable_by_typing_it():
     assert "causal account" in result.text
 
 
-def test_reach_is_reachable_by_typing_it():
-    result = cage.dispatch("/reach help")
+async def test_reach_is_reachable_by_typing_it():
+    result = await cage.dispatch_async("/reach help")
     assert result is not None, "/reach is mounted but unreachable"
     assert "reachability" in result.text
+
+
+async def test_an_async_verb_is_awaited_by_the_cage():
+    """An un-awaited coroutine renders as `<coroutine object …>`.
+
+    The verb would look mounted, print garbage and do nothing — the
+    unmounted class wearing a disguise. `/reach` is async because it parses
+    a thousand files and must not freeze the loop that runs the organism.
+    """
+    import inspect
+
+    raw = cage.dispatch("/reach help")
+    assert inspect.isawaitable(raw), "/reach stopped being async"
+    raw.close()
+    assert not inspect.isawaitable(await cage.dispatch_async("/reach help"))
+
+
+async def test_a_sync_verb_passes_through_the_async_seam_unchanged():
+    """A verb author picks def or async def on the merits of the work."""
+    assert (await cage.dispatch_async("/why help")).ok is True
+    assert await cage.dispatch_async("/no_such_verb_xyz") is None
 
 
 def test_an_unclaimed_verb_returns_none_so_the_typo_handler_still_runs():
@@ -132,25 +153,7 @@ def test_a_bare_word_is_not_a_slash_verb():
 # -- the mount itself ------------------------------------------------------
 
 
-def _code_of(module, *names):
-    """Executable source only — docstrings stripped.
-
-    A docstring EXPLAINING a mechanism greps identically to the mechanism.
-    """
-    tree = ast.parse(inspect.getsource(module))
-    out = []
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        if names and node.name not in names:
-            continue
-        body = list(node.body)
-        if (body and isinstance(body[0], ast.Expr)
-                and isinstance(getattr(body[0], "value", None), ast.Constant)
-                and isinstance(body[0].value.value, str)):
-            body = body[1:]
-        out.extend(ast.unparse(stmt) for stmt in body)
-    return "\n".join(out)
+from tests.source_probe import code_of as _code_of
 
 
 def test_the_repl_actually_calls_the_cage():
@@ -179,7 +182,7 @@ def test_cage_verbs_appear_in_the_palette():
     assert registry.find("/reach") is not None
 
 
-def test_every_contract_honouring_module_is_reachable():
+async def test_every_contract_honouring_module_is_reachable():
     """The invariant, stated once: declaring the contract IS mounting.
 
     A future `governance/foo_repl.py` that exports both halves is reachable
@@ -187,7 +190,7 @@ def test_every_contract_honouring_module_is_reachable():
     aspirational — a regression in the seam fails here, not in production.
     """
     for spec in cage.discover():
-        assert cage.dispatch(f"{spec.slash_form} help") is not None, (
+        assert await cage.dispatch_async(f"{spec.slash_form} help") is not None, (
             f"{spec.slash_form} declares the contract but is unreachable")
 
 

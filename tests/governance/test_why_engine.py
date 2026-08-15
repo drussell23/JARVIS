@@ -279,30 +279,7 @@ class _FakeGLS:
         self._active_ops = set(ops)
 
 
-def _code_of(module, *names):
-    """Executable source only — docstrings stripped.
-
-    Prose that EXPLAINS a mechanism reads identically to the mechanism when
-    grepped, so a docstring saying "we do not use os.access" satisfies a
-    search for os.access. Assertions here must see code.
-    """
-    import ast
-    import inspect
-
-    tree = ast.parse(inspect.getsource(module))
-    out = []
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        if names and node.name not in names:
-            continue
-        body = list(node.body)
-        if (body and isinstance(body[0], ast.Expr)
-                and isinstance(getattr(body[0], "value", None), ast.Constant)
-                and isinstance(body[0].value.value, str)):
-            body = body[1:]
-        out.extend(ast.unparse(stmt) for stmt in body)
-    return "\n".join(out)
+from tests.source_probe import code_of as _code_of
 
 
 def test_a_set_registry_is_adapted_without_the_engine_knowing_its_shape():

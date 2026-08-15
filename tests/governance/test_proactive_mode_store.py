@@ -128,21 +128,7 @@ def test_git_worktrees_keep_separate_dials(repo, tmp_path):
     assert asyncio.run(_go()) == "watch", "the worktree clobbered main"
 
 
-def _code_of(fn) -> str:
-    """Executable body with the docstring stripped.
-
-    Every prose check in this suite goes through here. Four times this
-    session a raw text search matched a docstring that EXPLAINED why
-    something was not used — a substring cannot tell an explanation from a
-    use, and these modules explain themselves at length."""
-    import ast
-    import inspect
-    import textwrap
-    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
-    fn_node = tree.body[0]
-    body = (fn_node.body[1:]
-            if isinstance(fn_node.body[0], ast.Expr) else fn_node.body)
-    return "\n".join(ast.unparse(stmt) for stmt in body)
+from tests.source_probe import code_of as _code_of
 
 
 def test_the_worktree_is_resolved_by_toplevel_not_git_dir():

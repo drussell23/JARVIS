@@ -6463,9 +6463,12 @@ class SerpentREPL:
         if line.startswith("/"):
             try:
                 from backend.core.ouroboros.governance.repl_verb_cage import (  # noqa: E501
-                    dispatch as _cage_dispatch,
+                    dispatch_async as _cage_dispatch,
                 )
-                _cage_result = _cage_dispatch(line)
+                # Awaited: a verb that does real work must be `async def`
+                # or it freezes the loop that runs the organism for the
+                # length of its own computation.
+                _cage_result = await _cage_dispatch(line)
             except Exception:  # noqa: BLE001 — never break the REPL on a verb
                 _cage_result = None
             # `None` means "no module claims this" and MUST fall through to
