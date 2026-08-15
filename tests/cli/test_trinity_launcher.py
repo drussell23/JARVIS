@@ -126,3 +126,61 @@ class TestInterpreterAuthority:
             "backend.core.ouroboros.cli.trinity_env.venv_dir",
             lambda: tmp_path / "nope")
         assert tl._service_python() == sys.executable
+
+
+class TestSupervisorLivenessIsNotTheCockpitsSocket:
+    """Two daemons cannot share one liveness signal.
+
+    `_backend_alive` probed `cockpit_attach.sock`, which was a fine proxy
+    while one process owned both the governed loop and the body. Once `ov`
+    took the loop it took that socket, and `trinity up` began printing
+    "organism already awake" and starting nothing — while `trinity status`,
+    which looks at pid + tcp + uds, correctly reported
+    `partial readiness (pid=None, tcp=refused, uds=live)`.
+    """
+
+    def test_a_live_cockpit_socket_is_not_a_live_supervisor(self, monkeypatch):
+        """THE regression. `ov` running must not convince `trinity up` that
+        a supervisor exists."""
+        monkeypatch.setattr(
+            "backend.core.ouroboros.cli.trinity_status.supervisor_pid",
+            lambda: None)
+
+        async def _refused(*_a, **_k):
+            return "refused"
+
+        monkeypatch.setattr(
+            "backend.core.ouroboros.cli.thin_client.probe_http", _refused)
+
+        async def _live_uds(*_a, **_k):
+            return "live"           # the cockpit socket IS answering
+
+        monkeypatch.setattr(
+            "backend.core.ouroboros.cli.thin_client.probe_socket", _live_uds)
+        assert tl._backend_alive() is False
+
+    def test_a_registered_pid_is_enough(self, monkeypatch):
+        monkeypatch.setattr(
+            "backend.core.ouroboros.cli.trinity_status.supervisor_pid",
+            lambda: 4242)
+        assert tl._backend_alive() is True
+
+    def test_a_live_http_port_is_enough(self, monkeypatch):
+        monkeypatch.setattr(
+            "backend.core.ouroboros.cli.trinity_status.supervisor_pid",
+            lambda: None)
+
+        async def _live(*_a, **_k):
+            return "live"
+
+        monkeypatch.setattr(
+            "backend.core.ouroboros.cli.thin_client.probe_http", _live)
+        assert tl._backend_alive() is True
+
+    def test_it_never_raises(self, monkeypatch):
+        def _boom():
+            raise RuntimeError("no pid for you")
+
+        monkeypatch.setattr(
+            "backend.core.ouroboros.cli.trinity_status.supervisor_pid", _boom)
+        assert tl._backend_alive() in (True, False)

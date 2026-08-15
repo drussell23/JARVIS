@@ -73,14 +73,32 @@ def _backend_socket() -> Path:
 
 
 def _backend_alive() -> bool:
-    """Zero-trust probe of the backend's attach socket (reuse the ov
-    thin-client probe). NEVER raises."""
+    """Is the SUPERVISOR up? NEVER raises.
+
+    Probes what the supervisor itself owns — its pid and its HTTP port —
+    and deliberately NOT the cockpit attach socket.
+
+    That socket used to be a fine proxy: one process owned the governed loop
+    and the body, so any transport answering meant the backend was up. Since
+    `ov` took ownership of the loop it owns that socket too, and this probe
+    read it as evidence of a supervisor that was not running: `trinity up`
+    printed "organism already awake" and started nothing, while
+    `trinity status` — which looks at all three signals — correctly said
+    ``partial readiness (pid=None, tcp=refused, uds=live)``.
+
+    Two daemons cannot share one liveness signal. This asks the question the
+    caller actually means: is there a supervisor to talk to.
+    """
     try:
-        from backend.core.ouroboros.cli.thin_client import probe_socket
-        from backend.core.ouroboros.battle_test.cockpit_attach import (
-            attach_socket_path,
+        from backend.core.ouroboros.cli.thin_client import probe_http
+        from backend.core.ouroboros.cli.trinity_status import (
+            supervisor_pid, _health_port, _strict_timeout,
         )
-        return asyncio.run(probe_socket(attach_socket_path())) == "live"
+        if supervisor_pid() is not None:
+            return True
+        return asyncio.run(
+            probe_http("127.0.0.1", _health_port(), _strict_timeout())
+        ) == "live"
     except Exception:
         return False
 

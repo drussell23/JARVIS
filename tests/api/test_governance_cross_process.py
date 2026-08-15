@@ -511,3 +511,95 @@ class TestTheLinkCarriesAFrameOverARealSocket:
                 pass
             await runner.cleanup()
             gbs.reset_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# The install must not race its own dependency
+# ---------------------------------------------------------------------------
+
+
+class TestTheProducerWaitsForTheBus:
+    """Measured on a live boot: the install point ran 64s BEFORE
+    `[TrinityEventBus] Started`. `GovernanceSSEBridge.install()` returns
+    False — not an error — when the bus is absent, so the forwarder was
+    permanently inert with no exception and no log line. Moving to a
+    different fixed point would only re-lose the race on a boot that
+    reorders.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fast(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_GOVERNANCE_OWNER", "ov")
+        monkeypatch.setenv("JARVIS_GOVERNANCE_BUS_PRODUCER_RETRY_S", "0.5")
+        monkeypatch.setenv("JARVIS_GOVERNANCE_BUS_PRODUCER_WAIT_S", "10")
+        yield
+
+    async def test_it_installs_once_the_bus_appears(self, monkeypatch):
+        """The regression that matters: absent bus at call time, present a
+        moment later, forwarder live without anyone re-calling."""
+        state = {"bus_up": False, "installs": 0}
+
+        class _Bridge:
+            def __init__(self, *a, **k):
+                pass
+
+            async def install(self):
+                state["installs"] += 1
+                return state["bus_up"]
+
+        monkeypatch.setattr(
+            "backend.api.governance_sse_bridge.GovernanceSSEBridge", _Bridge)
+        task = await gxp.install_governance_bus_producer()
+        assert task is not None, "must not give up when the bus is merely late"
+        state["bus_up"] = True
+        result = await asyncio.wait_for(task, timeout=8)
+        assert result is not None
+        assert state["installs"] >= 2, "it retried rather than gave up"
+
+    async def test_an_immediately_available_bus_needs_no_retry(
+            self, monkeypatch):
+        class _Bridge:
+            def __init__(self, *a, **k):
+                pass
+
+            async def install(self):
+                return True
+
+        monkeypatch.setattr(
+            "backend.api.governance_sse_bridge.GovernanceSSEBridge", _Bridge)
+        out = await gxp.install_governance_bus_producer()
+        assert out is not None and not isinstance(out, asyncio.Task)
+
+    async def test_it_gives_up_loudly_rather_than_retrying_forever(
+            self, monkeypatch, caplog):
+        """A task that outlives its reason is worse than a warning. A
+        forwarder that never installed is indistinguishable from a quiet
+        organism, so the give-up is said once at a level an operator sees."""
+        monkeypatch.setenv("JARVIS_GOVERNANCE_BUS_PRODUCER_WAIT_S", "1")
+
+        class _Bridge:
+            def __init__(self, *a, **k):
+                pass
+
+            async def install(self):
+                return False
+
+        monkeypatch.setattr(
+            "backend.api.governance_sse_bridge.GovernanceSSEBridge", _Bridge)
+        with caplog.at_level("WARNING"):
+            task = await gxp.install_governance_bus_producer()
+            assert await asyncio.wait_for(task, timeout=8) is None
+        assert any("never installed" in r.message for r in caplog.records)
+
+    async def test_waiting_can_be_declined(self, monkeypatch):
+        class _Bridge:
+            def __init__(self, *a, **k):
+                pass
+
+            async def install(self):
+                return False
+
+        monkeypatch.setattr(
+            "backend.api.governance_sse_bridge.GovernanceSSEBridge", _Bridge)
+        assert await gxp.install_governance_bus_producer(
+            wait_for_bus=False) is None
