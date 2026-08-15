@@ -31,11 +31,12 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from backend.core.ouroboros.governance.resource_monitor import (
     ResourceSnapshot,  # retained in signatures for caller compatibility
@@ -574,3 +575,75 @@ _DEFAULT_POLICY: Dict = {
         "cost_gate": {"daily_budget_usd": 0.50, "budget_exceeded_action": "queue"},
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Declared footprint — the policy's answer to "how much will this weigh?"
+# ---------------------------------------------------------------------------
+
+_FOOTPRINT_GIB = 1024 ** 3
+_footprint_selector: "Optional[BrainSelector]" = None
+_footprint_lock = threading.Lock()
+
+
+def _footprint_policy() -> Dict[str, Any]:
+    """The live policy dict, via the module that already owns loading it.
+
+    Reuses ``BrainSelector`` — including its mtime hot-reload — rather than
+    opening the YAML a second time. A second reader would be a second
+    authority for a file an operator edits expecting one effect, and the two
+    would disagree for exactly as long as one of them held a stale mtime.
+    """
+    global _footprint_selector
+    with _footprint_lock:
+        if _footprint_selector is None:
+            _footprint_selector = BrainSelector()
+        sel = _footprint_selector
+    try:
+        sel._maybe_reload_policy()
+        return sel._policy or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def footprint_bytes_for(brain_id: Optional[str]) -> int:
+    """Resident weight footprint a brain DECLARES, in bytes. 0 when unstated.
+
+    Zero is meaningful and must not be read as "small": it means the policy
+    made no claim, and ``local_model_admission`` treats an unstated footprint
+    by skipping the accelerator bound entirely rather than inferring one. A
+    guessed footprint driving a real refusal would be a fabricated
+    measurement — the failure class this whole arc exists to remove.
+
+    Searches every brain list under ``brains`` (``required``, ``optional``,
+    and any future sibling) so a brain does not become invisible here merely
+    by moving between them. NEVER raises.
+    """
+    if not brain_id:
+        return 0
+    target = str(brain_id).strip().lower()
+    try:
+        brains = (_footprint_policy().get("brains") or {})
+        for entries in brains.values():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                bid = str(entry.get("brain_id") or entry.get("id") or "").strip().lower()
+                if bid != target:
+                    continue
+                raw = entry.get("weight_gb")
+                if raw is None:
+                    return 0
+                return max(0, int(float(raw) * _FOOTPRINT_GIB))
+    except Exception:  # noqa: BLE001
+        logger.debug("[BrainSelector] footprint lookup degraded", exc_info=True)
+    return 0
+
+
+def reset_footprint_cache() -> None:
+    """Drop the cached selector — for tests and deliberate re-reads."""
+    global _footprint_selector
+    with _footprint_lock:
+        _footprint_selector = None
