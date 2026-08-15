@@ -6447,6 +6447,36 @@ class SerpentREPL:
                 )
                 return True
 
+        # Naming cage — a `governance/<verb>_repl.py` module that exports
+        # `__verb_help__` and `dispatch_<verb>_command` IS the verb `/<verb>`.
+        #
+        # Placed AFTER the explicit ladder above and BEFORE the unknown-verb
+        # handler below: every hand-written branch keeps priority and its
+        # behaviour is byte-identical, and only lines that would otherwise
+        # fall through to "did you mean…" reach the cage.
+        #
+        # This is what closes the unmounted-verb class. `/reach` and `/why`
+        # shipped importable, tested and untypeable, because nothing asserted
+        # that a human could reach them — and the next one would have too,
+        # since the ladder makes mounting a thing you must REMEMBER. Here the
+        # filesystem is the registration.
+        if line.startswith("/"):
+            try:
+                from backend.core.ouroboros.governance.repl_verb_cage import (  # noqa: E501
+                    dispatch as _cage_dispatch,
+                )
+                _cage_result = _cage_dispatch(line)
+            except Exception:  # noqa: BLE001 — never break the REPL on a verb
+                _cage_result = None
+            # `None` means "no module claims this" and MUST fall through to
+            # the typo handler; a result that merely answered "no" must not.
+            if _cage_result is not None:
+                self._flow.console.print(
+                    getattr(_cage_result, "text", str(_cage_result)),
+                    highlight=False,
+                )
+                return True
+
         # §41.3 Slice 2 #18 — typo suggestion on
         # unknown slash verbs. Lines starting with
         # `/` that didn't match any handler get a
