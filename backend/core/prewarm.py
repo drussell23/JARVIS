@@ -23,10 +23,20 @@ That is how ~2s of work became a 12.38s wedge. Warming in parallel would
 recreate exactly that. This dispatches sequentially through the existing
 primitive; nothing new is invented here.
 
-THE LIST IS EVIDENCE, NOT INTUITION
-------------------------------------
-Every default below came from a StallSampler dump taken while the loop was
-provably wedged. Two candidates that look obvious are deliberately ABSENT:
+TWO TIERS, AND ONLY ONE OF THEM IS EVIDENCE
+--------------------------------------------
+`DEFAULT_PREWARM` is first-party and evidence-derived: every entry came from
+a StallSampler dump taken while the loop was provably wedged.
+
+`DEFAULT_LIBRARY_PREWARM` is third-party and inherited -- it was a hardcoded
+list inside `unified_supervisor._prewarm_python_modules`, a SECOND
+pre-warmer doing this same job under this same `[Prewarm]` log tag. The two
+were consolidated here rather than left to run side by side. That list is
+intuition, not measurement, and is kept only because it was already in
+production; a name in it has not been shown to block anything.
+
+Two candidates that look obvious are deliberately ABSENT from the evidence
+tier:
 
 * ``Quartz`` — never imported in this process. The cursor probe runs an
   `osascript` that spawns its OWN python to import it, so warming it here
@@ -85,6 +95,52 @@ DEFAULT_PREWARM: Tuple[str, ...] = (
     # lowering JARVIS_STALL_SAMPLER_TRIGGER_S below the stall and reading
     # the stack, rather than by adding another instrument.
     "backend.core.coding_council.orchestrator",
+    # Caught with the IDENTICAL signature as the entry above -- `_write_atomic`
+    # -> `_cache_bytecode` -> `exec_module` -> `agent_initializer.py:25
+    # <module>` -- in the run that CONFIRMED the coding_council fix. Cold
+    # import measured at 12,929ms, the largest single import cost found in
+    # this arc, and it was landing on the event loop.
+    #
+    # It is placed LAST IN THIS TIER on purpose. The warm is sequential
+    # through one worker, so a 13-second entry ahead of the cheap,
+    # already-proven modules would delay every one of them. The inherited
+    # library tier does follow it and will wait -- acceptable, because those
+    # names are unmeasured guesses while this one is a measured 13s that
+    # currently lands on the loop. Warming it cannot make anything worse than
+    # the status quo, where the same cost is paid by whichever coroutine
+    # reaches it first.
+    "backend.neural_mesh.agents.agent_initializer",
+)
+
+#: Heavy THIRD-PARTY libraries. Moved here verbatim from a hardcoded list
+#: inside `unified_supervisor._prewarm_python_modules`, which was a second
+#: pre-warmer built for the same job and logging under the same `[Prewarm]`
+#: tag -- discovered only because both lines appeared in one boot log and the
+#: duplication was momentarily unreadable.
+#:
+#: Consolidating was not cosmetic. That implementation warmed through
+#: `run_in_executor(None, ...)` -- the DEFAULT executor, shared with the 200+
+#: `to_thread` sites in this codebase -- which is precisely the arrangement
+#: `import_off_loop`'s docstring records as turning ~2s of imports into a
+#: 12.38s wedge, because CPython takes a per-module lock and the loop thread
+#: ends up queued among the contenders. Routing these through the single
+#: serialized import worker removes that hazard, and the names stop being
+#: literals buried in a 102K-line file.
+DEFAULT_LIBRARY_PREWARM: Tuple[str, ...] = (
+    # ML/AI (slowest). `torch` is in the supervisor's original list and is
+    # deliberately NOT carried over: this module's docstring already records
+    # why -- it is reached through `safetensors.torch` above, and the same
+    # graph under two names is the same import and the same per-module locks.
+    # Copying it here would have made the docstring lie about its own list.
+    "transformers", "numpy", "scipy", "sklearn",
+    # Audio/voice
+    "librosa", "sounddevice", "pyaudio",
+    # Database
+    "asyncpg", "sqlalchemy",
+    # Web
+    "aiohttp", "websockets",
+    # System
+    "psutil", "watchdog",
 )
 
 __all__ = [
@@ -92,9 +148,13 @@ __all__ = [
     "PREWARM_SCHEMA_VERSION",
     "prewarm_enabled",
     "prewarm_modules",
+    "DEFAULT_LIBRARY_PREWARM",
+    "prewarm_result",
     "prewarm_stats",
     "spawn_prewarm",
 ]
+
+_task: Optional["asyncio.Task"] = None
 
 _stats: Dict[str, Any] = {
     "started": False, "done": False, "warmed": [], "failed": [],
@@ -109,12 +169,18 @@ def prewarm_enabled() -> bool:
 
 
 def prewarm_modules() -> Tuple[str, ...]:
-    """The list, with any env additions. NEVER raises."""
+    """The full list, with any env additions. NEVER raises.
+
+    First-party evidence entries lead, because each was observed blocking the
+    loop and is cheap; the third-party libraries follow. Order matters only
+    in that the warm is sequential and may be cut short by shutdown -- the
+    things measured to hurt should be paid for first.
+    """
     try:
         extra = (os.environ.get("JARVIS_PREWARM_MODULES") or "").strip()
         added = tuple(m.strip() for m in extra.split(",") if m.strip())
         seen, out = set(), []
-        for name in DEFAULT_PREWARM + added:
+        for name in DEFAULT_PREWARM + DEFAULT_LIBRARY_PREWARM + added:
             if name not in seen:
                 seen.add(name)
                 out.append(name)
@@ -161,6 +227,21 @@ async def _run() -> None:
             f", {len(failed)} unavailable" if failed else "")
 
 
+def prewarm_result() -> Dict[str, Any]:
+    """The legacy shape `unified_supervisor._prewarm_python_modules` returned.
+
+    Kept so consolidating the two pre-warmers cannot change what that method
+    hands back, even though its single call site discards the value. A
+    delegation that quietly alters a return type is how a harmless-looking
+    cleanup becomes someone else's bug six months later.
+    """
+    return {
+        "modules_loaded": list(_stats["warmed"]),
+        "modules_failed": list(_stats["failed"]),
+        "total_time_ms": float(_stats["elapsed_s"]) * 1000.0,
+    }
+
+
 def spawn_prewarm() -> Optional["asyncio.Task"]:
     """Fire the warm as a DETACHED task. NEVER raises, never blocks.
 
@@ -169,11 +250,20 @@ def spawn_prewarm() -> Optional["asyncio.Task"]:
     gracefully — a module the loop reaches first is simply imported there,
     exactly as it is today.
     """
+    global _task  # noqa: PLW0603
     if not prewarm_enabled():
         return None
+    # SINGLE-FLIGHT. There are now two spawn points -- the detached call at
+    # the top of `async_main` and the supervisor's own background-task phase
+    # -- and without this the second would re-enter `_run` and race the first
+    # through the same import worker. Returning the live task makes the
+    # second caller a no-op that still gets something awaitable.
+    if _task is not None and not _task.done():
+        return _task
     try:
-        return asyncio.get_running_loop().create_task(
+        _task = asyncio.get_running_loop().create_task(
             _run(), name="jarvis-prewarm")
+        return _task
     except RuntimeError:
         return None                     # no loop — a sync context
     except Exception:  # noqa: BLE001

@@ -92222,65 +92222,60 @@ class JarvisSystemKernel:
 
         Returns:
             Dict with pre-warming results
+
+        DELEGATES to `backend.core.prewarm`, which is the same capability.
+        Two pre-warmers were running in one process, both logging under
+        `[Prewarm]`, and the duplication was only noticed because both lines
+        landed in one boot log and became unreadable together.
+
+        The delegation is not bookkeeping. This method imported through
+        ``run_in_executor(None, ...)`` -- the DEFAULT executor, shared with
+        the 200+ ``to_thread`` sites in this codebase -- which is exactly the
+        arrangement ``async_offload.import_off_loop`` documents as turning
+        ~2s of imports into a 12.38s wedge: CPython holds a per-module lock,
+        threads pile up behind it, and the loop thread queues among them.
+        The canonical warmer funnels every deferred import through ONE
+        serialized worker for that reason. Its list is also env-extensible
+        (``JARVIS_PREWARM_MODULES``), where this one was fourteen literals
+        buried in a 102K-line file.
+
+        The return shape is preserved exactly, even though this method's only
+        call site discards it -- a delegation that quietly changes a return
+        type is how a harmless cleanup becomes a later bug.
         """
-        result: Dict[str, Any] = {
-            "modules_loaded": [],
-            "modules_failed": [],
-            "total_time_ms": 0,
-        }
-
-        start_time = time.time()
-
-        # Heavy modules to pre-warm (in order of priority)
-        modules_to_prewarm = [
-            # ML/AI modules (slowest)
-            "torch",
-            "transformers",
-            "numpy",
-            "scipy",
-            "sklearn",
-            # Audio/Voice
-            "librosa",
-            "sounddevice",
-            "pyaudio",
-            # Database
-            "asyncpg",
-            "sqlalchemy",
-            # Web
-            "aiohttp",
-            "websockets",
-            # System
-            "psutil",
-            "watchdog",
-        ]
-
-        self.logger.info(f"[Prewarm] Pre-warming {len(modules_to_prewarm)} modules...")
-
-        for module_name in modules_to_prewarm:
-            try:
-                # Import in executor to not block
-                await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    __import__,
-                    module_name
-                )
-                result["modules_loaded"].append(module_name)
-            except ImportError:
-                result["modules_failed"].append(module_name)
-            except Exception as e:
-                self.logger.debug(f"[Prewarm] {module_name} failed: {e}")
-                result["modules_failed"].append(module_name)
-
-            # Small yield to allow other tasks
-            await asyncio.sleep(0)
-
-        result["total_time_ms"] = (time.time() - start_time) * 1000
+        try:
+            from backend.core.prewarm import (
+                prewarm_modules, prewarm_result, spawn_prewarm,
+            )
+        except Exception as exc:  # noqa: BLE001 — never fail boot for a warm
+            self.logger.debug(f"[Prewarm] canonical warmer unavailable: {exc}")
+            return {"modules_loaded": [], "modules_failed": [],
+                    "total_time_ms": 0}
 
         self.logger.info(
-            f"[Prewarm] Loaded {len(result['modules_loaded'])}/{len(modules_to_prewarm)} "
-            f"modules in {result['total_time_ms']:.0f}ms"
+            f"[Prewarm] Pre-warming {len(prewarm_modules())} modules "
+            f"via the serialized import worker..."
         )
 
+        # `spawn_prewarm` is SINGLE-FLIGHT: the detached call at the top of
+        # `async_main` has usually already started this, in which case the
+        # live task comes back and is simply awaited here instead of a second
+        # pass racing the first through the same worker.
+        task = spawn_prewarm()
+        if task is not None:
+            try:
+                await task
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self.logger.debug(f"[Prewarm] warm task ended: {exc}")
+
+        result = prewarm_result()
+        self.logger.info(
+            f"[Prewarm] Loaded {len(result['modules_loaded'])}/"
+            f"{len(prewarm_modules())} modules in "
+            f"{result['total_time_ms']:.0f}ms"
+        )
         return result
 
     # =========================================================================
