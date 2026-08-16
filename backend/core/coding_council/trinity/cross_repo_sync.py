@@ -115,6 +115,21 @@ class CrossRepoSync:
         self._event_handlers: List[Callable[[SyncEvent], Coroutine]] = []
         self._sync_task: Optional[asyncio.Task] = None
         self._running = False
+        #: Last payload actually persisted per repo, so an unchanged state
+        #: costs nothing. Excludes `timestamp` — see `_write_repo_state`.
+        self._last_written: Dict[Any, Any] = {}
+        #: Set by an fs event; the loop waits on it instead of sleeping.
+        self._wake: asyncio.Event = asyncio.Event()
+        self._fs_subscribed: bool = False
+        #: Backstop interval. `JARVIS_CROSS_REPO_BACKSTOP_S` — default 60s,
+        #: six times the old blind poll, because the OS now does the noticing
+        #: and this is only here for the case where it cannot.
+        try:
+            self._backstop_s = max(5.0, min(3600.0, float(
+                (os.environ.get("JARVIS_CROSS_REPO_BACKSTOP_S") or "").strip()
+                or 60.0)))
+        except Exception:  # noqa: BLE001
+            self._backstop_s = 60.0
         self._sync_lock = asyncio.Lock()
 
         # Initialize repo states
@@ -152,9 +167,55 @@ class CrossRepoSync:
                 "— continuing with partial state"
             )
 
+        # Subscribe to the filesystem BEFORE the loop starts, so a mutation
+        # during startup is not missed by the window between the two.
+        await self._subscribe_to_fs_events()
+
         # Start sync loop
         self._sync_task = asyncio.create_task(self._sync_loop())
-        logger.info("[CrossRepoSync] Started")
+        logger.info(
+            "[CrossRepoSync] Started (%s, backstop %.0fs)",
+            "fs-events primary" if self._fs_subscribed else "poll-only",
+            self._backstop_s,
+        )
+
+    async def _subscribe_to_fs_events(self) -> bool:
+        """Wake on real filesystem mutations. NEVER raises.
+
+        Reuses the `TrinityEventBus` `fs.changed.*` topics the existing
+        `FileSystemEventBridge` already publishes and four intake sensors
+        already consume. Adding a second watcher (`watchdog`) here would mean
+        two independent observers of the same directories in one process,
+        and a second thing to keep alive.
+
+        A failure is not fatal: the loop's backstop still runs, so the worst
+        case is the cadence that shipped rather than blindness.
+        """
+        try:
+            from backend.core.trinity_event_bus import get_event_bus_if_exists
+            bus = get_event_bus_if_exists()
+            if bus is None:
+                return False
+            await bus.subscribe("fs.changed.*", self._on_fs_event)
+            self._fs_subscribed = True
+            return True
+        except Exception:  # noqa: BLE001
+            logger.debug("[CrossRepoSync] fs-event subscription unavailable",
+                         exc_info=True)
+            return False
+
+    async def _on_fs_event(self, event: Any) -> None:
+        """A mutation happened; evaluate now instead of at the next tick.
+
+        Only SETS a flag — the evaluation itself stays in the one loop that
+        owns this state. Doing the work here would let a burst of file events
+        run N overlapping evaluations, which is how an event-driven rewrite
+        becomes worse than the poll it replaced.
+        """
+        try:
+            self._wake.set()
+        except Exception:  # noqa: BLE001
+            pass
 
     async def stop(self) -> None:
         """Stop the sync manager."""
@@ -417,10 +478,30 @@ class CrossRepoSync:
             "sync_status": repo.sync_status.value,
         }
 
+        # Write ONLY when the state actually changed.
+        #
+        # This rewrote three files every ten seconds for the life of the
+        # daemon, whether or not anything moved — and StallSampler caught one
+        # of those writes on the event loop. `timestamp` is excluded from the
+        # comparison on purpose: including it makes every payload unique and
+        # turns "write on change" back into "write always".
+        payload = {k: v for k, v in state.items() if k != "timestamp"}
+        if self._last_written.get(repo_type) == payload:
+            return
         try:
-            tmp = state_file.with_suffix(".tmp")
-            tmp.write_text(json.dumps(state, indent=2))
-            tmp.rename(state_file)
+            def _persist() -> None:
+                tmp = state_file.with_suffix(".tmp")
+                tmp.write_text(json.dumps(state, indent=2))
+                tmp.rename(state_file)
+
+            # Off the loop: a small write is still a write, and this one
+            # happens on the thread that must answer everything else.
+            try:
+                from backend.core.async_offload import call_off_loop
+                await call_off_loop(_persist)
+            except Exception:  # noqa: BLE001 — fail-open to inline
+                _persist()
+            self._last_written[repo_type] = payload
         except Exception as e:
             logger.warning(f"[CrossRepoSync] Failed to write state: {e}")
 
@@ -459,10 +540,17 @@ class CrossRepoSync:
         while self._running:
             try:
                 # Re-discover repos (handles repos coming online/offline)
+                paths = {rt: self._repos[rt].repo_path for rt in RepoType}
+                try:
+                    from backend.core.async_offload import call_off_loop
+                    present = await call_off_loop(
+                        lambda: {rt: p.exists() for rt, p in paths.items()})
+                except Exception:  # noqa: BLE001 — fail-open to inline
+                    present = {rt: p.exists() for rt, p in paths.items()}
                 for repo_type in RepoType:
                     repo = self._repos[repo_type]
                     was_online = repo.online
-                    repo.online = repo.repo_path.exists()
+                    repo.online = present.get(repo_type, False)
 
                     # Status change detection
                     if repo.online and not was_online:
@@ -487,7 +575,25 @@ class CrossRepoSync:
                 for repo_type in RepoType:
                     await self._write_repo_state(repo_type)
 
-                await asyncio.sleep(10)  # Sync every 10 seconds
+                # Event-PRIMARY, poll as a backstop.
+                #
+                # A repo coming online or going offline is a filesystem
+                # mutation, and the OS already tells us: `TrinityEventBus`
+                # carries `fs.changed.*` from the existing
+                # `FileSystemEventBridge`, which four intake sensors already
+                # consume. Adding `watchdog` here would be a second watcher
+                # for a signal this process already receives.
+                #
+                # The sleep is not deleted, it is DEMOTED — the repo's own
+                # Gap #4 pattern is event-primary with a polling floor, so a
+                # missing or failed bus degrades to the behaviour that
+                # shipped rather than to blindness.
+                try:
+                    await asyncio.wait_for(self._wake.wait(),
+                                           timeout=self._backstop_s)
+                except asyncio.TimeoutError:
+                    pass
+                self._wake.clear()
 
             except asyncio.CancelledError:
                 break
