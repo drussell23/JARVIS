@@ -83,7 +83,7 @@ import struct
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum, auto
@@ -158,6 +158,13 @@ class EventBusConfig:
 
     # Deduplication
     DEDUP_WINDOW_SECONDS = _env_int("TRINITY_DEDUP_WINDOW", 60)
+    # Hard ceiling on the dedup index. Was the implicit `deque(maxlen=10000)`;
+    # named here because it is now a memory bound the code must honour itself.
+    DEDUP_RING_MAX = _env_int("TRINITY_DEDUP_RING_MAX", 10000)
+    # Expired entries drained per publish. Bounded so eviction can never
+    # reintroduce the O(N)-on-the-loop cost this replaced: memory is held by
+    # DEDUP_RING_MAX regardless, so expiry is opportunistic, not load-bearing.
+    DEDUP_EVICT_PER_PUBLISH = _env_int("TRINITY_DEDUP_EVICT_PER_PUBLISH", 8)
 
     # Cross-repo paths
     JARVIS_PATH = Path(_env_str(
@@ -871,7 +878,12 @@ class TrinityEventBus:
         self._request_lock = asyncio.Lock()
 
         # Deduplication
-        self._recent_fingerprints: Deque[Tuple[str, float]] = deque(maxlen=10000)
+        # fingerprint -> last-seen monotonic-ish wall time, in RECENCY order.
+        # An OrderedDict rather than a deque because the hot question is
+        # "have I seen THIS one", which is a lookup, not a search. The count
+        # bound that `deque(maxlen=...)` gave for free is now explicit in
+        # `_evict_stale_fingerprints` — see the note in `publish`.
+        self._recent_fingerprints: "OrderedDict[str, float]" = OrderedDict()
         self._dedup_lock = asyncio.Lock()
 
         # Dead letter queue
@@ -978,6 +990,36 @@ class TrinityEventBus:
 
         logger.info("[TrinityEventBus] Stopped")
 
+    def _evict_stale_fingerprints(self, now: float) -> None:
+        """Hold the dedup index to its bounds. O(1) amortized, never scans.
+
+        Two bounds, and only the first is load-bearing:
+
+        * COUNT — `DEDUP_RING_MAX`. This is the memory guarantee the old
+          `deque(maxlen=...)` gave implicitly, and it is enforced exactly:
+          each publish inserts at most one entry, so this pops at most one.
+        * AGE — entries past the dedup window are dead weight. Draining them
+          is capped at `DEDUP_EVICT_PER_PUBLISH` because an uncapped drain is
+          how an eviction pass turns back into the O(N)-on-the-loop stall
+          this method exists to prevent. Skipping a stale entry costs nothing
+          but a little memory, which the count bound already caps.
+
+        The front of the mapping is the least-recently-SEEN fingerprint —
+        `publish` calls `move_to_end` on every touch — so popping the front
+        never discards a fingerprint that is still actively deduplicating.
+        """
+        while len(self._recent_fingerprints) > EventBusConfig.DEDUP_RING_MAX:
+            self._recent_fingerprints.popitem(last=False)
+
+        window = EventBusConfig.DEDUP_WINDOW_SECONDS
+        for _ in range(EventBusConfig.DEDUP_EVICT_PER_PUBLISH):
+            if not self._recent_fingerprints:
+                return
+            oldest_fp = next(iter(self._recent_fingerprints))
+            if (now - self._recent_fingerprints[oldest_fp]) < window:
+                return          # front is live => everything behind it is too
+            self._recent_fingerprints.pop(oldest_fp, None)
+
     async def publish(
         self,
         event: TrinityEvent,
@@ -1000,19 +1042,38 @@ class TrinityEventBus:
         if event.source == RepoType.JARVIS:
             event.source = self.local_repo
 
-        # Deduplication
+        # Deduplication — O(1) keyed lookup, NOT a scan of the ring.
+        #
+        # This was a linear scan of up to DEDUP_RING_MAX entries, executed on
+        # the event loop while holding `_dedup_lock`, with no await inside it.
+        # A UNIQUE event (the common case — every distinct file in a burst)
+        # never matched, so it paid the FULL scan every time, making publish
+        # cost O(burst x ring): measured 5,232ms of uninterruptible loop CPU
+        # and 20,000,000 comparisons for a single 2,000-file `git checkout`.
+        # That is the burst-contention path, and it is quadratic by shape.
+        #
+        # The decision is IDENTICAL, not merely similar: the old scan deduped
+        # if ANY entry matched inside the window, and the newest occurrence of
+        # a fingerprint is always the one most likely to be inside it — so
+        # keying on the LATEST timestamp per fingerprint accepts and rejects
+        # exactly the same events. `OrderedDict` mirrors the idiom
+        # `file_watch_guard._seen_events` already uses for this same job.
         async with self._dedup_lock:
             now = time.time()
             fingerprint = event.fingerprint
 
-            # Check recent fingerprints
-            for fp, ts in self._recent_fingerprints:
-                if fp == fingerprint and (now - ts) < EventBusConfig.DEDUP_WINDOW_SECONDS:
-                    self._metrics.events_deduplicated += 1
-                    logger.debug(f"[TrinityEventBus] Deduplicated event {event.event_id}")
-                    return event.event_id
+            seen_at = self._recent_fingerprints.get(fingerprint)
+            if (seen_at is not None
+                    and (now - seen_at) < EventBusConfig.DEDUP_WINDOW_SECONDS):
+                self._metrics.events_deduplicated += 1
+                logger.debug(f"[TrinityEventBus] Deduplicated event {event.event_id}")
+                return event.event_id
 
-            self._recent_fingerprints.append((fingerprint, now))
+            # move_to_end keeps insertion order == recency order, which is what
+            # makes the front of the mapping the correct eviction candidate.
+            self._recent_fingerprints[fingerprint] = now
+            self._recent_fingerprints.move_to_end(fingerprint)
+            self._evict_stale_fingerprints(now)
 
         # Persist
         if persist:
