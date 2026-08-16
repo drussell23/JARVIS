@@ -2329,6 +2329,40 @@ class ParallelInitializer:
             logger.info("=" * 60)
 
             ai_manager = get_ai_manager()
+
+            # Warm engine discovery OFF the loop, once, before any
+            # `register_model` triggers it lazily.
+            #
+            # `OptimizationRouter.discover_engines` imports
+            # `voice_unlock.ml.quantized_models` and `safetensors.torch`
+            # (which pulls torch). It is correctly memoised — so it runs
+            # exactly once — but that once was happening inside
+            # `register_model` -> `select_engine`, ON the event loop:
+            # StallSampler caught `_probe_rust_engine` and `_probe_safetensors`
+            # on the wedged main thread. Paying it here, off-loop, leaves
+            # every later call hitting the cache.
+            try:
+                from backend.core.async_offload import call_off_loop
+                _router = getattr(ai_manager, "_router", None)
+                if _router is not None and hasattr(_router, "discover_engines"):
+                    await call_off_loop(_router.discover_engines)
+            except Exception as _warm_exc:  # noqa: BLE001 — never block boot
+                logger.debug(f"   engine discovery warm skipped: {_warm_exc}")
+
+            # Same treatment for the system voice catalogue. `say -v ?` is
+            # cached process-wide, but the FIRST call still shells out — and
+            # it was landing inside `RealtimeVoiceCommunicator.__init__`,
+            # constructed from a coroutine by `get_voice_communicator()`.
+            # StallSampler caught exactly that, as the last main-thread
+            # blocker of the boot. Paying it here, off-loop, means every
+            # constructor afterwards hits the cache.
+            try:
+                from backend.core.async_offload import call_off_loop
+                from backend.core.system_voices import voice_catalog_raw
+                await call_off_loop(voice_catalog_raw)
+            except Exception as _voice_exc:  # noqa: BLE001
+                logger.debug(f"   voice catalog warm skipped: {_voice_exc}")
+
             start_time = time.time()
 
             # =========================================================

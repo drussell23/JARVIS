@@ -872,8 +872,24 @@ class ExperienceQueueProcessor:
         if self.reactor_client is None:
             # Check via IPC
             try:
-                from backend.core.trinity_ipc import TrinityIPCBus
-                ipc = TrinityIPCBus()
+                # Constructed ONCE and cached. `TrinityIPCBus.__post_init__`
+                # mkdirs five directories, and this ran on every health check
+                # inside `_process_loop` — StallSampler caught the mkdir loop
+                # on the wedged main thread. Two defects, one line: repeated
+                # filesystem work, done on the event loop.
+                #
+                # The construction is also offloaded, because the FIRST one
+                # still touches the disk. Fail-open to inline so a missing
+                # helper cannot disable the health check.
+                ipc = getattr(self, "_trinity_ipc_bus", None)
+                if ipc is None:
+                    from backend.core.trinity_ipc import TrinityIPCBus
+                    try:
+                        from backend.core.async_offload import call_off_loop
+                        ipc = await call_off_loop(TrinityIPCBus)
+                    except Exception:  # noqa: BLE001
+                        ipc = TrinityIPCBus()
+                    self._trinity_ipc_bus = ipc
                 heartbeat = await ipc.read_heartbeat("reactor_core")
                 return heartbeat is not None and heartbeat.status == "ready"
             except Exception:

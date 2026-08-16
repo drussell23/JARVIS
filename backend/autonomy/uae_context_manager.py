@@ -410,12 +410,10 @@ class UAEContextManager:
                 return appName & "|" & winName
             '''
 
+            from backend.core.bounded_subprocess import run_bounded
             result = await _off_loop(
-                subprocess.run,
-                ["osascript", "-e", script],
-                capture_output=True,
-                text=True,
-                timeout=2,
+                run_bounded, ["osascript", "-e", script],
+                timeout=2.0, text=True,
             )
 
             if result is not None and result.returncode == 0:
@@ -441,12 +439,10 @@ class UAEContextManager:
                 return mousePos
             '''
 
+            from backend.core.bounded_subprocess import run_bounded
             result = await _off_loop(
-                subprocess.run,
-                ["osascript", "-e", script],
-                capture_output=True,
-                text=True,
-                timeout=2,
+                run_bounded, ["osascript", "-e", script],
+                timeout=2.0, text=True,
             )
 
             if result is not None and result.returncode == 0:
@@ -499,11 +495,14 @@ class UAEContextManager:
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                 tmp_path = tmp.name
 
-            subprocess.run(
-                ["screencapture", "-x", "-t", "png", tmp_path],
-                capture_output=True,
-                timeout=5,
-            )
+            from backend.core.bounded_subprocess import run_bounded
+            if run_bounded(["screencapture", "-x", "-t", "png", tmp_path],
+                           timeout=5.0) is None:
+                # Timed out, refused by the breaker, or the binary is
+                # missing. A hung `screencapture` is the TCC-consent case
+                # this guards: its group has been reaped and the worker
+                # released, and there is nothing to encode.
+                return None, ""
 
             with open(tmp_path, "rb") as f:
                 data = f.read()

@@ -77,19 +77,33 @@ class TestBlockingWorkLeavesTheLoop:
             assert await uae._off_loop(_boom) is None
         assert any("failed" in r.message for r in caplog.records)
 
-    async def test_cancellation_is_propagated_not_swallowed(self):
-        """Swallowing CancelledError is how a task becomes unkillable."""
-        started = asyncio.Event()
+    async def test_cancellation_is_not_swallowed_by_the_wrapper(self, monkeypatch):
+        """Swallowing CancelledError is how a task becomes unkillable.
 
-        def _slow():
-            started.set()
-            time.sleep(2)
+        Asserted against OUR wrapper, not against thread-pool semantics: a
+        `run_in_executor` future whose work has already begun cannot be
+        cancelled, so a test that races the worker measures scheduling luck
+        rather than the contract. What is ours to guarantee is that
+        `_off_loop` re-raises CancelledError instead of folding it into the
+        `except Exception -> None` path that every other failure takes.
+        """
+        async def _cancelled(*_a, **_k):
+            raise asyncio.CancelledError()
 
-        task = asyncio.create_task(uae._off_loop(_slow))
-        await asyncio.wait_for(started.wait(), timeout=2)
-        task.cancel()
+        monkeypatch.setattr(
+            "backend.core.async_offload.call_off_loop", _cancelled)
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await uae._off_loop(lambda: "never reached")
+
+    async def test_an_ordinary_error_is_still_absorbed(self, monkeypatch):
+        """The other half of the same contract: everything that is NOT a
+        cancellation becomes None, so a failed probe cannot kill the loop."""
+        async def _boom(*_a, **_k):
+            raise RuntimeError("worker exploded")
+
+        monkeypatch.setattr(
+            "backend.core.async_offload.call_off_loop", _boom)
+        assert await uae._off_loop(lambda: "x") is None
 
     async def test_it_degrades_to_inline_rather_than_failing(self, monkeypatch):
         """Fail-open: a missing offload helper must not break context
@@ -136,12 +150,12 @@ class TestTheScreenshotBodyIsOneUnitOfWork:
                             __import__("tempfile"), "NamedTemporaryFile",
                             lambda **k: _TmpFile())
 
-        def _explode(*a, **k):
-            raise RuntimeError("screencapture missing")
-
-        monkeypatch.setattr(__import__("subprocess"), "run", _explode)
-        with pytest.raises(RuntimeError):
-            uae.UAEContextManager._capture_screenshot_blocking()
+        # After the breaker landed, a failed capture no longer raises — it
+        # returns None (timed out, refused, or binary missing). The temp file
+        # must still be gone, which is the whole point of the `finally`.
+        import backend.core.bounded_subprocess as bsp
+        monkeypatch.setattr(bsp, "run_bounded", lambda *a, **k: None)
+        assert uae.UAEContextManager._capture_screenshot_blocking() == (None, "")
         import os
         assert not os.path.exists(seen["path"]), "temp PNG leaked"
 

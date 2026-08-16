@@ -361,7 +361,17 @@ async def run_registered_watchdogs() -> Dict[str, Drift]:
     """
     if not watchdogs_enabled():
         return {}
-    ratchets = registered_ratchets()
+    # `registered_ratchets` -> `prime_registry` -> `import_module` for every
+    # `*_repl` module in the package. StallSampler caught THIS call on the
+    # wedged main loop: a discovery walk is import work, and import work on
+    # the loop is a stall no `async def` around it can prevent. Offloaded to
+    # the house pool; fail-open to inline so a missing helper cannot silence
+    # every watchdog.
+    try:
+        from backend.core.async_offload import call_off_loop
+        ratchets = await call_off_loop(registered_ratchets)
+    except Exception:  # noqa: BLE001
+        ratchets = registered_ratchets()
     if not ratchets:
         return {}
     results = await asyncio.gather(

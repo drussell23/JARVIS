@@ -4306,12 +4306,16 @@ class YabaiSpaceDetector:
 
         try:
             # Quick query to verify yabai is responding
-            result = subprocess.run(
+            # Bounded + breaker: this runs on a POOL worker now, and a
+            # `yabai` blocked on a dead scripting-addition socket would hold
+            # that worker forever. The group is reaped on timeout, and a
+            # repeatedly-hanging binary is refused rather than retried.
+            from backend.core.bounded_subprocess import run_bounded
+            result = run_bounded(
                 [self._health.yabai_path, "-m", "query", "--spaces"],
-                capture_output=True,
-                text=True,
-                timeout=3,
-            )
+                timeout=3.0, text=True)
+            if result is None:
+                return False
             return result.returncode == 0 and "failed to connect" not in result.stderr.lower()
         except Exception:
             return False
