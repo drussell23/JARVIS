@@ -190,7 +190,13 @@ def _check_cgsession_locked_via_ctypes() -> Optional[bool]:
                 return True
 
             # Dictionary obtained and no lock indicators — screen is unlocked
-            logger.info(
+            # DEBUG, not INFO: this is the no-news answer on the hot path.
+            # Measured on a live supervisor, this line and its sibling in
+            # `is_screen_locked` produced 1,142 of 1,783 log lines -- 64% of
+            # everything the process said -- to report that nothing had
+            # changed, 571 times in a row. A transition IS logged, once, by
+            # the delta gate in `system_event_monitor`.
+            logger.debug(
                 "🔓 [SCREEN-DETECT] CGSession (ctypes) says UNLOCKED - Fast Path"
             )
             return False
@@ -397,7 +403,10 @@ def is_screen_locked() -> bool:
                 return True
             else:
                 detection_results.append(("CGSession-ctypes", False))
-                logger.info(
+                # DEBUG for the same reason as the sibling line above: the
+                # unlocked fast path is the boring case, and it is the case
+                # that runs on every probe.
+                logger.debug(
                     "🔓 [SCREEN-DETECT] ctypes CGSession says UNLOCKED - "
                     "Trusting ctypes (Fast Path)"
                 )
