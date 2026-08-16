@@ -97155,6 +97155,23 @@ async def async_main(args: argparse.Namespace) -> int:
 
     Handles CLI commands and kernel startup.
     """
+    # ---- Deterministic pre-warm (detached) --------------------------------
+    #
+    # The FIRST import of a heavy module is paid wherever the loop happens to
+    # reach it — StallSampler caught `backend/system/__init__.py` executing
+    # inside a served health endpoint. Paying it here, on a worker, makes
+    # every later touch a `sys.modules` hit no matter which coroutine gets
+    # there first, and changes no downstream code.
+    #
+    # Detached deliberately: awaiting it would move the cost onto this
+    # caller. It races the boot and loses gracefully — a module the loop
+    # reaches first is simply imported there, exactly as before.
+    try:
+        from backend.core.prewarm import spawn_prewarm
+        spawn_prewarm()
+    except Exception:  # noqa: BLE001 — a warm-up never blocks a boot
+        pass
+
     # Handle control commands first
     if args.status:
         return await handle_status()

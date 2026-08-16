@@ -796,7 +796,19 @@ class HeartbeatValidator:
         """
         try:
             if filepath.exists():
-                data = json.loads(filepath.read_text())
+                # `exists()` + `read_text()` + `json.loads()` per heartbeat
+                # file, every monitor tick. StallSampler caught this on the
+                # wedged main loop: a handful of small reads is nothing until
+                # the disk is busy, and then the loop wears the latency of
+                # every one of them. The parse rides along because splitting
+                # it would leave the JSON decode — CPU over the file — on the
+                # loop for no gain.
+                try:
+                    from backend.core.async_offload import call_off_loop
+                    data = await call_off_loop(
+                        lambda: json.loads(filepath.read_text()))
+                except Exception:  # noqa: BLE001 — fail-open to inline
+                    data = json.loads(filepath.read_text())
                 heartbeat = Heartbeat.from_dict(data)
 
                 health = ComponentHealth(

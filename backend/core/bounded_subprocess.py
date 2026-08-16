@@ -47,13 +47,15 @@ Python 3.9+, ``from __future__ import annotations``.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
 import subprocess
 import threading
 import time
-from typing import Any, Dict, Optional, Sequence
+from pathlib import Path
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 logger = logging.getLogger("Jarvis.BoundedSubprocess")
 
@@ -61,8 +63,10 @@ BOUNDED_SUBPROCESS_SCHEMA_VERSION: str = "bounded_subprocess.1"
 
 __all__ = [
     "BOUNDED_SUBPROCESS_SCHEMA_VERSION",
+    "breaker_ledger_path",
     "breaker_open",
     "breaker_state",
+    "open_breakers_on_disk",
     "reset_for_tests",
     "run_bounded",
 ]
@@ -139,21 +143,130 @@ def _key(cmd: Sequence[str]) -> str:
         return "?"
 
 
+
+# ---------------------------------------------------------------------------
+# Durable export — the breaker must be visible from ANOTHER process
+# ---------------------------------------------------------------------------
+#
+# A tripped breaker that only exists in the daemon's memory is invisible to
+# `trinity status`, which runs in its own CLI process. A revoked macOS
+# Screen-Recording permission would then present as "everything fine, the
+# screenshots merely stopped" — the silent failure this whole arc exists to
+# end. So a trip is written where any process can read it, and cleared the
+# moment the command succeeds again.
+
+
+def breaker_ledger_path() -> Path:
+    """Where open breakers are recorded. ``JARVIS_SUBPROC_BREAKER_LEDGER``,
+    else beside the other `.jarvis/` state."""
+    raw = (os.environ.get("JARVIS_SUBPROC_BREAKER_LEDGER") or "").strip()
+    if raw:
+        return Path(raw)
+    root = Path(os.environ.get("JARVIS_PROJECT_ROOT") or ".")
+    return root / ".jarvis" / "subprocess_breakers.json"
+
+
+def _write_ledger() -> None:
+    """Persist the open set. NEVER raises — telemetry may not break a probe."""
+    try:
+        path = breaker_ledger_path()
+        with _lock:
+            payload = {
+                "schema_version": BOUNDED_SUBPROCESS_SCHEMA_VERSION,
+                "open": {k: {"opened_at_monotonic": v,
+                             "consecutive_failures": _fails.get(k, 0)}
+                         for k, v in _opened_at.items()},
+                "updated_at": time.time(),
+                "pid": os.getpid(),
+                "cooldown_s": _breaker_cooldown_s(),
+            }
+        if not payload["open"]:
+            # An empty ledger is REMOVED rather than written empty: a stale
+            # file full of `{}` and an actually-healthy system should not be
+            # distinguishable only by reading a timestamp.
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True),
+                       encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001
+        logger.debug("[BoundedSubprocess] ledger write skipped", exc_info=True)
+
+
+def open_breakers_on_disk(path: Optional[Path] = None) -> Tuple[str, ...]:
+    """Commands currently refused, as recorded by ANY process. NEVER raises.
+
+    Read by `trinity status` so a tripped breaker in the daemon shows up on
+    the operator's screen instead of only in that daemon's memory. A ledger
+    older than the cooldown is ignored: the breaker would have re-probed by
+    now, and reporting a stale trip is its own kind of lie.
+    """
+    try:
+        p = path or breaker_ledger_path()
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return ()
+        age = time.time() - float(raw.get("updated_at") or 0)
+        if age > float(raw.get("cooldown_s") or _breaker_cooldown_s()) * 2:
+            return ()
+        return tuple(sorted(raw.get("open") or ()))
+    except Exception:  # noqa: BLE001 — absent / malformed == nothing open
+        return ()
+
+
+
+_hydrated = False
+
+
+def _hydrate_from_ledger() -> None:
+    """Adopt trips recorded by a PREVIOUS process, once. NEVER raises.
+
+    Found by testing recovery rather than by reading code: a success in a
+    fresh process could not clear an on-disk trip, because `_record_success`
+    only rewrote the ledger when the key was open in THIS process's memory —
+    and a new process has none.
+
+    Hydrating fixes both directions, and the second is the more valuable: a
+    daemon that restarts while a binary is still wedged should honour the
+    cooldown it already earned instead of spending a worker rediscovering
+    it. The staleness rule in `open_breakers_on_disk` still applies, so an
+    ancient ledger is ignored rather than inherited.
+    """
+    global _hydrated  # noqa: PLW0603
+    if _hydrated:
+        return
+    _hydrated = True
+    try:
+        for key in open_breakers_on_disk():
+            with _lock:
+                _opened_at.setdefault(key, time.monotonic())
+                _fails.setdefault(key, _breaker_trips())
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def breaker_open(cmd: Sequence[str]) -> bool:
     """Is this command currently refused? NEVER raises."""
     try:
+        _hydrate_from_ledger()
         key = _key(cmd)
         with _lock:
             opened = _opened_at.get(key)
             if opened is None:
                 return False
-            if (time.monotonic() - opened) >= _breaker_cooldown_s():
-                # Cooldown elapsed — allow ONE probe through. The counter is
-                # left as-is so a still-wedged binary re-opens immediately
-                # instead of earning a fresh budget of retries.
-                _opened_at.pop(key, None)
-                return False
-            return True
+            # Cooldown elapsed -> allow a probe through, but do NOT clear the
+            # state here. This function is a QUESTION, and it used to answer
+            # by mutating: it popped `_opened_at`, so the success that
+            # followed found nothing open and never cleared the on-disk
+            # ledger — the breaker recovered in memory and stayed tripped on
+            # the operator's screen forever. Only an OUTCOME
+            # (`_record_success` / `_record_timeout`) changes state now.
+            return (time.monotonic() - opened) < _breaker_cooldown_s()
     except Exception:  # noqa: BLE001
         return False
 
@@ -171,26 +284,39 @@ def breaker_state() -> Dict[str, Any]:
 
 
 def reset_for_tests() -> None:
+    global _hydrated  # noqa: PLW0603
+    _hydrated = True                 # tests own their state; never adopt disk
     with _lock:
         _fails.clear()
         _opened_at.clear()
 
 
 def _record_success(key: str) -> None:
+    _hydrate_from_ledger()
+    reopened = False
     with _lock:
         _fails.pop(key, None)
-        _opened_at.pop(key, None)
+        reopened = _opened_at.pop(key, None) is not None
+    if reopened:
+        _write_ledger()
 
 
 def _record_timeout(key: str) -> None:
+    newly_open = False
     with _lock:
         _fails[key] = _fails.get(key, 0) + 1
         if _fails[key] >= _breaker_trips() and key not in _opened_at:
             _opened_at[key] = time.monotonic()
-            logger.warning(
-                "[BoundedSubprocess] breaker OPEN for %r after %d consecutive "
-                "timeouts — refusing it for %.0fs rather than spending "
-                "another worker on it", key, _fails[key], _breaker_cooldown_s())
+            newly_open = True
+            failures = _fails[key]
+    if newly_open:
+        logger.warning(
+            "[BoundedSubprocess] breaker OPEN for %r after %d consecutive "
+            "timeouts — refusing it for %.0fs rather than spending another "
+            "worker on it", key, failures, _breaker_cooldown_s())
+        # Written OUTSIDE the lock: the ledger touches the filesystem, and a
+        # disk hiccup must not hold the lock every probe contends for.
+        _write_ledger()
 
 
 # ---------------------------------------------------------------------------

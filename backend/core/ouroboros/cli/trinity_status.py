@@ -429,6 +429,15 @@ class DaemonSpec:
     #: an operator at the supervisor's error log to debug the engine is worse
     #: than saying nothing.
     log_hint: Callable[[], str] = lambda: ""
+    #: Facts that degrade a daemon WITHOUT being a transport probe — e.g. a
+    #: tripped subprocess circuit breaker. Returns short reason codes.
+    #:
+    #: A daemon answering on every socket while its screen capture has been
+    #: refused for ten minutes is not HEALTHY, and calling it healthy is the
+    #: silent-failure mode the breaker was built to end. Folded into the SAME
+    #: verdict rather than reported beside it, so there is one answer per
+    #: daemon and no second health path to keep in step.
+    conditions: Callable[[], Tuple[str, ...]] = lambda: ()
 
 
 @dataclass(frozen=True)
@@ -440,6 +449,8 @@ class DaemonHealth:
     transports: Mapping[str, str] = field(default_factory=dict)
     detail: str = ""
     recommendation: str = ""
+    #: Non-transport faults, as short reason codes (e.g. CIRCUIT_OPEN:...).
+    conditions: Tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -467,6 +478,34 @@ class FleetHealth:
         return None
 
 
+
+def subprocess_breaker_conditions() -> Tuple[str, ...]:
+    """Open subprocess circuit breakers, as operator-facing reason codes.
+
+    Read from the DURABLE ledger, not from memory: the breaker trips inside
+    the daemon and this runs in the status CLI's own process, so in-memory
+    state would always read empty here — the failure would be invisible
+    precisely where an operator goes to look for it.
+
+    `screencapture` and `osascript` are the TCC-governed pair, so a trip on
+    either is reported as `TCC_BLOCKED` — that is what it means on macOS
+    nine times out of ten, and it names the fix (Screen Recording /
+    Automation permission) instead of making the operator infer it.
+    """
+    try:
+        from backend.core.bounded_subprocess import open_breakers_on_disk
+        out = []
+        for cmd in open_breakers_on_disk():
+            if cmd in ("screencapture", "osascript"):
+                out.append(f"TCC_BLOCKED:{cmd} (grant Screen Recording / "
+                           f"Automation, or it stays refused)")
+            else:
+                out.append(f"CIRCUIT_OPEN:{cmd}")
+        return tuple(out)
+    except Exception:  # noqa: BLE001
+        return ()
+
+
 def default_fleet() -> Tuple[DaemonSpec, ...]:
     """The two daemons this repo runs. Every address resolved dynamically."""
     return (
@@ -480,6 +519,7 @@ def default_fleet() -> Tuple[DaemonSpec, ...]:
             ),
             absent_hint="start it with `trinity up`",
             log_hint=lambda: f"tail {_err_log()}",
+            conditions=subprocess_breaker_conditions,
         ),
         DaemonSpec(
             name="ov",
@@ -601,6 +641,15 @@ async def assess_daemon(spec: DaemonSpec, *,
     required = {t.label: states.get(t.label, "error")
                 for t in spec.transports if not t.optional}
     state = classify(pid is not None, required or states)
+    try:
+        conditions = tuple(spec.conditions() or ())
+    except Exception:  # noqa: BLE001
+        conditions = ()
+    # A live daemon with an open breaker is DEGRADED, never HEALTHY. A daemon
+    # that is DOWN or already faulted keeps its verdict: a tripped breaker
+    # inside a process that is not running is not the operator's problem.
+    if conditions and state is Health.HEALTHY:
+        state = Health.DEGRADED
     shown = ", ".join(
         f"{k}={v}" + ("*" if any(t.label == k and t.optional
                                  for t in spec.transports) else "")
@@ -618,9 +667,17 @@ async def assess_daemon(spec: DaemonSpec, *,
     else:
         detail = f"pid {pid} live; {shown}" if pid else f"live; {shown}"
         rec = ""
+
+    # Conditions are APPENDED, not branched on. The verdict above may already
+    # be DEGRADED *because* of them, and an `elif` here would be unreachable
+    # exactly when it mattered — the operator would read "partial readiness"
+    # with no hint that a permission was revoked.
+    if conditions:
+        detail = f"{detail} — but {', '.join(conditions)}"
+        rec = rec or _hint(spec)
     return DaemonHealth(name=spec.name, title=spec.title, state=state,
                         pid=pid, transports=states, detail=detail,
-                        recommendation=rec)
+                        recommendation=rec, conditions=conditions)
 
 
 async def assess_fleet(specs: Optional[Tuple[DaemonSpec, ...]] = None, *,
@@ -686,6 +743,7 @@ __all__ = [
     "DaemonHealth", "DaemonSpec", "FleetHealth", "Health", "HealthReport",
     "Transport", "active_health_handshake", "assess_daemon", "assess_fleet",
     "classify", "default_fleet", "engine_endpoint", "engine_pid",
+    "subprocess_breaker_conditions",
     "engine_socket", "fleet_deadline_s", "fleet_probe_timeout_s",
     "status_main", "supervisor_endpoint", "supervisor_pid",
 ]
