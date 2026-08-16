@@ -493,6 +493,32 @@ def invalidate_yabai_cache():
 # - Virtual/Ghost display awareness
 # =============================================================================
 
+async def _yabai_off_loop(fn, *args, **kwargs):
+    """Run a blocking yabai probe off the event loop. NEVER raises.
+
+    `_check_service_running` and `_attempt_startup` shell out (`yabai -m
+    query`, `launchctl kickstart`) and the latter also `time.sleep`s — work
+    that must never touch the loop. Dispatched through the house primitive
+    (`core.async_offload.call_off_loop`), degrading to `to_thread` and then
+    to inline so a missing helper cannot disable health monitoring.
+
+    Returns None on failure, which the caller distinguishes from False: a
+    probe that could not run is NOT evidence the service stopped, and
+    treating it as such would trigger spurious auto-recovery.
+    """
+    try:
+        try:
+            from backend.core.async_offload import call_off_loop
+            return await call_off_loop(fn, *args, **kwargs)
+        except ImportError:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[YABAI] off-loop probe failed: %s", exc, exc_info=True)
+        return None
+
+
 class DisplayAwareRouter:
     """
     v34.0: Intelligent display-aware window routing.
@@ -4500,7 +4526,17 @@ class YabaiSpaceDetector:
                 try:
                     await asyncio.sleep(interval)
                     was_running = self._health.is_running
-                    is_running = self._check_service_running()
+                    # `_check_service_running` shells out to `yabai -m query`
+                    # with a 3s timeout. Called directly it blocked the loop
+                    # every interval — StallSampler caught it on the wedged
+                    # main thread three times, in the same sweep that found
+                    # `uae_context_manager`. `ensure_running_async` below
+                    # already offloads its own probe; this periodic path was
+                    # the one that did not.
+                    is_running = await _yabai_off_loop(
+                        self._check_service_running)
+                    if is_running is None:      # probe failed, not "stopped"
+                        continue
                     self._health.is_running = is_running
 
                     if was_running and not is_running:

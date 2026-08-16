@@ -29,6 +29,55 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 # =============================================================================
 
 
+logger = logging.getLogger(__name__)
+
+
+async def _off_loop(fn, *args, **kwargs):
+    """Run blocking work off the event loop. NEVER raises, NEVER hangs.
+
+    WHY THIS FILE NEEDED IT
+    -----------------------
+    `StallSampler` dumped the main thread while the loop was provably wedged,
+    and this module held it in 8 of 24 captures — the single largest share::
+
+        subprocess.run -> communicate -> selectors.select
+        uae_context_manager.py:394 in _get_cursor_position
+        uae_context_manager.py:319 in _capture_screen_state
+        uae_context_manager.py:282 in _update_context
+        asyncio/events.py:84 in _run            <- ON the loop
+
+    Every one of those call sites was already `async def`. That buys nothing:
+    a coroutine that calls `subprocess.run` blocks the loop for exactly as
+    long as the child runs — here an `osascript` that itself launches a
+    Python interpreter to import Quartz, and a `screencapture` with a 5s
+    timeout. The loop was gone for seconds at a time, which is why
+    `trinity status` intermittently and correctly called the supervisor
+    UNRESPONSIVE.
+
+    Dispatches through `core.async_offload.call_off_loop` — the house
+    primitive, with its own pool so this can never contend with the 200+
+    `to_thread` sites — and degrades to `asyncio.to_thread`, then to running
+    inline, so a missing helper cannot break context capture.
+
+    Returns None instead of raising: every caller here already treats a
+    failed probe as "unknown", and a screen-context sampler must never be
+    able to take down the loop it was moved off of. The exception is logged,
+    so this cannot become a silent background crash.
+    """
+    try:
+        try:
+            from backend.core.async_offload import call_off_loop
+            return await call_off_loop(fn, *args, **kwargs)
+        except ImportError:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[UAEContext] off-loop call %s failed: %s",
+                     getattr(fn, "__name__", fn), exc, exc_info=True)
+        return None
+
+
 @dataclass
 class UAEContextConfig:
     """Configuration for the UAE Context Manager."""
@@ -361,14 +410,15 @@ class UAEContextManager:
                 return appName & "|" & winName
             '''
 
-            result = subprocess.run(
+            result = await _off_loop(
+                subprocess.run,
                 ["osascript", "-e", script],
                 capture_output=True,
                 text=True,
                 timeout=2,
             )
 
-            if result.returncode == 0:
+            if result is not None and result.returncode == 0:
                 parts = result.stdout.strip().split("|")
                 app_name = parts[0] if parts else "Unknown"
                 window_name = parts[1] if len(parts) > 1 else ""
@@ -391,14 +441,15 @@ class UAEContextManager:
                 return mousePos
             '''
 
-            result = subprocess.run(
+            result = await _off_loop(
+                subprocess.run,
                 ["osascript", "-e", script],
                 capture_output=True,
                 text=True,
                 timeout=2,
             )
 
-            if result.returncode == 0:
+            if result is not None and result.returncode == 0:
                 parts = result.stdout.strip().split()
                 if len(parts) >= 2:
                     return int(parts[0]), int(parts[1])
@@ -416,37 +467,56 @@ class UAEContextManager:
     async def _capture_screenshot(self) -> Tuple[Optional[str], str]:
         """Capture a screenshot and return base64 + hash."""
         try:
-            import subprocess
-            import tempfile
+            # The WHOLE body goes to one worker, not just the subprocess: the
+            # file read, the md5 and the base64 all run over a full-screen
+            # PNG. Offloading only the capture would leave megabytes of
+            # hashing and encoding on the loop — CPU-bound work that `async
+            # def` does nothing about.
+            result = await _off_loop(self._capture_screenshot_blocking)
+            if result is None:
+                return None, ""
+            return result
 
+        except Exception as e:
+            self.logger.debug(f"[UAEContext] Screenshot failed: {e}")
+            return None, ""
+
+    @staticmethod
+    def _capture_screenshot_blocking() -> Tuple[Optional[str], str]:
+        """The blocking half, unchanged and deliberately synchronous.
+
+        Extracted rather than rewritten: `screencapture` is an external tool
+        with its own semantics, and the fix for blocking work is to move it,
+        not to reimplement it. Runs on the offload pool; the temp file is
+        removed on every path so a failed capture cannot leak PNGs into
+        /tmp for the life of the daemon.
+        """
+        import subprocess
+        import tempfile
+
+        tmp_path = ""
+        try:
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                 tmp_path = tmp.name
 
-            # Capture screenshot
             subprocess.run(
                 ["screencapture", "-x", "-t", "png", tmp_path],
                 capture_output=True,
                 timeout=5,
             )
 
-            # Read and encode
             with open(tmp_path, "rb") as f:
                 data = f.read()
 
-            # Clean up
-            os.unlink(tmp_path)
-
-            # Calculate hash
             screen_hash = hashlib.md5(data).hexdigest()
-
-            # Encode to base64
             b64 = base64.b64encode(data).decode("utf-8")
-
             return b64, screen_hash
-
-        except Exception as e:
-            self.logger.debug(f"[UAEContext] Screenshot failed: {e}")
-            return None, ""
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def _detect_changes(
         self,
