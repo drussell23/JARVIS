@@ -162,6 +162,13 @@ class SystemEventMonitor:
 
         # System state
         self._is_screen_locked: bool = False
+        # Set by LockStateListener from its own thread via
+        # loop.call_soon_threadsafe -- so `set` runs ON the loop and the
+        # Event needs no lock of its own. Created here rather than in the
+        # loop so `_start_lock_listener` can hand out the bound method
+        # before the first await.
+        self._lock_event: asyncio.Event = asyncio.Event()
+        self._lock_listener: Optional[Any] = None
         self._is_system_sleeping: bool = False
         self._last_user_activity: datetime = datetime.now()
         self._is_idle: bool = False
@@ -395,6 +402,19 @@ class SystemEventMonitor:
 
             self._running = False
             self._startup_state = "stopping"
+
+            # Released BEFORE the tasks are cancelled: the listener owns an
+            # OS thread and four descriptors, and a daemon thread blocked in
+            # select() outlives a cancelled coroutine. Its stop() wakes that
+            # thread through its self-pipe rather than waiting on a timeout.
+            listener = self._lock_listener
+            self._lock_listener = None
+            if listener is not None:
+                try:
+                    listener.stop()
+                except Exception:  # noqa: BLE001 — shutdown must not raise
+                    logger.debug("[SystemEventMonitor] listener stop failed",
+                                 exc_info=True)
 
             active_tasks = [task for task in list(self._tasks) if not task.done()]
             for task in active_tasks:
@@ -962,25 +982,110 @@ class SystemEventMonitor:
     # =========================================================================
 
     async def _system_state_monitoring_loop(self) -> None:
-        """Monitor system state (sleep, wake, screen lock)."""
+        """React to lock/unlock; fall back to asking only when nothing tells us.
+
+        Was `sleep(1)` forever. Measured on a live supervisor, that asked the
+        OS 571 times in 9.8 minutes and got the same answer 571 times, while
+        emitting 64% of everything the process logged.
+
+        The loop is now EVENT-PRIMARY: `LockStateListener` wakes it from a
+        Darwin `notify(3)` descriptor the instant the console state moves.
+        The sleep is DEMOTED, not deleted -- registration cannot prove macOS
+        posts those keys on this OS version (see the listener docstring), so
+        an unproven producer must degrade to the old cadence, never to
+        blindness. Same event-primary-with-a-floor shape the intake sensors
+        use for `fs.changed.*`.
+
+        The backstop is ADAPTIVE: it starts at the responsive interval and
+        backs off geometrically while nothing changes, so a machine that
+        never locks stops paying for the question. Any transition -- from the
+        listener or from the backstop itself -- collapses it back to
+        responsive, because the moment right after a change is the moment the
+        next one is most likely.
+        """
+        self._start_lock_listener()
+        delay = self._lock_backstop_min_s()
         while self._running:
             try:
-                await asyncio.sleep(1)  # Check every second
-                await self._update_screen_lock_status()
+                # Event-primary: return the instant the OS says something
+                # moved. `wait_for` is the timeout, so the backstop is the
+                # ceiling on ignorance, not the cadence of the check.
+                try:
+                    await asyncio.wait_for(self._lock_event.wait(), timeout=delay)
+                    self._lock_event.clear()
+                    woke_on_event = True
+                except asyncio.TimeoutError:
+                    woke_on_event = False
+
+                changed = await self._update_screen_lock_status()
+
+                if changed or woke_on_event:
+                    delay = self._lock_backstop_min_s()
+                else:
+                    delay = min(delay * self._lock_backstop_growth(),
+                                self._lock_backstop_max_s())
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.debug(f"System state monitoring error: {e}")
-                await asyncio.sleep(2)
+                await asyncio.sleep(self._lock_backstop_min_s() * 2)
+
+    # -- lock backstop tuning (env-driven; nothing here is a literal) -------
+
+    def _lock_backstop_min_s(self) -> float:
+        """Responsive interval, used right after any transition."""
+        return _clamp(_env_float("JARVIS_LOCK_BACKSTOP_MIN_S", 1.0), 0.1, 60.0)
+
+    def _lock_backstop_max_s(self) -> float:
+        """Ceiling while the state is quiet. With the listener live this is
+        the ONLY cost of the old poller, paid once per this interval."""
+        return _clamp(_env_float("JARVIS_LOCK_BACKSTOP_MAX_S", 60.0),
+                      self._lock_backstop_min_s(), 3600.0)
+
+    def _lock_backstop_growth(self) -> float:
+        """Geometric back-off factor. >1 or the backstop never widens."""
+        return _clamp(_env_float("JARVIS_LOCK_BACKSTOP_GROWTH", 2.0), 1.0, 10.0)
+
+    def _start_lock_listener(self) -> None:
+        """Arm the OS listener once. NEVER raises: a failure here means the
+        adaptive backstop is the whole mechanism, which is still strictly
+        better than the fixed 1Hz poll it replaced."""
+        if self._lock_listener is not None:
+            return
+        try:
+            from .lock_state_listener import LockStateListener
+
+            listener = LockStateListener(
+                on_change=self._lock_event.set,
+                loop=asyncio.get_running_loop(),
+            )
+            if listener.start():
+                self._lock_listener = listener
+        except Exception:  # noqa: BLE001
+            logger.debug("[SystemEventMonitor] lock listener unavailable",
+                         exc_info=True)
 
     async def _update_screen_lock_status(self) -> bool:
-        """Update screen lock status."""
+        """Update screen lock status. Returns whether the state CHANGED.
+
+        The return value used to be "did this run without throwing", which
+        no caller could act on. It now reports the transition, because the
+        adaptive backstop needs to know whether the last look found news.
+        """
         try:
             # Try using the existing screen lock detector
             try:
                 from voice_unlock.objc.server.screen_lock_detector import is_screen_locked
-                is_locked = is_screen_locked()
+                # OFF THE LOOP. On the fast path this is a cheap ctypes call,
+                # but `is_screen_locked` falls back to `osascript` when
+                # CGSession is inconclusive -- a synchronous subprocess on the
+                # event loop, and precisely the frame the surviving
+                # main-thread StallSampler dump caught.
+                from backend.core.async_offload import call_off_loop
+                is_locked = await call_off_loop(is_screen_locked)
+                if is_locked is None:
+                    return False        # probe failed; "unknown" is not "unlocked"
             except ImportError:
                 # Fallback: Check via IOKit/CGSession
                 script = """
@@ -995,7 +1100,10 @@ class SystemEventMonitor:
                 )
                 is_locked = b"true" in stdout.lower()
 
-            # Detect change
+            # Detect change. This delta gate was already here and already
+            # correct -- an event is emitted on TRANSITION, never per probe.
+            # It is deliberately left alone: the spam was never this gate, it
+            # was the detector logging its own no-news answer at INFO.
             if is_locked != self._is_screen_locked:
                 old_status = self._is_screen_locked
                 self._is_screen_locked = is_locked
@@ -1006,8 +1114,14 @@ class SystemEventMonitor:
                 else:
                     event = MacOSEventFactory.create_screen_unlocked()
 
+                logger.info(
+                    "[SystemEventMonitor] screen %s (was %s)",
+                    "LOCKED" if is_locked else "UNLOCKED",
+                    "locked" if old_status else "unlocked",
+                )
                 await self._emit_event(event)
-            return True
+                return True
+            return False
 
         except Exception as e:
             logger.debug(f"Error checking screen lock: {e}")
