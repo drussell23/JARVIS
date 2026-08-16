@@ -1050,6 +1050,18 @@ class EmailTriageRunner:
         if agent:
             payload: Dict[str, Any] = {
                 "limit": self._config.max_emails_per_cycle,
+                # A poll never consents to the visual tier. The provenance
+                # gate (execution_context.is_unattended_request → the agent's
+                # _visual_surface_refused) already refuses it when this cycle
+                # runs inside execution_budget(request_kind=AUTONOMOUS) — but
+                # agent_runtime degrades to running the cycle UNSTAMPED when
+                # that import fails, and an unstamped context reads as
+                # attended. This key closes that one hole at the one caller
+                # that knows, structurally, that no human asked: without it,
+                # the degraded path re-inherits the config default and the
+                # 60s poll goes back to foregrounding Chrome and switching
+                # the operator's Spaces (measured: 84 hijacks in one boot).
+                "allow_visual_fallback": False,
             }
             # v291.2: Propagate deadline so the workspace agent → Google client
             # chain uses budget-aware timeouts instead of the fixed 15s default.
