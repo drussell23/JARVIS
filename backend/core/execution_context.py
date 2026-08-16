@@ -55,6 +55,9 @@ __all__ = [
     "RootReason",
     "RequestKind",
     "Criticality",
+    # Attendance
+    "UNATTENDED_REQUEST_KINDS",
+    "is_unattended_request",
     # Errors
     "BudgetExhaustedError",
     "LocalCapExceededError",
@@ -380,6 +383,50 @@ def remaining_budget() -> Optional[float]:
     if ctx is None:
         return None
     return max(0.0, ctx.remaining)
+
+
+#: Request kinds during which NO HUMAN IS WATCHING the screen. The set lives
+#: here, beside the enum it interprets, so a new ``RequestKind`` member is
+#: added in the same diff that decides its attendance — not discovered later
+#: by whichever consumer guessed wrong.
+#:
+#: ``RUNTIME`` is deliberately absent: it is the kind interactive command
+#: paths run under (or they run with no context at all), and the consumers of
+#: this predicate use it to REFUSE things — a wrong ``True`` here silently
+#: degrades a human's "Iron Man" visual flow, which is the regression this
+#: comment exists to prevent.
+UNATTENDED_REQUEST_KINDS = frozenset({
+    RequestKind.STARTUP,
+    RequestKind.RECOVERY,
+    RequestKind.BACKGROUND,
+    RequestKind.AUTONOMOUS,
+})
+
+
+def is_unattended_request() -> bool:
+    """True iff the CURRENT task declared a request kind no human attends.
+
+    This is the canonical answer to "may this code path seize the user's
+    desktop / speak / otherwise commandeer an interactive surface?" — the
+    question v284.0's trusted-provenance work made answerable but nothing
+    yet asked. The first consumer is the workspace agent's visual tier,
+    which was observed foregrounding Chrome and switching macOS Spaces
+    every 60 seconds from an ``AUTONOMOUS``-stamped email-triage poll: the
+    stamp was present the whole time; no seam consulted it.
+
+    ``None`` context reads as ATTENDED. That polarity is load-bearing:
+    interactive command paths largely run outside any execution budget, so
+    fail-closed-on-None would break every human-initiated visual flow to
+    guard against callers that already carry the stamp. Unattended callers
+    that skip ``execution_budget`` (e.g. an ImportError degradation) must
+    declare themselves at their own seam instead — see
+    ``email_triage.runner._fetch_unread``. NEVER raises.
+    """
+    try:
+        ctx = _current_ctx.get()
+        return ctx is not None and ctx.request_kind in UNATTENDED_REQUEST_KINDS
+    except Exception:  # noqa: BLE001 — a telemetry predicate must not throw
+        return False
 
 
 # ---------------------------------------------------------------------------

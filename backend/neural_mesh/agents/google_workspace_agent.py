@@ -1086,6 +1086,10 @@ class UnifiedWorkspaceExecutor:
         self._calendar_bridge: Optional[CalendarBridge] = None
         self._computer_use: Optional[ComputerUseTool] = None
         self._spatial_awareness = None  # v6.2: SpatialAwarenessAgent integration
+        # Doors that already logged an unattended-refusal at INFO — the
+        # refusal fires on every autonomous poll tick, and only the first
+        # occurrence per door is a diagnostic (see _visual_surface_refused).
+        self._visual_refusals_logged: set = set()
         self._initialized = False
         self._lock = asyncio.Lock()
 
@@ -1148,8 +1152,53 @@ class UnifiedWorkspaceExecutor:
                 logger.exception(f"Error initializing unified executor: {e}")
                 return False
 
+    def _visual_surface_refused(self, door: str) -> bool:
+        """True when the CURRENT request may not seize the user's desktop.
+
+        The visual tier does not render into a sandbox — it foregrounds a
+        real browser via Yabai (``SwitchResult.LAUNCHED_APP``: it will OPEN
+        one if none exists), yanks the user across macOS Spaces, and
+        screenshots whatever is now frontmost. For a human who just said
+        "check my email" that is the product. For an unattended caller it is
+        a desktop hijack: the 60s email-triage poll, running with
+        ``RequestKind.AUTONOMOUS`` correctly stamped, was measured switching
+        the operator's Space every minute for an entire session (84 switches
+        in one boot) because the stamp existed and NO SEAM CONSULTED IT.
+
+        The decision is provenance-driven (``core.execution_context``), not
+        caller-discipline-driven: a payload flag can be authored by an LLM;
+        the contextvar cannot. Consulted at every door into the visual tier
+        — ``_ensure_spatial_awareness``, ``_ensure_visual_tooling``, and the
+        switch seam itself — BEFORE their cached fast paths, because an
+        interactive command warming the cache must not open the door for
+        the next autonomous poll. Fail-open to ATTENDED on any fault: the
+        predicate guards a convenience surface, and breaking the human flow
+        to guard it harder inverts the priorities. NEVER raises.
+        """
+        try:
+            from core.execution_context import is_unattended_request
+            refused = is_unattended_request()
+        except Exception:  # noqa: BLE001 — predicate unavailable ⇒ attended
+            return False
+        if refused:
+            # INFO once per door, then DEBUG — this fires on every poll tick
+            # and the first occurrence is the diagnostic, not the 500th.
+            if door not in self._visual_refusals_logged:
+                self._visual_refusals_logged.add(door)
+                logger.info(
+                    "[VisualTier] REFUSED (%s): unattended request kind — an "
+                    "autonomous caller may not foreground apps or switch "
+                    "Spaces; falling through to non-visual failure handling",
+                    door,
+                )
+            else:
+                logger.debug("[VisualTier] refused (%s): unattended", door)
+        return refused
+
     async def _ensure_spatial_awareness(self) -> bool:
         """Load spatial awareness only when a visual workflow actually needs it."""
+        if self._visual_surface_refused("spatial_awareness"):
+            return False
         if self._spatial_awareness is not None:
             return True
 
@@ -1174,6 +1223,8 @@ class UnifiedWorkspaceExecutor:
 
     async def _ensure_visual_tooling(self) -> bool:
         """Load Computer Use only for commands that explicitly need a visual tier."""
+        if self._visual_surface_refused("visual_tooling"):
+            return False
         if self._computer_use is not None:
             return True
 
@@ -1578,6 +1629,13 @@ class UnifiedWorkspaceExecutor:
         Returns:
             True if switch succeeded, False otherwise
         """
+        # Structural backstop at the ONE seam every visual path crosses to
+        # touch the desktop — including future callers that reach switching
+        # without passing either _ensure_* door first. Redundant with those
+        # doors by design: the doors give clean tier fallthrough; this line
+        # guarantees the hijack is impossible even if a door is bypassed.
+        if self._visual_surface_refused("app_switch"):
+            return False
         if not await self._ensure_spatial_awareness():
             logger.debug("Spatial Awareness not available, skipping app switch")
             return False
@@ -3731,7 +3789,21 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
         self._fallback_uses = 0
 
     async def _narrate(self, text: str) -> None:
-        """Fire-and-forget voice narration for real-time feedback."""
+        """Fire-and-forget voice narration for real-time feedback.
+
+        Real-time feedback presumes someone is there to receive it. The
+        same 60s email-triage poll that was foregrounding Chrome was also
+        speaking "Checking your inbox now." into an empty room on every
+        tick — narration is a seizure of the audio surface exactly as the
+        visual tier is of the desktop, so it consults the same provenance
+        predicate at its own one door. Unattended ⇒ silent, not queued.
+        """
+        try:
+            from core.execution_context import is_unattended_request
+            if is_unattended_request():
+                return
+        except Exception:  # noqa: BLE001 — predicate unavailable ⇒ legacy
+            pass
         try:
             from backend.core.supervisor.unified_voice_orchestrator import safe_say
             await safe_say(text)
