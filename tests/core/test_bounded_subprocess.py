@@ -224,3 +224,66 @@ class TestTheSharedVoiceCatalog:
         expensive."""
         from backend.core import system_voices as sv
         assert sv._timeout_s() <= 5.0
+
+
+class TestTheTripIsVisibleAcrossProcesses:
+    """A breaker that exists only in the daemon's memory is invisible to
+    `trinity status`, which runs in its own process — a revoked permission
+    would present as "everything fine, the screenshots merely stopped"."""
+
+    @pytest.fixture(autouse=True)
+    def _ledger(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("JARVIS_SUBPROC_BREAKER_LEDGER",
+                           str(tmp_path / "breakers.json"))
+        bs.reset_for_tests()
+        yield
+        bs.reset_for_tests()
+
+    def test_a_trip_is_written_where_another_process_can_read_it(
+            self, monkeypatch):
+        monkeypatch.setenv("JARVIS_SUBPROC_BREAKER_TRIPS", "1")
+        bs.run_bounded([sys.executable, "-c", "import time; time.sleep(30)"],
+                       timeout=0.3)
+        assert bs.open_breakers_on_disk(), "the trip never reached disk"
+
+    def test_the_full_lifecycle_trip_refuse_cooldown_recover_clear(
+            self, monkeypatch, tmp_path):
+        """Every step of the operator-visible cycle, in order."""
+        import shutil
+        fake = tmp_path / "screencapture"
+        shutil.copy(sys.executable, fake)
+        monkeypatch.setenv("JARVIS_SUBPROC_BREAKER_TRIPS", "1")
+        monkeypatch.setenv("JARVIS_SUBPROC_BREAKER_COOLDOWN_S", "1")
+        hang = [str(fake), "-c", "import time; time.sleep(30)"]
+        ok = [str(fake), "-c", "print(1)"]
+
+        assert bs.run_bounded(hang, timeout=0.3) is None          # trip
+        assert bs.open_breakers_on_disk() == ("screencapture",)
+        assert bs.run_bounded(ok, timeout=5) is None              # refused
+        time.sleep(1.2)                                           # cooldown
+        assert bs.run_bounded(ok, timeout=10) is not None         # probe ok
+        assert bs.open_breakers_on_disk() == (), "recovery must CLEAR it"
+
+    def test_asking_whether_it_is_open_does_not_change_the_answer(
+            self, monkeypatch):
+        """`breaker_open` used to POP the state, so the success that followed
+        found nothing open and never cleared the on-disk ledger — recovered
+        in memory, tripped forever on the operator's screen. A question must
+        not mutate."""
+        monkeypatch.setenv("JARVIS_SUBPROC_BREAKER_TRIPS", "1")
+        monkeypatch.setenv("JARVIS_SUBPROC_BREAKER_COOLDOWN_S", "1")
+        cmd = [sys.executable, "-c", "import time; time.sleep(30)"]
+        bs.run_bounded(cmd, timeout=0.3)
+        time.sleep(1.2)
+        assert bs.breaker_open(cmd) is False        # cooldown elapsed
+        assert bs.open_breakers_on_disk(), "the question erased the record"
+
+    def test_a_fresh_process_inherits_a_live_trip(self, monkeypatch):
+        """A daemon restarting into a still-wedged binary should honour the
+        cooldown it already earned, not spend a worker rediscovering it."""
+        monkeypatch.setenv("JARVIS_SUBPROC_BREAKER_TRIPS", "1")
+        bs.run_bounded([sys.executable, "-c", "import time; time.sleep(30)"],
+                       timeout=0.3)
+        bs._fails.clear(); bs._opened_at.clear()      # simulate a new process
+        bs._hydrated = False
+        assert bs.breaker_open([sys.executable]) is True

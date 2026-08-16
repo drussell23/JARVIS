@@ -480,3 +480,109 @@ class TestAnOptionalTransportIsReportedNotFatal:
         assert "supervisor.err.log" in sup.log_hint()
         hint = ov.log_hint()
         assert hint == "" or "sessions" in hint, hint
+
+
+class TestATrippedBreakerIsVisibleToTheOperator:
+    """A breaker that only exists in the daemon's memory is invisible to the
+    status CLI, which runs in its own process. A revoked Screen-Recording
+    permission would present as "everything fine, the screenshots merely
+    stopped" — the exact silent failure the breaker was built to end."""
+
+    async def test_an_open_breaker_degrades_a_daemon_that_answers_everything(
+            self):
+        """THE point: every transport live, pid live — and still not
+        HEALTHY, because its screen capture has been refused for minutes."""
+        import backend.core.ouroboros.cli.thin_client as tc
+        real = tc.probe_http
+
+        async def _live(*_a, **_k):
+            return "live"
+
+        tc.probe_http = _live
+        try:
+            spec = st.DaemonSpec(
+                name="sup", title="supervisor", pid_source=lambda: 1,
+                transports=(st.Transport("tcp", "tcp",
+                                         lambda: ("127.0.0.1", 1)),),
+                conditions=lambda: ("TCC_BLOCKED:screencapture",))
+            row = await st.assess_daemon(spec, timeout=0.2)
+            assert row.state is st.Health.DEGRADED, row.detail
+            assert "TCC_BLOCKED" in row.detail
+            assert row.transports["tcp"] == "live", "the socket is fine"
+            assert row.conditions
+        finally:
+            tc.probe_http = real
+
+    async def test_a_healthy_daemon_with_no_conditions_stays_healthy(self):
+        import backend.core.ouroboros.cli.thin_client as tc
+        real = tc.probe_http
+
+        async def _live(*_a, **_k):
+            return "live"
+
+        tc.probe_http = _live
+        try:
+            spec = st.DaemonSpec(
+                name="sup", title="supervisor", pid_source=lambda: 1,
+                transports=(st.Transport("tcp", "tcp",
+                                         lambda: ("127.0.0.1", 1)),))
+            row = await st.assess_daemon(spec, timeout=0.2)
+            assert row.state is st.Health.HEALTHY
+        finally:
+            tc.probe_http = real
+
+    async def test_a_down_daemon_is_not_relabelled_by_a_stale_breaker(self):
+        """A tripped breaker inside a process that is not running is not the
+        operator's problem; DOWN must survive."""
+        spec = st.DaemonSpec(
+            name="sup", title="supervisor", pid_source=lambda: None,
+            transports=(), conditions=lambda: ("CIRCUIT_OPEN:yabai",))
+        row = await st.assess_daemon(spec, timeout=0.05)
+        assert row.state is st.Health.DOWN
+
+    def test_the_condition_is_read_from_the_DURABLE_ledger(
+            self, tmp_path, monkeypatch):
+        """Cross-process by construction: the CLI reads what the daemon
+        wrote, because its own memory is always empty here."""
+        import json
+        import time as _t
+        led = tmp_path / "breakers.json"
+        led.write_text(json.dumps({
+            "schema_version": "bounded_subprocess.1",
+            "open": {"screencapture": {"consecutive_failures": 3}},
+            "updated_at": _t.time(), "cooldown_s": 300, "pid": 999,
+        }))
+        monkeypatch.setenv("JARVIS_SUBPROC_BREAKER_LEDGER", str(led))
+        conds = st.subprocess_breaker_conditions()
+        assert any("TCC_BLOCKED" in c and "screencapture" in c for c in conds)
+        assert any("Screen Recording" in c for c in conds), "name the FIX"
+
+    def test_a_non_tcc_binary_reports_circuit_open(self, tmp_path, monkeypatch):
+        import json
+        import time as _t
+        led = tmp_path / "b.json"
+        led.write_text(json.dumps({
+            "open": {"yabai": {}}, "updated_at": _t.time(), "cooldown_s": 300}))
+        monkeypatch.setenv("JARVIS_SUBPROC_BREAKER_LEDGER", str(led))
+        assert st.subprocess_breaker_conditions() == ("CIRCUIT_OPEN:yabai",)
+
+    def test_a_stale_ledger_is_ignored(self, tmp_path, monkeypatch):
+        """The breaker would have re-probed by now; reporting a stale trip is
+        its own kind of lie."""
+        import json
+        led = tmp_path / "b.json"
+        led.write_text(json.dumps({
+            "open": {"screencapture": {}}, "updated_at": 0, "cooldown_s": 1}))
+        monkeypatch.setenv("JARVIS_SUBPROC_BREAKER_LEDGER", str(led))
+        assert st.subprocess_breaker_conditions() == ()
+
+    def test_no_ledger_means_no_conditions(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("JARVIS_SUBPROC_BREAKER_LEDGER",
+                           str(tmp_path / "absent.json"))
+        assert st.subprocess_breaker_conditions() == ()
+
+    def test_the_supervisor_row_actually_carries_this_condition_source(self):
+        """Wiring pin: the fleet's supervisor row must consult it, or the
+        whole chain is a module nobody calls."""
+        sup, _ = st.default_fleet()
+        assert sup.conditions is st.subprocess_breaker_conditions
