@@ -269,15 +269,15 @@ class RealTimeVoiceCommunicator:
     def _discover_voices(self) -> None:
         """Discover available system voices."""
         try:
-            _voice_discover_timeout = float(os.getenv("JARVIS_VOICE_DISCOVER_TIMEOUT", "15"))
-            result = subprocess.run(
-                ['say', '-v', '?'],
-                capture_output=True,
-                text=True,
-                timeout=_voice_discover_timeout
-            )
+            # One cached, bounded query shared with `trinity_voice_coordinator`
+            # instead of a second 15s shell-out for the same immutable list.
+            # StallSampler caught this on the wedged main loop.
+            from backend.core.system_voices import voice_catalog_raw
+            catalog = voice_catalog_raw()
+            if catalog is None:
+                return
 
-            for line in result.stdout.split('\n'):
+            for line in catalog.split('\n'):
                 if line.strip():
                     parts = line.split()
                     if len(parts) >= 2:

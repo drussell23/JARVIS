@@ -56528,8 +56528,19 @@ class HotReloadWatcher:
         if self.verbose:
             self.logger.info(self._type_registry.get_summary())
 
-        # Initialize file hashes
-        self._file_hashes = self._calculate_file_hashes_parallel()
+        # Initialize file hashes — OFF the loop.
+        #
+        # The monitor-loop twin of this call was offloaded first; StallSampler
+        # then caught THIS one, the initial baseline, as the last main-thread
+        # blocker of the boot. Same shape: a ThreadPoolExecutor fan-out whose
+        # `submit`/`as_completed` wait runs on the loop thread while every
+        # watched file is hashed.
+        try:
+            from backend.core.async_offload import call_off_loop
+            self._file_hashes = await call_off_loop(
+                self._calculate_file_hashes_parallel)
+        except Exception:  # noqa: BLE001 — fail-open to inline
+            self._file_hashes = self._calculate_file_hashes_parallel()
 
         # Count files by category
         backend_count = 0
@@ -56604,8 +56615,24 @@ class HotReloadWatcher:
                 if self._is_in_grace_period():
                     continue
 
-                # Check for changes
-                has_changes, changed_files, categorized = self._detect_changes()
+                # Check for changes — OFF the loop.
+                #
+                # `_detect_changes` -> `_calculate_file_hashes_parallel`
+                # blocks in `concurrent.futures.as_completed` while a pool
+                # hashes every watched file. Being inside a coroutine does
+                # not help: the loop thread sits in `threading.wait` for the
+                # whole fan-out. StallSampler caught this on the wedged main
+                # thread in 4 of 6 dumps once the screen-context and voice
+                # blockers were removed — it is the dominant remaining one,
+                # and it recurs every `check_interval`.
+                #
+                # The inner pool is untouched; only the WAIT moves.
+                try:
+                    from backend.core.async_offload import call_off_loop
+                    has_changes, changed_files, categorized = (
+                        await call_off_loop(self._detect_changes))
+                except Exception:  # noqa: BLE001 — fail-open to inline
+                    has_changes, changed_files, categorized = self._detect_changes()
 
                 if has_changes:
                     # Log changes by category

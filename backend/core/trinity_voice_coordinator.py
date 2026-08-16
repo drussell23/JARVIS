@@ -2110,14 +2110,16 @@ class TrinityVoiceCoordinator:
 
         try:
             # v93.1: Increased timeout for heavily loaded systems
-            voice_timeout = float(os.getenv("JARVIS_VOICE_DETECT_TIMEOUT", "5.0"))
+            # Shared cached catalogue — see `core.system_voices`. This was
+            # the second of two subsystems shelling out for the same static
+            # list, both caught blocking the event loop.
+            from backend.core.system_voices import voice_catalog_raw
+            _catalog = voice_catalog_raw()
 
-            result = subprocess.run(
-                ["say", "-v", "?"],
-                capture_output=True,
-                text=True,
-                timeout=voice_timeout
-            )
+            class _R:                      # keep the parsing below unchanged
+                returncode = 0 if _catalog is not None else 1
+                stdout = _catalog or ""
+            result = _R()
 
             if result.returncode == 0:
                 voices = result.stdout.strip().split('\n')
