@@ -75,6 +75,16 @@ DEFAULT_PREWARM: Tuple[str, ...] = (
     "backend.core.trinity_ipc",
     # The registry walk `audit_ratchet.registered_ratchets` triggers.
     "backend.core.ouroboros.battle_test.repl_dispatch_registry",
+    # Caught at `coding_council/orchestrator.py:273 <module>`, reached from
+    # `main.health_check` -> `get_coding_council_health` ->
+    # `get_coding_council`, which does a LAZY `from .orchestrator import ...`
+    # inside an async function. The dump's innermost frame was
+    # `importlib._bootstrap_external._write_atomic` -- the loop was writing a
+    # .pyc while an HTTP health request waited. Cold import measured at
+    # 325ms. Same shape as `backend.system` above, found the same way: by
+    # lowering JARVIS_STALL_SAMPLER_TRIGGER_S below the stall and reading
+    # the stack, rather than by adding another instrument.
+    "backend.core.coding_council.orchestrator",
 )
 
 __all__ = [
