@@ -94,7 +94,27 @@ def _f(name: str, default: float, minimum: float) -> float:
 
 
 def trigger_s() -> float:
-    return _f(ENV_TRIGGER_S, 2.0, 0.25)
+    """How stale the heartbeat must be before a dump is worth taking.
+
+    Was 2.0s. Lowered because a STATIC definition of "pathological" goes
+    blind as the system improves, and this one did: it was calibrated when
+    the worst stall was 32.31s, and by the time the worst was 1.44s it could
+    no longer fire at all. Five rounds of fixes had made the instrument that
+    found them incapable of finding the next one -- the ratchet only ever
+    tightens against the tool.
+
+    1.0s is still 4x the sentinel's own stall threshold, so this stays what
+    the comment above promises: the pathological windows, not every
+    scheduling hiccup. The cost of being wrong is bounded elsewhere and
+    cheaply -- `min_gap_s` (10s) and `max_dumps` (8 per process) cap the
+    total spend at eight stack dumps no matter how often the loop hitches.
+
+    Setting this to 0.60 is what unmasked the 0.63s stall whose innermost
+    frame was `importlib._bootstrap_external._write_atomic`: a .pyc being
+    written on the event loop while a FastAPI health request waited on a
+    first-time import of `coding_council.orchestrator`.
+    """
+    return _f(ENV_TRIGGER_S, 1.0, 0.25)
 
 
 def min_gap_s() -> float:
