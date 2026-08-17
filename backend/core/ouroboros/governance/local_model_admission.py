@@ -68,10 +68,11 @@ from __future__ import annotations
 import enum
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("Ouroboros.LocalModelAdmission")
 
@@ -575,6 +576,260 @@ def _read_host_pressure() -> Tuple[str, float, str]:
         return ("unknown", -1.0, "unavailable")
 
 
+# ---------------------------------------------------------------------------
+# Contention dimension — the machine is not "fine below critical"
+# ---------------------------------------------------------------------------
+#
+# `free_pct` is a LEVEL. It answers "how much is left", and on unified memory
+# that is a lagging, compressed, and frankly optimistic number: measured on
+# this host at the moment of writing, the canonical gate said `warn` (22.8%
+# free) while the machine was swapping in at 3.6 MB/s and `coreaudiod` had
+# logged a real overload — `safety_violation: 1`, and page faults taken INSIDE
+# the IO cycle — four minutes earlier.
+#
+# So the level says "room to spare" at the exact moment the audio graph is
+# being severed by paging. What is missing is a RATE and a VICTIM:
+#
+#   * paging rate  — swap-in bytes per second. A level cannot distinguish a
+#     machine sitting still at 11 GB of swap (survivable) from one actively
+#     paging (not), and it is the paging that costs the real-time thread its
+#     deadline.
+#   * audio contention — `audio_contention_probe`, which reads the overload
+#     records coreaudiod already publishes. Its `paging_implicated` flag is
+#     the causal join: audio missed its deadline AND took page faults doing
+#     it. That is this module's docstring, finally measured instead of feared.
+#
+# Each independent signal escalates the host level ONE rung through the
+# EXISTING ladder (admit → prune → defer). No new action vocabulary, no
+# second decision path: strictest-wins composition, the same discipline this
+# module already applies across its accelerator and host bounds.
+
+
+def paging_rate_threshold_bps() -> float:
+    """Swap-in bytes/sec above which the machine counts as actively paging.
+
+    Default 1 MiB/s. Not a capacity figure — a *sustained transfer* figure:
+    below it, paging is incidental; above it, the machine is moving working
+    set through swap continuously, which is the condition that costs a
+    real-time audio thread its deadline.
+    """
+    return _envf("JARVIS_LOCAL_PAGING_RATE_BPS", 1_048_576.0, 0.0, 1e12)
+
+
+def contention_enabled() -> bool:
+    """``JARVIS_LOCAL_CONTENTION_GATE_ENABLED`` (default true).
+
+    Off restores the v2 ladder byte-for-byte: level-only, no rate, no audio.
+    """
+    raw = (os.environ.get("JARVIS_LOCAL_CONTENTION_GATE_ENABLED", "1") or "").strip()
+    return raw.lower() not in ("0", "false", "no", "off")
+
+
+def _envf(name: str, default: float, lo: float, hi: float) -> float:
+    """Env float, clamped. NEVER raises."""
+    try:
+        raw = (os.environ.get(name) or "").strip()
+        return max(lo, min(hi, float(raw))) if raw else default
+    except Exception:  # noqa: BLE001
+        return default
+
+
+class _PagingSampler:
+    """Swap-in RATE, from two samples. Thread-safe. NEVER raises.
+
+    Cascades psutil → `vm_stat`, mirroring `memory_pressure_gate`'s own probe
+    cascade rather than inventing a second one. The cascade is not
+    defensive decoration: `psutil.swap_memory()` raises OSError outright
+    under a restricted sandbox on this very machine (verified), while
+    `vm_stat` answers there — so a single-source probe would report
+    "unknown" for every caller that happens to be sandboxed.
+
+    A FIRST call can only return unknown: a rate needs two points in time,
+    and inventing one from a cumulative counter would be a fabricated
+    measurement driving a real refusal.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last: Optional[Tuple[float, int]] = None      # (monotonic, bytes)
+        self._rate: Optional[float] = None                  # last GOOD rate
+        self._rate_at: float = 0.0
+
+    @staticmethod
+    def _read_swapin_bytes() -> Optional[int]:
+        """Cumulative swap-in bytes since boot, or None. NEVER raises."""
+        try:
+            import psutil
+            return int(psutil.swap_memory().sin)
+        except Exception:  # noqa: BLE001 — OSError under sandbox, or absent
+            pass
+        try:
+            from backend.core.bounded_subprocess import run_bounded
+            completed = run_bounded(["vm_stat"], timeout=3.0, text=True)
+            if completed is None or completed.returncode != 0:
+                return None
+            page_size = 4096
+            m = re.search(r"page size of (\d+) bytes", completed.stdout or "")
+            if m:
+                page_size = int(m.group(1))
+            # `Pageins` is the closest cumulative analogue vm_stat exposes;
+            # it counts pages faulted in from backing store, which is the
+            # same event psutil reports as `sin`.
+            m = re.search(r"Pageins:\s+(\d+)", completed.stdout or "")
+            if not m:
+                return None
+            return int(m.group(1)) * page_size
+        except Exception:  # noqa: BLE001
+            return None
+
+    def rate_bps(self) -> Optional[float]:
+        """Bytes/sec, or None when unknowable.
+
+        HOLDS THE LAST GOOD RATE between samples, and that is load-bearing
+        rather than an optimisation. The first version recomputed on every
+        call, and a caller that sampled twice a millisecond apart measured a
+        near-zero delta over a near-zero interval and got ~0 B/s — so the
+        guard silently DISARMED itself under exactly the rapid-polling
+        pattern an admission check produces. Observed: 27.4 MiB/s on one
+        read, `admit` on the next call in the same breath.
+
+        A rate needs time to exist. Below `_MIN_INTERVAL_S` no new rate is
+        computed and the previous one stands, ageing out after
+        `_RATE_TTL_S` — after which the honest answer is again "unknown",
+        not "zero".
+        """
+        now = time.monotonic()
+        with self._lock:
+            prev = self._last
+            cached, cached_at = self._rate, self._rate_at
+
+        if prev is not None and (now - prev[0]) < self._min_interval_s():
+            # Too soon to measure again — serve the last good rate if it is
+            # still fresh, else admit we do not know.
+            if cached is not None and (now - cached_at) < self._rate_ttl_s():
+                return cached
+            return None
+
+        total = self._read_swapin_bytes()
+        if total is None:
+            return None
+        with self._lock:
+            self._last = (now, total)
+        if prev is None:
+            return None                      # first sample: no rate exists yet
+        dt = now - prev[0]
+        if dt <= 0:
+            return None
+        delta = total - prev[1]
+        if delta < 0:
+            return None                      # counter reset (reboot / wrap)
+        rate = delta / dt
+        with self._lock:
+            self._rate, self._rate_at = rate, now
+        return rate
+
+    @staticmethod
+    def _min_interval_s() -> float:
+        """Shortest span over which a swap-in rate is meaningful."""
+        return _envf("JARVIS_LOCAL_PAGING_MIN_INTERVAL_S", 2.0, 0.2, 60.0)
+
+    @staticmethod
+    def _rate_ttl_s() -> float:
+        """How long a computed rate stays quotable before it is stale."""
+        return _envf("JARVIS_LOCAL_PAGING_RATE_TTL_S", 20.0, 1.0, 600.0)
+
+
+_paging_sampler = _PagingSampler()
+
+_LEVEL_ORDER: Tuple[str, ...] = ("ok", "warn", "high", "critical")
+
+
+def _escalate(level: str, rungs: int) -> str:
+    """Move `level` up the EXISTING ladder, saturating at critical.
+
+    An unrecognised level (notably ``unknown``, which `_read_host_pressure`
+    returns when the probe fails) is left ALONE. Escalating from a level we
+    could not read would let a broken memory probe manufacture a refusal out
+    of nothing — the exact fail-toward-OK posture this module already keeps.
+    """
+    if rungs <= 0 or level not in _LEVEL_ORDER:
+        return level
+    idx = min(len(_LEVEL_ORDER) - 1, _LEVEL_ORDER.index(level) + rungs)
+    return _LEVEL_ORDER[idx]
+
+
+def _read_contention() -> Tuple[int, List[str], Dict[str, Any]]:
+    """(rungs_to_escalate, reasons, evidence). NEVER raises.
+
+    Synchronous and cheap by construction: the paging sampler is two counter
+    reads, and the audio probe is TTL-cached — its ~2s `log show` runs at
+    most once per TTL and never on this call's critical path when warm. A
+    cold audio probe here would block, so an unwarmed cache reports unknown
+    and the memory dimension rules alone; `warm_contention_async` exists for
+    callers that can await and want the audio dimension live.
+    """
+    rungs = 0
+    reasons: List[str] = []
+    evidence: Dict[str, Any] = {}
+
+    if not contention_enabled():
+        return (0, [], {"enabled": False})
+
+    # -- paging rate ----------------------------------------------------
+    try:
+        rate = _paging_sampler.rate_bps()
+    except Exception:  # noqa: BLE001
+        rate = None
+    evidence["paging_bps"] = rate
+    if rate is not None:
+        threshold = paging_rate_threshold_bps()
+        evidence["paging_threshold_bps"] = threshold
+        if rate > threshold:
+            rungs += 1
+            reasons.append(
+                f"swapping in at {rate / (1024 * 1024):.1f} MiB/s")
+
+    # -- audio contention ------------------------------------------------
+    try:
+        from backend.core.ouroboros.governance.audio_contention_probe import (
+            probe as _audio_probe,
+        )
+        audio = _audio_probe()
+        evidence["audio"] = audio.to_dict()
+        # Only `paging_implicated` moves an ADMISSION decision. A bare
+        # overload can be caused by things a local model cannot influence
+        # (a USB interface, a hostile plugin), and refusing local inference
+        # for those would be a guard punishing the innocent. Page faults
+        # inside the IO cycle are memory pressure, which loading weights
+        # provably makes worse.
+        if audio.paging_implicated:
+            rungs += 1
+            reasons.append(
+                f"audio graph missed {audio.overloads} deadline(s) while "
+                f"page-faulting")
+    except Exception:  # noqa: BLE001 — probe absent ⇒ memory dimension rules
+        evidence["audio"] = {"ok": False, "error": "unavailable"}
+
+    return (rungs, reasons, evidence)
+
+
+async def warm_contention_async() -> None:
+    """Refresh the audio probe OFF the loop so `_read_contention` finds it
+    warm. NEVER raises, never blocks the caller beyond the offload hop.
+
+    Exists because the audio probe costs ~1.4-3.7s (measured) and must never
+    run inside a synchronous admission decision. A caller about to dispatch
+    local work awaits this first; everything else reads the cache.
+    """
+    try:
+        from backend.core.ouroboros.governance.audio_contention_probe import (
+            probe_async,
+        )
+        await probe_async()
+    except Exception:  # noqa: BLE001
+        logger.debug("[LocalModelAdmission] audio warm failed", exc_info=True)
+
+
 async def assess_async(
     requested_ctx: Optional[int] = None,
     *,
@@ -606,6 +861,9 @@ async def assess_async(
             await ct.resolve_jit()
     except Exception as exc:  # noqa: BLE001 — a stale reading beats no ruling
         logger.debug("[LocalModelAdmission] JIT probe degraded: %s", exc)
+    # This is the caller that can await, so it is the one that pays for a
+    # live audio reading — `assess` itself must stay synchronous and cheap.
+    await warm_contention_async()
     return assess(requested_ctx, weight_bytes=weight_bytes, model_id=model_id)
 
 
@@ -698,6 +956,24 @@ def _assess_impl(
                                  reason="admission control disabled")
 
     level, free_pct, source = _read_host_pressure()
+
+    # Contention escalation, applied BEFORE the ladder so every rung below
+    # reads ONE effective level rather than each branch learning about
+    # paging separately. See the block comment above `_read_contention`:
+    # measured on this host, the gate said `warn` (22.8% free) while the
+    # machine swapped in at 3.6 MiB/s and coreaudiod logged a real overload
+    # with page faults inside the IO cycle.
+    _rungs, _reasons, _ = _read_contention()
+    if _rungs:
+        _raw = level
+        level = _escalate(level, _rungs)
+        if level != _raw:
+            logger.info(
+                "[LocalModelAdmission] host level %s -> %s — %.1f%% free says "
+                "otherwise, but: %s",
+                _raw, level, free_pct, "; ".join(_reasons))
+            source = f"{source}+contention"
+
     reading = _read_accelerator()
     topology = getattr(getattr(reading, "topology", None), "value", "unknown")
 
