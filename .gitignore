@@ -189,6 +189,15 @@ htmlcov/
 coverage.xml
 *.cover
 
+# E2E suite output. Declared as RESULTS_DIR by
+# .github/workflows/biometric-voice-unlock-e2e.yml and
+# unlock-integration-e2e.yml, which write reports here on every run --
+# so a LOCAL run of either suite permanently dirties the working tree.
+# That matters more here than it looks: the battle-test harness stashes
+# uncommitted work at boot, so an artifact directory nobody ignores becomes
+# a standing hazard to real work.
+test-results/
+
 # Testing framework artifacts
 .hypothesis/
 **/.hypothesis/

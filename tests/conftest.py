@@ -105,10 +105,26 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "permissions: mark test as requiring system permissions"
     )
+    # Applied by COLLECTION, not by hand -- see `tests/pty_gate` for why a
+    # decorator was the wrong mechanism (seven of eight files never wore one).
+    # Registered here so `-m pty` / `-m "not pty"` select correctly and no
+    # PytestUnknownMarkWarning is emitted for a marker nobody typed.
+    config.addinivalue_line(
+        "markers",
+        "pty: test drives a real pseudo-terminal (auto-applied; "
+        "see JARVIS_PTY_TESTS_REQUIRED)",
+    )
 
 
-def pytest_collection_modifyitems(config, items):
-    """Modify test items during collection."""
+def _apply_path_markers(items):
+    """Path-derived markers (`unit`, `vision`, `slow`, ...).
+
+    WAS a `pytest_collection_modifyitems` hook and therefore DEAD: a second
+    definition of that name later in this module rebound it at import time,
+    so Python kept only the last one and pytest never saw this body. Every
+    path marker below has been silently absent -- `-m unit` selected nothing.
+    Now a named helper called from the single composed hook, which is the
+    only arrangement in which adding a third concern cannot delete a second."""
     # Add markers based on test location
     for item in items:
         # Add markers based on path
@@ -190,13 +206,37 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     _report_live_state_writes(terminalreporter)
 
     try:
-        from tests.pty_gate import REQUIRED_ENV_VAR, SKIPPED
+        from tests.pty_gate import (
+            DISABLE_ENV_VAR, REQUIRED_ENV_VAR, SKIPPED, UNDECIDABLE,
+            automark_enabled,
+        )
     except Exception:  # noqa: BLE001 — a reporting aid must never break a run
-        return
-    if not SKIPPED:
         return
 
     write = terminalreporter.write_line
+
+    # A DISARMED detector is louder than a skip, because a skip at least
+    # names itself. If automarking is off, every terminal-driving test in the
+    # repository is ungated and the run says nothing about it -- which is the
+    # precise state this whole mechanism exists to make impossible.
+    if not automark_enabled():
+        write("")
+        write(f"⚠️  pty auto-detection is DISABLED ({DISABLE_ENV_VAR}) — "
+              f"terminal-driving tests are UNGATED.", yellow=True, bold=True)
+
+    # "We could not read the file" is not "the file needs no terminal".
+    # Reported separately from skips so an unreadable path can never be
+    # mistaken for a clean verdict.
+    if UNDECIDABLE:
+        write("")
+        write(f"⚠️  {len(UNDECIDABLE)} file(s) could not be inspected for pty "
+              f"affinity — gating status UNKNOWN, not clear.",
+              yellow=True, bold=True)
+        for path, why in sorted(set(UNDECIDABLE))[:10]:
+            write(f"   {path}: {why}", yellow=True)
+
+    if not SKIPPED:
+        return
     write("")
     write(f"⚠️  {len(SKIPPED)} terminal-dependent test(s) DID NOT RUN — "
           f"no pseudo-terminal was available.", yellow=True, bold=True)
@@ -577,7 +617,7 @@ def pytest_ignore_collect(collection_path=None, path=None, config=None):
     return None if rel in tracked else True
 
 
-def pytest_collection_modifyitems(session, config, items):
+def _amputate_untracked(config, items):
     """Amputate untracked items after traversal. NEVER raises.
 
     `pytest_ignore_collect` above is the right hook and its logic is proven
@@ -634,3 +674,82 @@ def pytest_collection_modifyitems(session, config, items):
                 "paths — OS artifacts are not part of the repository", dropped)
     except Exception:  # noqa: BLE001 — collection must never die here
         return
+
+
+# ---------------------------------------------------------------------------
+# The ONE collection hook
+# ---------------------------------------------------------------------------
+
+
+def pytest_collection_modifyitems(session, config, items):
+    """The single `modifyitems` hook, composing every collection concern.
+
+    THIS SHAPE IS THE FIX, NOT A STYLE CHOICE. This module previously defined
+    `pytest_collection_modifyitems` TWICE at module scope. Python does not
+    merge those -- the second binding replaced the first, so the path-marker
+    pass (`unit`, `integration`, `vision`, `voice`, `slow`, ...) never ran and
+    `-m unit` had been selecting nothing. Nothing reported it, because a hook
+    that does not exist raises no error.
+
+    A hook name that can be silently overwritten is a place where adding a
+    feature deletes one. So there is exactly one definition, it delegates to
+    named helpers, and the next concern is a fourth line here rather than a
+    third `def` that eats the second.
+
+    Order is deliberate:
+      1. amputate untracked paths -- do not spend analysis on items that are
+         about to be dropped;
+      2. path markers -- pure string work on what survived;
+      3. pty affinity -- the only pass that reads and parses files, so it runs
+         on the smallest possible set.
+
+    Each stage is independently fail-safe: a stage that raises is contained
+    here, and the stages after it still run. Collection dying is worse than
+    any one stage being skipped.
+    """
+    for stage, call in (
+        ("amputate_untracked", lambda: _amputate_untracked(config, items)),
+        ("path_markers", lambda: _apply_path_markers(items)),
+        ("pty_affinity", lambda: _mark_pty_items(config, items)),
+    ):
+        try:
+            call()
+        except Exception:  # noqa: BLE001 — one bad stage must not kill collection
+            _logging.getLogger(__name__).warning(
+                "[tests-conftest] collection stage %r failed; continuing",
+                stage, exc_info=True,
+            )
+
+
+def _mark_pty_items(config, items):
+    """Tag terminal-driving tests so the gate can enforce them at setup.
+
+    Delegates wholly to `tests.pty_gate`; this function owns no detection
+    logic of its own, because a second opinion about what needs a terminal is
+    how the first one drifts.
+    """
+    try:
+        from tests.pty_gate import mark_pty_items
+    except Exception:  # noqa: BLE001 — gate absent → no automarking, suite runs
+        return
+    marked = mark_pty_items(items)
+    if marked:
+        _logging.getLogger(__name__).debug(
+            "[tests-conftest] pty affinity: marked %d item(s)", marked)
+
+
+def pytest_runtest_setup(item):
+    """Enforce the terminal requirement BEFORE the test body allocates one.
+
+    Placement is the whole point. `test_region_layout_mount.py` calls
+    `pty.openpty()` in its own body, so on a machine without `/dev/ptmx` it
+    ERRORED with a raw `OSError` while its gated neighbours skipped cleanly --
+    one cause, two verdicts, and only the skips were legible. Deciding at
+    setup makes the verdict identical for every terminal-driving test in the
+    repository regardless of how each one happens to allocate.
+    """
+    try:
+        from tests.pty_gate import gate_item
+    except Exception:  # noqa: BLE001
+        return
+    gate_item(item)

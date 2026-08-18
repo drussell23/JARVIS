@@ -99,7 +99,7 @@ class TestCockpitConsoleThreshold:
         assert handler.level == logging.DEBUG  # file handler unaffected
         root = logging.getLogger()
         term = _terminal_handler(root)
-        assert term.level == logging.ERROR
+        assert sb.terminal_threshold_of(term) == logging.ERROR
 
     def test_cockpit_via_env_var_matches_explicit_mode(
         self, monkeypatch: pytest.MonkeyPatch, fresh_registry, session_dir,
@@ -108,7 +108,7 @@ class TestCockpitConsoleThreshold:
         sb.configure_silent_boot(session_dir)
         root = logging.getLogger()
         term = _terminal_handler(root)
-        assert term.level == logging.ERROR
+        assert sb.terminal_threshold_of(term) == logging.ERROR
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +182,7 @@ class TestSoakGoldenUnchanged:
         sb.configure_silent_boot(session_dir, mode=PresentationMode.SOAK)
         root = logging.getLogger()
         term = _terminal_handler(root)
-        assert term.level == logging.WARNING
+        assert sb.terminal_threshold_of(term) == logging.WARNING
 
     def test_default_mode_no_env_matches_soak(
         self, fresh_registry, session_dir,
@@ -192,7 +192,7 @@ class TestSoakGoldenUnchanged:
         sb.configure_silent_boot(session_dir)
         root = logging.getLogger()
         term = _terminal_handler(root)
-        assert term.level == logging.WARNING
+        assert sb.terminal_threshold_of(term) == logging.WARNING
 
     def test_soak_warning_reaches_both(
         self, fresh_registry, session_dir, capsys,
@@ -225,7 +225,7 @@ class TestThresholdPrecedence:
         )
         root = logging.getLogger()
         term = _terminal_handler(root)
-        assert term.level == logging.DEBUG
+        assert sb.terminal_threshold_of(term) == logging.DEBUG
 
     def test_explicit_env_override_wins_over_cockpit_default(
         self, monkeypatch: pytest.MonkeyPatch, fresh_registry, session_dir,
@@ -234,7 +234,7 @@ class TestThresholdPrecedence:
         sb.configure_silent_boot(session_dir, mode=PresentationMode.COCKPIT)
         root = logging.getLogger()
         term = _terminal_handler(root)
-        assert term.level == logging.INFO
+        assert sb.terminal_threshold_of(term) == logging.INFO
 
     def test_resolve_terminal_threshold_direct(self, fresh_registry):
         assert sb._resolve_terminal_threshold(

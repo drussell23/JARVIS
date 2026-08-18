@@ -17,8 +17,14 @@ import pytest
 from backend.core.ouroboros.governance import a1_trace
 
 
-def test_emits_warning_with_hop_and_goal(caplog):
-    with caplog.at_level(logging.WARNING, logger=a1_trace.logger.name):
+def test_emits_hop_and_goal(caplog):
+    """The MESSAGE is the contract; the level is a routing decision.
+
+    `g-123` was never emitted by the roadmap, so this hop is out of the A1
+    proof's scope and lands at DEBUG -- in `debug.log`, which is the sink
+    every auditor reads. The text is byte-identical to what it always was.
+    """
+    with caplog.at_level(logging.DEBUG, logger=a1_trace.logger.name):
         a1_trace.a1trace("ingest", "g-123", router="attached")
     msgs = [r.getMessage() for r in caplog.records]
     assert any(
@@ -26,22 +32,66 @@ def test_emits_warning_with_hop_and_goal(caplog):
     ), msgs
 
 
-def test_warning_level_so_it_survives_silent_boot(caplog):
-    with caplog.at_level(logging.WARNING, logger=a1_trace.logger.name):
+def test_in_scope_hop_reaches_the_operator_without_faking_severity(caplog):
+    """The proof still reaches the terminal -- by AUDIENCE, not by severity.
+
+    Replaces `test_warning_level_so_it_survives_silent_boot`, which pinned
+    the workaround rather than the requirement. The requirement is that a
+    soak operator sees the five ordered hops; WARNING was merely the only
+    lever that existed before `silent_boot.operator_extra`. Asserting the
+    old lever would forbid ever fixing the 376-line-per-session cost of it.
+    """
+    with caplog.at_level(logging.DEBUG, logger=a1_trace.logger.name):
         a1_trace.a1trace("emit", "g-1")
     assert caplog.records, "no record emitted"
-    assert all(r.levelno >= logging.WARNING for r in caplog.records)
+    rec = caplog.records[-1]
+    assert rec.getMessage() == "[A1Trace] emit goal=g-1"
+    # Honest severity ...
+    assert rec.levelno == logging.INFO
+    # ... and an explicit audience decision that carries it to the terminal.
+    assert getattr(rec, "operator", False) is True
+
+
+def test_out_of_scope_hop_is_not_promoted_to_the_operator(caplog):
+    """A sensor op must not spend the operator's attention.
+
+    188 `[A1Trace][emit-probe] MISSING ... source=non-roadmap` lines in one
+    session is the measurement this whole change answers.
+    """
+    a1_trace._emit_ledger.clear()
+    with caplog.at_level(logging.DEBUG, logger=a1_trace.logger.name):
+        a1_trace.a1trace("ingest", "op-sensor-42")
+    rec = caplog.records[-1]
+    assert rec.levelno == logging.DEBUG
+    assert getattr(rec, "operator", False) is False
+
+
+def test_scope_never_narrows_when_the_ledger_cannot_answer(monkeypatch, caplog):
+    """Probe OFF means no oracle -- and no oracle must not mean silence.
+
+    `emit_probe` returns early when its flag is off, so `_emit_ledger` stays
+    empty forever. A scope test that trusted an empty ledger would demote the
+    ENTIRE proof to DEBUG in exactly the configuration where someone had
+    already turned half the instrument off.
+    """
+    monkeypatch.setenv("JARVIS_A1_EMIT_PROBE_ENABLED", "false")
+    a1_trace._emit_ledger.clear()
+    with caplog.at_level(logging.DEBUG, logger=a1_trace.logger.name):
+        a1_trace.a1trace("accept", "g-unknown")
+    rec = caplog.records[-1]
+    assert rec.levelno == logging.INFO
+    assert getattr(rec, "operator", False) is True
 
 
 def test_gated_off_is_silent(caplog, monkeypatch):
     monkeypatch.setenv("JARVIS_A1_TRACE_ENABLED", "false")
-    with caplog.at_level(logging.WARNING, logger=a1_trace.logger.name):
+    with caplog.at_level(logging.DEBUG, logger=a1_trace.logger.name):
         a1_trace.a1trace("dequeue", "g-9")
     assert not caplog.records
 
 
 def test_none_kwargs_skipped(caplog):
-    with caplog.at_level(logging.WARNING, logger=a1_trace.logger.name):
+    with caplog.at_level(logging.DEBUG, logger=a1_trace.logger.name):
         a1_trace.a1trace("submit", "g-7", phase=None, target="GLS")
     msg = caplog.records[-1].getMessage()
     assert "phase=" not in msg

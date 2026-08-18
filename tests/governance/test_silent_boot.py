@@ -205,7 +205,7 @@ class TestTerminalHandler:
             and getattr(h, sb._HANDLER_MARKER, False)
         ]
         assert len(terminal_handlers) == 1
-        assert terminal_handlers[0].level == logging.WARNING
+        assert sb.terminal_threshold_of(terminal_handlers[0]) == logging.WARNING
 
     def test_terminal_threshold_kwarg_overrides(
         self, fresh_registry, session_dir,
@@ -220,7 +220,7 @@ class TestTerminalHandler:
             and not isinstance(h, logging.FileHandler)
             and getattr(h, sb._HANDLER_MARKER, False)
         ]
-        assert terminal_handlers[0].level == logging.ERROR
+        assert sb.terminal_threshold_of(terminal_handlers[0]) == logging.ERROR
 
 
 # ---------------------------------------------------------------------------

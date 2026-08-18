@@ -85,6 +85,62 @@ def _emit_ledger_size() -> int:
     return len(_emit_ledger)
 
 
+def _operator_extra() -> "Optional[Dict[str, Any]]":
+    """``extra=`` that puts a record on the operator terminal at its TRUE level.
+
+    Lazy + fail-soft so this module still imports with nothing else present
+    (the "stdlib only" constraint in the docstring is about import time, and
+    this keeps it). If the logging authority is unavailable the line simply
+    goes to ``debug.log`` -- the auditor's sink -- which is a degradation of
+    visibility, never of evidence.
+    """
+    try:
+        from backend.core.ouroboros.governance.silent_boot import (  # noqa: PLC0415
+            operator_extra,
+        )
+        return operator_extra()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _in_proof_scope(hop: str, goal_id: Any) -> bool:
+    """Is this hop part of the A1 milestone proof?
+
+    THE PROOF IS ABOUT ONE THING: a strategic GOAL emitted by the roadmap
+    orchestrator, followed across five hops. Sensor ops -- TestFailure,
+    TodoScanner, DocStaleness, the other thirteen -- travel the same pipe and
+    are not what the proof is about. The probe below already KNOWS this: when
+    a goal has no emit record it prints ``source=non-roadmap (ingest without
+    prior emit -- sensor/non-roadmap source?)``. It then logged that at
+    WARNING 188 times in one session, which is the instrument reporting, very
+    loudly, that it is looking at something outside its own scope.
+
+    So scope is read from the ledger rather than asserted: a goal the roadmap
+    emitted is in, anything else is out. The ``emit`` hop is in by definition
+    -- it is the hop that CREATES the record, and asking the ledger about a
+    goal it is in the act of recording would be a race, not a check.
+
+    Dynamic on purpose: nothing here enumerates sensors. A new signal source
+    needs no edit, and the roadmap remains the only thing that widens scope.
+    """
+    if str(hop) == "emit":
+        return True
+    # THE LEDGER IS ONLY AN ORACLE WHILE IT IS BEING WRITTEN. `emit_probe`
+    # returns early when the probe flag is off, so with the probe disabled
+    # `_emit_ledger` stays permanently empty -- and a scope test that reads an
+    # empty ledger would answer "out of scope" for EVERY hop, silently demoting
+    # the entire five-line proof to DEBUG and taking the milestone evidence off
+    # the operator's terminal. The instrument would go quiet in exactly the
+    # configuration where someone had turned part of it off, which is the
+    # worst possible time to lose it. No oracle -> no narrowing.
+    try:
+        if not emit_probe_enabled():
+            return True
+        return str(goal_id) in _emit_ledger
+    except Exception:  # noqa: BLE001
+        return True  # unknown -> keep it loud; never silence by accident
+
+
 def emit_probe(goal_id: Any, *, source: str = "?") -> None:
     """Record the emit hop for *goal_id* and log a structured probe line.
 
@@ -102,10 +158,12 @@ def emit_probe(goal_id: Any, *, source: str = "?") -> None:
         while len(_emit_ledger) > _EMIT_LEDGER_MAX:
             _emit_ledger.popitem(last=False)
         orch = _roadmap_enabled_repr()
-        logger.warning(
+        _x = _operator_extra()
+        logger.log(
+            logging.INFO if _x else logging.WARNING,
             "[A1Trace][emit-probe] EMIT goal=%s source=%s emit_ts=%.6f "
             "orchestrator_enabled=%s",
-            gid, source, ts, orch,
+            gid, source, ts, orch, extra=_x,
         )
     except Exception:  # noqa: BLE001 — a probe must never break a hop
         pass
@@ -147,10 +205,12 @@ def restore_emit_record(goal_id: Any, *, source: str,
         a1trace("emit", gid, source=source, lineage="resumed",
                 original_emit_wall=original_emit_wall)
         # The origin-witness probe line (auditor's _EMIT_PROBE_SOURCE_RE).
-        logger.warning(
+        _x = _operator_extra()
+        logger.log(
+            logging.INFO if _x else logging.WARNING,
             "[A1Trace][emit-probe] EMIT goal=%s source=%s emit_ts=%.6f "
             "orchestrator_enabled=%s lineage=resumed",
-            gid, source, ts, _roadmap_enabled_repr(),
+            gid, source, ts, _roadmap_enabled_repr(), extra=_x,
         )
     except Exception:  # noqa: BLE001 — a probe must never break a hop
         pass
@@ -173,7 +233,13 @@ def probe_ingest_order(goal_id: Any) -> None:
         ingest_ts = time.monotonic()
         record = _emit_ledger.get(gid)
         if record is None:
-            logger.warning(
+            # By construction this is a non-roadmap goal: no emit record
+            # exists because no roadmap emit happened. That is the normal
+            # state for all sixteen sensors, not a warning about anything.
+            # DEBUG keeps it in `debug.log`, where `parse_emit_probe_source`
+            # reads it as a secondary origin witness (the file handler runs
+            # at DEBUG, so the witness is preserved byte-for-byte).
+            logger.debug(
                 "[A1Trace][emit-probe] MISSING goal=%s emit_ts=MISSING "
                 "ingest_ts=%.6f ordered=False source=non-roadmap "
                 "(ingest without prior emit -- sensor/non-roadmap source?)",
@@ -182,10 +248,13 @@ def probe_ingest_order(goal_id: Any) -> None:
             return
         emit_ts, source = record
         ordered = emit_ts <= ingest_ts
-        logger.warning(
+        # A record EXISTS, so the roadmap emitted this goal: in scope.
+        _x = _operator_extra()
+        logger.log(
+            logging.INFO if _x else logging.WARNING,
             "[A1Trace][emit-probe] goal=%s emit_ts=%.6f ingest_ts=%.6f "
             "ordered=%s source=%s",
-            gid, emit_ts, ingest_ts, ordered, source,
+            gid, emit_ts, ingest_ts, ordered, source, extra=_x,
         )
     except Exception:  # noqa: BLE001 — a probe must never break a hop
         pass
@@ -210,6 +279,18 @@ def a1trace(hop: str, goal_id: Any, **kw: Any) -> None:
         )
         if extra:
             msg = f"{msg} {extra}"
-        logger.warning(msg)
+        # Severity tells the truth; the `operator` extra carries the audience.
+        # In-scope hops still reach the soak operator's terminal -- and now
+        # reach the COCKPIT operator too, which WARNING never did once
+        # `_resolve_terminal_threshold` raised that mode to ERROR precisely
+        # BECAUSE of chatter like this. Out-of-scope sensor hops drop to DEBUG
+        # and remain in `debug.log` at full fidelity, so every auditor that
+        # parses `[A1Trace]` (all of them level-agnostic, keyed on the tag)
+        # sees exactly what it saw before.
+        if _in_proof_scope(hop, goal_id):
+            _x = _operator_extra()
+            logger.info(msg, extra=_x) if _x else logger.warning(msg)
+        else:
+            logger.debug(msg)
     except Exception:  # noqa: BLE001 — a breadcrumb must never break a hop
         pass

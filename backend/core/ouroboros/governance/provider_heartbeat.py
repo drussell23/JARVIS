@@ -149,6 +149,41 @@ class AegisConfigurationError(RuntimeError):
     DW outage. Freezes the heartbeat + routes to the DLQ; never awakens."""
 
 
+class ProviderFundingRequired(RuntimeError):
+    """The data plane answered, and refused to serve until the account is paid.
+
+    A SEPARATE CLASS FROM AN OUTAGE, because the remedies are disjoint and the
+    failover controller acts on the difference. An outage means "this plane is
+    unreachable, stand up another one". HTTP 402 means the plane is reachable,
+    healthy, and declining to work for free -- a condition no amount of
+    infrastructure resolves.
+
+    MEASURED (bt-2026-08-18-021438): the deep probe took 402 down the generic
+    `-> outage degrade` path, the drop streak reached **7,619**, and the
+    lifecycle fired 125 awaken triggers -- 23 of them `HARD OUTAGE escalation
+    ... FORCED AWAKEN` -- against a billing failure. Nothing was provisioned
+    only because `JARVIS_FAILOVER_VM_ORCHESTRATION_HOLD` happened to be set;
+    the guard standing between a payment error and a GCE bill was one env var
+    that nothing in the classification path knows about.
+
+    Raising this instead composes the Safety Law that ALREADY exists for
+    401/403: `beat()` freezes, `consecutive_failures()` and `is_degrading()`
+    both report 0 by construction, and `_hard_outage_confirmed()` can never
+    fire. The breaker is not new machinery -- it is the correct classification
+    reaching machinery that was always there.
+    """
+
+
+class ProviderThrottled(RuntimeError):
+    """The plane is healthy and rate-limiting us (HTTP 429).
+
+    Neither an outage nor a funding stop: it is the provider working, saying
+    "slower". It must not degrade (a VM does not fix a rate limit) and must
+    not freeze (it clears on its own), so it records NO verdict and retries --
+    the same "no information either way" treatment a pre-dispatch skip gets.
+    """
+
+
 class ProbeAuthUnavailable(RuntimeError):
     """The probe could not ASSEMBLE complete credentials, so it never dispatched.
 
@@ -170,6 +205,32 @@ class ProbeAuthUnavailable(RuntimeError):
     """
 
 
+#: Status codes per class. Defaults are a FLOOR that the environment extends
+#: and cannot empty -- a classifier an env var could narrow to nothing is a
+#: classifier a typo silently turns back into "everything is an outage",
+#: which is the state this section exists to leave.
+_DEFAULT_AUTH_CODES = (401, 403)
+_DEFAULT_FUNDING_CODES = (402,)
+_DEFAULT_THROTTLE_CODES = (429,)
+_ENV_AUTH_CODES = "JARVIS_PROBE_AUTH_HTTP_CODES"
+_ENV_FUNDING_CODES = "JARVIS_PROBE_FUNDING_HTTP_CODES"
+_ENV_THROTTLE_CODES = "JARVIS_PROBE_THROTTLE_HTTP_CODES"
+
+
+def _http_codes(env_var: str, defaults: "tuple") -> "frozenset":
+    """Defaults plus any the operator adds. NEVER raises, never returns fewer."""
+    out = set(defaults)
+    try:
+        raw = str(os.environ.get(env_var, "") or "")
+        for piece in raw.replace(",", " ").split():
+            piece = piece.strip()
+            if piece.isdigit():
+                out.add(int(piece))
+    except Exception:  # noqa: BLE001
+        pass
+    return frozenset(out)
+
+
 def _classify_probe_exception(exc: BaseException) -> str:
     """Classify a probe failure as ``"transient"`` (credentials unavailable --
     never dispatched, no information either way), ``"auth"`` (401/403 -- config
@@ -182,8 +243,12 @@ def _classify_probe_exception(exc: BaseException) -> str:
         import urllib.error  # noqa: PLC0415
         if isinstance(exc, urllib.error.HTTPError):
             code = int(getattr(exc, "code", 0))
-            if code in (401, 403):
+            if code in _http_codes(_ENV_AUTH_CODES, _DEFAULT_AUTH_CODES):
                 return "auth"
+            if code in _http_codes(_ENV_FUNDING_CODES, _DEFAULT_FUNDING_CODES):
+                return "funding"
+            if code in _http_codes(_ENV_THROTTLE_CODES, _DEFAULT_THROTTLE_CODES):
+                return "throttled"
             return "outage"
     except Exception:  # noqa: BLE001
         pass
@@ -681,6 +746,16 @@ class DWHeartbeat:
                 raise AegisConfigurationError(
                     "deep probe auth failure (config error, NOT outage): %r" % (exc,)
                 ) from exc
+            if _cls == "funding":
+                # Same law, different cause: reachable plane, unpaid account.
+                raise ProviderFundingRequired(
+                    "deep probe refused for payment (NOT outage): %r" % (exc,)
+                ) from exc
+            if _cls == "throttled":
+                # Healthy plane asking for less traffic. No verdict either way.
+                raise ProviderThrottled(
+                    "deep probe rate-limited (NOT outage): %r" % (exc,)
+                ) from exc
             logger.debug("[DWHeartbeat] deep probe dispatch err=%r -> outage degrade", exc)
             return False
         ok = bool(result) and bool(str(result).strip())
@@ -702,6 +777,42 @@ class DWHeartbeat:
             self._dlq_emit_fn(payload)
         except Exception as exc2:  # noqa: BLE001 -- telemetry never blocks
             logger.debug("[DWHeartbeat] config DLQ emit fail-soft err=%r", exc2)
+
+    def _emit_funding_required(self, exc: BaseException) -> None:
+        """Route a funding stop to the DLQ **and** to the operator's cockpit.
+
+        Two sinks because they answer different questions. The DLQ is the
+        durable record an auditor reads afterwards; the SSE frame is what
+        tells the person sitting in front of the cockpit RIGHT NOW that the
+        organism has stopped for a reason they can fix in a browser tab.
+        Without the second one this state is indistinguishable from the
+        organism being idle -- which is how a soak burns an evening producing
+        `0 done / 12 failed / $0.00` while looking busy. Fail-soft: telemetry
+        never blocks, and the CRITICAL log above is the floor if both sinks
+        are unavailable."""
+        payload = {
+            "event": "provider_funding_required",
+            "error_class": "ProviderFundingRequired",
+            "surface": self._SURFACE.value,
+            "detail": str(exc)[:300],
+            "action": "heartbeat_frozen",
+            "remedy": "billing",
+            "note": (
+                "reachable plane, unpaid account -- NOT an outage; never "
+                "awakens J-Prime, never provisions an instance"
+            ),
+        }
+        try:
+            self._dlq_emit_fn(payload)
+        except Exception as exc2:  # noqa: BLE001 -- telemetry never blocks
+            logger.debug("[DWHeartbeat] funding DLQ emit fail-soft err=%r", exc2)
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: PLC0415
+                publish_provider_funding_required,
+            )
+            publish_provider_funding_required(payload)
+        except Exception as exc2:  # noqa: BLE001
+            logger.debug("[DWHeartbeat] funding SSE emit fail-soft err=%r", exc2)
 
     # ------------------------------------------------------------------
     # One probe + record (the testable core)
@@ -746,6 +857,37 @@ class DWHeartbeat:
                 "NOT awaken J-Prime. err=%r", exc,
             )
             self._emit_config_dlq(exc)
+            return
+        except ProviderFundingRequired as exc:
+            # THE SAFETY LAW, SECOND CAUSE. Composes the freeze above rather
+            # than adding a parallel breaker: `_frozen` already makes
+            # `consecutive_failures()` and `is_degrading()` return 0 by
+            # construction, which is what `_hard_outage_confirmed()` reads, so
+            # the awaken path is closed structurally and not by a second
+            # opinion that could disagree with the first. `run()`'s loop
+            # condition (`while not self._stopped and not self._frozen`) ends
+            # the retry storm in the same move.
+            self._frozen = True
+            self._healthy_streak = 0
+            logger.critical(
+                "[DWHeartbeat] PROVIDER FUNDING REQUIRED -- the data plane is "
+                "reachable and refusing to serve (HTTP 402). FREEZING "
+                "heartbeat; this is NOT an outage, will NOT awaken J-Prime, "
+                "and NO instance will be provisioned. Remedy is billing, not "
+                "infrastructure. err=%r", exc,
+            )
+            self._emit_funding_required(exc)
+            return
+        except ProviderThrottled as exc:
+            # No verdict: the plane is healthy and asked for less traffic.
+            # Recording a degrade here would walk the streak toward an awaken
+            # for a condition that clears itself.
+            self._transient_skips += 1
+            logger.info(
+                "[DWHeartbeat] probe THROTTLED (429) -- no freeze, no degrade, "
+                "no verdict recorded (skips=%d): %r",
+                self._transient_skips, exc,
+            )
             return
         except Exception as exc:  # noqa: BLE001 -- a non-auth probe error IS an outage
             logger.debug("[DWHeartbeat] probe raised (outage degrade) err=%r", exc)
