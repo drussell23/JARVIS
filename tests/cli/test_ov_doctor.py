@@ -95,22 +95,22 @@ def test_no_hydration_severs_edge3_and_skips_dependents():
 
 def test_exit_codes_and_first_broken_ordering():
     r = DoctorReport(verdicts=[
-        EdgeVerdict("1 process", EdgeState.OK),
-        EdgeVerdict("2 cockpit UDS", EdgeState.OK),
+        EdgeVerdict(ov_doctor.edge("process"), EdgeState.OK),
+        EdgeVerdict(ov_doctor.edge("cockpit"), EdgeState.OK),
     ])
     assert r.exit_code == 0 and r.first_broken is None
-    r.verdicts.append(EdgeVerdict("5 sensors", EdgeState.DEGRADED, "x"))
-    assert r.exit_code == 1 and r.first_broken.edge == "5 sensors"
-    r.verdicts.insert(1, EdgeVerdict("2 cockpit UDS", EdgeState.SEVERED, "y"))
+    r.verdicts.append(EdgeVerdict(ov_doctor.edge("sensors"), EdgeState.DEGRADED, "x"))
+    assert r.exit_code == 1 and r.first_broken.edge == ov_doctor.edge("sensors")
+    r.verdicts.insert(1, EdgeVerdict(ov_doctor.edge("cockpit"), EdgeState.SEVERED, "y"))
     assert r.exit_code == 2
-    assert r.first_broken.edge == "2 cockpit UDS"   # FIRST broken edge named
+    assert r.first_broken.edge == ov_doctor.edge("cockpit")   # FIRST broken edge named
 
 
 def test_absent_optional_surfaces_stay_green():
     """ABSENT (unconfigured MCP, no channel server) must not fail the chain."""
     r = DoctorReport(verdicts=[
-        EdgeVerdict("1 process", EdgeState.OK),
-        EdgeVerdict("8 mcp servers", EdgeState.ABSENT, "unset"),
+        EdgeVerdict(ov_doctor.edge("process"), EdgeState.OK),
+        EdgeVerdict(ov_doctor.edge("mcp"), EdgeState.ABSENT, "unset"),
     ])
     assert r.exit_code == 0
 
@@ -125,19 +125,19 @@ async def test_matrix_severed_socket_skips_uds_edges_probes_independents(
     monkeypatch,
 ):
     async def _proc():
-        return EdgeVerdict("1 process", EdgeState.SEVERED, "none")
+        return EdgeVerdict(ov_doctor.edge("process"), EdgeState.SEVERED, "none")
 
     async def _sock():
-        return EdgeVerdict("2 cockpit UDS", EdgeState.SEVERED, "absent"), "absent"
+        return EdgeVerdict(ov_doctor.edge("cockpit"), EdgeState.SEVERED, "absent"), "absent"
 
     async def _sensors():
-        return EdgeVerdict("5 sensors", EdgeState.ABSENT, "no server")
+        return EdgeVerdict(ov_doctor.edge("sensors"), EdgeState.ABSENT, "no server")
 
     async def _liveness():
-        return EdgeVerdict("7 liveness", EdgeState.ABSENT, "no server")
+        return EdgeVerdict(ov_doctor.edge("liveness"), EdgeState.ABSENT, "no server")
 
     async def _mcp():
-        return EdgeVerdict("8 mcp servers", EdgeState.ABSENT, "unset")
+        return EdgeVerdict(ov_doctor.edge("mcp"), EdgeState.ABSENT, "unset")
 
     monkeypatch.setattr(ov_doctor, "probe_edge_process", _proc)
     monkeypatch.setattr(ov_doctor, "probe_edge_socket", _sock)
@@ -145,13 +145,13 @@ async def test_matrix_severed_socket_skips_uds_edges_probes_independents(
     monkeypatch.setattr(ov_doctor, "probe_edge_liveness", _liveness)
     monkeypatch.setattr(ov_doctor, "probe_edge_mcp", _mcp)
     report = await ov_doctor.run_matrix()
-    assert len(report.verdicts) == 8
+    assert len(report.verdicts) == ov_doctor.edge_count()
     by_name = {v.edge: v for v in report.verdicts}
-    assert by_name["3 hydration"].state is EdgeState.SKIPPED
-    assert by_name["4 hive fabrics"].state is EdgeState.SKIPPED
-    assert by_name["6 providers"].state is EdgeState.SKIPPED
+    assert by_name[ov_doctor.edge("hydration")].state is EdgeState.SKIPPED
+    assert by_name[ov_doctor.edge("fabrics")].state is EdgeState.SKIPPED
+    assert by_name[ov_doctor.edge("providers")].state is EdgeState.SKIPPED
     assert report.exit_code == 2
-    assert report.first_broken.edge == "1 process"
+    assert report.first_broken.edge == ov_doctor.edge("process")
 
 
 @pytest.mark.asyncio
@@ -171,7 +171,7 @@ async def test_matrix_probes_independent_edges_concurrently(monkeypatch):
         return _p
 
     async def _sock():
-        return EdgeVerdict("2 cockpit UDS", EdgeState.OK, "served"), "live"
+        return EdgeVerdict(ov_doctor.edge("cockpit"), EdgeState.OK, "served"), "live"
 
     async def _hyd():
         active["n"] += 1
@@ -181,17 +181,17 @@ async def test_matrix_probes_independent_edges_concurrently(monkeypatch):
         return _payload()
 
     monkeypatch.setattr(ov_doctor, "probe_edge_process",
-                        _slow("1 process"))
+                        _slow(ov_doctor.edge("process")))
     monkeypatch.setattr(ov_doctor, "probe_edge_socket", _sock)
     monkeypatch.setattr(ov_doctor, "_read_hydration", _hyd)
-    monkeypatch.setattr(ov_doctor, "probe_edge_sensors", _slow("5 sensors"))
-    monkeypatch.setattr(ov_doctor, "probe_edge_liveness", _slow("7 liveness"))
-    monkeypatch.setattr(ov_doctor, "probe_edge_mcp", _slow("8 mcp servers"))
+    monkeypatch.setattr(ov_doctor, "probe_edge_sensors", _slow(ov_doctor.edge("sensors")))
+    monkeypatch.setattr(ov_doctor, "probe_edge_liveness", _slow(ov_doctor.edge("liveness")))
+    monkeypatch.setattr(ov_doctor, "probe_edge_mcp", _slow(ov_doctor.edge("mcp")))
 
     t0 = asyncio.get_running_loop().time()
     report = await ov_doctor.run_matrix()
     elapsed = asyncio.get_running_loop().time() - t0
-    assert len(report.verdicts) == 8
+    assert len(report.verdicts) == ov_doctor.edge_count()
     assert active["peak"] >= 3            # probes genuinely overlapped
     assert elapsed < DELAY * 4            # not sequential (4 slow probes)
 
@@ -271,7 +271,7 @@ def test_render_never_raises_on_minimal_console():
             pass
 
     ov_doctor.render_report(_C(), DoctorReport(verdicts=[
-        EdgeVerdict("1 process", EdgeState.OK, "pid 1")]))
+        EdgeVerdict(ov_doctor.edge("process"), EdgeState.OK, "pid 1")]))
 
 
 @pytest.mark.asyncio
@@ -311,8 +311,8 @@ def test_version_skew_synthesizer_names_the_remedy():
             lines.append(str(msg))
 
     ov_doctor.render_report(_C(), DoctorReport(verdicts=[
-        EdgeVerdict("1 process", EdgeState.OK, "pid 4765"),
-        EdgeVerdict("4 hive fabrics", EdgeState.DEGRADED,
+        EdgeVerdict(ov_doctor.edge("process"), EdgeState.OK, "pid 4765"),
+        EdgeVerdict(ov_doctor.edge("fabrics"), EdgeState.DEGRADED,
                     "no fabrics block (older daemon?)"),
         EdgeVerdict("9 live probe", EdgeState.SKIPPED,
                     "daemon predates /doctor probe"),
