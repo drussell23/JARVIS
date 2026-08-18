@@ -56,9 +56,13 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
+from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Set
+from typing import (
+    Any, Callable, Deque, Dict, List, Optional, Set, Tuple,
+)
 
 logger = logging.getLogger("Ouroboros.CockpitAttach")
 
@@ -298,6 +302,184 @@ def tool_activity_enabled() -> bool:
     ).strip().lower() in _TRUTHY
 
 
+def offline_backlog_enabled() -> bool:
+    """Master gate for retaining render frames emitted with NO cockpit attached.
+
+    Default ON. OFF is byte-identical to the pre-backlog behaviour: frames
+    emitted to an empty audience are dropped exactly as before."""
+    return os.environ.get(
+        "JARVIS_ATTACH_OFFLINE_BACKLOG_ENABLED", "1",
+    ).strip().lower() in _TRUTHY
+
+
+def _backlog_size() -> int:
+    """How many unheard frames to retain. Env ``JARVIS_ATTACH_BACKLOG_SIZE``.
+
+    A ring, not a buffer: the organism is long-lived and may run unattended
+    for hours, so this is sized to "what an operator can usefully read on
+    reattach", never to "everything that happened". Overflow is COUNTED, per
+    the no-silent-caps discipline -- a truncated backlog that presented itself
+    as complete would be a receipt for work it did not show."""
+    try:
+        return max(1, min(10000, int(
+            os.environ.get("JARVIS_ATTACH_BACKLOG_SIZE", "200"),
+        )))
+    except Exception:  # noqa: BLE001
+        return 200
+
+
+def _backlog_ttl_s() -> float:
+    """Age past which a retained frame is no longer worth showing.
+
+    Env ``JARVIS_ATTACH_BACKLOG_TTL_S``, default 1800 (30 min); ``0``
+    disables ageing. Render frames describe what the organism was doing at a
+    MOMENT. Replaying six-hour-old tool activity into a fresh cockpit would
+    paint history as present tense -- the same class of dishonesty as a
+    cached blast radius reported as a live measurement."""
+    try:
+        return max(0.0, float(
+            os.environ.get("JARVIS_ATTACH_BACKLOG_TTL_S", "1800"),
+        ))
+    except Exception:  # noqa: BLE001
+        return 1800.0
+
+
+class _OfflineBacklog:
+    """Render frames emitted while nobody was listening.
+
+    THE DEFECT THIS CLOSES
+    ----------------------
+    ``publish_line`` / ``publish_markup`` both open with ``if not
+    self._clients: return``. That is correct about the socket -- there is
+    nobody to write to -- and wrong about the ORGANISM, which went on
+    working. Every ``Update(path)`` block, every tool result, every diff
+    produced while the operator was detached was composed, formatted, and
+    discarded. Reattaching then showed an idle-looking cockpit for a session
+    that had been busy, which is indistinguishable from the organism having
+    done nothing.
+
+    WHAT IS RETAINED, AND WHAT IS DELIBERATELY NOT
+    ---------------------------------------------
+    * **Only the two RENDER channels.** The other ~9 ``not self._clients``
+      early returns in this module are control-plane (pending prompts, audio
+      state, autonomy holds, telemetry). A prompt frame replayed after its
+      gate resolved would offer the operator a decision that no longer
+      exists; ``focus_shield`` owns that lifecycle and has its own queue.
+      Retention here would be a second, disagreeing opinion about a live FSM.
+
+    * **Only AMBIENT frames.** A frame emitted under a session ContextVar is
+      one cockpit's private verb output. Its asker is gone, and session ids
+      are per-run, so replaying it to whoever attaches next paints someone
+      else's ``/posture status`` into a stranger's scrollback -- precisely
+      what ``_broadcast``'s addressing exists to prevent, arriving through a
+      new door. Ambient output has no owner and is everyone's business,
+      which is exactly what makes it safe to replay.
+
+    * **Only while the audience is EMPTY.** Retention stops the moment a
+      cockpit attaches. A second cockpit attaching later is joining a live
+      session, not recovering a gap, so it correctly sees nothing.
+
+    TWO-PHASE DRAIN
+    ---------------
+    :meth:`peek` then :meth:`commit`. The flush happens mid-handshake, and a
+    client whose socket breaks during it never saw a byte; clearing the ring
+    on read would destroy the backlog on behalf of a cockpit that failed to
+    receive it. So nothing is discarded until the write is known to have
+    landed.
+
+    Thread-safe: producers call from arbitrary threads (the publishers hop to
+    the loop only AFTER this point), the drain runs on the loop.
+    """
+
+    __slots__ = ("_frames", "_lock", "retained", "overflowed",
+                 "replayed", "dropped_stale")
+
+    def __init__(self) -> None:
+        self._frames: Deque[Tuple[float, Dict[str, Any]]] = deque(
+            maxlen=_backlog_size(),
+        )
+        self._lock = threading.Lock()
+        self.retained = 0
+        self.overflowed = 0
+        self.replayed = 0
+        self.dropped_stale = 0
+
+    def _evict_stale(self, now: float) -> None:
+        """Drop aged frames from the front. Caller holds the lock."""
+        ttl = _backlog_ttl_s()
+        if ttl <= 0.0:
+            return
+        cutoff = now - ttl
+        while self._frames and self._frames[0][0] < cutoff:
+            self._frames.popleft()
+            self.dropped_stale += 1
+
+    def retain(self, msg: Dict[str, Any]) -> None:
+        """Record one unheard frame. NEVER raises."""
+        try:
+            now = time.time()
+            with self._lock:
+                # `maxlen` silently discards the oldest, so overflow is
+                # detected by watching the ring sit at capacity rather than by
+                # trusting append to tell us. Counted, never silent.
+                if (self._frames.maxlen is not None
+                        and len(self._frames) == self._frames.maxlen):
+                    self.overflowed += 1
+                self._frames.append((now, msg))
+                self.retained += 1
+                self._evict_stale(now)
+        except Exception:  # noqa: BLE001 — retention must never break a publish
+            pass
+
+    def peek(self) -> List[Dict[str, Any]]:
+        """Frames to replay, oldest first. Does NOT consume. NEVER raises."""
+        try:
+            now = time.time()
+            with self._lock:
+                self._evict_stale(now)
+                out = []
+                for ts, msg in self._frames:
+                    frame = dict(msg)
+                    # Honest provenance: this is history, and it carries the
+                    # moment it happened rather than the moment it was
+                    # replayed. A client that stamped `ts` at receipt would
+                    # date an hour-old diff to now.
+                    frame["backlogged"] = True
+                    frame["ts"] = ts
+                    frame["addressed"] = False
+                    out.append(frame)
+                return out
+        except Exception:  # noqa: BLE001
+            return []
+
+    def commit(self, count: int) -> None:
+        """Discard the *count* frames a client has now provably received."""
+        try:
+            with self._lock:
+                for _ in range(max(0, int(count))):
+                    if not self._frames:
+                        break
+                    self._frames.popleft()
+                    self.replayed += 1
+        except Exception:  # noqa: BLE001
+            pass
+
+    def snapshot(self) -> Dict[str, int]:
+        """Counters for `/doctor` and the bridge stats. NEVER raises."""
+        try:
+            with self._lock:
+                pending = len(self._frames)
+        except Exception:  # noqa: BLE001
+            pending = 0
+        return {
+            "backlog_pending": pending,
+            "backlog_retained": self.retained,
+            "backlog_replayed": self.replayed,
+            "backlog_overflowed": self.overflowed,
+            "backlog_dropped_stale": self.dropped_stale,
+        }
+
+
 def _sentinel_interval_s() -> float:
     """Socket self-heal cadence (0 disables). The bridge binds once at
     boot; if ANY confused peer unlinks the inode (a CLI misclassifying
@@ -384,6 +566,10 @@ class CockpitAttachBridge:
         self._server: Optional[asyncio.AbstractServer] = None
         self._sentinel_task: Optional[asyncio.Task] = None
         self._clients: Set[asyncio.StreamWriter] = set()
+        #: Render frames composed while `_clients` was empty. The organism
+        #: does not stop working when the operator closes a terminal; before
+        #: this, everything it rendered in that window was discarded.
+        self._backlog = _OfflineBacklog()
         #: session_id → that cockpit's writer. Populated from the session
         #: field on inbound frames; entries are removed by _drop so a
         #: detached cockpit can never be addressed.
@@ -519,6 +705,18 @@ class CockpitAttachBridge:
     def client_count(self) -> int:
         return len(self._clients)
 
+    def backlog_stats(self) -> Dict[str, int]:
+        """Counters for the offline render backlog. NEVER raises.
+
+        Separate from ``self.stats`` because those are lifetime totals that
+        several call sites increment in place, while these are owned entirely
+        by the ring and include a LIVE gauge (`backlog_pending`) that would be
+        wrong the moment it were copied into a totals dict."""
+        try:
+            return self._backlog.snapshot()
+        except Exception:  # noqa: BLE001
+            return {}
+
     def _publish_presence(self) -> None:
         """Republish operator attention from the ONE authority for it —
         ``_clients`` — to the process-wide ledger that gates operator
@@ -567,15 +765,45 @@ class CockpitAttachBridge:
 
     # ---- publish (the harness _repl_print mirror) ----
 
+    def _retain_unheard(self, msg: Dict[str, Any]) -> None:
+        """Capture one render frame nobody was there to receive.
+
+        ONE seam for both render channels so the retention rule cannot drift
+        between them -- the two publishers already differ in escaping policy
+        and that is exactly the kind of divergence that produced a palette
+        fixed on one surface and dead on the other.
+
+        Ambience is resolved through ``attach_session.current_session()``, the
+        SAME call ``_broadcast`` uses to address a frame. Reading the session
+        a second way here would mean two opinions about who owns a line, and
+        the one that decides retention would be invisible."""
+        if not offline_backlog_enabled():
+            return
+        try:
+            from backend.core.ouroboros.battle_test.attach_session import (
+                current_session,
+            )
+            if current_session() is not None:
+                # Addressed output: it belongs to a cockpit that has gone, and
+                # session ids do not survive a reattach. Replaying it would
+                # put one operator's verb answer in another's scrollback.
+                return
+        except Exception:  # noqa: BLE001 — unresolvable ownership -> do not retain
+            return
+        self._backlog.retain(msg)
+
     def publish_line(self, text: str) -> None:
         """Broadcast one (already router-conformed) line to every
         attached terminal. Strictly non-blocking; per-client fail-drop
         (BrokenPipe/ConnectionReset = subscriber gone, organism
         unbothered). Thread-safe. NEVER raises."""
         try:
-            if not self._clients:
-                return
             msg = {"type": "line", "text": str(text), "ts": time.time()}
+            if not self._clients:
+                # Composed, and nobody to receive it. Retained rather than
+                # dropped -- see `_OfflineBacklog`.
+                self._retain_unheard(msg)
+                return
             self.stats["lines_published"] += 1
             loop = self._loop
             if loop is None or loop.is_closed():
@@ -608,11 +836,18 @@ class CockpitAttachBridge:
         broadcasts, which is right for AMBIENT output, since an autonomous
         operation belongs to no one and is everyone's business."""
         try:
-            if not self._clients or not tool_activity_enabled():
+            if not tool_activity_enabled():
+                # The CHANNEL is off. Not an empty audience -- retaining here
+                # would replay frames the operator disabled, so a kill switch
+                # would become a delay.
                 return
             msg = {"type": "markup", "text": str(text), "ts": time.time()}
             if session:
                 msg["session"] = session
+            if not self._clients:
+                if not session:
+                    self._retain_unheard(msg)
+                return
             self.stats["markup_published"] = (
                 self.stats.get("markup_published", 0) + 1
             )
@@ -1278,6 +1513,43 @@ class CockpitAttachBridge:
                 return
             except Exception:  # noqa: BLE001
                 pass
+            # The render backlog rides the SAME pre-join flush, immediately
+            # after the control-plane replay above. Two ordered groups rather
+            # than one timestamp-merged stream: they are different planes, the
+            # existing contract already promises telemetry-before-live, and
+            # merging would have to invent an ordering for `_replay()` frames
+            # that carry no comparable clock.
+            #
+            # Placement before `_clients.add(writer)` is what makes "history
+            # always precedes live" true for this channel too -- a frame
+            # published a microsecond later goes to the live set, and the
+            # backlog is already on the wire ahead of it.
+            _backlog_frames: List[Dict[str, Any]] = []
+            try:
+                _backlog_frames = self._backlog.peek()
+                for frame in _backlog_frames:
+                    writer.write((json.dumps(frame, separators=(",", ":"))
+                                  + "\n").encode())
+                await writer.drain()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                # The socket died mid-flush: this cockpit received nothing we
+                # can rely on. NOT committed -- the next attach still gets the
+                # backlog, because a client that failed to read it must not be
+                # able to destroy it on everyone else's behalf.
+                self._drop(writer)
+                return
+            except Exception:  # noqa: BLE001
+                _backlog_frames = []
+            else:
+                # Provably on the wire -> discard exactly what was sent.
+                # Counted by length rather than cleared wholesale, so a frame
+                # retained DURING the flush survives to the next attach.
+                if _backlog_frames:
+                    self._backlog.commit(len(_backlog_frames))
+                    logger.info(
+                        "[CockpitAttach] replayed %d unheard render frame(s) "
+                        "to a reattaching cockpit", len(_backlog_frames),
+                    )
             self._clients.add(writer)
             # Attention begins where hydration LANDED, not where the
             # socket connected: a client that never received the payload
