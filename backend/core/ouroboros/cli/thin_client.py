@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import plistlib
 import random
@@ -48,6 +49,16 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+#: THE MODULE USED THIS AND NEVER DEFINED IT.
+#:
+#: `spawn_daemon` has called `logger.debug(...)` since 2026-08-08 (#70440)
+#: while `logging` was not imported and no `logger` existed. Every ignition
+#: therefore raised `NameError: name 'logger' is not defined`, its blanket
+#: `except Exception: return None` swallowed it, and `ensure_daemon` reported
+#: "⚠ ignition failed" -- so bare `ov` could not cold-boot the organism at
+#: all for ten days. Stdlib only, per the import-isolation mandate above.
+logger = logging.getLogger("Ouroboros.ThinClient")
 
 _TRUTHY = ("1", "true", "yes", "on")
 
@@ -414,7 +425,17 @@ def spawn_daemon(
                 env=env,
             )
         return proc if getattr(proc, "pid", None) is not None else None
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — ignition must never raise at the caller
+        # exc_info is load-bearing, not decoration. Returning a bare None here
+        # turns EVERY failure -- a missing binary, an unwritable log, a typo in
+        # this function -- into the single operator-facing sentence "ignition
+        # failed", which names no cause and cannot be acted on. That is how a
+        # NameError on the line above survived ten days and every CI run: the
+        # only symptom was a cockpit that would not start.
+        logger.warning(
+            "[ov] ignition failed before the daemon was spawned — see %s",
+            daemon_log_path(), exc_info=True,
+        )
         return None
 
 
