@@ -1,19 +1,15 @@
-"""``ov doctor`` — the 8-edge full-chain connectivity matrix (Slice B/C).
+"""``ov doctor`` — the full-chain connectivity matrix (Slice B/C).
 
 Every edge is asserted with the SAME probe its real consumer uses (the
-Slice-A law: no probe may be weaker than the contract it vouches for):
+Slice-A law: no probe may be weaker than the contract it vouches for).
 
-  1 process   — an organism process exists (pgrep, bounded)
-  2 cockpit   — thin_client.probe_socket(deep=True): SERVING means the
-                hydration frame is actually served, not merely accepted
-  3 hydration — the frame parses; subsystem states read from it
-  4 fabrics   — hive aggregator attachment (trinity/sse/emitter) from the
-                hydration ``fabrics`` block (daemon-side pull provider)
-  5 sensors   — GET /channel/health (EventChannelServer)
-  6 providers — hydration ``liquidity`` block (DW=tokens lane, Claude=time
-                lane, J-Prime=sovereignty lane)
-  7 liveness  — GET /observability/liveness (Gap 2: static ∩ runtime)
-  8 mcp       — JARVIS_MCP_CONFIG declared servers (NEVER executed)
+**The edge set is declared in :data:`EDGES`, and that declaration is the
+only place it is written down.** This docstring used to enumerate the edges
+and call the matrix "8-edge"; ``probe_edge_compute`` was added as edge 9 and
+this text kept saying eight, while two tests kept asserting eight and failed
+on ``main`` for days. Prose that restates a data structure is prose that
+will eventually contradict it, so the per-edge summaries now live on
+:class:`EdgeSpec` where the code can read them too.
 
 Structure (mandate 1): edges 1+2 gate the chain; everything downstream
 that is structurally independent (hydration-read, channel-health,
@@ -38,6 +34,135 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+
+@dataclass(frozen=True)
+class EdgeSpec:
+    """One edge of the connectivity matrix, declared once.
+
+    ``number`` is the operator-facing position, ``key`` the stable
+    identifier code refers to, ``summary`` the one-line explanation that
+    used to live in this module's docstring. Keeping the prose here is the
+    point: a description parked in a docstring is a fifth place that claims
+    to know the edge set, and it was already wrong."""
+
+    number: int
+    key: str
+    name: str
+    summary: str
+    #: True for edges that only exist under an opt-in flag. They are
+    #: declared here so they get a NUMBER from the same sequence as
+    #: everything else -- which is exactly what the live probe did not have.
+    optional: bool = False
+
+    @property
+    def label(self) -> str:
+        """The rendered edge label -- DERIVED, never spelled twice."""
+        return f"{self.number} {self.name}"
+
+
+#: THE declaration of the matrix. Ordered, and the order IS canonical.
+#:
+#: WHY THIS EXISTS
+#: ---------------
+#: `probe_edge_compute` was added as edge 9 and four separate places went on
+#: describing an 8-edge matrix: this module's own docstring ("the 8-edge
+#: full-chain connectivity matrix", enumerating 1-8), the hand-ordered list
+#: in `run_matrix`, and two tests asserting `len(report.verdicts) == 8`. The
+#: tests failed on `main` for days. Nothing was authoritative, so nothing
+#: could be updated.
+#:
+#: The edge's identity was also re-spelled at ~30 `EdgeVerdict(...)` call
+#: sites -- every return path of every probe repeating its own label -- so a
+#: rename could half-land and a typo would invent a tenth edge that renders
+#: once and matches nothing.
+#:
+#: Adding an edge is now ONE entry here. Ordering, cardinality, labels and
+#: the operator-facing prose all follow, and `test_edge_registry_is_the_only
+#: _source` pins that no call site may reintroduce a literal.
+EDGES: "Tuple[EdgeSpec, ...]" = (
+    EdgeSpec(1, "process", "process",
+             "an organism process exists (pgrep, bounded)"),
+    EdgeSpec(2, "cockpit", "cockpit UDS",
+             "thin_client.probe_socket(deep=True): SERVING means the "
+             "hydration frame is actually served, not merely accepted"),
+    EdgeSpec(3, "hydration", "hydration",
+             "the frame parses; subsystem states read from it"),
+    EdgeSpec(4, "fabrics", "hive fabrics",
+             "hive aggregator attachment (trinity/sse/emitter) from the "
+             "hydration ``fabrics`` block (daemon-side pull provider)"),
+    EdgeSpec(5, "sensors", "sensors",
+             "GET /channel/health (EventChannelServer)"),
+    EdgeSpec(6, "providers", "providers",
+             "hydration ``liquidity`` block (DW=tokens lane, Claude=time "
+             "lane, J-Prime=sovereignty lane)"),
+    EdgeSpec(7, "liveness", "liveness",
+             "GET /observability/liveness (Gap 2: static n runtime)"),
+    EdgeSpec(8, "mcp", "mcp servers",
+             "JARVIS_MCP_CONFIG declared servers (NEVER executed)"),
+    EdgeSpec(9, "compute", "compute",
+             "host compute topology -- socket-independent BY DESIGN, so a "
+             "machine the organism has never run on can still answer "
+             "'can this host load anything?'"),
+    # `--live` only. It was numbered 9 when 9 was free, `probe_edge_compute`
+    # later took 9 as well, and `run_doctor(live=True)` appends this verdict
+    # to the SAME report -- so an operator running `ov doctor --live` saw TWO
+    # rows numbered 9. Neither site could see the other; only a shared
+    # declaration can. Optional, so it is not part of `edge_count()`.
+    EdgeSpec(10, "live", "live probe",
+             "the trace-isolated synthetic web_search loop: tool execution "
+             "-> Step 2 emitter -> aggregator -> UDS, proven end to end",
+             optional=True),
+)
+
+#: The edges `run_matrix()` ALWAYS produces. `edge_count()` means this set,
+#: not `len(EDGES)`: an opt-in probe that inflated the expected cardinality
+#: would make every base-matrix assertion wrong by one.
+MATRIX_EDGES: "Tuple[EdgeSpec, ...]" = tuple(e for e in EDGES if not e.optional)
+
+_BY_KEY: "Dict[str, EdgeSpec]" = {e.key: e for e in EDGES}
+_ORDER: "Dict[str, int]" = {e.label: i for i, e in enumerate(EDGES)}
+
+
+def edge(key: str) -> str:
+    """The canonical label for *key*. NEVER raises.
+
+    An unknown key renders ``? <key>`` rather than raising or silently
+    inventing a plausible label: this module's contract is that no probe may
+    raise from a return path, and a diagnostic that fabricates an edge name
+    is worse than one that says it does not recognise it. The AST pin in the
+    test suite is what stops an unknown key from ever shipping."""
+    spec = _BY_KEY.get(str(key))
+    return spec.label if spec is not None else f"? {key}"
+
+
+def edge_count() -> int:
+    """How many edges `run_matrix()` produces. The number no test may hardcode.
+
+    Counts `MATRIX_EDGES`, so declaring a new opt-in probe never silently
+    changes what the base matrix is expected to contain."""
+    return len(MATRIX_EDGES)
+
+
+def order_verdicts(verdicts: "List[EdgeVerdict]") -> "List[EdgeVerdict]":
+    """Sort verdicts into canonical edge order. NEVER raises.
+
+    `run_matrix` used to achieve this by placing them in a hand-written list
+    under a `# canonical edge order: 3,4,5,6,7,8,9` comment -- correct, and
+    correct only for as long as someone reads the comment. Deriving the order
+    from the declaration means a new edge lands in the right place because of
+    where it was declared, not because of where it was appended.
+
+    Unrecognised labels sort last, in arrival order, so an edge this registry
+    has never heard of is still REPORTED. Dropping it would make the matrix
+    quietly lie about what it probed."""
+    try:
+        return sorted(
+            verdicts,
+            key=lambda v: (_ORDER.get(getattr(v, "edge", ""), len(EDGES)),),
+        )
+    except Exception:  # noqa: BLE001 -- ordering must never break a report
+        return list(verdicts)
 
 
 class EdgeState(str, enum.Enum):
@@ -124,12 +249,12 @@ async def probe_edge_process() -> EdgeVerdict:
             proc.communicate(), timeout=_edge_timeout_s())
         pids = [p for p in out.decode().split() if p.strip()]
         if pids:
-            return EdgeVerdict("1 process", EdgeState.OK,
+            return EdgeVerdict(edge("process"), EdgeState.OK,
                                f"pid {', '.join(pids[:3])}")
-        return EdgeVerdict("1 process", EdgeState.SEVERED,
+        return EdgeVerdict(edge("process"), EdgeState.SEVERED,
                            "no organism process")
     except Exception as exc:  # noqa: BLE001
-        return EdgeVerdict("1 process", EdgeState.DEGRADED,
+        return EdgeVerdict(edge("process"), EdgeState.DEGRADED,
                            f"probe error: {str(exc)[:60]}")
 
 
@@ -165,10 +290,10 @@ async def probe_edge_socket() -> Tuple[EdgeVerdict, str]:
             "absent": (EdgeState.SEVERED, "no socket"),
         }
         es, detail = mapping.get(state, (EdgeState.SEVERED, state))
-        return EdgeVerdict("2 cockpit UDS", es,
+        return EdgeVerdict(edge("cockpit"), es,
                            f"{detail} · {path}"), state
     except Exception as exc:  # noqa: BLE001
-        return EdgeVerdict("2 cockpit UDS", EdgeState.SEVERED,
+        return EdgeVerdict(edge("cockpit"), EdgeState.SEVERED,
                            f"probe error: {str(exc)[:60]}"), "error"
 
 
@@ -201,9 +326,9 @@ def _verdicts_from_hydration(
     """Edges 3, 4, 6 — all read from ONE hydration frame (one connect)."""
     if payload is None:
         return [
-            EdgeVerdict("3 hydration", EdgeState.SEVERED, "no frame served"),
-            EdgeVerdict("4 hive fabrics", EdgeState.SKIPPED, "no hydration"),
-            EdgeVerdict("6 providers", EdgeState.SKIPPED, "no hydration"),
+            EdgeVerdict(edge("hydration"), EdgeState.SEVERED, "no frame served"),
+            EdgeVerdict(edge("fabrics"), EdgeState.SKIPPED, "no hydration"),
+            EdgeVerdict(edge("providers"), EdgeState.SKIPPED, "no hydration"),
         ]
     out: List[EdgeVerdict] = []
     # 3 — hydration content
@@ -212,21 +337,21 @@ def _verdicts_from_hydration(
     subs = hyd.get("subsystems") or {}
     bad = [k for k, v in subs.items() if str(v) not in ("ok", "ready")]
     if payload.get("type") != "hydration":
-        out.append(EdgeVerdict("3 hydration", EdgeState.DEGRADED,
+        out.append(EdgeVerdict(edge("hydration"), EdgeState.DEGRADED,
                                f"unexpected first frame {payload.get('type')}"))
     elif bad:
-        out.append(EdgeVerdict("3 hydration", EdgeState.DEGRADED,
+        out.append(EdgeVerdict(edge("hydration"), EdgeState.DEGRADED,
                                "subsystems degraded: " + ", ".join(bad[:4])))
     else:
         loaded = hyd.get("loaded"), hyd.get("total")
         out.append(EdgeVerdict(
-            "3 hydration", EdgeState.OK,
+            edge("hydration"), EdgeState.OK,
             f"subsystems {loaded[0]}/{loaded[1]}" if loaded[0] is not None
             else "frame parsed"))
     # 4 — hive fabrics
     fab = payload.get("fabrics") or {}
     if not fab:
-        out.append(EdgeVerdict("4 hive fabrics", EdgeState.DEGRADED,
+        out.append(EdgeVerdict(edge("fabrics"), EdgeState.DEGRADED,
                                "no fabrics block (older daemon?)"))
     else:
         tsubs = int(fab.get("trinity_subs", 0) or 0)
@@ -236,20 +361,20 @@ def _verdicts_from_hydration(
                                    ("emitter", emitter)) if not on]
         detail = f"trinity_subs={tsubs} sse={sse} emitter={emitter}"
         if not missing:
-            out.append(EdgeVerdict("4 hive fabrics", EdgeState.OK, detail))
+            out.append(EdgeVerdict(edge("fabrics"), EdgeState.OK, detail))
         elif missing == ["trinity"]:
             out.append(EdgeVerdict(
-                "4 hive fabrics", EdgeState.DEGRADED,
+                edge("fabrics"), EdgeState.DEGRADED,
                 detail + " (bus not yet materialized — re-attach pending)"))
         else:
-            out.append(EdgeVerdict("4 hive fabrics", EdgeState.DEGRADED,
+            out.append(EdgeVerdict(edge("fabrics"), EdgeState.DEGRADED,
                                    detail + " missing: " + ",".join(missing)))
     # 6 — providers (DW = tokens lane · Claude = time lane · J-Prime =
     # sovereignty lane)
     liq = payload.get("liquidity") or {}
     providers = liq.get("providers") or {}
     if not providers:
-        out.append(EdgeVerdict("6 providers", EdgeState.DEGRADED,
+        out.append(EdgeVerdict(edge("providers"), EdgeState.DEGRADED,
                                "no liquidity data in hydration"))
     else:
         rows = []
@@ -259,7 +384,7 @@ def _verdicts_from_hydration(
             rows.append(f"{name}:{tok:,}" if isinstance(tok, int)
                         else f"{name}:?")
         out.append(EdgeVerdict(
-            "6 providers",
+            edge("providers"),
             EdgeState.DEGRADED if exhausted else EdgeState.OK,
             (" ".join(rows) + (" · RUNWAY EXHAUSTED" if exhausted else "")),
         ))
@@ -284,20 +409,20 @@ async def probe_edge_compute() -> EdgeVerdict:
         from backend.core.ouroboros.governance import compute_topology as ct
         if not ct.is_enabled():
             return EdgeVerdict(
-                "9 compute", EdgeState.SKIPPED,
+                edge("compute"), EdgeState.SKIPPED,
                 "topology probe disabled (JARVIS_COMPUTE_TOPOLOGY_ENABLED)")
         reading = await asyncio.wait_for(
             ct.resolve(), timeout=_edge_timeout_s() * 4)
     except asyncio.TimeoutError:
-        return EdgeVerdict("9 compute", EdgeState.DEGRADED,
+        return EdgeVerdict(edge("compute"), EdgeState.DEGRADED,
                            "topology probe timed out — driver may be wedged")
     except Exception as exc:  # noqa: BLE001
-        return EdgeVerdict("9 compute", EdgeState.DEGRADED,
+        return EdgeVerdict(edge("compute"), EdgeState.DEGRADED,
                            f"topology unavailable ({type(exc).__name__})")
 
     if not getattr(reading, "measured", False):
         return EdgeVerdict(
-            "9 compute", EdgeState.DEGRADED,
+            edge("compute"), EdgeState.DEGRADED,
             f"host unresolved ({reading.source}) — admission falls back to "
             f"the host bound with the unverified ceiling")
 
@@ -315,7 +440,7 @@ async def probe_edge_compute() -> EdgeVerdict:
             detail += f" · {ooms} recent OOM(s) raising the margin"
     except Exception:  # noqa: BLE001 — the reading alone is still useful
         pass
-    return EdgeVerdict("9 compute", EdgeState.OK, detail)
+    return EdgeVerdict(edge("compute"), EdgeState.OK, detail)
 
 
 async def _http_get(path: str) -> Tuple[Optional[int], Optional[Any]]:
@@ -368,11 +493,11 @@ async def probe_edge_sensors() -> EdgeVerdict:
     ``status`` + per-sensor blocks under ``*_sensor`` keys."""
     code, data = await _http_get("/channel/health")
     if code is None:
-        return EdgeVerdict("5 sensors", EdgeState.ABSENT,
+        return EdgeVerdict(edge("sensors"), EdgeState.ABSENT,
                            "channel server unreachable "
                            f"({':'.join(map(str, _channel_host_port()))})")
     if data is None:
-        return EdgeVerdict("5 sensors", EdgeState.DEGRADED,
+        return EdgeVerdict(edge("sensors"), EdgeState.DEGRADED,
                            f"server up, /channel/health returned {code}")
     healthy = str(data.get("status", "")).lower() == "healthy"
     sensor_blocks = {k: v for k, v in data.items()
@@ -382,8 +507,8 @@ async def probe_edge_sensors() -> EdgeVerdict:
     detail = (f"{wired}/{len(sensor_blocks)} webhook sensor(s) wired · "
               f"{total_events} events routed")
     if healthy:
-        return EdgeVerdict("5 sensors", EdgeState.OK, detail)
-    return EdgeVerdict("5 sensors", EdgeState.DEGRADED,
+        return EdgeVerdict(edge("sensors"), EdgeState.OK, detail)
+    return EdgeVerdict(edge("sensors"), EdgeState.DEGRADED,
                        f"status={data.get('status')} · {detail}")
 
 
@@ -391,11 +516,11 @@ async def probe_edge_liveness() -> EdgeVerdict:
     """Edge 7: /observability/liveness (static ∩ runtime capabilities)."""
     code, data = await _http_get("/observability/liveness")
     if code is None:
-        return EdgeVerdict("7 liveness", EdgeState.ABSENT,
+        return EdgeVerdict(edge("liveness"), EdgeState.ABSENT,
                            "channel server unreachable")
     if data is None:
         return EdgeVerdict(
-            "7 liveness", EdgeState.ABSENT,
+            edge("liveness"), EdgeState.ABSENT,
             f"server up, path not mounted ({code}) — daemon predates "
             "the endpoint or the router is disabled")
     caps = data.get("capabilities") or data.get("liveness") or data
@@ -404,33 +529,33 @@ async def probe_edge_liveness() -> EdgeVerdict:
                    if isinstance(v, (str, dict))
                    and "dormant" in str(v).lower()][:3]
         if dormant:
-            return EdgeVerdict("7 liveness", EdgeState.DEGRADED,
+            return EdgeVerdict(edge("liveness"), EdgeState.DEGRADED,
                                "dormant: " + ", ".join(dormant))
-        return EdgeVerdict("7 liveness", EdgeState.OK,
+        return EdgeVerdict(edge("liveness"), EdgeState.OK,
                            f"{len(caps)} capabilities reported")
-    return EdgeVerdict("7 liveness", EdgeState.DEGRADED, "empty response")
+    return EdgeVerdict(edge("liveness"), EdgeState.DEGRADED, "empty response")
 
 
 async def probe_edge_mcp() -> EdgeVerdict:
     """Edge 8: MCP server CONFIGURATION only — never executed."""
     cfg = os.environ.get("JARVIS_MCP_CONFIG", "").strip()
     if not cfg:
-        return EdgeVerdict("8 mcp servers", EdgeState.ABSENT,
+        return EdgeVerdict(edge("mcp"), EdgeState.ABSENT,
                            "JARVIS_MCP_CONFIG unset")
     p = Path(cfg)
     if not p.exists():
-        return EdgeVerdict("8 mcp servers", EdgeState.SEVERED,
+        return EdgeVerdict(edge("mcp"), EdgeState.SEVERED,
                            f"config path missing: {cfg}")
     try:
         import yaml  # lazy — only when a config is declared
         data = yaml.safe_load(p.read_text()) or {}
         servers = data.get("servers") or data.get("mcp_servers") or []
         n = len(servers) if isinstance(servers, (list, dict)) else 0
-        return EdgeVerdict("8 mcp servers", EdgeState.OK,
+        return EdgeVerdict(edge("mcp"), EdgeState.OK,
                            f"{n} server(s) declared (config only — "
                            "never executed by doctor)")
     except Exception as exc:  # noqa: BLE001
-        return EdgeVerdict("8 mcp servers", EdgeState.DEGRADED,
+        return EdgeVerdict(edge("mcp"), EdgeState.DEGRADED,
                            f"config unparseable: {str(exc)[:60]}")
 
 
@@ -462,9 +587,12 @@ async def run_matrix() -> DoctorReport:
             v.latency_ms = lh / max(1, len(hydration_verdicts))
         v5.latency_ms, v7.latency_ms, v8.latency_ms = l5, l7, l8
         v9.latency_ms = l9
-        # canonical edge order: 3,4,5,6,7,8,9
         e3, e4, e6 = hydration_verdicts
-        report.verdicts.extend([e3, e4, v5, e6, v7, v8, v9])
+        # Order comes from the declaration, not from where these happen to
+        # be appended. The hand-written sequence this replaces was correct
+        # only for as long as someone read the comment above it.
+        report.verdicts.extend(
+            order_verdicts([e3, e4, v5, e6, v7, v8, v9]))
     else:
         # chain severed at the socket — probe the independent HTTP/static
         # edges anyway (they may localize the fault), skip the UDS-bound ones.
@@ -479,14 +607,16 @@ async def run_matrix() -> DoctorReport:
         )
         v5.latency_ms, v7.latency_ms, v8.latency_ms = l5, l7, l8
         v9.latency_ms = l9
-        report.verdicts.extend([
-            EdgeVerdict("3 hydration", EdgeState.SKIPPED, "socket not serving"),
-            EdgeVerdict("4 hive fabrics", EdgeState.SKIPPED,
+        report.verdicts.extend(order_verdicts([
+            EdgeVerdict(edge("hydration"), EdgeState.SKIPPED,
+                        "socket not serving"),
+            EdgeVerdict(edge("fabrics"), EdgeState.SKIPPED,
                         "socket not serving"),
             v5,
-            EdgeVerdict("6 providers", EdgeState.SKIPPED, "socket not serving"),
+            EdgeVerdict(edge("providers"), EdgeState.SKIPPED,
+                        "socket not serving"),
             v7, v8, v9,
-        ])
+        ]))
     return report
 
 
@@ -516,7 +646,7 @@ async def run_live_probe() -> EdgeVerdict:
             timeout=_edge_timeout_s(),
         )
     except Exception as exc:  # noqa: BLE001
-        return EdgeVerdict("9 live probe", EdgeState.SEVERED,
+        return EdgeVerdict(edge("live"), EdgeState.SEVERED,
                            f"could not attach: {str(exc)[:60]}")
     try:
         # consume hydration first — it is ALSO the capability signature:
@@ -538,12 +668,12 @@ async def run_live_probe() -> EdgeVerdict:
             hydration = None
         if hydration is None:
             return EdgeVerdict(
-                "9 live probe", EdgeState.DEGRADED,
+                edge("live"), EdgeState.DEGRADED,
                 "hydration not served within the bound (boot-starved?) — "
                 "re-run `ov doctor --live` in a moment")
         if "fabrics" not in hydration:
             return EdgeVerdict(
-                "9 live probe", EdgeState.SKIPPED,
+                edge("live"), EdgeState.SKIPPED,
                 "daemon predates /doctor probe (no fabrics capability "
                 "signature) — restart the organism to enable the live loop")
         w.write((json.dumps(
@@ -560,7 +690,7 @@ async def run_live_probe() -> EdgeVerdict:
             except asyncio.TimeoutError:
                 break
             if not line:
-                return EdgeVerdict("9 live probe", EdgeState.SEVERED,
+                return EdgeVerdict(edge("live"), EdgeState.SEVERED,
                                    "daemon closed the connection mid-probe")
             try:
                 frame = json.loads(line.decode())
@@ -574,7 +704,7 @@ async def run_live_probe() -> EdgeVerdict:
                          or "[synthetic probe]" in str(
                              payload.get("action_summary", "")))):
                 return EdgeVerdict(
-                    "9 live probe", EdgeState.OK,
+                    edge("live"), EdgeState.OK,
                     "synthetic actor_edge frame observed — tool → emitter "
                     "→ aggregator → cockpit proven "
                     f"({payload.get('action_summary', '')[:60]})")
@@ -583,11 +713,11 @@ async def run_live_probe() -> EdgeVerdict:
                 saw_verdict_line = text
         if saw_verdict_line:
             return EdgeVerdict(
-                "9 live probe", EdgeState.DEGRADED,
+                edge("live"), EdgeState.DEGRADED,
                 "daemon ran the probe but no synthetic actor_edge frame "
                 f"arrived in {_live_wait_s():.0f}s ({saw_verdict_line[:60]})")
         return EdgeVerdict(
-            "9 live probe", EdgeState.SEVERED,
+            edge("live"), EdgeState.SEVERED,
             f"no probe response within {_live_wait_s():.0f}s "
             "(daemon may not support /doctor probe)")
     finally:
