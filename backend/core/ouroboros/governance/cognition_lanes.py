@@ -135,6 +135,11 @@ async def rt_prompt(
         if call_stats is not None:
             call_stats[key] = call_stats.get(key, 0) + delta
 
+    #: Providers THIS call constructed, and therefore owns. An injected
+    #: provider belongs to its caller and is never touched here -- closing
+    #: someone else's pooled session would turn a leak into an outage.
+    _owned: List[Any] = []
+
     async def _resolve() -> Tuple[Any, str]:
         nonlocal dw_provider
         if session is not None and base_url is not None:
@@ -143,9 +148,41 @@ async def rt_prompt(
             from backend.core.ouroboros.governance.doubleword_provider import (
                 DoublewordProvider,
             )
+            # WHOEVER CREATES IT, CLOSES IT.
+            #
+            # This line built a provider on every un-injected call and let it
+            # fall out of scope with `rt_prompt`. The provider lazily opens an
+            # aiohttp.ClientSession inside `_get_session()`, so each call left
+            # one behind for the garbage collector: bt-2026-08-18-021438 logged
+            # 20 "Unclosed client session" + 15 "Unclosed connector" warnings,
+            # every cluster landing against `[CognitionLanes] RT degraded (rt
+            # status 402 ...)` -- one leak per RT attempt.
+            #
+            # The provider is not at fault: it owns `close()` and closes its
+            # session correctly. Nothing called it, because nothing had
+            # decided who owned the object.
             dw_provider = DoublewordProvider()
+            _owned.append(dw_provider)
         return (session or await dw_provider._get_session(),
                 base_url or dw_provider._base_url)
+
+    async def _release_owned() -> None:
+        """Close providers this call created. NEVER raises, never blocks exit.
+
+        Runs in a ``finally`` that may execute while the task is being
+        cancelled or the loop is closing, where an await can itself raise --
+        so every close is individually guarded and a failure to release is
+        logged, never propagated. Losing a session at that point is a leak;
+        raising here would lose the caller's result or their cancellation."""
+        while _owned:
+            provider = _owned.pop()
+            try:
+                await provider.close()
+            except Exception:  # noqa: BLE001 — teardown must not surface here
+                logger.debug(
+                    "[CognitionLanes] owned provider close degraded",
+                    exc_info=True,
+                )
 
     async def _headers() -> Dict[str, str]:
         if auth_headers_fn is not None:
@@ -221,36 +258,47 @@ async def rt_prompt(
             raise RTPromptTimeout(
                 f"rt cognition call exceeded {bound:.0f}s (stream evicted)")
 
-    sem = _rt_semaphore()
-    async with sem:                       # the Cognitive Concurrency Semaphore
-        stats["inflight"] += 1
-        stats["peak_inflight"] = max(stats["peak_inflight"],
-                                     stats["inflight"])
-        try:
+    # The release wraps EVERY exit: the successful return inside the
+    # semaphore, the Claude cascade below it, and any exception or
+    # cancellation through either. The RT path fails far more often than it
+    # succeeds when a provider is down — which is precisely the run that
+    # leaked twenty sessions — so a release reachable only on the happy path
+    # would be a release that never runs when it matters.
+    try:
+        sem = _rt_semaphore()
+        async with sem:                   # the Cognitive Concurrency Semaphore
+            stats["inflight"] += 1
+            stats["peak_inflight"] = max(stats["peak_inflight"],
+                                         stats["inflight"])
             try:
-                return await _rt_attempt()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 — timeout OR transport
-                logger.info("[CognitionLanes] RT degraded (%s: %s) — "
-                            "cascading to Claude (caller=%s)",
-                            type(exc).__name__, str(exc)[:120], caller_id)
-        finally:
-            stats["inflight"] -= 1
+                try:
+                    return await _rt_attempt()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 — timeout OR transport
+                    logger.info("[CognitionLanes] RT degraded (%s: %s) — "
+                                "cascading to Claude (caller=%s)",
+                                type(exc).__name__, str(exc)[:120], caller_id)
+            finally:
+                stats["inflight"] -= 1
 
-    # Claude cascade OUTSIDE the semaphore — a fallback turn must not hold
-    # an RT slot hostage while it waits on a different provider.
-    _bump("fallback_calls")
-    nonlocal_claude = claude
-    if nonlocal_claude is None:
-        from backend.core.ouroboros.governance.providers import ClaudeProvider
-        nonlocal_claude = ClaudeProvider(
-            api_key=os.getenv("ANTHROPIC_API_KEY", ""))
-    text = await nonlocal_claude.prompt_only(
-        prompt, caller_id=caller_id, max_tokens=max_tokens,
-        timeout_s=_env_float("JARVIS_COGNITION_FALLBACK_TIMEOUT_S", 60.0))
-    _bump("fallback_ok")
-    return text
+        # Claude cascade OUTSIDE the semaphore — a fallback turn must not hold
+        # an RT slot hostage while it waits on a different provider.
+        _bump("fallback_calls")
+        nonlocal_claude = claude
+        if nonlocal_claude is None:
+            from backend.core.ouroboros.governance.providers import (
+                ClaudeProvider,
+            )
+            nonlocal_claude = ClaudeProvider(
+                api_key=os.getenv("ANTHROPIC_API_KEY", ""))
+        text = await nonlocal_claude.prompt_only(
+            prompt, caller_id=caller_id, max_tokens=max_tokens,
+            timeout_s=_env_float("JARVIS_COGNITION_FALLBACK_TIMEOUT_S", 60.0))
+        _bump("fallback_ok")
+        return text
+    finally:
+        await _release_owned()
 
 
 __all__ = ["SLA_STRICT", "SLA_BULK", "RTPromptTimeout", "rt_prompt", "stats"]
