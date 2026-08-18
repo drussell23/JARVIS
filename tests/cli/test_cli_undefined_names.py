@@ -33,37 +33,47 @@ says so, because a gate that cannot pass is a gate somebody disables.
 from __future__ import annotations
 
 import ast
+import sys
 from pathlib import Path
 
 import pytest
 
-pyflakes_checker = pytest.importorskip(
-    "pyflakes.checker",
+pytest.importorskip(
+    "pyflakes",
     reason="pyflakes is declared in ci/requirements-ov-surface.txt; a runner "
            "without it cannot enforce this gate",
 )
-from pyflakes import messages as pyflakes_messages  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+# ONE analyzer, shared with the differential gate. This file previously
+# carried its own pyflakes wrapper, and a second opinion about what counts as
+# an undefined name is how the two would eventually disagree about a build.
+from ci.lint_gate import undefined_names as _undefined_names_shared  # noqa: E402
 
 #: The package this gate covers. Chosen because it is at zero today and it is
 #: what an operator runs.
 GATED = Path("backend/core/ouroboros/cli")
 
-#: Packages knowingly NOT covered, with their counts at the time this gate
-#: landed. Named so nobody reads a passing run as a repo-wide clean bill.
+#: Packages knowingly NOT covered. Named so nobody reads a passing run as a
+#: repo-wide clean bill.
+#:
+#: `governance` and `battle_test` USED to be here (16 and 8 findings). Both
+#: reached zero and were promoted into `ci.lint_gate.DEFAULT_CLEAN_PACKAGES`,
+#: which is now the ratchet of record. What remains ungated is the rest of the
+#: repository — ~812 findings dominated by vendored `venv/` and
+#: `core/quarantine/`, held by the DIFFERENTIAL gate instead.
 UNGATED_KNOWN = {
-    "backend/core/ouroboros/governance": 16,
-    "backend/core/ouroboros/battle_test": 8,
+    "backend/core/quarantine": "excluded — quarantined by name",
+    "backend/api": "differential gate only",
 }
 
 
 def _undefined_names(path: Path):
-    src = path.read_text(encoding="utf-8", errors="replace")
-    tree = ast.parse(src, filename=str(path))
-    check = pyflakes_checker.Checker(tree, filename=str(path))
+    """Real (non-inert) findings only — delegated to the shared analyzer."""
     return [
-        (m.lineno, m.message % m.message_args)
-        for m in check.messages
-        if isinstance(m, pyflakes_messages.UndefinedName)
+        (f.lineno, f"undefined name '{f.name}'")
+        for f in _undefined_names_shared(path)
+        if not f.inert
     ]
 
 
@@ -89,13 +99,13 @@ def test_cli_package_has_no_undefined_names():
     )
 
 
-def test_the_gate_can_actually_fail():
+def test_the_gate_can_actually_fail(tmp_path):
     """Guards the guard. A detector that cannot fire proves nothing."""
-    tree = ast.parse("def f():\n    return no_such_name\n", filename="<probe>")
-    check = pyflakes_checker.Checker(tree, filename="<probe>")
-    found = [m for m in check.messages
-             if isinstance(m, pyflakes_messages.UndefinedName)]
-    assert found, "pyflakes did not flag an obviously undefined name"
+    probe = tmp_path / "probe.py"
+    probe.write_text("def f():\n    return no_such_name\n", encoding="utf-8")
+    assert _undefined_names(probe), (
+        "the shared analyzer did not flag an obviously undefined name"
+    )
 
 
 def test_ungated_packages_are_named_not_forgotten():
@@ -107,4 +117,17 @@ def test_ungated_packages_are_named_not_forgotten():
         assert (_repo_root() / pkg).is_dir(), (
             f"{pkg} is named as ungated but does not exist — this note has "
             "gone stale and would mislead the next reader"
+        )
+
+    # And the converse: anything claimed CLEAN must actually be gated, or the
+    # ratchet is a comment rather than a mechanism.
+    import sys as _sys
+    _sys.path.insert(0, str(_repo_root()))
+    from ci.lint_gate import DEFAULT_CLEAN_PACKAGES
+    assert str(GATED) in DEFAULT_CLEAN_PACKAGES, (
+        "this file gates cli/, so cli/ must be in the shared ratchet too"
+    )
+    for pkg in DEFAULT_CLEAN_PACKAGES:
+        assert pkg not in UNGATED_KNOWN, (
+            f"{pkg} is claimed both gated and ungated"
         )

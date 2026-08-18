@@ -3402,6 +3402,16 @@ class GovernedOrchestrator:
     async def _run_pipeline(self, ctx: OperationContext) -> OperationContext:
         """Internal pipeline logic -- phases 1 through 8."""
 
+        #: Bound for real at the VALIDATE seam far below, and READ above it by
+        #: the re-plan block on a later retry pass. Initialised here because
+        #: the read guarded itself with `if 'validation' in dir()` — correct
+        #: at runtime and invisible to every static tool, which is how two
+        #: genuine undefined names in this repo's front door survived ten days
+        #: inside blanket handlers. A name that may be unbound is INITIALISED,
+        #: never interrogated. Not reset per retry: the re-plan block wants
+        #: the PREVIOUS pass's verdict, which is exactly what persists.
+        validation = None
+
         # A1-T4 — hop 5/5 (accept): the GOAL enters the governed FSM at
         # CLASSIFY. The fifth + final breadcrumb; the five ordered [A1Trace]
         # lines in a soak's stdout are the A1 milestone proof.
@@ -7505,8 +7515,10 @@ class GovernedOrchestrator:
                     #       INSUFFICIENT_EVIDENCE / DISABLED / FAILED.
                     _replan_text = ""
                     try:
-                        _fc = validation.failure_class or "" if 'validation' in dir() else ""
-                        _em = validation.short_summary or "" if 'validation' in dir() else ""
+                        _fc = (validation.failure_class or ""
+                               ) if validation is not None else ""
+                        _em = (validation.short_summary or ""
+                               ) if validation is not None else ""
                         _attempt_num = self._config.max_generate_retries - generate_retries_remaining + 1
                         # Stage 1 — structural falsification (proactive)
                         try:

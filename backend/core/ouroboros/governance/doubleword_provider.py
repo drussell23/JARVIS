@@ -4667,6 +4667,11 @@ class DoublewordProvider:
         _s35_op_id = getattr(context, "op_id", "?") or "?"
         _s35_model = self._model or "(unspecified)"
         _s35_stage_t0 = time.monotonic()
+        #: Set when the first stream chunk arrives; stays None if the stream
+        #: never produced one. Declared HERE with the rest of this method's
+        #: Slice-35 telemetry so the read far below is a plain `is not None`
+        #: rather than an `in dir()` interrogation no static tool can verify.
+        _s35_stream_t0 = None
 
         # Gap #7: discover MCP tools for prompt injection
         _mcp_tools = None
@@ -5641,7 +5646,16 @@ class DoublewordProvider:
                                                     "STAGE_RT_HTTP_POST",
                                                     op_id=_s35_op_id,
                                                     model_id=_s35_model,
-                                                    duration_ms=float(_ttft_ms),
+                                                    # `_ttft_ms` was bound
+                                                    # nowhere in this file —
+                                                    # a typo for the value
+                                                    # computed 29 lines above
+                                                    # and already used twice.
+                                                    # Every execution raised
+                                                    # NameError, so this stage
+                                                    # was never recorded.
+                                                    duration_ms=float(
+                                                        _pure_ttft_ms),
                                                 )
                                                 # Reset stream-consume timer
                                                 # to start AT first chunk.
@@ -5894,9 +5908,14 @@ class DoublewordProvider:
             _s35_dp.record_stage(
                 "STAGE_RT_STREAM_CONSUME",
                 op_id=_s35_op_id, model_id=_s35_model,
+                # Bound only once a first chunk arrives. INITIALISED at the
+                # top of this method rather than interrogated with `in dir()`
+                # — correct at runtime, and unverifiable by any static tool,
+                # which is how two genuine undefined names in this repo's
+                # front door survived ten days inside blanket handlers.
                 duration_ms=(
                     (time.monotonic() - _s35_stream_t0) * 1000.0
-                ) if "_s35_stream_t0" in dir() else 0.0,
+                ) if _s35_stream_t0 is not None else 0.0,
             )
         except Exception:  # noqa: BLE001
             pass
