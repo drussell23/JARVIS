@@ -337,7 +337,10 @@ def stamp_provenance(
 ) -> Optional[ProvenanceRecord]:
     """Stamp a hash-chained provenance record at INGESTION and emit a
     structured ``[Provenance] op=.. origin=.. origin_class=.. chain_ok=..``
-    line at WARNING level (so it survives ``silent_boot``).
+    line whose LEVEL follows the outcome: ``INFO`` when the chain verifies
+    (routine, and the auditor reads it from ``debug.log`` regardless),
+    ``WARNING`` when it does not or the stamp fails. Visibility is no longer
+    bought with severity -- see ``silent_boot.operator_extra``.
 
     Gated by ``JARVIS_PROVENANCE_LEDGER_ENABLED`` (default ON): when disabled
     this is a silent no-op (byte-identical to no instrumentation).
@@ -360,13 +363,29 @@ def stamp_provenance(
             )
             return None
         chain_ok = led.verify_chain()
-        logger.warning(
-            "[Provenance] op=%s origin=%s origin_class=%s chain_ok=%s",
-            record.op_id,
-            record.origin,
-            record.origin_class,
-            chain_ok,
-        )
+        # LEVEL BY OUTCOME, NOT BY TRANSPORT. This line was WARNING for the
+        # reason the docstring above still gives -- "so it survives
+        # silent_boot" -- which is a routing need wearing a severity's
+        # clothes. The cost was 182 lines a session announcing that a hash
+        # chain VERIFIED, in the same stream an operator scans for things
+        # that did not.
+        #
+        # A verified chain is INFO and lands in `debug.log`, where
+        # `parse_provenance_line` reads it (the file handler runs at DEBUG,
+        # and that parser is keyed on the `[Provenance]` tag, never on a
+        # level -- so the auditor sees an identical corpus). A chain that
+        # FAILS stays WARNING below, because that is a real warning.
+        if chain_ok:
+            logger.info(
+                "[Provenance] op=%s origin=%s origin_class=%s chain_ok=%s",
+                record.op_id, record.origin, record.origin_class, chain_ok,
+            )
+        else:
+            logger.warning(
+                "[Provenance] op=%s origin=%s origin_class=%s chain_ok=%s"
+                " -- CHAIN VERIFICATION FAILED",
+                record.op_id, record.origin, record.origin_class, chain_ok,
+            )
         return record
     except Exception:  # noqa: BLE001 -- provenance NEVER blocks ingestion
         logger.warning(

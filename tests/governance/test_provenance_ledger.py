@@ -137,7 +137,7 @@ def test_latest_for_op_returns_record():
 
 def test_stamp_emits_structured_line(caplog):
     led = pl.ProvenanceLedger()
-    with caplog.at_level(logging.WARNING, logger=pl.logger.name):
+    with caplog.at_level(logging.INFO, logger=pl.logger.name):
         pl.stamp_provenance("op-abc", "test_failure", ledger=led)
     line = [r.getMessage() for r in caplog.records if "[Provenance]" in r.getMessage()]
     assert line, "no [Provenance] line emitted"
@@ -150,7 +150,7 @@ def test_stamp_emits_structured_line(caplog):
 
 def test_stamp_roadmap_origin_class(caplog):
     led = pl.ProvenanceLedger()
-    with caplog.at_level(logging.WARNING, logger=pl.logger.name):
+    with caplog.at_level(logging.INFO, logger=pl.logger.name):
         pl.stamp_provenance("op-r", SignalSource.ROADMAP, ledger=led)
     msg = [r.getMessage() for r in caplog.records if "[Provenance]" in r.getMessage()][-1]
     assert "origin_class=roadmap" in msg
@@ -159,7 +159,7 @@ def test_stamp_roadmap_origin_class(caplog):
 def test_stamp_off_flag_is_byte_identical_noop(caplog, monkeypatch):
     monkeypatch.setenv("JARVIS_PROVENANCE_LEDGER_ENABLED", "false")
     led = pl.ProvenanceLedger()
-    with caplog.at_level(logging.WARNING, logger=pl.logger.name):
+    with caplog.at_level(logging.INFO, logger=pl.logger.name):
         result = pl.stamp_provenance("op-x", "test_failure", ledger=led)
     assert result is None
     assert not [r for r in caplog.records if "[Provenance]" in r.getMessage()]
@@ -187,3 +187,28 @@ def test_default_ledger_singleton_and_reset():
     assert a is b
     pl.reset_default_ledger()
     assert pl.get_default_ledger() is not a
+
+
+def test_verified_chain_is_info_and_failure_is_warning(caplog, monkeypatch):
+    """Severity follows the OUTCOME, not the transport.
+
+    This line was WARNING so it would "survive silent_boot" -- a routing need
+    solved with a severity dial, at a cost of 182 lines a session announcing
+    that a hash chain VERIFIED. An operator scanning for warnings was being
+    handed 182 non-warnings. A chain that FAILS is still a warning, and now
+    it is the only one.
+    """
+    led = pl.ProvenanceLedger()
+    with caplog.at_level(logging.DEBUG, logger=pl.logger.name):
+        pl.stamp_provenance("op-ok", "test_failure", ledger=led)
+    ok = [r for r in caplog.records if "[Provenance]" in r.getMessage()][-1]
+    assert ok.levelno == logging.INFO
+    assert "chain_ok=True" in ok.getMessage()
+
+    caplog.clear()
+    monkeypatch.setattr(led, "verify_chain", lambda: False)
+    with caplog.at_level(logging.DEBUG, logger=pl.logger.name):
+        pl.stamp_provenance("op-bad", "test_failure", ledger=led)
+    bad = [r for r in caplog.records if "[Provenance]" in r.getMessage()][-1]
+    assert bad.levelno == logging.WARNING
+    assert "chain_ok=False" in bad.getMessage()

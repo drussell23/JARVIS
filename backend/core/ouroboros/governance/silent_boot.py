@@ -158,6 +158,113 @@ class _CockpitErrorFormatter(logging.Formatter):
                 return "⚠ error (unformattable record)"
 
 
+#: Record attribute that promotes a record to the operator terminal
+#: REGARDLESS of its severity. The counterpart to ``file_only``.
+OPERATOR_ATTR = "operator"
+
+
+def operator_extra(**extra: Any) -> Dict[str, Any]:
+    """``extra=`` payload that puts a record on the operator terminal.
+
+    THE PROBLEM THIS SOLVES
+    -----------------------
+    This handler gated the terminal by LEVEL alone, so "who needs to see
+    this" and "how bad is this" were the same dial. A module that wanted an
+    operator to watch something had exactly one lever: claim to be a warning.
+    Two did, and they are the two loudest things in a soak log:
+
+      * ``a1_trace`` — its docstring states it outright: *"WARNING level is
+        load-bearing ... so a soak operator can watch the five ordered lines
+        appear in the terminal."* 376 lines a session, none of them warnings.
+      * ``provenance_ledger`` — *"emit ... at WARNING level (so it survives
+        silent_boot)"*. 182 lines a session reporting that a hash chain
+        VERIFIED.
+
+    Both are correct about what they need and wrong about the only mechanism
+    available to get it, and the cost is that a real warning arrives in a
+    stream of 550 fake ones. ``_resolve_terminal_threshold`` already documents
+    the consequence from the other end — COCKPIT mode had to be raised to
+    ERROR because *"boot chatter uses logger.warning(...) throughout this
+    codebase"* — which means the inflated lines stopped reaching the cockpit
+    operator anyway. Severity inflation did not even buy what it cost.
+
+    So audience becomes its own axis. A record marked here is shown at its
+    HONEST level, in either mode, and every other module can stop lying.
+    """
+    payload: Dict[str, Any] = dict(extra)
+    payload[OPERATOR_ATTR] = True
+    return payload
+
+
+class _TerminalAudienceFilter(logging.Filter):
+    """Decides who sees a record; the level says only how bad it is.
+
+    Installed in BOTH presentation modes and carrying the threshold that
+    used to live on the handler. It has to be a filter rather than a handler
+    level because ``Logger.callHandlers`` compares ``record.levelno`` against
+    ``handler.level`` BEFORE any filter runs — so a record below the handler
+    level can never be promoted by one. Moving the threshold into the filter
+    is what makes promotion expressible at all.
+
+    Three answers, in priority order:
+
+      * ``file_only=True``  -> never (forensic walls belong in the session log)
+      * ``operator=True``   -> always (an audience decision, not a severity one)
+      * otherwise           -> the mode's severity threshold, exactly as before
+
+    NEVER raises: a filter fault admits the record, because losing a routing
+    decision is survivable and losing an error is not."""
+
+    def __init__(self, threshold: int) -> None:
+        super().__init__()
+        try:
+            self._threshold = int(threshold)
+        except Exception:  # noqa: BLE001
+            self._threshold = logging.WARNING
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        try:
+            if getattr(record, "file_only", False):
+                return False
+            if getattr(record, OPERATOR_ATTR, False):
+                return True
+            return record.levelno >= self._threshold
+        except Exception:  # noqa: BLE001
+            return True
+
+
+def terminal_threshold_of(handler: logging.Handler) -> "Optional[int]":
+    """The severity threshold a terminal handler is enforcing, or ``None``.
+
+    Public because the threshold no longer lives on ``handler.level`` and a
+    caller asking "what gets shown" should not have to know that. Reading
+    ``.level`` would now answer ``NOTSET`` and be wrong in a way that looks
+    like an answer -- the same shape of mistake as a blast radius nobody
+    scanned. NEVER raises.
+    """
+    try:
+        for filt in getattr(handler, "filters", ()) or ():
+            if isinstance(filt, _TerminalAudienceFilter):
+                return filt._threshold  # noqa: SLF001 -- its own module
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def shows_on_terminal(handler: logging.Handler, record: logging.LogRecord) -> bool:
+    """Would this record reach the operator through this handler?
+
+    The behavioural question, answered by the same filters the handler runs,
+    so a test can assert what an operator SEES instead of how the plumbing
+    currently spells it."""
+    try:
+        if record.levelno < handler.level:
+            return False
+        return all(f.filter(record) for f in (handler.filters or ()))
+    except Exception:  # noqa: BLE001
+        return True
+
+
 class _CockpitConsoleFilter(logging.Filter):
     """Two console protections for the cockpit:
 
@@ -468,7 +575,15 @@ def _configure_locked(
             _resolved_mode, terminal_threshold,
         )
         term_handler = logging.StreamHandler(stream=sys.stderr)
-        term_handler.setLevel(threshold)
+        # NOTSET, deliberately: the threshold moved into
+        # `_TerminalAudienceFilter` below. `Logger.callHandlers` tests
+        # `record.levelno >= handler.level` BEFORE filters run, so a handler
+        # level would make `operator=True` promotion unreachable for exactly
+        # the records that need it. The threshold is not weakened -- it is
+        # enforced one layer later, by something that can also say "this one
+        # is for the operator regardless".
+        term_handler.setLevel(logging.NOTSET)
+        term_handler.addFilter(_TerminalAudienceFilter(threshold))
         if str(_resolved_mode).lower().endswith("cockpit") or (
             getattr(_resolved_mode, "value", "") == "cockpit"
         ):
