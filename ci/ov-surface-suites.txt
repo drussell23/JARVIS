@@ -1,6 +1,7 @@
 tests/api/test_hive_aggregator.py
 tests/api/test_hive_emitter.py
 tests/cli/test_thin_client.py
+tests/cli/test_cli_undefined_names.py
 tests/cli/test_ov_doctor.py
 tests/cli/test_ov_doctor_edge_registry.py
 tests/cli/test_ov_dispatch.py

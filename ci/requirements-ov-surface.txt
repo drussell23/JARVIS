@@ -11,3 +11,7 @@ aiofiles>=23
 uuid6>=2024.1
 numpy>=1.26
 aiohttp>=3.9
+# Undefined-name gate for cli/ (tests/cli/test_cli_undefined_names.py).
+# Two NameErrors in the operator's front door were swallowed by blanket
+# handlers and surfaced only as a cockpit that would not start.
+pyflakes>=3

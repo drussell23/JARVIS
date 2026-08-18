@@ -20,6 +20,7 @@ Everything after the verb forwards verbatim to the bootstrap, e.g.
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import time
@@ -70,6 +71,19 @@ from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
 #: Semantic colour roles — the SAME name and access pattern as every
 #: other module. One vocabulary, one spelling, one owner.
 _SEM = _role_palette()
+
+#: `ov` referenced a bare `logger` in `_client_extra_bindings` while no such
+#: name existed. The call raised NameError, the surrounding handler
+#: referenced `logger` AGAIN while handling it, and the outer
+#: `except Exception: return None` discarded the ENTIRE extra key-binding
+#: set — confirm actions, the completion arbiter, paste collapse, rewind,
+#: transcript hatches and mode. All built, all mounted, all thrown away one
+#: line later. A comment at the audio scope already carried the diagnosis
+#: ("`ov` has no module-level logger ... a bare `logger` here resolved to
+#: nothing but a swallowed NameError") and worked around it locally rather
+#: than declaring one. Stdlib only, per this module's import-isolation
+#: mandate.
+logger = logging.getLogger("Ouroboros.Ov")
 
 
 def version_line() -> str:
@@ -3925,7 +3939,10 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
                 # actually lives. A KEEPER task, not a one-shot connect: the
                 # host usually starts AFTER the cockpit (wake spawns it), and
                 # may restart at any point in the session.
-                _audio["rms_task"] = asyncio.get_running_loop().create_task(
+                # `_aio` is this scope's already-imported alias for asyncio.
+                # The bare name was never bound here and raised NameError, so
+                # the RMS keeper task was never created.
+                _audio["rms_task"] = _aio.get_running_loop().create_task(
                     _keep_rms_stream(_scope, _audio),
                 )
                 _audio.update(pump=_pump, latch=_latch, mode=_mode)
@@ -4181,7 +4198,7 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
                     _t.cancel()
                     try:
                         await _t
-                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    except (_aio.CancelledError, Exception):  # noqa: BLE001
                         pass
                 _c = _audio.get("rms_client")
                 if _c is not None:
