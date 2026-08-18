@@ -192,10 +192,33 @@ class ContextExpansionRunner(PhaseRunner):
                 except Exception as _dep_exc:
                     logger.debug("[Orchestrator] Dependency summary skipped: %s", _dep_exc)
         except Exception as exc:
+            # RUNNER PARITY -- the reason this bug outlived its own fix.
+            #
+            # The inline twin in `orchestrator.py` carries this exact handler
+            # WITH `exc_info=True` and a comment stating that the traceback is
+            # "load-bearing, not decoration ... the message alone ('bool'
+            # object is not callable') names a TYPE and no site", recorded
+            # after observing it live 3-for-3 in bt-2026-08-11-230412.
+            #
+            # That diagnosis was correct and was written on the seam that does
+            # not execute. `dispatch_pipeline` routes CONTEXT_EXPANSION here,
+            # so every real op has taken THIS branch -- which logged a message
+            # and no traceback. The session log proves the split: the inline
+            # site formats `type(exc).__name__` and would print "TypeError:
+            # 'bool' object is not callable", while every line in
+            # bt-2026-08-18-021438 reads ": 'bool' object is not callable"
+            # with no type prefix. Five ops a session for a week, each one
+            # continuing to GENERATE with UNEXPANDED context, and nothing
+            # anywhere naming the site.
+            #
+            # Identical treatment on both paths now, so the next occurrence
+            # names its own line and the underlying defect becomes findable
+            # instead of inferable.
             logger.warning(
-                "[Orchestrator] Context expansion failed for op=%s: %s; "
-                "continuing to GENERATE",
-                ctx.op_id, exc,
+                "[Orchestrator] Context expansion failed for op=%s: %s: %s; "
+                "continuing to GENERATE with UNEXPANDED context",
+                ctx.op_id, type(exc).__name__, exc,
+                exc_info=True,
             )
 
         # ---- ModuleContextRouter: architecture memory injection (MEM-2) ----
