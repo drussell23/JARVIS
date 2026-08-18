@@ -214,6 +214,10 @@ EVENT_TYPE_SOAK_CHUNK_QUARANTINED = "soak_chunk_quarantined"
 #     batch/RT queues are being cancelled. Both keyed by "soak_budget" (an
 #     organism property, no op_id) so ?op_id=soak_budget filters cleanly.
 EVENT_TYPE_SOAK_BUDGET_WARNING = "soak_budget_warning"
+#: A provider is reachable and REFUSING to serve until the account is
+#: funded (HTTP 402). Distinct from an outage on purpose: no amount of
+#: infrastructure fixes a billing state, so the cockpit must say so.
+EVENT_TYPE_PROVIDER_FUNDING_REQUIRED = "provider_funding_required"
 EVENT_TYPE_SOAK_CIRCUIT_TRIPPED = "soak_circuit_tripped"
 
 # Slice 249 (Async Observability + Live Steering) — three op-lifecycle events the
@@ -1526,6 +1530,7 @@ _VALID_EVENT_TYPES = frozenset({
     "worker_op_claimed",
     EVENT_TYPE_GOLDEN_IMAGE_DEGRADED,
     EVENT_TYPE_SOAK_BUDGET_WARNING,
+    EVENT_TYPE_PROVIDER_FUNDING_REQUIRED,
     EVENT_TYPE_SOAK_CIRCUIT_TRIPPED,
     EVENT_TYPE_COGNITIVE_WHY_SNAPSHOT,
     EVENT_TYPE_TASK_CREATED,
@@ -3068,6 +3073,34 @@ def publish_soak_budget_warning(
     except Exception:  # noqa: BLE001 — best-effort telemetry
         logger.debug(
             "[Stream] publish_soak_budget_warning exception", exc_info=True,
+        )
+        return None
+
+
+def publish_provider_funding_required(
+    detail: Mapping[str, Any],
+) -> Optional[str]:
+    """Best-effort publisher for ``provider_funding_required`` SSE frames.
+
+    Fired ONCE, when a provider's deep probe is refused for payment (HTTP
+    402) and the heartbeat freezes. This is deliberately NOT an outage event:
+    the operator's remedy is a billing action, and an outage banner would send
+    them to look at infrastructure that is working correctly. Keyed by the
+    provider surface. Returns the event_id, or None when the stream is
+    disabled / broker missing / payload invalid. NEVER raises."""
+    if not stream_enabled():
+        return None
+    try:
+        if not isinstance(detail, Mapping):
+            return None
+        key = str(detail.get("surface") or "provider")
+        return get_default_broker().publish(
+            EVENT_TYPE_PROVIDER_FUNDING_REQUIRED, key, dict(detail),
+        )
+    except Exception:  # noqa: BLE001 — best-effort telemetry
+        logger.debug(
+            "[Stream] publish_provider_funding_required exception",
+            exc_info=True,
         )
         return None
 
