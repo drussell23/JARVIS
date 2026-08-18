@@ -2182,6 +2182,32 @@ def main(argv: "list[str] | None" = None) -> None:
         # closed" during otherwise-clean session exit. See
         # memory/project_async_shutdown_race_triage.md for the full
         # traceback + root cause analysis.
+        # THE MISSING PHASE. `asyncio.run` does four things here and this
+        # block did the last three; the first — cancel every remaining task
+        # and let it finish — was absent. Without it any task the harness did
+        # not explicitly own is still parked inside an async generator when
+        # `shutdown_asyncgens()` calls `aclose()` on it, which is precisely
+        # `RuntimeError: aclose(): asynchronous generator is already running`
+        # (bt-2026-08-18-021438, on StreamEventBroker.stream_iter and
+        # ExecutionGraphProgressTracker._drain_subscriber), and precisely the
+        # "Task was destroyed but it is pending!" panic two seconds later.
+        #
+        # Bounded, unlike the stdlib's unbounded gather: a task that swallows
+        # CancelledError must not hang teardown, and survivors are NAMED
+        # rather than silently abandoned.
+        try:
+            from backend.core.ouroboros.battle_test.loop_teardown import (  # noqa: E501
+                cancel_remaining_tasks as _cancel_remaining_tasks,
+            )
+            _td_report = loop.run_until_complete(_cancel_remaining_tasks())
+            if not _td_report.skipped and _td_report.cancelled:
+                _log = logging.getLogger("Ouroboros.LoopTeardown")
+                (_log.warning if not _td_report.clean else _log.info)(
+                    "%s", _td_report.render(),
+                )
+        except Exception:  # noqa: BLE001 — teardown must never raise
+            pass
+
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
         except Exception:
