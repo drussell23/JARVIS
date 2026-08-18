@@ -5449,6 +5449,30 @@ def _jprime_inflight_guard():
                 pass
 
 
+@dataclass(frozen=True)
+class _AdmissionTicket:
+    """What the local-admission gate granted, carried to the seam that settles it.
+
+    FROZEN and PASSED, never closed over. The two fields previously lived as
+    locals of :meth:`PrimeProvider.generate` while their only consumer was
+    ``_generate_raw``, nested inside the SIBLING method ``_generate_impl`` --
+    so every settle call raised NameError into an ``except Exception: pass``
+    and the VRAM reservation was never handed back early.
+
+    Both fields default to ``None`` because admission is best-effort: when the
+    gate is disabled or its probe degraded, there is genuinely nothing to
+    settle, and a ticket that said otherwise would make the ledger record a
+    load it never admitted."""
+
+    brain_id: Optional[str] = None
+    reservation_id: Optional[str] = None
+
+    @property
+    def settleable(self) -> bool:
+        """Is there anything for the ledger to learn from or hand back?"""
+        return bool(self.brain_id) or bool(self.reservation_id)
+
+
 class PrimeProvider:
     """CandidateProvider adapter wrapping PrimeClient.generate().
 
@@ -5539,15 +5563,30 @@ class PrimeProvider:
         18 GB model load and the 37 ms voice path.
         """
         _adm = None
-        # Bound HERE, not inside the try below: `_generate_raw` closes over
-        # this name, and a lazily-bound name read from a closure becomes a
-        # bare NameError the moment the binding block raises early — a fault
-        # on the dispatch path that reads as a generation failure rather than
-        # as the telemetry wiring it actually is (PR #70386's class).
+        # THE CLOSURE THESE WERE WRITTEN FOR DOES NOT EXIST.
+        #
+        # The previous comments here recorded the right technique for the
+        # wrong topology: "`_generate_raw` closes over this name", and a
+        # one-slot cell so the closure would see an id assigned after it was
+        # defined. `_generate_raw` is nested inside `_generate_impl`
+        # (5627..6153), a SIBLING method — not inside this one (5516..5624).
+        # There is no closure, so both names resolved to nothing and every
+        # `record_load_outcome` / `release_reservation` call in that function
+        # raised NameError into an `except Exception: pass`.
+        #
+        # The cost was not telemetry. `release_reservation` hands back the
+        # soft VRAM claim; its own comment says the ledger self-heals "only
+        # after a settle window during which every other worker is throttled
+        # by memory this one has definitively stopped wanting". So the claim
+        # was never returned early, and local admission throttled workers
+        # against bytes nobody was using.
+        #
+        # A value that must cross a call boundary travels ALONG it. The
+        # reservation id is known here (assigned below, before the dispatch
+        # at the end of this method), so the one-slot cell has nothing left
+        # to solve and the ticket is frozen.
         _brain_for_adm: Optional[str] = None
-        # A one-slot cell rather than a bare name: `_generate_raw` closes over
-        # it and must see the id assigned AFTER the closure was defined.
-        _adm_reservation: list = [None]
+        _adm_reservation_id: Optional[str] = None
         try:
             from backend.core.ouroboros.governance import (
                 local_model_admission as _lma,
@@ -5583,7 +5622,7 @@ class PrimeProvider:
             _adm = await _lma.assess_async(
                 weight_bytes=_weight_bytes, model_id=_brain_for_adm,
             )
-            _adm_reservation[0] = getattr(_adm, "reservation_id", None)
+            _adm_reservation_id = getattr(_adm, "reservation_id", None)
             if not _adm.proceeds:
                 _lma.report(_adm, what="J-Prime generation")
                 logger.warning("[PrimeProvider] %s %s",
@@ -5622,6 +5661,10 @@ class PrimeProvider:
         with _jprime_inflight_guard():
             return await self._generate_impl(
                 context, deadline, repair_context, temperature=temperature,
+                admission=_AdmissionTicket(
+                    brain_id=_brain_for_adm,
+                    reservation_id=_adm_reservation_id,
+                ),
             )
 
     async def _generate_impl(
@@ -5631,8 +5674,15 @@ class PrimeProvider:
         repair_context: Optional[Any] = None,
         *,
         temperature: Optional[float] = None,
+        admission: "Optional[_AdmissionTicket]" = None,
     ) -> GenerationResult:
         """Generate code candidates via PrimeClient with optional tool-call loop.
+
+        ``admission`` carries what the local-admission gate granted in
+        :meth:`generate`, because the seam that settles it (``_generate_raw``)
+        lives in THIS method's scope and cannot see that one's locals. Default
+        ``None`` keeps every other caller — there are none today, and this
+        keeps it that way — byte-identical and unsettled.
 
         ``temperature`` (Adaptive Epistemic Feedback Matrix, T2): optional sampling
         override threaded by ``RepairEngine`` to lower temperature when the SAME
@@ -5834,13 +5884,18 @@ class PrimeProvider:
                     from backend.core.ouroboros.governance import (
                         local_model_admission as _lma_out,
                     )
-                    _lma_out.record_load_outcome(
-                        _brain_for_adm, ok=False, error=_load_err)
-                    # Hand back the soft claim on the failure path too. The
-                    # ledger self-heals if we don't, but only after a settle
-                    # window during which every other worker is throttled by
-                    # memory this one has definitively stopped wanting.
-                    _lma_out.release_reservation(_adm_reservation[0])
+                    # `admission` is this method's parameter, closed over
+                    # legitimately. The names that used to be here belonged to
+                    # `generate`'s scope and resolved to nothing.
+                    if admission is not None:
+                        _lma_out.record_load_outcome(
+                            admission.brain_id, ok=False, error=_load_err)
+                        # Hand back the soft claim on the failure path too.
+                        # The ledger self-heals if we don't, but only after a
+                        # settle window during which every other worker is
+                        # throttled by memory this one has definitively
+                        # stopped wanting.
+                        _lma_out.release_reservation(admission.reservation_id)
                 except Exception:  # noqa: BLE001 — telemetry never masks a fault
                     pass
                 raise
@@ -5848,11 +5903,12 @@ class PrimeProvider:
                 from backend.core.ouroboros.governance import (
                     local_model_admission as _lma_out,
                 )
-                _lma_out.record_load_outcome(_brain_for_adm, ok=True)
-                # The allocation is now resident and visible to the OS probe;
-                # continuing to subtract it would double-count one set of
-                # bytes against every subsequent worker.
-                _lma_out.release_reservation(_adm_reservation[0])
+                if admission is not None:
+                    _lma_out.record_load_outcome(admission.brain_id, ok=True)
+                    # The allocation is now resident and visible to the OS
+                    # probe; continuing to subtract it would double-count one
+                    # set of bytes against every subsequent worker.
+                    _lma_out.release_reservation(admission.reservation_id)
             except Exception:  # noqa: BLE001
                 pass
             _last_response[0] = resp

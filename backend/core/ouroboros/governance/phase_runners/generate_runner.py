@@ -2253,8 +2253,24 @@ class GENERATERunner(PhaseRunner):
                 try:
                     from backend.core.ouroboros.governance.self_evolution import DynamicRePlanner
                     _attempt_num = orch._config.max_generate_retries - generate_retries_remaining + 1
-                    _fc = validation.failure_class or "" if 'validation' in dir() else ""
-                    _em = validation.short_summary or "" if 'validation' in dir() else ""
+                    # NO VALIDATION VERDICT EXISTS IN THIS SCOPE.
+                    #
+                    # `validation` has no binding anywhere in `run()`; it was
+                    # carried over from the inline orchestrator twin, where it
+                    # IS bound (at the VALIDATE seam). The `in dir()` guard
+                    # therefore always evaluated False here, so these were
+                    # always "" — and this is the SHIPPING path
+                    # (`JARVIS_PHASE_RUNNER_GATE_EXTRACTED`). Dynamic
+                    # re-planning has been reasoning from empty failure
+                    # context on every real op.
+                    #
+                    # Made explicit rather than left as a guard that looks
+                    # like it might sometimes fire. Wiring a real verdict
+                    # through to this seam is a behavioural change with its
+                    # own design question — which verdict, from which
+                    # attempt — and is deliberately NOT invented here.
+                    _fc = ""
+                    _em = ""
                     _replan = DynamicRePlanner.suggest_replan(_fc, _em, _attempt_num)
                     if _replan:
                         _replan_text = DynamicRePlanner.format_for_prompt(_replan)

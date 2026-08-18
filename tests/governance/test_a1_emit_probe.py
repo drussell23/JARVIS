@@ -42,11 +42,27 @@ def _probe_lines(caplog):
     ]
 
 
+# LEVELS MOVED, MESSAGES DID NOT (PR #70529).
+#
+# `a1_trace` no longer buys operator visibility with severity. In-scope probe
+# lines are INFO carrying `operator=True` (which reaches the terminal in BOTH
+# presentation modes — WARNING never did once COCKPIT was raised to ERROR);
+# out-of-scope sensor lines are DEBUG and stay in `debug.log`, where every
+# auditor reads them. The message TEXT is byte-identical, so these assertions
+# are unchanged apart from the capture level.
+#
+# This file was missed when the contract changed — its sibling
+# `test_a1_trace_breadcrumbs.py` was updated and this one was not, so four
+# tests went red on `main`. Capturing at DEBUG covers every level the module
+# can now emit, which is what a test of MESSAGE CONTENT should have done from
+# the start.
+
+
 # --- (a) emit-then-ingest -> ordered probe --------------------------------
 
 
 def test_emit_then_ingest_records_ordered_probe(caplog):
-    with caplog.at_level(logging.WARNING, logger=a1_trace.logger.name):
+    with caplog.at_level(logging.DEBUG, logger=a1_trace.logger.name):
         a1_trace.emit_probe("g-1", source="roadmap")
         a1_trace.probe_ingest_order("g-1")
     lines = _probe_lines(caplog)
@@ -63,7 +79,7 @@ def test_emit_then_ingest_records_ordered_probe(caplog):
 
 
 def test_ingest_without_emit_logs_missing(caplog):
-    with caplog.at_level(logging.WARNING, logger=a1_trace.logger.name):
+    with caplog.at_level(logging.DEBUG, logger=a1_trace.logger.name):
         # No prior emit_probe for this goal — the sensor-op / Run-#17 mode.
         a1_trace.probe_ingest_order("g-sensor")
     lines = _probe_lines(caplog)
@@ -79,7 +95,7 @@ def test_ingest_without_emit_logs_missing(caplog):
 
 def test_orchestrator_off_is_captured(caplog, monkeypatch):
     monkeypatch.setenv("JARVIS_ROADMAP_ORCHESTRATOR_ENABLED", "false")
-    with caplog.at_level(logging.WARNING, logger=a1_trace.logger.name):
+    with caplog.at_level(logging.DEBUG, logger=a1_trace.logger.name):
         a1_trace.emit_probe("g-2", source="roadmap")
     lines = _probe_lines(caplog)
     assert any("orchestrator_enabled=False" in m for m in lines), lines
@@ -87,7 +103,7 @@ def test_orchestrator_off_is_captured(caplog, monkeypatch):
 
 def test_orchestrator_on_is_captured(caplog, monkeypatch):
     monkeypatch.setenv("JARVIS_ROADMAP_ORCHESTRATOR_ENABLED", "true")
-    with caplog.at_level(logging.WARNING, logger=a1_trace.logger.name):
+    with caplog.at_level(logging.DEBUG, logger=a1_trace.logger.name):
         a1_trace.emit_probe("g-3", source="roadmap")
     lines = _probe_lines(caplog)
     assert any("orchestrator_enabled=True" in m for m in lines), lines
@@ -117,7 +133,7 @@ def test_emit_probe_returns_none_observe_only():
 
 def test_gated_off_emits_no_probe_lines(caplog, monkeypatch):
     monkeypatch.setenv("JARVIS_A1_EMIT_PROBE_ENABLED", "false")
-    with caplog.at_level(logging.WARNING, logger=a1_trace.logger.name):
+    with caplog.at_level(logging.DEBUG, logger=a1_trace.logger.name):
         a1_trace.emit_probe("g-5", source="roadmap")
         a1_trace.probe_ingest_order("g-5")
     assert not _probe_lines(caplog)
@@ -127,7 +143,7 @@ def test_master_trace_off_also_silences_probe(caplog, monkeypatch):
     # The probe rides the same surface; killing the master A1Trace flag
     # also silences the probe (defence in depth).
     monkeypatch.setenv("JARVIS_A1_TRACE_ENABLED", "false")
-    with caplog.at_level(logging.WARNING, logger=a1_trace.logger.name):
+    with caplog.at_level(logging.DEBUG, logger=a1_trace.logger.name):
         a1_trace.emit_probe("g-6", source="roadmap")
         a1_trace.probe_ingest_order("g-6")
     assert not _probe_lines(caplog)
