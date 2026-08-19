@@ -4629,23 +4629,44 @@ Two profiler distortions worth recording, both pre-existing:
 #### 31.2.2 Windows inference host — the target
 
 ```
-CPU  AMD Ryzen 9 9950X3D
-GPU  NVIDIA RTX 5090 Founders Edition   32 GB GDDR7
-GPU  second NVIDIA card                 24 GB
-RAM  64 GB DDR5 (dual channel)
+CPU  AMD Ryzen 9 9950X3D   16C/32T, 4.30 GHz base, 128 MB L3 (3D V-Cache)
+GPU  NVIDIA RTX 5090 Founders Edition   32 GB GDDR7   <- the ONLY inference device
+iGPU AMD Radeon (integrated in the 9950X3D)  2 GB dedicated + 45.7 GB shared
+RAM  64 GB DDR5-6000, 2 of 2 DIMM slots used, 61.7 GB usable (2.3 GB reserved)
 ```
+
+> **CORRECTED 2026-08-18 from Task Manager screenshots.** An earlier draft of
+> this section recorded a *second NVIDIA card at 24 GB* and a pooled 56 GB.
+> That is wrong. `GPU 1` is the **AMD Radeon iGPU integrated into the
+> 9950X3D**, and its "45.7 GB shared" is system RAM addressed through the
+> display driver, not video memory. It is not a CUDA device: `nvidia-smi` and
+> `torch.cuda` do not enumerate it, and no llama.cpp/vLLM CUDA build will use
+> it. **There is exactly one inference GPU on this host.**
 
 | pool | bytes |
 |---|---|
-| largest single device | **32 GB** |
-| pooled VRAM (sharding declared) | **56 GB** |
-| VRAM + system RAM (weights may live in either) | **120 GB** |
+| the single inference device (RTX 5090) | **32 GB** |
+| pooled VRAM | **n/a — nothing to pool with** |
+| VRAM + usable system RAM (weights may live in either) | **~94 GB** |
 
-This is precisely the host the §31.1.2 work exists for: without it, the
-admission gate sees 32 GB and refuses a model that would fit across both
-cards; with sharding blindly summed, it would admit models that cannot land on
-a non-sharding stack. Both failure modes are now avoidable, and which one
-applies is stated rather than assumed.
+Two consequences follow, and both are load-bearing:
+
+1. **`JARVIS_LOCAL_ACCEL_SHARDING` is not merely left off — there is nothing
+   to declare.** The default-false choice in §31.1.2 turns out to have been
+   the difference between a correct gate and one that authorised a 56 GB load
+   onto a 32 GB card.
+2. **§31.1.2's `shardable_usable_bytes` guard is now exercised rather than
+   hypothetical**: on a single-device host it returns the single-device answer
+   *even when sharding is declared*, so a mistaken flag cannot invent the
+   card that is not there. Verified against this exact hardware shape.
+
+The §31.1.2 work still earns its place here, but for the opposite reason to
+the one first written down: not because two cards must be pooled, but because
+a probe that *cannot enumerate a second device* must say so rather than let a
+declaration fabricate one. `is_multi_device` keys off `len(devices)`, so on
+this host it is False and the affinity layer becomes a no-op — while the
+per-device **capacity** check (§31.6.1 #4a) still runs, which is the half that
+matters on a single 32 GB card.
 
 ### 31.3 Can a 1T–2.4T model run on that box? — answered with arithmetic
 
@@ -4669,14 +4690,18 @@ Published sizes:
 | IQ1_S | 508 GB | Unsloth |
 | **Unsloth Dynamic 1-bit GGUF (smallest that exists)** | **397 GB** | Unsloth |
 
-Against 120 GB of addressable memory on the target box:
+Against the ~94 GB actually addressable on the target box (32 GB VRAM +
+61.7 GB usable RAM — see the correction in §31.2.2):
 
 ```
 397 GB  smallest quantized form in existence
-120 GB  VRAM + system RAM
+ 94 GB  VRAM + usable system RAM
 -----
-277 GB  short  ->  3.3x over, at ~1.32 bits per parameter
+303 GB  short  ->  4.2x over, at ~1.32 bits per parameter
 ```
+
+The RAM ceiling is also harder than it looks: **both DIMM slots are already
+occupied**, so more memory means replacing the pair, not adding to it.
 
 There is no quantization below ~1 bit. The deficit cannot be closed by
 compression.
@@ -4768,8 +4793,8 @@ replace them with real numbers on first contact, and that is the point.
 |---|---|---|---|---|---|---|
 | **Qwen3-Coder-30B-A3B** | 30B / 3.3B MoE | ~19 GB | 256K → 1M | yes, with room | **220 tok/s** (reported) | **Best fit.** Clears the 3-lane bar with margin. The active-parameter count is what makes it fast. |
 | **Qwen3.8-27B** | 28B dense + vision | **17.8 GB** (Q4_K_M) | 256K native | yes | ~50–70 tok/s (est.) | **Best quality that still clears 1 lane.** Hybrid attention caches only 16 of 64 layers: KV is 0.5 GB @8K, 2.0 GB @32K, 16.4 GB @262K — unusually cheap. Apache-2.0. |
-| **Llama-3.3-70B** | 70B dense | ~40 GB | 128K | no — needs both cards | ~15–20 tok/s (est.) | **Below the bar.** Dense 70B cannot sustain 40 tok/s on this hardware. |
-| **gpt-oss-120b** | 117B / 5.1B MoE | **~60 GB** MXFP4 | 128K | no — 60 GB > 56 GB pooled | fast if resident (5.1B active) | **Marginal.** Weights alone exceed pooled VRAM; needs RAM spill plus KV cache, and vendor guidance says 80–96 GB. Revisit if a third card or 96 GB-class VRAM appears. |
+| **Llama-3.3-70B** | 70B dense | ~40 GB | 128K | no — 40 GB > 32 GB | ~15–20 tok/s (est.) | **Below the bar.** Dense 70B cannot sustain 40 tok/s here, and no longer fits VRAM at all. |
+| **gpt-oss-120b** | 117B / 5.1B MoE | **~60 GB** MXFP4 | 128K | no — 60 GB > 32 GB | usable ONLY with CPU-MoE offload | **The one case the 64 GB of RAM earns its keep.** Weights exceed VRAM, but with just **5.1B active** params the experts tolerate CPU offload (`--n-cpu-moe`) far better than a dense model would: attention stays on the 5090, experts stream from DDR5-6000. Worth measuring; the governor will price it honestly. |
 | **Kimi K2 / DeepSeek-class 1T** | 1T / 32B | 245 GB @1.8-bit | — | no | ~5 tok/s at best | **Out of scope** — see §31.3. |
 | **Qwen3.8-Max (2.4T-A95B)** | 2.4T / 95B | **397 GB** @1-bit | 256K–1M | no — 3.3x over | 0.18–0.45 tok/s streamed | **Impossible on this box, and unusable for O+V even on hardware that fits it.** |
 
@@ -4782,14 +4807,27 @@ replace them with real numbers on first contact, and that is the point.
    where one lane at higher fidelity beats three at lower. Its vision encoder
    also lines up with the existing multi-modal ingest path
    (`ctx.attachments` → GENERATE) and VisionSensor.
-3. Both fit the 5090 **alone**, which means `JARVIS_LOCAL_ACCEL_SHARDING` can
-   stay **off** and the second card is free to host the other model
-   concurrently — two resident models, no layer splitting, no pooled-capacity
-   risk. That is a strictly better use of 56 GB than one model spanning both.
+3. **They cannot both be resident.** 19 GB + 17.8 GB = 36.8 GB against a
+   32 GB card, before either one's KV cache. With a single inference GPU the
+   choice is exclusive, and swapping between them is not free: a cold model
+   load measured **~30 s** on this project's own hardware, which is a third of
+   a BACKGROUND budget spent before a single token is generated.
 
-> Note the shape of that recommendation: the second GPU's value here is
-> **another independent lane**, not a bigger model. Which is the same
-> conclusion §31.1.1 reached from the other direction.
+**So the deployment is one resident model, and it should be
+`Qwen3-Coder-30B-A3B`:** 19 GB of weights leaves ~11 GB of the 5090's free
+VRAM for KV, which at Qwen-class KV rates is roughly a **127K-token working
+context** — more than O+V ever asks for — while being the only candidate whose
+throughput clears the 3-lane bar in §31.4.1. Reach for `Qwen3.8-27B` instead
+only if a specific workload needs its vision encoder (which does line up with
+the existing `ctx.attachments` → GENERATE path and VisionSensor), accepting
+one lane instead of three.
+
+> The earlier draft of this section concluded that "the second GPU's value is
+> another independent lane, not a bigger model." The conclusion survives the
+> hardware correction; only the subject changes. There is no second GPU, so
+> the lane count now comes entirely from **how fast the one card is** — which
+> is precisely the quantity §31.1.1's governor measures, and precisely why it
+> had to be a measurement rather than a setting.
 
 Sources: [Qwen3.8-27B GGUF sizes](https://ofox.ai/blog/qwen-3-8-27b-run-locally-vram-gguf-2026/) ·
 [Qwen3-Coder-30B](https://www.morphllm.com/best-ollama-models) ·
@@ -4828,8 +4866,8 @@ Ranked by *leverage per line changed*, the §28 criterion.
 | # | Item | Why it is here | Cost | Blocked on |
 |---|---|---|---|---|
 | **1** | **`physics_key` hardware-class component** (§31.5.1) | Without it the bridge governs a 5090 with an M1's physics. This is a correctness bug that only appears under the exact configuration we are building toward. | S | nothing |
-| **2** | **Deploy `Qwen3-Coder-30B-A3B` + `Qwen3.8-27B` on the Windows host**, one per card | Turns the second GPU into a second lane. Makes the governor's arithmetic testable against hardware that can actually clear the bar. | S | machine powered on |
-| **3** | **Prove the dual-GPU probe end to end** — `nvidia-smi` enumeration, `is_multi_device`, admission with sharding both on and off | §31.1.2 is unit-proven and live-unproven. Every capability in this repo that shipped unproven eventually shipped broken. | S | machine powered on |
+| **2** | **Deploy `Qwen3-Coder-30B-A3B` as the single resident model** on the RTX 5090 | The one candidate that clears the 3-lane bar (§31.4.1), and the first hardware capable of testing the governor's arithmetic against real throughput rather than a 1-lane M1. | S | machine powered on |
+| **3** | **Prove the probe end to end on real silicon** — `nvidia-smi` enumeration (expect **one** device), `is_multi_device=False`, and admission refusing an over-long context with an actionable ceiling | §31.1.2 is unit-proven and live-unproven. The hardware correction *narrows* this: there is no pooling path to exercise, so what must be proven is that the single-device path is right — including that a declared `SHARDING=1` changes nothing. | S | machine powered on |
 | **4** | **Route-aware lane ceiling** (§31.5.2) | Re-gate after dequeue using the op's own route, reusing the existing re-enqueue idiom. | M | #2 |
 | **5** | **Observed sharding outranks the declared flag** | A stack reporting a resident model larger than its largest single device has **proven** sharding. Turns a trusted flag into a measurement — the same upgrade the physics ledger already represents. | M | #3 |
 | **6** | **Cold-load outlier isolation** (§31.2.1) | Recording model-load as per-token cost pins the estimator at its ceiling for a full sample window, which currently makes every M1 verdict `ceiling_clamped`. Record load separately. | M | nothing |
@@ -4848,7 +4886,7 @@ addressed lane COUNT while this addresses lane CHOICE.
 | 4a | Heterogeneous device routing + per-device KV admission | **closed (unit-proven only)** — `device_affinity.py` |
 | 7 | `psutil` DRY red | **closed** — `swap_in_bytes()` moved to `memory_pressure_gate` |
 | — | ToC dead anchors | **closed** — 124 broken links replaced with a companion-document map |
-| 2, 3 | Deploy the models; prove the dual-GPU probe live | **blocked on the Windows host being powered on** |
+| 2, 3 | Deploy the model; prove the probe live | **blocked on the Windows host being powered on** (scope narrowed by the §31.2.2 hardware correction — single GPU, so no pooling path to exercise) |
 
 **Three design decisions worth recording, because each rejected an easier
 answer:**
@@ -4872,10 +4910,22 @@ answer:**
    one rather than being deferred. Declining work a present device could do
    would be policy defeating the system it exists to tune.
 
-> **Honesty note.** §31.6 #4a is proven against synthetic `DeviceReading`s
-> only. No dual-GPU hardware has executed this path. Every capability in this
-> repository that shipped unproven eventually shipped broken, so #3 remains a
-> gate on trusting it, not a formality.
+> **Honesty note, updated 2026-08-18.** §31.6 #4a is proven against synthetic
+> `DeviceReading`s only, and the hardware correction in §31.2.2 means the
+> **routing half of it will never execute on this host** — one inference GPU
+> means `is_multi_device` is False and affinity is a no-op. What does execute,
+> and what therefore has to be right, is the per-device **capacity** half:
+> weights + KV at the reachable context against the single 32 GB card, and the
+> refusal path that reports an actionable ceiling. Verified against this exact
+> shape in-repo; still unproven on real silicon.
+>
+> Worth recording plainly: this section was written around a second GPU that
+> does not exist. The code survived the correction unchanged because two of
+> its guards were written to distrust exactly this class of mistake —
+> `is_multi_device` keys off enumerated devices rather than a reported count,
+> and `shardable_usable_bytes` returns the single-device answer even when
+> sharding is declared. **A design that assumes its own inputs may be wrong is
+> the only reason a wrong input cost nothing here.**
 
 **Not scheduled, and deliberately so:** anything aimed at running a 1T+ model
 locally. §31.3 shows the ceiling is not a hardware-budget problem but a
