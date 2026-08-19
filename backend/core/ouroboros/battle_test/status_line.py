@@ -115,6 +115,12 @@ class StatusSnapshot:
     #: an arbitrary constant, which is how an operator ends up asking where
     #: their own number came from.
     cost_budget_basis: str = ""
+    #: How the cost chip should READ — "" | partial | unfunded | local.
+    #: The ceiling is a policy cap; this says whether anything can spend
+    #: against it, and is lane-specific rather than a blanket verdict.
+    funding_mode: str = ""
+    #: The lanes that are out (partial), or the serving endpoint (local).
+    funding_label: str = ""
     # Idle window
     idle_elapsed_s: float = 0.0
     idle_timeout_s: float = 0.0
@@ -348,6 +354,7 @@ class StatusLineBuilder:
         primary_op, extra_ops = self._sample_ops()
         route, provider, model = self._sample_route_and_provider(primary_op)
         liq_exhausted, liq_provider, liq_reset = self._sample_liquidity()
+        funding_mode, funding_label = self._sample_funding()
 
         # §37 Slice 5 — feed cost-band-crossing observer.
         # Chatter-suppression is structural in the observer; this call
@@ -380,6 +387,8 @@ class StatusLineBuilder:
             liquidity_exhausted=liq_exhausted,
             liquidity_provider=liq_provider,
             liquidity_reset_s=liq_reset,
+            funding_mode=funding_mode,
+            funding_label=funding_label,
         )
 
     def render_plain(self) -> str:
@@ -676,30 +685,128 @@ class StatusLineBuilder:
         return (primary_phase, detail)
 
     def _sample_liquidity(self) -> tuple:
-        """Circadian liquidity sample (item #5) — reads the file-backed
-        ProviderLiquidityLedger the Aegis proxy hydrates on every
-        upstream response. Restraint contract: returns the exhausted
-        triple ONLY when some provider's declared runway is dry; the
-        healthy state samples as (False, "", None) and renders nothing.
+        """Which lane is dry, for the ``⚠ … dry`` token. NEVER raises.
+
+        Asks :func:`economic_state.display_liquidity`, NOT
+        `provider_liquidity_ledger.runway_exhausted`. That swap is the whole
+        fix: `runway_exhausted` is a ROUTING predicate and fail-opens by
+        design — it folds in `quota_exhausted`, which is `t < until`, a WINDOW
+        test that lapses on a TTL so a topped-up wallet resumes routing without
+        manual clearing. Correct for routing; catastrophic for a dashboard.
+        Once both windows lapsed this returned ``(False, "", None)`` while
+        Claude was answering 400 `credit balance too low` and DoubleWord 402,
+        and the cockpit reported healthy lanes over two empty accounts. The
+        ledger even still declared 5,000,000 tokens remaining, recorded before
+        the money ran out, so the token path agreed.
+
+        `display_liquidity` keeps a lapsed-but-unverified lane DRY, because
+        time passing is not payment.
+
+        FRACTIONAL, NOT BLANKET — the name returned is lane-specific whenever
+        exactly one lane is out, so "doubleword dry" never becomes a claim
+        about Anthropic. Only when EVERY known lane is dry does it collapse to
+        one phrase, and that phrase says so rather than naming an arbitrary
+        first offender.
+
         Master ``JARVIS_STATUS_LIQUIDITY_SEGMENT_ENABLED`` (default on).
-        NEVER raises."""
+        """
         try:
             if os.environ.get(
                 "JARVIS_STATUS_LIQUIDITY_SEGMENT_ENABLED", "1",
             ).strip().lower() in ("0", "false", "no", "off"):
                 return (False, "", None)
-            from backend.core.ouroboros.governance.provider_liquidity_ledger import (  # noqa: E501
-                _load,
-                liquidity,
-                runway_exhausted,
+            from backend.core.ouroboros.governance.economic_state import (
+                display_liquidity,
             )
-            for name in sorted((_load().get("providers") or {})):
-                if runway_exhausted(name):
-                    _tokens, secs = liquidity(name)
-                    return (True, str(name), secs)
-            return (False, "", None)
+            from backend.core.ouroboros.governance.provider_liquidity_ledger import (  # noqa: E501
+                liquidity,
+            )
+            view = display_liquidity()
+            dry = view.get("dry") or []
+            if not dry:
+                return (False, "", None)
+            if len(dry) == 1:
+                # ONE lane out — name it, even when it is the only lane the
+                # ledger knows. "all lanes" is technically true of a
+                # single-lane roster and useless: it hides the one fact the
+                # operator needs, which is WHICH lane.
+                label = str(dry[0])
+            elif view.get("all_dry"):
+                label = "all lanes"
+            else:
+                label = ", ".join(str(d) for d in dry)
+            # The reset horizon is only meaningful for a single named lane;
+            # two lanes recover on two clocks and one number would be a guess.
+            secs = None
+            if len(dry) == 1:
+                try:
+                    _tokens, secs = liquidity(dry[0])
+                except Exception:  # noqa: BLE001
+                    secs = None
+            return (True, label, secs)
         except Exception:  # noqa: BLE001 — status line never breaks
             return (False, "", None)
+
+    def _sample_funding(self) -> tuple:
+        """``(mode, label)`` telling the cost chip what kind of number it is.
+
+        The ceiling and the balance are different quantities, and the line was
+        printing the first as though it were the second: ``$0.00/$0.71`` reads
+        as "$0.71 of headroom" when the ceiling is a POLICY cap derived from
+        spend HISTORY (p95 of prior sessions x3) and the actual spendable
+        balance is zero. The cap still matters when lanes are funded — it is
+        what stops a runaway session — so it is qualified here, never deleted.
+
+        Modes, in the order they are decided:
+
+          ``"local"``     every paid lane is dry BUT a sovereign local tier is
+                          serving. Not paralysis: work continues at zero
+                          marginal cost, and a ceiling denominated in dollars
+                          is simply not the constraint any more.
+          ``"unfunded"``  every paid lane is dry and nothing else can serve.
+                          The ceiling is inert — say so.
+          ``"partial"``   SOME lane is dry. The ceiling is still real, because
+                          the funded lane can still spend against it. This is
+                          the case a blanket "unfunded" would get wrong, and
+                          it is why the decision is made over the lane ROSTER
+                          rather than an any()/all() on a single boolean.
+          ``""``          nothing to say; the chip renders unchanged.
+
+        Local state is read through `CapabilityEvaluator._read_remote`, which
+        is already the one non-blocking probe of the gateway (in-memory breaker
+        state, no `resident_models()` round-trip) — this runs on the render
+        path at ~500ms and must never wait on a LAN.
+        """
+        try:
+            from backend.core.ouroboros.governance.economic_state import (
+                display_liquidity,
+            )
+            view = display_liquidity()
+            # The ECONOMIC subset, not the display union. A rate-limited lane
+            # is dry — it earns the "⚠ … dry" token and its reset countdown —
+            # but it is not UNFUNDED, and a ceiling qualified as unfunded on
+            # the strength of a per-minute token cap would send an operator to
+            # a billing page to fix a problem a clock fixes.
+            econ = view.get("economic_dry") or []
+            if not view.get("readable") or not econ:
+                return ("", "")
+            if not view.get("all_economic_dry"):
+                # Fractional: name the lanes that are out of money, and leave
+                # the ceiling alone — it is still spendable through the rest.
+                return ("partial", ", ".join(econ))
+            try:
+                from backend.core.ouroboros.governance.capability_state import (
+                    CapabilityEvaluator,
+                )
+                remote_state, endpoint, _readable = (
+                    CapabilityEvaluator._read_remote())
+            except Exception:  # noqa: BLE001
+                remote_state, endpoint = "absent", ""
+            if remote_state == "serving":
+                return ("local", str(endpoint or "local"))
+            return ("unfunded", "")
+        except Exception:  # noqa: BLE001
+            return ("", "")
 
     def _sample_route_and_provider(self, op_id: str) -> tuple:
         """Pull route + provider + MODEL for the primary op. All optional.
@@ -874,6 +981,10 @@ def _format_plain(snap: StatusSnapshot, *, compact: bool) -> str:
                 # Not forwarding it meant the breadcrumb re-asserted a bare
                 # "IDLE" over an answer that had already been computed.
                 detail=getattr(snap, "phase_detail", "") or "",
+                # The ceiling is a POLICY cap, not a balance. Without this
+                # the chip renders `$0.00/$0.71` over two empty accounts.
+                funding=getattr(snap, "funding_mode", "") or "",
+                funding_label=getattr(snap, "funding_label", "") or "",
             )
             # A dry provider runway is MOST relevant while idle — the
             # organism may be idle BECAUSE it is dry. The one exception

@@ -1227,6 +1227,8 @@ def format_idle_breadcrumb(
     posture: str = "",
     op_id: str = "",
     detail: str = "",
+    funding: str = "",
+    funding_label: str = "",
 ) -> str:
     """One-line breadcrumb for the IDLE phase — replaces the silent
     empty status line that today leaves operators wondering whether
@@ -1257,8 +1259,35 @@ def format_idle_breadcrumb(
         parts[0] = f"IDLE · {detail}"
     if isinstance(branch, str) and branch:
         parts.append(branch)
+    # The ceiling is a POLICY cap derived from spend HISTORY (p95 of prior
+    # sessions x3), not a balance. Rendered bare it reads as headroom, and an
+    # operator watching `$0.00/$0.71` over two empty accounts is reading a
+    # number nothing can spend. `funding` says which kind of number it is;
+    # the cap is QUALIFIED, never deleted, because it is still what stops a
+    # runaway session the moment a lane is funded again.
     if cost_budget > 0.0:
-        parts.append(f"${cost_spent:.2f}/${cost_budget:.2f}")
+        chip = f"${cost_spent:.2f}/${cost_budget:.2f}"
+        if funding == "local":
+            # Every paid lane is dry, but a sovereign tier is serving. This is
+            # the case a flat "unfunded" gets exactly backwards: the organism
+            # is WORKING, at zero marginal cost, and a dollar ceiling is no
+            # longer the binding constraint. Show what is actually true — what
+            # has been spent — and name the tier carrying the work.
+            chip = f"${cost_spent:.2f} · local tier"
+            if funding_label:
+                chip += f" ({funding_label})"
+        elif funding == "unfunded":
+            # Nothing can spend against it and nothing else can serve.
+            chip += " unfunded"
+        elif funding == "partial":
+            # FRACTIONAL — and the reason this is not folded into "unfunded".
+            # One lane out does NOT make the ceiling inert: the funded lane can
+            # still spend the whole of it, so the denominator stays honest and
+            # only gains the name of the lane that is out. Collapsing this to a
+            # blanket verdict would tell an operator with a working Anthropic
+            # key that their organism is broke.
+            chip += f" · ⚠ {funding_label} dry" if funding_label else " · ⚠ dry"
+        parts.append(chip)
     elif cost_spent > 0.0:
         parts.append(f"${cost_spent:.2f}")
     if isinstance(posture, str) and posture:
