@@ -6045,18 +6045,10 @@ class GovernedOrchestrator:
                     # harnesses (e.g. live_fire_exploration_gate.py) can widen
                     # the architectural COMPLEX window without patching code.
                     # Defaults preserve the 2026-04-12 calibration.
-                    _route_timeouts = {
-                        "immediate": float(os.environ.get(
-                            "JARVIS_GEN_TIMEOUT_IMMEDIATE_S", "120")),
-                        "standard": float(os.environ.get(
-                            "JARVIS_GEN_TIMEOUT_STANDARD_S", "220")),
-                        "complex": float(os.environ.get(
-                            "JARVIS_GEN_TIMEOUT_COMPLEX_S", "240")),
-                        "background": float(os.environ.get(
-                            "JARVIS_GEN_TIMEOUT_BACKGROUND_S", "180")),
-                        "speculative": float(os.environ.get(
-                            "JARVIS_GEN_TIMEOUT_SPECULATIVE_S", "180")),
-                    }
+                    from backend.core.ouroboros.governance.route_budgets import (  # noqa: PLC0415,E501
+                        route_generation_budgets as _route_budgets,
+                    )
+                    _route_timeouts = _route_budgets()
                     # Slice 15 T4 — value-band adaptive allocation (parity
                     # twin of the live generate_runner seam). Fail-soft.
                     try:

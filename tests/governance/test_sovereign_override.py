@@ -188,14 +188,40 @@ class TestTheQoSBreakerThatAlreadyExists:
     model, and that the breach is attributable.
     """
 
-    def test_the_orchestrator_caps_generation_per_lane(self):
+    def test_the_budgets_are_keyed_on_the_lane(self, monkeypatch):
         """The budgets are keyed on the LANE, so a slow model forced onto a
         fast lane inherits the fast lane's ceiling — which is exactly the
-        containment the brief asked for."""
+        containment the brief asked for.
+
+        Asserted against the resolver's OUTPUT rather than against the
+        spelling of an env var in some module's source. The table moved to
+        `route_budgets` (it had been written twice, byte-identical, in
+        orchestrator and generate_runner); a source-grep would have called
+        that a regression when nothing about the behaviour changed.
+        """
+        from backend.core.ouroboros.governance.route_budgets import (
+            route_generation_budget_s,
+        )
+        immediate = route_generation_budget_s("immediate")
+        background = route_generation_budget_s("background")
+        # The containment the brief asked for: the fast lane's ceiling is
+        # genuinely tighter, so a slow model pinned to it cannot inherit a
+        # background-sized window.
+        assert immediate < background
+
+        # ...and it is tunable, which is the property the env var existed for.
+        monkeypatch.setenv("JARVIS_GEN_TIMEOUT_IMMEDIATE_S", "7")
+        assert route_generation_budget_s("immediate") == 7.0
+
+    def test_the_orchestrator_enforces_that_budget(self):
+        """The ceiling is not advisory: the orchestrator reads the canonical
+        table and enforces it with a cancelling wait, plus the outer grace."""
         import inspect
         from backend.core.ouroboros.governance import orchestrator
         source = inspect.getsource(orchestrator)
-        assert "JARVIS_GEN_TIMEOUT_IMMEDIATE_S" in source
+        # Wiring pin: the orchestrator must read the ONE table. Without this,
+        # a future edit could re-inline a private copy and drift again.
+        assert "route_generation_budgets" in source
         assert "_gen_timeout + _OUTER_GATE_GRACE_S" in source
         assert "asyncio.wait_for(" in source
 
