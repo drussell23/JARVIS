@@ -3847,6 +3847,10 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             "HEALTHY": "rgb(67,214,208)", "DEGRADED": "rgb(248,81,73)",
             "ARMED": "rgb(227,179,65)", "SOAKING": "rgb(94,224,106)",
             "DORMANT": "rgb(108,125,119)",
+            # Capability states. BLOCKED and UNKNOWN share the warning hue:
+            # "I cannot work" and "I cannot tell whether I can work" are both
+            # things the operator must not read as green.
+            "BLOCKED": "rgb(248,81,73)", "UNKNOWN": "rgb(227,179,65)",
         }
 
         def _header_lines():
@@ -3856,15 +3860,44 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             t1.append("O+V", style="bold rgb(94,224,106)")
             t1.append(f" v{resolve_version()}", style="rgb(219,230,225)")
             t2 = _Text()
-            state = "HEALTHY"
+            # CAPABILITY, not presentation.
+            #
+            # This line used to read `get_reactive_theme().state`, which
+            # answers "what colour should the dot be" -- and rendered that
+            # answer as though it meant "am I able to work". It also defaulted
+            # to HEALTHY and swallowed the lookup failure, so two optimistic
+            # defaults stacked on a category error. The observed result: a
+            # green `● healthy` while both provider lanes were at zero credit
+            # and every op was failing.
+            #
+            # `capability_state` fuses the liquidity ledger (the same reading
+            # that already renders "⚠ … dry" on the status line), the daemon
+            # heartbeat and op telemetry, degrades deterministically, recovers
+            # only on a verified success, and resolves UNKNOWN to blocked.
+            state, _reason = "HEALTHY", ""
             try:
-                from backend.core.ouroboros.ui.theme import get_reactive_theme
-                state = get_reactive_theme().state.value
+                from backend.core.ouroboros.governance.capability_state import (
+                    get_default_evaluator as _cap_eval,
+                )
+                _cap = _cap_eval().evaluate()
+                state = _cap.badge.upper()
+                _reason = _cap.reason
             except Exception:
-                pass
-            t2.append("● ", style=_STATE_DOT.get(state, "rgb(67,214,208)"))
+                # Even here the fallback is the theme's PRESENTATION state,
+                # used only to pick a word we then do not trust to be green:
+                # an unreadable capability is not evidence of health.
+                state = "UNKNOWN"
+            t2.append("● ", style=_STATE_DOT.get(state, "rgb(227,179,65)"))
             t2.append(state.lower(), style="rgb(174,188,182)")
-            t2.append(" · ouroboros + venom · the organism drives", style="rgb(108,125,119)")
+            # The tagline is a claim too. When the organism cannot dispatch,
+            # "the organism drives" is false, so the reason takes its place.
+            if state == "HEALTHY":
+                t2.append(" · ouroboros + venom · the organism drives",
+                          style="rgb(108,125,119)")
+            else:
+                t2.append(" · ouroboros + venom · ", style="rgb(108,125,119)")
+                t2.append(_reason or "cannot verify capability",
+                          style="rgb(227,179,65)")
             t3 = _Text(_home_path(), style="rgb(108,125,119)")
             return [t1, t2, t3]
 
