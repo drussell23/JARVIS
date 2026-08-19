@@ -260,3 +260,63 @@ class TestLifecycleAndConfig:
 
     def test_snapshot_never_raises(self):
         assert isinstance(ig.InferenceGateway().snapshot(), dict)
+
+
+class TestClientCacheIdentity:
+    """A client is bound to (endpoint, MODEL) — not to the endpoint alone.
+
+    FOUND BY LIVE-FIRE, not by the tests above, because every one of them used
+    a single model per gateway. With an endpoint-only cache key, a warm swap
+    to a second model on the same host meant every subsequent dispatch got the
+    FIRST model's client back: the requested model was silently ignored, the
+    op ran on the wrong weights, and its telemetry landed under the wrong
+    physics key.
+
+    On the deployment this exists for, that reads as: one vision one-off swaps
+    to the 27B, and every BACKGROUND op afterwards quietly runs on it at a
+    third of the throughput, blowing route budgets with no error anywhere.
+    """
+
+    def _t(self, model, url="http://h:11434"):
+        return ig.GatewayTarget(base_url=url, model_name=model, scope="remote",
+                                state=ig.HostState.HEALTHY, reason="t")
+
+    def test_two_models_on_one_host_get_two_clients(self):
+        g, made = _gw()
+        a, _ = g._client_for(self._t("qwen3-coder:30b"))
+        b, _ = g._client_for(self._t("qwen3.8:27b"))
+        assert a is not b
+        assert a.cfg.model_name == "qwen3-coder:30b"
+        assert b.cfg.model_name == "qwen3.8:27b"
+
+    def test_the_same_model_is_still_cached(self):
+        """The fix must not turn the cache off — a new client per dispatch
+        would leak a session per op."""
+        g, _made = _gw()
+        a, _ = g._client_for(self._t("qwen3-coder:30b"))
+        b, _ = g._client_for(self._t("qwen3-coder:30b"))
+        assert a is b
+
+    def test_each_client_writes_its_own_physics_key(self):
+        """The observable symptom of the bug: telemetry under the wrong key.
+        Two models must never share one ledger entry."""
+        g, _made = _gw()
+        _a, pa = g._client_for(self._t("qwen3-coder:30b"))
+        _b, pb = g._client_for(self._t("qwen3.8:27b"))
+        assert pa._ledger_key != pb._ledger_key
+        assert "qwen3-coder:30b" in pa._ledger_key
+        assert "qwen3.8:27b" in pb._ledger_key
+
+    def test_the_same_model_on_two_hosts_gets_two_clients(self):
+        g, _made = _gw()
+        a, _ = g._client_for(self._t("m", "http://a:11434"))
+        b, _ = g._client_for(self._t("m", "http://b:11434"))
+        assert a is not b
+
+    @pytest.mark.asyncio
+    async def test_aclose_still_closes_every_cached_client(self):
+        g, _made = _gw()
+        clients = [g._client_for(self._t(m))[0]
+                   for m in ("m1", "m2", "m3")]
+        await g.aclose()
+        assert all(c.closed for c in clients)

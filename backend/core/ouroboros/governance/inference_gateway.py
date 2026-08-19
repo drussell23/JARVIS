@@ -345,7 +345,13 @@ class InferenceGateway:
     def __init__(self, *, client_factory: Optional[Any] = None) -> None:
         self._lock = threading.Lock()
         self._health: Dict[str, _HostHealth] = {}
-        self._clients: Dict[str, Any] = {}
+        self._clients: Dict[Tuple[str, str], Any] = {}
+        #: (base_url, model_name) -> (client, profiler). Keyed by BOTH,
+        #: because a client is BOUND to a model: its cfg carries model_name
+        #: and its profiler is keyed by a physics_key that includes the model.
+        #: Keying on base_url alone silently served every later op with
+        #: whichever model was requested FIRST -- see the cache-identity note
+        #: on `_client_for`.
         #: base_url -> (monotonic_at, resident_models_or_None). None is
         #: "unknowable", which is NOT the same as an empty tuple.
         self._residency: Dict[str, Tuple[float, Optional[Tuple[str, ...]]]] = {}
@@ -428,8 +434,20 @@ class InferenceGateway:
         from backend.core.ouroboros.governance import (  # noqa: PLC0415
             local_inference_director as lid,
         )
+        # CACHE IDENTITY = (endpoint, model). Not the endpoint alone.
+        #
+        # Found by live-fire, not by 300+ unit tests, because every unit test
+        # used one model per gateway. After a warm swap to a second model on
+        # the SAME host, an endpoint-only key returned the first model's
+        # client for every subsequent dispatch -- so the requested model was
+        # silently ignored and its telemetry landed under the wrong physics
+        # key. On the deployment this is built for that is: one vision
+        # one-off swaps to the 27B, and every BACKGROUND op afterwards
+        # quietly runs on it at a third of the throughput, blowing budgets
+        # with no error anywhere.
+        cache_key = (target.base_url, target.model_name)
         with self._lock:
-            hit = self._clients.get(target.base_url)
+            hit = self._clients.get(cache_key)
         if hit is not None:
             return hit
         base = lid.LocalConfig.from_env()
@@ -443,7 +461,7 @@ class InferenceGateway:
             client = lid.LocalPrimeClient(cfg, profiler=profiler)
         pair = (client, profiler)
         with self._lock:
-            self._clients[target.base_url] = pair
+            self._clients[cache_key] = pair
         return pair
 
     async def dispatch(
