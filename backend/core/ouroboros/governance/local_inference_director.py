@@ -472,6 +472,56 @@ class LatencyProfiler:
         except Exception:  # noqa: BLE001
             pass
 
+    def inter_token_budget_s(self) -> "Tuple[float, float]":
+        """``(first_token_s, steady_token_s)`` for the streaming watchdog.
+
+        TWO deadlines, because the two waits measure different physics and a
+        single constant is wrong for both:
+
+        * **first token** must cover PREFILL. A 64K-context prompt can
+          legitimately take tens of seconds before its first byte, and the
+          static 30s was applied to this wait too -- so a large prompt on a
+          slow host could be declared "wedged" while it was working normally.
+          This deadline is therefore derived from measured TTFT and may only
+          ever be LOOSER than the legacy value, never tighter.
+        * **steady state** is the gap BETWEEN chunks once generation is
+          flowing. Here the static 30s is wildly loose: at 220 tok/s the
+          normal gap is ~4.5ms, so a wedged peer would be given ~6,600 normal
+          gaps before anyone noticed. This deadline is derived from measured
+          per-token cost and may only ever be TIGHTER than the legacy value.
+
+        Cold profiler -> the static value for both, i.e. byte-identical
+        legacy behaviour. NEVER raises.
+        """
+        static = _inter_token_timeout_s()
+        try:
+            if not _inter_token_adaptive_enabled():
+                return (static, static)
+            with self._lock:
+                warm = len(self._total) >= self._cfg.min_samples
+                ttft_m = self._mean(self._ttft)
+                ttft_sd = self._stddev(self._ttft)
+                tok_m = self._mean(self._per_tok)
+                tok_sd = self._stddev(self._per_tok)
+            if not warm:
+                return (static, static)
+            sigma = float(getattr(self._cfg, "margin_sigma", 2.0) or 2.0)
+            mult = _inter_token_stall_multiple()
+
+            # First token: measured TTFT + margin, scaled. Clamped at or ABOVE
+            # the static value -- prefill is the one wait that legitimately
+            # grows with the prompt, so tightening it would manufacture stalls.
+            first = max(static, mult * (ttft_m + sigma * ttft_sd) / 1000.0)
+
+            # Steady state: measured per-token + margin, scaled, floored so
+            # jitter is not mistaken for a wedge, and capped at the static
+            # value so this path can only ever DETECT SOONER, never later.
+            steady = mult * (tok_m + sigma * tok_sd) / 1000.0
+            steady = max(_inter_token_floor_s(), min(steady, static))
+            return (first, steady)
+        except Exception:  # noqa: BLE001 — a watchdog must never fail to arm
+            return (static, static)
+
     def is_warm(self) -> bool:
         with self._lock:
             return len(self._total) >= self._cfg.min_samples
@@ -620,6 +670,30 @@ def _streaming_enabled() -> bool:
     generation path. Default TRUE. OFF -> legacy total-duration adaptive timeout."""
     return _envb("JARVIS_LOCAL_STREAMING_ENABLED", True) if os.environ.get(
         "JARVIS_LOCAL_STREAMING_ENABLED") is not None else True
+
+
+def _inter_token_adaptive_enabled() -> bool:
+    """Derive the stall deadline from MEASURED physics instead of a constant.
+    Default TRUE. OFF -> the static value for both deadlines (legacy)."""
+    return _envb("JARVIS_LOCAL_INTER_TOKEN_ADAPTIVE_ENABLED", True)
+
+
+def _inter_token_stall_multiple() -> float:
+    """How many normal inter-token gaps constitute a STALL. Default 12.
+
+    A stall is not "slow", it is "stopped". At 220 tok/s a normal gap is
+    ~4.5ms, so twelve of them is ~54ms -- which is why the floor below
+    exists and does the real work on fast hosts."""
+    return max(2.0, _f_env("JARVIS_LOCAL_INTER_TOKEN_STALL_MULTIPLE", 12.0))
+
+
+def _inter_token_floor_s() -> float:
+    """Tightest steady-state deadline the adaptive path may produce.
+
+    Default 2.0s. Below this, ordinary LAN jitter and server-side chunk
+    batching would be indistinguishable from a wedged peer, and a false
+    positive costs a real generation."""
+    return max(0.25, _f_env("JARVIS_LOCAL_INTER_TOKEN_FLOOR_S", 2.0))
 
 
 def _inter_token_timeout_s() -> float:
@@ -835,7 +909,14 @@ class LocalPrimeClient:
         from backend.core.ouroboros.governance import cooperative_shutdown as _coop  # noqa: PLC0415
         body = dict(body)
         body["stream"] = True
-        inter_token_s = _inter_token_timeout_s()
+        # TWO deadlines, not one. The wait before the first chunk measures
+        # PREFILL (grows with prompt size); every wait after it measures the
+        # gap between tokens (roughly constant). A single constant is loose
+        # enough to hide a wedged peer for 6,600 normal gaps on a fast host,
+        # AND tight enough to declare a large legitimate prefill "wedged".
+        # See LatencyProfiler.inter_token_budget_s.
+        _first_token_s, _steady_token_s = self.profiler.inter_token_budget_s()
+        inter_token_s = _first_token_s
         # Seed with the resume prefill so the assembled text continues the partial.
         parts: List[str] = [prefill] if prefill else []
         ttft_ms = 0.0
@@ -911,6 +992,12 @@ class LocalPrimeClient:
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     if _read_task in done:
+                        # Generation is flowing: every subsequent wait is a
+                        # STEADY-STATE gap, so tighten from the prefill budget
+                        # to the measured inter-token one. Reassigned on each
+                        # chunk (not once) so a mid-stream physics refresh is
+                        # picked up without restarting the stream.
+                        inter_token_s = _steady_token_s
                         # A chunk (or EOF) is already in hand -- NEVER drop it, even if
                         # shutdown fired in the same tick. We buffer it here; the
                         # cooperative check at the top of the NEXT iteration freezes
@@ -924,9 +1011,29 @@ class LocalPrimeClient:
                     else:
                         # Neither fired within the window -> the stream is wedged.
                         _read_task.cancel()
+                        # PENALISE THE LEDGER BEFORE RAISING.
+                        #
+                        # Without this the stall is invisible to the physics:
+                        # record() only fires on a clean finish, so a host that
+                        # wedges every op keeps its optimistic EWMA forever and
+                        # the ThroughputGovernor keeps sizing lanes for a
+                        # machine that is actively failing -- a wrong answer
+                        # derived from stale-but-honest data, which is the
+                        # hardest kind to notice. record_timeout_penalty is the
+                        # EXISTING asymmetric-escalation seam (the non-streaming
+                        # path already used it); this puts the streaming path,
+                        # which is the one the LAN bridge forces, on the same
+                        # footing. Fail-soft: telemetry must never mask the
+                        # stall it is describing.
+                        try:
+                            self.profiler.record_timeout_penalty(
+                                max(1.0, (time.monotonic() - t0) * 1000.0))
+                        except Exception:  # noqa: BLE001
+                            pass
                         raise InterTokenStall(
-                            "inter-token stall: no chunk within %.0fs (stream wedged)"
-                            % inter_token_s
+                            "inter-token stall: no chunk within %.1fs "
+                            "(stream wedged; first_token_budget=%.1fs)"
+                            % (inter_token_s, _first_token_s)
                         )
                     if not line:
                         break  # EOF -> stream complete

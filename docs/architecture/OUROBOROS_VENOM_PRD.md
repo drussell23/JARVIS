@@ -5087,6 +5087,74 @@ including a structural pin that **every `JARVIS_*` setting in the profile is
 read by code** — a profile documenting a knob nothing consults is the same
 defect class as a capability with no caller.
 
+#### 31.8.6 The streaming handshake and the closed telemetry loop *(2026-08-18)*
+
+The final phase found **two defects that only became reachable once the bridge
+forced the streaming path**, and one requirement that was already satisfied.
+
+**Already closed:** the telemetry loop. `_complete_streaming` records
+`ttft/total/output_tokens` into the injected profiler on a clean finish, the
+gateway binds each target a profiler keyed by
+`physics_key(cfg, endpoint=...)`, and the governor profiles the ACTIVE target.
+Remote measurements therefore already reached the lane calculation. Nothing to
+build; the loop was closed by the hardware-signature work.
+
+**Defect 1 — one constant for two different physics.** The watchdog applied a
+single 30s budget to BOTH waits:
+
+| wait | what it measures | 30s is... |
+|---|---|---|
+| before the first chunk | **prefill** — grows with prompt size | too TIGHT: a 64K prompt whose first byte legitimately takes 40s is declared "wedged" while working normally |
+| between chunks | **inter-token gap** — roughly constant | too LOOSE: at 220 tok/s the normal gap is ~4.5ms, so a wedged peer gets ~6,600 normal gaps before anyone notices |
+
+`LatencyProfiler.inter_token_budget_s()` now returns **two** deadlines derived
+from measured TTFT and per-token cost, with directional clamps that make the
+change strictly safe:
+
+* the **first-token** deadline may only ever be **looser** than the legacy
+  value (prefill is the one wait that legitimately grows);
+* the **steady-state** deadline may only ever be **tighter** (it may detect a
+  wedge sooner, never later), and is floored so ordinary LAN jitter and
+  server-side chunk batching are not mistaken for a stopped peer — a false
+  positive aborts a real generation.
+
+Measured on this host: cold → `(30.0, 30.0)` (byte-identical legacy); a fast
+host → `(30.0, 2.0)`; a slow host with heavy prefill → `(108.0, 3.72)`. Every
+term is env-tunable; no network parameter is a literal in the decision path.
+
+**Defect 2 — a stall taught the ledger nothing.** `record()` fires only on a
+clean finish, and `record_timeout_penalty` was called only from the
+NON-streaming path. So a remote that wedged every op kept its optimistic EWMA
+forever, and the ThroughputGovernor kept sizing lanes for a machine that was
+actively failing — **a wrong answer derived from stale-but-honest data, which
+is the hardest kind to notice.** The streaming path now penalises the ledger
+before raising, through the existing asymmetric-escalation seam.
+
+> **A nuance worth stating rather than assuming.** `adaptive_timeout_ms` has
+> two branches, and the survival/CPU branch (no negotiated `num_ctx`) is
+> explicitly "byte-identical legacy — no EWMA escalation". So the penalty is
+> recorded there but not consulted. That is fortunate rather than accidental
+> for this work: the LAN bridge negotiates `num_ctx`, so **the host whose
+> stalls must move the estimate is exactly the host whose branch reads it.**
+> Measured: 16,580 ms → 135,000 ms with `num_ctx` set, unchanged without.
+> Pinned by test so a future edit to either branch confronts the asymmetry.
+
+**The degradation event** reuses `provider_state_changed` — already this
+codebase's DEGRADED↔HEALTHY signal — rather than minting a type. New SSE types
+must be added to the canonical `_VALID_EVENT_TYPES` frozenset or they are
+**silently dropped**, so inventing one would have produced a degradation signal
+that degrades silently. It is emitted best-effort AFTER the op has already been
+re-routed locally, so a publish failure cannot turn a handled degradation into
+an unhandled one.
+
+**Error boundaries, end to end.** A remote fault now travels: `InterTokenStall`
+raised inside the client (severing the socket as `async with` unwinds) →
+ledger penalised → classified as INFRASTRUCTURE by the gateway → host health
+recorded → `provider_state_changed` published non-fatally → the op re-dispatched
+to `_local_target()` → and on the next evaluation the governor reads a
+penalised ledger and sizes fewer lanes. The event loop is never blocked and the
+op is never lost.
+
 ### 31.7 Invariants this section adds
 
 1. **A lane count must be derived or declared, never assumed.** A constant in

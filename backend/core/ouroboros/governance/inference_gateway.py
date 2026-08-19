@@ -509,6 +509,7 @@ class InferenceGateway:
             logger.warning(
                 "[InferenceGateway] remote %s failed (%s) — falling back to "
                 "local for this op", target.base_url, type(exc).__name__)
+            self._publish_degraded(target, exc)
             fallback = self._local_target(
                 f"remote fault: {type(exc).__name__}")
             return await self._dispatch_to(
@@ -664,6 +665,39 @@ class InferenceGateway:
         except Exception as exc:  # noqa: BLE001 — pre-flight must never block dispatch
             out["reason"] = f"preflight degraded: {type(exc).__name__}"
             return out
+
+    def _publish_degraded(self, target: "GatewayTarget",
+                          exc: BaseException) -> None:
+        """Surface a NON-FATAL network degradation on the existing SSE channel.
+
+        Reuses ``provider_state_changed`` -- already the DEGRADED<->HEALTHY
+        signal in this codebase -- rather than minting a new event type. New
+        types must be added to the canonical ``_VALID_EVENT_TYPES`` frozenset
+        or they are SILENTLY DROPPED, so inventing one here would produce a
+        degradation signal that degrades silently.
+
+        Best-effort by construction: the op has already been re-routed to the
+        local target by the time this runs, so a failure to publish must not
+        turn a handled degradation into an unhandled one. NEVER raises.
+        """
+        try:
+            from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: PLC0415,E501
+                publish_provider_state_changed,
+            )
+            publish_provider_state_changed({
+                "provider": "local_tier_remote",
+                "endpoint": endpoint_host(target.base_url),
+                "state": self._health_for(target.base_url).state().value,
+                "model": target.model_name,
+                "failure_class": getattr(exc, "failure_class",
+                                         type(exc).__name__),
+                "error": str(exc)[:200],
+                "fallback": "local_triage",
+                "fatal": False,
+            })
+        except Exception:  # noqa: BLE001
+            logger.debug("[InferenceGateway] degradation publish failed",
+                         exc_info=True)
 
     # -- lifecycle + observability ----------------------------------------
 
