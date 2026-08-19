@@ -196,6 +196,9 @@ class Progress:
     _high_water: float = 0.0
     _last_stage_at: float = 0.0
     _seen: set = field(default_factory=set)
+    #: Elapsed-at-arrival for each stage reached IN THIS BOOT. The basis for
+    #: projecting the rest when no cross-boot history exists yet.
+    _stage_times: List[float] = field(default_factory=list)
 
     def observe_log(self, text: str, *, now: float) -> None:
         """Fold in whatever the daemon has written so far. NEVER raises."""
@@ -208,8 +211,50 @@ class Progress:
                     if i + 1 > self._reached:
                         self._reached = i + 1
                         self._last_stage_at = now
+                        self._stage_times.append(float(now))
         except Exception:  # noqa: BLE001
             pass
+
+    def _projected_total_s(self, elapsed: float) -> Optional[float]:
+        """Expected total boot time, projected from THIS boot's own cadence.
+
+        The first boots on a machine have no history, so `expected_s` is None
+        and the bar could only move when a marker landed — it sat frozen at
+        one percentage between stages, which is what the operator sees as a
+        hang. But a boot in progress is already evidence about itself: if four
+        stages arrived over twelve seconds, the remaining three will plausibly
+        take about nine more.
+
+        This is measurement, not a constant — it adapts to a slow disk, a cold
+        page cache or a loaded machine, and it needs no prior run. Requires
+        TWO arrivals so there is an actual interval to average; one timestamp
+        is a point, not a rate.
+        """
+        try:
+            if self._reached <= 0 or not self._stage_times:
+                return None
+            # Rate measured FROM THE START OF THE WAIT, not between arrivals.
+            #
+            # The interval form needed two distinct timestamps and returned
+            # nothing when several markers landed in the same poll — which is
+            # the common case on a fast boot, since the client reads the log
+            # tail every quarter second and a burst of stages can complete
+            # between two reads. Anchoring on t=0 makes a single arrival
+            # sufficient: two stages reached by second four is two seconds a
+            # stage, and that is a rate, not a point.
+            last = float(self._stage_times[-1])
+            if last <= 0:
+                return None
+            per_stage = last / float(self._reached)
+            if per_stage <= 0:
+                return None
+            projected = per_stage * float(len(self.stages))
+            # Never project a finish already in the past: a boot running long
+            # has disproved its own estimate, and an ETA of "0s left" that
+            # keeps not arriving is worse than no ETA.
+            return max(elapsed, projected)
+        except Exception:  # noqa: BLE001
+            return None
 
     @property
     def stage_label(self) -> str:
@@ -229,9 +274,15 @@ class Progress:
             if self._reached > 0:
                 done = sum(s.weight for s in self.stages[:self._reached])
                 evidence = done / total_w
+            # Cross-boot history is the better estimator when it exists (more
+            # samples, and it already knows how this machine behaves). Within
+            # -boot projection is the fallback that makes a FIRST boot move.
+            horizon = self.expected_s
+            if not horizon or horizon <= 0:
+                horizon = self._projected_total_s(elapsed)
             estimate = None
-            if self.expected_s and self.expected_s > 0:
-                estimate = elapsed / self.expected_s
+            if horizon and horizon > 0:
+                estimate = elapsed / horizon
 
             if evidence is None and estimate is None:
                 return None
@@ -268,8 +319,9 @@ class Progress:
                 parts.append(f"{int(frac * 100):3d}%")
             parts.append(self.stage_label)
             parts.append(f"{int(elapsed)}s")
-            if frac is not None and self.expected_s and frac > 0.02:
-                remaining = max(0.0, self.expected_s - elapsed)
+            horizon = self.expected_s or self._projected_total_s(elapsed)
+            if frac is not None and horizon and frac > 0.02:
+                remaining = max(0.0, horizon - elapsed)
                 if remaining >= 1.0:
                     parts.append(f"~{int(remaining)}s left")
             return "  ".join(parts)

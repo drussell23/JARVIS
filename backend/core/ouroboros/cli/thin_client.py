@@ -578,11 +578,25 @@ def _mk_tick(say: Callable[[str], None]) -> Callable[[float], None]:
     """
     last = [-1e9]
     started = [time.monotonic()]
-    interactive = False
+    # `real_stdout_isatty`, NOT `sys.stdout.isatty()`.
+    #
+    # prompt_toolkit's `patch_stdout` replaces sys.stdout with a non-TTY
+    # proxy, so the naive check returns False on a real terminal and the
+    # indicator falls back to APPENDING a line per tick — which is precisely
+    # the duplicate-line behaviour this was written to remove. The codebase
+    # already solved this once (the live status line never surfaced for the
+    # same reason) and the helper exists for it; using it is the fix, and
+    # writing a second TTY check would be the bug a third time.
     try:
-        interactive = bool(sys.stdout.isatty())
+        from backend.core.ouroboros.battle_test.presentation_restraint import (
+            real_stdout_isatty,
+        )
+        interactive = bool(real_stdout_isatty())
     except Exception:  # noqa: BLE001
-        interactive = False
+        try:
+            interactive = bool(sys.stdout.isatty())
+        except Exception:  # noqa: BLE001
+            interactive = False
     try:
         from backend.core.ouroboros.cli import boot_progress as _bp
         enabled = _bp.boot_progress_enabled()
@@ -613,12 +627,18 @@ def _mk_tick(say: Callable[[str], None]) -> Callable[[float], None]:
             say(line)
             return
         try:
+            # WRITE TO THE STREAM WE TESTED. `real_stdout_isatty` inspects
+            # `sys.__stdout__`; drawing on `sys.stdout` would test one stream
+            # and paint another, and under patch_stdout that proxy buffers by
+            # line — which turns a carriage-return redraw back into the very
+            # append this replaces.
+            out = sys.__stdout__ or sys.stdout
             # Pad to the previous width so a shrinking line cannot leave the
             # tail of the longer one behind it.
             pad = max(0, width[0] - len(line))
             width[0] = len(line)
-            sys.stdout.write("\r" + line + (" " * pad))
-            sys.stdout.flush()
+            out.write("\r" + line + (" " * pad))
+            out.flush()
         except Exception:  # noqa: BLE001
             say(line)
 
@@ -633,9 +653,17 @@ def _finish_tick(elapsed: float, *, live: bool) -> None:
     long as the operator's patience — the very number it exists to replace.
     """
     try:
-        if sys.stdout.isatty():
-            sys.stdout.write("\r" + " " * 100 + "\r")
-            sys.stdout.flush()
+        from backend.core.ouroboros.battle_test.presentation_restraint import (
+            real_stdout_isatty as _rti,
+        )
+        _tty = _rti()
+    except Exception:  # noqa: BLE001
+        _tty = False
+    try:
+        if _tty:
+            out = sys.__stdout__ or sys.stdout
+            out.write("\r" + " " * 120 + "\r")
+            out.flush()
     except Exception:  # noqa: BLE001
         pass
     if not live:

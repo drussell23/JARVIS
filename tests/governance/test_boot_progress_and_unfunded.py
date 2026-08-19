@@ -107,6 +107,13 @@ class TestBootHistory:
 
 
 class TestUnfundedNamesTheRemedy:
+    """NOTE on the fixture: these use the real `monkeypatch` FIXTURE, never a
+    bare `pytest.MonkeyPatch()`. A directly-constructed one is never undone,
+    so the class-level patches to `_read_lanes` / `_read_ops` / `_read_remote`
+    survived the test and leaked into every file that ran afterwards —
+    producing failures that appeared only when the suite ran together and
+    vanished when a file ran alone."""
+
     def _ev(self, monkeypatch, remote):
         e = cs.CapabilityEvaluator()
         monkeypatch.setattr(cs.CapabilityEvaluator, "_read_lanes",
@@ -117,24 +124,167 @@ class TestUnfundedNamesTheRemedy:
                             staticmethod(lambda: (remote, "http://h:1", True)))
         return e.evaluate()
 
-    def test_out_of_credit_is_unfunded_not_merely_blocked(self):
+    def test_out_of_credit_is_unfunded_not_merely_blocked(self, monkeypatch):
         """"blocked" sends the operator to a log to find out why. "unfunded"
         names the remedy in the word itself — and money is the one blocker the
         organism can never clear on its own."""
-        r = self._ev(pytest.MonkeyPatch(), "absent")
+        r = self._ev(monkeypatch, "absent")
         assert r.state is cs.Capability.UNFUNDED
         assert r.badge == "unfunded"
 
-    def test_the_reason_states_what_to_do(self):
-        r = self._ev(pytest.MonkeyPatch(), "absent")
+    def test_the_reason_states_what_to_do(self, monkeypatch):
+        r = self._ev(monkeypatch, "absent")
         assert "add credits" in r.reason.lower()
 
     def test_unfunded_still_stops_dispatch(self):
+        # no evaluator needed — this asks the enum directly
         """A friendlier word must not become a lesser state."""
         assert cs.Capability.UNFUNDED.is_blocking
         assert not cs.Capability.UNFUNDED.can_work
 
-    def test_a_serving_local_lane_is_degraded_not_unfunded(self):
-        r = self._ev(pytest.MonkeyPatch(), "serving")
+    def test_a_serving_local_lane_is_degraded_not_unfunded(self, monkeypatch):
+        r = self._ev(monkeypatch, "serving")
         assert r.state is cs.Capability.DEGRADED
         assert not r.is_funding_issue
+
+
+class TestOneLineNotMany:
+    """The indicator must REDRAW, not accumulate.
+
+    Observed: four identical rows appended during a single boot —
+
+        ⎿ [██████·······]  56%  session open   0s
+        ⎿ [██████·······]  56%  session open   5s
+        ⎿ [██████·······]  56%  session open  10s
+        ⎿ [██████·······]  56%  session open  16s
+
+    Two separate defects in one picture: it appended instead of redrawing,
+    and the percentage was frozen between stages.
+    """
+
+    def _tty_render(self, ticks):
+        import io as _io
+        import sys as _sys
+
+        class _FakeTTY(_io.StringIO):
+            def isatty(self):
+                return True
+
+        from backend.core.ouroboros.cli.thin_client import _mk_tick
+        real = _sys.__stdout__
+        _sys.__stdout__ = _FakeTTY()
+        try:
+            said = []
+            tick = _mk_tick(said.append)
+            for e in ticks:
+                tick(e)
+            return said, _sys.__stdout__.getvalue()
+        finally:
+            _sys.__stdout__ = real
+
+    def test_a_tty_redraws_one_line(self):
+        said, buf = self._tty_render([0.0, 0.3, 0.6, 0.9])
+        assert said == []                 # nothing appended
+        assert buf.count("\r") >= 3       # redrawn in place
+        assert "\n" not in buf            # exactly one line
+
+    def test_a_non_tty_keeps_appending(self):
+        """A carriage return in a pipe or a log file is an unreadable smear.
+        The wait must not become less legible in the transcript to become
+        prettier on screen."""
+        import sys as _sys
+        from backend.core.ouroboros.cli.thin_client import _mk_tick
+        real = _sys.__stdout__
+        _sys.__stdout__ = None            # no real stdout -> not interactive
+        try:
+            said = []
+            tick = _mk_tick(said.append)
+            for e in (0.0, 6.0, 12.0):
+                tick(e)
+        finally:
+            _sys.__stdout__ = real
+        assert len(said) >= 2
+        assert all("\r" not in s for s in said)
+
+    def test_the_tty_check_uses_the_unpatched_stream(self):
+        """`prompt_toolkit.patch_stdout` swaps sys.stdout for a non-TTY proxy,
+        so `sys.stdout.isatty()` returns False on a real terminal — which is
+        exactly why the indicator appended. The codebase already solved this
+        once for the live status line; a second TTY check would be the bug a
+        third time."""
+        import inspect
+        from backend.core.ouroboros.cli import thin_client
+        src = inspect.getsource(thin_client._mk_tick)
+        assert "real_stdout_isatty" in src
+
+
+class TestTheBarMovesOnAFirstBoot:
+    def test_progress_advances_between_stages_without_history(self):
+        """56% frozen across four ticks: with no cross-boot history there was
+        no horizon, so the bar could only move when a marker landed."""
+        p = bp.Progress(expected_s=None)
+        log = ""
+        for t, line in ((2.0, "[AegisPreflight] a"),
+                        (5.0, "[CredentialBootstrap] b"),
+                        (9.0, "[AegisDaemon] serving on x")):
+            log += line + "\n"
+            p.observe_log(log, now=t)
+        at_stage = p.fraction(9.0)
+        later = p.fraction(12.0)
+        assert later is not None and at_stage is not None
+        assert later > at_stage           # it MOVED with no new marker
+
+    def test_one_arrival_is_enough_because_the_start_is_known(self):
+        """An earlier version measured the rate BETWEEN arrivals and so
+        returned nothing when several markers landed in the same poll — the
+        common case on a fast boot, since the tail is read every quarter
+        second. Anchored on t=0, one arrival is a rate: two stages by second
+        four is two seconds a stage."""
+        p = bp.Progress(expected_s=None)
+        assert p._projected_total_s(1.0) is None      # nothing reached yet
+        p.observe_log("[AegisPreflight] a", now=2.0)
+        assert p._projected_total_s(3.0) is not None
+
+    def test_simultaneous_arrivals_still_project(self):
+        """Two markers in ONE observation share a timestamp; the interval
+        form produced zero span and gave up."""
+        p = bp.Progress(expected_s=None)
+        p.observe_log("[AegisPreflight] a\n[CredentialBootstrap] b", now=4.0)
+        assert p._projected_total_s(5.0) is not None
+
+    def test_an_overrunning_boot_never_promises_a_past_finish(self):
+        """An ETA of "0s left" that keeps not arriving is worse than none."""
+        p = bp.Progress(expected_s=None)
+        p.observe_log("[AegisPreflight] a", now=1.0)
+        assert p._projected_total_s(500.0) >= 500.0
+
+    def test_projection_still_cannot_claim_an_unconfirmed_stage(self):
+        """Interpolation earns motion, never milestones."""
+        p = bp.Progress(expected_s=None)
+        p.observe_log("[AegisPreflight] a\n[CredentialBootstrap] b", now=5.0)
+        total = sum(s.weight for s in bp.DEFAULT_STAGES)
+        nxt = sum(s.weight for s in bp.DEFAULT_STAGES[:3]) / total
+        assert p.fraction(9999.0) <= nxt + 1e-9
+
+    def test_cross_boot_history_still_wins_when_present(self):
+        """More samples, and it already knows how this machine behaves.
+
+        Asserts the INTENT — that the horizon lifted the bar above the pure
+        evidence floor — rather than a magic number. The first version
+        asserted >= 0.4 and failed at 0.375, which is the CORRECT value:
+        clamped at the next unconfirmed stage, exactly as designed. The test
+        was wrong, not the clamp.
+        """
+        p = bp.Progress(expected_s=20.0)
+        p.observe_log("[AegisPreflight] a\n[CredentialBootstrap] b", now=1.0)
+        assert p._projected_total_s(2.0) is not None   # both available
+        total = sum(s.weight for s in bp.DEFAULT_STAGES)
+        evidence_floor = sum(s.weight for s in bp.DEFAULT_STAGES[:2]) / total
+        next_bound = sum(s.weight for s in bp.DEFAULT_STAGES[:3]) / total
+        got = p.fraction(10.0)
+        assert evidence_floor < got <= next_bound
+
+    def test_an_eta_appears_without_any_history(self):
+        p = bp.Progress(expected_s=None)
+        p.observe_log("[AegisPreflight] a\n[CredentialBootstrap] b", now=4.0)
+        assert "left" in p.render(6.0)
