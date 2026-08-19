@@ -278,6 +278,32 @@ _MEASURED = (MemoryTopology.UNIFIED, MemoryTopology.DISCRETE, MemoryTopology.NON
 
 
 @dataclass(frozen=True)
+class DeviceReading:
+    """One accelerator's own numbers.
+
+    Exists because a host with two GPUs has TWO capacities and the collapsed
+    view can only carry one. Which one is correct depends on a fact this
+    module cannot observe -- whether the serving stack shards a model across
+    devices -- so both are reported and the consumer that knows composes them.
+    """
+
+    index: int
+    name: str
+    total_bytes: int
+    free_bytes: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "index": self.index,
+            "name": self.name,
+            "total_bytes": self.total_bytes,
+            "free_bytes": self.free_bytes,
+            "total_gib": round(self.total_bytes / _BYTES_PER_GIB, 2),
+            "free_gib": round(self.free_bytes / _BYTES_PER_GIB, 2),
+        }
+
+
+@dataclass(frozen=True)
 class AcceleratorProbe:
     """One probe attempt's result.
 
@@ -298,10 +324,15 @@ class AcceleratorProbe:
     #: True when ``free_bytes`` was measured; False when it was DERIVED
     #: from a system-RAM reading (unified) and therefore moves with it.
     free_is_measured: bool = True
+    #: Per-device readings when the probe could resolve them. Empty is not
+    #: "one device" -- it is "this stage could not enumerate", and consumers
+    #: must fall back to the collapsed view rather than infer a count.
+    devices: Tuple["DeviceReading", ...] = field(default_factory=tuple)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "topology": self.topology.value,
+            "devices": [d.to_dict() for d in self.devices],
             "total_bytes": self.total_bytes,
             "free_bytes": self.free_bytes,
             "device_name": self.device_name,
@@ -332,6 +363,9 @@ class ComputeReading:
     degraded: bool = False
     error: Optional[str] = None
     notes: Tuple[str, ...] = field(default_factory=tuple)
+    #: Per-device readings when the cascade stage could enumerate them.
+    #: Empty means "not enumerated", NEVER "one device".
+    devices: Tuple["DeviceReading", ...] = field(default_factory=tuple)
 
     @property
     def measured(self) -> bool:
@@ -340,8 +374,58 @@ class ComputeReading:
 
     @property
     def usable_bytes(self) -> int:
-        """Free capacity minus the reserved headroom. Never negative."""
+        """Free capacity minus the reserved headroom. Never negative.
+
+        Single-device: the conservative bound that holds no matter what the
+        serving stack does. This is the default every consumer gets.
+        """
         return max(0, int(self.free_bytes * (1.0 - headroom_fraction())))
+
+    @property
+    def aggregate_free_bytes(self) -> int:
+        """Free bytes summed across every enumerated device.
+
+        NOT interchangeable with :attr:`free_bytes`. This number is only
+        reachable by a serving stack that SHARDS a model across devices
+        (llama.cpp/Ollama layer split, vLLM tensor parallel). On a stack that
+        does not, it authorizes a load that cannot land -- which is exactly
+        why the collapsed view stays the default.
+
+        Returns 0 when devices were not enumerated, so a caller can never
+        mistake "could not enumerate" for "nothing free".
+        """
+        return sum(d.free_bytes for d in self.devices)
+
+    @property
+    def aggregate_total_bytes(self) -> int:
+        """Nameplate capacity summed across every enumerated device."""
+        return sum(d.total_bytes for d in self.devices)
+
+    @property
+    def is_multi_device(self) -> bool:
+        """True only when MORE THAN ONE device was actually enumerated.
+
+        Deliberately not `device_count > 1`: a stage can report a count while
+        failing to enumerate, and a pooled capacity claimed over devices we
+        never read would be a fabrication.
+        """
+        return len(self.devices) > 1
+
+    def shardable_usable_bytes(self, *, sharding: bool) -> int:
+        """Usable bytes under a DECLARED sharding capability.
+
+        *sharding* is not observable from here -- it is a property of the
+        serving stack, which this module deliberately knows nothing about. So
+        the caller that knows must say, and the honest default is the
+        conservative single-device bound.
+
+        Even when sharding is declared, a single-device host returns the
+        single-device answer: there is nothing to pool.
+        """
+        if not sharding or not self.is_multi_device:
+            return self.usable_bytes
+        return max(0, int(self.aggregate_free_bytes
+                          * (1.0 - headroom_fraction())))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -356,6 +440,13 @@ class ComputeReading:
             "usable_gib": round(self.usable_bytes / _BYTES_PER_GIB, 2),
             "device_name": self.device_name,
             "device_count": self.device_count,
+            "devices": [d.to_dict() for d in self.devices],
+            "is_multi_device": self.is_multi_device,
+            "aggregate_free_bytes": self.aggregate_free_bytes,
+            "aggregate_free_gib": round(
+                self.aggregate_free_bytes / _BYTES_PER_GIB, 2),
+            "aggregate_total_gib": round(
+                self.aggregate_total_bytes / _BYTES_PER_GIB, 2),
             "source": self.source,
             "resolved_class": self.resolved_class,
             "enabled": self.enabled,
@@ -576,21 +667,26 @@ def _probe_torch_cuda() -> Optional[AcceleratorProbe]:
         count = int(torch.cuda.device_count())
         if count <= 0:
             return None
-        best: Optional[Tuple[int, int, str]] = None
+        readings: List[DeviceReading] = []
         for idx in range(count):
             try:
                 free_b, total_b = torch.cuda.mem_get_info(idx)
                 name = str(torch.cuda.get_device_name(idx))
             except Exception:  # noqa: BLE001 — one bad device never voids the rest
                 continue
-            if best is None or int(total_b) > best[1]:
-                best = (int(free_b), int(total_b), name)
-        if best is None:
+            readings.append(DeviceReading(
+                index=idx, name=name,
+                total_bytes=int(total_b), free_bytes=int(free_b)))
+        devices = tuple(readings)
+        collapsed = collapse_to_largest(devices)
+        if collapsed is None:
             return None
+        free_b, total_b, name, _n = collapsed
         return AcceleratorProbe(
             topology=MemoryTopology.DISCRETE,
-            total_bytes=best[1], free_bytes=best[0],
-            device_name=best[2], device_count=count, source="torch_cuda",
+            total_bytes=total_b, free_bytes=free_b,
+            device_name=name, device_count=count, source="torch_cuda",
+            devices=devices,
         )
     except Exception as exc:  # noqa: BLE001
         return AcceleratorProbe(
@@ -728,14 +824,14 @@ def reset_nvidia_smi_cache() -> None:
         _smi_path_cache.clear()
 
 
-def _parse_nvidia_smi(text: str) -> Optional[Tuple[int, int, str, int]]:
-    """(free, total, name, count) from ``nvidia-smi`` CSV. None if unparseable.
+def _parse_nvidia_smi_devices(text: str) -> Tuple["DeviceReading", ...]:
+    """Every device ``nvidia-smi`` reported, in driver order.
 
     Values arrive in MiB. Rows that do not parse are skipped rather than
     zeroed, for the same reason a failed cascade stage is skipped: a
     malformed row is missing data, not a device with no memory.
     """
-    rows: List[Tuple[int, int, str]] = []
+    out: List[DeviceReading] = []
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -750,11 +846,38 @@ def _parse_nvidia_smi(text: str) -> Optional[Tuple[int, int, str, int]]:
             continue
         if total_mib <= 0:
             continue
-        rows.append((free_mib * 1024 * 1024, total_mib * 1024 * 1024, parts[2]))
-    if not rows:
+        out.append(DeviceReading(
+            index=len(out), name=parts[2],
+            total_bytes=total_mib * 1024 * 1024,
+            free_bytes=free_mib * 1024 * 1024,
+        ))
+    return tuple(out)
+
+
+def collapse_to_largest(
+    devices: "Tuple[DeviceReading, ...]",
+) -> Optional[Tuple[int, int, str, int]]:
+    """``(free, total, name, count)`` for the LARGEST SINGLE device.
+
+    The collapsed view, and the conservative one: a model must fit on one
+    device unless the serving stack shards it, and sharding is a property of
+    that stack rather than of the host. Summing here would authorize a load
+    that cannot physically land. Callers that KNOW their stack shards read
+    the aggregate instead -- see :meth:`ComputeReading.shardable_free_bytes`.
+    """
+    if not devices:
         return None
-    best = max(rows, key=lambda r: r[1])
-    return best[0], best[1], best[2], len(rows)
+    best = max(devices, key=lambda d: d.total_bytes)
+    return best.free_bytes, best.total_bytes, best.name, len(devices)
+
+
+def _parse_nvidia_smi(text: str) -> Optional[Tuple[int, int, str, int]]:
+    """(free, total, name, count) from ``nvidia-smi`` CSV. None if unparseable.
+
+    A derived view of :func:`_parse_nvidia_smi_devices` so there is exactly
+    one place that knows the CSV shape.
+    """
+    return collapse_to_largest(_parse_nvidia_smi_devices(text))
 
 
 async def _probe_nvidia_smi_async() -> Optional[AcceleratorProbe]:
@@ -807,7 +930,8 @@ async def _probe_nvidia_smi_async() -> Optional[AcceleratorProbe]:
             ok=False,
             error=f"rc={proc.returncode} {(err or b'').decode(errors='replace')[:120]}",
         )
-    parsed = _parse_nvidia_smi((out or b"").decode(errors="replace"))
+    _devices = _parse_nvidia_smi_devices((out or b"").decode(errors="replace"))
+    parsed = collapse_to_largest(_devices)
     if parsed is None:
         return AcceleratorProbe(
             topology=MemoryTopology.UNKNOWN, total_bytes=0, free_bytes=0,
@@ -818,7 +942,7 @@ async def _probe_nvidia_smi_async() -> Optional[AcceleratorProbe]:
     return AcceleratorProbe(
         topology=MemoryTopology.DISCRETE, total_bytes=total_b,
         free_bytes=free_b, device_name=name, device_count=count,
-        source="nvidia_smi",
+        source="nvidia_smi", devices=_devices,
     )
 
 
@@ -1270,6 +1394,7 @@ class ComputeTopologyResolver:
             degraded=not probe.ok,
             error=probe.error,
             notes=tuple(notes),
+            devices=probe.devices,
         )
 
     def _disabled_reading(self) -> ComputeReading:

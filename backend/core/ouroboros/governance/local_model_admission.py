@@ -114,6 +114,36 @@ def admission_enabled() -> bool:
             or "").strip().lower() not in ("0", "false", "no", "off")
 
 
+def accelerator_sharding_declared() -> bool:
+    """Does the serving stack split ONE model across MULTIPLE devices?
+
+    Default FALSE, and deliberately a declaration rather than an inference.
+
+    Whether a model can span two GPUs is a property of the SERVING STACK
+    (llama.cpp/Ollama layer split, vLLM tensor parallel), not of the host.
+    `compute_topology` can enumerate the devices but cannot see the stack, so
+    it reports the conservative collapsed view -- the largest single device --
+    and something that knows the stack has to say otherwise.
+
+    Getting this wrong in the optimistic direction is the expensive
+    direction: declaring sharding on a stack that does not shard admits a
+    model that then fails to load, having already passed the gate whose whole
+    job was to prevent that. Declaring it off on a stack that does merely
+    under-uses the second card.
+
+    Turn it ON for a host whose runtime is configured to split -- e.g. a
+    dual-GPU box running Ollama/llama.cpp with the layer splitter enabled,
+    where the two cards genuinely pool.
+
+    A future upgrade can PROVE this instead of trusting it: a serving stack
+    reporting a resident model larger than the largest single device has
+    demonstrated sharding. That is an observation, and would outrank this
+    flag. NEVER raises.
+    """
+    return (os.environ.get("JARVIS_LOCAL_ACCEL_SHARDING", "false")
+            or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def prune_floor_messages() -> int:
     """Messages never pruned, counted from the END. NEVER raises.
 
@@ -982,7 +1012,18 @@ def _assess_impl(
     margin = 0
     max_weight = 0
     if reading is not None and topology == "discrete" and weight_bytes > 0:
-        measured_free = int(getattr(reading, "usable_bytes", 0) or 0)
+        # Single-device by default; pooled ONLY under a declared sharding
+        # capability. `shardable_usable_bytes` returns the single-device
+        # answer for a single-device host even when sharding is declared,
+        # so the flag cannot invent capacity that is not there.
+        _sharding = accelerator_sharding_declared()
+        _shardable = getattr(reading, "shardable_usable_bytes", None)
+        if callable(_shardable):
+            measured_free = int(_shardable(sharding=_sharding) or 0)
+        else:
+            measured_free = int(getattr(reading, "usable_bytes", 0) or 0)
+        _pooled = bool(
+            _sharding and getattr(reading, "is_multi_device", False))
         # Subtract what OTHER workers have already been promised but have not
         # yet allocated. Without this, N concurrent workers each pass against
         # the same reading and collectively overcommit — the gate is correct
@@ -996,14 +1037,20 @@ def _assess_impl(
         if weight_bytes + margin > accel_free:
             return AdmissionDecision(
                 action=Admission.DEFER.value, level=level, free_pct=free_pct,
-                source=source, topology=topology, bound="accelerator",
+                source=source, topology=topology,
+                bound="accelerator_pooled" if _pooled else "accelerator",
                 accel_free_bytes=accel_free, weight_bytes=weight_bytes,
                 margin_bytes=margin, max_weight_bytes=max_weight,
                 reason=(
                     f"{weight_bytes / _GIB:.1f} GiB of weights plus a "
                     f"{margin / _GIB:.1f} GiB learned margin exceeds the "
-                    f"{accel_free / _GIB:.1f} GiB free on this accelerator "
-                    f"— largest admissible now is {max_weight / _GIB:.1f} GiB"
+                    f"{accel_free / _GIB:.1f} GiB free "
+                    + (
+                        f"pooled across {len(getattr(reading, 'devices', ()))} "
+                        f"accelerators (sharding declared)"
+                        if _pooled else "on this accelerator"
+                    )
+                    + f" — largest admissible now is {max_weight / _GIB:.1f} GiB"
                 ),
                 spoken_reason=("That model is larger than the free space on "
                                "my graphics card right now."))
