@@ -212,6 +212,16 @@
     - [28.4 Findings withdrawn under verification](#284-findings-withdrawn-under-verification)
     - [28.5 Measured affordance costs](#285-measured-affordance-costs)
     - [28.6 Remediation, ranked by leverage per line changed](#286-remediation-ranked-by-leverage-per-line-changed)
+29. [The Distributed Body/Engine Link](#29-the-distributed-bodyengine-link-new-2026-08-15)
+30. [Proactive Mode](#30-proactive-mode-new-2026-08-15)
+31. [The Local Sovereignty Tier — Physics as a Governance Input](#31-the-local-sovereignty-tier--physics-as-a-governance-input-new-2026-08-18) *(latest section)*
+    - [31.1 What shipped](#311-what-shipped)
+    - [31.2 The measured envelope](#312-the-measured-envelope)
+    - [31.3 Can a 1T–2.4T model run on that box? — answered with arithmetic](#313-can-a-1t24t-model-run-on-that-box--answered-with-arithmetic)
+    - [31.4 Which models suit O+V — derived from the budget, not from a leaderboard](#314-which-models-suit-ov--derived-from-the-budget-not-from-a-leaderboard)
+    - [31.5 What the bridge exposes — latent defects to close before Gap 3](#315-what-the-bridge-exposes--latent-defects-to-close-before-gap-3)
+    - [31.6 Priorities — what to do next, ranked](#316-priorities--what-to-do-next-ranked)
+    - [31.7 Invariants this section adds](#317-invariants-this-section-adds)
 
 ## 1. Executive Summary
 
@@ -4498,3 +4508,458 @@ op (§26.5). (d) `watch` and hibernation render distinguishably.
    already stores.)*
 
 ---
+
+---
+
+## 31. The Local Sovereignty Tier — Physics as a Governance Input *(NEW 2026-08-18)*
+
+> **Operator binding (2026-08-18)**: *"Execute the integration of this local
+> sovereignty tier, specifically bridging my current macOS M1 (16GB)
+> development environment with the Windows RTX 5090 inference host."* — and,
+> on lane sizing: *"do not just hardcode `JARVIS_BG_POOL_SIZE=1`."*
+
+### 31.0 The thesis — a budget is a claim about hardware
+
+Every route budget in this document (§9, and the table in `route_budgets.py`)
+is a promise: *an op of this class completes in this many seconds*. That
+promise was written against a **metered remote provider**, where concurrency
+is somebody else's problem — three requests to Claude or DoubleWord are served
+by three different machines.
+
+A local serving tier breaks that assumption silently. **One GPU serving three
+concurrent requests serves them SERIALLY.** The three lanes do not triple
+throughput; they triple each op's wall-clock. The budget is unchanged, so the
+tail blows it, and the loop records a failure class it already has a name for:
+`tool_loop_deadline_exceeded`.
+
+Nothing in the codebase was wrong. `JARVIS_BG_POOL_SIZE=3` was correct for the
+regime it was calibrated in. What was missing is that **the pool had no way to
+know which regime it was in** — and the fix for that is not a smaller
+constant. A smaller constant is the same defect with a different number: still
+a guess, still blind to the hardware it runs on, and now also wrong on the
+Windows host where three lanes may be entirely reasonable.
+
+The governing principle this section adds to §8:
+
+> **Concurrency is not a configuration value. It is a measurement about the
+> serving substrate, and it belongs to whoever measured it.**
+
+### 31.1 What shipped
+
+Two commits on `feat/throughput-governor-and-multi-device-topology`.
+
+#### 31.1.1 `9c322f380e` — ThroughputGovernor: lanes derived from measured latency
+
+`governance/throughput_governor.py`. The whole module is a binding between
+instruments that already existed and had never been connected:
+
+| Instrument | Already did | Was never used for |
+|---|---|---|
+| `LatencyProfiler` | measures TTFT + per-token cost, warm-started across runs from the file-backed physics ledger | sizing concurrency |
+| `MemoryPressureGate` | caps fan-out by memory level | the worker pool's lane count |
+| `BackgroundAgentPool.set_target_pool_size` | accepts a lane target | anything but fleet topology |
+
+The math:
+
+```
+lanes = floor( (budget_ms x safety_fraction) / per_op_ms )
+```
+
+`per_op_ms` is **not re-derived**. It is `LatencyProfiler.adaptive_timeout_ms`
+— the same estimator the dispatch path already trusts (measured TTFT +
+per-token x expected output + sigma margin, clamped to its own floor and
+ceiling). Re-deriving it would have created a second opinion about one set of
+physics, which is the drift class §12 exists to prevent.
+
+`safety_fraction` (default 0.6) is not a fudge factor. The route budget must
+also cover everything the op does BESIDES token generation — Venom tool
+round-trips, VALIDATE, the Iron Gate, SemanticGuardian's AST pass — while
+`adaptive_timeout_ms` estimates only the generation leg. Spending the whole
+budget on generation would guarantee the breach this exists to prevent.
+
+**Composition, not a second authority.** The verdict is deliberately NOT
+pushed through `set_target_pool_size`. That setter carries the Immutability
+Lock: `source="fleet_topology"` is hardware-derived truth and silently rejects
+every other source while held. A throughput number pushed through it would
+either vanish exactly where a serving mesh exists, or would have to outrank
+hardware truth — and it must not. The two are **different axes and both are
+real**:
+
+- **topology** answers *how many lanes exist* (nodes in the serving mesh);
+- **throughput** answers *how many can be driven* inside the route window.
+
+Four nodes can exist while a 16GB M1 drives one. The pool consults the
+governor cooperatively and composes strictest-wins, so each stays
+authoritative on its own axis.
+
+**Hold, never retire.** A topology retire is a permanent `break` and correct —
+a node either exists or it does not. A throughput ceiling comes from a reading
+with a ~30s TTL, so breaking on it would make a transient measurement (a cold
+model load, a memory spike) an irreversible decision. Excess lanes `await` and
+re-check, and grow back for free when physics improves. Named *hold* and not
+*park* because `ParkRequested` / `ParkedOpStore` already mean OP-level
+suspend-and-resume in that module.
+
+**Every verdict states its provenance.** `adaptive_timeout_ms` CLAMPS to its
+ceiling, and a clamp reported as a measurement is a fabricated reading — the
+same class the Advisor's blast-radius provenance work exists to prevent
+(`localized_lower_bound` vs `synthetic_cap`). Verdicts carry:
+
+| provenance | meaning | consequence |
+|---|---|---|
+| `measured` | the estimator's own value, unclamped | trust it |
+| `ceiling_clamped` | the estimate SATURATED its ceiling | per-op cost is a **lower bound**, so the lane count is conservative |
+| `seeded` | fewer than `min_samples` in the ledger | the blind seed, not physics |
+| `wedged` | the estimator refused (runaway latency) | governed lanes=1 — information, not absence |
+
+The `measured` flag keys off `is_warm()` and **not** `is_calibrated()`. That
+distinction is load-bearing: `_calibrated` is a per-instance scout-lock flag
+the physics ledger does not persist, so a fresh instance reports `False` while
+serving genuinely measured numbers. `is_warm()` counts samples, which the
+ledger repopulates at `__init__`.
+
+**One route table, not three.** The route-to-timeout table had been written
+twice, byte-identical, in `orchestrator.py` and `phase_runners/generate_runner.py`
+(the second carrying a comment calling itself a "parity twin" of the first).
+The governor needed the same numbers. Rather than add a third copy, the table
+moved to `governance/route_budgets.py` and both sites read it.
+
+Masters: `JARVIS_THROUGHPUT_GOVERNOR_ENABLED` (default on; off is
+byte-identical to prior behaviour), `_SAFETY_FRACTION`, `_MAX_LANES`,
+`_VERDICT_TTL_S`, `_REFERENCE_PROMPT_TOKENS`.
+
+#### 31.1.2 `8485b819c5` — multi-device capacity made expressible
+
+`compute_topology.py` collapsed a multi-GPU host to its **largest single
+device**, with a rationale that is correct and stays the default:
+
+> *"A model must fit on one device unless it was sharded, and sharding is a
+> property of the serving stack rather than of the host; summing would
+> authorize a load that cannot physically land."*
+
+**This was therefore not a bug.** The gap is representational: the probe could
+not express that two devices exist and a sharding runtime could pool them, so
+the single number it reported was wrong for somebody. An RTX 5090 (32GiB)
+beside a 24GiB card is **32GiB to a stack that does not shard and 56GiB to one
+that does**.
+
+Both facts are now carried:
+
+- `DeviceReading` per device (index, name, total, free), enumerated by **both**
+  the torch and nvidia-smi stages;
+- `free_bytes` / `total_bytes` keep their exact prior semantics, so every
+  existing consumer is byte-identical;
+- `aggregate_free_bytes` / `aggregate_total_bytes` sum the enumerated devices;
+- `shardable_usable_bytes(sharding=)` composes them, and returns the
+  single-device answer for a single-device host **even when sharding is
+  declared**, so the flag cannot invent a card that is not there.
+
+`is_multi_device` keys off `len(devices)`, **not** `device_count > 1`: a probe
+stage can report a count while failing to enumerate, and an aggregate over
+devices never read would be a fabrication — the same discipline
+`free_is_measured` already enforces for derived free bytes.
+
+**Sharding is a declaration, not an inference.** Whether a model can span two
+GPUs is a property of the serving stack (llama.cpp/Ollama layer split, vLLM
+tensor parallel), which `compute_topology` deliberately knows nothing about.
+So `local_model_admission.accelerator_sharding_declared()` reads
+`JARVIS_LOCAL_ACCEL_SHARDING`, **default false**. The asymmetry sets the
+default: declaring sharding on a stack that does not shard admits a model that
+then fails to load, having already passed the gate whose whole job was to
+prevent that; declaring it off on a stack that does merely under-uses the
+second card.
+
+Decisions now say which bound they used — `bound="accelerator_pooled"` and a
+reason naming the device count when pooling applied.
+
+#### 31.1.3 Verification
+
+50 new tests. 350 green across the affected surface, identified by an AST
+sweep of the entire `tests/` tree for the changed module and symbol names
+(73 files touched the throughput surface, 4 the topology surface). One
+genuine orphan was found and repaired: `test_sovereign_override` asserted an
+env var's presence in orchestrator **source** — a test of spelling, which the
+extraction broke while the behaviour was untouched. It now asserts the
+property its own docstring claims.
+
+Live-fire, not unit-green: the governor was driven against a real
+`qwen2.5-coder:3b` on a running Ollama, and the pool was observed holding
+workers 1 and 2 alive while a subsequent topology retire killed them.
+
+> **Two defects in this change's own code, caught by its own tests.** (1) The
+> consult first reached a route budget via `self._config`, which
+> `BackgroundAgentPool` does not own — every call raised, the broad `except`
+> swallowed it, and the wiring was **dead while looking live**. (2) The
+> log-dedup key was pool-level, so the second and third held workers were
+> deduped away and the log read as one held lane when three were. Both are
+> instances of the class §28 named: a capability needs a live caller on the
+> default path, and an observability surface that under-reports is not
+> observability.
+
+### 31.2 The measured envelope
+
+#### 31.2.1 macOS M1, 16GB unified — the development host
+
+Measured 2026-08-18 against live `qwen2.5-coder:3b` via the real
+`LocalPrimeClient.complete()` seam:
+
+| sample | TTFT | total | out | note |
+|---|---|---|---|---|
+| 1 | 3232 ms | 32321 ms | 25 tok | cold — model load |
+| 2 | 193 ms | 1933 ms | 23 tok | warm |
+| 3 | 311 ms | 3112 ms | 28 tok | warm |
+| 4 | 418 ms | 4177 ms | 31 tok | warm |
+| 5 | 350 ms | 3503 ms | 33 tok | warm |
+
+Derived: ~95 ms/token warm. With `output_ratio = 0.5`, an 8000-token
+CONTEXT_EXPANSION prompt predicts **4000 output tokens ≈ 380 s of generation
+alone** against a 180 s BACKGROUND window.
+
+> **Verdict: this host drives ONE lane, and the governor derives that number
+> rather than being told it.** The `3` in `JARVIS_BG_POOL_SIZE` was never a
+> statement about this machine.
+
+Two profiler distortions worth recording, both pre-existing:
+
+1. **Cold-load amortization.** `record()` computes
+   `per_tok = (total - ttft) / output_tokens`. A cold op with small output
+   folds MODEL-LOAD time into per-token cost — measured 1163 ms/tok cold
+   versus ~95 ms/tok warm, a 12x outlier that pins the estimate at its ceiling
+   for the length of the sample window.
+2. **Ceiling saturation.** Consequently `adaptive_timeout_ms(8000)` returns
+   exactly `timeout_ceiling_ms` (120000). The governor now labels that
+   `ceiling_clamped` rather than reporting a clamp as a measurement.
+
+#### 31.2.2 Windows inference host — the target
+
+```
+CPU  AMD Ryzen 9 9950X3D
+GPU  NVIDIA RTX 5090 Founders Edition   32 GB GDDR7
+GPU  second NVIDIA card                 24 GB
+RAM  64 GB DDR5 (dual channel)
+```
+
+| pool | bytes |
+|---|---|
+| largest single device | **32 GB** |
+| pooled VRAM (sharding declared) | **56 GB** |
+| VRAM + system RAM (weights may live in either) | **120 GB** |
+
+This is precisely the host the §31.1.2 work exists for: without it, the
+admission gate sees 32 GB and refuses a model that would fit across both
+cards; with sharding blindly summed, it would admit models that cannot land on
+a non-sharding stack. Both failure modes are now avoidable, and which one
+applies is stated rather than assumed.
+
+### 31.3 Can a 1T–2.4T model run on that box? — answered with arithmetic
+
+**Short answer: no, and the gap is not close enough to engineer around.**
+
+`Qwen3.8-Max` is `Qwen3.8-2.4T-A95B`: **2.4T total parameters, 95B active**,
+512 experts (10 routed + 1 shared per token), 92 layers, 256K native context
+extensible to ~1M.
+
+The single most common MoE sizing error is reading the active count as the
+memory footprint. **Active parameters set SPEED; total parameters set
+RESIDENCY.** Every one of the 512 experts must be reachable, because routing
+picks different ones each token.
+
+Published sizes:
+
+| format | size | source |
+|---|---|---|
+| BF16 (native) | **4.9 TB** | Unsloth |
+| INT4 | 600 GB – 1 TB | MindStudio |
+| IQ1_S | 508 GB | Unsloth |
+| **Unsloth Dynamic 1-bit GGUF (smallest that exists)** | **397 GB** | Unsloth |
+
+Against 120 GB of addressable memory on the target box:
+
+```
+397 GB  smallest quantized form in existence
+120 GB  VRAM + system RAM
+-----
+277 GB  short  ->  3.3x over, at ~1.32 bits per parameter
+```
+
+There is no quantization below ~1 bit. The deficit cannot be closed by
+compression.
+
+**Could it stream from NVMe?** `llama.cpp` will mmap a model larger than RAM
+and page from disk, so it would technically emit tokens. The arithmetic:
+
+- 95B active x ~1.32 bpw ≈ **15.7 GB read per forward pass**
+- ~30% of the file is resident (120 of 397 GB), so ~11 GB per token from NVMe
+- MoE routing scatters those reads across 512 experts x 92 layers — poor
+  locality, so a PCIe 5.0 drive's ~14 GB/s sequential figure does not apply;
+  2–5 GB/s effective is the realistic band
+- **≈ 2.2–5.5 s per token → 0.18–0.45 tok/s**
+
+A 500-token reply is 18–46 minutes. The 4000-token generation O+V's own
+`output_ratio` predicts for an 8K prompt is **2.5–6 hours**.
+
+**Calibration against a model that does work.** Kimi K2 (1T total, **32B
+active**) at Unsloth Dynamic 1.8-bit is 245 GB and reports ~5 tok/s on 24 GB
+VRAM + 256 GB RAM. Note why: 280 GB of memory holds a 245 GB file — it
+**fits**. The target box does not fit even the 1-bit Qwen, and Qwen3.8-Max has
+**3x the active parameters** of Kimi K2, so it moves 3x the bytes per token at
+equivalent residency.
+
+**What would actually be required** to run Qwen3.8-Max locally at all:
+
+| requirement | implication |
+|---|---|
+| ≥ 448 GB RAM+VRAM (397 GB weights + KV cache + headroom) | 512 GB DDR5 RDIMM on Threadripper PRO / EPYC — a different machine class, not an upgrade |
+| ≥ 8 memory channels | 95B active x 1.32 bpw = 15.7 GB/token; dual-channel DDR5 (~96 GB/s) caps at ~6 tok/s theoretical before overheads |
+| realistic outcome | ~4–8 tok/s |
+
+**And here is the conclusion that matters for O+V**, which no amount of
+hardware fixes: at 5 tok/s, the 4000-token generation predicted for a standard
+CONTEXT_EXPANSION prompt takes **800 s**. Every route budget — IMMEDIATE 120 s,
+STANDARD 220 s, COMPLEX 240 s, BACKGROUND 180 s — is blown by a single
+response, on hardware costing five figures.
+
+> **The local tier's job is not to run the biggest model. It is to run a model
+> whose per-op cost fits a route budget.** A 2.4T model is not "too big for
+> the GPU"; it is too slow for the loop, and would remain so after the GPU
+> problem was solved. This is exactly the property §31.1.1's governor now
+> measures and enforces — pointed at such a model it would return
+> `provenance=ceiling_clamped, lanes=1` and the deadline machinery would
+> record the breach honestly.
+
+Sources: [Unsloth Qwen3.8 GGUF](https://huggingface.co/unsloth/Qwen3.8-2.4T-A95B-GGUF) ·
+[vLLM recipe (2.4T/95B)](https://recipes.vllm.ai/Qwen/Qwen3.8-2.4T-A95B) ·
+[MindStudio hardware analysis](https://www.mindstudio.ai/blog/run-qwen3-8-locally-hardware) ·
+[Unsloth Kimi K2](https://huggingface.co/unsloth/Kimi-K2-Instruct-GGUF) ·
+[Trillion-parameter-at-home guide](https://hackmd.io/msiciwuST9mn3sgSPSyENw)
+
+### 31.4 Which models suit O+V — derived from the budget, not from a leaderboard
+
+#### 31.4.1 The selection criterion is arithmetic, not taste
+
+O+V's local tier serves the BACKGROUND and SPECULATIVE routes (§5 —
+OpportunityMiner, DocStaleness, TODOs, backlog, IntentDiscovery). Its budget is
+**180 s**, of which the governor allows `safety_fraction = 0.6` for generation:
+**108 s**. `output_ratio = 0.5` predicts **4000 output tokens** for an 8000-token
+CONTEXT_EXPANSION prompt. Therefore:
+
+```
+lanes = 1  requires  per_token <= 108s / 4000 tok  ~=  27 ms   ->  >=  40 tok/s
+lanes = 3  requires  per_token <=  36s / 4000 tok  ~=   9 ms   ->  >= 120 tok/s
+```
+
+> **A local model is admissible for O+V if and only if it sustains ~40 tok/s at
+> the target context.** Below that, it cannot complete one BACKGROUND op inside
+> the window no matter how good its code is. This is the number to shop for —
+> not parameter count, and not SWE-bench alone.
+
+Second hard requirement: **tool-calling fidelity.** Venom is a multi-turn loop
+over 16 built-in tools plus MCP-forwarded external tools, and the Iron Gate
+requires ≥2 exploration calls before any patch is accepted. A model that emits
+malformed tool calls does not degrade gracefully here — it fails the
+exploration gate, routes through GENERATE_RETRY, and burns the budget twice.
+
+Third: **context.** Tool results accumulate until compaction fires at 75% of
+budget. 128K+ is comfortable; 256K removes the concern.
+
+#### 31.4.2 The shortlist
+
+Sizes are Q4-class quantized weights. **Throughput figures marked (est.) are
+derived from memory bandwidth and are not measurements** — the governor will
+replace them with real numbers on first contact, and that is the point.
+
+| Model | Total / active | Q4 size | Context | Fits 5090 alone (32GB)? | Throughput | O+V verdict |
+|---|---|---|---|---|---|---|
+| **Qwen3-Coder-30B-A3B** | 30B / 3.3B MoE | ~19 GB | 256K → 1M | yes, with room | **220 tok/s** (reported) | **Best fit.** Clears the 3-lane bar with margin. The active-parameter count is what makes it fast. |
+| **Qwen3.8-27B** | 28B dense + vision | **17.8 GB** (Q4_K_M) | 256K native | yes | ~50–70 tok/s (est.) | **Best quality that still clears 1 lane.** Hybrid attention caches only 16 of 64 layers: KV is 0.5 GB @8K, 2.0 GB @32K, 16.4 GB @262K — unusually cheap. Apache-2.0. |
+| **Llama-3.3-70B** | 70B dense | ~40 GB | 128K | no — needs both cards | ~15–20 tok/s (est.) | **Below the bar.** Dense 70B cannot sustain 40 tok/s on this hardware. |
+| **gpt-oss-120b** | 117B / 5.1B MoE | **~60 GB** MXFP4 | 128K | no — 60 GB > 56 GB pooled | fast if resident (5.1B active) | **Marginal.** Weights alone exceed pooled VRAM; needs RAM spill plus KV cache, and vendor guidance says 80–96 GB. Revisit if a third card or 96 GB-class VRAM appears. |
+| **Kimi K2 / DeepSeek-class 1T** | 1T / 32B | 245 GB @1.8-bit | — | no | ~5 tok/s at best | **Out of scope** — see §31.3. |
+| **Qwen3.8-Max (2.4T-A95B)** | 2.4T / 95B | **397 GB** @1-bit | 256K–1M | no — 3.3x over | 0.18–0.45 tok/s streamed | **Impossible on this box, and unusable for O+V even on hardware that fits it.** |
+
+**Recommendation for the Windows host, in deployment order:**
+
+1. **`Qwen3-Coder-30B-A3B`** as the BACKGROUND/SPECULATIVE workhorse — it is
+   the only entry that clears the 3-lane bar, so it is the one that makes the
+   pool's parallelism real rather than nominal.
+2. **`Qwen3.8-27B`** as the quality tier for COMPLEX-adjacent local work,
+   where one lane at higher fidelity beats three at lower. Its vision encoder
+   also lines up with the existing multi-modal ingest path
+   (`ctx.attachments` → GENERATE) and VisionSensor.
+3. Both fit the 5090 **alone**, which means `JARVIS_LOCAL_ACCEL_SHARDING` can
+   stay **off** and the second card is free to host the other model
+   concurrently — two resident models, no layer splitting, no pooled-capacity
+   risk. That is a strictly better use of 56 GB than one model spanning both.
+
+> Note the shape of that recommendation: the second GPU's value here is
+> **another independent lane**, not a bigger model. Which is the same
+> conclusion §31.1.1 reached from the other direction.
+
+Sources: [Qwen3.8-27B GGUF sizes](https://ofox.ai/blog/qwen-3-8-27b-run-locally-vram-gguf-2026/) ·
+[Qwen3-Coder-30B](https://www.morphllm.com/best-ollama-models) ·
+[gpt-oss-120b requirements](https://yingtu.ai/en/blog/gpt-oss-120b-memory-requirements)
+
+### 31.5 What the bridge exposes — latent defects to close before Gap 3
+
+The M1→Windows bridge is mostly configuration (`JARVIS_LOCAL_MODEL_BASE_URL`,
+default `http://127.0.0.1:11434`). But routing one host's governor at another
+host's GPU surfaces three real issues that do not exist while everything is
+local:
+
+1. **`physics_key` conflates hosts.** It is `model_name@num_ctx` —
+   deliberately not the endpoint, because *"node IPs change every run; the
+   physics belongs to the brain+window."* That reasoning holds for a mesh of
+   like machines. It does **not** hold across a 16 GB M1 and a 5090: the same
+   model name on both writes to one ledger key, and the M1's ~95 ms/token
+   would govern the 5090's lane count. **The key needs a hardware-class
+   component before the bridge carries load** — and the class, not the IP, so
+   the original rationale survives.
+2. **The lane ceiling is pool-level, not route-level.** The pre-dequeue gate
+   sizes against `DEFAULT_POOL_ROUTE` (background) because it does not yet
+   hold an op. Correct for a pool that predominantly serves that route;
+   wrong once a remote host makes SPECULATIVE genuinely cheap and IMMEDIATE
+   genuinely viable.
+3. **Network latency is inside `per_op_ms` but is not model physics.** Once
+   the M1 measures a remote endpoint, TTFT includes the LAN round trip. That
+   is honest for lane sizing (the wall-clock is real), but it pollutes the
+   ledger's claim to be *model* physics. Worth a `transport` dimension before
+   the ledger is trusted for anything else.
+
+### 31.6 Priorities — what to do next, ranked
+
+Ranked by *leverage per line changed*, the §28 criterion.
+
+| # | Item | Why it is here | Cost | Blocked on |
+|---|---|---|---|---|
+| **1** | **`physics_key` hardware-class component** (§31.5.1) | Without it the bridge governs a 5090 with an M1's physics. This is a correctness bug that only appears under the exact configuration we are building toward. | S | nothing |
+| **2** | **Deploy `Qwen3-Coder-30B-A3B` + `Qwen3.8-27B` on the Windows host**, one per card | Turns the second GPU into a second lane. Makes the governor's arithmetic testable against hardware that can actually clear the bar. | S | machine powered on |
+| **3** | **Prove the dual-GPU probe end to end** — `nvidia-smi` enumeration, `is_multi_device`, admission with sharding both on and off | §31.1.2 is unit-proven and live-unproven. Every capability in this repo that shipped unproven eventually shipped broken. | S | machine powered on |
+| **4** | **Route-aware lane ceiling** (§31.5.2) | Re-gate after dequeue using the op's own route, reusing the existing re-enqueue idiom. | M | #2 |
+| **5** | **Observed sharding outranks the declared flag** | A stack reporting a resident model larger than its largest single device has **proven** sharding. Turns a trusted flag into a measurement — the same upgrade the physics ledger already represents. | M | #3 |
+| **6** | **Cold-load outlier isolation** (§31.2.1) | Recording model-load as per-token cost pins the estimator at its ceiling for a full sample window, which currently makes every M1 verdict `ceiling_clamped`. Record load separately. | M | nothing |
+| **7** | **Fix the pre-existing DRY red** — `local_model_admission._read_swapin_bytes` imports `psutil` directly (`f2c3974ddc`), which `test_dry_admission_derives_neither_reading_itself` forbids. Expose swap-in via `memory_pressure_gate`. | Red on `main` today; it will fail every PR touching that file. | S | nothing |
+| **8** | **`InferenceGateway` abstraction** — one seam for local/remote endpoint selection, health, and backpressure | The original Gap 3 ask. Deliberately last: three of its inputs (lane ceiling, pooled capacity, per-endpoint physics) had to exist first, and two of them now do. | L | #1, #4 |
+
+**Not scheduled, and deliberately so:** anything aimed at running a 1T+ model
+locally. §31.3 shows the ceiling is not a hardware-budget problem but a
+tokens-per-second problem that persists on hardware costing five figures. The
+capability O+V gains from a bigger local model is smaller than the capability
+it gains from item #2.
+
+### 31.7 Invariants this section adds
+
+1. **A lane count must be derived or declared, never assumed.** A constant in
+   an env var is a measurement someone took once, on a machine that may not be
+   this one.
+2. **Topology and throughput are separate authorities.** Neither may overwrite
+   the other; they compose strictest-wins. A capability that has to defeat an
+   existing authority to function is modelled wrong.
+3. **A clamped estimate is a lower bound and must say so.** Extends the
+   Advisor's blast-provenance rule (§26) to latency.
+4. **Pooled capacity requires a declared or observed sharding capability.**
+   Summing device memory without one authorizes a load that cannot land.
+5. **A reversible constraint must use a reversible mechanism.** A ~30 s
+   reading may hold a worker; only a permanent fact may retire one.
+6. **The local tier is bounded by the route budget, not by VRAM.** A model is
+   admissible when its per-op cost fits the window — see §31.4.1 for the
+   arithmetic that turns this into a purchasing criterion.
