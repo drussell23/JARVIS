@@ -28,6 +28,7 @@ gate), ``AsyncOracleProxy`` (Slice 112), ``oracle_ipc.process_isolation_enabled`
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 from typing import Any, Optional
@@ -42,6 +43,83 @@ def _env_truthy(name: str) -> bool:
         return (os.environ.get(name, "") or "").strip().lower() in _TRUTHY
     except Exception:  # noqa: BLE001
         return False
+
+
+def oracle_is_ready(oracle: Any) -> bool:
+    """Is *oracle* ready? Total across BOTH oracle surfaces. NEVER raises.
+
+    THE SPLIT THIS RESOLVES
+    -----------------------
+    ``is_ready`` is a METHOD on :class:`TheOracle` and a ``@property`` on both
+    adapters in this module. A consumer holding "an oracle" cannot know which
+    it received, and writing either spelling is wrong half the time:
+
+      * ``oracle.is_ready()`` on an adapter  -> ``TypeError: 'bool' object is
+        not callable``
+      * ``oracle.is_ready`` on TheOracle     -> a bound method, which is
+        ALWAYS truthy: silently "ready" forever
+
+    That first failure ran in production on every operation, swallowed by
+    ``except Exception`` in the CONTEXT_EXPANSION runner, until a live soak on
+    2026-08-18 produced the traceback (`context_expander.py:117`). A second
+    consumer, ``native_integration``, additionally ``await``ed the result —
+    and no ``is_ready`` anywhere in this codebase is async.
+
+    NEITHER SURFACE IS CHANGED, deliberately. Both spellings are pinned by
+    tests on their own type — ``test_oracle_deferred_boot`` asserts
+    ``o.is_ready() is False`` and ``test_slice112_oracle_ipc`` asserts
+    ``proxy.is_ready is False`` — so unifying the protocol would break
+    whichever side lost. The split is real and per-type; what was missing is a
+    reader that survives it.
+
+    Resolution order, and why each degenerate case answers as it does:
+
+    * ``None`` -> ``False``. No oracle is not a ready oracle.
+    * a plain ``bool`` attribute (property already evaluated) -> its value.
+    * a CALLABLE -> called; a non-bool result is coerced with ``bool()``.
+    * a coroutine came back -> closed and treated as UNKNOWN. This resolver is
+      sync by contract because no async ``is_ready`` exists; leaving the
+      coroutine unawaited would emit a "never awaited" warning and leak.
+    * the attribute is ABSENT -> ``True``, mirroring the adapters' own
+      documented fallback ("if the Oracle exposes no OracleReadiness
+      primitive, assume ready"). A duck-typed oracle without the probe is the
+      legacy shape, and treating it as permanently unready would silently
+      disable context expansion — the very outcome this function exists to
+      end.
+    * anything RAISES -> ``True``, for the same reason: a readiness probe that
+      fails must not be the thing that disables the feature it guards.
+    """
+    if oracle is None:
+        return False
+    try:
+        probe = getattr(oracle, "is_ready")
+    except Exception:  # noqa: BLE001 — a hostile __getattr__
+        return True
+    except AttributeError:  # pragma: no cover — defensive, covered above
+        return True
+    if probe is None:
+        return True
+    if isinstance(probe, bool):
+        return probe
+    if callable(probe):
+        try:
+            value = probe()
+        except Exception:  # noqa: BLE001 — a failing probe is not a verdict
+            return True
+        if inspect.iscoroutine(value):
+            try:
+                value.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        try:
+            return bool(value)
+        except Exception:  # noqa: BLE001
+            return True
+    try:
+        return bool(probe)
+    except Exception:  # noqa: BLE001
+        return True
 
 
 class InProcessOracleAdapter:
