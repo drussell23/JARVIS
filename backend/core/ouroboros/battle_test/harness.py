@@ -4891,6 +4891,7 @@ class BattleTestHarness:
                         "phase_detail": snap.phase_detail,
                         "cost_spent_usd": snap.cost_spent_usd,
                         "cost_budget_usd": snap.cost_budget_usd,
+                        "cost_budget_basis": snap.cost_budget_basis,
                         "idle_elapsed_s": snap.idle_elapsed_s,
                         "primary_op_id": snap.primary_op_id,
                         "route": snap.route,

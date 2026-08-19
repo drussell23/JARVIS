@@ -600,6 +600,31 @@ def _render_hydration(console: Any, payload: dict) -> None:
         head.append(f"${cost:.2f}", style=_body)
         head.append(f"/${budget:.2f}", style=_muted)
         console.print(head, highlight=False)
+        # A CEILING WITHOUT ITS BASIS IS AN ARBITRARY CONSTANT.
+        #
+        # `$0.00/$0.71` prompted "where is the $0.71 coming from?" — a fair
+        # question, because 0.71 is derived (p95 of the operator's own
+        # recorded sessions x a headroom multiple) and nothing on screen said
+        # so. The derivation already returns its basis; it was being dropped
+        # between the spawner and here.
+        _basis = str(status.get("cost_budget_basis") or "").strip()
+        if _basis and budget:
+            # `_T`, not `_Text`: this function aliases rich's Text as `_T`,
+            # while `_Text` exists only inside the header builder. The wrong
+            # name raised NameError, the "NEVER raises" wrapper swallowed it,
+            # and every line BELOW this point — including the liquidity rows —
+            # silently stopped rendering. A fail-soft contract turns a typo
+            # into missing output rather than a crash, which is why this is
+            # pinned by a test that asserts the lines are actually produced.
+            console.print(
+                # Parenthesised, not em-dashed: the basis string carries its
+                # own punctuation and varies in shape ("observed — 98
+                # sessions…", "clamped to the Aegis session cap…",
+                # "unmeasured — …", "operator"). A parenthetical reads
+                # correctly for all of them without parsing any of them.
+                _T(f"{_glyph('detail', '-')} budget ${budget:.2f} "
+                   f"({_basis})", style=_muted),
+                highlight=False)
         if ops:
             console.print(_active_ops_line(ops), markup=False, highlight=False)
         for line in _liquidity_lines(liq.get("providers") or {},

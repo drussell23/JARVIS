@@ -409,6 +409,20 @@ def spawn_daemon(
         _cap, _cap_basis = _cockpit_cost_cap()
         if _cap is not None:
             env.setdefault("OUROBOROS_BATTLE_COST_CAP", _cap)
+        # THE BASIS TRAVELS WITH THE NUMBER.
+        #
+        # `derived_cost_cap` computes both and its docstring is explicit that
+        # "a surface that shows the number without it repeats the exact defect
+        # this replaces" — yet the basis went only to logger.debug here, so an
+        # operator seeing `$0.00/$0.71` had no way to learn that 0.71 is the
+        # p95 of their own 98 recorded sessions times a 3x headroom. It read
+        # as an arbitrary constant.
+        #
+        # Exported rather than recomputed daemon-side ON PURPOSE: the basis
+        # belongs to the DECISION that set this ceiling. Re-deriving it later
+        # would sample a different set of sessions and could explain the
+        # number with evidence that did not produce it.
+        env.setdefault("OUROBOROS_BATTLE_COST_CAP_BASIS", _cap_basis or "")
         logger.debug("[ov] session ceiling %s — %s",
                      f"${_cap}" if _cap else "(not asserted)", _cap_basis)
         env.setdefault("OUROBOROS_BATTLE_IDLE_TIMEOUT", os.environ.get(
