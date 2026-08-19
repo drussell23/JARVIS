@@ -71,6 +71,9 @@ LOCAL_TRIAGE_MODEL_ENV = "JARVIS_LOCAL_TRIAGE_MODEL"
 FAILURE_THRESHOLD_ENV = "JARVIS_GATEWAY_FAILURE_THRESHOLD"
 COOLDOWN_ENV = "JARVIS_GATEWAY_COOLDOWN_S"
 PROBE_TIMEOUT_ENV = "JARVIS_GATEWAY_PROBE_TIMEOUT_S"
+PREFLIGHT_ENV = "JARVIS_GATEWAY_PREFLIGHT_ENABLED"
+RESIDENCY_TTL_ENV = "JARVIS_GATEWAY_RESIDENCY_TTL_S"
+SWAP_BUDGET_ENV = "JARVIS_GATEWAY_WARM_SWAP_BUDGET_S"
 
 _TRUTHY = ("1", "true", "yes", "on")
 
@@ -143,6 +146,40 @@ def probe_timeout_s() -> float:
         return max(0.5, float(os.environ.get(PROBE_TIMEOUT_ENV, "3")))
     except (TypeError, ValueError):
         return 3.0
+
+
+def preflight_enabled() -> bool:
+    """Master gate for the residency pre-flight. Default ON. NEVER raises."""
+    try:
+        return os.environ.get(PREFLIGHT_ENV, "1").strip().lower() in _TRUTHY
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def residency_ttl_s() -> float:
+    """How long a residency reading stays fresh. Default 30s.
+
+    Short, because residency is exactly the thing that changes underneath us:
+    another client can request a different model and evict ours. Long enough
+    that a burst of ops does not issue a probe each."""
+    try:
+        return max(0.0, float(os.environ.get(RESIDENCY_TTL_ENV, "30")))
+    except (TypeError, ValueError):
+        return 30.0
+
+
+def warm_swap_budget_s() -> float:
+    """Wall-clock allowed for a cold load. Default 180s.
+
+    Generous ON PURPOSE and NOT derived from a route budget: this is the
+    cost of moving ~19GB across PCIe into VRAM, which has nothing to do with
+    how urgent the op is. Measured ~30s for a 1.9GB model on Apple Silicon;
+    a 30B on a discrete card is meaningfully longer. The whole point of
+    paying it here is that it is paid OUTSIDE the op's generation clock."""
+    try:
+        return max(1.0, float(os.environ.get(SWAP_BUDGET_ENV, "180")))
+    except (TypeError, ValueError):
+        return 180.0
 
 
 class HostState(str, enum.Enum):
@@ -309,6 +346,9 @@ class InferenceGateway:
         self._lock = threading.Lock()
         self._health: Dict[str, _HostHealth] = {}
         self._clients: Dict[str, Any] = {}
+        #: base_url -> (monotonic_at, resident_models_or_None). None is
+        #: "unknowable", which is NOT the same as an empty tuple.
+        self._residency: Dict[str, Tuple[float, Optional[Tuple[str, ...]]]] = {}
         self._client_factory = client_factory
 
     # -- resolution --------------------------------------------------------
@@ -441,6 +481,11 @@ class InferenceGateway:
            raised.
         """
         target = self.target_for(route=route, now=now)
+        if target.is_remote:
+            # Pre-flight OUTSIDE the try: a warm swap is not a dispatch
+            # attempt, so a slow load must not be classified as a host fault
+            # and must not open the breaker.
+            await self.ensure_model_resident(target)
         try:
             return await self._dispatch_to(
                 target, system=system, user=user, prompt_tokens=prompt_tokens,
@@ -485,6 +530,140 @@ class InferenceGateway:
         if target.is_remote:
             self._health_for(target.base_url).record_success()
         return result
+
+    # -- pre-flight residency ---------------------------------------------
+
+    async def resident_models(self, base_url: str) -> Optional[Tuple[str, ...]]:
+        """Models the remote currently holds IN VRAM, or None if unknowable.
+
+        ``/api/ps`` answers "what is loaded RIGHT NOW", which is a different
+        question from ``/api/tags`` ("what is installed") -- the latter is
+        already memoised elsewhere in this codebase and would answer the wrong
+        question here: a model can be installed and not resident, which is
+        precisely the case a warm swap exists to handle.
+
+        None is returned for "could not determine", NEVER an empty tuple. A
+        server that does not implement ``/api/ps`` (vLLM, an older ollama)
+        must not be read as "nothing is loaded" -- that would make every op
+        trigger a needless warm swap. Empty tuple means the endpoint answered
+        and genuinely holds nothing.
+
+        Bounded by :func:`probe_timeout_s`; a probe that can hang is a second
+        instance of the bug this whole module exists to prevent. NEVER raises.
+        """
+        try:
+            import aiohttp  # noqa: PLC0415
+        except Exception:  # noqa: BLE001
+            return None
+        url = base_url.rstrip("/") + "/api/ps"
+        try:
+            timeout = aiohttp.ClientTimeout(total=probe_timeout_s())
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.get(url) as resp:
+                    if resp.status != 200:
+                        return None
+                    payload = await resp.json(content_type=None)
+        except Exception:  # noqa: BLE001 — unreachable, unparseable, absent
+            return None
+        try:
+            rows = payload.get("models") or payload.get("data") or []
+            names = tuple(
+                str(r.get("name") or r.get("model") or "").strip()
+                for r in rows if isinstance(r, dict)
+            )
+            return tuple(n for n in names if n)
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _model_matches(wanted: str, resident: Tuple[str, ...]) -> bool:
+        """Is *wanted* among *resident*? Tolerates ollama's tag conventions.
+
+        ``qwen3-coder:30b`` and ``qwen3-coder:30b-instruct-q4_K_M`` are the
+        same weights to an operator and different strings to a registry, and
+        a bare ``qwen3-coder`` is reported as ``qwen3-coder:latest``. An
+        over-strict comparison would warm-swap a model that is already
+        resident -- burning a cold load to load what is loaded.
+        """
+        w = (wanted or "").strip().lower()
+        if not w:
+            return True          # nothing requested -> nothing to verify
+        w_base = w.split(":", 1)[0]
+        for r in resident:
+            r = r.strip().lower()
+            if r == w or r.startswith(w + "-"):
+                return True
+            if r.split(":", 1)[0] == w_base and (":" not in w or w.split(":", 1)[1] in r):
+                return True
+        return False
+
+    async def ensure_model_resident(self, target: "GatewayTarget") -> Dict[str, Any]:
+        """Pre-flight: verify the target model is loaded, warm-swapping if not.
+
+        WHY THIS EXISTS. Ollama loads a model on first use. If the resident
+        model is the 30B coder and an op asks for the 27B vision model, that
+        first request pays a multi-second-to-multi-minute cold load INSIDE its
+        own generation window -- and the route budget was calibrated for
+        generation, not for PCIe transfer. The op then fails on a deadline
+        that had nothing to do with the model's speed, which is the most
+        misleading failure this tier can produce.
+
+        So the swap is performed as an explicit handshake, BEFORE the op's
+        clock starts, against a budget of its own (:func:`warm_swap_budget_s`)
+        rather than against the route's.
+
+        Composes the EXISTING ``LocalPrimeClient.warmup()``, which already
+        forces weights into VRAM with a dedicated cold-start HTTP context.
+        Re-implementing it here would be a second cold-load path.
+
+        NEVER raises. Returns a small report for observability.
+        """
+        out: Dict[str, Any] = {"checked": False, "swapped": False,
+                               "resident": None, "reason": ""}
+        if not preflight_enabled():
+            out["reason"] = "preflight disabled"
+            return out
+        try:
+            now = time.monotonic()
+            with self._lock:
+                cached = self._residency.get(target.base_url)
+            if cached is not None and (now - cached[0]) < residency_ttl_s():
+                resident = cached[1]
+            else:
+                resident = await self.resident_models(target.base_url)
+                with self._lock:
+                    self._residency[target.base_url] = (now, resident)
+            out["checked"] = True
+            out["resident"] = list(resident) if resident is not None else None
+
+            if resident is None:
+                # Unknowable, not empty. Dispatch anyway: the client's own
+                # inter-token watchdog still bounds a slow first token, and
+                # swapping on every op would be worse than the problem.
+                out["reason"] = "residency unknown — dispatching without a swap"
+                return out
+            if self._model_matches(target.model_name, resident):
+                out["reason"] = "already resident"
+                return out
+
+            logger.info(
+                "[InferenceGateway] warm swap: %s is resident, op needs %s — "
+                "loading before the op clock starts (budget %.0fs)",
+                ", ".join(resident) or "<none>", target.model_name,
+                warm_swap_budget_s(),
+            )
+            client, _prof = self._client_for(target)
+            ok = await client.warmup(timeout_s=warm_swap_budget_s())
+            out["swapped"] = bool(ok)
+            out["reason"] = "warm swap completed" if ok else (
+                "warm swap did not confirm — dispatching anyway")
+            # The reading is now stale either way.
+            with self._lock:
+                self._residency.pop(target.base_url, None)
+            return out
+        except Exception as exc:  # noqa: BLE001 — pre-flight must never block dispatch
+            out["reason"] = f"preflight degraded: {type(exc).__name__}"
+            return out
 
     # -- lifecycle + observability ----------------------------------------
 

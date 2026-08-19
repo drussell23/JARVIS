@@ -118,6 +118,7 @@
     - [31.5 What the bridge exposes — latent defects to close before Gap 3](#315-what-the-bridge-exposes--latent-defects-to-close-before-gap-3)
     - [31.6 Priorities — what to do next, ranked](#316-priorities--what-to-do-next-ranked)
     - [31.7 Invariants this section adds](#317-invariants-this-section-adds)
+    - [31.8 The local tier, configured — deployment profile and warm-swap protocol](#318-the-local-tier-configured--deployment-profile-and-warm-swap-protocol-2026-08-18)
 
 ## 1. Executive Summary
 
@@ -4932,6 +4933,159 @@ locally. §31.3 shows the ceiling is not a hardware-budget problem but a
 tokens-per-second problem that persists on hardware costing five figures. The
 capability O+V gains from a bigger local model is smaller than the capability
 it gains from item #2.
+
+### 31.8 The local tier, configured — deployment profile and warm-swap protocol *(2026-08-18)*
+
+> **Operator binding**: *"We will adopt Qwen3-Coder-30B-A3B as the resident
+> background workhorse on the Windows RTX 5090, keeping Qwen3.8-27B on disk
+> for specialized visual or high-fidelity one-offs."*
+
+#### 31.8.1 Why the MoE wins on THIS card
+
+The decision is hardware-specific and does not generalise. Both candidates
+cost roughly the same VRAM; they cost wildly different **memory traffic per
+token**, which is what sets decode speed:
+
+| | Qwen3-Coder-30B-A3B | Qwen3.8-27B |
+|---|---|---|
+| Architecture | **MoE** — 30B total, **3.3B active** | **Dense** — 28B, all active |
+| VRAM to load (Q4) | ~19 GB | ~17.8 GB |
+| **Bytes read per token** | **~1.9 GB** | **~17.8 GB** |
+| Decode on the 5090 | **~220 tok/s** (reported) | ~50–70 tok/s (est.) |
+
+A dense model reads every weight for every token; an MoE routes each token
+through a few experts while all experts stay resident. **The MoE pays the
+capacity price of 30B and the bandwidth price of 3.3B.**
+
+The 5090 has 32 GB of capacity and ~1.8 TB/s of bandwidth. Either model
+leaves ~13 GB unused, so **capacity is the surplus and bandwidth is the
+constraint** — and MoE is precisely the architecture that trades the abundant
+resource for the scarce one. The same choice would be *wrong* on a 16 GB card,
+where the 30B MoE does not fit at all; this is not a general preference.
+
+Against the §31.4.1 lane arithmetic (108 s of generation allowance, ~4000
+predicted output tokens):
+
+| | Time per op | Lanes |
+|---|---|---|
+| Coder-30B-A3B | ~18 s | ⌊108/18⌋ = 5 → capped to **3** |
+| Qwen3.8-27B | ~67 s | ⌊108/67⌋ = **1** |
+
+Three lanes is meaningful on ONE card because the governor's math already
+accounts for serialisation: 3 × 18 s = 54 s of GPU time fits inside the 108 s
+allowance, so all three finish within budget. Two dense ops would need 134 s
+and **both** would breach.
+
+#### 31.8.2 The argument that actually decides it — retry economics
+
+O+V is by design a **high-rejection architecture**. The Iron Gate,
+the ASCII gate, AST/placeholder validation, SemanticGuardian and the
+multi-file coverage gate can each independently force a full regeneration.
+Rejection is a routine path, not an exception.
+
+That inverts the usual "smarter model wins" reasoning: **where regeneration is
+common, a 3.7× faster model makes every rejection 3.7× cheaper.** For a
+realistic BACKGROUND op — 6 tool rounds plus a final patch, ~3,300 output
+tokens against a growing prompt:
+
+| | Coder-30B-A3B | Qwen3.8-27B |
+|---|---|---|
+| Decode + prefill across the op | ~30 s | ~95 s |
+| Left inside the 108 s allowance | **~78 s** | **~13 s** |
+| Must still cover | VALIDATE (pytest), Iron Gate, SemanticGuardian, **and any retry** | same |
+
+13 s does not cover a pytest run, let alone a retry. The dense model does not
+merely run slower — **it cannot absorb a single rejection inside a BACKGROUND
+budget.**
+
+> **Benchmark caution.** Qwen3.8-27B's 163/164 HumanEval is close to
+> irrelevant here: HumanEval measures single-function synthesis from a
+> docstring, and O+V never does that. It does multi-round, tool-driven,
+> multi-file repo edits behind five rejection gates. Different skill,
+> different bottleneck.
+
+What the dense model retains: better per-response quality, and a **vision
+encoder**. The latter matters less than it appears — VisionSensor's Tier 2
+already uses Qwen3-VL-235B, so local vision is not on the coding model's
+critical path. It stays on disk for that work, at the cost of a swap.
+
+#### 31.8.3 Two machines, two kinds of setting
+
+`deploy/local_tier_windows.env` is the single activation artifact, and it is
+explicit about a distinction that is easy to get wrong:
+
+* **`OLLAMA_*` are read by `ollama serve` ON THE WINDOWS HOST.** JARVIS cannot
+  set them remotely, and sourcing the profile on the Mac does not apply them.
+  `OLLAMA_KEEP_ALIVE=-1` (never evict), `OLLAMA_MAX_LOADED_MODELS=1`
+  (co-residency is impossible anyway: 19 + 17.8 = 36.8 GB against 32 GB before
+  KV, so pinning it makes eviction deterministic rather than emergent), and
+  `OLLAMA_KV_CACHE_TYPE=q8_0` (Qwen3.8-27B's ~62.5 KiB/token means a full
+  262 K context is ~16.4 GiB at fp16 and does **not** fit alongside weights;
+  q8 roughly halves it and the native window fits).
+* **`JARVIS_*` are read where the orchestration runs**, normally the Mac.
+
+Client-side keep-alive needed **no new code**: `LocalConfig.keep_alive_seconds`
+already flows into the request body as ollama's `keep_alive`, and `-1` survives
+parsing verbatim. The one hazard is that the same value also feeds the aiohttp
+connector; `max(30, keep_alive_seconds)` is what stops one env var from meaning
+two incompatible things, and is pinned by test.
+
+#### 31.8.4 The pre-flight warm-swap protocol
+
+**The failure it prevents.** Ollama loads a model on first use. If the resident
+model is the 30B coder and an op requests the 27B, that request pays a cold
+load **inside its own generation window** — a window calibrated for generation,
+not for PCIe transfer. The op then dies on a deadline that says nothing about
+the model's speed, which is the most misleading failure this tier can produce.
+
+So residency is verified and repaired as an explicit handshake **before the
+op's clock starts**, against a budget of its own
+(`JARVIS_GATEWAY_WARM_SWAP_BUDGET_S`, default 180 s) rather than the route's.
+
+Four design points, each rejecting an easier answer:
+
+1. **`/api/ps`, not `/api/tags`.** Tags answers "what is installed"; ps answers
+   "what is loaded". The former is already memoised elsewhere in this codebase
+   and would answer the wrong question — a model can be installed and not
+   resident, which is exactly the case a swap exists to handle.
+2. **`None` is not `()`.** A server that does not implement `/api/ps` (vLLM, an
+   older ollama) returns unknowable. Reading that as "nothing is loaded" would
+   make every op trigger a needless swap. Empty tuple means the endpoint
+   answered and genuinely holds nothing. *Live-verified against a real ollama:
+   `()` before any load, `('qwen2.5-coder:3b',)` after, `None` when
+   unreachable.*
+3. **Tag-tolerant matching.** `qwen3-coder:30b` and
+   `qwen3-coder:30b-instruct-q4_K_M` are the same weights to an operator and
+   different strings to a registry; a bare name reports as `:latest`. An
+   over-strict comparison burns a cold load to load what is already loaded.
+4. **The swap runs OUTSIDE the failure classifier.** A slow cold load is not a
+   host fault, and counting it would open the breaker on a healthy machine that
+   was merely loading. Pinned structurally by AST test.
+
+It composes the EXISTING `LocalPrimeClient.warmup()` — which already forces
+weights into VRAM under a dedicated cold-start HTTP context — rather than
+adding a second cold-load path.
+
+#### 31.8.5 What was NOT built, and why
+
+Three of this arc's four requirements turned out to be satisfiable by existing
+machinery, and building them again would have created second authorities:
+
+| Requirement | Already existed |
+|---|---|
+| Streaming inter-token timeout | `LocalPrimeClient._complete_streaming` + `InterTokenStall` — the gateway only had to **arm** it (`stream=True`) on the remote path |
+| Model residency forcing | `LocalPrimeClient.warmup(timeout_s=)` |
+| Client-side keep-alive | `LocalConfig.keep_alive_seconds` → request body |
+| Local triage fallback | `InferenceGateway._local_target()`, one builder, DRY-pinned |
+
+The genuinely new surface is small: a bounded `/api/ps` probe, a tag-tolerant
+match, a TTL'd residency cache, and the decision to spend a swap budget
+outside the op clock.
+
+**Regression spine:** 26 tests in `tests/governance/test_local_tier_profile.py`,
+including a structural pin that **every `JARVIS_*` setting in the profile is
+read by code** — a profile documenting a knob nothing consults is the same
+defect class as a capability with no caller.
 
 ### 31.7 Invariants this section adds
 
