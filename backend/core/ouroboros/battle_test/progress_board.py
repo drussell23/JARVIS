@@ -790,10 +790,26 @@ class ProgressBoard:
         prefix = flag_prefix()
         scanned = 0
         for rel, path in _iter_source_files(self._repo_root, roots):
-            try:
-                tree = ast.parse(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, SyntaxError, ValueError):
-                continue
+            # Test-ness is decided from the PATH (`_is_test_path`), and a test
+            # module contributes NOTHING but its name: the analysers below all
+            # sit under `not is_test`, because a test importer must not launder
+            # a dark module into a live one. Parsing 3908 test files to reach
+            # `aliases.setdefault` cost 9.2s of every cold scan and produced a
+            # tree nobody read.
+            #
+            # The one observable difference is a test file that does not PARSE:
+            # it used to be skipped entirely, and is now named and counted like
+            # any other. That is the more honest answer — this loop no longer
+            # forms an opinion about the syntax of a file whose syntax it never
+            # consults — and the repository currently contains no such file, so
+            # `scanned_files` is unchanged today.
+            is_test = _is_test_path(rel, self._repo_root)
+            tree = None
+            if not is_test:
+                try:
+                    tree = ast.parse(path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, SyntaxError, ValueError):
+                    continue
             scanned += 1
             self_mod = _module_name(rel)
             # Every module gets an alias entry regardless of test-ness: this is
@@ -805,10 +821,27 @@ class ProgressBoard:
                 root_prefix = f"{root}."
                 if self_mod.startswith(root_prefix):
                     aliases.setdefault(self_mod[len(root_prefix):], self_mod)
-            is_test = _is_test_path(rel, self._repo_root)
-            if not is_test:
+            # Equivalent to `not is_test` — a failed parse already `continue`d,
+            # so a tree exists exactly for the production files — and it is the
+            # tree, not the path, that the analysers below actually require.
+            if tree is not None:
+                # ONE traversal, five questions. Each analyser below used to
+                # open its own `ast.walk`, so this loop traversed every tree
+                # FIVE times (six counting the one `_dotted_module_strings`
+                # spends inside `_docstring_constants`) to gather facts that
+                # are all present in a single pass. Materialised because
+                # `ast.walk` is a generator and a generator feeds exactly one
+                # consumer: handing the same one to five analysers would give
+                # the first every node and the rest an empty file, which is
+                # indistinguishable from a module that imports nothing.
+                #
+                # Built INSIDE the `not is_test` branch on purpose — a test
+                # module reaches none of these analysers, so walking one would
+                # be pure cost for a result nobody reads.
+                nodes = tuple(ast.walk(tree))
                 for name in _imported_modules(
-                        tree, self_mod, rel.endswith("__init__.py")):
+                        tree, self_mod, rel.endswith("__init__.py"),
+                        nodes=nodes):
                     # A module importing ITSELF is not a caller. Without
                     # this every module would look live, which is the same
                     # as having no signal at all.
@@ -820,19 +853,19 @@ class ProgressBoard:
                 # feature shipped this session. Deriving from source makes
                 # the board complete by construction and immune to anyone
                 # forgetting to register.
-                if _has_main_guard(tree):
+                if _has_main_guard(tree, nodes=nodes):
                     entries.add(self_mod)
                 marker = _semantic_marker(tree, rel)
                 if marker:
                     shadows[self_mod] = marker
                 if string_ref_edges_enabled():
-                    for dotted in _dotted_module_strings(tree):
+                    for dotted in _dotted_module_strings(tree, nodes=nodes):
                         # A module naming ITSELF proves nothing, and a
                         # registry listing its own package would otherwise
                         # vouch for itself.
                         if dotted != self_mod:
                             string_refs.setdefault(dotted, rel)
-                for flag, dflt in _flag_literals(tree, prefix):
+                for flag, dflt in _flag_literals(tree, prefix, nodes=nodes):
                     if flag not in flags:
                         flags[flag] = rel
                         defaults[flag] = dflt
@@ -1295,8 +1328,35 @@ def _resolve_relative(self_mod: str, level: int, module: str,
         return ""
 
 
+def _nodes_of(tree: "ast.AST",
+              nodes: "Optional[Sequence[ast.AST]]" = None
+              ) -> "Iterable[ast.AST]":
+    """THE walk. Every analyser below iterates this, never ``ast.walk`` direct.
+
+    Each analyser used to open its own ``ast.walk``, so a caller wanting five
+    facts about one file paid five full traversals of the same tree —
+    :meth:`ProgressBoard.build_import_graph` wants exactly five, over 3556
+    files. Profiled: 49.7M ``walk`` calls, 131M ``iter_fields``, ~177s of pure
+    traversal machinery for facts that were all available from one pass.
+
+    The fix is not to merge the analysers — they have separate callers
+    (`surface_reachability`, `render_thread`, `source_assertion_audit`) and
+    each owns its own matching rules. It is to let a caller that already has
+    the node sequence HAND IT OVER. ``nodes=None`` keeps every existing call
+    site working and walking exactly as before; a caller with several
+    questions materialises the walk once and passes it to each.
+
+    Materialising is what makes reuse possible at all: ``ast.walk`` returns a
+    generator, and a generator can only be consumed once, so passing one to
+    five analysers would feed the first everything and the rest nothing —
+    silence that reads exactly like a file with no imports and no flags.
+    """
+    return ast.walk(tree) if nodes is None else nodes
+
+
 def _imported_modules(tree: ast.AST, self_mod: str = "",
-                      is_package: bool = False) -> Set[str]:
+                      is_package: bool = False, *,
+                      nodes: Optional[Sequence[ast.AST]] = None) -> Set[str]:
     """Every module this file imports, in both syntaxes.
 
     RELATIVE imports are resolved rather than skipped, and that omission was
@@ -1315,7 +1375,7 @@ def _imported_modules(tree: ast.AST, self_mod: str = "",
     #: file is a real cost for an instrument people run interactively.
     lazy: Set[str] = set()
     dynamic = False
-    for node in ast.walk(tree):
+    for node in _nodes_of(tree, nodes):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 found.add(alias.name)
@@ -1490,7 +1550,9 @@ def string_ref_edges_enabled() -> bool:
 _DOTTED_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$")
 
 
-def _docstring_constants(tree: ast.AST) -> Set[int]:
+def _docstring_constants(tree: ast.AST, *,
+                         nodes: Optional[Sequence[ast.AST]] = None
+                         ) -> Set[int]:
     """Node ids of every docstring, so prose cannot be read as a reference.
 
     This is the single most-repeated defect in this codebase's audit tooling
@@ -1504,7 +1566,7 @@ def _docstring_constants(tree: ast.AST) -> Set[int]:
     matched, rather than any guess from the content.
     """
     out: Set[int] = set()
-    for node in ast.walk(tree):
+    for node in _nodes_of(tree, nodes):
         if not isinstance(node, (ast.Module, ast.ClassDef,
                                  ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -1519,7 +1581,9 @@ def _docstring_constants(tree: ast.AST) -> Set[int]:
     return out
 
 
-def _dotted_module_strings(tree: ast.AST) -> Set[str]:
+def _dotted_module_strings(tree: ast.AST, *,
+                           nodes: Optional[Sequence[ast.AST]] = None
+                           ) -> Set[str]:
     """Dotted module paths spelled as STRING LITERALS in executable positions.
 
     The mechanism this exists for is real and this codebase uses it twice:
@@ -1549,9 +1613,9 @@ def _dotted_module_strings(tree: ast.AST) -> Set[str]:
     to a module the walk actually found — so this can afford to be generous
     and let the index be strict.
     """
-    docs = _docstring_constants(tree)
+    docs = _docstring_constants(tree, nodes=nodes)
     out: Set[str] = set()
-    for node in ast.walk(tree):
+    for node in _nodes_of(tree, nodes):
         if not isinstance(node, ast.Constant) or id(node) in docs:
             continue
         value = node.value
@@ -1611,7 +1675,8 @@ def _decorator_name(node: ast.AST) -> str:
         return node.attr
     return ""
 
-def _has_main_guard(tree: ast.AST) -> bool:
+def _has_main_guard(tree: ast.AST, *,
+                    nodes: Optional[Sequence[ast.AST]] = None) -> bool:
     """Does this module run itself?
 
     `if __name__ == "__main__":` means the module is reachable by EXECUTION —
@@ -1620,7 +1685,7 @@ def _has_main_guard(tree: ast.AST) -> bool:
     inert. The board's own sampling caught this: `commit_authority_cli` was
     reported dark in the same session the operator ran it by hand.
     """
-    for node in ast.walk(tree):
+    for node in _nodes_of(tree, nodes):
         if not isinstance(node, ast.If):
             continue
         test = node.test
@@ -1692,7 +1757,8 @@ def _coerce_bool(value: Any) -> Optional[bool]:
             return False
     return None
 
-def _flag_literals(tree: ast.AST, prefix: str):
+def _flag_literals(tree: ast.AST, prefix: str, *,
+                   nodes: Optional[Sequence[ast.AST]] = None):
     """Yield ``(flag_name, default_literal)`` for every env read in a file.
 
     Covers the three shapes this codebase actually uses —
@@ -1705,7 +1771,7 @@ def _flag_literals(tree: ast.AST, prefix: str):
     ``get("X", "1")`` is ON by default, and a board that cannot see that would
     call every unset feature OFF and hide precisely the dark ones.
     """
-    for node in ast.walk(tree):
+    for node in _nodes_of(tree, nodes):
         name = None
         default = None
         if isinstance(node, ast.Call):
