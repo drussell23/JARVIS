@@ -221,3 +221,38 @@ class TestTheDegradationEvent:
                              scope="remote", state=ig.HostState.DEGRADED,
                              reason="t")
         g._publish_degraded(t, RuntimeError("x"))   # must not raise
+
+    def test_the_payload_actually_reaches_the_channel(self, monkeypatch):
+        """`must not raise` is not `did publish`.
+
+        The blanket ``except`` that makes this method safe also makes it MUTE:
+        for one release it called an ``endpoint_host()`` that did not exist
+        anywhere in the tree, and the NameError was swallowed into a debug
+        line. Every test above still passed -- two read the SOURCE, and the
+        third asserted only that nothing propagated, which a swallow
+        guarantees. CI's undefined-name gate caught it; the suite did not.
+
+        So assert delivery, not survival.
+        """
+        from backend.core.ouroboros.governance import (
+            ide_observability_stream as s,
+        )
+        seen: list = []
+        monkeypatch.setattr(s, "publish_provider_state_changed",
+                            lambda payload: seen.append(payload))
+
+        g = ig.InferenceGateway()
+        t = ig.GatewayTarget(base_url="http://h:1", model_name="m",
+                             scope="remote", state=ig.HostState.DEGRADED,
+                             reason="t")
+        g._publish_degraded(t, RuntimeError("boom"))
+
+        assert seen, "the degradation was swallowed and never published"
+        payload = seen[0]
+        assert payload["fatal"] is False
+        assert payload["fallback"] == "local_triage"
+        assert payload["model"] == "m"
+        # The endpoint must be the SAME identity the breaker is keyed on, or
+        # the operator cannot correlate this event with `_health_for()`.
+        assert payload["endpoint"] == t.base_url
+        assert g._health_for(payload["endpoint"]) is g._health_for(t.base_url)

@@ -719,7 +719,11 @@ class InferenceGateway:
             )
             publish_provider_state_changed({
                 "provider": "local_tier_remote",
-                "endpoint": endpoint_host(target.base_url),
+                # The SAME identity the breaker, the residency cache and the
+                # client cache are keyed on. A prettier derived host would be
+                # a second identity for one endpoint, and an operator could no
+                # longer line this event up with `_health_for(base_url)`.
+                "endpoint": target.base_url,
                 "state": self._health_for(target.base_url).state().value,
                 "model": target.model_name,
                 "failure_class": getattr(exc, "failure_class",
