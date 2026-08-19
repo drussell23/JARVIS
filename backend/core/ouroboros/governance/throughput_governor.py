@@ -231,11 +231,37 @@ class ThroughputGovernor:
         physics at process start and it would never see a re-measured model.
         """
         try:
+            import dataclasses  # noqa: PLC0415
+
             from backend.core.ouroboros.governance import (  # noqa: PLC0415
                 local_inference_director as lid,
             )
             cfg = lid.LocalConfig.from_env()
-            return (lid.LatencyProfiler(cfg, ledger_key=lid.physics_key(cfg)), cfg)
+            endpoint = ""
+            try:
+                # THE HOST THAT WILL SERVE THE OPS IS THE HOST TO SIZE AGAINST.
+                # When the gateway is dispatching to a remote GPU, this Mac's
+                # own physics is irrelevant to how many lanes the queue may
+                # run -- the serialisation happens on the REMOTE device. Ask
+                # the gateway which host is actually active, and profile that
+                # one. Fail-soft: no gateway, or a degraded one, leaves the
+                # local config in place, which is the pre-bridge behaviour.
+                from backend.core.ouroboros.governance.inference_gateway import (  # noqa: PLC0415,E501
+                    get_default_gateway,
+                )
+                target = get_default_gateway().target_for()
+                if target.base_url and target.base_url != cfg.base_url:
+                    endpoint = target.base_url
+                    cfg = dataclasses.replace(
+                        cfg, base_url=target.base_url,
+                        model_name=target.model_name or cfg.model_name)
+            except Exception:  # noqa: BLE001
+                endpoint = ""
+            return (
+                lid.LatencyProfiler(
+                    cfg, ledger_key=lid.physics_key(cfg, endpoint=endpoint)),
+                cfg,
+            )
         except Exception:  # noqa: BLE001
             return (None, None)
 
