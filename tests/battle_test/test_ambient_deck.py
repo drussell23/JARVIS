@@ -224,18 +224,45 @@ def test_addressed_goes_to_scrollback_ambient_goes_to_the_deck(
 
 def test_live_region_grows_above_the_caret() -> None:
     """The pulse and deck render ABOVE the input line (operator layout), so
-    the block is part of the prompt, not the bottom toolbar."""
+    the block is part of the prompt, not the bottom toolbar.
+
+    The contract is POSITION. This asserted line COUNT as a proxy for "the
+    deck row appeared" -- ``len(splitlines()) > base_lines`` -- and the proxy
+    is wrong at exactly one point: the FIRST row does not grow the block, it
+    SUPERSEDES the cold-boot ignition skeleton (``⏺ awaiting daemon
+    telemetry…``), which occupies that slot precisely so the gap before
+    hydration does not read as an empty screen. Cold 3 lines -> one post 3
+    lines -> two posts 4. The row was there and named in the output the whole
+    time; only the counter disagreed.
+
+    So assert the property directly -- the row is present and ABOVE the caret
+    -- and keep the growth check where growth genuinely happens, on the post
+    that has no placeholder left to consume.
+    """
     from backend.core.ouroboros.cli import ov
 
     ui = ov.AttachUI()
-    base_lines = len(ui.prompt().splitlines())
+    cold = ui.prompt().splitlines()
     ui.on_ambient("DW provider failover")
-    out = ui.prompt()
-    assert "failover" in out
-    assert len(out.splitlines()) > base_lines, "the deck row did not appear"
-    assert out.splitlines()[-1].strip().endswith("›"), (
+    out = ui.prompt().splitlines()
+
+    assert any("failover" in ln for ln in out), "the deck row did not appear"
+    assert out[-1].strip().endswith("›"), (
         "the caret must be the LAST line — the live region sits above it"
     )
+    # ...and it is genuinely IN the region, not merely somewhere in the block.
+    assert any("failover" in ln for ln in out[:-1])
+    # The skeleton was replaced, not accumulated beside the real row.
+    assert not any("awaiting daemon" in ln for ln in out), (
+        "the ignition skeleton outlived the first real row"
+    )
+    assert len(out) == len(cold)
+
+    # A second post has no placeholder to consume, so NOW the block grows.
+    ui.on_ambient("second ambient post")
+    grown = ui.prompt().splitlines()
+    assert len(grown) > len(out), "a second deck row did not extend the region"
+    assert grown[-1] == out[-1], "the caret moved when the region grew"
 
 
 def test_deck_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
