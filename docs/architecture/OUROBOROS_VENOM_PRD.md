@@ -5155,6 +5155,81 @@ to `_local_target()` → and on the next evaluation the governor reads a
 penalised ledger and sizes fewer lanes. The event loop is never blocked and the
 op is never lost.
 
+#### 31.8.7 Live-fire status — what is proven, and what remains *(2026-08-18)*
+
+`scripts/live_fire_local_tier.py` drives the REAL gateway, ledger and governor
+against a real endpoint. There is no separate diagnostic channel: every number
+it prints is read back out of the objects the running system consults, because
+a diagnostic that observes a parallel copy of the state proves nothing about
+the state.
+
+**It found a bug on its first run that 300+ unit tests had not** — see
+§31.8.8. That is the argument for this milestone in one sentence.
+
+##### Proven on real infrastructure (loopback, Apple Silicon)
+
+| Capability | Evidence |
+|---|---|
+| `/api/ps` residency probe | answered in **165 ms**; `()` before load, `('qwen2.5-coder:3b',)` after, `None` unreachable |
+| Autonomous warm-swap handshake | 3b → 7b completed in **25.6 s**, paid OUTSIDE the op clock |
+| Adaptive stall detection | `InterTokenStall` at **2.1 s** against the adaptive 2.0 s deadline — **14× faster** than the static 30 s, against a real socket |
+| Fault classification | `InterTokenStall` → INFRASTRUCTURE; a request fault → not counted |
+| Breaker + recovery | opens after 3 stalls; exactly one probe offered after cooldown |
+| Non-fatal degradation event | `provider_state_changed` published after re-route |
+| Local triage fallback | resolves to the configured model |
+| **Closed telemetry loop** | ledger 0 → 4 → 7 samples under the correct model key; governor `seeded` → **`measured=True`**; deadlines re-derived live to `first=30.0 s / steady=7.7 s` |
+
+##### NOT proven — and the list is short and specific
+
+**Nothing has crossed a LAN.** Every figure above is loopback on a 16 GB M1.
+The remaining work is not more code; it is the same script, unchanged, pointed
+at the Windows host:
+
+| # | What | Blocked on | Command |
+|---|---|---|---|
+| **L1** | LAN reachability + residency of `qwen3-coder:30b` | Windows host powered on, Ollama bound `0.0.0.0`, firewall open on 11434 | `--phase 1 --endpoint http://<WIN-IP>:11434 --model qwen3-coder:30b` |
+| **L2** | Remote telemetry lands under a **remote** hardware signature (`provenance=endpoint`, distinct digest) | L1 | `--phase 2 --rounds 8` |
+| **L3** | Governor sizes **3 lanes** from measured 5090 throughput (the §31.4 prediction) | L2 | read `governor post:` line |
+| **L4** | Warm swap `qwen3-coder:30b` → `qwen3.8:27b` on a 32 GB card with `OLLAMA_MAX_LOADED_MODELS=1` — proving eviction is deterministic, not emergent | L1 | `--phase 1 --swap-model qwen3.8:27b` |
+| **L5** | Real LAN partition (unplug / stop the service) vs. the synthetic wedged peer | L1 | `--phase 3` then physically interrupt |
+| **L6** | Measured KV rate for `qwen3-coder:30b` → `JARVIS_KV_BYTES_PER_TOKEN_BY_MODEL` | L2 | compare `/api/ps` `size_vram` against weight size at two context sizes |
+| **L7** | Unattended soak under `ov` + `BackgroundAgentPool` with the governor live | L3 | existing battle-test harness, `--max-wall-seconds 2400` |
+
+**Two predictions this will falsify or confirm**, both currently estimates
+rather than measurements: `qwen3-coder:30b` at **~220 tok/s** (reported, not
+measured here) and the resulting **3-lane** verdict. The governor replaces both
+on first contact — which is the entire reason it was built as a measurement.
+
+#### 31.8.8 The bug live-fire found — cache identity
+
+`_client_for` cached clients keyed by `base_url` **alone**. But a client is
+bound to a MODEL: its cfg carries `model_name` and its profiler is keyed by a
+`physics_key` that includes the model. So after a warm swap to a second model
+on the same host, every subsequent dispatch got the **first** model's client
+back — the requested model was silently ignored, the op ran on the wrong
+weights, and its telemetry landed under the wrong physics key.
+
+Observed directly: phase 1 swapped to `qwen2.5-coder:7b`, then phase 2
+requested `qwen2.5-coder:3b` and ran four successful generations with real
+latencies — and the 3b ledger entry stayed at **zero** while the 7b entry
+gained exactly four. Nothing raised. Nothing logged. The only visible symptom
+was a telemetry key that stayed empty.
+
+On this deployment that reads as: one vision one-off swaps to the 27B, and
+every BACKGROUND op afterwards quietly runs on it at a third of the
+throughput, blowing route budgets with no error anywhere — while the governor
+sizes lanes from a ledger describing a model the ops are not using.
+
+> **Why the unit tests could not catch it.** Every one of them used a single
+> model per gateway, so the cache key and the model identity were the same
+> thing by construction. The defect needed two models on one host — which is
+> exactly what the deployment does and what a mock does not. **This is the
+> case for live-fire stated as a finding rather than as a principle.**
+
+Fixed by keying on `(base_url, model_name)`; five regression tests pin it,
+including that the cache is still a cache (a client per dispatch would leak a
+session per op) and that two models never share one ledger entry.
+
 ### 31.7 Invariants this section adds
 
 1. **A lane count must be derived or declared, never assumed.** A constant in
