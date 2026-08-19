@@ -285,15 +285,58 @@ def _physics_ledger_save(key: str, payload: dict) -> None:
         pass
 
 
-def physics_key(cfg: "LocalConfig") -> str:
-    """The DURABLE physics identity: (model, ctx-bucket) -- NOT the endpoint
-    (node IPs change every run; the physics belongs to the brain+window)."""
+def physics_key(cfg: "LocalConfig", *, endpoint: str = "") -> str:
+    """The DURABLE physics identity: (hardware, model, ctx-bucket).
+
+    NOT the endpoint -- node IPs change every run, and the physics belongs to
+    the brain+window. That original reasoning is preserved and is why the
+    address never appears here.
+
+    But it was incomplete. (model, ctx) alone CONFLATES MACHINES: the same
+    model name on a 16GB M1 and on an RTX 5090 wrote one ledger key, so
+    whichever measured last governed both -- and once a Mac dispatches to a
+    Windows inference host, the Mac's ~95ms/token would size the 5090's lane
+    count. The ThroughputGovernor would then compute a wrong answer from
+    perfectly honest data, which is the worst shape a defect can take.
+
+    So the identity gains a hardware axis: a hashed, machine-scoped signature
+    of the host SERVING this config (see `hardware_signature`), never of the
+    host timing it. Two machines now keep strictly separate ledgers for the
+    same model.
+
+    MIGRATION: this changes the key shape, so entries written under the old
+    shape become unreachable and each (hardware, model, ctx) triple
+    cold-starts once. That is the intended direction -- the unreachable
+    entries are exactly the conflated measurements this change exists to stop
+    trusting. `JARVIS_HARDWARE_SIGNATURE_ENABLED=0` restores the old shape
+    byte-for-byte.
+    """
     try:
         model = str(getattr(cfg, "model_name", "") or "unknown")
         ctx = int(getattr(cfg, "num_ctx", 0) or 0)
-        return "%s@%s" % (model, ctx if ctx > 0 else "cpu")
+        base = "%s@%s" % (model, ctx if ctx > 0 else "cpu")
     except Exception:  # noqa: BLE001
         return "unknown@cpu"
+    try:
+        from backend.core.ouroboros.governance.hardware_signature import (
+            signature_for,
+        )
+        # *endpoint* wins over cfg.base_url when supplied. The failover path
+        # holds one profiler per ENDPOINT while carrying a single cfg, so
+        # resolving the signature from cfg there would stamp every failover
+        # target with the base config's identity -- re-creating the exact
+        # host conflation this axis exists to remove, at the one seam
+        # (cross-node failover) where it matters most.
+        target = str(endpoint or getattr(cfg, "base_url", "") or "")
+        digest = signature_for(target).digest
+        # An empty digest means the signature layer is off or declined to
+        # guess. Fall back to the legacy shape rather than inventing a
+        # placeholder segment -- a key containing "unknown" would silently
+        # merge every unidentifiable host into one bucket, which is the very
+        # conflation being removed.
+        return "%s@%s" % (digest, base) if digest else base
+    except Exception:  # noqa: BLE001 — identity must never break dispatch
+        return base
 
 
 class LatencyProfiler:

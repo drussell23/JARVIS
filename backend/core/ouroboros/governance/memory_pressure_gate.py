@@ -311,6 +311,45 @@ class FanoutDecision:
 # ---------------------------------------------------------------------------
 
 
+def swap_in_bytes() -> Optional[int]:
+    """Cumulative bytes faulted in from swap since boot, or None.
+
+    Lives HERE and not in a consumer because this module owns the
+    system-memory probe substrate -- the same reason `free_pct` is not
+    re-derived by every gate that wants it. `local_model_admission` had this
+    inline with a direct ``import psutil``, which its own DRY pin
+    (`test_dry_admission_derives_neither_reading_itself`) forbids precisely
+    so that "how do we read system memory" has one answer.
+
+    Cascade mirrors :func:`_probe_psutil` -> vm_stat, and returns None rather
+    than 0 when unknowable: a rate computed from a fabricated zero reads as
+    "no swapping" and would DISARM the caller's contention guard. NEVER raises.
+    """
+    try:
+        import psutil
+        return int(psutil.swap_memory().sin)
+    except Exception:  # noqa: BLE001 — OSError under sandbox, or absent
+        pass
+    try:
+        from backend.core.bounded_subprocess import run_bounded
+        completed = run_bounded(["vm_stat"], timeout=3.0, text=True)
+        if completed is None or completed.returncode != 0:
+            return None
+        page_size = 4096
+        m = re.search(r"page size of (\d+) bytes", completed.stdout or "")
+        if m:
+            page_size = int(m.group(1))
+        # `Pageins` is the closest cumulative analogue vm_stat exposes; it
+        # counts pages faulted in from backing store, which is the same event
+        # psutil reports as `sin`.
+        m = re.search(r"Pageins:\s+(\d+)", completed.stdout or "")
+        if not m:
+            return None
+        return int(m.group(1)) * page_size
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _probe_psutil() -> Optional[MemoryProbe]:
     try:
         import psutil  # noqa: F401

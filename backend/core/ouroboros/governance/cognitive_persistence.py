@@ -25,7 +25,14 @@ _TOKEN_RE = re.compile(r"[^A-Za-z0-9_.:-]")
 
 
 def cognitive_footprint(model_name: str, num_ctx: Optional[int]) -> str:
-    """Same shape as local_inference_director.physics_key: model@ctx-bucket."""
+    """The MODEL-scoped identity: model@ctx-bucket.
+
+    Deliberately NOT the same as `local_inference_director.physics_key`, which
+    gained a hardware axis because LATENCY is a property of the machine. A
+    cognitive experience -- a hallucinated tool, a malformed call -- is a
+    property of the MODEL and is equally true on every machine that runs it.
+    Sharding it by hardware would make each host re-learn the same lesson.
+    """
     return "%s@%s" % (model_name, num_ctx if num_ctx else "cpu")
 
 

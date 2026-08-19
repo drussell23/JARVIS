@@ -687,29 +687,20 @@ class _PagingSampler:
 
     @staticmethod
     def _read_swapin_bytes() -> Optional[int]:
-        """Cumulative swap-in bytes since boot, or None. NEVER raises."""
+        """Cumulative swap-in bytes since boot, or None. NEVER raises.
+
+        CONSUMED from `memory_pressure_gate`, never re-derived here. This
+        module is forbidden from reaching for a probe substrate directly (see
+        `test_dry_admission_derives_neither_reading_itself`) for the same
+        reason it does not compute `free_pct` itself: two readers of the same
+        substrate drift, and the one the operator sees is whichever ran last.
+        """
         try:
-            import psutil
-            return int(psutil.swap_memory().sin)
-        except Exception:  # noqa: BLE001 — OSError under sandbox, or absent
-            pass
-        try:
-            from backend.core.bounded_subprocess import run_bounded
-            completed = run_bounded(["vm_stat"], timeout=3.0, text=True)
-            if completed is None or completed.returncode != 0:
-                return None
-            page_size = 4096
-            m = re.search(r"page size of (\d+) bytes", completed.stdout or "")
-            if m:
-                page_size = int(m.group(1))
-            # `Pageins` is the closest cumulative analogue vm_stat exposes;
-            # it counts pages faulted in from backing store, which is the
-            # same event psutil reports as `sin`.
-            m = re.search(r"Pageins:\s+(\d+)", completed.stdout or "")
-            if not m:
-                return None
-            return int(m.group(1)) * page_size
-        except Exception:  # noqa: BLE001
+            from backend.core.ouroboros.governance.memory_pressure_gate import (
+                swap_in_bytes,
+            )
+            return swap_in_bytes()
+        except Exception:  # noqa: BLE001 — a probe must never break admission
             return None
 
     def rate_bps(self) -> Optional[float]:
@@ -929,6 +920,7 @@ def assess(
     *,
     weight_bytes: int = 0,
     model_id: Optional[str] = None,
+    route: Optional[str] = None,
 ) -> AdmissionDecision:
     """Should this generation be admitted right now?
 
@@ -942,7 +934,7 @@ def assess(
     """
     try:
         return _assess_impl(requested_ctx, weight_bytes=weight_bytes,
-                            model_id=model_id)
+                            model_id=model_id, route=route)
     except Exception as exc:  # noqa: BLE001
         logger.debug("[LocalModelAdmission] assess degraded: %s", exc,
                      exc_info=True)
@@ -957,6 +949,7 @@ def _assess_impl(
     *,
     weight_bytes: int = 0,
     model_id: Optional[str] = None,
+    route: Optional[str] = None,
 ) -> AdmissionDecision:
     """The decision itself. See :func:`assess` for the raise contract.
 
@@ -1024,6 +1017,57 @@ def _assess_impl(
             measured_free = int(getattr(reading, "usable_bytes", 0) or 0)
         _pooled = bool(
             _sharding and getattr(reading, "is_multi_device", False))
+
+        # ---- per-device validation (asymmetric lanes) --------------------
+        # A POOLED reading describes one model spanning several devices, so
+        # there is no per-device question to ask and the pooled bound below is
+        # the right one. Otherwise each device is an INDEPENDENT LANE and the
+        # payload must fit the specific device it lands on: weights are
+        # constant per model, but KV cache is linear in context, and at long
+        # context KV is the term that decides whether the 24GB card can take
+        # the op at all.
+        _devices = tuple(getattr(reading, "devices", ()) or ())
+        _sel = None
+        if not _pooled and _devices and requested_ctx and int(requested_ctx) > 0:
+            try:
+                from backend.core.ouroboros.governance.device_affinity import (
+                    select_device,
+                )
+                from backend.core.ouroboros.governance.compute_topology import (
+                    headroom_fraction,
+                )
+                _sel = select_device(
+                    _devices, ctx_tokens=int(requested_ctx),
+                    weight_bytes=weight_bytes, route=route, model_id=model_id,
+                )
+                if _sel.device is None:
+                    # Nothing on this host can hold it. DEFER carrying the
+                    # ceiling that WOULD fit -- "too big" is a fact, "the
+                    # largest context that fits is N" is a next step.
+                    return AdmissionDecision(
+                        action=Admission.DEFER.value, level=level,
+                        free_pct=free_pct, source=source, topology=topology,
+                        bound="accelerator_device",
+                        accel_free_bytes=0, weight_bytes=weight_bytes,
+                        margin_bytes=0, max_weight_bytes=0,
+                        reason=(
+                            f"{weight_bytes / _GIB:.1f} GiB of weights plus "
+                            f"{_sel.kv_bytes / _GIB:.1f} GiB of KV cache for a "
+                            f"{int(requested_ctx)}-token context exceeds every "
+                            f"accelerator on this host — the largest context "
+                            f"that fits is about {_sel.max_ctx_tokens} tokens"
+                        ),
+                        spoken_reason=("That context is too long for any of my "
+                                       "graphics cards right now."),
+                    )
+                # The chosen device's own free bytes REPLACE the pooled
+                # number, and the KV term joins the requirement. Same headroom
+                # fraction the pooled path uses -- one reserve policy, not two.
+                measured_free = max(0, int(
+                    _sel.device.free_bytes * (1.0 - headroom_fraction())))
+                weight_bytes = weight_bytes + _sel.kv_bytes
+            except Exception:  # noqa: BLE001 — a router must never break the gate
+                _sel = None
         # Subtract what OTHER workers have already been promised but have not
         # yet allocated. Without this, N concurrent workers each pass against
         # the same reading and collectively overcommit — the gate is correct
@@ -1038,7 +1082,9 @@ def _assess_impl(
             return AdmissionDecision(
                 action=Admission.DEFER.value, level=level, free_pct=free_pct,
                 source=source, topology=topology,
-                bound="accelerator_pooled" if _pooled else "accelerator",
+                bound=("accelerator_pooled" if _pooled
+                       else "accelerator_device" if _sel is not None
+                       else "accelerator"),
                 accel_free_bytes=accel_free, weight_bytes=weight_bytes,
                 margin_bytes=margin, max_weight_bytes=max_weight,
                 reason=(

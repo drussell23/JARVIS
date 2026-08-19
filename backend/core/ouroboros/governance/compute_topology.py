@@ -291,11 +291,18 @@ class DeviceReading:
     name: str
     total_bytes: int
     free_bytes: int
+    #: Driver-assigned GPU UUID (e.g. "GPU-4c2f...") when the probe stage can
+    #: supply one. It is the ONLY device identifier that survives a reboot, a
+    #: PCIe slot swap and a driver reinstall -- name+capacity cannot tell two
+    #: identical cards apart, and index is assignment order, not identity.
+    #: Empty when unavailable; consumers must degrade, never fabricate.
+    uuid: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "index": self.index,
             "name": self.name,
+            "uuid": self.uuid,
             "total_bytes": self.total_bytes,
             "free_bytes": self.free_bytes,
             "total_gib": round(self.total_bytes / _BYTES_PER_GIB, 2),
@@ -674,8 +681,16 @@ def _probe_torch_cuda() -> Optional[AcceleratorProbe]:
                 name = str(torch.cuda.get_device_name(idx))
             except Exception:  # noqa: BLE001 — one bad device never voids the rest
                 continue
+            _uuid = ""
+            try:
+                # Present on recent torch builds only; absent is a missing
+                # field, never a reason to drop an otherwise good reading.
+                _uuid = str(getattr(
+                    torch.cuda.get_device_properties(idx), "uuid", "") or "")
+            except Exception:  # noqa: BLE001
+                _uuid = ""
             readings.append(DeviceReading(
-                index=idx, name=name,
+                index=idx, name=name, uuid=_uuid,
                 total_bytes=int(total_b), free_bytes=int(free_b)))
         devices = tuple(readings)
         collapsed = collapse_to_largest(devices)
@@ -846,10 +861,14 @@ def _parse_nvidia_smi_devices(text: str) -> Tuple["DeviceReading", ...]:
             continue
         if total_mib <= 0:
             continue
+        # A 4th column is the uuid when the driver supplied it. Older
+        # drivers answer 3 columns; that is a missing field, not a parse
+        # failure, so the row still counts as a device.
         out.append(DeviceReading(
             index=len(out), name=parts[2],
             total_bytes=total_mib * 1024 * 1024,
             free_bytes=free_mib * 1024 * 1024,
+            uuid=parts[3] if len(parts) > 3 else "",
         ))
     return tuple(out)
 
@@ -901,7 +920,7 @@ async def _probe_nvidia_smi_async() -> Optional[AcceleratorProbe]:
     try:
         proc = await asyncio.create_subprocess_exec(
             binary,
-            "--query-gpu=memory.total,memory.free,name",
+            "--query-gpu=memory.total,memory.free,name,uuid",
             "--format=csv,noheader,nounits",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

@@ -10,7 +10,15 @@ from backend.core.ouroboros.governance.cognitive_persistence import (
 )
 
 
-def test_footprint_matches_physics_key_shape():
+def test_footprint_is_model_scoped_and_deliberately_not_hardware_scoped():
+    """Mirrors the TAIL of `physics_key`, and stops there on purpose.
+
+    `physics_key` gained a hardware axis because LATENCY is a property of the
+    machine. A cognitive experience -- a hallucinated tool, a malformed call
+    -- is a property of the MODEL, and is equally true on every machine that
+    runs it. Adding hardware here would shard the experience ledger by
+    accident and make each host re-learn the same lesson.
+    """
     assert cognitive_footprint("qwen3:32b", 16384) == "qwen3:32b@16384"
     assert cognitive_footprint("qwen3:32b", None) == "qwen3:32b@cpu"
 

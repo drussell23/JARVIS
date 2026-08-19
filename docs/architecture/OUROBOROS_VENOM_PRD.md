@@ -67,130 +67,26 @@
     - [23.10 Pass A → Pass B → Pass C — the Three-Pass Sequence](#2310-pass-a--pass-b--pass-c--the-three-pass-sequence)
     - [23.11 Operator Decisions Ratified 2026-04-26](#2311-operator-decisions-ratified-2026-04-26)
     - [23.12 Implementation Discipline + Cross-References](#2312-implementation-discipline--cross-references)
-24. [Brutal Architectural Review v3 — Convergence-Phase (2026-04-28)](#24-brutal-architectural-review-v3--convergence-phase-2026-04-28) *(superseded in part by §25)*
-    - [24.1 Context & Scope of Review](#241-context--scope-of-review)
-    - [24.2 Capability Matrix — current vs A-level sovereign developer](#242-capability-matrix--current-vs-a-level-sovereign-developer)
-    - [24.3 Cognitive & Epistemic Delta — what CC paradigms O+V lacks](#243-cognitive--epistemic-delta--what-cc-paradigms-ov-lacks)
-    - [24.4 The HypothesisProbe Primitive — autonomous ambiguity resolution](#244-the-hypothesisprobe-primitive--autonomous-ambiguity-resolution)
-    - [24.5 Temporal Observability — state reconstruction surface](#245-temporal-observability--state-reconstruction-surface)
-    - [24.6 Systemic Fragility — race conditions in async phase-runners](#246-systemic-fragility--race-conditions-in-async-phase-runners)
-    - [24.7 Cascading state-failure vectors over long horizons](#247-cascading-state-failure-vectors-over-long-horizons)
-    - [24.8 Antivenom bypass vectors — Quine-class hallucinations](#248-antivenom-bypass-vectors--quine-class-hallucinations)
-    - [24.9 Letter grade — B+ trending A-, defended](#249-letter-grade--b-trending-a-defended) *(superseded by §25.4 — current grade B-)*
-    - [24.10 Critical Path to A-Level RSI — top 3 systemic upgrades](#2410-critical-path-to-a-level-rsi--top-3-systemic-upgrades) *(superseded by §25.5 — top 5 priorities)*
-    - [24.11 In-flight alignment — Phase 12 / 12.2 maps to the critical path](#2411-in-flight-alignment--phase-12--122-maps-to-the-critical-path)
-    - [24.12 What this review explicitly does NOT prescribe](#2412-what-this-review-explicitly-does-not-prescribe)
-25. [Brutal Architectural Review v4 — Post-Phase-2-Production-Verification (2026-04-29)](#25-brutal-architectural-review-v4--post-phase-2-production-verification-2026-04-29) *(superseded by §26 — Priorities A–F all closed)*
-    - [25.1 What soak #3 actually proved (and didn't)](#251-what-soak-3-actually-proved-and-didnt)
-    - [25.2 The Cognitive & Epistemic Delta — refined post-Phase-2](#252-the-cognitive--epistemic-delta--refined-post-phase-2)
-    - [25.3 Deep Observability — Temporal surface refined](#253-deep-observability--temporal-surface-refined)
-    - [25.4 Brutal grade — current state: **B-**](#254-brutal-grade--current-state-b-)
-    - [25.5 Critical Path to A-Level RSI — top 5 systemic upgrades](#255-critical-path-to-a-level-rsi--top-5-systemic-upgrades)
-    - [25.6 In-flight alignment — what's on main right now that helps](#256-in-flight-alignment--whats-on-main-right-now-that-helps)
-    - [25.7 Reverse Russian Doll alignment](#257-reverse-russian-doll-alignment)
-    - [25.8 What this review explicitly does NOT prescribe](#258-what-this-review-explicitly-does-not-prescribe)
-    - [25.9 Summary](#259-summary)
-26. [Brutal Architectural Review v5 — Post-Phase-12-DW-Resilience-Closure (2026-04-29)](#26-brutal-architectural-review-v5--post-phase-12-dw-resilience-closure-2026-04-29) *(superseded by §27 — Pass B + Pass C + Priorities 1+2 all closed; autonomy question re-graded)*
-    - [26.1 What soak #7 actually proved (and what §25 priorities A–F now closed)](#261-what-soak-7-actually-proved-and-what-25-priorities-af-now-closed)
-    - [26.2 Refined Cognitive & Epistemic Delta — what CC still has that O+V doesn't](#262-refined-cognitive--epistemic-delta--what-cc-still-has-that-ov-doesnt)
-    - [26.3 Refined Deep Observability — temporal reconstruction is the missing depth](#263-refined-deep-observability--temporal-reconstruction-is-the-missing-depth)
-    - [26.4 Brutal grade — current state: **B+ / B−**](#264-brutal-grade--current-state-b--b-)
-    - [26.5 Critical Path to A-Level RSI — top 3 systemic upgrades (post-Phase-12)](#265-critical-path-to-a-level-rsi--top-3-systemic-upgrades-post-phase-12)
-    - [26.6 Cost contract structural reinforcement — BG never cascades to Claude (bulletproofing)](#266-cost-contract-structural-reinforcement--bg-never-cascades-to-claude-bulletproofing)
-    - [26.7 In-flight alignment + sequencing](#267-in-flight-alignment--sequencing)
-    - [26.8 What this review explicitly does NOT prescribe](#268-what-this-review-explicitly-does-not-prescribe)
-    - [26.9 Summary — the path from B+ to A](#269-summary--the-path-from-b-to-a)
-27. [Brutal Architectural Review v6 — The Autonomy Question (2026-04-29)](#27-brutal-architectural-review-v6--the-autonomy-question-2026-04-29)
-    - [27.1 What's actually shipped (vs the §26 v5 framing which is now stale)](#271-whats-actually-shipped-vs-the-26-v5-framing-which-is-now-stale)
-    - [27.2 The 8 capability dimensions of "autonomous coding"](#272-the-8-capability-dimensions-of-autonomous-coding)
-    - [27.3 Brutal letter grade — answering the autonomy question directly](#273-brutal-letter-grade--answering-the-autonomy-question-directly)
-    - [27.4 Critical path to actual autonomy — top 3 systemic moves](#274-critical-path-to-actual-autonomy--top-3-systemic-moves)
-    - [27.5 What this review explicitly does NOT prescribe](#275-what-this-review-explicitly-does-not-prescribe)
-    - [27.6 Summary — answering the operator's question directly](#276-summary--answering-the-operators-question-directly)
-30. [ASCO Mapping — What's True, What's Not, What's Buildable (2026-05-04)](#30-asco-mapping--whats-true-whats-not-whats-buildable-2026-05-04) *(latest section)*
-    - [30.1 The ASCO Definition (operator-supplied source)](#301-the-asco-definition-operator-supplied-source)
-    - [30.2 The Honest 4-Axis Mapping](#302-the-honest-4-axis-mapping)
-    - [30.3 Synthesis Table (one-screen summary)](#303-synthesis-table-one-screen-summary)
-    - [30.4 The Most Defensible Label](#304-the-most-defensible-label)
-    - [30.5 Buildability — The Three Buildable Arcs (Near/Medium-Term)](#305-buildability--the-three-buildable-arcs-nearmedium-term)
-    - [30.6 Buildability — The Long-Horizon Arc (J-Prime LoRA)](#306-buildability--the-long-horizon-arc-j-prime-lora)
-    - [30.7 What's NOT Worth Building (Honest List)](#307-whats-not-worth-building-honest-list)
-    - [30.8 CLI UI/UX Discipline — Lessons from the Claude Code Article](#308-cli-uiux-discipline--lessons-from-the-claude-code-article-operator-supplied)
-    - [30.9 Updated Capability Matrix vs CC + ASCO](#309-updated-capability-matrix-vs-cc--asco)
-    - [30.10 Sequencing Recommendation (operator-binding)](#3010-sequencing-recommendation-operator-binding)
-    - [30.11 Cross-References](#3011-cross-references)
-    - [30.12 Summary — Honest Answer to the Operator's Question](#3012-summary--honest-answer-to-the-operators-question)
-31. [Critical Path Systemic Upgrades v3 — Bounded Epistemic Loop + Decision Causality + Failure-Mode Memory (2026-05-04)](#31-critical-path-systemic-upgrades-v3--bounded-epistemic-loop--decision-causality--failure-mode-memory-2026-05-04) *(newest section)*
-    - [31.1 Why "systemic upgrades" not "features"](#311-why-systemic-upgrades-not-features)
-    - [31.2 Upgrade 1 — Bounded Epistemic Loop](#312-upgrade-1--bounded-epistemic-loop)
-    - [31.3 Upgrade 2 — DecisionRecord Causality Graph](#313-upgrade-2--decisionrecord-causality-graph)
-    - [31.4 Upgrade 3 — Failure-Mode Memory at GENERATE-prompt-construction](#314-upgrade-3--failure-mode-memory-at-generate-prompt-construction)
-    - [31.5 Synthesis Table — How the 3 Upgrades Compose](#315-synthesis-table--how-the-3-upgrades-compose)
-    - [31.6 Sequencing Recommendation (operator-binding)](#316-sequencing-recommendation-operator-binding)
-    - [31.7 What Each Upgrade Does NOT Do (Anti-Goals)](#317-what-each-upgrade-does-not-do-anti-goals)
-    - [31.8 Cross-References](#318-cross-references)
-    - [31.9 Summary — Why These Three (and Why Now)](#319-summary--why-these-three-and-why-now)
-32. [`graduation_orchestrator.py` Salvage + M10 Refinement + Targeted Venom Enhancements + GitHub Recon (2026-05-04)](#32-graduation_orchestratorpy-salvage--m10-refinement--targeted-venom-enhancements--github-recon-2026-05-04) *(latest section)*
-    - [32.1 Why this section exists](#321-why-this-section-exists)
-    - [32.2 `graduation_orchestrator.py` — Bit-Rot Assessment](#322-graduation_orchestratorpy--bit-rot-assessment)
-    - [32.3 Verdict — Design Reference, Not Direct Integration](#323-verdict--design-reference-not-direct-integration)
-    - [32.4 M10 ArchitectureProposer — Refined Slice Plan (Supersedes §30.5.2)](#324-m10-architectureproposer--refined-slice-plan-supersedes-3052)
-    - [32.5 Cleanup Arc — `graduation_orchestrator.py` Removal](#325-cleanup-arc--graduation_orchestratorpy-removal)
-    - [32.6 Targeted Venom Enhancements — Agent SDK Architecture, NOT Migration](#326-targeted-venom-enhancements--agent-sdk-architecture-not-migration)
-    - [32.7 `anthropics/claude-code` GitHub Repo Recon — 3 Patterns Worth Porting](#327-anthropicsclaude-code-github-repo-recon--3-patterns-worth-porting)
-    - [32.8 Sequencing — Where §32 Fits in §31.6 (Updated 11-Item Operator-Binding Order)](#328-sequencing--where-32-fits-in-316-updated-10-item-operator-binding-order)
-    - [32.9 Cross-References](#329-cross-references)
-    - [32.10 Summary — Three Investigations, One Architectural Conclusion](#3210-summary--three-investigations-one-architectural-conclusion)
-    - [32.11 Slice 5b Consolidation Arc — CLOSED 2026-05-04](#3211-slice-5b-consolidation-arc--closed-2026-05-04)
-33. [Reusable Meta-Patterns](#33-reusable-meta-patterns-new-2026-05-05--derived-from-coverage-audit)
-34. [VisionSensor + Multi-modal Subsystem](#34-visionsensor--multi-modal-subsystem-new-2026-05-05--anchored-from-claudemd)
-35. [Open Strategic Moves Registry](#35-open-strategic-moves-registry-new-2026-05-05--consolidates-2863--294-scattered-moves)
-36. [Brutal Architectural Review v10 + Forward Priority Roadmap](#36-brutal-architectural-review-v10--forward-priority-roadmap-new-2026-05-05--operator-driven-post-move-7move-8wave-3285133-catalog-closures)
-37. [Operator UX/UI v10 Brutal Review + Comprehensive CC-Feature Catalog](#37-operator-uxui-v10-brutal-review--comprehensive-cc-feature-catalog-new-2026-05-05--operator-driven-post-phase-9-day-1-graduation)
-39. [Ultra Next-Level Autonomy-Native UX Brainstorm (NEW 2026-05-07)](#39-ultra-next-level-autonomy-native-ux-brainstorm-new-2026-05-07--operator-driven-make-ov-super-duper-advanced--coolest-sickest-uiux)
-38. [Karen's Voice + UX/UI Future Roadmap (NEW 2026-05-07)](#38-karens-voice--uxui-future-roadmap-new-2026-05-07--operator-driven-post-phase-1--3-closures)
-    - [38.1 Why this section exists](#381-why-this-section-exists)
-    - [38.2 The real visibility problem (operator awareness gap)](#382-the-real-visibility-problem-operator-awareness-gap)
-    - [38.3 Karen's Voice — full architecture + risk analysis](#383-karens-voice--full-architecture--risk-analysis)
-    - [38.4 Already-unique features that should be the visual centerpiece](#384-already-unique-features-that-should-be-the-visual-centerpiece)
-    - [38.5 CC features worth porting (parity polish)](#385-cc-features-worth-porting-parity-polish)
-    - [38.6 Edge cases + defensive handling](#386-edge-cases--defensive-handling)
-    - [38.7 Deliberate differentiation — what NOT to port](#387-deliberate-differentiation--what-not-to-port)
-    - [38.8 13 creative ideas ranked by uniqueness × effort](#388-13-creative-ideas-ranked-by-uniqueness--effort)
-    - [38.9 Sequencing recommendation (path to A++ professional)](#389-sequencing-recommendation-path-to-a-professional)
-    - [38.10 Operator-binding alignment per arc](#3810-operator-binding-alignment-per-arc)
-    - [38.11 Proactive-only UX features (CC structurally cannot have these)](#3811-proactive-only-ux-features-cc-structurally-cannot-have-these-new-2026-05-07)
-40. [Advanced Forward Roadmap (post-tonight, operator-paced) (NEW 2026-05-10)](#40-advanced-forward-roadmap-post-tonight-operator-paced) *(22-item prioritization across 5 chronological waves + academic-research grounding)*
-    - [40.1 Tier 1 — Recursion-bounding (load-bearing for second-order doll)](#401-tier-1--recursion-bounding-load-bearing-for-second-order-doll)
-    - [40.2 Tier 2 — Antivenom completeness + cross-session coherence](#402-tier-2--antivenom-completeness--cross-session-coherence)
-    - [40.3 Tier 3 — Calibration, learning, second-order metrics](#403-tier-3--calibration-learning-second-order-metrics)
-    - [40.4 Truly experimental (research-grade, deferred)](#404-truly-experimental-research-grade-deferred)
-    - [40.5 Chronological prioritization — all 22 items ranked by impact + sequencing (5 waves)](#405-chronological-prioritization--all-22-items-ranked-by-impact--sequencing)
-        - [40.5.1 Top-3 if you want to start TODAY](#4051-top-3-if-you-want-to-start-today)
-        - [40.5.2 Anti-recommendation](#4052-anti-recommendation)
-    - [40.6 Status — operational, not engineering](#406-status--operational-not-engineering)
-    - [40.7 Academic foundations & related work (prestigious-university research grounding)](#407-academic-foundations--related-work-prestigious-university-research-grounding)
-        - [40.7.1 — Recursive Self-Improvement (RRD architectural foundation)](#4071--recursive-self-improvement-rrd-architectural-foundation)
-        - [40.7.2 — Formal verification + AST safety (Antivenom foundation)](#4072--formal-verification--ast-safety-antivenom-foundation)
-        - [40.7.3 — Multi-agent consensus + speculative execution (Move 6.5 foundation)](#4073--multi-agent-consensus--speculative-execution-move-65-foundation)
-        - [40.7.4 — AI Safety + Constitutional Cage (Antivenom philosophical foundation)](#4074--ai-safety--constitutional-cage-antivenom-philosophical-foundation)
-        - [40.7.5 — Benchmarks (Phase 9 cadence empirical foundation)](#4075--benchmarks-phase-9-cadence-empirical-foundation)
-        - [40.7.6 — Why this matters](#4076--why-this-matters)
-41. [Critical Path to Tier D — Fully Autonomous JARVIS Development (NEW 2026-05-11)](#41-critical-path-to-tier-d--fully-autonomous-jarvis-development-new-2026-05-11) *(the load-bearing North Star: O+V develops JARVIS proactively + fully autonomously, safely + governance-bounded — 18-30 month phased roadmap)*
-    - [41.1 The Stated Goal (Verbatim)](#411-the-stated-goal-verbatim)
-    - [41.2 The Tier Framework: A → B → C → D](#412-the-tier-framework-a--b--c--d)
-    - [41.3 UX Polish Gap (Updated Post-Slice 1)](#413-ux-polish-gap-updated-post-slice-1)
-    - [41.4 Layer 2 — Engineering Capability Gaps](#414-layer-2--engineering-capability-gaps)
-    - [41.5 NEW Operator-Flagged Gap — Web Search & Browsing Capability](#415-new-operator-flagged-gap--web-search--browsing-capability)
-    - [41.6 Layer 3 — Empirical Evidence Requirements (Wall-Clock)](#416-layer-3--empirical-evidence-requirements-wall-clock)
-    - [41.7 Layer 4 — The Architectural Decision (Tier C → Tier D)](#417-layer-4--the-architectural-decision-tier-c--tier-d)
-    - [41.8 Roadmap to Tier D — Phased 18-30 Month Plan](#418-roadmap-to-tier-d--phased-18-30-month-plan)
-    - [41.9 Prioritization Framework — Highest Leverage at Each Horizon](#419-prioritization-framework--highest-leverage-at-each-horizon)
-    - [41.10 Honest Framing & Decision Points](#4110-honest-framing--decision-points)
-- [Appendix A — Glossary](#appendix-a--glossary)
-- [Appendix B — Reference Documents Map](#appendix-b--reference-documents-map)
-- [Appendix C — Phase Gate Criteria (entry/exit conditions)](#appendix-c--phase-gate-criteria-entryexit-conditions)
-- [Appendix D — Document History](#appendix-d--document-history)
+
+### Sections §24–§41 and Appendices A–D — moved, not deleted
+
+> These 124 entries pointed at anchors this file no longer contains. The
+> sections were not removed: commit `9f8625a775` (Slice 226) split a 2.2MB
+> PRD into four files so GitHub would render them, and the table of contents
+> was never repointed. Every link below was therefore broken — navigation
+> that silently fails is worse than navigation that is absent, because a
+> reader concludes the content is gone.
+
+| Looking for | Now lives in |
+|---|---|
+| §24–§28 Brutal Architectural Reviews v3–v9, §30 ASCO Mapping, §31–§39 critical-path/UX/meta-pattern sections, Appendices A–C | [`OUROBOROS_VENOM_PRD_SPEC_DETAIL.md`](./OUROBOROS_VENOM_PRD_SPEC_DETAIL.md) |
+| §40 Advanced Forward Roadmap, §41 Critical Path to Tier D, wave-closure banners and the session cross-off table | [`OUROBOROS_VENOM_PRD_HISTORY.md`](./OUROBOROS_VENOM_PRD_HISTORY.md) |
+| §51 The North Star Galaxy, Appendix D Document History | [`OUROBOROS_VENOM_NORTH_STAR.md`](./OUROBOROS_VENOM_NORTH_STAR.md) |
+
+> **Numbering note.** Section numbers §24 and up were REUSED in this file
+> after the split, so `§24` here means Voice I/O (2026-07-26) while `§24` in
+> the spec-detail document means Brutal Architectural Review v3 (2026-04-28).
+> Cite the file, not just the number.
 
 ---
 24. [Voice I/O — the `ov` Conversational Loop](#24-voice-io--the-ov-conversational-loop-new-2026-07-26)
@@ -4939,6 +4835,47 @@ Ranked by *leverage per line changed*, the §28 criterion.
 | **6** | **Cold-load outlier isolation** (§31.2.1) | Recording model-load as per-token cost pins the estimator at its ceiling for a full sample window, which currently makes every M1 verdict `ceiling_clamped`. Record load separately. | M | nothing |
 | **7** | **Fix the pre-existing DRY red** — `local_model_admission._read_swapin_bytes` imports `psutil` directly (`f2c3974ddc`), which `test_dry_admission_derives_neither_reading_itself` forbids. Expose swap-in via `memory_pressure_gate`. | Red on `main` today; it will fail every PR touching that file. | S | nothing |
 | **8** | **`InferenceGateway` abstraction** — one seam for local/remote endpoint selection, health, and backpressure | The original Gap 3 ask. Deliberately last: three of its inputs (lane ceiling, pooled capacity, per-endpoint physics) had to exist first, and two of them now do. | L | #1, #4 |
+
+#### 31.6.1 Execution log — 2026-08-18 (operator-directed)
+
+Items **1**, **7** and the ToC cleanup are CLOSED; the heterogeneous-routing
+work the operator specified became a new item **4a** (below), since §31.6 #4
+addressed lane COUNT while this addresses lane CHOICE.
+
+| # | Item | State |
+|---|---|---|
+| 1 | `physics_key` hardware axis | **closed** — `hardware_signature.py`; key is now `hardware_sig@model@ctx` |
+| 4a | Heterogeneous device routing + per-device KV admission | **closed (unit-proven only)** — `device_affinity.py` |
+| 7 | `psutil` DRY red | **closed** — `swap_in_bytes()` moved to `memory_pressure_gate` |
+| — | ToC dead anchors | **closed** — 124 broken links replaced with a companion-document map |
+| 2, 3 | Deploy the models; prove the dual-GPU probe live | **blocked on the Windows host being powered on** |
+
+**Three design decisions worth recording, because each rejected an easier
+answer:**
+
+1. **The signature has ONE SPINE.** An early draft appended GPU components to
+   the machine id, which made the digest depend on
+   `JARVIS_COMPUTE_TOPOLOGY_ENABLED` — flipping that flag re-keyed the ledger
+   and orphaned every prior measurement on a machine that had not changed.
+   GPU identity is now a SUBSTITUTE for a missing spine, never an addition to
+   a present one. **A signature must change only when the machine does.**
+
+2. **The endpoint beats the config.** `_failover_profiler_for(endpoint, cfg)`
+   keys its in-memory store by ENDPOINT but derived its ledger key from CFG.
+   Resolving the machine from `cfg` there would have stamped every failover
+   target with the base config's identity — re-creating the conflation at the
+   one seam, cross-node failover, where it matters most. `physics_key` now
+   takes an explicit `endpoint=`.
+
+3. **Capacity is a constraint; affinity is a preference.** SPECULATIVE prefers
+   the smaller card, but a payload that does not fit there goes to the larger
+   one rather than being deferred. Declining work a present device could do
+   would be policy defeating the system it exists to tune.
+
+> **Honesty note.** §31.6 #4a is proven against synthetic `DeviceReading`s
+> only. No dual-GPU hardware has executed this path. Every capability in this
+> repository that shipped unproven eventually shipped broken, so #3 remains a
+> gate on trusting it, not a formality.
 
 **Not scheduled, and deliberately so:** anything aimed at running a 1T+ model
 locally. §31.3 shows the ceiling is not a hardware-budget problem but a
