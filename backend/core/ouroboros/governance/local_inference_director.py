@@ -329,6 +329,27 @@ def physics_key(cfg: "LocalConfig", *, endpoint: str = "") -> str:
         # (cross-node failover) where it matters most.
         target = str(endpoint or getattr(cfg, "base_url", "") or "")
         digest = signature_for(target).digest
+        # TRANSPORT is a THIRD axis, distinct from hardware and from model.
+        #
+        # The same 5090 reached over a Tailscale direct link and over a DERP
+        # relay is the same silicon on two different networks: identical
+        # hardware signature, wildly different observed latency. Blending them
+        # into one entry would have the ThroughputGovernor size lanes for a
+        # hotel-wifi session from home-LAN measurements, and vice versa — the
+        # exact cross-contamination the hardware axis exists to prevent, one
+        # level down the stack.
+        #
+        # Empty when unmeasured: an unknown transport must not become a bucket
+        # that later real measurements are mixed into.
+        try:
+            from backend.core.ouroboros.governance.transport_profile import (
+                transport_class_for,
+            )
+            _tclass = transport_class_for(target)
+        except Exception:  # noqa: BLE001
+            _tclass = ""
+        if digest and _tclass:
+            return "%s@%s@%s" % (digest, _tclass, base)
         # An empty digest means the signature layer is off or declined to
         # guess. Fall back to the legacy shape rather than inventing a
         # placeholder segment -- a key containing "unknown" would silently
@@ -916,7 +937,25 @@ class LocalPrimeClient:
         # AND tight enough to declare a large legitimate prefill "wedged".
         # See LatencyProfiler.inter_token_budget_s.
         _first_token_s, _steady_token_s = self.profiler.inter_token_budget_s()
+        # TRANSPORT FLOOR — added, never substituted.
+        #
+        # A stall deadline must cover the time the MODEL needs plus the time
+        # the NETWORK takes to deliver it. The model term comes from the
+        # physics ledger; this one comes from measured inter-arrival variance
+        # and rises automatically when the path degrades mid-stream (Tailscale
+        # can flip direct -> DERP without warning). Without it, the ~2.0s
+        # steady deadline computed from a fast host would sever perfectly
+        # healthy streams the moment the operator left the LAN.
+        try:
+            from backend.core.ouroboros.governance.transport_profile import (
+                profile_for as _tprofile,
+            )
+            _tp = _tprofile(self._cfg.base_url)
+            _steady_token_s = _steady_token_s + _tp.floor_s()
+        except Exception:  # noqa: BLE001
+            _tp = None
         inter_token_s = _first_token_s
+        _last_chunk_at = time.monotonic()
         # Seed with the resume prefill so the assembled text continues the partial.
         parts: List[str] = [prefill] if prefill else []
         ttft_ms = 0.0
@@ -992,6 +1031,15 @@ class LocalPrimeClient:
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     if _read_task in done:
+                        # Feed the ARRIVAL back into the transport profile
+                        # before anything else. This is what makes the budget
+                        # roll: each inter-chunk gap is a sample, so a path
+                        # that degrades mid-stream widens the deadline within
+                        # a chunk or two rather than after the stream dies.
+                        if _tp is not None:
+                            _now_chunk = time.monotonic()
+                            _tp.observe((_now_chunk - _last_chunk_at) * 1000.0)
+                            _last_chunk_at = _now_chunk
                         # Generation is flowing: every subsequent wait is a
                         # STEADY-STATE gap, so tighten from the prefill budget
                         # to the measured inter-token one. Reassigned on each

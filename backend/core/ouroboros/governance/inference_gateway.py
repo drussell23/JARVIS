@@ -575,6 +575,7 @@ class InferenceGateway:
         except Exception:  # noqa: BLE001
             return None
         url = base_url.rstrip("/") + "/api/ps"
+        _t0 = time.monotonic()
         try:
             timeout = aiohttp.ClientTimeout(total=probe_timeout_s())
             async with aiohttp.ClientSession(timeout=timeout) as sess:
@@ -584,6 +585,20 @@ class InferenceGateway:
                     payload = await resp.json(content_type=None)
         except Exception:  # noqa: BLE001 — unreachable, unparseable, absent
             return None
+        # THE PROBE IS ALREADY A ROUND TRIP — so it is already an RTT sample,
+        # and taking it costs nothing. This seeds the transport profile BEFORE
+        # the first stream, so the very first generation is bounded by a
+        # deadline that already knows whether the host is 0.4ms away or 90ms
+        # away. Without it the first stream on a relayed link would be judged
+        # by a LAN-derived budget, which is precisely the false-positive this
+        # whole mechanism exists to prevent.
+        try:
+            from backend.core.ouroboros.governance.transport_profile import (  # noqa: PLC0415,E501
+                profile_for as _tprofile,
+            )
+            _tprofile(base_url).observe((time.monotonic() - _t0) * 1000.0)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             rows = payload.get("models") or payload.get("data") or []
             names = tuple(

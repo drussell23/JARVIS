@@ -204,6 +204,43 @@ class CapabilityEvaluator:
             return (False, "", False)
 
     @staticmethod
+    def _read_remote() -> "tuple":
+        """(state, endpoint, readable) for the remote sovereign host.
+
+        Reads `InferenceGateway.snapshot()`, which is PURE IN-MEMORY -- it
+        consults cached breaker state and env, and deliberately does NOT call
+        `resident_models()` (the only method that touches the network). That
+        matters here: this evaluator runs on the render path, and a capability
+        badge that blocked the UI thread on a LAN round-trip would be a worse
+        defect than the one it replaces.
+
+        Returns one of:
+          * ``absent``      -- no remote configured; single-machine case
+          * ``serving``     -- configured and the breaker is not open
+          * ``unreachable`` -- breaker OPEN; the LAN is being bypassed
+        """
+        try:
+            from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                inference_gateway as ig,
+            )
+            endpoint = ig.remote_endpoint()
+            if not endpoint or not ig.gateway_enabled():
+                return ("absent", "", True)
+            snap = ig.get_default_gateway().snapshot() or {}
+            host = (snap.get("hosts") or {}).get(endpoint) or {}
+            state = str(host.get("state") or "")
+            if state == ig.HostState.UNREACHABLE.value:
+                return ("unreachable", endpoint, True)
+            # HEALTHY, DEGRADED, PROBING, or never-contacted all mean the
+            # lane is still a candidate. "Never contacted" is deliberately
+            # NOT treated as unreachable: a configured fallback that has not
+            # been tried yet is unverified, not broken, and reporting BLOCKED
+            # would send the operator to buy credits they do not need.
+            return ("serving", endpoint, True)
+        except Exception:  # noqa: BLE001
+            return ("absent", "", False)
+
+    @staticmethod
     def _read_ops() -> "tuple":
         """(attempted, completed, failed, readable) from the most recent
         session summary — the same source `ov status` renders."""
@@ -250,7 +287,8 @@ class CapabilityEvaluator:
 
         dry, dry_provider, lanes_readable = self._read_lanes()
         attempted, completed, failed, ops_readable = self._read_ops()
-        readable = sum((lanes_readable, ops_readable,
+        remote_state, remote_endpoint, remote_readable = self._read_remote()
+        readable = sum((lanes_readable, ops_readable, remote_readable,
                         heartbeat_ok is not None))
         provenance = ("fused" if readable >= 2
                       else "partial" if readable == 1 else "unreadable")
@@ -259,6 +297,7 @@ class CapabilityEvaluator:
             dry=dry, dry_provider=dry_provider, lanes_readable=lanes_readable,
             heartbeat_ok=heartbeat_ok, attempted=attempted,
             completed=completed, failed=failed, ops_readable=ops_readable,
+            remote_state=remote_state, remote_endpoint=remote_endpoint,
         )
 
         reading = CapabilityReading(
@@ -266,7 +305,9 @@ class CapabilityEvaluator:
             dry_provider=dry_provider, heartbeat_ok=heartbeat_ok,
             attempted=attempted, completed=completed, failed=failed,
             provenance=provenance, held_by_hysteresis=held,
-            detail={"fail_streak_threshold": fail_streak_threshold()},
+            detail={"fail_streak_threshold": fail_streak_threshold(),
+                    "remote_state": remote_state,
+                    "remote_endpoint": remote_endpoint},
         )
         with self._lock:
             self._cached = reading
@@ -283,13 +324,33 @@ class CapabilityEvaluator:
 
     def _decide(self, *, dry: bool, dry_provider: str, lanes_readable: bool,
                 heartbeat_ok: Optional[bool], attempted: int, completed: int,
-                failed: int, ops_readable: bool) -> "tuple":
+                failed: int, ops_readable: bool,
+                remote_state: str = "absent",
+                remote_endpoint: str = "") -> "tuple":
         """The fusion rules, strictest-wins. Returns (state, reason, held)."""
         # 1. A dry runway is DETERMINISTIC, not jitter -- it is a billing
         #    state. Degrading immediately is correct; waiting for a streak
         #    would reproduce the original defect in slower motion.
         if dry:
             who = dry_provider or "provider"
+            # A DRY PAID LANE IS ONLY BLOCKING IF THERE IS NOWHERE ELSE TO GO.
+            #
+            # Before the sovereign tier existed, "no runway" and "cannot work"
+            # were the same sentence. They are not any more: BACKGROUND and
+            # SPECULATIVE can run on the local host, so an exhausted card is a
+            # COST condition, not a capability one. Reporting BLOCKED here
+            # would send the operator to buy credits while the organism was
+            # working perfectly well on its own GPU -- a false alarm that
+            # teaches them to distrust the badge, which is how a badge stops
+            # being read at all.
+            if remote_state == "serving":
+                return (Capability.DEGRADED,
+                        f"no runway on {who} — running local on "
+                        f"{remote_endpoint or 'the sovereign host'}", False)
+            if remote_state == "unreachable":
+                return (Capability.BLOCKED,
+                        f"no runway on {who} and {remote_endpoint} is "
+                        f"unreachable — no lane left", False)
             return (Capability.BLOCKED,
                     f"no runway on {who} — cannot dispatch work", False)
 
