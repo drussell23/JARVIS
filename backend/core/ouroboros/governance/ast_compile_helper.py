@@ -119,6 +119,19 @@ class ParseOutcome(str, enum.Enum):
     TIMEOUT         = "timeout"
     TOO_LARGE       = "too_large"
     INTERNAL_ERROR  = "internal_error"
+    #: Rejected PRE-FLIGHT by shape (minified, binary, absurd line density).
+    #: Distinct from TOO_LARGE, which is about bytes: a 40 KB single-line
+    #: minified bundle is well under any byte cap and still pathological for
+    #: an AST walk. Load-bearing beyond tidiness -- the inline-tiny path runs
+    #: ON THE CALLER'S THREAD and the Oracle's in-process path has no pool, so
+    #: NEITHER can be cancelled by a timeout. For those paths this pre-flight
+    #: refusal is the only protection that exists.
+    PATHOLOGICAL    = "pathological"
+    #: Not attempted because the shared pool was saturated. The file is fine;
+    #: the queue was full. Recorded in the DeferredTaskLedger so the blind
+    #: spot has a name and can be revisited, rather than being an anonymous
+    #: increment of an error counter.
+    SHED            = "shed"
 
 
 class AnalyzeOutcome(str, enum.Enum):
@@ -131,6 +144,19 @@ class AnalyzeOutcome(str, enum.Enum):
     TIMEOUT         = "timeout"
     TOO_LARGE       = "too_large"
     INTERNAL_ERROR  = "internal_error"
+    #: Rejected PRE-FLIGHT by shape (minified, binary, absurd line density).
+    #: Distinct from TOO_LARGE, which is about bytes: a 40 KB single-line
+    #: minified bundle is well under any byte cap and still pathological for
+    #: an AST walk. Load-bearing beyond tidiness -- the inline-tiny path runs
+    #: ON THE CALLER'S THREAD and the Oracle's in-process path has no pool, so
+    #: NEITHER can be cancelled by a timeout. For those paths this pre-flight
+    #: refusal is the only protection that exists.
+    PATHOLOGICAL    = "pathological"
+    #: Not attempted because the shared pool was saturated. The file is fine;
+    #: the queue was full. Recorded in the DeferredTaskLedger so the blind
+    #: spot has a name and can be revisited, rather than being an anonymous
+    #: increment of an error counter.
+    SHED            = "shed"
 
 
 class ExecutionMode(str, enum.Enum):
@@ -241,6 +267,80 @@ def _resolve_default_timeout_s() -> float:
         return max(0.1, v)
     except (TypeError, ValueError):
         return _DEFAULT_TIMEOUT_S
+
+
+def _resolve_max_bytes_per_line() -> float:
+    """Bytes-per-line above which a source is treated as PATHOLOGICAL.
+
+    Default 400. Hand-written Python averages roughly 25-80 bytes per line;
+    minified or generated bundles run to thousands. Density is the shape
+    signal that byte count alone cannot express -- and shape, not size, is
+    what makes an AST walk explode.
+    """
+    try:
+        raw = os.environ.get("JARVIS_AST_MAX_BYTES_PER_LINE", "").strip()
+        return max(80.0, float(raw)) if raw else 400.0
+    except (TypeError, ValueError):
+        return 400.0
+
+
+def _resolve_density_floor_bytes() -> int:
+    """Below this size the density heuristic does not apply. Default 4096.
+
+    A legitimate 300-byte one-liner has a terrible bytes-per-line ratio and
+    costs nothing to parse. Applying the guard to it would reject healthy
+    files to prevent a cost that does not exist.
+    """
+    try:
+        raw = os.environ.get("JARVIS_AST_DENSITY_FLOOR_BYTES", "").strip()
+        return max(256, int(raw)) if raw else 4096
+    except (TypeError, ValueError):
+        return 4096
+
+
+def _resolve_shed_queue_depth() -> int:
+    """Pending pool tasks above which new work is SHED. Default = 4x workers.
+
+    Shedding rather than queueing is the whole point. The observed failure was
+    `source_bytes=6770 timeout_s=10.0 parent_await_ms=14143.7` -- a 6.7 KB
+    file "timing out" after 14.1 s against a 10 s budget, which is impossible
+    unless most of that time was spent WAITING FOR A WORKER rather than
+    parsing. A deeper queue makes that worse, not better.
+    """
+    try:
+        raw = os.environ.get("JARVIS_AST_SHED_QUEUE_DEPTH", "").strip()
+        if raw:
+            return max(1, int(raw))
+    except (TypeError, ValueError):
+        pass
+    return max(4, _resolve_pool_max_workers() * 4)
+
+
+def _pathological_shape(source: str, source_bytes: int) -> "Optional[str]":
+    """Pre-flight shape check. Returns a reason string, or None if healthy.
+
+    Runs BEFORE any dispatch decision, so it protects every path equally --
+    including the two that cannot be interrupted (inline-tiny on the caller's
+    thread, and the Oracle's in-process worker). NEVER raises: a guard that
+    could throw would become the hang it exists to prevent.
+    """
+    try:
+        # Binary content. `ast.parse` on a NUL-bearing string raises, but the
+        # bytes still have to be scanned first, and a large binary blob is
+        # exactly the payload that makes that expensive.
+        if "\x00" in source:
+            return "binary content (NUL byte)"
+        if source_bytes < _resolve_density_floor_bytes():
+            return None
+        lines = source.count("\n") + 1
+        density = source_bytes / float(max(1, lines))
+        limit = _resolve_max_bytes_per_line()
+        if density > limit:
+            return (f"line density {density:.0f} B/line exceeds {limit:.0f} "
+                    f"({lines} lines in {source_bytes}B) — minified or generated")
+        return None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _resolve_default_max_bytes() -> int:
@@ -484,6 +584,38 @@ def _worker_analyze_in_process(
 # ============================================================================
 # Lazy process-pool singleton
 # ============================================================================
+
+
+#: In-flight submissions to the shared pool. Tracked here rather than read
+#: from the executor's private `_pending_work_items` so the saturation signal
+#: does not depend on a CPython implementation detail.
+_inflight: int = 0
+_inflight_lock = threading.Lock()
+
+
+def _pool_saturated() -> bool:
+    """Is the shared pool too busy to accept more work? NEVER raises."""
+    try:
+        with _inflight_lock:
+            return _inflight >= _resolve_shed_queue_depth()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _record_deferral(filename: str, reason: str, caller: str,
+                     source_bytes: int, detail: str) -> None:
+    """Name the blind spot. Best-effort; never breaks a scan."""
+    try:
+        from backend.core.ouroboros.governance.deferred_task_ledger import (  # noqa: PLC0415,E501
+            DeferReason,
+            get_default_ledger,
+        )
+        get_default_ledger().defer(
+            path=filename, reason=DeferReason(reason), caller=caller,
+            source_bytes=source_bytes, detail=detail,
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 _pool: Optional[ProcessPoolExecutor] = None
@@ -883,6 +1015,15 @@ async def _process_pool_parse(
             execution_mode=ExecutionMode.PROCESS,
             error_detail=f"pool dispatch failed: {type(exc).__name__}: {exc}",
         )
+    finally:
+        # Released on EVERY path — success, timeout, cancellation and internal
+        # error alike. A counter that leaks on the failure paths would drift
+        # upward until `_pool_saturated()` returned True forever, converting
+        # a backpressure valve into a permanent outage. The failure paths are
+        # exactly the ones that fire under load, so this is where the leak
+        # would have mattered most.
+        with _inflight_lock:
+            _inflight = max(0, _inflight - 1)
 
     elapsed_ms = (time.monotonic() - t0) * 1000.0
     # Worker returned (outcome_label, payload) tuple. Branch on
@@ -1022,6 +1163,34 @@ async def analyze_python_source_for_opportunity_miner(
             ),
         )
 
+    # ---- HIGH-ENTROPY GUARD (pre-flight, path-independent) --------------
+    #
+    # Placed HERE, before the inline/pool branch, because two of the three
+    # execution paths cannot be interrupted once started:
+    #   * inline-tiny runs on the CALLER'S THREAD (no future to cancel), and
+    #   * the Oracle runs analyze IN-PROCESS inside its own daemonic
+    #     subprocess (oracle_ipc sets JARVIS_AST_HELPER_INPROCESS_ENABLED=1
+    #     precisely because a daemonic process cannot own a pool).
+    # For those two, a timeout is not available at all, so this refusal is
+    # the ONLY protection they have. Putting the guard after the branch would
+    # have protected the one path that was already protected.
+    _shape = _pathological_shape(source, source_bytes)
+    if _shape is not None:
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        logger.info(
+            "[AstCompileHelper] caller=%s outcome=pathological kind=analyze "
+            "source_bytes=%d detail=%s elapsed_ms=%.2f",
+            caller, source_bytes, _shape, elapsed_ms,
+        )
+        _record_deferral(filename, "pathological", caller, source_bytes, _shape)
+        return AnalysisResult(
+            outcome=AnalyzeOutcome.PATHOLOGICAL, payload=_ZERO_PAYLOAD,
+            elapsed_ms=elapsed_ms, worker_elapsed_ms=0.0,
+            source_bytes=source_bytes, caller=caller,
+            execution_mode=ExecutionMode.INLINE_TINY,  # nominal; not invoked
+            error_detail=_shape,
+        )
+
     # Inline-tiny path. ast.parse + the six dimension calcs are
     # cheap for small sources; IPC overhead would dominate. The
     # measure() wrapper is genuine here — the work truly runs
@@ -1030,6 +1199,42 @@ async def analyze_python_source_for_opportunity_miner(
         return _inline_tiny_analyze(
             caller=caller, source=source, filename=filename,
             source_bytes=source_bytes, t0=t0,
+        )
+
+    # ---- BACKPRESSURE: SHED RATHER THAN QUEUE ---------------------------
+    #
+    # The pool is a module-global singleton shared by every sensor in this
+    # process. When it saturates, a queued task waits — and the observed
+    # failure was exactly that: a 6.7 KB file reported `timeout_s=10.0` after
+    # `parent_await_ms=14143.7`. A 6.7 KB parse does not take 14 s; the file
+    # spent that time waiting for a worker and was then blamed for it.
+    #
+    # Deepening the queue or raising the timeout both make this worse: more
+    # waiting, same starvation, and the blame stays on the wrong party. So a
+    # saturated pool sheds IMMEDIATELY and the task is recorded as deferred —
+    # a named blind spot the system can revisit — instead of an anonymous
+    # increment of an error counter.
+    #
+    # NOTE ON THE ORACLE: it is NOT shielded here because it is not exposed.
+    # `oracle_ipc._oracle_worker_main` enables the in-process path, so the
+    # Oracle never enqueues into this pool and cannot be starved by it. What
+    # protects the Oracle is the shape guard above, which is why that guard
+    # runs before the branch rather than inside this one.
+    if _pool_saturated():
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        logger.info(
+            "[AstCompileHelper] caller=%s outcome=shed kind=analyze "
+            "source_bytes=%d queue_depth>=%d elapsed_ms=%.2f",
+            caller, source_bytes, _resolve_shed_queue_depth(), elapsed_ms,
+        )
+        _record_deferral(filename, "shed_pressure", caller, source_bytes,
+                         "ast pool saturated")
+        return AnalysisResult(
+            outcome=AnalyzeOutcome.SHED, payload=_ZERO_PAYLOAD,
+            elapsed_ms=elapsed_ms, worker_elapsed_ms=0.0,
+            source_bytes=source_bytes, caller=caller,
+            execution_mode=ExecutionMode.PROCESS,
+            error_detail="shed_pressure: ast pool saturated",
         )
 
     # Process-pool path — the heavy case.
@@ -1105,6 +1310,21 @@ async def _process_pool_analyze(
     pool = _get_pool()
 
     try:
+        # QUEUE-WAIT IS NOT EXECUTION TIME.
+        #
+        # `run_in_executor` returns a future that completes when the WORK
+        # finishes, but the clock starts when it is SUBMITTED. Under
+        # saturation most of the elapsed wall-clock is spent queued, and the
+        # old single budget charged that wait to the file: hence a 6.7 KB
+        # source reported as a 10 s "timeout" after 14.1 s of waiting.
+        #
+        # The shed check upstream is what actually bounds queue depth; this
+        # counter is what makes that check honest, and the split below is what
+        # stops a starved worker from being reported as a slow file.
+        global _inflight
+        with _inflight_lock:
+            _inflight += 1
+        _submitted_at = time.monotonic()
         worker_tuple = await asyncio.wait_for(
             loop.run_in_executor(
                 pool, _worker_analyze_in_process, source, filename,
@@ -1113,12 +1333,21 @@ async def _process_pool_analyze(
         )
     except asyncio.TimeoutError:
         elapsed_ms = (time.monotonic() - t0) * 1000.0
+        # Split the wall-clock so the log stops blaming the file for the
+        # queue. `pre_submit_ms` is everything before the task was handed to
+        # the pool; `awaited_ms` is the wait on the future, which still mixes
+        # queue time with work time but is now bounded by the shed check.
+        _pre_submit_ms = max(0.0, (_submitted_at - t0) * 1000.0)
+        _awaited_ms = max(0.0, elapsed_ms - _pre_submit_ms)
         logger.warning(
             "[AstCompileHelper] caller=%s outcome=timeout kind=analyze "
             "execution_mode=process source_bytes=%d timeout_s=%.1f "
-            "parent_await_ms=%.1f",
+            "parent_await_ms=%.1f pre_submit_ms=%.1f awaited_ms=%.1f",
             caller, source_bytes, timeout_s, elapsed_ms,
+            _pre_submit_ms, _awaited_ms,
         )
+        _record_deferral(filename, "timeout", caller, source_bytes,
+                         f"exceeded {timeout_s:.1f}s (awaited {_awaited_ms:.0f}ms)")
         return AnalysisResult(
             outcome=AnalyzeOutcome.TIMEOUT,
             payload=_ZERO_PAYLOAD,
@@ -1143,6 +1372,19 @@ async def _process_pool_analyze(
             execution_mode=ExecutionMode.PROCESS,
             error_detail=f"pool dispatch failed: {type(exc).__name__}: {exc}",
         )
+    finally:
+        # Released on EVERY path — success, timeout, cancellation and internal
+        # error alike. A counter that leaks on the failure paths would drift
+        # upward until `_pool_saturated()` returned True forever, converting
+        # a backpressure valve into a permanent outage.
+        #
+        # This file mirrors its parse and analyze implementations almost
+        # line-for-line, and an anchored edit first landed this block in the
+        # PARSE twin — so analyze incremented and never released. The exact
+        # permanent-outage bug described above was live for one test run,
+        # which is why the release is pinned by test rather than by comment.
+        with _inflight_lock:
+            _inflight = max(0, _inflight - 1)
 
     elapsed_ms = (time.monotonic() - t0) * 1000.0
     try:

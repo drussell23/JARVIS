@@ -4891,6 +4891,7 @@ class BattleTestHarness:
                         "phase_detail": snap.phase_detail,
                         "cost_spent_usd": snap.cost_spent_usd,
                         "cost_budget_usd": snap.cost_budget_usd,
+                        "cost_budget_basis": snap.cost_budget_basis,
                         "idle_elapsed_s": snap.idle_elapsed_s,
                         "primary_op_id": snap.primary_op_id,
                         "route": snap.route,
@@ -4953,16 +4954,56 @@ class BattleTestHarness:
                         breaker = get_claude_circuit_breaker().snapshot()
                         economic = int(
                             breaker.get("consecutive_economic_failures") or 0)
+                        econ: dict = {}
                         if economic > 0 or str(
                             breaker.get("state") or "").lower() == "open":
-                            payload["economic"] = {
-                                "claude": {
-                                    "state": breaker.get("state"),
-                                    "consecutive_economic_failures": economic,
-                                    "recovery_window_s": breaker.get(
-                                        "effective_recovery_window_s"),
-                                }
+                            econ["claude"] = {
+                                "state": breaker.get("state"),
+                                "consecutive_economic_failures": economic,
+                                "recovery_window_s": breaker.get(
+                                    "effective_recovery_window_s"),
                             }
+                        # EVERY LANE, FROM THE AUTHORITATIVE CLASSIFIER.
+                        #
+                        # This block used to consult the CLAUDE circuit breaker
+                        # alone and emit a single "claude" key, so Doubleword —
+                        # the lane actually refusing with 402 — was never
+                        # represented. The cockpit then held `any_exhausted`
+                        # true with an empty economic map and rendered its own
+                        # contradiction: "a runway is reported dry but no
+                        # provider row shows it".
+                        #
+                        # `economic_state.economic_view` is the classifier that
+                        # already knows (its table handles Doubleword's 402 and
+                        # Anthropic's 400 + "credit balance" alike), and it is
+                        # the same function the banner's renderer consumes. One
+                        # source, every lane.
+                        try:
+                            from backend.core.ouroboros.governance.economic_state import (  # noqa: E501
+                                economic_view,
+                            )
+                            for _name in sorted(set(providers) | set(econ)):
+                                try:
+                                    _view = economic_view(_name)
+                                except Exception:  # noqa: BLE001
+                                    continue
+                                if not isinstance(_view, dict):
+                                    continue
+                                _state = str(_view.get("state") or "").lower()
+                                _dead = (_state == "economic"
+                                         or bool(_view.get("hard_open")))
+                                # A LAPSED verdict still carries what was last
+                                # known; the renderer decides how to say so.
+                                _stale = bool(_view.get("stale_clock")
+                                              and _view.get("reason"))
+                                if _dead or _stale:
+                                    econ.setdefault(_name, {}).update(_view)
+                                if _dead:
+                                    payload["any_exhausted"] = True
+                        except Exception:  # noqa: BLE001
+                            pass
+                        if econ:
+                            payload["economic"] = econ
                             # An economically dead lane IS an exhausted runway,
                             # whatever the rate-limit bucket says. Without this
                             # the banner keeps its cheerful token count and the

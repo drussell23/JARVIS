@@ -90,12 +90,33 @@ def _parse_module(path: pathlib.Path) -> _ast.Module:
 
 class TestClosedTaxonomies(unittest.TestCase):
 
-    def test_analyze_outcome_five_values(self) -> None:
-        self.assertEqual(len(list(AnalyzeOutcome)), 5)
+    def test_analyze_outcome_seven_values(self) -> None:
+        """Bumped 5 -> 7 deliberately, per the enum's own contract.
+
+        PATHOLOGICAL and SHED were added because the previous taxonomy could
+        not express two distinct facts the sensor needed to act on:
+
+        * PATHOLOGICAL — refused pre-flight by SHAPE (minified, binary,
+          absurd line density). Not TOO_LARGE, which is about bytes: a 40 KB
+          single-line bundle is under any byte cap and still explodes an AST
+          walk. Load-bearing, because the inline-tiny path runs on the
+          caller's thread and the Oracle's in-process path owns no pool, so
+          neither can be cancelled by a timeout — the pre-flight refusal is
+          their only protection.
+        * SHED — not attempted because the shared pool was saturated. The
+          file is fine; the queue was full. Collapsing this into TIMEOUT
+          blamed the file for the queue, which is exactly how a 6.7 KB source
+          came to be logged as a 10 s timeout after 14.1 s of waiting.
+
+        Both consumers (oracle.py, opportunity_miner_sensor) branch on
+        `!= OK`, so the new values degrade safely to "skip this file" while
+        the DeferredTaskLedger records WHY and whether it is worth revisiting.
+        """
+        self.assertEqual(len(list(AnalyzeOutcome)), 7)
         self.assertEqual(
             {m.name for m in AnalyzeOutcome},
             {"OK", "SYNTAX_ERROR", "TIMEOUT", "TOO_LARGE",
-             "INTERNAL_ERROR"},
+             "INTERNAL_ERROR", "PATHOLOGICAL", "SHED"},
         )
 
     def test_opportunity_analysis_payload_is_frozen(self) -> None:

@@ -4979,9 +4979,16 @@ class CandidateGenerator:
                     physics_key,
                 )
                 # The Amnesia Cure: key the profiler by its DURABLE physics
-                # identity (model@ctx -- endpoints/IPs change every run) so
-                # the EWMA warm-starts from the cross-run ledger.
-                prof = LatencyProfiler(cfg, ledger_key=physics_key(cfg))
+                # identity so the EWMA warm-starts from the cross-run ledger.
+                # That identity is (hardware, model, ctx) -- the ADDRESS is
+                # still excluded, because IPs change every run, but the
+                # MACHINE is not, because a 16GB Mac and a 5090 measuring the
+                # same model are not the same physics. `endpoint` is passed
+                # explicitly: this store holds one profiler per endpoint while
+                # carrying one cfg, so deriving the machine from cfg would
+                # stamp every failover target with the base config's identity.
+                prof = LatencyProfiler(
+                    cfg, ledger_key=physics_key(cfg, endpoint=endpoint))
                 store[endpoint] = prof
             return prof
         except Exception:  # noqa: BLE001

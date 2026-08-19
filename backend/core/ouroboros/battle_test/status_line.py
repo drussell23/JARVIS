@@ -110,6 +110,11 @@ class StatusSnapshot:
     # Cost
     cost_spent_usd: float = 0.0
     cost_budget_usd: float = 0.0
+    #: WHY the budget is what it is — e.g. "observed — 98 sessions,
+    #: p95=$0.24 x3". A ceiling without its basis is indistinguishable from
+    #: an arbitrary constant, which is how an operator ends up asking where
+    #: their own number came from.
+    cost_budget_basis: str = ""
     # Idle window
     idle_elapsed_s: float = 0.0
     idle_timeout_s: float = 0.0
@@ -338,6 +343,7 @@ class StatusLineBuilder:
         """
         phase, phase_detail = self._sample_phase_and_detail()
         cost_spent, cost_budget = self._sample_cost()
+        cost_basis = self._sample_cost_basis()
         idle_elapsed, idle_timeout = self._sample_idle()
         primary_op, extra_ops = self._sample_ops()
         route, provider, model = self._sample_route_and_provider(primary_op)
@@ -363,6 +369,7 @@ class StatusLineBuilder:
             phase_detail=phase_detail,
             cost_spent_usd=cost_spent,
             cost_budget_usd=cost_budget,
+            cost_budget_basis=cost_basis,
             idle_elapsed_s=idle_elapsed,
             idle_timeout_s=idle_timeout,
             primary_op_id=primary_op,
@@ -437,6 +444,20 @@ class StatusLineBuilder:
         except Exception:  # noqa: BLE001
             budget = 0.0
         return (spent, budget)
+
+    def _sample_cost_basis(self) -> str:
+        """The basis the spawner recorded for this session's ceiling.
+
+        Read from the environment rather than re-derived: the basis belongs to
+        the decision that set the cap. Re-deriving would sample a different
+        set of sessions and could explain the number with evidence that did
+        not produce it. NEVER raises.
+        """
+        try:
+            return str(os.environ.get(
+                "OUROBOROS_BATTLE_COST_CAP_BASIS", "") or "").strip()
+        except Exception:  # noqa: BLE001
+            return ""
 
     def _sample_idle(self) -> tuple:
         if self._idle is None:

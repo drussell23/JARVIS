@@ -285,15 +285,79 @@ def _physics_ledger_save(key: str, payload: dict) -> None:
         pass
 
 
-def physics_key(cfg: "LocalConfig") -> str:
-    """The DURABLE physics identity: (model, ctx-bucket) -- NOT the endpoint
-    (node IPs change every run; the physics belongs to the brain+window)."""
+def physics_key(cfg: "LocalConfig", *, endpoint: str = "") -> str:
+    """The DURABLE physics identity: (hardware, model, ctx-bucket).
+
+    NOT the endpoint -- node IPs change every run, and the physics belongs to
+    the brain+window. That original reasoning is preserved and is why the
+    address never appears here.
+
+    But it was incomplete. (model, ctx) alone CONFLATES MACHINES: the same
+    model name on a 16GB M1 and on an RTX 5090 wrote one ledger key, so
+    whichever measured last governed both -- and once a Mac dispatches to a
+    Windows inference host, the Mac's ~95ms/token would size the 5090's lane
+    count. The ThroughputGovernor would then compute a wrong answer from
+    perfectly honest data, which is the worst shape a defect can take.
+
+    So the identity gains a hardware axis: a hashed, machine-scoped signature
+    of the host SERVING this config (see `hardware_signature`), never of the
+    host timing it. Two machines now keep strictly separate ledgers for the
+    same model.
+
+    MIGRATION: this changes the key shape, so entries written under the old
+    shape become unreachable and each (hardware, model, ctx) triple
+    cold-starts once. That is the intended direction -- the unreachable
+    entries are exactly the conflated measurements this change exists to stop
+    trusting. `JARVIS_HARDWARE_SIGNATURE_ENABLED=0` restores the old shape
+    byte-for-byte.
+    """
     try:
         model = str(getattr(cfg, "model_name", "") or "unknown")
         ctx = int(getattr(cfg, "num_ctx", 0) or 0)
-        return "%s@%s" % (model, ctx if ctx > 0 else "cpu")
+        base = "%s@%s" % (model, ctx if ctx > 0 else "cpu")
     except Exception:  # noqa: BLE001
         return "unknown@cpu"
+    try:
+        from backend.core.ouroboros.governance.hardware_signature import (
+            signature_for,
+        )
+        # *endpoint* wins over cfg.base_url when supplied. The failover path
+        # holds one profiler per ENDPOINT while carrying a single cfg, so
+        # resolving the signature from cfg there would stamp every failover
+        # target with the base config's identity -- re-creating the exact
+        # host conflation this axis exists to remove, at the one seam
+        # (cross-node failover) where it matters most.
+        target = str(endpoint or getattr(cfg, "base_url", "") or "")
+        digest = signature_for(target).digest
+        # TRANSPORT is a THIRD axis, distinct from hardware and from model.
+        #
+        # The same 5090 reached over a Tailscale direct link and over a DERP
+        # relay is the same silicon on two different networks: identical
+        # hardware signature, wildly different observed latency. Blending them
+        # into one entry would have the ThroughputGovernor size lanes for a
+        # hotel-wifi session from home-LAN measurements, and vice versa — the
+        # exact cross-contamination the hardware axis exists to prevent, one
+        # level down the stack.
+        #
+        # Empty when unmeasured: an unknown transport must not become a bucket
+        # that later real measurements are mixed into.
+        try:
+            from backend.core.ouroboros.governance.transport_profile import (
+                transport_class_for,
+            )
+            _tclass = transport_class_for(target)
+        except Exception:  # noqa: BLE001
+            _tclass = ""
+        if digest and _tclass:
+            return "%s@%s@%s" % (digest, _tclass, base)
+        # An empty digest means the signature layer is off or declined to
+        # guess. Fall back to the legacy shape rather than inventing a
+        # placeholder segment -- a key containing "unknown" would silently
+        # merge every unidentifiable host into one bucket, which is the very
+        # conflation being removed.
+        return "%s@%s" % (digest, base) if digest else base
+    except Exception:  # noqa: BLE001 — identity must never break dispatch
+        return base
 
 
 class LatencyProfiler:
@@ -428,6 +492,56 @@ class LatencyProfiler:
             _physics_ledger_save(self._ledger_key, payload)
         except Exception:  # noqa: BLE001
             pass
+
+    def inter_token_budget_s(self) -> "Tuple[float, float]":
+        """``(first_token_s, steady_token_s)`` for the streaming watchdog.
+
+        TWO deadlines, because the two waits measure different physics and a
+        single constant is wrong for both:
+
+        * **first token** must cover PREFILL. A 64K-context prompt can
+          legitimately take tens of seconds before its first byte, and the
+          static 30s was applied to this wait too -- so a large prompt on a
+          slow host could be declared "wedged" while it was working normally.
+          This deadline is therefore derived from measured TTFT and may only
+          ever be LOOSER than the legacy value, never tighter.
+        * **steady state** is the gap BETWEEN chunks once generation is
+          flowing. Here the static 30s is wildly loose: at 220 tok/s the
+          normal gap is ~4.5ms, so a wedged peer would be given ~6,600 normal
+          gaps before anyone noticed. This deadline is derived from measured
+          per-token cost and may only ever be TIGHTER than the legacy value.
+
+        Cold profiler -> the static value for both, i.e. byte-identical
+        legacy behaviour. NEVER raises.
+        """
+        static = _inter_token_timeout_s()
+        try:
+            if not _inter_token_adaptive_enabled():
+                return (static, static)
+            with self._lock:
+                warm = len(self._total) >= self._cfg.min_samples
+                ttft_m = self._mean(self._ttft)
+                ttft_sd = self._stddev(self._ttft)
+                tok_m = self._mean(self._per_tok)
+                tok_sd = self._stddev(self._per_tok)
+            if not warm:
+                return (static, static)
+            sigma = float(getattr(self._cfg, "margin_sigma", 2.0) or 2.0)
+            mult = _inter_token_stall_multiple()
+
+            # First token: measured TTFT + margin, scaled. Clamped at or ABOVE
+            # the static value -- prefill is the one wait that legitimately
+            # grows with the prompt, so tightening it would manufacture stalls.
+            first = max(static, mult * (ttft_m + sigma * ttft_sd) / 1000.0)
+
+            # Steady state: measured per-token + margin, scaled, floored so
+            # jitter is not mistaken for a wedge, and capped at the static
+            # value so this path can only ever DETECT SOONER, never later.
+            steady = mult * (tok_m + sigma * tok_sd) / 1000.0
+            steady = max(_inter_token_floor_s(), min(steady, static))
+            return (first, steady)
+        except Exception:  # noqa: BLE001 — a watchdog must never fail to arm
+            return (static, static)
 
     def is_warm(self) -> bool:
         with self._lock:
@@ -577,6 +691,30 @@ def _streaming_enabled() -> bool:
     generation path. Default TRUE. OFF -> legacy total-duration adaptive timeout."""
     return _envb("JARVIS_LOCAL_STREAMING_ENABLED", True) if os.environ.get(
         "JARVIS_LOCAL_STREAMING_ENABLED") is not None else True
+
+
+def _inter_token_adaptive_enabled() -> bool:
+    """Derive the stall deadline from MEASURED physics instead of a constant.
+    Default TRUE. OFF -> the static value for both deadlines (legacy)."""
+    return _envb("JARVIS_LOCAL_INTER_TOKEN_ADAPTIVE_ENABLED", True)
+
+
+def _inter_token_stall_multiple() -> float:
+    """How many normal inter-token gaps constitute a STALL. Default 12.
+
+    A stall is not "slow", it is "stopped". At 220 tok/s a normal gap is
+    ~4.5ms, so twelve of them is ~54ms -- which is why the floor below
+    exists and does the real work on fast hosts."""
+    return max(2.0, _f_env("JARVIS_LOCAL_INTER_TOKEN_STALL_MULTIPLE", 12.0))
+
+
+def _inter_token_floor_s() -> float:
+    """Tightest steady-state deadline the adaptive path may produce.
+
+    Default 2.0s. Below this, ordinary LAN jitter and server-side chunk
+    batching would be indistinguishable from a wedged peer, and a false
+    positive costs a real generation."""
+    return max(0.25, _f_env("JARVIS_LOCAL_INTER_TOKEN_FLOOR_S", 2.0))
 
 
 def _inter_token_timeout_s() -> float:
@@ -792,7 +930,32 @@ class LocalPrimeClient:
         from backend.core.ouroboros.governance import cooperative_shutdown as _coop  # noqa: PLC0415
         body = dict(body)
         body["stream"] = True
-        inter_token_s = _inter_token_timeout_s()
+        # TWO deadlines, not one. The wait before the first chunk measures
+        # PREFILL (grows with prompt size); every wait after it measures the
+        # gap between tokens (roughly constant). A single constant is loose
+        # enough to hide a wedged peer for 6,600 normal gaps on a fast host,
+        # AND tight enough to declare a large legitimate prefill "wedged".
+        # See LatencyProfiler.inter_token_budget_s.
+        _first_token_s, _steady_token_s = self.profiler.inter_token_budget_s()
+        # TRANSPORT FLOOR — added, never substituted.
+        #
+        # A stall deadline must cover the time the MODEL needs plus the time
+        # the NETWORK takes to deliver it. The model term comes from the
+        # physics ledger; this one comes from measured inter-arrival variance
+        # and rises automatically when the path degrades mid-stream (Tailscale
+        # can flip direct -> DERP without warning). Without it, the ~2.0s
+        # steady deadline computed from a fast host would sever perfectly
+        # healthy streams the moment the operator left the LAN.
+        try:
+            from backend.core.ouroboros.governance.transport_profile import (
+                profile_for as _tprofile,
+            )
+            _tp = _tprofile(self._cfg.base_url)
+            _steady_token_s = _steady_token_s + _tp.floor_s()
+        except Exception:  # noqa: BLE001
+            _tp = None
+        inter_token_s = _first_token_s
+        _last_chunk_at = time.monotonic()
         # Seed with the resume prefill so the assembled text continues the partial.
         parts: List[str] = [prefill] if prefill else []
         ttft_ms = 0.0
@@ -868,6 +1031,21 @@ class LocalPrimeClient:
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     if _read_task in done:
+                        # Feed the ARRIVAL back into the transport profile
+                        # before anything else. This is what makes the budget
+                        # roll: each inter-chunk gap is a sample, so a path
+                        # that degrades mid-stream widens the deadline within
+                        # a chunk or two rather than after the stream dies.
+                        if _tp is not None:
+                            _now_chunk = time.monotonic()
+                            _tp.observe((_now_chunk - _last_chunk_at) * 1000.0)
+                            _last_chunk_at = _now_chunk
+                        # Generation is flowing: every subsequent wait is a
+                        # STEADY-STATE gap, so tighten from the prefill budget
+                        # to the measured inter-token one. Reassigned on each
+                        # chunk (not once) so a mid-stream physics refresh is
+                        # picked up without restarting the stream.
+                        inter_token_s = _steady_token_s
                         # A chunk (or EOF) is already in hand -- NEVER drop it, even if
                         # shutdown fired in the same tick. We buffer it here; the
                         # cooperative check at the top of the NEXT iteration freezes
@@ -881,9 +1059,29 @@ class LocalPrimeClient:
                     else:
                         # Neither fired within the window -> the stream is wedged.
                         _read_task.cancel()
+                        # PENALISE THE LEDGER BEFORE RAISING.
+                        #
+                        # Without this the stall is invisible to the physics:
+                        # record() only fires on a clean finish, so a host that
+                        # wedges every op keeps its optimistic EWMA forever and
+                        # the ThroughputGovernor keeps sizing lanes for a
+                        # machine that is actively failing -- a wrong answer
+                        # derived from stale-but-honest data, which is the
+                        # hardest kind to notice. record_timeout_penalty is the
+                        # EXISTING asymmetric-escalation seam (the non-streaming
+                        # path already used it); this puts the streaming path,
+                        # which is the one the LAN bridge forces, on the same
+                        # footing. Fail-soft: telemetry must never mask the
+                        # stall it is describing.
+                        try:
+                            self.profiler.record_timeout_penalty(
+                                max(1.0, (time.monotonic() - t0) * 1000.0))
+                        except Exception:  # noqa: BLE001
+                            pass
                         raise InterTokenStall(
-                            "inter-token stall: no chunk within %.0fs (stream wedged)"
-                            % inter_token_s
+                            "inter-token stall: no chunk within %.1fs "
+                            "(stream wedged; first_token_budget=%.1fs)"
+                            % (inter_token_s, _first_token_s)
                         )
                     if not line:
                         break  # EOF -> stream complete

@@ -35,11 +35,58 @@ def ledger(tmp_path, monkeypatch):
 
 
 class TestLedgerBasics:
-    def test_physics_key_is_model_and_ctx_not_endpoint(self):
+    def test_physics_key_carries_model_and_ctx_but_never_the_address(self):
+        """The original contract, minus the exact-string assertion.
+
+        The key still ends in model@ctx and still must not contain a port or
+        an address -- node IPs change every run. What was added in front is a
+        HARDWARE axis; see the host-isolation tests below for why.
+        """
         cfg = _cfg(model_name="qwen2.5-coder:32b", num_ctx=16640)
-        assert lid.physics_key(cfg) == "qwen2.5-coder:32b@16640"
-        cfg2 = _cfg(model_name="qwen2.5-coder:3b", num_ctx=0)
-        assert lid.physics_key(cfg2) == "qwen2.5-coder:3b@cpu"
+        key = lid.physics_key(cfg)
+        assert key.endswith("qwen2.5-coder:32b@16640")
+        assert _cfg(model_name="qwen2.5-coder:3b", num_ctx=0) and \
+            lid.physics_key(_cfg(model_name="qwen2.5-coder:3b",
+                                 num_ctx=0)).endswith("qwen2.5-coder:3b@cpu")
+        # the address must not survive into the identity
+        assert "11434" not in key and "127.0.0.1" not in key
+
+    def test_two_machines_do_not_share_one_ledger_key(self):
+        """The defect this axis exists for.
+
+        Same model name, two hosts. Under the old key they wrote the SAME
+        entry, so a 16GB M1 that measured ~95ms/token would size an RTX
+        5090's lane count -- the ThroughputGovernor computing a wrong answer
+        from honest data.
+        """
+        from backend.core.ouroboros.governance import hardware_signature as hs
+        hs.reset_for_tests()
+        local = lid.physics_key(_cfg(model_name="m", num_ctx=8192,
+                                     base_url="http://127.0.0.1:11434"))
+        remote = lid.physics_key(_cfg(model_name="m", num_ctx=8192,
+                                      base_url="http://192.168.1.50:11434"))
+        assert local != remote
+        assert local.endswith("m@8192") and remote.endswith("m@8192")
+
+    def test_one_machine_serving_two_ports_is_one_machine(self):
+        """A port is not a piece of hardware. Splitting the ledger by port
+        would re-introduce the amnesia it exists to cure."""
+        from backend.core.ouroboros.governance import hardware_signature as hs
+        hs.reset_for_tests()
+        a = lid.physics_key(_cfg(model_name="m", num_ctx=8192,
+                                 base_url="http://192.168.1.50:11434"))
+        b = lid.physics_key(_cfg(model_name="m", num_ctx=8192,
+                                 base_url="http://192.168.1.50:8080"))
+        assert a == b
+
+    def test_the_flag_off_restores_the_legacy_shape_byte_for_byte(self,
+                                                                  monkeypatch):
+        from backend.core.ouroboros.governance import hardware_signature as hs
+        monkeypatch.setenv("JARVIS_HARDWARE_SIGNATURE_ENABLED", "0")
+        hs.reset_for_tests()
+        assert lid.physics_key(
+            _cfg(model_name="qwen2.5-coder:32b", num_ctx=16640)
+        ) == "qwen2.5-coder:32b@16640"
 
     def test_corrupt_ledger_failsoft(self, ledger):
         ledger.write_text("{not json")

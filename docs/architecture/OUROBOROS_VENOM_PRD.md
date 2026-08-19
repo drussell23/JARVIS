@@ -67,130 +67,26 @@
     - [23.10 Pass A → Pass B → Pass C — the Three-Pass Sequence](#2310-pass-a--pass-b--pass-c--the-three-pass-sequence)
     - [23.11 Operator Decisions Ratified 2026-04-26](#2311-operator-decisions-ratified-2026-04-26)
     - [23.12 Implementation Discipline + Cross-References](#2312-implementation-discipline--cross-references)
-24. [Brutal Architectural Review v3 — Convergence-Phase (2026-04-28)](#24-brutal-architectural-review-v3--convergence-phase-2026-04-28) *(superseded in part by §25)*
-    - [24.1 Context & Scope of Review](#241-context--scope-of-review)
-    - [24.2 Capability Matrix — current vs A-level sovereign developer](#242-capability-matrix--current-vs-a-level-sovereign-developer)
-    - [24.3 Cognitive & Epistemic Delta — what CC paradigms O+V lacks](#243-cognitive--epistemic-delta--what-cc-paradigms-ov-lacks)
-    - [24.4 The HypothesisProbe Primitive — autonomous ambiguity resolution](#244-the-hypothesisprobe-primitive--autonomous-ambiguity-resolution)
-    - [24.5 Temporal Observability — state reconstruction surface](#245-temporal-observability--state-reconstruction-surface)
-    - [24.6 Systemic Fragility — race conditions in async phase-runners](#246-systemic-fragility--race-conditions-in-async-phase-runners)
-    - [24.7 Cascading state-failure vectors over long horizons](#247-cascading-state-failure-vectors-over-long-horizons)
-    - [24.8 Antivenom bypass vectors — Quine-class hallucinations](#248-antivenom-bypass-vectors--quine-class-hallucinations)
-    - [24.9 Letter grade — B+ trending A-, defended](#249-letter-grade--b-trending-a-defended) *(superseded by §25.4 — current grade B-)*
-    - [24.10 Critical Path to A-Level RSI — top 3 systemic upgrades](#2410-critical-path-to-a-level-rsi--top-3-systemic-upgrades) *(superseded by §25.5 — top 5 priorities)*
-    - [24.11 In-flight alignment — Phase 12 / 12.2 maps to the critical path](#2411-in-flight-alignment--phase-12--122-maps-to-the-critical-path)
-    - [24.12 What this review explicitly does NOT prescribe](#2412-what-this-review-explicitly-does-not-prescribe)
-25. [Brutal Architectural Review v4 — Post-Phase-2-Production-Verification (2026-04-29)](#25-brutal-architectural-review-v4--post-phase-2-production-verification-2026-04-29) *(superseded by §26 — Priorities A–F all closed)*
-    - [25.1 What soak #3 actually proved (and didn't)](#251-what-soak-3-actually-proved-and-didnt)
-    - [25.2 The Cognitive & Epistemic Delta — refined post-Phase-2](#252-the-cognitive--epistemic-delta--refined-post-phase-2)
-    - [25.3 Deep Observability — Temporal surface refined](#253-deep-observability--temporal-surface-refined)
-    - [25.4 Brutal grade — current state: **B-**](#254-brutal-grade--current-state-b-)
-    - [25.5 Critical Path to A-Level RSI — top 5 systemic upgrades](#255-critical-path-to-a-level-rsi--top-5-systemic-upgrades)
-    - [25.6 In-flight alignment — what's on main right now that helps](#256-in-flight-alignment--whats-on-main-right-now-that-helps)
-    - [25.7 Reverse Russian Doll alignment](#257-reverse-russian-doll-alignment)
-    - [25.8 What this review explicitly does NOT prescribe](#258-what-this-review-explicitly-does-not-prescribe)
-    - [25.9 Summary](#259-summary)
-26. [Brutal Architectural Review v5 — Post-Phase-12-DW-Resilience-Closure (2026-04-29)](#26-brutal-architectural-review-v5--post-phase-12-dw-resilience-closure-2026-04-29) *(superseded by §27 — Pass B + Pass C + Priorities 1+2 all closed; autonomy question re-graded)*
-    - [26.1 What soak #7 actually proved (and what §25 priorities A–F now closed)](#261-what-soak-7-actually-proved-and-what-25-priorities-af-now-closed)
-    - [26.2 Refined Cognitive & Epistemic Delta — what CC still has that O+V doesn't](#262-refined-cognitive--epistemic-delta--what-cc-still-has-that-ov-doesnt)
-    - [26.3 Refined Deep Observability — temporal reconstruction is the missing depth](#263-refined-deep-observability--temporal-reconstruction-is-the-missing-depth)
-    - [26.4 Brutal grade — current state: **B+ / B−**](#264-brutal-grade--current-state-b--b-)
-    - [26.5 Critical Path to A-Level RSI — top 3 systemic upgrades (post-Phase-12)](#265-critical-path-to-a-level-rsi--top-3-systemic-upgrades-post-phase-12)
-    - [26.6 Cost contract structural reinforcement — BG never cascades to Claude (bulletproofing)](#266-cost-contract-structural-reinforcement--bg-never-cascades-to-claude-bulletproofing)
-    - [26.7 In-flight alignment + sequencing](#267-in-flight-alignment--sequencing)
-    - [26.8 What this review explicitly does NOT prescribe](#268-what-this-review-explicitly-does-not-prescribe)
-    - [26.9 Summary — the path from B+ to A](#269-summary--the-path-from-b-to-a)
-27. [Brutal Architectural Review v6 — The Autonomy Question (2026-04-29)](#27-brutal-architectural-review-v6--the-autonomy-question-2026-04-29)
-    - [27.1 What's actually shipped (vs the §26 v5 framing which is now stale)](#271-whats-actually-shipped-vs-the-26-v5-framing-which-is-now-stale)
-    - [27.2 The 8 capability dimensions of "autonomous coding"](#272-the-8-capability-dimensions-of-autonomous-coding)
-    - [27.3 Brutal letter grade — answering the autonomy question directly](#273-brutal-letter-grade--answering-the-autonomy-question-directly)
-    - [27.4 Critical path to actual autonomy — top 3 systemic moves](#274-critical-path-to-actual-autonomy--top-3-systemic-moves)
-    - [27.5 What this review explicitly does NOT prescribe](#275-what-this-review-explicitly-does-not-prescribe)
-    - [27.6 Summary — answering the operator's question directly](#276-summary--answering-the-operators-question-directly)
-30. [ASCO Mapping — What's True, What's Not, What's Buildable (2026-05-04)](#30-asco-mapping--whats-true-whats-not-whats-buildable-2026-05-04) *(latest section)*
-    - [30.1 The ASCO Definition (operator-supplied source)](#301-the-asco-definition-operator-supplied-source)
-    - [30.2 The Honest 4-Axis Mapping](#302-the-honest-4-axis-mapping)
-    - [30.3 Synthesis Table (one-screen summary)](#303-synthesis-table-one-screen-summary)
-    - [30.4 The Most Defensible Label](#304-the-most-defensible-label)
-    - [30.5 Buildability — The Three Buildable Arcs (Near/Medium-Term)](#305-buildability--the-three-buildable-arcs-nearmedium-term)
-    - [30.6 Buildability — The Long-Horizon Arc (J-Prime LoRA)](#306-buildability--the-long-horizon-arc-j-prime-lora)
-    - [30.7 What's NOT Worth Building (Honest List)](#307-whats-not-worth-building-honest-list)
-    - [30.8 CLI UI/UX Discipline — Lessons from the Claude Code Article](#308-cli-uiux-discipline--lessons-from-the-claude-code-article-operator-supplied)
-    - [30.9 Updated Capability Matrix vs CC + ASCO](#309-updated-capability-matrix-vs-cc--asco)
-    - [30.10 Sequencing Recommendation (operator-binding)](#3010-sequencing-recommendation-operator-binding)
-    - [30.11 Cross-References](#3011-cross-references)
-    - [30.12 Summary — Honest Answer to the Operator's Question](#3012-summary--honest-answer-to-the-operators-question)
-31. [Critical Path Systemic Upgrades v3 — Bounded Epistemic Loop + Decision Causality + Failure-Mode Memory (2026-05-04)](#31-critical-path-systemic-upgrades-v3--bounded-epistemic-loop--decision-causality--failure-mode-memory-2026-05-04) *(newest section)*
-    - [31.1 Why "systemic upgrades" not "features"](#311-why-systemic-upgrades-not-features)
-    - [31.2 Upgrade 1 — Bounded Epistemic Loop](#312-upgrade-1--bounded-epistemic-loop)
-    - [31.3 Upgrade 2 — DecisionRecord Causality Graph](#313-upgrade-2--decisionrecord-causality-graph)
-    - [31.4 Upgrade 3 — Failure-Mode Memory at GENERATE-prompt-construction](#314-upgrade-3--failure-mode-memory-at-generate-prompt-construction)
-    - [31.5 Synthesis Table — How the 3 Upgrades Compose](#315-synthesis-table--how-the-3-upgrades-compose)
-    - [31.6 Sequencing Recommendation (operator-binding)](#316-sequencing-recommendation-operator-binding)
-    - [31.7 What Each Upgrade Does NOT Do (Anti-Goals)](#317-what-each-upgrade-does-not-do-anti-goals)
-    - [31.8 Cross-References](#318-cross-references)
-    - [31.9 Summary — Why These Three (and Why Now)](#319-summary--why-these-three-and-why-now)
-32. [`graduation_orchestrator.py` Salvage + M10 Refinement + Targeted Venom Enhancements + GitHub Recon (2026-05-04)](#32-graduation_orchestratorpy-salvage--m10-refinement--targeted-venom-enhancements--github-recon-2026-05-04) *(latest section)*
-    - [32.1 Why this section exists](#321-why-this-section-exists)
-    - [32.2 `graduation_orchestrator.py` — Bit-Rot Assessment](#322-graduation_orchestratorpy--bit-rot-assessment)
-    - [32.3 Verdict — Design Reference, Not Direct Integration](#323-verdict--design-reference-not-direct-integration)
-    - [32.4 M10 ArchitectureProposer — Refined Slice Plan (Supersedes §30.5.2)](#324-m10-architectureproposer--refined-slice-plan-supersedes-3052)
-    - [32.5 Cleanup Arc — `graduation_orchestrator.py` Removal](#325-cleanup-arc--graduation_orchestratorpy-removal)
-    - [32.6 Targeted Venom Enhancements — Agent SDK Architecture, NOT Migration](#326-targeted-venom-enhancements--agent-sdk-architecture-not-migration)
-    - [32.7 `anthropics/claude-code` GitHub Repo Recon — 3 Patterns Worth Porting](#327-anthropicsclaude-code-github-repo-recon--3-patterns-worth-porting)
-    - [32.8 Sequencing — Where §32 Fits in §31.6 (Updated 11-Item Operator-Binding Order)](#328-sequencing--where-32-fits-in-316-updated-10-item-operator-binding-order)
-    - [32.9 Cross-References](#329-cross-references)
-    - [32.10 Summary — Three Investigations, One Architectural Conclusion](#3210-summary--three-investigations-one-architectural-conclusion)
-    - [32.11 Slice 5b Consolidation Arc — CLOSED 2026-05-04](#3211-slice-5b-consolidation-arc--closed-2026-05-04)
-33. [Reusable Meta-Patterns](#33-reusable-meta-patterns-new-2026-05-05--derived-from-coverage-audit)
-34. [VisionSensor + Multi-modal Subsystem](#34-visionsensor--multi-modal-subsystem-new-2026-05-05--anchored-from-claudemd)
-35. [Open Strategic Moves Registry](#35-open-strategic-moves-registry-new-2026-05-05--consolidates-2863--294-scattered-moves)
-36. [Brutal Architectural Review v10 + Forward Priority Roadmap](#36-brutal-architectural-review-v10--forward-priority-roadmap-new-2026-05-05--operator-driven-post-move-7move-8wave-3285133-catalog-closures)
-37. [Operator UX/UI v10 Brutal Review + Comprehensive CC-Feature Catalog](#37-operator-uxui-v10-brutal-review--comprehensive-cc-feature-catalog-new-2026-05-05--operator-driven-post-phase-9-day-1-graduation)
-39. [Ultra Next-Level Autonomy-Native UX Brainstorm (NEW 2026-05-07)](#39-ultra-next-level-autonomy-native-ux-brainstorm-new-2026-05-07--operator-driven-make-ov-super-duper-advanced--coolest-sickest-uiux)
-38. [Karen's Voice + UX/UI Future Roadmap (NEW 2026-05-07)](#38-karens-voice--uxui-future-roadmap-new-2026-05-07--operator-driven-post-phase-1--3-closures)
-    - [38.1 Why this section exists](#381-why-this-section-exists)
-    - [38.2 The real visibility problem (operator awareness gap)](#382-the-real-visibility-problem-operator-awareness-gap)
-    - [38.3 Karen's Voice — full architecture + risk analysis](#383-karens-voice--full-architecture--risk-analysis)
-    - [38.4 Already-unique features that should be the visual centerpiece](#384-already-unique-features-that-should-be-the-visual-centerpiece)
-    - [38.5 CC features worth porting (parity polish)](#385-cc-features-worth-porting-parity-polish)
-    - [38.6 Edge cases + defensive handling](#386-edge-cases--defensive-handling)
-    - [38.7 Deliberate differentiation — what NOT to port](#387-deliberate-differentiation--what-not-to-port)
-    - [38.8 13 creative ideas ranked by uniqueness × effort](#388-13-creative-ideas-ranked-by-uniqueness--effort)
-    - [38.9 Sequencing recommendation (path to A++ professional)](#389-sequencing-recommendation-path-to-a-professional)
-    - [38.10 Operator-binding alignment per arc](#3810-operator-binding-alignment-per-arc)
-    - [38.11 Proactive-only UX features (CC structurally cannot have these)](#3811-proactive-only-ux-features-cc-structurally-cannot-have-these-new-2026-05-07)
-40. [Advanced Forward Roadmap (post-tonight, operator-paced) (NEW 2026-05-10)](#40-advanced-forward-roadmap-post-tonight-operator-paced) *(22-item prioritization across 5 chronological waves + academic-research grounding)*
-    - [40.1 Tier 1 — Recursion-bounding (load-bearing for second-order doll)](#401-tier-1--recursion-bounding-load-bearing-for-second-order-doll)
-    - [40.2 Tier 2 — Antivenom completeness + cross-session coherence](#402-tier-2--antivenom-completeness--cross-session-coherence)
-    - [40.3 Tier 3 — Calibration, learning, second-order metrics](#403-tier-3--calibration-learning-second-order-metrics)
-    - [40.4 Truly experimental (research-grade, deferred)](#404-truly-experimental-research-grade-deferred)
-    - [40.5 Chronological prioritization — all 22 items ranked by impact + sequencing (5 waves)](#405-chronological-prioritization--all-22-items-ranked-by-impact--sequencing)
-        - [40.5.1 Top-3 if you want to start TODAY](#4051-top-3-if-you-want-to-start-today)
-        - [40.5.2 Anti-recommendation](#4052-anti-recommendation)
-    - [40.6 Status — operational, not engineering](#406-status--operational-not-engineering)
-    - [40.7 Academic foundations & related work (prestigious-university research grounding)](#407-academic-foundations--related-work-prestigious-university-research-grounding)
-        - [40.7.1 — Recursive Self-Improvement (RRD architectural foundation)](#4071--recursive-self-improvement-rrd-architectural-foundation)
-        - [40.7.2 — Formal verification + AST safety (Antivenom foundation)](#4072--formal-verification--ast-safety-antivenom-foundation)
-        - [40.7.3 — Multi-agent consensus + speculative execution (Move 6.5 foundation)](#4073--multi-agent-consensus--speculative-execution-move-65-foundation)
-        - [40.7.4 — AI Safety + Constitutional Cage (Antivenom philosophical foundation)](#4074--ai-safety--constitutional-cage-antivenom-philosophical-foundation)
-        - [40.7.5 — Benchmarks (Phase 9 cadence empirical foundation)](#4075--benchmarks-phase-9-cadence-empirical-foundation)
-        - [40.7.6 — Why this matters](#4076--why-this-matters)
-41. [Critical Path to Tier D — Fully Autonomous JARVIS Development (NEW 2026-05-11)](#41-critical-path-to-tier-d--fully-autonomous-jarvis-development-new-2026-05-11) *(the load-bearing North Star: O+V develops JARVIS proactively + fully autonomously, safely + governance-bounded — 18-30 month phased roadmap)*
-    - [41.1 The Stated Goal (Verbatim)](#411-the-stated-goal-verbatim)
-    - [41.2 The Tier Framework: A → B → C → D](#412-the-tier-framework-a--b--c--d)
-    - [41.3 UX Polish Gap (Updated Post-Slice 1)](#413-ux-polish-gap-updated-post-slice-1)
-    - [41.4 Layer 2 — Engineering Capability Gaps](#414-layer-2--engineering-capability-gaps)
-    - [41.5 NEW Operator-Flagged Gap — Web Search & Browsing Capability](#415-new-operator-flagged-gap--web-search--browsing-capability)
-    - [41.6 Layer 3 — Empirical Evidence Requirements (Wall-Clock)](#416-layer-3--empirical-evidence-requirements-wall-clock)
-    - [41.7 Layer 4 — The Architectural Decision (Tier C → Tier D)](#417-layer-4--the-architectural-decision-tier-c--tier-d)
-    - [41.8 Roadmap to Tier D — Phased 18-30 Month Plan](#418-roadmap-to-tier-d--phased-18-30-month-plan)
-    - [41.9 Prioritization Framework — Highest Leverage at Each Horizon](#419-prioritization-framework--highest-leverage-at-each-horizon)
-    - [41.10 Honest Framing & Decision Points](#4110-honest-framing--decision-points)
-- [Appendix A — Glossary](#appendix-a--glossary)
-- [Appendix B — Reference Documents Map](#appendix-b--reference-documents-map)
-- [Appendix C — Phase Gate Criteria (entry/exit conditions)](#appendix-c--phase-gate-criteria-entryexit-conditions)
-- [Appendix D — Document History](#appendix-d--document-history)
+
+### Sections §24–§41 and Appendices A–D — moved, not deleted
+
+> These 124 entries pointed at anchors this file no longer contains. The
+> sections were not removed: commit `9f8625a775` (Slice 226) split a 2.2MB
+> PRD into four files so GitHub would render them, and the table of contents
+> was never repointed. Every link below was therefore broken — navigation
+> that silently fails is worse than navigation that is absent, because a
+> reader concludes the content is gone.
+
+| Looking for | Now lives in |
+|---|---|
+| §24–§28 Brutal Architectural Reviews v3–v9, §30 ASCO Mapping, §31–§39 critical-path/UX/meta-pattern sections, Appendices A–C | [`OUROBOROS_VENOM_PRD_SPEC_DETAIL.md`](./OUROBOROS_VENOM_PRD_SPEC_DETAIL.md) |
+| §40 Advanced Forward Roadmap, §41 Critical Path to Tier D, wave-closure banners and the session cross-off table | [`OUROBOROS_VENOM_PRD_HISTORY.md`](./OUROBOROS_VENOM_PRD_HISTORY.md) |
+| §51 The North Star Galaxy, Appendix D Document History | [`OUROBOROS_VENOM_NORTH_STAR.md`](./OUROBOROS_VENOM_NORTH_STAR.md) |
+
+> **Numbering note.** Section numbers §24 and up were REUSED in this file
+> after the split, so `§24` here means Voice I/O (2026-07-26) while `§24` in
+> the spec-detail document means Brutal Architectural Review v3 (2026-04-28).
+> Cite the file, not just the number.
 
 ---
 24. [Voice I/O — the `ov` Conversational Loop](#24-voice-io--the-ov-conversational-loop-new-2026-07-26)
@@ -212,6 +108,17 @@
     - [28.4 Findings withdrawn under verification](#284-findings-withdrawn-under-verification)
     - [28.5 Measured affordance costs](#285-measured-affordance-costs)
     - [28.6 Remediation, ranked by leverage per line changed](#286-remediation-ranked-by-leverage-per-line-changed)
+29. [The Distributed Body/Engine Link](#29-the-distributed-bodyengine-link-new-2026-08-15)
+30. [Proactive Mode](#30-proactive-mode-new-2026-08-15)
+31. [The Local Sovereignty Tier — Physics as a Governance Input](#31-the-local-sovereignty-tier--physics-as-a-governance-input-new-2026-08-18) *(latest section)*
+    - [31.1 What shipped](#311-what-shipped)
+    - [31.2 The measured envelope](#312-the-measured-envelope)
+    - [31.3 Can a 1T–2.4T model run on that box? — answered with arithmetic](#313-can-a-1t24t-model-run-on-that-box--answered-with-arithmetic)
+    - [31.4 Which models suit O+V — derived from the budget, not from a leaderboard](#314-which-models-suit-ov--derived-from-the-budget-not-from-a-leaderboard)
+    - [31.5 What the bridge exposes — latent defects to close before Gap 3](#315-what-the-bridge-exposes--latent-defects-to-close-before-gap-3)
+    - [31.6 Priorities — what to do next, ranked](#316-priorities--what-to-do-next-ranked)
+    - [31.7 Invariants this section adds](#317-invariants-this-section-adds)
+    - [31.8 The local tier, configured — deployment profile and warm-swap protocol](#318-the-local-tier-configured--deployment-profile-and-warm-swap-protocol-2026-08-18)
 
 ## 1. Executive Summary
 
@@ -4498,3 +4405,845 @@ op (§26.5). (d) `watch` and hibernation render distinguishably.
    already stores.)*
 
 ---
+
+---
+
+## 31. The Local Sovereignty Tier — Physics as a Governance Input *(NEW 2026-08-18)*
+
+> **Operator binding (2026-08-18)**: *"Execute the integration of this local
+> sovereignty tier, specifically bridging my current macOS M1 (16GB)
+> development environment with the Windows RTX 5090 inference host."* — and,
+> on lane sizing: *"do not just hardcode `JARVIS_BG_POOL_SIZE=1`."*
+
+### 31.0 The thesis — a budget is a claim about hardware
+
+Every route budget in this document (§9, and the table in `route_budgets.py`)
+is a promise: *an op of this class completes in this many seconds*. That
+promise was written against a **metered remote provider**, where concurrency
+is somebody else's problem — three requests to Claude or DoubleWord are served
+by three different machines.
+
+A local serving tier breaks that assumption silently. **One GPU serving three
+concurrent requests serves them SERIALLY.** The three lanes do not triple
+throughput; they triple each op's wall-clock. The budget is unchanged, so the
+tail blows it, and the loop records a failure class it already has a name for:
+`tool_loop_deadline_exceeded`.
+
+Nothing in the codebase was wrong. `JARVIS_BG_POOL_SIZE=3` was correct for the
+regime it was calibrated in. What was missing is that **the pool had no way to
+know which regime it was in** — and the fix for that is not a smaller
+constant. A smaller constant is the same defect with a different number: still
+a guess, still blind to the hardware it runs on, and now also wrong on the
+Windows host where three lanes may be entirely reasonable.
+
+The governing principle this section adds to §8:
+
+> **Concurrency is not a configuration value. It is a measurement about the
+> serving substrate, and it belongs to whoever measured it.**
+
+### 31.1 What shipped
+
+Two commits on `feat/throughput-governor-and-multi-device-topology`.
+
+#### 31.1.1 `9c322f380e` — ThroughputGovernor: lanes derived from measured latency
+
+`governance/throughput_governor.py`. The whole module is a binding between
+instruments that already existed and had never been connected:
+
+| Instrument | Already did | Was never used for |
+|---|---|---|
+| `LatencyProfiler` | measures TTFT + per-token cost, warm-started across runs from the file-backed physics ledger | sizing concurrency |
+| `MemoryPressureGate` | caps fan-out by memory level | the worker pool's lane count |
+| `BackgroundAgentPool.set_target_pool_size` | accepts a lane target | anything but fleet topology |
+
+The math:
+
+```
+lanes = floor( (budget_ms x safety_fraction) / per_op_ms )
+```
+
+`per_op_ms` is **not re-derived**. It is `LatencyProfiler.adaptive_timeout_ms`
+— the same estimator the dispatch path already trusts (measured TTFT +
+per-token x expected output + sigma margin, clamped to its own floor and
+ceiling). Re-deriving it would have created a second opinion about one set of
+physics, which is the drift class §12 exists to prevent.
+
+`safety_fraction` (default 0.6) is not a fudge factor. The route budget must
+also cover everything the op does BESIDES token generation — Venom tool
+round-trips, VALIDATE, the Iron Gate, SemanticGuardian's AST pass — while
+`adaptive_timeout_ms` estimates only the generation leg. Spending the whole
+budget on generation would guarantee the breach this exists to prevent.
+
+**Composition, not a second authority.** The verdict is deliberately NOT
+pushed through `set_target_pool_size`. That setter carries the Immutability
+Lock: `source="fleet_topology"` is hardware-derived truth and silently rejects
+every other source while held. A throughput number pushed through it would
+either vanish exactly where a serving mesh exists, or would have to outrank
+hardware truth — and it must not. The two are **different axes and both are
+real**:
+
+- **topology** answers *how many lanes exist* (nodes in the serving mesh);
+- **throughput** answers *how many can be driven* inside the route window.
+
+Four nodes can exist while a 16GB M1 drives one. The pool consults the
+governor cooperatively and composes strictest-wins, so each stays
+authoritative on its own axis.
+
+**Hold, never retire.** A topology retire is a permanent `break` and correct —
+a node either exists or it does not. A throughput ceiling comes from a reading
+with a ~30s TTL, so breaking on it would make a transient measurement (a cold
+model load, a memory spike) an irreversible decision. Excess lanes `await` and
+re-check, and grow back for free when physics improves. Named *hold* and not
+*park* because `ParkRequested` / `ParkedOpStore` already mean OP-level
+suspend-and-resume in that module.
+
+**Every verdict states its provenance.** `adaptive_timeout_ms` CLAMPS to its
+ceiling, and a clamp reported as a measurement is a fabricated reading — the
+same class the Advisor's blast-radius provenance work exists to prevent
+(`localized_lower_bound` vs `synthetic_cap`). Verdicts carry:
+
+| provenance | meaning | consequence |
+|---|---|---|
+| `measured` | the estimator's own value, unclamped | trust it |
+| `ceiling_clamped` | the estimate SATURATED its ceiling | per-op cost is a **lower bound**, so the lane count is conservative |
+| `seeded` | fewer than `min_samples` in the ledger | the blind seed, not physics |
+| `wedged` | the estimator refused (runaway latency) | governed lanes=1 — information, not absence |
+
+The `measured` flag keys off `is_warm()` and **not** `is_calibrated()`. That
+distinction is load-bearing: `_calibrated` is a per-instance scout-lock flag
+the physics ledger does not persist, so a fresh instance reports `False` while
+serving genuinely measured numbers. `is_warm()` counts samples, which the
+ledger repopulates at `__init__`.
+
+**One route table, not three.** The route-to-timeout table had been written
+twice, byte-identical, in `orchestrator.py` and `phase_runners/generate_runner.py`
+(the second carrying a comment calling itself a "parity twin" of the first).
+The governor needed the same numbers. Rather than add a third copy, the table
+moved to `governance/route_budgets.py` and both sites read it.
+
+Masters: `JARVIS_THROUGHPUT_GOVERNOR_ENABLED` (default on; off is
+byte-identical to prior behaviour), `_SAFETY_FRACTION`, `_MAX_LANES`,
+`_VERDICT_TTL_S`, `_REFERENCE_PROMPT_TOKENS`.
+
+#### 31.1.2 `8485b819c5` — multi-device capacity made expressible
+
+`compute_topology.py` collapsed a multi-GPU host to its **largest single
+device**, with a rationale that is correct and stays the default:
+
+> *"A model must fit on one device unless it was sharded, and sharding is a
+> property of the serving stack rather than of the host; summing would
+> authorize a load that cannot physically land."*
+
+**This was therefore not a bug.** The gap is representational: the probe could
+not express that two devices exist and a sharding runtime could pool them, so
+the single number it reported was wrong for somebody. An RTX 5090 (32GiB)
+beside a 24GiB card is **32GiB to a stack that does not shard and 56GiB to one
+that does**.
+
+Both facts are now carried:
+
+- `DeviceReading` per device (index, name, total, free), enumerated by **both**
+  the torch and nvidia-smi stages;
+- `free_bytes` / `total_bytes` keep their exact prior semantics, so every
+  existing consumer is byte-identical;
+- `aggregate_free_bytes` / `aggregate_total_bytes` sum the enumerated devices;
+- `shardable_usable_bytes(sharding=)` composes them, and returns the
+  single-device answer for a single-device host **even when sharding is
+  declared**, so the flag cannot invent a card that is not there.
+
+`is_multi_device` keys off `len(devices)`, **not** `device_count > 1`: a probe
+stage can report a count while failing to enumerate, and an aggregate over
+devices never read would be a fabrication — the same discipline
+`free_is_measured` already enforces for derived free bytes.
+
+**Sharding is a declaration, not an inference.** Whether a model can span two
+GPUs is a property of the serving stack (llama.cpp/Ollama layer split, vLLM
+tensor parallel), which `compute_topology` deliberately knows nothing about.
+So `local_model_admission.accelerator_sharding_declared()` reads
+`JARVIS_LOCAL_ACCEL_SHARDING`, **default false**. The asymmetry sets the
+default: declaring sharding on a stack that does not shard admits a model that
+then fails to load, having already passed the gate whose whole job was to
+prevent that; declaring it off on a stack that does merely under-uses the
+second card.
+
+Decisions now say which bound they used — `bound="accelerator_pooled"` and a
+reason naming the device count when pooling applied.
+
+#### 31.1.3 Verification
+
+50 new tests. 350 green across the affected surface, identified by an AST
+sweep of the entire `tests/` tree for the changed module and symbol names
+(73 files touched the throughput surface, 4 the topology surface). One
+genuine orphan was found and repaired: `test_sovereign_override` asserted an
+env var's presence in orchestrator **source** — a test of spelling, which the
+extraction broke while the behaviour was untouched. It now asserts the
+property its own docstring claims.
+
+Live-fire, not unit-green: the governor was driven against a real
+`qwen2.5-coder:3b` on a running Ollama, and the pool was observed holding
+workers 1 and 2 alive while a subsequent topology retire killed them.
+
+> **Two defects in this change's own code, caught by its own tests.** (1) The
+> consult first reached a route budget via `self._config`, which
+> `BackgroundAgentPool` does not own — every call raised, the broad `except`
+> swallowed it, and the wiring was **dead while looking live**. (2) The
+> log-dedup key was pool-level, so the second and third held workers were
+> deduped away and the log read as one held lane when three were. Both are
+> instances of the class §28 named: a capability needs a live caller on the
+> default path, and an observability surface that under-reports is not
+> observability.
+
+### 31.2 The measured envelope
+
+#### 31.2.1 macOS M1, 16GB unified — the development host
+
+Measured 2026-08-18 against live `qwen2.5-coder:3b` via the real
+`LocalPrimeClient.complete()` seam:
+
+| sample | TTFT | total | out | note |
+|---|---|---|---|---|
+| 1 | 3232 ms | 32321 ms | 25 tok | cold — model load |
+| 2 | 193 ms | 1933 ms | 23 tok | warm |
+| 3 | 311 ms | 3112 ms | 28 tok | warm |
+| 4 | 418 ms | 4177 ms | 31 tok | warm |
+| 5 | 350 ms | 3503 ms | 33 tok | warm |
+
+Derived: ~95 ms/token warm. With `output_ratio = 0.5`, an 8000-token
+CONTEXT_EXPANSION prompt predicts **4000 output tokens ≈ 380 s of generation
+alone** against a 180 s BACKGROUND window.
+
+> **Verdict: this host drives ONE lane, and the governor derives that number
+> rather than being told it.** The `3` in `JARVIS_BG_POOL_SIZE` was never a
+> statement about this machine.
+
+Two profiler distortions worth recording, both pre-existing:
+
+1. **Cold-load amortization.** `record()` computes
+   `per_tok = (total - ttft) / output_tokens`. A cold op with small output
+   folds MODEL-LOAD time into per-token cost — measured 1163 ms/tok cold
+   versus ~95 ms/tok warm, a 12x outlier that pins the estimate at its ceiling
+   for the length of the sample window.
+2. **Ceiling saturation.** Consequently `adaptive_timeout_ms(8000)` returns
+   exactly `timeout_ceiling_ms` (120000). The governor now labels that
+   `ceiling_clamped` rather than reporting a clamp as a measurement.
+
+#### 31.2.2 Windows inference host — the target
+
+```
+CPU  AMD Ryzen 9 9950X3D   16C/32T, 4.30 GHz base, 128 MB L3 (3D V-Cache)
+GPU  NVIDIA RTX 5090 Founders Edition   32 GB GDDR7   <- the ONLY inference device
+iGPU AMD Radeon (integrated in the 9950X3D)  2 GB dedicated + 45.7 GB shared
+RAM  64 GB DDR5-6000, 2 of 2 DIMM slots used, 61.7 GB usable (2.3 GB reserved)
+```
+
+> **CORRECTED 2026-08-18 from Task Manager screenshots.** An earlier draft of
+> this section recorded a *second NVIDIA card at 24 GB* and a pooled 56 GB.
+> That is wrong. `GPU 1` is the **AMD Radeon iGPU integrated into the
+> 9950X3D**, and its "45.7 GB shared" is system RAM addressed through the
+> display driver, not video memory. It is not a CUDA device: `nvidia-smi` and
+> `torch.cuda` do not enumerate it, and no llama.cpp/vLLM CUDA build will use
+> it. **There is exactly one inference GPU on this host.**
+
+| pool | bytes |
+|---|---|
+| the single inference device (RTX 5090) | **32 GB** |
+| pooled VRAM | **n/a — nothing to pool with** |
+| VRAM + usable system RAM (weights may live in either) | **~94 GB** |
+
+Two consequences follow, and both are load-bearing:
+
+1. **`JARVIS_LOCAL_ACCEL_SHARDING` is not merely left off — there is nothing
+   to declare.** The default-false choice in §31.1.2 turns out to have been
+   the difference between a correct gate and one that authorised a 56 GB load
+   onto a 32 GB card.
+2. **§31.1.2's `shardable_usable_bytes` guard is now exercised rather than
+   hypothetical**: on a single-device host it returns the single-device answer
+   *even when sharding is declared*, so a mistaken flag cannot invent the
+   card that is not there. Verified against this exact hardware shape.
+
+The §31.1.2 work still earns its place here, but for the opposite reason to
+the one first written down: not because two cards must be pooled, but because
+a probe that *cannot enumerate a second device* must say so rather than let a
+declaration fabricate one. `is_multi_device` keys off `len(devices)`, so on
+this host it is False and the affinity layer becomes a no-op — while the
+per-device **capacity** check (§31.6.1 #4a) still runs, which is the half that
+matters on a single 32 GB card.
+
+### 31.3 Can a 1T–2.4T model run on that box? — answered with arithmetic
+
+**Short answer: no, and the gap is not close enough to engineer around.**
+
+`Qwen3.8-Max` is `Qwen3.8-2.4T-A95B`: **2.4T total parameters, 95B active**,
+512 experts (10 routed + 1 shared per token), 92 layers, 256K native context
+extensible to ~1M.
+
+The single most common MoE sizing error is reading the active count as the
+memory footprint. **Active parameters set SPEED; total parameters set
+RESIDENCY.** Every one of the 512 experts must be reachable, because routing
+picks different ones each token.
+
+Published sizes:
+
+| format | size | source |
+|---|---|---|
+| BF16 (native) | **4.9 TB** | Unsloth |
+| INT4 | 600 GB – 1 TB | MindStudio |
+| IQ1_S | 508 GB | Unsloth |
+| **Unsloth Dynamic 1-bit GGUF (smallest that exists)** | **397 GB** | Unsloth |
+
+Against the ~94 GB actually addressable on the target box (32 GB VRAM +
+61.7 GB usable RAM — see the correction in §31.2.2):
+
+```
+397 GB  smallest quantized form in existence
+ 94 GB  VRAM + usable system RAM
+-----
+303 GB  short  ->  4.2x over, at ~1.32 bits per parameter
+```
+
+The RAM ceiling is also harder than it looks: **both DIMM slots are already
+occupied**, so more memory means replacing the pair, not adding to it.
+
+There is no quantization below ~1 bit. The deficit cannot be closed by
+compression.
+
+**Could it stream from NVMe?** `llama.cpp` will mmap a model larger than RAM
+and page from disk, so it would technically emit tokens. The arithmetic:
+
+- 95B active x ~1.32 bpw ≈ **15.7 GB read per forward pass**
+- ~30% of the file is resident (120 of 397 GB), so ~11 GB per token from NVMe
+- MoE routing scatters those reads across 512 experts x 92 layers — poor
+  locality, so a PCIe 5.0 drive's ~14 GB/s sequential figure does not apply;
+  2–5 GB/s effective is the realistic band
+- **≈ 2.2–5.5 s per token → 0.18–0.45 tok/s**
+
+A 500-token reply is 18–46 minutes. The 4000-token generation O+V's own
+`output_ratio` predicts for an 8K prompt is **2.5–6 hours**.
+
+**Calibration against a model that does work.** Kimi K2 (1T total, **32B
+active**) at Unsloth Dynamic 1.8-bit is 245 GB and reports ~5 tok/s on 24 GB
+VRAM + 256 GB RAM. Note why: 280 GB of memory holds a 245 GB file — it
+**fits**. The target box does not fit even the 1-bit Qwen, and Qwen3.8-Max has
+**3x the active parameters** of Kimi K2, so it moves 3x the bytes per token at
+equivalent residency.
+
+**What would actually be required** to run Qwen3.8-Max locally at all:
+
+| requirement | implication |
+|---|---|
+| ≥ 448 GB RAM+VRAM (397 GB weights + KV cache + headroom) | 512 GB DDR5 RDIMM on Threadripper PRO / EPYC — a different machine class, not an upgrade |
+| ≥ 8 memory channels | 95B active x 1.32 bpw = 15.7 GB/token; dual-channel DDR5 (~96 GB/s) caps at ~6 tok/s theoretical before overheads |
+| realistic outcome | ~4–8 tok/s |
+
+**And here is the conclusion that matters for O+V**, which no amount of
+hardware fixes: at 5 tok/s, the 4000-token generation predicted for a standard
+CONTEXT_EXPANSION prompt takes **800 s**. Every route budget — IMMEDIATE 120 s,
+STANDARD 220 s, COMPLEX 240 s, BACKGROUND 180 s — is blown by a single
+response, on hardware costing five figures.
+
+> **The local tier's job is not to run the biggest model. It is to run a model
+> whose per-op cost fits a route budget.** A 2.4T model is not "too big for
+> the GPU"; it is too slow for the loop, and would remain so after the GPU
+> problem was solved. This is exactly the property §31.1.1's governor now
+> measures and enforces — pointed at such a model it would return
+> `provenance=ceiling_clamped, lanes=1` and the deadline machinery would
+> record the breach honestly.
+
+Sources: [Unsloth Qwen3.8 GGUF](https://huggingface.co/unsloth/Qwen3.8-2.4T-A95B-GGUF) ·
+[vLLM recipe (2.4T/95B)](https://recipes.vllm.ai/Qwen/Qwen3.8-2.4T-A95B) ·
+[MindStudio hardware analysis](https://www.mindstudio.ai/blog/run-qwen3-8-locally-hardware) ·
+[Unsloth Kimi K2](https://huggingface.co/unsloth/Kimi-K2-Instruct-GGUF) ·
+[Trillion-parameter-at-home guide](https://hackmd.io/msiciwuST9mn3sgSPSyENw)
+
+### 31.4 Which models suit O+V — derived from the budget, not from a leaderboard
+
+#### 31.4.1 The selection criterion is arithmetic, not taste
+
+O+V's local tier serves the BACKGROUND and SPECULATIVE routes (§5 —
+OpportunityMiner, DocStaleness, TODOs, backlog, IntentDiscovery). Its budget is
+**180 s**, of which the governor allows `safety_fraction = 0.6` for generation:
+**108 s**. `output_ratio = 0.5` predicts **4000 output tokens** for an 8000-token
+CONTEXT_EXPANSION prompt. Therefore:
+
+```
+lanes = 1  requires  per_token <= 108s / 4000 tok  ~=  27 ms   ->  >=  40 tok/s
+lanes = 3  requires  per_token <=  36s / 4000 tok  ~=   9 ms   ->  >= 120 tok/s
+```
+
+> **A local model is admissible for O+V if and only if it sustains ~40 tok/s at
+> the target context.** Below that, it cannot complete one BACKGROUND op inside
+> the window no matter how good its code is. This is the number to shop for —
+> not parameter count, and not SWE-bench alone.
+
+Second hard requirement: **tool-calling fidelity.** Venom is a multi-turn loop
+over 16 built-in tools plus MCP-forwarded external tools, and the Iron Gate
+requires ≥2 exploration calls before any patch is accepted. A model that emits
+malformed tool calls does not degrade gracefully here — it fails the
+exploration gate, routes through GENERATE_RETRY, and burns the budget twice.
+
+Third: **context.** Tool results accumulate until compaction fires at 75% of
+budget. 128K+ is comfortable; 256K removes the concern.
+
+#### 31.4.2 The shortlist
+
+Sizes are Q4-class quantized weights. **Throughput figures marked (est.) are
+derived from memory bandwidth and are not measurements** — the governor will
+replace them with real numbers on first contact, and that is the point.
+
+| Model | Total / active | Q4 size | Context | Fits 5090 alone (32GB)? | Throughput | O+V verdict |
+|---|---|---|---|---|---|---|
+| **Qwen3-Coder-30B-A3B** | 30B / 3.3B MoE | ~19 GB | 256K → 1M | yes, with room | **220 tok/s** (reported) | **Best fit.** Clears the 3-lane bar with margin. The active-parameter count is what makes it fast. |
+| **Qwen3.8-27B** | 28B dense + vision | **17.8 GB** (Q4_K_M) | 256K native | yes | ~50–70 tok/s (est.) | **Best quality that still clears 1 lane.** Hybrid attention caches only 16 of 64 layers: KV is 0.5 GB @8K, 2.0 GB @32K, 16.4 GB @262K — unusually cheap. Apache-2.0. |
+| **Llama-3.3-70B** | 70B dense | ~40 GB | 128K | no — 40 GB > 32 GB | ~15–20 tok/s (est.) | **Below the bar.** Dense 70B cannot sustain 40 tok/s here, and no longer fits VRAM at all. |
+| **gpt-oss-120b** | 117B / 5.1B MoE | **~60 GB** MXFP4 | 128K | no — 60 GB > 32 GB | usable ONLY with CPU-MoE offload | **The one case the 64 GB of RAM earns its keep.** Weights exceed VRAM, but with just **5.1B active** params the experts tolerate CPU offload (`--n-cpu-moe`) far better than a dense model would: attention stays on the 5090, experts stream from DDR5-6000. Worth measuring; the governor will price it honestly. |
+| **Kimi K2 / DeepSeek-class 1T** | 1T / 32B | 245 GB @1.8-bit | — | no | ~5 tok/s at best | **Out of scope** — see §31.3. |
+| **Qwen3.8-Max (2.4T-A95B)** | 2.4T / 95B | **397 GB** @1-bit | 256K–1M | no — 3.3x over | 0.18–0.45 tok/s streamed | **Impossible on this box, and unusable for O+V even on hardware that fits it.** |
+
+**Recommendation for the Windows host, in deployment order:**
+
+1. **`Qwen3-Coder-30B-A3B`** as the BACKGROUND/SPECULATIVE workhorse — it is
+   the only entry that clears the 3-lane bar, so it is the one that makes the
+   pool's parallelism real rather than nominal.
+2. **`Qwen3.8-27B`** as the quality tier for COMPLEX-adjacent local work,
+   where one lane at higher fidelity beats three at lower. Its vision encoder
+   also lines up with the existing multi-modal ingest path
+   (`ctx.attachments` → GENERATE) and VisionSensor.
+3. **They cannot both be resident.** 19 GB + 17.8 GB = 36.8 GB against a
+   32 GB card, before either one's KV cache. With a single inference GPU the
+   choice is exclusive, and swapping between them is not free: a cold model
+   load measured **~30 s** on this project's own hardware, which is a third of
+   a BACKGROUND budget spent before a single token is generated.
+
+**So the deployment is one resident model, and it should be
+`Qwen3-Coder-30B-A3B`:** 19 GB of weights leaves ~11 GB of the 5090's free
+VRAM for KV, which at Qwen-class KV rates is roughly a **127K-token working
+context** — more than O+V ever asks for — while being the only candidate whose
+throughput clears the 3-lane bar in §31.4.1. Reach for `Qwen3.8-27B` instead
+only if a specific workload needs its vision encoder (which does line up with
+the existing `ctx.attachments` → GENERATE path and VisionSensor), accepting
+one lane instead of three.
+
+> The earlier draft of this section concluded that "the second GPU's value is
+> another independent lane, not a bigger model." The conclusion survives the
+> hardware correction; only the subject changes. There is no second GPU, so
+> the lane count now comes entirely from **how fast the one card is** — which
+> is precisely the quantity §31.1.1's governor measures, and precisely why it
+> had to be a measurement rather than a setting.
+
+Sources: [Qwen3.8-27B GGUF sizes](https://ofox.ai/blog/qwen-3-8-27b-run-locally-vram-gguf-2026/) ·
+[Qwen3-Coder-30B](https://www.morphllm.com/best-ollama-models) ·
+[gpt-oss-120b requirements](https://yingtu.ai/en/blog/gpt-oss-120b-memory-requirements)
+
+### 31.5 What the bridge exposes — latent defects to close before Gap 3
+
+The M1→Windows bridge is mostly configuration (`JARVIS_LOCAL_MODEL_BASE_URL`,
+default `http://127.0.0.1:11434`). But routing one host's governor at another
+host's GPU surfaces three real issues that do not exist while everything is
+local:
+
+1. **`physics_key` conflates hosts.** It is `model_name@num_ctx` —
+   deliberately not the endpoint, because *"node IPs change every run; the
+   physics belongs to the brain+window."* That reasoning holds for a mesh of
+   like machines. It does **not** hold across a 16 GB M1 and a 5090: the same
+   model name on both writes to one ledger key, and the M1's ~95 ms/token
+   would govern the 5090's lane count. **The key needs a hardware-class
+   component before the bridge carries load** — and the class, not the IP, so
+   the original rationale survives.
+2. **The lane ceiling is pool-level, not route-level.** The pre-dequeue gate
+   sizes against `DEFAULT_POOL_ROUTE` (background) because it does not yet
+   hold an op. Correct for a pool that predominantly serves that route;
+   wrong once a remote host makes SPECULATIVE genuinely cheap and IMMEDIATE
+   genuinely viable.
+3. **Network latency is inside `per_op_ms` but is not model physics.** Once
+   the M1 measures a remote endpoint, TTFT includes the LAN round trip. That
+   is honest for lane sizing (the wall-clock is real), but it pollutes the
+   ledger's claim to be *model* physics. Worth a `transport` dimension before
+   the ledger is trusted for anything else.
+
+### 31.6 Priorities — what to do next, ranked
+
+Ranked by *leverage per line changed*, the §28 criterion.
+
+| # | Item | Why it is here | Cost | Blocked on |
+|---|---|---|---|---|
+| **1** | **`physics_key` hardware-class component** (§31.5.1) | Without it the bridge governs a 5090 with an M1's physics. This is a correctness bug that only appears under the exact configuration we are building toward. | S | nothing |
+| **2** | **Deploy `Qwen3-Coder-30B-A3B` as the single resident model** on the RTX 5090 | The one candidate that clears the 3-lane bar (§31.4.1), and the first hardware capable of testing the governor's arithmetic against real throughput rather than a 1-lane M1. | S | machine powered on |
+| **3** | **Prove the probe end to end on real silicon** — `nvidia-smi` enumeration (expect **one** device), `is_multi_device=False`, and admission refusing an over-long context with an actionable ceiling | §31.1.2 is unit-proven and live-unproven. The hardware correction *narrows* this: there is no pooling path to exercise, so what must be proven is that the single-device path is right — including that a declared `SHARDING=1` changes nothing. | S | machine powered on |
+| **4** | **Route-aware lane ceiling** (§31.5.2) | Re-gate after dequeue using the op's own route, reusing the existing re-enqueue idiom. | M | #2 |
+| **5** | **Observed sharding outranks the declared flag** | A stack reporting a resident model larger than its largest single device has **proven** sharding. Turns a trusted flag into a measurement — the same upgrade the physics ledger already represents. | M | #3 |
+| **6** | **Cold-load outlier isolation** (§31.2.1) | Recording model-load as per-token cost pins the estimator at its ceiling for a full sample window, which currently makes every M1 verdict `ceiling_clamped`. Record load separately. | M | nothing |
+| **7** | **Fix the pre-existing DRY red** — `local_model_admission._read_swapin_bytes` imports `psutil` directly (`f2c3974ddc`), which `test_dry_admission_derives_neither_reading_itself` forbids. Expose swap-in via `memory_pressure_gate`. | Red on `main` today; it will fail every PR touching that file. | S | nothing |
+| **8** | **`InferenceGateway` abstraction** — one seam for local/remote endpoint selection, health, and backpressure | The original Gap 3 ask. Deliberately last: three of its inputs (lane ceiling, pooled capacity, per-endpoint physics) had to exist first, and two of them now do. | L | #1, #4 |
+
+#### 31.6.1 Execution log — 2026-08-18 (operator-directed)
+
+Items **1**, **7** and the ToC cleanup are CLOSED; the heterogeneous-routing
+work the operator specified became a new item **4a** (below), since §31.6 #4
+addressed lane COUNT while this addresses lane CHOICE.
+
+| # | Item | State |
+|---|---|---|
+| 1 | `physics_key` hardware axis | **closed** — `hardware_signature.py`; key is now `hardware_sig@model@ctx` |
+| 4a | Heterogeneous device routing + per-device KV admission | **closed (unit-proven only)** — `device_affinity.py` |
+| 7 | `psutil` DRY red | **closed** — `swap_in_bytes()` moved to `memory_pressure_gate` |
+| — | ToC dead anchors | **closed** — 124 broken links replaced with a companion-document map |
+| 2, 3 | Deploy the model; prove the probe live | **blocked on the Windows host being powered on** (scope narrowed by the §31.2.2 hardware correction — single GPU, so no pooling path to exercise) |
+
+**Three design decisions worth recording, because each rejected an easier
+answer:**
+
+1. **The signature has ONE SPINE.** An early draft appended GPU components to
+   the machine id, which made the digest depend on
+   `JARVIS_COMPUTE_TOPOLOGY_ENABLED` — flipping that flag re-keyed the ledger
+   and orphaned every prior measurement on a machine that had not changed.
+   GPU identity is now a SUBSTITUTE for a missing spine, never an addition to
+   a present one. **A signature must change only when the machine does.**
+
+2. **The endpoint beats the config.** `_failover_profiler_for(endpoint, cfg)`
+   keys its in-memory store by ENDPOINT but derived its ledger key from CFG.
+   Resolving the machine from `cfg` there would have stamped every failover
+   target with the base config's identity — re-creating the conflation at the
+   one seam, cross-node failover, where it matters most. `physics_key` now
+   takes an explicit `endpoint=`.
+
+3. **Capacity is a constraint; affinity is a preference.** SPECULATIVE prefers
+   the smaller card, but a payload that does not fit there goes to the larger
+   one rather than being deferred. Declining work a present device could do
+   would be policy defeating the system it exists to tune.
+
+> **Honesty note, updated 2026-08-18.** §31.6 #4a is proven against synthetic
+> `DeviceReading`s only, and the hardware correction in §31.2.2 means the
+> **routing half of it will never execute on this host** — one inference GPU
+> means `is_multi_device` is False and affinity is a no-op. What does execute,
+> and what therefore has to be right, is the per-device **capacity** half:
+> weights + KV at the reachable context against the single 32 GB card, and the
+> refusal path that reports an actionable ceiling. Verified against this exact
+> shape in-repo; still unproven on real silicon.
+>
+> Worth recording plainly: this section was written around a second GPU that
+> does not exist. The code survived the correction unchanged because two of
+> its guards were written to distrust exactly this class of mistake —
+> `is_multi_device` keys off enumerated devices rather than a reported count,
+> and `shardable_usable_bytes` returns the single-device answer even when
+> sharding is declared. **A design that assumes its own inputs may be wrong is
+> the only reason a wrong input cost nothing here.**
+
+**Not scheduled, and deliberately so:** anything aimed at running a 1T+ model
+locally. §31.3 shows the ceiling is not a hardware-budget problem but a
+tokens-per-second problem that persists on hardware costing five figures. The
+capability O+V gains from a bigger local model is smaller than the capability
+it gains from item #2.
+
+### 31.8 The local tier, configured — deployment profile and warm-swap protocol *(2026-08-18)*
+
+> **Operator binding**: *"We will adopt Qwen3-Coder-30B-A3B as the resident
+> background workhorse on the Windows RTX 5090, keeping Qwen3.8-27B on disk
+> for specialized visual or high-fidelity one-offs."*
+
+#### 31.8.1 Why the MoE wins on THIS card
+
+The decision is hardware-specific and does not generalise. Both candidates
+cost roughly the same VRAM; they cost wildly different **memory traffic per
+token**, which is what sets decode speed:
+
+| | Qwen3-Coder-30B-A3B | Qwen3.8-27B |
+|---|---|---|
+| Architecture | **MoE** — 30B total, **3.3B active** | **Dense** — 28B, all active |
+| VRAM to load (Q4) | ~19 GB | ~17.8 GB |
+| **Bytes read per token** | **~1.9 GB** | **~17.8 GB** |
+| Decode on the 5090 | **~220 tok/s** (reported) | ~50–70 tok/s (est.) |
+
+A dense model reads every weight for every token; an MoE routes each token
+through a few experts while all experts stay resident. **The MoE pays the
+capacity price of 30B and the bandwidth price of 3.3B.**
+
+The 5090 has 32 GB of capacity and ~1.8 TB/s of bandwidth. Either model
+leaves ~13 GB unused, so **capacity is the surplus and bandwidth is the
+constraint** — and MoE is precisely the architecture that trades the abundant
+resource for the scarce one. The same choice would be *wrong* on a 16 GB card,
+where the 30B MoE does not fit at all; this is not a general preference.
+
+Against the §31.4.1 lane arithmetic (108 s of generation allowance, ~4000
+predicted output tokens):
+
+| | Time per op | Lanes |
+|---|---|---|
+| Coder-30B-A3B | ~18 s | ⌊108/18⌋ = 5 → capped to **3** |
+| Qwen3.8-27B | ~67 s | ⌊108/67⌋ = **1** |
+
+Three lanes is meaningful on ONE card because the governor's math already
+accounts for serialisation: 3 × 18 s = 54 s of GPU time fits inside the 108 s
+allowance, so all three finish within budget. Two dense ops would need 134 s
+and **both** would breach.
+
+#### 31.8.2 The argument that actually decides it — retry economics
+
+O+V is by design a **high-rejection architecture**. The Iron Gate,
+the ASCII gate, AST/placeholder validation, SemanticGuardian and the
+multi-file coverage gate can each independently force a full regeneration.
+Rejection is a routine path, not an exception.
+
+That inverts the usual "smarter model wins" reasoning: **where regeneration is
+common, a 3.7× faster model makes every rejection 3.7× cheaper.** For a
+realistic BACKGROUND op — 6 tool rounds plus a final patch, ~3,300 output
+tokens against a growing prompt:
+
+| | Coder-30B-A3B | Qwen3.8-27B |
+|---|---|---|
+| Decode + prefill across the op | ~30 s | ~95 s |
+| Left inside the 108 s allowance | **~78 s** | **~13 s** |
+| Must still cover | VALIDATE (pytest), Iron Gate, SemanticGuardian, **and any retry** | same |
+
+13 s does not cover a pytest run, let alone a retry. The dense model does not
+merely run slower — **it cannot absorb a single rejection inside a BACKGROUND
+budget.**
+
+> **Benchmark caution.** Qwen3.8-27B's 163/164 HumanEval is close to
+> irrelevant here: HumanEval measures single-function synthesis from a
+> docstring, and O+V never does that. It does multi-round, tool-driven,
+> multi-file repo edits behind five rejection gates. Different skill,
+> different bottleneck.
+
+What the dense model retains: better per-response quality, and a **vision
+encoder**. The latter matters less than it appears — VisionSensor's Tier 2
+already uses Qwen3-VL-235B, so local vision is not on the coding model's
+critical path. It stays on disk for that work, at the cost of a swap.
+
+#### 31.8.3 Two machines, two kinds of setting
+
+`deploy/local_tier_windows.env` is the single activation artifact, and it is
+explicit about a distinction that is easy to get wrong:
+
+* **`OLLAMA_*` are read by `ollama serve` ON THE WINDOWS HOST.** JARVIS cannot
+  set them remotely, and sourcing the profile on the Mac does not apply them.
+  `OLLAMA_KEEP_ALIVE=-1` (never evict), `OLLAMA_MAX_LOADED_MODELS=1`
+  (co-residency is impossible anyway: 19 + 17.8 = 36.8 GB against 32 GB before
+  KV, so pinning it makes eviction deterministic rather than emergent), and
+  `OLLAMA_KV_CACHE_TYPE=q8_0` (Qwen3.8-27B's ~62.5 KiB/token means a full
+  262 K context is ~16.4 GiB at fp16 and does **not** fit alongside weights;
+  q8 roughly halves it and the native window fits).
+* **`JARVIS_*` are read where the orchestration runs**, normally the Mac.
+
+Client-side keep-alive needed **no new code**: `LocalConfig.keep_alive_seconds`
+already flows into the request body as ollama's `keep_alive`, and `-1` survives
+parsing verbatim. The one hazard is that the same value also feeds the aiohttp
+connector; `max(30, keep_alive_seconds)` is what stops one env var from meaning
+two incompatible things, and is pinned by test.
+
+#### 31.8.4 The pre-flight warm-swap protocol
+
+**The failure it prevents.** Ollama loads a model on first use. If the resident
+model is the 30B coder and an op requests the 27B, that request pays a cold
+load **inside its own generation window** — a window calibrated for generation,
+not for PCIe transfer. The op then dies on a deadline that says nothing about
+the model's speed, which is the most misleading failure this tier can produce.
+
+So residency is verified and repaired as an explicit handshake **before the
+op's clock starts**, against a budget of its own
+(`JARVIS_GATEWAY_WARM_SWAP_BUDGET_S`, default 180 s) rather than the route's.
+
+Four design points, each rejecting an easier answer:
+
+1. **`/api/ps`, not `/api/tags`.** Tags answers "what is installed"; ps answers
+   "what is loaded". The former is already memoised elsewhere in this codebase
+   and would answer the wrong question — a model can be installed and not
+   resident, which is exactly the case a swap exists to handle.
+2. **`None` is not `()`.** A server that does not implement `/api/ps` (vLLM, an
+   older ollama) returns unknowable. Reading that as "nothing is loaded" would
+   make every op trigger a needless swap. Empty tuple means the endpoint
+   answered and genuinely holds nothing. *Live-verified against a real ollama:
+   `()` before any load, `('qwen2.5-coder:3b',)` after, `None` when
+   unreachable.*
+3. **Tag-tolerant matching.** `qwen3-coder:30b` and
+   `qwen3-coder:30b-instruct-q4_K_M` are the same weights to an operator and
+   different strings to a registry; a bare name reports as `:latest`. An
+   over-strict comparison burns a cold load to load what is already loaded.
+4. **The swap runs OUTSIDE the failure classifier.** A slow cold load is not a
+   host fault, and counting it would open the breaker on a healthy machine that
+   was merely loading. Pinned structurally by AST test.
+
+It composes the EXISTING `LocalPrimeClient.warmup()` — which already forces
+weights into VRAM under a dedicated cold-start HTTP context — rather than
+adding a second cold-load path.
+
+#### 31.8.5 What was NOT built, and why
+
+Three of this arc's four requirements turned out to be satisfiable by existing
+machinery, and building them again would have created second authorities:
+
+| Requirement | Already existed |
+|---|---|
+| Streaming inter-token timeout | `LocalPrimeClient._complete_streaming` + `InterTokenStall` — the gateway only had to **arm** it (`stream=True`) on the remote path |
+| Model residency forcing | `LocalPrimeClient.warmup(timeout_s=)` |
+| Client-side keep-alive | `LocalConfig.keep_alive_seconds` → request body |
+| Local triage fallback | `InferenceGateway._local_target()`, one builder, DRY-pinned |
+
+The genuinely new surface is small: a bounded `/api/ps` probe, a tag-tolerant
+match, a TTL'd residency cache, and the decision to spend a swap budget
+outside the op clock.
+
+**Regression spine:** 26 tests in `tests/governance/test_local_tier_profile.py`,
+including a structural pin that **every `JARVIS_*` setting in the profile is
+read by code** — a profile documenting a knob nothing consults is the same
+defect class as a capability with no caller.
+
+#### 31.8.6 The streaming handshake and the closed telemetry loop *(2026-08-18)*
+
+The final phase found **two defects that only became reachable once the bridge
+forced the streaming path**, and one requirement that was already satisfied.
+
+**Already closed:** the telemetry loop. `_complete_streaming` records
+`ttft/total/output_tokens` into the injected profiler on a clean finish, the
+gateway binds each target a profiler keyed by
+`physics_key(cfg, endpoint=...)`, and the governor profiles the ACTIVE target.
+Remote measurements therefore already reached the lane calculation. Nothing to
+build; the loop was closed by the hardware-signature work.
+
+**Defect 1 — one constant for two different physics.** The watchdog applied a
+single 30s budget to BOTH waits:
+
+| wait | what it measures | 30s is... |
+|---|---|---|
+| before the first chunk | **prefill** — grows with prompt size | too TIGHT: a 64K prompt whose first byte legitimately takes 40s is declared "wedged" while working normally |
+| between chunks | **inter-token gap** — roughly constant | too LOOSE: at 220 tok/s the normal gap is ~4.5ms, so a wedged peer gets ~6,600 normal gaps before anyone notices |
+
+`LatencyProfiler.inter_token_budget_s()` now returns **two** deadlines derived
+from measured TTFT and per-token cost, with directional clamps that make the
+change strictly safe:
+
+* the **first-token** deadline may only ever be **looser** than the legacy
+  value (prefill is the one wait that legitimately grows);
+* the **steady-state** deadline may only ever be **tighter** (it may detect a
+  wedge sooner, never later), and is floored so ordinary LAN jitter and
+  server-side chunk batching are not mistaken for a stopped peer — a false
+  positive aborts a real generation.
+
+Measured on this host: cold → `(30.0, 30.0)` (byte-identical legacy); a fast
+host → `(30.0, 2.0)`; a slow host with heavy prefill → `(108.0, 3.72)`. Every
+term is env-tunable; no network parameter is a literal in the decision path.
+
+**Defect 2 — a stall taught the ledger nothing.** `record()` fires only on a
+clean finish, and `record_timeout_penalty` was called only from the
+NON-streaming path. So a remote that wedged every op kept its optimistic EWMA
+forever, and the ThroughputGovernor kept sizing lanes for a machine that was
+actively failing — **a wrong answer derived from stale-but-honest data, which
+is the hardest kind to notice.** The streaming path now penalises the ledger
+before raising, through the existing asymmetric-escalation seam.
+
+> **A nuance worth stating rather than assuming.** `adaptive_timeout_ms` has
+> two branches, and the survival/CPU branch (no negotiated `num_ctx`) is
+> explicitly "byte-identical legacy — no EWMA escalation". So the penalty is
+> recorded there but not consulted. That is fortunate rather than accidental
+> for this work: the LAN bridge negotiates `num_ctx`, so **the host whose
+> stalls must move the estimate is exactly the host whose branch reads it.**
+> Measured: 16,580 ms → 135,000 ms with `num_ctx` set, unchanged without.
+> Pinned by test so a future edit to either branch confronts the asymmetry.
+
+**The degradation event** reuses `provider_state_changed` — already this
+codebase's DEGRADED↔HEALTHY signal — rather than minting a type. New SSE types
+must be added to the canonical `_VALID_EVENT_TYPES` frozenset or they are
+**silently dropped**, so inventing one would have produced a degradation signal
+that degrades silently. It is emitted best-effort AFTER the op has already been
+re-routed locally, so a publish failure cannot turn a handled degradation into
+an unhandled one.
+
+**Error boundaries, end to end.** A remote fault now travels: `InterTokenStall`
+raised inside the client (severing the socket as `async with` unwinds) →
+ledger penalised → classified as INFRASTRUCTURE by the gateway → host health
+recorded → `provider_state_changed` published non-fatally → the op re-dispatched
+to `_local_target()` → and on the next evaluation the governor reads a
+penalised ledger and sizes fewer lanes. The event loop is never blocked and the
+op is never lost.
+
+#### 31.8.7 Live-fire status — what is proven, and what remains *(2026-08-18)*
+
+`scripts/live_fire_local_tier.py` drives the REAL gateway, ledger and governor
+against a real endpoint. There is no separate diagnostic channel: every number
+it prints is read back out of the objects the running system consults, because
+a diagnostic that observes a parallel copy of the state proves nothing about
+the state.
+
+**It found a bug on its first run that 300+ unit tests had not** — see
+§31.8.8. That is the argument for this milestone in one sentence.
+
+##### Proven on real infrastructure (loopback, Apple Silicon)
+
+| Capability | Evidence |
+|---|---|
+| `/api/ps` residency probe | answered in **165 ms**; `()` before load, `('qwen2.5-coder:3b',)` after, `None` unreachable |
+| Autonomous warm-swap handshake | 3b → 7b completed in **25.6 s**, paid OUTSIDE the op clock |
+| Adaptive stall detection | `InterTokenStall` at **2.1 s** against the adaptive 2.0 s deadline — **14× faster** than the static 30 s, against a real socket |
+| Fault classification | `InterTokenStall` → INFRASTRUCTURE; a request fault → not counted |
+| Breaker + recovery | opens after 3 stalls; exactly one probe offered after cooldown |
+| Non-fatal degradation event | `provider_state_changed` published after re-route |
+| Local triage fallback | resolves to the configured model |
+| **Closed telemetry loop** | ledger 0 → 4 → 7 samples under the correct model key; governor `seeded` → **`measured=True`**; deadlines re-derived live to `first=30.0 s / steady=7.7 s` |
+
+##### NOT proven — and the list is short and specific
+
+**Nothing has crossed a LAN.** Every figure above is loopback on a 16 GB M1.
+The remaining work is not more code; it is the same script, unchanged, pointed
+at the Windows host:
+
+| # | What | Blocked on | Command |
+|---|---|---|---|
+| **L1** | LAN reachability + residency of `qwen3-coder:30b` | Windows host powered on, Ollama bound `0.0.0.0`, firewall open on 11434 | `--phase 1 --endpoint http://<WIN-IP>:11434 --model qwen3-coder:30b` |
+| **L2** | Remote telemetry lands under a **remote** hardware signature (`provenance=endpoint`, distinct digest) | L1 | `--phase 2 --rounds 8` |
+| **L3** | Governor sizes **3 lanes** from measured 5090 throughput (the §31.4 prediction) | L2 | read `governor post:` line |
+| **L4** | Warm swap `qwen3-coder:30b` → `qwen3.8:27b` on a 32 GB card with `OLLAMA_MAX_LOADED_MODELS=1` — proving eviction is deterministic, not emergent | L1 | `--phase 1 --swap-model qwen3.8:27b` |
+| **L5** | Real LAN partition (unplug / stop the service) vs. the synthetic wedged peer | L1 | `--phase 3` then physically interrupt |
+| **L6** | Measured KV rate for `qwen3-coder:30b` → `JARVIS_KV_BYTES_PER_TOKEN_BY_MODEL` | L2 | compare `/api/ps` `size_vram` against weight size at two context sizes |
+| **L7** | Unattended soak under `ov` + `BackgroundAgentPool` with the governor live | L3 | existing battle-test harness, `--max-wall-seconds 2400` |
+
+**Two predictions this will falsify or confirm**, both currently estimates
+rather than measurements: `qwen3-coder:30b` at **~220 tok/s** (reported, not
+measured here) and the resulting **3-lane** verdict. The governor replaces both
+on first contact — which is the entire reason it was built as a measurement.
+
+#### 31.8.8 The bug live-fire found — cache identity
+
+`_client_for` cached clients keyed by `base_url` **alone**. But a client is
+bound to a MODEL: its cfg carries `model_name` and its profiler is keyed by a
+`physics_key` that includes the model. So after a warm swap to a second model
+on the same host, every subsequent dispatch got the **first** model's client
+back — the requested model was silently ignored, the op ran on the wrong
+weights, and its telemetry landed under the wrong physics key.
+
+Observed directly: phase 1 swapped to `qwen2.5-coder:7b`, then phase 2
+requested `qwen2.5-coder:3b` and ran four successful generations with real
+latencies — and the 3b ledger entry stayed at **zero** while the 7b entry
+gained exactly four. Nothing raised. Nothing logged. The only visible symptom
+was a telemetry key that stayed empty.
+
+On this deployment that reads as: one vision one-off swaps to the 27B, and
+every BACKGROUND op afterwards quietly runs on it at a third of the
+throughput, blowing route budgets with no error anywhere — while the governor
+sizes lanes from a ledger describing a model the ops are not using.
+
+> **Why the unit tests could not catch it.** Every one of them used a single
+> model per gateway, so the cache key and the model identity were the same
+> thing by construction. The defect needed two models on one host — which is
+> exactly what the deployment does and what a mock does not. **This is the
+> case for live-fire stated as a finding rather than as a principle.**
+
+Fixed by keying on `(base_url, model_name)`; five regression tests pin it,
+including that the cache is still a cache (a client per dispatch would leak a
+session per op) and that two models never share one ledger entry.
+
+### 31.7 Invariants this section adds
+
+1. **A lane count must be derived or declared, never assumed.** A constant in
+   an env var is a measurement someone took once, on a machine that may not be
+   this one.
+2. **Topology and throughput are separate authorities.** Neither may overwrite
+   the other; they compose strictest-wins. A capability that has to defeat an
+   existing authority to function is modelled wrong.
+3. **A clamped estimate is a lower bound and must say so.** Extends the
+   Advisor's blast-provenance rule (§26) to latency.
+4. **Pooled capacity requires a declared or observed sharding capability.**
+   Summing device memory without one authorizes a load that cannot land.
+5. **A reversible constraint must use a reversible mechanism.** A ~30 s
+   reading may hold a worker; only a permanent fact may retire one.
+6. **The local tier is bounded by the route budget, not by VRAM.** A model is
+   admissible when its per-op cost fits the window — see §31.4.1 for the
+   arithmetic that turns this into a purchasing criterion.

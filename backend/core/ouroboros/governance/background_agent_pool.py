@@ -356,6 +356,16 @@ class BackgroundAgentPool:
         # mathematical authority -- lower-ranked writers (env/config/
         # manifest) are silently rejected.
         self._topology_locked: bool = False
+        # worker_id -> the throughput ceiling it last stood down on.
+        # Log-dedup only: without it a held worker emits a line every 2s.
+        # Keyed PER WORKER, not per pool: a single shared key deduped the
+        # second and third workers' identical messages away, so the log said
+        # "Worker 1 standing down" and stayed silent about 2 -- an operator
+        # would read that as one held lane when three were.
+        # Deliberately NOT called "park": in this module ParkRequested /
+        # ParkedOpStore already mean OP-level suspend-and-resume, which is a
+        # different mechanism at a different granularity.
+        self._throughput_hold_lanes: Dict[int, int] = {}
         # PriorityQueue: items are (priority, submission_order, op).
         # Lower priority number = runs first.  Ensures IMMEDIATE ops
         # don't starve BACKGROUND ops when workers free up.
@@ -410,6 +420,54 @@ class BackgroundAgentPool:
         self._resumed_ops: Dict[str, int] = {}
 
     # -- Lifecycle -----------------------------------------------------------
+
+    def _throughput_lane_ceiling(self) -> Optional[int]:
+        """Lanes the LOCAL serving endpoint can actually drive, or None.
+
+        A SECOND, composable ceiling — deliberately not routed through
+        :meth:`set_target_pool_size`. That setter carries the Immutability
+        Lock, under which ``fleet_topology`` is the sole authority; pushing a
+        throughput number through it would either be silently rejected (a
+        no-op exactly where a serving mesh exists) or would have to outrank
+        hardware truth, which it must not.
+
+        The two are different axes and both are real:
+
+          * topology answers HOW MANY LANES EXIST (nodes in the mesh),
+          * throughput answers HOW MANY CAN BE DRIVEN inside the route
+            window (one local GPU serves N concurrent ops SERIALLY, so N
+            lanes multiply each op's wall-clock rather than its output).
+
+        Four nodes can exist while a 16GB M1 drives one. Composing them
+        strictest-wins keeps each authoritative on its own axis.
+
+        Returns None when the governor is off or could not measure — the
+        caller must then leave lane behaviour exactly as it was.
+        NEVER raises.
+        """
+        try:
+            from backend.core.ouroboros.governance.throughput_governor import (  # noqa: PLC0415,E501
+                get_default_governor,
+            )
+            from backend.core.ouroboros.governance.route_budgets import (  # noqa: PLC0415,E501
+                DEFAULT_POOL_ROUTE,
+                route_generation_budget_s,
+            )
+            # DEFAULT_POOL_ROUTE is a KNOWN key, so the resolver always
+            # returns a real window and the default is never reached. It is
+            # passed as 0.0 (not some other attribute) deliberately: a
+            # fallback that reads a field this class does not own would raise,
+            # be swallowed by the except below, and silently make this whole
+            # consult inert -- a wired-but-dead capability.
+            budget_s = route_generation_budget_s(DEFAULT_POOL_ROUTE, 0.0)
+            if budget_s <= 0.0:
+                return None
+            verdict = get_default_governor().evaluate(budget_s=budget_s)
+            if not verdict.governed:
+                return None
+            return max(1, int(verdict.lanes))
+        except Exception:  # noqa: BLE001 — a governor must never break dispatch
+            return None
 
     def set_target_pool_size(self, n: int, *, source: str = "config",
                              lock: bool = False) -> bool:
@@ -1107,6 +1165,31 @@ class BackgroundAgentPool:
                         worker_id, self._target_pool_size,
                     )
                     break
+                # Throughput ceiling: HOLD, never retire. A topology retire
+                # is permanent and correct -- a node either exists or does
+                # not. A throughput ceiling comes from a reading with a
+                # ~30s TTL, so killing a worker on it would make a transient
+                # measurement (a cold model load, a memory spike) an
+                # irreversible decision. Excess lanes therefore wait and
+                # re-check, and grow back for free when physics improves.
+                #
+                # Bounded at 2.0s to match the two waits below, so stop()
+                # still reacts within ~2s. Worker 0 can never park: the
+                # governor floors its verdict at 1 lane, because a zero-lane
+                # pool is a stalled queue -- a worse failure than a slow one.
+                _thr = self._throughput_lane_ceiling()
+                if _thr is not None and worker_id >= _thr:
+                    if self._throughput_hold_lanes.get(worker_id) != _thr:
+                        self._throughput_hold_lanes[worker_id] = _thr
+                        logger.info(
+                            "Worker %d standing down: local throughput drives %d "
+                            "lane(s) inside the route window (topology "
+                            "target=%d) -- resumes if physics improves",
+                            worker_id, _thr, self._target_pool_size,
+                        )
+                    await asyncio.sleep(2.0)
+                    continue
+                self._throughput_hold_lanes.pop(worker_id, None)
                 # HIBERNATION_MODE: block here while paused. Bounded wait so
                 # stop() still reacts within ~2s even if resume() never fires.
                 if not self._unpaused_event.is_set():

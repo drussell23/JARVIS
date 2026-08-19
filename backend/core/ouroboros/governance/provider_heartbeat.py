@@ -277,13 +277,22 @@ def _default_dlq_emit(payload: Any) -> None:
         logger.critical("[AegisConfigDLQ] %s", json.dumps(payload, sort_keys=True))
     except Exception:  # noqa: BLE001
         logger.critical("[AegisConfigDLQ] %r", payload)
-    # Best-effort persisted DLQ entry (reuse the existing intake_dlq surface;
-    # append_dlq serializes a dict envelope via its _to_serializable path).
+    # Persist as a DIAGNOSTIC, not as queued work.
+    #
+    # This used to call `append_dlq`, with the rationale "reuse the existing
+    # intake_dlq surface" — i.e. a replay queue was borrowed as a persistence
+    # surface because it happened to serialize dicts. It accounted for 57 of
+    # the 156 rows found in the production DLQ, and it was not merely untidy:
+    # `replay_dlq` dedups by goal_id, an Aegis config error has none, so a
+    # replay would hand this record to the intake router AS WORK.
+    #
+    # The CRITICAL line above is already the durable floor (WAL -> debug.log
+    # -> GCS flight recorder), so nothing is lost by filing it correctly.
     try:
         from backend.core.ouroboros.governance.intake_dlq import (  # noqa: PLC0415
-            append_dlq,
+            append_diagnostic,
         )
-        append_dlq(payload, reason="aegis_configuration_error")
+        append_diagnostic(payload, reason="aegis_configuration_error")
     except Exception:  # noqa: BLE001 -- the WAL record above is the durable floor
         pass
 

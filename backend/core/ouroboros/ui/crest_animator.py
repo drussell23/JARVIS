@@ -350,6 +350,9 @@ class CrestAnimator:
             plus_lead_deg if plus_lead_deg is not None else _plus_lead_deg_env()
         )
         self._logs: "deque[str]" = deque(maxlen=max(1, int(log_lines)))
+        #: The single live progress line, rendered under the transcript. A
+        #: value, not a history — see `set_progress`.
+        self._progress: str = ""
         self._lock = threading.Lock()
         # The resting emblem — the static crest's OWN raster (full fidelity).
         self._base: Dict[Tuple[int, int], Tuple[int, int, int]] = {}
@@ -512,6 +515,35 @@ class CrestAnimator:
 
     # -- the bottom log partition (thread-safe) --------------------------
 
+    def set_progress(self, line: str) -> None:
+        """Set the ONE live progress line under the boot log. Thread-safe.
+
+        Distinct from `add_log` on purpose. The log deque is a TRANSCRIPT —
+        each entry is an event that happened and must stay. Progress is a
+        GAUGE: one value that supersedes its predecessor, and appending it
+        produced the stack of six identical bars the operator saw.
+
+        No repaint is triggered here. `Live` re-renders `render(phase)` on
+        every frame anyway, so a mutated slot is picked up by the next one —
+        which is precisely why the progress line must live INSIDE this
+        renderable. Written to the terminal directly it lands underneath the
+        Live and is erased by the following frame, which is what made it
+        appear to flicker.
+        """
+        try:
+            with self._lock:
+                self._progress = str(line)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def clear_progress(self) -> None:
+        """Drop the progress line — the boot is over and the gauge is spent."""
+        try:
+            with self._lock:
+                self._progress = ""
+        except Exception:  # noqa: BLE001
+            pass
+
     def add_log(self, line: str) -> None:
         """Append one async boot log to the BOTTOM partition — never touches the
         crest matrix. Thread-safe; never raises."""
@@ -526,11 +558,17 @@ class CrestAnimator:
             from rich.text import Text
             with self._lock:
                 lines = list(self._logs)
+            with self._lock:
+                progress = self._progress
             t = Text()
             for i, ln in enumerate(lines):
                 t.append(ln, style=_LOG_RGB)
-                if i < len(lines) - 1:
+                if i < len(lines) - 1 or progress:
                     t.append("\n")
+            # LAST, and always last: the gauge sits beneath the transcript so
+            # new log entries push it down rather than scrolling past it.
+            if progress:
+                t.append(progress, style=_LOG_RGB)
             return t
         except Exception:  # noqa: BLE001
             return ""
@@ -1029,6 +1067,42 @@ def render_cockpit_header(
         text_rows: List[Any] = [
             ln if not isinstance(ln, str) else Text(ln) for ln in lines
         ]
+        # BOUND EACH IDENTITY ROW TO THE COLUMN IT LIVES IN.
+        #
+        # The rows are appended after the crest and a two-space gutter, and
+        # were previously appended WHOLE. A row longer than the remaining
+        # width therefore wrapped — and a wrapped continuation starts at
+        # column ZERO, i.e. on top of the crest. The capability reason
+        # ("doubleword is out of credit — add credits, or configure a local
+        # lane to keep background work moving") is exactly long enough to do
+        # it, so the nameplate collided with the artwork.
+        #
+        # This function's own docstring already states the principle — it is
+        # "the only place that knows the terminal width", and it degrades
+        # "instead of wrapping into a broken layout" — but applied it only to
+        # the gutter. The same bound belongs on the rows themselves, using the
+        # same arithmetic, which is why it is computed once here rather than
+        # guessed by the caller.
+        #
+        # Truncation over wrapping is deliberate: the header is a NAMEPLATE,
+        # a fixed number of rows beside a fixed-height crest. Letting it grow
+        # would push the layout around every time a provider state changed,
+        # and the full text is always available in the banner below.
+        _text_avail = max(8, int(width) - (
+            mini.cols if (mini is not None and crest_rows) else 0) - 2)
+        _bounded: List[Any] = []
+        for _ln in text_rows:
+            try:
+                # Copy before truncating: `lines` belongs to the caller and is
+                # rebuilt per frame, but mutating a shared Text would make the
+                # first narrow frame permanent.
+                _c = _ln.copy() if hasattr(_ln, "copy") else _ln
+                if hasattr(_c, "truncate"):
+                    _c.truncate(_text_avail, overflow="ellipsis")
+                _bounded.append(_c)
+            except Exception:  # noqa: BLE001 — a bound never breaks the header
+                _bounded.append(_ln)
+        text_rows = _bounded
         # Top-align the text beside the crest (the CC layout) with a
         # 1-row optical inset. Computed from the ORIGINAL text rows, BEFORE a
         # "below" gutter is appended: otherwise arming the audio plane would
