@@ -1067,10 +1067,21 @@ class AttachUI:
     the app so prompt_toolkit repaints on its own schedule.
     """
 
+    #: The caret when no voice plane is in play — the base identity prompt.
+    #: Named once because FOUR things resolve to it: three FSM states, and the
+    #: unknown-state fallback, which must give the same answer as OFFLINE or an
+    #: unrecognised frame would look like a state change. Spelling it four
+    #: times made it four things to keep in step.
+    _BASE_CARET = "ov › "
+    #: The same identity in ASCII, for the append-only degradation. A terminal
+    #: that cannot report a cursor position may equally be one that cannot
+    #: render U+203A, so the degraded path does not borrow the glyph.
+    _ASCII_CARET = "ov > "
+
     _PROMPTS = {
-        "OFFLINE": "ov › ",
-        "UNAVAILABLE": "ov › ",
-        "HELD": "ov › ",
+        "OFFLINE": _BASE_CARET,
+        "UNAVAILABLE": _BASE_CARET,
+        "HELD": _BASE_CARET,
         "LISTENING": "🎙 Karen › ",
         "HEARING": "🎙 Karen (hearing you) › ",
         "THINKING": "💭 Karen (thinking) › ",
@@ -1426,16 +1437,43 @@ class AttachUI:
         the same redraw machinery — no second region, no manual cursor math.
         The bottom toolbar keeps only the static key hints, which genuinely
         do belong under the input."""
+        caret = self.caret()
         if self.append_only:
             # A bare caret. No live region, because there is no way to
             # repaint one without knowing where it is.
-            return "ov > "
-        caret = self._PROMPTS.get(self.audio_state, "ov › ")
+            return caret
         try:
             block = self._live_region()
             return f"{block}\n{caret}" if block else caret
         except Exception:  # noqa: BLE001 — a caret always renders
             return caret
+
+    def caret(self) -> str:
+        """The input caret ALONE — the audio FSM's own observable surface.
+
+        The FSM had no surface of its own: the caret was resolved inline
+        inside :meth:`prompt`, so the only way to ask "what did the state
+        change do?" was to read the whole composed block — pulse, flash,
+        ignition skeleton, deck rows and all. Those move for reasons that have
+        nothing to do with audio, so an FSM assertion written against
+        ``prompt()`` fails whenever the DECK changes, which is exactly what
+        happened when the live region moved above the input line: three
+        ``TestFooterMorphing`` cases had been asserting ``prompt() == "ov › "``
+        and went red for a layout decision they were not testing.
+
+        This is the ONE resolution of state -> caret, and :meth:`prompt`
+        composes it rather than repeating the lookup. That direction matters:
+        a caret re-derived here in parallel with the one ``prompt`` renders
+        would be a second authority, and the operator sees the one downstream.
+
+        Always answers — an unknown state falls back to the base caret, which
+        is deliberately the SAME string ``OFFLINE`` resolves to, so a garbled
+        frame is indistinguishable from idle rather than looking like a new
+        mode nobody can name.
+        """
+        if self.append_only:
+            return self._ASCII_CARET
+        return self._PROMPTS.get(self.audio_state, self._BASE_CARET)
 
     def _live_region(self) -> str:
         """Pulse + (deck | lanes | focused pane) — the block above the caret.

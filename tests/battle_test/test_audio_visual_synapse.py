@@ -252,6 +252,23 @@ class TestFooterMorphing:
         ui.bind_app(session.app)
         return ui, session
 
+    # These three assert `caret()`, not `prompt()`.
+    #
+    # `prompt()` is a COMPOSITION: a live region (pulse, flash, ignition
+    # skeleton, deck rows) above the input line, with the caret last. That
+    # layout is deliberate and has its own tests —
+    # `test_ambient_deck.test_live_region_grows_above_the_caret` ("the caret
+    # must be the LAST line") and
+    # `test_append_only_degradation.test_the_degraded_client_emits_a_bare_caret`
+    # ("the normal prompt is a multi-line block"). Asserting
+    # `prompt() == "ov › "` here contradicted both, and went red the moment the
+    # region moved above the caret — for a layout decision the audio FSM is not
+    # party to.
+    #
+    # The fix is a seam, not a looser assertion: `caret()` is the FSM's own
+    # surface. `test_the_caret_the_fsm_resolves_is_the_one_the_prompt_renders`
+    # below keeps the two from drifting into separate authorities.
+
     async def test_listening_frame_morphs_prompt_without_touching_buffer(self):
         """Mock an incoming ``AUDIO_STATE: LISTENING`` IPC frame; the
         Footer prompt repaints while the active keystroke buffer is
@@ -259,18 +276,21 @@ class TestFooterMorphing:
         from prompt_toolkit.application import create_app_session
         from prompt_toolkit.input.defaults import create_pipe_input
         from prompt_toolkit.output import DummyOutput
+        from backend.core.ouroboros.cli.ov import AttachUI
 
         with create_pipe_input() as pipe:
             with create_app_session(input=pipe, output=DummyOutput()):
                 ui, session = self._session()
                 # Operator mid-keystroke:
                 session.default_buffer.insert_text("deploy the fix")
-                assert ui.prompt() == "ov › "
+                assert ui.caret() == AttachUI._BASE_CARET
                 # The mocked IPC frame lands (exactly what
                 # CockpitAttachClient's read loop dispatches):
                 ui.on_audio_state("LISTENING")
-                assert ui.prompt() == "🎙 Karen › "
+                assert ui.caret() == AttachUI._PROMPTS["LISTENING"]
                 assert "listening" in ui.toolbar()
+                # ...and the morph reached the rendered prompt.
+                assert ui.prompt().splitlines()[-1] == ui.caret()
                 # Keystroke integrity: the buffer was never interrupted.
                 assert session.default_buffer.text == "deploy the fix"
 
@@ -280,16 +300,39 @@ class TestFooterMorphing:
         seen = []
         for state in ("LISTENING", "HEARING", "THINKING", "SPEAKING"):
             ui.on_audio_state(state)
-            seen.append(ui.prompt())
+            seen.append(ui.caret())
         assert len(set(seen)) == 4              # every state is distinct
         ui.on_audio_state("OFFLINE")
-        assert ui.prompt() == "ov › "
+        assert ui.caret() == AttachUI._BASE_CARET
 
     def test_unknown_state_is_inert(self):
+        """An unrecognised frame must be INDISTINGUISHABLE from idle.
+
+        Not merely "some default": the same string OFFLINE resolves to. A
+        distinct fallback caret would render a mode the operator cannot name
+        and no state machine can leave.
+        """
         from backend.core.ouroboros.cli.ov import AttachUI
         ui = AttachUI()
         ui.on_audio_state("QUANTUM")
-        assert ui.prompt() == "ov › "           # graceful: default prompt
+        assert ui.caret() == AttachUI._BASE_CARET
+        assert ui.caret() == AttachUI._PROMPTS["OFFLINE"]
+
+    def test_the_caret_the_fsm_resolves_is_the_one_the_prompt_renders(self):
+        """One authority. `caret()` would be worthless as a surface if
+        `prompt()` re-derived the caret alongside it — the operator sees the
+        downstream one, so a test passing against the upstream one would prove
+        nothing. Holds across every state, and across the append-only
+        degradation where the live region is suppressed entirely.
+        """
+        from backend.core.ouroboros.cli.ov import AttachUI
+        ui = AttachUI()
+        for state in list(AttachUI._PROMPTS) + ["QUANTUM", ""]:
+            ui.on_audio_state(state)
+            assert ui.prompt().splitlines()[-1] == ui.caret(), state
+        ui.degrade_to_append_only()
+        assert ui.prompt() == ui.caret() == AttachUI._ASCII_CARET
+        assert "\n" not in ui.prompt()
 
     def test_invalidate_called_on_morph(self):
         from backend.core.ouroboros.cli.ov import AttachUI

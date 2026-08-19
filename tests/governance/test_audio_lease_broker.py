@@ -559,7 +559,12 @@ class TestFlush:
             assert ui.should_flush_on_input() is ducks
         ui.on_audio_state("HELD")
         assert "held by another terminal" in ui.toolbar()
-        assert ui.prompt() == "ov › "
+        # HELD is a TOOLBAR state, not a caret state: another terminal owns the
+        # voice plane, so this one shows the base caret. Asserted on `caret()`,
+        # the FSM's own surface -- `prompt()` composes the live region (pulse,
+        # deck, ignition skeleton) ABOVE it, so `prompt() == "ov › "` was the
+        # pre-live-region contract and had been red since that layout landed.
+        assert ui.caret() == AttachUI._BASE_CARET
 
 
 # ---------------------------------------------------------------------------
