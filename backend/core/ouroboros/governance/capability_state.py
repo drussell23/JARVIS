@@ -199,24 +199,37 @@ class CapabilityEvaluator:
 
     @staticmethod
     def _read_lanes() -> "tuple":
-        """(dry, provider_name, readable). Reuses the ledger the status line
-        already samples — no new probe, no API call."""
+        """(dry, provider_name, readable) — no new probe, no API call.
+
+        Asks :func:`economic_state.display_liquidity`, the same authority
+        `status_line._sample_liquidity` uses, so the badge and the "⚠ … dry"
+        token cannot disagree about which lane is out.
+
+        This used to walk `runway_exhausted`, which is a ROUTING predicate: it
+        fail-opens once the quota-outage WINDOW lapses, because routing wants a
+        topped-up wallet to resume without manual clearing. The badge inherited
+        that optimism and reported `healthy — lanes viable` over two accounts
+        answering 400 and 402. A lapsed window means time passed, not that
+        anyone paid, so the display keeps such a lane DRY.
+        """
         try:
             from backend.core.ouroboros.governance import (  # noqa: PLC0415
                 provider_liquidity_ledger as pl,
             )
             if not pl.liquidity_ledger_enabled():
                 return (False, "", False)
-            # Same walk `status_line._sample_liquidity` performs, so the
-            # badge and the "⚠ … dry" token can never disagree about WHICH
-            # provider is out. `liquidity()` is per-provider, not a snapshot.
-            name = ""
-            for candidate in sorted((pl._load().get("providers") or {})):
-                if pl.runway_exhausted(candidate):
-                    name = str(candidate)
-                    break
-            dry = bool(name) or bool(pl.any_runway_exhausted())
-            return (dry, name, True)
+            from backend.core.ouroboros.governance.economic_state import (  # noqa: PLC0415,E501
+                display_liquidity,
+            )
+            view = display_liquidity()
+            if not view.get("readable"):
+                return (False, "", False)
+            dry_lanes = view.get("dry") or []
+            # The NAME stays the first dry lane (the badge shows one), while
+            # `dry` is the roster-wide answer — so a half-dry fleet still
+            # reports the specific lane rather than an arbitrary verdict.
+            return (bool(dry_lanes), str(dry_lanes[0]) if dry_lanes else "",
+                    True)
         except Exception:  # noqa: BLE001
             return (False, "", False)
 

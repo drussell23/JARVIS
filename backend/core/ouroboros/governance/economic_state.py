@@ -407,6 +407,135 @@ def economic_view(provider: str, *, now: Optional[float] = None) -> Dict[str, An
         return out
 
 
+def display_liquidity(*, now: Optional[float] = None) -> Dict[str, Any]:
+    """Which lanes are dry FOR DISPLAY — per lane, never blanket. NEVER raises.
+
+    THE PREDICATE THIS REPLACES, AND WHY IT WAS THE WRONG ONE
+    ---------------------------------------------------------
+    Every display consumer asked `provider_liquidity_ledger.runway_exhausted`,
+    which is a ROUTING predicate and fail-opens on purpose: it folds in
+    `quota_exhausted`, and that is `t < quota_exhausted_until` — a WINDOW test.
+    `record_quota_exhaustion` self-heals after the TTL so a topped-up wallet
+    recovers without manual clearing, which is right for routing and wrong for
+    a dashboard. Once the window lapses the predicate answers False, and the
+    cockpit went back to reporting healthy lanes while both accounts sat at
+    zero: Claude answering 400 `credit balance too low`, DoubleWord 402, and
+    the ledger still declaring 5,000,000 tokens remaining from before the money
+    ran out.
+
+    :func:`economic_view` already draws the distinction this needs — see its
+    ``unverified_since``, and its own summary of the rule: *routing keeps its
+    fail-open optimism; the display stops calling it knowledge.* This function
+    is that rule made callable, so the status line, the capability badge and
+    anything else showing money to a human share ONE answer instead of each
+    re-deriving it from a routing primitive.
+
+    A lane is dry for display when EITHER holds:
+
+      * ``state == ECONOMIC`` — inside a live recorded outage. Certain.
+      * ``unverified_since is not None`` — the outage window lapsed and
+        nothing has since proved the wallet was refilled. Time passing is not
+        payment. Reported as dry but ``verified=False``, so a renderer can say
+        "last known dry" rather than asserting a present-tense fact it cannot
+        support.
+
+    RATE_LIMITED is deliberately NOT dry: a clock fixes it, and telling an
+    operator to buy credits they already have is a worse error than silence.
+
+    Returns::
+
+        {"lanes": {name: {"dry", "verified", "state", "reason", "stale_for_s"}},
+         "dry": [...], "funded": [...],           # ordered, lane-specific
+         "any_dry": bool, "all_dry": bool,
+         "readable": bool}                        # False = could not tell
+
+    ``all_dry`` is computed over lanes the ledger actually knows, and is False
+    when it knows none — "no lanes recorded" is ignorance, not insolvency, and
+    must never render as an empty wallet.
+    """
+    out: Dict[str, Any] = {
+        "lanes": {}, "dry": [], "funded": [],
+        "any_dry": False, "all_dry": False, "readable": False,
+        # The ECONOMIC subset, kept apart from `dry` on purpose. A lane can be
+        # unusable for two unrelated reasons and they demand opposite things
+        # of the operator: an economic lane needs money, a rate-limited one
+        # needs a minute. "⚠ dry" is right for both; "unfunded" is right for
+        # only one, and a funding verdict built on the union would tell
+        # someone to buy credits they already have.
+        "economic_dry": [], "all_economic_dry": False,
+    }
+    try:
+        from backend.core.ouroboros.governance.provider_liquidity_ledger import (
+            _load,
+        )
+        # The lane roster is whatever the ledger has SEEN. Never a literal
+        # list: a hardcoded ("anthropic", "doubleword") goes silently wrong
+        # the day a third lane is added, and goes wrong in the direction that
+        # hides an empty account.
+        names = sorted((_load().get("providers") or {}))
+        out["readable"] = True
+        t = float(now if now is not None else time.time())
+        # A SUPERSET of the routing predicate, never a substitute for it.
+        # `runway_exhausted` answers TWO questions at once — is this lane
+        # inside an economic outage window, AND has it declared fewer tokens
+        # than the floor. Swapping it for the economic half alone made a lane
+        # with 500 tokens left render as perfectly healthy, because the money
+        # was fine and only the runway was gone. Display dryness is the UNION:
+        # the economic case (including the lapsed-but-unverified one routing
+        # deliberately forgets) OR the declared token runway.
+        try:
+            from backend.core.ouroboros.governance.provider_liquidity_ledger import (  # noqa: E501
+                runway_exhausted,
+            )
+        except Exception:  # noqa: BLE001
+            runway_exhausted = None  # type: ignore[assignment]
+
+        for name in names:
+            view = economic_view(name, now=t)
+            unverified = view.get("unverified_since")
+            economic_dry = view.get("state") == ECONOMIC or unverified is not None
+            runway_dry = False
+            if runway_exhausted is not None:
+                try:
+                    runway_dry = bool(runway_exhausted(name))
+                except Exception:  # noqa: BLE001
+                    runway_dry = False
+            dry = economic_dry or runway_dry
+            stale_for = None
+            if unverified is not None:
+                try:
+                    stale_for = max(0.0, t - float(unverified))
+                except (TypeError, ValueError):
+                    stale_for = None
+            # WHY the lane is dry, because the two demand different things of
+            # the operator: "economic" sends them to a billing page, "runway"
+            # resolves itself when the window rolls over.
+            kind = "economic" if economic_dry else ("runway" if runway_dry
+                                                    else "")
+            out["lanes"][name] = {
+                "dry": bool(dry),
+                # Certainty, not just polarity. A live outage window and a
+                # declared token count are both MEASURED; a lapsed economic
+                # window is an assumption that nobody paid.
+                "verified": bool(view.get("hard_open")) or runway_dry,
+                "kind": kind,
+                "state": view.get("state"),
+                "reason": view.get("reason") or "",
+                "stale_for_s": stale_for,
+            }
+            (out["dry"] if dry else out["funded"]).append(name)
+            if economic_dry:
+                out["economic_dry"].append(name)
+        out["any_dry"] = bool(out["dry"])
+        out["all_dry"] = bool(names) and not out["funded"]
+        out["all_economic_dry"] = (
+            bool(names) and len(out["economic_dry"]) == len(names))
+        return out
+    except Exception:  # noqa: BLE001
+        logger.debug("[EconomicState] display_liquidity degraded", exc_info=True)
+        return out
+
+
 def blast_radius(*, now: Optional[float] = None) -> Dict[str, Any]:
     """Who absorbs the traffic when a lane is down — and whether they CAN.
 
