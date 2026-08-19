@@ -1343,7 +1343,12 @@ class Slice4bRunner(PhaseRunner):
                     return await _ckpt_mgr.working_tree_content_sha()
 
                 def _g2_dlq_fn(reason):
-                    _g2_dlq.append_dlq({"op_id": ctx.op_id, "phase": "blast_radius"}, reason=reason)
+                    # A phase marker is not work: it carries an id and no
+                    # actionable payload, so it can never be replayed. Filed
+                    # as a diagnostic rather than into the replay queue.
+                    _g2_dlq.append_diagnostic(
+                        {"op_id": ctx.op_id, "phase": "blast_radius"},
+                        reason=reason)
 
                 try:
                     _blast_tok = await acquire_blast_radius_token(

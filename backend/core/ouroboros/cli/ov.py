@@ -762,6 +762,35 @@ def _active_ops_line(ops: Any) -> str:
         f"{body}{suffix}")
 
 
+def _economic_evidence(reason: str, limit: int = 88) -> str:
+    """The human sentence out of a provider's error envelope. NEVER raises.
+
+    Vendors wrap the one useful sentence in transport noise —
+    ``Error code: 400 - {'type': 'error', 'error': {'type': ...,
+    'message': 'Your credit balance is too low…'}}``. Truncating that at 88
+    characters yields the JSON scaffolding and drops the sentence, so the
+    operator reads a type name where the remedy should be. Pull the message
+    out when it is there; fall back to the raw text when it is not.
+    """
+    try:
+        text = str(reason or "").strip()
+        if not text:
+            return ""
+        for marker in ("'message': '", '"message": "'):
+            i = text.find(marker)
+            if i == -1:
+                continue
+            rest = text[i + len(marker):]
+            end = rest.find(marker[-1])
+            msg = (rest[:end] if end > 0 else rest).strip()
+            if msg:
+                text = msg
+                break
+        return text if len(text) <= limit else text[:limit - 1] + "…"
+    except Exception:  # noqa: BLE001
+        return str(reason or "")[:limit]
+
+
 def _liquidity_lines(providers: Any, *, any_exhausted: Any = None,
                      economic: Any = None) -> list:
     """Provider runways, ordered by what an operator needs to act on.
@@ -843,16 +872,77 @@ def _liquidity_lines(providers: Any, *, any_exhausted: Any = None,
     # "Add credits" is also the one remedy in this whole banner the operator
     # can act on immediately, so it leads.
     for provider, detail in sorted((economic or {}).items()):
+        # READ THE SHAPE `economic_view()` ACTUALLY RETURNS.
+        #
+        # This block filtered on `consecutive_economic_failures`, a key that
+        # does not exist in the payload it is given. `economic_view(name)`
+        # returns {state, reason, hard_open, expires_in_s, ...}, so the filter
+        # was always zero and the branch never rendered — for ANY provider,
+        # ever. Verified live: doubleword sat at `state='economic',
+        # hard_open=True, reason='status 402'` while the banner showed only
+        # `liquidity anthropic: 5,000,000 tokens` and said nothing about
+        # credit at all.
+        #
+        # That is the precise defect the comment above this loop describes as
+        # FIXED. The axis was computed, plumbed and then read with the wrong
+        # key, so the cockpit knew the lane was economically dead and had no
+        # way to say it — 20 hours of "maximum displayed health and total
+        # inability to spend" was the symptom, and this was the cause.
+        #
+        # Both shapes are accepted: the counter form in case any caller does
+        # supply it, and the state form the real provider emits.
         try:
+            if not isinstance(detail, dict):
+                continue
             failures = int(detail.get("consecutive_economic_failures") or 0)
+            state = str(detail.get("state") or "").strip().lower()
+            hard_open = bool(detail.get("hard_open"))
+            reason = str(detail.get("reason") or "").strip()
         except Exception:  # noqa: BLE001
-            failures = 0
-        if failures <= 0:
             continue
+        dead = failures > 0 or state == "economic" or hard_open
+        if not dead:
+            # A LAPSED ECONOMIC FLAG IS NOT AN ABSENCE OF ONE.
+            #
+            # `economic_view` degrades a stale verdict to state="unknown" once
+            # its TTL expires without a re-probe — correct, since it must not
+            # assert current knowledge it does not have. But the UI then
+            # dropped the row entirely, which reports "nothing known" when
+            # what is actually known is "last time we looked, this lane was
+            # out of money, and that was N hours ago."
+            #
+            # Observed live: anthropic carried the literal string "Your credit
+            # balance is too low" in `reason`, `stale_clock=True`, and
+            # rendered NOTHING — while the row above it advertised 5,000,000
+            # tokens. The classifier is left authoritative; this only stops a
+            # stale-but-informative verdict from being displayed as silence.
+            if not (detail.get("stale_clock") and reason):
+                continue
+            since = detail.get("unverified_since")
+            try:
+                import time as _t
+                age = f"{max(0.0, (_t.time() - float(since))) / 3600.0:.1f}h"
+            except Exception:  # noqa: BLE001
+                age = "an unknown time"
+            _ev = _economic_evidence(reason, limit=80)
+            lines.append(
+                f"{_glyph('warn', '!')} {provider}: last known OUT OF CREDIT, "
+                f"unverified for {age} ({_ev}) — the flag lapsed on a timer, "
+                f"not on a successful probe"
+            )
+            continue
+        # Prefer the evidence the provider actually gave us over a count it
+        # never reported: "status 402" is more use to an operator than "1
+        # billing refusal(s)".
+        if reason:
+            evidence = _economic_evidence(reason)
+        elif failures > 0:
+            evidence = f"{failures} billing refusal(s)"
+        else:
+            evidence = state or "economically refused"
         lines.append(
             f"{_glyph('warn', '!')} {provider}: OUT OF CREDIT — the lane is "
-            f"economically dead "
-            f"({failures} billing refusal(s)); the token count above is a "
+            f"economically dead ({evidence}); the token count above is a "
             f"RATE LIMIT, not a balance. Add credits to restore it."
         )
 
