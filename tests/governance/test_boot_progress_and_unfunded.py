@@ -288,3 +288,129 @@ class TestTheBarMovesOnAFirstBoot:
         p = bp.Progress(expected_s=None)
         p.observe_log("[AegisPreflight] a\n[CredentialBootstrap] b", now=4.0)
         assert "left" in p.render(6.0)
+
+
+class TestTheScreenOwnerRendersTheGauge:
+    """Six screenshots across six seconds showed the bar absent from every
+    one. A Rich `Live` draws the animated crest and OWNS the terminal during
+    ignition; a carriage-return line written to stdout underneath it is erased
+    by the next frame. The gauge must live inside that Live's renderable.
+    """
+
+    def _anim(self):
+        from backend.core.ouroboros.ui.crest_animator import CrestAnimator
+        a = CrestAnimator(cols=40, rows=20)
+        a.add_log("⏺ no organism awake — igniting one in the background")
+        return a
+
+    def test_the_gauge_is_one_line_that_replaces_itself(self):
+        from backend.core.ouroboros.cli.thin_client import _mk_tick
+        a = self._anim()
+        base = len(a.logs_renderable().plain.split("\n"))
+        tick = _mk_tick(a.add_log, a.set_progress)
+        seen = []
+        # Elapsed values a whole second apart: with no new markers and no
+        # history the ONLY thing that can legitimately change is the clock, so
+        # sub-second ticks would rightly render an identical line. Asserting
+        # change there would demand motion the data does not support — the
+        # thing this whole indicator refuses to do.
+        for e in (0.0, 1.2, 2.4, 3.6):
+            tick(e)
+            lines = a.logs_renderable().plain.split("\n")
+            assert len(lines) == base + 1     # exactly ONE extra, always
+            seen.append(lines[-1])
+        assert len(set(seen)) > 1             # and it changes
+
+    def test_progress_is_not_appended_to_the_transcript(self):
+        """`add_log` is a TRANSCRIPT — entries are events that happened and
+        must stay. A gauge appended to it produced six stacked bars."""
+        from backend.core.ouroboros.cli.thin_client import _mk_tick
+        a = self._anim()
+        tick = _mk_tick(a.add_log, a.set_progress)
+        for e in (0.0, 0.3, 0.6, 0.9, 1.2):
+            tick(e)
+        a.clear_progress()
+        assert len(a.logs_renderable().plain.split("\n")) == 1
+
+    def test_clearing_the_gauge_leaves_the_transcript(self):
+        a = self._anim()
+        a.set_progress("⎿ [██····] 20% x")
+        assert "20%" in a.logs_renderable().plain
+        a.clear_progress()
+        assert "20%" not in a.logs_renderable().plain
+        assert "no organism awake" in a.logs_renderable().plain
+
+    def test_the_owner_takes_priority_over_raw_stdout(self):
+        """With an owner present the tick must NOT touch the terminal."""
+        import io as _io
+        import sys as _sys
+        from backend.core.ouroboros.cli.thin_client import _mk_tick
+
+        class _FakeTTY(_io.StringIO):
+            def isatty(self):
+                return True
+
+        a = self._anim()
+        real = _sys.__stdout__
+        _sys.__stdout__ = _FakeTTY()
+        try:
+            tick = _mk_tick(a.add_log, a.set_progress)
+            for e in (0.0, 0.3, 0.6):
+                tick(e)
+            wrote = _sys.__stdout__.getvalue()
+        finally:
+            _sys.__stdout__ = real
+        assert wrote == ""                    # nothing written under the Live
+
+
+class TestTheLogAnchor:
+    def test_a_previous_boots_markers_do_not_count(self):
+        """The daemon log is APPEND-ONLY ACROSS RUNS. Read unanchored, its
+        tail already contains every marker from every previous boot, so a
+        fresh wait matched all seven stages on its first poll and rendered
+        97% — complete before the work began."""
+        import os
+        import tempfile
+        d = tempfile.mkdtemp()
+        log = os.path.join(d, "ov.log")
+        with open(log, "w") as fh:
+            for st in bp.DEFAULT_STAGES:
+                fh.write(st.marker + " (previous boot)\n")
+        p = bp.make_progress(log)             # anchors at current size
+        p.observe_log(bp.read_log_tail(log, since=p.log_origin), now=1.0)
+        assert p._reached == 0
+        assert p.fraction(1.0) is None        # nothing known yet
+
+    def test_this_boots_markers_do_count(self):
+        import os
+        import tempfile
+        d = tempfile.mkdtemp()
+        log = os.path.join(d, "ov.log")
+        open(log, "w").write("old noise\n")
+        p = bp.make_progress(log)
+        with open(log, "a") as fh:
+            fh.write(bp.DEFAULT_STAGES[0].marker + " now\n")
+        p.observe_log(bp.read_log_tail(log, since=p.log_origin), now=1.0)
+        assert p._reached == 1
+
+    def test_a_missing_log_is_not_an_error(self):
+        assert bp.read_log_tail("/nonexistent/ov.log", since=0) == ""
+        assert bp.log_size("/nonexistent/ov.log") == 0
+
+
+class TestOnlyRealBootsAreRecorded:
+    def test_attach_latency_is_not_a_boot_duration(self):
+        """`await_socket` has four callers and three are "already up — confirm
+        and attach", ~0.1s. Recording those gave a median of 0.22s, so the bar
+        hit 97% on its first frame. Attach latency and boot duration are
+        different quantities."""
+        import inspect
+        from backend.core.ouroboros.cli import thin_client
+        sig = inspect.signature(thin_client._finish_tick)
+        assert sig.parameters["record"].default is False
+
+    def test_only_the_spawning_branch_asks_to_record(self):
+        import inspect
+        from backend.core.ouroboros.cli import thin_client
+        src = inspect.getsource(thin_client.ensure_daemon)
+        assert src.count("record_boot=True") == 1

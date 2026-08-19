@@ -4757,7 +4757,18 @@ def _run_cockpit_thin_inner(console: Any, alt_screen_active: bool) -> int:
 
             async def _boot() -> None:
                 try:
-                    _ok["v"] = await ensure_daemon(on_status=_status)
+                    # THE SCREEN OWNER RENDERS THE GAUGE.
+                    #
+                    # `_status` appends to the boot transcript, which is right
+                    # for events and wrong for progress — appending a gauge is
+                    # what produced six stacked bars. `set_progress` is a
+                    # single slot inside the same Live renderable, so it
+                    # updates in place and cannot be erased by the next crest
+                    # frame the way a raw stdout write was.
+                    _ok["v"] = await ensure_daemon(
+                        on_status=_status,
+                        on_progress=_animator.set_progress,
+                    )
                 finally:
                     _stop.set()
 

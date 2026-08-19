@@ -192,6 +192,9 @@ class Progress:
     stages: Tuple[BootStage, ...] = DEFAULT_STAGES
     log_path: str = ""
     expected_s: Optional[float] = None
+    #: Log size when this wait began. Everything before it belongs to a
+    #: PREVIOUS boot and must not count toward this one.
+    log_origin: int = 0
     _reached: int = 0
     _high_water: float = 0.0
     _last_stage_at: float = 0.0
@@ -329,25 +332,49 @@ class Progress:
             return f"waking · {int(elapsed)}s"
 
 
-def read_log_tail(path: str, *, max_bytes: int = 65536) -> str:
-    """Last *max_bytes* of the daemon log, or "". NEVER raises.
+def log_size(path: str) -> int:
+    """Current size of the daemon log, or 0. NEVER raises."""
+    try:
+        return os.path.getsize(path) if path and os.path.exists(path) else 0
+    except Exception:  # noqa: BLE001
+        return 0
 
-    Bounded because the log reaches tens of megabytes; a boot's markers are
-    always in the tail, and reading the whole file every poll would make the
-    progress indicator the slowest thing in the boot.
+
+def read_log_tail(path: str, *, since: int = 0, max_bytes: int = 65536) -> str:
+    """Log bytes written AFTER *since*, capped at *max_bytes*. NEVER raises.
+
+    `since` is load-bearing, not an optimisation. The daemon log is APPEND-ONLY
+    ACROSS RUNS, so its tail already contains every boot marker from every
+    previous boot. Reading it unanchored made a fresh wait match all seven
+    stages on its first poll and render 97% instantly — a bar that is
+    complete before the work starts, which is worse than no bar at all.
+    Anchoring at the size observed when the wait began means only THIS boot's
+    output can advance it.
+
+    Still bounded: the log reaches tens of megabytes, and reading it whole on
+    every poll would make the progress indicator the slowest thing in the boot.
     """
     try:
         if not path or not os.path.exists(path):
             return ""
         size = os.path.getsize(path)
+        start = max(0, int(since))
+        if size <= start:
+            return ""                      # nothing new since the wait began
+        start = max(start, size - max_bytes)
         with open(path, "rb") as fh:
-            if size > max_bytes:
-                fh.seek(size - max_bytes)
+            fh.seek(start)
             return fh.read().decode("utf-8", "replace")
     except Exception:  # noqa: BLE001
         return ""
 
 
 def make_progress(log_path: str = "") -> Progress:
-    """A Progress primed with this machine's measured boot history."""
-    return Progress(log_path=log_path, expected_s=expected_boot_s())
+    """A Progress primed with this machine's history AND anchored to now.
+
+    The anchor is taken at construction, which is the moment the wait starts —
+    any later and markers from the boot's own first milliseconds would be
+    skipped; any earlier and the previous boot's tail would be counted.
+    """
+    return Progress(log_path=log_path, expected_s=expected_boot_s(),
+                    log_origin=log_size(log_path))

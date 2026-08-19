@@ -475,6 +475,8 @@ async def await_socket(
     on_tick: Optional[Callable[[float], None]] = None,
     deadline_s: Optional[float] = None,
     child_poll: Optional[Callable[[], Optional[int]]] = None,
+    on_progress: Optional[Callable[[str], None]] = None,
+    record_boot: bool = False,
 ) -> bool:
     """Wait (bounded) for the daemon's bridge to genuinely SERVE — each
     re-probe is the deep application handshake (``probe_socket(deep=True)``),
@@ -508,7 +510,9 @@ async def await_socket(
                 # one seam, so a future wait branch cannot forget to clear the
                 # in-place line or to record the measurement.
                 if on_tick is not None:
-                    _finish_tick(time.monotonic() - start, live=True)
+                    _finish_tick(time.monotonic() - start, live=True,
+                                 on_progress=on_progress,
+                                 record=record_boot)
                 return True
             if child_poll is not None:
                 try:
@@ -521,7 +525,9 @@ async def await_socket(
                         ) == "live"
                         if on_tick is not None:
                             _finish_tick(time.monotonic() - start,
-                                         live=_dead_live)
+                                         live=_dead_live,
+                                         on_progress=on_progress,
+                                         record=record_boot)
                         return _dead_live
                 except Exception:  # noqa: BLE001
                     pass
@@ -539,7 +545,8 @@ async def await_socket(
         if on_tick is not None:
             # Deadline reached without a live socket. The line is cleared, but
             # NOTHING is recorded: an abandoned boot has no duration.
-            _finish_tick(time.monotonic() - start, live=False)
+            _finish_tick(time.monotonic() - start, live=False,
+                         on_progress=on_progress)
         return False
     except asyncio.CancelledError:
         raise
@@ -560,7 +567,9 @@ def _live_incumbent() -> Optional[int]:
         return None
 
 
-def _mk_tick(say: Callable[[str], None]) -> Callable[[float], None]:
+def _mk_tick(say: Callable[[str], None],
+             on_progress: Optional[Callable[[str], None]] = None,
+             ) -> Callable[[float], None]:
     """The waking indicator — one builder for every wait branch.
 
     Replaces a fresh `organism waking · Ns` line every five seconds, which
@@ -578,6 +587,17 @@ def _mk_tick(say: Callable[[str], None]) -> Callable[[float], None]:
     """
     last = [-1e9]
     started = [time.monotonic()]
+    # RENDER THROUGH WHOEVER OWNS THE SCREEN.
+    #
+    # During ignition a Rich `Live` draws the animated crest and owns the
+    # terminal. Writing a carriage-return line to stdout underneath it is
+    # erased by the very next frame — six screenshots taken across six
+    # seconds showed the bar absent from every one, which the operator
+    # correctly described as flickering. `on_progress` hands the line to that
+    # owner instead, as a VALUE it renders, and the Live picks it up on its
+    # next repaint. Direct terminal writing is reserved for the case where
+    # nothing else owns the screen.
+    #
     # `real_stdout_isatty`, NOT `sys.stdout.isatty()`.
     #
     # prompt_toolkit's `patch_stdout` replaces sys.stdout with a non-TTY
@@ -605,8 +625,10 @@ def _mk_tick(say: Callable[[str], None]) -> Callable[[float], None]:
         _bp, enabled, prog = None, False, None
 
     # A TTY can be redrawn ~4x/s without flicker; a transcript should not gain
-    # a line that often, so the two cadences differ on purpose.
-    cadence = 0.25 if (interactive and enabled) else 5.0
+    # a line that often, so the two cadences differ on purpose. A screen owner
+    # takes the fast cadence too — it is repainting anyway.
+    live_owner = on_progress is not None
+    cadence = 0.25 if ((interactive or live_owner) and enabled) else 5.0
     width = [0]
 
     def _tick(elapsed: float) -> None:
@@ -617,12 +639,19 @@ def _mk_tick(say: Callable[[str], None]) -> Callable[[float], None]:
             say(f"⎿ organism waking · {int(elapsed)}s")
             return
         try:
-            prog.observe_log(_bp.read_log_tail(prog.log_path),
-                             now=time.monotonic() - started[0])
+            prog.observe_log(
+                _bp.read_log_tail(prog.log_path, since=prog.log_origin),
+                now=time.monotonic() - started[0])
             body = prog.render(elapsed)
         except Exception:  # noqa: BLE001
             body = f"waking · {int(elapsed)}s"
         line = f"⎿ {body}"
+        if live_owner:
+            try:
+                on_progress(line)     # a value for the owner to render
+                return
+            except Exception:  # noqa: BLE001
+                pass                  # fall through to the plain paths
         if not interactive:
             say(line)
             return
@@ -645,13 +674,30 @@ def _mk_tick(say: Callable[[str], None]) -> Callable[[float], None]:
     return _tick
 
 
-def _finish_tick(elapsed: float, *, live: bool) -> None:
-    """Close the in-place line and record a SUCCESSFUL boot. NEVER raises.
+def _finish_tick(elapsed: float, *, live: bool,
+                 on_progress: Optional[Callable[[str], None]] = None,
+                 record: bool = False) -> None:
+    """Close the progress surface, and record ONLY a genuine cold boot.
 
-    Only a live socket is recorded: a boot that failed or was abandoned has no
-    duration, and folding one in would teach the estimator that boots take as
-    long as the operator's patience — the very number it exists to replace.
+    `record` defaults False, and that default is the fix for a real defect.
+    `await_socket` has four callers and three of them are "an organism is
+    already up — confirm and attach", which completes in ~0.1s. Recording
+    those as boot durations poisoned the estimator: the observed history read
+    [0.10, 0.22, 0.10, 0.22, 0.10, 0.23, 72.05, 0.10, 0.22] with a median of
+    0.22s, so any elapsed time instantly exceeded the expected total and the
+    bar rendered 97% on its first frame — complete before the work began.
+
+    Attach latency and boot duration are different quantities. Only the
+    caller that actually spawned a daemon knows which it just measured, so
+    only that caller asks for the sample to be kept.
     """
+    # Clear the owner's gauge first: it renders inside the Live, so wiping
+    # the raw terminal would not touch it.
+    if on_progress is not None:
+        try:
+            on_progress("")
+        except Exception:  # noqa: BLE001
+            pass
     try:
         from backend.core.ouroboros.battle_test.presentation_restraint import (
             real_stdout_isatty as _rti,
@@ -666,7 +712,7 @@ def _finish_tick(elapsed: float, *, live: bool) -> None:
             out.flush()
     except Exception:  # noqa: BLE001
         pass
-    if not live:
+    if not (live and record):
         return
     try:
         from backend.core.ouroboros.cli import boot_progress as _bp
@@ -688,7 +734,10 @@ def _ignition_retry_budget_s() -> float:
         return 20.0
 
 
-async def _await_ignition_window(path: Any, *, say: Any) -> bool:
+async def _await_ignition_window(
+    path: Any, *, say: Any,
+    on_progress: Optional[Callable[[str], None]] = None,
+) -> bool:
     """Wait out a transient lock refusal. True iff an organism is now serving.
 
     Races the two ways the window closes — the incumbent starts serving, or it
@@ -715,7 +764,8 @@ async def _await_ignition_window(path: Any, *, say: Any) -> bool:
             if _live_incumbent() is None:
                 proc = spawn_daemon()
                 if proc is not None and await await_socket(
-                    path, on_tick=_mk_tick(say),
+                    path, on_tick=_mk_tick(say, on_progress),
+                    on_progress=on_progress,
                     child_poll=getattr(proc, "poll", None),
                 ):
                     say("⏺ organism live — attaching")
@@ -734,6 +784,7 @@ async def ensure_daemon(
     *,
     on_status: Optional[Callable[[str], None]] = None,
     spawner: Callable[..., Any] = subprocess.Popen,
+    on_progress: Optional[Callable[[str], None]] = None,
 ) -> bool:
     """The full zero-trust route: probe → (clean ghost) → (cold boot)
     → wait-for-live. True when a live daemon is reachable. NEVER
@@ -781,7 +832,8 @@ async def ensure_daemon(
                 # A daemon is home but boot-starved — its socket must NOT be
                 # cleaned and no second ignition raced. Wait for it to serve.
                 _say("⏺ organism already waking — waiting for it to serve")
-                if await await_socket(path, on_tick=_mk_tick(_say)):
+                if await await_socket(path, on_tick=_mk_tick(_say, on_progress),
+                                      on_progress=on_progress):
                     _say("⏺ organism live — attaching")
                     return True
                 _say(
@@ -801,7 +853,8 @@ async def ensure_daemon(
                     f"⏺ organism (PID {incumbent}) is alive but not "
                     "serving — waiting, never cleaning a live socket"
                 )
-                if await await_socket(path, on_tick=_mk_tick(_say)):
+                if await await_socket(path, on_tick=_mk_tick(_say, on_progress),
+                                      on_progress=on_progress):
                     _say("⏺ organism live — attaching")
                     return True
                 _say(
@@ -819,8 +872,10 @@ async def ensure_daemon(
             return False
 
         if await await_socket(
-            path, on_tick=_mk_tick(_say),
+            path, on_tick=_mk_tick(_say, on_progress),
             child_poll=getattr(proc, "poll", None),
+            on_progress=on_progress,
+            record_boot=True,   # this branch SPAWNED — it is a real boot
         ):
             _say("⏺ organism live — attaching")
             return True
@@ -845,7 +900,8 @@ async def ensure_daemon(
             # legitimately: the incumbent finishes booting and starts SERVING
             # (attach to it — there was never anything wrong), or it finishes
             # DYING and releases the lock (ignite again).
-            if await _await_ignition_window(path, say=_say):
+            if await _await_ignition_window(path, say=_say,
+                                            on_progress=on_progress):
                 return True
             incumbent = _live_incumbent()
             who = f"PID {incumbent}" if incumbent else "another process"
