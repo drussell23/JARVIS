@@ -504,6 +504,11 @@ async def await_socket(
         while (time.monotonic() - start) < deadline:
             bound = min(3.0, max(_probe_timeout_s(), delay))
             if await probe_socket(path, timeout=bound, deep=True) == "live":
+                # Closed HERE rather than at each of the four call sites —
+                # one seam, so a future wait branch cannot forget to clear the
+                # in-place line or to record the measurement.
+                if on_tick is not None:
+                    _finish_tick(time.monotonic() - start, live=True)
                 return True
             if child_poll is not None:
                 try:
@@ -511,9 +516,13 @@ async def await_socket(
                         # The ignited daemon is DEAD. One last escalated
                         # probe (an incumbent may serve this same path),
                         # then stop — the caller reads the exit code.
-                        return await probe_socket(
+                        _dead_live = await probe_socket(
                             path, timeout=3.0, deep=True,
                         ) == "live"
+                        if on_tick is not None:
+                            _finish_tick(time.monotonic() - start,
+                                         live=_dead_live)
+                        return _dead_live
                 except Exception:  # noqa: BLE001
                     pass
             if on_tick is not None:
@@ -527,6 +536,10 @@ async def await_socket(
             sleep_for = min(random.uniform(_backoff_min_s(), delay), remaining)
             await asyncio.sleep(sleep_for)
             delay = min(delay * 2, ceiling)
+        if on_tick is not None:
+            # Deadline reached without a live socket. The line is cleared, but
+            # NOTHING is recorded: an abandoned boot has no duration.
+            _finish_tick(time.monotonic() - start, live=False)
         return False
     except asyncio.CancelledError:
         raise
@@ -548,16 +561,90 @@ def _live_incumbent() -> Optional[int]:
 
 
 def _mk_tick(say: Callable[[str], None]) -> Callable[[float], None]:
-    """The waking breadcrumb (≥5s cadence) — one builder for every
-    wait branch."""
-    last = [-10.0]
+    """The waking indicator — one builder for every wait branch.
+
+    Replaces a fresh `organism waking · Ns` line every five seconds, which
+    said only that time was passing and read as a stall by virtue of
+    repeating. The line now carries the STAGE the boot has actually reached
+    (parsed from the daemon's own log, which is already being written and
+    whose path this module already knows) and a completion estimate drawn
+    from this machine's measured boot history.
+
+    IN-PLACE ON A TTY, APPEND OTHERWISE. A carriage return redraws one line
+    for a human; written into a pipe or a log file it produces a single
+    unreadable smear, so a non-TTY keeps the old cadence and the old shape.
+    The wait must not become less legible in the transcript to become prettier
+    on screen.
+    """
+    last = [-1e9]
+    started = [time.monotonic()]
+    interactive = False
+    try:
+        interactive = bool(sys.stdout.isatty())
+    except Exception:  # noqa: BLE001
+        interactive = False
+    try:
+        from backend.core.ouroboros.cli import boot_progress as _bp
+        enabled = _bp.boot_progress_enabled()
+        prog = _bp.make_progress(str(daemon_log_path())) if enabled else None
+    except Exception:  # noqa: BLE001
+        _bp, enabled, prog = None, False, None
+
+    # A TTY can be redrawn ~4x/s without flicker; a transcript should not gain
+    # a line that often, so the two cadences differ on purpose.
+    cadence = 0.25 if (interactive and enabled) else 5.0
+    width = [0]
 
     def _tick(elapsed: float) -> None:
-        if elapsed - last[0] >= 5.0:
-            last[0] = elapsed
+        if elapsed - last[0] < cadence:
+            return
+        last[0] = elapsed
+        if prog is None or _bp is None:
             say(f"⎿ organism waking · {int(elapsed)}s")
+            return
+        try:
+            prog.observe_log(_bp.read_log_tail(prog.log_path),
+                             now=time.monotonic() - started[0])
+            body = prog.render(elapsed)
+        except Exception:  # noqa: BLE001
+            body = f"waking · {int(elapsed)}s"
+        line = f"⎿ {body}"
+        if not interactive:
+            say(line)
+            return
+        try:
+            # Pad to the previous width so a shrinking line cannot leave the
+            # tail of the longer one behind it.
+            pad = max(0, width[0] - len(line))
+            width[0] = len(line)
+            sys.stdout.write("\r" + line + (" " * pad))
+            sys.stdout.flush()
+        except Exception:  # noqa: BLE001
+            say(line)
 
     return _tick
+
+
+def _finish_tick(elapsed: float, *, live: bool) -> None:
+    """Close the in-place line and record a SUCCESSFUL boot. NEVER raises.
+
+    Only a live socket is recorded: a boot that failed or was abandoned has no
+    duration, and folding one in would teach the estimator that boots take as
+    long as the operator's patience — the very number it exists to replace.
+    """
+    try:
+        if sys.stdout.isatty():
+            sys.stdout.write("\r" + " " * 100 + "\r")
+            sys.stdout.flush()
+    except Exception:  # noqa: BLE001
+        pass
+    if not live:
+        return
+    try:
+        from backend.core.ouroboros.cli import boot_progress as _bp
+        _bp.record_boot_duration(elapsed)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _ignition_retry_budget_s() -> float:

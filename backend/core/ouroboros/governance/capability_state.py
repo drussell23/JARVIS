@@ -110,11 +110,24 @@ class Capability(str, enum.Enum):
     HEALTHY = "healthy"    # a lane is viable and work has recently completed
     DEGRADED = "degraded"  # work is landing, but failures are present
     BLOCKED = "blocked"    # structurally cannot complete an op right now
+    #: Blocked SPECIFICALLY for want of money. Distinguished from BLOCKED
+    #: because the two demand different things of the operator: "blocked"
+    #: sends them to a log to find out why, "unfunded" names the remedy in
+    #: the word itself. Everything that treats BLOCKED as terminal must treat
+    #: this identically — see `can_work`.
+    UNFUNDED = "unfunded"
     UNKNOWN = "unknown"    # inputs unreadable — renders AS blocked
 
     @property
     def can_work(self) -> bool:
         return self in (Capability.HEALTHY, Capability.DEGRADED)
+
+    @property
+    def is_blocking(self) -> bool:
+        """Terminal for dispatch. UNFUNDED is a REASON, not a lesser state —
+        anything gating on "can this organism act" must include it."""
+        return self in (Capability.BLOCKED, Capability.UNFUNDED,
+                        Capability.UNKNOWN)
 
 
 @dataclass(frozen=True)
@@ -142,6 +155,10 @@ class CapabilityReading:
         state we cannot determine must not be shown as a green dot."""
         return ("blocked" if self.state is Capability.UNKNOWN
                 else self.state.value)
+
+    @property
+    def is_funding_issue(self) -> bool:
+        return self.state is Capability.UNFUNDED
 
     def render(self) -> str:
         return f"[Capability] {self.badge} — {self.reason}"
@@ -348,11 +365,21 @@ class CapabilityEvaluator:
                         f"no runway on {who} — running local on "
                         f"{remote_endpoint or 'the sovereign host'}", False)
             if remote_state == "unreachable":
-                return (Capability.BLOCKED,
-                        f"no runway on {who} and {remote_endpoint} is "
-                        f"unreachable — no lane left", False)
-            return (Capability.BLOCKED,
-                    f"no runway on {who} — cannot dispatch work", False)
+                return (Capability.UNFUNDED,
+                        f"{who} is out of credit and {remote_endpoint} is "
+                        f"unreachable — add credits, or bring the local host "
+                        f"up", False)
+            # THE REASON NAMES THE REMEDY.
+            #
+            # "cannot dispatch work" states the symptom and leaves the
+            # operator to discover the cause; the cause is already in hand.
+            # And the state word is UNFUNDED rather than BLOCKED because
+            # money is the one blocker the organism can never clear itself —
+            # the distinction is precisely what tells the operator this is
+            # theirs to fix.
+            return (Capability.UNFUNDED,
+                    f"{who} is out of credit — add credits, or configure a "
+                    f"local lane to keep background work moving", False)
 
         # 2. An explicit heartbeat failure outranks op history: the ops may
         #    simply not have been attempted yet.

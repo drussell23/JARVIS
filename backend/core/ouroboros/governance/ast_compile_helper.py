@@ -119,6 +119,19 @@ class ParseOutcome(str, enum.Enum):
     TIMEOUT         = "timeout"
     TOO_LARGE       = "too_large"
     INTERNAL_ERROR  = "internal_error"
+    #: Rejected PRE-FLIGHT by shape (minified, binary, absurd line density).
+    #: Distinct from TOO_LARGE, which is about bytes: a 40 KB single-line
+    #: minified bundle is well under any byte cap and still pathological for
+    #: an AST walk. Load-bearing beyond tidiness -- the inline-tiny path runs
+    #: ON THE CALLER'S THREAD and the Oracle's in-process path has no pool, so
+    #: NEITHER can be cancelled by a timeout. For those paths this pre-flight
+    #: refusal is the only protection that exists.
+    PATHOLOGICAL    = "pathological"
+    #: Not attempted because the shared pool was saturated. The file is fine;
+    #: the queue was full. Recorded in the DeferredTaskLedger so the blind
+    #: spot has a name and can be revisited, rather than being an anonymous
+    #: increment of an error counter.
+    SHED            = "shed"
 
 
 class AnalyzeOutcome(str, enum.Enum):
@@ -1002,6 +1015,15 @@ async def _process_pool_parse(
             execution_mode=ExecutionMode.PROCESS,
             error_detail=f"pool dispatch failed: {type(exc).__name__}: {exc}",
         )
+    finally:
+        # Released on EVERY path — success, timeout, cancellation and internal
+        # error alike. A counter that leaks on the failure paths would drift
+        # upward until `_pool_saturated()` returned True forever, converting
+        # a backpressure valve into a permanent outage. The failure paths are
+        # exactly the ones that fire under load, so this is where the leak
+        # would have mattered most.
+        with _inflight_lock:
+            _inflight = max(0, _inflight - 1)
 
     elapsed_ms = (time.monotonic() - t0) * 1000.0
     # Worker returned (outcome_label, payload) tuple. Branch on

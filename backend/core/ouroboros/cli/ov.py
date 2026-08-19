@@ -607,6 +607,33 @@ def _render_hydration(console: Any, payload: dict) -> None:
         # recorded sessions x a headroom multiple) and nothing on screen said
         # so. The derivation already returns its basis; it was being dropped
         # between the spawner and here.
+        # A CEILING IS NOT A BALANCE.
+        #
+        # `$0.00/$0.71` reads as "you have $0.71 to spend". It is not: 0.71 is
+        # a POLICY CEILING derived from past sessions, and when every paid
+        # lane is out of credit the spendable capacity behind it is zero. The
+        # arithmetic was right and the meaning was wrong, which is why the
+        # number "looked inaccurate" — it was describing a limit while the
+        # operator read it as a balance.
+        #
+        # Neither vendor can settle this for us: Anthropic has no balance
+        # endpoint (GET /v1/organizations/balance is a 404 and the feature is
+        # an open request), and Doubleword's inference API answers 404 on
+        # /balance, /credits, /account, /billing and /usage alike. So the
+        # honest move is not to invent a balance but to stop implying one.
+        try:
+            from backend.core.ouroboros.governance.capability_state import (
+                get_default_evaluator as _cap_eval2,
+            )
+            _unfunded = _cap_eval2().evaluate().is_funding_issue
+        except Exception:  # noqa: BLE001
+            _unfunded = False
+        if _unfunded and budget:
+            console.print(
+                _T(f"{_glyph('warn', '!')} the ${budget:.2f} ceiling is a "
+                   f"POLICY LIMIT, not a balance — no paid lane is funded, so "
+                   f"nothing can be spent against it", style=_muted),
+                highlight=False)
         _basis = str(status.get("cost_budget_basis") or "").strip()
         if _basis and budget:
             # `_T`, not `_Text`: this function aliases rich's Text as `_T`,
@@ -3966,6 +3993,10 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             # "I cannot work" and "I cannot tell whether I can work" are both
             # things the operator must not read as green.
             "BLOCKED": "rgb(248,81,73)", "UNKNOWN": "rgb(227,179,65)",
+            # Amber, not red: unfunded is a state the operator can clear in a
+            # minute with a card, which is a different urgency from a broken
+            # organism even though both stop dispatch.
+            "UNFUNDED": "rgb(227,179,65)",
         }
 
         def _header_lines():
