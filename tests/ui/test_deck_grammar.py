@@ -92,8 +92,31 @@ class TestHierarchy:
         assert theme.semantic("ok") in deck.action("Validate")
 
     def test_additions_and_removals_are_told_apart(self):
-        assert theme.semantic("ok") in deck.diff(1, "+", "x")
-        assert theme.semantic("crit") in deck.diff(1, "-", "x")
+        """The band belongs to the SIGN -- and it is a BACKGROUND role.
+
+        This asserted the FOREGROUND `ok`/`crit` tones, which `diff` stopped
+        using in eaa1d1468e (2026-07-30): `on <foreground green>` is a
+        saturated slab that renders syntax-highlighted code illegible over it,
+        so the hunk body moved to the dedicated `code_add_bg` / `code_del_bg`
+        background roles. Red ever since, unseen because CI runs tests/unit
+        and tests/integration and never tests/ui.
+
+        The roles are read from `role_palette`, their declared owner, rather
+        than restated as two hexes: the exact tint is a palette decision, and
+        "an addition does not look like a removal" is the invariant this test
+        is named for.
+        """
+        from backend.core.ouroboros.ui.semantic_tokens import role_palette
+        palette = role_palette()
+        add_band, del_band = palette["code_add_bg"], palette["code_del_bg"]
+        assert add_band != del_band, "one tint cannot tell two signs apart"
+
+        added, removed = deck.diff(1, "+", "x"), deck.diff(1, "-", "x")
+        assert f"on {add_band}" in added
+        assert f"on {del_band}" in removed
+        # ...and neither sign wears the other's band.
+        assert f"on {del_band}" not in added
+        assert f"on {add_band}" not in removed
 
 
 class TestContentIsNeverMarkup:

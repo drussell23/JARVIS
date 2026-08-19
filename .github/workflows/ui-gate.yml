@@ -1,0 +1,73 @@
+# presentation gate — the cockpit's own suite has to actually run somewhere
+#
+# The root problem this closes: nothing ran `tests/ui/`. `test.yml` and
+# `ci-cd-pipeline.yml` between them run `tests/unit/` and `tests/integration/`,
+# and both append `|| true` so the result is discarded anyway. `tests/ui/` —
+# 496 tests over the crest, the theme guard, the deck grammar, the awakening
+# ceremony and the alt-screen — was named by no workflow at all.
+#
+# So four failures sat on `main` for six weeks each, and every one of them was
+# a contract that had MOVED while its test stayed still:
+#
+#   * 2026-07-18 the crest took a one-column right margin; two tests still
+#     asserted `frame.cols == terminal_cols` (the pre-margin contract).
+#   * 2026-07-27 `ui/alt_screen.py` arrived owning smcup/rmcup, and the theme
+#     guard banned every `\x1b[` — flagging terminal CONTROL as styling.
+#   * 2026-07-30 diff hunks moved from foreground tones to background bands;
+#     the test still asserted the retired foreground hex.
+#
+# None of that is exotic. All of it is what a test suite is for, and it was
+# invisible because the suite had no runner.
+#
+# Design invariants:
+#   * HARD FAIL. No `|| true`. A gate whose result is discarded is not a gate
+#     — that is the exact defect `lint-gate.yml` was written to answer, and
+#     repeating it here would buy nothing.
+#   * NARROW + KEYLESS. rich, prompt_toolkit, pytest. `tests/ui/` is a leaf
+#     suite over the presentation layer; it needs no models, no API keys, no
+#     services. Installing the full requirements set would make this slow and
+#     flaky for no coverage.
+#   * Runs from the REPO ROOT. `pytest.ini` lives there and sets
+#     `pythonpath = . backend`; running from `backend/` (as the older
+#     workflows do) would not import `backend.core.*` at all.
+#   * pty-backed tests self-skip via `tests/pty_gate.py` when no pty can be
+#     allocated. Ubuntu runners have them, so they are expected to RUN here —
+#     which is the point, since a sandboxed laptop is where they skip.
+
+name: ui gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ui-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  presentation-suite:
+    name: ui suite (tests/ui)
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install the presentation layer's dependencies
+        run: |
+          python -m pip install -q --upgrade pip
+          python -m pip install -q \
+            "pytest>=8" "pytest-asyncio>=0.23" "pytest-timeout>=2.2" \
+            "rich>=13" "prompt_toolkit>=3.0"
+
+      - name: Run the presentation suite
+        run: python -m pytest tests/ui/ -p no:randomly --timeout=180

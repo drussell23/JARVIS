@@ -17,6 +17,7 @@ from rich.console import Console
 
 from backend.core.ouroboros.ui.awakening import AwakeningConductor
 from backend.core.ouroboros.ui import theme
+from backend.core.ouroboros.ui import crest as crest_mod
 from tests.ui.test_awakening import FakeClock, FakeTimer
 
 
@@ -69,7 +70,14 @@ async def test_mid_trace_resize_regenerates_and_stays_monotonic():
 
     assert c.regenerations >= 1
     cols_seen = {cols for cols, _ in revealed_counts}
-    assert 50 in cols_seen                            # regenerated at new width
+    # The crest's width is DERIVED from the terminal's, not equal to it:
+    # `_fit_cols` solves both dimensions and holds back the right margin. This
+    # asserted the raw terminal width (`50 in cols_seen`), which was the
+    # pre-margin contract and has been red since 14a2a47ef5 (2026-07-18).
+    # Read the mapping from the sizing function -- the margin and the bounds
+    # are tunables, "it regenerated at the new measurement" is the invariant.
+    assert crest_mod._fit_cols(80, 30)[2] in cols_seen     # before SIGWINCH
+    assert crest_mod._fit_cols(50, 30)[2] in cols_seen     # after  SIGWINCH
     # monotonic reveal FRACTION across the resize boundary (no flash-back)
     fracs = [f for _, f in revealed_counts]
     assert all(b >= a - 1e-9 for a, b in zip(fracs, fracs[1:]))
