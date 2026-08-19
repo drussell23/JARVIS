@@ -62,9 +62,33 @@ ENABLED_ENV = "JARVIS_OV_BOOT_PROGRESS_ENABLED"
 HISTORY_ENV = "JARVIS_OV_BOOT_HISTORY_PATH"
 MAX_SAMPLES_ENV = "JARVIS_OV_BOOT_HISTORY_MAX"
 CEILING_ENV = "JARVIS_OV_BOOT_PROGRESS_CEILING"
+#: How far past its own prediction a boot may run before the line says so.
+OVERRUN_TOLERANCE_ENV = "JARVIS_OV_BOOT_OVERRUN_TOLERANCE"
+OVERRUN_GRACE_ENV = "JARVIS_OV_BOOT_OVERRUN_GRACE_S"
 
 _TRUTHY = ("1", "true", "yes", "on")
 _DEFAULT_HISTORY = os.path.join(".jarvis", "boot_durations.json")
+
+
+def _finite_seconds(value: Any) -> float:
+    """A number of seconds that is safe to format. NEVER raises.
+
+    `elapsed` arrives from a caller's clock arithmetic, and clock arithmetic
+    produces NaN and infinities: a monotonic source read twice across a
+    suspend, a subtraction of two unset timestamps. `int(nan)` raises
+    ValueError, which is how the fallback branch — the one whose entire job is
+    to guarantee this module never breaks a boot — became the only line in it
+    that could. Non-finite and negative both degrade to 0.0; a wait cannot
+    have run for a negative or unknowable time, and printing `0s` is honest
+    where crashing is not.
+    """
+    try:
+        v = float(value)
+        if v != v or v in (float("inf"), float("-inf")) or v < 0.0:
+            return 0.0
+        return v
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def boot_progress_enabled() -> bool:
@@ -89,6 +113,31 @@ def max_samples() -> int:
         return max(3, int(os.environ.get(MAX_SAMPLES_ENV, "40")))
     except (TypeError, ValueError):
         return 40
+
+
+def overrun_tolerance() -> float:
+    """Fraction past the prediction before a boot is called overrun.
+
+    PROPORTIONAL, not a fixed number of seconds: a 2s boot taking 3s is noise
+    and a 90s boot taking 135s is a fact, and no single absolute grace can
+    serve both. Default 0.25.
+    """
+    try:
+        return max(0.0, float(os.environ.get(OVERRUN_TOLERANCE_ENV, "0.25")))
+    except (TypeError, ValueError):
+        return 0.25
+
+
+def overrun_grace_s() -> float:
+    """Floor under the proportional tolerance, in seconds.
+
+    A very short prediction has a very short 25%, which would trip on ordinary
+    scheduler jitter and cry overrun on a healthy boot. Default 3.0.
+    """
+    try:
+        return max(0.0, float(os.environ.get(OVERRUN_GRACE_ENV, "3.0")))
+    except (TypeError, ValueError):
+        return 3.0
 
 
 def progress_ceiling() -> float:
@@ -218,6 +267,88 @@ class Progress:
         except Exception:  # noqa: BLE001
             pass
 
+    def _raw_projection(self) -> Optional[float]:
+        """This boot's own projected total — UNCLAMPED. NEVER raises.
+
+        Split out from :meth:`_projected_total_s` because that method answers
+        an ETA question and therefore clamps to ``elapsed``: an ETA may never
+        point into the past. The clamp is right for a countdown and fatal for
+        an overrun test, because the moment a boot runs long the clamped value
+        starts tracking ``elapsed`` and the two become equal by construction —
+        the evidence that the estimate was exceeded is destroyed by the very
+        function that computed it. One number cannot answer both "when will
+        this finish" and "has this taken longer than predicted".
+        """
+        try:
+            if self._reached <= 0 or not self._stage_times:
+                return None
+            last = float(self._stage_times[-1])
+            if last <= 0:
+                return None
+            per_stage = last / float(self._reached)
+            if per_stage <= 0:
+                return None
+            return per_stage * float(len(self.stages))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _eta_horizon(self, elapsed: float) -> Optional[float]:
+        """THE horizon an ETA counts down from — history first, else cadence.
+
+        Extracted because :meth:`fraction` and :meth:`render` each spelled
+        ``self.expected_s or self._projected_total_s(elapsed)`` independently.
+        Two copies of a precedence rule is two rules, and the one that drifts
+        is found by an operator watching a bar disagree with its own ETA.
+        """
+        horizon = self.expected_s
+        if not horizon or horizon <= 0:
+            horizon = self._projected_total_s(elapsed)
+        return horizon if horizon and horizon > 0 else None
+
+    def overrun_s(self, elapsed: float) -> Optional[float]:
+        """Seconds this boot is past its own prediction, or ``None``.
+
+        Uses the UNCLAMPED basis (:meth:`_raw_projection`) with the same
+        history-first precedence an ETA uses, so the two never contradict.
+
+        A tolerance stands between "late" and "overrun", and it is
+        proportional rather than a fixed number of seconds: a 2s boot that
+        takes 3s is noise, a 90s boot that takes 135s is a fact, and the same
+        absolute grace cannot serve both. The floor keeps a very short
+        prediction from tripping on jitter. Both are env-tunable
+        (``JARVIS_OV_BOOT_OVERRUN_TOLERANCE`` / ``_GRACE_S``) because the
+        right patience on a cold laptop is not the right patience in CI.
+
+        Returns None when there is no prediction to exceed — an unmeasured
+        boot cannot be late, and claiming otherwise would invent a deadline.
+        """
+        try:
+            basis = self.expected_s
+            if not basis or basis <= 0:
+                basis = self._raw_projection()
+            if not basis or basis <= 0:
+                return None
+            allowance = max(overrun_grace_s(), basis * overrun_tolerance())
+            over = float(elapsed) - (float(basis) + allowance)
+            return over if over > 0.0 else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    @property
+    def awaiting_label(self) -> str:
+        """The stage that has NOT arrived — what the wait is actually on.
+
+        ``stage_label`` names the last milestone REACHED, which during an
+        overrun is the least useful thing on screen: it reports what already
+        succeeded while the operator is asking what is stuck.
+        """
+        try:
+            if self._reached >= len(self.stages):
+                return ""
+            return self.stages[self._reached].label
+        except Exception:  # noqa: BLE001
+            return ""
+
     def _projected_total_s(self, elapsed: float) -> Optional[float]:
         """Expected total boot time, projected from THIS boot's own cadence.
 
@@ -229,32 +360,26 @@ class Progress:
         take about nine more.
 
         This is measurement, not a constant — it adapts to a slow disk, a cold
-        page cache or a loaded machine, and it needs no prior run. Requires
-        TWO arrivals so there is an actual interval to average; one timestamp
-        is a point, not a rate.
+        page cache or a loaded machine, and it needs no prior run.
+
+        Rate measured FROM THE START OF THE WAIT, not between arrivals. The
+        interval form needed two distinct timestamps and returned nothing when
+        several markers landed in the same poll — the common case on a fast
+        boot, since the client reads the log tail every quarter second and a
+        burst of stages can complete between two reads. Anchoring on t=0 makes
+        a single arrival sufficient: two stages reached by second four is two
+        seconds a stage, and that is a rate, not a point.
+
+        The math lives in :meth:`_raw_projection`; this is that value made
+        SAFE FOR A COUNTDOWN. Never project a finish already in the past: an
+        ETA of "0s left" that keeps not arriving is worse than no ETA. Callers
+        asking whether the estimate was EXCEEDED must use the raw projection —
+        the clamp here makes overrun undetectable by design.
         """
         try:
-            if self._reached <= 0 or not self._stage_times:
+            projected = self._raw_projection()
+            if projected is None:
                 return None
-            # Rate measured FROM THE START OF THE WAIT, not between arrivals.
-            #
-            # The interval form needed two distinct timestamps and returned
-            # nothing when several markers landed in the same poll — which is
-            # the common case on a fast boot, since the client reads the log
-            # tail every quarter second and a burst of stages can complete
-            # between two reads. Anchoring on t=0 makes a single arrival
-            # sufficient: two stages reached by second four is two seconds a
-            # stage, and that is a rate, not a point.
-            last = float(self._stage_times[-1])
-            if last <= 0:
-                return None
-            per_stage = last / float(self._reached)
-            if per_stage <= 0:
-                return None
-            projected = per_stage * float(len(self.stages))
-            # Never project a finish already in the past: a boot running long
-            # has disproved its own estimate, and an ETA of "0s left" that
-            # keeps not arriving is worse than no ETA.
             return max(elapsed, projected)
         except Exception:  # noqa: BLE001
             return None
@@ -280,9 +405,7 @@ class Progress:
             # Cross-boot history is the better estimator when it exists (more
             # samples, and it already knows how this machine behaves). Within
             # -boot projection is the fallback that makes a FIRST boot move.
-            horizon = self.expected_s
-            if not horizon or horizon <= 0:
-                horizon = self._projected_total_s(elapsed)
+            horizon = self._eta_horizon(elapsed)
             estimate = None
             if horizon and horizon > 0:
                 estimate = elapsed / horizon
@@ -313,6 +436,7 @@ class Progress:
 
     def render(self, elapsed: float, *, width: int = 18) -> str:
         """One line. Bar + stage + clock + ETA when known. NEVER raises."""
+        elapsed = _finite_seconds(elapsed)
         try:
             frac = self.fraction(elapsed)
             parts = []
@@ -322,14 +446,35 @@ class Progress:
                 parts.append(f"{int(frac * 100):3d}%")
             parts.append(self.stage_label)
             parts.append(f"{int(elapsed)}s")
-            horizon = self.expected_s or self._projected_total_s(elapsed)
-            if frac is not None and horizon and frac > 0.02:
-                remaining = max(0.0, horizon - elapsed)
-                if remaining >= 1.0:
-                    parts.append(f"~{int(remaining)}s left")
+            # An overrun used to be reported by ABSENCE: `remaining` clamped
+            # to 0, the "~Ns left" token simply stopped being appended, and an
+            # operator cannot see a token that is not there. Paired with the
+            # 97% ceiling that is the whole defect — a slow boot and a dead
+            # one rendered identically (`97%  session open  89s`), which is
+            # exactly the line that sent an operator here asking if it hung.
+            over = self.overrun_s(elapsed)
+            if over is not None:
+                parts.append(f"+{int(over)}s over")
+                # Name what has NOT arrived. `stage_label` reports the last
+                # milestone reached, which during an overrun answers a
+                # question nobody is asking.
+                waiting = self.awaiting_label
+                if waiting:
+                    parts.append(f"waiting on {waiting}")
+            else:
+                horizon = self._eta_horizon(elapsed)
+                if frac is not None and horizon and frac > 0.02:
+                    remaining = max(0.0, horizon - elapsed)
+                    if remaining >= 1.0:
+                        parts.append(f"~{int(remaining)}s left")
             return "  ".join(parts)
         except Exception:  # noqa: BLE001
-            return f"waking · {int(elapsed)}s"
+            # The fallback must not be able to fail: `int(nan)` raises
+            # ValueError, so the branch that exists to guarantee "NEVER
+            # raises" was itself the last thing that could break a boot.
+            # Sanitised HERE and not only at entry, because this handler also
+            # catches failures that happen before any sanitising would run.
+            return f"waking · {_finite_seconds(elapsed):.0f}s"
 
 
 def log_size(path: str) -> int:
