@@ -1067,6 +1067,42 @@ def render_cockpit_header(
         text_rows: List[Any] = [
             ln if not isinstance(ln, str) else Text(ln) for ln in lines
         ]
+        # BOUND EACH IDENTITY ROW TO THE COLUMN IT LIVES IN.
+        #
+        # The rows are appended after the crest and a two-space gutter, and
+        # were previously appended WHOLE. A row longer than the remaining
+        # width therefore wrapped — and a wrapped continuation starts at
+        # column ZERO, i.e. on top of the crest. The capability reason
+        # ("doubleword is out of credit — add credits, or configure a local
+        # lane to keep background work moving") is exactly long enough to do
+        # it, so the nameplate collided with the artwork.
+        #
+        # This function's own docstring already states the principle — it is
+        # "the only place that knows the terminal width", and it degrades
+        # "instead of wrapping into a broken layout" — but applied it only to
+        # the gutter. The same bound belongs on the rows themselves, using the
+        # same arithmetic, which is why it is computed once here rather than
+        # guessed by the caller.
+        #
+        # Truncation over wrapping is deliberate: the header is a NAMEPLATE,
+        # a fixed number of rows beside a fixed-height crest. Letting it grow
+        # would push the layout around every time a provider state changed,
+        # and the full text is always available in the banner below.
+        _text_avail = max(8, int(width) - (
+            mini.cols if (mini is not None and crest_rows) else 0) - 2)
+        _bounded: List[Any] = []
+        for _ln in text_rows:
+            try:
+                # Copy before truncating: `lines` belongs to the caller and is
+                # rebuilt per frame, but mutating a shared Text would make the
+                # first narrow frame permanent.
+                _c = _ln.copy() if hasattr(_ln, "copy") else _ln
+                if hasattr(_c, "truncate"):
+                    _c.truncate(_text_avail, overflow="ellipsis")
+                _bounded.append(_c)
+            except Exception:  # noqa: BLE001 — a bound never breaks the header
+                _bounded.append(_ln)
+        text_rows = _bounded
         # Top-align the text beside the crest (the CC layout) with a
         # 1-row optical inset. Computed from the ORIGINAL text rows, BEFORE a
         # "below" gutter is appended: otherwise arming the audio plane would
