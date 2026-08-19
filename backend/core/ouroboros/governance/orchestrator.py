@@ -7515,10 +7515,19 @@ class GovernedOrchestrator:
                     #       INSUFFICIENT_EVIDENCE / DISABLED / FAILED.
                     _replan_text = ""
                     try:
-                        _fc = (validation.failure_class or ""
-                               ) if validation is not None else ""
-                        _em = (validation.short_summary or ""
-                               ) if validation is not None else ""
+                        # ONE READER, shared with `generate_runner` — the
+                        # two call sites have already drifted once, which is
+                        # how the shipping path spent months re-planning on
+                        # empty inputs while this twin read a real verdict.
+                        # Prefers the context (which VALIDATE publishes and
+                        # `advance()` carries forward) and falls back to this
+                        # scope's local, so neither source can go stale.
+                        from backend.core.ouroboros.governance.op_context import (  # noqa: E501,PLC0415
+                            replan_inputs as _replan_inputs,
+                        )
+                        _fc, _em = _replan_inputs(
+                            getattr(ctx, "validation", None) or validation
+                        )
                         _attempt_num = self._config.max_generate_retries - generate_retries_remaining + 1
                         # Stage 1 — structural falsification (proactive)
                         try:

@@ -1418,8 +1418,19 @@ class BackgroundAgentPool:
                                     "provider_route", "",
                                 ) or "background"
                             )
-                            _s195_model_id = _s195_get_topology().model_for_route(
-                                _s195_route,
+                            # Phase 10 Slice 5a deletion-side: the v1
+                            # `model_for_route` is yaml-direct and blind to the
+                            # v2 catalog. `model_for_route_unified` is a drop-in
+                            # superset — same signature, same return type, and
+                            # it DELEGATES to v1 whenever
+                            # `JARVIS_TOPOLOGY_SENTINEL_ENABLED` is off, so the
+                            # legacy path stays byte-identical. This call site
+                            # survived the migration and was the last v1 caller
+                            # in production `governance/`.
+                            _s195_model_id = (
+                                _s195_get_topology().model_for_route_unified(
+                                    _s195_route,
+                                )
                             )
                         except Exception:  # noqa: BLE001
                             _s195_model_id = None

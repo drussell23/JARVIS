@@ -28,7 +28,7 @@ Pinned coverage (~38 tests):
     oversized-file
   * 7 AST pins clean (parametrized) + each fires on
     synthetic regression:
-      - master_default_false
+      - master_switch_honors_explicit_off
       - authority_asymmetry
       - read_only (synthetic regression: forbid mutation)
       - composes_canonical_tracker
@@ -92,14 +92,28 @@ def tmp_ledger(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_master_default_false(monkeypatch):
-    monkeypatch.delenv(
-        "JARVIS_EXEC_GRAPH_BRIDGE_ENABLED", raising=False,
-    )
+def test_master_switch_honors_explicit_off(monkeypatch):
+    """A GRADUATED flag must still be switchable off.
+
+    WAS `test_master_default_false`. The bridge graduated on 2026-07-24
+    (#70086) and `master_enabled()` returns True on an empty env var, exactly
+    as its docstring states. This file kept asserting the pre-graduation
+    default while `tests/governance/test_agentic_cockpit_visibility.py:124`
+    asserted the graduated one — TWO test files holding opposite contracts
+    for one flag, which is how four tests sat red.
+
+    The DEFAULT is deliberately not re-asserted here; that claim has an owner.
+    Two files asserting one default is what produced the contradiction. What
+    this file owns is the SWITCH: graduation moved the default, and must not
+    have welded the flag on."""
     from backend.core.ouroboros.governance.execution_graph_progress_bridge import (  # noqa: E501
         master_enabled,
     )
-    assert master_enabled() is False
+    for off in ("0", "false", "no", "off"):
+        monkeypatch.setenv("JARVIS_EXEC_GRAPH_BRIDGE_ENABLED", off)
+        assert master_enabled() is False, off
+    monkeypatch.setenv("JARVIS_EXEC_GRAPH_BRIDGE_ENABLED", "1")
+    assert master_enabled() is True
 
 
 def test_verbose_default_false(monkeypatch):
@@ -184,8 +198,11 @@ def test_should_emit_defensive():
 def test_recorder_noop_when_master_off(
     monkeypatch, tmp_ledger,
 ):
-    monkeypatch.delenv(
-        "JARVIS_EXEC_GRAPH_BRIDGE_ENABLED", raising=False,
+    # EXPLICIT off. Expressing a state by OMISSION is the defect: this read
+    # "off" from the default, so it broke the day the capability graduated
+    # even though the off-behaviour it tests never changed.
+    monkeypatch.setenv(
+        "JARVIS_EXEC_GRAPH_BRIDGE_ENABLED", "0",
     )
     from backend.core.ouroboros.governance.execution_graph_progress_bridge import (  # noqa: E501
         record_graph_event,
@@ -398,7 +415,7 @@ def test_read_missing_ledger_returns_empty(tmp_path):
 
 @pytest.mark.parametrize(
     "pin_name", [
-        "execution_graph_progress_bridge_master_default_false",  # noqa: E501
+        "execution_graph_progress_bridge_master_switch_honors_explicit_off",  # noqa: E501
         "execution_graph_progress_bridge_authority_asymmetry",
         "execution_graph_progress_bridge_read_only",
         (
@@ -660,8 +677,9 @@ def test_singleton_lifecycle(monkeypatch):
 async def test_start_default_bridge_master_off(
     monkeypatch,
 ):
-    monkeypatch.delenv(
-        "JARVIS_EXEC_GRAPH_BRIDGE_ENABLED", raising=False,
+    # EXPLICIT off — see `test_recorder_noop_when_master_off`.
+    monkeypatch.setenv(
+        "JARVIS_EXEC_GRAPH_BRIDGE_ENABLED", "0",
     )
     from backend.core.ouroboros.governance.execution_graph_progress_bridge import (  # noqa: E501
         start_default_bridge,

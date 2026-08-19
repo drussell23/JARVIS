@@ -39,10 +39,51 @@ _EXPECTED_ARCHIVE_PATHS = (
 )
 
 _FORBIDDEN_PRODUCTION_PATHS = (
-    "backend/core/ouroboros/governance/graduation_orchestrator.py",
     "backend/core/ouroboros/governance/graduation_tracker.py",
     "tests/governance/test_graduation_orchestrator.py",
 )
+
+#: archive -> the production path its implementation must never return to.
+#:
+#: WHY THIS REPLACED A PATH BAN FOR `graduation_orchestrator`
+#: ---------------------------------------------------------
+#: The original pin forbade the PATH. Slice 132 (#69347) and Slice 136
+#: (#69351) then created a genuinely DIFFERENT module at that path — the
+#: Cognitive Graduation Matrix, 312 lines exposing `graduate` /
+#: `graduate_all` / `GraduationOutcome`, against the archived module's 1,137
+#: lines exposing `GraduationOrchestrator` / `GraduationPhase` /
+#: `EphemeralUsageTracker`. ZERO symbol overlap; only the name is shared, and
+#: `phase9_orchestrator.py` already documents the two as distinct ("different
+#: scope", "graduation_orchestrator_archived_only").
+#:
+#: So the pin failed for a module it was never written about. A path is a
+#: PROXY for the property that matters — "the archived implementation has not
+#: come back" — and a proxy that cannot tell one module from another reports a
+#: violation nobody committed. The check below tests IDENTITY instead, and
+#: derives the archived symbol set FROM THE ARCHIVE at test time, so it stays
+#: correct if the archive is ever amended.
+_ARCHIVE_IDENTITY_PAIRS = (
+    (
+        "archive/legacy/graduation_orchestrator_2026_04_06.py",
+        "backend/core/ouroboros/governance/graduation_orchestrator.py",
+    ),
+)
+
+
+def _top_level_symbols(path: Path) -> set:
+    """Top-level class/function names defined by a module. NEVER raises."""
+    import ast as _ast
+    try:
+        tree = _ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:  # noqa: BLE001 — unparseable proves nothing either way
+        return set()
+    return {
+        node.name for node in tree.body
+        if isinstance(
+            node,
+            (_ast.ClassDef, _ast.FunctionDef, _ast.AsyncFunctionDef),
+        )
+    }
 
 
 @pytest.mark.parametrize("rel_path", _EXPECTED_ARCHIVE_PATHS)
@@ -71,6 +112,40 @@ def test_forbidden_production_path_absent(rel_path):
     )
 
 
+@pytest.mark.parametrize(
+    "archived_rel,production_rel", _ARCHIVE_IDENTITY_PAIRS,
+)
+def test_archived_implementation_is_not_resurrected(
+    archived_rel, production_rel,
+):
+    """The ARCHIVED CODE must not return — a reused name is not a relapse.
+
+    An absent production path is the strongest possible pass. When one does
+    exist, it must share no top-level symbol with the archived module: that is
+    what distinguishes "someone restored the retired implementation" from
+    "a later slice reused a good name for different code"."""
+    root = _repo_root()
+    production = root / production_rel
+    if not production.exists():
+        return                      # nothing there at all — strongest pass
+
+    archived = root / archived_rel
+    assert archived.exists(), (
+        f"archive missing: {archived_rel} — the pin cannot judge a "
+        "resurrection without the thing it is comparing against"
+    )
+    archived_syms = _top_level_symbols(archived)
+    assert archived_syms, (
+        f"no symbols parsed from {archived_rel}; the comparison would pass "
+        "vacuously and prove nothing"
+    )
+    overlap = archived_syms & _top_level_symbols(production)
+    assert not overlap, (
+        f"archived implementation resurrected at {production_rel}: "
+        f"shares {sorted(overlap)} with {archived_rel}"
+    )
+
+
 def test_archive_readme_exists():
     readme = _repo_root() / "archive" / "legacy" / "README.md"
     assert readme.exists()
@@ -90,13 +165,11 @@ def test_archived_module_not_importable_via_production_path():
     """The archived modules MUST NOT be importable via their
     original dotted production path. Any importer that tried
     would get ImportError."""
-    spec = importlib.util.find_spec(
-        "backend.core.ouroboros.governance.graduation_orchestrator",
-    )
-    assert spec is None, (
-        "graduation_orchestrator still importable from "
-        "production path — archive may have failed"
-    )
+    # `graduation_orchestrator` is DELIBERATELY importable again: a different
+    # module (Slice 132/136) took the name. Its identity — not its
+    # importability — is what `test_archived_implementation_is_not_resurrected`
+    # guards. Asserting un-importability here would forbid a name rather than
+    # an implementation.
     spec = importlib.util.find_spec(
         "backend.core.ouroboros.governance.graduation_tracker",
     )
@@ -182,7 +255,11 @@ def test_cleanup_pins_pass_validation():
     ]
     assert not cleanup_violations, (
         "cleanup pin violations: " + "; ".join(
-            f"{v.invariant_name}: {v.violation}"
+            # `.detail` — `InvariantViolation` has no `.violation`. This
+            # f-string is only evaluated WHEN violations exist, so the
+            # AttributeError replaced the report at the one moment it
+            # mattered: a diagnostic that fails precisely when it is needed.
+            f"{v.invariant_name}: {v.detail}"
             for v in cleanup_violations
         )
     )
