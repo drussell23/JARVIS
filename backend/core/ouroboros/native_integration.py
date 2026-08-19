@@ -15549,9 +15549,24 @@ class GoalDecomposer:
             # Validate oracle connection if present
             if self._oracle:
                 try:
-                    # Attempt a simple query to validate oracle
-                    if hasattr(self._oracle, 'is_ready'):
-                        await self._oracle.is_ready()
+                    # Attempt a simple query to validate oracle.
+                    #
+                    # This AWAITED the result, and no `is_ready` in this
+                    # codebase is async — so it raised on every path that had
+                    # one: `TypeError: object bool can't be used in 'await'`
+                    # for TheOracle's method, and `'bool' object is not
+                    # callable` for an adapter's property. Both were swallowed
+                    # by the handler below, so "Oracle validation" has never
+                    # validated anything. The shared resolver settles the
+                    # method-vs-property split and is sync by contract.
+                    from backend.core.ouroboros.oracle_adapter import (  # noqa: PLC0415
+                        oracle_is_ready as _oracle_is_ready,
+                    )
+                    if not _oracle_is_ready(self._oracle):
+                        logger.info(
+                            "[GoalDecomposer] Oracle present but not ready "
+                            "— proceeding (decomposition degrades, never blocks)"
+                        )
                 except Exception as e:
                     logger.warning(f"[GoalDecomposer] Oracle validation failed: {e}")
 

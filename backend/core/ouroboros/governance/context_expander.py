@@ -94,6 +94,10 @@ class ContextExpander:
         # ── P3: Cross-session dialogue injection ──────────────────────────
         # Inject past reasoning dialogues for the same domain so the model
         # has context from previous operations on similar tasks.
+        from backend.core.ouroboros.oracle_adapter import (  # noqa: PLC0415
+            oracle_is_ready as _oracle_is_ready,
+        )
+
         if self._dialogue_store is not None:
             try:
                 from backend.core.ouroboros.governance.entropy_calculator import extract_domain_key
@@ -114,7 +118,13 @@ class ContextExpander:
             except Exception:
                 pass
 
-        if self._oracle is None or not self._oracle.is_ready():
+        # `is_ready` is a METHOD on TheOracle and a @property on both oracle
+        # adapters. This line spelled it as a method, so every operation that
+        # received an adapter raised `TypeError: 'bool' object is not callable`
+        # into the CONTEXT_EXPANSION runner's `except Exception` and continued
+        # with UNEXPANDED context — silently, on every op, until a live soak
+        # produced the traceback pointing here.
+        if not _oracle_is_ready(self._oracle):
             logger.info("[ContextExpander] Oracle not ready \u2014 using blind baseline")
             return self._inject_skill_instructions(ctx)
 
