@@ -3,7 +3,8 @@
 Ports docs/superpowers/specs/assets/2026-07-07-ov-crest-v5-generator.py into
 a reactive generator: every metric scales from the measured terminal width
 (Mandate 2 -- zero absolute canvas dimensions), clamped to
-[JARVIS_OV_CREST_MIN_COLS, JARVIS_OV_CREST_MAX_COLS]. Rendering is
+[JARVIS_OV_CREST_MIN_COLS, JARVIS_OV_CREST_MAX_COLS] and held back from the
+terminal's last column by JARVIS_OV_CREST_RIGHT_MARGIN. Rendering is
 hard-threshold quadrant rasterization -- solid fill, no anti-aliasing.
 
 The asset is the geometry source of truth; this module reproduces its math
@@ -151,35 +152,71 @@ def _fit_cols(measured_cols: int, measured_rows: int) -> Tuple[int, int, int]:
     exactly where a crest either overflows or vanishes. The range is at most
     a few hundred integers and this runs once per resize."""
     # The cap is now a SAFETY rail, not the working limit: a crest wider than
-    # it stops reading as an emblem and starts reading as wallpaper. The
-    # bounds and the one-column margin come from _clamp_cols so there is a
-    # single definition of each (DRY).
+    # it stops reading as an emblem and starts reading as wallpaper. Every
+    # bound — floor, cap and right margin — comes from _crest_bounds via
+    # _clamp_cols, so each has exactly one definition (DRY).
     lo, hi, width_budget = _clamp_cols(measured_cols)
     # Reserve rows for the header the ceremony prints beneath the crest.
     # CREST_HEADER_ROWS is the single definition of that number — awakening
     # independently reserved 6 rows before deciding whether the animated path
     # would fit, so a reserve chosen separately here would be a second copy
     # free to drift out of step with it.
-    try:
-        reserve = max(0, int(os.environ.get(
-            "JARVIS_OV_CREST_ROW_RESERVE", str(CREST_HEADER_ROWS))))
-    except (TypeError, ValueError):
-        reserve = CREST_HEADER_ROWS
+    reserve = _env_int("JARVIS_OV_CREST_ROW_RESERVE", CREST_HEADER_ROWS)
     row_budget = max(0, int(measured_rows) - reserve)
 
+    # The shrink floor is the minimum CREST width, which is not the ``lo``
+    # returned above — that one is the minimum MEASURED width and includes the
+    # margin. Shrinking to it would stop one column early and, at the
+    # boundary, hand back a crest wider than the width budget it was given.
+    min_crest, _hi, _margin = _crest_bounds()
     fitted = width_budget
-    while fitted > lo and _Geometry.rows_needed(fitted) > row_budget:
+    while fitted > min_crest and _Geometry.rows_needed(fitted) > row_budget:
         fitted -= 1
     return lo, hi, fitted
+
+
+def _env_int(name: str, default: int, *, floor: int = 0) -> int:
+    """One tunable read, defended once.
+
+    Every column bound is operator-tunable, and a malformed value must not be
+    the thing that takes the crest down: this module's contract is that it
+    NEVER raises. ``int("")`` and ``int("wide")`` both raise, so an unparseable
+    override silently became a crash inside a render path that callers trust
+    to degrade instead.
+    """
+    try:
+        return max(floor, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _crest_bounds() -> Tuple[int, int, int]:
+    """``(min_crest, max_crest, right_margin)`` -- THE definition of every
+    column bound, each independently tunable.
+
+    The margin is a bound in its own right, not a literal buried in an
+    expression. It was written as a bare ``- 1`` inside the clamp, which is
+    how it came to be silently cancelled at the low boundary (see
+    :func:`_clamp_cols`): a number with no name is a number no caller can
+    reason about, and the floor that defeated it looked correct precisely
+    because the thing it was defeating was invisible.
+    """
+    return (
+        _env_int("JARVIS_OV_CREST_MIN_COLS", 46, floor=1),
+        _env_int("JARVIS_OV_CREST_MAX_COLS", 140, floor=1),
+        _env_int("JARVIS_OV_CREST_RIGHT_MARGIN", 1),
+    )
 
 
 def _clamp_cols(measured: int) -> Tuple[int, int, int]:
     """Return (lo, hi, clamped) column bounds for a measured width.
 
-    ``clamped`` is only meaningful when ``measured >= lo`` -- callers must
-    check the low bound against ``measured`` directly (not ``clamped``,
-    which is floored at ``lo`` by construction and so can never itself
-    read as "below minimum").
+    ``lo`` is the minimum MEASURED width -- the narrowest terminal that can
+    hold a crest -- not the minimum crest width. Those differ by the margin,
+    and conflating them is the bug documented below. ``clamped`` is only
+    meaningful when ``measured >= lo``; callers must check the low bound
+    against ``measured`` directly (not ``clamped``, which is floored by
+    construction and so can never itself read as "below minimum").
 
     Width-only. Since 2026-07-25 this is the WIDTH HALF of
     :func:`_fit_cols`, which additionally solves for height — callers that
@@ -190,10 +227,26 @@ def _clamp_cols(measured: int) -> Tuple[int, int, int]:
     as wide as the terminal auto-wraps its last cell onto the next line, and
     every row sheds one detached artifact block. One column of right margin
     kills the whole off-by-one wrap class.
+
+    ...except at the boundary, where it did not (fixed 2026-08-19). The clamp
+    read ``max(min_crest, min(measured - margin, hi))``, and that outer floor
+    is reached exactly when ``measured <= min_crest`` -- at which point it
+    hands back a crest as wide as the terminal and reinstates the wrap class
+    the margin exists to kill. At the default bounds a 46-column terminal
+    emitted 46-column rows: measured and reproducible, not theoretical.
+
+    The floor is not the defect -- a crest narrower than ``min_crest`` stops
+    reading as an emblem, so refusing to shrink past it is right. The defect
+    was asking ONE number to answer two questions. A terminal must afford
+    ``min_crest`` columns for the emblem PLUS ``margin`` for the margin, so
+    the minimum measured width is their SUM, and below it the honest answer
+    is "unavailable" rather than a crest that wraps. Returning that sum as
+    ``lo`` makes the availability guard callers already run
+    (``measured_cols < lo``) correct without a second check to forget.
     """
-    lo = int(os.environ.get("JARVIS_OV_CREST_MIN_COLS", "46"))
-    hi = int(os.environ.get("JARVIS_OV_CREST_MAX_COLS", "140"))
-    return lo, hi, max(lo, min(measured - 1, hi))
+    min_crest, hi, margin = _crest_bounds()
+    return (min_crest + margin, hi,
+            max(min_crest, min(measured - margin, hi)))
 
 
 # ===========================================================================

@@ -5,8 +5,23 @@ This is the enforcement mechanism for the Restrained Mono migration (spec
 presentation consumer for banned patterns:
 
   * legacy Rich color markup  -- ``[bold cyan]`` / ``[bright_green]`` / ``[dim]``
-  * raw ANSI CSI escapes       -- ``\\x1b[`` (OSC title ``\\x1b]`` is allowed)
+  * raw ANSI SGR escapes       -- ``\\x1b[1;32m`` and every spelling of it
   * hardcoded frames           -- ``"─" * 52`` and friends
+
+The ANSI pattern matches by FUNCTION, not by introducer. What is banned is
+*styling*, so the pattern is SGR -- a CSI run terminated by ``m``. Cursor and
+mode control (``\\x1b[?1049h`` smcup, ``\\x1b[H`` home) carries no appearance
+decision, has no theme-token spelling to migrate to, and is the entire purpose
+of ``ui/alt_screen.py``. Matching every ``\\x1b[`` flagged that module for
+doing its job, while the OSC carve-out below shows the line was always meant
+to be drawn by function.
+
+It matches every SPELLING, too: ``\\x1b``, ``\\033`` and ``\\e`` are one byte
+with three source forms, and a guard that knows only the first is blind to the
+other two -- which is exactly what happened. ``battle_test/diff_display.py``
+sat on the enforced list below for six weeks holding eighteen raw SGR colour
+constants (``_GRN = "\\033[32m"``), invisible because it spelt the escape in
+octal.
 
 ``theme.py`` is the single exempt source of truth -- it legitimately defines
 the concrete color values and box glyphs the tokens resolve to. Consumers must
@@ -43,9 +58,28 @@ _MIGRATED_CONSUMERS = [
     _BATTLE / "status_line.py",
     _BATTLE / "live_status_line.py",
     _BATTLE / "diff_preview.py",
-    _BATTLE / "diff_display.py",
     _BATTLE / "tool_render_view.py",
     _BATTLE / "boot_timing.py",
+]
+
+#: ANSI-native modules: exempt from the STYLING ban because emitting raw SGR
+#: is what they are for, and there is no token spelling available to them.
+#:
+#: ``diff_display.py`` was listed as a migrated consumer on 2026-07-06 and is
+#: not migrated -- it holds eighteen raw colour constants and imports neither
+#: ``rich`` nor ``ui.theme``. It is the fallback the cockpit falls through to
+#: when Rich cannot own the screen, so it writes SGR to a plain stream by
+#: construction; "migrate it to semantic tokens" would mean giving it the
+#: dependency whose absence is its whole reason to exist.
+#:
+#: The claim was never contradicted because the guard matched only ``\x1b``
+#: and the file spells its escapes ``\033``. That is the part worth fixing:
+#: an exemption should be a decision on the record, not a spelling accident.
+#: ``test_the_ansi_native_exemption_still_earns_itself`` pins the premise, so
+#: the day anything here gains a Rich/theme dependency the exemption fails
+#: rather than quietly widening.
+_ANSI_NATIVE = [
+    _BATTLE / "diff_display.py",
 ]
 
 _BANNED = {
@@ -60,7 +94,9 @@ _BANNED = {
         r"""(?:bright_)?(?:black|red|green|yellow|blue|magenta|cyan|white|gr[ae]y\d*)\b"""
     ),
     "style_kw_dim": re.compile(r"""(?:border_)?style\s*=\s*["']dim\b"""),
-    "raw_ansi_csi": re.compile(r"\\x1b\["),
+    # SGR only -- a CSI run terminated by `m`. Cursor/mode control is not
+    # styling (see module docstring). All three source spellings of ESC.
+    "raw_ansi_sgr": re.compile(r"\\(?:x1[bB]|033|e)\[[0-9;]*m"),
     "hardcoded_frame": re.compile(
         r"""["'][─═]["']\s*\*|["'][=\-]["']\s*\*\s*\d{2,}"""
     ),
@@ -104,6 +140,55 @@ def test_migrated_consumers_have_no_literal_styling() -> None:
         if hits:
             offenders[str(path.relative_to(_REPO))] = hits
     assert not offenders, f"literal styling regressed: {offenders}"
+
+
+def test_the_ansi_pattern_bans_styling_and_permits_terminal_control() -> None:
+    """The line is drawn by FUNCTION, so pin both sides of it.
+
+    Banning every ``\\x1b[`` made ``ui/alt_screen.py`` an offender for owning
+    smcup/rmcup -- sequences with no colour in them and no token to migrate
+    to. Banning only the ``\\x1b`` spelling made eighteen ``\\033[3Xm`` colour
+    constants invisible. A pattern this load-bearing gets its own test rather
+    than being inferred from whichever files happen to exist today.
+    """
+    rx = _BANNED["raw_ansi_sgr"]
+    for styling in (r'"\x1b[0m"', r'"\x1b[1;32m"', r'"\033[32m"',
+                    r'"\033[38;2;255;0;0m"', r'"\e[0m"', r'"\x1B[7m"',
+                    r'"\x1b[m"'):
+        assert rx.search(styling), f"styling not caught: {styling}"
+    for control in (r'"\x1b[?1049h"', r'"\x1b[?1049l"', r'"\x1b[H"',
+                    r'"\x1b[2J"', r'"\x1b[?25h"', r'"\033[?25l"',
+                    r'"\x1b]0;title\x07"'):
+        assert not rx.search(control), f"terminal control flagged: {control}"
+
+
+def test_the_ansi_native_exemption_still_earns_itself() -> None:
+    """An exemption is a claim, and this one is checkable.
+
+    ``diff_display.py`` is exempt because it has no Rich/theme dependency and
+    therefore no token spelling to migrate to. If that ever stops being true
+    the exemption has to be re-argued -- so assert the PREMISE, not the
+    conclusion. Import edges are read from the AST: a substring search would
+    be satisfied by the word ``rich`` in a comment, which tests spelling
+    rather than structure.
+    """
+    import ast
+    for path in _ANSI_NATIVE:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module)
+        offenders = {m for m in imported
+                     if m == "rich" or m.startswith("rich.")
+                     or m.endswith("ui.theme")}
+        assert not offenders, (
+            f"{path.name} now depends on {sorted(offenders)} -- it has a token "
+            f"vocabulary available, so its ANSI-native exemption no longer "
+            f"holds. Migrate it and move it to _MIGRATED_CONSUMERS."
+        )
 
 
 def test_boot_banner_active_path_log_line_migrated() -> None:

@@ -84,9 +84,76 @@ def test_delays_monotonic_tail_to_head_and_bounded():
 # ---- reactivity + clamping (Mandate 2) --------------------------------------
 
 def test_geometry_scales_with_width():
-    small, large = gen(cols=46), gen(cols=72)
-    assert small.cols == 46 and large.cols == 72
+    """Wider terminal -> wider, denser crest.
+
+    The crest's width is DERIVED from the terminal's, never equal to it:
+    ``_clamp_cols`` holds back ``JARVIS_OV_CREST_RIGHT_MARGIN`` columns so the
+    last cell cannot auto-wrap. This asserted ``cols == 46 and cols == 72``,
+    which was the PRE-margin contract and has been red since 14a2a47ef5
+    (2026-07-18) -- unseen because CI runs tests/unit and tests/integration,
+    never tests/ui.
+
+    The bounds are tunables; the scaling is the invariant. So the expected
+    width is READ from the sizing function rather than restated -- the idiom
+    ``test_hard_clamp_at_default_max`` below already uses.
+    """
+    lo, _hi, _c = crest_mod._clamp_cols(0)     # lo does not depend on measured
+    small_term, large_term = lo, lo + 26
+    rows = 60                                   # ample: isolate WIDTH scaling
+    small, large = gen(cols=small_term, rows=rows), gen(cols=large_term,
+                                                        rows=rows)
+    assert small.unavailable_reason is None and large.unavailable_reason is None
+    assert small.cols == crest_mod._fit_cols(small_term, rows)[2]
+    assert large.cols == crest_mod._fit_cols(large_term, rows)[2]
+    assert large.cols > small.cols
     assert len(large.cells) > len(small.cells) * 1.5
+
+
+def test_the_crest_never_occupies_the_terminals_last_column():
+    """The margin is the whole point of the clamp, and it was cancelled at the
+    boundary for a month.
+
+    ``max(min_crest, min(measured - margin, hi))`` reaches its outer floor
+    exactly when ``measured <= min_crest``, handing back a crest as wide as
+    the terminal -- the auto-wrap / detached-artifact class the margin exists
+    to kill. At default bounds a 46-column terminal emitted 46-column rows.
+
+    A single-width check (``_clamp_cols(80) == 79``) could not see it. Sweep
+    the boundary, and assert the PROPERTY rather than any one number.
+    """
+    lo, hi, _c = crest_mod._clamp_cols(0)
+    _min_crest, _hi, margin = crest_mod._crest_bounds()
+    widths = list(range(lo - 2, lo + 6)) + [60, 72, 80, hi, hi + 1, hi + 60]
+    for term in widths:
+        _lo, _h, clamped = crest_mod._clamp_cols(term)
+        if term < lo:
+            continue                            # correctly unavailable
+        assert clamped <= term - margin, (
+            f"terminal {term}: crest {clamped} leaves no margin")
+
+
+def test_a_terminal_too_narrow_for_crest_plus_margin_is_unavailable():
+    """Availability must account for the margin, or the narrowest accepted
+    terminal is precisely the one that wraps. ``lo`` is the minimum MEASURED
+    width (crest + margin), not the minimum crest width."""
+    lo, _hi, _c = crest_mod._clamp_cols(0)
+    assert generate_crest(lo - 1, 60, tier=T,
+                          unicode_ok=True).unavailable_reason is not None
+    f = generate_crest(lo, 60, tier=T, unicode_ok=True)
+    assert f.unavailable_reason is None
+    assert f.cols < lo                          # the margin survived
+
+
+def test_column_bounds_are_tunable_and_survive_a_malformed_override(
+        monkeypatch):
+    """Every bound is operator-tunable, and this module NEVER raises -- so an
+    unparseable override must degrade to the default, not crash a render."""
+    monkeypatch.setenv("JARVIS_OV_CREST_RIGHT_MARGIN", "3")
+    assert crest_mod._clamp_cols(80)[2] == 77
+    monkeypatch.setenv("JARVIS_OV_CREST_RIGHT_MARGIN", "not-a-number")
+    assert crest_mod._clamp_cols(80)[2] == 79   # back to the default margin
+    monkeypatch.setenv("JARVIS_OV_CREST_MAX_COLS", "")
+    assert crest_mod._clamp_cols(400)[2] == crest_mod._crest_bounds()[1]
 
 
 def test_hard_clamp_at_default_max():
