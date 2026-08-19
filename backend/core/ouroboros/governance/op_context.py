@@ -365,6 +365,70 @@ class ValidationResult:
     adapter_names_run: Tuple[str, ...] = ()      # e.g. ("python",) or ("python", "cpp")
 
 
+#: Cap on the summary handed to the re-planner. The field's own comment
+#: promises "<=300 chars"; a promise nothing enforces is a promise, and an
+#: unbounded string reaches a prompt.
+REPLAN_SUMMARY_MAX_CHARS: int = 300
+
+
+def replan_inputs(validation: Any) -> Tuple[str, str]:
+    """``(failure_class, short_summary)`` for the dynamic re-planner.
+
+    THE ONE READER, because there are two callers and they have already
+    drifted once. `generate_runner.run()` — the SHIPPING path — referenced a
+    bare `validation` that has no binding anywhere in its scope, guarded by
+    `if 'validation' in dir()`. The guard therefore always evaluated False and
+    re-planning ran on empty inputs on every real op, while the inline
+    orchestrator twin read a real verdict. One helper, both call sites.
+
+    NO NEW VERDICT TYPE. :class:`ValidationResult` is already frozen, already
+    carries exactly these two fields, and is already carried on
+    :class:`OperationContext` — `advance()` uses ``dataclasses.replace``, so a
+    verdict set at VALIDATE survives into a GENERATE retry, which is precisely
+    the "previous attempt's verdict" the re-planner wants. Defining a parallel
+    dataclass would be a second spelling of a value that already exists.
+
+    TOTAL BY CONSTRUCTION — every degenerate input maps to a defined state,
+    because the re-planner must degrade rather than fly blind or raise:
+
+    * ``None`` — no VALIDATE has run yet (the first GENERATE attempt, or an
+      op that failed before validation). Returns ``("", "")``: the honest
+      "no evidence" state, which `DynamicRePlanner` already tolerates.
+    * **evaluator crashed / verdict never set** — indistinguishable from the
+      above at this seam, and deliberately so. Both mean "no verdict
+      exists"; inventing a third state would be claiming knowledge about WHY
+      that this reader does not have.
+    * **foreign or malformed object** — read by ``getattr`` with defaults, so
+      a duck-typed stand-in (tests, a future verdict type) works and a
+      missing attribute degrades instead of raising.
+    * **non-string fields** — coerced with ``str()``. A failure_class that
+      arrived as an enum or ``None`` must not put ``"None"`` into a prompt,
+      so falsy values normalise to ``""``.
+    * **oversized summary** — truncated to :data:`REPLAN_SUMMARY_MAX_CHARS`.
+
+    NEVER raises."""
+    if validation is None:
+        return ("", "")
+    try:
+        raw_fc = getattr(validation, "failure_class", None)
+        raw_em = getattr(validation, "short_summary", None)
+    except Exception:  # noqa: BLE001 — a hostile property must not break GENERATE
+        return ("", "")
+
+    def _clean(value: Any, limit: Optional[int] = None) -> str:
+        if not value:
+            return ""
+        try:
+            out = str(value).strip()
+        except Exception:  # noqa: BLE001
+            return ""
+        if limit is not None and len(out) > limit:
+            out = out[:limit]
+        return out
+
+    return (_clean(raw_fc), _clean(raw_em, REPLAN_SUMMARY_MAX_CHARS))
+
+
 @dataclass(frozen=True)
 class ApprovalDecision:
     """Context-embedded approval decision.

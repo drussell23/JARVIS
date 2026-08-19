@@ -70,9 +70,49 @@ _EXPECTED_ARCHIVE_PATHS: tuple = (
 # Repo-relative paths where the modules MUST NOT live post-cleanup
 # (regression catch — if a refactor accidentally restores them).
 _FORBIDDEN_PRODUCTION_PATHS: tuple = (
-    "backend/core/ouroboros/governance/graduation_orchestrator.py",
     "backend/core/ouroboros/governance/graduation_tracker.py",
 )
+
+#: (archive, production) pairs judged by IDENTITY rather than by path.
+#:
+#: A PATH IS A PROXY, AND THIS ONE STOPPED MATCHING THE PROPERTY.
+#: `graduation_orchestrator.py` was banned by path. Slice 132 (#69347) and
+#: Slice 136 (#69351) then created a genuinely different module at that path —
+#: the Cognitive Graduation Matrix, 312 lines exposing `graduate` /
+#: `graduate_all` / `GraduationOutcome`, against the archived module's 1,137
+#: lines exposing `GraduationOrchestrator` / `GraduationPhase` /
+#: `EphemeralUsageTracker`. Zero symbol overlap; only the NAME is shared, and
+#: `phase9_orchestrator.py` already documents the two as distinct.
+#:
+#: So this pin reported a §32.5 violation nobody committed, on every run, for
+#: months. The property §32.5 actually protects is "the archived
+#: implementation has not come back" — which is about CODE, not a filename.
+#: The archived symbol set is read FROM THE ARCHIVE at validation time, so
+#: amending the archive keeps the check honest without editing this list.
+_ARCHIVE_IDENTITY_PAIRS: tuple = (
+    (
+        "archive/legacy/graduation_orchestrator_2026_04_06.py",
+        "backend/core/ouroboros/governance/graduation_orchestrator.py",
+    ),
+)
+
+
+def _top_level_symbols(path: "Path") -> set:
+    """Top-level class/function names a module defines. NEVER raises.
+
+    An unparseable or unreadable file yields an empty set, and the caller
+    treats an empty ARCHIVE set as "cannot judge" rather than as "clean" —
+    a comparison that passes because it read nothing is a vacuous pass."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:  # noqa: BLE001 — a pin must never raise
+        return set()
+    return {
+        node.name for node in tree.body
+        if isinstance(
+            node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef),
+        )
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +283,29 @@ def _validate_archive_provenance(
                 f"forbidden production path re-introduced: "
                 f"{rel} (archived per §32.5; remove and "
                 f"replace with M10 substrate)"
+            )
+
+    # IDENTITY, not path — see `_ARCHIVE_IDENTITY_PAIRS`. An absent
+    # production file is the strongest pass; a present one must share no
+    # top-level symbol with the archived implementation.
+    for archived_rel, production_rel in _ARCHIVE_IDENTITY_PAIRS:
+        production = root / production_rel
+        if not production.exists():
+            continue
+        archived_syms = _top_level_symbols(root / archived_rel)
+        if not archived_syms:
+            # Cannot judge: say so rather than pass vacuously.
+            violations.append(
+                f"archive unreadable for identity check: {archived_rel} — "
+                f"cannot prove {production_rel} is not a resurrection"
+            )
+            continue
+        overlap = archived_syms & _top_level_symbols(production)
+        if overlap:
+            violations.append(
+                f"archived implementation resurrected at "
+                f"{production_rel}: shares {sorted(overlap)} with "
+                f"{archived_rel} (§32.5)"
             )
 
     # Ensure provenance README exists so future operators know

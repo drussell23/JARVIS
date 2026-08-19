@@ -822,9 +822,33 @@ def register_shipped_invariants() -> list:
         "execution_graph_progress_bridge.py"
     )
 
-    def _validate_master_default_false(
+    def _validate_master_switch_honors_explicit_off(
         tree: "ast.Module", source: str,  # noqa: ARG001
     ) -> tuple:
+        """A GRADUATED flag must still be switchable OFF.
+
+        THIS PIN OUTLIVED ITS OWN PREMISE. It was
+        ``master_default_false`` and AST-asserted that
+        ``master_enabled()`` contained ``if raw == "": return False`` —
+        the §33.1 pre-graduation contract. The capability GRADUATED on
+        2026-07-24 (#70086, cockpit agentic-visibility: observability-
+        only, zero authority) and the function now returns True on an
+        empty string, exactly as its docstring says. The pin kept
+        asserting the retired state and failed on every run.
+
+        A pin whose premise expired is not deleted here — the property
+        that still matters is that graduation did not weld the switch
+        shut. So it now asserts the POST-graduation guarantee: the
+        function must consult a truthiness set, which is what makes an
+        explicit ``0`` / ``false`` turn the bridge off. §33.1's real
+        subject is operator control, and that survives graduation even
+        though the default does not.
+
+        Note the DEFAULT itself is deliberately NOT re-asserted here.
+        `tests/governance/test_agentic_cockpit_visibility.py` owns that
+        claim; two files asserting one default is precisely how this
+        one came to contradict the code it guards.
+        """
         violations: list = []
         target_func = None
         for node in ast.walk(tree):
@@ -837,44 +861,19 @@ def register_shipped_invariants() -> list:
         if target_func is None:
             violations.append("master_enabled() missing")
             return tuple(violations)
-        empty_returns_false = False
+        honors_off = False
         for sub in ast.walk(target_func):
-            if not isinstance(sub, ast.If):
-                continue
-            for cmp_node in ast.walk(sub.test):
-                if not isinstance(cmp_node, ast.Compare):
-                    continue
-                if not cmp_node.ops or not isinstance(
-                    cmp_node.ops[0], ast.Eq,
-                ):
-                    continue
-                operand_empty = False
-                for operand in (
-                    cmp_node.left, *cmp_node.comparators,
-                ):
-                    if (
-                        isinstance(operand, ast.Constant)
-                        and operand.value == ""
-                    ):
-                        operand_empty = True
-                        break
-                if not operand_empty:
-                    continue
-                for stmt in sub.body:
-                    if isinstance(stmt, ast.Return) and (
-                        isinstance(stmt.value, ast.Constant)
-                        and stmt.value.value is False
-                    ):
-                        empty_returns_false = True
-                        break
-                if empty_returns_false:
-                    break
-            if empty_returns_false:
+            # `raw in _TRUTHY` (or any membership test) is the shape
+            # that lets an explicit falsy value return False.
+            if isinstance(sub, ast.Compare) and any(
+                isinstance(op, ast.In) for op in sub.ops
+            ):
+                honors_off = True
                 break
-        if not empty_returns_false:
+        if not honors_off:
             violations.append(
-                "master_enabled() MUST return False on "
-                "empty env-var string per §33.1"
+                "master_enabled() MUST consult a truthiness set so an "
+                "explicit off value can disable a GRADUATED flag"
             )
         return tuple(violations)
 
@@ -1163,14 +1162,15 @@ def register_shipped_invariants() -> list:
         ShippedCodeInvariant(
             invariant_name=(
                 "execution_graph_progress_bridge_"
-                "master_default_false"
+                "master_switch_honors_explicit_off"
             ),
             target_file=target,
             description=(
-                "Phase 3 A2 — §33.1 master flag stays "
-                "default-FALSE."
+                "Graduated 2026-07-24 (#70086): the default moved to "
+                "TRUE, so the surviving guarantee is that an explicit "
+                "off value still disables the bridge."
             ),
-            validate=_validate_master_default_false,
+            validate=_validate_master_switch_honors_explicit_off,
         ),
         ShippedCodeInvariant(
             invariant_name=(

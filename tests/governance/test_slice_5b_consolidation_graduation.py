@@ -48,12 +48,44 @@ def test_slice1_archived_files_exist():
 
 
 def test_slice1_production_paths_absent():
+    """The THIRD copy of this check, and the same proxy defect in all of them.
+
+    A path ban asks "is this filename in use", when §32.5 protects "has the
+    archived IMPLEMENTATION come back". Slice 132 (#69347) / Slice 136
+    (#69351) put a genuinely different module at
+    `governance/graduation_orchestrator.py` — 312 lines exposing `graduate` /
+    `graduate_all` / `GraduationOutcome`, against the archive's 1,137 exposing
+    `GraduationOrchestrator` / `GraduationPhase` / `EphemeralUsageTracker`.
+    Zero symbol overlap; only the name is shared.
+
+    The two paths that are genuinely still absent keep the cheap check. The
+    reused name is judged by identity, delegated to the ONE authority
+    (`cleanup_invariants`) rather than re-implemented a fourth time."""
     for rel in (
-        "backend/core/ouroboros/governance/graduation_orchestrator.py",  # noqa: E501
         "backend/core/ouroboros/governance/graduation_tracker.py",
         "tests/governance/test_graduation_orchestrator.py",
     ):
         assert not (_repo_root() / rel).exists()
+
+    from backend.core.ouroboros.governance.cleanup_invariants import (
+        _ARCHIVE_IDENTITY_PAIRS,
+        _top_level_symbols,
+    )
+    root = _repo_root()
+    for archived_rel, production_rel in _ARCHIVE_IDENTITY_PAIRS:
+        production = root / production_rel
+        if not production.exists():
+            continue
+        archived_syms = _top_level_symbols(root / archived_rel)
+        assert archived_syms, (
+            f"archive unreadable: {archived_rel} — the comparison would pass "
+            "vacuously"
+        )
+        overlap = archived_syms & _top_level_symbols(production)
+        assert not overlap, (
+            f"archived implementation resurrected at {production_rel}: "
+            f"shares {sorted(overlap)}"
+        )
 
 
 def test_slice1_archive_readme_present():
@@ -348,7 +380,12 @@ def test_consolidation_arc_all_pins_pass_validation():
     assert not relevant, (
         "consolidation-arc pin violations: "
         + "; ".join(
-            f"{v.invariant_name}: {v.violation}"
+            # `.detail` — `InvariantViolation` has no `.violation`. The
+            # SECOND copy of this bug; the first was in
+            # `test_cleanup_arc_slice1.py`. This f-string is only evaluated
+            # WHEN violations exist, so the AttributeError replaced the
+            # report at the one moment it mattered.
+            f"{v.invariant_name}: {v.detail}"
             for v in relevant
         )
     )

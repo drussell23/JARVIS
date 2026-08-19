@@ -399,6 +399,9 @@ class GENERATERunner(PhaseRunner):
         self._consciousness_bridge = consciousness_bridge
 
     async def run(self, ctx: OperationContext) -> PhaseResult:
+        from backend.core.ouroboros.governance.op_context import (  # noqa: PLC0415
+            replan_inputs as _replan_inputs,
+        )
         orch = self._orchestrator
         _serpent = self._serpent
         _consciousness_bridge = self._consciousness_bridge
@@ -2253,24 +2256,28 @@ class GENERATERunner(PhaseRunner):
                 try:
                     from backend.core.ouroboros.governance.self_evolution import DynamicRePlanner
                     _attempt_num = orch._config.max_generate_retries - generate_retries_remaining + 1
-                    # NO VALIDATION VERDICT EXISTS IN THIS SCOPE.
+                    # THE VERDICT WAS ALWAYS REACHABLE — from `ctx`, not from
+                    # a local. `validation` has no binding anywhere in
+                    # `run()`; it was carried over from the inline
+                    # orchestrator twin, where it IS bound at the VALIDATE
+                    # seam. The `in dir()` guard therefore always evaluated
+                    # False, and dynamic re-planning ran on empty failure
+                    # context on every real op of the SHIPPING path.
                     #
-                    # `validation` has no binding anywhere in `run()`; it was
-                    # carried over from the inline orchestrator twin, where it
-                    # IS bound (at the VALIDATE seam). The `in dir()` guard
-                    # therefore always evaluated False here, so these were
-                    # always "" — and this is the SHIPPING path
-                    # (`JARVIS_PHASE_RUNNER_GATE_EXTRACTED`). Dynamic
-                    # re-planning has been reasoning from empty failure
-                    # context on every real op.
+                    # `validate_runner` publishes the verdict with
+                    # `ctx.advance(GATE, validation=best_validation)`, and
+                    # `advance()` uses `dataclasses.replace` — so every field
+                    # not explicitly overridden carries forward, and a verdict
+                    # set at VALIDATE survives into the next GENERATE attempt.
+                    # That is exactly the "previous pass's verdict" this block
+                    # wants, and it needed no new machinery to obtain.
                     #
-                    # Made explicit rather than left as a guard that looks
-                    # like it might sometimes fire. Wiring a real verdict
-                    # through to this seam is a behavioural change with its
-                    # own design question — which verdict, from which
-                    # attempt — and is deliberately NOT invented here.
-                    _fc = ""
-                    _em = ""
+                    # `replan_inputs` is TOTAL: a missing verdict (first
+                    # attempt, or an evaluator that never produced one) yields
+                    # ("", "") — the same honest no-evidence state this code
+                    # already degraded to, now reached deliberately instead of
+                    # by accident.
+                    _fc, _em = _replan_inputs(getattr(ctx, "validation", None))
                     _replan = DynamicRePlanner.suggest_replan(_fc, _em, _attempt_num)
                     if _replan:
                         _replan_text = DynamicRePlanner.format_for_prompt(_replan)
