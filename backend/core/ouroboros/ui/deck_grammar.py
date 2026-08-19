@@ -39,7 +39,9 @@ is escaped: a diff hunk containing ``[foo]`` is content, never a tag.
 """
 from __future__ import annotations
 
+import functools
 import logging
+import os
 from typing import Any, Optional
 
 logger = logging.getLogger("Ouroboros.DeckGrammar")
@@ -293,6 +295,125 @@ def _legible_over_band(style: str, banded: bool) -> str:
         return style
 
 
+#: How many distinct paths keep a resolved lexer. A diff session touches the
+#: files in its hunks and no more, so this is a memory bound rather than a
+#: behaviour knob — it is read once, and every value produces identical output,
+#: only a different number of re-resolutions. Tunable because "how many files
+#: can one session touch" has no defensible constant.
+try:
+    _LEXER_CACHE_ENTRIES = max(
+        1, int(os.environ.get("JARVIS_DECK_LEXER_CACHE_ENTRIES", "512")))
+except (TypeError, ValueError):
+    _LEXER_CACHE_ENTRIES = 512
+
+
+def _filename_candidates(path: str) -> int:
+    """How many lexers claim ``path`` BY NAME. ``-1`` means "could not tell".
+
+    This is the loop-invariant half of pygments' own algorithm.
+    ``guess_lexer_for_filename`` first collects every lexer whose ``filenames``
+    globs match — a function of the PATH ALONE — and only then, if more than
+    one matched, consults the content to break the tie. Collecting that set is
+    where the whole cost lives: it walks ``_iter_lexerclasses()``, which calls
+    ``find_plugin_lexers()`` -> ``importlib.metadata.entry_points()``, which
+    re-reads the ``entry_points.txt`` of every installed distribution. Profiled
+    at 1125 file reads and ~88% of a 19ms call — repeated for every line of
+    every hunk, always returning the same answer.
+
+    So the count is cached per path, and it is the only thing this function
+    reports: the identity of the winner still comes from pygments.
+
+    Uses pygments' private helpers, which is a coupling worth naming: they are
+    guarded by ``hasattr`` and any failure returns ``-1``, which routes the
+    caller to the ordinary uncached call. A pygments that reorganises these
+    costs us the optimisation, never the answer.
+    """
+    try:
+        from pygments import lexers as _lx
+        iter_classes = getattr(_lx, "_iter_lexerclasses", None)
+        fn_matches = getattr(_lx, "_fn_matches", None)
+        if iter_classes is None or fn_matches is None:
+            return -1
+        matched = 0
+        for lexer in iter_classes():
+            names = tuple(getattr(lexer, "filenames", ()) or ())
+            aliases = tuple(getattr(lexer, "alias_filenames", ()) or ())
+            if any(fn_matches(path, f) for f in names) or \
+                    any(fn_matches(path, f) for f in aliases):
+                matched += 1
+                if matched > 1:
+                    return matched          # ambiguous is all the caller needs
+        return matched
+    except Exception:  # noqa: BLE001
+        return -1
+
+
+def _sole_lexer_alias(path: str) -> Optional[str]:
+    """The alias for a path exactly ONE lexer claims, else ``None``.
+
+    When a single lexer matches the filename, pygments returns it WITHOUT
+    reading the content at all, so caching by path is not an approximation —
+    the content provably cannot change the answer. That covers ``.py``,
+    ``.md``, ``.toml`` and very nearly every file a hunk contains.
+    """
+    if _filename_candidates(path) != 1:
+        return None
+    try:
+        from pygments.lexers import get_lexer_for_filename
+        lexer = get_lexer_for_filename(path)
+        return lexer.aliases[0] if lexer.aliases else lexer.name
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _guess_with_content(path: str, code: str) -> str:
+    """Pygments' answer for an AMBIGUOUS filename, memoized on (path, code).
+
+    ``index.html`` is claimed by nine lexers — html, html+django, html+php and
+    friends — and only the content separates them. That per-line choice is the
+    RIGHT behaviour for a line-oriented renderer: a hunk line showing
+    ``{% block %}`` should be highlighted as the template tag it is, and
+    resolving one lexer for the whole file would flatten it back to plain html.
+
+    So the ambiguous case still asks pygments, through Rich, unchanged. It is
+    memoized rather than avoided: a deck repaints the same hunk on every frame,
+    so the same (path, code) is asked over and over.
+    """
+    try:
+        from rich.syntax import Syntax
+        return Syntax.guess_lexer(path, code)
+    except Exception:  # noqa: BLE001
+        return "default"
+
+
+#: Cached in its own right, not merely through `_sole_lexer_alias`: the
+#: candidate COUNT is the loop-invariant this whole change exists to hoist, and
+#: leaving it reachable only via its caller would make that dependence
+#: incidental — a later caller could re-pay the scan without anything noticing.
+_filename_candidates = functools.lru_cache(  # type: ignore[assignment]
+    maxsize=_LEXER_CACHE_ENTRIES)(_filename_candidates)
+_sole_lexer_alias = functools.lru_cache(  # type: ignore[assignment]
+    maxsize=_LEXER_CACHE_ENTRIES)(_sole_lexer_alias)
+_guess_with_content = functools.lru_cache(  # type: ignore[assignment]
+    maxsize=_LEXER_CACHE_ENTRIES)(_guess_with_content)
+
+
+def _lexer_for(path: str, code: str) -> str:
+    """Path (+ content, only when the path is ambiguous) -> lexer alias.
+
+    Byte-identical to the previous ``Syntax.guess_lexer(path, code)`` by
+    construction: the single-candidate branch returns what pygments returns
+    without consulting content, and every other path defers to pygments.
+    `functools.lru_cache` is the memo idiom this package already uses
+    (`crest._generate_cached`) and is thread-safe, which matters — the deck
+    renders from the TUI's repaint path.
+    """
+    sole = _sole_lexer_alias(path)
+    if sole is not None:
+        return sole
+    return _guess_with_content(path, code)
+
+
 def _highlight_to_markup(code: str, path: Optional[str], bg: str) -> str:
     """Syntax-highlight ``code`` and return DECK MARKUP. NEVER raises.
 
@@ -311,11 +432,19 @@ def _highlight_to_markup(code: str, path: Optional[str], bg: str) -> str:
     the escapes. Returning markup keeps every existing consumer working, so the
     highlighting is additive rather than a migration.
 
-    The lexer is INFERRED by Rich from the path (`Syntax.guess_lexer`), never from
-    a table here. A hardcoded extension map is wrong the first time someone edits
-    a `.toml`, and Rich already owns that knowledge — it resolves `.py` to python,
-    `.md` to markdown, and a bare `Makefile` to make, none of which this module
-    should be in the business of knowing.
+    The lexer is INFERRED from the path, never from a table here. A hardcoded
+    extension map is wrong the first time someone edits a `.toml`, and Rich and
+    pygments already own that knowledge — `.py` is python, `.md` is markdown, a
+    bare `Makefile` is make, none of which this module should be in the business
+    of knowing.
+
+    Resolution goes through `_lexer_for`, which is byte-for-byte what
+    `Syntax.guess_lexer(path, code)` returned but without re-deriving the part
+    that never changes. The call cost 19.4ms PER LINE — 7.7s on a 400-line hunk
+    — and profiling put ~88% of it in `find_plugin_lexers()` ->
+    `importlib.metadata.entry_points()`, re-reading 1125 installed
+    `entry_points.txt` files on every single line to reach the same answer.
+    That is the defect: a loop-invariant filesystem scan inside a per-line call.
     """
     try:
         from rich.console import Console
@@ -328,7 +457,7 @@ def _highlight_to_markup(code: str, path: Optional[str], bg: str) -> str:
         lexer = None
         if path:
             try:
-                lexer = Syntax.guess_lexer(str(path), code)
+                lexer = _lexer_for(str(path), code)
             except Exception:  # noqa: BLE001
                 lexer = None
         if not lexer:
