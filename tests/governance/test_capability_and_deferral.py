@@ -52,7 +52,8 @@ class TestTheBadgeCannotClaimHealthItDoesNotHave:
         """A dry runway is a BILLING state, not jitter. Waiting for a streak
         would reproduce the original defect in slower motion."""
         r = _ev(monkeypatch, dry=True, provider="doubleword").evaluate()
-        assert r.state is cs.Capability.BLOCKED
+        assert r.state.is_blocking and not r.state.can_work
+        assert r.state is cs.Capability.UNFUNDED   # money has its own word
         assert "doubleword" in r.reason
 
     def test_unknown_renders_as_blocked_never_healthy(self, monkeypatch):
@@ -112,7 +113,7 @@ class TestAsymmetricHysteresis:
         that COMPLETED has."""
         e = _ev(monkeypatch, dry=True, provider="dw", attempted=4,
                 completed=0, failed=4)
-        assert e.evaluate().state is cs.Capability.BLOCKED
+        assert e.evaluate().state.is_blocking
 
         # lane returns, but nothing has completed yet -> still blocked
         monkeypatch.setattr(cs.CapabilityEvaluator, "_read_lanes",
@@ -136,7 +137,7 @@ class TestAsymmetricHysteresis:
         monkeypatch.setattr(cs.CapabilityEvaluator, "_read_lanes",
                             staticmethod(lambda: (True, "dw", True)))
         e.invalidate()
-        assert e.evaluate().state is cs.Capability.BLOCKED
+        assert e.evaluate().state.is_blocking
 
     def test_the_master_flag_off_restores_legacy(self, monkeypatch):
         monkeypatch.setenv("JARVIS_CAPABILITY_STATE_ENABLED", "0")

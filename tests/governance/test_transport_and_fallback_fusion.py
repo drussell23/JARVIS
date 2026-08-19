@@ -55,14 +55,22 @@ class TestAWorkingFallbackIsNotAnOutage:
         assert r.state is cs.Capability.DEGRADED
         assert "running local" in r.reason
 
-    def test_dry_lane_with_no_remote_is_still_blocked(self, monkeypatch):
-        r = _ev(monkeypatch, dry=True, remote="absent").evaluate()
-        assert r.state is cs.Capability.BLOCKED
+    def test_dry_lane_with_no_remote_still_stops_dispatch(self, monkeypatch):
+        """Asserts the SEMANTIC, not the enum member.
 
-    def test_dry_lane_with_an_unreachable_remote_is_blocked(self, monkeypatch):
+        This read `is cs.Capability.BLOCKED` and broke the moment UNFUNDED was
+        added — a legitimate refinement, since money is the one blocker the
+        organism cannot clear itself. `is_blocking` is the property that
+        actually matters and survives the next refinement too.
+        """
+        r = _ev(monkeypatch, dry=True, remote="absent").evaluate()
+        assert r.state.is_blocking and not r.state.can_work
+        assert r.state is cs.Capability.UNFUNDED
+
+    def test_dry_lane_with_an_unreachable_remote_stops_dispatch(self, monkeypatch):
         r = _ev(monkeypatch, dry=True, remote="unreachable").evaluate()
-        assert r.state is cs.Capability.BLOCKED
-        assert "no lane left" in r.reason
+        assert r.state.is_blocking and not r.state.can_work
+        assert "unreachable" in r.reason
 
     def test_a_configured_but_untried_host_counts_as_a_lane(self, monkeypatch):
         """Never-contacted is UNVERIFIED, not broken. Reporting BLOCKED would

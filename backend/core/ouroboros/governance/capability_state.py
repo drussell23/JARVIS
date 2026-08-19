@@ -331,7 +331,13 @@ class CapabilityEvaluator:
             self._cached_at = _now
             changed = self._last_state is not state
             self._last_state = state
-            if state is Capability.BLOCKED and self._degraded_at_completed is None:
+            # `is_blocking`, not `is BLOCKED`. Arming the hysteresis mark on
+            # the enum member meant that once UNFUNDED existed, a funding
+            # degrade no longer armed it — so the "recovery requires a
+            # VERIFIED SUCCESS" rule silently stopped applying to the most
+            # common degrade there is. Every gate on "can this act" must ask
+            # the property, never the member.
+            if state.is_blocking and self._degraded_at_completed is None:
                 self._degraded_at_completed = completed
             elif state is Capability.HEALTHY:
                 self._degraded_at_completed = None
