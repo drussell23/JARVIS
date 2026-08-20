@@ -3035,6 +3035,59 @@ def _f3c_inflight_bracket(endpoint: "Optional[str]") -> Any:
     return _f3c_null_bracket()
 
 
+#: Monotonic stamp of the last credential re-read. Module-level because the
+#: question ("does this host have a paid lane?") is process-wide, not per-op.
+_FREE_LANE_CRED_REFRESH_AT: float = 0.0
+
+
+def _free_lane_cred_ttl_s() -> float:
+    """How stale a credential reading may be before ``.env`` is consulted again.
+    Default 30s. 0 disables refresh (boot-time environment only)."""
+    return _envf_or_default("JARVIS_FREE_LANE_CRED_TTL_S", 30.0)
+
+
+def _refresh_paid_lane_credentials() -> None:
+    """Re-read allowlisted provider credentials from ``.env`` into the process.
+
+    WHY THIS IS NEEDED AT ALL. Reading ``os.environ`` on every call already makes
+    the interlock reactive to any IN-PROCESS change -- but an operator cannot
+    reach a running process that way. ``os.environ`` is per-process, so a shell
+    export is invisible to an orchestrator already running, and
+    ``env_bootstrap.load_env_once`` is idempotent by design, so editing ``.env``
+    mid-soak is never re-read either. Without this, "keys added mid-soak revoke
+    the free lane" would be a claim the code could not honour: the loop would
+    keep treating a now-metered host as free.
+
+    Composes ``credential_env_loader.load_provider_credentials`` rather than
+    parsing ``.env`` here -- that module already owns the allowlist (which is
+    exactly DOUBLEWORD_API_KEY / ANTHROPIC_API_KEY plus HF tokens), the
+    explicit-export-wins precedence, and the never-log-secrets contract. A second
+    parser would be a second policy about credentials, which is the last thing
+    this repo needs two of.
+
+    TTL-bounded: the answer changes at operator speed, not per-op, so a file
+    stat per generation would be waste. NEVER raises."""
+    global _FREE_LANE_CRED_REFRESH_AT  # noqa: PLW0603
+    try:
+        ttl = _free_lane_cred_ttl_s()
+        if ttl <= 0:
+            return
+        now = time.monotonic()
+        if (now - _FREE_LANE_CRED_REFRESH_AT) < ttl:
+            return
+        _FREE_LANE_CRED_REFRESH_AT = now
+        from backend.core.ouroboros.aegis.credential_env_loader import (  # noqa: PLC0415
+            load_provider_credentials,
+        )
+        # Note the asymmetry this inherits, and it is the SAFE one: the loader
+        # never overwrites an explicit export, so a key can be ADDED mid-run
+        # (revoking free-lane status, the cautious direction) but a stale key
+        # cannot be silently cleared into free-lane status by editing a file.
+        load_provider_credentials()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _free_lane_active() -> bool:
     """True when generation runs on a lane with ~zero marginal cost per op.
 
@@ -3057,6 +3110,9 @@ def _free_lane_active() -> bool:
         from .local_inference_director import local_prime_enabled  # noqa: PLC0415
         if not local_prime_enabled():
             return False
+        # Consult .env before answering, so a key added while the loop is
+        # RUNNING revokes free-lane status without a restart. TTL-bounded.
+        _refresh_paid_lane_credentials()
         if os.environ.get("DOUBLEWORD_API_KEY") or os.environ.get("ANTHROPIC_API_KEY"):
             return False
         return True
