@@ -4939,49 +4939,107 @@ class CandidateGenerator:
     # Route-specific generation strategies (Manifesto §5)
     # ------------------------------------------------------------------
 
+    async def _local_jprime_endpoint(self) -> Optional[str]:
+        """The ALWAYS-ON local J-Prime lane's endpoint, when it can serve.
+
+        Sources 1-2 in :meth:`_discover_jprime_endpoint` both answer "was a GCP
+        failover node awakened?". That was the same question as "is J-Prime
+        available?" only while J-Prime was exclusively a cloud VM. An operator
+        serving the 32B locally has a J-Prime endpoint permanently -- there is no
+        node to awaken and no lifecycle FSM to enter SERVING, so discovery
+        returned None and every dispatch fell to a DW lane that may not be
+        funded at all.
+
+        Enabled AND reachable, never enabled alone: an endpoint that does not
+        answer would COMMIT the Phase 3c seam (``_committed = True``), and under
+        Absolute Route Sealing a committed dispatch failure is TERMINAL -- so a
+        flag pointing at a dead engine would convert a survivable DW attempt into
+        an unrecoverable op. Reachability is the difference between a lane and a
+        promise.
+
+        Reads the endpoint from ``LocalConfig.from_env()`` and probes the same
+        ``/api/tags`` readiness surface ``_resolve_dispatch_model_name`` uses, so
+        this cannot disagree with the client that will serve the request. Bounded
+        and memoized-by-nothing (residency changes; a stale yes is worse than a
+        second probe). Fail-soft -- NEVER raises."""
+        try:
+            from .local_inference_director import LocalConfig, local_prime_enabled
+            if not local_prime_enabled():
+                return None
+            base = (LocalConfig.from_env().base_url or "").strip()
+            if not base:
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            import aiohttp  # noqa: PLC0415
+            timeout_s = _envf_or_default("JARVIS_LOCAL_JPRIME_PROBE_S", 4.0)
+            timeout = aiohttp.ClientTimeout(total=timeout_s)
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.get(base.rstrip("/") + "/api/tags") as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json(content_type=None)
+            # A reachable engine serving zero models is not a lane.
+            if not (data or {}).get("models"):
+                return None
+            return base
+        except Exception:  # noqa: BLE001 -- unprovable lane == no lane
+            return None
+
     async def _discover_jprime_endpoint(self) -> Optional[str]:
-        """Dynamic state-driven discovery of the awakened J-Prime node's endpoint.
+        """Dynamic state-driven discovery of a SERVING J-Prime endpoint.
 
         The failover node awakens at RUNTIME, so we do NOT rely on a boot-wired
-        ``self._jprime``. Two dynamic sources, in order:
+        ``self._jprime``. Three dynamic sources, in order:
           (1) the failover controller's PUBLISHED endpoint when it is SERVING
               (fast path -- same as the Phase 3c seam);
           (2) a direct zone-aware GCP query (``get_node_endpoints``) -- works even
               when THIS process's controller is not in SERVING state (e.g. the node
               was awakened out-of-band by the ignition driver), composing
-              ``http://<ip>:<port>``.
-        Returns a full URL or None. Gated by ``lifecycle_enabled()`` (byte-identical
-        when failover is off). Fail-soft -- NEVER raises."""
+              ``http://<ip>:<port>``;
+          (3) the ALWAYS-ON local lane (:meth:`_local_jprime_endpoint`).
+
+        Source 3 is consulted LAST, deliberately: sources 1-2 are byte-identical
+        to their previous behaviour, so a deployment with a real failover node
+        keeps using it and nothing about GCP routing changes. Local only fills
+        the case where discovery previously returned None -- which, on a host
+        with no GCP failover at all, is every case.
+
+        The GCP sources remain gated by ``lifecycle_enabled()``; the local lane
+        is gated by ``local_prime_enabled()`` (also default-OFF) and must NOT
+        inherit the failover gate, because a locally-served 32B has no failover
+        lifecycle to enable. Returns a full URL or None. Fail-soft -- NEVER
+        raises."""
+        gcp_enabled = False
         try:
             from .failover_lifecycle import (
                 lifecycle_enabled, get_failover_controller, _failover_port,
             )
+            gcp_enabled = bool(lifecycle_enabled())
         except Exception:  # noqa: BLE001
-            return None
-        try:
-            if not lifecycle_enabled():
-                return None
-        except Exception:  # noqa: BLE001
-            return None
-        # (1) Controller-published endpoint (fast path).
-        try:
-            ctrl = get_failover_controller()
-            if ctrl.is_jprime_serving():
-                ep = ctrl.jprime_endpoint()
-                if ep:
-                    return ep
-        except Exception:  # noqa: BLE001
-            pass
-        # (2) Direct zone-aware GCP discovery (controller-state-independent).
-        try:
-            from .gcp_compute_rest import get_compute_rest
-            internal, external = await get_compute_rest().get_node_endpoints()
-            ip = external or internal
-            if ip:
-                return "http://%s:%d" % (ip, _failover_port())
-        except Exception:  # noqa: BLE001
-            pass
-        return None
+            gcp_enabled = False
+        if gcp_enabled:
+            # (1) Controller-published endpoint (fast path).
+            try:
+                ctrl = get_failover_controller()
+                if ctrl.is_jprime_serving():
+                    ep = ctrl.jprime_endpoint()
+                    if ep:
+                        return ep
+            except Exception:  # noqa: BLE001
+                pass
+            # (2) Direct zone-aware GCP discovery (controller-state-independent).
+            try:
+                from .gcp_compute_rest import get_compute_rest
+                internal, external = await get_compute_rest().get_node_endpoints()
+                ip = external or internal
+                if ip:
+                    return "http://%s:%d" % (ip, _failover_port())
+            except Exception:  # noqa: BLE001
+                pass
+        # (3) The local lane -- no node to awaken, no FSM to enter SERVING.
+        return await self._local_jprime_endpoint()
 
     async def _resolve_dispatch_model_name(self, endpoint: Optional[str]) -> Optional[str]:
         """The model the awakened J-Prime node ACTUALLY serves (loaded in VRAM) --
