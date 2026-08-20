@@ -3035,6 +3035,35 @@ def _f3c_inflight_bracket(endpoint: "Optional[str]") -> Any:
     return _f3c_null_bracket()
 
 
+def _free_lane_active() -> bool:
+    """True when generation runs on a lane with ~zero marginal cost per op.
+
+    Exists so cost-motivated gates can ask about COST rather than hardcode a
+    route name. Several policies in this file trade quality away to save money
+    -- correct against a metered provider, and pure loss on a locally-served
+    model where the only per-op cost is electricity.
+
+    Deliberately conservative: it requires the local lane to be the configured
+    one AND both paid lanes to be unavailable. A host with credentials might
+    still route to a paid provider, and treating that as free would silently
+    multiply someone's bill. Absence of a key is the strongest available
+    evidence that no paid lane exists.
+
+    NEVER raises -- an unprovable answer is False, which preserves the
+    pre-existing cost-averse behaviour exactly."""
+    try:
+        if not _envb("JARVIS_FREE_LANE_POLICY_ENABLED", True):
+            return False
+        from .local_inference_director import local_prime_enabled  # noqa: PLC0415
+        if not local_prime_enabled():
+            return False
+        if os.environ.get("DOUBLEWORD_API_KEY") or os.environ.get("ANTHROPIC_API_KEY"):
+            return False
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def _f3c_gateway_residency(
     endpoint: str, model: str, context: Any = None,
 ) -> "Optional[Dict[str, Any]]":
@@ -4102,8 +4131,21 @@ class CandidateGenerator:
         if not self._swarm_routing_enabled():
             return None
         route = (getattr(context, "provider_route", "") or "standard").lower()
-        if route in ("background", "speculative"):
-            return None  # cost-optimized routes never fan out a swarm
+        if route in ("background", "speculative") and not _free_lane_active():
+            # Cost-optimized routes do not fan out a swarm -- because a swarm is
+            # N generation calls and, on a metered provider, N times the bill.
+            # That is a statement about MONEY, not about correctness, and it
+            # stops being true on a lane whose marginal cost is zero.
+            #
+            # It also inverts on such a lane: the swarm exists to avoid handing a
+            # model a whole large file, which is exactly the failure a local 32B
+            # hits hardest (truncated full_content -> missing required fields and
+            # syntax errors). Skipping chunking to save money we are not spending
+            # buys nothing and costs the op. Note the local "swarm" is not even
+            # parallel -- the VRAM mutex serializes it onto one device, so it is
+            # sequential chunk processing, slower but free, which is precisely
+            # the trade a background op should take.
+            return None
         target_files = tuple(getattr(context, "target_files", ()) or ())
         if not target_files:
             return None
