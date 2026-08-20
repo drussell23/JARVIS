@@ -445,6 +445,12 @@ class InferenceGateway:
         #: read-and-mutated. See `_swap_lock_for` for why a per-endpoint asyncio
         #: lock rather than the shared threading one.
         self._swap_locks: Dict[str, "asyncio.Lock"] = {}
+        #: base_url -> count of generations CURRENTLY streaming on that host.
+        #: The swap mutex is released the moment residency is settled, which is
+        #: BEFORE generation starts -- so the mutex alone cannot stop an
+        #: advisory pre-warm from evicting weights out from under a live
+        #: stream. This counter is what makes that impossible.
+        self._inflight: Dict[str, int] = {}
         self._client_factory = client_factory
 
     # -- resolution --------------------------------------------------------
@@ -625,17 +631,49 @@ class InferenceGateway:
                 prompt_tokens=prompt_tokens, temperature=temperature,
                 max_tokens=max_tokens)
 
+    def _inflight_count(self, base_url: str) -> int:
+        """Generations currently streaming on *base_url*. NEVER raises."""
+        try:
+            with self._lock:
+                return int(self._inflight.get(base_url, 0))
+        except Exception:  # noqa: BLE001
+            # Unknowable reads as BUSY: an advisory swap that cannot prove the
+            # host is idle must not proceed. Fail toward not-evicting.
+            return 1
+
+    def _inflight_adjust(self, base_url: str, delta: int) -> None:
+        """Move the in-flight counter. NEVER raises -- an accounting failure
+        must not propagate into a dispatch."""
+        try:
+            with self._lock:
+                cur = int(self._inflight.get(base_url, 0)) + delta
+                if cur > 0:
+                    self._inflight[base_url] = cur
+                else:
+                    self._inflight.pop(base_url, None)
+        except Exception:  # noqa: BLE001
+            pass
+
     async def _dispatch_to(self, target: GatewayTarget, *, system: str,
                            user: str, prompt_tokens: int, temperature: float,
                            max_tokens: Optional[int]) -> Any:
         client, _profiler = self._client_for(target)
-        result = await client.complete(
-            system=system, user=user, prompt_tokens=prompt_tokens,
-            temperature=temperature, max_tokens=max_tokens,
-            # See the docstring: forced for remote, left to the client's own
-            # policy locally (where a stall is slowness, not a dead peer).
-            stream=True if target.is_remote else None,
-        )
+        # The generation window. Incremented HERE and not in `dispatch` on
+        # purpose: this is the only place weights are actually in use, and the
+        # decrement must survive InterTokenStall, cancellation and any provider
+        # exception -- hence try/finally rather than a post-await line, which a
+        # raised stall would skip and leak the host as permanently busy.
+        self._inflight_adjust(target.base_url, 1)
+        try:
+            result = await client.complete(
+                system=system, user=user, prompt_tokens=prompt_tokens,
+                temperature=temperature, max_tokens=max_tokens,
+                # See the docstring: forced for remote, left to the client's own
+                # policy locally (where a stall is slowness, not a dead peer).
+                stream=True if target.is_remote else None,
+            )
+        finally:
+            self._inflight_adjust(target.base_url, -1)
         if target.is_remote:
             self._health_for(target.base_url).record_success()
         return result
@@ -738,7 +776,11 @@ class InferenceGateway:
             return lk
 
     async def ensure_model_resident(
-        self, target: "GatewayTarget", *, route: Optional[str] = None,
+        self,
+        target: "GatewayTarget",
+        *,
+        route: Optional[str] = None,
+        advisory: bool = False,
     ) -> Dict[str, Any]:
         """Pre-flight: verify the target model is loaded, warm-swapping if not.
 
@@ -779,14 +821,26 @@ class InferenceGateway:
             out["reason"] = "preflight disabled"
             return out
         if not vram_mutex_enabled():
+            # An advisory swap is only safe BECAUSE the mutex and the in-flight
+            # counter exist. With the mutex disabled there is nothing to queue
+            # behind, so a pre-warm would be an unsynchronized eviction -- it
+            # declines rather than degrading into the exact race it prevents.
+            if advisory:
+                out["deferred"] = True
+                out["reason"] = "pre-warm declined: VRAM mutex disabled"
+                return out
             return await self._ensure_model_resident_inner(target, out, route=route)
         try:
             lock = self._swap_lock_for(target.base_url)
         except Exception:  # noqa: BLE001 -- lock creation must never block dispatch
+            if advisory:
+                out["deferred"] = True
+                out["reason"] = "pre-warm declined: no swap lock"
+                return out
             return await self._ensure_model_resident_inner(target, out, route=route)
         async with lock:
             return await self._ensure_model_resident_inner(
-                target, out, route=route, guarded=True)
+                target, out, route=route, guarded=True, advisory=advisory)
 
     async def _ensure_model_resident_inner(
         self,
@@ -795,6 +849,7 @@ class InferenceGateway:
         *,
         route: Optional[str] = None,
         guarded: bool = False,
+        advisory: bool = False,
     ) -> Dict[str, Any]:
         """The residency check-and-swap itself. Split out so the mutex wraps the
         WHOLE read-decide-mutate sequence rather than only the mutation -- a lock
@@ -822,6 +877,29 @@ class InferenceGateway:
             if self._model_matches(target.model_name, resident):
                 out["reason"] = "already resident"
                 return out
+
+            # -- advisory guard: never disturb a live generation ---------------
+            # Re-read the counter HERE, inside the lock and after the residency
+            # probe awaited, rather than before acquiring it: a dispatch can
+            # start during either await, and a check made earlier would be a
+            # stale answer to the only question that matters.
+            #
+            # Holding the swap lock does NOT make this safe on its own. The lock
+            # is released as soon as residency is settled, which is before
+            # `_dispatch_to` begins streaming -- so a pre-warm can hold the lock
+            # legitimately, see a mismatch, and evict weights a running
+            # generation is mid-way through reading. That is the CUDA-OOM /
+            # partial-offload class this guard exists to make unreachable.
+            if advisory:
+                busy = self._inflight_count(target.base_url)
+                if busy > 0:
+                    out["deferred"] = True
+                    out["reason"] = (
+                        f"pre-warm deferred: {busy} generation(s) in flight on "
+                        f"{target.base_url} — an advisory swap never evicts "
+                        f"weights that are in use"
+                    )
+                    return out
 
             # -- capacity admission (mutex path only) --------------------------
             # A swap on a card that cannot hold both models is an EVICTION, not
