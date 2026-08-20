@@ -4185,9 +4185,21 @@ class CandidateGenerator:
         tasks + DW sockets (its awaited children) tear down with no ghost tasks.
         """
         if not self._swarm_routing_enabled():
+            # The LAST unlogged decline path, and the one that cost the most to
+            # find: with every other branch instrumented, an op that dispatched
+            # while emitting no decline line could only have exited here. Left
+            # silent, "the flag is off" and "the function was never called" look
+            # identical from the log, and they demand opposite fixes.
+            logger.info(
+                "[CandidateGenerator] swarm decline: JARVIS_SWARM_ROUTING_ENABLED "
+                "is not set (observed=%r)",
+                os.environ.get("JARVIS_SWARM_ROUTING_ENABLED"))
             return None
         route = (getattr(context, "provider_route", "") or "standard").lower()
         if route in ("background", "speculative") and not _free_lane_active():
+            logger.info(
+                "[CandidateGenerator] swarm decline: route=%s is cost-optimized "
+                "and this lane is metered", route)
             # Cost-optimized routes do not fan out a swarm -- because a swarm is
             # N generation calls and, on a metered provider, N times the bill.
             # That is a statement about MONEY, not about correctness, and it
@@ -4202,12 +4214,26 @@ class CandidateGenerator:
             # sequential chunk processing, slower but free, which is precisely
             # the trade a background op should take.
             return None
+        # DIAGNOSABILITY. This method declines at five separate points and, until
+        # now, every one of them returned None silently. That is fine when the
+        # feature is off and nobody is asking -- and actively obstructive the
+        # moment someone enables it and it does nothing, because "no swarm
+        # happened" and "the swarm declined for reason X" are indistinguishable
+        # in the log. Three soaks were spent inferring which gate fired from the
+        # SIZE OF THE MODEL'S OUTPUT. One line per decline turns that into a
+        # reading. INFO, not DEBUG: a silent no-op the operator explicitly asked
+        # for is exactly the thing worth saying out loud.
         target_files = tuple(getattr(context, "target_files", ()) or ())
         if not target_files:
+            logger.info(
+                "[CandidateGenerator] swarm decline: op carries no target_files")
             return None
         path = target_files[0]
         source = self._read_source_for_swarm(path)
         if source is None:
+            logger.info(
+                "[CandidateGenerator] swarm decline: source unreadable for %s "
+                "(repo_root=%s)", path, getattr(self, "_repo_root", None))
             return None
         try:
             from backend.core.ouroboros.governance.chunked_generation import (
@@ -4222,9 +4248,15 @@ class CandidateGenerator:
             from backend.core.ouroboros.governance.agent_turn_adapter import (
                 ProductionAgentTurnFn,
             )
-        except Exception:  # noqa: BLE001 — swarm stack absent → standard route
+        except Exception as _swarm_imp_exc:  # noqa: BLE001 — stack absent → standard route
+            logger.info(
+                "[CandidateGenerator] swarm decline: stack unavailable (%s: %s)",
+                type(_swarm_imp_exc).__name__, _swarm_imp_exc)
             return None
         if not is_big_file(source):
+            logger.info(
+                "[CandidateGenerator] swarm decline: %s is under the big-file "
+                "threshold (%d lines)", path, source.count("\n"))
             return None
 
         res = resolve_target_symbols(
