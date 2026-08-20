@@ -852,17 +852,49 @@ class TestDiscovery:
         assert discovered == 0
 
     def test_discover_skips_modules_without_register_function(self):
-        # Modules that don't expose register_termination_hooks
-        # are silently skipped — no error, no log noise that
-        # breaks anything. Slice 3 added 1 module that DOES
-        # expose it (the default-adapters); the rest of the
-        # battle_test + governance packages don't, and the
-        # discovery loop must skip them silently.
+        # The claim in the name is that a module WITHOUT
+        # `register_termination_hooks` contributes NOTHING — not that
+        # some exact number of modules have one.
+        #
+        # This asserted `discovered == 1`, a snapshot of how many
+        # providers existed when Slice 3 landed. So the second provider
+        # to ship anywhere under battle_test/ or governance/ turned this
+        # suite red for doing exactly what the discovery contract
+        # invites — co-locating hooks with the consuming code, "no edits
+        # to this module required". A count is the one thing a
+        # zero-edit contract guarantees will drift.
+        #
+        # That is the same shape `list_verbs()` was written to end: a
+        # hand-written number saying what exists while the code says
+        # something else. So pin the PREMISE, not the census.
         reg = TerminationHookRegistry()
         discovered = discover_module_provided_hooks(reg)
-        # Exactly the default-adapter module's 1 hook —
-        # no spurious registrations from non-provider modules.
-        assert discovered == 1
+
+        # 1. Discovery RAN, and found the providers that do exist.
+        assert discovered >= 1
+
+        # 2. Nothing spurious: every hook now in the registry was
+        #    contributed by a provider, and the walk's own count agrees
+        #    with what actually landed. A non-provider module that
+        #    somehow registered would break this equality.
+        landed = sum(
+            len(reg.for_phase(phase)) for phase in TerminationPhase
+        )
+        assert landed == discovered
+
+        # 3. The actual claim, isolated: point the walk at a package
+        #    tree with no providers in it and it contributes zero,
+        #    silently — no error, no partial registration.
+        import backend.core.ouroboros.battle_test.termination_hook_registry as _thr  # noqa: E501
+        empty = TerminationHookRegistry()
+        with mock.patch.object(
+            _thr, "_TERMINATION_HOOK_PROVIDER_PACKAGES",
+            ("backend.core.ouroboros.governance.meta",),
+        ):
+            assert discover_module_provided_hooks(empty) == 0
+        assert sum(
+            len(empty.for_phase(phase)) for phase in TerminationPhase
+        ) == 0
 
 
 # ---------------------------------------------------------------------------
