@@ -1135,6 +1135,32 @@ class SerpentFlow:
             self._stream_renderer = None
             self._stream_mirror = None
 
+        # Side-question lane (`/btw`) — where a deferred answer lands.
+        #
+        # An aside is answered minutes after it is asked, on the side
+        # channel's own worker, so it has no console of its own. The
+        # producer publishes ITSELF here rather than the substrate
+        # hunting for a harness accessor — the same contract
+        # `set_active_queue` documents, and for the same reason: the
+        # version of that which reached for a getter failed silently
+        # because the getter did not exist.
+        #
+        # The lambda resolves `self.console` at CALL time on purpose.
+        # The harness swaps that attribute for the spooled mirror after
+        # boot, and a captured reference would keep rendering to the
+        # un-mirrored original — an answer that reaches the daemon's
+        # terminal and no attached cockpit.
+        try:
+            from backend.core.ouroboros.governance.side_channel import (
+                set_answer_sink,
+            )
+            set_answer_sink(
+                lambda markup: self.console.print(markup, highlight=False),
+            )
+        except Exception:  # noqa: BLE001 — the lane falls back to the
+            # attach bridge's own speech primitive; asides still land.
+            pass
+
         # InlinePromptGate Slice 5b (2026-05-02) — phase-boundary
         # renderer boot wire-up. Subscribes a listener to the
         # InlinePromptController singleton so phase-boundary prompts
@@ -8497,6 +8523,9 @@ class SerpentREPL:
             (Treefinement Phase 4): re-renders an archived L2
             tree-search branch (diff + score + outcome + prune
             reason + worktree id).
+          * ``s-N`` → :class:`side_channel.SideChannel`: re-renders a
+            ``/btw`` side question — the answer once it has landed,
+            otherwise the ticket and why it is still waiting.
           * ``<op-id>`` (no prefix) → look up the matching ``o-N`` for
             the most recent op with that id.
 
@@ -8533,6 +8562,13 @@ class SerpentREPL:
             elif ref_or_op.startswith("b-"):
                 # Treefinement Phase 4 — L2 tree-search branch archive
                 self._expand_repair_branch(ref_or_op)
+            elif ref_or_op.startswith("s-"):
+                # `/btw` side-question ticket. Routed here as well as
+                # through `/btw <s-N>` because an operator who has just
+                # been handed a ref reaches for `/expand`, and a ref
+                # family with one member that does not answer there is
+                # a ref family with a hole in it.
+                self._expand_side_question(ref_or_op)
             else:
                 # Treat as op_id and find latest matching o-N
                 self._expand_op_block_by_op_id(ref_or_op)
@@ -8917,6 +8953,28 @@ class SerpentREPL:
                 f"{total}[/{_SEM['dim']}]",
                 highlight=False,
             )
+
+    def _expand_side_question(self, ref: str) -> None:
+        """``/expand s-N`` — re-render one `/btw` aside.
+
+        Delegates the RENDERING to the substrate so this surface and
+        the `/btw` verb cannot drift into two accounts of one ticket —
+        the divergence the ref rings exist to prevent. NEVER raises
+        into the dispatch."""
+        try:
+            from backend.core.ouroboros.governance.side_channel import (
+                render_ref,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._flow.console.print(
+                f"  [{_SEM['death']}]/expand {ref}: side_channel "
+                f"unavailable: {exc}[/{_SEM['death']}]",
+                highlight=False,
+            )
+            return
+        text = render_ref(ref)
+        self._flow._mirror_markup(text)
+        self._flow.console.print(text, highlight=False)
 
     def _expand_repair_branch(self, ref: str) -> None:
         """Treefinement Phase 4 — re-render an archived L2 tree-search

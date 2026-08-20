@@ -4617,6 +4617,11 @@ class BattleTestHarness:
             # Plugin-registered slash commands: /greet, /<plugin_cmd>, etc.
             # Returns True iff a plugin handled the command.
             pass
+        elif await self._try_registry_verb(command.strip()):
+            # Auto-discovered governance verbs (/btw, /posture,
+            # /governor, /decisions, ...). See _try_registry_verb for
+            # why this branch has to exist here at all.
+            pass
         elif self._try_chat_text_bridge(command):
             # Heuristic Intent Multiplexer (chat_text_bridge): bare
             # operator text becomes a conversational turn through the
@@ -7026,6 +7031,77 @@ class BattleTestHarness:
             console.print(panel, highlight=False)
         else:
             self._repl_print(str(panel))
+
+    async def _try_registry_verb(self, line: str) -> bool:
+        """Route a line through the auto-discovery verb registry.
+
+        THE SURFACE SPLIT. This ladder and ``SerpentREPL``'s are two
+        different verb surfaces for one organism. The local terminal
+        falls through to
+        :func:`repl_dispatch_registry.try_dispatch`, which builds a
+        verb→dispatcher map from every module-level
+        ``dispatch_<verb>_command`` in the governance packages. An
+        attached ``ov`` cockpit reaches THIS method's ladder instead —
+        which had no such fallback, so a verb the daemon's own terminal
+        answered was logged as "Unknown REPL command" when typed into
+        the cockpit the operator is actually watching.
+
+        That is the same class as the 59 verbs that executed and
+        rendered to a terminal nobody was reading: the command works,
+        the operator sees nothing, and nothing says which. Adding one
+        branch per verb here would be the switch statement wearing a
+        different hat — and the 23rd would be forgotten. So the two
+        surfaces share the registry instead, and a module that ships a
+        dispatcher tomorrow is reachable from both with no edit.
+
+        Output goes to ``SerpentFlow.console`` rather than
+        :meth:`_repl_print`: after attach, that console IS the spooled
+        mirror, so one print both renders locally and addresses the
+        cockpit that ran the verb. ``_repl_print`` additionally
+        BROADCASTS via ``publish_line``, which for a verb result means
+        every other attached terminal is painted with an answer it did
+        not ask for.
+
+        Rollback: ``JARVIS_ATTACH_REGISTRY_DISPATCH=false`` restores the
+        unknown-command behaviour for THIS seam only, leaving the local
+        terminal's dispatch untouched. NEVER raises.
+        """
+        try:
+            if not line or not line.startswith("/"):
+                # Bare text is a conversation, not a verb — the chat
+                # bridge below owns it, and consuming it here would
+                # silently swallow goals.
+                return False
+            if os.environ.get(
+                "JARVIS_ATTACH_REGISTRY_DISPATCH", "1",
+            ).strip().lower() in ("0", "false", "no", "off"):
+                return False
+            from backend.core.ouroboros.battle_test.repl_dispatch_registry import (  # noqa: E501
+                try_dispatch,
+            )
+            outcome = await try_dispatch(line)
+        except Exception:  # noqa: BLE001 — a verb must not kill the REPL
+            logger.debug("[Harness] registry dispatch degraded",
+                         exc_info=True)
+            return False
+        if outcome is None or not getattr(outcome, "matched", False):
+            return False
+        text = str(getattr(outcome, "text", "") or "")
+        if not text:
+            return True
+        try:
+            sf = getattr(self, "_serpent_flow", None)
+            if sf is not None:
+                sf.console.print(text, highlight=False)
+            else:
+                # No console at all (a daemon that never built one).
+                # _repl_print's broadcast is the only reach left, and a
+                # broadcast beats silence.
+                self._repl_print(text)
+        except Exception:  # noqa: BLE001
+            logger.debug("[Harness] registry verb render degraded",
+                         exc_info=True)
+        return True
 
     async def _try_dispatch_plugin_command(self, line: str) -> bool:
         """Return True if a plugin-registered REPL command matched and
