@@ -51,6 +51,7 @@ Components
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import logging
 import os
@@ -2999,6 +3000,79 @@ def _local_vram_autodetect_enabled() -> bool:
     return _envb("JARVIS_LOCAL_VRAM_AUTODETECT_ENABLED", False)
 
 
+def _gateway_inflight_unification_enabled() -> bool:
+    """Master for registering Phase 3c generations with the InferenceGateway's
+    in-flight counter. Default TRUE: this is a correctness fix, and OFF
+    reinstates the blind spot where an advisory pre-warm cannot see a running
+    local generation. Kept as a flag purely so it is revocable without a
+    revert."""
+    return _envb("JARVIS_GATEWAY_INFLIGHT_UNIFICATION_ENABLED", True)
+
+
+@contextlib.asynccontextmanager
+async def _f3c_null_bracket() -> "AsyncIterator[None]":
+    """An async no-op bracket. ``contextlib.nullcontext`` only grew async
+    support in 3.10 and this module targets 3.9+, so the fallback is explicit
+    rather than version-dependent."""
+    yield
+
+
+def _f3c_inflight_bracket(endpoint: "Optional[str]") -> Any:
+    """Async context manager marking a Phase 3c generation as in-flight on the
+    gateway, or a null bracket when that is unavailable.
+
+    Pure accounting -- it never touches the generation itself. Its only job is
+    to make the gateway's view of "is this device busy?" true for the path that
+    actually generates, so the advisory pre-warm's in-flight guard stops being
+    blind. Fail-soft to the null bracket: an accounting failure must never cost
+    an op. NEVER raises."""
+    try:
+        if endpoint and _gateway_inflight_unification_enabled():
+            from .inference_gateway import get_default_gateway  # noqa: PLC0415
+            return get_default_gateway().external_generation(endpoint)
+    except Exception:  # noqa: BLE001
+        pass
+    return _f3c_null_bracket()
+
+
+async def _f3c_gateway_residency(
+    endpoint: str, model: str, context: Any = None,
+) -> "Optional[Dict[str, Any]]":
+    """Run the InferenceGateway's residency handshake for a Phase 3c dispatch.
+
+    Gives the live local path the gateway's swap mutex, capacity admission and
+    warm-swap budget without moving the generation itself. The route is passed
+    through so the gateway's down-route policy can decline to evict for
+    eviction-averse work; a real dispatch is never advisory, so it will swap if
+    it must.
+
+    Returns the gateway's report for telemetry, or None when the handshake did
+    not run. NEVER raises -- residency is an optimisation over Ollama's own
+    load-on-first-use, so a failure here degrades to the pre-existing behaviour
+    rather than costing an op."""
+    try:
+        if not _gateway_inflight_unification_enabled():
+            return None
+        from .inference_gateway import get_default_gateway  # noqa: PLC0415
+        gw = get_default_gateway()
+        target = gw.target_for_endpoint(endpoint, model)
+        route = ""
+        try:
+            route = str(getattr(context, "provider_route", "") or "").lower()
+        except Exception:  # noqa: BLE001
+            route = ""
+        report = await gw.ensure_model_resident(target, route=route or None)
+        if report and report.get("swapped"):
+            logger.info(
+                "[CandidateGenerator] gateway warm-swap completed before Phase 3c "
+                "dispatch: model=%s endpoint=%s (paid outside the op clock)",
+                model, endpoint,
+            )
+        return report
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _measured_local_vram_bytes() -> int:
     """VRAM (bytes) MEASURED on this host, via the existing compute-topology
     probe. 0 when the probe is disabled, unavailable, or returned an absence.
@@ -5223,6 +5297,22 @@ class CandidateGenerator:
         _model = await self._resolve_dispatch_model_name(endpoint)
         if _model:
             _base_overrides["model_name"] = _model
+        # Gateway residency handshake. The device can hold ONE large model, so
+        # "which model is resident" is shared state that two concurrent
+        # dispatches can race on: both read the same snapshot, both see a
+        # mismatch, both request a load, and the loser is not a queued request
+        # but a partial offload to system RAM for BOTH. The gateway already owns
+        # the mutex, the capacity admission and the warm-swap budget for exactly
+        # this -- but only for dispatches routed through it, and this seam was
+        # not one of them. Running the handshake here puts the live local path
+        # under the same lock as everything else instead of beside it.
+        #
+        # Advisory=False: this is a real op that NEEDS its model, unlike a
+        # speculative pre-warm which must defer. Fail-soft and non-blocking on
+        # error -- an unavailable gateway must never cost an op, so the dispatch
+        # proceeds exactly as it did before this call existed.
+        if _model:
+            await _f3c_gateway_residency(endpoint, _model, context)
         _num_ctx = await self._negotiate_num_ctx(endpoint)
         _op = getattr(context, "op_id", "?")[:16]
         if _num_ctx:
@@ -5328,12 +5418,28 @@ class CandidateGenerator:
                         _streaming = bool(_num_ctx) and _f3c_stream_on()
                     except Exception:  # noqa: BLE001
                         _streaming = False
+                    # Gateway unification: bracket this generation in the
+                    # InferenceGateway's in-flight counter. The generation stays
+                    # HERE -- the PrimeProvider seat carries the Venom tool loop,
+                    # which gateway.dispatch() (a single client.complete call)
+                    # cannot express, so routing through it would either lose the
+                    # tool loop or duplicate it. What the gateway must own is
+                    # RESIDENCY STATE, not the call: its advisory pre-warm refuses
+                    # to swap only while it believes weights are in use, and a
+                    # generation it cannot see reads as idle. Unbracketed, a
+                    # pre-warm could evict the 32B mid-stream -- exactly the
+                    # failure the mutex exists to prevent, blind on the one path
+                    # that actually generates. Fail-soft: no gateway -> a
+                    # null bracket, and the op proceeds unchanged.
+                    _bracket = _f3c_inflight_bracket(endpoint)
                     if _streaming:
-                        return await _provider.generate(context, deadline)
-                    return await asyncio.wait_for(
-                        _provider.generate(context, deadline),
-                        timeout=remaining,
-                    )
+                        async with _bracket:
+                            return await _provider.generate(context, deadline)
+                    async with _bracket:
+                        return await asyncio.wait_for(
+                            _provider.generate(context, deadline),
+                            timeout=remaining,
+                        )
                 except GracefulStreamInterruption as _gsi:
                     # Cooperative freeze-mid-sentence. GSI is a BaseException by design
                     # (the Earmuff Bypass) -- it pierced the Venom tool loop's

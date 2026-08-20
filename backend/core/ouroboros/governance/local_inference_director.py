@@ -36,6 +36,17 @@ def local_prime_enabled() -> bool:
     return _envb("JARVIS_LOCAL_PRIME_ENABLED", False)
 
 
+def _json_mode_enabled() -> bool:
+    """Whether to request constrained JSON decoding on local completions.
+
+    Default ON: every schema this client speaks is JSON, so the constraint can
+    only remove outputs that were going to be rejected anyway. Set
+    ``JARVIS_LOCAL_JSON_MODE_ENABLED=0`` to restore free-form sampling -- worth
+    doing only if a future schema stops being JSON, or to reproduce a parse
+    failure that the constraint would otherwise mask."""
+    return _envb("JARVIS_LOCAL_JSON_MODE_ENABLED", True)
+
+
 @dataclass(frozen=True)
 class LocalConfig:
     base_url: str
@@ -900,6 +911,28 @@ class LocalPrimeClient:
             body["options"] = {"num_ctx": int(self._cfg.num_ctx)}
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
+        # Constrained decoding. Every schema this provider speaks (2b.1
+        # candidates, 2b.2-tool calls) is JSON, and a local mid-size model
+        # reliably breaks it in ONE specific way: asked to place a whole source
+        # file into a JSON string, it reaches for Python triple-quotes --
+        #     "full_content": """\"\"\"module docstring...
+        # -- which is not representable in JSON and fails at the same offset
+        # every time. Live soak: 6 of 6 candidate payloads, while the smaller
+        # tool-call payloads parsed fine.
+        #
+        # Prompting harder is the wrong lever: it lowers the probability of
+        # invalid output without bounding it. `response_format=json_object`
+        # constrains the SAMPLER, so invalid JSON stops being representable at
+        # all -- a guarantee rather than an improvement. This is the OpenAI-
+        # compatible spelling because the request targets /v1/chat/completions;
+        # ollama's native `format` field belongs to /api/chat and would be
+        # silently ignored here.
+        #
+        # Advertised as opt-out (default ON) but harmless where unsupported: an
+        # engine that does not know the field ignores it, which is exactly the
+        # pre-existing behaviour.
+        if _json_mode_enabled():
+            body["response_format"] = {"type": "json_object"}
 
         _use_stream = stream if stream is not None else (
             bool(self._cfg.num_ctx) and _streaming_enabled())

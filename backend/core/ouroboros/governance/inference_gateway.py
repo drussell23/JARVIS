@@ -54,6 +54,7 @@ Python 3.9+. Every governance import is lazy and fail-soft.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 import logging
 import os
@@ -653,6 +654,52 @@ class InferenceGateway:
                     self._inflight.pop(base_url, None)
         except Exception:  # noqa: BLE001
             pass
+
+    def target_for_endpoint(
+        self,
+        base_url: str,
+        model_name: str,
+        *,
+        scope: str = "local",
+        reason: str = "externally resolved",
+    ) -> "GatewayTarget":
+        """A :class:`GatewayTarget` for an endpoint resolved OUTSIDE this gateway.
+
+        Exists so a caller that already knows where it is dispatching -- the
+        Phase 3c seam, which discovers its own J-Prime endpoint -- can still use
+        this gateway's residency machinery instead of reimplementing it. Carries
+        the endpoint's CURRENT health so a caller cannot accidentally launder a
+        host the breaker has taken out of service. NEVER raises."""
+        try:
+            state = self._health_for(base_url).state()
+        except Exception:  # noqa: BLE001
+            state = HostState.UNKNOWN
+        return GatewayTarget(
+            base_url=base_url, model_name=model_name, scope=scope,
+            state=state, reason=reason,
+        )
+
+    @contextlib.asynccontextmanager
+    async def external_generation(self, base_url: str) -> Any:
+        """Count a generation this gateway did NOT itself dispatch.
+
+        The in-flight counter is what makes an advisory pre-warm safe: it
+        refuses to swap while weights are in use. That guarantee is only as
+        complete as the counter's visibility, and a generation dispatched
+        through another path is invisible to it -- so the pre-warm would
+        correctly conclude "idle" and evict weights out from under a live
+        stream. This bracket closes that blind spot without moving the
+        generation itself into this class.
+
+        Decrements in ``finally``: a stall, cancellation or provider exception
+        must not leak the host as permanently busy, which would silently disable
+        pre-warming forever. NEVER raises -- accounting must not break a
+        dispatch."""
+        self._inflight_adjust(base_url, 1)
+        try:
+            yield
+        finally:
+            self._inflight_adjust(base_url, -1)
 
     async def _dispatch_to(self, target: GatewayTarget, *, system: str,
                            user: str, prompt_tokens: int, temperature: float,
