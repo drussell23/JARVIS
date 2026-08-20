@@ -46,6 +46,27 @@ from backend.core.ouroboros.governance.target_stratification import (
 logger = logging.getLogger(__name__)
 
 
+def _prewarm_hint(*, urgency: str, complexity: str, source: str) -> str:
+    """Tell the pre-warm director that work of this shape is now queued.
+
+    Imported LAZILY and swallowed unconditionally. A sensor's ingestion path
+    must not acquire a hard dependency on the inference tier -- this sensor runs
+    in deployments with no local GPU at all, and an ImportError here would turn
+    a speculative optimisation into a boot failure. The director itself is
+    gated OFF by default, so on an unconfigured host this costs one function
+    call that returns "disabled".
+
+    NON-BLOCKING: the director schedules its own task and returns immediately.
+    NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.prewarm_director import (  # noqa: PLC0415
+            hint as _hint,
+        )
+        return _hint(urgency=urgency, complexity=complexity, source=source)
+    except Exception:  # noqa: BLE001
+        return "unavailable"
+
+
 # ---------------------------------------------------------------------------
 # Analysis result types
 # ---------------------------------------------------------------------------
@@ -947,6 +968,31 @@ class OpportunityMinerSensor:
                 result = await self._router.ingest(envelope)
                 self._record_ingest_result(counters, result)
                 if result in ("enqueued", "pending_ack"):
+                    # Predictive pre-warm. The router ACCEPTING this envelope is
+                    # the earliest moment the system knows work of a known shape
+                    # is queued -- so it is the earliest moment the ~20GB model
+                    # transfer can start overlapping the queue wait instead of
+                    # following it.
+                    #
+                    # Complexity is this sensor's OWN existing verdict
+                    # (`self._threshold`, the same cutoff that decided this file
+                    # was worth an envelope at all), not a second opinion. The
+                    # tier is then resolved by the dispatcher's own
+                    # `resolve_tier`, so a pre-warm cannot target a model the
+                    # dispatcher would not have chosen.
+                    #
+                    # NON-BLOCKING and NEVER raises: it is deliberately not
+                    # inside the try/except below, because it cannot fail in a
+                    # way that concerns ingestion.
+                    _prewarm_hint(
+                        urgency=envelope.urgency,
+                        complexity=(
+                            "complex"
+                            if analysis.cyclomatic_complexity >= self._threshold
+                            else ""
+                        ),
+                        source="ai_miner",
+                    )
                     self._seen_file_paths.add(rel)
                     self._cooldown_map[rel] = self._scan_cycle
                     ingested.append(StaticCandidate(

@@ -23,10 +23,11 @@ from dataclasses import dataclass
 
 _PARAM_RE = re.compile(r"(\d+(?:\.\d+)?)\s*b\b", re.IGNORECASE)
 
-# VRAM (GiB) per GCP accelerator type -- the physical ceiling the Context-Hardware
+# VRAM (GiB) per accelerator -- the physical ceiling the Context-Hardware
 # Negotiator derives the safe num_ctx from. Descriptive hardware facts, NOT a
 # tunable cap; an operator may override the resolved value with JARVIS_GPU_VRAM_GIB.
 _GPU_VRAM_GIB = {
+    # --- GCP accelerator types (as provisioned by the failover tiers) ---
     "nvidia-l4": 24,
     "nvidia-tesla-t4": 16,
     "nvidia-t4": 16,
@@ -38,18 +39,76 @@ _GPU_VRAM_GIB = {
     "nvidia-h100": 80,
     "nvidia-h100-80gb": 80,
     "nvidia-h100-mega-80gb": 80,
+    # --- Consumer / workstation parts (operator-local serving tier) ---
+    #
+    # WHY THESE ARE HERE. The GCP rows above are reached from a provisioning
+    # SPEC (`_quality_tier().accelerator_type`). A local serving host has no
+    # such spec -- it has an `nvidia-smi` device NAME. Before these rows, a
+    # workstation GPU fell through to the QUALITY tier default `nvidia-l4` and
+    # was sized as 24 GiB. That is not a missing reading, it is a CONFIDENTLY
+    # WRONG one: a 32 GiB card gets an L4's KV budget and the negotiator
+    # under-derives num_ctx by ~2x, silently. Keys are stored in normalized
+    # form (see `_normalize_accel_key`) so `nvidia-smi`'s
+    # "NVIDIA GeForce RTX 5090" resolves without the caller pre-cleaning it.
+    "rtx-5090": 32,
+    "rtx-5090-d": 24,
+    "rtx-5080": 16,
+    "rtx-5070-ti": 16,
+    "rtx-5070": 12,
+    "rtx-4090": 24,
+    "rtx-4080": 16,
+    "rtx-4070-ti": 12,
+    "rtx-3090-ti": 24,
+    "rtx-3090": 24,
+    "rtx-a6000": 48,
+    "rtx-6000-ada": 48,
+    "rtx-5000-ada": 32,
+    "rtx-4500-ada": 24,
+    "l40s": 48,
+    "l40": 48,
 }
+
+# Vendor/marketing tokens carried by `nvidia-smi` device names that say nothing
+# about the part. Dropped during normalization so the ledger keys stay short.
+_ACCEL_NAME_NOISE = frozenset({
+    "nvidia", "geforce", "gpu", "graphics", "laptop", "generation", "ada",
+})
+
+_ACCEL_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _normalize_accel_key(raw: str) -> str:
+    """Reduce an accelerator string to a ledger key. Lower-cases, collapses any
+    non-alphanumeric run to a single dash, and drops vendor/marketing tokens, so
+    ``"NVIDIA GeForce RTX 5090"`` and ``"rtx_5090"`` both become ``"rtx-5090"``.
+    Pure; NEVER raises."""
+    try:
+        flat = _ACCEL_NON_ALNUM_RE.sub("-", (raw or "").strip().lower()).strip("-")
+        if not flat:
+            return ""
+        kept = [tok for tok in flat.split("-") if tok and tok not in _ACCEL_NAME_NOISE]
+        return "-".join(kept)
+    except Exception:  # noqa: BLE001 -- descriptive helper must never raise
+        return ""
 
 
 def accelerator_vram_bytes(accel_type: str) -> int:
-    """Physical VRAM (bytes) for a GCP accelerator type. ``JARVIS_GPU_VRAM_GIB``
-    force-overrides the lookup (any node); an unknown type returns 0 so the caller
-    floors the context window rather than guessing. NEVER raises."""
+    """Physical VRAM (bytes) for an accelerator type or device name.
+
+    Resolution order: ``JARVIS_GPU_VRAM_GIB`` force-override -> EXACT ledger hit
+    -> normalized ledger hit. The exact lookup runs first so every pre-existing
+    GCP accelerator type resolves byte-identically to before the consumer rows
+    existed; normalization only ever RESCUES a string that would otherwise have
+    returned 0. An unknown type still returns 0 so the caller floors the context
+    window rather than guessing. NEVER raises."""
     try:
         forced = (os.environ.get("JARVIS_GPU_VRAM_GIB", "") or "").strip()
         if forced:
             return int(float(forced) * (1024 ** 3))
-        gib = _GPU_VRAM_GIB.get((accel_type or "").strip().lower(), 0)
+        raw = (accel_type or "").strip().lower()
+        gib = _GPU_VRAM_GIB.get(raw, 0)
+        if not gib:
+            gib = _GPU_VRAM_GIB.get(_normalize_accel_key(raw), 0)
         return int(gib * (1024 ** 3))
     except Exception:  # noqa: BLE001 -- descriptive helper must never raise
         return 0
