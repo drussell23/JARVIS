@@ -312,17 +312,31 @@ def build_response_json_schema() -> "Dict[str, Any]":
             "additionalProperties": True,
         }
 
+    # PROPERTY ORDER IS LOAD-BEARING, not cosmetic. A grammar emits required
+    # properties in declaration order, and `full_content` is unbounded -- it
+    # carries an entire source file. Declared last, `rationale` was reached only
+    # if the token budget survived the file body, and on a 15KB target it did
+    # not: the sampler was still inside full_content when generation stopped, so
+    # a field the schema marks REQUIRED simply never got emitted
+    # (candidate_0_missing_rationale, observed against
+    # scripts/ouroboros_battle_test.py at raw=15,837 bytes). `required` bounds
+    # what is legal; it cannot manufacture budget.
+    #
+    # Every short field therefore precedes the unbounded one. Ordering costs
+    # nothing and converts "rationale survives if the file was small enough"
+    # into "rationale is already written before the risk begins".
     candidate = _obj(
         {
             "candidate_id": {"type": "string"},
             "file_path": {"type": "string"},
-            "full_content": {"type": "string"},
             "rationale": {"type": "string"},
+            "full_content": {"type": "string"},
         },
         # Deliberately NOT every key in _CANDIDATE_KEYS: "files" is the optional
         # multi-file extension, and full_content describes the PRIMARY file. The
-        # required set is the intersection the validator actually demands.
-        ["candidate_id", "file_path", "full_content", "rationale"],
+        # required set is the intersection the validator actually demands --
+        # listed in emission order for the reason above.
+        ["candidate_id", "file_path", "rationale", "full_content"],
     )
     candidates_shape = _obj(
         {
@@ -357,7 +371,44 @@ def build_response_json_schema() -> "Dict[str, Any]":
         },
         ["schema_version", "tool_calls"],
     )
-    return {"anyOf": [candidates_shape, noop_shape, tool_shape]}
+    # 2b.1-diff -- the unified-diff answer shape for single-file edits. Omitting
+    # it was a real defect in the first version of this union: the repo can ask
+    # for a diff (see the _SCHEMA_VERSION_DIFF prompt), and a grammar listing
+    # only the other three would have made the requested shape UNREPRESENTABLE,
+    # producing a guaranteed failure with no diagnostic. Exactly the trap the
+    # union exists to avoid, and one this function walked into for the diff case
+    # while carefully avoiding it for tool calls.
+    #
+    # It also matters for the reason the ordering comment above describes: a
+    # diff carries only changed hunks, so it does not spend the token budget
+    # rewriting an unchanged 15KB file, and it is the structural answer to both
+    # truncation and the syntax errors truncation causes.
+    diff_shape = _obj(
+        {
+            "schema_version": {"const": _SCHEMA_VERSION_DIFF},
+            "candidates": {
+                "type": "array",
+                "minItems": 1,
+                "items": _obj(
+                    {
+                        "candidate_id": {"type": "string"},
+                        "file_path": {"type": "string"},
+                        "rationale": {"type": "string"},
+                        "unified_diff": {"type": "string"},
+                    },
+                    # Same short-fields-first rule: unified_diff is the
+                    # unbounded one and is declared last.
+                    sorted(
+                        _DIFF_CANDIDATE_KEYS,
+                        key=lambda k: (k == "unified_diff", k),
+                    ),
+                ),
+            },
+            "provider_metadata": {"type": "object"},
+        },
+        ["schema_version", "candidates"],
+    )
+    return {"anyOf": [candidates_shape, diff_shape, noop_shape, tool_shape]}
 
 
 # ---------------------------------------------------------------------------
