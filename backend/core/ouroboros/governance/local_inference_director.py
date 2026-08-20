@@ -36,6 +36,106 @@ def local_prime_enabled() -> bool:
     return _envb("JARVIS_LOCAL_PRIME_ENABLED", False)
 
 
+def _json_schema_mode_enabled() -> bool:
+    """Whether to constrain the sampler with a full JSON *Schema* rather than
+    only ``json_object``.
+
+    json_object guarantees the output PARSES; it says nothing about SHAPE, which
+    is why ``candidate_0_missing_rationale`` and
+    ``wrong_schema_version:__missing__`` survived it. A schema makes a missing
+    required field unrepresentable. Default ON, with automatic per-model
+    degradation below for engines that reject the field."""
+    return _envb("JARVIS_LOCAL_JSON_SCHEMA_MODE_ENABLED", True)
+
+
+#: (base_url, model) pairs that have REJECTED a json_schema response_format.
+#: Learned at run time from the engine's own 4xx rather than from a version
+#: table: llama.cpp/ollama grammar support varies by build and by how exotic the
+#: schema is, and a static capability list would be wrong the moment either
+#: changes. One rejection is enough -- the answer cannot become "yes" without a
+#: restart, and retrying a known-400 on every op would spend a round trip to
+#: learn nothing.
+_SCHEMA_UNSUPPORTED: "set" = set()
+
+
+def _schema_key(cfg: "LocalConfig") -> "Tuple[str, str]":
+    return ((cfg.base_url or "").strip(), (cfg.model_name or "").strip())
+
+
+def _resolve_response_schema() -> "Optional[Dict[str, Any]]":
+    """The sampler grammar, derived from the provider layer's own constants.
+
+    Imported LAZILY: ``providers`` imports this module (PrimeProvider wraps
+    LocalPrimeClient), so a module-level import here would be circular. Returns
+    None if the provider layer is unavailable, which degrades to json_object
+    rather than failing. NEVER raises."""
+    try:
+        from .providers import build_response_json_schema  # noqa: PLC0415
+        schema = build_response_json_schema()
+        return schema if isinstance(schema, dict) and schema else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _apply_response_format(body: "Dict[str, Any]", cfg: "LocalConfig") -> str:
+    """Attach the strongest response constraint this engine is known to accept.
+
+    Ladder, strongest first: json_schema -> json_object -> nothing. Each rung is
+    a strict superset of what the next allows, so degrading can only ever admit
+    outputs the parser was already prepared to reject -- never break a request
+    that would have worked. Returns the mode applied, for telemetry. NEVER
+    raises: a constraint is an optimisation over parsing, and failing to attach
+    one must not fail the generation."""
+    try:
+        if not _json_mode_enabled():
+            return "none"
+        if _json_schema_mode_enabled() and _schema_key(cfg) not in _SCHEMA_UNSUPPORTED:
+            schema = _resolve_response_schema()
+            if schema:
+                body["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "ov_generation",
+                        # strict=False: the schema is a UNION and leaves
+                        # additionalProperties open by design (the parser
+                        # diagnoses unknown keys far better than a grammar can).
+                        # Demanding strict here is what makes some backends
+                        # reject an otherwise-valid schema.
+                        "strict": False,
+                        "schema": schema,
+                    },
+                }
+                return "json_schema"
+        body["response_format"] = {"type": "json_object"}
+        return "json_object"
+    except Exception:  # noqa: BLE001
+        return "none"
+
+
+def _degrade_response_format(body: "Dict[str, Any]", cfg: "LocalConfig") -> bool:
+    """Record that this engine rejected json_schema and downgrade the body.
+
+    Returns True when a retry is worth attempting. Idempotent: a second call for
+    the same engine returns False, so a persistently-400ing endpoint cannot
+    become a retry loop. NEVER raises."""
+    try:
+        key = _schema_key(cfg)
+        if key in _SCHEMA_UNSUPPORTED:
+            return False
+        _SCHEMA_UNSUPPORTED.add(key)
+        body["response_format"] = {"type": "json_object"}
+        logger.warning(
+            "[LocalPrimeClient] engine rejected json_schema response_format for "
+            "model=%s at %s — degrading to json_object for the rest of this "
+            "process. Shape errors become parser-diagnosed rather than "
+            "sampler-prevented.",
+            cfg.model_name, cfg.base_url,
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _json_mode_enabled() -> bool:
     """Whether to request constrained JSON decoding on local completions.
 
@@ -931,8 +1031,7 @@ class LocalPrimeClient:
         # Advertised as opt-out (default ON) but harmless where unsupported: an
         # engine that does not know the field ignores it, which is exactly the
         # pre-existing behaviour.
-        if _json_mode_enabled():
-            body["response_format"] = {"type": "json_object"}
+        _apply_response_format(body, self._cfg)
 
         _use_stream = stream if stream is not None else (
             bool(self._cfg.num_ctx) and _streaming_enabled())
@@ -941,7 +1040,26 @@ class LocalPrimeClient:
 
         t0 = time.monotonic()
         async with sess.post(url, json=body) as resp:
-            data = await resp.json()
+            # Capability probe by OBSERVATION, not by version table. A 4xx here
+            # is the engine telling us it will not accept this grammar; the only
+            # honest response is to believe it, remember it, and retry once at
+            # the next rung down. Restricted to 4xx: a 5xx is the engine failing,
+            # not refusing, and degrading on it would silently disable schema
+            # enforcement for the whole process over a transient blip.
+            if 400 <= resp.status < 500 and "response_format" in body:
+                _body_txt = await resp.text()
+                if _degrade_response_format(body, self._cfg):
+                    logger.info(
+                        "[LocalPrimeClient] retrying once without json_schema "
+                        "(engine said %s: %s)", resp.status, _body_txt[:160],
+                    )
+                    async with sess.post(url, json=body) as resp2:
+                        data = await resp2.json()
+                else:
+                    resp.raise_for_status()
+                    data = await resp.json()
+            else:
+                data = await resp.json()
         total_ms = (time.monotonic() - t0) * 1000.0
         text = data["choices"][0]["message"]["content"]
         out_toks = int(data.get("usage", {}).get("completion_tokens", 0)) or max(1, len(text) // 4)

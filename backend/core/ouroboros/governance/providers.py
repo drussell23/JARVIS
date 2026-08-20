@@ -260,6 +260,105 @@ _DIFF_CANDIDATE_KEYS = frozenset({"candidate_id", "file_path", "unified_diff", "
 # the source of truth for multi-file VALIDATE and APPLY iteration.
 _MULTI_FILE_ENTRY_KEYS = frozenset({"file_path", "full_content", "rationale"})
 
+#: Terminal no-op shape. The prompt instructs the model to emit this when the
+#: requested change is ALREADY PRESENT, and the parser treats it as a legal
+#: terminal result rather than a failure.
+_NOOP_SCHEMA_VERSION = "2b.1-noop"
+_NOOP_KEYS = frozenset({"schema_version", "reason"})
+#: Mid-loop tool-call shape. NOT terminal: the Venom loop executes the calls and
+#: re-prompts. It MUST remain emittable -- exploration-first is a hard gate.
+_TOOL_SCHEMA_VERSION = "2b.2-tool"
+_TOOL_KEYS = frozenset({"schema_version", "preamble", "tool_calls"})
+
+
+def build_response_json_schema() -> "Dict[str, Any]":
+    """Derive a sampler-enforceable JSON Schema from THIS module's own constants.
+
+    Written as a projection of ``_SCHEMA_VERSION`` / ``_CANDIDATE_KEYS`` /
+    ``_NOOP_KEYS`` / ``_TOOL_KEYS`` rather than as a literal, so the grammar the
+    model is constrained by and the validator that judges its output cannot
+    drift apart. Adding a key to ``_CANDIDATE_KEYS`` changes both at once; that
+    is the only property that makes constraining the sampler safe long-term.
+
+    WHY A UNION, AND WHY THAT IS LOAD-BEARING. It is tempting to pin the single
+    "correct" answer shape (2b.1 candidates) -- and that would be a serious bug.
+    A generation round legitimately produces one of THREE shapes: candidates
+    when work is due, ``2b.1-noop`` when the change is already present, and
+    ``2b.2-tool`` mid-loop while the model is still exploring. The client issuing
+    the request does not know which round this is. Constraining to candidates
+    alone would make tool calls unrepresentable, so the Venom loop could never
+    run, the exploration-first Iron Gate could never be satisfied, and every
+    correct "already done" verdict would become a schema failure. The union
+    forbids MALFORMED output without forbidding VALID output.
+
+    ``required`` carries the whole point of the upgrade: json_object mode
+    guarantees parseable JSON but says nothing about shape, which is why
+    ``candidate_0_missing_rationale`` and ``wrong_schema_version:__missing__``
+    survived it. Listing them here makes a missing field unrepresentable rather
+    than merely discouraged.
+
+    ``additionalProperties`` stays TRUE on purpose. The parser rejects unknown
+    keys itself, with a diagnosable error naming them; forbidding them in the
+    grammar instead converts that into a silent generation dead-end, which is
+    strictly harder to debug. Constrain what must be PRESENT, diagnose what must
+    be ABSENT.
+
+    Pure; NEVER raises."""
+    def _obj(props: "Dict[str, Any]", required: "List[str]") -> "Dict[str, Any]":
+        return {
+            "type": "object",
+            "properties": props,
+            "required": required,
+            "additionalProperties": True,
+        }
+
+    candidate = _obj(
+        {
+            "candidate_id": {"type": "string"},
+            "file_path": {"type": "string"},
+            "full_content": {"type": "string"},
+            "rationale": {"type": "string"},
+        },
+        # Deliberately NOT every key in _CANDIDATE_KEYS: "files" is the optional
+        # multi-file extension, and full_content describes the PRIMARY file. The
+        # required set is the intersection the validator actually demands.
+        ["candidate_id", "file_path", "full_content", "rationale"],
+    )
+    candidates_shape = _obj(
+        {
+            "schema_version": {"const": _SCHEMA_VERSION},
+            "candidates": {"type": "array", "items": candidate, "minItems": 1},
+            "provider_metadata": {"type": "object"},
+        },
+        ["schema_version", "candidates"],
+    )
+    noop_shape = _obj(
+        {
+            "schema_version": {"const": _NOOP_SCHEMA_VERSION},
+            "reason": {"type": "string"},
+        },
+        sorted(_NOOP_KEYS),
+    )
+    tool_shape = _obj(
+        {
+            "schema_version": {"const": _TOOL_SCHEMA_VERSION},
+            "preamble": {"type": "string"},
+            "tool_calls": {
+                "type": "array",
+                "minItems": 1,
+                "items": _obj(
+                    {
+                        "name": {"type": "string"},
+                        "arguments": {"type": "object"},
+                    },
+                    ["name", "arguments"],
+                ),
+            },
+        },
+        ["schema_version", "tool_calls"],
+    )
+    return {"anyOf": [candidates_shape, noop_shape, tool_shape]}
+
 
 # ---------------------------------------------------------------------------
 # Slice 235 — adaptive diff: capability + size gated force_full_content
