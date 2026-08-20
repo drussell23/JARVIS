@@ -74,6 +74,8 @@ PROBE_TIMEOUT_ENV = "JARVIS_GATEWAY_PROBE_TIMEOUT_S"
 PREFLIGHT_ENV = "JARVIS_GATEWAY_PREFLIGHT_ENABLED"
 RESIDENCY_TTL_ENV = "JARVIS_GATEWAY_RESIDENCY_TTL_S"
 SWAP_BUDGET_ENV = "JARVIS_GATEWAY_WARM_SWAP_BUDGET_S"
+VRAM_MUTEX_ENV = "JARVIS_GATEWAY_VRAM_MUTEX_ENABLED"
+DOWNROUTE_ROUTES_ENV = "JARVIS_GATEWAY_DOWNROUTE_ROUTES"
 
 _TRUTHY = ("1", "true", "yes", "on")
 
@@ -180,6 +182,90 @@ def warm_swap_budget_s() -> float:
         return max(1.0, float(os.environ.get(SWAP_BUDGET_ENV, "180")))
     except (TypeError, ValueError):
         return 180.0
+
+
+def vram_mutex_enabled() -> bool:
+    """Master gate for residency serialization + capacity admission.
+
+    Default OFF -> `ensure_model_resident` behaves exactly as before: an
+    unserialized check-then-swap with no capacity opinion. NEVER raises."""
+    try:
+        return os.environ.get(VRAM_MUTEX_ENV, "").strip().lower() in _TRUTHY
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def downroute_routes() -> "frozenset":
+    """Routes whose ops may be served by whatever model is ALREADY resident
+    rather than forcing an eviction. Comma-separated; default background +
+    speculative -- the two routes the urgency router already defines as
+    cost-optimized and latency-insensitive. NEVER raises."""
+    try:
+        raw = (os.environ.get(DOWNROUTE_ROUTES_ENV, "") or "").strip()
+        if not raw:
+            return frozenset({"background", "speculative"})
+        return frozenset(
+            p.strip().lower() for p in raw.split(",") if p.strip()
+        )
+    except Exception:  # noqa: BLE001
+        return frozenset({"background", "speculative"})
+
+
+def _serving_vram_bytes() -> int:
+    """VRAM (bytes) of the device serving this endpoint, via the ONE resolver
+    that already owns that question. Lazy + fail-soft: 0 means "undeterminable",
+    which every caller must treat as "do not form a capacity opinion" rather
+    than as "no VRAM". NEVER raises."""
+    try:
+        from .candidate_generator import _awakened_vram_bytes  # noqa: PLC0415
+        return max(0, int(_awakened_vram_bytes() or 0))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _model_bytes(model_id: str) -> int:
+    """On-disk bytes for a model label, via the existing GGUF estimator.
+    0 when the label carries no parseable parameter count. NEVER raises."""
+    try:
+        from .failover_tier import estimate_gguf_bytes  # noqa: PLC0415
+        return max(0, int(estimate_gguf_bytes(model_id) or 0))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def models_can_coexist(wanted: str, resident: "Tuple[str, ...]") -> "Optional[bool]":
+    """Can *wanted* load WITHOUT evicting *resident*?
+
+    True/False is an opinion; ``None`` means undeterminable (unknown VRAM or an
+    unparseable label) and the caller must fall through to legacy behaviour
+    rather than inventing a verdict.
+
+    WHY THIS IS NEEDED AT ALL. Ollama will accept a request for a second model
+    while a first is loaded and try to make room -- and when it cannot, the
+    resolution is not a clean error but eviction plus reload, or worse, a
+    partial offload to system RAM that turns a 40 tok/s model into a 2 tok/s
+    one. On a 32GiB card a 19.85GB coder and an 18.56GB MoE cannot coexist by
+    ~5GB, so the "both resident" state this guards against is not hypothetical.
+    Reserves the SAME overhead the context negotiator reserves, from the same
+    env knob, so the two cannot disagree about the same card. NEVER raises."""
+    try:
+        vram = _serving_vram_bytes()
+        want_b = _model_bytes(wanted)
+        if vram <= 0 or want_b <= 0:
+            return None
+        resident_b = 0
+        for r in resident or ():
+            rb = _model_bytes(r)
+            if rb <= 0:
+                return None  # one unknown resident poisons the whole sum
+            resident_b += rb
+        try:
+            overhead = int(os.environ.get("JARVIS_CTX_OVERHEAD_BYTES", "1500000000"))
+        except (TypeError, ValueError):
+            overhead = 1_500_000_000
+        return (resident_b + want_b + overhead) <= vram
+    except Exception:  # noqa: BLE001
+        return None
 
 
 class HostState(str, enum.Enum):
@@ -355,6 +441,10 @@ class InferenceGateway:
         #: base_url -> (monotonic_at, resident_models_or_None). None is
         #: "unknowable", which is NOT the same as an empty tuple.
         self._residency: Dict[str, Tuple[float, Optional[Tuple[str, ...]]]] = {}
+        #: base_url -> the ONE lock under which that endpoint's residency may be
+        #: read-and-mutated. See `_swap_lock_for` for why a per-endpoint asyncio
+        #: lock rather than the shared threading one.
+        self._swap_locks: Dict[str, "asyncio.Lock"] = {}
         self._client_factory = client_factory
 
     # -- resolution --------------------------------------------------------
@@ -631,8 +721,39 @@ class InferenceGateway:
                 return True
         return False
 
-    async def ensure_model_resident(self, target: "GatewayTarget") -> Dict[str, Any]:
+    def _swap_lock_for(self, endpoint: str) -> "asyncio.Lock":
+        """The one lock under which *endpoint*'s residency may be read-and-mutated.
+
+        Per-endpoint, not global: two DIFFERENT hosts have independent VRAM and
+        must be able to swap concurrently. An ``asyncio.Lock`` rather than the
+        instance's ``threading.Lock`` because the critical section awaits a
+        multi-minute PCIe transfer -- holding a thread lock across that would
+        block the event loop, which is the failure this whole tier exists to
+        avoid. Created lazily inside the running loop. NEVER raises."""
+        with self._lock:
+            lk = self._swap_locks.get(endpoint)
+            if lk is None:
+                lk = asyncio.Lock()
+                self._swap_locks[endpoint] = lk
+            return lk
+
+    async def ensure_model_resident(
+        self, target: "GatewayTarget", *, route: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Pre-flight: verify the target model is loaded, warm-swapping if not.
+
+        ``route`` is optional and advisory: supplied, it lets a cost-optimized
+        route be served by an already-resident model instead of forcing a
+        ~20GB eviction. Omitted, no op is ever down-routed -- the caller gets
+        exactly the swap-or-not behaviour it asked for.
+
+        SERIALIZED when :func:`vram_mutex_enabled`. Without the mutex this is a
+        check-then-act race: two concurrent ops wanting different models both
+        read the same residency snapshot, both see a mismatch, and both call
+        ``warmup()``. The device is then asked to hold both -- and on a card
+        that cannot, the loser is not a queued request but a partial offload to
+        system RAM, silently, for both ops. The lock makes "what is resident"
+        a question only one coroutine per endpoint may act on at a time.
 
         WHY THIS EXISTS. Ollama loads a model on first use. If the resident
         model is the 30B coder and an op asks for the 27B vision model, that
@@ -657,6 +778,28 @@ class InferenceGateway:
         if not preflight_enabled():
             out["reason"] = "preflight disabled"
             return out
+        if not vram_mutex_enabled():
+            return await self._ensure_model_resident_inner(target, out, route=route)
+        try:
+            lock = self._swap_lock_for(target.base_url)
+        except Exception:  # noqa: BLE001 -- lock creation must never block dispatch
+            return await self._ensure_model_resident_inner(target, out, route=route)
+        async with lock:
+            return await self._ensure_model_resident_inner(
+                target, out, route=route, guarded=True)
+
+    async def _ensure_model_resident_inner(
+        self,
+        target: "GatewayTarget",
+        out: Dict[str, Any],
+        *,
+        route: Optional[str] = None,
+        guarded: bool = False,
+    ) -> Dict[str, Any]:
+        """The residency check-and-swap itself. Split out so the mutex wraps the
+        WHOLE read-decide-mutate sequence rather than only the mutation -- a lock
+        held across just the swap would still let two coroutines read the same
+        stale snapshot and both decide to swap. NEVER raises."""
         try:
             now = time.monotonic()
             with self._lock:
@@ -679,6 +822,33 @@ class InferenceGateway:
             if self._model_matches(target.model_name, resident):
                 out["reason"] = "already resident"
                 return out
+
+            # -- capacity admission (mutex path only) --------------------------
+            # A swap on a card that cannot hold both models is an EVICTION, not
+            # an addition. For a latency-insensitive route that is a bad trade:
+            # it pays ~20GB of PCIe transfer, and the op it evicted for will pay
+            # it again in the other direction moments later. Serving such an op
+            # with whatever is already loaded is strictly cheaper and, for
+            # background/speculative work, good enough. A capable model already
+            # in VRAM beats the right model that is not.
+            if guarded:
+                coexist = models_can_coexist(target.model_name, resident)
+                out["can_coexist"] = coexist
+                rt = (route or "").strip().lower()
+                if coexist is False and resident and rt and rt in downroute_routes():
+                    out["downrouted_to"] = resident[0]
+                    out["reason"] = (
+                        f"down-routed: {target.model_name} cannot coexist with "
+                        f"{', '.join(resident)} on this device; route '{rt}' is "
+                        f"eviction-averse — serving with {resident[0]}"
+                    )
+                    logger.info(
+                        "[InferenceGateway] down-route: op wanted %s but %s is "
+                        "resident and they do not fit together; route=%s — "
+                        "serving with the resident model instead of evicting",
+                        target.model_name, ", ".join(resident), rt,
+                    )
+                    return out
 
             logger.info(
                 "[InferenceGateway] warm swap: %s is resident, op needs %s — "

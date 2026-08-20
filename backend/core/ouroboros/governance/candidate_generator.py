@@ -2993,10 +2993,49 @@ def _dilate_sovereign_deadline(deadline: "datetime", profiler: Any,
         return deadline
 
 
+def _local_vram_autodetect_enabled() -> bool:
+    """Master switch for preferring a MEASURED local VRAM reading over the GCP
+    provisioning spec. Default OFF -> the legacy spec-derived path, byte-identical."""
+    return _envb("JARVIS_LOCAL_VRAM_AUTODETECT_ENABLED", False)
+
+
+def _measured_local_vram_bytes() -> int:
+    """VRAM (bytes) MEASURED on this host, via the existing compute-topology
+    probe. 0 when the probe is disabled, unavailable, or returned an absence.
+
+    Composes ``compute_topology.resolve_sync()`` -- the module that already owns
+    the ``nvidia-smi`` cascade, its timeout discipline and its caching. A second
+    probe here would be a second authority over the same physics. NEVER raises."""
+    try:
+        from . import compute_topology  # noqa: PLC0415
+        if not compute_topology.is_enabled():
+            return 0
+        reading = compute_topology.resolve_sync()
+        if not getattr(reading, "measured", False):
+            return 0
+        return max(0, int(getattr(reading, "total_bytes", 0) or 0))
+    except Exception:  # noqa: BLE001 -- descriptive helper must never raise
+        return 0
+
+
 def _awakened_vram_bytes() -> int:
-    """VRAM (bytes) of the awakened GPU tier -- the controller's live awakened tier
-    if available, else the QUALITY provisioning spec. 0 if not a GPU tier / unknown
-    (the negotiator then keeps the legacy path). NEVER raises."""
+    """VRAM (bytes) of the serving GPU -- MEASURED on this host when possible,
+    else the awakened tier, else the QUALITY provisioning spec. 0 if not a GPU
+    tier / unknown (the negotiator then keeps the legacy path). NEVER raises.
+
+    WHY MEASURED COMES FIRST. The spec path answers "what did we ASK GCP for",
+    which is the right question for a provisioned failover node and the WRONG
+    one for an operator workstation serving Ollama locally. There, no controller
+    tier is awake, so resolution fell through to ``_quality_tier()`` whose
+    accelerator default is ``nvidia-l4`` -- and a local 32 GiB card was sized as
+    24 GiB. Not an absence the negotiator could floor on, but a confident wrong
+    number that silently halved the derived context window. A reading of the
+    actual hardware outranks a guess about it; the spec chain is retained
+    verbatim beneath as the fallback for genuinely remote tiers."""
+    if _local_vram_autodetect_enabled():
+        measured = _measured_local_vram_bytes()
+        if measured > 0:
+            return measured
     accel = ""
     try:
         from .failover_lifecycle import get_failover_controller  # noqa: PLC0415
