@@ -5036,13 +5036,39 @@ class CandidateGenerator:
             )
             return LatencyProfiler(cfg)
 
-    async def _negotiate_num_ctx(self, endpoint: Optional[str]) -> Optional[int]:
+    async def _negotiate_num_ctx(
+        self, endpoint: Optional[str], *, model: Optional[str] = None,
+    ) -> Optional[int]:
         """Autonomous Context-Hardware Negotiator: derive the VRAM-safe context
         window for *endpoint* from the MEASURED buffer -- node VRAM (awakened GPU
         tier) minus the served model's on-disk bytes (its own /api/tags) -- so the
         KV cache can never overflow VRAM (the warm-32B ServerDisconnect root cause).
         None when undeterminable (not a GPU tier / size unknown) -> caller keeps the
-        legacy path. Fail-soft -- NEVER raises."""
+        legacy path. Fail-soft -- NEVER raises.
+
+        When ``model`` is supplied AND model-physics autodetect is on, two inputs
+        stop being global constants and become properties OF THAT MODEL:
+
+          * ``kv_bytes_per_token`` -- architectural (layers x kv-heads x
+            (key+value) x dtype), spanning 57,344..262,144 across the local
+            fleet. One constant for all of them is necessarily wrong for most.
+          * ``ceiling`` -- the STRICTER of the operator's configured cap and the
+            model's NATIVE trained context. This is the decoupling that matters:
+            VRAM says how much context fits, the model says how much it can
+            actually use, and those are different limits. qwen2.5-coder is 32K
+            native while qwen3-coder:30b is 262K, so a single global ceiling
+            either starves the MoE or pushes the dense model past its training.
+
+        Physics unavailable -> both fall back to the global env constants, which
+        is exactly the pre-existing behaviour.
+
+        ``model`` is an OPTIONAL injection point for tests and is NOT passed by
+        the production caller. It is resolved internally instead, deliberately:
+        this method is overridden by stubs and subclasses that implement the
+        one-argument signature, so widening the CALL to pass a second argument
+        would break them at runtime -- a contract change disguised as an
+        enhancement. Resolution is memoized per-endpoint, so doing it here costs
+        one cached lookup rather than a second round trip."""
         try:
             model_bytes = await _resolve_served_model_bytes(endpoint)
             vram_bytes = _awakened_vram_bytes()
@@ -5051,7 +5077,32 @@ class CandidateGenerator:
             from backend.core.ouroboros.governance.local_inference_director import (  # noqa: PLC0415
                 derive_safe_num_ctx,
             )
-            return derive_safe_num_ctx(vram_bytes=vram_bytes, model_bytes=model_bytes)
+            kwargs: Dict[str, Any] = {}
+            try:
+                from . import local_inference_director as _lid  # noqa: PLC0415
+                from .model_physics import (  # noqa: PLC0415
+                    effective_ceiling,
+                    physics_autodetect_enabled,
+                    resolve_model_physics,
+                )
+                # Resolve the served model ONLY when physics is armed: gate off
+                # means not even a cached lookup runs, so the legacy path stays
+                # byte-identical in work performed, not merely in result.
+                if model is None and physics_autodetect_enabled():
+                    model = await self._resolve_dispatch_model_name(endpoint)
+                physics = await resolve_model_physics(endpoint, model)
+                if physics is not None:
+                    kwargs["kv_bytes_per_token"] = physics.kv_bytes_per_token
+                    # Read the configured ceiling through the SAME env name and
+                    # the SAME default constant derive_safe_num_ctx itself uses,
+                    # so the two can never disagree about what "unset" means.
+                    configured = _lid._int_env(
+                        "JARVIS_NUM_CTX_CEILING", _lid._NUM_CTX_CEILING_DEFAULT)
+                    kwargs["ceiling"] = effective_ceiling(physics, configured)
+            except Exception:  # noqa: BLE001 -- physics is advisory, never required
+                kwargs = {}
+            return derive_safe_num_ctx(
+                vram_bytes=vram_bytes, model_bytes=model_bytes, **kwargs)
         except Exception:  # noqa: BLE001
             return None
 
