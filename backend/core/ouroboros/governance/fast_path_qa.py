@@ -1229,6 +1229,7 @@ async def ask_question(
         Callable[[str, str, str, str], None]
     ] = None,
     retrieval_callable: Optional[RetrievalCallable] = None,
+    grounding: str = "",
     now_unix: Optional[float] = None,
 ) -> QAReport:
     """Top-level Q&A entry. NEVER raises.
@@ -1262,6 +1263,21 @@ async def ask_question(
         Operator-injectable conversation-bridge recorder for
         hermetic testing. None → composes
         :func:`_record_turn_safely`.
+    grounding:
+        Caller-supplied context appended to the system prompt,
+        AFTER any retrieved snippets. For questions whose answer
+        depends on something the semantic index cannot know —
+        the live situation a ``/btw`` aside refers to, a caller's
+        own charter for the answerer. Empty string (the default)
+        is byte-identical to the pre-grounding behaviour.
+
+        It is a SYSTEM-side block, never appended to the
+        question: the stored ``q-N`` artifact must record what the
+        operator actually asked, or ``/expand`` re-reads a
+        sentence they never typed. It is also ignored on the
+        HIGH-confidence retrieval-only path, which invokes no
+        provider at all — grounding a call that does not happen
+        would be a claim of context the answer does not carry.
     now_unix:
         Time override for tests.
     """
@@ -1464,6 +1480,17 @@ async def ask_question(
         effective_prompt = base_prompt + "\n\n" + ctx_block
     else:
         effective_prompt = base_prompt
+    # Caller-supplied grounding goes LAST — after the base prompt
+    # and after any retrieved snippets. Order is deliberate: the
+    # retrieved block describes the repository, the grounding
+    # block describes the moment, and where they disagree the
+    # moment is the newer fact.
+    try:
+        grounding_block = str(grounding or "").strip()
+    except Exception:  # noqa: BLE001
+        grounding_block = ""
+    if grounding_block:
+        effective_prompt = effective_prompt + "\n\n" + grounding_block
 
     # Step 7: invoke provider callable.
     provider = (
