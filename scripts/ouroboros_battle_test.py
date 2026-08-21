@@ -861,13 +861,74 @@ def _single_flight_preflight(*, quiet: bool = False) -> None:
         sys.exit(75)
 
 
+def _local_generation_lane() -> "Optional[str]":
+    """The local J-Prime lane's endpoint when it can actually serve, else None.
+
+    Returns the endpoint only when the lane is BOTH enabled and REACHABLE. A
+    flag alone is not evidence: ``JARVIS_LOCAL_PRIME_ENABLED=true`` against a
+    stopped Ollama would let the preflight pass and the soak boot into a loop
+    with no generation lane at all -- trading a loud death at second zero for a
+    silent one an hour in, which is strictly worse.
+
+    Reads the endpoint from ``LocalConfig.from_env()`` rather than a literal, so
+    this and the inference director can never disagree about where local lives.
+    Probes ``/api/tags`` -- the same readiness surface the model resolver and the
+    driver gate already use. Bounded and fail-soft: any error, timeout or
+    non-200 means "no lane", which routes back into the fatal path. NEVER
+    raises."""
+    try:
+        from backend.core.ouroboros.governance.local_inference_director import (
+            LocalConfig, local_prime_enabled,
+        )
+        if not local_prime_enabled():
+            return None
+        base = (LocalConfig.from_env().base_url or "").strip()
+        if not base:
+            return None
+        import json as _json
+        import urllib.request as _url
+        try:
+            timeout = float(os.environ.get("JARVIS_PREFLIGHT_LOCAL_PROBE_S", "4"))
+        except (TypeError, ValueError):
+            timeout = 4.0
+        with _url.urlopen(base.rstrip("/") + "/api/tags", timeout=timeout) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return None
+            payload = _json.loads(resp.read().decode("utf-8", "replace"))
+        # A reachable engine serving ZERO models is not a lane either.
+        if not (payload or {}).get("models"):
+            return None
+        return base
+    except Exception:  # noqa: BLE001 -- unprovable lane == no lane
+        return None
+
+
 def _check_api_keys_or_die() -> None:
-    """FATAL preflight: no provider keys -> die loudly. Deliberately OUTSIDE
-    the presentation gate (Mandate 1): no mode can suppress this."""
-    if not os.environ.get("DOUBLEWORD_API_KEY") and not os.environ.get("ANTHROPIC_API_KEY"):
-        print(f"\n  {_RED}{_BOLD}ERROR: No API keys set.{_RESET}")
-        print(f"  {_RED}Export DOUBLEWORD_API_KEY or ANTHROPIC_API_KEY.{_RESET}\n")
-        sys.exit(1)
+    """FATAL preflight: no usable GENERATION LANE -> die loudly. Deliberately
+    OUTSIDE the presentation gate (Mandate 1): no mode can suppress this.
+
+    The assertion is "a lane exists", not "a cloud key exists". Those were the
+    same statement when every provider was remote; they stopped being the same
+    once J-Prime could be served locally. A host running a local 32B has a
+    lane -- refusing to boot it because no cloud key is exported would make the
+    zero-marginal-cost configuration the one configuration that cannot run,
+    which is precisely backwards.
+
+    The fatality is unchanged. Mandate 1 is about no MODE suppressing the
+    check; it was never about requiring a cloud vendor specifically."""
+    if os.environ.get("DOUBLEWORD_API_KEY") or os.environ.get("ANTHROPIC_API_KEY"):
+        return
+    local = _local_generation_lane()
+    if local:
+        print(f"  {_BOLD}Generation lane: LOCAL J-Prime at {local}{_RESET}")
+        print("  (no cloud keys exported — running at zero marginal cost)")
+        return
+    print(f"\n  {_RED}{_BOLD}ERROR: No usable generation lane.{_RESET}")
+    print(f"  {_RED}Export DOUBLEWORD_API_KEY or ANTHROPIC_API_KEY,{_RESET}")
+    print(f"  {_RED}or enable the local lane: JARVIS_LOCAL_PRIME_ENABLED=true{_RESET}")
+    print(f"  {_RED}with a reachable engine at JARVIS_LOCAL_MODEL_BASE_URL{_RESET}")
+    print(f"  {_RED}(currently unreachable, or serving no models).{_RESET}\n")
+    sys.exit(1)
 
 
 def _print_preflight() -> None:

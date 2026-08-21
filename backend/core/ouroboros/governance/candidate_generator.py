@@ -51,6 +51,7 @@ Components
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import logging
 import os
@@ -2999,6 +3000,164 @@ def _local_vram_autodetect_enabled() -> bool:
     return _envb("JARVIS_LOCAL_VRAM_AUTODETECT_ENABLED", False)
 
 
+def _gateway_inflight_unification_enabled() -> bool:
+    """Master for registering Phase 3c generations with the InferenceGateway's
+    in-flight counter. Default TRUE: this is a correctness fix, and OFF
+    reinstates the blind spot where an advisory pre-warm cannot see a running
+    local generation. Kept as a flag purely so it is revocable without a
+    revert."""
+    return _envb("JARVIS_GATEWAY_INFLIGHT_UNIFICATION_ENABLED", True)
+
+
+@contextlib.asynccontextmanager
+async def _f3c_null_bracket() -> "AsyncIterator[None]":
+    """An async no-op bracket. ``contextlib.nullcontext`` only grew async
+    support in 3.10 and this module targets 3.9+, so the fallback is explicit
+    rather than version-dependent."""
+    yield
+
+
+def _f3c_inflight_bracket(endpoint: "Optional[str]") -> Any:
+    """Async context manager marking a Phase 3c generation as in-flight on the
+    gateway, or a null bracket when that is unavailable.
+
+    Pure accounting -- it never touches the generation itself. Its only job is
+    to make the gateway's view of "is this device busy?" true for the path that
+    actually generates, so the advisory pre-warm's in-flight guard stops being
+    blind. Fail-soft to the null bracket: an accounting failure must never cost
+    an op. NEVER raises."""
+    try:
+        if endpoint and _gateway_inflight_unification_enabled():
+            from .inference_gateway import get_default_gateway  # noqa: PLC0415
+            return get_default_gateway().external_generation(endpoint)
+    except Exception:  # noqa: BLE001
+        pass
+    return _f3c_null_bracket()
+
+
+#: Monotonic stamp of the last credential re-read. Module-level because the
+#: question ("does this host have a paid lane?") is process-wide, not per-op.
+_FREE_LANE_CRED_REFRESH_AT: float = 0.0
+
+
+def _free_lane_cred_ttl_s() -> float:
+    """How stale a credential reading may be before ``.env`` is consulted again.
+    Default 30s. 0 disables refresh (boot-time environment only)."""
+    return _envf_or_default("JARVIS_FREE_LANE_CRED_TTL_S", 30.0)
+
+
+def _refresh_paid_lane_credentials() -> None:
+    """Re-read allowlisted provider credentials from ``.env`` into the process.
+
+    WHY THIS IS NEEDED AT ALL. Reading ``os.environ`` on every call already makes
+    the interlock reactive to any IN-PROCESS change -- but an operator cannot
+    reach a running process that way. ``os.environ`` is per-process, so a shell
+    export is invisible to an orchestrator already running, and
+    ``env_bootstrap.load_env_once`` is idempotent by design, so editing ``.env``
+    mid-soak is never re-read either. Without this, "keys added mid-soak revoke
+    the free lane" would be a claim the code could not honour: the loop would
+    keep treating a now-metered host as free.
+
+    Composes ``credential_env_loader.load_provider_credentials`` rather than
+    parsing ``.env`` here -- that module already owns the allowlist (which is
+    exactly DOUBLEWORD_API_KEY / ANTHROPIC_API_KEY plus HF tokens), the
+    explicit-export-wins precedence, and the never-log-secrets contract. A second
+    parser would be a second policy about credentials, which is the last thing
+    this repo needs two of.
+
+    TTL-bounded: the answer changes at operator speed, not per-op, so a file
+    stat per generation would be waste. NEVER raises."""
+    global _FREE_LANE_CRED_REFRESH_AT  # noqa: PLW0603
+    try:
+        ttl = _free_lane_cred_ttl_s()
+        if ttl <= 0:
+            return
+        now = time.monotonic()
+        if (now - _FREE_LANE_CRED_REFRESH_AT) < ttl:
+            return
+        _FREE_LANE_CRED_REFRESH_AT = now
+        from backend.core.ouroboros.aegis.credential_env_loader import (  # noqa: PLC0415
+            load_provider_credentials,
+        )
+        # Note the asymmetry this inherits, and it is the SAFE one: the loader
+        # never overwrites an explicit export, so a key can be ADDED mid-run
+        # (revoking free-lane status, the cautious direction) but a stale key
+        # cannot be silently cleared into free-lane status by editing a file.
+        load_provider_credentials()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _free_lane_active() -> bool:
+    """True when generation runs on a lane with ~zero marginal cost per op.
+
+    Exists so cost-motivated gates can ask about COST rather than hardcode a
+    route name. Several policies in this file trade quality away to save money
+    -- correct against a metered provider, and pure loss on a locally-served
+    model where the only per-op cost is electricity.
+
+    Deliberately conservative: it requires the local lane to be the configured
+    one AND both paid lanes to be unavailable. A host with credentials might
+    still route to a paid provider, and treating that as free would silently
+    multiply someone's bill. Absence of a key is the strongest available
+    evidence that no paid lane exists.
+
+    NEVER raises -- an unprovable answer is False, which preserves the
+    pre-existing cost-averse behaviour exactly."""
+    try:
+        if not _envb("JARVIS_FREE_LANE_POLICY_ENABLED", True):
+            return False
+        from .local_inference_director import local_prime_enabled  # noqa: PLC0415
+        if not local_prime_enabled():
+            return False
+        # Consult .env before answering, so a key added while the loop is
+        # RUNNING revokes free-lane status without a restart. TTL-bounded.
+        _refresh_paid_lane_credentials()
+        if os.environ.get("DOUBLEWORD_API_KEY") or os.environ.get("ANTHROPIC_API_KEY"):
+            return False
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _f3c_gateway_residency(
+    endpoint: str, model: str, context: Any = None,
+) -> "Optional[Dict[str, Any]]":
+    """Run the InferenceGateway's residency handshake for a Phase 3c dispatch.
+
+    Gives the live local path the gateway's swap mutex, capacity admission and
+    warm-swap budget without moving the generation itself. The route is passed
+    through so the gateway's down-route policy can decline to evict for
+    eviction-averse work; a real dispatch is never advisory, so it will swap if
+    it must.
+
+    Returns the gateway's report for telemetry, or None when the handshake did
+    not run. NEVER raises -- residency is an optimisation over Ollama's own
+    load-on-first-use, so a failure here degrades to the pre-existing behaviour
+    rather than costing an op."""
+    try:
+        if not _gateway_inflight_unification_enabled():
+            return None
+        from .inference_gateway import get_default_gateway  # noqa: PLC0415
+        gw = get_default_gateway()
+        target = gw.target_for_endpoint(endpoint, model)
+        route = ""
+        try:
+            route = str(getattr(context, "provider_route", "") or "").lower()
+        except Exception:  # noqa: BLE001
+            route = ""
+        report = await gw.ensure_model_resident(target, route=route or None)
+        if report and report.get("swapped"):
+            logger.info(
+                "[CandidateGenerator] gateway warm-swap completed before Phase 3c "
+                "dispatch: model=%s endpoint=%s (paid outside the op clock)",
+                model, endpoint,
+            )
+        return report
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _measured_local_vram_bytes() -> int:
     """VRAM (bytes) MEASURED on this host, via the existing compute-topology
     probe. 0 when the probe is disabled, unavailable, or returned an absence.
@@ -4026,16 +4185,55 @@ class CandidateGenerator:
         tasks + DW sockets (its awaited children) tear down with no ghost tasks.
         """
         if not self._swarm_routing_enabled():
+            # The LAST unlogged decline path, and the one that cost the most to
+            # find: with every other branch instrumented, an op that dispatched
+            # while emitting no decline line could only have exited here. Left
+            # silent, "the flag is off" and "the function was never called" look
+            # identical from the log, and they demand opposite fixes.
+            logger.info(
+                "[CandidateGenerator] swarm decline: JARVIS_SWARM_ROUTING_ENABLED "
+                "is not set (observed=%r)",
+                os.environ.get("JARVIS_SWARM_ROUTING_ENABLED"))
             return None
         route = (getattr(context, "provider_route", "") or "standard").lower()
-        if route in ("background", "speculative"):
-            return None  # cost-optimized routes never fan out a swarm
+        if route in ("background", "speculative") and not _free_lane_active():
+            logger.info(
+                "[CandidateGenerator] swarm decline: route=%s is cost-optimized "
+                "and this lane is metered", route)
+            # Cost-optimized routes do not fan out a swarm -- because a swarm is
+            # N generation calls and, on a metered provider, N times the bill.
+            # That is a statement about MONEY, not about correctness, and it
+            # stops being true on a lane whose marginal cost is zero.
+            #
+            # It also inverts on such a lane: the swarm exists to avoid handing a
+            # model a whole large file, which is exactly the failure a local 32B
+            # hits hardest (truncated full_content -> missing required fields and
+            # syntax errors). Skipping chunking to save money we are not spending
+            # buys nothing and costs the op. Note the local "swarm" is not even
+            # parallel -- the VRAM mutex serializes it onto one device, so it is
+            # sequential chunk processing, slower but free, which is precisely
+            # the trade a background op should take.
+            return None
+        # DIAGNOSABILITY. This method declines at five separate points and, until
+        # now, every one of them returned None silently. That is fine when the
+        # feature is off and nobody is asking -- and actively obstructive the
+        # moment someone enables it and it does nothing, because "no swarm
+        # happened" and "the swarm declined for reason X" are indistinguishable
+        # in the log. Three soaks were spent inferring which gate fired from the
+        # SIZE OF THE MODEL'S OUTPUT. One line per decline turns that into a
+        # reading. INFO, not DEBUG: a silent no-op the operator explicitly asked
+        # for is exactly the thing worth saying out loud.
         target_files = tuple(getattr(context, "target_files", ()) or ())
         if not target_files:
+            logger.info(
+                "[CandidateGenerator] swarm decline: op carries no target_files")
             return None
         path = target_files[0]
         source = self._read_source_for_swarm(path)
         if source is None:
+            logger.info(
+                "[CandidateGenerator] swarm decline: source unreadable for %s "
+                "(repo_root=%s)", path, getattr(self, "_repo_root", None))
             return None
         try:
             from backend.core.ouroboros.governance.chunked_generation import (
@@ -4050,9 +4248,15 @@ class CandidateGenerator:
             from backend.core.ouroboros.governance.agent_turn_adapter import (
                 ProductionAgentTurnFn,
             )
-        except Exception:  # noqa: BLE001 — swarm stack absent → standard route
+        except Exception as _swarm_imp_exc:  # noqa: BLE001 — stack absent → standard route
+            logger.info(
+                "[CandidateGenerator] swarm decline: stack unavailable (%s: %s)",
+                type(_swarm_imp_exc).__name__, _swarm_imp_exc)
             return None
         if not is_big_file(source):
+            logger.info(
+                "[CandidateGenerator] swarm decline: %s is under the big-file "
+                "threshold (%d lines)", path, source.count("\n"))
             return None
 
         res = resolve_target_symbols(
@@ -4939,49 +5143,107 @@ class CandidateGenerator:
     # Route-specific generation strategies (Manifesto §5)
     # ------------------------------------------------------------------
 
+    async def _local_jprime_endpoint(self) -> Optional[str]:
+        """The ALWAYS-ON local J-Prime lane's endpoint, when it can serve.
+
+        Sources 1-2 in :meth:`_discover_jprime_endpoint` both answer "was a GCP
+        failover node awakened?". That was the same question as "is J-Prime
+        available?" only while J-Prime was exclusively a cloud VM. An operator
+        serving the 32B locally has a J-Prime endpoint permanently -- there is no
+        node to awaken and no lifecycle FSM to enter SERVING, so discovery
+        returned None and every dispatch fell to a DW lane that may not be
+        funded at all.
+
+        Enabled AND reachable, never enabled alone: an endpoint that does not
+        answer would COMMIT the Phase 3c seam (``_committed = True``), and under
+        Absolute Route Sealing a committed dispatch failure is TERMINAL -- so a
+        flag pointing at a dead engine would convert a survivable DW attempt into
+        an unrecoverable op. Reachability is the difference between a lane and a
+        promise.
+
+        Reads the endpoint from ``LocalConfig.from_env()`` and probes the same
+        ``/api/tags`` readiness surface ``_resolve_dispatch_model_name`` uses, so
+        this cannot disagree with the client that will serve the request. Bounded
+        and memoized-by-nothing (residency changes; a stale yes is worse than a
+        second probe). Fail-soft -- NEVER raises."""
+        try:
+            from .local_inference_director import LocalConfig, local_prime_enabled
+            if not local_prime_enabled():
+                return None
+            base = (LocalConfig.from_env().base_url or "").strip()
+            if not base:
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            import aiohttp  # noqa: PLC0415
+            timeout_s = _envf_or_default("JARVIS_LOCAL_JPRIME_PROBE_S", 4.0)
+            timeout = aiohttp.ClientTimeout(total=timeout_s)
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.get(base.rstrip("/") + "/api/tags") as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json(content_type=None)
+            # A reachable engine serving zero models is not a lane.
+            if not (data or {}).get("models"):
+                return None
+            return base
+        except Exception:  # noqa: BLE001 -- unprovable lane == no lane
+            return None
+
     async def _discover_jprime_endpoint(self) -> Optional[str]:
-        """Dynamic state-driven discovery of the awakened J-Prime node's endpoint.
+        """Dynamic state-driven discovery of a SERVING J-Prime endpoint.
 
         The failover node awakens at RUNTIME, so we do NOT rely on a boot-wired
-        ``self._jprime``. Two dynamic sources, in order:
+        ``self._jprime``. Three dynamic sources, in order:
           (1) the failover controller's PUBLISHED endpoint when it is SERVING
               (fast path -- same as the Phase 3c seam);
           (2) a direct zone-aware GCP query (``get_node_endpoints``) -- works even
               when THIS process's controller is not in SERVING state (e.g. the node
               was awakened out-of-band by the ignition driver), composing
-              ``http://<ip>:<port>``.
-        Returns a full URL or None. Gated by ``lifecycle_enabled()`` (byte-identical
-        when failover is off). Fail-soft -- NEVER raises."""
+              ``http://<ip>:<port>``;
+          (3) the ALWAYS-ON local lane (:meth:`_local_jprime_endpoint`).
+
+        Source 3 is consulted LAST, deliberately: sources 1-2 are byte-identical
+        to their previous behaviour, so a deployment with a real failover node
+        keeps using it and nothing about GCP routing changes. Local only fills
+        the case where discovery previously returned None -- which, on a host
+        with no GCP failover at all, is every case.
+
+        The GCP sources remain gated by ``lifecycle_enabled()``; the local lane
+        is gated by ``local_prime_enabled()`` (also default-OFF) and must NOT
+        inherit the failover gate, because a locally-served 32B has no failover
+        lifecycle to enable. Returns a full URL or None. Fail-soft -- NEVER
+        raises."""
+        gcp_enabled = False
         try:
             from .failover_lifecycle import (
                 lifecycle_enabled, get_failover_controller, _failover_port,
             )
+            gcp_enabled = bool(lifecycle_enabled())
         except Exception:  # noqa: BLE001
-            return None
-        try:
-            if not lifecycle_enabled():
-                return None
-        except Exception:  # noqa: BLE001
-            return None
-        # (1) Controller-published endpoint (fast path).
-        try:
-            ctrl = get_failover_controller()
-            if ctrl.is_jprime_serving():
-                ep = ctrl.jprime_endpoint()
-                if ep:
-                    return ep
-        except Exception:  # noqa: BLE001
-            pass
-        # (2) Direct zone-aware GCP discovery (controller-state-independent).
-        try:
-            from .gcp_compute_rest import get_compute_rest
-            internal, external = await get_compute_rest().get_node_endpoints()
-            ip = external or internal
-            if ip:
-                return "http://%s:%d" % (ip, _failover_port())
-        except Exception:  # noqa: BLE001
-            pass
-        return None
+            gcp_enabled = False
+        if gcp_enabled:
+            # (1) Controller-published endpoint (fast path).
+            try:
+                ctrl = get_failover_controller()
+                if ctrl.is_jprime_serving():
+                    ep = ctrl.jprime_endpoint()
+                    if ep:
+                        return ep
+            except Exception:  # noqa: BLE001
+                pass
+            # (2) Direct zone-aware GCP discovery (controller-state-independent).
+            try:
+                from .gcp_compute_rest import get_compute_rest
+                internal, external = await get_compute_rest().get_node_endpoints()
+                ip = external or internal
+                if ip:
+                    return "http://%s:%d" % (ip, _failover_port())
+            except Exception:  # noqa: BLE001
+                pass
+        # (3) The local lane -- no node to awaken, no FSM to enter SERVING.
+        return await self._local_jprime_endpoint()
 
     async def _resolve_dispatch_model_name(self, endpoint: Optional[str]) -> Optional[str]:
         """The model the awakened J-Prime node ACTUALLY serves (loaded in VRAM) --
@@ -5165,6 +5427,22 @@ class CandidateGenerator:
         _model = await self._resolve_dispatch_model_name(endpoint)
         if _model:
             _base_overrides["model_name"] = _model
+        # Gateway residency handshake. The device can hold ONE large model, so
+        # "which model is resident" is shared state that two concurrent
+        # dispatches can race on: both read the same snapshot, both see a
+        # mismatch, both request a load, and the loser is not a queued request
+        # but a partial offload to system RAM for BOTH. The gateway already owns
+        # the mutex, the capacity admission and the warm-swap budget for exactly
+        # this -- but only for dispatches routed through it, and this seam was
+        # not one of them. Running the handshake here puts the live local path
+        # under the same lock as everything else instead of beside it.
+        #
+        # Advisory=False: this is a real op that NEEDS its model, unlike a
+        # speculative pre-warm which must defer. Fail-soft and non-blocking on
+        # error -- an unavailable gateway must never cost an op, so the dispatch
+        # proceeds exactly as it did before this call existed.
+        if _model:
+            await _f3c_gateway_residency(endpoint, _model, context)
         _num_ctx = await self._negotiate_num_ctx(endpoint)
         _op = getattr(context, "op_id", "?")[:16]
         if _num_ctx:
@@ -5270,12 +5548,28 @@ class CandidateGenerator:
                         _streaming = bool(_num_ctx) and _f3c_stream_on()
                     except Exception:  # noqa: BLE001
                         _streaming = False
+                    # Gateway unification: bracket this generation in the
+                    # InferenceGateway's in-flight counter. The generation stays
+                    # HERE -- the PrimeProvider seat carries the Venom tool loop,
+                    # which gateway.dispatch() (a single client.complete call)
+                    # cannot express, so routing through it would either lose the
+                    # tool loop or duplicate it. What the gateway must own is
+                    # RESIDENCY STATE, not the call: its advisory pre-warm refuses
+                    # to swap only while it believes weights are in use, and a
+                    # generation it cannot see reads as idle. Unbracketed, a
+                    # pre-warm could evict the 32B mid-stream -- exactly the
+                    # failure the mutex exists to prevent, blind on the one path
+                    # that actually generates. Fail-soft: no gateway -> a
+                    # null bracket, and the op proceeds unchanged.
+                    _bracket = _f3c_inflight_bracket(endpoint)
                     if _streaming:
-                        return await _provider.generate(context, deadline)
-                    return await asyncio.wait_for(
-                        _provider.generate(context, deadline),
-                        timeout=remaining,
-                    )
+                        async with _bracket:
+                            return await _provider.generate(context, deadline)
+                    async with _bracket:
+                        return await asyncio.wait_for(
+                            _provider.generate(context, deadline),
+                            timeout=remaining,
+                        )
                 except GracefulStreamInterruption as _gsi:
                     # Cooperative freeze-mid-sentence. GSI is a BaseException by design
                     # (the Earmuff Bypass) -- it pierced the Venom tool loop's

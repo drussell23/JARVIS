@@ -32,6 +32,24 @@ logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_S = float(os.environ.get("JARVIS_DOC_STALENESS_INTERVAL_S", "86400"))
 _MIN_PUBLIC_SYMBOLS = int(os.environ.get("JARVIS_DOC_MIN_PUBLIC_SYMBOLS", "3"))
+
+
+def _max_named_symbols() -> int:
+    """How many undocumented symbol names a finding may spell out.
+
+    Read at call time, not frozen at import, so an operator can widen or narrow
+    it without a restart -- the same live-knob discipline the rest of this
+    sensor's tunables follow.
+
+    Default 8: enough that a typical low-coverage module names every gap, few
+    enough that a pathological file cannot turn an op description into a wall of
+    identifiers that crowds out the actual instruction. 0 restores the
+    count-only description exactly. NEVER raises; a malformed value falls back
+    to the default rather than disabling the feature silently."""
+    try:
+        return max(0, int(os.environ.get("JARVIS_DOC_MAX_NAMED_SYMBOLS", "8")))
+    except (TypeError, ValueError):
+        return 8
 _SCAN_PATHS: Tuple[str, ...] = (
     "backend/core/ouroboros/governance/",
     "backend/core/",
@@ -145,6 +163,11 @@ class DocFinding:
     file_path: str
     public_symbols: int    # Count of public classes/functions
     documented_symbols: int
+    #: Names of the public symbols with no docstring, in source order. Carried
+    #: alongside the counts because a count says a file needs work while a name
+    #: says WHERE, and only the latter can narrow an op below whole-file scope.
+    #: Defaulted so every existing construction site stays valid.
+    undocumented_symbols: Tuple[str, ...] = ()
     details: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -479,6 +502,10 @@ class DocStalenessSensor:
                         "category": finding.category,
                         "public_symbols": finding.public_symbols,
                         "documented_symbols": finding.documented_symbols,
+                        # Machine-readable twin of the names now in the
+                        # description. A consumer that wants the targets should
+                        # read them, never re-parse the prose.
+                        "undocumented_symbols": list(finding.undocumented_symbols),
                         "coverage": (
                             finding.documented_symbols / max(1, finding.public_symbols)
                         ),
@@ -577,9 +604,20 @@ class DocStalenessSensor:
         except (SyntaxError, UnicodeDecodeError):
             return None
 
-        # Count public symbols and their docstring coverage
+        # Count public symbols and their docstring coverage.
+        #
+        # The NAMES are recorded, not just the tally. They cost nothing here --
+        # the walk already visits every node and already reads every docstring --
+        # and downstream they are the difference between an op that can be
+        # narrowed to a symbol and one that cannot. TargetSymbolResolver's
+        # deterministic goal-keyword pass scores this file's symbol index
+        # against the op description; a description that says only
+        # "2/3 public symbols undocumented" names nothing to score, resolves to
+        # nothing, and correctly fails closed -- so the whole file goes to the
+        # generator instead of the ~50 lines that actually need work.
         public_symbols = 0
         documented_symbols = 0
+        undocumented_names: List[str] = []
 
         for node in ast.iter_child_nodes(tree):
             if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -589,6 +627,8 @@ class DocStalenessSensor:
                 public_symbols += 1
                 if ast.get_docstring(node):
                     documented_symbols += 1
+                else:
+                    undocumented_names.append(node.name)
 
         # Only flag files with significant public API surface
         if public_symbols < _MIN_PUBLIC_SYMBOLS:
@@ -609,10 +649,22 @@ class DocStalenessSensor:
             if not has_module_doc:
                 summary_parts.append("missing module docstring")
             if undocumented > 0:
-                summary_parts.append(
+                # Name the symbols in the summary, because the summary BECOMES
+                # the op description and the description is what the resolver
+                # scores. Bounded: a file with 40 undocumented symbols must not
+                # produce a 40-name description that dominates the prompt, and
+                # past a certain count the op is genuinely whole-file work
+                # anyway. The cap is env-tunable, never a literal in a branch.
+                named = undocumented_names[:_max_named_symbols()]
+                detail = (
                     f"{undocumented}/{public_symbols} public symbols undocumented "
                     f"({coverage:.0%} coverage)"
                 )
+                if named:
+                    detail += ": " + ", ".join(named)
+                    if len(undocumented_names) > len(named):
+                        detail += f" (+{len(undocumented_names) - len(named)} more)"
+                summary_parts.append(detail)
 
             return DocFinding(
                 category="undocumented_api",
@@ -621,9 +673,14 @@ class DocStalenessSensor:
                 file_path=rel_path,
                 public_symbols=public_symbols,
                 documented_symbols=documented_symbols,
+                undocumented_symbols=tuple(undocumented_names),
                 details={
                     "has_module_docstring": has_module_doc,
                     "coverage_pct": round(coverage * 100, 1),
+                    # Structured twin of the names in the summary. The summary is
+                    # prose for a model; this is data for a consumer that should
+                    # never have to parse prose to recover it.
+                    "undocumented_symbols": list(undocumented_names),
                 },
             )
 
