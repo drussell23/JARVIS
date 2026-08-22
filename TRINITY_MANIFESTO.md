@@ -37,9 +37,11 @@ The single most common architectural confusion is mixing the **organism axis** (
 
 | Tier | Provider | Cost | Role |
 |------|----------|------|------|
-| 0 | **DoubleWord 397B** | $0.10/$0.40/M | **PRIMARY** — cheapest, does ~all day-to-day generation |
+| 0 | **DoubleWord 397B** | RT $0.39/$2.45 · async $0.29/$1.84 · batch $0.19/$1.23 /M | **PRIMARY** — cheapest, does ~all day-to-day generation |
 | 1 | Claude (Anthropic) | $3/$15/M | Fallback |
 | 2 | **J-Prime** (the Mind) | VM-cost only | **Last-resort, self-hosted sovereign generator** |
+
+> **Pricing corrected 2026-07-21.** This table previously read `$0.10/$0.40/M`. That was the **35B-dottxt BATCH** rate, not the 397B — a 4–6× understatement carried into every cost estimate derived from it. Tier 0 is still by far the cheapest lane; the ratio to Claude narrowed, the ordering did not change.
 
 **The relationship that matters:** DoubleWord is the cheap external workhorse. J-Prime is *sovereignty insurance* — it exists so a total DoubleWord collapse cannot kill the organism. And every DoubleWord generation produces *experience* that trains the J-Prime Mind. **DW does the work; the Trinity owns the sovereignty.**
 
@@ -53,7 +55,7 @@ The Body runs an 11-phase governance FSM that turns a detected need into a verif
 CLASSIFY → ROUTE → [CONTEXT_EXPANSION] → [PLAN] → GENERATE → VALIDATE → GATE → [APPROVE] → APPLY → VERIFY → COMPLETE
 ```
 
-- **16 autonomous sensors** feed the intake (TestFailure, OpportunityMiner, RuntimeHealth, …).
+- **24 autonomous sensors** feed the intake (TestFailure, OpportunityMiner, RuntimeHealth, …). Counted from the `*Sensor` classes under `intake/sensors/`, every one of which is referenced by a wiring site outside its own module — not a hand-maintained number.
 - A **4-tier risk ladder** governs every change: `SAFE_AUTO` / `NOTIFY_APPLY` / `APPROVAL_REQUIRED` / `BLOCKED`.
 - The **Iron Gate** hard-enforces exploration-first (2+ tool calls before any patch) and ASCII-strictness.
 - **L2 self-repair** closes the loop when validation fails.
