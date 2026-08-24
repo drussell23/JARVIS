@@ -47,4 +47,4 @@ pygame>=2.5.0
 anthropic>=0.7.0
 
 # Utilities
-python-dotenv>=1.0.0
+python-dotenv>=1.2.3

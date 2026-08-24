@@ -15,7 +15,7 @@ google-cloud-storage>=2.14.0
 google-cloud-compute>=1.40.0
 
 # Environment management
-python-dotenv>=1.0.0
+python-dotenv>=1.2.3
 
 # Already in main requirements but listed for reference:
 # aiosqlite - for local SQLite support
