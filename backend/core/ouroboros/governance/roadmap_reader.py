@@ -310,6 +310,22 @@ class RoadmapGoal:
     success_criteria: str
     depends_on: Tuple[str, ...]
     max_duration_s: int
+    #: Optional operator-DECLARED repair target inside ``target_files`` — a
+    #: function/class name, or several. Distinct from ``target_files`` in kind,
+    #: not just granularity: a file says WHERE, a symbol says WHAT, and the
+    #: difference decides whether a 10,923-line file or a 75-line function is
+    #: handed to a 32,768-token model.
+    #:
+    #: It was already covered by the signature (``_build_signing_payload``
+    #: signs the whole ``goals`` list) but silently dropped here, so a goal
+    #: could DECLARE its target and still be resolved by keyword guessing —
+    #: observed in soak bt-2026-08-28-115654, which chose
+    #: ``_read_with_truncation`` at confidence 0.50 over the declared
+    #: ``_should_use_lean_prompt``. Signed intent outranks inference.
+    #:
+    #: Empty tuple = not declared; every consumer must keep inferring, so a
+    #: roadmap written before this field parses and behaves exactly as before.
+    target_symbols: Tuple[str, ...] = ()
     schema_version: str = ROADMAP_READER_SCHEMA_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
@@ -495,6 +511,19 @@ def _parse_goal_entry(entry: Any) -> Optional[RoadmapGoal]:
             if isinstance(f, (str, bytes, int, float))
             and str(f).strip()
         )
+        # Accept both spellings: ``target_symbol`` (one) and
+        # ``target_symbols`` (several). An operator writing one symbol should
+        # not have to know the field is plural, and a schema that punishes the
+        # singular is a schema people get wrong silently.
+        _sym_raw = entry.get("target_symbols")
+        if _sym_raw is None:
+            _sym_raw = entry.get("target_symbol")
+        if isinstance(_sym_raw, (str, bytes)):
+            _sym_raw = [_sym_raw]
+        target_symbols = tuple(
+            str(s).strip() for s in (_sym_raw or ())
+            if isinstance(s, (str, bytes)) and str(s).strip()
+        )
         success = str(entry.get("success_criteria", "") or "")
         depends_raw = entry.get("depends_on") or ()
         depends_on = tuple(
@@ -515,6 +544,7 @@ def _parse_goal_entry(entry: Any) -> Optional[RoadmapGoal]:
             success_criteria=success,
             depends_on=depends_on,
             max_duration_s=max(0, max_dur),
+            target_symbols=target_symbols,
         )
     except Exception:  # noqa: BLE001
         return None
