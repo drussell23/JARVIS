@@ -1025,8 +1025,9 @@ class _FreeLaneStub:
 
 
 class _Candidates:
-    def __init__(self, n):
+    def __init__(self, n, is_noop=False):
         self.candidates = tuple(object() for _ in range(n))
+        self.is_noop = is_noop
 
 
 @pytest.fixture()
@@ -1101,6 +1102,37 @@ async def test_empty_candidates_are_not_a_success(free_lane):
     the op would look served and produce nothing.
     """
     stub = _FreeLaneStub(endpoint=EP, result=_Candidates(0))
+
+    assert await free_lane(stub) is None
+
+
+async def test_a_noop_verdict_is_an_answer_not_an_absence(free_lane):
+    """`2b.1-noop` must terminate the op, not fall through to the queue raise.
+
+    Measured, not hypothesised: in soak bt-2026-08-28-061124 the 32B answered
+    "the dependency 'torch' is already present in requirements.txt" in 2.8s
+    for 28 tokens. That carries zero candidates because zero was the CORRECT
+    answer. Counting candidates alone cannot distinguish it from a lane that
+    produced nothing, and the fall-through would tell the operator the op died
+    of `background_dw_blocked_by_topology` — a topology outage that never
+    happened, on a lane that worked perfectly.
+    """
+    verdict = _Candidates(0, is_noop=True)
+    stub = _FreeLaneStub(endpoint=EP, result=verdict)
+
+    assert await free_lane(stub) is verdict
+
+
+async def test_a_result_without_the_noop_attribute_still_falls_through(free_lane):
+    """Absence of `is_noop` is not a noop.
+
+    The provider seat is duck-typed here; a result object that predates the
+    flag must read as "no candidates", never as a silent success.
+    """
+    class _Bare:
+        candidates = ()
+
+    stub = _FreeLaneStub(endpoint=EP, result=_Bare())
 
     assert await free_lane(stub) is None
 

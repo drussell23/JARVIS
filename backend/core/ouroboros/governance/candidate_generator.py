@@ -5744,8 +5744,26 @@ class CandidateGenerator:
             )
             return None
 
-        if result is not None and len(getattr(result, "candidates", ()) or ()) > 0:
-            return result
+        if result is not None:
+            # A NO-OP is an ANSWER, not an absence. `2b.1-noop` means the model
+            # read the request and concluded the work is already done -- soak
+            # bt-2026-08-28-061124 returned exactly that ("the dependency
+            # 'torch' is already present in requirements.txt") in 2.8s for 28
+            # tokens. Counting candidates alone cannot tell that apart from a
+            # lane that produced nothing, and falling through would report
+            # `background_dw_blocked_by_topology` for an op that was never
+            # blocked -- the operator would read a topology outage where the
+            # truth is "correctly declined". The orchestrator already knows how
+            # to terminate an `is_noop` result benignly; hand it over.
+            if getattr(result, "is_noop", False):
+                logger.info(
+                    "[CandidateGenerator] free-lane returned a NO-OP verdict — "
+                    "the op is answered, not blocked (route=%s) [%s]",
+                    route, op_id_short,
+                )
+                return result
+            if len(getattr(result, "candidates", ()) or ()) > 0:
+                return result
 
         logger.info(
             "[CandidateGenerator] free-lane produced no candidates — falling "
