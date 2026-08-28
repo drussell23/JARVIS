@@ -45,6 +45,48 @@ _DEFAULT_LONGTERM_MAX = 512
 _DEFAULT_RELEVANCE_K = 3
 
 
+_ENV_SUMMARY_MAX = "JARVIS_EPISODIC_SUMMARY_MAX_CHARS"
+_DEFAULT_SUMMARY_MAX = 240
+
+
+def _summary_max_chars() -> int:
+    """Per-episode summary ceiling. ``0`` disables the clamp entirely."""
+    try:
+        return max(0, int(os.getenv(_ENV_SUMMARY_MAX, "").strip()
+                          or _DEFAULT_SUMMARY_MAX))
+    except (TypeError, ValueError):
+        return _DEFAULT_SUMMARY_MAX
+
+
+def _clamp_summary(summary: object) -> str:
+    """Bound a summary at RECORD time, where the cost is paid once.
+
+    Every other dimension of episodic injection is already bounded: the window
+    is count-bounded (``JARVIS_EPISODIC_WINDOW``, default 8), long-term recall
+    is count-bounded (``JARVIS_EPISODIC_RELEVANCE_K``), and ``Episode.render``
+    emits exactly ONE line per episode. Summary length was the only unbounded
+    input, so a single caller passing a stack trace or a file body could put
+    an arbitrarily large block into the prompt tail — on a 32K-context local
+    model, memory bloat causing truncation would be a self-inflicted version
+    of the very failure the truncation work exists to prevent.
+
+    Clamped here rather than at render because an oversized summary is also
+    written to the durable hash-chained receipt; trimming only at display
+    would leave the ledger carrying what the prompt refuses to show.
+
+    Nothing in-tree writes a long summary today (they read like
+    "economic CASCADE_CHEAP → cheap-default"), so this is a guard against a
+    future caller, not a fix for a present bug. NEVER raises.
+    """
+    text = str(summary or "")
+    limit = _summary_max_chars()
+    if limit <= 0 or len(text) <= limit:
+        return text
+    # Marked, not silently cut: a reader of the ledger must be able to tell
+    # a short summary from a truncated one.
+    return text[:limit].rstrip() + f" …[+{len(text) - limit} chars]"
+
+
 def episodic_core_enabled() -> bool:
     """Master gate, default-FALSE per §33.1. NEVER raises."""
     return os.getenv(_ENV_MASTER, "false").strip().lower() in ("1", "true", "yes", "on")
@@ -184,11 +226,12 @@ class EpisodicLedger:
         terminal episodes out of the window (no append → no eviction → no extra
         durable I/O). Fail-soft — never raises."""
         try:
+            summary = _clamp_summary(summary)
             with self._lock:
                 if coalesce_key:
                     for existing in self._window:
                         if existing.coalesce_key == coalesce_key:
-                            existing.summary = str(summary or "")
+                            existing.summary = summary
                             existing.ts = time.time()
                             existing.context.update(dict(context or {}))
                             existing.context["coalesced_count"] = (
@@ -196,7 +239,7 @@ class EpisodicLedger:
                             )
                             return existing  # coalesced — no append, no eviction
                 ep = Episode(self._seq, time.time(), str(kind), str(op_id),
-                             str(summary or ""), dict(context or {}),
+                             summary, dict(context or {}),
                              str(coalesce_key or ""))
                 self._seq += 1
                 evicted: Optional[Episode] = None
