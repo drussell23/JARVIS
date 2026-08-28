@@ -4,5 +4,15 @@ build/
 .idea/
 *.iml
 out/
-gradle/wrapper/gradle-wrapper.jar
+
+# The wrapper JAR is COMMITTED, deliberately.
+#
+# It was previously ignored, which quietly cancelled the wrapper: a fresh clone
+# had gradle-wrapper.properties but no jar and no gradlew, so `./gradlew` could
+# not run and every tool fell back to whatever Gradle it found. A wrapper whose
+# binary is not in the repo does not pin anything — it just documents an
+# intention. ~60KB is the price of a reproducible build.
+!gradle/wrapper/gradle-wrapper.jar
 !gradle/wrapper/gradle-wrapper.properties
+!gradlew
+!gradlew.bat
