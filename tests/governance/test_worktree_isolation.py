@@ -240,3 +240,110 @@ async def test_reap_orphans_idempotent(tmp_path: Path) -> None:
 
     assert first == 1
     assert second == 0
+
+
+# ===========================================================================
+# Live-session self-protection (bt-2026-08-28-065825)
+# ===========================================================================
+#
+# Slice 44 added the `ouroboros__auto__bt-` prefix to the reap set to clear
+# real debris (62 stale checkouts, 492k files, 13GB). The CURRENT session's
+# workspace carries that same prefix, and nothing told the reaper the
+# difference between a previous session's corpse and the tree it is standing
+# in. Measured:
+#
+#   23:59:37  [FileIsolation] routed project_root -> ...-065825-174b22
+#   23:59:41  _git_worktree_remove: git -C ...-065825-174b22 worktree remove
+#   23:59:58  reap_orphans: reaped 1 orphan worktree(s) at boot
+#   00:08:25  every op reaching APPLY: "armed but unusable (no .git)"
+#
+# Four seconds after arming a valid worktree, boot deleted it. Because
+# `effective_execution_root` fails closed at the APPLY boundary, the ops it
+# destroyed were the ones that had travelled furthest.
+
+
+@pytest.mark.asyncio
+async def test_reap_orphans_never_eats_the_live_session_workspace(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The workspace named by JARVIS_AUTO_COMMIT_WORKSPACE is not debris."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    await _init_git_repo(repo_root)
+
+    mgr = WorktreeManager(repo_root=repo_root)
+    live = await mgr.create("ouroboros/auto/bt-live-session-aaa111")
+    stale = await mgr.create("ouroboros/auto/bt-dead-session-bbb222")
+
+    # Exactly how the live workspace announces itself in production.
+    monkeypatch.setenv("JARVIS_AUTO_COMMIT_WORKSPACE", str(live))
+
+    reaped = await mgr.reap_orphans()
+
+    assert live.exists(), (
+        "the live session's own workspace was reaped — this is the husk bug"
+    )
+    assert (live / ".git").exists(), "live workspace must remain a work-area"
+    assert not stale.exists(), "genuine debris must still be reaped"
+    assert reaped == 1
+
+
+@pytest.mark.asyncio
+async def test_reap_orphans_keeps_the_live_branch(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Deleting the live branch is the 'branch already exists' class.
+
+    `reap_dangling_auto_branches` already excludes `current_branch`; the
+    branch sweep inside `reap_orphans` had no such notion, so it would delete
+    the live session's branch out from under its own worktree.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    await _init_git_repo(repo_root)
+
+    mgr = WorktreeManager(repo_root=repo_root)
+    live = await mgr.create("ouroboros/auto/bt-keepme-ccc333")
+    monkeypatch.setenv("JARVIS_AUTO_COMMIT_WORKSPACE", str(live))
+
+    await mgr.reap_orphans()
+
+    branches = await _list_branches(repo_root)
+    assert "ouroboros/auto/bt-keepme-ccc333" in branches
+
+
+@pytest.mark.asyncio
+async def test_reap_orphans_protects_an_explicitly_passed_path(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """`protect_paths` covers callers that know more than the environment."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    await _init_git_repo(repo_root)
+    monkeypatch.delenv("JARVIS_AUTO_COMMIT_WORKSPACE", raising=False)
+
+    mgr = WorktreeManager(repo_root=repo_root)
+    keep = await mgr.create("ouroboros/auto/bt-explicit-ddd444")
+
+    await mgr.reap_orphans(protect_paths=[keep])
+
+    assert keep.exists(), "explicitly protected worktree must survive"
+
+
+@pytest.mark.asyncio
+async def test_unset_env_reaps_everything_as_before(tmp_path: Path, monkeypatch) -> None:
+    """With nothing live, behaviour is byte-identical to before the guard."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    await _init_git_repo(repo_root)
+    monkeypatch.delenv("JARVIS_AUTO_COMMIT_WORKSPACE", raising=False)
+    monkeypatch.delenv("JARVIS_OUROBOROS_SESSION_ID", raising=False)
+
+    mgr = WorktreeManager(repo_root=repo_root)
+    a = await mgr.create("ouroboros/auto/bt-old-1")
+    b = await mgr.create("ouroboros/auto/bt-old-2")
+
+    reaped = await mgr.reap_orphans()
+
+    assert reaped == 2
+    assert not a.exists() and not b.exists()
