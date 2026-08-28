@@ -3088,6 +3088,56 @@ def _refresh_paid_lane_credentials() -> None:
         pass
 
 
+#: Parse-error messages that mean "the output stopped early", not "the model
+#: mistyped". CPython's wording for each is stable and is the only signal
+#: available at the parse seam — the generator cannot see its own token budget.
+_TRUNCATION_SIGNATURES: Tuple[str, ...] = (
+    "unterminated string literal",
+    "unterminated triple-quoted string literal",
+    "unexpected eof while parsing",
+    "was never closed",
+    "expected an indented block",
+)
+
+
+def _truncation_shaped(failures: Any) -> bool:
+    """True when the parse failures look like a cut-off payload.
+
+    Deliberately conservative: ANY failure bearing a truncation signature
+    makes the whole retry truncation-shaped. Reshaping a retry that did not
+    need it costs a smaller output; NOT reshaping one that did costs the op,
+    because a whole-file retry hits the same ceiling. Asymmetric, so it errs
+    toward the cheaper mistake. NEVER raises.
+    """
+    try:
+        for fail in failures or ():
+            msg = str((fail or {}).get("message", "")).lower()
+            if any(sig in msg for sig in _TRUNCATION_SIGNATURES):
+                return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
+def _truncation_reshape_enabled() -> bool:
+    """Master for coupling truncation-shaped parse failures to a reduced
+    output shape. Falsey retries whole-file with feedback only (the
+    pre-coupling behaviour)."""
+    return _envb("JARVIS_TRUNCATION_RESHAPE_ENABLED", True)
+
+
+def _local_primary_enabled() -> bool:
+    """Master for serving ANY route on the local lane when no paid lane exists.
+
+    Default ON, but the master alone changes nothing: `_try_local_primary`
+    still requires `_free_lane_active()` (local configured AND no provider
+    credentials) plus an endpoint that answers. A host with a paid key is
+    byte-identical either way. Falsey pins the local lane back to a fallback
+    for BACKGROUND/SPECULATIVE only.
+    """
+    return _envb("JARVIS_LOCAL_PRIME_PRIMARY_ENABLED", True)
+
+
 def _syntax_repair_enabled() -> bool:
     """Master for the local lane's one-shot syntax-repair retry.
 
@@ -4393,6 +4443,7 @@ class CandidateGenerator:
         if _override_result is not None:
             return _override_result
 
+
         # ── Big-file Agentic Swarm short-circuit (default-OFF; fail-closed) ──
         # When JARVIS_SWARM_ROUTING_ENABLED and the op targets a big file with a
         # deterministically-resolvable symbol, route through the swarm
@@ -4402,6 +4453,33 @@ class CandidateGenerator:
         _swarm_result = await self._maybe_swarm_short_circuit(context, deadline)
         if _swarm_result is not None:
             return _swarm_result
+
+        # ── Local-primary: the free lane runs BEFORE the cascade ───────────
+        # ORDER IS LOAD-BEARING, and getting it wrong is measured, not
+        # theoretical. This block originally sat ABOVE the swarm short-circuit,
+        # which meant that on a host with no paid credential it answered every
+        # op first and the swarm interceptor was never reached — soak
+        # bt-2026-08-28-111858 logged ZERO occurrences of "swarm" with
+        # JARVIS_SWARM_ROUTING_ENABLED=true. Enabling the chunker and then
+        # short-circuiting past it is worse than leaving it off, because the
+        # telemetry says it is on.
+        #
+        # The two are answering different questions and must run in that
+        # order: the swarm decides WHAT to generate (scope reduction — slice
+        # the 75-line symbol out of a 10,923-line file), this decides WHO
+        # generates it (provider selection). Reducing scope first is what
+        # makes the local engine's 32,768-token ceiling sufficient; choosing
+        # the engine first throws the reduction away.
+        #
+        # Still ahead of every route handler, which is the point: a lane that
+        # runs only after the cascade has failed is a fallback, and on a host
+        # with no paid credential the cascade does not fail usefully — it
+        # exhausts (bt-2026-08-28-100733: a SANCTIONED op died
+        # `all_providers_exhausted:circuit_breaker_tripped` on route=standard
+        # while a warm 32B sat resident on the GPU).
+        _local_first = await self._try_local_primary(context, deadline)
+        if _local_first is not None:
+            return _local_first
 
         # ── Route-based dispatch (Manifesto §5 Tier 0: deterministic) ──
         _provider_route = getattr(context, "provider_route", "") or "standard"
@@ -5666,6 +5744,89 @@ class CandidateGenerator:
         # is never serialized, only the one-shot cold calibration is gated.
         return await _prof.run_calibrated(_attempts)
 
+    async def _try_local_primary(
+        self,
+        context: OperationContext,
+        deadline: datetime,
+    ) -> Optional[GenerationResult]:
+        """Serve ANY route on the local lane when no paid lane exists.
+
+        `_try_free_lane_dispatch` made the free lane reachable for BACKGROUND
+        and SPECULATIVE, and deliberately refused the rest: "a STANDARD op has
+        a working cascade and an explicit cost contract; quietly moving it onto
+        a local model would change what the operator paid for." That reasoning
+        is sound while a paid lane exists. It is what stranded a SANCTIONED op
+        in soak bt-2026-08-28-100733, which routed STANDARD by SOURCE (the
+        UrgencyRouter keys on source, not urgency alone, so `source="roadmap"`
+        never reaches BACKGROUND however low its urgency), then died
+        `all_providers_exhausted:circuit_breaker_tripped` — with a warm 32B
+        resident on the GPU the whole time.
+
+        The gate is `_free_lane_active()`, and the choice of predicate is the
+        whole design. It does not ask "which route is this" — route names are
+        exactly the hardcoded mapping that produced the bug. It asks whether
+        any PAID lane exists at all: it requires the local lane to be
+        configured AND both provider credentials to be absent, re-reading
+        `.env` on a TTL so a key added mid-run revokes this immediately. When
+        no paid lane exists there is no cost contract to protect, so the
+        objection above does not apply; when one does exist this returns None
+        and every route cascades exactly as before, byte-identical.
+
+        Evidence, not assertion: a reachable endpoint must answer before
+        anything is dispatched. A configured-but-dead engine falls through to
+        the legacy cascade rather than swallowing the op.
+
+        Returns the result, or None to fall through — including on dispatch
+        failure, so the local lane can only ever ADD a way for an op to
+        succeed, never a new way for it to die.
+        """
+        if not _local_primary_enabled():
+            return None
+        if not _free_lane_active():
+            # A paid lane exists (or the local lane is not configured). Do not
+            # re-route work the operator is paying for.
+            return None
+
+        op_id_short = (getattr(context, "op_id", "") or "?")[:16]
+        route = (getattr(context, "provider_route", "") or "standard").lower()
+        try:
+            endpoint = await self._discover_jprime_endpoint()
+        except Exception:  # noqa: BLE001 — discovery is advisory
+            return None
+        if not endpoint:
+            logger.debug(
+                "[CandidateGenerator] local-primary declined: no endpoint "
+                "(route=%s) [%s]", route, op_id_short,
+            )
+            return None
+
+        logger.info(
+            "[CandidateGenerator] local-primary: no paid lane is configured, "
+            "serving route=%s on the local engine at %s BEFORE the cascade "
+            "[%s]", route, endpoint, op_id_short,
+        )
+        try:
+            result = await self._local_dispatch_with_syntax_repair(
+                context, deadline, endpoint,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[CandidateGenerator] local-primary dispatch failed "
+                "(%s: %.120s) — falling through to the legacy cascade [%s]",
+                type(exc).__name__, str(exc), op_id_short,
+            )
+            return None
+
+        if result is None:
+            return None
+        if getattr(result, "is_noop", False):
+            return result
+        if len(getattr(result, "candidates", ()) or ()) > 0:
+            return result
+        return None
+
     async def _local_dispatch_with_syntax_repair(
         self,
         context: OperationContext,
@@ -5739,6 +5900,43 @@ class CandidateGenerator:
                     type(context).__name__, op_id_short,
                 )
                 raise
+            # Truncation is not a typo, and must not be retried as one.
+            #
+            # The first live firing (soak bt-2026-08-28-100733) showed the
+            # distinction in one trace: line 231 "unterminated string literal"
+            # → retry → line 196 "unterminated string literal". The model did
+            # not mis-type a quote; its OUTPUT WAS CUT OFF, and the second
+            # attempt was cut off earlier. Telling it "fix line 231" asks it to
+            # repair a line it never finished writing, and a full-file retry
+            # spends the same budget to hit the same ceiling.
+            #
+            # `force_diff_on_retry` already exists for exactly this: the
+            # truncation-retry seam whose documented purpose is "change output
+            # SHAPE on the next attempt instead of retrying with the same
+            # parameters". A diff is a fraction of a whole file, so the payload
+            # that overran the budget stops being the payload.
+            if _truncation_shaped(failures) and _truncation_reshape_enabled():
+                _reshape = getattr(context, "with_forced_diff_retry", None)
+                logger.info(
+                    "[CandidateGenerator] the parse failure is TRUNCATION-"
+                    "shaped (%s) — retrying with a reduced output shape rather "
+                    "than another whole-file attempt [%s]",
+                    (failures[0] or {}).get("message", "?")[:60], op_id_short,
+                )
+                if callable(_reshape):
+                    context = _reshape()
+                else:
+                    # No reshape helper on this context: dataclasses.replace is
+                    # the same mechanism the field's own owner uses.
+                    try:
+                        import dataclasses as _dc  # noqa: PLC0415
+                        context = _dc.replace(context, force_diff_on_retry=True)
+                    except Exception:  # noqa: BLE001 — reshape is best-effort
+                        pass
+                _stamp = getattr(context, "with_syntax_retry_feedback", None)
+                if not callable(_stamp):
+                    raise
+
             retry_ctx = _stamp(feedback)
             if retry_ctx is context:
                 # Stamping failed (degraded to self); retrying unchanged would

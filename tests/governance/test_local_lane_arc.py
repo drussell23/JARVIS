@@ -1050,12 +1050,28 @@ class _RetryableCtx:
     dragging the real dataclass and its hashing into these tests.
     """
 
-    def __init__(self, syntax_retry_feedback=""):
+    def __init__(self, syntax_retry_feedback="", force_diff_on_retry=False):
         self.op_id = "op-free-lane-test"
+        self.provider_route = "background"
         self.syntax_retry_feedback = syntax_retry_feedback
+        self.force_diff_on_retry = force_diff_on_retry
 
     def with_syntax_retry_feedback(self, feedback):
-        return _RetryableCtx(syntax_retry_feedback=feedback)
+        # PRESERVES sibling fields, because the real implementation is
+        # `dataclasses.replace(self, ...)` and replace copies everything it is
+        # not told to change. A double that rebuilds from scratch silently
+        # drops whatever a caller stamped just before — which is exactly how
+        # this fixture hid the truncation reshape.
+        return _RetryableCtx(
+            syntax_retry_feedback=feedback,
+            force_diff_on_retry=self.force_diff_on_retry,
+        )
+
+    def with_forced_diff_retry(self):
+        return _RetryableCtx(
+            syntax_retry_feedback=self.syntax_retry_feedback,
+            force_diff_on_retry=True,
+        )
 
 
 class _Candidates:
@@ -1306,3 +1322,145 @@ async def test_a_non_syntax_failure_is_not_retried(free_lane):
 
 def test_syntax_repair_defaults_on(cg):
     assert cg._syntax_repair_enabled() is True
+
+
+# ===========================================================================
+# Phase 5 -- local as PRIMARY when no paid lane exists
+# ===========================================================================
+#
+# `_try_free_lane_dispatch` refused non-cost-optimized routes to protect a cost
+# contract. Soak bt-2026-08-28-100733 showed the cost of that when there IS no
+# contract: a SANCTIONED roadmap op routed STANDARD (the UrgencyRouter keys on
+# SOURCE, so source="roadmap" never reaches BACKGROUND however low its urgency)
+# and died all_providers_exhausted with a warm 32B resident on the GPU.
+
+
+class _PrimaryStub(_FreeLaneStub):
+    async def _try_local_primary(self, context, deadline):
+        mod = importlib.import_module(CG)
+        return await mod.CandidateGenerator._try_local_primary(
+            self, context, deadline,
+        )
+
+
+@pytest.fixture()
+def local_primary(monkeypatch):
+    """`_try_local_primary` bound to a stub, with NO paid credentials."""
+    mod = importlib.import_module(CG)
+    monkeypatch.setattr(mod, "_FREE_LANE_CRED_REFRESH_AT", -1e9)
+    monkeypatch.setenv("JARVIS_LOCAL_PRIME_ENABLED", "true")
+    for k in ("DOUBLEWORD_API_KEY", "ANTHROPIC_API_KEY",
+              "JARVIS_LOCAL_PRIME_PRIMARY_ENABLED"):
+        monkeypatch.delenv(k, raising=False)
+
+    async def _call(stub, route="standard"):
+        ctx = _RetryableCtx()
+        ctx.provider_route = route
+        return await mod.CandidateGenerator._try_local_primary(
+            stub, ctx, object(),
+        )
+
+    return _call
+
+
+@pytest.mark.parametrize("route", ["standard", "immediate", "complex"])
+async def test_local_primary_serves_paid_routes_when_no_paid_lane(
+    local_primary, route,
+):
+    """The regression: a sanctioned STANDARD op must not die exhausted."""
+    good = _Candidates(1)
+    stub = _PrimaryStub(endpoint=EP, result=good)
+
+    assert await local_primary(stub, route=route) is good
+    assert stub.dispatched_to == EP
+
+
+@pytest.mark.parametrize("key", ["DOUBLEWORD_API_KEY", "ANTHROPIC_API_KEY"])
+async def test_local_primary_declines_when_a_paid_lane_exists(
+    local_primary, monkeypatch, key,
+):
+    """One credential is enough to restore the legacy cascade untouched.
+
+    This is the guard that keeps a cloud deployment byte-identical: the
+    predicate asks whether a PAID lane exists, never which route this is.
+    """
+    monkeypatch.setenv(key, "sk-not-a-real-key")
+    stub = _PrimaryStub(endpoint=EP, result=_Candidates(1))
+
+    assert await local_primary(stub) is None
+    assert stub.dispatched_to is None
+
+
+async def test_local_primary_master_off_restores_fallback_only(
+    local_primary, monkeypatch,
+):
+    monkeypatch.setenv("JARVIS_LOCAL_PRIME_PRIMARY_ENABLED", "0")
+    stub = _PrimaryStub(endpoint=EP, result=_Candidates(1))
+
+    assert await local_primary(stub) is None
+
+
+async def test_local_primary_requires_a_reachable_endpoint(local_primary):
+    """A flag is not evidence; an endpoint that answers is."""
+    stub = _PrimaryStub(endpoint=None, result=_Candidates(1))
+
+    assert await local_primary(stub) is None
+
+
+async def test_local_primary_failure_falls_through_to_the_cascade(local_primary):
+    """The local lane may only ADD a way to succeed, never a way to die."""
+    stub = _PrimaryStub(
+        endpoint=EP, result=None, dispatch_raises=RuntimeError("engine down"),
+    )
+
+    assert await local_primary(stub) is None
+
+
+# ---------------------------------------------------------------------------
+# Truncation-shaped failures reshape the retry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("msg,expected", [
+    ("unterminated string literal (detected at line 231)", True),
+    ("unterminated triple-quoted string literal", True),
+    ("unexpected EOF while parsing", True),
+    ("'(' was never closed", True),
+    ("expected an indented block", True),
+    ("invalid syntax", False),
+    ("unindent does not match any outer indentation level", False),
+])
+def test_truncation_classifier(cg, msg, expected):
+    """Truncation is a cut-off payload; a typo is not. They need opposite
+    remedies, so the classifier must not blur them."""
+    assert cg._truncation_shaped([{"message": msg}]) is expected
+
+
+async def test_truncation_reshapes_the_retry_instead_of_repeating_it(free_lane):
+    """A cut-off payload must be retried SMALLER, not identically.
+
+    Measured: line 231 unterminated -> retry -> line 196 unterminated. The
+    model was not mis-typing; its output was being cut off, and the second
+    attempt was cut off earlier. `force_diff_on_retry` is the existing seam
+    for changing output SHAPE rather than repeating parameters.
+    """
+    trunc = [{
+        "file_path": "tests/x.py", "line": 231,
+        "message": "unterminated string literal (detected at line 231)",
+        "source_line": '    assert x == "abc',
+    }]
+    stub = _SyntaxThenSuccessStub(EP, _Candidates(1))
+    stub._first_failures = trunc
+
+    async def _dispatch(context, deadline, endpoint):
+        stub.dispatch_calls += 1
+        stub.last_context = context
+        if stub.dispatch_calls == 1:
+            raise _syntax_exc(trunc)
+        return stub._result
+
+    stub._failover_local_dispatch = _dispatch
+    assert await free_lane(stub) is stub._result
+    assert getattr(stub.last_context, "force_diff_on_retry", False) is True, (
+        "a truncation-shaped failure must reduce the output shape on retry"
+    )
