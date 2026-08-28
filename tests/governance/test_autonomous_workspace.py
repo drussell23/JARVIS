@@ -24,7 +24,19 @@ from backend.core.ouroboros.governance import execution_context as ec
 
 
 class _FakeMgr:
-    """Stand-in WorktreeManager: records create() calls, returns a real dir."""
+    """Stand-in WorktreeManager: records create() calls, returns a real
+    WORK-AREA — a directory carrying ``.git``, which is what distinguishes a
+    worktree from a directory that merely exists.
+
+    The `.git` marker is load-bearing. This fake used to `mkdir()` and stop,
+    making every test that used it assert behaviour against a HUSK. That is
+    how the arming defect reached production twice
+    (bt-2026-08-28-061124, -065825): a real `create` returned a marker-only
+    directory, the arming seam trusted it, and `effective_execution_root`
+    raised at the APPLY boundary for every op that got that far. A linked
+    worktree's `.git` is a FILE pointing at the parent repo; either shape
+    satisfies :func:`is_valid_git_work_area`.
+    """
 
     def __init__(self, base: Path):
         self._base = base
@@ -34,6 +46,27 @@ class _FakeMgr:
         self.created.append(branch)
         p = self._base / ("wt_" + branch.replace("/", "__"))
         p.mkdir(parents=True, exist_ok=True)
+        (p / ".git").write_text("gitdir: /repo/.git/worktrees/fake\n")
+        return p
+
+
+class _HuskMgr:
+    """A create that SUCCEEDS but yields an unusable work-area.
+
+    Not hypothetical — this is the observed production shape: the directory
+    exists, carries only a `.jarvis/` marker, and `git worktree list` has
+    never heard of it.
+    """
+
+    def __init__(self, base: Path):
+        self._base = base
+        self.created: list[str] = []
+
+    async def create(self, branch: str) -> Path:
+        self.created.append(branch)
+        p = self._base / ("husk_" + branch.replace("/", "__"))
+        p.mkdir(parents=True, exist_ok=True)
+        (p / ".jarvis").mkdir(exist_ok=True)  # marker only, no .git
         return p
 
 
@@ -104,6 +137,40 @@ async def test_autonomous_route_unifies_commit_workspace_env(
     # Reuses the existing commit-workspace handoff env so AutoCommitter +
     # ChangeEngine converge on the SAME worktree (not new global cwd state).
     assert os.environ["JARVIS_AUTO_COMMIT_WORKSPACE"] == str(out)
+
+
+async def test_husk_worktree_stays_in_primary_and_never_arms(
+    tmp_path, monkeypatch,
+):
+    """A create that returns an unusable work-area must not become the root.
+
+    This seam is documented as the SINGLE canonical materialization point for
+    `JARVIS_AUTO_COMMIT_WORKSPACE`, and the Ledger-Sovereignty boot phase
+    explicitly reuses whatever lands here — so an unvalidated husk becomes
+    every consumer's execution root. `effective_execution_root` then raises
+    `ExecutionRootInvalid` at the APPLY boundary, killing the ops that had
+    progressed furthest (8 of 80 in bt-2026-08-28-061124; 5 of 77 in -065825).
+
+    Fail-safe is `return root`, the same move this function already makes when
+    `create` raises: staying in the primary checkout is a documented posture,
+    pointing every consumer at a husk is not.
+    """
+    import os
+    from backend.core.ouroboros.governance import autonomous_workspace as aw
+    monkeypatch.setenv("JARVIS_FILE_ISOLATION_ENABLED", "true")
+    monkeypatch.setattr(ec, "is_autonomous", lambda *a, **k: True)
+    monkeypatch.delenv("JARVIS_AUTO_COMMIT_WORKSPACE", raising=False)
+
+    mgr = _HuskMgr(tmp_path)
+    out = await aw.resolve_loop_project_root(
+        tmp_path, session_id="bt-husk", worktree_manager=mgr,
+    )
+
+    assert mgr.created, "create() should still have been attempted"
+    assert out == tmp_path, "must fall back to the primary checkout"
+    assert "JARVIS_AUTO_COMMIT_WORKSPACE" not in os.environ, (
+        "a husk was armed: 'armed' must always imply 'usable'"
+    )
 
 
 async def test_autonomous_route_does_not_clobber_operator_override(

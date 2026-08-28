@@ -279,6 +279,38 @@ async def resolve_loop_project_root(
         wt_path = Path(await mgr.create(workspace_branch(session_id)))
     except Exception:  # noqa: BLE001 — fail-safe: stay in primary
         return root
+    # A create that RETURNS is not proof the workspace is usable, and this is
+    # the seam where that matters most: the comment below calls this the SINGLE
+    # canonical materialization point for the env, and the Ledger-Sovereignty
+    # boot phase explicitly "reuses whatever lands here". Whatever lands here
+    # therefore becomes every consumer's execution root.
+    #
+    # Measured twice on this host (bt-2026-08-28-061124, bt-2026-08-28-065825):
+    # `create` returned `.worktrees/ouroboros__auto__<session>`, a directory
+    # holding only `.jarvis/` and no `.git`, which `git worktree list` never
+    # knew about. `effective_execution_root` (line ~185, this module) then
+    # raises `ExecutionRootInvalid` by design — and it raises at the APPLY
+    # boundary, so it killed the ops that had travelled FURTHEST: through
+    # GENERATE on the local lane, VALIDATE, GATE and REVIEW-SHADOW. 8 of 80,
+    # then 5 of 77.
+    #
+    # `is_valid_git_work_area` (defined above in this module) states the rule:
+    # "Armers MUST validate with this predicate ... so 'armed' always implies
+    # 'usable'". Arming was the only step that skipped it, which left the read
+    # side failing loud about a promise the write side never checked.
+    #
+    # `return root` on failure is this function's OWN established fail-safe —
+    # the same move the `except` above makes. Staying in the primary checkout
+    # is a documented posture; pointing every consumer at a husk is not.
+    if not is_valid_git_work_area(wt_path):
+        logger.warning(
+            "[FileIsolation] worktree create returned %s but it is not a "
+            "usable git work-area (no .git) — staying in the primary checkout "
+            "%s rather than arming an unusable execution root "
+            "(session=%s branch=%s)",
+            wt_path, root, session_id, workspace_branch(session_id),
+        )
+        return root
     # Unify with the EXISTING commit-workspace handoff idiom (the same env
     # the Ledger-Sovereignty phase sets) so AutoCommitter + ChangeEngine +
     # the orchestrator all converge on this one worktree. This is the
