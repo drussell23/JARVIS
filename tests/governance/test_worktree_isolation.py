@@ -540,3 +540,103 @@ async def test_unreadable_lock_is_treated_as_reapable(tmp_path: Path, monkeypatc
 
     assert reaped == 1
     assert not wt.exists()
+
+
+# ===========================================================================
+# Multi-root sweeping (bt-2026-08-28-083617)
+# ===========================================================================
+#
+# The boot reaper runs on the L3 manager, whose base defaults to
+# `$HOME/.jarvis/ouroboros/worktrees`. Session workspaces live in
+# `<repo>/.worktrees`. Both placements are deliberate; the bug was a sweep
+# that knew about only one of them, so in-repo husks survived for days while
+# the reaper reported success.
+
+
+@pytest.mark.asyncio
+async def test_sweep_reaches_in_repo_husks_from_a_foreign_base(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A manager based OUTSIDE the repo must still sweep in-repo debris."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    await _init_git_repo(repo_root)
+    monkeypatch.delenv("JARVIS_AUTO_COMMIT_WORKSPACE", raising=False)
+    monkeypatch.delenv("JARVIS_WORKTREE_BASE", raising=False)
+
+    # The L3 base: elsewhere entirely, as in production.
+    l3_base = tmp_path / "home" / ".jarvis" / "ouroboros" / "worktrees"
+    l3_base.mkdir(parents=True)
+
+    # In-repo husk — the exact observed shape: marker only, no .git, and git
+    # has never heard of it.
+    husk = repo_root / ".worktrees" / "ouroboros__auto__bt-dead-session-aaa111"
+    husk.mkdir(parents=True)
+    (husk / ".jarvis").mkdir()
+
+    mgr = WorktreeManager(repo_root=repo_root, worktree_base=l3_base)
+    reaped = await mgr.reap_orphans()
+
+    assert not husk.exists(), (
+        "in-repo husk survived a sweep run from the L3 base — the bug"
+    )
+    assert reaped == 1
+
+
+@pytest.mark.asyncio
+async def test_multi_root_sweep_still_honours_the_liveness_lock(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Widening the sweep must not widen what it is allowed to destroy."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    await _init_git_repo(repo_root)
+    monkeypatch.delenv("JARVIS_AUTO_COMMIT_WORKSPACE", raising=False)
+    monkeypatch.delenv("JARVIS_WORKTREE_BASE", raising=False)
+
+    l3_base = tmp_path / "l3base"
+    l3_base.mkdir()
+
+    # A LIVE in-repo workspace, created through the default (in-repo) base.
+    session_mgr = WorktreeManager(repo_root=repo_root)
+    live = await session_mgr.create("ouroboros/auto/bt-live-bbb222")
+
+    # A dead one alongside it.
+    dead = await session_mgr.create("ouroboros/auto/bt-dead-ccc333")
+    _orphan(dead)
+
+    # The boot reaper, based elsewhere, now reaches both — and must still
+    # tell them apart.
+    boot_mgr = WorktreeManager(repo_root=repo_root, worktree_base=l3_base)
+    await boot_mgr.reap_orphans()
+
+    assert live.exists(), "the lock must survive the wider sweep"
+    assert (live / ".git").exists()
+    assert not dead.exists()
+
+
+def test_sweep_roots_dedupes_equivalent_spellings(tmp_path: Path, monkeypatch) -> None:
+    """The same directory spelled two ways is one root, not two."""
+    from backend.core.ouroboros.governance.worktree_manager import (
+        worktree_sweep_roots,
+    )
+
+    repo_root = tmp_path / "repo"
+    (repo_root / ".worktrees").mkdir(parents=True)
+    monkeypatch.setenv("JARVIS_WORKTREE_BASE", str(repo_root / ".worktrees") + "/")
+
+    roots = worktree_sweep_roots(repo_root, repo_root / ".worktrees")
+
+    assert len(roots) == 1, f"expected one deduped root, got {roots}"
+
+
+def test_sweep_roots_skips_nonexistent_and_never_raises(tmp_path: Path, monkeypatch) -> None:
+    """A configured-but-absent base is not an error, it is just not a root."""
+    from backend.core.ouroboros.governance.worktree_manager import (
+        worktree_sweep_roots,
+    )
+
+    monkeypatch.setenv("JARVIS_WORKTREE_BASE", str(tmp_path / "does-not-exist"))
+    roots = worktree_sweep_roots(tmp_path / "no-repo-here", None, "")
+
+    assert roots == ()

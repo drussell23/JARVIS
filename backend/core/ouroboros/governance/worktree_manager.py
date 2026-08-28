@@ -185,6 +185,74 @@ def _resolve_reap_prefixes(primary: str) -> "tuple[str, ...]":
     return tuple(out)
 
 
+#: The in-repo worktree root. Kept as a constant so the several modules that
+#: currently spell `.worktrees` as a literal have one name to converge on.
+_IN_REPO_WORKTREE_DIRNAME = ".worktrees"
+
+
+def worktree_sweep_roots(repo_root: object, *extra: object) -> "Tuple[Path, ...]":
+    """Every directory this system materializes worktrees in.
+
+    There is more than one, on purpose, and that is the point. The L3 subagent
+    base defaults to ``$HOME/.jarvis/ouroboros/worktrees`` — deliberately off
+    the repo, because on this host the repo lives on a 9p ``/mnt/c`` mount
+    where checkouts are pathologically slow. The session workspace base is
+    ``<repo_root>/.worktrees``, because ``resolve_loop_project_root`` builds
+    its ``WorktreeManager`` with no explicit base and takes the default.
+
+    Both placements are correct. What was NOT correct is that the boot sweep
+    knew about only one of them: ``reap_orphans`` ran on the L3 manager, so it
+    iterated the home base and never saw in-repo debris. Measured on
+    bt-2026-08-28-083617 — one registered orphan reaped (loop 1 finds those via
+    ``git worktree list``, which reports absolute paths regardless of base)
+    while three marker-only husks under ``<repo>/.worktrees`` survived
+    untouched, as they had for days. That is the unfinished half of Slice 44,
+    whose whole purpose was reclaiming exactly this debris.
+
+    So the fix is NOT to force one base — that would either drag L3 checkouts
+    onto the slow mount or move session workspaces out of the repo, breaking a
+    deliberate decision in each case. The fix is to stop having a sweep that
+    knows about a subset of the places its own system writes to.
+
+    Sources, deduped: the caller's own base(s), the in-repo default, and
+    ``JARVIS_WORKTREE_BASE`` (which ``posture_observer.worktree_orphan_count``
+    already reads as authoritative — a third module with a fourth opinion,
+    which is the smell this helper exists to remove).
+
+    Deduped by ``os.path.realpath`` so ``/mnt/c/...`` versus a symlinked or
+    trailing-slash spelling of the same directory is swept once, not twice.
+    Only extant directories are returned. NEVER raises.
+    """
+    seen: Set[str] = set()
+    roots: List[Path] = []
+
+    def _add(candidate: object) -> None:
+        if candidate in (None, ""):
+            return
+        try:
+            resolved = os.path.realpath(str(candidate))
+        except (OSError, TypeError, ValueError):
+            return
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        path = Path(resolved)
+        try:
+            if path.is_dir():
+                roots.append(path)
+        except OSError:
+            pass
+
+    for candidate in extra:
+        _add(candidate)
+    try:
+        _add(Path(str(repo_root)) / _IN_REPO_WORKTREE_DIRNAME)
+    except (TypeError, ValueError):
+        pass
+    _add(os.environ.get("JARVIS_WORKTREE_BASE"))
+    return tuple(roots)
+
+
 # ---------------------------------------------------------------------------
 # Workspace liveness lock
 # ---------------------------------------------------------------------------
@@ -677,6 +745,16 @@ class WorktreeManager:
         # layer — Oracle was the scanner.)
         prefixes = _resolve_reap_prefixes(branch_prefix)
 
+        # Every root this system writes worktrees into, not just this
+        # manager's own. See :func:`worktree_sweep_roots` for why there is
+        # legitimately more than one and why forcing a single base would be
+        # the wrong repair.
+        sweep_roots = worktree_sweep_roots(self._repo_root, self._worktree_base)
+        logger.debug(
+            "WorktreeManager.reap_orphans: sweeping %d root(s): %s",
+            len(sweep_roots), ", ".join(str(r) for r in sweep_roots) or "(none)",
+        )
+
         # ------------------------------------------------------------------
         # Self-protection: never reap the workspace THIS process is using.
         #
@@ -807,8 +885,10 @@ class WorktreeManager:
                 else ""
             )
             try:
-                base_resolved = self._worktree_base.resolve()
-                lives_under_base = wt_path.parent.resolve() == base_resolved
+                _parent = wt_path.parent.resolve()
+                lives_under_base = any(
+                    _parent == _root for _root in sweep_roots
+                )
             except OSError:
                 lives_under_base = False
             name_matches = any(wt_path.name.startswith(p) for p in prefixes)
@@ -838,8 +918,16 @@ class WorktreeManager:
             if branch_short:
                 await self._git_delete_branch(branch_short)
 
-        if self._worktree_base.exists():
-            for child in self._worktree_base.iterdir():
+        for _root in sweep_roots:
+            try:
+                _children = list(_root.iterdir())
+            except OSError as exc:
+                logger.warning(
+                    "WorktreeManager.reap_orphans: cannot list %s: %s",
+                    _root, exc,
+                )
+                continue
+            for child in _children:
                 if not child.is_dir():
                     continue
                 if not any(child.name.startswith(p) for p in prefixes):
