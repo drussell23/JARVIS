@@ -1164,6 +1164,19 @@ class OperationContext:
     force_diff_on_retry: bool = False        # Truncation-retry: force 2b.1-diff output on this retry
     retry_max_tokens_override: int = 0        # Truncation-retry: >0 overrides provider max_tokens for this retry
 
+    # Syntax-retry feedback. Same lifecycle as the two flags above — stamped
+    # when the previous attempt's candidates were rejected by ``ast.parse``,
+    # consumed by the provider tier to change the next attempt rather than
+    # repeating it unchanged.
+    #
+    # It carries the actual parse errors (file, line, message, offending
+    # source line). Before this the SyntaxError was logged and discarded, so
+    # `all_candidates_syntax_error` was terminal on a lane with nowhere to
+    # escalate to: the local 32B IS J-Prime, so `syntax_escalation`'s
+    # DW → J-Prime cascade escalates to the model that just failed. A model
+    # cannot correct an error it is never shown.
+    syntax_retry_feedback: str = ""
+
     # ---- Slice 245 — hibernation resurrection flag ----
     # Set (via with_resurrection()) when an op that failed with provider
     # exhaustion during a dark window is re-ingested after the Grid Sentinel
@@ -1618,6 +1631,35 @@ class OperationContext:
         fields_for_hash = _context_to_hash_dict(intermediate)
         new_hash = _compute_hash(fields_for_hash)
         return dataclasses.replace(intermediate, context_hash=new_hash)
+
+    def with_syntax_retry_feedback(self, feedback: str) -> "OperationContext":
+        """Return a context carrying the previous attempt's parse errors.
+
+        Hash-chain-safe by the same mechanics as :meth:`with_resurrection`:
+        the retry is a genuinely different attempt and must be auditable as
+        one, not a silent re-run wearing the first attempt's identity.
+
+        ``generate_file_hashes`` is deliberately untouched — the retry targets
+        the same files at the same disk state, and rewriting those hashes here
+        would blind the Slice 248 file-drift guillotine to real drift.
+
+        NEVER raises into the caller: a retry that cannot be stamped degrades
+        to no retry, which is the pre-existing behaviour.
+        """
+        try:
+            if not (feedback or "").strip():
+                return self
+            intermediate = dataclasses.replace(
+                self,
+                syntax_retry_feedback=str(feedback),
+                previous_hash=self.context_hash,
+                context_hash="",  # placeholder — recomputed below
+            )
+            fields_for_hash = _context_to_hash_dict(intermediate)
+            new_hash = _compute_hash(fields_for_hash)
+            return dataclasses.replace(intermediate, context_hash=new_hash)
+        except Exception:  # noqa: BLE001 — degrade to no retry
+            return self
 
     def with_steering_guidance(self, guidance: str) -> "OperationContext":
         """Slice 249 — fold live human steering into the context (durable/auditable

@@ -4032,6 +4032,19 @@ Rules:
     if _s89_enabled and _s89_manifest is not None:
         parts.append(_build_exploration_manifest_block(_s89_manifest))
 
+    # Syntax-retry correction — LAST, and deliberately outside the
+    # `not _is_bg_route` gate above.
+    #
+    # Last because it is a correction to work the model has already done, and
+    # an instruction to fix a specific line is worth little buried above two
+    # thousand lines of source snapshot. Outside the BG gate because BACKGROUND
+    # is precisely the route this exists for: the local lane serves BG, and a
+    # prompt-size economy that drops the one instruction naming the defect
+    # guarantees the retry repeats it. It costs a few hundred characters.
+    _syntax_fb = getattr(ctx, "syntax_retry_feedback", "")
+    if isinstance(_syntax_fb, str) and _syntax_fb.strip():
+        parts.append(f"## Correction Required\n\n{_syntax_fb.strip()}")
+
     prompt = "\n\n".join(parts)
 
     # N7: Prompt-size gate — prevent silent context-window truncation.
@@ -4053,6 +4066,69 @@ Rules:
 # ---------------------------------------------------------------------------
 # Shared: Response Parser helpers
 # ---------------------------------------------------------------------------
+
+
+def _describe_syntax_error(
+    exc: SyntaxError, file_path: str, content: str,
+) -> Dict[str, Any]:
+    """Turn a rejected candidate's SyntaxError into feedback a model can use.
+
+    The offending SOURCE LINE is the load-bearing part. "line 214: unexpected
+    indent" asks the model to recount 214 lines of its own output; quoting the
+    line, and the one before it, points at the mistake directly. Bounded to a
+    couple of short strings so a retry prompt cannot be crowded out by the
+    error report.
+
+    NEVER raises — this runs on the failure path, where a second exception
+    would replace a recoverable error with an unrecoverable one.
+    """
+    try:
+        lineno = int(getattr(exc, "lineno", 0) or 0)
+    except (TypeError, ValueError):
+        lineno = 0
+    detail: Dict[str, Any] = {
+        "file_path": str(file_path),
+        "line": lineno,
+        "message": str(getattr(exc, "msg", "") or exc)[:200],
+    }
+    try:
+        lines = content.splitlines()
+        if 1 <= lineno <= len(lines):
+            detail["source_line"] = lines[lineno - 1][:200]
+            if lineno >= 2:
+                detail["preceding_line"] = lines[lineno - 2][:200]
+    except Exception:  # noqa: BLE001 — feedback is best-effort
+        pass
+    return detail
+
+
+def _format_syntax_feedback(failures: List[Dict[str, Any]]) -> str:
+    """Render :func:`_describe_syntax_error` records as a retry directive.
+
+    Deliberately imperative and specific. A generic "your output was invalid"
+    reliably produces another invalid output; naming the construct and the line
+    gives the model something to act on. Capped at three failures — beyond that
+    the model is not making a fixable slip, and a longer list only eats the
+    token budget the corrected file needs.
+    """
+    if not failures:
+        return ""
+    parts: List[str] = [
+        "Your previous response was rejected: the Python you produced does "
+        "not parse. Fix EXACTLY these errors and return the COMPLETE file "
+        "again — do not summarise, do not elide, do not explain.",
+    ]
+    for fail in failures[:3]:
+        chunk = (
+            f"- {fail.get('file_path', '?')} line {fail.get('line', '?')}: "
+            f"{fail.get('message', 'syntax error')}"
+        )
+        if fail.get("preceding_line"):
+            chunk += f"\n    preceding: {fail['preceding_line']}"
+        if fail.get("source_line"):
+            chunk += f"\n    offending: {fail['source_line']}"
+        parts.append(chunk)
+    return "\n".join(parts)
 
 
 def _try_reconstruct_from_ellipsis(
@@ -5326,6 +5402,13 @@ def _parse_generation_response(
 
     # Step 6: per-candidate validation
     validated: List[Dict[str, Any]] = []
+    # Structured record of WHY each Python candidate failed ast.parse. The
+    # SyntaxError used to be logged and dropped, so all that reached the caller
+    # was the fact that everything failed — no line, no message, nothing a
+    # retry could act on. A model cannot correct an error it is never shown,
+    # which is why `all_candidates_syntax_error` has been a terminal wall on
+    # the local lane rather than a recoverable one.
+    _syntax_failures: List[Dict[str, Any]] = []
     for i, cand in enumerate(raw_candidates):
         if not isinstance(cand, dict):
             raise RuntimeError(f"{pfx}_schema_invalid:candidate_{i}_not_object")
@@ -5397,11 +5480,16 @@ def _parse_generation_response(
         if file_path.endswith(".py"):
             try:
                 ast.parse(full_content)
-            except SyntaxError:
+            except SyntaxError as _se:
+                _syntax_failures.append(_describe_syntax_error(
+                    _se, file_path, full_content,
+                ))
                 logger.warning(
-                    "Skipping candidate %s: SyntaxError in %s",
+                    "Skipping candidate %s: SyntaxError in %s (line %s: %s)",
                     cand["candidate_id"],
                     file_path,
+                    getattr(_se, "lineno", "?"),
+                    getattr(_se, "msg", _se),
                 )
                 continue  # skip this candidate; try next
 
@@ -5500,10 +5588,16 @@ def _parse_generation_response(
                 if _fp_entry.endswith(".py"):
                     try:
                         ast.parse(_fc_entry)
-                    except SyntaxError:
+                    except SyntaxError as _se:
+                        _syntax_failures.append(_describe_syntax_error(
+                            _se, _fp_entry, _fc_entry,
+                        ))
                         logger.warning(
-                            "Skipping multi-file candidate %s: SyntaxError in %s",
+                            "Skipping multi-file candidate %s: SyntaxError in "
+                            "%s (line %s: %s)",
                             cand["candidate_id"], _fp_entry,
+                            getattr(_se, "lineno", "?"),
+                            getattr(_se, "msg", _se),
                         )
                         _skip_candidate = True
                         break
@@ -5537,6 +5631,12 @@ def _parse_generation_response(
 
     if not validated:
         _syntax_exc = RuntimeError(f"{pfx}_schema_invalid:all_candidates_syntax_error")
+        # The parse errors themselves, so a retry can show the model exactly
+        # what it got wrong instead of asking it to guess. Empty when the
+        # candidates failed for a non-syntax reason (placeholders, truncation),
+        # which keeps "no syntax detail" distinguishable from "no syntax
+        # problem" at the consuming end.
+        _syntax_exc.syntax_failures = list(_syntax_failures)  # type: ignore[attr-defined]
         # Attach failure context for the SyntaxExhaustionEscalator so
         # J-Prime receives the DW model's failed candidate preview and
         # target file path — enabling structural avoidance of the same
