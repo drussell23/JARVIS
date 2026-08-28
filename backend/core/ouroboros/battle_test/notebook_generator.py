@@ -14,7 +14,7 @@ import json
 import logging
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +75,182 @@ def _atomic_write(path: "Path", render: "Callable[[Path], None]") -> "Path":
         raise
 
 
+# ---------------------------------------------------------------------------
+# Schema adaptation
+# ---------------------------------------------------------------------------
+
+_OP_COUNT_KEYS: Tuple[str, ...] = ("attempted", "completed", "failed", "cancelled", "queued")
+_BRANCH_KEYS: Tuple[str, ...] = ("commits", "files_changed", "insertions", "deletions")
+
+# Statuses a recorded operation can carry that map 1:1 onto a counter above.
+# ``attempted`` is deliberately absent: it is the total, not a status.
+_COUNTABLE_STATUSES: Tuple[str, ...] = ("completed", "failed", "cancelled", "queued")
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    """Coerce a summary field to a float that a format spec can consume.
+
+    Every numeric in the view model is rendered through ``:.4f`` / ``:.1f``.
+    A ``None`` from a partial (signal-killed) summary would raise there, which
+    is precisely when the report matters most — so absence degrades to the
+    default rather than to a second traceback on the shutdown path.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return default
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return default if math.isnan(result) or math.isinf(result) else result
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    """Coerce a counter field to an int; see :func:`_as_float` for the why."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_pairs(value: Any) -> List[Tuple[str, int]]:
+    """Normalise a top-N ranking to ``[(name, count), ...]``.
+
+    ``SessionRecorder.top_sensors()`` returns tuples, which survive a JSON
+    round-trip as two-element lists. Both are accepted; anything that is not a
+    usable pair is dropped rather than crashing the render.
+    """
+    pairs: List[Tuple[str, int]] = []
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return pairs
+    for entry in value:
+        if isinstance(entry, Mapping):
+            name, count = entry.get("name"), entry.get("count")
+        elif isinstance(entry, Sequence) and not isinstance(entry, (str, bytes)) and len(entry) >= 2:
+            name, count = entry[0], entry[1]
+        else:
+            continue
+        if name is None:
+            continue
+        pairs.append((str(name), _as_int(count)))
+    return pairs
+
+
+def normalise_summary(data: Mapping[str, Any]) -> Dict[str, Any]:
+    """Adapt any battle-test summary generation to ONE stable report view.
+
+    This exists because the report renderers and the summary writer drifted
+    into two different schemas and nothing connected them.
+    :meth:`SessionRecorder.write_summary` (``schema_version`` 2) writes the
+    outcome counters under ``stats``, the per-operation records under
+    ``operations``, and flattens the rest into ``convergence_state`` /
+    ``convergence_slope`` / ``convergence_r2``, ``cost_total`` /
+    ``cost_breakdown`` and ``branch_stats``. The renderers read a nested shape
+    — ``operations`` as a counter dict, the records under ``operation_log``,
+    and ``convergence`` / ``cost`` / ``branch`` as sub-objects — that the
+    recorder has never emitted. The counter read (``operations.get``) raised
+    ``AttributeError`` against a list; every *other* mismatched read failed
+    silently, rendering a well-formed report full of zeroes and "unknown".
+
+    Both shapes are read here, at one seam, so that (a) a report can be
+    rendered from any artifact already on disk, and (b) neither renderer has
+    to know which generation it is holding. The discriminator is the type of
+    ``operations`` — a list is the recorder's schema, a mapping is the nested
+    one — never a version number, because partial summaries written from a
+    signal handler are not guaranteed to carry one.
+
+    Returns a dict with fixed keys and fully-typed values: ``session_id``,
+    ``stop_reason``, ``duration_s``, ``convergence`` (state/slope/
+    r_squared_log), ``op_counts`` (the five counters), ``operation_log``,
+    ``scores``, ``cost`` (total/breakdown), ``branch``, ``top_sensors`` and
+    ``top_techniques``.
+    """
+    operations = data.get("operations")
+    operation_log = data.get("operation_log")
+
+    if isinstance(operations, list):
+        # Recorder schema: ``operations`` IS the per-op log, counters in ``stats``.
+        records: List[Any] = operations
+        counters: Any = data.get("stats")
+    else:
+        records = operation_log if isinstance(operation_log, list) else []
+        # Nested schema: ``operations`` IS the counter mapping. ``stats`` is
+        # still consulted so a hybrid artifact is not silently zeroed.
+        counters = operations if isinstance(operations, Mapping) else data.get("stats")
+
+    records = [rec for rec in records if isinstance(rec, Mapping)]
+
+    if not isinstance(counters, Mapping):
+        counters = {}
+    op_counts = {key: _as_int(counters.get(key)) for key in _OP_COUNT_KEYS}
+
+    # A summary that carries records but no counters still deserves a real
+    # table — derive it from the records rather than printing five zeroes.
+    if records and not any(op_counts.values()):
+        op_counts["attempted"] = len(records)
+        for rec in records:
+            status = str(rec.get("status", "")).strip().lower()
+            if status in _COUNTABLE_STATUSES:
+                op_counts[status] += 1
+
+    convergence = data.get("convergence")
+    if not isinstance(convergence, Mapping):
+        convergence = {
+            "state": data.get("convergence_state", "unknown"),
+            "slope": data.get("convergence_slope", 0.0),
+            "r_squared_log": data.get("convergence_r2", 0.0),
+        }
+    convergence_view = {
+        "state": str(convergence.get("state", "unknown") or "unknown"),
+        "slope": _as_float(convergence.get("slope")),
+        "r_squared_log": _as_float(convergence.get("r_squared_log")),
+    }
+
+    cost = data.get("cost")
+    if not isinstance(cost, Mapping):
+        cost = {
+            "total": data.get("cost_total", 0.0),
+            "breakdown": data.get("cost_breakdown", {}),
+        }
+    breakdown = cost.get("breakdown")
+    cost_view = {
+        "total": _as_float(cost.get("total")),
+        "breakdown": (
+            {str(k): _as_float(v) for k, v in breakdown.items()}
+            if isinstance(breakdown, Mapping)
+            else {}
+        ),
+    }
+
+    branch = data.get("branch")
+    if not isinstance(branch, Mapping):
+        branch = data.get("branch_stats")
+    if not isinstance(branch, Mapping):
+        branch = {}
+    branch_view = {key: _as_int(branch.get(key)) for key in _BRANCH_KEYS}
+
+    scores = [
+        _as_float(rec.get("composite_score"))
+        for rec in records
+        if rec.get("composite_score") is not None
+    ]
+
+    return {
+        "session_id": str(data.get("session_id", "unknown") or "unknown"),
+        "stop_reason": str(data.get("stop_reason", "unknown") or "unknown"),
+        "duration_s": _as_float(data.get("duration_s")),
+        "convergence": convergence_view,
+        "op_counts": op_counts,
+        "operation_log": records,
+        "scores": scores,
+        "cost": cost_view,
+        "branch": branch_view,
+        "top_sensors": _as_pairs(data.get("top_sensors")),
+        "top_techniques": _as_pairs(data.get("top_techniques")),
+    }
+
+
 class NotebookGenerator:
     """Generate a Jupyter notebook or Markdown report from a battle test summary.
 
@@ -89,6 +265,11 @@ class NotebookGenerator:
         self._summary_path = Path(summary_path)
         raw = self._summary_path.read_text()
         self._data: Dict[str, Any] = json.loads(raw)
+        # Both renderers read the view, never ``_data`` directly, so the
+        # schema question is answered exactly once per generator instance.
+        # ``_data`` is retained verbatim for provenance — it is what gets
+        # embedded in the notebook so the artifact stays self-contained.
+        self._view: Dict[str, Any] = normalise_summary(self._data)
 
     # ------------------------------------------------------------------
     # Public API
@@ -146,15 +327,21 @@ class NotebookGenerator:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Embed the raw JSON as a string literal so the notebook is self-contained.
+        # Embed BOTH: the raw summary for provenance (so the notebook remains
+        # a faithful copy of the artifact) and the normalised view the cells
+        # actually compute from. Cells that read the raw shape directly are
+        # how this renderer silently drifted from the recorder's schema; the
+        # view is the single place that question is answered.
         json_literal = json.dumps(self._data, indent=2)
-        sid = self._data.get("session_id", "unknown")
-        stop_reason = self._data.get("stop_reason", "unknown")
-        duration = self._data.get("duration_s", 0.0)
-        convergence = self._data.get("convergence", {})
-        conv_state = convergence.get("state", "unknown")
-        conv_slope = convergence.get("slope", 0.0)
-        conv_r2 = convergence.get("r_squared_log", 0.0)
+        view_literal = json.dumps(self._view, indent=2)
+        view = self._view
+        sid = view["session_id"]
+        stop_reason = view["stop_reason"]
+        duration = view["duration_s"]
+        convergence = view["convergence"]
+        conv_state = convergence["state"]
+        conv_slope = convergence["slope"]
+        conv_r2 = convergence["r_squared_log"]
 
         cells: List[nbformat.NotebookNode] = [
             # ── Cell 1: title + session info ────────────────────────────────
@@ -171,20 +358,22 @@ class NotebookGenerator:
                 "import json\n"
                 "import math\n"
                 "\n"
-                "# Summary data embedded directly — notebook is self-contained\n"
+                "# Summary data embedded directly — notebook is self-contained.\n"
+                "# `data` is the raw artifact (provenance); `view` is the\n"
+                "# schema-normalised projection every cell below reads.\n"
                 "_SUMMARY_JSON = '''\n"
                 f"{json_literal}\n"
                 "'''\n"
                 "\n"
-                "data = json.loads(_SUMMARY_JSON)\n"
+                "_VIEW_JSON = '''\n"
+                f"{view_literal}\n"
+                "'''\n"
                 "\n"
-                "# Extract composite scores from operation_log\n"
-                "scores = [\n"
-                "    op['composite_score']\n"
-                "    for op in data.get('operation_log', [])\n"
-                "    if op.get('composite_score') is not None\n"
-                "]\n"
-                "print(f\"Session: {data['session_id']}\")\n"
+                "data = json.loads(_SUMMARY_JSON)\n"
+                "view = json.loads(_VIEW_JSON)\n"
+                "\n"
+                "scores = view['scores']\n"
+                "print(f\"Session: {view['session_id']}\")\n"
                 "print(f\"Scores extracted: {len(scores)}\")\n"
                 "print(f\"Scores: {scores}\")\n"
             ),
@@ -233,10 +422,10 @@ class NotebookGenerator:
             ),
             # ── Cell 6: convergence state/slope/r2 with interpretation ───────
             nbformat.v4.new_code_cell(
-                "convergence = data.get('convergence', {})\n"
-                "state = convergence.get('state', 'unknown')\n"
-                "slope = convergence.get('slope', 0.0)\n"
-                "r2 = convergence.get('r_squared_log', 0.0)\n"
+                "convergence = view['convergence']\n"
+                "state = convergence['state']\n"
+                "slope = convergence['slope']\n"
+                "r2 = convergence['r_squared_log']\n"
                 "\n"
                 "print(f'Convergence State : {state}')\n"
                 "print(f'Slope             : {slope:.6f}')\n"
@@ -262,13 +451,13 @@ class NotebookGenerator:
             ),
             # ── Cell 8: pie chart completed/failed/cancelled/queued ──────────
             nbformat.v4.new_code_cell(
-                "ops = data.get('operations', {})\n"
+                "ops = view['op_counts']\n"
                 "labels = ['Completed', 'Failed', 'Cancelled', 'Queued']\n"
                 "values = [\n"
-                "    ops.get('completed', 0),\n"
-                "    ops.get('failed', 0),\n"
-                "    ops.get('cancelled', 0),\n"
-                "    ops.get('queued', 0),\n"
+                "    ops['completed'],\n"
+                "    ops['failed'],\n"
+                "    ops['cancelled'],\n"
+                "    ops['queued'],\n"
                 "]\n"
                 "colors = ['#4caf50', '#f44336', '#ff9800', '#2196f3']\n"
                 "\n"
@@ -291,7 +480,7 @@ class NotebookGenerator:
             ),
             # ── Cell 10: horizontal bar chart of sensor counts ───────────────
             nbformat.v4.new_code_cell(
-                "top_sensors = data.get('top_sensors', [])\n"
+                "top_sensors = view['top_sensors']\n"
                 "\n"
                 "if top_sensors:\n"
                 "    sensor_names = [s[0] for s in top_sensors]\n"
@@ -315,21 +504,24 @@ class NotebookGenerator:
             ),
             # ── Cell 12: cost breakdown and branch stats ─────────────────────
             nbformat.v4.new_code_cell(
-                "cost = data.get('cost', {})\n"
-                "branch = data.get('branch', {})\n"
+                "cost = view['cost']\n"
+                "branch = view['branch']\n"
                 "\n"
                 "print('=== Cost Summary ===')\n"
-                "print(f\"Total cost : ${cost.get('total', 0.0):.4f}\")\n"
+                "print(f\"Total cost : ${cost['total']:.4f}\")\n"
                 "print('Breakdown  :')\n"
-                "for provider, amount in cost.get('breakdown', {}).items():\n"
-                "    print(f'  {provider:<30} ${amount:.4f}')\n"
+                "if cost['breakdown']:\n"
+                "    for provider, amount in cost['breakdown'].items():\n"
+                "        print(f'  {provider:<30} ${amount:.4f}')\n"
+                "else:\n"
+                "    print('  (no billed providers)')\n"
                 "\n"
                 "print()\n"
                 "print('=== Branch Summary ===')\n"
-                "print(f\"Commits       : {branch.get('commits', 0)}\")\n"
-                "print(f\"Files changed : {branch.get('files_changed', 0)}\")\n"
-                "print(f\"Insertions    : {branch.get('insertions', 0)}\")\n"
-                "print(f\"Deletions     : {branch.get('deletions', 0)}\")\n"
+                "print(f\"Commits       : {branch['commits']}\")\n"
+                "print(f\"Files changed : {branch['files_changed']}\")\n"
+                "print(f\"Insertions    : {branch['insertions']}\")\n"
+                "print(f\"Deletions     : {branch['deletions']}\")\n"
             ),
         ]
 
@@ -370,27 +562,20 @@ class NotebookGenerator:
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / "report.md"
 
-        data = self._data
-        sid = data.get("session_id", "unknown")
-        stop_reason = data.get("stop_reason", "unknown")
-        duration = data.get("duration_s", 0.0)
-        convergence = data.get("convergence", {})
-        conv_state = convergence.get("state", "unknown")
-        conv_slope = convergence.get("slope", 0.0)
-        conv_r2 = convergence.get("r_squared_log", 0.0)
-        ops = data.get("operations", {})
-        cost = data.get("cost", {})
-        branch = data.get("branch", {})
-        top_sensors = data.get("top_sensors", [])
-        top_techniques = data.get("top_techniques", [])
-        operation_log = data.get("operation_log", [])
-
-        # Extract composite scores
-        scores = [
-            op["composite_score"]
-            for op in operation_log
-            if op.get("composite_score") is not None
-        ]
+        view = self._view
+        sid = view["session_id"]
+        stop_reason = view["stop_reason"]
+        duration = view["duration_s"]
+        convergence = view["convergence"]
+        conv_state = convergence["state"]
+        conv_slope = convergence["slope"]
+        conv_r2 = convergence["r_squared_log"]
+        ops = view["op_counts"]
+        cost = view["cost"]
+        branch = view["branch"]
+        top_sensors = view["top_sensors"]
+        top_techniques = view["top_techniques"]
+        scores = view["scores"]
 
         lines: List[str] = [
             "# Ouroboros Battle Test Report",
@@ -444,11 +629,11 @@ class NotebookGenerator:
             "",
             "| Outcome | Count |",
             "|---------|-------|",
-            f"| Attempted | {ops.get('attempted', 0)} |",
-            f"| Completed | {ops.get('completed', 0)} |",
-            f"| Failed | {ops.get('failed', 0)} |",
-            f"| Cancelled | {ops.get('cancelled', 0)} |",
-            f"| Queued | {ops.get('queued', 0)} |",
+            f"| Attempted | {ops['attempted']} |",
+            f"| Completed | {ops['completed']} |",
+            f"| Failed | {ops['failed']} |",
+            f"| Cancelled | {ops['cancelled']} |",
+            f"| Queued | {ops['queued']} |",
             "",
             "## Sensor Activation",
             "",
@@ -480,14 +665,19 @@ class NotebookGenerator:
             "",
             "## Cost Summary",
             "",
-            f"**Total cost:** ${cost.get('total', 0.0):.4f}",
+            f"**Total cost:** ${cost['total']:.4f}",
             "",
             "| Provider | Cost (USD) |",
             "|----------|------------|",
         ]
 
-        for provider, amount in cost.get("breakdown", {}).items():
-            lines.append(f"| {provider} | ${amount:.4f} |")
+        if cost["breakdown"]:
+            for provider, amount in cost["breakdown"].items():
+                lines.append(f"| {provider} | ${amount:.4f} |")
+        else:
+            # A zero-cost session is the *point* of the local lane, not a gap
+            # in the data — say so rather than leaving an empty table body.
+            lines.append("| _no billed providers_ | $0.0000 |")
 
         lines += [
             "",
@@ -495,10 +685,10 @@ class NotebookGenerator:
             "",
             "| Metric | Value |",
             "|--------|-------|",
-            f"| Commits | {branch.get('commits', 0)} |",
-            f"| Files Changed | {branch.get('files_changed', 0)} |",
-            f"| Insertions | {branch.get('insertions', 0)} |",
-            f"| Deletions | {branch.get('deletions', 0)} |",
+            f"| Commits | {branch['commits']} |",
+            f"| Files Changed | {branch['files_changed']} |",
+            f"| Insertions | {branch['insertions']} |",
+            f"| Deletions | {branch['deletions']} |",
             "",
         ]
 

@@ -3977,6 +3977,39 @@ class BattleTestHarness:
             )
             return
 
+        # Slice 2 arming integrity, THIRD path (bt-2026-08-28-061124). The
+        # reuse check above and the create-failure handler below both validate
+        # with `is_valid_git_work_area` before letting the env stay armed. This
+        # path — a create that RETURNED — did not, and trusted the returned
+        # path on the strength of "it did not raise".
+        #
+        # A return is not a guarantee. That soak armed
+        # `.worktrees/ouroboros__auto__bt-2026-08-28-061124-9669f1`, a directory
+        # containing only `.jarvis/` and no `.git`, which `git worktree list`
+        # never knew about. Every op that then reached the APPLY boundary died
+        # on `execution_root`'s fail-closed guard as an UNHANDLED pipeline
+        # exception — 8 of 80 in that session, and they were the ops that had
+        # got furthest, so the arc's best work was what it destroyed.
+        #
+        # `is_valid_git_work_area`'s own docstring already states the rule this
+        # restores: "Armers MUST validate with this predicate (and clear the
+        # env when it fails) so 'armed' always implies 'usable'". Unarmed is
+        # strictly better than armed-but-broken — it resolves the execution
+        # root to project_root and APPLY proceeds under the documented
+        # no-workspace posture, which is the same fail-open the create-failure
+        # branch takes.
+        if not is_valid_git_work_area(wt_path):
+            os.environ.pop("JARVIS_AUTO_COMMIT_WORKSPACE", None)
+            logger.warning(
+                "[ledger_sovereignty] worktree create RETURNED %r but it is "
+                "not a usable git work-area (no .git) — leaving the session "
+                "UNARMED rather than armed-but-unusable; AutoCommitter will "
+                "refuse commits and APPLY proceeds against project_root "
+                "(branch=%s, session=%s)",
+                str(wt_path), branch_name, self._session_id,
+            )
+            return
+
         os.environ["JARVIS_AUTO_COMMIT_WORKSPACE"] = str(wt_path)
         # Stash on self for telemetry / cleanup decisions.
         self._auto_commit_workspace = wt_path

@@ -474,7 +474,12 @@ class WorktreeManager:
 
         logger.info("WorktreeManager: cleaned up worktree at %s", worktree_path)
 
-    async def reap_orphans(self, branch_prefix: str = "unit-") -> int:
+    async def reap_orphans(
+        self,
+        branch_prefix: str = "unit-",
+        *,
+        protect_paths: Optional[Sequence[object]] = None,
+    ) -> int:
         """Remove leftover subagent worktrees from prior crashed runs.
 
         Active work units do not survive a process boundary — in-memory
@@ -514,6 +519,67 @@ class WorktreeManager:
         # layer — Oracle was the scanner.)
         prefixes = _resolve_reap_prefixes(branch_prefix)
 
+        # ------------------------------------------------------------------
+        # Self-protection: never reap the workspace THIS process is using.
+        #
+        # Slice 44 added the ``ouroboros__auto__bt-`` prefix here to clear real
+        # debris (62 stale checkouts, 492k files, 13GB). The current session's
+        # own workspace carries that same prefix, and nothing distinguished
+        # "previous session's corpse" from "the tree I am standing in".
+        #
+        # Measured, bt-2026-08-28-065825:
+        #   23:59:37  [FileIsolation] routed project_root -> ...-065825-174b22
+        #   23:59:41  _git_worktree_remove: git -C ...-065825-174b22 remove
+        #   23:59:58  reap_orphans: reaped 1 orphan worktree(s) at boot
+        #   00:08:25  every op reaching APPLY: "armed but unusable (no .git)"
+        # Four seconds after arming a VALID worktree the boot reaper deleted
+        # it, leaving the `.jarvis` marker — the husk. Because
+        # ``effective_execution_root`` fails closed at the APPLY boundary, the
+        # ops it destroyed were the ones that had travelled furthest.
+        #
+        # This is why validating at ARMING time cannot fix it: the workspace
+        # was valid when armed and was destroyed afterwards. The reaper is the
+        # root cause; arming-time validation only makes an unrelated race safe.
+        #
+        # Derived from state rather than passed in, so no call site can forget
+        # it — ``reap_orphans()`` is invoked at boot with no arguments today.
+        # ``reap_dangling_auto_branches`` already carries the same idea as an
+        # explicit ``current_branch``; this is that concept applied where it
+        # was missing.
+        protected_paths: Set[str] = set()
+        protected_branches: Set[str] = set()
+        for _p in (protect_paths or ()):
+            try:
+                protected_paths.add(str(Path(_p).resolve()))
+            except (OSError, TypeError, ValueError):
+                continue
+        _live_ws = (os.environ.get("JARVIS_AUTO_COMMIT_WORKSPACE") or "").strip()
+        if _live_ws:
+            try:
+                protected_paths.add(str(Path(_live_ws).resolve()))
+            except OSError:
+                protected_paths.add(_live_ws)
+        _live_session = (os.environ.get("JARVIS_OUROBOROS_SESSION_ID") or "").strip()
+        if _live_session:
+            try:
+                from backend.core.ouroboros.governance.autonomous_workspace import (
+                    workspace_branch,  # noqa: PLC0415 — lazy: avoids an import cycle
+                )
+                protected_branches.add(workspace_branch(_live_session))
+            except Exception:  # noqa: BLE001 — protection is best-effort, never fatal
+                pass
+
+        def _is_protected(path: Optional[Path], branch: str = "") -> bool:
+            """True when this path/branch belongs to the LIVE session."""
+            if branch and branch in protected_branches:
+                return True
+            if path is None:
+                return False
+            try:
+                return str(path.resolve()) in protected_paths
+            except OSError:
+                return str(path) in protected_paths
+
         porcelain = await self._run_git_capture(["worktree", "list", "--porcelain"])
         for entry in _parse_worktree_porcelain(porcelain):
             path_str = entry.get("worktree", "")
@@ -534,6 +600,13 @@ class WorktreeManager:
             name_matches = any(wt_path.name.startswith(p) for p in prefixes)
             branch_matches = any(branch_short.startswith(p) for p in prefixes)
             if not (branch_matches or (lives_under_base and name_matches)):
+                continue
+            if _is_protected(wt_path, branch_short):
+                logger.info(
+                    "WorktreeManager.reap_orphans: SKIPPING %s (branch=%s) — "
+                    "it is the live session's own workspace, not orphan debris",
+                    wt_path, branch_short or "?",
+                )
                 continue
 
             git_ok = await self._git_worktree_remove(wt_path)
@@ -559,6 +632,15 @@ class WorktreeManager:
                     continue
                 if str(child) in reaped:
                     continue
+                if _is_protected(child):
+                    # The husk case specifically: git has already lost the
+                    # registration, so loop 1 cannot see it, and an rmtree here
+                    # would delete the live session's `.jarvis` marker too.
+                    logger.info(
+                        "WorktreeManager.reap_orphans: SKIPPING unregistered "
+                        "dir %s — live session workspace", child,
+                    )
+                    continue
                 try:
                     shutil.rmtree(child)
                     reaped.add(str(child))
@@ -578,8 +660,19 @@ class WorktreeManager:
             )
             for name in branches.splitlines():
                 name = name.strip()
-                if name.startswith(_p):
-                    await self._git_delete_branch(name)
+                if not name.startswith(_p):
+                    continue
+                if name in protected_branches:
+                    # Deleting the live session's branch out from under its own
+                    # worktree is the "branch already exists" class that
+                    # `reap_dangling_auto_branches(current_branch=...)` exists
+                    # to avoid — the same exclusion, applied here.
+                    logger.info(
+                        "WorktreeManager.reap_orphans: SKIPPING branch %s — "
+                        "live session", name,
+                    )
+                    continue
+                await self._git_delete_branch(name)
 
         await self._run_git_capture(["worktree", "prune"])
 

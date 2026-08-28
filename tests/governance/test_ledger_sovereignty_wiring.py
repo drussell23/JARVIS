@@ -351,6 +351,12 @@ class TestHarnessWorkspaceBoot:
         _enable(monkeypatch)
         fake_wt = tmp_path / "fake-worktree"
         fake_wt.mkdir()
+        # The `.git` marker is load-bearing, not decoration. This fixture used
+        # to be a bare mkdir(), which made it a HUSK — and the test then
+        # asserted that a husk gets armed, encoding the defect that
+        # bt-2026-08-28-061124 hit for real. A linked worktree carries `.git`
+        # as a FILE; either shape satisfies `is_valid_git_work_area`.
+        (fake_wt / ".git").write_text("gitdir: /somewhere/.git/worktrees/fake\n")
 
         async def _fake_create(self, branch_name):  # noqa: ARG001
             return fake_wt
@@ -389,6 +395,70 @@ class TestHarnessWorkspaceBoot:
             )
 
         # Env var NOT set on failure path.
+        assert _WORKSPACE_FLAG not in os.environ
+
+    def test_create_returning_a_husk_leaves_the_session_unarmed(
+        self, tmp_harness, monkeypatch, tmp_path,
+    ):
+        """A create that RETURNS is not proof the workspace is usable.
+
+        Measured in soak bt-2026-08-28-061124: `create_or_reclaim` returned
+        `.worktrees/ouroboros__auto__bt-2026-08-28-061124-9669f1`, a directory
+        holding only `.jarvis/` and no `.git`, that `git worktree list` never
+        knew about. The env was armed on the strength of "it did not raise",
+        and every op reaching the APPLY boundary then died on
+        `execution_root`'s fail-closed guard as an UNHANDLED pipeline exception
+        -- 8 of 80, and precisely the ops that had progressed furthest.
+
+        The reuse path and the create-FAILURE path both already validated with
+        `is_valid_git_work_area`; only this third path trusted the return
+        value. Unarmed is strictly better than armed-but-broken: the execution
+        root falls back to project_root and APPLY proceeds under the documented
+        no-workspace posture.
+        """
+        _enable(monkeypatch)
+        husk = tmp_path / "husk-worktree"
+        husk.mkdir()
+        (husk / ".jarvis").mkdir()  # marker only -- exactly the observed shape
+
+        async def _returns_husk(self, branch_name):  # noqa: ARG001
+            return husk
+
+        with patch.object(WorktreeManager, "create", _returns_husk):
+            # MUST NOT raise -- fail-open, same as the create-failure branch.
+            asyncio.run(
+                tmp_harness
+                ._boot_ledger_sovereignty_workspace()
+            )
+
+        assert _WORKSPACE_FLAG not in os.environ, (
+            "a husk was armed: 'armed' must always imply 'usable'"
+        )
+
+    def test_a_stale_armed_husk_is_cleared_not_inherited(
+        self, tmp_harness, monkeypatch, tmp_path,
+    ):
+        """An env armed by an EARLIER stage at a husk must not survive.
+
+        Complements the case above: there the husk arrives as a return value,
+        here it is already in the environment when boot runs. Both must end
+        unarmed, because the read side (`effective_execution_root`) fails LOUD
+        by design and cannot tell a husk from sabotage.
+        """
+        _enable(monkeypatch)
+        husk = tmp_path / "stale-husk"
+        husk.mkdir()
+        monkeypatch.setenv(_WORKSPACE_FLAG, str(husk))
+
+        async def _also_husk(self, branch_name):  # noqa: ARG001
+            return husk
+
+        with patch.object(WorktreeManager, "create", _also_husk):
+            asyncio.run(
+                tmp_harness
+                ._boot_ledger_sovereignty_workspace()
+            )
+
         assert _WORKSPACE_FLAG not in os.environ
 
 

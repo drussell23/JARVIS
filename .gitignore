@@ -27,7 +27,18 @@ dist/
 .env.bak
 
 # IDE files
-.vscode/
+# `.vscode/*`, NOT `.vscode/` — git does not descend into an ignored
+# DIRECTORY, so a negation for a file inside one can never match. The trailing
+# `/*` ignores the contents instead, which leaves the negation below reachable.
+.vscode/*
+# ...except the shared workspace settings. `.vscode/settings.json` here is not
+# a personal preference file: it excludes `.worktrees/` from project discovery,
+# and `.worktrees/` is a property of THIS repo — SubagentScheduler creates a
+# full checkout there per parallel L3 work unit. Without it every IDE that
+# opens this repo silently indexes, watches, and (for Gradle/Java) configures
+# each ephemeral worktree as its own project. That is a fact about the
+# codebase, so it belongs in the codebase.
+!.vscode/settings.json
 .idea/
 *.swp
 *.swo

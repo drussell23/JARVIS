@@ -1459,3 +1459,65 @@ class LocalInferenceDirector:
             await self._client.aclose()
         except Exception:
             pass
+
+
+def register_flags(registry: Any) -> int:
+    """Module-owned FlagRegistry registration.  NEVER raises.
+
+    Co-located with the consuming code deliberately: the default a caller sees
+    and the default the registry advertises are read off the same lines, so
+    ``/help flag JARVIS_LOCAL_JSON_MODE_ENABLED`` cannot drift from what
+    :func:`_json_mode_enabled` actually does.
+    """
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category,
+            FlagSpec,
+            FlagType,
+        )
+    except ImportError:
+        return 0
+
+    src = "backend/core/ouroboros/governance/local_inference_director.py"
+    specs = [
+        FlagSpec(
+            name="JARVIS_LOCAL_JSON_MODE_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Outer rung of the constrained-decoding ladder: request JSON "
+                "mode on local completions. Default ON because every schema "
+                "this client speaks is JSON, so the constraint can only "
+                "remove output the parser was going to reject anyway. Set "
+                "falsey to restore free-form sampling -- worth doing only to "
+                "reproduce a parse failure the constraint would mask."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="true",
+            since="local-lane arc (2026-08-24)",
+        ),
+        FlagSpec(
+            name="JARVIS_LOCAL_JSON_SCHEMA_MODE_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Inner rung: constrain the sampler with a full JSON *Schema* "
+                "rather than only json_object. json_object guarantees the "
+                "output PARSES and says nothing about SHAPE, which is how "
+                "candidate_0_missing_rationale and "
+                "wrong_schema_version:__missing__ survived it. Degrades "
+                "automatically per-engine on a 4xx; requires "
+                "JARVIS_LOCAL_JSON_MODE_ENABLED to be on."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="true",
+            since="local-lane arc (2026-08-24)",
+        ),
+    ]
+    try:
+        registry.bulk_register(specs, override=True)
+    except Exception:  # noqa: BLE001 -- registration is descriptive, never load-bearing
+        return 0
+    return len(specs)

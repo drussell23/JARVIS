@@ -5719,6 +5719,36 @@ SEED_SPECS: list = [
         since="2026-07-13",
         posture_relevance=_HARDEN_CRITICAL,
     ),
+    # ====================================================================
+    # DocStalenessSensor — 1 flag
+    #
+    # Seeded here rather than via a module-owned ``register_flags`` because
+    # ``intake.sensors`` is not one of the ``_FLAG_PROVIDER_PACKAGES`` walked
+    # by the discovery loop below, so a registrar co-located with the sensor
+    # would never be invoked. Registering it where it is actually READ beats
+    # registering it where it would merely look tidier.
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_DOC_MAX_NAMED_SYMBOLS",
+        type=FlagType.INT, default=8,
+        description=(
+            "How many undocumented symbol names a DocStaleness finding may "
+            "spell out in its summary. The summary becomes the op "
+            "description, and the description is what TargetSymbolResolver "
+            "scores — a count names nothing to score and correctly fails "
+            "closed, sending the whole file to the generator. Bounded so a "
+            "pathological file cannot crowd out the instruction; 0 restores "
+            "the count-only description. The structured "
+            "``undocumented_symbols`` field is never truncated."
+        ),
+        category=Category.TUNING,
+        source_file=(
+            "backend/core/ouroboros/governance/intake/sensors/"
+            "doc_staleness_sensor.py"
+        ),
+        example="8",
+        since="local-lane arc (2026-08-24)",
+    ),
 ]
 
 

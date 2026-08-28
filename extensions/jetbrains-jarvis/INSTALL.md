@@ -9,12 +9,21 @@ schema-v1.0 HTTP GET + SSE surface.
 
 | IDE           | Versions       |
 |---------------|----------------|
-| IntelliJ IDEA | 2023.2 – 2024.3 |
-| PyCharm       | 2023.2 – 2024.3 |
-| WebStorm      | 2023.2 – 2024.3 |
-| GoLand        | 2023.2 – 2024.3 |
-| Rider         | 2023.2 – 2024.3 |
-| RubyMine      | 2023.2 – 2024.3 |
+| IntelliJ IDEA | 2023.3+ |
+| PyCharm       | 2023.3+ |
+| WebStorm      | 2023.3+ |
+| GoLand        | 2023.3+ |
+| Rider         | 2023.3+ |
+| RubyMine      | 2023.3+ |
+
+The floor moved 2023.2 -> 2023.3 on 2026-08-27: the IntelliJ Platform
+Gradle Plugin 2.x does not support building against anything earlier,
+and the 1.x plugin this build used before cannot run on Gradle 9 at all.
+
+There is no upper bound any more. The old `untilBuild = "243.*"` capped
+the plugin at 2024.3, so it refused to install on newer IDEs — an expiry
+date on a read-only internal tool, for no measured incompatibility.
+Set `pluginUntilBuild` in `gradle.properties` if one is ever found.
 
 Same `.zip` drops into any JetBrains IDE in that range via
 `Settings → Plugins → ⚙ → Install Plugin from Disk...`.
@@ -51,7 +60,7 @@ Output: `build/distributions/jarvis-observability-*.zip`.
 
 ## Install the built plugin
 
-1. In any JetBrains IDE 2023.2+, open
+1. In any JetBrains IDE 2023.3+, open
    `Settings → Plugins`.
 2. Click the gear icon → `Install Plugin from Disk...`.
 3. Pick `build/distributions/jarvis-observability-*.zip`.

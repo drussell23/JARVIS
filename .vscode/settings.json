@@ -1,0 +1,57 @@
+{
+  // ==========================================================================
+  // O+V worktree isolation vs. IDE project discovery
+  // ==========================================================================
+  // SubagentScheduler gives every parallel L3 work unit its own git worktree
+  // under `.worktrees/` (see worktree_manager.py). Each one is a FULL checkout,
+  // so each contains its own copy of extensions/jetbrains-jarvis and every
+  // other buildable project in the tree.
+  //
+  // `.worktrees/` is already in .gitignore, but IDE tooling discovers projects
+  // by scanning the filesystem, not by asking git. The Gradle extension
+  // therefore configured the same plugin project once per worktree — visible
+  // as the identical build failure repeating for
+  // `.worktrees/ouroboros__auto__bt-...`, `.worktrees/chore-organize-root-docs`
+  // and the main tree.
+  //
+  // While the build was broken this was only noise. Once it works it is not:
+  // each worktree becomes a separate Gradle daemon plus its own ~1GB IntelliJ
+  // Platform SDK resolution. O+V creates and reaps these continuously, so the
+  // cost is unbounded — and on a 16GB machine it competes with the agent it is
+  // supposed to be observing.
+  //
+  // Excluded, not hidden: these are ephemeral machine-generated checkouts, and
+  // the authoritative copy of every file in them is the one in the main tree.
+  "files.exclude": {
+    "**/.worktrees": true
+  },
+  "files.watcherExclude": {
+    "**/.worktrees/**": true,
+    "**/.ouroboros/sessions/**": true,
+    "**/.jarvis/**": true
+  },
+  "search.exclude": {
+    "**/.worktrees": true,
+    "**/.ouroboros/sessions": true
+  },
+
+  // Gradle project discovery. `nestedProjects: false` stops the extension
+  // walking the tree for additional settings.gradle.kts files; the plugin
+  // project is opened directly when it is worked on.
+  "gradle.nestedProjects": false,
+
+  // Java/Gradle import scope — same reasoning as files.exclude above.
+  "java.import.exclusions": [
+    "**/.worktrees/**",
+    "**/node_modules/**",
+    "**/.git/**"
+  ],
+
+  // The battle test writes high-frequency JSONL under .jarvis/ and
+  // .ouroboros/sessions/. Watching them buys nothing and wakes the file
+  // watcher constantly during a soak.
+  "python.analysis.exclude": [
+    "**/.worktrees/**",
+    "**/.ouroboros/sessions/**"
+  ]
+}
