@@ -3088,6 +3088,19 @@ def _refresh_paid_lane_credentials() -> None:
         pass
 
 
+def _background_local_lane_enabled() -> bool:
+    """Master for the cost-optimized routes' zero-cost lane preemption.
+
+    Module-level, not a method, so the arc's flag table can bind it as the
+    accessor that proves the registered default is the default the code
+    applies. See :meth:`CandidateGenerator._try_free_lane_dispatch` for what
+    it gates. NEVER raises -- an unreadable environment keeps the feature on,
+    because the feature's own evidence gate (a reachable endpoint) is what
+    actually decides, and it fails closed on its own.
+    """
+    return _envb("JARVIS_BACKGROUND_LOCAL_LANE_ENABLED", True)
+
+
 def _free_lane_active() -> bool:
     """True when generation runs on a lane with ~zero marginal cost per op.
 
@@ -4578,6 +4591,18 @@ class CandidateGenerator:
                     )
                 except Exception:  # noqa: BLE001 -- never block the raise path
                     pass
+                # The dormant queue's own release condition, checked before
+                # the queue claims it: "until a viable, cost-effective
+                # inference endpoint is secured". A locally-served 32B IS
+                # that endpoint, at $0.00/op. Returns None on every host that
+                # does not have one -> the raises below are untouched.
+                _free_lane = await self._try_free_lane_dispatch(
+                    context, deadline,
+                    route=_provider_route,
+                    reason=f"topology_block:{_block_reason}",
+                )
+                if _free_lane is not None:
+                    return _free_lane
                 if _provider_route == "speculative":
                     raise RuntimeError(
                         f"speculative_deferred:blocked_by_topology:"
@@ -5630,6 +5655,103 @@ class CandidateGenerator:
         # once calibrated the herd runs CONCURRENTLY on the escalated seed -- the DAG
         # is never serialized, only the one-shot cold calibration is gated.
         return await _prof.run_calibrated(_attempts)
+
+    async def _try_free_lane_dispatch(
+        self,
+        context: OperationContext,
+        deadline: datetime,
+        *,
+        route: str,
+        reason: str,
+    ) -> Optional[GenerationResult]:
+        """Serve a dead-queued cost-optimized op on a zero-marginal-cost lane.
+
+        BACKGROUND and SPECULATIVE exist to say "spend nothing you don't have
+        to". Both encode that as a PROVIDER NAME — DoubleWord — and so, when
+        the DW catalog is purged or every DW model is exhausted, the only move
+        left is to dead-queue the op with ``background_dw_blocked_by_topology``.
+        The dormant-queue comment at the block site names its own release
+        condition exactly: *"the queue stays dormant until a viable,
+        cost-effective inference endpoint is secured."* On a host serving the
+        32B locally that endpoint is already secured, permanently, at $0.00 per
+        operation — the gate simply cannot see it, because it is asking after a
+        provider's NAME rather than after its COST. Six of six operations in
+        soak ``bt-2026-08-24-074121`` died at that gate on a box whose GPU was
+        idle the whole time; three of them with this exact code.
+
+        This is the same correction :func:`_free_lane_active` made for the
+        swarm-chunking skip, applied to the routing decision itself.
+
+        Deliberately NOT conditioned on :func:`_free_lane_active`. That
+        predicate answers "is the free lane the ONLY lane?", which is the right
+        question for a cost *interlock* and the wrong one here: the local lane's
+        marginal cost is zero whether or not a DW key also exists, so an
+        operator who has both should still get the free lane for a route whose
+        entire contract is frugality — rather than a dead queue — when DW is
+        down. What IS required is EVIDENCE: a reachable endpoint that answered,
+        never a flag asserting one should exist.
+
+        Returns the ``GenerationResult`` on success, or ``None`` to fall
+        through to the caller's existing raise. Every failure mode — flag off,
+        wrong route, no endpoint, empty candidates, dispatch error — returns
+        ``None``, so a topology with no local lane keeps its byte-identical
+        dead-queue behaviour and the cloud deployment is untouched.
+        """
+        if not _background_local_lane_enabled():
+            return None
+        if route not in ("background", "speculative"):
+            return None
+
+        op_id_short = (getattr(context, "op_id", "") or "?")[:16]
+
+        try:
+            endpoint = await self._discover_jprime_endpoint()
+        except Exception:  # noqa: BLE001 — discovery is advisory, never fatal
+            logger.debug(
+                "[CandidateGenerator] free-lane discovery failed [%s]",
+                op_id_short, exc_info=True,
+            )
+            return None
+        if not endpoint:
+            # The honest, and common, case: no local lane on this host. Logged
+            # at DEBUG because on a cloud node it is every cost-optimized op.
+            logger.debug(
+                "[CandidateGenerator] free-lane declined: no local J-Prime "
+                "endpoint discoverable (route=%s, block=%s) [%s]",
+                route, reason[:60], op_id_short,
+            )
+            return None
+
+        logger.info(
+            "[CandidateGenerator] free-lane preemption: route=%s would "
+            "dead-queue (%s) but a zero-marginal-cost lane is SERVING at %s — "
+            "dispatching GENERATE locally instead of queueing [%s]",
+            route, reason[:80], endpoint, op_id_short,
+        )
+        try:
+            result = await self._failover_local_dispatch(
+                context, deadline, endpoint,
+            )
+        except asyncio.CancelledError:
+            # Structured concurrency: a parent cancellation is NOT a lane
+            # failure and must not be swallowed into a dead-queue raise.
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[CandidateGenerator] free-lane dispatch failed (%s: %.120s) — "
+                "falling through to the queue path [%s]",
+                type(exc).__name__, str(exc), op_id_short,
+            )
+            return None
+
+        if result is not None and len(getattr(result, "candidates", ()) or ()) > 0:
+            return result
+
+        logger.info(
+            "[CandidateGenerator] free-lane produced no candidates — falling "
+            "through to the queue path (route=%s) [%s]", route, op_id_short,
+        )
+        return None
 
     async def _dispatch_via_sentinel(
         self,
@@ -6693,6 +6815,20 @@ class CandidateGenerator:
         except Exception:  # noqa: BLE001 -- gradient is advisory, never blocks
             pass
         if fallback_tolerance == "queue":
+            # Zero-cost lane FIRST — before the read-only Claude cascade below.
+            # Both branches exist to keep a cost-optimized op moving; this one
+            # costs $0.00 and that one costs ~$0.005, so consulting Claude
+            # first would be paying for the more expensive of two available
+            # answers on the route whose entire contract is not to. Returns
+            # None when no local lane is serving, leaving the cascade and the
+            # queue raise exactly as they were.
+            _free_lane = await self._try_free_lane_dispatch(
+                context, deadline,
+                route=provider_route,
+                reason=f"dw_exhausted:{(last_failure or 'all_models_open')[:60]}",
+            )
+            if _free_lane is not None:
+                return _free_lane
             # Defect #5 fix (2026-05-03) — Read-only cascade reflex.
             # Soak v5 (bt-2026-05-03-060330) had 17/19 BG ops terminal-
             # failing here with "background_dw_blocked_by_topology".
@@ -10477,3 +10613,117 @@ def register_shipped_invariants() -> list:
             validate=_validate,
         ),
     ]
+
+
+def register_flags(registry: Any) -> int:
+    """Module-owned FlagRegistry registration.  NEVER raises.
+
+    Covers the free-lane cost interlock and the gateway in-flight seam. Both
+    are policy about MONEY and about device accounting respectively, so an
+    operator needs to be able to find them by name without reading this file.
+    """
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category,
+            FlagSpec,
+            FlagType,
+        )
+    except ImportError:
+        return 0
+
+    src = "backend/core/ouroboros/governance/candidate_generator.py"
+    specs = [
+        FlagSpec(
+            name="JARVIS_FREE_LANE_POLICY_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Let cost-motivated gates ask about COST rather than hardcode "
+                "a route name. When the local lane is the configured one AND "
+                "no paid credential is present, per-op marginal cost is ~zero, "
+                "so quality-for-money trades (notably skipping swarm chunking) "
+                "stop being correct and are re-enabled. Deliberately "
+                "conservative: any paid key present means NOT free. Set falsey "
+                "to force the pre-existing cost-averse behaviour everywhere."
+            ),
+            category=Category.ROUTING,
+            source_file=src,
+            example="true",
+            since="local-lane arc (2026-08-24)",
+        ),
+        FlagSpec(
+            name="JARVIS_FREE_LANE_CRED_TTL_S",
+            type=FlagType.FLOAT,
+            default=30.0,
+            description=(
+                "How stale a credential reading may be before .env is "
+                "consulted again, so a key added while the loop is RUNNING "
+                "revokes free-lane status without a restart. os.environ is "
+                "per-process and load_env_once is idempotent, so without this "
+                "re-read a mid-soak key would never be seen. 0 disables the "
+                "re-read entirely (boot-time environment only)."
+            ),
+            category=Category.TIMING,
+            source_file=src,
+            example="30",
+            since="local-lane arc (2026-08-24)",
+        ),
+        FlagSpec(
+            name="JARVIS_GATEWAY_INFLIGHT_UNIFICATION_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Register Phase 3c generations with the InferenceGateway's "
+                "in-flight counter. Default TRUE: this is a correctness fix, "
+                "and OFF reinstates the blind spot where an advisory pre-warm "
+                "sees an idle host and evicts weights out from under a live "
+                "stream. Kept as a flag purely so it is revocable without a "
+                "revert."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="true",
+            since="local-lane arc (2026-08-24)",
+        ),
+        FlagSpec(
+            name="JARVIS_LOCAL_VRAM_AUTODETECT_ENABLED",
+            type=FlagType.BOOL,
+            default=False,
+            description=(
+                "Prefer a MEASURED compute_topology VRAM reading over the GCP "
+                "provisioning spec. The spec answers 'what did we ask GCP for', "
+                "which is right for a provisioned failover node and wrong for a "
+                "workstation serving Ollama. Default OFF -- byte-identical to "
+                "the legacy spec-derived path."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="true",
+            since="local-inference 32B arc (2026-08-20)",
+        ),
+        FlagSpec(
+            name="JARVIS_BACKGROUND_LOCAL_LANE_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Let a BACKGROUND / SPECULATIVE op that would dead-queue on "
+                "'background_dw_blocked_by_topology' run on a locally-served "
+                "J-Prime instead. Those routes encode 'spend nothing' as a "
+                "PROVIDER NAME (DoubleWord), so a purged DW catalog kills the "
+                "op even when a $0.00/op lane is serving on the same host. "
+                "Requires a reachable endpoint -- evidence, never a flag "
+                "asserting one exists -- so a host without a local lane keeps "
+                "its byte-identical dead-queue behaviour. Set falsey to "
+                "restore the unconditional queue."
+            ),
+            category=Category.ROUTING,
+            source_file=src,
+            example="true",
+            since="local-lane arc (2026-08-27)",
+        ),
+    ]
+    try:
+        registry.bulk_register(specs, override=True)
+    except Exception:  # noqa: BLE001 -- registration is descriptive, never load-bearing
+        return 0
+    return len(specs)

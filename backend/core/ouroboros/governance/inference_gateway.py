@@ -1090,3 +1090,43 @@ def reset_for_tests() -> None:
     global _SINGLETON
     with _SINGLETON_LOCK:
         _SINGLETON = None
+
+
+def register_flags(registry: Any) -> int:
+    """Module-owned FlagRegistry registration.  NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.flag_registry import (
+            Category,
+            FlagSpec,
+            FlagType,
+        )
+    except ImportError:
+        return 0
+
+    src = "backend/core/ouroboros/governance/inference_gateway.py"
+    specs = [
+        FlagSpec(
+            name=VRAM_MUTEX_ENV,
+            type=FlagType.BOOL,
+            default=False,
+            description=(
+                "Serialize the read-decide-mutate residency sequence behind a "
+                "per-endpoint lock, with capacity admission and optional "
+                "down-routing. Closes the check-then-act race where concurrent "
+                "ops wanting different models each observe one snapshot, each "
+                "call warmup(), and a card that cannot hold both partially "
+                "offloads to system RAM for BOTH. Default OFF -- byte-identical "
+                "to the pre-mutex path; turn ON when serving a local model on a "
+                "single device."
+            ),
+            category=Category.SAFETY,
+            source_file=src,
+            example="true",
+            since="local-inference 32B arc (2026-08-20)",
+        ),
+    ]
+    try:
+        registry.bulk_register(specs, override=True)
+    except Exception:  # noqa: BLE001 -- registration is descriptive, never load-bearing
+        return 0
+    return len(specs)
