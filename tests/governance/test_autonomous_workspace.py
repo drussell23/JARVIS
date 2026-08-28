@@ -120,7 +120,18 @@ async def test_on_and_autonomous_routes_to_worktree(tmp_path, monkeypatch):
     assert out.is_dir()
     # Same naming as the Ledger Sovereignty phase → one unified worktree,
     # swept by the existing ouroboros/auto/* reaper.
-    assert mgr.created == ["ouroboros/auto/bt-xyz"]
+    #
+    # Asserted against `workspace_branch` rather than a literal. The literal
+    # was `"ouroboros/auto/bt-xyz"`, which stopped being the name when a
+    # per-boot cryptographic nonce was added to make collisions provably
+    # impossible across crashed runs — so the test had been failing on a
+    # naming change it was never really about. Deriving the expectation from
+    # the same function production calls means the next naming change cannot
+    # break it either.
+    assert mgr.created == [aw.workspace_branch("bt-xyz")]
+    assert mgr.created[0].startswith("ouroboros/auto/bt-xyz-"), (
+        "must stay under the prefix the ouroboros/auto/* reaper sweeps"
+    )
 
 
 async def test_autonomous_route_unifies_commit_workspace_env(

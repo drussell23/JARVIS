@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -183,6 +185,153 @@ def _resolve_reap_prefixes(primary: str) -> "tuple[str, ...]":
     return tuple(out)
 
 
+# ---------------------------------------------------------------------------
+# Workspace liveness lock
+# ---------------------------------------------------------------------------
+#
+# Answers ONE question for the reaper: "is a live process using this tree?"
+#
+# Placed under `.jarvis/` rather than at the worktree root because `.jarvis/`
+# is already gitignored — a lock file at the root would show as untracked in
+# every `git status` run inside the worktree, and a workspace that reports
+# itself dirty is a workspace whose APPLY/rollback gates start lying.
+#
+# Why not reuse the Ledger-Sovereignty ownership marker, which already carries
+# creator_pid and created_at: `ledger_sovereignty.master_enabled()` defaults to
+# FALSE (§33.1), so that marker is absent in a default configuration. Whether
+# one session may delete another's live workspace cannot be contingent on an
+# unrelated feature flag. Both are consulted when reaping (see `_live_owner`);
+# only this one is guaranteed to exist.
+_WORKSPACE_LOCK_RELATIVE = (".jarvis", ".workspace_lock")
+_WORKSPACE_LOCK_SCHEMA = "workspace_lock.1"
+
+
+def workspace_lock_path(wt_path: "Path") -> "Path":
+    """Absolute path of the liveness lock for *wt_path*."""
+    return Path(wt_path, *_WORKSPACE_LOCK_RELATIVE)
+
+
+def _process_start_time(pid: int) -> Optional[float]:
+    """Process start time, or None when it cannot be established.
+
+    This is what makes the PID check trustworthy. A bare `os.kill(pid, 0)`
+    cannot distinguish "my session is alive" from "my session died and the
+    OS handed that number to something unrelated" — and on a long-lived host
+    reaping on a reused PID would skip real debris forever, while reaping on
+    a stale one destroys live work. Comparing start times settles it.
+    """
+    try:
+        import psutil  # noqa: PLC0415 — optional; absent → no reuse check
+        return float(psutil.Process(pid).create_time())
+    except Exception:  # noqa: BLE001 — psutil missing, or process gone
+        return None
+
+
+def _write_workspace_lock(wt_path: "Path", branch_name: str) -> bool:
+    """Atomically stamp the liveness lock. NEVER raises.
+
+    Atomic because the reaper may read it at any moment, including while it
+    is being written: a torn read must be impossible, so the payload is
+    written to a temp sibling, fsynced, then `os.replace`d into place —
+    rename within a directory is atomic on POSIX and on NTFS.
+
+    Returns True on success. A False here is not fatal: a missing lock means
+    "unprovable", and the reaper treats unprovable as reapable, which is the
+    pre-existing behaviour.
+    """
+    lock = workspace_lock_path(wt_path)
+    pid = os.getpid()
+    payload = {
+        "schema_version": _WORKSPACE_LOCK_SCHEMA,
+        "pid": pid,
+        # Wall-clock, for humans reading the file and for age heuristics.
+        "created_at": time.time(),
+        # The PID-reuse discriminator. None when psutil is unavailable —
+        # the reader degrades to a plain liveness probe rather than failing.
+        "proc_start": _process_start_time(pid),
+        "session_id": os.environ.get("JARVIS_OUROBOROS_SESSION_ID", ""),
+        "branch_name": branch_name,
+    }
+    tmp = lock.with_name(lock.name + f".{pid}.tmp")
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, lock)
+        return True
+    except Exception as exc:  # noqa: BLE001 — a lock is best-effort
+        logger.debug(
+            "WorktreeManager: workspace lock write failed for %s: %r",
+            wt_path, exc,
+        )
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def read_workspace_lock(wt_path: "Path") -> Optional[dict]:
+    """Read the liveness lock, or None when absent/unreadable. NEVER raises."""
+    try:
+        raw = workspace_lock_path(wt_path).read_text(encoding="utf-8")
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001 — absent / torn / malformed → unprovable
+        return None
+
+
+def _pid_is_live(pid: object, proc_start: object = None) -> bool:
+    """True ONLY on positive proof that *pid* is a live process.
+
+    ``proc_start`` (when both recorded and observable) must match, so a
+    recycled PID reads as dead rather than as a live owner.
+
+    Every uncertainty resolves to False — "not provably alive". That polarity
+    is deliberate and is the OPPOSITE of the one
+    :meth:`reap_dangling_auto_branches` uses. There, an auto branch may hold
+    real unpushed work, so the default is "don't touch unless proven dead".
+    Here the caller is a debris sweeper whose whole purpose is reclaiming
+    disk (Slice 44: 62 checkouts, 492k files, 13GB); defaulting to "don't
+    touch" would silently restore that problem. So: reap unless proven alive.
+    """
+    try:
+        pid_i = int(pid)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    if pid_i <= 0:
+        return False
+    # No short-circuit for our OWN pid. It is trivially live, but "the lock
+    # names my pid" and "the lock was written by me" are different claims —
+    # a dead session whose number the OS later handed to this process would
+    # satisfy the first and not the second. The start-time comparison below
+    # is what separates them, so our own pid goes through it like any other.
+    try:
+        os.kill(pid_i, 0)
+    except ProcessLookupError:
+        return False           # proven gone
+    except PermissionError:
+        pass                   # exists, owned by another user → alive
+    except Exception:  # noqa: BLE001 — OverflowError on an out-of-range pid,
+        # OSError on an unprobeable one. Anything that is not a clean "yes"
+        # is "not provably alive", which keeps debris reapable.
+        return False
+    if proc_start is None:
+        return True            # alive; reuse undetectable, accept
+    observed = _process_start_time(pid_i)
+    if observed is None:
+        return True            # alive; cannot compare → accept
+    try:
+        # 1s tolerance: create_time() resolution differs across platforms
+        # and a clock adjustment must not read as a reused PID.
+        return abs(float(observed) - float(proc_start)) <= 1.0
+    except (TypeError, ValueError):
+        return True
+
+
 class WorktreeManager:
     """Manages git worktree creation and cleanup for subagent isolation.
 
@@ -306,6 +455,15 @@ class WorktreeManager:
         # raises — mark_owned itself returns None on I/O failure
         # and the downstream assertion surfaces the missing marker.
         self._stamp_ownership_marker(wt_path, branch_name)
+
+        # Liveness lock — stamped UNCONDITIONALLY, unlike the sovereignty
+        # marker above. That marker carries the same facts (creator_pid,
+        # created_at) and would have been the DRY answer, except
+        # `master_enabled()` defaults to FALSE (§33.1), so in a default
+        # configuration it is never written. Whether one session may destroy
+        # another's workspace must not depend on an unrelated feature flag
+        # being switched on, so this one has no master.
+        _write_workspace_lock(wt_path, branch_name)
 
         logger.info("WorktreeManager: created worktree at %s", wt_path)
         return wt_path
@@ -569,6 +727,46 @@ class WorktreeManager:
             except Exception:  # noqa: BLE001 — protection is best-effort, never fatal
                 pass
 
+        def _locked_by_live_process(path: Optional[Path]) -> Optional[str]:
+            """Reason string when a LIVE process holds this tree, else None.
+
+            Two independent sources, because neither alone is sufficient:
+
+              * the workspace lock (`.jarvis/.workspace_lock`) — stamped
+                unconditionally at materialization, so it is the one that
+                exists in a default configuration;
+              * the Ledger-Sovereignty ownership marker — richer, but absent
+                unless `master_enabled()` (default FALSE).
+
+            This is what makes cross-process destruction structurally
+            impossible: the env-derived protection above only knows about the
+            workspace THIS process armed, so a second worker's tree was still
+            fair game. A lock on disk is visible to every reaper.
+            """
+            if path is None:
+                return None
+            lock = read_workspace_lock(path)
+            if lock and _pid_is_live(lock.get("pid"), lock.get("proc_start")):
+                return (
+                    f"workspace lock held by live pid={lock.get('pid')} "
+                    f"session={lock.get('session_id') or '?'}"
+                )
+            try:
+                from backend.core.ouroboros.governance.ledger_sovereignty import (
+                    read_ownership,  # noqa: PLC0415 — optional, master-gated
+                )
+                record = read_ownership(path)
+            except Exception:  # noqa: BLE001 — absent marker → unprovable
+                record = None
+            if record is not None and _pid_is_live(
+                getattr(record, "creator_pid", 0), None,
+            ):
+                return (
+                    f"sovereignty marker held by live pid="
+                    f"{getattr(record, 'creator_pid', '?')}"
+                )
+            return None
+
         def _is_protected(path: Optional[Path], branch: str = "") -> bool:
             """True when this path/branch belongs to the LIVE session."""
             if branch and branch in protected_branches:
@@ -576,9 +774,25 @@ class WorktreeManager:
             if path is None:
                 return False
             try:
-                return str(path.resolve()) in protected_paths
+                if str(path.resolve()) in protected_paths:
+                    return True
             except OSError:
-                return str(path) in protected_paths
+                if str(path) in protected_paths:
+                    return True
+            held = _locked_by_live_process(path)
+            if held:
+                # Remember it so the branch sweep (loop 3) cannot delete the
+                # ref out from under a tree we just refused to remove.
+                lock = read_workspace_lock(path)
+                _b = (lock or {}).get("branch_name") or branch
+                if _b:
+                    protected_branches.add(str(_b))
+                logger.info(
+                    "WorktreeManager.reap_orphans: SKIPPING %s — %s",
+                    path, held,
+                )
+                return True
+            return False
 
         porcelain = await self._run_git_capture(["worktree", "list", "--porcelain"])
         for entry in _parse_worktree_porcelain(porcelain):
