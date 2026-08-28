@@ -33,6 +33,53 @@ async def _init_git_repo(path: Path) -> None:
 # Tests
 # ---------------------------------------------------------------------------
 
+
+def _orphan(*worktrees: Path) -> None:
+    """Mark worktrees as debris left by a process that no longer exists.
+
+    `reap_orphans` reaps what SIGKILL / OOM / power-loss left behind — by
+    definition the creating process is gone. Tests build their fixtures
+    in-process, so without this the workspace lock records a LIVE pid (ours)
+    and the reaper correctly refuses to touch them.
+
+    That refusal is not a test artifact to work around: it is the production
+    behaviour being protected. `resolve_loop_project_root` and the boot reaper
+    really do run in the same process, which is precisely how the live
+    workspace got eaten (bt-2026-08-28-065825). A test that creates a worktree
+    and immediately calls it an orphan was only ever passing because nothing
+    checked liveness.
+
+    A crashed session leaves its lock behind holding a STALE pid, so that is
+    what is simulated — not a deleted lock, which would test a different case.
+    """
+    import json
+    import subprocess
+
+    from backend.core.ouroboros.governance.worktree_manager import (
+        workspace_lock_path,
+    )
+
+    # A genuinely dead pid: spawn a trivial child, reap it, reuse its number.
+    proc = subprocess.Popen(["/bin/sh", "-c", "exit 0"])
+    proc.wait()
+    dead_pid = proc.pid
+
+    for wt in worktrees:
+        lock = workspace_lock_path(wt)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(
+            json.dumps({
+                "schema_version": "workspace_lock.1",
+                "pid": dead_pid,
+                "created_at": 0.0,
+                "proc_start": None,
+                "session_id": "bt-dead-session",
+                "branch_name": "",
+            }),
+            encoding="utf-8",
+        )
+
+
 @pytest.mark.asyncio
 async def test_create_and_cleanup(tmp_path: Path) -> None:
     """create() produces a worktree directory; cleanup() removes it."""
@@ -145,6 +192,7 @@ async def test_reap_orphans_removes_registered_unit_worktree(tmp_path: Path) -> 
     mgr = WorktreeManager(repo_root=repo_root)
     wt_path = await mgr.create("unit-abc-graph-xyz")
     assert wt_path.exists()
+    _orphan(wt_path)
 
     pre_branches = await _list_branches(repo_root)
     assert "unit-abc-graph-xyz" in pre_branches
@@ -191,6 +239,7 @@ async def test_reap_orphans_preserves_non_unit_worktrees(tmp_path: Path) -> None
     mgr = WorktreeManager(repo_root=repo_root)
     user_wt = await mgr.create("feature-do-not-touch")
     unit_wt = await mgr.create("unit-xyz-graph-1")
+    _orphan(user_wt, unit_wt)
 
     reaped = await mgr.reap_orphans()
     assert reaped == 1
@@ -233,7 +282,7 @@ async def test_reap_orphans_idempotent(tmp_path: Path) -> None:
     await _init_git_repo(repo_root)
 
     mgr = WorktreeManager(repo_root=repo_root)
-    await mgr.create("unit-first")
+    _orphan(await mgr.create("unit-first"))
 
     first = await mgr.reap_orphans()
     second = await mgr.reap_orphans()
@@ -274,6 +323,7 @@ async def test_reap_orphans_never_eats_the_live_session_workspace(
     mgr = WorktreeManager(repo_root=repo_root)
     live = await mgr.create("ouroboros/auto/bt-live-session-aaa111")
     stale = await mgr.create("ouroboros/auto/bt-dead-session-bbb222")
+    _orphan(stale)
 
     # Exactly how the live workspace announces itself in production.
     monkeypatch.setenv("JARVIS_AUTO_COMMIT_WORKSPACE", str(live))
@@ -342,8 +392,151 @@ async def test_unset_env_reaps_everything_as_before(tmp_path: Path, monkeypatch)
     mgr = WorktreeManager(repo_root=repo_root)
     a = await mgr.create("ouroboros/auto/bt-old-1")
     b = await mgr.create("ouroboros/auto/bt-old-2")
+    _orphan(a, b)
 
     reaped = await mgr.reap_orphans()
 
     assert reaped == 2
     assert not a.exists() and not b.exists()
+
+
+# ===========================================================================
+# Workspace liveness lock — cross-process protection
+# ===========================================================================
+#
+# The env-derived guard protects only the workspace THIS process armed, so a
+# second worker's tree was still fair game. The lock is on disk, so every
+# reaper in every process can see it.
+
+
+@pytest.mark.asyncio
+async def test_create_writes_an_atomic_liveness_lock(tmp_path: Path) -> None:
+    """Materialization stamps pid + start timestamp, unconditionally.
+
+    Unconditionally is the point: the Ledger-Sovereignty ownership marker
+    carries the same facts but `master_enabled()` defaults FALSE, so it is
+    absent in a default configuration. Reaping safety cannot depend on an
+    unrelated feature flag.
+    """
+    import json
+
+    from backend.core.ouroboros.governance.worktree_manager import (
+        workspace_lock_path,
+    )
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    await _init_git_repo(repo_root)
+
+    mgr = WorktreeManager(repo_root=repo_root)
+    wt = await mgr.create("unit-lock-shape")
+
+    lock = workspace_lock_path(wt)
+    assert lock.exists(), "create() must stamp a liveness lock"
+    payload = json.loads(lock.read_text(encoding="utf-8"))
+    import os as _os
+    assert payload["pid"] == _os.getpid()
+    assert payload["created_at"] > 0
+    assert "proc_start" in payload
+    # No partial writes left behind by the atomic replace.
+    assert not list(lock.parent.glob(".workspace_lock.*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_live_lock_survives_reaping_by_another_manager(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A tree locked by a LIVE process is untouchable, env or no env.
+
+    This is the multi-process race: worker A materializes a workspace, worker
+    B boots and sweeps. B has never heard of A's env vars — the lock is the
+    only thing that can stop it.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    await _init_git_repo(repo_root)
+    # Deliberately unset: prove the protection comes from the LOCK, not from
+    # the environment guard.
+    monkeypatch.delenv("JARVIS_AUTO_COMMIT_WORKSPACE", raising=False)
+    monkeypatch.delenv("JARVIS_OUROBOROS_SESSION_ID", raising=False)
+
+    worker_a = WorktreeManager(repo_root=repo_root)
+    live = await worker_a.create("unit-worker-a-live")
+    dead = await worker_a.create("unit-worker-b-dead")
+    _orphan(dead)  # only this one's owner has exited
+
+    worker_b = WorktreeManager(repo_root=repo_root)
+    reaped = await worker_b.reap_orphans()
+
+    assert live.exists(), "a live process's workspace was destroyed"
+    assert not dead.exists(), "genuine debris must still be reaped"
+    assert reaped == 1
+
+
+@pytest.mark.asyncio
+async def test_recycled_pid_does_not_read_as_a_live_owner(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A stale lock whose pid was reused must not protect forever.
+
+    `os.kill(pid, 0)` alone cannot tell "my session is alive" from "my session
+    died and the OS handed that number to something else". On a long-lived
+    host that would make debris permanently unreapable. The recorded start
+    time settles it.
+    """
+    import json
+    import os as _os
+
+    from backend.core.ouroboros.governance.worktree_manager import (
+        workspace_lock_path,
+    )
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    await _init_git_repo(repo_root)
+    monkeypatch.delenv("JARVIS_AUTO_COMMIT_WORKSPACE", raising=False)
+
+    mgr = WorktreeManager(repo_root=repo_root)
+    wt = await mgr.create("unit-recycled-pid")
+
+    # Our pid IS alive — but the lock claims it started at a different time,
+    # which is exactly what a recycled pid looks like.
+    lock = workspace_lock_path(wt)
+    payload = json.loads(lock.read_text(encoding="utf-8"))
+    if payload.get("proc_start") is None:
+        pytest.skip("psutil unavailable — reuse detection is not active here")
+    payload["proc_start"] = float(payload["proc_start"]) - 9999.0
+    lock.write_text(json.dumps(payload), encoding="utf-8")
+    assert payload["pid"] == _os.getpid()
+
+    reaped = await mgr.reap_orphans()
+
+    assert reaped == 1, "a recycled pid must not protect stale debris"
+    assert not wt.exists()
+
+
+@pytest.mark.asyncio
+async def test_unreadable_lock_is_treated_as_reapable(tmp_path: Path, monkeypatch) -> None:
+    """A torn or malformed lock means 'unprovable', which means reapable.
+
+    The opposite polarity would let one corrupt byte pin 13GB of debris on
+    disk forever — the exact problem Slice 44's prefix expansion existed to
+    solve.
+    """
+    from backend.core.ouroboros.governance.worktree_manager import (
+        workspace_lock_path,
+    )
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    await _init_git_repo(repo_root)
+    monkeypatch.delenv("JARVIS_AUTO_COMMIT_WORKSPACE", raising=False)
+
+    mgr = WorktreeManager(repo_root=repo_root)
+    wt = await mgr.create("unit-torn-lock")
+    workspace_lock_path(wt).write_text("{not json", encoding="utf-8")
+
+    reaped = await mgr.reap_orphans()
+
+    assert reaped == 1
+    assert not wt.exists()

@@ -189,9 +189,42 @@ class TestAutoCommitterEffectiveRoot:
     ):
         override = tmp_path / "alt-workspace"
         override.mkdir()
+        # The `.git` marker is what makes this a WORK-AREA rather than a
+        # directory that happens to exist. Without it `effective_execution_root`
+        # raises `ExecutionRootInvalid` — correctly, and this test was failing
+        # on exactly that. It is the fourth fixture in this repo to model a
+        # worktree as a bare `mkdir()`, and that shared blind spot is why the
+        # husk defect shipped: production armed marker-only directories because
+        # every test said a marker-only directory was fine. A linked worktree's
+        # `.git` is a FILE pointing at the parent repo.
+        (override / ".git").write_text(
+            "gitdir: /repo/.git/worktrees/alt-workspace\n"
+        )
         monkeypatch.setenv(_WORKSPACE_FLAG, str(override))
         ac = AutoCommitter(repo_root=tmp_path / "primary")
         assert ac._effective_repo_root() == override
+
+    def test_env_override_at_a_husk_is_refused_not_honoured(
+        self, tmp_path, monkeypatch,
+    ):
+        """An armed path with no `.git` must fail LOUD, not resolve.
+
+        The read side is deliberately strict — it is the last thing standing
+        between a half-created workspace and an APPLY that writes into it.
+        This pins that strictness so a future fixture cannot quietly relax it.
+        """
+        from backend.core.ouroboros.governance.autonomous_workspace import (
+            ExecutionRootInvalid,
+        )
+
+        husk = tmp_path / "husk-workspace"
+        husk.mkdir()
+        (husk / ".jarvis").mkdir()  # marker only — the observed shape
+        monkeypatch.setenv(_WORKSPACE_FLAG, str(husk))
+        ac = AutoCommitter(repo_root=tmp_path / "primary")
+
+        with pytest.raises(ExecutionRootInvalid):
+            ac._effective_repo_root()
 
 
 class TestAutoCommitterSovereigntyAssertion:
