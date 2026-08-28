@@ -1011,6 +1011,8 @@ class _FreeLaneStub:
         self._discover_raises = discover_raises
         self._dispatch_raises = dispatch_raises
         self.dispatched_to = None
+        self.dispatch_calls = 0
+        self.last_context = None
 
     async def _discover_jprime_endpoint(self):
         if self._discover_raises is not None:
@@ -1019,9 +1021,41 @@ class _FreeLaneStub:
 
     async def _failover_local_dispatch(self, context, deadline, endpoint):
         self.dispatched_to = endpoint
+        self.dispatch_calls += 1
+        self.last_context = context
         if self._dispatch_raises is not None:
             raise self._dispatch_raises
         return self._result
+
+    async def _local_dispatch_with_syntax_repair(self, context, deadline, endpoint):
+        """The REAL wrapper, bound to this stub.
+
+        Not a stub of its own: the stub supplies only the true collaborator
+        (`_failover_local_dispatch`) and production's retry logic runs on top,
+        so these tests exercise the shipped code path rather than a second
+        description of it.
+        """
+        mod = importlib.import_module(CG)
+        return await mod.CandidateGenerator._local_dispatch_with_syntax_repair(
+            self, context, deadline, endpoint,
+        )
+
+
+class _RetryableCtx:
+    """A context that can carry syntax feedback, like the real one.
+
+    `OperationContext.with_syntax_retry_feedback` returns a NEW context and
+    advances the hash-chain; the retry has to be auditable as a distinct
+    attempt. This mirrors that shape (new object, feedback set) without
+    dragging the real dataclass and its hashing into these tests.
+    """
+
+    def __init__(self, syntax_retry_feedback=""):
+        self.op_id = "op-free-lane-test"
+        self.syntax_retry_feedback = syntax_retry_feedback
+
+    def with_syntax_retry_feedback(self, feedback):
+        return _RetryableCtx(syntax_retry_feedback=feedback)
 
 
 class _Candidates:
@@ -1038,7 +1072,7 @@ def free_lane(monkeypatch):
 
     async def _call(stub, route="background", reason="topology_block:purged"):
         return await mod.CandidateGenerator._try_free_lane_dispatch(
-            stub, object(), object(), route=route, reason=reason,
+            stub, _RetryableCtx(), object(), route=route, reason=reason,
         )
 
     return _call
@@ -1167,3 +1201,108 @@ async def test_cancellation_is_not_swallowed(free_lane):
 
     with pytest.raises(asyncio.CancelledError):
         await free_lane(stub)
+
+
+# ===========================================================================
+# Phase 4 -- one-shot syntax repair on the local lane
+# ===========================================================================
+#
+# `all_candidates_syntax_error` was the top non-governance failure on the
+# local lane (6 dispatches in bt-2026-08-28-061124): valid JSON wrapping
+# invalid Python. `syntax_escalation` exists for this class but cascades
+# DW -> J-Prime, and on a workstation the local 32B IS J-Prime -- so it
+# escalates to the model that just failed. The missing move was never another
+# provider; it was showing the model the parse error it never saw.
+
+
+def _syntax_exc(failures):
+    exc = RuntimeError("gcp-jprime_schema_invalid:all_candidates_syntax_error")
+    exc.syntax_failures = failures
+    return exc
+
+
+_ONE_FAILURE = [{
+    "file_path": "backend/util.py",
+    "line": 3,
+    "message": "unindent does not match any outer indentation level",
+    "source_line": "  y = 2",
+    "preceding_line": "    x = 1",
+}]
+
+
+class _SyntaxThenSuccessStub(_FreeLaneStub):
+    """Fails the first dispatch on syntax, succeeds on the retry."""
+
+    def __init__(self, endpoint, result):
+        super().__init__(endpoint=endpoint, result=result)
+        self._first = True
+
+    async def _failover_local_dispatch(self, context, deadline, endpoint):
+        self.dispatch_calls += 1
+        self.last_context = context
+        self.dispatched_to = endpoint
+        if self._first:
+            self._first = False
+            raise _syntax_exc(_ONE_FAILURE)
+        return self._result
+
+
+async def test_syntax_failure_is_retried_once_with_the_parse_error(free_lane):
+    """The regression: a fixable slip must not be terminal."""
+    good = _Candidates(1)
+    stub = _SyntaxThenSuccessStub(EP, good)
+
+    assert await free_lane(stub) is good
+    assert stub.dispatch_calls == 2, "expected exactly one retry"
+
+
+async def test_the_retry_actually_carries_the_error_text(free_lane):
+    """Feedback must reach the model, naming the line and the source.
+
+    A retry that does not show the model what broke is just a second roll of
+    the same dice at full token cost.
+    """
+    stub = _SyntaxThenSuccessStub(EP, _Candidates(1))
+    await free_lane(stub)
+
+    fb = getattr(stub.last_context, "syntax_retry_feedback", "")
+    assert "backend/util.py" in fb
+    assert "line 3" in fb
+    assert "unindent" in fb
+    assert "y = 2" in fb, "the offending source line must be quoted"
+
+
+async def test_only_one_retry_even_if_it_fails_again(free_lane):
+    """Two corrections would be a loop that spends the whole op budget."""
+    stub = _FreeLaneStub(
+        endpoint=EP, result=None, dispatch_raises=_syntax_exc(_ONE_FAILURE),
+    )
+
+    assert await free_lane(stub) is None
+    assert stub.dispatch_calls == 2, "must stop after a single retry"
+
+
+async def test_master_off_restores_single_attempt(free_lane, monkeypatch):
+    monkeypatch.setenv("JARVIS_LOCAL_SYNTAX_REPAIR_ENABLED", "0")
+    stub = _SyntaxThenSuccessStub(EP, _Candidates(1))
+
+    assert await free_lane(stub) is None
+    assert stub.dispatch_calls == 1, "no retry when the master is off"
+
+
+async def test_a_non_syntax_failure_is_not_retried(free_lane):
+    """Only parse errors are recoverable this way.
+
+    A timeout or a dead engine retried immediately just burns the budget
+    twice; those have their own recovery paths.
+    """
+    stub = _FreeLaneStub(
+        endpoint=EP, result=None, dispatch_raises=RuntimeError("engine down"),
+    )
+
+    assert await free_lane(stub) is None
+    assert stub.dispatch_calls == 1
+
+
+def test_syntax_repair_defaults_on(cg):
+    assert cg._syntax_repair_enabled() is True

@@ -3088,6 +3088,16 @@ def _refresh_paid_lane_credentials() -> None:
         pass
 
 
+def _syntax_repair_enabled() -> bool:
+    """Master for the local lane's one-shot syntax-repair retry.
+
+    Default ON: without it `all_candidates_syntax_error` is terminal on a
+    topology whose escalation target is the failing model itself. Falsey
+    restores the pre-existing single-attempt behaviour exactly.
+    """
+    return _envb("JARVIS_LOCAL_SYNTAX_REPAIR_ENABLED", True)
+
+
 def _background_local_lane_enabled() -> bool:
     """Master for the cost-optimized routes' zero-cost lane preemption.
 
@@ -5656,6 +5666,94 @@ class CandidateGenerator:
         # is never serialized, only the one-shot cold calibration is gated.
         return await _prof.run_calibrated(_attempts)
 
+    async def _local_dispatch_with_syntax_repair(
+        self,
+        context: OperationContext,
+        deadline: datetime,
+        endpoint: str,
+    ) -> Optional[GenerationResult]:
+        """Local dispatch that shows the model its own parse errors once.
+
+        `all_candidates_syntax_error` was the top non-governance failure on the
+        local lane — 6 dispatches in soak bt-2026-08-28-061124, the model
+        emitting VALID JSON wrapping INVALID Python. That is a recoverable
+        slip, and it was being treated as terminal.
+
+        `syntax_escalation` exists for this class, but it cascades DW →
+        J-Prime, and on a workstation topology the local 32B *is* J-Prime — so
+        it escalates to the model that just failed. The escalation is sound and
+        simply has nowhere to go here; the missing move is not another provider
+        but the feedback the first attempt never received.
+
+        ONE retry, deliberately. Two would be a loop that spends the op's whole
+        budget re-reading the same file; and if a model cannot fix a named
+        `unexpected indent` on the second attempt, a third will not help. The
+        retry is stamped through `with_syntax_retry_feedback`, which advances
+        the hash-chain, so it is auditable as a distinct attempt rather than a
+        silent re-run.
+
+        Falls through to the original exception when the retry also fails, so
+        the operator still reads the real terminal cause.
+        """
+        try:
+            return await self._failover_local_dispatch(context, deadline, endpoint)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — inspected, then re-raised
+            failures = getattr(exc, "syntax_failures", None)
+            if not failures or not _syntax_repair_enabled():
+                raise
+            if getattr(context, "syntax_retry_feedback", ""):
+                # Already the retry. A second correction round is the loop this
+                # method exists to avoid.
+                raise
+            try:
+                from backend.core.ouroboros.governance.providers import (
+                    _format_syntax_feedback,  # noqa: PLC0415
+                )
+                feedback = _format_syntax_feedback(failures)
+            except Exception:  # noqa: BLE001 — no feedback → no retry
+                raise exc from None
+            if not feedback:
+                raise
+            op_id_short = (getattr(context, "op_id", "") or "?")[:16]
+            logger.info(
+                "[CandidateGenerator] local lane returned unparseable Python "
+                "(%d file(s), first: %s line %s) — retrying ONCE with the "
+                "parse errors fed back [%s]",
+                len(failures),
+                (failures[0] or {}).get("file_path", "?"),
+                (failures[0] or {}).get("line", "?"),
+                op_id_short,
+            )
+            # Duck-typed contexts reach this path (the harness and several
+            # call sites build minimal ones). A context that cannot CARRY the
+            # feedback cannot benefit from the retry, and turning a diagnosed
+            # syntax error into an AttributeError would replace a precise
+            # terminal reason with a useless one.
+            _stamp = getattr(context, "with_syntax_retry_feedback", None)
+            if not callable(_stamp):
+                logger.debug(
+                    "[CandidateGenerator] context cannot carry syntax feedback "
+                    "(%s) — not retrying [%s]",
+                    type(context).__name__, op_id_short,
+                )
+                raise
+            retry_ctx = _stamp(feedback)
+            if retry_ctx is context:
+                # Stamping failed (degraded to self); retrying unchanged would
+                # just repeat the failure at full cost.
+                raise
+            result = await self._failover_local_dispatch(
+                retry_ctx, deadline, endpoint,
+            )
+            logger.info(
+                "[CandidateGenerator] syntax-repair retry produced %d "
+                "candidate(s) [%s]",
+                len(getattr(result, "candidates", ()) or ()), op_id_short,
+            )
+            return result
+
     async def _try_free_lane_dispatch(
         self,
         context: OperationContext,
@@ -5729,7 +5827,7 @@ class CandidateGenerator:
             route, reason[:80], endpoint, op_id_short,
         )
         try:
-            result = await self._failover_local_dispatch(
+            result = await self._local_dispatch_with_syntax_repair(
                 context, deadline, endpoint,
             )
         except asyncio.CancelledError:
