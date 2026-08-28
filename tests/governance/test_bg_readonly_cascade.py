@@ -86,15 +86,40 @@ def test_canonical_matches_providers_prime() -> None:
         Path(__file__).resolve().parents[2]
         / "backend" / "core" / "ouroboros" / "governance" / "providers.py"
     ).read_text()
-    # Both gates must read `_is_read_only` and use the same shape.
-    assert "_skip_tools = _route in (\"background\", \"speculative\") and not _is_read_only" in src, (
-        "providers.py does not contain the expected post-Option A "
-        "skip-tools gate — the two provider sites must agree"
+    # Assert the INVARIANT, not one spelling of it.
+    #
+    # This used to pin the literal
+    #     _skip_tools = _route in ("background", "speculative") and not _is_read_only
+    # which stopped existing when the route tuple was extracted into
+    # `should_skip_venom_for_route()` — a strict improvement (the route list
+    # now lives in one place) that this test reported as a regression, because
+    # it was matching the implementation's TEXT rather than its meaning.
+    #
+    # What actually has to hold: every route-derived skip decision, at every
+    # provider site, must be conjoined with `not _is_read_only`. A read-only op
+    # may never have the tool loop skipped out from under it — that is what
+    # makes `dispatch_subagent` reachable on the low-cost routes, and Rule 0d
+    # is what makes it safe. `_skip_tools = True` assignments from other
+    # sources (e.g. the repair-context path) are deliberately out of scope.
+    # `startswith` after stripping, so prose is excluded: providers.py quotes
+    # the old inline form inside a docstring (~line 3298), and a drift
+    # detector that trips on its own module's COMMENTARY reports noise instead
+    # of drift. Only real assignments are gates.
+    route_gates = [
+        ln.strip()
+        for ln in src.splitlines()
+        if ln.strip().startswith("_skip_tools =") and "_route" in ln
+    ]
+    assert len(route_gates) >= 2, (
+        "Expected at least 2 route-derived skip-tools gates "
+        f"(PrimeProvider + ClaudeProvider); found {len(route_gates)}: "
+        f"{route_gates}"
     )
-    assert src.count("_skip_tools = _route in (\"background\", \"speculative\") and not _is_read_only") >= 2, (
-        "Expected at least 2 occurrences of the canonical gate "
-        "(PrimeProvider + ClaudeProvider)"
-    )
+    for gate in route_gates:
+        assert "not _is_read_only" in gate, (
+            "a provider's route-derived skip-tools gate no longer honours "
+            f"the read-only contract: {gate!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +169,87 @@ def _make_generator_with_paused_topology(
     return gen
 
 
+def _blocked_topology(
+    *,
+    block_mode: str = "skip_and_queue",
+    reason: str = "dw_paused_for_test",
+) -> MagicMock:
+    """A topology that blocks DW, speaking the Slice-5a unified contract.
+
+    These tests used to stub only the PRE-Slice-5a trio
+    (``dw_allowed_for_route`` / ``reason_for_route`` / ``block_mode_for_route``)
+    while production had moved to the unified
+    :meth:`ProviderTopology.is_dw_blocked_for_route`. A ``MagicMock``
+    auto-creates any attribute it is asked for, so the missing method returned
+    a ``Mock`` that unpacked to nothing::
+
+        ValueError: not enough values to unpack (expected 3, got 0)
+
+    — which is worse than an AttributeError, because it fails at the call site
+    with a message that says nothing about the real cause: a mock that had
+    silently stopped resembling the thing it stands for.
+
+    The fix is not to hand-write the 3-tuple here. That would put a SECOND
+    copy of the v1→tuple translation in the test suite, free to drift from the
+    one in production exactly as the old stub did. Instead the fixture supplies
+    only the PRIMITIVE facts and delegates to the real implementation, so the
+    derivation under test is production's own.
+
+    Both generations are stubbed deliberately: the v1 trio and the v2 pair
+    (``dw_models_for_route`` / ``fallback_tolerance_for_route``). Which branch
+    runs depends on ``JARVIS_TOPOLOGY_SENTINEL_ENABLED`` at call time, and a
+    fixture that only satisfies one of them is a test that passes or fails on
+    an ambient env var. When Slice 5b deletes the v1 branch, the v2 stubs here
+    already carry the same meaning.
+    """
+    from backend.core.ouroboros.governance.provider_topology import (
+        ProviderTopology,
+    )
+
+    topo = MagicMock()
+    topo.enabled = True
+    # v1 primitives (sentinel OFF path).
+    topo.dw_allowed_for_route = lambda route: False
+    topo.reason_for_route = lambda route: reason
+    topo.block_mode_for_route = lambda route: block_mode
+    # v2 primitives (sentinel ON path) — same meaning: no DW models for this
+    # route, and the route queues rather than cascading.
+    topo.dw_models_for_route = lambda route: []
+    topo.fallback_tolerance_for_route = lambda route: (
+        "queue" if block_mode == "skip_and_queue" else "cascade_to_claude"
+    )
+    # THE POINT: production's own derivation, bound to this fixture's facts.
+    topo.is_dw_blocked_for_route = (
+        lambda route: ProviderTopology.is_dw_blocked_for_route(topo, route)
+    )
+    return topo
+
+
+def _allowed_topology(reason: str = "dw_allowed_for_test") -> MagicMock:
+    """The permissive counterpart of :func:`_blocked_topology`.
+
+    Same delegation, opposite primitives. Exists so no test in this file
+    hand-rolls a v1-only topology again: such a mock passes for as long as
+    its code path happens not to reach the unified helper, and fails
+    incomprehensibly the moment it does.
+    """
+    from backend.core.ouroboros.governance.provider_topology import (
+        ProviderTopology,
+    )
+
+    topo = MagicMock()
+    topo.enabled = True
+    topo.dw_allowed_for_route = lambda route: True
+    topo.reason_for_route = lambda route: reason
+    topo.block_mode_for_route = lambda route: "cascade_to_claude"
+    topo.dw_models_for_route = lambda route: ["dw-model-for-test"]
+    topo.fallback_tolerance_for_route = lambda route: "cascade_to_claude"
+    topo.is_dw_blocked_for_route = (
+        lambda route: ProviderTopology.is_dw_blocked_for_route(topo, route)
+    )
+    return topo
+
+
 @pytest.mark.asyncio
 async def test_bg_readonly_cascades_on_topology_skip_and_queue(
     monkeypatch: pytest.MonkeyPatch,
@@ -154,11 +260,7 @@ async def test_bg_readonly_cascades_on_topology_skip_and_queue(
     from backend.core.ouroboros.governance import candidate_generator as cg
 
     # Force topology to block BG with skip_and_queue
-    _topology = MagicMock()
-    _topology.enabled = True
-    _topology.dw_allowed_for_route = lambda route: False
-    _topology.reason_for_route = lambda route: "dw_paused_for_test"
-    _topology.block_mode_for_route = lambda route: "skip_and_queue"
+    _topology = _blocked_topology()
     monkeypatch.setattr(cg, "get_topology", lambda: _topology, raising=False)
 
     # The get_topology import inside the method is local — we also need
@@ -198,11 +300,7 @@ async def test_bg_mutating_still_raises_on_topology_skip_and_queue(
     from backend.core.ouroboros.governance import candidate_generator as cg
     from backend.core.ouroboros.governance import provider_topology
 
-    _topology = MagicMock()
-    _topology.enabled = True
-    _topology.dw_allowed_for_route = lambda route: False
-    _topology.reason_for_route = lambda route: "dw_paused_for_test"
-    _topology.block_mode_for_route = lambda route: "skip_and_queue"
+    _topology = _blocked_topology()
     monkeypatch.setattr(cg, "get_topology", lambda: _topology, raising=False)
     monkeypatch.setattr(provider_topology, "get_topology", lambda: _topology)
 
@@ -435,10 +533,11 @@ async def test_bg_readonly_uses_tight_stall_budget(
     from backend.core.ouroboros.governance import provider_topology
 
     # Topology lets BG through (no skip_and_queue) so we exercise the
-    # DW-attempt path.
-    _topology = MagicMock()
-    _topology.enabled = True
-    _topology.dw_allowed_for_route = lambda route: True
+    # DW-attempt path. Built through the same helper as the blocking
+    # fixtures: this one passes today only because the code path under test
+    # happens not to reach `is_dw_blocked_for_route`, which makes a bare
+    # v1-only MagicMock a landmine rather than a passing test.
+    _topology = _allowed_topology()
     monkeypatch.setattr(provider_topology, "get_topology", lambda: _topology)
 
     captured = {}
