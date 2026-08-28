@@ -26,3 +26,10 @@ PyYAML==6.0.3
 typing_extensions==4.15.0
 uuid6==2025.0.1
 xxhash==3.7.0
+# nbformat: the battle-test session report. `NotebookGenerator.generate` falls
+# back to Markdown when this import fails, so the harness never *needs* it — but
+# the fallback is the untested path (it is what surfaced the schema drift fixed
+# on 2026-08-27), and a session that loses its notebook loses the artifact the
+# whole run is judged from. Declared so the environment is reproducible rather
+# than depending on whether someone installed it by hand.
+nbformat==5.11.1
