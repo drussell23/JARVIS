@@ -175,3 +175,130 @@ def test_reader_defaults_to_empty_for_older_roadmaps():
 
     assert goal is not None
     assert goal.target_symbols == ()
+
+
+# ---------------------------------------------------------------------------
+# The TRUST BOUNDARY itself.
+#
+# `_declared_symbols_for` is what turns a signed roadmap into a confidence-1.0
+# instruction, and it shipped with NO test of its own: the suite above proves
+# the resolver honours a declaration, and the reader parses one, but nothing
+# proved WHERE a declaration is allowed to come from. That gap is how the
+# function came to gate on `doc is None` alone.
+#
+# `_verified_roadmap()` RETURNS THE DOCUMENT REGARDLESS OF VERDICT — it reports
+# verification, it does not enforce it. So `doc is not None` says only "a file
+# was parsed", never "an operator signed it". These tests pin BOTH properties,
+# the same pair `delegated_provenance` demands of the same call.
+# ---------------------------------------------------------------------------
+
+
+class _Verdict:
+    def __init__(self, value):
+        self.value = value
+
+
+class _Goal:
+    goal_id = "g1"
+    target_files = ("backend/core/ouroboros/governance/providers.py",)
+    target_symbols = ("_should_use_lean_prompt",)
+
+
+class _Doc:
+    goals = (_Goal(),)
+
+    def __init__(self, signature_valid):
+        self.signature_valid = signature_valid
+
+
+class _Ctx:
+    evidence = {"provenance": {"goal_id": "g1"}}
+
+
+_PATH = "backend/core/ouroboros/governance/providers.py"
+
+
+def _declared_with(monkeypatch, verdict_value, signature_valid):
+    from backend.core.ouroboros.governance import delegated_provenance
+    from backend.core.ouroboros.governance.candidate_generator import (
+        _declared_symbols_for,
+    )
+    monkeypatch.setattr(
+        delegated_provenance, "_verified_roadmap",
+        lambda: (_Verdict(verdict_value), _Doc(signature_valid)),
+    )
+    return _declared_symbols_for(_Ctx(), _PATH)
+
+
+def test_a_validly_signed_roadmap_confers_the_declared_target(monkeypatch):
+    """The positive control. Without this the refusals below could pass for
+    the trivial reason that the function never returns anything at all."""
+    assert _declared_with(monkeypatch, "valid", True) == (
+        "_should_use_lean_prompt",
+    )
+
+
+@pytest.mark.parametrize(
+    "verdict_value",
+    ["invalid_signature", "tampered", "missing", "invalid_format", "expired"],
+)
+def test_an_unverified_roadmap_confers_nothing(monkeypatch, verdict_value):
+    """Every non-valid verdict must refuse. A tampered or unsigned roadmap
+    that still named a target would hand an attacker who can write
+    `.jarvis/roadmap.yaml` a confidence-1.0 instruction — the exact forgery
+    this function's pointer-only contract exists to prevent, and a silent
+    defeat of the operator's JARVIS_ROADMAP_READER_REQUIRE_SIGNATURE."""
+    assert _declared_with(monkeypatch, verdict_value, True) == ()
+
+
+def test_the_cryptographic_fact_is_demanded_not_just_the_verdict(monkeypatch):
+    """The reader permits an unsigned dev-mode (REQUIRE_SIGNATURE=false) that
+    can report `valid` for a document carrying no signature at all. The
+    verdict alone is therefore not sufficient — `delegated_provenance` demands
+    both of this same call, and so must this."""
+    assert _declared_with(monkeypatch, "valid", False) == ()
+
+
+def test_a_declaration_cannot_reach_a_file_its_goal_does_not_cover(monkeypatch):
+    """Scope is enforced twice over. Even validly signed, a goal may only
+    direct the files inside its own `target_files`."""
+    from backend.core.ouroboros.governance import delegated_provenance
+    from backend.core.ouroboros.governance.candidate_generator import (
+        _declared_symbols_for,
+    )
+    monkeypatch.setattr(
+        delegated_provenance, "_verified_roadmap",
+        lambda: (_Verdict("valid"), _Doc(True)),
+    )
+    assert _declared_symbols_for(_Ctx(), "backend/core/unrelated.py") == ()
+
+
+def test_an_unavailable_roadmap_degrades_to_inference(monkeypatch):
+    """No roadmap is not an error — it is the ordinary case for almost every
+    op. It must return empty, never raise."""
+    from backend.core.ouroboros.governance import delegated_provenance
+    from backend.core.ouroboros.governance.candidate_generator import (
+        _declared_symbols_for,
+    )
+    monkeypatch.setattr(
+        delegated_provenance, "_verified_roadmap", lambda: (None, None),
+    )
+    assert _declared_symbols_for(_Ctx(), _PATH) == ()
+
+
+def test_an_op_with_no_provenance_pointer_declares_nothing(monkeypatch):
+    """The op contributes only a POINTER. An op without one gets inference,
+    and a context cannot smuggle a symbol list in by another route."""
+    from backend.core.ouroboros.governance.candidate_generator import (
+        _declared_symbols_for,
+    )
+
+    class _Bare:
+        evidence = {}
+
+    class _Forged:
+        # A fabricated field naming a target directly, with no goal_id.
+        evidence = {"target_symbols": ["_should_use_lean_prompt"]}
+
+    assert _declared_symbols_for(_Bare(), _PATH) == ()
+    assert _declared_symbols_for(_Forged(), _PATH) == ()

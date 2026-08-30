@@ -25,6 +25,10 @@ dist/
 .env.production.local
 .env.*.bak
 .env.bak
+# Dated backups (.env.bak.20260828) match neither pattern above: one is an
+# exact name, the other demands a .bak SUFFIX. An untracked file here makes the
+# tree dirty, and a dirty tree blocks battle-test accumulation branch creation.
+.env.bak*
 
 # IDE files
 # `.vscode/*`, NOT `.vscode/` — git does not descend into an ignored

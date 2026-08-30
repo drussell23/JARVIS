@@ -3159,7 +3159,7 @@ def _declared_symbols_for(context: Any, file_path: str) -> Tuple[str, ...]:
             return ()
 
         from backend.core.ouroboros.governance.delegated_provenance import (
-            _verified_roadmap,  # noqa: PLC0415 — verifies signature internally
+            _verified_roadmap,  # noqa: PLC0415 — REPORTS a verdict; see below
         )
         # (verdict, document) — NOT the other way round. Getting this
         # backwards yields a verdict object with no `.goals`, and the broad
@@ -3167,7 +3167,19 @@ def _declared_symbols_for(context: Any, file_path: str) -> Tuple[str, ...]:
         # empty result: declared symbols would simply never work, with nothing
         # in the log to say why.
         _verdict, doc = _verified_roadmap()
-        if doc is None:
+        # It RETURNS THE DOCUMENT REGARDLESS OF VERDICT — it reports
+        # verification, it does not enforce it. Gating on `doc is None` alone
+        # would honour a roadmap whose signature is invalid, tampered or absent
+        # and hand back its symbols at confidence 1.0 — precisely the forgery
+        # this function's pointer-only contract exists to prevent, and it would
+        # silently defeat an operator's JARVIS_ROADMAP_READER_REQUIRE_SIGNATURE.
+        # Demand BOTH properties, the same pair `delegated_provenance` demands
+        # of this same call: the cryptographic fact AND the verdict, because the
+        # reader permits an unsigned dev-mode (REQUIRE_SIGNATURE=false) that
+        # must never confer a target.
+        if doc is None or not bool(getattr(doc, "signature_valid", False)):
+            return ()
+        if str(getattr(_verdict, "value", _verdict)) != "valid":
             return ()
         for goal in getattr(doc, "goals", ()) or ():
             if getattr(goal, "goal_id", "") != goal_id:
