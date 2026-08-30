@@ -2924,6 +2924,90 @@ class UnifiedIntakeRouter:
     # WAL crash recovery
     # ------------------------------------------------------------------
 
+
+    def _replay_ordering_enabled(self) -> bool:
+        """Master for authority-ordered WAL re-drain. Default ON.
+
+        Falsey restores raw insertion order byte-for-byte.
+        """
+        raw = (
+            os.environ.get("JARVIS_WAL_REPLAY_AUTHORITY_ORDER", "")
+            .strip()
+            .lower()
+        )
+        return raw in {"", "1", "true", "yes", "on"}
+
+    def _order_replay_by_authority(
+        self, pending: "List[WALEntry]", IE: Any
+    ) -> "List[WALEntry]":
+        """Order parked WAL rows by the SAME priority the live queue uses.
+
+        THE DEFECT THIS CLOSES. `_replay_wal` iterated `pending` in raw
+        insertion order. A row's position was therefore decided by WHEN the
+        pool happened to be full when it arrived — not by what it is. Under
+        sustained backpressure the parked set is dominated by background
+        sensor churn, so an operator's signed goal re-dispatches somewhere in
+        the middle of a queue of trivia, every drain, forever. Admission was
+        fixed at intake step 4; this is the second half of the same problem,
+        one layer down: winning the door does not help if the re-drain then
+        deals you back into the pack.
+
+        NO NEW PRIORITY VOCABULARY. Ordinary rows are scored by the module's
+        own `_compute_priority` — the identical function the live queue uses,
+        so replay order and queue order cannot drift into disagreement.
+        Authority-backed rows take `_sovereign_human_priority()`, the existing
+        dynamic anchor whose docstring already states the invariant this needs
+        ("a live human intent can never be starved"): it is derived from
+        `_PRIORITY_MAP`'s own floor with an env-tunable margin, so nothing here
+        is a hardcoded tier.
+
+        STABILITY IS LOAD-BEARING. Python's sort is stable, so rows of equal
+        priority keep their insertion order — the ordering ADDS a tier
+        discipline over FIFO rather than replacing it with churn, and a drain
+        that repeats cannot reshuffle equals into a different order each time.
+
+        NEVER RAISES. A row whose envelope will not rebuild, or whose scoring
+        throws, keeps a neutral key and stays in place; any failure of the sort
+        as a whole returns `pending` untouched. The replay path must survive a
+        malformed row, because the alternative is losing durably parked work.
+        """
+        if not self._replay_ordering_enabled() or len(pending) < 2:
+            return pending
+        try:
+            neutral = 0
+            try:
+                neutral = max(_PRIORITY_MAP.values()) + 1
+            except (ValueError, TypeError):
+                neutral = 100
+
+            def _key(entry: Any) -> int:
+                try:
+                    envelope = IE.from_dict(entry.envelope_dict)
+                except Exception:  # noqa: BLE001 — unrebuildable: leave in place
+                    return neutral
+                try:
+                    if _carries_verified_operator_authority(envelope):
+                        return _sovereign_human_priority()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    score, _ = _compute_priority(envelope)
+                    return int(score)
+                except Exception:  # noqa: BLE001
+                    return neutral
+
+            ordered = sorted(pending, key=_key)
+            if ordered and ordered[0] is not pending[0]:
+                logger.info(
+                    "[Router] wal_replay_reordered n=%d head_moved=True "
+                    "(authority/priority ahead of insertion order)",
+                    len(ordered),
+                )
+            return ordered
+        except Exception:  # noqa: BLE001 — ordering is an optimisation, never a risk
+            logger.debug("[Router] replay ordering skipped", exc_info=True)
+            return pending
+
     async def _replay_wal(
         self, pending: Optional[List[WALEntry]] = None
     ) -> None:
@@ -2942,6 +3026,7 @@ class UnifiedIntakeRouter:
         logger.info("Router: replaying %d pending WAL entries", len(pending))
         from .intent_envelope import IntentEnvelope as IE
 
+        pending = self._order_replay_by_authority(pending, IE)
         for entry in pending:
             try:
                 envelope = IE.from_dict(entry.envelope_dict)
