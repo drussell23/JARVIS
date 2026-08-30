@@ -10400,6 +10400,7 @@ class ClaudeProvider:
                     first_token_ms=_first_token_ms,
                     thinking_reason=_thinking_reason_out,
                     tool_records=(), venom_edits=(),
+                    prompt_text=prompt_text,
                 )
 
             _gate_gr, _gate_outcome = await _cached_or_generate(
@@ -10618,6 +10619,7 @@ class ClaudeProvider:
             thinking_reason=_thinking_reason_out,
             tool_records=tool_records,
             venom_edits=venom_edits,
+            prompt_text=prompt_text,
         )
 
     async def _assemble_codegen_prompt(
@@ -10737,11 +10739,16 @@ class ClaudeProvider:
         thinking_reason: List[str],
         tool_records: Tuple[Any, ...],
         venom_edits: Tuple[Dict[str, Any], ...],
+        prompt_text: str = "",
     ) -> GenerationResult:
         """Zero-Waste S1 (D2) extract — post-raw result parsing +
         token/cost finalize. Shared by :meth:`generate`'s normal
         return path and the S1 gate's ``_no_tools_inner`` thunk.
-        Pure: takes everything it needs as args (no nonlocal)."""
+        Pure: takes everything it needs as args (no nonlocal).
+
+        ``prompt_text`` is carried only so the trajectory recorder can
+        pair the prompt with the candidates it produced; it is additive
+        and defaults empty, so nothing else about this seam changes."""
         duration = time.monotonic() - start
         source_hash = ""
         source_path = (
@@ -10830,9 +10837,38 @@ class ClaudeProvider:
                 _s2_rec_exc,
             )
         # ───────────────────────────────────────────────────────────
-        return result.with_tool_records(
+        _final = result.with_tool_records(
             tool_records
         ).with_venom_edits(venom_edits)
+        # ── Trajectory recorder — half of a preference pair ─────────
+        # This is the ONE funnel both the normal return path and the
+        # cache thunk pass through, so recording here covers every
+        # generation without a second call site. The verdict half is
+        # emitted from the orchestrator's OP_TERMINAL hook and joined
+        # by op_id inside the recorder. Non-blocking (put_nowait),
+        # master-gated default-OFF, NEVER raises.
+        try:
+            from backend.core.ouroboros.governance.observability.trajectory_recorder import (  # noqa: E501
+                record_generation as _traj_record_generation,
+            )
+            _traj_record_generation(
+                op_id=str(getattr(context, "op_id", "") or ""),
+                prompt=prompt_text,
+                generation_result=_final,
+                latency_ms=duration * 1000.0,
+                # Deliberately NOT one of dpo_pair_generator's
+                # specialist_models keys: that tiebreaker should stay
+                # neutral until a mapping is justified by evidence.
+                task_type="code_repair",
+                session_id=str(getattr(context, "session_id", "") or ""),
+                route=(_route_str if _route_str != "?" else "standard"),
+            )
+        except Exception as _traj_exc:  # noqa: BLE001 — fail-open
+            logger.debug(
+                "[TrajectoryRecorder] generation emit degraded: %s",
+                _traj_exc,
+            )
+        return _final
 
     async def health_probe(self) -> bool:
         """Lightweight API ping. Returns True if API responds.

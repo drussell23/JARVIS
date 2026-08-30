@@ -3329,6 +3329,36 @@ class GovernedOrchestrator:
                 logger.debug(
                     "[Phase8Wiring] terminal hooks failed", exc_info=True,
                 )
+            # ── Trajectory recorder — the verdict half of the pair ───
+            # Separate try/except from the Phase 8 hooks above: those
+            # are gated on their own master flags, and a failure there
+            # must not silently swallow this emit (or the reverse).
+            # The recorder joins this to the candidates by op_id.
+            # Non-blocking, master-gated default-OFF, NEVER raises.
+            try:
+                from backend.core.ouroboros.governance.observability.trajectory_recorder import (  # noqa: E501
+                    record_outcome as _traj_record_outcome,
+                )
+                _traj_final_ctx = _phase8_terminal_ctx
+                _traj_record_outcome(
+                    op_id=str(
+                        getattr(_traj_final_ctx, "op_id", "") or ""
+                    ),
+                    terminal_phase=(
+                        _traj_final_ctx.phase.name
+                        if hasattr(_traj_final_ctx, "phase") else ""
+                    ),
+                    terminal_reason=str(
+                        getattr(
+                            _traj_final_ctx, "terminal_reason_code", "",
+                        ) or ""
+                    ),
+                )
+            except Exception:
+                logger.debug(
+                    "[TrajectoryRecorder] terminal emit degraded",
+                    exc_info=True,
+                )
             # Finalize the cost-governor entry no matter how the op ended.
             # This also logs the full summary (cap, cumulative, per-provider
             # breakdown) at DEBUG for postmortem analysis.
