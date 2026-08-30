@@ -5746,6 +5746,21 @@ class CandidateGenerator:
                 "[CandidateGenerator] Context-Hardware Negotiator: VRAM-safe "
                 "num_ctx=%d for the 32B at %s op=%s", _num_ctx, endpoint, _op,
             )
+            # PUBLISH the negotiated window. It was previously a local override
+            # that died with this dispatch, so every client built outside this
+            # path -- L2 Repair's most consequentially -- saw `num_ctx=None`,
+            # lost the streaming inter-token watchdog, and fell to the legacy
+            # total-duration branch with a cold seed sized for a small model.
+            # One negotiation, every consumer: no duplicated VRAM probe, no
+            # second policy, and nothing static (absent a negotiation the
+            # registry stays empty and behaviour is unchanged).
+            try:
+                from backend.core.ouroboros.governance.local_inference_director import (  # noqa: PLC0415, E501
+                    publish_negotiated_num_ctx as _pub_ctx,
+                )
+                _pub_ctx(endpoint, int(_num_ctx))
+            except Exception:  # noqa: BLE001 — publication is additive
+                pass
 
         # Stateful, session-scoped Latency Profiler kept PER ENDPOINT on this
         # generator (EWMA survives across ops + L7 retries -- cures profiler
