@@ -64,6 +64,7 @@ _DECOMP_LEDGER_FLAG = "JARVIS_GOAL_DECOMPOSITION_LEDGER_PATH"
 #   orchestrator ledger = "...ORCHESTRATION_LEDGER_PATH"
 #   orchestrator completion ledger reader =
 #                    "...ORCHESTRATION_COMPLETION_LEDGER_PATH"
+_READER_LEDGER_FLAG = "JARVIS_ROADMAP_READER_LEDGER_PATH"
 _ORCH_LEDGER_FLAG = "JARVIS_MULTI_STEP_ORCHESTRATION_LEDGER_PATH"
 _ORCH_COMPLETION_LEDGER_FLAG = (
     "JARVIS_MULTI_STEP_ORCHESTRATION_COMPLETION_LEDGER_PATH"
@@ -85,7 +86,8 @@ def _isolate(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> Iterator[None]:
-    """Enable all 4 master flags + redirect every ledger to tmp."""
+    """Enable all 4 master flags + redirect every ledger AND the roadmap
+    source to tmp. "Every" is load-bearing: it was previously only three."""
     monkeypatch.setenv(_MASTER_FLAG, "true")
     monkeypatch.setenv(_READER_MASTER, "true")
     monkeypatch.setenv(_DECOMP_MASTER, "true")
@@ -106,6 +108,24 @@ def _isolate(
     monkeypatch.setenv(
         _ORCH_COMPLETION_LEDGER_FLAG,
         str(tmp_path / "goal_decomp_ledger.jsonl"),
+    )
+    # The RoadmapReader's own audit ledger. Omitting it did not fail a test —
+    # it appended fixture rows (goal_id "g-idem", operator_id
+    # "test@operator.local") to the PRODUCTION
+    # `.jarvis/roadmap_reader_ledger.jsonl` on every run, so a §8 append-only
+    # audit of operator intent silently accumulated events no operator caused.
+    # Nothing reads this ledger back, which is exactly why it went unnoticed:
+    # the damage is to the audit trail's truthfulness, not to control flow.
+    monkeypatch.setenv(
+        _READER_LEDGER_FLAG,
+        str(tmp_path / "roadmap_reader_ledger.jsonl"),
+    )
+    # Pin the roadmap SOURCE too. `_READER_PATH_FLAG` was declared and never
+    # used, leaving reads to fall through to the production `.jarvis/`
+    # roadmap — so these tests' results depended on an operator's live file.
+    monkeypatch.setenv(
+        _READER_PATH_FLAG,
+        str(tmp_path / "roadmap.yaml"),
     )
     yield
 
