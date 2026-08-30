@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from backend.core.ouroboros.governance.operation_id import generate_operation_id
 
@@ -297,6 +297,84 @@ _URGENCY_BOOST: Dict[str, int] = {
 
 # Sources that bypass backpressure
 _BACKPRESSURE_EXEMPT = frozenset({"voice_human", "test_failure"})
+
+
+def _operator_authority_exemption_enabled() -> bool:
+    """Master for the signed-intent backpressure exemption. Default ON.
+
+    Falsey restores the pre-existing behaviour exactly: the static
+    ``_BACKPRESSURE_EXEMPT`` set alone decides, and an operator's signed goal
+    parks behind sensor noise as before.
+    """
+    raw = (
+        os.environ.get("JARVIS_SIGNED_INTENT_BACKPRESSURE_EXEMPT", "")
+        .strip()
+        .lower()
+    )
+    return raw in {"", "1", "true", "yes", "on"}
+
+
+def _carries_verified_operator_authority(envelope: Any) -> bool:
+    """True iff *envelope* traces to a goal in a CRYPTOGRAPHICALLY VERIFIED
+    operator roadmap.
+
+    WHY THIS IS NOT ``source == "roadmap"``. The static exemption set encodes
+    one idea — a signal carrying HUMAN authority must not be parked behind
+    machine-generated work. ``voice_human`` is a person speaking now;
+    ``test_failure`` is a runtime fire. An operator-signed goal is delegated
+    human intent, and belongs in that category. But the SOURCE NAME is not the
+    authority: the SIGNATURE is. A roadmap read under dev-mode
+    (``REQUIRE_SIGNATURE=false``), or one an attacker dropped into ``.jarvis/``,
+    presents the identical ``source="roadmap"`` string. Exempting on the name
+    would let unsigned work preempt the queue — the same forgery class the
+    declared-symbol path had to close.
+
+    So authority is RE-DERIVED from ground truth on every call. The envelope
+    contributes only a ``goal_id`` POINTER; the verdict, the signature bytes,
+    and the goal's presence are all read back from the verified document. A
+    fabricated evidence block names a goal that must still exist in a roadmap
+    whose HMAC validates, or it earns nothing.
+
+    Cost is not a concern despite re-deriving: the caller short-circuits, so
+    this runs ONLY when the queue is already past its backpressure threshold
+    AND the source was not already statically exempt — the rare path, never
+    the hot one.
+
+    NEVER raises. Anything unprovable returns False, which means the envelope
+    stays subject to backpressure exactly as before — fail-closed, so a broken
+    reader degrades to the old behaviour rather than opening the gate.
+    """
+    if not _operator_authority_exemption_enabled():
+        return False
+    try:
+        evidence = getattr(envelope, "evidence", None)
+        if not isinstance(evidence, Mapping):
+            return False
+        claim = evidence.get("provenance")
+        if not isinstance(claim, Mapping):
+            return False
+        goal_id = str(claim.get("goal_id", "")).strip()
+        if not goal_id:
+            return False
+
+        from backend.core.ouroboros.governance.delegated_provenance import (  # noqa: PLC0415, E501
+            _verified_roadmap,
+        )
+        verdict, doc = _verified_roadmap()
+        # Both properties, the pair `delegated_provenance` demands of this same
+        # call: the verdict AND the cryptographic fact. The reader permits an
+        # unsigned dev-mode that can report `valid` for a document carrying no
+        # signature at all.
+        if doc is None or not bool(getattr(doc, "signature_valid", False)):
+            return False
+        if str(getattr(verdict, "value", verdict)) != "valid":
+            return False
+        for goal in getattr(doc, "goals", ()) or ():
+            if str(getattr(goal, "goal_id", "")) == goal_id:
+                return True
+        return False
+    except Exception:  # noqa: BLE001 — unprovable => no exemption
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1522,9 +1600,23 @@ class UnifiedIntakeRouter:
                 return "queued_behind"
 
         # 4. Backpressure check
+        # Order matters and is load-bearing. The depth probe is cheap and the
+        # authority check re-reads + verifies the roadmap, so the expensive
+        # term is LAST: it evaluates only for a non-exempt source that is
+        # actually about to be rejected. On every healthy tick this short-
+        # circuits before it, costing nothing.
+        #
+        # Step 4 sits UPSTREAM of every adaptive mechanism below it — the
+        # SensorGovernor consult and the QoS aging/starvation escalation at 4b
+        # both live after this return. A signal bounced here never reaches the
+        # machinery designed to rescue a starved one, which is how an
+        # operator's signed goal parked 146 times behind background sensor
+        # noise in soak bt-2026-08-30-072704 while the reader ledger recorded
+        # it as emitted (`idempotency_key: "backpressure"` — this literal).
         if (
             envelope.source not in _BACKPRESSURE_EXEMPT
             and self.intake_queue_depth() >= self._config.backpressure_threshold
+            and not _carries_verified_operator_authority(envelope)
         ):
             return "backpressure"
 
