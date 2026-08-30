@@ -3129,6 +3129,50 @@ def _truncation_reshape_enabled() -> bool:
     return _envb("JARVIS_TRUNCATION_RESHAPE_ENABLED", True)
 
 
+def _provenance_claim_from_ctx(context: Any) -> Optional[Mapping]:
+    """The op's roadmap provenance CLAIM, read from where it actually rides.
+
+    THE CARRIER IS NOT `ctx.evidence`. `roadmap_reader` attaches the claim to
+    the ENVELOPE (`evidence["provenance"] = claim_for_goal(goal.goal_id)`), and
+    the dispatch path snapshots that dict onto `ctx.intake_evidence_json` — a
+    JSON STRING. An `OperationContext` has no `.evidence` mapping at all, so a
+    reader written against one always saw nothing and silently degraded to
+    inference.
+
+    Measured, soak bt-2026-08-30-145744: the operator's signed goal reached
+    the resolver and came back `goal_keyword (conf=1.00)` — the right symbol,
+    found by scoring prose, while the DECLARATION that names it exactly sat
+    unread one attribute away. The declared pass has therefore never fired in
+    production; it was reachable only from tests that hand-built a context
+    with a `.evidence` dict no dispatch path produces. That is the same shape
+    as the `Mapping`-import defect: a feature that cannot work, with nothing
+    in the log to say so.
+
+    Reads the JSON carrier FIRST (the production shape, exactly as
+    `_swarm_frames_from_ctx` does with the same attribute — one parsing idiom
+    for one field), then falls back to a live `.evidence` mapping for callers
+    that hold an envelope-shaped object. NEVER raises; any miss returns None
+    and the resolver's inference cascade runs unchanged.
+    """
+    raw = getattr(context, "intake_evidence_json", "") or ""
+    if raw:
+        try:
+            import json as _json  # noqa: PLC0415
+            data = _json.loads(raw)
+            if isinstance(data, Mapping):
+                claim = data.get("provenance")
+                if isinstance(claim, Mapping):
+                    return claim
+        except (ValueError, TypeError):
+            pass
+    evidence = getattr(context, "evidence", None)
+    if isinstance(evidence, Mapping):
+        claim = evidence.get("provenance")
+        if isinstance(claim, Mapping):
+            return claim
+    return None
+
+
 def _declared_symbols_for(context: Any, file_path: str) -> Tuple[str, ...]:
     """Operator-declared repair targets for *file_path*, from the SIGNED goal.
 
@@ -3148,10 +3192,7 @@ def _declared_symbols_for(context: Any, file_path: str) -> Tuple[str, ...]:
     simply absent, and absence degrades to inference.
     """
     try:
-        claim = None
-        evidence = getattr(context, "evidence", None)
-        if isinstance(evidence, Mapping):
-            claim = evidence.get("provenance")
+        claim = _provenance_claim_from_ctx(context)
         if not isinstance(claim, Mapping):
             return ()
         goal_id = str(claim.get("goal_id", "")).strip()
@@ -3678,6 +3719,71 @@ class CandidateGenerator:
         # ``self._counters`` above.
         from ._governance_state import get_jprime_state
         self._jprime_state = get_jprime_state()
+
+    # ------------------------------------------------------------------
+    # Swarm generation client — resolved, never assigned
+    # ------------------------------------------------------------------
+    @property
+    def _client(self) -> Any:
+        """The provider the symbol-sliced swarm path generates through.
+
+        THIS ATTRIBUTE NEVER EXISTED. `ce141a7af8` wired the Agentic Swarm
+        seam with three reads of `self._client` and no writer anywhere in the
+        class, which sets `_primary` / `_fallback` / `_tier0` / `_jprime`. The
+        path could not crash while nothing reached it: five upstream gates
+        (the §33.1 master, the A1 breaker, intake backpressure, WAL re-drain
+        order, pool capacity) each stopped the first operator-signed goal
+        before generation. Soak bt-2026-08-30-145744 cleared the last of them
+        and the seam raised `AttributeError` on its first execution ever.
+
+        LOCAL FIRST, AND NOT AS A PREFERENCE. Binding this to `_primary`
+        would have been the obvious repair and the wrong one: on a host whose
+        cloud tiers answer 402, `_primary` is a funded-endpoint handle with no
+        funding. That trades an AttributeError for a payment failure — the
+        same dead end, wearing a costlier and more confusing error. The
+        resident model is not a fallback here; it is the lane that can
+        actually serve.
+
+        Resolution order — local, then whatever else is configured:
+
+          1. `_jprime`  — the resident zero-marginal-cost lane. Chosen when it
+             can generate, which on a free-lane host is the only true answer.
+             `_free_lane_active()` is consulted for TELEMETRY-grade certainty
+             (it means "local is the ONLY lane"), never as a gate: a host that
+             has both should still spend nothing on a pure-completion node
+             repair.
+          2. `_primary`, `_tier0`, `_fallback` — in the class's own declared
+             order, for a deployment where local inference is unconfigured.
+
+        Every candidate must expose `generate`; a handle that does not is
+        skipped rather than returned, because returning it only defers the
+        AttributeError to a deeper frame. `None` when nothing qualifies —
+        the caller declines the swarm and the standard route runs unchanged,
+        which is the same outcome as before this property existed.
+
+        A PROPERTY, NOT AN ASSIGNMENT, because the answer is not fixed for
+        the life of the generator: a lane can be reconfigured, and a
+        credential can appear mid-session (`_free_lane_active` re-reads `.env`
+        on a TTL for exactly that reason). Resolving per access keeps this
+        honest; caching it would pin a stale topology.
+        """
+        for name in ("_jprime", "_primary", "_tier0", "_fallback"):
+            handle = getattr(self, name, None)
+            if handle is None:
+                continue
+            if not callable(getattr(handle, "generate", None)):
+                continue
+            if name == "_jprime":
+                try:
+                    logger.debug(
+                        "[CandidateGenerator] swarm client=local jprime "
+                        "free_lane=%s", _free_lane_active(),
+                    )
+                except Exception:  # noqa: BLE001 — telemetry only
+                    pass
+            return handle
+        return None
+
         self._jprime_sem = self._jprime_state.jprime_sem
         self._jprime_counters = self._jprime_state.counters
 
