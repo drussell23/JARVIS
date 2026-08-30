@@ -2475,14 +2475,35 @@ class GovernedLoopService:
                             _a1_router_is_ready = None
                             _a1_get_bus = None
                         if _a1_await_ready is not None:
+                            # 600s, not 60s. This budget is not the router's
+                            # own work — it is everything the router waits
+                            # BEHIND during a cold boot: 24 sensors
+                            # registering, the embedding service loading its
+                            # ONNX weights, the Aegis daemon binding a port.
+                            # Measured on the reference workstation (soak
+                            # bt-2026-08-30-070418): the breaker fired at
+                            # +2m12s while the wall-clock watchdog did not
+                            # arm until +4m38s, and full boot ran 6-7 min. A
+                            # 60s budget could therefore NEVER be met on that
+                            # host, so the very first sanctioned roadmap goal
+                            # aborted before the daemon emitted anything.
+                            #
+                            # The breaker itself is correct and stays: on a
+                            # clean not-ready it raises rather than looping a
+                            # goal into a void (the A1 run #15 silent-DLQ).
+                            # Only its calibration was wrong — it was sized
+                            # for a warm process, not a cold organism. A
+                            # too-SHORT deadline on a boot path is not a
+                            # safety property; it is an outage that reports
+                            # itself as one.
                             try:
                                 _a1_timeout = float(
                                     (os.environ.get(
                                         "JARVIS_A1_ROUTER_READY_TIMEOUT_S", ""
-                                    ) or "60").strip()
+                                    ) or "600").strip()
                                 )
                             except (TypeError, ValueError):
-                                _a1_timeout = 60.0
+                                _a1_timeout = 600.0
                             # Task 2 — CIRCUIT BREAKER: capture the readiness
                             # result. Fail-OPEN only on an UNEXPECTED valve error
                             # (infra hiccup) so a transient bus glitch doesn't
