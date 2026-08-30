@@ -2757,6 +2757,21 @@ class UnifiedIntakeRouter:
             _a1trace("submit", ctx.op_id, target="GLS")
         except Exception:  # noqa: BLE001
             pass
+        # AUTHORITY STAMP. The pool cannot re-verify an HMAC on its submit
+        # path -- it has no roadmap reader and no business growing one. So the
+        # layer that ALREADY established authority at intake step 4 records
+        # the finding on the context, and the pool reads the finding. Same
+        # trust boundary as `provider_route`: an internal field set by the
+        # component that computed it, never parsed from an outside claim.
+        # Absent or False => the op is ordinary, which is the old behaviour.
+        try:
+            setattr(
+                ctx,
+                "operator_authority",
+                bool(_carries_verified_operator_authority(envelope)),
+            )
+        except Exception:  # noqa: BLE001 — a stamp must never fail a submit
+            pass
         try:
             _submit_fn = getattr(self._gls, "submit_background", None)
             if _submit_fn is not None:

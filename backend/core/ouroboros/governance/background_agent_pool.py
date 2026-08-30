@@ -753,6 +753,40 @@ class BackgroundAgentPool:
 
     # -- Submit / Query ------------------------------------------------------
 
+    def _authority_headroom_slots(self) -> int:
+        """Slots reserved for authority-backed work. Dynamic, never a constant.
+
+        A RATIO of the configured queue size (``JARVIS_BG_AUTHORITY_HEADROOM_
+        RATIO``, default 0.125 -> 2 of 16) so it tracks the pool as the
+        operator sizes it. Floored at 1 so any queue of two or more keeps a
+        lane open, and capped at ``_queue_size - 1`` so the reservation can
+        never starve ordinary work to a standstill. NEVER raises.
+        """
+        try:
+            size = int(self._queue_size)
+        except (TypeError, ValueError):
+            return 0
+        if size < 2:
+            return 0                      # nothing to partition
+        try:
+            raw = os.environ.get(
+                "JARVIS_BG_AUTHORITY_HEADROOM_RATIO", ""
+            ).strip()
+            ratio = float(raw) if raw else 0.125
+        except (TypeError, ValueError):
+            ratio = 0.125
+        if ratio <= 0.0:
+            return 0                      # explicitly disabled
+        slots = int(round(size * ratio))
+        return max(1, min(slots, size - 1))
+
+    def _ordinary_soft_capacity(self) -> int:
+        """Queue depth beyond which ordinary (unsigned) work is deferred."""
+        try:
+            return max(1, int(self._queue_size) - self._authority_headroom_slots())
+        except (TypeError, ValueError):
+            return max(1, int(getattr(self, "_queue_size", 1) or 1))
+
     async def submit(self, op_context: OperationContext) -> str:
         """Submit an operation for background processing.
 
@@ -804,6 +838,38 @@ class BackgroundAgentPool:
         else:
             _priority = _ROUTE_PRIORITY.get(_route, 3)
         self._submit_counter += 1
+
+        # ── AUTHORITY HEADROOM ────────────────────────────────────────────
+        # `put_nowait` on a bounded queue rejects by CAPACITY, and capacity is
+        # priority-blind: a sovereign-priority op is refused exactly like
+        # trivia once the queue is full. The `_priority` computed above
+        # governs DEQUEUE ORDER only, so it cannot help an op that was never
+        # admitted. Measured, soak bt-2026-08-30-093912: an operator's signed
+        # goal reached the HEAD of the WAL re-drain (`wal_replay_reordered
+        # head_moved=True`) and still never dispatched -- 215
+        # `pool_capacity_full` parks -- because being first in line does not
+        # help when the line never moves.
+        #
+        # So ordinary work is capped BELOW the hard queue bound, leaving a
+        # reserve that only authority-backed work may enter. This is the same
+        # admission-partition idea the router applies at intake, one layer
+        # down, and it is what makes the priority tiers above actually
+        # reachable under saturation.
+        #
+        # The reserve is derived from the CONFIGURED capacity, never a fixed
+        # count: a ratio of `_queue_size`, floored at one slot so any pool of
+        # two or more always keeps a lane open, and clamped to leave at least
+        # one slot for ordinary work so background traffic can never be
+        # starved to a standstill by the reservation itself.
+        if not bool(getattr(op_context, "operator_authority", False)):
+            _soft_cap = self._ordinary_soft_capacity()
+            if self._queue.qsize() >= _soft_cap:
+                raise QueueFullError(
+                    f"Background queue at ordinary-work capacity "
+                    f"({self._queue.qsize()}/{_soft_cap} of "
+                    f"{self._queue_size}; authority headroom reserved). "
+                    f"Operation {op_id} deferred."
+                )
 
         try:
             self._queue.put_nowait((_priority, self._submit_counter, op))
