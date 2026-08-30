@@ -59,7 +59,10 @@ import time
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Dict, List, NoReturn, Optional, Protocol, Tuple, runtime_checkable
+from typing import (
+    Any, Dict, List, Mapping, NoReturn, Optional, Protocol, Tuple,
+    runtime_checkable,
+)
 
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
@@ -3126,6 +3129,75 @@ def _truncation_reshape_enabled() -> bool:
     return _envb("JARVIS_TRUNCATION_RESHAPE_ENABLED", True)
 
 
+def _declared_symbols_for(context: Any, file_path: str) -> Tuple[str, ...]:
+    """Operator-declared repair targets for *file_path*, from the SIGNED goal.
+
+    Re-derived from ground truth on every call — the op's evidence contributes
+    only a POINTER (``goal_id``), exactly as `verify_provenance_claim` treats
+    it. Reading the symbol list off the context instead would let a fabricated
+    or hallucinated field name a target the operator never authorised, which
+    is the forgery class Slice 20 exists to prevent.
+
+    Scope is enforced twice over: the goal must be signature-valid, and the
+    file must be inside that goal's own ``target_files``. A declaration cannot
+    reach a file the mandate does not cover.
+
+    Returns () for every op without a verified roadmap claim — which is almost
+    all of them — so the resolver's inference cascade is unchanged for
+    everything else. NEVER raises: a declaration that cannot be proven is
+    simply absent, and absence degrades to inference.
+    """
+    try:
+        claim = None
+        evidence = getattr(context, "evidence", None)
+        if isinstance(evidence, Mapping):
+            claim = evidence.get("provenance")
+        if not isinstance(claim, Mapping):
+            return ()
+        goal_id = str(claim.get("goal_id", "")).strip()
+        if not goal_id:
+            return ()
+
+        from backend.core.ouroboros.governance.delegated_provenance import (
+            _verified_roadmap,  # noqa: PLC0415 — REPORTS a verdict; see below
+        )
+        # (verdict, document) — NOT the other way round. Getting this
+        # backwards yields a verdict object with no `.goals`, and the broad
+        # except below would have swallowed the AttributeError into a silent
+        # empty result: declared symbols would simply never work, with nothing
+        # in the log to say why.
+        _verdict, doc = _verified_roadmap()
+        # It RETURNS THE DOCUMENT REGARDLESS OF VERDICT — it reports
+        # verification, it does not enforce it. Gating on `doc is None` alone
+        # would honour a roadmap whose signature is invalid, tampered or absent
+        # and hand back its symbols at confidence 1.0 — precisely the forgery
+        # this function's pointer-only contract exists to prevent, and it would
+        # silently defeat an operator's JARVIS_ROADMAP_READER_REQUIRE_SIGNATURE.
+        # Demand BOTH properties, the same pair `delegated_provenance` demands
+        # of this same call: the cryptographic fact AND the verdict, because the
+        # reader permits an unsigned dev-mode (REQUIRE_SIGNATURE=false) that
+        # must never confer a target.
+        if doc is None or not bool(getattr(doc, "signature_valid", False)):
+            return ()
+        if str(getattr(_verdict, "value", _verdict)) != "valid":
+            return ()
+        for goal in getattr(doc, "goals", ()) or ():
+            if getattr(goal, "goal_id", "") != goal_id:
+                continue
+            targets = tuple(getattr(goal, "target_files", ()) or ())
+            if targets and not any(
+                str(file_path).replace("\\", "/").endswith(
+                    str(t).replace("\\", "/").lstrip("./")
+                )
+                for t in targets
+            ):
+                return ()  # declaration does not cover this file
+            return tuple(getattr(goal, "target_symbols", ()) or ())
+    except Exception:  # noqa: BLE001 — unprovable ⇒ infer, never fabricate
+        return ()
+    return ()
+
+
 def _local_primary_enabled() -> bool:
     """Master for serving ANY route on the local lane when no paid lane exists.
 
@@ -4337,6 +4409,11 @@ class CandidateGenerator:
             traceback_frames=self._swarm_frames_from_ctx(context),
             source_loci=target_files,
             goal=getattr(context, "description", "") or "",
+            # Operator-declared targets from the SIGNED roadmap goal this op
+            # traces to. Re-derived from ground truth at read time rather than
+            # taken off the op, so a fabricated context field cannot inject a
+            # target the operator never authorised.
+            declared_symbols=_declared_symbols_for(context, path),
         )
         if not res.resolved:
             logger.info(

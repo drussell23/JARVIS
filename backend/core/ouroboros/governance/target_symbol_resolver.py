@@ -61,6 +61,7 @@ _DEFAULT_MAX_CLUSTER = 6
 _MAX_PRIMARY_ENV = "JARVIS_SYMBOL_RESOLVER_MAX_PRIMARY"
 _DEFAULT_MAX_PRIMARY = 4
 
+METHOD_DECLARED = "declared_symbol"
 METHOD_STACK_TRACE = "stack_trace"
 METHOD_GOAL_KEYWORD = "goal_keyword"
 METHOD_UNRESOLVED = "unresolved"
@@ -312,6 +313,7 @@ def resolve_target_symbols(
     traceback_frames: Sequence[str] = (),
     source_loci: Sequence[str] = (),
     goal: str = "",
+    declared_symbols: Sequence[str] = (),
     min_confidence: Optional[float] = None,
     expand_cluster: Optional[bool] = None,
 ) -> ResolutionResult:
@@ -336,25 +338,76 @@ def resolve_target_symbols(
             "PlanGenerator._extract_symbols", file_path, len(top_level_universe),
         )
 
-    # ── Pass 1: deterministic stack-trace mapping ──
     primaries: List[_SymDef] = []
     method = METHOD_UNRESOLVED
     confidence = 0.0
     loci = {os.path.basename(p) for p in source_loci or ()}
-    for frame_file, line, func in _parse_frames(traceback_frames):
-        in_this_file = _file_matches(frame_file, file_path) or (
-            os.path.basename(frame_file) in loci and os.path.basename(frame_file) == os.path.basename(file_path)
-        )
-        if not in_this_file:
-            continue
-        hit = _enclosing(index, line)
-        if hit is None and func in by_base:      # line drifted → func-name tie-break
-            hit = by_base[func]
-        if hit is not None and hit.name not in {p.name for p in primaries}:
-            primaries.append(hit)
-    if primaries:
-        method = METHOD_STACK_TRACE
-        confidence = 1.0
+
+    # ── Pass 0: operator-DECLARED symbols ──────────────────────────────────
+    # Ordered ahead of every inference pass because it is not an inference.
+    # A stack trace is evidence, a goal keyword is a guess, and a declared
+    # symbol is an INSTRUCTION — carried on a goal whose HMAC the risk engine
+    # has already verified before the op was allowed to exist at all.
+    #
+    # Measured cost of not having this (soak bt-2026-08-28-115654): a goal
+    # declaring `_should_use_lean_prompt` resolved instead to
+    # `_read_with_truncation` at confidence 0.50, because the only signal that
+    # reached here was prose and the prose said "truncation" more often than it
+    # said the symbol's name. The declaration existed; nothing read it.
+    #
+    # Confidence 1.0, matching METHOD_STACK_TRACE: both are facts rather than
+    # scores, so neither should be filterable by a confidence floor an operator
+    # raised to suppress weak keyword guesses.
+    #
+    # Names are matched against the file's OWN symbol index, so a declaration
+    # naming something absent from this file resolves nothing here and the
+    # inference passes still run — a typo degrades to the old behaviour instead
+    # of fabricating a target.
+    declared = tuple(
+        str(s).strip() for s in (declared_symbols or ()) if str(s).strip()
+    )
+    if declared:
+        _wanted = {d for d in declared}
+        for sym in index:
+            if sym.name in _wanted or sym.basename in _wanted:
+                if sym.name not in {p.name for p in primaries}:
+                    primaries.append(sym)
+        if primaries:
+            method = METHOD_DECLARED
+            confidence = 1.0
+            logger.info(
+                "[TargetSymbolResolver] %s: DECLARED target(s) honoured %s "
+                "(operator-signed; inference passes skipped)",
+                file_path, [p.name for p in primaries],
+            )
+        else:
+            logger.info(
+                "[TargetSymbolResolver] %s: declared symbol(s) %s not present "
+                "in this file — falling back to inference",
+                file_path, list(declared),
+            )
+
+    # ── Pass 1: deterministic stack-trace mapping ──
+    # Guarded on `not primaries` for the same reason Pass 2 already is: a
+    # declared target must not be widened by frames it did not ask for, and
+    # `if primaries:` below would otherwise relabel a DECLARED result as
+    # STACK_TRACE even with zero frames parsed — a resolution reporting a
+    # provenance it does not have.
+    if not primaries:
+        for frame_file, line, func in _parse_frames(traceback_frames):
+            in_this_file = _file_matches(frame_file, file_path) or (
+                os.path.basename(frame_file) in loci and os.path.basename(frame_file) == os.path.basename(file_path)
+            )
+            if not in_this_file:
+                continue
+            hit = _enclosing(index, line)
+            if hit is None and func in by_base:      # line drifted → func-name tie-break
+                hit = by_base[func]
+            if hit is not None and hit.name not in {p.name for p in primaries}:
+                primaries.append(hit)
+        if primaries:
+            method = METHOD_STACK_TRACE
+            confidence = 1.0
 
     # ── Pass 2: deterministic goal keyword match (NO LLM) ──
     if not primaries and goal.strip():
@@ -428,6 +481,7 @@ def _to_public(sym: _SymDef, *, is_cluster: bool) -> ResolvedSymbol:
 
 __all__ = [
     "METHOD_GOAL_KEYWORD",
+    "METHOD_DECLARED",
     "METHOD_STACK_TRACE",
     "METHOD_UNRESOLVED",
     "ResolutionResult",
