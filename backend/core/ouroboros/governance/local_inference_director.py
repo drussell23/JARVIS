@@ -16,7 +16,7 @@ import os
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from .memory_pressure_gate import PressureLevel, get_default_gate, is_enabled as memory_gate_enabled
@@ -727,6 +727,58 @@ class LatencyProfiler:
         return elapsed_ms > (m + 3.0 * sd_eff)
 
 
+# ---------------------------------------------------------------------------
+# Negotiated-context registry — one negotiation, every consumer
+# ---------------------------------------------------------------------------
+# The Context-Hardware Negotiator derives a VRAM-safe ``num_ctx`` from MEASURED
+# hardware, but it ran inside ONE dispatch path and its result died there as a
+# local override. `LocalConfig.from_env()` reads `JARVIS_LOCAL_NUM_CTX`, which
+# is deliberately unset on a machine that autodetects — so every client built
+# outside that path got ``num_ctx=None`` and fell to the legacy survival branch:
+# no streaming inter-token watchdog, and a flat cold seed sized for a small
+# model.
+#
+# Measured, soak bt-2026-08-30-155721: the main path negotiated
+# ``num_ctx=32768`` 69 times while L2 Repair -- calling the SAME provider object
+# by a different route -- timed out at ``budget=30000ms warm=False`` against a
+# cold 32B, cascading 7 ops into ``l2_cancelled``.
+#
+# Publishing the negotiated value per endpoint keeps ONE negotiation (no
+# duplicated VRAM probing, no second policy) and lets any client inherit it.
+# The value is never a constant: absent a negotiation, the registry is empty
+# and behaviour is byte-identical to before.
+_NEGOTIATED_NUM_CTX: Dict[str, int] = {}
+_NEGOTIATED_LOCK = threading.Lock()
+
+
+def publish_negotiated_num_ctx(endpoint: str, num_ctx: int) -> None:
+    """Record the Negotiator's VRAM-safe window for *endpoint*. NEVER raises."""
+    try:
+        key = str(endpoint or "").strip()
+        value = int(num_ctx or 0)
+        if not key or value <= 0:
+            return
+        with _NEGOTIATED_LOCK:
+            _NEGOTIATED_NUM_CTX[key] = value
+    except Exception:  # noqa: BLE001 — telemetry-grade, never fatal
+        return
+
+
+def negotiated_num_ctx(endpoint: str) -> Optional[int]:
+    """The negotiated window for *endpoint*, or None if never negotiated."""
+    try:
+        with _NEGOTIATED_LOCK:
+            return _NEGOTIATED_NUM_CTX.get(str(endpoint or "").strip())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def reset_negotiated_num_ctx_for_tests() -> None:
+    """Test hook — the registry is process-wide by design."""
+    with _NEGOTIATED_LOCK:
+        _NEGOTIATED_NUM_CTX.clear()
+
+
 class LocalLatencyLockup(RuntimeError):
     """Raised when local inference breaches the adaptive/ceiling timeout.
 
@@ -1261,6 +1313,35 @@ class LocalPrimeClient:
                              total_ms=total_ms, output_tokens=out_toks)
         return LocalCompletion(text=text, output_tokens=out_toks, ttft_ms=ttft_ms, total_ms=total_ms)
 
+    def _inherit_negotiated_num_ctx(self) -> None:
+        """Adopt this endpoint's negotiated window when this client has none.
+
+        A client built straight from env has ``num_ctx=None`` on a host that
+        autodetects, because the value is DERIVED from measured VRAM rather
+        than configured. Inheriting the published figure puts every consumer
+        -- L2 Repair included -- on the same streaming inter-token watchdog and
+        the same context-aware cold seed as the main dispatch path, instead of
+        the legacy total-duration branch.
+
+        Only ever FILLS A GAP: an explicitly configured or already-negotiated
+        window is left exactly as it is, so a caller that chose a smaller
+        window keeps it. No negotiation published => unchanged. NEVER raises.
+        """
+        try:
+            if self._cfg.num_ctx:
+                return
+            inherited = negotiated_num_ctx(getattr(self._cfg, "base_url", ""))
+            if not inherited:
+                return
+            self._cfg = _dc_replace(self._cfg, num_ctx=int(inherited))
+            logger.info(
+                "[LocalPrimeClient] inherited negotiated num_ctx=%d for %s "
+                "(streaming watchdog armed; legacy survival branch bypassed)",
+                int(inherited), getattr(self._cfg, "base_url", "?"),
+            )
+        except Exception:  # noqa: BLE001 — inheritance is additive, never fatal
+            return
+
     async def complete_guarded(self, *, system: str, user: str, prompt_tokens: int,
                                temperature: float = 0.2,
                                max_tokens: "Optional[int]" = None) -> LocalCompletion:
@@ -1268,6 +1349,7 @@ class LocalPrimeClient:
         # Inter-Token Watchdog inside _complete_streaming is the sole guard -- a
         # model that keeps emitting tokens runs indefinitely; only a STALL trips it.
         # This is the mathematically-robust replacement for guessing total latency.
+        self._inherit_negotiated_num_ctx()
         if self._cfg.num_ctx and _streaming_enabled():
             logger.info(
                 "[LocalPrimeClient] streaming generation (inter-token watchdog=%.0fs, "

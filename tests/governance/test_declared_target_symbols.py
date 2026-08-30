@@ -302,3 +302,122 @@ def test_an_op_with_no_provenance_pointer_declares_nothing(monkeypatch):
 
     assert _declared_symbols_for(_Bare(), _PATH) == ()
     assert _declared_symbols_for(_Forged(), _PATH) == ()
+
+# ---------------------------------------------------------------------------
+# The CARRIER.
+#
+# Every test above hands `_declared_symbols_for` an object with a `.evidence`
+# dict. No dispatch path produces one. `roadmap_reader` attaches the claim to
+# the ENVELOPE and the dispatch path snapshots it onto
+# `ctx.intake_evidence_json` -- a JSON STRING -- so the reader always saw
+# nothing in production and silently degraded to inference.
+#
+# Measured, soak bt-2026-08-30-145744: the signed goal reached the resolver
+# and came back `goal_keyword (conf=1.00)`. The right symbol, found by scoring
+# prose, while the declaration naming it exactly sat unread one attribute
+# away. These tests fix the suite's own blind spot: they drive the shape
+# production actually builds.
+# ---------------------------------------------------------------------------
+import json as _json
+
+from backend.core.ouroboros.governance.candidate_generator import (
+    _provenance_claim_from_ctx,
+)
+
+_CLAIM = {
+    "schema_version": "delegated_provenance.v1",
+    "kind": "roadmap_reader",
+    "goal_id": "g1",
+}
+
+
+class _ProdCtx:
+    """What the dispatch path actually hands the generator."""
+    def __init__(self, claim=_CLAIM):
+        self.intake_evidence_json = _json.dumps({"provenance": claim})
+
+
+class _EnvelopeCtx:
+    """Envelope-shaped: a live evidence mapping, no JSON snapshot."""
+    def __init__(self, claim=_CLAIM):
+        self.evidence = {"provenance": claim}
+
+
+def test_the_production_json_carrier_is_read():
+    """The shape that ships. This is the one that was broken."""
+    assert _provenance_claim_from_ctx(_ProdCtx()) == _CLAIM
+
+
+def test_the_envelope_mapping_still_works():
+    """The fallback must keep serving callers holding an envelope."""
+    assert _provenance_claim_from_ctx(_EnvelopeCtx()) == _CLAIM
+
+
+def test_declared_symbols_resolve_from_the_production_shape(monkeypatch):
+    """End to end on the real carrier: a context with ONLY
+    `intake_evidence_json` must yield the operator's declared symbol."""
+    from backend.core.ouroboros.governance import delegated_provenance
+    from backend.core.ouroboros.governance.candidate_generator import (
+        _declared_symbols_for,
+    )
+
+    class _V:
+        value = "valid"
+
+    class _G:
+        goal_id = "g1"
+        target_files = ("backend/x.py",)
+        target_symbols = ("_should_use_lean_prompt",)
+
+    class _D:
+        signature_valid = True
+        goals = (_G(),)
+
+    monkeypatch.setattr(
+        delegated_provenance, "_verified_roadmap", lambda: (_V(), _D())
+    )
+    assert _declared_symbols_for(_ProdCtx(), "backend/x.py") == (
+        "_should_use_lean_prompt",
+    )
+
+
+@pytest.mark.parametrize("raw", ["", "not json", "[]", '{"provenance": 7}'])
+def test_a_malformed_carrier_never_raises(raw):
+    """A truncated or wrong-typed snapshot degrades to inference, never a
+    crash -- the broad except in the caller would have hidden a raise here."""
+    class _Bad:
+        intake_evidence_json = raw
+
+    assert _provenance_claim_from_ctx(_Bad()) is None
+
+
+def test_a_context_with_neither_carrier_yields_nothing():
+    """The ordinary case for almost every op."""
+    class _Bare:
+        pass
+
+    assert _provenance_claim_from_ctx(_Bare()) is None
+
+
+def test_the_json_carrier_takes_precedence():
+    """When both exist the production snapshot wins -- it is the one the
+    dispatch path authored for THIS op."""
+    class _Both:
+        intake_evidence_json = _json.dumps(
+            {"provenance": {"kind": "roadmap_reader", "goal_id": "from-json"}}
+        )
+        evidence = {"provenance": {"kind": "roadmap_reader",
+                                   "goal_id": "from-mapping"}}
+
+    assert _provenance_claim_from_ctx(_Both())["goal_id"] == "from-json"
+
+
+def test_the_reader_uses_the_same_attribute_the_swarm_path_does():
+    """DRY pin: one parsing idiom for one field. If a future edit invents a
+    second way to reach intake evidence, this fails."""
+    import io as _io
+
+    import backend.core.ouroboros.governance.candidate_generator as M
+
+    src = _io.open(M.__file__, encoding="utf-8").read()
+    assert src.count('getattr(context, "intake_evidence_json", "")') >= 2

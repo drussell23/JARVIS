@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from backend.core.ouroboros.governance.operation_id import generate_operation_id
 
@@ -297,6 +297,84 @@ _URGENCY_BOOST: Dict[str, int] = {
 
 # Sources that bypass backpressure
 _BACKPRESSURE_EXEMPT = frozenset({"voice_human", "test_failure"})
+
+
+def _operator_authority_exemption_enabled() -> bool:
+    """Master for the signed-intent backpressure exemption. Default ON.
+
+    Falsey restores the pre-existing behaviour exactly: the static
+    ``_BACKPRESSURE_EXEMPT`` set alone decides, and an operator's signed goal
+    parks behind sensor noise as before.
+    """
+    raw = (
+        os.environ.get("JARVIS_SIGNED_INTENT_BACKPRESSURE_EXEMPT", "")
+        .strip()
+        .lower()
+    )
+    return raw in {"", "1", "true", "yes", "on"}
+
+
+def _carries_verified_operator_authority(envelope: Any) -> bool:
+    """True iff *envelope* traces to a goal in a CRYPTOGRAPHICALLY VERIFIED
+    operator roadmap.
+
+    WHY THIS IS NOT ``source == "roadmap"``. The static exemption set encodes
+    one idea — a signal carrying HUMAN authority must not be parked behind
+    machine-generated work. ``voice_human`` is a person speaking now;
+    ``test_failure`` is a runtime fire. An operator-signed goal is delegated
+    human intent, and belongs in that category. But the SOURCE NAME is not the
+    authority: the SIGNATURE is. A roadmap read under dev-mode
+    (``REQUIRE_SIGNATURE=false``), or one an attacker dropped into ``.jarvis/``,
+    presents the identical ``source="roadmap"`` string. Exempting on the name
+    would let unsigned work preempt the queue — the same forgery class the
+    declared-symbol path had to close.
+
+    So authority is RE-DERIVED from ground truth on every call. The envelope
+    contributes only a ``goal_id`` POINTER; the verdict, the signature bytes,
+    and the goal's presence are all read back from the verified document. A
+    fabricated evidence block names a goal that must still exist in a roadmap
+    whose HMAC validates, or it earns nothing.
+
+    Cost is not a concern despite re-deriving: the caller short-circuits, so
+    this runs ONLY when the queue is already past its backpressure threshold
+    AND the source was not already statically exempt — the rare path, never
+    the hot one.
+
+    NEVER raises. Anything unprovable returns False, which means the envelope
+    stays subject to backpressure exactly as before — fail-closed, so a broken
+    reader degrades to the old behaviour rather than opening the gate.
+    """
+    if not _operator_authority_exemption_enabled():
+        return False
+    try:
+        evidence = getattr(envelope, "evidence", None)
+        if not isinstance(evidence, Mapping):
+            return False
+        claim = evidence.get("provenance")
+        if not isinstance(claim, Mapping):
+            return False
+        goal_id = str(claim.get("goal_id", "")).strip()
+        if not goal_id:
+            return False
+
+        from backend.core.ouroboros.governance.delegated_provenance import (  # noqa: PLC0415, E501
+            _verified_roadmap,
+        )
+        verdict, doc = _verified_roadmap()
+        # Both properties, the pair `delegated_provenance` demands of this same
+        # call: the verdict AND the cryptographic fact. The reader permits an
+        # unsigned dev-mode that can report `valid` for a document carrying no
+        # signature at all.
+        if doc is None or not bool(getattr(doc, "signature_valid", False)):
+            return False
+        if str(getattr(verdict, "value", verdict)) != "valid":
+            return False
+        for goal in getattr(doc, "goals", ()) or ():
+            if str(getattr(goal, "goal_id", "")) == goal_id:
+                return True
+        return False
+    except Exception:  # noqa: BLE001 — unprovable => no exemption
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1522,9 +1600,23 @@ class UnifiedIntakeRouter:
                 return "queued_behind"
 
         # 4. Backpressure check
+        # Order matters and is load-bearing. The depth probe is cheap and the
+        # authority check re-reads + verifies the roadmap, so the expensive
+        # term is LAST: it evaluates only for a non-exempt source that is
+        # actually about to be rejected. On every healthy tick this short-
+        # circuits before it, costing nothing.
+        #
+        # Step 4 sits UPSTREAM of every adaptive mechanism below it — the
+        # SensorGovernor consult and the QoS aging/starvation escalation at 4b
+        # both live after this return. A signal bounced here never reaches the
+        # machinery designed to rescue a starved one, which is how an
+        # operator's signed goal parked 146 times behind background sensor
+        # noise in soak bt-2026-08-30-072704 while the reader ledger recorded
+        # it as emitted (`idempotency_key: "backpressure"` — this literal).
         if (
             envelope.source not in _BACKPRESSURE_EXEMPT
             and self.intake_queue_depth() >= self._config.backpressure_threshold
+            and not _carries_verified_operator_authority(envelope)
         ):
             return "backpressure"
 
@@ -2665,6 +2757,21 @@ class UnifiedIntakeRouter:
             _a1trace("submit", ctx.op_id, target="GLS")
         except Exception:  # noqa: BLE001
             pass
+        # AUTHORITY STAMP. The pool cannot re-verify an HMAC on its submit
+        # path -- it has no roadmap reader and no business growing one. So the
+        # layer that ALREADY established authority at intake step 4 records
+        # the finding on the context, and the pool reads the finding. Same
+        # trust boundary as `provider_route`: an internal field set by the
+        # component that computed it, never parsed from an outside claim.
+        # Absent or False => the op is ordinary, which is the old behaviour.
+        try:
+            setattr(
+                ctx,
+                "operator_authority",
+                bool(_carries_verified_operator_authority(envelope)),
+            )
+        except Exception:  # noqa: BLE001 — a stamp must never fail a submit
+            pass
         try:
             _submit_fn = getattr(self._gls, "submit_background", None)
             if _submit_fn is not None:
@@ -2832,6 +2939,90 @@ class UnifiedIntakeRouter:
     # WAL crash recovery
     # ------------------------------------------------------------------
 
+
+    def _replay_ordering_enabled(self) -> bool:
+        """Master for authority-ordered WAL re-drain. Default ON.
+
+        Falsey restores raw insertion order byte-for-byte.
+        """
+        raw = (
+            os.environ.get("JARVIS_WAL_REPLAY_AUTHORITY_ORDER", "")
+            .strip()
+            .lower()
+        )
+        return raw in {"", "1", "true", "yes", "on"}
+
+    def _order_replay_by_authority(
+        self, pending: "List[WALEntry]", IE: Any
+    ) -> "List[WALEntry]":
+        """Order parked WAL rows by the SAME priority the live queue uses.
+
+        THE DEFECT THIS CLOSES. `_replay_wal` iterated `pending` in raw
+        insertion order. A row's position was therefore decided by WHEN the
+        pool happened to be full when it arrived — not by what it is. Under
+        sustained backpressure the parked set is dominated by background
+        sensor churn, so an operator's signed goal re-dispatches somewhere in
+        the middle of a queue of trivia, every drain, forever. Admission was
+        fixed at intake step 4; this is the second half of the same problem,
+        one layer down: winning the door does not help if the re-drain then
+        deals you back into the pack.
+
+        NO NEW PRIORITY VOCABULARY. Ordinary rows are scored by the module's
+        own `_compute_priority` — the identical function the live queue uses,
+        so replay order and queue order cannot drift into disagreement.
+        Authority-backed rows take `_sovereign_human_priority()`, the existing
+        dynamic anchor whose docstring already states the invariant this needs
+        ("a live human intent can never be starved"): it is derived from
+        `_PRIORITY_MAP`'s own floor with an env-tunable margin, so nothing here
+        is a hardcoded tier.
+
+        STABILITY IS LOAD-BEARING. Python's sort is stable, so rows of equal
+        priority keep their insertion order — the ordering ADDS a tier
+        discipline over FIFO rather than replacing it with churn, and a drain
+        that repeats cannot reshuffle equals into a different order each time.
+
+        NEVER RAISES. A row whose envelope will not rebuild, or whose scoring
+        throws, keeps a neutral key and stays in place; any failure of the sort
+        as a whole returns `pending` untouched. The replay path must survive a
+        malformed row, because the alternative is losing durably parked work.
+        """
+        if not self._replay_ordering_enabled() or len(pending) < 2:
+            return pending
+        try:
+            neutral = 0
+            try:
+                neutral = max(_PRIORITY_MAP.values()) + 1
+            except (ValueError, TypeError):
+                neutral = 100
+
+            def _key(entry: Any) -> int:
+                try:
+                    envelope = IE.from_dict(entry.envelope_dict)
+                except Exception:  # noqa: BLE001 — unrebuildable: leave in place
+                    return neutral
+                try:
+                    if _carries_verified_operator_authority(envelope):
+                        return _sovereign_human_priority()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    score, _ = _compute_priority(envelope)
+                    return int(score)
+                except Exception:  # noqa: BLE001
+                    return neutral
+
+            ordered = sorted(pending, key=_key)
+            if ordered and ordered[0] is not pending[0]:
+                logger.info(
+                    "[Router] wal_replay_reordered n=%d head_moved=True "
+                    "(authority/priority ahead of insertion order)",
+                    len(ordered),
+                )
+            return ordered
+        except Exception:  # noqa: BLE001 — ordering is an optimisation, never a risk
+            logger.debug("[Router] replay ordering skipped", exc_info=True)
+            return pending
+
     async def _replay_wal(
         self, pending: Optional[List[WALEntry]] = None
     ) -> None:
@@ -2850,6 +3041,7 @@ class UnifiedIntakeRouter:
         logger.info("Router: replaying %d pending WAL entries", len(pending))
         from .intent_envelope import IntentEnvelope as IE
 
+        pending = self._order_replay_by_authority(pending, IE)
         for entry in pending:
             try:
                 envelope = IE.from_dict(entry.envelope_dict)
