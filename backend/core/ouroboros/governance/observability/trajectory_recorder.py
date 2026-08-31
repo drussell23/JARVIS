@@ -384,7 +384,22 @@ class TrajectoryRecorder:
         )
         if self._offer(pending):
             self._stats["generations_queued"] += 1
+            # Speak on SUCCESS too. A recorder that only logs failures
+            # cannot distinguish "the generation hook never fired" from
+            # "it fired and the verdict never joined" -- and those have
+            # opposite fixes. Both halves must be visible by op_id or the
+            # join is undiagnosable from a log.
+            logger.info(
+                "[TrajectoryRecorder] queued generation op=%s "
+                "candidates=%d model=%s (awaiting verdict)",
+                pending.op_id, len(pending.candidates), pending.model_id,
+            )
             return True
+        logger.info(
+            "[TrajectoryRecorder] generation for op=%s was NOT queued "
+            "(enabled=%s candidates=%d) — no trajectory will be written",
+            str(op_id), recorder_enabled(), len(traj.candidates),
+        )
         return False
 
     def record_outcome(
