@@ -12,6 +12,7 @@ Covers the three properties the recorder MUST hold:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -335,6 +336,131 @@ async def test_prompt_and_output_are_capped(
     assert len(row["user_input"]) < 1_000
     assert len(row["assistant_output"]) < 1_000
     assert "truncated by trajectory_recorder" in row["assistant_output"]
+
+
+# ---------------------------------------------------------------------------
+# Expiry must be driven by WALL CLOCK, not by queue traffic
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_watchdog_flushes_without_any_further_queue_activity(
+    rec: TrajectoryRecorder, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The defect that produced 4 candidate sets and 0 recorded lines.
+
+    One generation arrives, its op never terminates, and NOTHING else is
+    ever queued. Expiry that only ran after a queue item would wait
+    forever; the watchdog must write it on time.
+    """
+    monkeypatch.setenv("JARVIS_TRAJECTORY_RECORDER_TICK_S", "1")
+    monkeypatch.setenv("JARVIS_TRAJECTORY_RECORDER_PENDING_TTL_S", "30")
+
+    rec.record_generation(
+        op_id="op-stranded",
+        prompt="p",
+        generation_result=_FakeGenerationResult(candidates=(_candidate(),)),
+    )
+    await rec.drain()
+    assert _lines(rec.path) == [], "not due yet"
+
+    # Age it past the TTL without touching the queue.
+    for gen in rec._pending.values():
+        gen.created_monotonic = 0.0
+
+    for _ in range(60):
+        if _lines(rec.path):
+            break
+        await asyncio.sleep(0.1)
+
+    rows = _lines(rec.path)
+    assert rows, "watchdog never flushed the stranded generation"
+    assert rows[0]["outcome"] == "unknown"
+    assert rows[0]["metadata"]["should_train"] is False
+    assert rec.stats()["pending_expired"] == 1
+
+
+@pytest.mark.asyncio
+async def test_aclose_flushes_inflight_pendings(
+    rec: TrajectoryRecorder,
+) -> None:
+    """A clean shutdown must not silently discard in-flight trajectories."""
+    rec.record_generation(
+        op_id="op-shutdown",
+        prompt="p",
+        generation_result=_FakeGenerationResult(candidates=(_candidate(),)),
+    )
+    await rec.drain()
+    assert _lines(rec.path) == []
+
+    await rec.aclose()
+    rows = _lines(rec.path)
+    assert len(rows) == 1
+    assert rows[0]["metadata"]["op_id"] == "op-shutdown"
+
+
+# ---------------------------------------------------------------------------
+# Throughput must be recoverable
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tokens_are_split_so_tok_s_is_derivable(
+    rec: TrajectoryRecorder,
+) -> None:
+    """A summed tokens_used makes throughput unrecoverable, and throughput
+    is half the model question."""
+    gr = _FakeGenerationResult(
+        candidates=(_candidate(),),
+        total_input_tokens=900,
+        total_output_tokens=300,
+    )
+    rec.record_generation(
+        op_id="op-tok", prompt="p", generation_result=gr, latency_ms=2000.0,
+    )
+    rec.record_outcome(op_id="op-tok", terminal_reason="applied")
+    await rec.drain()
+
+    row = _lines(rec.path)[0]
+    assert row["prompt_tokens"] == 900
+    assert row["completion_tokens"] == 300
+    assert row["tokens_used"] == 1200          # canonical field preserved
+    assert row["tokens_per_second"] == 150.0   # 300 tok / 2.0 s
+
+
+@pytest.mark.asyncio
+async def test_zero_latency_does_not_divide_by_zero(
+    rec: TrajectoryRecorder,
+) -> None:
+    rec.record_generation(
+        op_id="op-zero", prompt="p",
+        generation_result=_FakeGenerationResult(candidates=(_candidate(),)),
+        latency_ms=0.0,
+    )
+    rec.record_outcome(op_id="op-zero", terminal_reason="applied")
+    await rec.drain()
+    assert _lines(rec.path)[0]["tokens_per_second"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# A broken join must be visible, not silent
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_orphan_verdict_names_the_op(
+    rec: TrajectoryRecorder, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If generation-side and terminal-side op_ids disagree, every
+    trajectory is lost. The log is the only thing that can say so."""
+    with caplog.at_level("INFO"):
+        rec.record_outcome(op_id="op-mismatched", terminal_reason="applied")
+        await rec.drain()
+
+    assert rec.stats()["orphan_outcomes"] == 1
+    assert any(
+        "op-mismatched" in r.getMessage() for r in caplog.records
+    ), "the orphaned op_id must appear in the log"
 
 
 def test_emit_without_running_loop_is_silent_not_fatal(

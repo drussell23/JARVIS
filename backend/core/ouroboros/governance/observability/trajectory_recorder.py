@@ -74,12 +74,14 @@ _ENV_DIR = "JARVIS_TRAJECTORY_RECORDER_DIR"
 _ENV_QUEUE_MAX = "JARVIS_TRAJECTORY_RECORDER_QUEUE_MAX"
 _ENV_PENDING_MAX = "JARVIS_TRAJECTORY_RECORDER_PENDING_MAX"
 _ENV_PENDING_TTL_S = "JARVIS_TRAJECTORY_RECORDER_PENDING_TTL_S"
+_ENV_TICK_S = "JARVIS_TRAJECTORY_RECORDER_TICK_S"
 _ENV_MAX_PROMPT_CHARS = "JARVIS_TRAJECTORY_RECORDER_MAX_PROMPT_CHARS"
 _ENV_MAX_OUTPUT_CHARS = "JARVIS_TRAJECTORY_RECORDER_MAX_OUTPUT_CHARS"
 
 _DEFAULT_QUEUE_MAX = 512
 _DEFAULT_PENDING_MAX = 256
 _DEFAULT_PENDING_TTL_S = 900.0
+_DEFAULT_TICK_S = 60.0
 _DEFAULT_MAX_PROMPT_CHARS = 24_000
 _DEFAULT_MAX_OUTPUT_CHARS = 24_000
 
@@ -205,7 +207,12 @@ class _PendingGeneration:
     provider_name: str
     is_noop: bool
     latency_ms: float
-    tokens_used: int
+    # Split, not summed. tok/s is completion_tokens over the generation
+    # duration; a single `tokens_used` that folds the prompt in makes the
+    # throughput term unrecoverable, and throughput is half of the
+    # model A/B question (a smarter model that is 3x slower may lose).
+    prompt_tokens: int
+    completion_tokens: int
     cost_usd: float
     task_type: str
     session_id: str
@@ -227,6 +234,13 @@ class TrajectoryRecorder:
         self._path_override = path
         self._queue: Optional[asyncio.Queue] = None
         self._writer: Optional[asyncio.Task] = None
+        # Wall-clock expiry watchdog. Separate from the drain loop because
+        # expiry that only runs when a queue item arrives is not expiry at
+        # all: on a sparse workload the pending generation waits for an
+        # event that never comes, and its trajectory is never written. That
+        # is exactly what produced 4 candidate sets and 0 recorded lines.
+        self._watchdog: Optional[asyncio.Task] = None
+        self._lock: Optional[asyncio.Lock] = None
         self._pending: "OrderedDict[str, _PendingGeneration]" = OrderedDict()
         self._stats: Dict[str, int] = {
             "generations_queued": 0,
@@ -262,11 +276,31 @@ class TrajectoryRecorder:
                     _ENV_QUEUE_MAX, _DEFAULT_QUEUE_MAX, 16, 65_536
                 )
             )
+        if self._lock is None:
+            self._lock = asyncio.Lock()
         if self._writer is None or self._writer.done():
             self._writer = loop.create_task(
                 self._drain_loop(), name="trajectory_recorder_drain"
             )
+        if self._watchdog is None or self._watchdog.done():
+            self._watchdog = loop.create_task(
+                self._expiry_watchdog(), name="trajectory_recorder_expiry"
+            )
         return True
+
+    async def _expiry_watchdog(self) -> None:
+        """Flush overdue pendings on WALL-CLOCK time, not on queue traffic."""
+        while True:
+            tick = _env_float(_ENV_TICK_S, _DEFAULT_TICK_S, 1.0, 3_600.0)
+            try:
+                await asyncio.sleep(tick)
+                await self._expire_pending()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 -- a watchdog must not die
+                logger.debug(
+                    "[TrajectoryRecorder] expiry tick failed", exc_info=True,
+                )
 
     def _offer(self, item: Any) -> bool:
         if not recorder_enabled():
@@ -342,9 +376,8 @@ class TrajectoryRecorder:
             provider_name=traj.provider_name,
             is_noop=bool(traj.is_noop),
             latency_ms=max(0.0, float(latency_ms or 0.0)),
-            tokens_used=int(
-                traj.total_input_tokens + traj.total_output_tokens
-            ),
+            prompt_tokens=int(traj.total_input_tokens or 0),
+            completion_tokens=int(traj.total_output_tokens or 0),
             cost_usd=float(traj.original_cost_usd),
             task_type=str(task_type or ""),
             session_id=str(session_id or ""),
@@ -386,9 +419,11 @@ class TrajectoryRecorder:
                 continue
             try:
                 if isinstance(item, _PendingGeneration):
-                    self._admit_pending(item)
+                    await self._admit_pending(item)
                 elif isinstance(item, _OutcomeEvent):
                     await self._resolve(item)
+                # Opportunistic sweep on activity; the watchdog is what
+                # guarantees expiry when there is none.
                 await self._expire_pending()
             except asyncio.CancelledError:
                 raise
@@ -402,21 +437,45 @@ class TrajectoryRecorder:
                 except Exception:  # noqa: BLE001
                     pass
 
-    def _admit_pending(self, gen: _PendingGeneration) -> None:
+    async def _admit_pending(self, gen: _PendingGeneration) -> None:
         cap = _env_int(_ENV_PENDING_MAX, _DEFAULT_PENDING_MAX, 8, 100_000)
-        self._pending[gen.op_id] = gen
-        self._pending.move_to_end(gen.op_id)
-        while len(self._pending) > cap:
-            self._pending.popitem(last=False)
-            self._stats["pending_evicted"] += 1
+        async with self._guard():
+            self._pending[gen.op_id] = gen
+            self._pending.move_to_end(gen.op_id)
+            while len(self._pending) > cap:
+                dropped, _ = self._pending.popitem(last=False)
+                self._stats["pending_evicted"] += 1
+                logger.warning(
+                    "[TrajectoryRecorder] evicted pending op=%s (cap=%d) — "
+                    "its trajectory is lost; raise %s if this recurs",
+                    dropped, cap, _ENV_PENDING_MAX,
+                )
+
+    def _guard(self) -> Any:
+        """The pending-map lock, created lazily with the loop."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def _resolve(self, evt: _OutcomeEvent) -> None:
-        gen = self._pending.pop(evt.op_id, None)
+        async with self._guard():
+            gen = self._pending.pop(evt.op_id, None)
         if gen is None:
-            # An op that never generated (caged before GENERATE) has no
-            # candidate text — there is nothing to train on, so nothing
-            # to write.
+            # Two very different causes, and the distinction matters:
+            #   * an op caged before GENERATE has no candidate text, so
+            #     there is genuinely nothing to record; or
+            #   * the op_id on the generation side does not MATCH the one
+            #     on the terminal side, in which case the join is silently
+            #     broken and every trajectory is being lost.
+            # Only the log can tell them apart, so name the op.
             self._stats["orphan_outcomes"] += 1
+            logger.info(
+                "[TrajectoryRecorder] verdict for op=%s had no pending "
+                "generation (reason=%s). Expected when the op was caged "
+                "before GENERATE; if generations ARE happening, the "
+                "generation/terminal op_ids disagree and the join is broken.",
+                evt.op_id, evt.terminal_reason or "?",
+            )
             return
         outcome, autonomy_type, should_train = classify_terminal_reason(
             evt.terminal_reason, evt.terminal_phase,
@@ -426,21 +485,43 @@ class TrajectoryRecorder:
         await self._write(gen, outcome, autonomy_type, should_train, evt)
 
     async def _expire_pending(self) -> None:
-        """Flush generations whose op never reported a verdict."""
+        """Flush generations whose op never reported a verdict.
+
+        Collects under the lock and writes OUTSIDE it: the write awaits a
+        cross-process file lock, and holding the pending-map lock across
+        that would block every concurrent emit for the duration of disk
+        I/O.
+        """
         ttl = _env_float(
             _ENV_PENDING_TTL_S, _DEFAULT_PENDING_TTL_S, 30.0, 86_400.0
         )
         now = time.monotonic()
-        stale = [
-            op_id
-            for op_id, gen in self._pending.items()
-            if (now - gen.created_monotonic) > ttl
-        ]
-        for op_id in stale:
-            gen = self._pending.pop(op_id, None)
-            if gen is None:
-                continue
+        expired: list = []
+        async with self._guard():
+            stale = [
+                op_id
+                for op_id, gen in self._pending.items()
+                if (now - gen.created_monotonic) > ttl
+            ]
+            for op_id in stale:
+                gen = self._pending.pop(op_id, None)
+                if gen is not None:
+                    expired.append((op_id, gen))
+
+        for op_id, gen in expired:
             self._stats["pending_expired"] += 1
+            # The breakpoint, named: this generation produced candidates
+            # and its op never reported a terminal reason. Recorded as
+            # non-trainable, because an outcome we never saw is not a
+            # label -- but recorded, because the candidate text is still
+            # evidence about the model.
+            logger.warning(
+                "[TrajectoryRecorder] op=%s expired after %.0fs with %d "
+                "candidate(s) and NO verdict — writing outcome=unknown, "
+                "should_train=false. If this is common, ops are outliving "
+                "the TTL (%s) or never reaching a terminal phase.",
+                op_id, ttl, len(gen.candidates), _ENV_PENDING_TTL_S,
+            )
             await self._write(
                 gen,
                 "unknown",
@@ -504,7 +585,20 @@ class TrajectoryRecorder:
                     "confidence": confidence,
                     "model_id": gen.model_id,
                     "latency_ms": gen.latency_ms,
-                    "tokens_used": gen.tokens_used,
+                    # Canonical ExperienceEvent field, kept for the reactor
+                    # consumers that read it; the split values below are the
+                    # ones throughput analysis uses.
+                    "tokens_used": gen.prompt_tokens + gen.completion_tokens,
+                    "prompt_tokens": gen.prompt_tokens,
+                    "completion_tokens": gen.completion_tokens,
+                    "tokens_per_second": (
+                        round(
+                            gen.completion_tokens / (gen.latency_ms / 1000.0),
+                            2,
+                        )
+                        if gen.latency_ms > 0 and gen.completion_tokens
+                        else 0.0
+                    ),
                     "session_id": gen.session_id,
                     "task_type": gen.task_type,
                     "metadata": {
@@ -554,15 +648,33 @@ class TrajectoryRecorder:
 
     async def aclose(self, timeout_s: float = 5.0) -> None:
         await self.drain(timeout_s)
-        if self._writer is not None and not self._writer.done():
-            self._writer.cancel()
-            try:
-                await self._writer
-            except asyncio.CancelledError:
-                pass
-            except Exception:  # noqa: BLE001
-                pass
-        self._writer = None
+        # Flush anything still awaiting a verdict BEFORE tearing down, or a
+        # clean shutdown silently discards the trajectories of every op
+        # that was still in flight.
+        try:
+            prev = os.environ.get(_ENV_PENDING_TTL_S)
+            os.environ[_ENV_PENDING_TTL_S] = "30"
+            for gen in list(self._pending.values()):
+                gen.created_monotonic = 0.0
+            await self._expire_pending()
+            if prev is None:
+                os.environ.pop(_ENV_PENDING_TTL_S, None)
+            else:
+                os.environ[_ENV_PENDING_TTL_S] = prev
+        except Exception:  # noqa: BLE001
+            logger.debug("[TrajectoryRecorder] final flush failed", exc_info=True)
+
+        for task_attr in ("_watchdog", "_writer"):
+            task = getattr(self, task_attr, None)
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # noqa: BLE001
+                    pass
+            setattr(self, task_attr, None)
 
     def stats(self) -> Dict[str, Any]:
         return {
@@ -678,6 +790,18 @@ def register_flags(registry) -> int:  # noqa: ANN001
             description=(
                 "Seconds a generation waits for its verdict before being "
                 "flushed with outcome=unknown/should_train=false."
+            ),
+        ),
+        FlagSpec(
+            name=_ENV_TICK_S, type=FlagType.FLOAT,
+            default=_DEFAULT_TICK_S, category=Category.TIMING,
+            source_file=tgt, example=f"{_ENV_TICK_S}=30",
+            description=(
+                "Seconds between wall-clock expiry sweeps. A dedicated "
+                "watchdog task owns this because expiry driven by queue "
+                "activity is not expiry: on a sparse workload the pending "
+                "generation waits for an event that never arrives and its "
+                "trajectory is never written."
             ),
         ),
         FlagSpec(
