@@ -6447,14 +6447,30 @@ class PrimeProvider:
                 result, prompt_preloaded_files=tuple(_preloaded_files),
             )
 
+        # The local director carries the token split + its provenance here.
+        # Read once: both the log line and the recorder hook below need it,
+        # and a second getattr chain is how the two drift apart.
+        _prime_meta = getattr(response, "metadata", None) if response else None
+        if not isinstance(_prime_meta, dict):
+            _prime_meta = {}
+        _prime_ct = int(_prime_meta.get(
+            "completion_tokens",
+            getattr(response, "tokens_used", 0) if response else 0,
+        ) or 0)
         logger.info(
             "[PrimeProvider] Generated %d candidates in %.1fs (tool_rounds=%d), "
-            "model=%s, tokens=%d",
+            "model=%s, tokens=%d+%d%s, %.1f tok/s",
             len(result.candidates),
             duration,
             tool_rounds,
             getattr(response, "model", "unknown") if response else "unknown",
-            getattr(response, "tokens_used", 0) if response else 0,
+            int(_prime_meta.get("prompt_tokens", 0) or 0),
+            _prime_ct,
+            # Say which it is, in the log as well as the corpus. A number
+            # that might be a guess and might be a measurement is not an
+            # instrument.
+            " (est)" if _prime_meta.get("tokens_estimated", True) else "",
+            (_prime_ct / duration) if duration > 0 and _prime_ct else 0.0,
         )
         _prime_final = result.with_tool_records(
             tool_records
@@ -6494,8 +6510,33 @@ class PrimeProvider:
                     getattr(getattr(self, "_cfg", None), "model_name", "")
                     or os.environ.get("JARVIS_LOCAL_MODEL_NAME", "")
                 ),
-                completion_tokens_override=int(
-                    getattr(response, "output_tokens", -1) if response else -1
+                # PrimeResponse names its completion count `tokens_used`;
+                # it has never had an `output_tokens` attribute, so this
+                # read resolved to the -1 default on EVERY local generation
+                # and the recorder fell through to the GenerationResult's
+                # zero. That is the whole reason the corpus carried
+                # completion_tokens=0 and tokens_per_second=0.0 -- not a
+                # missing usage payload upstream. The engine was reporting
+                # counts the whole time; this getattr threw them away.
+                #
+                # `metadata` carries the split when the local director
+                # produced the response (see its generate()); `tokens_used`
+                # is the compatible fallback for any other PrimeResponse
+                # producer.
+                completion_tokens_override=int(_prime_meta.get(
+                    "completion_tokens",
+                    getattr(response, "tokens_used", -1) if response else -1,
+                ) or -1),
+                # Recorded for the same reason the recorder splits the
+                # fields: prompt tokens are cost, completion tokens are
+                # throughput, and a single total makes tok/s unrecoverable.
+                prompt_tokens_override=int(
+                    _prime_meta.get("prompt_tokens", -1) or -1
+                ),
+                # Default TRUE when absent: a producer that says nothing
+                # about provenance has not earned the "measured" label.
+                tokens_estimated=bool(
+                    _prime_meta.get("tokens_estimated", True)
                 ),
             )
         except Exception as _traj_exc:  # noqa: BLE001 — fail-open

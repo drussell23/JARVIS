@@ -17,7 +17,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, NamedTuple, Optional, Tuple
 
 from .memory_pressure_gate import PressureLevel, get_default_gate, is_enabled as memory_gate_enabled
 
@@ -944,6 +944,16 @@ def _streaming_enabled() -> bool:
         "JARVIS_LOCAL_STREAMING_ENABLED") is not None else True
 
 
+def _stream_usage_enabled() -> bool:
+    """Request the engine's own token accounting on the streaming path.
+
+    Default TRUE. OFF -> no ``stream_options`` is sent and the chars/4
+    estimate resumes (labelled ``tokens_estimated=True``), which is the
+    byte-identical pre-slice request body for any engine that turns out to
+    mind the field."""
+    return _envb("JARVIS_LOCAL_STREAM_USAGE_ENABLED", True)
+
+
 def _inter_token_adaptive_enabled() -> bool:
     """Derive the stall deadline from MEASURED physics instead of a constant.
     Default TRUE. OFF -> the static value for both deadlines (legacy)."""
@@ -977,10 +987,28 @@ def _inter_token_timeout_s() -> float:
 _SSE_DONE = object()  # sentinel: the [DONE] terminator of an OpenAI-compat SSE stream
 
 
+class _SSEUsage(NamedTuple):
+    """The engine's OWN token accounting, carried on the stream's final frame.
+
+    Distinct from a content delta so the read loop cannot mistake accounting
+    for output: this never appends to the response buffer.
+    """
+
+    prompt_tokens: int
+    completion_tokens: int
+
+
 def _parse_sse_delta(line: bytes) -> "Any":
     """Parse ONE line of an ollama /v1/chat/completions SSE stream. Returns the
-    incremental content string, the ``_SSE_DONE`` sentinel on ``data: [DONE]``, or
-    None for keep-alives / non-data / parse errors. Pure + fail-soft."""
+    incremental content string, the ``_SSE_DONE`` sentinel on ``data: [DONE]``,
+    an :class:`_SSEUsage` on the terminal accounting frame, or None for
+    keep-alives / non-data / parse errors. Pure + fail-soft.
+
+    The accounting frame carries ``choices: []`` -- which is precisely the
+    shape the old ``if not choices: return None`` discarded. That discard is
+    why the streaming path had no token counts to report and fell back to a
+    ``len(text) // 4`` guess.
+    """
     try:
         s = line.decode("utf-8", "ignore").strip() if isinstance(line, (bytes, bytearray)) else str(line).strip()
         if not s or not s.startswith("data:"):
@@ -992,6 +1020,16 @@ def _parse_sse_delta(line: bytes) -> "Any":
         obj = _json.loads(payload)
         choices = obj.get("choices") or []
         if not choices:
+            # No choices AND a usage object -> the accounting frame. No
+            # choices and no usage -> a keep-alive, as before.
+            usage = obj.get("usage")
+            if isinstance(usage, dict):
+                _ct = int(usage.get("completion_tokens", 0) or 0)
+                if _ct > 0:
+                    return _SSEUsage(
+                        prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+                        completion_tokens=_ct,
+                    )
             return None
         delta = (choices[0] or {}).get("delta") or {}
         return delta.get("content") or None
@@ -1050,6 +1088,15 @@ class LocalCompletion:
     output_tokens: int
     ttft_ms: float
     total_ms: float
+    # Split, and labelled. tok/s is completion_tokens over the generation
+    # duration, so folding the prompt in makes throughput unrecoverable --
+    # and an ESTIMATE reported as a measurement is worse than no number at
+    # all, because a model A/B is decided on exactly this quantity. When
+    # the engine reports its own usage, `tokens_estimated` is False and the
+    # counts are the engine's; otherwise they are a chars/4 guess and the
+    # flag says so, all the way out to the trajectory corpus.
+    prompt_tokens: int = 0
+    tokens_estimated: bool = True
 
 
 class LocalPrimeClient:
@@ -1242,10 +1289,20 @@ class LocalPrimeClient:
                 data = await resp.json()
         total_ms = (time.monotonic() - t0) * 1000.0
         text = data["choices"][0]["message"]["content"]
-        out_toks = int(data.get("usage", {}).get("completion_tokens", 0)) or max(1, len(text) // 4)
+        _usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        _reported = int(_usage.get("completion_tokens", 0) or 0)
+        # Estimation is the LAST resort, and it is labelled when used. The
+        # `or` chain that preceded this silently produced the same int for
+        # a measurement and a guess, so nothing downstream could tell a
+        # real tok/s from a fabricated one.
+        out_toks = _reported or max(1, len(text) // 4)
         ttft_ms = min(total_ms, 0.1 * total_ms)
         self.profiler.record(ttft_ms=ttft_ms, total_ms=total_ms, output_tokens=out_toks)
-        return LocalCompletion(text=text, output_tokens=out_toks, ttft_ms=ttft_ms, total_ms=total_ms)
+        return LocalCompletion(
+            text=text, output_tokens=out_toks, ttft_ms=ttft_ms, total_ms=total_ms,
+            prompt_tokens=int(_usage.get("prompt_tokens", 0) or 0),
+            tokens_estimated=(_reported <= 0),
+        )
 
     async def _complete_streaming(self, sess: Any, url: str, body: Dict[str, Any],
                                   *, prefill: str = "") -> LocalCompletion:
@@ -1261,6 +1318,20 @@ class LocalPrimeClient:
         from backend.core.ouroboros.governance import cooperative_shutdown as _coop  # noqa: PLC0415
         body = dict(body)
         body["stream"] = True
+        # ASK for the accounting. A streamed response carries no usage object
+        # unless the client requests one, which is why this path had nothing
+        # to report and guessed `len(text) // 4` instead -- a guess that then
+        # travelled into the trajectory corpus as if it were a measurement.
+        # Verified against the engine this lane serves (ollama 0.33.1): the
+        # terminal frame carries exact prompt/completion counts.
+        #
+        # Additive and free to ignore: an engine that does not know the field
+        # returns the same stream it always did, `_stream_usage` stays None,
+        # and the estimate resumes -- now labelled as one. There is nothing
+        # to degrade, so this needs no capability-rejection cache like the
+        # schema / reasoning_effort / draft ladders above.
+        if _stream_usage_enabled():
+            body["stream_options"] = {"include_usage": True}
         # TWO deadlines, not one. The wait before the first chunk measures
         # PREFILL (grows with prompt size); every wait after it measures the
         # gap between tokens (roughly constant). A single constant is loose
@@ -1292,6 +1363,7 @@ class LocalPrimeClient:
         ttft_ms = 0.0
         t0 = time.monotonic()
         first = True
+        _stream_usage: "Optional[_SSEUsage]" = None
 
         def _freeze() -> "GracefulStreamInterruption":
             return GracefulStreamInterruption(
@@ -1419,6 +1491,12 @@ class LocalPrimeClient:
                     delta = _parse_sse_delta(line)
                     if delta is _SSE_DONE:
                         break
+                    if isinstance(delta, _SSEUsage):
+                        # The accounting frame. NOT output: it must never
+                        # reach `parts` or `_emit_stream_token`, and it is
+                        # not a token arrival, so `first`/ttft stay put.
+                        _stream_usage = delta
+                        continue
                     if delta:
                         if first:
                             ttft_ms = (time.monotonic() - t0) * 1000.0
@@ -1435,11 +1513,21 @@ class LocalPrimeClient:
                 _shutdown_task.cancel()
         total_ms = (time.monotonic() - t0) * 1000.0
         text = "".join(parts)
-        out_toks = max(1, len(text) // 4)
+        # Engine-reported when the stream carried an accounting frame; the
+        # chars/4 guess only when it did not -- and then said to be a guess.
+        # On a RESUME the count describes the continuation, not the seeded
+        # prefill -- which is the right pairing, because `total_ms` is this
+        # request's duration too, so the tok/s they form is this request's.
+        _measured = _stream_usage is not None
+        out_toks = _stream_usage.completion_tokens if _measured else max(1, len(text) // 4)
         # A completed stream is a REAL latency sample -> the EWMA learns + decays.
         self.profiler.record(ttft_ms=ttft_ms or min(total_ms, 0.1 * total_ms),
                              total_ms=total_ms, output_tokens=out_toks)
-        return LocalCompletion(text=text, output_tokens=out_toks, ttft_ms=ttft_ms, total_ms=total_ms)
+        return LocalCompletion(
+            text=text, output_tokens=out_toks, ttft_ms=ttft_ms, total_ms=total_ms,
+            prompt_tokens=(_stream_usage.prompt_tokens if _measured else 0),
+            tokens_estimated=(not _measured),
+        )
 
     async def complete_guarded(self, *, system: str, user: str, prompt_tokens: int,
                                temperature: float = 0.2,
@@ -1501,6 +1589,16 @@ class LocalPrimeClient:
             source="local_prime",
             latency_ms=lc.total_ms,
             tokens_used=lc.output_tokens,
+            # PrimeResponse has ONE token field and it is the completion
+            # count, so the prompt half and the measured/estimated label
+            # ride in `metadata` -- the only additive seam that does not
+            # change a dataclass every provider in the tree constructs.
+            # The trajectory recorder reads these; see providers.py.
+            metadata={
+                "prompt_tokens": lc.prompt_tokens,
+                "completion_tokens": lc.output_tokens,
+                "tokens_estimated": lc.tokens_estimated,
+            },
         )
 
     async def warmup(self, *, timeout_s: float) -> bool:

@@ -216,6 +216,11 @@ class _PendingGeneration:
     cost_usd: float
     task_type: str
     session_id: str
+    # Whether the counts above were REPORTED by the engine or inferred from
+    # response length. An A/B decided on tok/s must be able to exclude rows
+    # whose tok/s was derived from a chars/4 guess -- a corpus that cannot
+    # distinguish the two silently launders an estimate into a measurement.
+    tokens_estimated: bool = True
     created_monotonic: float = field(default_factory=time.monotonic)
     created_iso: str = field(default_factory=_utc_now_iso)
 
@@ -334,6 +339,7 @@ class TrajectoryRecorder:
         model_id_override: str = "",
         completion_tokens_override: int = -1,
         prompt_tokens_override: int = -1,
+        tokens_estimated: bool = False,
     ) -> bool:
         """Queue one generation. Non-blocking. NEVER raises.
 
@@ -399,6 +405,7 @@ class TrajectoryRecorder:
             cost_usd=float(traj.original_cost_usd),
             task_type=str(task_type or ""),
             session_id=str(session_id or ""),
+            tokens_estimated=bool(tokens_estimated),
         )
         if self._offer(pending):
             self._stats["generations_queued"] += 1
@@ -632,6 +639,11 @@ class TrajectoryRecorder:
                         if gen.latency_ms > 0 and gen.completion_tokens
                         else 0.0
                     ),
+                    # Provenance of the two counts above and the rate they
+                    # form. False = the engine reported them; True = they
+                    # were inferred from response length. Filter on this
+                    # before ranking models by throughput.
+                    "tokens_estimated": gen.tokens_estimated,
                     "session_id": gen.session_id,
                     "task_type": gen.task_type,
                     "metadata": {
