@@ -5647,6 +5647,28 @@ class CandidateGenerator:
         exhausted on a recoverable fault (so sealing halts) or on a non-recoverable
         error (the caller's try/except is the final net).
         """
+        # Do not generate from a model that is being replaced. Reactor's
+        # gpu_lease stops a deploy landing while a leased job runs; this is
+        # the other half, and without it `ollama create` can swap the blob
+        # under a stream. Returning None PARKS the dispatch through the
+        # existing fall-through, so the op re-queues rather than failing.
+        try:
+            from backend.core.ouroboros.governance.gpu_deployment_gate import (  # noqa: E501, PLC0415
+                deployment_in_progress as _gpu_deploy_busy,
+            )
+            _blocked, _why = await _gpu_deploy_busy()
+            if _blocked:
+                logger.info(
+                    "[CandidateGenerator] deferring local dispatch op=%s: %s",
+                    getattr(context, "op_id", "?")[:16], _why,
+                )
+                return None
+        except Exception:  # noqa: BLE001 -- fail OPEN, never block the loop
+            logger.debug(
+                "[CandidateGenerator] deployment gate probe failed",
+                exc_info=True,
+            )
+
         import dataclasses as _f3c_dc
 
         from backend.core.ouroboros.governance.local_inference_director import (
