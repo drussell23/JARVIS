@@ -6728,6 +6728,22 @@ class ToolLoopCoordinator:
             # Allowed calls are gathered for parallel execution.
             prompt_appendix = ""
             pending_execs: List[Tuple[ToolCall, PolicyContext, str, str]] = []
+            # Bound HERE, per round, because `exec_results` is otherwise
+            # assigned only inside `if pending_execs:` below. A round in
+            # which the model called tools and policy DENIED every one of
+            # them leaves the name unassigned, and the exploration-budget
+            # block reads it unconditionally further down. Its
+            # `if exec_results else set()` guard reads as if it handles
+            # the empty case -- it cannot, because a name that was never
+            # assigned raises UnboundLocalError on the read itself, not
+            # on the truth test.
+            #
+            # Observed live (soak bt-2026-08-31-174037): "UnboundLocalError:
+            # cannot access local variable 'exec_results'" killed a whole
+            # tool-loop round. Pre-existing and independent of anything
+            # about siblings -- drawing more candidates just runs this loop
+            # more often, so it surfaces sooner.
+            exec_results: List[Any] = []
 
             for idx, tc in enumerate(tool_calls):
                 call_id = f"{op_id}:r{round_index}.{idx}:{tc.name}"
