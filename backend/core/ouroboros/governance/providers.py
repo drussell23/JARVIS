@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 
 # Slice 2B-ii — Aegis Provider Bridge wiring.
 # Per-op lease scoping uses a ContextVar (asyncio-task-local, safe
@@ -271,8 +271,25 @@ _TOOL_SCHEMA_VERSION = "2b.2-tool"
 _TOOL_KEYS = frozenset({"schema_version", "preamble", "tool_calls"})
 
 
-def build_response_json_schema() -> "Dict[str, Any]":
+def build_response_json_schema(
+    allow: "Optional[FrozenSet[str]]" = None,
+) -> "Dict[str, Any]":
     """Derive a sampler-enforceable JSON Schema from THIS module's own constants.
+
+    *allow* narrows the union to the answer shapes named by their
+    ``schema_version`` constant (e.g. ``frozenset({_TOOL_SCHEMA_VERSION})``).
+    None -- the default -- returns the full union, byte-identical to before.
+    It exists so a CALLER that knows something about the op's state can make
+    a shape unrepresentable rather than merely discouraged; see
+    ``tool_masking.answer_shapes_allowed``. Narrowing is the caller's
+    judgement, never this function's: the builder still owns exactly one
+    definition of each shape, so a narrowed grammar and the full one cannot
+    describe the same shape differently.
+
+    An *allow* that matches nothing degrades to the full union rather than
+    emitting an empty ``anyOf`` -- a grammar that permits no output at all
+    is a guaranteed generation dead-end, and the caller's mistake must not
+    become an unparseable response.
 
     Written as a projection of ``_SCHEMA_VERSION`` / ``_CANDIDATE_KEYS`` /
     ``_NOOP_KEYS`` / ``_TOOL_KEYS`` rather than as a literal, so the grammar the
@@ -408,7 +425,23 @@ def build_response_json_schema() -> "Dict[str, Any]":
         },
         ["schema_version", "candidates"],
     )
-    return {"anyOf": [candidates_shape, diff_shape, noop_shape, tool_shape]}
+    _by_version = (
+        (_SCHEMA_VERSION, candidates_shape),
+        (_SCHEMA_VERSION_DIFF, diff_shape),
+        (_NOOP_SCHEMA_VERSION, noop_shape),
+        (_TOOL_SCHEMA_VERSION, tool_shape),
+    )
+    if allow:
+        _kept = [shape for ver, shape in _by_version if ver in allow]
+        if _kept:
+            return {"anyOf": _kept}
+        logger.warning(
+            "[Providers] response schema `allow` matched no known shape "
+            "(%s) -- falling back to the full union rather than emitting a "
+            "grammar that permits nothing",
+            ", ".join(sorted(allow)),
+        )
+    return {"anyOf": [shape for _, shape in _by_version]}
 
 
 # ---------------------------------------------------------------------------

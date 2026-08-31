@@ -71,7 +71,19 @@ def _resolve_response_schema() -> "Optional[Dict[str, Any]]":
     rather than failing. NEVER raises."""
     try:
         from .providers import build_response_json_schema  # noqa: PLC0415
-        schema = build_response_json_schema()
+        # State-Driven Schema Constraint (tool_masking lever 3). While the op
+        # is below the Iron Gate exploration floor this narrows the union to
+        # the tool-call shape, making a premature patch -- or a premature
+        # "already complete" -- UNREPRESENTABLE rather than merely rejected
+        # after the fact. Returns None outside a tool loop, on every non-local
+        # provider, and whenever the floor is met, so the default path is the
+        # full union exactly as before.
+        try:
+            from .tool_masking import answer_shapes_allowed  # noqa: PLC0415
+            _allow = answer_shapes_allowed()
+        except Exception:  # noqa: BLE001 — narrowing is an optimisation
+            _allow = None
+        schema = build_response_json_schema(_allow)
         return schema if isinstance(schema, dict) and schema else None
     except Exception:  # noqa: BLE001
         return None

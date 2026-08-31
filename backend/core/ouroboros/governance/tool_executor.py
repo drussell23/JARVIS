@@ -6507,7 +6507,50 @@ class ToolLoopCoordinator:
             except Exception:  # noqa: BLE001 — fail-open to the full prompt
                 _prompt_for_model = current_prompt
 
-            raw = await generate_fn(_prompt_for_model)
+            # ── Stateful Tool Masking (lever 3): publish the LIVE exploration
+            # state so the local client can narrow the sampler grammar for
+            # THIS call. Levers 1 and 2 ask the model to explore; this one
+            # removes its ability not to.
+            #
+            # The count is the executed-tool-call history
+            # (`_cumulative_explore_calls`), never a round index: a round
+            # whose every tool call was denied by policy advances the round
+            # and gathers nothing, so counting rounds would unlock the patch
+            # shape for a model that has still read nothing.
+            #
+            # `may_finalize` is the release valve. Once the loop is no longer
+            # willing to spend another round -- the same reserve lever 2 uses
+            # -- the narrowing lifts, so a model that cannot explore still
+            # gets to answer rather than dead-ending against a grammar it
+            # cannot satisfy.
+            _sm_token = None
+            try:
+                from backend.core.ouroboros.governance.tool_masking import (
+                    set_exploration_state as _tm_set_state,
+                )
+                _sm_token = _tm_set_state(
+                    explore_count=_cumulative_explore_calls,
+                    floor=_epistemic_exploration_floor(),
+                    may_finalize=(
+                        (deadline - time.monotonic())
+                        <= plan.final_write_reserve_s
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — fail-open to the full union
+                _sm_token = None
+            try:
+                raw = await generate_fn(_prompt_for_model)
+            finally:
+                # Reset in `finally`: the state is scoped to ONE generation
+                # call, and leaking a narrowed grammar past it would
+                # constrain whatever this task does next.
+                try:
+                    from backend.core.ouroboros.governance.tool_masking import (
+                        reset_exploration_state as _tm_reset_state,
+                    )
+                    _tm_reset_state(_sm_token)
+                except Exception:  # noqa: BLE001
+                    pass
             tool_calls = parse_fn(raw)
             if tool_calls is None:
                 # ── Stateful Tool Masking (lever 2, load-bearing): a FINAL patch
