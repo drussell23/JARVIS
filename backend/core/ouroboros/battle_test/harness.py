@@ -2491,6 +2491,49 @@ class BattleTestHarness:
             logger.error("Session %s boot failed: %s", self._session_id, exc)
             self._stop_reason = f"boot_failure: {exc}"
         finally:
+            # Trajectory flush — FIRST, while the loop is still alive.
+            #
+            # A generation is written only when its op reports a verdict, so
+            # every op still in flight at session end is holding an unwritten
+            # trajectory. `TrajectoryRecorder.aclose()` exists precisely to
+            # flush those, and NOTHING called it: the recorder was built with
+            # a correct final-flush path that never ran. Measured on soak
+            # bt-2026-08-31-164353: 7 generations queued, 2 rows on disk --
+            # the other 5 were discarded at teardown, 71% of that session's
+            # entire harvest.
+            #
+            # It has to run here rather than in _shutdown_components: this is
+            # a data-loss boundary, and the component drain below is the part
+            # documented as "slow, possibly-hanging". Ordering it before
+            # _generate_report also means the report counts a complete corpus.
+            # Bounded and fail-open -- a telemetry flush must never be the
+            # reason a session cannot shut down.
+            try:
+                from backend.core.ouroboros.governance.observability.trajectory_recorder import (  # noqa: E501
+                    get_recorder as _traj_get_recorder,
+                    recorder_enabled as _traj_enabled,
+                )
+                if _traj_enabled():
+                    _rec = _traj_get_recorder()
+                    _before = dict(_rec.stats())
+                    await asyncio.wait_for(_rec.aclose(timeout_s=10.0), timeout=30.0)
+                    _after = dict(_rec.stats())
+                    logger.info(
+                        "[TrajectoryRecorder] session flush: wrote %d event(s) "
+                        "at teardown (total written=%d, expired=%d, "
+                        "orphan_outcomes=%d)",
+                        _after.get("events_written", 0)
+                        - _before.get("events_written", 0),
+                        _after.get("events_written", 0),
+                        _after.get("pending_expired", 0),
+                        _after.get("orphan_outcomes", 0),
+                    )
+            except Exception as _traj_flush_exc:  # noqa: BLE001 — fail-open
+                logger.warning(
+                    "Session %s trajectory flush failed (corpus may be "
+                    "incomplete): %s", self._session_id, _traj_flush_exc,
+                )
+
             # Sovereign Telemetry Flush Failsafe (2026-06-21) — persist the
             # COMPLETE summary BEFORE the (slow, possibly-hanging) component
             # drain. _generate_report reads recorder/ledger/score-history (no
