@@ -47,7 +47,9 @@ def test_exec_results_is_bound_before_the_conditional_assignment() -> None:
     of the line.
     """
     init = _SRC.index("exec_results: List[Any] = []")
-    guard = _SRC.index("if pending_execs:")
+    # Match the STATEMENT, not the phrase: the fix's own comment explains
+    # the guard by name, and a bare substring search finds the prose first.
+    guard = _SRC.index("\n            if pending_execs:")
     first_cond_assign = _SRC.index("exec_results = [(tc, tool_result")
     read = _SRC.index("{tc.name for tc, *_ in exec_results}")
 
