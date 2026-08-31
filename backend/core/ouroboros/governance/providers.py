@@ -6456,7 +6456,40 @@ class PrimeProvider:
             getattr(response, "model", "unknown") if response else "unknown",
             getattr(response, "tokens_used", 0) if response else 0,
         )
-        return result.with_tool_records(tool_records).with_venom_edits(venom_edits)
+        _prime_final = result.with_tool_records(
+            tool_records
+        ).with_venom_edits(venom_edits)
+        # Trajectory recorder — the LOCAL lane's generation half.
+        #
+        # This seam is separate from ClaudeProvider's
+        # `_finalize_codegen_result` and must be: they are different
+        # classes with independent generate() paths, and PrimeProvider is
+        # the one the local lane wraps. Hooking only the Claude seam
+        # recorded ZERO local generations while every verdict arrived
+        # orphaned -- the whole local corpus, silently absent.
+        try:
+            from backend.core.ouroboros.governance.observability.trajectory_recorder import (  # noqa: E501, PLC0415
+                record_generation as _traj_record_generation,
+            )
+            _traj_record_generation(
+                op_id=str(getattr(context, "op_id", "") or ""),
+                # PrimeProvider names its assembled prompt `prompt`, not
+                # `prompt_text` as ClaudeProvider does. Getting this wrong
+                # raises NameError into the except below and turns the
+                # whole hook into a silent no-op that still compiles.
+                prompt=prompt,
+                generation_result=_prime_final,
+                latency_ms=duration * 1000.0,
+                task_type="code_repair",
+                session_id=str(getattr(context, "session_id", "") or ""),
+                route=str(getattr(context, "provider_route", "") or "local"),
+            )
+        except Exception as _traj_exc:  # noqa: BLE001 — fail-open
+            logger.debug(
+                "[TrajectoryRecorder] prime generation emit degraded: %s",
+                _traj_exc,
+            )
+        return _prime_final
 
     async def health_probe(self) -> bool:
         """Check PrimeClient health. Returns True only if AVAILABLE."""
