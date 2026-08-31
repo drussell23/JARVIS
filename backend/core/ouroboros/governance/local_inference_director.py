@@ -1817,6 +1817,28 @@ def register_flags(registry: Any) -> int:
             example="true",
             since="local-lane arc (2026-08-24)",
         ),
+        FlagSpec(
+            name="JARVIS_LOCAL_STREAM_USAGE_ENABLED",
+            type=FlagType.BOOL,
+            default=True,
+            description=(
+                "Ask the engine for its own token accounting on the "
+                "streaming path (stream_options.include_usage). Without it a "
+                "stream carries no usage object and the path falls back to a "
+                "len(text)//4 guess -- reported through the same field a "
+                "measurement would use, so tok/s could not be trusted. The "
+                "error is not uniform across models (measured: 31% low for "
+                "qwen3-coder:30b, 10% for qwen2.5-coder:32b), so it biases a "
+                "model A/B rather than cancelling out. Additive: an engine "
+                "that ignores the field returns the same stream, and the "
+                "estimate resumes -- now labelled tokens_estimated=true. Set "
+                "falsey for the byte-identical previous request body."
+            ),
+            category=Category.OBSERVABILITY,
+            source_file=src,
+            example="true",
+            since="local-lane arc (2026-08-31)",
+        ),
     ]
     try:
         registry.bulk_register(specs, override=True)

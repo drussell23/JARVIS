@@ -221,6 +221,13 @@ class _PendingGeneration:
     # whose tok/s was derived from a chars/4 guess -- a corpus that cannot
     # distinguish the two silently launders an estimate into a measurement.
     tokens_estimated: bool = True
+    # candidate_hash -> (passed, failure_class), filled in as VALIDATE
+    # judges each sibling. THE reason n>1 generation is worth doing: without
+    # a per-candidate verdict every sibling of one op inherits that op's
+    # single terminal outcome, scores identically in the DPO ranker, and
+    # yields ZERO pairs (measured: 3 uniform siblings -> 0 pairs; the same
+    # 3 with per-candidate outcomes -> 2 pairs, method=outcome_diff).
+    candidate_verdicts: Dict[str, Tuple[bool, str]] = field(default_factory=dict)
     created_monotonic: float = field(default_factory=time.monotonic)
     created_iso: str = field(default_factory=_utc_now_iso)
 
@@ -230,6 +237,21 @@ class _OutcomeEvent:
     op_id: str
     terminal_phase: str
     terminal_reason: str
+
+
+@dataclass
+class _CandidateVerdictEvent:
+    """One sibling's VALIDATE result, en route to its pending generation.
+
+    Separate from :class:`_OutcomeEvent` because it arrives EARLIER and does
+    not terminate anything: validation judges candidates while the op is
+    still running, and only the op-level verdict triggers the write.
+    """
+
+    op_id: str
+    candidate_hash: str
+    passed: bool
+    failure_class: str
 
 
 class TrajectoryRecorder:
@@ -257,6 +279,9 @@ class TrajectoryRecorder:
             "pending_expired": 0,
             "orphan_outcomes": 0,
             "write_failures": 0,
+            "candidate_verdicts_queued": 0,
+            "candidate_verdicts_joined": 0,
+            "orphan_candidate_verdicts": 0,
         }
 
     # -- paths ------------------------------------------------------------
@@ -427,6 +452,34 @@ class TrajectoryRecorder:
         )
         return False
 
+    def record_candidate_verdict(
+        self,
+        *,
+        op_id: str,
+        candidate_hash: str,
+        passed: bool,
+        failure_class: str = "",
+    ) -> bool:
+        """Queue ONE sibling's VALIDATE verdict. Non-blocking. NEVER raises.
+
+        Keyed by ``candidate_hash`` because that is what the written event
+        already carries per candidate, so the join needs no new identity.
+        A candidate with no hash cannot be joined and is dropped rather
+        than guessed onto a sibling.
+        """
+        if not recorder_enabled() or not op_id or not candidate_hash:
+            return False
+        evt = _CandidateVerdictEvent(
+            op_id=str(op_id),
+            candidate_hash=str(candidate_hash),
+            passed=bool(passed),
+            failure_class=str(failure_class or ""),
+        )
+        if self._offer(evt):
+            self._stats["candidate_verdicts_queued"] += 1
+            return True
+        return False
+
     def record_outcome(
         self,
         *,
@@ -460,6 +513,8 @@ class TrajectoryRecorder:
             try:
                 if isinstance(item, _PendingGeneration):
                     await self._admit_pending(item)
+                elif isinstance(item, _CandidateVerdictEvent):
+                    await self._attach_verdict(item)
                 elif isinstance(item, _OutcomeEvent):
                     await self._resolve(item)
                 # Opportunistic sweep on activity; the watchdog is what
@@ -490,6 +545,30 @@ class TrajectoryRecorder:
                     "its trajectory is lost; raise %s if this recurs",
                     dropped, cap, _ENV_PENDING_MAX,
                 )
+
+    async def _attach_verdict(self, evt: "_CandidateVerdictEvent") -> None:
+        """Record one sibling's VALIDATE result onto its pending generation.
+
+        Ordering is sound by construction: the generation is queued when
+        the provider returns, and VALIDATE cannot judge a candidate that
+        has not been generated -- so the pending entry always exists first.
+        A verdict that finds none is therefore a real anomaly, counted and
+        named rather than silently dropped.
+        """
+        async with self._guard():
+            gen = self._pending.get(evt.op_id)
+            if gen is None:
+                self._stats["orphan_candidate_verdicts"] += 1
+                logger.debug(
+                    "[TrajectoryRecorder] candidate verdict for op=%s "
+                    "cand=%s had no pending generation",
+                    evt.op_id, evt.candidate_hash[:12],
+                )
+                return
+            gen.candidate_verdicts[evt.candidate_hash] = (
+                evt.passed, evt.failure_class,
+            )
+            self._stats["candidate_verdicts_joined"] += 1
 
     def _guard(self) -> Any:
         """The pending-map lock, created lazily with the loop."""
@@ -598,10 +677,6 @@ class TrajectoryRecorder:
             self._stats["write_failures"] += 1
             return
 
-        confidence = (
-            1.0 if outcome == "success"
-            else (0.0 if outcome == "failure" else 0.5)
-        )
         n_cands = len(gen.candidates)
 
         for idx, cand in enumerate(gen.candidates):
@@ -611,6 +686,28 @@ class TrajectoryRecorder:
             if not body:
                 continue
             cand_hash = str(cand.get("candidate_hash", "") or "")
+            # Per-candidate verdict beats the op-level one where it exists.
+            #
+            # A candidate VALIDATE rejected was bad on its own merits --
+            # broken syntax, failing tests -- and that is model quality
+            # regardless of how the op later ended, so it is trainable
+            # even when the op died of something the model did not cause.
+            # A candidate that PASSED has only earned "not broken"; what
+            # happened after (GATE, APPLY, VERIFY) is the op-level verdict,
+            # so it inherits that. Siblings of one op therefore end up with
+            # DIFFERENT outcomes, which is the entire point: identical
+            # outcomes score identically and the ranker emits no pair.
+            _verdict = gen.candidate_verdicts.get(cand_hash)
+            if _verdict is not None and not _verdict[0]:
+                c_outcome, c_autonomy, c_train = _FAILURE
+                c_reason = _verdict[1] or "validation_failed"
+            else:
+                c_outcome, c_autonomy, c_train = outcome, autonomy_type, should_train
+                c_reason = evt.terminal_reason
+            c_confidence = (
+                1.0 if c_outcome == "success"
+                else (0.0 if c_outcome == "failure" else 0.5)
+            )
             line = json.dumps(
                 {
                     "event_id": str(uuid.uuid4()),
@@ -621,8 +718,8 @@ class TrajectoryRecorder:
                     "user_input": gen.prompt,
                     "assistant_output": _truncate(body, out_cap),
                     "system_context": "",
-                    "outcome": outcome,
-                    "confidence": confidence,
+                    "outcome": c_outcome,
+                    "confidence": c_confidence,
                     "model_id": gen.model_id,
                     "latency_ms": gen.latency_ms,
                     # Canonical ExperienceEvent field, kept for the reactor
@@ -661,11 +758,21 @@ class TrajectoryRecorder:
                         "is_noop": gen.is_noop,
                         "cost_usd": gen.cost_usd,
                         "terminal_phase": evt.terminal_phase,
-                        "terminal_reason": evt.terminal_reason,
+                        "terminal_reason": c_reason,
                         # Same exclusion policy as reactor-core's
                         # autonomy_classifier: infrastructure != quality.
-                        "autonomy_event_type": autonomy_type,
-                        "should_train": should_train,
+                        "autonomy_event_type": c_autonomy,
+                        "should_train": c_train,
+                        # Whether THIS row's outcome came from VALIDATE
+                        # judging this candidate, or was inherited from the
+                        # op. A sibling set that is all-inherited explains
+                        # its own zero pair count without re-deriving it.
+                        "verdict_source": (
+                            "candidate" if _verdict is not None else "operation"
+                        ),
+                        "candidate_validated": (
+                            None if _verdict is None else bool(_verdict[0])
+                        ),
                         "idempotency_key": f"{gen.op_id}:{cand_hash or idx}",
                     },
                 },
@@ -770,6 +877,18 @@ def record_outcome(**kwargs: Any) -> bool:
     except Exception:  # noqa: BLE001
         logger.debug(
             "[TrajectoryRecorder] record_outcome failed", exc_info=True,
+        )
+        return False
+
+
+def record_candidate_verdict(**kwargs: Any) -> bool:
+    """Fire-and-forget per-candidate VALIDATE verdict. NEVER raises."""
+    try:
+        return get_recorder().record_candidate_verdict(**kwargs)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[TrajectoryRecorder] record_candidate_verdict failed",
+            exc_info=True,
         )
         return False
 
@@ -880,6 +999,7 @@ __all__ = [
     "classify_terminal_reason",
     "events_dir",
     "get_recorder",
+    "record_candidate_verdict",
     "record_generation",
     "record_outcome",
     "recorder_enabled",

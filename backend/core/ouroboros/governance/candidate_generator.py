@@ -2760,6 +2760,35 @@ def _invalidate_jprime_model_cache() -> None:
     _JPRIME_SERVED_BYTES_CACHE.clear()
 
 
+def _sibling_candidate_count() -> int:
+    """How many candidates to draw per op on the local lane. Default 3.
+
+    A DPO preference pair needs at least TWO answers to one question, so
+    1 is the value at which the trajectory corpus can never produce a pair
+    however long a soak runs. 3 gives a pair even when one sibling is a
+    duplicate or fails to parse. Clamped to [1, 8]; 1 restores the exact
+    single-candidate behaviour this lane had.
+
+    The upper clamp is not decoration: siblings are sequential on one GPU,
+    so a fat-fingered 300 would spend the whole op budget generating and
+    leave nothing for VALIDATE -- which is where the per-candidate verdict
+    that makes siblings worth having actually comes from.
+    """
+    return max(1, min(8, _envi_or_default("JARVIS_LOCAL_SIBLING_CANDIDATES", 3)))
+
+
+def _sibling_budget_margin() -> float:
+    """Safety factor on "can the op still afford another sibling?".
+
+    Default 1.5. The estimate is the PREVIOUS sibling's measured cost, and
+    the next one can legitimately run longer (a larger patch, a tool
+    round). Starting a sibling the budget cannot finish wastes the whole
+    generation AND the slack, so the margin is deliberately generous:
+    skipping a sibling costs one training pair, overrunning costs the op.
+    """
+    return max(1.0, _envf_or_default("JARVIS_LOCAL_SIBLING_BUDGET_MARGIN", 1.5))
+
+
 def _model_pin() -> str:
     """Operator's explicit choice of local model, or empty for auto."""
     return os.environ.get("JARVIS_LOCAL_MODEL_NAME", "").strip()
@@ -5899,7 +5928,144 @@ class CandidateGenerator:
         # concurrent op scouts (calibrates the EWMA) while the herd awaits the lock;
         # once calibrated the herd runs CONCURRENTLY on the escalated seed -- the DAG
         # is never serialized, only the one-shot cold calibration is gated.
-        return await _prof.run_calibrated(_attempts)
+        _first = await _prof.run_calibrated(_attempts)
+        return await self._extend_with_siblings(
+            _first, _attempts, context, deadline,
+            resume_prefill=_resume_prefill,
+        )
+
+    async def _extend_with_siblings(
+        self,
+        first: Optional[GenerationResult],
+        attempt: Any,
+        context: OperationContext,
+        deadline: datetime,
+        *,
+        resume_prefill: str = "",
+    ) -> Optional[GenerationResult]:
+        """Draw additional candidates for the SAME op, sequentially.
+
+        A preference pair needs two answers to one question. The local lane
+        produced exactly one per op, so the DPO corpus had nothing to pair
+        and every farming soak yielded zero pairs no matter how long it ran.
+
+        SEQUENTIAL, not ``asyncio.gather``, on measurement rather than
+        taste: on this host three concurrent generations finish in 2.6s
+        against 2.7s sequential -- 1.04x -- because the engine serializes
+        them onto one device anyway (the same reason the local "swarm" is
+        sequential chunking). Concurrency here would buy 4% while putting
+        three inter-token watchdogs, three streams and three num_ctx
+        negotiations in flight against one GPU. The watchdog TTL "reset"
+        this needs is structural and already true: each sibling builds its
+        own client and its own stream, so the inter-token deadline starts
+        fresh per sibling with no timer to reach into and reset.
+
+        Siblings are STRICTLY ADDITIVE and best-effort. The first candidate
+        is produced exactly as before; every sibling is attempted only if
+        the op's own remaining budget can already pay for it, measured
+        against what the previous one actually cost. The op deadline is
+        never extended -- a sibling is a bonus drawn from slack, never a
+        reason to overrun. So on a tight budget this degrades silently to
+        today's single candidate, and a sibling that fails or stalls can
+        never turn a working op into a failed one.
+
+        Diversity comes from sampling temperature, which the provider seat
+        already applies (measured: 3/3 distinct outputs at temperature 0.7
+        and 1.0 on a real refactor prompt). Identical siblings are dropped
+        here rather than shipped -- the pair generator discards duplicate
+        responses anyway, so an identical sibling is pure cost.
+        """
+        n_want = _sibling_candidate_count()
+        if first is None or n_want <= 1 or not getattr(first, "candidates", None):
+            return first
+        # A RESUME is continuing one specific interrupted thought. Drawing
+        # alternatives to it would be answering a different question.
+        if resume_prefill:
+            return first
+
+        _op = (getattr(context, "op_id", "") or "?")[:16]
+        merged = list(first.candidates)
+        seen = {
+            str((c or {}).get("candidate_hash", "") or "")
+            for c in merged if isinstance(c, dict)
+        }
+        _dupes = 0
+        # Seed the affordability estimate with what the FIRST candidate
+        # actually cost on this model and this prompt. A static per-sibling
+        # guess is the thing that would make this either skip siblings a
+        # fast model could afford, or start one a slow model cannot finish.
+        _last_cost = max(
+            0.05, float(getattr(first, "generation_duration_s", 0.0) or 0.0),
+        )
+
+        for _i in range(2, n_want + 1):
+            _t0 = time.monotonic()
+            remaining = self._remaining_seconds(deadline)
+            # Pay only out of slack we can already see. `_last_cost` is what
+            # the PREVIOUS sibling actually took, so the estimate tracks the
+            # real model on the real prompt instead of a static guess.
+            _needed = _last_cost * _sibling_budget_margin()
+            if remaining <= _needed:
+                logger.info(
+                    "[CandidateGenerator] sibling %d/%d skipped op=%s: "
+                    "%.1fs budget left, previous sibling cost %.1fs",
+                    _i, n_want, _op, remaining, _last_cost,
+                )
+                break
+            try:
+                _sib = await self._profiler_for_siblings(attempt)
+            except Exception as _sib_exc:  # noqa: BLE001
+                # A sibling is a bonus. Losing one must never cost the op
+                # the candidate it already has -- so this swallows, where
+                # the FIRST attempt deliberately propagates.
+                logger.info(
+                    "[CandidateGenerator] sibling %d/%d failed op=%s (%s: %s)"
+                    " -- keeping %d candidate(s)",
+                    _i, n_want, _op, type(_sib_exc).__name__,
+                    _trim_exc_msg(_sib_exc), len(merged),
+                )
+                break
+            _last_cost = max(0.05, time.monotonic() - _t0)
+            if _sib is None or not getattr(_sib, "candidates", None):
+                logger.info(
+                    "[CandidateGenerator] sibling %d/%d empty op=%s -- stopping",
+                    _i, n_want, _op,
+                )
+                break
+            for _c in _sib.candidates:
+                if not isinstance(_c, dict):
+                    continue
+                _h = str(_c.get("candidate_hash", "") or "")
+                if _h and _h in seen:
+                    _dupes += 1
+                    continue
+                if _h:
+                    seen.add(_h)
+                merged.append(_c)
+
+        if len(merged) == len(first.candidates):
+            return first
+        logger.info(
+            "[CandidateGenerator] op=%s drew %d candidate(s) from %d "
+            "sibling generation(s)%s -- a preference pair needs two "
+            "answers to one question",
+            _op, len(merged), n_want,
+            f" ({_dupes} identical, dropped)" if _dupes else "",
+        )
+        import dataclasses as _sib_dc
+        return _sib_dc.replace(first, candidates=tuple(merged))
+
+    async def _profiler_for_siblings(self, attempt: Any) -> Optional[GenerationResult]:
+        """Run one sibling attempt.
+
+        Split out so the sibling loop reads as a loop. Deliberately NOT
+        wrapped in ``run_calibrated``: the Scout Lock exists to serialize a
+        COLD profiler's one-shot calibration, and by the time a sibling
+        runs the profiler is warm by construction -- the first candidate
+        just calibrated it. Re-entering the lock per sibling would
+        serialize the herd for no reading.
+        """
+        return await attempt()
 
     async def _try_local_primary(
         self,
@@ -11191,6 +11357,43 @@ def register_flags(registry: Any) -> int:
             source_file=src,
             example="true",
             since="local-lane arc (2026-08-27)",
+        ),
+        FlagSpec(
+            name="JARVIS_LOCAL_SIBLING_CANDIDATES",
+            type=FlagType.INT,
+            default=3,
+            description=(
+                "How many candidates to draw per op on the local lane. A DPO "
+                "preference pair needs TWO answers to one question, so 1 is "
+                "the value at which the trajectory corpus can never yield a "
+                "pair however long a soak runs; 3 survives one duplicate or "
+                "one parse failure. Drawn SEQUENTIALLY (measured on this "
+                "host: concurrent n=3 is 1.04x sequential, because the engine "
+                "serializes onto one device anyway) and only out of budget "
+                "slack the op already has -- the deadline is never extended, "
+                "so a tight budget degrades silently to one candidate. "
+                "Clamped [1, 8]; 1 restores single-candidate behaviour."
+            ),
+            category=Category.ROUTING,
+            source_file=src,
+            example="3",
+            since="local-lane arc (2026-08-31)",
+        ),
+        FlagSpec(
+            name="JARVIS_LOCAL_SIBLING_BUDGET_MARGIN",
+            type=FlagType.FLOAT,
+            default=1.5,
+            description=(
+                "Safety factor on 'can the op still afford another sibling?'. "
+                "The estimate is the PREVIOUS sibling's measured cost and the "
+                "next may legitimately run longer, so the margin is generous "
+                "on purpose: skipping a sibling costs one training pair, "
+                "overrunning costs the op. Floored at 1.0."
+            ),
+            category=Category.ROUTING,
+            source_file=src,
+            example="1.5",
+            since="local-lane arc (2026-08-31)",
         ),
     ]
     try:

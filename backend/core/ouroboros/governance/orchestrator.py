@@ -8534,6 +8534,37 @@ class GovernedOrchestrator:
                         "exploration_count": _exploration_count,
                     })
 
+                    # ── Trajectory recorder — the per-candidate half ─────
+                    # This loop ALREADY computes the only signal that can
+                    # tell one sibling from another; it just had nowhere to
+                    # go. Without it every sibling of an op inherits that
+                    # op's single terminal verdict, scores identically in
+                    # the DPO ranker, and the whole set yields ZERO pairs —
+                    # so n>1 generation would buy N× the wall-clock and no
+                    # training data at all. Emitting HERE (rather than a
+                    # second validation pass) is why n>1 costs only
+                    # generation: the validation was already happening.
+                    # Non-blocking, master-gated default-OFF, NEVER raises.
+                    try:
+                        from backend.core.ouroboros.governance.observability.trajectory_recorder import (  # noqa: E501
+                            record_candidate_verdict as _traj_cand_verdict,
+                        )
+                        _traj_cand_verdict(
+                            op_id=ctx.op_id,
+                            candidate_hash=str(
+                                candidate.get("candidate_hash", "") or ""
+                            ),
+                            passed=bool(validation.passed),
+                            failure_class=str(
+                                validation.failure_class or ""
+                            ),
+                        )
+                    except Exception:  # noqa: BLE001 — fail-open
+                        logger.debug(
+                            "[TrajectoryRecorder] candidate verdict emit "
+                            "degraded", exc_info=True,
+                        )
+
                     # Heartbeat: validation result for TUI (Manifesto §7)
                     try:
                         _val_msg = type("_Msg", (), {
