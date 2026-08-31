@@ -112,6 +112,78 @@ def _apply_response_format(body: "Dict[str, Any]", cfg: "LocalConfig") -> str:
         return "none"
 
 
+#: (base_url, model) pairs that have REJECTED a ``reasoning_effort`` field.
+#: Kept separate from ``_SCHEMA_UNSUPPORTED`` deliberately: attributing a
+#: reasoning_effort rejection to the schema would permanently disable
+#: constrained decoding for the process over an unrelated field.
+_REASONING_UNSUPPORTED: "set" = set()
+
+_VALID_REASONING_EFFORTS = frozenset(
+    {"none", "low", "medium", "high", "xhigh"}
+)
+
+
+def _reasoning_effort() -> str:
+    """How much the engine should think before answering.
+
+    Default ``none``. Measured on this host against qwen3.8:27b over
+    ``/v1/chat/completions`` with the json_schema response_format attached:
+
+        baseline (thinking on) : valid JSON, 629 chars reasoning, 6.8s
+        reasoning_effort=none  : valid JSON,   0 chars reasoning, 1.5s
+        reasoning_effort=low   : valid JSON, 531 chars reasoning, 2.3s
+
+    Correctness is NOT the issue on this path -- ollama returns reasoning in
+    a separate ``reasoning`` field, so the constrained ``content`` stays
+    schema-valid either way. Cost is: reasoning is a 4.5x wall-clock tax on
+    a lane whose soaks are wall-clock capped, and O+V judges a candidate by
+    whether it parses and passes tests, not by the prose that preceded it.
+
+    Set to empty to omit the field entirely (byte-identical to pre-flag
+    behaviour); set higher to buy reasoning back if it proves to raise
+    candidate quality.
+
+    NOTE the two spellings that do NOT work here and must not be reached
+    for: ollama's native ``think`` field and ``chat_template_kwargs
+    {enable_thinking: false}`` are both silently IGNORED on
+    /v1/chat/completions (measured: reasoning stayed at 629 chars for
+    both). They belong to /api/chat.
+    """
+    raw = os.environ.get("JARVIS_LOCAL_REASONING_EFFORT", "none").strip().lower()
+    return raw if raw in _VALID_REASONING_EFFORTS else ""
+
+
+def _apply_reasoning_effort(body: "Dict[str, Any]", cfg: "LocalConfig") -> str:
+    """Attach ``reasoning_effort`` unless this engine has rejected it.
+
+    Returns the effort applied, for telemetry. NEVER raises: thinking
+    budget is an optimisation, and failing to set one must not fail the
+    generation."""
+    try:
+        effort = _reasoning_effort()
+        if not effort or _schema_key(cfg) in _REASONING_UNSUPPORTED:
+            return ""
+        body["reasoning_effort"] = effort
+        return effort
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _degrade_reasoning_effort(body: "Dict[str, Any]", cfg: "LocalConfig") -> bool:
+    """Record that this engine rejected ``reasoning_effort`` and drop it.
+
+    Returns True when a retry is worth attempting. Idempotent, so a
+    persistently-400ing endpoint cannot become a retry loop. NEVER raises."""
+    try:
+        key = _schema_key(cfg)
+        if key in _REASONING_UNSUPPORTED:
+            return False
+        _REASONING_UNSUPPORTED.add(key)
+        return body.pop("reasoning_effort", None) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _degrade_response_format(body: "Dict[str, Any]", cfg: "LocalConfig") -> bool:
     """Record that this engine rejected json_schema and downgrade the body.
 
@@ -1032,6 +1104,10 @@ class LocalPrimeClient:
         # engine that does not know the field ignores it, which is exactly the
         # pre-existing behaviour.
         _apply_response_format(body, self._cfg)
+        # Thinking budget. Same seam, same discipline: declared here once so
+        # the streaming and non-streaming paths cannot disagree, and dropped
+        # by observation if the engine refuses the field.
+        _apply_reasoning_effort(body, self._cfg)
 
         _use_stream = stream if stream is not None else (
             bool(self._cfg.num_ctx) and _streaming_enabled())
@@ -1046,12 +1122,37 @@ class LocalPrimeClient:
             # the next rung down. Restricted to 4xx: a 5xx is the engine failing,
             # not refusing, and degrading on it would silently disable schema
             # enforcement for the whole process over a transient blip.
-            if 400 <= resp.status < 500 and "response_format" in body:
+            if 400 <= resp.status < 500 and (
+                "response_format" in body or "reasoning_effort" in body
+            ):
                 _body_txt = await resp.text()
-                if _degrade_response_format(body, self._cfg):
+                # Attribute the refusal to the field the engine actually
+                # named. Blaming the schema for a reasoning_effort rejection
+                # would disable constrained decoding for the whole process
+                # over an unrelated field -- and constrained decoding is what
+                # made invalid JSON unrepresentable in the first place.
+                if (
+                    "reasoning_effort" in body
+                    and "reasoning_effort" in _body_txt
+                ):
+                    _degraded = _degrade_reasoning_effort(body, self._cfg)
+                    _what = "reasoning_effort"
+                elif "response_format" in body:
+                    _degraded = _degrade_response_format(body, self._cfg)
+                    _what = "json_schema"
+                else:
+                    # Neither field is implicated: a 400 that names no
+                    # constraint we attached is the engine refusing the
+                    # REQUEST (bad model, bad auth), not a grammar. Blaming
+                    # a constraint that was never sent would record a false
+                    # capability and cost a retry for nothing.
+                    _degraded = False
+                    _what = ""
+                if _degraded:
                     logger.info(
-                        "[LocalPrimeClient] retrying once without json_schema "
-                        "(engine said %s: %s)", resp.status, _body_txt[:160],
+                        "[LocalPrimeClient] retrying once without %s "
+                        "(engine said %s: %s)",
+                        _what, resp.status, _body_txt[:160],
                     )
                     async with sess.post(url, json=body) as resp2:
                         data = await resp2.json()
@@ -1480,6 +1581,30 @@ def register_flags(registry: Any) -> int:
 
     src = "backend/core/ouroboros/governance/local_inference_director.py"
     specs = [
+        FlagSpec(
+            name="JARVIS_LOCAL_REASONING_EFFORT",
+            type=FlagType.STR,
+            default="none",
+            description=(
+                "Thinking budget for reasoning-capable local models "
+                "(none|low|medium|high|xhigh; empty omits the field). "
+                "Measured on qwen3.8:27b over /v1/chat/completions WITH the "
+                "json_schema response_format attached: thinking on -> valid "
+                "JSON, 629 chars of reasoning, 6.8s; none -> valid JSON, 0 "
+                "reasoning, 1.5s. Correctness is unaffected either way "
+                "(ollama returns reasoning in a separate field, so the "
+                "constrained content stays schema-valid) -- this is a 4.5x "
+                "wall-clock tax on a wall-capped soak. Raise it to buy "
+                "reasoning back if it proves to lift candidate quality. "
+                "NOTE ollama's native `think` and `chat_template_kwargs "
+                "{enable_thinking:false}` are silently IGNORED on this "
+                "endpoint; this is the spelling that works."
+            ),
+            category=Category.TUNING,
+            source_file=src,
+            example="none",
+            since="model A/B arc (2026-08-31)",
+        ),
         FlagSpec(
             name="JARVIS_LOCAL_JSON_MODE_ENABLED",
             type=FlagType.BOOL,

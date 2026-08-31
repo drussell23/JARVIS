@@ -2760,18 +2760,77 @@ def _invalidate_jprime_model_cache() -> None:
     _JPRIME_SERVED_BYTES_CACHE.clear()
 
 
-def _parse_served_model(tags: Optional[Dict[str, Any]]) -> Optional[str]:
-    """From an ollama ``/api/tags`` payload, pick the model loaded in VRAM -- the
-    largest by ``size`` (the 32B, not any small sidecar), preferring ``name`` then
-    ``model``. Pure + fail-soft -> None on empty/malformed input."""
+def _model_pin() -> str:
+    """Operator's explicit choice of local model, or empty for auto."""
+    return os.environ.get("JARVIS_LOCAL_MODEL_NAME", "").strip()
+
+
+def _entry_name(entry: Optional[Dict[str, Any]]) -> str:
+    return ((entry or {}).get("name") or (entry or {}).get("model") or "").strip()
+
+
+def _select_served_entry(
+    tags: Optional[Dict[str, Any]],
+    *,
+    pin: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Choose ONE entry from an ollama ``/api/tags`` payload.
+
+    Single source of selection: both the served-model NAME and its on-disk
+    BYTES are projections of this one choice, so they cannot disagree. They
+    were separately-implemented ``max(size)`` scans before, and the bytes
+    feed the num_ctx negotiator -- a divergence there would size the
+    context window from a different model than the one being asked to
+    generate.
+
+    Selection order:
+
+    1. **An explicit pin that the node actually serves.**
+       ``JARVIS_LOCAL_MODEL_NAME`` names the model the operator wants.
+       Matched exactly, then by base tag (``qwen3.8`` matches
+       ``qwen3.8:27b``). The "actually serves" clause is load-bearing and
+       preserved from the original: naming a model the node lacks is how
+       the request comes back ``KeyError('choices')``.
+    2. **Largest by size**, the previous behaviour, when no pin is set or
+       the pin is not served.
+
+    Why the pin has to win: the size heuristic encodes "one big model plus
+    small sidecars", which held when this host served a 32B and a 7B. It
+    does not hold once several LARGE models are on disk -- a 32B (19.85GB),
+    a 30B MoE (18.56GB) and a 27B (18GB) -- where "largest" is an arbitrary
+    property with no relationship to which model the operator selected, and
+    silently makes a model A/B compare a model against itself.
+
+    Pure + fail-soft -> None on empty/malformed input.
+    """
     try:
-        models = (tags or {}).get("models") or []
+        models = [m for m in ((tags or {}).get("models") or []) if m]
         if not models:
             return None
-        best = max(models, key=lambda m: (m or {}).get("size", 0) or 0)
-        return ((best.get("name") or best.get("model") or "").strip()) or None
+        want = (pin if pin is not None else _model_pin()).strip()
+        if want:
+            for entry in models:
+                if _entry_name(entry) == want:
+                    return entry
+            base = want.split(":")[0]
+            for entry in models:
+                if _entry_name(entry).split(":")[0] == base:
+                    return entry
+            logger.warning(
+                "[CandidateGenerator] pinned local model %r is not served "
+                "(node offers %s) -- falling back to largest-by-size",
+                want, ", ".join(sorted(_entry_name(m) for m in models)) or "none",
+            )
+        return max(models, key=lambda m: (m or {}).get("size", 0) or 0)
     except Exception:  # noqa: BLE001
         return None
+
+
+def _parse_served_model(tags: Optional[Dict[str, Any]]) -> Optional[str]:
+    """From an ollama ``/api/tags`` payload, the model to dispatch to --
+    the operator's pin when the node serves it, else the largest by
+    ``size``. See :func:`_select_served_entry`. Pure + fail-soft."""
+    return _entry_name(_select_served_entry(tags)) or None
 
 
 async def _fetch_served_model(endpoint: str, *, timeout_s: float = 8.0) -> Optional[str]:
@@ -2842,14 +2901,13 @@ async def _resolve_served_model(
 
 
 def _parse_served_model_bytes(tags: Optional[Dict[str, Any]]) -> int:
-    """On-disk BYTES of the largest model in an ollama /api/tags payload (the same
-    model _parse_served_model names). Pure, fail-soft -> 0."""
+    """On-disk BYTES of the model :func:`_parse_served_model` names -- the
+    SAME :func:`_select_served_entry` choice, not a second scan. These feed
+    the num_ctx negotiator, so a divergence would size the context window
+    from a model other than the one generating. Pure, fail-soft -> 0."""
     try:
-        models = (tags or {}).get("models") or []
-        if not models:
-            return 0
-        best = max(models, key=lambda m: (m or {}).get("size", 0) or 0)
-        return int(best.get("size", 0) or 0)
+        entry = _select_served_entry(tags)
+        return int((entry or {}).get("size", 0) or 0)
     except Exception:  # noqa: BLE001
         return 0
 
