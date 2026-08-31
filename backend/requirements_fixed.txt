@@ -8,7 +8,7 @@ sentencepiece>=0.1.0
 protobuf>=3.19.6,<4.24
 pydantic==2.5.3
 python-multipart==0.0.6
-spacy>=3.7.0
+spacy>=3.8.16
 
 # Voice dependencies
 sounddevice==0.4.6
