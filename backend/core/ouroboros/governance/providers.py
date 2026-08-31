@@ -6483,6 +6483,20 @@ class PrimeProvider:
                 task_type="code_repair",
                 session_id=str(getattr(context, "session_id", "") or ""),
                 route=str(getattr(context, "provider_route", "") or "local"),
+                # The GenerationResult on this path reports model_id
+                # "gpt-4" -- the OpenAI-compat default, not the model that
+                # ran. Prefer what the engine itself reported, then the
+                # client's configured model. Recording the placeholder
+                # would make every model in an A/B look identical.
+                model_id_override=str(
+                    getattr(response, "model", "") if response else ""
+                ) or str(
+                    getattr(getattr(self, "_cfg", None), "model_name", "")
+                    or os.environ.get("JARVIS_LOCAL_MODEL_NAME", "")
+                ),
+                completion_tokens_override=int(
+                    getattr(response, "output_tokens", -1) if response else -1
+                ),
             )
         except Exception as _traj_exc:  # noqa: BLE001 — fail-open
             logger.debug(

@@ -331,8 +331,20 @@ class TrajectoryRecorder:
         task_type: str = "",
         session_id: str = "",
         route: str = "codegen",
+        model_id_override: str = "",
+        completion_tokens_override: int = -1,
+        prompt_tokens_override: int = -1,
     ) -> bool:
-        """Queue one generation. Non-blocking. NEVER raises."""
+        """Queue one generation. Non-blocking. NEVER raises.
+
+        The ``*_override`` arguments exist because a GenerationResult does
+        not always carry the truth. On the local lane the result reports
+        ``model_id="gpt-4"`` -- the OpenAI-compat client's default, not the
+        model that ran -- and zero token counts. For a MODEL A/B the model
+        identity is the entire experiment: three runs all labelled "gpt-4"
+        are indistinguishable, and the corpus is worthless. Callers that
+        know better pass what they know.
+        """
         if not recorder_enabled() or not op_id:
             return False
         try:
@@ -372,12 +384,18 @@ class TrajectoryRecorder:
             prompt=prompt_text,
             prompt_key=prompt_key,
             candidates=tuple(traj.candidates),
-            model_id=traj.model_id,
+            model_id=(str(model_id_override).strip() or traj.model_id),
             provider_name=traj.provider_name,
             is_noop=bool(traj.is_noop),
             latency_ms=max(0.0, float(latency_ms or 0.0)),
-            prompt_tokens=int(traj.total_input_tokens or 0),
-            completion_tokens=int(traj.total_output_tokens or 0),
+            prompt_tokens=(
+                prompt_tokens_override if prompt_tokens_override >= 0
+                else int(traj.total_input_tokens or 0)
+            ),
+            completion_tokens=(
+                completion_tokens_override if completion_tokens_override >= 0
+                else int(traj.total_output_tokens or 0)
+            ),
             cost_usd=float(traj.original_cost_usd),
             task_type=str(task_type or ""),
             session_id=str(session_id or ""),

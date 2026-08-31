@@ -429,6 +429,47 @@ async def test_tokens_are_split_so_tok_s_is_derivable(
 
 
 @pytest.mark.asyncio
+async def test_model_id_override_wins_over_a_placeholder(
+    rec: TrajectoryRecorder,
+) -> None:
+    """The local lane's GenerationResult reports model_id='gpt-4' -- the
+    OpenAI-compat default, not the model that ran. In a MODEL A/B that
+    field IS the experiment: three runs all labelled 'gpt-4' are
+    indistinguishable and the corpus is worthless."""
+    gr = _FakeGenerationResult(candidates=(_candidate(),), model_id="gpt-4")
+    rec.record_generation(
+        op_id="op-mid", prompt="p", generation_result=gr,
+        model_id_override="qwen3.8:27b",
+        completion_tokens_override=250,
+        latency_ms=1000.0,
+    )
+    rec.record_outcome(op_id="op-mid", terminal_reason="applied")
+    await rec.drain()
+
+    row = _lines(rec.path)[0]
+    assert row["model_id"] == "qwen3.8:27b"
+    assert row["completion_tokens"] == 250
+    assert row["tokens_per_second"] == 250.0
+
+
+@pytest.mark.asyncio
+async def test_absent_override_keeps_the_result_value(
+    rec: TrajectoryRecorder,
+) -> None:
+    """A negative override means 'I don't know', not 'zero'."""
+    gr = _FakeGenerationResult(
+        candidates=(_candidate(),), total_output_tokens=77,
+    )
+    rec.record_generation(op_id="op-noov", prompt="p", generation_result=gr)
+    rec.record_outcome(op_id="op-noov", terminal_reason="applied")
+    await rec.drain()
+
+    row = _lines(rec.path)[0]
+    assert row["model_id"] == "qwen2.5-coder:32b"
+    assert row["completion_tokens"] == 77
+
+
+@pytest.mark.asyncio
 async def test_zero_latency_does_not_divide_by_zero(
     rec: TrajectoryRecorder,
 ) -> None:
