@@ -61,7 +61,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +228,12 @@ class _PendingGeneration:
     # yields ZERO pairs (measured: 3 uniform siblings -> 0 pairs; the same
     # 3 with per-candidate outcomes -> 2 pairs, method=outcome_diff).
     candidate_verdicts: Dict[str, Tuple[bool, str]] = field(default_factory=dict)
+    # Where this generation sits in its op's lineage. A retry exists
+    # BECAUSE the previous attempt was rejected, so attempt 0 and attempt 1
+    # of one op are very often a genuine {rejected, chosen} pair on the same
+    # prompt -- the corpus has to be able to see that ordering to use it.
+    attempt_index: int = 0
+    lineage_size: int = 1
     created_monotonic: float = field(default_factory=time.monotonic)
     created_iso: str = field(default_factory=_utc_now_iso)
 
@@ -268,7 +274,7 @@ class TrajectoryRecorder:
         # is exactly what produced 4 candidate sets and 0 recorded lines.
         self._watchdog: Optional[asyncio.Task] = None
         self._lock: Optional[asyncio.Lock] = None
-        self._pending: "OrderedDict[str, _PendingGeneration]" = OrderedDict()
+        self._pending: "OrderedDict[str, List[_PendingGeneration]]" = OrderedDict()
         self._stats: Dict[str, int] = {
             "generations_queued": 0,
             "outcomes_queued": 0,
@@ -532,18 +538,55 @@ class TrajectoryRecorder:
                 except Exception:  # noqa: BLE001
                     pass
 
+    def _pending_count(self) -> int:
+        """Total pending GENERATIONS, not ops. Caller holds the lock."""
+        return sum(len(v) for v in self._pending.values())
+
     async def _admit_pending(self, gen: _PendingGeneration) -> None:
+        """Append this generation to its op's lineage.
+
+        APPEND, not assign. Keying by op_id alone made the map
+        last-write-wins, so an op that generated more than once --
+        GENERATE_RETRY, syntax repair, a sibling draw that itself retried
+        -- kept only its final attempt and every earlier candidate set was
+        discarded before it could be written. Measured on soak
+        bt-2026-08-31-185439: 31 generations across 13 ops produced 14
+        rows.
+
+        Those discarded attempts are not noise, they are the most valuable
+        rows in the corpus: a retry exists BECAUSE the first attempt was
+        rejected, so an op's lineage is very often a genuine
+        {rejected, chosen} pair on one prompt -- exactly what DPO needs and
+        exactly what the flat key was throwing away.
+        """
         cap = _env_int(_ENV_PENDING_MAX, _DEFAULT_PENDING_MAX, 8, 100_000)
         async with self._guard():
-            self._pending[gen.op_id] = gen
+            lineage = self._pending.get(gen.op_id)
+            if lineage is None:
+                lineage = []
+                self._pending[gen.op_id] = lineage
+            gen.attempt_index = len(lineage)
+            lineage.append(gen)
             self._pending.move_to_end(gen.op_id)
-            while len(self._pending) > cap:
-                dropped, _ = self._pending.popitem(last=False)
+            # The cap counts GENERATIONS. Counting ops would let a single
+            # retry-storming op hold unbounded memory while the map looked
+            # one entry deep -- the leak this structure could otherwise
+            # introduce.
+            while self._pending_count() > cap and self._pending:
+                oldest_op = next(iter(self._pending))
+                victim = self._pending[oldest_op]
+                # Drop the OLDEST attempt of the oldest op, not the whole
+                # lineage: evicting a list would discard newer generations
+                # to make room for one.
+                victim.pop(0)
+                if not victim:
+                    self._pending.pop(oldest_op, None)
                 self._stats["pending_evicted"] += 1
                 logger.warning(
-                    "[TrajectoryRecorder] evicted pending op=%s (cap=%d) — "
-                    "its trajectory is lost; raise %s if this recurs",
-                    dropped, cap, _ENV_PENDING_MAX,
+                    "[TrajectoryRecorder] evicted one pending generation of "
+                    "op=%s (cap=%d generations) — that attempt is lost; "
+                    "raise %s if this recurs",
+                    oldest_op, cap, _ENV_PENDING_MAX,
                 )
 
     async def _attach_verdict(self, evt: "_CandidateVerdictEvent") -> None:
@@ -556,8 +599,8 @@ class TrajectoryRecorder:
         named rather than silently dropped.
         """
         async with self._guard():
-            gen = self._pending.get(evt.op_id)
-            if gen is None:
+            lineage = self._pending.get(evt.op_id)
+            if not lineage:
                 self._stats["orphan_candidate_verdicts"] += 1
                 logger.debug(
                     "[TrajectoryRecorder] candidate verdict for op=%s "
@@ -565,7 +608,36 @@ class TrajectoryRecorder:
                     evt.op_id, evt.candidate_hash[:12],
                 )
                 return
-            gen.candidate_verdicts[evt.candidate_hash] = (
+            # Attach to the attempt that actually PRODUCED this candidate.
+            # With a lineage, "the op's generation" is ambiguous and
+            # guessing the newest would credit a retry's verdict to the
+            # wrong attempt -- mislabelling exactly the row a pair is built
+            # from. candidate_hash is unique per candidate, so it resolves
+            # the attempt without needing a second identity.
+            target = next(
+                (
+                    g for g in reversed(lineage)
+                    if any(
+                        str((c or {}).get("candidate_hash", "") or "")
+                        == evt.candidate_hash
+                        for c in g.candidates
+                        if isinstance(c, dict)
+                    )
+                ),
+                None,
+            )
+            if target is None:
+                # A verdict whose candidate belongs to no recorded attempt
+                # (its generation was evicted, say). Counted, never guessed
+                # onto a neighbour.
+                self._stats["orphan_candidate_verdicts"] += 1
+                logger.debug(
+                    "[TrajectoryRecorder] candidate verdict for op=%s "
+                    "cand=%s matched no attempt in a %d-deep lineage",
+                    evt.op_id, evt.candidate_hash[:12], len(lineage),
+                )
+                return
+            target.candidate_verdicts[evt.candidate_hash] = (
                 evt.passed, evt.failure_class,
             )
             self._stats["candidate_verdicts_joined"] += 1
@@ -578,7 +650,8 @@ class TrajectoryRecorder:
 
     async def _resolve(self, evt: _OutcomeEvent) -> None:
         async with self._guard():
-            gen = self._pending.pop(evt.op_id, None)
+            lineage = self._pending.pop(evt.op_id, None)
+        gen = (lineage or [None])[0]
         if gen is None:
             # Two very different causes, and the distinction matters:
             #   * an op caged before GENERATE has no candidate text, so
@@ -599,9 +672,18 @@ class TrajectoryRecorder:
         outcome, autonomy_type, should_train = classify_terminal_reason(
             evt.terminal_reason, evt.terminal_phase,
         )
-        if gen.is_noop and outcome == "success":
-            outcome, autonomy_type, should_train = _NOOP
-        await self._write(gen, outcome, autonomy_type, should_train, evt)
+        # EVERY attempt in the lineage is written, not just the survivor.
+        # The op's verdict describes where the op ENDED, and that is the
+        # honest label for each attempt that led there: a retry exists
+        # because the previous attempt was rejected, so the earlier rows
+        # carry the model's rejected work on the same prompt. Discarding
+        # them was discarding the better half of the pair.
+        for _n, _gen in enumerate(lineage or []):
+            _outcome, _autonomy, _train = outcome, autonomy_type, should_train
+            if _gen.is_noop and _outcome == "success":
+                _outcome, _autonomy, _train = _NOOP
+            _gen.lineage_size = len(lineage or [])
+            await self._write(_gen, _outcome, _autonomy, _train, evt)
 
     async def _expire_pending(self) -> None:
         """Flush generations whose op never reported a verdict.
@@ -617,15 +699,26 @@ class TrajectoryRecorder:
         now = time.monotonic()
         expired: list = []
         async with self._guard():
-            stale = [
-                op_id
-                for op_id, gen in self._pending.items()
-                if (now - gen.created_monotonic) > ttl
-            ]
-            for op_id in stale:
-                gen = self._pending.pop(op_id, None)
-                if gen is not None:
-                    expired.append((op_id, gen))
+            # Age each ATTEMPT on its own clock. Expiring a whole lineage
+            # on its oldest member would flush a retry that is seconds old
+            # and still likely to get a real verdict; expiring on its
+            # newest would pin stale attempts in memory for as long as an
+            # op keeps retrying -- the leak this structure has to avoid.
+            for op_id in list(self._pending.keys()):
+                lineage = self._pending.get(op_id) or []
+                fresh = [
+                    g for g in lineage
+                    if (now - g.created_monotonic) <= ttl
+                ]
+                if len(fresh) == len(lineage):
+                    continue
+                for g in lineage:
+                    if (now - g.created_monotonic) > ttl:
+                        expired.append((op_id, g))
+                if fresh:
+                    self._pending[op_id] = fresh
+                else:
+                    self._pending.pop(op_id, None)
 
         for op_id, gen in expired:
             self._stats["pending_expired"] += 1
@@ -752,6 +845,12 @@ class TrajectoryRecorder:
                         "candidate_hash": cand_hash,
                         "candidate_index": idx,
                         "n_candidates": n_cands,
+                        # Lineage position. Two rows of one op with
+                        # different attempt_index are the SAME prompt
+                        # answered twice, which is the shape a preference
+                        # pair is built from.
+                        "attempt_index": gen.attempt_index,
+                        "lineage_size": gen.lineage_size,
                         "file_path": str(cand.get("file_path", "") or ""),
                         "source_path": str(cand.get("source_path", "") or ""),
                         "provider_name": gen.provider_name,
@@ -773,7 +872,15 @@ class TrajectoryRecorder:
                         "candidate_validated": (
                             None if _verdict is None else bool(_verdict[0])
                         ),
-                        "idempotency_key": f"{gen.op_id}:{cand_hash or idx}",
+                        # Attempt-scoped. Without it, two attempts of one
+                        # op collide whenever candidate_hash is absent and
+                        # the key falls back to the index -- so a
+                        # downstream dedup would drop the retry, which is
+                        # the row this whole change exists to keep.
+                        "idempotency_key": (
+                            f"{gen.op_id}:{gen.attempt_index}:"
+                            f"{cand_hash or idx}"
+                        ),
                     },
                 },
                 ensure_ascii=False,
@@ -806,8 +913,13 @@ class TrajectoryRecorder:
         try:
             prev = os.environ.get(_ENV_PENDING_TTL_S)
             os.environ[_ENV_PENDING_TTL_S] = "30"
-            for gen in list(self._pending.values()):
-                gen.created_monotonic = 0.0
+            # Values are LINEAGES now, not single generations. Iterating
+            # them as objects would set an attribute on a list and raise
+            # into the fail-open below -- turning the final flush back into
+            # the silent no-op it was before it had a caller at all.
+            for lineage in list(self._pending.values()):
+                for gen in lineage:
+                    gen.created_monotonic = 0.0
             await self._expire_pending()
             if prev is None:
                 os.environ.pop(_ENV_PENDING_TTL_S, None)

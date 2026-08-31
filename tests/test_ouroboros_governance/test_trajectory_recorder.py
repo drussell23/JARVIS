@@ -364,9 +364,12 @@ async def test_watchdog_flushes_without_any_further_queue_activity(
     await rec.drain()
     assert _lines(rec.path) == [], "not due yet"
 
-    # Age it past the TTL without touching the queue.
-    for gen in rec._pending.values():
-        gen.created_monotonic = 0.0
+    # Age it past the TTL without touching the queue. `_pending` maps an
+    # op to its LINEAGE of attempts, so each attempt is aged on its own
+    # clock (a fresh retry must not be flushed with a stale sibling).
+    for lineage in rec._pending.values():
+        for gen in lineage:
+            gen.created_monotonic = 0.0
 
     for _ in range(60):
         if _lines(rec.path):
