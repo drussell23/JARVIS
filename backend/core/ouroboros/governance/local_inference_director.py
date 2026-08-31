@@ -77,6 +77,74 @@ def _resolve_response_schema() -> "Optional[Dict[str, Any]]":
         return None
 
 
+#: (base_url, model) pairs that have REJECTED a ``draft_num_predict``.
+_DRAFT_UNSUPPORTED: "set" = set()
+
+
+def _draft_num_predict() -> int:
+    """Speculative tokens to draft per step. 0 disables.
+
+    This is the REQUEST-TIME half of speculative decoding. Its deploy-time
+    counterpart is the ``DRAFT`` Modelfile instruction, which binds a draft
+    MODEL to a tag; this knob drives ollama's Multi-Token Prediction, where
+    the model drafts its own continuations and needs no second model.
+
+    Default 0 (off) deliberately. MTP requires an MTP-enabled build --
+    ``qwen3.8:27b-mtp-q4_K_M`` rather than ``qwen3.8:27b`` -- and enabling
+    it against a build without one is unmeasured behaviour on the hot path.
+    Turn it on together with that tag, and measure.
+
+    Draft-MODEL speculation additionally requires a shared tokenizer:
+    qwen2.5-coder:7b can draft for qwen2.5-coder:32b (both pre=qwen2,
+    BOS 151643) but NOT for qwen3.8:27b (pre=qwen35, BOS 248044).
+    """
+    try:
+        return max(0, min(32, int(
+            os.environ.get("JARVIS_LOCAL_DRAFT_NUM_PREDICT", "0")
+        )))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _apply_draft_tokens(body: "Dict[str, Any]", cfg: "LocalConfig") -> int:
+    """Attach ``draft_num_predict`` unless this engine has rejected it.
+
+    NEVER raises: speculation is a throughput optimisation, and failing to
+    request one must not fail the generation."""
+    try:
+        n = _draft_num_predict()
+        if n <= 0 or _schema_key(cfg) in _DRAFT_UNSUPPORTED:
+            return 0
+        opts = body.setdefault("options", {})
+        if isinstance(opts, dict):
+            opts["draft_num_predict"] = n
+            return n
+        return 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _degrade_draft_tokens(body: "Dict[str, Any]", cfg: "LocalConfig") -> bool:
+    """Record that this engine rejected speculation and drop it.
+
+    Degrading to single-token generation is always safe: the OUTPUT is
+    identical, only slower. That asymmetry is why this degrades on the
+    first refusal without a second thought, where the schema ladder had to
+    reason about what it was giving up."""
+    try:
+        key = _schema_key(cfg)
+        if key in _DRAFT_UNSUPPORTED:
+            return False
+        _DRAFT_UNSUPPORTED.add(key)
+        opts = body.get("options")
+        if isinstance(opts, dict) and "draft_num_predict" in opts:
+            opts.pop("draft_num_predict", None)
+            return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _apply_response_format(body: "Dict[str, Any]", cfg: "LocalConfig") -> str:
     """Attach the strongest response constraint this engine is known to accept.
 
@@ -1108,6 +1176,7 @@ class LocalPrimeClient:
         # the streaming and non-streaming paths cannot disagree, and dropped
         # by observation if the engine refuses the field.
         _apply_reasoning_effort(body, self._cfg)
+        _apply_draft_tokens(body, self._cfg)
 
         _use_stream = stream if stream is not None else (
             bool(self._cfg.num_ctx) and _streaming_enabled())
@@ -1122,8 +1191,13 @@ class LocalPrimeClient:
             # the next rung down. Restricted to 4xx: a 5xx is the engine failing,
             # not refusing, and degrading on it would silently disable schema
             # enforcement for the whole process over a transient blip.
+            _has_draft = isinstance(body.get("options"), dict) and (
+                "draft_num_predict" in body["options"]
+            )
             if 400 <= resp.status < 500 and (
-                "response_format" in body or "reasoning_effort" in body
+                "response_format" in body
+                or "reasoning_effort" in body
+                or _has_draft
             ):
                 _body_txt = await resp.text()
                 # Attribute the refusal to the field the engine actually
@@ -1131,7 +1205,12 @@ class LocalPrimeClient:
                 # would disable constrained decoding for the whole process
                 # over an unrelated field -- and constrained decoding is what
                 # made invalid JSON unrepresentable in the first place.
-                if (
+                if _has_draft and "draft" in _body_txt.lower():
+                    # Cheapest thing to give up: dropping speculation
+                    # changes throughput, never output.
+                    _degraded = _degrade_draft_tokens(body, self._cfg)
+                    _what = "draft_num_predict"
+                elif (
                     "reasoning_effort" in body
                     and "reasoning_effort" in _body_txt
                 ):
