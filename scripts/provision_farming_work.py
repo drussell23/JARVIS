@@ -102,35 +102,99 @@ def is_caged(rel_path: str, sentinels: Tuple[str, ...]) -> str:
 #: Ordinary, real improvements on small modules well outside every sentinel.
 #: Deliberately DOC/TYPE-only: a farming soak wants many ops reaching
 #: VALIDATE, not risky diffs. Each names its target ONCE, in backticks.
+#: Phrases whose deliverable is INVISIBLE to the value gate.
+#:
+#: `CandidateValueGate` proves a change cosmetic by comparing `ast.dump()`
+#: after `epistemic_shedder._DocstringStripper` -- so comments, formatting
+#: and DOCSTRINGS never reach the comparison. A docstring-only patch is
+#: therefore cosmetic BY CONSTRUCTION: the op completes as benign
+#: `no_op_cosmetic`, which `classify_terminal_reason` maps to
+#: ('unknown', 'intent_written', should_train=False).
+#:
+#: The first farming batch was six documentation tasks. It ran, it cleared
+#: the cage, four of seven ops reached APPLY -- and produced 48
+#: `no_op_cosmetic` rows out of 74, none trainable. The batch was chosen to
+#: avoid the governance cage and accidentally chose the one deliverable the
+#: value gate exists to discard. Refused structurally, like a sentinel
+#: path, so the mistake cannot be repeated by someone in a hurry.
+_COSMETIC_MARKERS: Tuple[str, ...] = (
+    "docs only",
+    "documentation only",
+    "docstrings only",
+    "comment only",
+    "comments only",
+    "change no executable line",
+    "change no executable logic",
+    "no executable change",
+)
+
+
+def assert_produces_executable_change(target: str, task: str) -> None:
+    """Refuse a task whose deliverable cannot survive the value gate.
+
+    Raises rather than warns: farming exists to produce TRAINABLE outcomes,
+    and a task that can only yield `no_op_cosmetic` produces none. A warning
+    in a staging script is read once and ignored forever.
+    """
+    low = (task or "").lower()
+    hit = next((m for m in _COSMETIC_MARKERS if m in low), "")
+    if hit:
+        raise ValueError(
+            "refusing to stage a cosmetic task for {!r}: contains {!r}. "
+            "Docstrings are stripped before the AST comparison that decides "
+            "no_op_cosmetic, so this can only terminate as "
+            "('unknown', should_train=False) and yields no training signal. "
+            "State a change to executable behaviour instead.".format(
+                target, hit)
+        )
+
+
+#: Real, small, self-contained defects on NON-cage modules. Each names a
+#: concrete behavioural change, so the patch alters the AST and the op can
+#: reach a trainable verdict. Grounded by reading the files -- every item
+#: below is a defect that exists in the tree today, not invented busywork.
 TASKS: List[Tuple[str, str]] = [
     ("backend/api/monitoring_endpoint.py",
-     "Add a module-level docstring and complete type hints to every public "
-     "function. Explain what the endpoint reports and who consumes it. "
-     "DOCS AND TYPE HINTS ONLY — change no executable logic, add no imports "
-     "beyond typing, touch no tests."),
-    ("backend/api/sse_contract.py",
-     "Document the SSE contract: add a module docstring stating the event "
-     "shape and the ordering guarantees callers may rely on, and give every "
-     "public function a docstring naming its failure mode. DOCS ONLY — "
-     "change no executable line."),
-    ("backend/api/clean_vision_response.py",
-     "Add docstrings explaining what each cleaning step removes and why, "
-     "plus type hints on the public surface. DOCS AND TYPE HINTS ONLY."),
-    ("backend/api/audio_error_fallback.py",
-     "Document the fallback ladder: which failure each rung handles and what "
-     "the caller sees when every rung is exhausted. DOCS ONLY."),
+     "Fix the error-code bug in control_monitoring: the "
+     "HTTPException(status_code=400) raised for an invalid action is thrown "
+     "INSIDE the try block, and HTTPException subclasses Exception, so the "
+     "broad except catches it and re-raises it as a 500. A client sending an "
+     "invalid action receives Internal Server Error instead of Bad Request. "
+     "Re-raise HTTPException unchanged before the generic handler runs."),
     ("backend/api/model_status_api.py",
-     "Add a module docstring and per-function docstrings describing the "
-     "status fields returned and their staleness semantics. DOCS ONLY."),
+     "Replace every timezone-naive datetime.now() with "
+     "datetime.now(timezone.utc) and import timezone, so emitted timestamps "
+     "are unambiguous. Naive timestamps in an API response cannot be "
+     "compared across hosts."),
+    ("backend/api/audio_error_fallback.py",
+     "Lift the hardcoded fallback policy (delay_ms 1000, max_retries 3) into "
+     "named module-level constants so the retry contract has one definition, "
+     "and make the fallback timestamp timezone-aware."),
     ("backend/api/display_routes.py",
-     "Add type hints and docstrings to the public route handlers, naming the "
-     "error each returns. DOCS AND TYPE HINTS ONLY."),
+     "The broad except handlers return a success-shaped payload carrying an "
+     "error string, so a caller cannot distinguish success from failure "
+     "without string-matching the body. Give the failure path an explicit "
+     "ok/error flag so the two are structurally distinguishable."),
+    ("backend/api/sse_contract.py",
+     "Make the broad except blocks observable: log the exception with "
+     "exc_info before degrading, so a silently-swallowed SSE fault leaves "
+     "evidence. Keep behaviour otherwise identical."),
+    ("backend/api/clean_vision_response.py",
+     "The cleaning steps assume their input is a str; a None or non-str "
+     "value raises deep inside instead of being rejected at the boundary. "
+     "Add an explicit type guard at the public entry point that returns the "
+     "empty result for unusable input."),
 ]
 
 
 def build_orders(n: int, sentinels: Tuple[str, ...]) -> List[str]:
     out: List[str] = []
     for rel, instruction in TASKS[:n]:
+        # Both refusals are structural and both run BEFORE anything is
+        # written: a cage trip means the work needs an operator signature
+        # this tool must never mint, and a cosmetic task means the work
+        # cannot produce a trainable outcome however cleanly it runs.
+        assert_produces_executable_change(rel, instruction)
         trip = is_caged(rel, sentinels)
         if trip:
             raise SystemExit(
