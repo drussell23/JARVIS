@@ -1032,6 +1032,30 @@ def _find_tests_by_ast_import(
 # (the executor call is idempotent and cheap races are benign).
 _ast_import_cache: Dict[Path, Dict[str, List[Path]]] = {}
 
+#: The build currently producing a map, per repo root. Module-level for the
+#: same reason the cache is: the point is to be shared across every caller
+#: in the process.
+_ast_import_inflight: Dict[Path, "asyncio.Future"] = {}
+
+
+def _ast_map_inflight_for_this_loop(root: Path) -> Optional["asyncio.Future"]:
+    """The in-flight build for *root*, IF it belongs to the running loop.
+
+    A future from another loop can never complete for this caller --
+    awaiting it deadlocks. Tests create a fresh loop per case and the
+    battle-test harness re-enters on reconnect, so this is a live condition
+    rather than a theoretical one. Mirrors
+    ``audit_ratchet._inflight_for_this_loop``; the shape is deliberately the
+    same so there is one idiom for single-flight in this tree.
+    """
+    fut = _ast_import_inflight.get(root)
+    if fut is None or fut.done():
+        return None
+    try:
+        return fut if fut.get_loop() is asyncio.get_running_loop() else None
+    except Exception:  # noqa: BLE001
+        return None
+
 
 # ---------------------------------------------------------------------------
 # TestRunner
@@ -1077,20 +1101,64 @@ class TestRunner:
         The map is built once in a thread executor (non-blocking) and cached at
         module level keyed by ``self._repo_root``.  Subsequent calls are O(1).
         """
-        if self._repo_root not in _ast_import_cache:
-            loop = asyncio.get_running_loop()
-            import_map = await loop.run_in_executor(
-                None,
-                _build_test_import_map,
-                self._repo_root,
-                _TEST_DIR_NAMES,
-            )
-            _ast_import_cache[self._repo_root] = import_map
-            logger.debug(
-                "[TestRunner] AST import map built: %d module keys indexed",
-                len(import_map),
-            )
-        return _ast_import_cache[self._repo_root]
+        cached = _ast_import_cache.get(self._repo_root)
+        if cached is not None:
+            return cached
+
+        # SINGLE-FLIGHT. The check-then-build above was unsynchronised, and
+        # VALIDATE gathers every sibling candidate concurrently
+        # (`asyncio.gather` in validate_runner), so N candidates reached the
+        # miss simultaneously -- before any could populate the cache -- and
+        # each launched its OWN full-tree AST scan of every test file in the
+        # repo. A thundering herd of identical scans, contending for the same
+        # default executor threads and the same slow filesystem.
+        #
+        # Measured cost of one scan on this tree: 28.3s cold, 7.0s warm. With
+        # the herd, VALIDATE burned its entire budget in discovery and never
+        # reached pytest: 12 ops in soak bt-2026-09-01-153545 died on
+        # "budget exhausted before adapter run" holding 233-549s of budget,
+        # and were reported as `failure_class="infra"` -- which reads as a
+        # broken test environment and is not one.
+        joined = _ast_map_inflight_for_this_loop(self._repo_root)
+        if joined is not None:
+            try:
+                return await asyncio.shield(joined)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — fall through and build our own
+                logger.debug("[TestRunner] joined AST map build failed",
+                             exc_info=True)
+
+        loop = asyncio.get_running_loop()
+        # `run_in_executor` already returns a scheduled Future bound to this
+        # loop -- exactly what the join side needs. Wrapping it in
+        # `create_task` raises (a Future is not a coroutine), and would also
+        # add a second cancellation layer over work running in a thread that
+        # cannot be cancelled anyway.
+        task = loop.run_in_executor(
+            None,
+            _build_test_import_map,
+            self._repo_root,
+            _TEST_DIR_NAMES,
+        )
+        _ast_import_inflight[self._repo_root] = task
+        try:
+            import_map = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # The build keeps running and still fills the cache below --
+            # the work is already paid for, and discarding it would make a
+            # cancelled op cost the next one a fresh cold scan.
+            raise
+        finally:
+            if _ast_import_inflight.get(self._repo_root) is task and task.done():
+                _ast_import_inflight.pop(self._repo_root, None)
+
+        _ast_import_cache[self._repo_root] = import_map
+        logger.debug(
+            "[TestRunner] AST import map built: %d module keys indexed",
+            len(import_map),
+        )
+        return import_map
 
     # -- public API ---------------------------------------------------------
 
