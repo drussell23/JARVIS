@@ -36,6 +36,7 @@ from backend.core.ouroboros.governance.external_watchdog import (
     _suspend_detected,
     evaluate_kill,
 )
+from backend.core.ouroboros.governance import external_watchdog as ew
 
 
 # ── §1 budget (wall-authoritative) ──────────────────────────────────────
@@ -133,3 +134,94 @@ def test_harness_wires_external_watchdog() -> None:
         "_disarm_external_watchdog",
     ):
         assert hasattr(_h.BattleTestHarness, m), f"missing {m}"
+
+
+# ---------------------------------------------------------------------------
+# A transient read failure must not kill a healthy organism
+# ---------------------------------------------------------------------------
+
+
+def test_one_unreadable_poll_does_not_kill_a_beating_parent(tmp_path) -> None:
+    """THE regression: soak bt-2026-09-01-173444.
+
+    A healthy 44-minute soak was SIGKILLed on its FIRST failed beat read,
+    4ms after a successful write, with ZERO write failures. The fallback
+    went straight to ``armed_wall``, so one unreadable poll computed an age
+    equal to the whole session (2645s) against a 120s window. SIGKILL is
+    uncatchable, so teardown never ran and the trajectory corpus was lost.
+
+    The heartbeat lives on a 9p mount where ``os.replace`` is not reliably
+    atomic however correct the writer is -- so the sentinel cannot assume
+    every read succeeds, and must fail SAFE when one does not.
+    """
+    armed, stale, budget = 1000.0, 120.0, 3690.0
+    now = armed + 2645.0
+    fresh = now - 0.004                      # the beat really was 4ms old
+
+    # what the old fallback did
+    kill_old, reason_old = ew.evaluate_kill(
+        now_wall=now, armed_wall=armed, last_beat_wall=armed,
+        budget_s=budget, stale_window_s=stale, suspended=False,
+    )
+    assert kill_old and reason_old == "heartbeat_stale"
+
+    # what a remembered good beat does
+    kill_new, _ = ew.evaluate_kill(
+        now_wall=now, armed_wall=armed, last_beat_wall=fresh,
+        budget_s=budget, stale_window_s=stale, suspended=False,
+    )
+    assert kill_new is False
+
+
+def test_a_genuinely_hung_parent_still_dies(tmp_path) -> None:
+    """Fail-safe must not become fail-never.
+
+    If reads keep failing AND the last good beat ages past the window, the
+    kill fires on its own -- the remembered beat is a fact with a timestamp,
+    not an amnesty.
+    """
+    armed, stale, budget = 1000.0, 120.0, 3690.0
+    now = armed + 2645.0
+    kill, reason = ew.evaluate_kill(
+        now_wall=now, armed_wall=armed, last_beat_wall=now - 600.0,
+        budget_s=budget, stale_window_s=stale, suspended=False,
+    )
+    assert kill and reason == "heartbeat_stale"
+
+
+def test_a_parent_that_never_beat_is_still_governed_by_budget() -> None:
+    """`armed_wall` remains the fallback for a parent with NO beat ever.
+
+    That is what the original fallback was actually for, and it is kept.
+    """
+    armed, stale, budget = 1000.0, 120.0, 3690.0
+    kill, reason = ew.evaluate_kill(
+        now_wall=armed + budget + 1, armed_wall=armed, last_beat_wall=armed,
+        budget_s=budget, stale_window_s=stale, suspended=False,
+    )
+    assert kill and reason == "wall_budget_exceeded"
+
+
+def test_read_beat_ex_reports_why_it_failed(tmp_path) -> None:
+    """The reason must survive: a read failure and a hang look identical
+    from the value alone, and only one of them warrants a kill."""
+    missing = tmp_path / "nope.tick"
+    val, exc = ew._read_beat_ex(str(missing))
+    assert val is None and isinstance(exc, OSError)
+
+    torn = tmp_path / "torn.tick"
+    torn.write_text("")                       # mid-write shape
+    val, exc = ew._read_beat_ex(str(torn))
+    assert val is None and isinstance(exc, ValueError)
+
+    good = tmp_path / "good.tick"
+    good.write_text(repr(1234.5))
+    assert ew._read_beat_ex(str(good)) == (1234.5, None)
+
+
+def test_read_beat_wrapper_keeps_its_optional_float_shape(tmp_path) -> None:
+    """Existing callers and tests depend on the narrow shape."""
+    good = tmp_path / "g.tick"
+    good.write_text(repr(99.5))
+    assert ew._read_beat(str(good)) == 99.5
+    assert ew._read_beat(str(tmp_path / "absent.tick")) is None

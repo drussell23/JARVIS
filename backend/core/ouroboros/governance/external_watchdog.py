@@ -76,13 +76,38 @@ def evaluate_kill(
     return False, ""
 
 
-def _read_beat(heartbeat_path: str) -> Optional[float]:
-    """Read the parent's last wall timestamp; None on any error."""
+#: How often to re-log a run of consecutive beat-read failures. First
+#: failure always logs; then every Nth, so a persistently unreadable path
+#: is visible without flooding a 1Hz poller's stderr.
+_READ_WARN_EVERY_N = 30
+
+
+def _read_beat_ex(
+    heartbeat_path: str,
+) -> Tuple[Optional[float], Optional[BaseException]]:
+    """Read the parent's last wall timestamp, and WHY if it could not be read.
+
+    The exception is returned rather than swallowed because a read failure
+    and a stale process are indistinguishable from the value alone -- and
+    only one of them warrants killing a healthy organism. Post-mortem on
+    bt-2026-09-01-173444 could not say whether the sentinel saw an OSError
+    from the 9p mount or a malformed payload, because the reason was
+    discarded at this line.
+    """
     try:
         with open(heartbeat_path, "r") as f:
-            return float(f.read().strip())
-    except (OSError, ValueError):
-        return None
+            return float(f.read().strip()), None
+    except (OSError, ValueError) as exc:
+        return None, exc
+
+
+def _read_beat(heartbeat_path: str) -> Optional[float]:
+    """Read the parent's last wall timestamp; None on any error.
+
+    Thin wrapper over :func:`_read_beat_ex`, kept because callers and tests
+    depend on the Optional[float] shape.
+    """
+    return _read_beat_ex(heartbeat_path)[0]
 
 
 def format_poll_forensics(
@@ -166,6 +191,11 @@ def run_watchdog(
 
     # If the parent never writes a beat, fall back to arm time so the budget
     # path still governs.
+    #: Last beat we actually READ. Distinct from `armed_wall`: liveness once
+    #: proven is not un-proven by a filesystem hiccup.
+    last_known_good_beat: Optional[float] = None
+    read_failures = 0
+
     while True:
         time.sleep(poll_s)
         now_wall = time.time()
@@ -188,8 +218,51 @@ def run_watchdog(
         except PermissionError:
             pass  # alive, different ownership — keep guarding
 
-        last_beat = _read_beat(heartbeat_path)
-        effective_beat = last_beat if last_beat is not None else armed_wall
+        last_beat, beat_read_exc = _read_beat_ex(heartbeat_path)
+        if last_beat is not None:
+            if read_failures:
+                _emit(
+                    "[ExternalWatchdog:beat-read-recovered] after %d "
+                    "consecutive failure(s)" % read_failures
+                )
+            last_known_good_beat = last_beat
+            read_failures = 0
+        else:
+            read_failures += 1
+            # Name the actual I/O fault BEFORE staleness is evaluated. A
+            # sentinel that kills without saying what it could not read
+            # leaves a post-mortem unable to separate "the organism hung"
+            # from "one read glitched".
+            if (
+                read_failures == 1
+                or read_failures % _READ_WARN_EVERY_N == 0
+            ):
+                _emit(
+                    "[ExternalWatchdog:beat-read-failed] consecutive=%d "
+                    "path=%s %s: %s"
+                    % (
+                        read_failures, heartbeat_path,
+                        type(beat_read_exc).__name__, beat_read_exc,
+                    )
+                )
+
+        # A transient read failure must NOT erase known liveness. The old
+        # fallback went straight to `armed_wall`, so ONE unreadable poll at
+        # any point past `stale_window_s` computed an age equal to the whole
+        # session and killed instantly: soak bt-2026-09-01-173444 died at
+        # 2645s on its FIRST failed read, 4ms after a successful beat, with
+        # zero write failures, on a 9p mount where `os.replace` is not
+        # reliably atomic no matter how correct the writer is.
+        #
+        # `armed_wall` remains the fallback for a parent that has never
+        # beaten AT ALL, which is what that fallback was actually for --
+        # the budget path still governs a parent that never starts beating.
+        if last_beat is not None:
+            effective_beat = last_beat
+        elif last_known_good_beat is not None:
+            effective_beat = last_known_good_beat
+        else:
+            effective_beat = armed_wall
 
         kill, reason = evaluate_kill(
             now_wall=now_wall, armed_wall=armed_wall,
