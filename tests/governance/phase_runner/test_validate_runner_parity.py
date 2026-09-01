@@ -117,6 +117,7 @@ class _FakeOrchestrator:
     _l2_directive: Any = None
     _check_source_drift_result: Optional[str] = None
     ledger_records: List = field(default_factory=list)
+    candidate_verdicts: List = field(default_factory=list)
 
     async def _run_validation(self, ctx, cand, remaining_s):
         if self._run_validation_raise:
@@ -125,6 +126,36 @@ class _FakeOrchestrator:
 
     async def _record_ledger(self, ctx, state, extra):
         self.ledger_records.append((ctx.phase, state, extra))
+
+    async def _publish_candidate_verdict(
+        self, ctx, *, candidate, validation, duration_s, generation,
+        exploration_first_ok=None, exploration_count=None,
+    ):
+        """Mirror the real publisher: ledger entry AND a recorded call.
+
+        The real method feeds TWO consumers -- the ledger and the trajectory
+        recorder -- because the extracted runner previously wrote only the
+        first. The fake records both, so a future extraction that drops the
+        recorder half fails HERE rather than silently starving the training
+        corpus, which is the regression the publisher exists to prevent.
+        """
+        self.candidate_verdicts.append({
+            "candidate_hash": candidate.get("candidate_hash", ""),
+            "passed": bool(validation.passed),
+            "failure_class": validation.failure_class,
+        })
+        await self._record_ledger(ctx, "gating", {
+            "event": "candidate_validated",
+            "candidate_id": candidate.get("candidate_id", "unknown"),
+            "candidate_hash": candidate.get("candidate_hash", ""),
+            "validation_outcome": "pass" if validation.passed else "fail",
+            "failure_class": validation.failure_class,
+            "duration_s": round(float(duration_s), 3),
+            "provider": getattr(generation, "provider_name", ""),
+            "model": getattr(generation, "model_id", ""),
+            "exploration_first_ok": exploration_first_ok,
+            "exploration_count": exploration_count,
+        })
 
     async def _l2_hook(self, ctx, bv, deadline):
         return self._l2_directive

@@ -2518,15 +2518,32 @@ class BattleTestHarness:
                     _before = dict(_rec.stats())
                     await asyncio.wait_for(_rec.aclose(timeout_s=10.0), timeout=30.0)
                     _after = dict(_rec.stats())
+                    # Report the recorder's WHOLE counter set, not a
+                    # hand-picked three. The recorder has always tracked
+                    # candidate_verdicts_queued / _joined and
+                    # orphan_candidate_verdicts; this line named
+                    # events_written / pending_expired / orphan_outcomes and
+                    # dropped the rest, so the only numbers that could
+                    # diagnose a per-candidate join failure were collected
+                    # and then thrown away. A soak reported
+                    # "verdict_source=operation" on every row with no way to
+                    # tell whether verdicts were never queued, queued and
+                    # orphaned, or joined and overwritten.
+                    #
+                    # Serialising the dict means a counter added later is
+                    # visible the day it is added, instead of waiting for
+                    # someone to remember this format string. Zeros are kept
+                    # deliberately: `candidate_verdicts_joined=0` IS the
+                    # finding, and filtering falsy values would hide exactly
+                    # the case worth seeing.
                     logger.info(
-                        "[TrajectoryRecorder] session flush: wrote %d event(s) "
-                        "at teardown (total written=%d, expired=%d, "
-                        "orphan_outcomes=%d)",
+                        "[TrajectoryRecorder] session flush: wrote %d "
+                        "event(s) at teardown | %s",
                         _after.get("events_written", 0)
                         - _before.get("events_written", 0),
-                        _after.get("events_written", 0),
-                        _after.get("pending_expired", 0),
-                        _after.get("orphan_outcomes", 0),
+                        " ".join(
+                            f"{_k}={_v}" for _k, _v in sorted(_after.items())
+                        ),
                     )
             except Exception as _traj_flush_exc:  # noqa: BLE001 — fail-open
                 logger.warning(

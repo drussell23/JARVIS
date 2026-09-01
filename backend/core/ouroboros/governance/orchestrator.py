@@ -8520,50 +8520,15 @@ class GovernedOrchestrator:
                         continue
                     candidate, validation, _validate_duration_s = _vr
 
-                    # Per-candidate ledger entry — always, pass or fail
-                    await self._record_ledger(ctx, OperationState.GATING, {
-                        "event": "candidate_validated",
-                        "candidate_id": candidate.get("candidate_id", "unknown"),
-                        "candidate_hash": candidate.get("candidate_hash", ""),
-                        "validation_outcome": "pass" if validation.passed else "fail",
-                        "failure_class": validation.failure_class,
-                        "duration_s": round(_validate_duration_s, 3),
-                        "provider": generation.provider_name,
-                        "model": getattr(generation, "model_id", ""),
-                        "exploration_first_ok": _exploration_first_ok,
-                        "exploration_count": _exploration_count,
-                    })
-
-                    # ── Trajectory recorder — the per-candidate half ─────
-                    # This loop ALREADY computes the only signal that can
-                    # tell one sibling from another; it just had nowhere to
-                    # go. Without it every sibling of an op inherits that
-                    # op's single terminal verdict, scores identically in
-                    # the DPO ranker, and the whole set yields ZERO pairs —
-                    # so n>1 generation would buy N× the wall-clock and no
-                    # training data at all. Emitting HERE (rather than a
-                    # second validation pass) is why n>1 costs only
-                    # generation: the validation was already happening.
-                    # Non-blocking, master-gated default-OFF, NEVER raises.
-                    try:
-                        from backend.core.ouroboros.governance.observability.trajectory_recorder import (  # noqa: E501
-                            record_candidate_verdict as _traj_cand_verdict,
-                        )
-                        _traj_cand_verdict(
-                            op_id=ctx.op_id,
-                            candidate_hash=str(
-                                candidate.get("candidate_hash", "") or ""
-                            ),
-                            passed=bool(validation.passed),
-                            failure_class=str(
-                                validation.failure_class or ""
-                            ),
-                        )
-                    except Exception:  # noqa: BLE001 — fail-open
-                        logger.debug(
-                            "[TrajectoryRecorder] candidate verdict emit "
-                            "degraded", exc_info=True,
-                        )
+                    await self._publish_candidate_verdict(
+                        ctx,
+                        candidate=candidate,
+                        validation=validation,
+                        duration_s=_validate_duration_s,
+                        generation=generation,
+                        exploration_first_ok=_exploration_first_ok,
+                        exploration_count=_exploration_count,
+                    )
 
                     # Heartbeat: validation result for TUI (Manifesto §7)
                     try:
@@ -14985,6 +14950,77 @@ class GovernedOrchestrator:
         self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_saga, rolled_back=True)
         await self._publish_outcome(ctx, OperationState.FAILED, apply_result.reason_code)
         return ctx
+
+    async def _publish_candidate_verdict(
+        self,
+        ctx: Any,
+        *,
+        candidate: Dict[str, Any],
+        validation: Any,
+        duration_s: float,
+        generation: Any,
+        exploration_first_ok: Any = None,
+        exploration_count: Any = None,
+    ) -> None:
+        """Publish ONE sibling's VALIDATE verdict to both consumers.
+
+        There are two of them and they are not interchangeable: the LEDGER
+        (audit, replay, the report) and the TRAJECTORY RECORDER (training
+        corpus). They must not drift apart, because a verdict that reaches
+        only the ledger is invisible to training and a verdict that reaches
+        only the recorder is unauditable.
+
+        This exists because they DID drift. The VALIDATE block was extracted
+        into ``phase_runners/validate_runner.py`` as a near-verbatim copy,
+        and the copy kept the ledger write and dropped the recorder call.
+        It is dead today only because
+        ``JARVIS_PHASE_RUNNER_VALIDATE_EXTRACTED`` defaults false — flip that
+        flag and per-candidate verdicts stop reaching the corpus silently,
+        with every row falling back to the op-level outcome and every
+        sibling in a group scoring identically. One publisher, two call
+        sites, so the extraction can never lose half of it again.
+
+        Never raises: a telemetry write must not be able to fail a
+        validation that already succeeded.
+        """
+        try:
+            await self._record_ledger(ctx, OperationState.GATING, {
+                "event": "candidate_validated",
+                "candidate_id": candidate.get("candidate_id", "unknown"),
+                "candidate_hash": candidate.get("candidate_hash", ""),
+                "validation_outcome": "pass" if validation.passed else "fail",
+                "failure_class": validation.failure_class,
+                "duration_s": round(float(duration_s), 3),
+                "provider": getattr(generation, "provider_name", ""),
+                "model": getattr(generation, "model_id", ""),
+                "exploration_first_ok": exploration_first_ok,
+                "exploration_count": exploration_count,
+            })
+        except Exception:  # noqa: BLE001 — audit write is best-effort
+            logger.debug("[Orchestrator] candidate ledger write degraded",
+                         exc_info=True)
+
+        # The per-candidate verdict is the ONLY thing that separates siblings
+        # of one prompt. Without it every sibling inherits the op's single
+        # terminal verdict, scores identically, and the group yields zero
+        # training pairs -- so n>1 generation would buy N x the wall clock
+        # and no data. Emitting HERE rather than in a second validation pass
+        # is why n>1 costs only generation: the validation already happened.
+        try:
+            from backend.core.ouroboros.governance.observability.trajectory_recorder import (  # noqa: E501
+                record_candidate_verdict as _traj_cand_verdict,
+            )
+            _traj_cand_verdict(
+                op_id=ctx.op_id,
+                candidate_hash=str(candidate.get("candidate_hash", "") or ""),
+                passed=bool(validation.passed),
+                failure_class=str(validation.failure_class or ""),
+            )
+        except Exception:  # noqa: BLE001 — fail-open
+            logger.debug(
+                "[TrajectoryRecorder] candidate verdict emit degraded",
+                exc_info=True,
+            )
 
     async def _record_ledger(
         self,

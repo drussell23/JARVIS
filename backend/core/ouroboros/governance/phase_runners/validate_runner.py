@@ -301,18 +301,22 @@ class VALIDATERunner(PhaseRunner):
                     continue
                 candidate, validation, _validate_duration_s = _vr
 
-                await orch._record_ledger(ctx, OperationState.GATING, {
-                    "event": "candidate_validated",
-                    "candidate_id": candidate.get("candidate_id", "unknown"),
-                    "candidate_hash": candidate.get("candidate_hash", ""),
-                    "validation_outcome": "pass" if validation.passed else "fail",
-                    "failure_class": validation.failure_class,
-                    "duration_s": round(_validate_duration_s, 3),
-                    "provider": generation.provider_name,
-                    "model": getattr(generation, "model_id", ""),
-                    "exploration_first_ok": _exploration_first_ok,
-                    "exploration_count": _exploration_count,
-                })
+                # One publisher for BOTH consumers -- see
+                # Orchestrator._publish_candidate_verdict. This block was
+                # a copy that wrote the ledger and silently skipped the
+                # trajectory recorder, so flipping
+                # JARVIS_PHASE_RUNNER_VALIDATE_EXTRACTED would have
+                # stopped per-candidate verdicts reaching the corpus with
+                # nothing failing to say so.
+                await orch._publish_candidate_verdict(
+                    ctx,
+                    candidate=candidate,
+                    validation=validation,
+                    duration_s=_validate_duration_s,
+                    generation=generation,
+                    exploration_first_ok=_exploration_first_ok,
+                    exploration_count=_exploration_count,
+                )
 
                 # Heartbeat: validation result for TUI (Manifesto §7)
                 try:
