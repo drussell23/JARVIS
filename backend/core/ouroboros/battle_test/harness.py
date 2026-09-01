@@ -2551,6 +2551,41 @@ class BattleTestHarness:
                     "incomplete): %s", self._session_id, _traj_flush_exc,
                 )
 
+            # Flywheel close-out: hand the finished corpus to Reactor-Core.
+            #
+            # Ordered AFTER the flush above deliberately -- that flush is
+            # what makes the corpus complete, and a trainer reading it
+            # first would train on a corpus missing every in-flight
+            # trajectory. Ordered BEFORE _shutdown_components for the same
+            # reason the flush is: that drain is documented as "slow,
+            # possibly-hanging", and this must not sit behind it.
+            #
+            # Default OFF, and gated four more times inside (graceful stop,
+            # corpus has a differentiated group, card actually free,
+            # commands resolvable). It is expected to REFUSE; a refusal is
+            # logged at INFO with its reason so "nothing happened" is never
+            # ambiguous.
+            try:
+                from backend.core.ouroboros.governance.observability.training_trigger import (  # noqa: E501
+                    autotrain_enabled as _autotrain_on,
+                    maybe_train_after_soak as _maybe_train,
+                )
+                if _autotrain_on():
+                    _train_verdict = await _maybe_train(
+                        stop_reason=self._stop_reason,
+                        session_id=self._session_id,
+                    )
+                    logger.info("[AutoTrain] %s", _train_verdict)
+            except asyncio.CancelledError:
+                raise
+            except Exception as _autotrain_exc:  # noqa: BLE001 — fail-open
+                logger.warning(
+                    "Session %s auto-train hook degraded; the soak result "
+                    "is unaffected: %s", self._session_id, _autotrain_exc,
+                )
+                logger.debug("[AutoTrain] detail: %s", _autotrain_exc,
+                             exc_info=True)
+
             # Sovereign Telemetry Flush Failsafe (2026-06-21) — persist the
             # COMPLETE summary BEFORE the (slow, possibly-hanging) component
             # drain. _generate_report reads recorder/ledger/score-history (no
