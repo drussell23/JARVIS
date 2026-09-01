@@ -331,8 +331,12 @@ class PythonAdapter:
 
     name = "python"
 
-    def __init__(self, repo_root: Path, timeout: float = 120.0) -> None:
+    def __init__(self, repo_root: Path, timeout: float = 120.0,
+                 map_root: Optional[Path] = None) -> None:
         self._repo_root = repo_root
+        #: Base tree whose test index applies when this adapter runs
+        #: against a sandbox COPY -- see TestRunner._import_map_key.
+        self._map_root = map_root
         self._timeout = timeout
 
     async def resolve(
@@ -346,7 +350,10 @@ class PythonAdapter:
         Passes *original_paths* through so sandbox paths are mapped back
         to repo-relative paths for correct test directory discovery.
         """
-        runner = TestRunner(repo_root=self._repo_root, timeout=self._timeout)
+        runner = TestRunner(
+            repo_root=self._repo_root, timeout=self._timeout,
+            map_root=self._map_root,
+        )
         return await runner.resolve_affected_tests(
             changed_files, original_paths=original_paths,
         )
@@ -965,6 +972,21 @@ def _register_import(
         lst.append(test_file)
 
 
+def _is_test_tree_path(
+    path: Path, dir_names: FrozenSet[str] = _TEST_DIR_NAMES,
+) -> bool:
+    """True when *path* lies inside a test directory.
+
+    Uses the same ``_TEST_DIR_NAMES`` the discovery strategies do, so
+    "what counts as a test" has one definition and one env knob
+    (``JARVIS_TEST_DIR_NAMES``).
+    """
+    try:
+        return any(part in dir_names for part in Path(path).parts)
+    except Exception:  # noqa: BLE001 — a malformed path is simply not a test
+        return False
+
+
 def _build_test_import_map(
     repo_root: Path,
     dir_names: FrozenSet[str],
@@ -1086,22 +1108,56 @@ class TestRunner:
         self,
         repo_root: Path,
         timeout: float = _TEST_TIMEOUT_S,
+        map_root: Optional[Path] = None,
         *,
         event_callback: Optional[Callable[[Dict[str, object]], None]] = None,
     ) -> None:
         self._repo_root = repo_root.resolve()
         self._timeout = timeout
+        #: The tree whose TEST index applies here. A validation sandbox is
+        #: a copy of the working tree at a fresh /tmp path every time, so
+        #: keying the import map by its own root guarantees a cache MISS
+        #: and rebuilds an identical index once per candidate.
+        self._map_root = map_root.resolve() if map_root is not None else None
         self._event_callback = event_callback
 
     # -- internal helpers ---------------------------------------------------
 
-    async def _get_ast_import_map(self) -> Dict[str, List[Path]]:
+    def _import_map_key(self, changed_files: Tuple[Path, ...]) -> Path:
+        """Which tree's import map applies to this run.
+
+        The map indexes the TEST tree. A VALIDATE sandbox is a copy of the
+        working tree with one candidate SOURCE file applied, so its test tree
+        is byte-identical to the base and the base's map is exactly correct.
+        Keying by the sandbox path instead makes the key unique per candidate
+        and the cache unhittable BY CONSTRUCTION: soak bt-2026-09-01-164438
+        rebuilt the same 14,121-key index 12 times at ~28-44s each, which
+        consumed the VALIDATE budget and left pytest 0.2s of a 120s
+        allowance.
+
+        The alias is UNSAFE in exactly one case: a candidate that touches a
+        test file. Then the sandbox's test tree genuinely differs from the
+        base, and reusing the base index would scope the run by a map
+        describing tests that are no longer there. Decided per CALL, because
+        it is a property of the change, not of the runner.
+        """
+        if self._map_root is None:
+            return self._repo_root
+        if any(_is_test_tree_path(pth) for pth in changed_files):
+            return self._repo_root
+        return self._map_root
+
+
+    async def _get_ast_import_map(
+        self, cache_key: Optional[Path] = None,
+    ) -> Dict[str, List[Path]]:
         """Return the AST import map for this repo, building and caching if needed.
 
         The map is built once in a thread executor (non-blocking) and cached at
-        module level keyed by ``self._repo_root``.  Subsequent calls are O(1).
+        module level keyed by ``key``.  Subsequent calls are O(1).
         """
-        cached = _ast_import_cache.get(self._repo_root)
+        key = cache_key if cache_key is not None else self._repo_root
+        cached = _ast_import_cache.get(key)
         if cached is not None:
             return cached
 
@@ -1119,7 +1175,7 @@ class TestRunner:
         # "budget exhausted before adapter run" holding 233-549s of budget,
         # and were reported as `failure_class="infra"` -- which reads as a
         # broken test environment and is not one.
-        joined = _ast_map_inflight_for_this_loop(self._repo_root)
+        joined = _ast_map_inflight_for_this_loop(key)
         if joined is not None:
             try:
                 return await asyncio.shield(joined)
@@ -1138,10 +1194,10 @@ class TestRunner:
         task = loop.run_in_executor(
             None,
             _build_test_import_map,
-            self._repo_root,
+            key,
             _TEST_DIR_NAMES,
         )
-        _ast_import_inflight[self._repo_root] = task
+        _ast_import_inflight[key] = task
         try:
             import_map = await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -1150,10 +1206,10 @@ class TestRunner:
             # cancelled op cost the next one a fresh cold scan.
             raise
         finally:
-            if _ast_import_inflight.get(self._repo_root) is task and task.done():
-                _ast_import_inflight.pop(self._repo_root, None)
+            if _ast_import_inflight.get(key) is task and task.done():
+                _ast_import_inflight.pop(key, None)
 
-        _ast_import_cache[self._repo_root] = import_map
+        _ast_import_cache[key] = import_map
         logger.debug(
             "[TestRunner] AST import map built: %d module keys indexed",
             len(import_map),
@@ -1208,7 +1264,9 @@ class TestRunner:
         seen: set = set()
 
         # Build (or retrieve from cache) the AST import map for Strategy 3.
-        import_map = await self._get_ast_import_map()
+        import_map = await self._get_ast_import_map(
+            self._import_map_key(tuple(changed_files))
+        )
 
         # Defense-in-depth: translate .worktrees/<name> paths to the real repo
         # root for test DISCOVERY so tests are found even when the isolation

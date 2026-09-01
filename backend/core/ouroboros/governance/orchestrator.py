@@ -14198,7 +14198,17 @@ class GovernedOrchestrator:
                             _tree_runner = LanguageRouter(
                                 repo_root=_troot,
                                 adapters={
-                                    "python": PythonAdapter(repo_root=_troot),
+                                    # map_root: the sandbox is a COPY of the
+                                    # working tree at a fresh /tmp path, so
+                                    # its test index is identical to the
+                                    # base's. Without this the cache key is
+                                    # unique per candidate and an identical
+                                    # 14k-key index is rebuilt every time,
+                                    # spending the budget pytest needed.
+                                    "python": PythonAdapter(
+                                        repo_root=_troot,
+                                        map_root=_ae_effective_repo_root,
+                                    ),
                                     "cpp": CppAdapter(repo_root=_troot),
                                 },
                             )
