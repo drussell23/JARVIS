@@ -312,6 +312,154 @@ def scale_gen_timeout(base_s: float, ctx: Any) -> float:
 # ===========================================================================
 
 
+
+# ---------------------------------------------------------------------------
+# Validation reserve — GENERATE must yield early enough for VALIDATE to RUN
+# ---------------------------------------------------------------------------
+#
+# `scale_gen_timeout` above answers "how much does this payload need?".
+# This answers a different question that nothing was asking: "how much must
+# generation NOT take?".
+#
+# VALIDATE was funded by whatever GENERATE left behind. Measured across
+# soaks bt-2026-09-01-164438 and -182912, that residue was 0.2s, 5.1s,
+# 11.0s, 16.7s against a fixed ~12s conftest import tax and a ~23s scoped
+# run -- so pytest was cut off before it could reach a verdict, and every
+# cut-off was recorded as a candidate FAILURE. Validation is not optional
+# work funded by leftovers; it is the step that produces the only signal
+# the training corpus contains.
+#
+# Deliberately a SEPARATE function with its own flag rather than folded
+# into `scale_gen_timeout`: that function's spine-pinned invariant #1 is
+# "the scaled budget is NEVER below the route base", and a reserve
+# necessarily lowers it. Two concerns, two flags, two invariants.
+
+_ENV_RESERVE_ENABLED = "JARVIS_VALIDATION_RESERVE_ENABLED"
+_ENV_RESERVE_COLD_S = "JARVIS_VALIDATION_RESERVE_COLD_S"
+_ENV_RESERVE_SAFETY = "JARVIS_VALIDATION_RESERVE_SAFETY"
+_ENV_RESERVE_MAX_FRAC = "JARVIS_VALIDATION_RESERVE_MAX_FRACTION"
+_ENV_RESERVE_CONCURRENCY_K = "JARVIS_VALIDATION_RESERVE_CONCURRENCY_K"
+_ENV_RESERVE_ROUTE = "validation"
+
+_validation_estimator: Optional[Any] = None
+
+
+def validation_reserve_enabled() -> bool:
+    """Master flag. Default FALSE per §33.1 (shadow-first)."""
+    raw = (os.environ.get(_ENV_RESERVE_ENABLED) or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def get_validation_estimator() -> Any:
+    """Rolling EWMA of OBSERVED validation durations, per route.
+
+    Reuses `admission_estimator.WaitTimeEstimator` rather than growing a
+    second rolling-average implementation: it is already thread-safe,
+    memory-bounded over a closed route vocabulary, and contractually
+    never raises. A dedicated instance keeps validation observations out
+    of the admission gate's state.
+    """
+    global _validation_estimator  # noqa: PLW0603
+    if _validation_estimator is None:
+        from backend.core.ouroboros.governance.admission_estimator import (
+            WaitTimeEstimator,
+        )
+        _validation_estimator = WaitTimeEstimator()
+    return _validation_estimator
+
+
+def observe_validation_duration(route: str, observed_s: float) -> None:
+    """Feed a COMPLETED validation's wall time back into the reserve.
+
+    The reserve is only adaptive if it learns; without this it would be a
+    constant wearing an EWMA's clothes. Never raises -- a telemetry write
+    must not be able to fail the validation that produced it.
+    """
+    try:
+        get_validation_estimator().update_observed(route, float(observed_s))
+    except Exception:  # noqa: BLE001
+        logger.debug("[ValidationReserve] observation dropped", exc_info=True)
+
+
+def compute_validation_reserve(
+    total_budget_s: float,
+    route: str,
+    *,
+    inflight: int = 1,
+) -> float:
+    """Seconds to WITHHOLD from generation so validation can finish.
+
+    Adaptive on two axes, because the cost moves on both:
+
+    * **history** -- the EWMA of what validation actually took on this
+      route. Cold start falls back to an env floor rather than zero,
+      since a reserve of zero is the bug this exists to fix.
+    * **concurrency** -- siblings validate together
+      (`asyncio.gather` in validate_runner) and contend for CPU and the
+      filesystem, so N concurrent validations cost more than one. Scaled
+      by a bounded coefficient, not multiplied outright: they overlap,
+      they do not serialise.
+
+    Bounded at both ends. Never returns more than
+    ``JARVIS_VALIDATION_RESERVE_MAX_FRACTION`` of the op budget -- a
+    reserve that starves generation produces nothing to validate, which
+    fails in the opposite direction and just as completely.
+
+    Returns 0.0 when disabled, so every caller is byte-identical to today
+    until the flag is set. NEVER raises.
+    """
+    try:
+        if not validation_reserve_enabled():
+            return 0.0
+        total = float(total_budget_s)
+        if total <= 0.0:
+            return 0.0
+
+        observed = 0.0
+        try:
+            observed = float(get_validation_estimator().project_wait(route))
+        except Exception:  # noqa: BLE001 — cold/unknown route is not an error
+            observed = 0.0
+
+        cold = _env_float(_ENV_RESERVE_COLD_S, 45.0, minimum=1.0)
+        base = observed if observed > 0.0 else cold
+
+        safety = _env_float(_ENV_RESERVE_SAFETY, 1.5, minimum=1.0)
+        k = _env_float(_ENV_RESERVE_CONCURRENCY_K, 0.5, minimum=0.0)
+        n = max(1, int(inflight or 1))
+        want = base * safety * (1.0 + k * (n - 1))
+
+        max_frac = _env_float(_ENV_RESERVE_MAX_FRAC, 0.5, minimum=0.05)
+        ceiling = total * min(0.95, max_frac)
+        return max(0.0, min(want, ceiling))
+    except Exception:  # noqa: BLE001 — fail-open to "no reserve"
+        logger.debug("[ValidationReserve] fell back to no reserve",
+                     exc_info=True)
+        return 0.0
+
+
+def apply_validation_reserve(
+    gen_budget_s: float,
+    total_budget_s: float,
+    route: str,
+    *,
+    inflight: int = 1,
+) -> float:
+    """Return the generation budget with the validation reserve withheld.
+
+    Generation keeps at least ``1 - max_fraction`` of the op budget by
+    construction, so this can shorten generation but never starve it.
+    """
+    try:
+        reserve = compute_validation_reserve(
+            total_budget_s, route, inflight=inflight,
+        )
+        if reserve <= 0.0:
+            return gen_budget_s
+        return max(gen_budget_s - reserve, float(total_budget_s) - reserve)
+    except Exception:  # noqa: BLE001
+        return gen_budget_s
+
 def register_flags(registry: Any) -> int:
     """Module-owned FlagRegistry registration.  NEVER raises."""
     try:
@@ -444,6 +592,11 @@ def register_flags(registry: Any) -> int:
 
 
 __all__ = [
+    "validation_reserve_enabled",
+    "compute_validation_reserve",
+    "apply_validation_reserve",
+    "observe_validation_duration",
+    "get_validation_estimator",
     "ADAPTIVE_GEN_BUDGET_ENABLED_ENV_VAR",
     "PayloadWeight",
     "compute_payload_weight",

@@ -6298,6 +6298,45 @@ class GovernedOrchestrator:
                             "skipped (fail-open to route base)",
                             exc_info=True,
                         )
+
+                    # VALIDATION RESERVE. The same seam, the opposite
+                    # question: not "how much does generation need" but
+                    # "how much must it NOT take". VALIDATE was funded by
+                    # the residue and got 0.2-16.7s against a ~12s import
+                    # tax, so pytest was cut off before any verdict and
+                    # every cut-off was recorded as a candidate FAILURE.
+                    # Separate flag from the scaler above because that
+                    # one's invariant is "never below route base" and a
+                    # reserve necessarily lowers it.
+                    try:
+                        from backend.core.ouroboros.governance.adaptive_gen_budget import (  # noqa: E501
+                            apply_validation_reserve,
+                        )
+                        _reserved_gt = apply_validation_reserve(
+                            _gen_timeout,
+                            total_budget_s=_gen_timeout,
+                            route=str(_route or ""),
+                            inflight=self._config.local_sibling_candidates
+                            if hasattr(
+                                self._config, "local_sibling_candidates",
+                            ) else 1,
+                        )
+                        if _reserved_gt < _gen_timeout:
+                            logger.info(
+                                "[Orchestrator] validation reserve: gen "
+                                "%.0fs → %.0fs (withheld %.0fs) route=%s "
+                                "op=%s",
+                                _gen_timeout, _reserved_gt,
+                                _gen_timeout - _reserved_gt, _route,
+                                getattr(ctx, "op_id", "?"),
+                            )
+                        _gen_timeout = _reserved_gt
+                    except Exception:  # noqa: BLE001 — fail-open
+                        logger.debug(
+                            "[Orchestrator] validation reserve skipped "
+                            "(fail-open to unreserved budget)",
+                            exc_info=True,
+                        )
                     deadline = datetime.now(tz=timezone.utc) + timedelta(
                         seconds=_gen_timeout
                     )
@@ -15009,6 +15048,21 @@ class GovernedOrchestrator:
         except Exception:  # noqa: BLE001 — audit write is best-effort
             logger.debug("[Orchestrator] candidate ledger write degraded",
                          exc_info=True)
+
+        # Feed the measured duration back so the reserve LEARNS. Without
+        # this the EWMA never moves and the "adaptive" floor is a constant
+        # in disguise. Placed in the publisher because this is the one seam
+        # every validated candidate passes through, on both call paths.
+        try:
+            from backend.core.ouroboros.governance.adaptive_gen_budget import (  # noqa: E501
+                observe_validation_duration,
+            )
+            observe_validation_duration(
+                str(getattr(ctx, "provider_route", "") or ""),
+                float(duration_s),
+            )
+        except Exception:  # noqa: BLE001 — telemetry must never fail a verdict
+            logger.debug("[ValidationReserve] observe skipped", exc_info=True)
 
         # The per-candidate verdict is the ONLY thing that separates siblings
         # of one prompt. Without it every sibling inherits the op's single
