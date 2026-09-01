@@ -123,6 +123,13 @@ class TestResult:
     duration_seconds: float
     stdout: str
     flake_suspected: bool
+    #: The run was CUT OFF, not judged. A timeout says nothing about the
+    #: code -- reporting it as a test failure labels correct work as bad.
+    #: Structural, because deciding it by matching "pytest timed out" in
+    #: `stdout` is the same string-shape dispatch that already had to be
+    #: removed from the reward grader. Defaulted so every existing
+    #: construction site stays valid.
+    timed_out: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +387,22 @@ class PythonAdapter:
         return AdapterResult(
             adapter="python",
             passed=test_result.passed,
-            failure_class="none" if test_result.passed else "test",
+            # A timeout is INFRASTRUCTURE, not a verdict on the code. It
+            # was previously reported as "test", so a candidate whose tests
+            # never finished was recorded as a trainable FAILURE -- teaching
+            # the model that correct work it wrote was bad, because our
+            # harness could not run it. Measured on the live corpus: 20 of
+            # 36 per-candidate rows carried failure_class=infra with
+            # should_train=True.
+            #
+            # "infra" is the existing taxonomy value for exactly this (see
+            # graduation_ledger.INFRA "waived (OOM / TLS / network flake)"
+            # and risk_tier_extender's "not policy-relevant"), so no new
+            # class is introduced and no downstream consumer changes.
+            failure_class=(
+                "none" if test_result.passed
+                else ("infra" if test_result.timed_out else "test")
+            ),
             test_result=test_result,
             duration_s=elapsed,
         )
@@ -1541,6 +1563,7 @@ class TestRunner:
                 duration_seconds=elapsed,
                 stdout="pytest timed out after {:.1f}s".format(self._timeout),
                 flake_suspected=False,
+                timed_out=True,
             )
         finally:
             self._cleanup_report(report_path)

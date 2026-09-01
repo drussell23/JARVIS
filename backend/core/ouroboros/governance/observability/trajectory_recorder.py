@@ -133,6 +133,12 @@ _CAGED: _OutcomePolicy = ("unknown", "policy_denied", False)
 _INFRA: _OutcomePolicy = ("unknown", "no_journal_lease", False)
 _UNKNOWN: _OutcomePolicy = ("unknown", "intent_written", False)
 
+#: Validation failure classes that mean "never judged", not "judged bad".
+#: Mirrors reactor-core's autonomy_classifier policy -- infrastructure is
+#: not quality -- and the op-level mapping that already sends
+#: `validation_infra_failure` to a non-trainable `unknown`.
+_UNASSESSED_FAILURE_CLASSES: frozenset = frozenset({"infra", "build", "security"})
+
 # Terminal reason codes observed in the battle-test soaks. Governance
 # denials and environmental faults are deliberately NOT trainable: the
 # model's output was never the reason the op died.
@@ -792,7 +798,18 @@ class TrajectoryRecorder:
             # outcomes score identically and the ranker emits no pair.
             _verdict = gen.candidate_verdicts.get(cand_hash)
             if _verdict is not None and not _verdict[0]:
-                c_outcome, c_autonomy, c_train = _FAILURE
+                # ...but ONLY when the candidate was actually judged. A
+                # verdict whose failure_class is infrastructure means the
+                # tests never ran -- a timeout, an exhausted budget, a
+                # harness fault. Labelling that a FAILURE trains the model
+                # against code no one assessed, which is worse than
+                # discarding the row: it is a confident wrong label.
+                # Measured: 20 of 36 per-candidate rows carried
+                # failure_class=infra with should_train=True.
+                if _verdict[1] in _UNASSESSED_FAILURE_CLASSES:
+                    c_outcome, c_autonomy, c_train = _INFRA
+                else:
+                    c_outcome, c_autonomy, c_train = _FAILURE
                 c_reason = _verdict[1] or "validation_failed"
             else:
                 c_outcome, c_autonomy, c_train = outcome, autonomy_type, should_train
