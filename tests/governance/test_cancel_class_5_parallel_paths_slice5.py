@@ -294,3 +294,64 @@ async def test_master_off_plan_exploit_passes_through_to_wait_for(
         cancel_token=None,
     )
     assert result == ["ok", "ok"]
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-02: a raced task's exception is always RETRIEVED
+#
+# Soak bt-2026-09-02-203607 logged, at shutdown:
+#   [PANIC] SessionBudgetPreflightRefused: Task exception was never retrieved
+#   future=<Task ... coro=<ClaudeProvider.generate() ...>>
+# `race_or_wait_for` cancels the loser in `finally` without reading its
+# exception; a coroutine that catches CancelledError on its way out and then
+# raises leaves an exception nobody owns, and asyncio reports it at GC time.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_losing_task_exception_is_consumed_not_leaked() -> None:
+    import gc
+
+    leaked: list = []
+    loop = asyncio.get_running_loop()
+    prev_handler = loop.get_exception_handler()
+
+    def _capture(loop_, ctx):
+        if "never retrieved" in str(ctx.get("message", "")):
+            leaked.append(ctx)
+        elif prev_handler:
+            prev_handler(loop_, ctx)
+        else:
+            loop_.default_exception_handler(ctx)
+
+    loop.set_exception_handler(_capture)
+    try:
+        token = CancelToken("op-leak-001")
+        cancel_token_var.set(token)
+
+        async def _refuses_on_the_way_out():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                # A provider's cleanup path: swallows the cancel, then a
+                # budget preflight refuses. Nothing awaits this any more.
+                raise RuntimeError("session_budget_preflight_refused")
+
+        async def _fire():
+            await asyncio.sleep(0.02)
+            token.set(_make_record("op-leak-001"))
+
+        asyncio.create_task(_fire())
+        with pytest.raises(OperationCancelledError):
+            await race_or_wait_for(
+                _refuses_on_the_way_out(), timeout=2.0, cancel_token=token,
+            )
+        # Let the loser finish, then force the collection that reports leaks.
+        await asyncio.sleep(0.05)
+        gc.collect()
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(prev_handler)
+        cancel_token_var.set(None)
+
+    assert leaked == [], f"unretrieved task exception leaked: {leaked}"

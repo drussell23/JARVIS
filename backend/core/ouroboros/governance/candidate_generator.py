@@ -9357,13 +9357,34 @@ class CandidateGenerator:
             # OFF (or breaker CLOSED) is the byte-identical legacy cascade.
             _fallback_dead = False
             _autarky_reason = ""  # "structural" (expected) | "breaker_open" (abnormal)
+            # Is the seat about to be called the LOCAL engine? The reflex cap
+            # is DW-shaped -- 30s tuned for a metered cloud API whose fallback
+            # is a second cloud API. A locally-served model has neither
+            # property: its prefill on a 32K prompt alone can exceed the cap,
+            # and its budget is already governed by the streaming watchdog
+            # and the profiler's absolute ceiling.
+            try:
+                _local_seat = (
+                    self._jprime is not None and self._primary is self._jprime
+                )
+            except Exception:  # noqa: BLE001 — defensive
+                _local_seat = False
             if _dw_autarky_enabled():
                 # A CONFIG-disabled Claude (JARVIS_PROVIDER_CLAUDE_DISABLED) is the
                 # deadest fallback of all — never constructed — yet it leaves the
                 # circuit breaker CLOSED, so the breaker-state check below misses it.
                 # Check it first so the sole-lane DW gets the full runway instead of
                 # the reflex cap (the live-soak TIMEOUT root, 2026-06-20).
-                _fallback_dead = _claude_config_disabled()
+                #
+                # The FREE LANE is the same class of dead: local engine
+                # configured, no DW key, no Anthropic key -- nothing to
+                # reserve runway for. Soak bt-2026-09-02-203607 ran exactly
+                # that topology and still reserved 9,852s of a 9,882s budget
+                # for a Claude call that `session_budget_preflight_refused`
+                # and `anthropic_not_installed` could never make, severing
+                # every local primary at 30s. `_free_lane_active` is the
+                # existing predicate for "no paid lane exists".
+                _fallback_dead = _claude_config_disabled() or _free_lane_active()
                 if _fallback_dead:
                     _autarky_reason = "structural"
                 else:
@@ -9378,7 +9399,7 @@ class CandidateGenerator:
                         _fallback_dead = False
             primary_budget = self._compute_primary_budget(
                 remaining, model_id=model_id, force_batch=_force_batch,
-                fallback_dead=_fallback_dead,
+                fallback_dead=_fallback_dead, local_seat=_local_seat,
                 # T5 -- per-op deadline dilation seam: a LANE-COLLAPSED op (both
                 # transport lanes timed out) carries a recorded dilation hop, so
                 # this re-attempt's budget is scaled up (bounded). No hops / gate
@@ -11165,9 +11186,19 @@ class CandidateGenerator:
         model_id: str = "",
         force_batch: bool = False,
         fallback_dead: bool = False,
+        local_seat: bool = False,
         op_id: str = "",
     ) -> float:
         """Deterministic Tier 1 primary budget with fallback reserve + Tier 3 cap.
+
+        ``local_seat`` (2026-09-02): the primary about to be called is the
+        locally-served engine. With ``fallback_dead`` it lifts the DW autarky
+        constant in favour of the local profiler's own absolute ceiling --
+        the number that module already treats as the un-inflatable kill
+        line for a wedged model. A 180s constant tuned for a cloud API was
+        wrong for a 30B model whose real draws run 250-600s; the physics it
+        replaces is already measured and owned elsewhere, so it is read,
+        not redeclared.
 
         Invariants (enforced via ``min()`` — strictest wins):
           - primary_budget <= total_s * _PRIMARY_BUDGET_FRACTION
@@ -11246,6 +11277,22 @@ class CandidateGenerator:
         # caller stamps fallback_dead from the read-only _claude_breaker_open
         # predicate; default False is byte-identical to the legacy cascade.
         if fallback_dead:
+            if local_seat:
+                # The local lane's kill line is the local profiler's absolute
+                # ceiling (JARVIS_LOCAL_INFERENCE_ABSOLUTE_CEILING_MS) -- the
+                # one number that module refuses to let the EWMA inflate past.
+                # Below it, the streaming watchdog is the guard. Fail-soft to
+                # the DW constant only if the director cannot be consulted.
+                try:
+                    from backend.core.ouroboros.governance.local_inference_director import (  # noqa: PLC0415
+                        _absolute_ceiling_ms as _local_kill_line_ms,
+                    )
+                    local_cap = max(1.0, _local_kill_line_ms() / 1000.0)
+                    return CandidateGenerator._apply_lane_dilation(
+                        max(min(total_s, local_cap), 0.0), op_id,
+                    )
+                except Exception:  # noqa: BLE001 — never lose the op over a budget read
+                    pass
             autarky_cap = _envf_or_default(
                 "JARVIS_DW_AUTARKY_MAX_BUDGET_S", 180.0,
             )

@@ -256,3 +256,105 @@ class TestTheDegradationEvent:
         # the operator cannot correlate this event with `_health_for()`.
         assert payload["endpoint"] == t.base_url
         assert g._health_for(payload["endpoint"]) is g._health_for(t.base_url)
+
+
+# ---------------------------------------------------------------------------
+# The draw's own physics reach the watchdog (2026-09-02)
+#
+# Soak bt-2026-09-02-203607 armed 153 streams at exactly 30s and died of
+# `session_exhausted` at 40% of its budget. Three defects, each pinned here:
+# the first-token deadline ignored the prompt's size, ignored the stall
+# penalty the streaming path itself recorded, and the steady-state deadline
+# ignored how much wider a high-entropy draw samples.
+# ---------------------------------------------------------------------------
+
+
+class TestTheDrawDescribesItself:
+    def test_no_description_is_byte_identical_legacy(self):
+        static = lid._inter_token_timeout_s()
+        assert _profiler().inter_token_budget_s() == (static, static)
+        assert _profiler().inter_token_budget_s(
+            prompt_tokens=None, temperature=None, sampling=None,
+        ) == (static, static)
+
+    def test_a_long_prompt_widens_only_the_first_token_deadline(self, monkeypatch):
+        """Prefill grows with the prompt; the inter-token gap does not."""
+        monkeypatch.setenv("JARVIS_LOCAL_SEED_CTX_BASELINE", "8192")
+        static = lid._inter_token_timeout_s()
+        first, steady = _profiler().inter_token_budget_s(prompt_tokens=32768)
+        assert first == pytest.approx(static * 4.0)
+        assert steady == pytest.approx(static)
+
+    def test_a_short_prompt_never_tightens_below_static(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_LOCAL_SEED_CTX_BASELINE", "8192")
+        static = lid._inter_token_timeout_s()
+        first, _ = _profiler().inter_token_budget_s(prompt_tokens=512)
+        assert first == pytest.approx(static)
+
+    def test_prefill_scale_is_bounded(self, monkeypatch):
+        """A pathological prompt cannot buy an unbounded first-token wait."""
+        monkeypatch.setenv("JARVIS_LOCAL_SEED_CTX_BASELINE", "8192")
+        monkeypatch.setenv("JARVIS_LOCAL_PREFILL_SCALE_MAX", "3")
+        static = lid._inter_token_timeout_s()
+        first, _ = _profiler().inter_token_budget_s(prompt_tokens=10_000_000)
+        assert first == pytest.approx(static * 3.0)
+
+    def test_a_recorded_stall_lifts_the_next_first_token_deadline(self):
+        """The penalty the streaming path pays must be READ, not just written.
+
+        `record_timeout_penalty` escalates the EWMA on every wedge -- and the
+        deadline that was wedging never consulted it, so a host that stalled
+        every op kept the static 30s forever. This is the cold-profiler
+        starvation the penalty seam exists to break.
+        """
+        p = _profiler()
+        static = lid._inter_token_timeout_s()
+        before, _ = p.inter_token_budget_s()
+        p.record_timeout_penalty(static * 1000.0)
+        after, _ = p.inter_token_budget_s()
+        assert before == pytest.approx(static)
+        assert after > before
+
+    def test_entropy_widens_the_steady_state_ceiling(self):
+        """A rung-4 draw samples wider than a T=0.2 draw; its tolerance follows."""
+        from backend.core.ouroboros.governance import sibling_entropy as ent
+        p = _profiler()
+        static = lid._inter_token_timeout_s()
+        r4 = ent.sampling_for(4, op_id="sla-entropy")
+        _, steady_legacy = p.inter_token_budget_s()
+        _, steady_hot = p.inter_token_budget_s(
+            temperature=r4.temperature, sampling=r4,
+        )
+        factor = lid.entropy_latency_factor(r4.temperature, r4)
+        assert factor > 1.0
+        assert steady_hot == pytest.approx(static * factor)
+        assert steady_legacy == pytest.approx(static)
+
+    def test_warm_steady_state_still_detects_sooner_than_its_ceiling(self):
+        """Entropy raises the CEILING; measured physics still tighten under it."""
+        from backend.core.ouroboros.governance import sibling_entropy as ent
+        p = _warm(_profiler(), ttft_ms=800.0, total_ms=4000.0, out_tokens=400)
+        r4 = ent.sampling_for(4, op_id="sla-warm")
+        _, steady = p.inter_token_budget_s(temperature=r4.temperature, sampling=r4)
+        static = lid._inter_token_timeout_s()
+        assert lid._inter_token_floor_s() <= steady <= static * lid.entropy_latency_factor(
+            r4.temperature, r4)
+
+    def test_first_token_is_bounded_by_the_absolute_ceiling(self, monkeypatch):
+        """A long prompt plus a huge penalty still cannot outrun the kill line."""
+        monkeypatch.setenv("JARVIS_LOCAL_INFERENCE_ABSOLUTE_CEILING_MS", "90000")
+        monkeypatch.setenv("JARVIS_LOCAL_SEED_CTX_BASELINE", "8192")
+        p = _profiler()
+        p.record_timeout_penalty(600_000.0)
+        first, _ = p.inter_token_budget_s(prompt_tokens=200_000)
+        assert first <= 90.0 + 1e-6
+
+    def test_a_hostile_sampling_point_never_disarms_the_watchdog(self):
+        class _Hostile:
+            def config_overrides(self):
+                raise RuntimeError("boom")
+        static = lid._inter_token_timeout_s()
+        first, steady = _profiler().inter_token_budget_s(
+            prompt_tokens="not-a-number", temperature=0.9, sampling=_Hostile(),
+        )
+        assert first >= static and steady >= lid._inter_token_floor_s()

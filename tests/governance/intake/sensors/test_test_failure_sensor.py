@@ -1,5 +1,6 @@
 """Tests for TestFailureSensor (Sensor B)."""
 import importlib
+import pytest
 import time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -271,3 +272,50 @@ class TestInFlightDedup:
         assert results[1] is None
         assert results[2] is None
         assert router.ingest.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-02: a git scan that finished as its timeout fired must not traceback
+#
+# Soak bt-2026-09-02-203607 logged three `ProcessLookupError` tracebacks from
+# `_git_dirty_py_paths`: `communicate()` was cancelled by the 10s bound in the
+# same tick the process exited, and `kill()` on a reaped process raises.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_git_dirty_scan_survives_a_process_that_exited_at_the_deadline(
+    monkeypatch, tmp_path,
+):
+    import asyncio as _asyncio
+    mod = importlib.import_module(
+        "backend.core.ouroboros.governance.intake.sensors.test_failure_sensor")
+
+    class _Reaped:
+        """A subprocess whose timeout and natural exit landed together."""
+        returncode = None                     # not yet observed by the caller
+
+        async def communicate(self):
+            await _asyncio.sleep(10)
+
+        def kill(self):
+            raise ProcessLookupError()        # the OS already reaped it
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+    async def _spawn(*a, **k):
+        return _Reaped()
+
+    async def _instant_timeout(coro, timeout=None):
+        coro.close()
+        raise _asyncio.TimeoutError()
+
+    monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", _spawn)
+    monkeypatch.setattr(mod.asyncio, "wait_for", _instant_timeout)
+
+    sensor = mod.TestFailureSensor.__new__(mod.TestFailureSensor)
+    monkeypatch.setattr(sensor, "_repo_root", lambda: tmp_path, raising=False)
+
+    assert await sensor._git_dirty_py_paths() == []

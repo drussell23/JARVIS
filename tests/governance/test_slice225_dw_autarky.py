@@ -105,3 +105,63 @@ def test_claude_config_disabled_false_when_explicit_false(monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ── 2026-09-02: the LOCAL seat, and a fallback that is structurally unfunded ──
+#
+# Soak bt-2026-09-02-203607 (no DW key, no Anthropic key, local engine as the
+# primary seat) logged `primary_budget=30.0s ... remaining=9882.4s
+# fallback_reserve=9852.4s` on every op: 99.7% of the budget reserved for a
+# Claude call that `session_budget_preflight_refused` could never make, and
+# the local 30B severed at 30s before its 32K prefill finished. Ten in a row
+# tripped the breaker and the session died at 40% of its wall budget.
+
+
+def test_local_seat_with_dead_fallback_gets_the_local_kill_line(monkeypatch):
+    """Not the DW autarky constant -- the local profiler's own absolute ceiling."""
+    monkeypatch.setenv("JARVIS_LOCAL_INFERENCE_ABSOLUTE_CEILING_MS", "600000")
+    monkeypatch.delenv("JARVIS_DW_AUTARKY_MAX_BUDGET_S", raising=False)
+    budget = CandidateGenerator._compute_primary_budget(
+        9882.0, fallback_dead=True, local_seat=True)
+    assert budget == pytest.approx(600.0, abs=0.5)
+    # and it is NOT the DW constant
+    assert budget != pytest.approx(180.0, abs=0.5)
+
+
+def test_local_seat_is_still_bounded_by_the_op_budget():
+    budget = CandidateGenerator._compute_primary_budget(
+        400.0, fallback_dead=True, local_seat=True)
+    assert budget == pytest.approx(400.0, abs=0.5)
+
+
+def test_local_seat_with_live_fallback_keeps_the_legacy_cap():
+    """`local_seat` alone changes nothing; only a dead fallback lifts the cap."""
+    assert CandidateGenerator._compute_primary_budget(
+        9882.0, fallback_dead=False, local_seat=True) == _PRIMARY_MAX_TIMEOUT_S
+
+
+def test_dw_seat_with_dead_fallback_is_unchanged():
+    """The DW autarky path is byte-identical -- this is additive."""
+    assert CandidateGenerator._compute_primary_budget(
+        9882.0, fallback_dead=True, local_seat=False) == pytest.approx(180.0, abs=0.5)
+
+
+def test_free_lane_counts_as_a_structurally_dead_fallback(monkeypatch):
+    """No paid lane exists -> nothing to reserve runway for.
+
+    `_free_lane_active` is the existing predicate for that topology; the
+    autarky decision reuses it rather than growing a third spelling of
+    "is there a Claude to fall back to".
+    """
+    import backend.core.ouroboros.governance.candidate_generator as cg
+    monkeypatch.setenv("JARVIS_FREE_LANE_POLICY_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_LOCAL_PRIME_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_FREE_LANE_CRED_TTL_S", "0")
+    monkeypatch.delenv("DOUBLEWORD_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("JARVIS_PROVIDER_CLAUDE_DISABLED", raising=False)
+    monkeypatch.setattr(cg, "_refresh_paid_lane_credentials", lambda: None)
+    assert cg._free_lane_active() is True
+    assert cg._claude_config_disabled() is False
+    # The decision the call site makes:
+    assert (cg._claude_config_disabled() or cg._free_lane_active()) is True

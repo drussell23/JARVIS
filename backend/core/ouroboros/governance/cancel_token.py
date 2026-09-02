@@ -769,6 +769,32 @@ class OperationCancelledError(Exception):
         )
 
 
+def _consume_task_exception(task: "asyncio.Future") -> None:
+    """Done-callback: retrieve a raced task's exception so asyncio never
+    reports it as unretrieved.
+
+    Mirrors ``candidate_generator._swallow_task_exception`` -- which cannot
+    be imported here without closing an import cycle (that module imports
+    this one). The contract is identical and deliberately minimal: a
+    cancelled task has nothing to retrieve; a finished one has its
+    exception READ, which is all asyncio requires; nothing is re-raised and
+    nothing is re-logged at a level above DEBUG, because the raise site
+    already spoke. NEVER raises.
+    """
+    try:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logging.getLogger(__name__).debug(
+                "[CancelToken] raced task finished with %s(%s) after the "
+                "race resolved -- consumed",
+                type(exc).__name__, str(exc)[:160],
+            )
+    except Exception:  # noqa: BLE001 -- contract: a callback never crashes
+        pass
+
+
 async def race_or_wait_for(
     coro: Awaitable[Any],
     *,
@@ -807,6 +833,18 @@ async def race_or_wait_for(
 
     coro_task = asyncio.ensure_future(coro)
     cancel_task = asyncio.ensure_future(cancel_token.wait())
+    # Every task this racer spawns gets a consumer for its exception. The
+    # `finally` below cancels whichever task is still running -- and a
+    # coroutine that catches CancelledError (a provider's cleanup path, a
+    # budget preflight that refuses on the way out) can finish with an
+    # exception nobody is left to read. asyncio then reports "Task exception
+    # was never retrieved" at garbage-collection time, which the
+    # PanicArbiter promotes to an ERROR. Soak bt-2026-09-02-203607 logged
+    # exactly that for `ClaudeProvider.generate()` raising
+    # `SessionBudgetPreflightRefused` during teardown. The callback retrieves
+    # the exception so the loser's failure is a DEBUG line, not a panic.
+    coro_task.add_done_callback(_consume_task_exception)
+    cancel_task.add_done_callback(_consume_task_exception)
     try:
         done, pending = await asyncio.wait(
             {coro_task, cancel_task},

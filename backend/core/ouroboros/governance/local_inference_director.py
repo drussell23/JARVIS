@@ -293,6 +293,29 @@ def entropy_latency_factor(
         return 1.0
 
 
+def _prefill_context_scale(prompt_tokens: "Optional[int]") -> float:
+    """How much longer than baseline THIS prompt's prefill should be allowed.
+
+    Prefill cost is close to linear in prompt length, and the first-token
+    deadline is the one wait that measures prefill. The baseline is the
+    same ``JARVIS_LOCAL_SEED_CTX_BASELINE`` that ``_cold_seed_ms`` scales the
+    total budget by -- one notion of "a normal-sized prompt", not two.
+
+    Bounded above (``JARVIS_LOCAL_PREFILL_SCALE_MAX``) so a pathological
+    prompt cannot buy an unbounded first-token wait; the absolute ceiling
+    still owns the wedged-model case. >= 1.0 always: a short prompt never
+    TIGHTENS the deadline below the static value. NEVER raises.
+    """
+    try:
+        if prompt_tokens is None or prompt_tokens <= 0:
+            return 1.0
+        baseline = max(1, _int_env("JARVIS_LOCAL_SEED_CTX_BASELINE", 8192))
+        ceiling = max(1.0, _f_env("JARVIS_LOCAL_PREFILL_SCALE_MAX", 6.0))
+        return float(max(1.0, min(ceiling, float(prompt_tokens) / baseline)))
+    except Exception:  # noqa: BLE001
+        return 1.0
+
+
 def _entropy_latency_enabled() -> bool:
     raw = (os.environ.get("JARVIS_LOCAL_ENTROPY_LATENCY_ENABLED", "true") or "")
     return raw.strip().lower() not in ("0", "false", "no", "off")
@@ -942,7 +965,12 @@ class LatencyProfiler:
         except Exception:  # noqa: BLE001
             pass
 
-    def inter_token_budget_s(self) -> "Tuple[float, float]":
+    def inter_token_budget_s(
+        self, *,
+        prompt_tokens: "Optional[int]" = None,
+        temperature: "Optional[float]" = None,
+        sampling: "Optional[Any]" = None,
+    ) -> "Tuple[float, float]":
         """``(first_token_s, steady_token_s)`` for the streaming watchdog.
 
         TWO deadlines, because the two waits measure different physics and a
@@ -960,8 +988,39 @@ class LatencyProfiler:
           gaps before anyone noticed. This deadline is derived from measured
           per-token cost and may only ever be TIGHTER than the legacy value.
 
-        Cold profiler -> the static value for both, i.e. byte-identical
-        legacy behaviour. NEVER raises.
+        ## The draw's own physics (2026-09-02)
+
+        ``prompt_tokens``, ``temperature`` and ``sampling`` describe THIS
+        draw. They exist because soak bt-2026-09-02-203607 died with 153
+        streams armed at exactly ``30s`` and a profiler that never warmed:
+
+        * **Prefill grows with the prompt**, and a cold profiler has no TTFT
+          sample to say so. The first-token deadline is therefore scaled by
+          the prompt's size against the same context baseline
+          ``_cold_seed_ms`` already uses -- a 32K prompt on a 30B model
+          legitimately needs longer than an 8K one before its first byte,
+          warm or cold.
+        * **A stall was already being recorded and never consulted.** The
+          streaming path calls ``record_timeout_penalty`` on every wedge,
+          which escalates ``_ewma_ms`` -- and this method never read it. So
+          the very seam that exists to "break the cold-profiler starvation"
+          had no effect on the deadline that was starving it. The first-token
+          deadline now honours the escalated EWMA.
+        * **Entropy widens the steady-state tolerance.** A wide ``top_k`` and
+          a ``repeat_penalty`` applied across the whole ``repeat_last_n``
+          window raise per-token sampler cost and its VARIANCE, so twelve
+          "normal" gaps at temperature 0.2 is the wrong yardstick for a draw
+          at T=1.10/top_k=140. The steady deadline's ceiling is scaled by the
+          same ``entropy_latency_factor`` the total budget uses -- one
+          definition of "how much wider is this draw".
+
+        Every scale is >= 1.0 and every knob is env-derived; a draw with no
+        description gets the pre-existing budget byte-for-byte. The absolute
+        ceiling still bounds the first-token wait so a wedged model cannot
+        buy unlimited time by being asked a long question.
+
+        Cold profiler + no draw description -> the static value for both,
+        i.e. byte-identical legacy behaviour. NEVER raises.
         """
         static = _inter_token_timeout_s()
         try:
@@ -973,21 +1032,36 @@ class LatencyProfiler:
                 ttft_sd = self._stddev(self._ttft)
                 tok_m = self._mean(self._per_tok)
                 tok_sd = self._stddev(self._per_tok)
-            if not warm:
-                return (static, static)
+                ewma_ms = self._ewma_ms
+
+            ctx_scale = _prefill_context_scale(prompt_tokens)
+            entropy = entropy_latency_factor(temperature, sampling)
+            absolute_s = _absolute_ceiling_ms() / 1000.0
             sigma = float(getattr(self._cfg, "margin_sigma", 2.0) or 2.0)
             mult = _inter_token_stall_multiple()
 
-            # First token: measured TTFT + margin, scaled. Clamped at or ABOVE
-            # the static value -- prefill is the one wait that legitimately
-            # grows with the prompt, so tightening it would manufacture stalls.
-            first = max(static, mult * (ttft_m + sigma * ttft_sd) / 1000.0)
+            # First token: never below the static value scaled by the prompt
+            # (prefill physics), and never below the timeout-escalated EWMA
+            # (a stall the ledger already paid for). Warm adds the measured
+            # TTFT + margin. Bounded by the absolute ceiling.
+            first = static * ctx_scale
+            if ewma_ms > 0.0:
+                first = max(first, ewma_ms / 1000.0)
+            if warm:
+                first = max(first, mult * (ttft_m + sigma * ttft_sd) / 1000.0)
+            first = min(first, absolute_s) if absolute_s > 0 else first
+
+            if not warm:
+                # Steady state has nothing measured to tighten against; the
+                # entropy premium is all this draw knows about itself.
+                return (first, static * entropy)
 
             # Steady state: measured per-token + margin, scaled, floored so
-            # jitter is not mistaken for a wedge, and capped at the static
-            # value so this path can only ever DETECT SOONER, never later.
+            # jitter is not mistaken for a wedge, and capped at the
+            # entropy-scaled static value so this path can only ever DETECT
+            # SOONER than that ceiling, never later.
             steady = mult * (tok_m + sigma * tok_sd) / 1000.0
-            steady = max(_inter_token_floor_s(), min(steady, static))
+            steady = max(_inter_token_floor_s(), min(steady, static * entropy))
             return (first, steady)
         except Exception:  # noqa: BLE001 — a watchdog must never fail to arm
             return (static, static)
@@ -1463,7 +1537,11 @@ class LocalPrimeClient:
         _use_stream = stream if stream is not None else (
             bool(self._cfg.num_ctx) and _streaming_enabled())
         if _use_stream:
-            return await self._complete_streaming(sess, url, body, prefill=_eff_prefill)
+            return await self._complete_streaming(
+                sess, url, body, prefill=_eff_prefill,
+                prompt_tokens=prompt_tokens, temperature=temperature,
+                sampling=sampling,
+            )
 
         t0 = time.monotonic()
         async with sess.post(url, json=body) as resp:
@@ -1540,7 +1618,10 @@ class LocalPrimeClient:
         )
 
     async def _complete_streaming(self, sess: Any, url: str, body: Dict[str, Any],
-                                  *, prefill: str = "") -> LocalCompletion:
+                                  *, prefill: str = "",
+                                  prompt_tokens: "Optional[int]" = None,
+                                  temperature: "Optional[float]" = None,
+                                  sampling: "Optional[Any]" = None) -> LocalCompletion:
         """Streaming generation with the Asynchronous Inter-Token Watchdog +
         cooperative shutdown. Reads the SSE stream chunk-by-chunk; each ``readline``
         is bounded by the inter-token timeout (NOT the total duration). Between
@@ -1573,7 +1654,10 @@ class LocalPrimeClient:
         # enough to hide a wedged peer for 6,600 normal gaps on a fast host,
         # AND tight enough to declare a large legitimate prefill "wedged".
         # See LatencyProfiler.inter_token_budget_s.
-        _first_token_s, _steady_token_s = self.profiler.inter_token_budget_s()
+        _first_token_s, _steady_token_s = self.profiler.inter_token_budget_s(
+            prompt_tokens=prompt_tokens, temperature=temperature,
+            sampling=sampling,
+        )
         # TRANSPORT FLOOR — added, never substituted.
         #
         # A stall deadline must cover the time the MODEL needs plus the time

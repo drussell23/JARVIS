@@ -1645,7 +1645,17 @@ class TestFailureSensor:
             try:
                 out, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
             except asyncio.TimeoutError:
-                proc.kill()
+                # The timeout and a natural exit can land in the same tick:
+                # `communicate()` was cancelled but the process had already
+                # gone, and `kill()` on a reaped process raises
+                # ProcessLookupError -- three tracebacks per soak for a scan
+                # that had, in fact, finished. Only kill what is still alive,
+                # and treat "already gone" as the success it is.
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
                 await proc.wait()
                 return []
         except Exception:
