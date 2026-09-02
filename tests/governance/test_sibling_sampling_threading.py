@@ -377,3 +377,110 @@ def test_every_provider_seat_accepts_a_sampling_point():
         assert any(
             p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
         ), f"{seat.__name__} would TypeError on an unknown sampling field"
+
+
+# ---------------------------------------------------------------------------
+# Entropy-aware budgets: a wider draw needs a wider window
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_draw_gets_a_byte_identical_budget(lid, ent):
+    """No point, or the legacy point, must not move the timeout at all."""
+    assert lid.entropy_latency_factor(None, None) == 1.0
+    assert lid.entropy_latency_factor(0.2, ent.SiblingSampling()) == 1.0
+
+
+def test_entropy_factor_rises_monotonically_with_the_ladder(lid, ent):
+    """Each rung is wider than the last, because each rung samples wider."""
+    factors = [
+        lid.entropy_latency_factor(p.temperature, p)
+        for p in (ent.sampling_for(d, op_id="op-t") for d in (2, 3, 4))
+    ]
+    assert factors == sorted(factors), factors
+    assert factors[0] > 1.0
+    assert all(f == pytest.approx(f, abs=1e-9) for f in factors)
+
+
+def test_entropy_factor_is_bounded(lid, monkeypatch):
+    """A runaway rung must not inflate a budget without limit.
+
+    The absolute breaker stays the authority on a wedged model; this knob
+    only prices a wider sampler.
+    """
+    absurd = {"top_k": 10_000_000, "repeat_penalty": 99.0}
+    ceiling = float(lid._f_env("JARVIS_LOCAL_ENTROPY_FACTOR_MAX", 2.5))
+    assert lid.entropy_latency_factor(50.0, absurd) <= ceiling
+
+
+def test_entropy_widens_the_adaptive_timeout(lid, ent):
+    """The budget actually moves — the factor is not merely computed."""
+    cfg = lid.LocalConfig.from_env()
+    prof = lid.LatencyProfiler(cfg)
+    for _ in range(cfg.min_samples + 1):
+        prof.record(ttft_ms=400.0, total_ms=8000.0, output_tokens=200)
+    base = prof.adaptive_timeout_ms(prompt_tokens=4000)
+    hot = prof.adaptive_timeout_ms(
+        prompt_tokens=4000, temperature=1.10,
+        sampling=ent.sampling_for(4, op_id="op-b"),
+    )
+    assert hot > base, (base, hot)
+
+
+def test_entropy_budget_survives_a_malformed_point(lid):
+    """A bad point costs the draw its premium, never the draw itself."""
+    class _Hostile:
+        def config_overrides(self):
+            raise RuntimeError("boom")
+    assert lid.entropy_latency_factor(0.9, _Hostile()) >= 1.0
+    assert lid.entropy_latency_factor(None, {"top_k": "not-a-number"}) >= 1.0
+
+
+def test_entropy_premium_can_be_switched_off(lid, monkeypatch, ent):
+    monkeypatch.setenv("JARVIS_LOCAL_ENTROPY_LATENCY_ENABLED", "false")
+    p = ent.sampling_for(4, op_id="op-off")
+    assert lid.entropy_latency_factor(p.temperature, p) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Telemetry partitioning must be deterministic
+# ---------------------------------------------------------------------------
+
+
+def test_corpus_rows_carry_the_session_they_came_from(monkeypatch):
+    """`OperationContext` has no `session_id`, so the default wrote "".
+
+    Every row on disk was anonymous and two consecutive soaks could only be
+    told apart by clustering timestamps — a heuristic that merges runs whose
+    gap is small, which is exactly the comparison a reward change needs.
+    """
+    from backend.core.ouroboros.governance.observability import (
+        trajectory_recorder as tr,
+    )
+    monkeypatch.setenv("JARVIS_OUROBOROS_SESSION_ID", "bt-2026-09-02-999999")
+    assert tr._canonical_session_id() == "bt-2026-09-02-999999"
+
+
+def test_an_explicit_session_id_still_wins(monkeypatch):
+    """The canonical id is a FALLBACK, not an override."""
+    from backend.core.ouroboros.governance.autonomous_workspace import (
+        canonical_session_id,
+    )
+    monkeypatch.setenv("JARVIS_OUROBOROS_SESSION_ID", "  bt-spaces  ")
+    assert canonical_session_id() == "bt-spaces"
+    monkeypatch.delenv("JARVIS_OUROBOROS_SESSION_ID", raising=False)
+    assert canonical_session_id() == ""
+
+
+def test_operation_context_still_has_no_session_id_field():
+    """Pins WHY the fallback exists.
+
+    If a `session_id` field is ever added to OperationContext, this fails
+    and the recorder should prefer it — the fallback would then be masking
+    a real value rather than supplying a missing one.
+    """
+    from backend.core.ouroboros.governance.op_context import OperationContext
+    ctx = OperationContext.create(
+        target_files=("a.py",), description="d",
+        _timestamp=datetime(2026, 3, 10, tzinfo=timezone.utc),
+    )
+    assert not hasattr(ctx, "session_id")

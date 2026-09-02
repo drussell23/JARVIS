@@ -112,6 +112,34 @@ def recorder_enabled() -> bool:
     return _env_flag(_ENV_MASTER)
 
 
+def _canonical_session_id() -> str:
+    """Which soak a row belongs to, when the caller did not say.
+
+    Every caller passes ``session_id=getattr(context, "session_id", "")``
+    and ``OperationContext`` has NEVER defined that field, so the default
+    won and every row on disk carried ``session_id: ""``. Partitioning a
+    corpus by session then had to be done by clustering timestamps and
+    guessing where one soak ended -- a heuristic that silently merges two
+    runs whose gap is small, which is exactly what a reward comparison
+    between consecutive soaks must never do.
+
+    The process-wide identity is authoritative here BECAUSE a soak process
+    runs exactly one session: the harness stamps
+    ``JARVIS_OUROBOROS_SESSION_ID`` at boot and the worktree manager,
+    auto-committer and workspace router already treat it as the session's
+    name. Imported lazily so this observability module never sits on a
+    governance import cycle, and fail-open: an unidentified session must
+    not stop a row being written.
+    """
+    try:
+        from backend.core.ouroboros.governance.autonomous_workspace import (  # noqa: PLC0415
+            canonical_session_id,
+        )
+        return canonical_session_id()
+    except Exception:  # noqa: BLE001 — a nameless row beats a lost row
+        return ""
+
+
 def events_dir() -> Path:
     """Directory the Trinity experience receiver already watches."""
     raw = os.getenv(_ENV_DIR, "").strip()
@@ -502,7 +530,7 @@ class TrajectoryRecorder:
             ),
             cost_usd=float(traj.original_cost_usd),
             task_type=str(task_type or ""),
-            session_id=str(session_id or ""),
+            session_id=str(session_id or "") or _canonical_session_id(),
             tokens_estimated=bool(tokens_estimated),
         )
         if self._offer(pending):

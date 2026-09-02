@@ -202,6 +202,102 @@ def _apply_sampling(body: "Dict[str, Any]", cfg: "LocalConfig") -> "Dict[str, An
         return applied
 
 
+def _sampling_overrides(sampling: "Optional[Any]") -> "Dict[str, Any]":
+    """The ``LocalConfig`` fields a sampling point sets. ONE reader.
+
+    Duck-typed on purpose: this module must not import ``sibling_entropy``
+    (that module imports nothing from here, and the dependency would close
+    a cycle through the governance package). Anything exposing
+    ``config_overrides()`` works, and so does a plain mapping — which is
+    what makes both the request seam and the timeout seam testable without
+    constructing a ladder.
+
+    Unknown keys are DROPPED rather than raising: a provider that learns a
+    new sampling field before this dataclass does must degrade to the
+    fields we understand, not fail the generation. NEVER raises.
+    """
+    if sampling is None:
+        return {}
+    try:
+        raw = sampling
+        getter = getattr(sampling, "config_overrides", None)
+        if callable(getter):
+            raw = getter()
+        if not isinstance(raw, dict):
+            return {}
+        allowed = {"top_p", "top_k", "repeat_penalty", "seed"}
+        return {k: v for k, v in raw.items() if k in allowed and v is not None}
+    except Exception:  # noqa: BLE001
+        logger.debug("[LocalPrimeClient] sampling override unreadable", exc_info=True)
+        return {}
+
+
+def entropy_latency_factor(
+    temperature: "Optional[float]", sampling: "Optional[Any]",
+) -> float:
+    """How much LONGER a draw at this sampling point is expected to run.
+
+    ## Why this scales output length, not the timeout
+
+    Entropy does not make a token slower to produce — it makes the model
+    produce MORE of them. A flatter distribution (higher temperature, a
+    wider ``top_k``) lowers the probability mass on EOS at every step, and
+    ``repeat_penalty`` actively discourages the repetition a model would
+    otherwise use to wind a passage down. The cost lands on the token
+    COUNT, and the adaptive timeout already prices tokens
+    (``ttft + per_token * est_out``) from measured per-token latency.
+
+    So this returns a multiplier for ``est_out``, and every statistical
+    property of the existing profiler — warm/cold, the sigma margin, the
+    EWMA escalation, the absolute breaker — continues to hold. A flat
+    multiplier on the whole timeout would have inflated the fixed
+    time-to-first-token as if entropy slowed the prefill, which it does
+    not, and would have escaped the breaker's meaning.
+
+    Soak 14 is why this exists: threading the real sampling point produced
+    89 ``TimeoutError`` and a `session_exhausted` 25 minutes early, because
+    the draws got genuinely longer and the budget was still sized for
+    temperature 0.2.
+
+    Returns exactly 1.0 for the legacy point (no sampling, or temperature
+    at the baseline), so a non-sibling generation keeps a byte-identical
+    budget. Bounded above so a runaway rung cannot inflate a budget without
+    limit — the breaker stays the authority on a wedged model. NEVER raises.
+    """
+    if not _entropy_latency_enabled():
+        return 1.0
+    try:
+        over = _sampling_overrides(sampling)
+        t_base = _f_env("JARVIS_LOCAL_ENTROPY_TEMP_BASELINE", 0.2)
+        k_base = max(1.0, _f_env("JARVIS_LOCAL_ENTROPY_TOPK_BASELINE", 40.0))
+
+        factor = 1.0
+        if temperature is not None:
+            factor += _f_env("JARVIS_LOCAL_ENTROPY_TEMP_COEFF", 0.6) * max(
+                0.0, float(temperature) - t_base)
+        top_k = over.get("top_k")
+        if top_k is not None and float(top_k) > k_base:
+            # Logarithmic: doubling the candidate pool does not double the
+            # length, it widens the tail the sampler can wander into.
+            factor += _f_env("JARVIS_LOCAL_ENTROPY_TOPK_COEFF", 0.25) * math.log2(
+                float(top_k) / k_base)
+        rp = over.get("repeat_penalty")
+        if rp is not None:
+            factor += _f_env("JARVIS_LOCAL_ENTROPY_RP_COEFF", 0.5) * max(
+                0.0, float(rp) - 1.0)
+
+        ceiling = max(1.0, _f_env("JARVIS_LOCAL_ENTROPY_FACTOR_MAX", 2.5))
+        return float(max(1.0, min(ceiling, factor)))
+    except Exception:  # noqa: BLE001 — a budget hint must never fail a draw
+        logger.debug("[LocalPrimeClient] entropy latency factor failed", exc_info=True)
+        return 1.0
+
+
+def _entropy_latency_enabled() -> bool:
+    raw = (os.environ.get("JARVIS_LOCAL_ENTROPY_LATENCY_ENABLED", "true") or "")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 def _config_for_draw(
     cfg: "LocalConfig", sampling: "Optional[Any]",
 ) -> "LocalConfig":
@@ -227,17 +323,8 @@ def _config_for_draw(
     NEVER raises -- on any fault the caller gets the unmodified config,
     i.e. exactly the pre-sampling behaviour.
     """
-    if sampling is None:
-        return cfg
     try:
-        raw = sampling
-        getter = getattr(sampling, "config_overrides", None)
-        if callable(getter):
-            raw = getter()
-        if not isinstance(raw, dict) or not raw:
-            return cfg
-        allowed = {"top_p", "top_k", "repeat_penalty", "seed"}
-        overrides = {k: v for k, v in raw.items() if k in allowed and v is not None}
+        overrides = _sampling_overrides(sampling)
         if not overrides:
             return cfg
         return _dc_replace(cfg, **overrides)
@@ -920,8 +1007,25 @@ class LatencyProfiler:
         m = cls._mean(xs)
         return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
 
-    def adaptive_timeout_ms(self, *, prompt_tokens: int) -> float:
+    def adaptive_timeout_ms(
+        self, *, prompt_tokens: int,
+        temperature: "Optional[float]" = None,
+        sampling: "Optional[Any]" = None,
+    ) -> float:
+        """Budget for ONE draw, priced from measured latency AND its entropy.
+
+        ``temperature``/``sampling`` describe this draw's point in sampling
+        space. They widen the expected OUTPUT (see
+        ``entropy_latency_factor``) rather than the timeout as a whole, so
+        the profiler's own statistics keep their meaning: the sigma margin
+        still covers variance, the EWMA still escalates on real timeouts,
+        and the absolute breaker still owns the wedged-model case.
+
+        Both default to None, which yields factor 1.0 — every caller that
+        does not describe a sampling point gets a byte-identical budget.
+        """
         cfg = self._cfg
+        entropy = entropy_latency_factor(temperature, sampling)
         with self._lock:
             warm = len(self._total) >= cfg.min_samples
             ttft_m = self._mean(self._ttft)
@@ -929,12 +1033,14 @@ class LatencyProfiler:
             tot_sd = self._stddev(self._total)
             ewma = self._ewma_ms
 
-        # SURVIVAL / CPU path (no negotiated num_ctx): BYTE-IDENTICAL legacy -- no
-        # EWMA escalation, no absolute breaker, soft ceiling is the cap.
+        # SURVIVAL / CPU path (no negotiated num_ctx): BYTE-IDENTICAL legacy at
+        # entropy 1.0 -- no EWMA escalation, no absolute breaker, soft ceiling
+        # is the cap.
         if not cfg.num_ctx:
             if not warm:
-                return float(min(cfg.timeout_seed_ms, cfg.timeout_ceiling_ms))
-            est_out = max(1.0, prompt_tokens * cfg.output_ratio)
+                seed = cfg.timeout_seed_ms * entropy
+                return float(min(seed, cfg.timeout_ceiling_ms))
+            est_out = max(1.0, prompt_tokens * cfg.output_ratio * entropy)
             flexed = ttft_m + tok_m * est_out + cfg.margin_sigma * tot_sd
             return float(max(cfg.timeout_floor_ms, min(flexed, cfg.timeout_ceiling_ms)))
 
@@ -942,10 +1048,13 @@ class LatencyProfiler:
         # + Absolute Global Circuit Breaker.
         absolute = _absolute_ceiling_ms()
         if warm:
-            est_out = max(1.0, prompt_tokens * cfg.output_ratio)
+            est_out = max(1.0, prompt_tokens * cfg.output_ratio * entropy)
             value = ttft_m + tok_m * est_out + cfg.margin_sigma * tot_sd
         else:
-            value = self._cold_seed_ms()
+            # A cold profiler has no per-token measurement to widen, so the
+            # entropy premium rides the seed itself -- the first sibling of a
+            # cold op is exactly the draw that must not be cut off.
+            value = self._cold_seed_ms() * entropy
         # Never below the (timeout-escalated) EWMA -- a starved cold profiler still
         # expands the window on the next dispatch.
         if ewma > 0.0:
@@ -1677,7 +1786,14 @@ class LocalPrimeClient:
 
         # SURVIVAL / non-streaming path: legacy total-duration adaptive timeout.
         # May raise UnrecoverableInferenceLatency (absolute breaker) -> terminal.
-        timeout_ms = self.profiler.adaptive_timeout_ms(prompt_tokens=prompt_tokens)
+        # The budget must know what it is buying. A high-entropy sibling
+        # produces more tokens than the temperature-0.2 draw the profiler
+        # was calibrated on, and sizing it as if it were that draw is what
+        # ended soak 14 twenty-five minutes early (89 TimeoutError).
+        timeout_ms = self.profiler.adaptive_timeout_ms(
+            prompt_tokens=prompt_tokens, temperature=temperature,
+            sampling=sampling,
+        )
         try:
             return await asyncio.wait_for(
                 self.complete(system=system, user=user, prompt_tokens=prompt_tokens,

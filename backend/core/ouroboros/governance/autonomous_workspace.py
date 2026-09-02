@@ -69,6 +69,31 @@ _ENV_COMMIT_WORKSPACE = "JARVIS_AUTO_COMMIT_WORKSPACE"
 _ENV_SESSION_ID = "JARVIS_OUROBOROS_SESSION_ID"
 
 
+def canonical_session_id() -> str:
+    """THE session this process belongs to, or "" if it is not in one.
+
+    ``JARVIS_OUROBOROS_SESSION_ID`` is set once at harness boot and already
+    read by the worktree manager, the auto-committer and the workspace
+    router. This is the accessor for it, so a sixth consumer does not add a
+    sixth spelling of ``os.environ.get(...)`` — the env name is owned here,
+    next to the code that writes it.
+
+    A soak process runs exactly ONE session, which is why the identity is
+    process-wide rather than threaded: making it a parameter would give
+    every call site its own chance to forget, and the one that forgot is
+    the reason this function exists (the trajectory recorder asked
+    ``OperationContext`` for a ``session_id`` field that has never been
+    defined, and ``getattr``'s default wrote "" onto every corpus row).
+
+    NEVER raises — an unidentified session is a partitioning problem, not a
+    reason to fail a write.
+    """
+    try:
+        return (os.environ.get(_ENV_SESSION_ID, "") or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def file_isolation_enabled() -> bool:
     """Master flag — ``JARVIS_FILE_ISOLATION_ENABLED`` (default false).
     Off → :func:`resolve_loop_project_root` is a pure pass-through (the
