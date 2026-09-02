@@ -1658,6 +1658,18 @@ class LocalPrimeClient:
             prompt_tokens=prompt_tokens, temperature=temperature,
             sampling=sampling,
         )
+        # Say what was ARMED. The banner in `complete_guarded` prints the
+        # static knob, and the only other place these deadlines appear is the
+        # stall message -- so on a healthy run the derived budget was
+        # unobservable, which is exactly how "wired but inert" hides. One
+        # INFO line per stream is the proof a soak can grep for.
+        logger.info(
+            "[LocalPrimeClient] stream watchdog armed: first=%.1fs steady=%.1fs "
+            "prompt_tokens=%s entropy=%.2f",
+            _first_token_s, _steady_token_s,
+            "?" if prompt_tokens is None else int(prompt_tokens),
+            entropy_latency_factor(temperature, sampling),
+        )
         # TRANSPORT FLOOR — added, never substituted.
         #
         # A stall deadline must cover the time the MODEL needs plus the time
