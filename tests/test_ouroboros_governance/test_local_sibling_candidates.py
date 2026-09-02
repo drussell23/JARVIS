@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -85,10 +85,36 @@ def test_margin_floors_at_one(monkeypatch: pytest.MonkeyPatch) -> None:
 # --------------------------------------------------------------------------
 
 
+#: Genuinely different ANSWERS -- different control flow, not different
+#: names. The fixtures used to be `f"# {h}\n"`, a bare comment: comments
+#: never reach the AST, so every one of them was the same empty module.
+#: That was invisible while dedup was byte-wise and became load-bearing
+#: the moment acceptance turned structural, which is the whole point of
+#: the change -- "different bytes" and "different logic" are not the same
+#: predicate, and the corpus was full of pairs that satisfied only the
+#: first.
+_SHAPES: Tuple[str, ...] = (
+    "def run(x):\n    return x + 1\n",
+    "def run(x):\n    total = 0\n    for i in range(x):\n"
+    "        total += i\n    return total\n",
+    "def run(x):\n    if x > 0:\n        return x\n"
+    "    while x < 0:\n        x += 1\n    return x\n",
+    "class R:\n    def go(self, x):\n        try:\n"
+    "            return x / 2\n        except ZeroDivisionError:\n"
+    "            return 0\n",
+)
+
+
 def _cand(h: str) -> Dict[str, Any]:
+    """One candidate whose SHAPE is a deterministic function of ``h``.
+
+    Same ``h`` -> same logic (a real duplicate); different ``h`` -> a
+    different control-flow shape, so a merge test is exercising the case
+    it claims to.
+    """
     return {
-        "candidate_id": h, "candidate_hash": h,
-        "file_path": "m.py", "full_content": f"# {h}\n",
+        "candidate_id": h, "candidate_hash": h, "file_path": "m.py",
+        "full_content": _SHAPES[sum(ord(c) for c in h) % len(_SHAPES)],
     }
 
 
@@ -126,11 +152,19 @@ class _Gen:
 
 
 def _run(first: Any, attempts: List[Any], *, budget_s: float = 600.0,
-         prefill: str = "") -> Any:
-    """Drive the loop with a scripted sequence of sibling attempts."""
+         prefill: str = "", sampling_log: Optional[List[Any]] = None) -> Any:
+    """Drive the loop with a scripted sequence of sibling attempts.
+
+    ``_attempt`` takes the DRAW's sampling point, mirroring the real
+    ``_attempts`` closure. ``sampling_log`` collects what each draw was
+    handed, so a test can assert the entropy ladder actually reached the
+    request rather than merely being computed.
+    """
     calls = {"n": 0}
 
-    async def _attempt() -> Any:
+    async def _attempt(sampling: Any = None) -> Any:
+        if sampling_log is not None:
+            sampling_log.append(sampling)
         i = calls["n"]
         calls["n"] += 1
         item = attempts[i] if i < len(attempts) else None
@@ -426,3 +460,118 @@ def test_orphan_verdict_is_counted_not_raised(_recorder) -> None:
     stats = asyncio.run(_go())
     assert stats["orphan_candidate_verdicts"] == 1
     assert stats["candidate_verdicts_joined"] == 0
+
+
+# --------------------------------------------------------------------------
+# Structural diversity: a sibling must add LOGIC, not just bytes
+# --------------------------------------------------------------------------
+
+
+def _shaped(h: str, shape: int) -> Dict[str, Any]:
+    """A candidate with an explicit shape, so a test can force a duplicate.
+
+    ``_cand`` derives shape from the hash; these tests need the two
+    decoupled -- a different hash carrying the SAME logic is exactly the
+    pair that byte-wise dedup shipped and structural dedup must reject.
+    """
+    return {
+        "candidate_id": h, "candidate_hash": h, "file_path": "m.py",
+        "full_content": _SHAPES[shape % len(_SHAPES)],
+    }
+
+
+def test_a_redundant_sibling_is_redrawn_at_higher_entropy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The corpus failure, reproduced and fixed.
+
+    Draw 2 comes back with a DIFFERENT hash and the SAME logic -- the
+    shape that filled the trajectory corpus with rows that could never
+    become a preference pair. It must be rejected and re-drawn, and the
+    re-draw must be handed a hotter sampling point than the draw that
+    failed.
+    """
+    monkeypatch.setenv(_ENV_N, "2")
+    monkeypatch.setenv("JARVIS_SIBLING_MAX_RESAMPLE", "1")
+    log: List[Any] = []
+    first = _real_result([_shaped("a", 1)])
+    out, n_calls = _run(
+        first,
+        [
+            _real_result([_shaped("b", 1)]),   # same logic, different hash
+            _real_result([_shaped("c", 2)]),   # genuinely different
+        ],
+        sampling_log=log,
+    )
+    assert n_calls == 2, "the redundant draw was not re-taken"
+    assert [c["candidate_hash"] for c in out.candidates] == ["a", "c"]
+    assert len(log) == 2
+    assert log[1].temperature > log[0].temperature
+    assert log[0].seed != log[1].seed
+
+
+def test_a_sibling_that_stays_redundant_is_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persisting it would write a row that LOOKS like half of a pair."""
+    monkeypatch.setenv(_ENV_N, "2")
+    monkeypatch.setenv("JARVIS_SIBLING_MAX_RESAMPLE", "1")
+    first = _real_result([_shaped("a", 1)])
+    out, n_calls = _run(
+        first,
+        [_real_result([_shaped("b", 1)]), _real_result([_shaped("c", 1)])],
+    )
+    assert n_calls == 2
+    assert out is first, "a redundant sibling must not reach the corpus"
+
+
+def test_a_structurally_new_sibling_is_taken_first_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No re-draw when the draw already added logic -- re-draws cost budget."""
+    monkeypatch.setenv(_ENV_N, "2")
+    log: List[Any] = []
+    first = _real_result([_shaped("a", 1)])
+    out, n_calls = _run(
+        first, [_real_result([_shaped("b", 2)])], sampling_log=log,
+    )
+    assert n_calls == 1
+    assert [c["candidate_hash"] for c in out.candidates] == ["a", "b"]
+
+
+def test_every_sibling_draw_leaves_the_legacy_sampling_point(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Draw 1 is the op's own candidate; draws 2+ are the ones that explore.
+
+    Every sibling that reached the model at temperature 0.2 was a draw
+    from a near-deterministic distribution -- which is why the corpus
+    filled with near-identical answers.
+    """
+    monkeypatch.setenv(_ENV_N, "3")
+    log: List[Any] = []
+    first = _real_result([_shaped("a", 0)])
+    _run(
+        first,
+        [_real_result([_shaped("b", 1)]), _real_result([_shaped("c", 2)])],
+        sampling_log=log,
+    )
+    assert len(log) == 2
+    assert all(s is not None and not s.is_legacy for s in log)
+    assert [s.temperature for s in log] == sorted(s.temperature for s in log)
+
+
+def test_master_switch_off_restores_byte_wise_behaviour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Entropy OFF: legacy sampling, and a same-logic sibling is kept again."""
+    monkeypatch.setenv(_ENV_N, "2")
+    monkeypatch.setenv("JARVIS_SIBLING_ENTROPY_ENABLED", "false")
+    log: List[Any] = []
+    first = _real_result([_shaped("a", 1)])
+    out, n_calls = _run(
+        first, [_real_result([_shaped("b", 1)])], sampling_log=log,
+    )
+    assert n_calls == 1
+    assert all(s.is_legacy for s in log)
+    assert [c["candidate_hash"] for c in out.candidates] == ["a", "b"]

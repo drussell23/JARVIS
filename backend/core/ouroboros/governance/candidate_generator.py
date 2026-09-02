@@ -5793,7 +5793,16 @@ class CandidateGenerator:
                     len(_resume_prefill), _op,
                 )
 
-        async def _attempts() -> Optional[GenerationResult]:
+        async def _attempts(sampling: Any = None) -> Optional[GenerationResult]:
+            """One full generation attempt (with L7 auto-heal retries).
+
+            ``sampling`` is an optional ``SiblingSampling`` naming this
+            DRAW's point in sampling space. None -> the legacy point, so
+            ``run_calibrated(_attempts)`` (which calls this with no
+            arguments) is byte-identical to the pre-entropy path. The
+            point rides the SAME override seam every other per-call
+            setting uses, so no request-building logic is duplicated.
+            """
             nonlocal _num_ctx
             _n = _l7_recovery_attempts()
             _last_exc: Optional[BaseException] = None
@@ -5801,6 +5810,8 @@ class CandidateGenerator:
                 _overrides = dict(_base_overrides)
                 if _num_ctx:
                     _overrides["num_ctx"] = int(_num_ctx)
+                if sampling is not None:
+                    _overrides.update(sampling.config_overrides())
                 _cfg = _f3c_dc.replace(_F3cLocalConfig.from_env(), **_overrides)
                 _client = _F3cLocalPrimeClient(_cfg, profiler=_prof)
                 if _resume_prefill:
@@ -5861,12 +5872,21 @@ class CandidateGenerator:
                     # that actually generates. Fail-soft: no gateway -> a
                     # null bracket, and the op proceeds unchanged.
                     _bracket = _f3c_inflight_bracket(endpoint)
+                    # Temperature rides the parameter PrimeProvider.generate
+                    # ALREADY accepts (the T2 epistemic override). Passing
+                    # None keeps its hardcoded 0.2 -- so the first draw is
+                    # untouched and only bonus draws explore.
+                    _gen_kw: Dict[str, Any] = {}
+                    if sampling is not None and not sampling.is_legacy:
+                        _gen_kw["temperature"] = float(sampling.temperature)
                     if _streaming:
                         async with _bracket:
-                            return await _provider.generate(context, deadline)
+                            return await _provider.generate(
+                                context, deadline, **_gen_kw,
+                            )
                     async with _bracket:
                         return await asyncio.wait_for(
-                            _provider.generate(context, deadline),
+                            _provider.generate(context, deadline, **_gen_kw),
                             timeout=remaining,
                         )
                 except GracefulStreamInterruption as _gsi:
@@ -5969,11 +5989,33 @@ class CandidateGenerator:
         today's single candidate, and a sibling that fails or stalls can
         never turn a working op into a failed one.
 
-        Diversity comes from sampling temperature, which the provider seat
-        already applies (measured: 3/3 distinct outputs at temperature 0.7
-        and 1.0 on a real refactor prompt). Identical siblings are dropped
-        here rather than shipped -- the pair generator discards duplicate
-        responses anyway, so an identical sibling is pure cost.
+        ## Diversity is DRAWN, not hoped for
+
+        This once read "diversity comes from sampling temperature, which
+        the provider seat already applies (measured: 3/3 distinct outputs
+        at temperature 0.7 and 1.0)". That experiment was never wired to
+        this path: ``PrimeProvider._generate_impl`` computes
+        ``_eff_temperature = 0.2 if temperature is None else ...`` and
+        nothing here passed a temperature, so every sibling was drawn at
+        0.2 -- a near-deterministic distribution sampled N times.
+
+        Measured consequence on the live corpus (2026-09-01): 8 shipped
+        sibling rows carried **3 structurally distinct answers**; all
+        three groups collapsed to ONE fingerprint each, so not a single
+        preference pair was constructible. Peak structural similarity
+        between "distinct" siblings was 0.9987 -- they differed by
+        docstring wording and one unused import.
+
+        So each draw now gets its own point in sampling space
+        (``sibling_entropy.sampling_for``), and a draw that adds no logic
+        is REJECTED and re-taken at higher entropy rather than persisted.
+        Draw 1 keeps the legacy point exactly, so the candidate an op
+        would have produced anyway is byte-identical.
+
+        Dedup is structural, not byte-wise. ``candidate_hash`` equality
+        was the wrong predicate: two candidates differing in one docstring
+        word have different hashes and identical logic, which is exactly
+        the pair the corpus was full of. It is kept as a cheap first pass.
         """
         n_want = _sibling_candidate_count()
         if first is None or n_want <= 1 or not getattr(first, "candidates", None):
@@ -5983,6 +6025,10 @@ class CandidateGenerator:
         if resume_prefill:
             return first
 
+        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+            sibling_entropy as _ent,
+        )
+
         _op = (getattr(context, "op_id", "") or "?")[:16]
         merged = list(first.candidates)
         seen = {
@@ -5990,6 +6036,19 @@ class CandidateGenerator:
             for c in merged if isinstance(c, dict)
         }
         _dupes = 0
+        _redundant = 0
+        _resamples = 0
+        # Structural fingerprints already accepted into this group. The
+        # ACCEPTANCE test, where `seen` above is only the cheap byte-wise
+        # pre-filter.
+        # Fingerprint against the file each candidate proposes to REPLACE
+        # (hunk-level) when the repo root is known; whole-file otherwise.
+        # Resolved the way every other path in this class is resolved.
+        _fp_root = getattr(self, "_repo_root", None) or None
+        _seen_fps: List[str] = list(
+            _ent.fingerprint_candidates(merged, _fp_root),
+        )
+        _max_resample = _ent.max_resample_attempts()
         # Seed the affordability estimate with what the FIRST candidate
         # actually cost on this model and this prompt. A static per-sibling
         # guess is the thing that would make this either skip siblings a
@@ -5998,64 +6057,131 @@ class CandidateGenerator:
             0.05, float(getattr(first, "generation_duration_s", 0.0) or 0.0),
         )
 
+        _stop = False
         for _i in range(2, n_want + 1):
-            _t0 = time.monotonic()
-            remaining = self._remaining_seconds(deadline)
-            # Pay only out of slack we can already see. `_last_cost` is what
-            # the PREVIOUS sibling actually took, so the estimate tracks the
-            # real model on the real prompt instead of a static guess.
-            _needed = _last_cost * _sibling_budget_margin()
-            if remaining <= _needed:
-                logger.info(
-                    "[CandidateGenerator] sibling %d/%d skipped op=%s: "
-                    "%.1fs budget left, previous sibling cost %.1fs",
-                    _i, n_want, _op, remaining, _last_cost,
-                )
+            if _stop:
                 break
-            try:
-                _sib = await self._profiler_for_siblings(attempt)
-            except Exception as _sib_exc:  # noqa: BLE001
-                # A sibling is a bonus. Losing one must never cost the op
-                # the candidate it already has -- so this swallows, where
-                # the FIRST attempt deliberately propagates.
-                logger.info(
-                    "[CandidateGenerator] sibling %d/%d failed op=%s (%s: %s)"
-                    " -- keeping %d candidate(s)",
-                    _i, n_want, _op, type(_sib_exc).__name__,
-                    _trim_exc_msg(_sib_exc), len(merged),
+            # One SLOT, possibly several draws: a redundant draw is re-taken
+            # at higher entropy rather than persisted. Bounded by
+            # `_max_resample`, and every re-draw still pays the same budget
+            # test as a first draw -- a diversity retry can never overrun
+            # the op any more than a sibling could.
+            _escalation = 0
+            while True:
+                _t0 = time.monotonic()
+                remaining = self._remaining_seconds(deadline)
+                # Pay only out of slack we can already see. `_last_cost` is what
+                # the PREVIOUS sibling actually took, so the estimate tracks the
+                # real model on the real prompt instead of a static guess.
+                _needed = _last_cost * _sibling_budget_margin()
+                if remaining <= _needed:
+                    logger.info(
+                        "[CandidateGenerator] sibling %d/%d skipped op=%s: "
+                        "%.1fs budget left, previous sibling cost %.1fs",
+                        _i, n_want, _op, remaining, _last_cost,
+                    )
+                    _stop = True
+                    break
+                _sampling = _ent.sampling_for(
+                    _i, escalation=_escalation, op_id=_op,
                 )
-                break
-            _last_cost = max(0.05, time.monotonic() - _t0)
-            if _sib is None or not getattr(_sib, "candidates", None):
-                logger.info(
-                    "[CandidateGenerator] sibling %d/%d empty op=%s -- stopping",
-                    _i, n_want, _op,
+                try:
+                    _sib = await self._profiler_for_siblings(attempt, _sampling)
+                except Exception as _sib_exc:  # noqa: BLE001
+                    # A sibling is a bonus. Losing one must never cost the op
+                    # the candidate it already has -- so this swallows, where
+                    # the FIRST attempt deliberately propagates.
+                    logger.info(
+                        "[CandidateGenerator] sibling %d/%d failed op=%s (%s: %s)"
+                        " -- keeping %d candidate(s)",
+                        _i, n_want, _op, type(_sib_exc).__name__,
+                        _trim_exc_msg(_sib_exc), len(merged),
+                    )
+                    _stop = True
+                    break
+                _last_cost = max(0.05, time.monotonic() - _t0)
+                if _sib is None or not getattr(_sib, "candidates", None):
+                    logger.info(
+                        "[CandidateGenerator] sibling %d/%d empty op=%s -- stopping",
+                        _i, n_want, _op,
+                    )
+                    _stop = True
+                    break
+
+                _fresh = [_c for _c in _sib.candidates if isinstance(_c, dict)]
+                _new_fps = _ent.fingerprint_candidates(_fresh, _fp_root)
+                _is_red, _peak = _ent.is_structurally_redundant(
+                    _new_fps, _seen_fps,
+                    hunks=_ent.hunks_for_candidates(_fresh, _fp_root),
                 )
-                break
-            for _c in _sib.candidates:
-                if not isinstance(_c, dict):
+                if _is_red and _escalation < _max_resample:
+                    _redundant += 1
+                    _resamples += 1
+                    _escalation += 1
+                    logger.info(
+                        "[CandidateGenerator] sibling %d/%d op=%s adds no "
+                        "logic (structural similarity %.4f >= %.2f at %s) "
+                        "-- re-drawing at higher entropy (%s)",
+                        _i, n_want, _op, _peak, _ent.diversity_threshold(),
+                        _sampling.describe(),
+                        _ent.sampling_for(
+                            _i, escalation=_escalation, op_id=_op,
+                        ).describe(),
+                    )
+                    # The provider already reported this draw to the
+                    # recorder; without a retraction it lands in the corpus
+                    # as a twin of the candidate it duplicates.
+                    _ent.retract_draw(
+                        str(getattr(context, "op_id", "") or ""), _fresh,
+                        reason=f"redundant_redraw:{_peak:.4f}",
+                    )
                     continue
-                _h = str(_c.get("candidate_hash", "") or "")
-                if _h and _h in seen:
-                    _dupes += 1
-                    continue
-                if _h:
-                    seen.add(_h)
-                merged.append(_c)
+                if _is_red:
+                    # Entropy budget spent and it is still the same answer.
+                    # Persisting it would write a row that cannot become
+                    # half of a preference pair while looking like it could.
+                    _redundant += 1
+                    logger.info(
+                        "[CandidateGenerator] sibling %d/%d op=%s still "
+                        "redundant after %d re-draw(s) (similarity %.4f) "
+                        "-- dropped",
+                        _i, n_want, _op, _escalation, _peak,
+                    )
+                    _ent.retract_draw(
+                        str(getattr(context, "op_id", "") or ""), _fresh,
+                        reason=f"redundant_dropped:{_peak:.4f}",
+                    )
+                    break
+
+                for _c in _fresh:
+                    _h = str(_c.get("candidate_hash", "") or "")
+                    if _h and _h in seen:
+                        _dupes += 1
+                        continue
+                    if _h:
+                        seen.add(_h)
+                    merged.append(_c)
+                _seen_fps.extend(_new_fps)
+                break
 
         if len(merged) == len(first.candidates):
             return first
+        _distinct = _ent.distinct_structure_count(merged)
         logger.info(
             "[CandidateGenerator] op=%s drew %d candidate(s) from %d "
-            "sibling generation(s)%s -- a preference pair needs two "
-            "answers to one question",
-            _op, len(merged), n_want,
+            "sibling generation(s), %d structurally distinct%s%s -- a "
+            "preference pair needs two DIFFERENT answers to one question",
+            _op, len(merged), n_want, _distinct,
             f" ({_dupes} identical, dropped)" if _dupes else "",
+            f" ({_redundant} redundant, {_resamples} re-drawn)"
+            if _redundant else "",
         )
         import dataclasses as _sib_dc
         return _sib_dc.replace(first, candidates=tuple(merged))
 
-    async def _profiler_for_siblings(self, attempt: Any) -> Optional[GenerationResult]:
+    async def _profiler_for_siblings(
+        self, attempt: Any, sampling: Any = None,
+    ) -> Optional[GenerationResult]:
         """Run one sibling attempt.
 
         Split out so the sibling loop reads as a loop. Deliberately NOT
@@ -6064,8 +6190,11 @@ class CandidateGenerator:
         runs the profiler is warm by construction -- the first candidate
         just calibrated it. Re-entering the lock per sibling would
         serialize the herd for no reading.
+
+        ``sampling`` names this draw's point in sampling space; None keeps
+        the legacy point, which is what the calibration path passes.
         """
-        return await attempt()
+        return await attempt(sampling)
 
     async def _try_local_primary(
         self,

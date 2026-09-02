@@ -157,6 +157,51 @@ def _degrade_draft_tokens(body: "Dict[str, Any]", cfg: "LocalConfig") -> bool:
         return False
 
 
+def _apply_sampling(body: "Dict[str, Any]", cfg: "LocalConfig") -> "Dict[str, Any]":
+    """Attach the per-draw sampling point, if this config carries one.
+
+    Written in BOTH spellings on purpose. The request targets an
+    OpenAI-compatible ``/v1/chat/completions``, where ``top_p`` and
+    ``seed`` are standard top-level fields; ``top_k`` and
+    ``repeat_penalty`` have no OpenAI spelling and exist only as
+    ollama-native ``options``. Writing each field where its engine looks
+    for it is what makes the knob actually bite -- a value the engine
+    silently ignores looks wired and changes nothing, which is precisely
+    the failure this module exists to end (siblings were nominally
+    "diversified by temperature" while every draw ran at 0.2).
+
+    Unknown fields are ignored by both engines, so the dual spelling
+    cannot break a request. Returns what it set, for logging.
+
+    NEVER raises: sampling is an improvement to a draw, and failing to
+    request one must not fail the generation."""
+    applied: "Dict[str, Any]" = {}
+    try:
+        if cfg.top_p is not None:
+            body["top_p"] = float(cfg.top_p)
+            applied["top_p"] = float(cfg.top_p)
+        if cfg.seed is not None:
+            body["seed"] = int(cfg.seed)
+            applied["seed"] = int(cfg.seed)
+        native = {
+            "top_p": None if cfg.top_p is None else float(cfg.top_p),
+            "top_k": None if cfg.top_k is None else int(cfg.top_k),
+            "repeat_penalty": (
+                None if cfg.repeat_penalty is None else float(cfg.repeat_penalty)
+            ),
+            "seed": None if cfg.seed is None else int(cfg.seed),
+        }
+        native = {k: v for k, v in native.items() if v is not None}
+        if native:
+            opts = body.setdefault("options", {})
+            if isinstance(opts, dict):
+                opts.update(native)
+                applied.update(native)
+        return applied
+    except Exception:  # noqa: BLE001
+        return applied
+
+
 def _apply_response_format(body: "Dict[str, Any]", cfg: "LocalConfig") -> str:
     """Attach the strongest response constraint this engine is known to accept.
 
@@ -317,6 +362,16 @@ class LocalConfig:
     # injected as ollama ``options.num_ctx`` + used as the Cognitive Compression
     # budget. None -> legacy (no injection, no compression) = byte-identical.
     num_ctx: Optional[int] = None
+    # Sibling entropy (see governance/sibling_entropy.py). All None -> the
+    # engine's own defaults, i.e. byte-identical legacy sampling. Set per
+    # DRAW by the candidate generator so siblings explore different regions
+    # of sampling space instead of re-deriving one answer at temperature
+    # 0.2. Threaded through ``dataclasses.replace`` like every other
+    # override, so there is still exactly one request builder.
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    repeat_penalty: Optional[float] = None
+    seed: Optional[int] = None
 
     @classmethod
     def from_env(cls) -> "LocalConfig":
@@ -1236,6 +1291,15 @@ class LocalPrimeClient:
         # by observation if the engine refuses the field.
         _apply_reasoning_effort(body, self._cfg)
         _apply_draft_tokens(body, self._cfg)
+        # Per-draw sampling point. Placed AFTER the num_ctx block, which
+        # assigns `body["options"]` wholesale -- setting sampling first
+        # would have it silently overwritten, the exact class of bug this
+        # whole change is fixing.
+        _sampling_applied = _apply_sampling(body, self._cfg)
+        if _sampling_applied:
+            logger.debug(
+                "[LocalPrimeClient] sibling sampling: %s", _sampling_applied,
+            )
 
         _use_stream = stream if stream is not None else (
             bool(self._cfg.num_ctx) and _streaming_enabled())
