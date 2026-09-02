@@ -304,6 +304,46 @@ def _read_env_int(key: str, default: int) -> int:
         return default
 
 
+#: Budget starts when WORK starts. Default ON; OFF restores the submit-time
+#: stamp exactly, for the rollback case.
+_ENV_DEADLINE_AT_START = "JARVIS_PIPELINE_DEADLINE_AT_START"
+
+
+def restamp_pipeline_deadline_at_start(ctx: Any) -> Any:
+    """Re-base an op's ``pipeline_deadline`` to the moment a worker starts it.
+
+    The governed loop stamps the deadline once at ``submit()``; a background
+    op then queues behind whatever the pool is busy with. In soak
+    bt-2026-09-02-013719 the roadmap batch waited 16-20 min in FIFO behind
+    the boot burst, so ~1000 s of a 2400 s budget were gone before GENERATE
+    began and VALIDATE was left 30-46 s for pytest. The budget was meant to
+    bound the op's RUNNING time; queue wait is the pool's cost, not the
+    op's.
+
+    Only ever EXTENDS: ``max(existing, now + JARVIS_PIPELINE_TIMEOUT_S)`` so a
+    deadline a caller deliberately set further out is never pulled in.
+    Returns ``ctx`` unchanged when the flag is off, when the context has no
+    deadline seam, or on any fault. NEVER raises.
+    """
+    try:
+        raw = (os.environ.get(_ENV_DEADLINE_AT_START, "true") or "").strip().lower()
+        if raw in ("0", "false", "no", "off"):
+            return ctx
+        if not hasattr(ctx, "with_pipeline_deadline"):
+            return ctx
+        from datetime import datetime, timedelta, timezone  # noqa: PLC0415
+
+        budget_s = max(1.0, float(os.environ.get("JARVIS_PIPELINE_TIMEOUT_S", "600") or 600))
+        fresh = datetime.now(tz=timezone.utc) + timedelta(seconds=budget_s)
+        existing = getattr(ctx, "pipeline_deadline", None)
+        if existing is not None and existing >= fresh:
+            return ctx
+        return ctx.with_pipeline_deadline(fresh)
+    except Exception:  # noqa: BLE001 — a budget re-stamp must never fail the op
+        logger.debug("[BackgroundAgentPool] deadline re-stamp skipped", exc_info=True)
+        return ctx
+
+
 class BackgroundAgentPool:
     """Bounded async worker pool for non-blocking governance operations.
 
@@ -1544,7 +1584,17 @@ class BackgroundAgentPool:
                     # engaged lifecycle (zone hunt / heavy streaming) grants a
                     # bounded extension; DORMANT kills exactly like the legacy
                     # single wait_for (cancel + TimeoutError to the handler).
-                    _run_task = asyncio.ensure_future(_orch.run(op.context))
+                    # Budget starts when WORK starts. The governed loop stamps
+                    # pipeline_deadline once at submit(); a background op
+                    # then waits in this FIFO for as long as the boot burst
+                    # takes -- 16-20 min in soak bt-2026-09-02-013719 -- and
+                    # arrives at a worker with most of its budget already
+                    # spent by the queue. VALIDATE then ran pytest with the
+                    # 30-46 s that were left. Re-stamping here charges the
+                    # op for the time it is actually RUNNING, which is what
+                    # the budget was ever meant to measure.
+                    _ctx_to_run = restamp_pipeline_deadline_at_start(op.context)
+                    _run_task = asyncio.ensure_future(_orch.run(_ctx_to_run))
                     _fsm_granted_s = 0.0
                     _next_timeout_s = _op_timeout_s
                     try:
