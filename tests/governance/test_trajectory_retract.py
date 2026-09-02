@@ -218,3 +218,48 @@ async def test_the_generator_facing_helper_forwards_candidate_dicts(
     rec.record_outcome(op_id="op-6", terminal_phase="COMPLETED", terminal_reason="applied")
     await rec.drain()
     assert [r["metadata"]["candidate_hash"] for r in _rows(rec.path)] == ["hash-c1"]
+
+
+# --------------------------------------------------------------------------
+# The collision soak 12 exposed
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_byte_identical_twin_shares_a_hash_and_must_not_take_the_original(
+    rec: TrajectoryRecorder,
+) -> None:
+    """candidate_hash is content-derived, so an identical twin carries the
+    SAME hash as the candidate it duplicates. Measured on soak
+    bt-2026-09-02-013719: one retract event removed two generations and the
+    kept candidate's verdict then orphaned. A retract names ONE draw -- the
+    most recent generation carrying those hashes -- and stops there."""
+    first = _FakeGenerationResult(candidates=(_candidate("same", _A),))
+    twin = _FakeGenerationResult(candidates=(_candidate("same", _A),))   # same hash-same
+    assert rec.record_generation(op_id="op-7", prompt="p", generation_result=first) is True
+    assert rec.record_generation(op_id="op-7", prompt="p", generation_result=twin) is True
+    rec.record_retraction(op_id="op-7", candidate_hashes=("hash-same",), reason="redundant_redraw:1.0000")
+    rec.record_outcome(op_id="op-7", terminal_phase="COMPLETED", terminal_reason="applied")
+    await rec.drain()
+    rows = _rows(rec.path)
+    assert len(rows) == 1, "the accepted generation must survive its twin's retraction"
+    assert rows[0]["metadata"]["candidate_hash"] == "hash-same"
+    assert rows[0]["metadata"]["lineage_size"] == 1
+    assert rec.stats()["generations_retracted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_two_retractions_remove_two_twins_newest_first(rec: TrajectoryRecorder) -> None:
+    """Three identical draws, two retracts: the original is the survivor."""
+    for _ in range(3):
+        rec.record_generation(
+            op_id="op-8", prompt="p",
+            generation_result=_FakeGenerationResult(candidates=(_candidate("same", _A),)),
+        )
+    rec.record_retraction(op_id="op-8", candidate_hashes=("hash-same",))
+    rec.record_retraction(op_id="op-8", candidate_hashes=("hash-same",))
+    rec.record_outcome(op_id="op-8", terminal_phase="COMPLETED", terminal_reason="applied")
+    await rec.drain()
+    rows = _rows(rec.path)
+    assert len(rows) == 1 and rows[0]["metadata"]["attempt_index"] == 0
+    assert rec.stats()["generations_retracted"] == 2

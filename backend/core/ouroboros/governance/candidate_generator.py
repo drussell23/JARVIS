@@ -6130,9 +6130,17 @@ class CandidateGenerator:
                     )
                     # The provider already reported this draw to the
                     # recorder; without a retraction it lands in the corpus
-                    # as a twin of the candidate it duplicates.
+                    # as a twin of the candidate it duplicates. Retract ONLY
+                    # hashes not already accepted: a byte-identical twin
+                    # carries the SAME candidate_hash as the candidate it
+                    # duplicates, and retracting that hash would take the
+                    # accepted generation with it. Measured in soak
+                    # bt-2026-09-02-013719: one retract event removed two
+                    # generations and the kept candidate's verdict orphaned.
                     _ent.retract_draw(
-                        str(getattr(context, "op_id", "") or ""), _fresh,
+                        str(getattr(context, "op_id", "") or ""),
+                        [_c for _c in _fresh
+                         if str(_c.get("candidate_hash", "") or "") not in seen],
                         reason=f"redundant_redraw:{_peak:.4f}",
                     )
                     continue
@@ -6148,7 +6156,9 @@ class CandidateGenerator:
                         _i, n_want, _op, _escalation, _peak,
                     )
                     _ent.retract_draw(
-                        str(getattr(context, "op_id", "") or ""), _fresh,
+                        str(getattr(context, "op_id", "") or ""),
+                        [_c for _c in _fresh
+                         if str(_c.get("candidate_hash", "") or "") not in seen],
                         reason=f"redundant_dropped:{_peak:.4f}",
                     )
                     break

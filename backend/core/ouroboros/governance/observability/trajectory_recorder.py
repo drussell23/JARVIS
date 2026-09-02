@@ -718,17 +718,26 @@ class TrajectoryRecorder:
         async with self._guard():
             lineage = self._pending.get(evt.op_id)
             if lineage:
-                keep: List[_PendingGeneration] = []
-                for gen in lineage:
+                # ONE retract names ONE draw, and a draw is the MOST RECENT
+                # generation carrying those hashes. Scanning the whole
+                # lineage removed two generations in soak
+                # bt-2026-09-02-013719: a byte-identical twin carries the
+                # same candidate_hash as the candidate it duplicates, so a
+                # subset match also took the accepted generation and its
+                # verdict orphaned. Walk from the newest and stop at the
+                # first match.
+                keep: List[_PendingGeneration] = list(lineage)
+                for idx in range(len(keep) - 1, -1, -1):
+                    gen = keep[idx]
                     hashes = {
                         str((c or {}).get("candidate_hash", "") or "")
                         for c in gen.candidates if isinstance(c, dict)
                     }
                     hashes.discard("")
                     if hashes and hashes <= wanted:
-                        removed += 1
-                        continue
-                    keep.append(gen)
+                        del keep[idx]
+                        removed = 1
+                        break
                 if removed:
                     for idx, gen in enumerate(keep):
                         gen.attempt_index = idx
