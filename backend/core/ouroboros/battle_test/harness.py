@@ -442,6 +442,37 @@ def _wall_clock_monitor_max_restarts() -> int:
         return 5
 
 
+def _env_float_or(name: str, default: float) -> float:
+    """A non-negative float knob, or ``default``. NEVER raises."""
+    try:
+        return max(0.0, float(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _trajectory_flush_timeout_s() -> float:
+    """``JARVIS_TRAJECTORY_FLUSH_TIMEOUT_S`` — how long the end-of-session
+    trajectory flush may take. Default 30.
+
+    ONE definition, read by two places that must never disagree: the flush
+    itself, and :meth:`_teardown_budget_s`, which sizes the bounded-shutdown
+    watchdog so the flush is allowed to finish. They were independent
+    literals — both 30 — which meant the guard's entire budget could be
+    consumed by the first phase it guards, and the session was killed
+    mid-flush with its corpus still in memory."""
+    return _env_float_or("JARVIS_TRAJECTORY_FLUSH_TIMEOUT_S", 30.0)
+
+
+def _trajectory_close_timeout_s() -> float:
+    """Inner ``aclose`` budget — the drain's own cap, held below the outer
+    flush timeout so the queue drain loses to the wall it is measured
+    against rather than the other way round. Default: half the flush
+    timeout, so tuning one knob keeps the pair ordered."""
+    return _env_float_or(
+        "JARVIS_TRAJECTORY_CLOSE_TIMEOUT_S", _trajectory_flush_timeout_s() / 2.0,
+    )
+
+
 def _should_restart_wall_clock_monitor(
     *,
     cancelled: bool,
@@ -2516,7 +2547,14 @@ class BattleTestHarness:
                 if _traj_enabled():
                     _rec = _traj_get_recorder()
                     _before = dict(_rec.stats())
-                    await asyncio.wait_for(_rec.aclose(timeout_s=10.0), timeout=30.0)
+                    # Both budgets come from _trajectory_flush_timeout_s(),
+                    # which _teardown_budget_s() also reads when it sizes the
+                    # shutdown watchdog — so the guard can never be smaller
+                    # than the work it is guarding.
+                    await asyncio.wait_for(
+                        _rec.aclose(timeout_s=_trajectory_close_timeout_s()),
+                        timeout=_trajectory_flush_timeout_s(),
+                    )
                     _after = dict(_rec.stats())
                     # Report the recorder's WHOLE counter set, not a
                     # hand-picked three. The recorder has always tracked
@@ -7928,6 +7966,63 @@ class BattleTestHarness:
         except NotImplementedError:
             logger.warning("Signal handlers not supported on this platform")
 
+    def _teardown_budget_s(self) -> float:
+        """Deadline that covers the work the teardown path is CONFIGURED to do.
+
+        ``BoundedShutdownWatchdog.arm`` is first-arm-wins by design — "this
+        avoids accidentally extending the deadline by re-arming" — so the
+        number has to be right at arm time. It was not: the bare
+        ``default_deadline_s()`` is 30 s, while the trajectory flush alone
+        is allowed 30 s before ``_generate_report`` and
+        ``_shutdown_components`` have run at all. Soak
+        bt-2026-09-02-025257 paid for that arithmetic: ARMED 21:28:09,
+        FIRED 21:28:39 with ``os._exit(75)``, and the session died holding
+        seven pairable sibling groups that never reached the corpus —
+        no flush line, no ``[AutoTrain]`` line, 0 rows.
+
+        So the budget is composed from the SAME knobs the phases it
+        guards spend, and nothing here is a literal:
+
+          * the flush's own ``JARVIS_TRAJECTORY_FLUSH_TIMEOUT_S`` (the
+            call site below reads this identical value — one source of
+            truth, so the guard cannot drift from the work);
+          * the auto-train hook's ``JARVIS_GRPO_AUTOTRAIN_TIMEOUT_S`` +
+            eviction wait, but ONLY when that hook is actually enabled —
+            a 3600 s allowance on a session that will never train is a
+            watchdog switched off by accident.
+
+        This does NOT breach the Slice-47 watchdog-isolation invariant.
+        That invariant forbids the WALL-CLOCK cap and its hard-kill
+        thread from consulting the op-ledger, because a wedged VERIFY
+        would keep an extend-condition true forever. Nothing here reads
+        op state: these are CONFIGURATION reads, resolved once, producing
+        a fixed finite deadline that no in-flight work can grow. It is
+        the same shape as the autoscore-drain extension a few lines
+        below, which already extends this deadline for the same reason.
+        """
+        from backend.core.ouroboros.battle_test.shutdown_watchdog import (  # noqa: E501,PLC0415
+            default_deadline_s as _bsw_deadline_s,
+        )
+
+        total = _bsw_deadline_s()
+        try:
+            total += _trajectory_flush_timeout_s()
+        except Exception:  # noqa: BLE001 — never let sizing break the arm
+            pass
+        try:
+            from backend.core.ouroboros.governance.observability.training_trigger import (  # noqa: E501,PLC0415
+                autotrain_enabled as _autotrain_on,
+            )
+            if _autotrain_on():
+                total += _env_float_or(
+                    "JARVIS_GRPO_AUTOTRAIN_TIMEOUT_S", 3600.0,
+                ) + _env_float_or(
+                    "JARVIS_GRPO_AUTOTRAIN_EVICT_WAIT_S", 120.0,
+                )
+        except Exception:  # noqa: BLE001 — hook optional
+            pass
+        return total
+
     def _arm_shutdown_deadline(self, reason: str = "shutdown") -> None:
         """Bound the EXIT, not just the run. NEVER raises. Idempotent.
 
@@ -8060,12 +8155,15 @@ class BattleTestHarness:
         # os._exit(75) after the deadline. Master flag default true;
         # ``=false`` reverts to pre-Slice-1 (asyncio-only shutdown).
         try:
-            from backend.core.ouroboros.battle_test.shutdown_watchdog import (
-                default_deadline_s as _bsw_deadline_s,
-            )
             _wdg = getattr(self, "_shutdown_watchdog", None)
             if _wdg is not None and signal_name is not None:
-                _wdg.arm(reason=signal_name, deadline_s=_bsw_deadline_s())
+                # Same sizing as the wall-cap arm: a SIGTERM runs the
+                # identical teardown path, so it needs the identical
+                # budget. Using the bare default here is what made
+                # every operator-initiated stop lose its corpus too.
+                _wdg.arm(
+                    reason=signal_name, deadline_s=self._teardown_budget_s(),
+                )
         except Exception:  # noqa: BLE001 — never let watchdog arm crash signal handler
             pass
 
@@ -9196,9 +9294,6 @@ class BattleTestHarness:
         # this thread-side arm guarantees os._exit fires after the
         # deadline. Best-effort, never raises.
         try:
-            from backend.core.ouroboros.battle_test.shutdown_watchdog import (
-                default_deadline_s as _bsw_deadline_s,
-            )
             _wdg = getattr(self, "_shutdown_watchdog", None)
             if _wdg is not None:
                 # Task #22 — composed-deadline coherence. The bounded
@@ -9212,7 +9307,7 @@ class BattleTestHarness:
                 # so the drain (which the evaluator already reserved
                 # via Task #21) completes first. Composes existing
                 # env knobs; no hardcode; bare path unchanged otherwise.
-                _arm_deadline = _bsw_deadline_s()
+                _arm_deadline = self._teardown_budget_s()
                 try:
                     from backend.core.ouroboros.governance.swe_bench_pro.harness_inject import (  # noqa: E501
                         autoscore_work_in_flight,
