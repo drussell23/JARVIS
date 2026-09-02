@@ -5827,10 +5827,28 @@ class PrimeProvider:
         repair_context: Optional[Any] = None,
         *,
         temperature: Optional[float] = None,
+        sampling: Optional[Any] = None,
+        **_forward_compat: Any,
     ) -> GenerationResult:
         """Generation entrypoint. Brackets the J-Prime generation with the
         in-flight guard (the failover Zero-Drop Drain awaits this count before
         teardown -- no op severed mid-generation), then delegates to the impl.
+
+        ``sampling`` carries the REST of the draw's sampling point --
+        ``top_p``, ``top_k``, ``repeat_penalty``, ``seed``. Until it existed
+        this signature accepted ``temperature`` alone, so the entropy
+        ladder's other three values were computed, logged by ``describe()``
+        and dropped at this boundary: siblings drawn at T=1.10 with distinct
+        seeds came back byte-identical (structural similarity 1.0000,
+        measured in soak bt-2026-09-02-025257) because the tail temperature
+        was re-weighting had already been truncated away by an unchanged
+        ``top_k``. ``sibling_entropy`` says so in its own ladder comment.
+
+        ``**_forward_compat`` exists so a caller threading a sampling field
+        this provider has not learned yet degrades to a normal generation
+        instead of a ``TypeError`` that fails the op. It is deliberately
+        anonymous: nothing reads it, so it cannot become a second, undeclared
+        way to pass a parameter that matters.
 
         ADMISSION FIRST, IN-FLIGHT GUARD SECOND.
         ------------------------------------------
@@ -5944,6 +5962,7 @@ class PrimeProvider:
         with _jprime_inflight_guard():
             return await self._generate_impl(
                 context, deadline, repair_context, temperature=temperature,
+                sampling=sampling,
                 admission=_AdmissionTicket(
                     brain_id=_brain_for_adm,
                     reservation_id=_adm_reservation_id,
@@ -5957,6 +5976,7 @@ class PrimeProvider:
         repair_context: Optional[Any] = None,
         *,
         temperature: Optional[float] = None,
+        sampling: Optional[Any] = None,
         admission: "Optional[_AdmissionTicket]" = None,
     ) -> GenerationResult:
         """Generate code candidates via PrimeClient with optional tool-call loop.
@@ -6145,6 +6165,17 @@ class PrimeProvider:
         # None (non-repair callers) preserves the legacy hardcoded 0.2 byte-identically.
         _eff_temperature = 0.2 if temperature is None else float(temperature)
 
+        # The rest of the sampling point, passed ONLY when a draw actually
+        # carries one. `self._client` is either the in-process
+        # LocalPrimeClient or the remote PrimeClient; both accept **kwargs,
+        # so an unconditional `sampling=None` would be harmless -- but
+        # omitting it keeps every non-sibling generation byte-identical to
+        # the pre-entropy request, which is the property that makes a
+        # regression here bisectable.
+        _sampling_kw: Dict[str, Any] = (
+            {} if sampling is None else {"sampling": sampling}
+        )
+
         async def _generate_raw(p: str) -> str:
             # The load is the authority no probe can be. Contiguous VRAM is
             # not observable from outside the allocator, so a fit cannot be
@@ -6161,6 +6192,7 @@ class PrimeProvider:
                     temperature=_eff_temperature,
                     model_name=_brain_model,
                     task_profile=_task_profile,
+                    **_sampling_kw,
                 )
             except BaseException as _load_err:
                 try:
@@ -9455,8 +9487,24 @@ class ClaudeProvider:
         repair_context: Optional[Any] = None,
         *,
         temperature: Optional[float] = None,
+        sampling: Optional[Any] = None,
+        **_forward_compat: Any,
     ) -> GenerationResult:
         """Generate code candidates via Claude API with optional tool-call loop.
+
+        ``sampling`` is ACCEPTED AND DELIBERATELY NOT APPLIED, so that one
+        caller can hand the same draw description to any seat in the cascade
+        without asking which provider it reached. Honouring it here would be
+        worse than ignoring it: ``seed`` and ``repeat_penalty`` have no
+        Anthropic spelling at all, and ``top_p`` is documented as an
+        alternative to ``temperature`` rather than a companion, so a
+        faithful-looking translation would change sampling in a way the
+        entropy ladder never modelled and could not be compared against the
+        local lane. The sibling/entropy path is local-only by construction
+        (``_try_local_primary``), so nothing is lost by refusing.
+
+        ``**_forward_compat`` keeps an unknown sampling field a no-op rather
+        than a ``TypeError`` that would fail the op at the cascade seam.
 
         ``temperature`` (Adaptive Epistemic Feedback Matrix, T2): optional sampling
         override threaded by ``RepairEngine`` to lower temperature when the SAME

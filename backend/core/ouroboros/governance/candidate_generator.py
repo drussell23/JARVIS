@@ -5872,13 +5872,32 @@ class CandidateGenerator:
                     # that actually generates. Fail-soft: no gateway -> a
                     # null bracket, and the op proceeds unchanged.
                     _bracket = _f3c_inflight_bracket(endpoint)
-                    # Temperature rides the parameter PrimeProvider.generate
-                    # ALREADY accepts (the T2 epistemic override). Passing
-                    # None keeps its hardcoded 0.2 -- so the first draw is
-                    # untouched and only bonus draws explore.
+                    # The WHOLE sampling point crosses this seam, not just
+                    # temperature.
+                    #
+                    # This used to forward `temperature` alone, because that
+                    # was the one parameter `PrimeProvider.generate` already
+                    # accepted (the T2 epistemic override). The ladder's
+                    # top_p/top_k/repeat_penalty/seed were computed, printed
+                    # by `describe()` into the sibling log line, and dropped
+                    # right here -- so the log showed `T=1.10 top_p=0.90
+                    # top_k=140 rp=1.15 seed=...` while the request carried a
+                    # temperature and nothing else. Soak bt-2026-09-02-025257
+                    # measured the result: structural similarity 1.0000
+                    # between siblings drawn at different seeds, one group of
+                    # 8 draws collapsing to a single structure_id, and a
+                    # reward spread of 6e-05 where GRPO needs a real gap.
+                    # `sibling_entropy`'s ladder comment had already named the
+                    # cause: raising temperature alone re-weights a tail that
+                    # top_k/top_p have truncated away.
+                    #
+                    # `config_overrides()` stays the single definition of
+                    # which fields a point sets -- this seam does not
+                    # re-derive it, it just carries the object.
                     _gen_kw: Dict[str, Any] = {}
                     if sampling is not None and not sampling.is_legacy:
                         _gen_kw["temperature"] = float(sampling.temperature)
+                        _gen_kw["sampling"] = sampling
                     if _streaming:
                         async with _bracket:
                             return await _provider.generate(

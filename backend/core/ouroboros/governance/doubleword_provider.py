@@ -3650,8 +3650,17 @@ class DoublewordProvider:
         *,
         prompt_override: Optional[str] = None,
         temperature: Optional[float] = None,
+        sampling: Optional[Any] = None,
+        **_forward_compat: Any,
     ) -> GenerationResult:
         """Generate code via Doubleword batch API (blocking).
+
+        ``sampling`` is accepted and not applied, for the same reason as the
+        Claude seat: the entropy ladder is a LOCAL-lane instrument, and a
+        batch API that does not expose the same sampler knobs would have to
+        approximate them. Accepting the parameter keeps one call shape
+        across every seat in the cascade; ``**_forward_compat`` makes an
+        unknown sampling field a no-op instead of a ``TypeError``.
 
         Parameters
         ----------

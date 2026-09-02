@@ -16,7 +16,7 @@ import os
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 from typing import Any, Deque, Dict, List, NamedTuple, Optional, Tuple
 
 from .memory_pressure_gate import PressureLevel, get_default_gate, is_enabled as memory_gate_enabled
@@ -200,6 +200,50 @@ def _apply_sampling(body: "Dict[str, Any]", cfg: "LocalConfig") -> "Dict[str, An
         return applied
     except Exception:  # noqa: BLE001
         return applied
+
+
+def _config_for_draw(
+    cfg: "LocalConfig", sampling: "Optional[Any]",
+) -> "LocalConfig":
+    """The config THIS ONE draw runs under. Never mutates ``cfg``.
+
+    The sampling point is per-draw state; the client's ``_cfg`` is
+    process-wide. Writing the point onto ``self._cfg`` would leak one
+    sibling's temperature/seed into every later op on the same client --
+    so the override is applied immutably here and the caller passes the
+    result down, leaving the shared default untouched.
+
+    ``sampling`` is duck-typed on purpose: this module must not import
+    ``sibling_entropy`` (that module already imports nothing from here,
+    and the dependency would close a cycle through the governance
+    package). Anything exposing ``config_overrides()`` works, and so does
+    a plain mapping of ``LocalConfig`` field names -- which is what makes
+    the seam testable without constructing a ladder.
+
+    Unknown keys are DROPPED rather than raising: a provider that learns a
+    new sampling field before this dataclass does must degrade to the
+    fields we understand, not fail the generation.
+
+    NEVER raises -- on any fault the caller gets the unmodified config,
+    i.e. exactly the pre-sampling behaviour.
+    """
+    if sampling is None:
+        return cfg
+    try:
+        raw = sampling
+        getter = getattr(sampling, "config_overrides", None)
+        if callable(getter):
+            raw = getter()
+        if not isinstance(raw, dict) or not raw:
+            return cfg
+        allowed = {"top_p", "top_k", "repeat_penalty", "seed"}
+        overrides = {k: v for k, v in raw.items() if k in allowed and v is not None}
+        if not overrides:
+            return cfg
+        return _dc_replace(cfg, **overrides)
+    except Exception:  # noqa: BLE001 — a draw without its point still generates
+        logger.debug("[LocalPrimeClient] sampling override ignored", exc_info=True)
+        return cfg
 
 
 def _apply_response_format(body: "Dict[str, Any]", cfg: "LocalConfig") -> str:
@@ -1212,7 +1256,8 @@ class LocalPrimeClient:
                        temperature: float = 0.2,
                        max_tokens: "Optional[int]" = None,
                        stream: "Optional[bool]" = None,
-                       prefill: str = "") -> LocalCompletion:
+                       prefill: str = "",
+                       sampling: "Optional[Any]" = None) -> LocalCompletion:
         sess = await self._ensure_session()
         url = self._cfg.base_url.rstrip("/") + "/v1/chat/completions"
         # Dynamic Cognitive Compression + num_ctx injection (Context-Hardware
@@ -1295,10 +1340,15 @@ class LocalPrimeClient:
         # assigns `body["options"]` wholesale -- setting sampling first
         # would have it silently overwritten, the exact class of bug this
         # whole change is fixing.
-        _sampling_applied = _apply_sampling(body, self._cfg)
+        # Per-draw sampling point, resolved immutably so one sibling's seed
+        # can never persist onto the shared client config.
+        _sampling_applied = _apply_sampling(
+            body, _config_for_draw(self._cfg, sampling),
+        )
         if _sampling_applied:
-            logger.debug(
-                "[LocalPrimeClient] sibling sampling: %s", _sampling_applied,
+            logger.info(
+                "[LocalPrimeClient] per-draw sampling applied: %s",
+                _sampling_applied,
             )
 
         _use_stream = stream if stream is not None else (
@@ -1607,7 +1657,8 @@ class LocalPrimeClient:
 
     async def complete_guarded(self, *, system: str, user: str, prompt_tokens: int,
                                temperature: float = 0.2,
-                               max_tokens: "Optional[int]" = None) -> LocalCompletion:
+                               max_tokens: "Optional[int]" = None,
+                               sampling: "Optional[Any]" = None) -> LocalCompletion:
         # HEAVY (num_ctx) STREAMING path: deprecate the total-duration timeout. The
         # Inter-Token Watchdog inside _complete_streaming is the sole guard -- a
         # model that keeps emitting tokens runs indefinitely; only a STALL trips it.
@@ -1621,6 +1672,7 @@ class LocalPrimeClient:
             return await self.complete(
                 system=system, user=user, prompt_tokens=prompt_tokens,
                 temperature=temperature, max_tokens=max_tokens, stream=True,
+                sampling=sampling,
             )
 
         # SURVIVAL / non-streaming path: legacy total-duration adaptive timeout.
@@ -1629,7 +1681,8 @@ class LocalPrimeClient:
         try:
             return await asyncio.wait_for(
                 self.complete(system=system, user=user, prompt_tokens=prompt_tokens,
-                              temperature=temperature, max_tokens=max_tokens),
+                              temperature=temperature, max_tokens=max_tokens,
+                              sampling=sampling),
                 timeout=timeout_ms / 1000.0,
             )
         except asyncio.TimeoutError as e:
@@ -1642,11 +1695,20 @@ class LocalPrimeClient:
     async def generate(self, prompt: str, system_prompt: "Optional[str]" = None,
                        context: "Optional[Any]" = None, max_tokens: int = 4096,
                        temperature: float = 0.7, model_name: "Optional[str]" = None,
-                       task_profile: "Optional[Any]" = None, **kwargs: Any) -> Any:
+                       task_profile: "Optional[Any]" = None,
+                       sampling: "Optional[Any]" = None, **kwargs: Any) -> Any:
         """Drop-in PrimeClient.generate adapter -> PrimeResponse (source=local_prime).
 
         context/task_profile are accepted for interface parity; the 3B path relies
         on the structured prompt + files already in `prompt` (documented v1 limit).
+
+        ``sampling`` is this draw's point in sampling space (anything with
+        ``config_overrides()``, or a plain mapping). It is NAMED rather than
+        left to ride ``**kwargs`` because ``**kwargs`` here is a silent
+        sink: the pre-existing signature already swallowed every extra a
+        caller passed, which is how ``top_p``/``top_k``/``seed`` could be
+        threaded this far and vanish without one error. A name is the only
+        spelling a caller cannot get silently wrong.
         """
         if self._governor is not None:
             await self._governor.memory_guard()
@@ -1657,6 +1719,7 @@ class LocalPrimeClient:
         lc = await self.complete_guarded(
             system=sys_txt, user=prompt, prompt_tokens=est_tokens,
             temperature=temperature, max_tokens=max_tokens,
+            sampling=sampling,
         )
         return PrimeResponse(
             content=lc.text,
