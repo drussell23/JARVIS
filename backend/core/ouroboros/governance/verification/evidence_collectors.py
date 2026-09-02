@@ -262,27 +262,107 @@ async def _gather_file_parses_after_change(
         targets = getattr(ctx, "target_files", None)
         if not targets:
             return {}
+        # Same wedge class as the tests walk above, one order of
+        # magnitude smaller: exists() + is_file() + read_text() is three
+        # DrvFS round trips per target, serialised in the coroutine.
+        # `_stat_and_read` collapses the two stats into one and the
+        # whole per-file step runs on the advisor-blast executor; the
+        # targets are then read CONCURRENTLY, because this cost is
+        # latency-dominated and the executor -- not this loop -- is what
+        # bounds the fan-out.
         out: List[Dict[str, Any]] = []
-        for path_str in targets:
-            try:
-                p = Path(str(path_str))
-                if not p.exists():
-                    # File doesn't exist post-op — record without
-                    # content; the evaluator will treat absent .py
-                    # as a SyntaxError-equivalent if relevant.
-                    out.append({"path": str(p), "content": ""})
-                    continue
-                if not p.is_file():
-                    continue
-                content = p.read_text(
-                    encoding="utf-8", errors="replace",
-                )
-                out.append({"path": str(p), "content": content})
-            except OSError:
-                continue
+        gathered = await _read_targets_offloaded(
+            [str(t) for t in targets],
+        )
+        for item in gathered:
+            if item is not None:
+                out.append(item)
         return {"target_files_post": out}
     except Exception:  # noqa: BLE001 — defensive
         return {}
+
+
+def _stat_and_read(path_str: str) -> Optional[Dict[str, Any]]:
+    """Classify one target and read it. Executor-side; NEVER raises.
+
+    Returns the ``{path, content}`` record, or ``None`` for a target
+    that must be SKIPPED. The three outcomes are exactly the ones the
+    inline version produced, preserved deliberately:
+
+      * missing  -> ``{"path": ..., "content": ""}``. Absence is
+        evidence: the evaluator treats an absent ``.py`` as the
+        SyntaxError-equivalent for ``file_parses_after_change``.
+      * not a regular file (a directory, a socket) -> ``None``. Not a
+        parse failure, not evidence of anything; skipped.
+      * unreadable -> ``None``. Honest gap, never a fabricated "".
+
+    One ``os.stat`` replaces ``exists()`` + ``is_file()``: those are two
+    syscalls answering one question, and on DrvFS each is a round trip.
+    The read is deliberately UNBOUNDED -- this evidence is fed to an AST
+    parse, and a truncated file does not parse, so a byte cap would
+    manufacture the exact SyntaxError the claim exists to detect.
+    """
+    import os  # noqa: PLC0415
+    import stat as _stat  # noqa: PLC0415
+
+    try:
+        p = Path(path_str)
+        try:
+            st = os.stat(p)
+        except (FileNotFoundError, NotADirectoryError):
+            return {"path": str(p), "content": ""}
+        except OSError:
+            return None
+        if not _stat.S_ISREG(st.st_mode):
+            return None
+        return {
+            "path": str(p),
+            "content": p.read_text(encoding="utf-8", errors="replace"),
+        }
+    except Exception:  # noqa: BLE001 — executor payloads never raise out
+        return None
+
+
+async def _read_targets_offloaded(
+    paths: List[str],
+) -> List[Optional[Dict[str, Any]]]:
+    """Read every target off-loop, concurrently. NEVER raises.
+
+    Falls back to in-line synchronous reads when the substrate is
+    unavailable, so behaviour is preserved on a bare checkout rather
+    than silently losing evidence. A per-target failure yields ``None``
+    for that target only -- one unreadable file must not discard the
+    others.
+    """
+    try:
+        from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: E501,PLC0415
+            is_offload_error,
+            offload,
+        )
+    except Exception:  # noqa: BLE001
+        return [_stat_and_read(p) for p in paths]
+    import asyncio  # noqa: PLC0415
+
+    try:
+        settled = await asyncio.gather(
+            *(offload(_stat_and_read, p, cpu_bound=False) for p in paths),
+            return_exceptions=True,
+        )
+    except Exception:  # noqa: BLE001 — gather itself must not propagate
+        logger.debug(
+            "[EvidenceCollectors] offloaded target reads failed",
+            exc_info=True,
+        )
+        return [None] * len(paths)
+    out: List[Optional[Dict[str, Any]]] = []
+    for item in settled:
+        if isinstance(item, BaseException) or is_offload_error(item):
+            out.append(None)
+        elif item is None or isinstance(item, dict):
+            out.append(item)
+        else:  # pragma: no cover — an executor cannot return this shape
+            out.append(None)
+    return out
 
 
 def _from_ctx_or_ledger(ctx: Any, *keys: str) -> Dict[str, Any]:
@@ -416,27 +496,108 @@ async def _gather_test_set_hash_stable(
         if pre is None:
             return {}
 
-        # Post can self-gather.
+        # Post can self-gather — OFF the event loop.
+        #
+        # This walk used to be `base.glob("tests/**/*.py")` with a
+        # `p.is_file()` per hit, run inline in this coroutine. `glob`
+        # stats every entry and `is_file()` stats each one again; on a
+        # /mnt/c (DrvFS) tree each stat is a round trip to the Windows
+        # filesystem driver. Soak bt-2026-09-02-003459 measured the
+        # result: the main loop blocked 46.9 s here during POSTMORTEM,
+        # and repeated stalls tripped the out-of-process heartbeat
+        # watchdog, which SIGKILLed the session and lost every
+        # in-flight trajectory. It is the same class of wedge Slice 12U
+        # was built to eradicate -- `predictive_engine._fragility`
+        # doing rglob+read_text on the loop -- so it composes that
+        # substrate rather than growing a private thread hop.
         target_dir = getattr(ctx, "target_dir", None) or "."
         try:
             base = Path(str(target_dir))
         except Exception:  # noqa: BLE001
             base = Path(".")
-        if not base.exists() or not base.is_dir():
+        result = await _walk_tests_offloaded(base)
+        if result is None:
             return {}
-        post_set: List[str] = []
-        try:
-            for p in base.glob("tests/**/*.py"):
-                if p.is_file():
-                    post_set.append(str(p))
-        except (OSError, ValueError):
-            pass
+        # A TRUNCATED walk is not a smaller answer, it is a WRONG one:
+        # this claim compares a set hash, so a post-set missing files
+        # the budget never reached reads as "the test set changed" and
+        # fails a candidate that changed nothing. Budget exhaustion is
+        # an absence of evidence, and this module says so rather than
+        # guessing -- the same choice the pre-state branch above makes.
+        if result.truncated:
+            logger.debug(
+                "[EvidenceCollectors] test_set_hash_stable walk %s "
+                "(%s, scanned=%d) — reporting INSUFFICIENT_EVIDENCE "
+                "rather than a partial set",
+                base, result.truncation_reason(), result.scanned_count,
+            )
+            return {}
         return {
             "test_files_pre": list(pre),
-            "test_files_post": post_set,
+            "test_files_post": list(result.matches),
         }
     except Exception:  # noqa: BLE001
         return {}
+
+
+async def _walk_tests_offloaded(base: Path) -> Any:
+    """Bounded walk of ``base/tests`` for ``*.py``, off the event loop.
+
+    Returns the canonical ``BoundedWalkResult`` (so the caller can see
+    ``truncated``), or ``None`` when the walk could not be performed at
+    all — a missing substrate, a pool fault, or a root that is not a
+    directory. NEVER raises.
+
+    Composition, not reimplementation:
+      * ``bounded_walker.bounded_glob`` already owns the walk, the
+        skip-dirs pruning, the budget contract and the truncation
+        vocabulary. Its budgets come from the operator's own
+        ``JARVIS_BLAST_RADIUS_*`` knobs -- passing ``None`` here means
+        "whatever this deployment configured for filesystem scans",
+        which is why nothing in this function is a literal.
+      * ``cooperative_fs_io.offload(..., cpu_bound=False)`` puts it on
+        the dedicated ``advisor-blast`` executor. Not
+        ``asyncio.to_thread``: that targets the contested default pool
+        shared with sensors, the Oracle and DreamEngine -- the
+        antipattern Slice 12S introduced and 12T reverted.
+
+    The pattern is a FILENAME pattern (``bounded_glob`` fnmatches
+    ``entry.name``), so the recursion is expressed by rooting the walk
+    at ``base/tests`` rather than by a ``tests/**/`` path glob. The
+    walker also yields regular files only -- directories are traversed,
+    never matched -- which is what the discarded ``is_file()`` call was
+    for.
+    """
+    try:
+        from backend.core.ouroboros.governance.bounded_walker import (  # noqa: E501,PLC0415
+            bounded_glob,
+        )
+        from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: E501,PLC0415
+            is_offload_error,
+            offload,
+        )
+    except Exception:  # noqa: BLE001 — substrate optional; degrade honestly
+        logger.debug(
+            "[EvidenceCollectors] cooperative FS substrate unavailable",
+            exc_info=True,
+        )
+        return None
+    try:
+        result = await offload(
+            bounded_glob, base / "tests", "*.py", cpu_bound=False,
+        )
+    except Exception:  # noqa: BLE001 — offload itself must never propagate
+        logger.debug(
+            "[EvidenceCollectors] offloaded tests walk failed for %s",
+            base, exc_info=True,
+        )
+        return None
+    # `offload` reports failure by RETURNING a sentinel, so a plain
+    # try/except would sail past it and hand a sentinel to the caller
+    # as if it were a walk result.
+    if is_offload_error(result) or not hasattr(result, "matches"):
+        return None
+    return result
 
 
 async def _gather_no_new_credential_shapes(
