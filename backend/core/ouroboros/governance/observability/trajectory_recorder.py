@@ -52,6 +52,7 @@ correctly-refused work is bad output.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -196,6 +197,49 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _structure_stamps(
+    candidates: "Tuple[Dict[str, Any], ...]",
+) -> "Tuple[Dict[str, str], int]":
+    """``(candidate_hash -> structure_id, distinct_structure_count)``.
+
+    The corpus must be able to say how many ANSWERS a generation holds,
+    not how many rows it wrote. Measured before this existed: 8 sibling
+    rows across 3 groups carried 3 structurally distinct answers, every
+    group collapsing to one -- so ``n_candidates`` read 2 or 3 while the
+    number that decides whether a preference pair is constructible was
+    1. A consumer filtering on ``n_candidates >= 2`` was selecting groups
+    that cannot train.
+
+    ``structure_id`` is a short digest of the docstring-stripped AST, so
+    two rows that differ only in prose share one id and a reader can
+    group by it without re-parsing. Empty when the candidate does not
+    parse -- unparseable answers are real and must not be silently
+    folded together under one shared id.
+
+    Describes; never decides. The recorder does not re-sample -- that
+    belongs to the generation lane, which owns the budget and the
+    provider seat.
+    """
+    ids: "Dict[str, str]" = {}
+    distinct: set = set()
+    try:
+        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+            sibling_entropy as _ent,
+        )
+        for cand in candidates or ():
+            if not isinstance(cand, dict):
+                continue
+            fp = _ent.structural_fingerprint(_ent.candidate_source(cand))
+            if fp is None:
+                continue
+            sid = hashlib.sha256(fp.encode("utf-8", "replace")).hexdigest()[:12]
+            ids[str(cand.get("candidate_hash", "") or "")] = sid
+            distinct.add(sid)
+    except Exception:  # noqa: BLE001 — telemetry must never block a write
+        logger.debug("[TrajectoryRecorder] structure stamp fault", exc_info=True)
+    return ids, len(distinct)
+
+
 # ---------------------------------------------------------------------------
 # Queue payloads
 # ---------------------------------------------------------------------------
@@ -249,6 +293,23 @@ class _OutcomeEvent:
     op_id: str
     terminal_phase: str
     terminal_reason: str
+
+
+@dataclass
+class _RetractEvent:
+    """The generator DROPPED a draw it had already reported.
+
+    ``record_generation`` fires per provider call, before the sibling loop
+    has judged the draw, so a redundant sibling was reaching the corpus as
+    a row with the same ``structure_id`` as its twin. This event travels
+    the SAME queue as the generation it names, so ordering is a property
+    of the queue, not of timing: it can only be processed after that
+    generation was admitted and before the outcome that would write it.
+    """
+
+    op_id: str
+    candidate_hashes: Tuple[str, ...]
+    reason: str = ""
 
 
 @dataclass
@@ -464,6 +525,41 @@ class TrajectoryRecorder:
         )
         return False
 
+    def record_retraction(
+        self,
+        *,
+        op_id: str,
+        candidate_hashes: Any,
+        reason: str = "",
+    ) -> bool:
+        """Retract a generation the generator has since rejected.
+
+        Non-blocking, same queue as ``record_generation``. NEVER raises.
+        The generator calls this in the one place it DROPS a draw -- the
+        structural-redundancy branch of the sibling loop -- so a rejected
+        twin stops reaching the corpus as a row that looks like half of a
+        preference pair.
+        """
+        if not recorder_enabled() or not op_id:
+            return False
+        try:
+            hashes = tuple(
+                str(h or "") for h in (candidate_hashes or ()) if h
+            )
+        except TypeError:
+            return False
+        if not hashes:
+            return False
+        evt = _RetractEvent(
+            op_id=str(op_id), candidate_hashes=hashes, reason=str(reason or ""),
+        )
+        if self._offer(evt):
+            self._stats["retractions_queued"] = (
+                self._stats.get("retractions_queued", 0) + 1
+            )
+            return True
+        return False
+
     def record_candidate_verdict(
         self,
         *,
@@ -525,6 +621,8 @@ class TrajectoryRecorder:
             try:
                 if isinstance(item, _PendingGeneration):
                     await self._admit_pending(item)
+                elif isinstance(item, _RetractEvent):
+                    await self._retract(item)
                 elif isinstance(item, _CandidateVerdictEvent):
                     await self._attach_verdict(item)
                 elif isinstance(item, _OutcomeEvent):
@@ -594,6 +692,68 @@ class TrajectoryRecorder:
                     "raise %s if this recurs",
                     oldest_op, cap, _ENV_PENDING_MAX,
                 )
+
+    async def _retract(self, evt: "_RetractEvent") -> None:
+        """Drop a generation the generator has since REJECTED.
+
+        Removes every pending generation of ``evt.op_id`` whose candidate
+        set is entirely covered by ``evt.candidate_hashes`` -- a draw is one
+        provider call, so its hashes are exactly one lineage entry. The
+        survivors are re-indexed so ``attempt_index`` stays dense and
+        ``lineage_size`` (stamped at write) stays honest.
+
+        Transactional by construction: the removal happens under the same
+        guard ``_admit_pending`` and ``_resolve`` take, and the event sits
+        on the one queue those operations share, so a retract can never
+        race the write it is meant to pre-empt. A retract naming a
+        generation that was never admitted (or already written) is counted
+        as an orphan and named, never guessed at -- the row it would have
+        removed is either not there or already on disk, and this reader
+        must not decide which.
+        """
+        wanted = {h for h in evt.candidate_hashes if h}
+        if not wanted or not evt.op_id:
+            return
+        removed = 0
+        async with self._guard():
+            lineage = self._pending.get(evt.op_id)
+            if lineage:
+                keep: List[_PendingGeneration] = []
+                for gen in lineage:
+                    hashes = {
+                        str((c or {}).get("candidate_hash", "") or "")
+                        for c in gen.candidates if isinstance(c, dict)
+                    }
+                    hashes.discard("")
+                    if hashes and hashes <= wanted:
+                        removed += 1
+                        continue
+                    keep.append(gen)
+                if removed:
+                    for idx, gen in enumerate(keep):
+                        gen.attempt_index = idx
+                    if keep:
+                        self._pending[evt.op_id] = keep
+                    else:
+                        self._pending.pop(evt.op_id, None)
+        if removed:
+            self._stats["generations_retracted"] = (
+                self._stats.get("generations_retracted", 0) + removed
+            )
+            logger.info(
+                "[TrajectoryRecorder] retracted %d generation(s) for op=%s "
+                "(%s) -- will not reach the corpus",
+                removed, evt.op_id, evt.reason or "rejected",
+            )
+        else:
+            self._stats["orphan_retractions"] = (
+                self._stats.get("orphan_retractions", 0) + 1
+            )
+            logger.debug(
+                "[TrajectoryRecorder] retraction for op=%s matched no "
+                "pending generation (hashes=%s)",
+                evt.op_id, [h[:12] for h in sorted(wanted)],
+            )
 
     async def _attach_verdict(self, evt: "_CandidateVerdictEvent") -> None:
         """Record one sibling's VALIDATE result onto its pending generation.
@@ -777,6 +937,9 @@ class TrajectoryRecorder:
             return
 
         n_cands = len(gen.candidates)
+        # How many ANSWERS this generation holds, as opposed to how many
+        # rows it is about to write. Computed once for the whole group.
+        _structure_ids, _n_distinct = _structure_stamps(gen.candidates)
 
         for idx, cand in enumerate(gen.candidates):
             if not isinstance(cand, dict):
@@ -862,6 +1025,17 @@ class TrajectoryRecorder:
                         "candidate_hash": cand_hash,
                         "candidate_index": idx,
                         "n_candidates": n_cands,
+                        # `n_candidates` counts ROWS; this counts ANSWERS.
+                        # A consumer selecting trainable groups must filter
+                        # on THIS -- three rows sharing one structure_id
+                        # cannot yield a preference pair, and filtering on
+                        # `n_candidates >= 2` was selecting exactly those.
+                        "n_distinct_structures": _n_distinct,
+                        # Docstring-stripped AST digest: rows differing only
+                        # in prose share an id. Empty when the candidate does
+                        # not parse -- unparseable answers are real and must
+                        # not be folded together under one shared id.
+                        "structure_id": _structure_ids.get(cand_hash, ""),
                         # Lineage position. Two rows of one op with
                         # different attempt_index are the SAME prompt
                         # answered twice, which is the shape a preference
@@ -980,6 +1154,151 @@ def get_recorder() -> TrajectoryRecorder:
     return _default_recorder
 
 
+def harvest_snapshot(
+    *, max_rows: int = 20_000, events_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """What the flywheel has actually harvested. Read-only. NEVER raises.
+
+    ONE definition of "how is the harvest going", so the REPL verb, any
+    status chip and a soak postmortem cannot each answer it differently.
+    It lives here because this module owns both halves: the live in-process
+    counters AND the file those counters write to.
+
+    ## The number that matters is not `rows`
+
+    A sibling group is rows sharing an ``op_id`` with different
+    ``attempt_index`` -- ``record_generation`` is called per PROVIDER CALL,
+    so each draw writes its own row with ``n_candidates=1``. Counting rows
+    therefore says nothing about trainability: measured 2026-09-01, 8
+    sibling rows across 3 groups carried 3 structurally distinct answers
+    and every group collapsed to one, so not one preference pair was
+    constructible while the row count looked healthy.
+
+    So this reports ``groups_pairable`` -- groups holding 2+ structurally
+    distinct answers -- alongside ``groups``. A soak whose rows climb while
+    ``groups_pairable`` stays 0 is producing nothing, and that is exactly
+    the failure an operator watching a row counter would not see.
+
+    Prefers each row's recorded ``structure_id`` and falls back to
+    fingerprinting the text, so rows written before that field existed are
+    still counted rather than silently dropped from the denominator.
+    """
+    out: Dict[str, Any] = {
+        "enabled": False, "counters": {}, "path": "", "rows": 0,
+        "rows_trainable": 0, "groups": 0, "groups_pairable": 0,
+        "groups_collapsed": 0, "truncated": False, "error": "",
+    }
+    try:
+        out["enabled"] = recorder_enabled()
+        try:
+            out["counters"] = dict(get_recorder().stats())
+        except Exception:  # noqa: BLE001 — a dead recorder still has a corpus
+            out["counters"] = {}
+        path = Path(events_path) if events_path is not None else events_dir()
+        out["path"] = str(path)
+
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        rows = 0
+        for f in sorted(path.glob("*.jsonl")) if path.is_dir() else []:
+            try:
+                fh = f.open("r", encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    if rows >= max_rows:
+                        out["truncated"] = True
+                        break
+                    try:
+                        row = json.loads(line)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if row.get("event_type") != "interaction":
+                        continue
+                    rows += 1
+                    meta = row.get("metadata") or {}
+                    if meta.get("should_train"):
+                        out["rows_trainable"] += 1
+                    key = str(
+                        meta.get("op_id")
+                        or meta.get("prompt_key")
+                        or (row.get("user_input") or "")[:80]
+                    )
+                    groups.setdefault(key, []).append(row)
+            if out["truncated"]:
+                break
+        out["rows"] = rows
+
+        multi = [v for v in groups.values() if len(v) > 1]
+        out["groups"] = len(multi)
+        for members in multi:
+            ids = set()
+            for row in members:
+                meta = row.get("metadata") or {}
+                sid = str(meta.get("structure_id") or "")
+                if not sid:
+                    sid = _fingerprint_id(row.get("assistant_output") or "")
+                if sid:
+                    ids.add(sid)
+            if len(ids) <= 1:
+                continue                      # identical ids — definitely one answer
+            # Distinct ids are NECESSARY but not sufficient. The acceptance
+            # filter judges by SIMILARITY, so a group whose answers differ
+            # by an unused import has two ids and one answer -- measured at
+            # 0.9987 and 0.9999 on this corpus. Counting those as pairable
+            # would make this surface disagree with the filter that decides
+            # what gets kept, and the disagreement would always flatter the
+            # harvest. Only groups that clear the cheap test pay for
+            # fingerprinting, so the common (collapsed) case stays cheap.
+            if _group_has_distinct_answers(members):
+                out["groups_pairable"] += 1
+        out["groups_collapsed"] = out["groups"] - out["groups_pairable"]
+        return out
+    except Exception as exc:  # noqa: BLE001 — an observability read is never fatal
+        logger.debug("[TrajectoryRecorder] harvest_snapshot failed", exc_info=True)
+        out["error"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+
+def _group_has_distinct_answers(members: "List[Dict[str, Any]]") -> bool:
+    """True when two rows of this group differ by MORE than the threshold.
+
+    Reuses ``sibling_entropy``'s own predicate rather than re-deriving one,
+    so "distinct enough to train on" has a single definition shared by the
+    filter that accepts a draw and the surface that reports the harvest.
+    """
+    try:
+        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+            sibling_entropy as _ent,
+        )
+        seen: List[str] = []
+        for row in members:
+            fp = _ent.structural_fingerprint(row.get("assistant_output") or "")
+            if fp is None:
+                continue
+            redundant, _ = _ent.is_structurally_redundant([fp], seen)
+            if seen and not redundant:
+                return True
+            seen.append(fp)
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _fingerprint_id(text: str) -> str:
+    """Structure id for a row written before ``structure_id`` existed."""
+    try:
+        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+            sibling_entropy as _ent,
+        )
+        fp = _ent.structural_fingerprint(text)
+        if fp is None:
+            return ""
+        return hashlib.sha256(fp.encode("utf-8", "replace")).hexdigest()[:12]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def reset_recorder_for_tests(
     path: Optional[Path] = None,
 ) -> TrajectoryRecorder:
@@ -1006,6 +1325,17 @@ def record_outcome(**kwargs: Any) -> bool:
     except Exception:  # noqa: BLE001
         logger.debug(
             "[TrajectoryRecorder] record_outcome failed", exc_info=True,
+        )
+        return False
+
+
+def record_retraction(**kwargs: Any) -> bool:
+    """Fire-and-forget retraction of a rejected draw. NEVER raises."""
+    try:
+        return get_recorder().record_retraction(**kwargs)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "[TrajectoryRecorder] record_retraction failed", exc_info=True,
         )
         return False
 
@@ -1128,9 +1458,11 @@ __all__ = [
     "classify_terminal_reason",
     "events_dir",
     "get_recorder",
+    "harvest_snapshot",
     "record_candidate_verdict",
     "record_generation",
     "record_outcome",
+    "record_retraction",
     "recorder_enabled",
     "register_flags",
     "reset_recorder_for_tests",

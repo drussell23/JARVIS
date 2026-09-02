@@ -167,9 +167,11 @@ def _render_status() -> str:
 def _render_groups(limit: int) -> str:
     """Per-group structural breakdown, largest first.
 
-    Prints the group's peak pairwise structural similarity, because that is
-    what the acceptance filter compares against its threshold: two answers
-    at 0.9987 are two rows and one answer.
+    Prints the MINIMUM pairwise structural similarity, not the maximum.
+    A group is pairable when its two most DISTINCT answers differ, so the
+    minimum is the statistic the verdict column actually follows; the
+    maximum reads 1.0000 for any group containing one duplicate and would
+    sit beside "PAIRABLE" looking like a contradiction.
     """
     from backend.core.ouroboros.governance import (  # noqa: PLC0415
         sibling_entropy as ent,
@@ -218,7 +220,7 @@ def _render_groups(limit: int) -> str:
         f"  /harvest groups — {len(multi)} group(s) with 2+ rows "
         f"(showing {min(limit, len(multi))})",
         "",
-        f"    {'op':<20} {'rows':>4} {'answers':>7} {'peak_sim':>8}  verdict",
+        f"    {'op':<20} {'rows':>4} {'answers':>7} {'min_sim':>8}  verdict",
     ]
     for key, members in multi[:limit]:
         fps = []
@@ -227,14 +229,16 @@ def _render_groups(limit: int) -> str:
             if fp is not None:
                 fps.append(fp)
         distinct = len({*fps})
-        peak = 0.0
-        for i in range(len(fps)):
-            for j in range(i + 1, len(fps)):
-                peak = max(peak, ent.structural_similarity(fps[i], fps[j]))
+        sims = [
+            ent.structural_similarity(fps[i], fps[j])
+            for i in range(len(fps))
+            for j in range(i + 1, len(fps))
+        ]
+        low = min(sims) if sims else 1.0
         verdict = "PAIRABLE" if distinct > 1 else "collapsed"
         out.append(
             f"    {key[:20]:<20} {len(members):>4} {distinct:>7} "
-            f"{peak:>8.4f}  {verdict}"
+            f"{low:>8.4f}  {verdict}"
         )
     out.append("")
     out.append(

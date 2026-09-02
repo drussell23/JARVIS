@@ -34,8 +34,25 @@ _ENV_DIR = "JARVIS_TRAJECTORY_RECORDER_DIR"
 # Two answers that differ ONLY by an unused import — the exact shape the
 # corpus was full of. Distinct ASTs, therefore distinct structure ids, and
 # 0.99+ similar: two rows, one answer.
-_NEAR_A = "from typing import Optional\n\n\ndef run(x):\n    return x + 1\n"
-_NEAR_B = "def run(x):\n    return x + 1\n"
+#
+# The BODY has to be realistic in SIZE, and that is the point of the
+# constant rather than a two-line snippet. A first draft used
+# `def run(x): return x + 1`, where deleting an import removes a large
+# FRACTION of a tiny tree: it measured 0.8833 — below threshold — so the
+# fixture proved the opposite of what it claimed and the test failed
+# against correct code. The real corpus rows were ~5 KB modules where one
+# import is negligible; at that scale the pair measures 0.9940.
+_BODY = "".join(
+    f"def handler_{i}(payload):\n"
+    f"    total = 0\n"
+    f"    for item in payload:\n"
+    f"        if item.get('active'):\n"
+    f"            total += item['size']\n"
+    f"    return {{'n': total}}\n\n"
+    for i in range(8)
+)
+_NEAR_A = "from typing import Optional\n\n" + _BODY
+_NEAR_B = _BODY
 
 # A genuinely different implementation of the same job.
 _DIFFERENT = (
@@ -272,5 +289,9 @@ def test_the_verb_is_auto_discovered_for_both_cockpits() -> None:
     from backend.core.ouroboros.battle_test import repl_dispatch_registry as R
 
     R.reset_registry_for_tests()
+    # `reset` clears the cache and `list_verbs` READS it without rebuilding,
+    # so priming is the caller's job — without it this asserts against an
+    # empty tuple and looks like the verb was never discovered.
+    R.prime_registry()
     assert "harvest" in R.list_verbs()
     assert "harvest" in R.list_dispatchable_verbs()
