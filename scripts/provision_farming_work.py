@@ -149,6 +149,69 @@ def assert_produces_executable_change(target: str, task: str) -> None:
         )
 
 
+#: Task-text signals for DESIGN FREEDOM -- work that admits more than one
+#: correct implementation (a lookup table, a branch chain, a recursive
+#: walk, an iterative one). Measured on soak bt-2026-09-02-003459: the
+#: canonical tasks (re-raise an exception, swap `datetime.now()` for the
+#: tz-aware form) collapsed to ONE structure across three draws at
+#: temperatures 0.2/0.70/0.95, while the free-form tasks (a per-type
+#: strategy table, a type guard with recursion + list handling, an
+#: ok/error flag) drew 2-3 structurally distinct candidates. Sampling
+#: cannot manufacture variance a task does not admit, so the batch should
+#: LEAD with the work that can pair.
+_FREEDOM_SIGNALS: Tuple[str, ...] = (
+    "strategy", "table", "mapping", "depend on", "recurs", "depth",
+    "bounded", "join", "collect", "handle list", "each element", "guard",
+    "distinguish", "structurally", "ladder", "backoff", "retry", "per-",
+    "policy", "fallback", "flag", "algorithm", "iterat", "walk",
+)
+_CANONICAL_SIGNALS: Tuple[str, ...] = (
+    "re-raise", "reraise", "timezone", "datetime.now", "import timezone",
+    "rename", "log the exception", "exc_info", "lift the hardcoded",
+    "named module-level constants", "unused import",
+)
+
+
+def _branch_density(rel: str) -> float:
+    """Decision points per definition in the target file, or 0.0.
+
+    A file whose functions already branch a lot leaves more room for a
+    different branching structure than a file of straight-line handlers.
+    Read from disk with `ast`; never raises."""
+    import ast  # noqa: PLC0415
+
+    try:
+        tree = ast.parse((REPO / rel).read_text(encoding="utf-8", errors="replace"))
+    except Exception:  # noqa: BLE001
+        return 0.0
+    defs = [n for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    if not defs:
+        return 0.0
+    branches = sum(
+        1 for n in ast.walk(tree)
+        if isinstance(n, (ast.If, ast.For, ast.While, ast.Try, ast.With,
+                          ast.BoolOp, ast.IfExp))
+    )
+    return branches / len(defs)
+
+
+def design_freedom_score(rel: str, task: str) -> float:
+    """How many correct shapes this task admits, as a sortable number.
+
+    Task text decides most of it (+1 per freedom signal, -1 per canonical
+    signal); the target's branch density adds a fraction so that, between
+    two similarly worded tasks, the one on the more algorithmic file leads.
+    Deterministic and explainable -- the dry run prints it beside each
+    order so an operator can see WHY the batch is in this order."""
+    low = (task or "").lower()
+    score = 0.0
+    score += sum(1.0 for s in _FREEDOM_SIGNALS if s in low)
+    score -= sum(1.0 for s in _CANONICAL_SIGNALS if s in low)
+    score += min(1.0, _branch_density(rel) / 4.0)
+    return round(score, 3)
+
+
 #: Real, small, self-contained defects on NON-cage modules. Each names a
 #: concrete behavioural change, so the patch alters the AST and the op can
 #: reach a trainable verdict. Grounded by reading the files -- every item
@@ -184,12 +247,46 @@ TASKS: List[Tuple[str, str]] = [
      "value raises deep inside instead of being rejected at the boundary. "
      "Add an explicit type guard at the public entry point that returns the "
      "empty result for unusable input."),
+    # --- Sibling-entropy harvest batch (2026-09-01). Each of these admits
+    # MORE THAN ONE correct implementation (a lookup table, a branch chain,
+    # a recursive walk, an iterative one), which is what a GRPO group needs:
+    # siblings that differ in STRUCTURE, not in docstring wording.
+    ("backend/api/clean_vision_response.py",
+     "clean_vision_response recurses into nested dicts with no depth guard, "
+     "so a self-referential or deeply nested payload recurses until "
+     "RecursionError, and a list payload (e.g. a list of text fragments) is "
+     "str()-ified into a Python literal. Add a bounded recursion depth and "
+     "handle list inputs by cleaning each element and joining the non-empty "
+     "text parts, returning the existing formatting-issue fallback when the "
+     "bound is exceeded."),
+    ("backend/api/audio_error_fallback.py",
+     "handle_audio_error returns one fixed fallback_strategy (retry, 1000ms, "
+     "3 attempts) for EVERY error_type, so a not-allowed permission error and "
+     "an aborted error are told to retry the same way a transient network "
+     "error is. Make the fallback strategy depend on error_type: network "
+     "retries with backoff, no-speech retries once with no delay, aborted "
+     "and not-allowed do not retry and name the alternative, and an unknown "
+     "type gets a conservative single retry. Keep the existing suggestions."),
+    ("backend/api/sse_contract.py",
+     "eventstream_frame_to_jarviskit reads only the FIRST data: line of a "
+     "frame, but the SSE grammar allows a payload to span several data: "
+     "lines that the consumer joins with a newline before parsing. A "
+     "multi-line frame therefore fails json.loads and is dropped as "
+     "unparseable. Collect every data: line in the frame in order and join "
+     "them with a newline before decoding, leaving single-line frames "
+     "byte-identical in behaviour."),
 ]
 
 
 def build_orders(n: int, sentinels: Tuple[str, ...]) -> List[str]:
     out: List[str] = []
-    for rel, instruction in TASKS[:n]:
+    # Most design freedom FIRST. WorkOrderSensor reads the tail of
+    # progress.md and the pool is FIFO, so batch order is dispatch order:
+    # the work most likely to pair should reach a worker first.
+    ranked = sorted(
+        TASKS, key=lambda t: design_freedom_score(t[0], t[1]), reverse=True,
+    )
+    for rel, instruction in ranked[:n]:
         # Both refusals are structural and both run BEFORE anything is
         # written: a cage trip means the work needs an operator signature
         # this tool must never mint, and a cosmetic task means the work
@@ -207,6 +304,7 @@ def build_orders(n: int, sentinels: Tuple[str, ...]) -> List[str]:
             print(f"  ! skipping {rel} (not present in this checkout)")
             continue
         # ONE backticked token, and no literal "NEXT:" inside the prose.
+        print(f"  [freedom {design_freedom_score(rel, instruction):+.2f}] {rel}")
         out.append(f"NEXT: {instruction} Target file: `{rel}`")
     return out
 
