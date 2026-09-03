@@ -466,6 +466,29 @@ def _default_fs_process_pool_workers() -> int:
     return max(1, min(2, half))
 
 
+def fs_process_pool_deadline_s() -> float:
+    """How long ``offload(cpu_bound=True)`` waits on a pool worker.
+
+    Derived, not declared: the walk a worker performs is already bounded by
+    ``bounded_walker.blast_radius_timeout_s`` (``JARVIS_BLAST_RADIUS_
+    TIMEOUT_S``, default 10 s), so the only thing to size here is the
+    overhead a process adds around it -- spawn, pickling, IPC, and the
+    parse that follows the walk. ``JARVIS_FS_POOL_DEADLINE_MULT`` (default
+    6.0) is that multiplier. ``0`` disables the deadline (the legacy
+    unbounded await). Floor 1 s. NEVER raises."""
+    try:
+        raw = (os.environ.get("JARVIS_FS_POOL_DEADLINE_MULT", "") or "").strip()
+        mult = float(raw) if raw else 6.0
+        if mult <= 0.0:
+            return 0.0
+        from backend.core.ouroboros.governance.bounded_walker import (  # noqa: PLC0415
+            blast_radius_timeout_s,
+        )
+        return max(1.0, float(blast_radius_timeout_s()) * mult)
+    except Exception:  # noqa: BLE001 — a bad knob must not unbound the await
+        return 60.0
+
+
 def fs_process_pool_workers() -> int:
     """``JARVIS_FS_PROCESS_POOL_WORKERS`` — worker count for the
     lazily-created bounded FS process pool. Falls back to
@@ -777,6 +800,13 @@ async def offload(
       synchronously, before any pool submission — a loud, clear
       failure naming the offending object (a caller bug, not a
       runtime fault, so it is NOT fail-soft).
+    * ``cpu_bound=True`` is BOUNDED by ``fs_process_pool_deadline_s()``
+      (the walk budget times a process-overhead multiplier). A worker
+      that outlives it is SIGKILLed via ``reap_fs_process_pool_hard``,
+      the pool is rebuilt on the next call, and the caller receives an
+      :class:`OffloadError` with ``exc_type="TimeoutError"`` -- never a
+      pending future. Set ``JARVIS_FS_POOL_DEADLINE_MULT=0`` to restore
+      the unbounded await.
     * ``cpu_bound=True`` requires ``fn`` to be a module-level function
       (picklable by reference) — closures/lambdas must use
       ``cpu_bound=False`` instead.
@@ -813,9 +843,45 @@ async def offload(
                 message=str(exc),
                 cpu_bound=True,
             )
-        return await loop.run_in_executor(
+        # BOUNDED. A process-pool future that never resolves is a hang the
+        # caller cannot see: no exception, no sentinel, just an `await`
+        # that outlives the op. Soak bt-2026-09-03-012434 lost its run to
+        # exactly this -- 91 of 92 rust-map crawls returned, one worker
+        # wedged silently on a DrvFS walk, the only in-flight op sat in
+        # CLASSIFY for 2,103 s, and the stale detector ended the session at
+        # 141 of 150 minutes. The harness's child-reaper found the ghost
+        # worker at shutdown. The deadline derives from the walk's own
+        # budget (`bounded_walker.blast_radius_timeout_s`) times a
+        # multiplier for spawn/IPC/parse overhead -- not a new constant.
+        # On expiry the wedged worker is SIGKILLed and the pool rebuilt on
+        # the next call, so one hung child cannot poison every later
+        # offload, and the caller gets the same sentinel every other
+        # failure produces.
+        deadline_s = fs_process_pool_deadline_s()
+        fut = loop.run_in_executor(
             executor, _offload_worker, fn, args, kwargs, True,
         )
+        if deadline_s <= 0.0:
+            return await fut
+        try:
+            return await asyncio.wait_for(fut, timeout=deadline_s)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[CooperativeFSIO] offload(cpu_bound=True) of %s exceeded "
+                "%.1fs -- reaping the process pool (a wedged worker is "
+                "SIGKILLed; the pool is rebuilt on the next call)",
+                getattr(fn, "__name__", repr(fn)), deadline_s,
+            )
+            try:
+                reap_fs_process_pool_hard()
+            except Exception:  # noqa: BLE001 — the reaper never raises, belt and braces
+                pass
+            return OffloadError(
+                fn_name=getattr(fn, "__name__", repr(fn)),
+                exc_type="TimeoutError",
+                message=f"process-pool offload exceeded {deadline_s:.1f}s",
+                cpu_bound=True,
+            )
 
     # Thread path — reuse the EXISTING advisor-blast pool (do not
     # create a second thread pool).

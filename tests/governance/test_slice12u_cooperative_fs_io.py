@@ -1065,3 +1065,56 @@ class TestWalkForFilenameOffloaded:
             planted_tree, "MARKER.txt",
         )
         assert all(isinstance(p, Path) for p in results)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 2026-09-03: a process-pool future can never be a hang the caller cannot see
+#
+# Soak bt-2026-09-03-012434: 91 of 92 rust-map crawls returned; one worker
+# wedged silently on a DrvFS walk, the only in-flight op sat in CLASSIFY
+# for 2,103 s awaiting `offload(..., cpu_bound=True)`, and the stale
+# detector ended the run at 141 of 150 minutes. No exception, no sentinel,
+# no log line -- just an await that outlived the op.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _worker_block(duration_s: float) -> str:
+    import time as _t
+    _t.sleep(duration_s)
+    return "finished"
+
+
+class TestProcessPoolDeadline:
+    @pytest.mark.asyncio
+    async def test_a_wedged_worker_becomes_a_sentinel_not_a_hang(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_BLAST_RADIUS_TIMEOUT_S", "0.2")
+        monkeypatch.setenv("JARVIS_FS_POOL_DEADLINE_MULT", "5")   # -> 1.0 s deadline
+        import time as _t
+        t0 = _t.monotonic()
+        result = await offload(_worker_block, 30.0, cpu_bound=True)
+        elapsed = _t.monotonic() - t0
+        assert is_offload_error(result), result
+        assert result.exc_type == "TimeoutError" and result.cpu_bound is True
+        assert elapsed < 10.0, f"deadline did not bound the await ({elapsed:.1f}s)"
+
+    @pytest.mark.asyncio
+    async def test_the_pool_is_rebuilt_after_a_timeout(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_BLAST_RADIUS_TIMEOUT_S", "0.2")
+        monkeypatch.setenv("JARVIS_FS_POOL_DEADLINE_MULT", "5")
+        first = await offload(_worker_block, 30.0, cpu_bound=True)
+        assert is_offload_error(first)
+        # The wedged worker was reaped; a fresh pool serves the next call.
+        assert await offload(_worker_add, 2, 3, cpu_bound=True) == 5
+
+    @pytest.mark.asyncio
+    async def test_zero_multiplier_restores_the_unbounded_await(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_FS_POOL_DEADLINE_MULT", "0")
+        assert cooperative_fs_io.fs_process_pool_deadline_s() == 0.0
+        assert await offload(_worker_block, 0.05, cpu_bound=True) == "finished"
+
+    def test_deadline_derives_from_the_walk_budget(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_BLAST_RADIUS_TIMEOUT_S", "10")
+        monkeypatch.setenv("JARVIS_FS_POOL_DEADLINE_MULT", "6")
+        assert cooperative_fs_io.fs_process_pool_deadline_s() == pytest.approx(60.0)
+        monkeypatch.setenv("JARVIS_FS_POOL_DEADLINE_MULT", "not-a-number")
+        assert cooperative_fs_io.fs_process_pool_deadline_s() > 0.0   # fail-safe, still bounded
