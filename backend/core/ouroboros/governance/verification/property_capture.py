@@ -570,6 +570,93 @@ def _ledger_path_for_session(session_id: Optional[str] = None) -> Path:
     return Path(base) / sid / "decisions.jsonl"
 
 
+#: Sealed segments of a session's ledger. The LIVE file is ``decisions.jsonl``;
+#: when the writer seals it (``decision_runtime._atomic_append``, size-capped)
+#: it becomes ``decisions.<NNNNNN>.jsonl`` and a fresh live file starts. The
+#: zero-padded ordinal makes lexical order == seal order, so readers need no
+#: mtime heuristics.
+LEDGER_SEGMENT_GLOB = "decisions.*.jsonl"
+
+
+def ledger_segments_for_session(
+    session_id: Optional[str] = None,
+) -> Tuple[Path, ...]:
+    """Every file holding this session's records, oldest first, live LAST.
+
+    THE one definition of "the session's ledger" now that a ledger can be
+    more than one file. Every reader -- claims, evidence, postmortems, the
+    runtime's index, the decisions reader, replay -- composes this rather
+    than spelling ``decisions.jsonl`` itself, so sealing a segment cannot
+    make a record invisible to one consumer and visible to another.
+
+    Sealed segments sort lexically (zero-padded ordinal). The live file is
+    appended last so a concatenation preserves insertion order and a
+    replay's zero-based ``record_index`` stays monotonic across seals.
+    NEVER raises; an unresolvable directory yields the live path alone so
+    callers keep their exists-check semantics.
+    """
+    live = _ledger_path_for_session(session_id)
+    # The glob rule lives beside the writer that seals (decision_runtime),
+    # so reader and writer cannot disagree about what a segment is called.
+    try:
+        from backend.core.ouroboros.governance.determinism.decision_runtime import (  # noqa: E501, PLC0415
+            ledger_segments,
+        )
+        return ledger_segments(live)
+    except Exception:  # noqa: BLE001 — a listing fault is not a read fault
+        return (live,)
+
+
+def iter_ledger_records(
+    session_id: Optional[str] = None,
+    *,
+    live_path: Optional[Path] = None,
+):
+    """Yield ``(record, segment_path)`` for every parseable JSONL row of the
+    session, across all segments, in insertion order. Skips blank and
+    corrupt rows and non-object rows. Swallows per-segment OSError (a
+    segment sealed mid-read is skipped, not fatal) -- NEVER raises.
+
+    This is the ONE file-walking loop the three verification readers share.
+    Each of them used to carry its own copy of exactly this loop, which is
+    how they could disagree about what a ledger is.
+
+    ``live_path`` lets a caller keep its OWN path authority: the postmortem
+    and evidence readers resolve the live file through their own
+    (test-patchable) resolvers and hand it here, so sharing the walk does
+    not quietly change whose resolver decides where the ledger is.
+    """
+    live = live_path if live_path is not None else _ledger_path_for_session(session_id)
+    try:
+        from backend.core.ouroboros.governance.determinism.decision_runtime import (  # noqa: E501, PLC0415
+            ledger_segments,
+        )
+        segments = ledger_segments(live)
+    except Exception:  # noqa: BLE001 — a listing fault is not a read fault
+        segments = (live,)
+    for seg in segments:
+        try:
+            if not seg.exists():
+                continue
+            with seg.open("r", encoding="utf-8") as fh:
+                for raw_line in fh:
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    try:
+                        record = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(record, Mapping):
+                        yield record, seg
+        except OSError as exc:
+            logger.debug(
+                "[verification.capture] ledger segment unreadable %s: %s",
+                seg, exc,
+            )
+            continue
+
+
 def get_recorded_claims(
     *,
     op_id: str,
@@ -585,53 +672,81 @@ def get_recorded_claims(
     Returns claims in insertion order (matches synthesis order).
     NEVER raises — corrupt rows / missing files yield empty tuple
     + a debug log."""
-    path = _ledger_path_for_session(session_id)
-    if not path.exists():
-        return tuple()
-
     safe_op = (str(op_id).strip() if op_id else "")
     if not safe_op:
         return tuple()
 
     claims: List[PropertyClaim] = []
     try:
-        with path.open("r", encoding="utf-8") as fh:
-            for raw_line in fh:
-                raw_line = raw_line.strip()
-                if not raw_line:
-                    continue
-                try:
-                    record = json.loads(raw_line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(record, Mapping):
-                    continue
-                # Filter by op_id, phase=PLAN, kind=property_claim
-                if record.get("op_id") != safe_op:
-                    continue
-                if record.get("phase") != "PLAN":
-                    continue
-                if record.get("kind") != "property_claim":
-                    continue
-                # The claim is in output_repr (canonical-serialized JSON)
-                output_repr = record.get("output_repr", "")
-                if not isinstance(output_repr, str):
-                    continue
-                try:
-                    claim_dict = json.loads(output_repr)
-                except json.JSONDecodeError:
-                    continue
-                claim = PropertyClaim.from_dict(claim_dict)
-                if claim is not None:
-                    claims.append(claim)
-    except OSError as exc:
+        for record, _seg in iter_ledger_records(session_id):
+            # Filter by op_id, phase=PLAN, kind=property_claim
+            if record.get("op_id") != safe_op:
+                continue
+            if record.get("phase") != "PLAN":
+                continue
+            if record.get("kind") != "property_claim":
+                continue
+            # The claim is in output_repr (canonical-serialized JSON)
+            output_repr = record.get("output_repr", "")
+            if not isinstance(output_repr, str):
+                continue
+            try:
+                claim_dict = json.loads(output_repr)
+            except json.JSONDecodeError:
+                continue
+            claim = PropertyClaim.from_dict(claim_dict)
+            if claim is not None:
+                claims.append(claim)
+    except Exception:  # noqa: BLE001 — a reader must not break VERIFY
         logger.debug(
-            "[verification.capture] could not read ledger %s: %s",
-            path, exc,
+            "[verification.capture] could not read ledger for %s",
+            safe_op, exc_info=True,
         )
         return tuple()
 
     return tuple(claims)
+
+
+async def get_recorded_claims_offloaded(
+    *,
+    op_id: str,
+    session_id: Optional[str] = None,
+) -> Tuple[PropertyClaim, ...]:
+    """``get_recorded_claims`` off the event loop.
+
+    The synchronous reader scans every segment of the session ledger on
+    DrvFS. Called from the loop it was the second-worst frame the sidecar
+    profiler recorded in soak bt-2026-09-02-220948 (56 STUCK_FRAME events,
+    stalls to 65 s) -- every op's VERIFY paid for the whole ledger while
+    every other op's phase transition waited. This runs the same reader on
+    the ``advisor-blast`` executor through ``cooperative_fs_io.offload``,
+    the substrate the evidence collectors already use for exactly this
+    class of read.
+
+    ``offload`` signals failure by RETURNING a sentinel, never by raising;
+    that sentinel is an empty result here, which is what a missing ledger
+    already meant. Falls back to the in-line reader if the substrate is
+    unavailable, so a bare checkout still verifies. NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: PLC0415
+            is_offload_error,
+            offload,
+        )
+    except Exception:  # noqa: BLE001
+        return get_recorded_claims(op_id=op_id, session_id=session_id)
+    try:
+        result = await offload(
+            get_recorded_claims, op_id=op_id, session_id=session_id,
+            cpu_bound=False,
+        )
+    except Exception:  # noqa: BLE001 — the trampoline itself must not fail VERIFY
+        logger.debug("[verification.capture] offloaded read faulted", exc_info=True)
+        return tuple()
+    if is_offload_error(result):
+        logger.debug("[verification.capture] offloaded read failed: %s", result)
+        return tuple()
+    return result if isinstance(result, tuple) else tuple(result or ())
 
 
 def filter_load_bearing(

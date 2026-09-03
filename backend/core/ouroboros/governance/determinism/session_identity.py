@@ -146,9 +146,13 @@ def resolve_session_id(session_id: Optional[str] = None) -> str:
        second-guess it, or a test written to exercise cross-session behaviour
        becomes untestable.
     2. ``OUROBOROS_BATTLE_SESSION_ID`` — a real session is running.
-    3. Under pytest with neither of the above: a test-scoped session, so an
+    3. ``JARVIS_OUROBOROS_SESSION_ID`` — the id the battle-test harness
+       ACTUALLY stamps (via ``autonomous_workspace.canonical_session_id``).
+       Rung 2 was documented as "set by the harness" and never was; without
+       this rung every soak wrote to ``default``.
+    4. Under pytest with none of the above: a test-scoped session, so an
        accidental write cannot reach the production ledger.
-    4. ``default``.
+    5. ``default``.
 
     Sanitised in every branch, because the return value becomes a directory
     name and a caller-supplied id containing a path separator would write
@@ -160,12 +164,38 @@ def resolve_session_id(session_id: Optional[str] = None) -> str:
         from_env = os.environ.get(SESSION_ENV, "").strip()
         if from_env:
             return _sanitise(from_env)
+        # The live harness has never stamped SESSION_ENV -- only the replay
+        # tool does. It stamps JARVIS_OUROBOROS_SESSION_ID, which the
+        # worktree manager, the auto-committer, the workspace router and
+        # the trajectory recorder already treat as the session's name. So
+        # every soak since the ledger existed resolved to `default` and
+        # appended to one cross-session file (578 MB, 8,375 records by
+        # 2026-09-02), which three synchronous readers then scanned on the
+        # main loop for every op. Honouring the canonical id here is what
+        # makes a session's ledger the size of a session.
+        canonical = _canonical_session_id()
+        if canonical:
+            return _sanitise(canonical)
         if test_isolation_enabled() and under_pytest():
             return _test_session_id()
         return DEFAULT_SESSION
     except Exception:  # noqa: BLE001 — a path resolver must not be the thing
         logger.debug("[SessionIdentity] resolution degraded", exc_info=True)
         return DEFAULT_SESSION
+
+
+def _canonical_session_id() -> str:
+    """The harness-stamped ``JARVIS_OUROBOROS_SESSION_ID``, via the accessor
+    that owns that env name. Imported lazily -- ``autonomous_workspace``
+    sits above this module in the governance graph -- and fail-open: an
+    unreadable accessor is an unset session, never a resolution fault."""
+    try:
+        from backend.core.ouroboros.governance.autonomous_workspace import (  # noqa: PLC0415
+            canonical_session_id,
+        )
+        return canonical_session_id()
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _sanitise(raw: str) -> str:

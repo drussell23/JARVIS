@@ -456,7 +456,10 @@ def replay_session_consistency(
                 ),
             )
 
-    if not decisions_path.exists():
+    from backend.core.ouroboros.governance.determinism.decision_runtime import (  # noqa: E501, PLC0415
+        ledger_exists as _ledger_exists,
+    )
+    if not _ledger_exists(decisions_path):
         return ReplaySummary(
             session_id=sid,
             decisions_path=str(decisions_path),
@@ -486,10 +489,14 @@ def replay_session_consistency(
                     ),
                 )
             try:
-                text = decisions_path.read_text(
-                    encoding="utf-8",
+                # Segment-aware: sealed segments precede the live file, so
+                # ``record_index`` stays a stable zero-based position over
+                # the whole session even after a seal.
+                from backend.core.ouroboros.governance.determinism.decision_runtime import (  # noqa: E501, PLC0415
+                    read_ledger_lines,
                 )
-                lines = text.splitlines()
+                lines = read_ledger_lines(decisions_path)
+                text = "\n".join(lines)
             except OSError as exc:
                 return ReplaySummary(
                     session_id=sid,

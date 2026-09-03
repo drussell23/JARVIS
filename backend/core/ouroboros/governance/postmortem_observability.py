@@ -1115,11 +1115,55 @@ def publish_terminal_postmortem_persisted(
             get_post_postmortem_observer,
         )
         observer = get_post_postmortem_observer()
-        observer.on_terminal_postmortem_persisted(
-            op_id=str(op_id),
-            terminal_phase=str(terminal_phase),
-            has_blocking_failures=bool(has_blocking_failures),
-        )
+
+        def _notify() -> None:
+            observer.on_terminal_postmortem_persisted(
+                op_id=str(op_id),
+                terminal_phase=str(terminal_phase),
+                has_blocking_failures=bool(has_blocking_failures),
+            )
+
+        # OFF THE LOOP. The observer walks the session ledger
+        # (`recent_postmortem_outcomes` -> `list_recent_postmortems`) to
+        # build its context -- a whole-file scan on DrvFS that the sidecar
+        # profiler named 52 times in soak bt-2026-09-02-220948, with the
+        # main loop starved up to 65 s each time. The SSE publish above
+        # is loop-affine (subscriber queues are asyncio.Queues) and stays
+        # here; the observer is pure sync work and goes to the dedicated
+        # advisor-blast executor -- the same pool MetaSensor already uses
+        # for exactly this reader, and never the contested default pool.
+        # Fire-and-forget with a consuming done-callback: the hook is
+        # best-effort by contract, and a dropped exception must not become
+        # a "Task exception was never retrieved" panic. No running loop
+        # (a synchronous caller) -> the legacy in-line call.
+        _dispatched = False
+        try:
+            import asyncio  # noqa: PLC0415
+            from backend.core.ouroboros.governance.operation_advisor import (  # noqa: PLC0415
+                _get_advisor_blast_executor as _blast_pool,
+            )
+            _loop = asyncio.get_running_loop()
+            _fut = _loop.run_in_executor(_blast_pool(), _notify)
+
+            def _consume(f: "asyncio.Future") -> None:
+                try:
+                    exc = f.exception() if not f.cancelled() else None
+                except Exception:  # noqa: BLE001
+                    exc = None
+                if exc is not None:
+                    logger.debug(
+                        "[PostmortemObservability] offloaded observer hook "
+                        "raised %s(%s)", type(exc).__name__, str(exc)[:160],
+                    )
+
+            _fut.add_done_callback(_consume)
+            _dispatched = True
+        except RuntimeError:
+            _dispatched = False          # no running loop: run in-line below
+        except Exception:  # noqa: BLE001 — pool unavailable: run in-line
+            _dispatched = False
+        if not _dispatched:
+            _notify()
     except Exception:  # noqa: BLE001 — observer hook MUST NOT
         # propagate errors into the publish path.
         logger.debug(

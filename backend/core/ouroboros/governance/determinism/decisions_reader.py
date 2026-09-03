@@ -204,9 +204,20 @@ def list_available_sessions(
                 if not child.is_dir():
                     continue
                 decisions = child / "decisions.jsonl"
-                if not decisions.exists():
+                from backend.core.ouroboros.governance.determinism.decision_runtime import (  # noqa: E501, PLC0415
+                    ledger_exists,
+                    ledger_segments,
+                )
+                if not ledger_exists(decisions):
                     continue
-                stat = decisions.stat()
+                # A session sealed into segments is still one session:
+                # size is the sum, mtime is the newest file's.
+                _segs = [p for p in ledger_segments(decisions) if p.exists()]
+                _stats = [p.stat() for p in _segs]
+                stat = max(_stats, key=lambda s: s.st_mtime)
+                _size_total = sum(s.st_size for s in _stats)
+                if not decisions.exists():
+                    decisions = _segs[-1]
                 # Bounded line-count estimate — for "tracked"
                 # surfaces we don't actually need to scan the
                 # file; mtime + size is enough. Real counts
@@ -225,7 +236,7 @@ def list_available_sessions(
                 out.append(SessionListEntry(
                     session_id=child.name,
                     decisions_path=str(decisions),
-                    file_size_bytes=int(stat.st_size),
+                    file_size_bytes=int(_size_total),
                     mtime_unix=float(stat.st_mtime),
                     record_count_estimate=int(record_estimate),
                 ))
@@ -282,7 +293,10 @@ def read_records_for_session(
         )
 
     decisions_path = _decisions_path_for(sid)
-    if not decisions_path.exists():
+    from backend.core.ouroboros.governance.determinism.decision_runtime import (  # noqa: E501, PLC0415
+        ledger_exists,
+    )
+    if not ledger_exists(decisions_path):
         return DecisionsQueryResult(
             session_id=sid,
             elapsed_s=_time.monotonic() - started,
@@ -319,9 +333,12 @@ def read_records_for_session(
                             f"bytes > {_MAX_LEDGER_FILE_BYTES}",
                         ),
                     )
-                text = decisions_path.read_text(
-                    encoding="utf-8",
+                # Segment-aware: sealed segments precede the live file,
+                # so record positions stay stable across a seal.
+                from backend.core.ouroboros.governance.determinism.decision_runtime import (  # noqa: E501, PLC0415
+                    read_ledger_lines,
                 )
+                text = "\n".join(read_ledger_lines(decisions_path))
             except OSError as exc:
                 return DecisionsQueryResult(
                     session_id=sid,

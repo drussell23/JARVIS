@@ -253,8 +253,8 @@ async def _gather_file_parses_after_change(
     INSUFFICIENT_EVIDENCE — honest about the gap)."""
     try:
         # Priority 1 — pre-stamped (future Slice F2 wiring)
-        stamped = _from_ctx_or_ledger(
-            ctx, "target_files_post").get("target_files_post")
+        stamped = (await _from_ctx_or_ledger_async(
+            ctx, "target_files_post")).get("target_files_post")
         if stamped is not None:
             return {"target_files_post": list(stamped)}
 
@@ -414,6 +414,45 @@ def _from_ctx_or_ledger(ctx: Any, *keys: str) -> Dict[str, Any]:
     return out
 
 
+async def _from_ctx_or_ledger_async(ctx: Any, *keys: str) -> Dict[str, Any]:
+    """``_from_ctx_or_ledger`` for the async gatherers: the ledger read is
+    OFF the loop.
+
+    The synchronous helper is kept for the callers that are synchronous;
+    the three async gatherers that reach for it were the ones paying for
+    a whole-ledger scan on the main loop (sidecar profiler, soak
+    bt-2026-09-02-220948: `evidence_ledger._iter_records` 108 stalls, to
+    65 s). Same precedence -- ctx first, ledger only for what ctx lacks --
+    same result shape, and the read goes through
+    ``recorded_evidence_offloaded``. NEVER raises."""
+    out: Dict[str, Any] = {}
+    missing = []
+    for key in keys:
+        got = getattr(ctx, key, None)
+        if got is None:
+            missing.append(key)
+        else:
+            out[key] = got
+    if not missing:
+        return out
+    op_id = str(getattr(ctx, "op_id", "") or "").strip()
+    if not op_id:
+        return out
+    try:
+        from backend.core.ouroboros.governance.verification.evidence_ledger import (  # noqa: E501, PLC0415
+            recorded_evidence_offloaded,
+        )
+        recorded = await recorded_evidence_offloaded(op_id=op_id)
+    except Exception:  # noqa: BLE001 — reader unavailable; ctx-only
+        logger.debug("[EvidenceCollectors] ledger read failed", exc_info=True)
+        return out
+    for key in missing:
+        got = recorded.get(key)
+        if got is not None:
+            out[key] = got
+    return out
+
+
 async def _gather_cost_contract_bg_op_did_not_use_claude(
     claim: Any, ctx: Any,
 ) -> Mapping[str, Any]:
@@ -457,8 +496,11 @@ async def _gather_cost_contract_bg_op_did_not_use_claude(
                 # providers, and the empty tuple is the correct evidence for
                 # that — distinct from the key being absent, which means the
                 # ledger could not be read.
+                from backend.core.ouroboros.governance.verification.evidence_ledger import (  # noqa: E501, PLC0415
+                    recorded_providers_used_offloaded,
+                )
                 out["providers_used"] = list(
-                    recorded_providers_used(op_id=op_id))
+                    await recorded_providers_used_offloaded(op_id=op_id))
             except Exception:  # noqa: BLE001
                 logger.debug("[EvidenceCollectors] providers_used unavailable",
                              exc_info=True)
@@ -482,7 +524,7 @@ async def _gather_test_set_hash_stable(
 
     NEVER raises."""
     try:
-        resolved = _from_ctx_or_ledger(ctx, "test_files_pre", "test_files_post")
+        resolved = await _from_ctx_or_ledger_async(ctx, "test_files_pre", "test_files_post")
         pre = resolved.get("test_files_pre")
         post = resolved.get("test_files_post")
         if pre is not None and post is not None:
@@ -615,7 +657,7 @@ async def _gather_no_new_credential_shapes(
 
     NEVER raises."""
     try:
-        diff = _from_ctx_or_ledger(ctx, "diff_text").get("diff_text")
+        diff = (await _from_ctx_or_ledger_async(ctx, "diff_text")).get("diff_text")
         if diff is None:
             return {}
         # Coerce to string defensively

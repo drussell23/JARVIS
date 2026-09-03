@@ -833,11 +833,11 @@ class DecisionRuntime:
                 return
             self._index = {}
             self._index_loaded_from_path = path
-            if not path.exists():
+            if not ledger_exists(path):
                 return
             try:
-                with path.open("r", encoding="utf-8") as fh:
-                    for raw_line in fh:
+                # Segment-aware: a sealed record is still this session's.
+                for raw_line in iter_ledger_lines(path):
                         raw_line = raw_line.strip()
                         if not raw_line:
                             continue
@@ -1146,6 +1146,144 @@ def reset_all_for_tests() -> None:
 # ---------------------------------------------------------------------------
 
 
+#: Sealed segments of a ledger live beside it as ``decisions.<NNNNNN>.jsonl``.
+#: Zero-padded so lexical order IS seal order; readers need no mtimes.
+LEDGER_SEGMENT_GLOB = "decisions.*.jsonl"
+_SEGMENT_WIDTH = 6
+
+
+def ledger_max_bytes() -> int:
+    """Size at which the live ledger file is sealed into a segment.
+
+    ``JARVIS_DETERMINISM_LEDGER_MAX_BYTES``; the default is the reader's own
+    ``file_too_large`` guard (``decisions_reader._MAX_LEDGER_FILE_BYTES``),
+    so the writer never produces a file the reader has declared it will
+    refuse. ``0`` disables sealing. NEVER raises."""
+    try:
+        raw = os.environ.get("JARVIS_DETERMINISM_LEDGER_MAX_BYTES", "").strip()
+        if raw:
+            return max(0, int(raw))
+        from backend.core.ouroboros.governance.determinism.decisions_reader import (  # noqa: PLC0415
+            _MAX_LEDGER_FILE_BYTES,
+        )
+        return int(_MAX_LEDGER_FILE_BYTES)
+    except Exception:  # noqa: BLE001
+        return 100 * 1024 * 1024
+
+
+def ledger_segments(live: Path) -> Tuple[Path, ...]:
+    """Every file holding a ledger's records, oldest first, live LAST.
+
+    THE one definition of "the ledger" now that it can be several files.
+    Sealed segments sort lexically (zero-padded ordinal); the live file is
+    appended last so a concatenation preserves insertion order and a
+    replay's zero-based ``record_index`` stays monotonic across seals.
+    NEVER raises; an unlistable directory yields the live path alone so
+    callers keep their exists-check semantics."""
+    try:
+        sealed = sorted(
+            p for p in live.parent.glob(LEDGER_SEGMENT_GLOB)
+            if p.is_file() and p.name != live.name
+        )
+    except Exception:  # noqa: BLE001
+        sealed = []
+    return tuple(sealed) + (live,)
+
+
+def ledger_exists(live: Path) -> bool:
+    """True when ANY segment of the ledger exists."""
+    try:
+        return any(p.exists() for p in ledger_segments(live))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def read_ledger_lines(live: Path, encoding: str = "utf-8") -> List[str]:
+    """All lines of the ledger across every segment, in insertion order.
+
+    The segment-aware equivalent of ``live.read_text().splitlines()`` for
+    the readers that need positional record indices (replay, the query
+    reader). A segment that vanishes between listing and reading is
+    skipped, not fatal. Raises OSError only if the LIVE file itself
+    cannot be read, preserving the callers' existing error handling."""
+    out: List[str] = []
+    for seg in ledger_segments(live):
+        if seg == live:
+            out.extend(live.read_text(encoding=encoding).splitlines())
+            continue
+        try:
+            out.extend(seg.read_text(encoding=encoding).splitlines())
+        except OSError:
+            continue
+    return out
+
+
+def iter_ledger_lines(live: Path, encoding: str = "utf-8"):
+    """Yield raw lines across every segment, oldest first, live last.
+
+    Streaming counterpart of ``read_ledger_lines`` for readers that do not
+    need positional indices -- the index loader walks a 500 MB ledger
+    without materialising it. A segment that vanishes between listing and
+    reading is skipped. OSError on the live file propagates so the caller's
+    existing handling applies."""
+    for seg in ledger_segments(live):
+        if seg != live:
+            try:
+                with seg.open("r", encoding=encoding) as fh:
+                    for raw in fh:
+                        yield raw
+            except OSError:
+                continue
+        else:
+            if not live.exists():
+                continue
+            with live.open("r", encoding=encoding) as fh:
+                for raw in fh:
+                    yield raw
+
+
+def _next_segment_path(live: Path) -> Path:
+    existing = [p for p in ledger_segments(live) if p != live]
+    n = 0
+    for p in existing:
+        try:
+            n = max(n, int(p.name.split(".")[1]))
+        except (IndexError, ValueError):
+            continue
+    return live.with_name(f"decisions.{n + 1:0{_SEGMENT_WIDTH}d}.jsonl")
+
+
+def _maybe_seal(path: Path) -> None:
+    """Seal ``path`` into a numbered segment if it has outgrown the cap.
+
+    Runs inside the writer's executor, never on the loop. The rename is
+    atomic on POSIX and taken under the ledger's cross-process lock so a
+    concurrent appender cannot write into a file that is mid-rename. A
+    seal that fails for any reason leaves the live file in place -- an
+    oversized ledger is a slow ledger, not a lost one. NEVER raises."""
+    try:
+        cap = ledger_max_bytes()
+        if cap <= 0 or not path.exists() or path.stat().st_size < cap:
+            return
+        from backend.core.ouroboros.governance.cross_process_jsonl import (  # noqa: PLC0415
+            flock_critical_section,
+        )
+        with flock_critical_section(path) as acquired:
+            if not acquired:
+                return
+            # Re-check under the lock: another process may have sealed it.
+            if not path.exists() or path.stat().st_size < cap:
+                return
+            target = _next_segment_path(path)
+            os.replace(path, target)
+            logger.info(
+                "[determinism] ledger sealed: %s -> %s (%d bytes >= cap %d)",
+                path.name, target.name, target.stat().st_size, cap,
+            )
+    except Exception:  # noqa: BLE001 — sealing is an optimisation, never a fault
+        logger.debug("[determinism] ledger seal skipped", exc_info=True)
+
+
 def _atomic_append(path: Path, line: str) -> None:
     """Append one line to ``path`` with cross-process safety via
     flock. Creates parent dirs if needed. The line MUST already
@@ -1161,6 +1299,17 @@ def _atomic_append(path: Path, line: str) -> None:
     decision_trace_ledger so behavior is consistent across the
     two ledgers."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    # SEAL BEFORE APPEND. A ledger that only ever grows is the wedge this
+    # repository measured on 2026-09-02: `default/decisions.jsonl` at
+    # 578 MB / 8,375 records, scanned front-to-back on the main loop by
+    # three readers for every op, stalling phase transitions 10-65 s.
+    # Partitioning by session bounds a ledger to one run; this bounds it
+    # regardless -- a run that outgrows the cap seals the live file into
+    # a numbered segment and starts a fresh one. Readers compose
+    # `ledger_segments()` so a sealed record is never invisible, and the
+    # seal happens HERE, inside the executor `_append_to_disk` already
+    # dispatches to, so it costs the loop nothing.
+    _maybe_seal(path)
     # Open in append-binary so the OS-level append is atomic with
     # respect to the file's size cursor (POSIX guarantees this for
     # < PIPE_BUF writes; our lines are typically < 1KB).

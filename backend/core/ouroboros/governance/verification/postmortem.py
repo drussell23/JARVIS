@@ -120,6 +120,8 @@ from backend.core.ouroboros.governance.verification.property_capture import (
     SEVERITY_MUST_HOLD,
     SEVERITY_SHOULD_HOLD,
     get_recorded_claims,
+    get_recorded_claims_offloaded,
+    iter_ledger_records,
 )
 from backend.core.ouroboros.governance.verification.property_oracle import (
     PropertyOracle,
@@ -623,7 +625,7 @@ async def produce_verification_postmortem(
 
     # Read recorded claims
     try:
-        claims = get_recorded_claims(op_id=op_id, session_id=sid)
+        claims = await get_recorded_claims_offloaded(op_id=op_id, session_id=sid)
     except Exception:  # noqa: BLE001 — defensive
         claims = ()
 
@@ -817,56 +819,91 @@ def list_recent_postmortems(
             "verification_postmortem", "terminal_postmortem",
         )
     safe_kinds = tuple(str(k) for k in include_kinds)
-    path = _ledger_path_for_session(session_id)
-    if not path.exists():
-        return ()
     pms: List[VerificationPostmortem] = []
     try:
-        with path.open("r", encoding="utf-8") as fh:
-            for raw_line in fh:
-                raw_line = raw_line.strip()
-                if not raw_line:
-                    continue
-                try:
-                    record = json.loads(raw_line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(record, Mapping):
-                    continue
-                if record.get("kind") not in safe_kinds:
-                    continue
-                output_repr = record.get("output_repr", "")
-                if not isinstance(output_repr, str):
-                    continue
-                try:
-                    pm_dict = json.loads(output_repr)
-                except json.JSONDecodeError:
-                    continue
-                pm = VerificationPostmortem.from_dict(pm_dict)
-                if pm is not None:
-                    # Stamp the ENCLOSING record's identity onto the reading.
-                    # Both values were already parsed two lines above and
-                    # then dropped, and dropping them is what made
-                    # `total_claims == 0` unreadable: a CLASSIFY termination
-                    # and a COMPLETE with no claims arrived here identical.
-                    # Carrying them costs nothing and needs no migration —
-                    # every historical record acquires provenance on read.
-                    pm = _replace(
-                        pm,
-                        record_kind=str(record.get("kind") or ""),
-                        terminated_at_phase=str(record.get("phase") or ""),
-                    )
-                    pms.append(pm)
-    except OSError as exc:
+        # This module's resolver decides where the ledger is (it is what
+        # tests patch); the shared walker only decides how to read it.
+        for record, _seg in iter_ledger_records(
+                session_id, live_path=_ledger_path_for_session(session_id)):
+            if record.get("kind") not in safe_kinds:
+                continue
+            output_repr = record.get("output_repr", "")
+            if not isinstance(output_repr, str):
+                continue
+            try:
+                pm_dict = json.loads(output_repr)
+            except json.JSONDecodeError:
+                continue
+            pm = VerificationPostmortem.from_dict(pm_dict)
+            if pm is not None:
+                # Stamp the ENCLOSING record's identity onto the reading.
+                # Both values were already parsed two lines above and
+                # then dropped, and dropping them is what made
+                # `total_claims == 0` unreadable: a CLASSIFY termination
+                # and a COMPLETE with no claims arrived here identical.
+                # Carrying them costs nothing and needs no migration —
+                # every historical record acquires provenance on read.
+                pm = _replace(
+                    pm,
+                    record_kind=str(record.get("kind") or ""),
+                    terminated_at_phase=str(record.get("phase") or ""),
+                )
+                pms.append(pm)
+                # A rolling window: the caller wants the LAST N, so the
+                # buffer never needs to outgrow N. On a ledger that has
+                # been sealed into segments this bounds memory to the
+                # answer, not to the history.
+                if len(pms) > safe_limit * 2:
+                    del pms[:-safe_limit]
+    except Exception:  # noqa: BLE001 — a reader must not break a sensor
         logger.debug(
-            "[verification.postmortem] list_recent read failed at "
-            "%s: %s", path, exc,
+            "[verification.postmortem] list_recent read failed",
+            exc_info=True,
         )
         return ()
     # Return last `safe_limit` records (newest-last).
     if len(pms) > safe_limit:
         return tuple(pms[-safe_limit:])
     return tuple(pms)
+
+
+async def list_recent_postmortems_offloaded(
+    *,
+    limit: int = 100,
+    session_id: Optional[str] = None,
+    include_kinds: Optional[Tuple[str, ...]] = None,
+) -> Tuple[VerificationPostmortem, ...]:
+    """``list_recent_postmortems`` off the event loop.
+
+    The synchronous reader walks every segment of the session ledger on
+    DrvFS. Called from the loop it was the third frame the sidecar profiler
+    named in soak bt-2026-09-02-220948 (52 STUCK_FRAME events). Same reader,
+    same answer, run on the ``advisor-blast`` executor through
+    ``cooperative_fs_io.offload``. The sentinel ``offload`` returns on
+    failure is an empty result here. Falls back to the in-line reader
+    without the substrate. NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: PLC0415
+            is_offload_error,
+            offload,
+        )
+    except Exception:  # noqa: BLE001
+        return list_recent_postmortems(
+            limit=limit, session_id=session_id, include_kinds=include_kinds,
+        )
+    try:
+        result = await offload(
+            list_recent_postmortems, limit=limit, session_id=session_id,
+            include_kinds=include_kinds, cpu_bound=False,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[verification.postmortem] offloaded list faulted", exc_info=True)
+        return ()
+    if is_offload_error(result):
+        logger.debug("[verification.postmortem] offloaded list failed: %s", result)
+        return ()
+    return result if isinstance(result, tuple) else tuple(result or ())
 
 
 def get_recorded_postmortem(

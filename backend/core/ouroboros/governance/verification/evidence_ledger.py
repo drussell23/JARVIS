@@ -127,43 +127,36 @@ def _iter_records(
     safe_op = str(op_id or "").strip()
     if not safe_op:
         return
+    # The ONE ledger walk, shared with the claims and postmortem readers,
+    # and segment-aware: a session ledger sealed into
+    # ``decisions.<N>.jsonl`` segments is still one ledger to every reader.
     try:
-        path = _ledger_path(session_id)
-    except Exception:  # noqa: BLE001 — resolution failed; nothing to read
-        logger.debug("[EvidenceLedger] path unresolved", exc_info=True)
+        from backend.core.ouroboros.governance.verification.property_capture import (  # noqa: E501, PLC0415
+            iter_ledger_records,
+        )
+    except Exception:  # noqa: BLE001 — reader unavailable; nothing to read
+        logger.debug("[EvidenceLedger] ledger walker unavailable", exc_info=True)
         return
     try:
-        if not path.exists():
-            return
-    except OSError:
-        return
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            for raw_line in fh:
-                raw_line = raw_line.strip()
-                if not raw_line:
-                    continue
-                try:
-                    record = json.loads(raw_line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(record, Mapping):
-                    continue
-                if record.get("op_id") != safe_op:
-                    continue
-                if record.get("kind") != kind:
-                    continue
-                payload = record.get("output_repr", "")
-                if not isinstance(payload, str):
-                    continue
-                try:
-                    parsed = json.loads(payload)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(parsed, Mapping):
-                    yield record, parsed
-    except OSError as exc:
-        logger.debug("[EvidenceLedger] read failed at %s: %s", path, exc)
+        # This module's resolver decides WHERE (it mirrors the postmortem
+        # reader's, and is what tests patch); the shared walker decides HOW.
+        for record, _seg in iter_ledger_records(
+                session_id, live_path=_ledger_path(session_id)):
+            if record.get("op_id") != safe_op:
+                continue
+            if record.get("kind") != kind:
+                continue
+            payload = record.get("output_repr", "")
+            if not isinstance(payload, str):
+                continue
+            try:
+                parsed = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, Mapping):
+                yield record, parsed
+    except Exception:  # noqa: BLE001 — a reader must not break the verdict
+        logger.debug("[EvidenceLedger] read failed", exc_info=True)
         return
 
 
@@ -233,3 +226,50 @@ def recorded_providers_used(
         logger.debug("[EvidenceLedger] recorded_providers_used degraded",
                      exc_info=True)
     return tuple(seen)
+
+
+async def _offloaded(fn, fallback, **kwargs):
+    """Run a synchronous ledger reader off the loop; fail to ``fallback``.
+
+    ``cooperative_fs_io.offload`` RETURNS a sentinel on failure rather than
+    raising, so the check is ``is_offload_error``, never try/except. Without
+    the substrate the reader runs in-line -- a bare checkout still gathers
+    evidence, it just pays for it on the loop as it always did."""
+    try:
+        from backend.core.ouroboros.governance.cooperative_fs_io import (  # noqa: PLC0415
+            is_offload_error,
+            offload,
+        )
+    except Exception:  # noqa: BLE001
+        return fn(**kwargs)
+    try:
+        result = await offload(fn, cpu_bound=False, **kwargs)
+    except Exception:  # noqa: BLE001 — the trampoline must not break the verdict
+        logger.debug("[EvidenceLedger] offloaded read faulted", exc_info=True)
+        return fallback
+    if is_offload_error(result):
+        logger.debug("[EvidenceLedger] offloaded read failed: %s", result)
+        return fallback
+    return result
+
+
+async def recorded_evidence_offloaded(
+    *, op_id: str, session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """``recorded_evidence`` off the event loop.
+
+    The synchronous reader was the WORST frame the sidecar profiler named
+    in soak bt-2026-09-02-220948 -- 108 of 219 STUCK_FRAME events, stalls
+    to 65 s -- because every VERIFY gatherer walked the whole session
+    ledger on DrvFS from the main loop. Same reader, same answer, run on
+    the ``advisor-blast`` executor. NEVER raises."""
+    out = await _offloaded(recorded_evidence, {}, op_id=op_id, session_id=session_id)
+    return out if isinstance(out, dict) else {}
+
+
+async def recorded_providers_used_offloaded(
+    *, op_id: str, session_id: Optional[str] = None,
+) -> Tuple[str, ...]:
+    """``recorded_providers_used`` off the event loop. NEVER raises."""
+    out = await _offloaded(recorded_providers_used, (), op_id=op_id, session_id=session_id)
+    return tuple(out) if isinstance(out, (tuple, list)) else ()
