@@ -281,3 +281,173 @@ def test_teardown_flush_walks_lineages(_rec) -> None:
 
     rows = asyncio.run(_go())
     assert [r["metadata"]["attempt_index"] for r in rows] == [0, 1, 2]
+
+
+# --------------------------------------------------------------------------
+# Lineage purification: draw kinds, the validation guard, hash dedupe
+# --------------------------------------------------------------------------
+#
+# Soak bt-2026-09-03-012434 (soak 17): 29 of 43 rows were L2 repair
+# re-generations recorded as sibling attempts of the draw they repaired --
+# attempt patterns [0,1,2,1], [0,1,1] -- so the "twins" the harvest paired
+# were the same accepted candidate written twice, 1.0000 alike. A repair
+# answers a DIFFERENT prompt (the failing tests) and is never a sibling of
+# the primary draw; a duplicate hash is one row however it was produced.
+
+
+def test_draw_kind_is_derived_from_the_seam_not_guessed() -> None:
+    assert tr.derive_draw_kind(is_repair=True, sampling=None) == tr.DRAW_REPAIR
+    assert tr.derive_draw_kind(is_repair=False, sampling=None) == tr.DRAW_PRIMARY
+    assert tr.derive_draw_kind(
+        is_repair=False, sampling={"top_p": 0.9, "seed": 7}) == tr.DRAW_SIBLING
+    # An explicit tag wins; a repair with sampling is still a repair.
+    assert tr.derive_draw_kind(
+        is_repair=False, sampling=None, explicit=tr.DRAW_SIBLING) == tr.DRAW_SIBLING
+    assert tr.derive_draw_kind(
+        is_repair=True, sampling={"top_p": 0.9}) == tr.DRAW_REPAIR
+
+
+def test_genuine_draws_are_primary_sibling_and_legacy_unknown() -> None:
+    assert tr.is_genuine_draw({"draw_kind": tr.DRAW_PRIMARY})
+    assert tr.is_genuine_draw({"draw_kind": tr.DRAW_SIBLING})
+    assert tr.is_genuine_draw({}), "a pre-discriminator row must not vanish"
+    assert not tr.is_genuine_draw({"draw_kind": tr.DRAW_REPAIR})
+    assert not tr.is_genuine_draw({"draw_kind": tr.DRAW_RETRY})
+
+
+def test_rows_carry_the_discriminator_and_the_sampling_point(_rec) -> None:
+    async def _go():
+        await _rec._admit_pending(_gen(
+            "op-k1", ["p"], draw_kind=tr.DRAW_PRIMARY, temperature=0.7))
+        await _rec._admit_pending(_gen(
+            "op-k1", ["s"], draw_kind=tr.DRAW_SIBLING, temperature=1.1,
+            sampling={"top_p": 0.95, "top_k": 40, "seed": 12}))
+        await _rec._resolve(tr._OutcomeEvent(
+            op_id="op-k1", terminal_phase="COMPLETED", terminal_reason="applied",
+        ))
+
+    asyncio.run(_go())
+    rows = _rows(_rec, "op-k1")
+    assert [r["metadata"]["draw_kind"] for r in rows] == [tr.DRAW_PRIMARY, tr.DRAW_SIBLING]
+    assert [r["metadata"]["temperature"] for r in rows] == [0.7, 1.1]
+    assert rows[1]["metadata"]["sampling"] == {"top_p": 0.95, "top_k": 40, "seed": 12}
+    assert rows[0]["metadata"]["sampling"] == {}
+
+
+def test_a_second_primary_on_one_op_is_a_retry_not_a_sibling(_rec) -> None:
+    """GENERATE_RETRY re-draws at the legacy point; only ONE primary exists."""
+
+    async def _go():
+        await _rec._admit_pending(_gen("op-k2", ["a"], draw_kind=tr.DRAW_PRIMARY))
+        await _rec._admit_pending(_gen("op-k2", ["b"], draw_kind=tr.DRAW_PRIMARY))
+        await _rec._resolve(tr._OutcomeEvent(
+            op_id="op-k2", terminal_phase="COMPLETED", terminal_reason="applied",
+        ))
+
+    asyncio.run(_go())
+    kinds = [r["metadata"]["draw_kind"] for r in _rows(_rec, "op-k2")]
+    assert kinds == [tr.DRAW_PRIMARY, tr.DRAW_RETRY]
+
+
+def test_repair_that_re_records_an_earlier_hash_is_pruned(_rec) -> None:
+    """The soak-17 twin: L2 re-emits the accepted candidate. Zero new rows."""
+
+    async def _go():
+        await _rec._admit_pending(_gen("op-k3", ["same"], draw_kind=tr.DRAW_PRIMARY))
+        await _rec._admit_pending(_gen("op-k3", ["same"], draw_kind=tr.DRAW_REPAIR))
+        await _rec._resolve(tr._OutcomeEvent(
+            op_id="op-k3", terminal_phase="COMPLETED", terminal_reason="applied",
+        ))
+
+    asyncio.run(_go())
+    rows = _rows(_rec, "op-k3")
+    assert len(rows) == 1
+    assert rows[0]["metadata"]["draw_kind"] == tr.DRAW_PRIMARY
+    assert rows[0]["metadata"]["lineage_size"] == 1
+    assert _rec._stats["lineage_pruned"] == 1
+
+
+def test_repair_that_produced_something_new_is_kept_and_tagged(_rec) -> None:
+    """A genuinely different repair is a second answer -- kept, but tagged
+    so the harvest can decline to pair it with the primary."""
+
+    async def _go():
+        await _rec._admit_pending(_gen("op-k4", ["orig"], draw_kind=tr.DRAW_PRIMARY))
+        await _rec._admit_pending(_gen("op-k4", ["fixed"], draw_kind=tr.DRAW_REPAIR))
+        await _rec._resolve(tr._OutcomeEvent(
+            op_id="op-k4", terminal_phase="COMPLETED", terminal_reason="applied",
+        ))
+
+    asyncio.run(_go())
+    rows = _rows(_rec, "op-k4")
+    assert [r["metadata"]["draw_kind"] for r in rows] == [tr.DRAW_PRIMARY, tr.DRAW_REPAIR]
+    assert [r["metadata"]["attempt_index"] for r in rows] == [0, 1]
+    assert _rec._stats["lineage_pruned"] == 0
+
+
+def test_guard_reindexes_survivors_densely(_rec) -> None:
+    async def _go():
+        await _rec._admit_pending(_gen("op-k5", ["a"], draw_kind=tr.DRAW_PRIMARY))
+        await _rec._admit_pending(_gen("op-k5", ["a"], draw_kind=tr.DRAW_REPAIR))
+        await _rec._admit_pending(_gen("op-k5", ["c"], draw_kind=tr.DRAW_SIBLING))
+        await _rec._resolve(tr._OutcomeEvent(
+            op_id="op-k5", terminal_phase="COMPLETED", terminal_reason="applied",
+        ))
+
+    asyncio.run(_go())
+    rows = _rows(_rec, "op-k5")
+    assert [r["metadata"]["candidate_hash"] for r in rows] == ["a", "c"]
+    assert [r["metadata"]["attempt_index"] for r in rows] == [0, 1]
+    assert {r["metadata"]["lineage_size"] for r in rows} == {2}
+
+
+def test_guard_drops_a_generation_with_no_candidates(_rec) -> None:
+    async def _go():
+        await _rec._admit_pending(_gen("op-k6", ["a"], draw_kind=tr.DRAW_PRIMARY))
+        await _rec._admit_pending(_gen("op-k6", [], draw_kind=tr.DRAW_SIBLING))
+        await _rec._resolve(tr._OutcomeEvent(
+            op_id="op-k6", terminal_phase="COMPLETED", terminal_reason="applied",
+        ))
+
+    asyncio.run(_go())
+    assert [r["metadata"]["candidate_hash"] for r in _rows(_rec, "op-k6")] == ["a"]
+    assert _rec._stats["lineage_pruned"] == 1
+
+
+def test_guard_never_raises_on_a_malformed_lineage(_rec) -> None:
+    """A guard that loses a lineage on its own bug is worse than no guard."""
+    g = _gen("op-k7", ["a"], draw_kind=tr.DRAW_REPAIR)
+    g.candidates = ("not-a-dict", None, {"candidate_hash": "z"})
+    out = _rec._validate_lineage("op-k7", [g])
+    assert out == [g]
+
+
+def test_same_hash_twice_in_genuine_draws_is_written_once(_rec) -> None:
+    """Deterministic (op_id, candidate_hash) dedupe at persistence: a
+    sibling that collapsed onto the primary bytes exactly is one row."""
+
+    async def _go():
+        await _rec._admit_pending(_gen("op-k8", ["dup"], draw_kind=tr.DRAW_PRIMARY))
+        await _rec._admit_pending(_gen(
+            "op-k8", ["dup"], draw_kind=tr.DRAW_SIBLING, sampling={"seed": 1}))
+        await _rec._resolve(tr._OutcomeEvent(
+            op_id="op-k8", terminal_phase="COMPLETED", terminal_reason="applied",
+        ))
+
+    asyncio.run(_go())
+    assert len(_rows(_rec, "op-k8")) == 1
+    assert _rec._stats["rows_deduped"] == 1
+    assert "op-k8" not in getattr(_rec, "_persisted", {}), "dedupe set must be released"
+
+
+def test_dedupe_is_per_op_not_global(_rec) -> None:
+    async def _go():
+        for op in ("op-k9a", "op-k9b"):
+            await _rec._admit_pending(_gen(op, ["shared"], draw_kind=tr.DRAW_PRIMARY))
+            await _rec._resolve(tr._OutcomeEvent(
+                op_id=op, terminal_phase="COMPLETED", terminal_reason="applied",
+            ))
+
+    asyncio.run(_go())
+    assert len(_rows(_rec, "op-k9a")) == 1 and len(_rows(_rec, "op-k9b")) == 1
+    assert _rec._stats["rows_deduped"] == 0

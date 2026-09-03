@@ -295,3 +295,50 @@ def test_the_verb_is_auto_discovered_for_both_cockpits() -> None:
     R.prime_registry()
     assert "harvest" in R.list_verbs()
     assert "harvest" in R.list_dispatchable_verbs()
+
+
+# --------------------------------------------------------------------------
+# Lineage purification at the harvest: repair rows and duplicate hashes
+# --------------------------------------------------------------------------
+
+
+def _tagged(op: str, attempt: int, body: str, *, kind: str, h: str) -> dict:
+    r = _row(op, attempt, body)
+    r["metadata"]["draw_kind"] = kind
+    r["metadata"]["candidate_hash"] = h
+    return r
+
+
+def test_repair_rows_are_not_siblings_of_the_draw_they_repaired(tmp_path: Path) -> None:
+    """Soak 17: an L2 repair recorded as attempt 1 of the primary's op
+    made a pairable group out of a prompt answered once."""
+    d = _corpus(tmp_path, [
+        _tagged("op-r1", 0, _NEAR_A, kind="primary", h="h-a"),
+        _tagged("op-r1", 1, _DIFFERENT, kind="repair", h="h-b"),
+    ])
+    snap = harvest_snapshot(events_path=d)
+    assert snap["rows"] == 2, "rows counts what was READ (it feeds the cap)"
+    assert snap["rows_repair"] == 1
+    assert snap["groups"] == 0 and snap["groups_pairable"] == 0
+
+
+def test_duplicate_hash_in_one_op_is_one_row(tmp_path: Path) -> None:
+    d = _corpus(tmp_path, [
+        _tagged("op-r2", 0, _NEAR_A, kind="primary", h="same"),
+        _tagged("op-r2", 1, _NEAR_A, kind="sibling", h="same"),
+        _tagged("op-r2", 2, _DIFFERENT, kind="sibling", h="other"),
+    ])
+    snap = harvest_snapshot(events_path=d)
+    assert snap["rows_deduped"] == 1
+    assert snap["rows"] == 3, "rows counts what was READ (it feeds the cap)"
+    assert snap["groups"] == 1 and snap["groups_pairable"] == 1
+
+
+def test_legacy_rows_without_a_draw_kind_still_harvest(tmp_path: Path) -> None:
+    d = _corpus(tmp_path, [
+        _row("op-r3", 0, _NEAR_A),
+        _row("op-r3", 1, _DIFFERENT),
+    ])
+    snap = harvest_snapshot(events_path=d)
+    assert snap["rows"] == 2 and snap["rows_repair"] == 0 and snap["rows_deduped"] == 0
+    assert snap["groups_pairable"] == 1

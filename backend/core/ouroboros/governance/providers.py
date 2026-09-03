@@ -6603,6 +6603,11 @@ class PrimeProvider:
                 tokens_estimated=bool(
                     _prime_meta.get("tokens_estimated", True)
                 ),
+                # Draw-kind discriminator: an L2 repair iteration is NOT
+                # a sibling of the draw it repaired.
+                is_repair=repair_context is not None,
+                sampling=sampling,
+                temperature=temperature,
             )
         except Exception as _traj_exc:  # noqa: BLE001 — fail-open
             logger.debug(
@@ -10570,6 +10575,9 @@ class ClaudeProvider:
                     thinking_reason=_thinking_reason_out,
                     tool_records=(), venom_edits=(),
                     prompt_text=prompt_text,
+                    is_repair=repair_context is not None,
+                    temperature=temperature,
+                    sampling=sampling,
                 )
 
             _gate_gr, _gate_outcome = await _cached_or_generate(
@@ -10789,6 +10797,9 @@ class ClaudeProvider:
             tool_records=tool_records,
             venom_edits=venom_edits,
             prompt_text=prompt_text,
+            is_repair=repair_context is not None,
+            temperature=temperature,
+            sampling=sampling,
         )
 
     async def _assemble_codegen_prompt(
@@ -10909,6 +10920,9 @@ class ClaudeProvider:
         tool_records: Tuple[Any, ...],
         venom_edits: Tuple[Dict[str, Any], ...],
         prompt_text: str = "",
+        is_repair: bool = False,
+        temperature: Optional[float] = None,
+        sampling: Any = None,
     ) -> GenerationResult:
         """Zero-Waste S1 (D2) extract — post-raw result parsing +
         token/cost finalize. Shared by :meth:`generate`'s normal
@@ -11031,6 +11045,9 @@ class ClaudeProvider:
                 task_type="code_repair",
                 session_id=str(getattr(context, "session_id", "") or ""),
                 route=(_route_str if _route_str != "?" else "standard"),
+                is_repair=bool(is_repair),
+                sampling=sampling,
+                temperature=temperature,
             )
         except Exception as _traj_exc:  # noqa: BLE001 — fail-open
             logger.debug(

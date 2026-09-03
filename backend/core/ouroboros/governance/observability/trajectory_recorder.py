@@ -314,6 +314,83 @@ class _PendingGeneration:
     lineage_size: int = 1
     created_monotonic: float = field(default_factory=time.monotonic)
     created_iso: str = field(default_factory=_utc_now_iso)
+    # WHAT KIND OF DRAW this was -- the discriminator soak 17 was missing.
+    # `attempt_index = len(lineage)` made every provider call for an op the
+    # next "attempt", so an L2 repair re-generation (same prompt, legacy
+    # temperature, very often the accepted candidate's own structure) was
+    # indistinguishable from an entropy-ladder sibling. Measured across 11
+    # groups: attempt patterns like [0,1,2,1] / [0,1,1] / [0,1,2,2] where the
+    # repeated index carried `l2_stopped` and an EARLIER attempt's
+    # structure_id -- byte-identical "twins" that inflated groups with
+    # untrainable rows (29 of 43) and dragged the reward spread.
+    draw_kind: str = "unknown"
+    temperature: Optional[float] = None
+    sampling: Dict[str, Any] = field(default_factory=dict)
+
+
+#: Draw kinds. ONE vocabulary, shared by the record seam, the persisted row,
+#: the harvest and the reactor's ingestion filter.
+DRAW_PRIMARY = "primary"    # an op's first draw at the legacy point
+DRAW_SIBLING = "sibling"    # an entropy-ladder redraw (non-legacy sampling)
+DRAW_REPAIR = "repair"      # an L2 repair iteration (repair_context present)
+DRAW_RETRY = "retry"        # another legacy-point draw after a primary exists
+DRAW_UNKNOWN = "unknown"    # rows written before the discriminator existed
+#: The kinds a preference GROUP may contain. A repair or retry re-answers the
+#: same prompt without exploring, so it can only ever add a twin.
+GENUINE_DRAW_KINDS = frozenset({DRAW_PRIMARY, DRAW_SIBLING, DRAW_UNKNOWN})
+
+
+def _sampling_overrides_of(sampling: Any) -> Dict[str, Any]:
+    """The sampling point as a plain dict, or {}. Duck-typed on the SAME
+    contract ``local_inference_director._sampling_overrides`` reads
+    (``config_overrides()`` or a mapping) so the row carries exactly what
+    the request carried. NEVER raises."""
+    try:
+        raw = sampling
+        getter = getattr(sampling, "config_overrides", None)
+        if callable(getter):
+            raw = getter()
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k): v for k, v in raw.items() if v is not None}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def derive_draw_kind(
+    *, is_repair: bool, sampling: Any, explicit: str = "",
+) -> str:
+    """Classify a draw from what the record seam knows.
+
+    An explicit kind wins. Otherwise: a repair context makes it a repair
+    regardless of sampling (L2 lowers temperature, and a lowered legacy
+    point is still not exploration); a non-legacy sampling point makes it a
+    sibling; anything else is a primary, which the lineage may later
+    reclassify as a RETRY when a primary already exists for the op. Pure,
+    NEVER raises."""
+    try:
+        if explicit:
+            return str(explicit)
+        if is_repair:
+            return DRAW_REPAIR
+        if sampling is not None and not bool(getattr(sampling, "is_legacy", False)):
+            if _sampling_overrides_of(sampling) or getattr(sampling, "temperature", None) is not None:
+                return DRAW_SIBLING
+        return DRAW_PRIMARY
+    except Exception:  # noqa: BLE001
+        return DRAW_UNKNOWN
+
+
+def is_genuine_draw(meta: Any) -> bool:
+    """True when a persisted row may take part in a preference group.
+    Reads ``metadata.draw_kind``; rows written before the field existed
+    are kept (``unknown``) so the historical corpus is not silently
+    emptied. NEVER raises."""
+    try:
+        kind = str((meta or {}).get("draw_kind") or DRAW_UNKNOWN)
+    except Exception:  # noqa: BLE001
+        return True
+    return kind in GENUINE_DRAW_KINDS
 
 
 @dataclass
@@ -374,6 +451,8 @@ class TrajectoryRecorder:
             "generations_queued": 0,
             "outcomes_queued": 0,
             "events_written": 0,
+            "lineage_pruned": 0,
+            "rows_deduped": 0,
             "dropped_queue_full": 0,
             "dropped_no_loop": 0,
             "pending_evicted": 0,
@@ -466,8 +545,19 @@ class TrajectoryRecorder:
         completion_tokens_override: int = -1,
         prompt_tokens_override: int = -1,
         tokens_estimated: bool = False,
+        draw_kind: str = "",
+        is_repair: bool = False,
+        sampling: Any = None,
+        temperature: Optional[float] = None,
     ) -> bool:
         """Queue one generation. Non-blocking. NEVER raises.
+
+        ``is_repair`` / ``sampling`` / ``temperature`` are the draw's
+        PROVENANCE: whether an L2 repair context was present, the sampling
+        point the request carried, and its temperature. They resolve to a
+        ``draw_kind`` (see ``derive_draw_kind``) that the row persists, so
+        the harvest can group only genuine draws. ``draw_kind`` may be
+        passed explicitly by a caller that knows better.
 
         The ``*_override`` arguments exist because a GenerationResult does
         not always carry the truth. On the local lane the result reports
@@ -532,6 +622,12 @@ class TrajectoryRecorder:
             task_type=str(task_type or ""),
             session_id=str(session_id or "") or _canonical_session_id(),
             tokens_estimated=bool(tokens_estimated),
+            draw_kind=derive_draw_kind(
+                is_repair=bool(is_repair), sampling=sampling,
+                explicit=str(draw_kind or ""),
+            ),
+            temperature=(None if temperature is None else float(temperature)),
+            sampling=_sampling_overrides_of(sampling),
         )
         if self._offer(pending):
             self._stats["generations_queued"] += 1
@@ -698,6 +794,14 @@ class TrajectoryRecorder:
                 lineage = []
                 self._pending[gen.op_id] = lineage
             gen.attempt_index = len(lineage)
+            # A second legacy-point draw for an op that already has a
+            # primary is a RETRY, not a sibling and not a primary: it
+            # re-answers the same prompt without exploring. The record seam
+            # cannot know this (it sees one call); the lineage can.
+            if gen.draw_kind == DRAW_PRIMARY and any(
+                g.draw_kind == DRAW_PRIMARY for g in lineage
+            ):
+                gen.draw_kind = DRAW_RETRY
             lineage.append(gen)
             self._pending.move_to_end(gen.op_id)
             # The cap counts GENERATIONS. Counting ops would let a single
@@ -881,12 +985,68 @@ class TrajectoryRecorder:
         # because the previous attempt was rejected, so the earlier rows
         # carry the model's rejected work on the same prompt. Discarding
         # them was discarding the better half of the pair.
+        lineage = self._validate_lineage(evt.op_id, list(lineage or []))
         for _n, _gen in enumerate(lineage or []):
             _outcome, _autonomy, _train = outcome, autonomy_type, should_train
             if _gen.is_noop and _outcome == "success":
                 _outcome, _autonomy, _train = _NOOP
             _gen.lineage_size = len(lineage or [])
             await self._write(_gen, _outcome, _autonomy, _train, evt)
+        # The op's lineage is on disk: release its dedupe set. The map is
+        # bounded by construction, so a leak here would be a slow one, but
+        # a set that outlives its op is still state nobody reads again.
+        _seen = getattr(self, "_persisted", None)
+        if _seen:
+            _seen.pop(evt.op_id, None)
+
+    def _validate_lineage(
+        self, op_id: str, lineage: "List[_PendingGeneration]",
+    ) -> "List[_PendingGeneration]":
+        """The lineage validation guard: prune what cannot be a preference
+        pair BEFORE it reaches the corpus, and re-index the survivors.
+
+        Dropped, with a counter each:
+          * a generation with no candidates (nothing to pair);
+          * a REPAIR or RETRY whose every candidate hash duplicates one an
+            earlier generation of this op already carries -- the L2 path
+            re-recording the accepted candidate under an op-level verdict,
+            the exact twin that inflated soak 17's groups (29 of 43 rows).
+            A repair that produced something NEW is kept: it is a genuine
+            second answer to the prompt.
+
+        Survivors are re-indexed so ``attempt_index`` stays dense and
+        ``lineage_size`` honest, mirroring what ``_retract`` already does.
+        Pure over its input, NEVER raises -- on any fault the lineage is
+        returned untouched, because a guard that drops rows on its own
+        bug is worse than no guard."""
+        try:
+            seen_hashes: set = set()
+            kept: List[_PendingGeneration] = []
+            for gen in lineage:
+                hashes = {
+                    str((c or {}).get("candidate_hash", "") or "")
+                    for c in (gen.candidates or ()) if isinstance(c, dict)
+                }
+                hashes.discard("")
+                if not gen.candidates:
+                    self._stats["lineage_pruned"] += 1
+                    continue
+                if gen.draw_kind in (DRAW_REPAIR, DRAW_RETRY) and hashes and hashes <= seen_hashes:
+                    self._stats["lineage_pruned"] += 1
+                    logger.info(
+                        "[TrajectoryRecorder] pruned %s draw for op=%s: every "
+                        "candidate duplicates an earlier attempt (%s)",
+                        gen.draw_kind, op_id, sorted(h[:12] for h in hashes),
+                    )
+                    continue
+                seen_hashes |= hashes
+                kept.append(gen)
+            for idx, gen in enumerate(kept):
+                gen.attempt_index = idx
+            return kept
+        except Exception:  # noqa: BLE001 — a guard must never lose a lineage
+            logger.debug("[TrajectoryRecorder] lineage guard degraded", exc_info=True)
+            return list(lineage)
 
     async def _expire_pending(self) -> None:
         """Flush generations whose op never reported a verdict.
@@ -985,6 +1145,23 @@ class TrajectoryRecorder:
             if not body:
                 continue
             cand_hash = str(cand.get("candidate_hash", "") or "")
+            # DETERMINISTIC DEDUPE at the persistence layer, keyed by the
+            # candidate's OWN hash (the one the retract seam already keys
+            # on -- no second hasher). One (op_id, candidate_hash) reaches
+            # the corpus once, whatever path produced it again.
+            if cand_hash:
+                _seen = getattr(self, "_persisted", None)
+                if _seen is None:
+                    _seen = self._persisted = {}
+                _op_seen = _seen.setdefault(gen.op_id, set())
+                if cand_hash in _op_seen:
+                    self._stats["rows_deduped"] += 1
+                    continue
+                _op_seen.add(cand_hash)
+                # Bounded: cap the per-op map so a flood of ops that never
+                # report an outcome cannot grow it without limit.
+                while len(_seen) > 512:
+                    _seen.pop(next(iter(_seen)))
             # Per-candidate verdict beats the op-level one where it exists.
             #
             # A candidate VALIDATE rejected was bad on its own merits --
@@ -1079,6 +1256,13 @@ class TrajectoryRecorder:
                         # pair is built from.
                         "attempt_index": gen.attempt_index,
                         "lineage_size": gen.lineage_size,
+                        # The draw-kind discriminator: harvest and Reactor
+                        # ingestion pair only GENUINE draws (primary /
+                        # sibling); an L2 repair iteration is a different
+                        # prompt's answer and never a sibling of these.
+                        "draw_kind": gen.draw_kind,
+                        "temperature": gen.temperature,
+                        "sampling": dict(gen.sampling),
                         "file_path": str(cand.get("file_path", "") or ""),
                         "source_path": str(cand.get("source_path", "") or ""),
                         "provider_name": gen.provider_name,
@@ -1224,6 +1408,10 @@ def harvest_snapshot(
         "enabled": False, "counters": {}, "path": "", "rows": 0,
         "rows_trainable": 0, "groups": 0, "groups_pairable": 0,
         "groups_collapsed": 0, "truncated": False, "error": "",
+        # Lineage purification: rows excluded because they are not a genuine
+        # primary/sibling draw (L2 repair / retry re-generations), and rows
+        # dropped as an exact (op_id, candidate_hash) duplicate of one seen.
+        "rows_repair": 0, "rows_deduped": 0,
     }
     try:
         out["enabled"] = recorder_enabled()
@@ -1235,6 +1423,7 @@ def harvest_snapshot(
         out["path"] = str(path)
 
         groups: Dict[str, List[Dict[str, Any]]] = {}
+        seen_keys: set = set()
         rows = 0
         for f in sorted(path.glob("*.jsonl")) if path.is_dir() else []:
             try:
@@ -1254,6 +1443,21 @@ def harvest_snapshot(
                         continue
                     rows += 1
                     meta = row.get("metadata") or {}
+                    # Purification, in the same order Reactor ingestion
+                    # applies it: a repair/retry re-generation is not a
+                    # sibling of the primary draw it re-answered, and one
+                    # (op_id, candidate_hash) is one row however many
+                    # paths re-recorded it.
+                    if not is_genuine_draw(meta):
+                        out["rows_repair"] += 1
+                        continue
+                    _dk = (str(meta.get("op_id", "") or ""),
+                           str(meta.get("candidate_hash", "") or ""))
+                    if _dk[1]:
+                        if _dk in seen_keys:
+                            out["rows_deduped"] += 1
+                            continue
+                        seen_keys.add(_dk)
                     if meta.get("should_train"):
                         out["rows_trainable"] += 1
                     key = str(
