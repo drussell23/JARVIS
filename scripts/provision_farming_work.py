@@ -275,6 +275,390 @@ TASKS: List[Tuple[str, str]] = [
      "unparseable. Collect every data: line in the frame in order and join "
      "them with a newline before decoding, leaving single-line frames "
      "byte-identical in behaviour."),
+    # --- Yield batch (2026-09-03). Soak 18 produced the arc's first clean
+    # sample and only SIX trainable groups, because nine authored tasks were
+    # all the real work that existed: the log carries 427 `2b.1-noop`
+    # declines against 112 candidates, the model correctly refusing ambient
+    # sensor work that is already done. Breadth, not sampling, is what the
+    # corpus was short of. Every item below was read out of the tree with
+    # the offending line quoted, and every one admits more than one correct
+    # implementation -- a dispatch table or a branch chain, a guard clause
+    # or an eager validation, a registry or a single slot -- because a task
+    # with one obvious two-line fix draws three identical siblings.
+    ("backend/api/simple_context_handler.py",
+     "When a command needs the screen and the unlock helper reports "
+     "success, the handler waits a fixed two seconds, then runs the "
+     "command and rewrites the reply as an unlocked-and-executed success "
+     "with screen_unlocked set true, without ever re-checking the lock "
+     "state. On a slow or partially-completed unlock the command executes "
+     "against a still-locked screen while the caller receives a success- "
+     "shaped payload asserting the screen was unlocked. Confirm the screen "
+     "actually reached the unlocked state within a bounded wait before "
+     "executing the command, and return the existing unlock-failure "
+     "response when that confirmation never arrives, instead of trusting a "
+     "single fixed delay."),
+    ("backend/api/direct_vision_fix.py",
+     "The start-monitoring branch calls start_video_streaming a second "
+     "time even though the manager's start_monitoring already started it, "
+     "and when that call reports failure execution falls through to a "
+     "payload with handled, success and monitoring_active all true, so a "
+     "caller cannot tell that streaming never started and the reported "
+     "error is discarded. It also assumes the streaming call returns a "
+     "mapping, raising AttributeError for any analyzer that returns None "
+     "or a bool. Drop the redundant second start, produce a distinct "
+     "unsuccessful result that carries the reported error when streaming "
+     "does not come up, and tolerate a non-mapping return value from the "
+     "analyzer."),
+    ("backend/api/voice_503_fix.py",
+     "Every exit path of the activation endpoint returns HTTP 200 with "
+     "status activated, including a malformed request body, a full queue, "
+     "and the two-second wait timeout, so a client has no way to "
+     "distinguish an activation that actually happened from one that was "
+     "dropped or never processed. The timed-out request is also left in "
+     "the queue with its future still pending, so the background worker "
+     "later resolves an abandoned request and burns a CPU sample doing it. "
+     "Keep the endpoint from emitting 503, but make the reported status "
+     "and body distinguish accepted, queued, throttled and failed "
+     "outcomes, and make a request that is no longer awaited be cancelled "
+     "or discarded so the worker does not complete orphaned work."),
+    ("backend/api/context_aware_integration.py",
+     "The execution callback that runs the user's real command sits inside "
+     "the same broad try as all the result-shaping code, which "
+     "dereferences the success key directly, so any exception or missing "
+     "key raised after the command already executed falls into the "
+     "fallback and executes that same command a second time. Side- "
+     "effectful commands therefore run twice and the caller only ever sees "
+     "the second result, with no indication of the duplication. Restrict "
+     "the fallback to the case where the original command demonstrably has "
+     "not been executed yet, and turn a malformed or incomplete context "
+     "result into an explicit failure response rather than a reason to re- "
+     "run the command."),
+    ("backend/api/vision_query_bypass.py",
+     "Routing decisions are made by bare substring containment, so short "
+     "cues match inside unrelated words, count fires on account and open "
+     "in fires mid-sentence, and any imperative that happens to contain "
+     "browser, windows, application or show me but does not literally "
+     "start with one of the nine hardcoded verbs is diverted to vision "
+     "analysis instead of being executed, silently dropping the user's "
+     "action. The same containment flaw misclassifies query_type and picks "
+     "the first application or UI element mentioned regardless of "
+     "position. Make cue matching respect word boundaries and require "
+     "genuine interrogative or observational form before bypassing command "
+     "interpretation, so action requests keep reaching the command path."),
+    ("backend/api/hud_local_bridge.py",
+     "The loopback check treats an empty or missing host as loopback, so a "
+     "request whose client address is unknown or stripped by a proxy is "
+     "granted the unauthenticated trust-the-localhost shortcut that is "
+     "supposed to be reachable only from this machine. In the other "
+     "direction the only normalization performed is stripping an "
+     "IPv4-mapped IPv6 prefix, so legitimate local origins such as a "
+     "bracketed IPv6 literal, an address carrying a zone identifier, or a "
+     "host with a port appended are rejected and the native client is "
+     "refused. Make an absent or unrecognizable origin untrusted, and "
+     "normalize the supplied host properly so all real loopback forms are "
+     "accepted."),
+    ("backend/api/screen_control_api.py",
+     "The unlock endpoint ignores both the action and the method fields of "
+     "the request, it unconditionally drives the keychain implementation, "
+     "yet echoes the caller's requested method back in the response, so a "
+     "client that asks for the applescript or swift path, or that posts an "
+     "action of lock to this endpoint, receives a successful response "
+     "naming a method that was never executed. Callers therefore cannot "
+     "detect that their requested strategy was silently substituted. "
+     "Dispatch on the requested method, reject or explicitly report an "
+     "unsupported or contradictory request, and only ever report the "
+     "method that actually ran."),
+    ("backend/api/vision_ws_endpoint.py",
+     "When the idle timeout fires the receive loop breaks out and the "
+     "function returns without removing the client from the active "
+     "connections registry and without closing the socket, so the dead "
+     "entry persists forever. Every later broadcast then tries to send on "
+     "that stale socket, and the registry grows without bound across "
+     "reconnects. Guarantee that the connection is deregistered and closed "
+     "on every way out of the handler, normal exit, idle timeout, "
+     "disconnect and unexpected error alike."),
+    ("backend/api/self_healing_api.py",
+     "The fix endpoint reads the last entry of the healer's fix history "
+     "after invoking it and reports that entry's issue and strategy as the "
+     "outcome of this request, without checking that the entry was "
+     "produced by this call. When the healer appends nothing, because "
+     "nothing was wrong or a retry limit blocked the attempt, the response "
+     "attributes a previous run's issue type and strategy to the current "
+     "request and pairs it with this call's success flag, so the caller "
+     "reads a stale diagnosis as fresh. Capture enough state before "
+     "invoking the healer to identify which history entries this call "
+     "produced, report only those, and return an explicit no-attempt "
+     "result otherwise."),
+    ("backend/api/display_monitor_api.py",
+     "Every endpoint raises a 503 for an uninitialized display monitor "
+     "from inside a try block whose broad handler re-wraps any exception "
+     "as a 500, so a caller polling for readiness sees an opaque server "
+     "error instead of the service-unavailable signal it was given, and an "
+     "unimportable display package produces that same indistinguishable "
+     "500. Restructure the handlers so a deliberately chosen HTTP status "
+     "propagates untouched, an absent or uninitialized monitor is reported "
+     "as unavailable, and genuinely unexpected faults keep their 500. "
+     "Share the monitor resolution and status mapping across all six "
+     "endpoints instead of repeating the same try wrapper in each."),
+    ("backend/api/direct_unlock_handler.py",
+     "The system screen-lock fallback launches a second interpreter with "
+     "no timeout and runs it synchronously from an async call path, so an "
+     "unresponsive child process blocks the whole event loop indefinitely "
+     "with no way to recover. The daemon health check likewise closes its "
+     "probe socket only on the success path, leaking the descriptor "
+     "whenever the connect attempt raises. Give every OS resource a "
+     "guaranteed release regardless of how the block exits, bound the "
+     "external probe in wall-clock time, and keep the blocking work off "
+     "the event loop so a stuck probe degrades to a negative answer "
+     "instead of freezing the backend."),
+    ("backend/api/service_surface.py",
+     "Mounting the service surface discards the router mount result "
+     "entirely and treats hydration alone as success, so when the "
+     "websocket and device SSE router fails to import or fails to mount, "
+     "the function still reports success and logs that the device SSE "
+     "routes are served, precisely the silently-missing-router failure "
+     "this module exists to catch. Make the reported outcome reflect what "
+     "actually got mounted as well as what hydrated, so a caller can "
+     "distinguish a complete surface from a partial one, and record which "
+     "surfaces are missing somewhere an operator can see. Keep both halves "
+     "non-fatal; degrade visibly rather than raising."),
+    ("backend/api/autonomy_handler.py",
+     "The activation sequence appends a step-succeeded string after each "
+     "helper and then reports success with all systems online, even though "
+     "every helper swallows its own import failure and leaves its flag "
+     "false, so a caller receives a success payload and autonomous mode is "
+     "set while nothing was actually activated. Have each step surface its "
+     "real outcome and let the aggregate response separate full activation "
+     "from partial or total failure, including whether autonomous mode "
+     "should be entered at all. Emit the reported instants unambiguously "
+     "enough to be ordered across machines rather than using the host's "
+     "bare local clock."),
+    ("backend/api/hive_envelope.py",
+     "Both adapters coerce the source timestamp with a float conversion "
+     "that raises on a string or any other non-numeric value, dropping an "
+     "otherwise valid frame into the catch-all fallback; that fallback "
+     "then emits a normal-looking info-severity envelope with no detail, "
+     "no event id and no trace, so the feed cannot tell a degraded cast "
+     "from a genuine informational event. Make timestamp interpretation "
+     "tolerant of the shapes sources actually send and fall back to the "
+     "current time only when no usable value exists. Mark envelopes "
+     "produced by the failure path so consumers can see that the cast "
+     "degraded and why, preserving whatever identifying fields survived "
+     "instead of discarding the payload."),
+    ("backend/api/progressive_hydration.py",
+     "The per-subsystem guard catches BaseException, so cancelling the "
+     "background hydration task or interrupting the process is recorded as "
+     "an ordinary subsystem error and the loop keeps walking every "
+     "remaining loader; shutdown therefore blocks until the whole graph "
+     "has been traversed and the cancellation is never observed by whoever "
+     "requested it. Nothing bounds how long a single loader may run "
+     "either, so one hanging subsystem stalls hydration forever with no "
+     "degraded event emitted. Preserve the fail-soft behaviour for genuine "
+     "load failures while letting cancellation and interruption end "
+     "hydration promptly, and give each loader a bounded time budget whose "
+     "expiry degrades that subsystem like any other failure."),
+    ("backend/api/loopback_selftest.py",
+     "The self-test is documented to never raise, yet the self-heal path "
+     "calls the injected recovery engine and imports its helpers outside "
+     "any guard, and the classification step reads attributes straight off "
+     "the failover result, so a recovery engine that throws or a result "
+     "missing those attributes escapes the boot self-test and takes down "
+     "the hydration step that scheduled it. Nothing bounds how long the "
+     "provider attempts may take either, so a wedged backup provider hangs "
+     "boot indefinitely. Make the entry point total: every outward path "
+     "must produce a result state, an unexpected fault must be classified "
+     "and reported as a surfaced non-fatal failure rather than "
+     "propagating, and provider attempts must be time-bounded with the "
+     "expiry classified like any other non-answer."),
+    ("backend/api/auto_config_endpoint.py",
+     "The discovery responses hardcode localhost and the plain http and ws "
+     "schemes for every caller and read the port straight out of an "
+     "environment variable, so a client on another machine or behind TLS "
+     "is handed base, websocket and endpoint URLs it can never reach, "
+     "which defeats the entire purpose of an auto-configuration endpoint. "
+     "A non-numeric configured port additionally turns the whole response "
+     "into an unhandled server error. Derive the advertised host, scheme "
+     "and port from what the request actually arrived on, honouring "
+     "forwarding headers when present and falling back to configured "
+     "values only when the request cannot tell you, keep the websocket "
+     "scheme consistent with the http one, and validate the configured "
+     "port before it reaches the response."),
+    ("backend/api/package_recovery.py",
+     "Recovery collapses the requested module to its top-level package "
+     "before the allowlist lookup and before probing, and the post-install "
+     "verification imports only that top-level name, so a missing "
+     "submodule is reported as recovered whenever its parent package "
+     "merely imports; the caller then retries, fails with the identical "
+     "fault, and the once-per-session ledger now refuses to try again. "
+     "Carry the full dotted module name through resolution and "
+     "verification so the exact module that was missing is the one proven "
+     "importable, while the governed allowlist decision stays keyed on the "
+     "installable distribution. A verification that does not actually "
+     "restore the requested import must be reported as a distinct non- "
+     "recovered outcome rather than as success."),
+    ("backend/api/wake_word_api.py",
+     "The streaming endpoint installs its per-connection send function "
+     "into the single shared service's one callback slot, so a second "
+     "client silently steals the stream from the first, and whichever "
+     "client disconnects first restores the pre-existing callback and cuts "
+     "off every other connected client. Replace the single-slot handoff "
+     "with a registration model that lets any number of concurrent streams "
+     "receive activations and that removes only the departing connection's "
+     "own subscription, leaving whatever callback existed before the first "
+     "subscriber intact until the last subscriber leaves. A delivery "
+     "failure to one client must not prevent delivery to the rest or leave "
+     "a dead subscriber registered."),
+    ("backend/api/proactive_monitoring_handler.py",
+     "Enabling change reporting returns a payload asserting that "
+     "monitoring is active, with prose telling the user the indicator "
+     "confirms active watching, regardless of whether the vision "
+     "intelligence exists, whether it exposes the multi-space monitoring "
+     "entry point, or whether starting it returned false; in all of those "
+     "cases no monitoring task is ever created and the caller is told the "
+     "opposite of the truth. Report the state actually reached and make an "
+     "unavailable or refused start distinguishable in the response, with "
+     "narration that matches. The workspace-state read must also stop "
+     "returning nothing when its detector attribute is absent, since an "
+     "empty state silently prevents the loop from ever holding two states "
+     "to compare."),
+    ("backend/api/dynamic_cors_handler.py",
+     "Preflight and normal responses are emitted with credentials enabled "
+     "alongside wildcard values for allowed and exposed headers, a "
+     "combination browsers reject outright for credentialed requests, so "
+     "every cross-origin call carrying cookies fails even though the "
+     "origin was explicitly allowed. Responses whose CORS headers are "
+     "computed from the request origin also carry nothing telling caches "
+     "that they vary by origin, so a shared cache can hand one origin's "
+     "headers to another. Reflect the concrete headers the preflight "
+     "actually requested instead of a wildcard, keep the exposed-header "
+     "set explicit, and mark origin-dependent responses so any cache keys "
+     "on the origin."),
+    ("backend/api/rust_api.py",
+     "The build endpoint guards concurrency by testing for a lock file and "
+     "then separately creating it, so two requests arriving together both "
+     "see no lock and both launch the build subprocess, and a lock left "
+     "behind by a crashed or killed process makes every later build fail "
+     "with a permanent 409 that nothing can clear. Replace the check-then- "
+     "create pattern with an acquisition that cannot be interleaved, and "
+     "make a lock left by a process that is no longer alive or that is "
+     "older than a sane build window reclaimable rather than fatal. Ensure "
+     "the caller can tell a build that is genuinely running apart from a "
+     "stale marker, and only the request that actually acquired the lock "
+     "may release it."),
+    ("backend/api/startup_voice_api.py",
+     "After successfully queueing an announcement the handlers reach into "
+     "the coordinator status dictionary with required-key indexing for "
+     "running, queue, size, active_engines, workers and rate_limiter, so a "
+     "coordinator that omits or renames any of those keys raises inside "
+     "the try block and the endpoint answers 500 with an error payload "
+     "even though the announcement was accepted and will be spoken. "
+     "Callers treat that as a failure and retry, producing duplicate "
+     "speech. Make the status summary tolerant of a partial or differently "
+     "shaped status object so that the outcome reported to the caller "
+     "always reflects the queueing result, and reserve the error response "
+     "for cases where the announcement itself did not happen."),
+    ("backend/api/async_tts_handler.py",
+     "Generated audio may end up as AIFF when both ffmpeg and lame are "
+     "unavailable, but the cache writes every file under an mp3 name and "
+     "the cache-hit path unconditionally reports audio/mpeg, so a cached "
+     "AIFF payload is later served to clients as MP3 and fails to decode. "
+     "Record or derive the actual format of each cached artifact and "
+     "return the content type that matches the bytes on disk, including "
+     "for entries already produced by the fallback path. The format "
+     "information must survive a process restart, since the metadata is "
+     "reloaded from disk on startup."),
+    ("backend/api/direct_unlock_handler_fixed.py",
+     "The daemon health check performs a synchronous blocking socket "
+     "connect with a half-second timeout from inside a coroutine, so "
+     "whenever the unlock daemon is down or slow the whole event loop "
+     "stalls and every other request served by the process is frozen for "
+     "the duration; the socket is also closed only on the success path, "
+     "leaking a descriptor when the connect call itself raises. Perform "
+     "the reachability probe without blocking the event loop and guarantee "
+     "the socket is released on every exit path. Keep the fast-fail "
+     "behaviour so an unavailable daemon is still detected quickly rather "
+     "than waiting for the full WebSocket timeout."),
+    ("backend/api/lazy_enhanced_vision_api.py",
+     "The vision WebSocket endpoint only unregisters a client in its "
+     "exception handlers, so the idle-timeout path breaks out of the "
+     "receive loop and returns while the socket is still in the manager's "
+     "active connection set and is never closed. The stale entry makes "
+     "every later broadcast attempt a send on a dead socket, keeps the "
+     "connection count wrong, and prevents monitoring from stopping when "
+     "the last real client leaves. Guarantee that leaving the handler for "
+     "any reason removes the connection from the manager exactly once and "
+     "closes the underlying socket, without double-removing on the paths "
+     "that already handle disconnection."),
+    ("backend/api/notification_vision_api.py",
+     "When a broadcast to a client fails, the notification manager logs "
+     "the error and keeps that connection in its active list, and the "
+     "WebSocket endpoint's idle-timeout branch leaves without "
+     "unregistering at all, so dead sockets accumulate forever. Every "
+     "subsequent notification then pays repeated failing sends, and the "
+     "reported active websocket count in the status endpoint drifts away "
+     "from reality. Prune connections that fail to receive a broadcast and "
+     "make departure from the endpoint unregister the client on every exit "
+     "path, ensuring a client removed twice is handled harmlessly."),
+    ("backend/api/startup_progress_api.py",
+     "Both state callbacks obtain the running event loop and schedule a "
+     "broadcast, and when they are invoked from a plain worker thread the "
+     "lookup raises and the update is discarded silently, so progress and "
+     "readiness changes emitted off the async thread never reach connected "
+     "clients and the loading page stalls with no diagnostic. The "
+     "scheduled tasks are also created without keeping a reference, so "
+     "they can be collected before they run. Deliver updates that "
+     "originate outside the event loop instead of dropping them, keep "
+     "scheduled broadcasts alive until they complete, and make a genuinely "
+     "undeliverable update observable rather than invisible."),
+    ("backend/api/network_recovery_api.py",
+     "The diagnosis path runs ping and privileged cache-flush commands "
+     "with blocking synchronous subprocess calls and no timeout from "
+     "inside an async endpoint, so the entire event loop is frozen while "
+     "they run and a privileged invocation that waits for a password never "
+     "returns, hanging the server permanently on a request that is "
+     "supposed to be a quick diagnostic. Run these probes so they cannot "
+     "block the event loop and cannot exceed a bounded wall-clock budget, "
+     "terminating anything that overruns. Have the diagnosis report which "
+     "steps actually ran, timed out, or were skipped for lack of "
+     "privileges instead of silently reporting an unknown issue."),
+    ("backend/api/converged_headless.py",
+     "The background boot coroutine runs hydration, the self-test wiring "
+     "and the ready emission with no failure handling around the whole "
+     "sequence, and the task it runs in is created without any completion "
+     "handling, so an exception from hydration or the control plane kills "
+     "the boot silently: the system state is left at booting forever, no "
+     "readiness event is ever emitted, and the status endpoint keeps "
+     "reporting a boot in progress that will never finish. Ensure a "
+     "failure anywhere in the boot sequence is logged, drives the exposed "
+     "system state to a terminal degraded or failed value, and still emits "
+     "a readiness signal carrying that outcome so attached cockpits and "
+     "pollers stop waiting. The lifespan must not raise on this path, and "
+     "cancellation at shutdown must remain distinguishable from a real "
+     "boot failure."),
+    ("backend/api/enhanced_vision_api.py",
+     "The action-suggestion callback executes every suggestion whose "
+     "priority is high or urgent by calling straight into the AI core, "
+     "without consulting the autonomy handler that the rest of the manager "
+     "treats as the gate for autonomous behaviour, so the system performs "
+     "actions on the user's machine even when autonomous mode is switched "
+     "off. It also runs the batch with no error isolation, so the first "
+     "failing action aborts the remainder and no client is told anything "
+     "happened. Gate execution on the current autonomy state and on the "
+     "suggestion's own confidence rather than priority alone, and make "
+     "each suggestion succeed or fail independently with the outcome "
+     "broadcast either way, including for suggestions that were withheld."),
+    ("backend/api/enhanced_voice_routes.py",
+     "Every request path samples CPU with a blocking hundred-millisecond "
+     "interval call, twice per activation, directly on the event loop, so "
+     "the load-management feature that exists to avoid overload instead "
+     "serialises all concurrent requests behind repeated synchronous "
+     "sleeps and makes the reported processing time mostly measurement "
+     "overhead. The per-request samples are also appended to lists that "
+     "are never trimmed even though only the most recent entries are ever "
+     "read, so the process grows without bound. Obtain the utilisation "
+     "figures without stalling the event loop and keep only a bounded "
+     "window of samples, while still allowing the activation handler to "
+     "compare utilisation before and after processing."),
 ]
 
 
