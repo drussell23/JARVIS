@@ -356,6 +356,162 @@ def _config_for_draw(
         return cfg
 
 
+_TRANSPORT_NATIVE = "native"
+_TRANSPORT_OPENAI = "openai"
+_TRANSPORTS = (_TRANSPORT_NATIVE, _TRANSPORT_OPENAI)
+
+
+def _normalise_transport(raw: "Optional[str]") -> str:
+    """The configured wire dialect, or native. Unknown -> native, logged once.
+
+    Native is the default because it is the only route on which the
+    sampler options are known to bite (see ``LocalConfig.transport``). A
+    typo cannot silently select the leaky dialect: it selects the working one
+    and says so."""
+    value = (raw or "").strip().lower()
+    if value in _TRANSPORTS:
+        return value
+    if value:
+        logger.warning(
+            "[LocalPrimeClient] JARVIS_LOCAL_TRANSPORT=%r is not one of %s; "
+            "using %s", raw, _TRANSPORTS, _TRANSPORT_NATIVE,
+        )
+    return _TRANSPORT_NATIVE
+
+
+def transport_for(cfg: "LocalConfig") -> str:
+    return _normalise_transport(getattr(cfg, "transport", _TRANSPORT_NATIVE))
+
+
+def is_native_transport(cfg: "LocalConfig") -> bool:
+    return transport_for(cfg) == _TRANSPORT_NATIVE
+
+
+def chat_endpoint(cfg: "LocalConfig") -> str:
+    """The ONE place the chat URL is spelled."""
+    base = str(getattr(cfg, "base_url", "") or "").rstrip("/")
+    return base + ("/api/chat" if is_native_transport(cfg) else "/v1/chat/completions")
+
+
+def _spell_for_transport(body: "Dict[str, Any]", cfg: "LocalConfig") -> "Dict[str, Any]":
+    """Move the OpenAI-spelled scalars into ``options`` for the native route.
+
+    The request is BUILT once, in OpenAI spelling, by ``complete()``. This is
+    the single translation seam: on the native route ``temperature`` and
+    ``max_tokens`` have no top-level meaning and live in ``options`` as
+    ``temperature`` / ``num_predict``; ``top_p`` and ``seed`` already have
+    both spellings written by ``_apply_sampling`` and the top-level copies
+    are simply dropped. Everything else (``model``, ``messages``,
+    ``keep_alive``, ``stream``, ``options``) is shared by both dialects.
+
+    On the OpenAI route this returns ``body`` untouched, so that path stays
+    byte-identical to before the native transport existed. NEVER raises."""
+    try:
+        if not is_native_transport(cfg):
+            return body
+        opts = body.setdefault("options", {})
+        if not isinstance(opts, dict):
+            opts = body["options"] = {}
+        if "temperature" in body:
+            opts["temperature"] = float(body.pop("temperature"))
+        if "max_tokens" in body:
+            opts["num_predict"] = int(body.pop("max_tokens"))
+        for k in ("top_p", "seed"):
+            body.pop(k, None)             # ``options`` already carries them
+        body.pop("stream_options", None)  # OpenAI-only accounting request
+        # The native route STREAMS BY DEFAULT. A non-streaming caller must say
+        # so or the engine answers application/x-ndjson and a JSON read
+        # fails (measured live, first native call). The streaming path sets
+        # this to True afterwards, so setdefault is the right verb.
+        body.setdefault("stream", False)
+        return body
+    except Exception:  # noqa: BLE001 — a spelling fault must not drop the request
+        return body
+
+
+async def _read_json(resp: Any) -> Any:
+    """Read a JSON body from ANY response object this client is handed.
+
+    aiohttp refuses to decode a body whose mimetype is not application/json
+    unless told ``content_type=None`` -- and ollama's native route labels a
+    non-streaming reply ``application/x-ndjson``. Test doubles and other
+    sessions expose a ``json()`` without that keyword. One reader, both
+    shapes: ask leniently first, fall back to the bare call. NEVER hides a
+    decode error -- only the keyword mismatch is absorbed."""
+    try:
+        return await resp.json(content_type=None)
+    except TypeError:
+        return await resp.json()
+
+
+def _extract_completion(data: "Dict[str, Any]") -> "Tuple[str, int, int]":
+    """``(text, completion_tokens, prompt_tokens)`` from EITHER dialect's
+    non-streaming reply. Dispatches on SHAPE, not on config, so a proxy that
+    answers in the other dialect is still read correctly. Missing counts are
+    0 (the caller labels the estimate). NEVER raises on a well-formed reply of
+    either shape; a malformed one raises KeyError like the old path did."""
+    if isinstance(data.get("message"), dict):              # ollama native
+        text = str(data["message"].get("content") or "")
+        return (text, int(data.get("eval_count") or 0),
+                int(data.get("prompt_eval_count") or 0))
+    text = data["choices"][0]["message"]["content"]         # OpenAI-compat
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    return (text, int(usage.get("completion_tokens", 0) or 0),
+            int(usage.get("prompt_tokens", 0) or 0))
+
+
+def _parse_ndjson_delta(line: "bytes") -> "Any":
+    """Parse ONE line of an ollama native ``/api/chat`` stream.
+
+    Clean sibling of ``_parse_sse_delta`` with the SAME contract, so the read
+    loop is dialect-blind: the incremental content string, ``_SSE_DONE`` on
+    the terminal frame, an ``_SSEUsage`` when that frame carries counts, or
+    None for blanks / parse errors. The native stream frames a JSON object
+    per line -- ``{"message": {"content": ...}, "done": false}`` -- and its
+    LAST frame carries ``done: true`` plus ``eval_count`` /
+    ``prompt_eval_count``. That final frame may also carry a trailing content
+    fragment, which is returned first through the same channel so nothing is
+    lost. Pure + fail-soft."""
+    try:
+        s = line.decode("utf-8", "ignore").strip() if isinstance(line, (bytes, bytearray)) else str(line).strip()
+        if not s or not s.startswith("{"):
+            return None
+        import json as _json  # noqa: PLC0415
+        obj = _json.loads(s)
+        if not isinstance(obj, dict):
+            return None
+        msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+        content = msg.get("content") or None
+        if obj.get("done"):
+            if content:
+                # A last fragment AND the end: hand back the fragment; the
+                # loop's next readline() hits EOF, which is also "done".
+                return content
+            ct = int(obj.get("eval_count") or 0)
+            if ct > 0:
+                return _SSEUsage(
+                    prompt_tokens=int(obj.get("prompt_eval_count") or 0),
+                    completion_tokens=ct,
+                )
+            return _SSE_DONE
+        return content
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _parse_stream_line(line: "bytes") -> "Any":
+    """Dialect-blind line parser: native NDJSON frames begin with ``{``,
+    OpenAI SSE frames begin with ``data:``. One loop, two wire formats, no
+    per-transport branch in the loop itself."""
+    try:
+        head = line.lstrip()[:1] if isinstance(line, (bytes, bytearray)) else str(line).lstrip()[:1]
+    except Exception:  # noqa: BLE001
+        return None
+    if head in (b"{", "{"):
+        return _parse_ndjson_delta(line)
+    return _parse_sse_delta(line)
+
+
 def _apply_response_format(body: "Dict[str, Any]", cfg: "LocalConfig") -> str:
     """Attach the strongest response constraint this engine is known to accept.
 
@@ -371,21 +527,29 @@ def _apply_response_format(body: "Dict[str, Any]", cfg: "LocalConfig") -> str:
         if _json_schema_mode_enabled() and _schema_key(cfg) not in _SCHEMA_UNSUPPORTED:
             schema = _resolve_response_schema()
             if schema:
-                body["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "ov_generation",
-                        # strict=False: the schema is a UNION and leaves
-                        # additionalProperties open by design (the parser
-                        # diagnoses unknown keys far better than a grammar can).
-                        # Demanding strict here is what makes some backends
-                        # reject an otherwise-valid schema.
-                        "strict": False,
-                        "schema": schema,
-                    },
-                }
+                if is_native_transport(cfg):
+                    # Native spelling: ``format`` carries the schema object
+                    # itself. Same grammar, same ladder, same rejection cache.
+                    body["format"] = schema
+                else:
+                    body["response_format"] = {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "ov_generation",
+                            # strict=False: the schema is a UNION and leaves
+                            # additionalProperties open by design (the parser
+                            # diagnoses unknown keys far better than a grammar can).
+                            # Demanding strict here is what makes some backends
+                            # reject an otherwise-valid schema.
+                            "strict": False,
+                            "schema": schema,
+                        },
+                    }
                 return "json_schema"
-        body["response_format"] = {"type": "json_object"}
+        if is_native_transport(cfg):
+            body["format"] = "json"
+        else:
+            body["response_format"] = {"type": "json_object"}
         return "json_object"
     except Exception:  # noqa: BLE001
         return "none"
@@ -442,7 +606,15 @@ def _apply_reasoning_effort(body: "Dict[str, Any]", cfg: "LocalConfig") -> str:
         effort = _reasoning_effort()
         if not effort or _schema_key(cfg) in _REASONING_UNSUPPORTED:
             return ""
-        body["reasoning_effort"] = effort
+        if is_native_transport(cfg):
+            # Native spelling. The docstring on ``_reasoning_effort`` records
+            # that ``think`` is silently IGNORED on /v1 -- it belongs to
+            # /api/chat, which is now where this request goes. ``none``
+            # maps to ``think: false``; any positive effort leaves thinking
+            # at the engine's default, since the native field is boolean.
+            body["think"] = effort != "none"
+        else:
+            body["reasoning_effort"] = effort
         return effort
     except Exception:  # noqa: BLE001
         return ""
@@ -458,7 +630,9 @@ def _degrade_reasoning_effort(body: "Dict[str, Any]", cfg: "LocalConfig") -> boo
         if key in _REASONING_UNSUPPORTED:
             return False
         _REASONING_UNSUPPORTED.add(key)
-        return body.pop("reasoning_effort", None) is not None
+        popped_openai = body.pop("reasoning_effort", None) is not None
+        popped_native = body.pop("think", None) is not None
+        return popped_openai or popped_native
     except Exception:  # noqa: BLE001
         return False
 
@@ -474,7 +648,10 @@ def _degrade_response_format(body: "Dict[str, Any]", cfg: "LocalConfig") -> bool
         if key in _SCHEMA_UNSUPPORTED:
             return False
         _SCHEMA_UNSUPPORTED.add(key)
-        body["response_format"] = {"type": "json_object"}
+        if is_native_transport(cfg):
+            body["format"] = "json"
+        else:
+            body["response_format"] = {"type": "json_object"}
         logger.warning(
             "[LocalPrimeClient] engine rejected json_schema response_format for "
             "model=%s at %s — degrading to json_object for the rest of this "
@@ -526,6 +703,17 @@ class LocalConfig:
     top_k: Optional[int] = None
     repeat_penalty: Optional[float] = None
     seed: Optional[int] = None
+    #: Which wire protocol the engine is spoken to over. ``native`` is
+    #: ollama's own ``/api/chat``; ``openai`` is ``/v1/chat/completions``.
+    #: Native is the default because the OpenAI-compatible layer DROPS the
+    #: ``options`` block -- measured on ollama 0.33.2 with curl: the same
+    #: ``seed`` produced two different completions and ``options.top_k=1``
+    #: (greedy) still varied, while the native route reproduced a seed
+    #: byte-for-byte and was greedy-identical twice. Every sampler field the
+    #: entropy ladder sets (top_k, repeat_penalty, seed) rides ``options``,
+    #: so on ``/v1`` the ladder was reaching the wire and not the sampler.
+    #: ``openai`` stays selectable for engines that only speak that dialect.
+    transport: str = "native"
 
     @classmethod
     def from_env(cls) -> "LocalConfig":
@@ -547,6 +735,8 @@ class LocalConfig:
             max_concurrency=_i("JARVIS_LOCAL_MODEL_MAX_CONCURRENCY", 2),
             pool_limit=_i("JARVIS_LOCAL_POOL_LIMIT", 8),
             num_ctx=int(_nc) if _nc.isdigit() else None,
+            transport=_normalise_transport(
+                os.environ.get("JARVIS_LOCAL_TRANSPORT", "")),
         )
 
 
@@ -1442,7 +1632,7 @@ class LocalPrimeClient:
                        prefill: str = "",
                        sampling: "Optional[Any]" = None) -> LocalCompletion:
         sess = await self._ensure_session()
-        url = self._cfg.base_url.rstrip("/") + "/v1/chat/completions"
+        url = chat_endpoint(self._cfg)
         # Dynamic Cognitive Compression + num_ctx injection (Context-Hardware
         # Negotiator). When a VRAM-safe num_ctx is configured, fit the payload to
         # the INPUT budget (num_ctx minus reserved output) so the KV cache can never
@@ -1533,6 +1723,9 @@ class LocalPrimeClient:
                 "[LocalPrimeClient] per-draw sampling applied: %s",
                 _sampling_applied,
             )
+        # Built once in OpenAI spelling; translated once for the wire it is
+        # about to travel. The native route is where ``options`` bites.
+        _spell_for_transport(body, self._cfg)
 
         _use_stream = stream if stream is not None else (
             bool(self._cfg.num_ctx) and _streaming_enabled())
@@ -1556,7 +1749,9 @@ class LocalPrimeClient:
             )
             if 400 <= resp.status < 500 and (
                 "response_format" in body
+                or "format" in body
                 or "reasoning_effort" in body
+                or "think" in body
                 or _has_draft
             ):
                 _body_txt = await resp.text()
@@ -1571,12 +1766,12 @@ class LocalPrimeClient:
                     _degraded = _degrade_draft_tokens(body, self._cfg)
                     _what = "draft_num_predict"
                 elif (
-                    "reasoning_effort" in body
-                    and "reasoning_effort" in _body_txt
+                    ("reasoning_effort" in body and "reasoning_effort" in _body_txt)
+                    or ("think" in body and "think" in _body_txt.lower())
                 ):
                     _degraded = _degrade_reasoning_effort(body, self._cfg)
                     _what = "reasoning_effort"
-                elif "response_format" in body:
+                elif "response_format" in body or "format" in body:
                     _degraded = _degrade_response_format(body, self._cfg)
                     _what = "json_schema"
                 else:
@@ -1594,16 +1789,17 @@ class LocalPrimeClient:
                         _what, resp.status, _body_txt[:160],
                     )
                     async with sess.post(url, json=body) as resp2:
-                        data = await resp2.json()
+                        data = await _read_json(resp2)
                 else:
                     resp.raise_for_status()
-                    data = await resp.json()
+                    data = await _read_json(resp)
             else:
-                data = await resp.json()
+                data = await _read_json(resp)
         total_ms = (time.monotonic() - t0) * 1000.0
-        text = data["choices"][0]["message"]["content"]
-        _usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-        _reported = int(_usage.get("completion_tokens", 0) or 0)
+        # Shape-dispatched: reads the native reply (``message.content`` +
+        # ``eval_count``) or the OpenAI one (``choices[0]`` + ``usage``).
+        text, _reported, _prompt_reported = _extract_completion(data)
+        _usage = {"prompt_tokens": _prompt_reported}
         # Estimation is the LAST resort, and it is labelled when used. The
         # `or` chain that preceded this silently produced the same int for
         # a measurement and a guess, so nothing downstream could tell a
@@ -1646,7 +1842,9 @@ class LocalPrimeClient:
         # and the estimate resumes -- now labelled as one. There is nothing
         # to degrade, so this needs no capability-rejection cache like the
         # schema / reasoning_effort / draft ladders above.
-        if _stream_usage_enabled():
+        if _stream_usage_enabled() and not is_native_transport(self._cfg):
+            # OpenAI-only accounting request. The native stream's terminal
+            # frame carries eval_count/prompt_eval_count unasked.
             body["stream_options"] = {"include_usage": True}
         # TWO deadlines, not one. The wait before the first chunk measures
         # PREFILL (grows with prompt size); every wait after it measures the
@@ -1819,7 +2017,7 @@ class LocalPrimeClient:
                         )
                     if not line:
                         break  # EOF -> stream complete
-                    delta = _parse_sse_delta(line)
+                    delta = _parse_stream_line(line)
                     if delta is _SSE_DONE:
                         break
                     if isinstance(delta, _SSEUsage):
@@ -1966,14 +2164,13 @@ class LocalPrimeClient:
         """
         async def _do_warmup() -> bool:
             sess = await self._ensure_session()
-            url = self._cfg.base_url.rstrip("/") + "/v1/chat/completions"
-            body = {
+            url = chat_endpoint(self._cfg)
+            body = _spell_for_transport({
                 "model": self._cfg.model_name,
                 "messages": [{"role": "user", "content": "warmup"}],
                 "max_tokens": 1,
-                "num_predict": 1,
                 "temperature": 0.0,
-            }
+            }, self._cfg)
             # Dedicated Cold-Start HTTP Context: give the warmup POST its OWN total
             # timeout == the (heavy-mult-scaled) warmup budget, overriding aiohttp's
             # 300s session default. A 32B is ~20GB; the PCIe->VRAM cold-load can
@@ -1986,7 +2183,7 @@ class LocalPrimeClient:
             except Exception:  # noqa: BLE001
                 _post_kw = {}
             async with sess.post(url, json=body, **_post_kw) as resp:
-                await resp.json()
+                await _read_json(resp)
             return True
 
         try:

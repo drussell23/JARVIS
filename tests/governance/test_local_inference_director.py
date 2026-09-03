@@ -108,7 +108,8 @@ async def test_client_generate_posts_to_openai_compat_with_keep_alive():
     payload = {"choices": [{"message": {"content": "patched code"}}],
                "usage": {"completion_tokens": 12}}
     fake = _FakeSession(payload)
-    cfg = LocalConfig.from_env()
+    # Pins the OpenAI-compatible dialect explicitly; the default is native.
+    cfg = LocalConfig(**{**LocalConfig.from_env().__dict__, "transport": "openai"})
     client = LocalPrimeClient(cfg, session=fake)
     out = await client.complete(system="<sys/>", user="<task/>", prompt_tokens=100)
     assert out.text == "patched code"
@@ -211,7 +212,8 @@ async def test_generate_returns_primeresponse_with_content():
     from backend.core.ouroboros.governance.local_inference_director import LocalPrimeClient, LocalConfig
     fake = _FakeSession({"choices": [{"message": {"content": "GENERATED"}}],
                          "usage": {"completion_tokens": 7}})
-    client = LocalPrimeClient(LocalConfig.from_env(), session=fake)
+    _cfg = LocalConfig(**{**LocalConfig.from_env().__dict__, "transport": "openai"})
+    client = LocalPrimeClient(_cfg, session=fake)
     resp = await client.generate(prompt="do x", system_prompt="be terse", max_tokens=256, temperature=0.0)
     assert resp.content == "GENERATED"
     assert resp.source == "local_prime"

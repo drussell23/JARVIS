@@ -55,7 +55,14 @@ def lid(monkeypatch):
 
 @pytest.fixture()
 def cfg(lid):
-    return lid.LocalConfig.from_env()
+    # These tests pin the OpenAI-compatible DIALECT's spellings
+    # (``response_format``, ``/v1/chat/completions``). The default transport
+    # is now native (``/api/chat`` -- the only route on which the sampler
+    # options bite), so the dialect under test is declared rather than
+    # inherited. The native spellings have their own spine in
+    # test_local_native_transport.py.
+    return lid.LocalConfig(**{**lid.LocalConfig.from_env().__dict__,
+                              "transport": "openai"})
 
 
 @pytest.fixture()
@@ -324,7 +331,9 @@ def _client(lid, session, **cfg_over):
     base = lid.LocalConfig.from_env().__dict__
     # num_ctx=None keeps the non-streaming branch, which is the path the 4xx
     # probe lives on.
-    cfg = lid.LocalConfig(**{**base, "num_ctx": None, **cfg_over})
+    # These probes assert the OpenAI dialect's spellings (``response_format``);
+    # the default transport is native, so the dialect is declared.
+    cfg = lid.LocalConfig(**{**base, "num_ctx": None, "transport": "openai", **cfg_over})
     return lid.LocalPrimeClient(cfg, session=session), cfg
 
 

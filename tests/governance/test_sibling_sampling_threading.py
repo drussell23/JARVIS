@@ -131,19 +131,24 @@ async def test_sampling_point_reaches_the_request_body(lid, ent):
     )
     body = sess.last_body
 
-    # OpenAI-compatible spelling: top-level fields.
-    assert body["top_p"] == pytest.approx(float(point.top_p))
-    assert body["seed"] == int(point.seed)
-
-    # ollama-native spelling: top_k and repeat_penalty have no OpenAI form.
+    # The default transport is NATIVE (/api/chat): every sampler field rides
+    # ``options``, which is the only block that route honours. The top-level
+    # OpenAI copies are deliberately ABSENT -- on /v1 they were the fields
+    # that reached the wire and not the sampler (measured: same seed, two
+    # different completions). The OpenAI dialect keeps both spellings; its
+    # twin lives in test_local_native_transport.py.
+    assert lid.is_native_transport(cfg)
+    assert "top_p" not in body and "seed" not in body
     opts = body["options"]
     assert opts["top_k"] == int(point.top_k)
     assert opts["repeat_penalty"] == pytest.approx(float(point.repeat_penalty))
     assert opts["top_p"] == pytest.approx(float(point.top_p))
     assert opts["seed"] == int(point.seed)
 
-    # Temperature is the one that always worked; it must not have regressed.
-    assert body["temperature"] == pytest.approx(0.2)
+    # Temperature is the one that always worked; on the native route it too
+    # lives in ``options`` -- and must not have regressed.
+    assert "temperature" not in body
+    assert opts["temperature"] == pytest.approx(0.2)
 
 
 @pytest.mark.asyncio
@@ -185,7 +190,7 @@ async def test_distinct_draws_post_distinct_seeds(lid, ent):
         await client.complete(
             system="<s/>", user="<u/>", prompt_tokens=10, sampling=point,
         )
-        seeds.append(sess.last_body["seed"])
+        seeds.append(sess.last_body["options"]["seed"])
 
     assert seeds[0] != seeds[1], f"both draws posted seed={seeds[0]}"
 
