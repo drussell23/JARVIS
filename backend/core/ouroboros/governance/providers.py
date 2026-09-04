@@ -5165,6 +5165,7 @@ def _parse_generation_response(
             provider_name=pfx,
             generation_duration_s=duration_s,
             is_noop=True,
+            noop_reason=str(_quick.get("reason", "") or ""),
         )
 
     # Step 1: JSON parse (with repair fallback for DW 397B malformed output)
@@ -5359,6 +5360,7 @@ def _parse_generation_response(
             provider_name=pfx,
             generation_duration_s=duration_s,
             is_noop=True,
+            noop_reason=str(data.get("reason", "") or ""),
         )
 
     if actual_version == _TOOL_SCHEMA_VERSION:

@@ -303,6 +303,11 @@ class GenerationResult:
     generation_duration_s: float
     model_id: str = ""      # provider model identifier; empty = not reported
     is_noop: bool = False   # True when model signals change already present
+    # The model's stated REASON for declining. Only meaningful when
+    # `is_noop`. Carried because a refusal is an ANSWER: the trajectory
+    # recorder persists it as the candidate body, and two refusals that
+    # differ only in reasoning are two answers, not one.
+    noop_reason: str = ""
     # L1: audit records from tool-use loop (empty when tools disabled)
     tool_execution_records: Tuple[Any, ...] = ()
     # Venom edit/write/delete audit trail captured from ToolExecutor at

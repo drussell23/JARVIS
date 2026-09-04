@@ -140,6 +140,54 @@ def _canonical_session_id() -> str:
         return ""
 
 
+#: Schema the model itself uses to decline. The synthesised body below is
+#: this exact envelope because reactor's `grpo_verifier.extract_sources`
+#: already knows it: it returns `no_source_by_shape`, which `verify_static`
+#: scores at the SYNTAX ceiling -- full credit for a well-formed answer,
+#: zero credit for substance it never claimed. Storing the bare reason
+#: PROSE instead would fail `json.loads`, fall through to `_grade_source`,
+#: and be graded as broken Python: measured 0.250/tier-2 `syntax_error`
+#: against 0.450/tier-1 for the envelope. That inversion would teach the
+#: model that declining is no better than emitting garbage, which is the
+#: precise failure the verifier's own reason-kind dispatch exists to stop.
+_NOOP_SCHEMA_VERSION = "2b.1-noop"
+
+#: Candidate id for a synthesised refusal row. Stable, so a consumer can
+#: recognise one without parsing prose.
+_NOOP_CANDIDATE_ID = "noop"
+
+#: The structure class every refusal shares. Not a digest: a decline has
+#: no AST to digest, and all declines are one answer-kind.
+_NOOP_STRUCTURE_ID = "noop"
+
+
+def noop_candidate(reason: str) -> Dict[str, Any]:
+    """One candidate dict standing for a refusal. NEVER raises.
+
+    The body is the decline ENVELOPE, not the reason text -- see
+    `_NOOP_SCHEMA_VERSION`. The hash is derived from that body so the
+    recorder's existing (op_id, candidate_hash) dedupe collapses a model
+    that repeats itself while keeping two genuinely different refusals as
+    two rows. No second hasher: `candidate_hash` is the same identity the
+    retract seam and the per-candidate verdict join already key on.
+    """
+    body = json.dumps(
+        {"schema_version": _NOOP_SCHEMA_VERSION, "reason": str(reason or "")},
+        ensure_ascii=False, separators=(",", ":"),
+    )
+    digest = hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()[:32]
+    return {
+        "candidate_id": _NOOP_CANDIDATE_ID,
+        "candidate_hash": digest,
+        "file_path": "",
+        "full_content": body,
+        # The deterministic tag downstream reads INSTEAD of sniffing the
+        # body. A consumer must never have to string-match prose to learn
+        # that a row is a refusal.
+        "candidate_status": "noop",
+    }
+
+
 def events_dir() -> Path:
     """Directory the Trinity experience receiver already watches."""
     raw = os.getenv(_ENV_DIR, "").strip()
@@ -244,6 +292,15 @@ def _structure_stamps(
     parse -- unparseable answers are real and must not be silently
     folded together under one shared id.
 
+    A REFUSAL is its own structure class, ``_NOOP_STRUCTURE_ID``. Its body
+    is a decline envelope, not Python, so it fingerprints as unparseable
+    and would otherwise contribute nothing -- making a {refusal, patch}
+    group report ``n_distinct_structures=1`` and read as unpairable when
+    it is in fact the widest-separated pair the corpus holds (0.3586 by
+    the static grader). Two refusals still share the id, which is also
+    right: declining twice is one answer given twice, so an all-refusal
+    group correctly reports 1 and stays out of the pairable count.
+
     Describes; never decides. The recorder does not re-sample -- that
     belongs to the generation lane, which owns the budget and the
     provider seat.
@@ -256,6 +313,12 @@ def _structure_stamps(
         )
         for cand in candidates or ():
             if not isinstance(cand, dict):
+                continue
+            if str(cand.get("candidate_status", "") or "") == "noop":
+                ids[str(cand.get("candidate_hash", "") or "")] = (
+                    _NOOP_STRUCTURE_ID
+                )
+                distinct.add(_NOOP_STRUCTURE_ID)
                 continue
             fp = _ent.structural_fingerprint(_ent.candidate_source(cand))
             if fp is None:
@@ -598,14 +661,36 @@ class TrajectoryRecorder:
         traj = _trajectory_from_generation_result(
             "", prompt_key, generation_result,
         )
-        if traj is None or not traj.candidates:
+        if traj is None:
             return False
+        _cands = tuple(traj.candidates)
+        if not _cands:
+            # A REFUSAL IS AN ANSWER. The model was asked to change a file
+            # and replied "already correct" -- a response to this exact
+            # prompt, and the cleanest negative half of a preference pair
+            # the corpus can hold: measured against a working patch the
+            # static grader separates them by 0.3586, where the trainable
+            # gate asks for 0.01.
+            #
+            # Dropping it here is what made 8 of soak 19's 15 singleton
+            # ops singletons, and the drop was silent: this early return
+            # fires BEFORE the "was NOT queued" log below, so a refused
+            # draw left no row and no trace of having been refused.
+            #
+            # `_NOOP` in the outcome policy above has ALWAYS said
+            # should_train=True ("a NO-OP verdict is an answer, not an
+            # absence"). Only the row was missing.
+            if not bool(getattr(traj, "is_noop", False)):
+                return False
+            _cands = (
+                noop_candidate(str(getattr(traj, "noop_reason", "") or "")),
+            )
 
         pending = _PendingGeneration(
             op_id=str(op_id),
             prompt=prompt_text,
             prompt_key=prompt_key,
-            candidates=tuple(traj.candidates),
+            candidates=_cands,
             model_id=(str(model_id_override).strip() or traj.model_id),
             provider_name=traj.provider_name,
             is_noop=bool(traj.is_noop),
@@ -1263,6 +1348,14 @@ class TrajectoryRecorder:
                         "draw_kind": gen.draw_kind,
                         "temperature": gen.temperature,
                         "sampling": dict(gen.sampling),
+                        # Deterministic discriminator: "noop" for a
+                        # synthesised refusal, "patch" for a real
+                        # candidate. Downstream selects on THIS rather
+                        # than inferring from an empty file_path or by
+                        # parsing the body.
+                        "candidate_status": str(
+                            cand.get("candidate_status", "") or "patch"
+                        ),
                         "file_path": str(cand.get("file_path", "") or ""),
                         "source_path": str(cand.get("source_path", "") or ""),
                         "provider_name": gen.provider_name,
@@ -1698,6 +1791,7 @@ __all__ = [
     "TrajectoryRecorder",
     "classify_terminal_reason",
     "events_dir",
+    "noop_candidate",
     "get_recorder",
     "harvest_snapshot",
     "record_candidate_verdict",

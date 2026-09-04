@@ -249,6 +249,10 @@ class CachedTrajectory:
     # "unknown" (older serialized entries without this field roundtrip
     # cleanly as 0.0; their would-save is reported as $0.000000).
     original_cost_usd: float = 0.0
+    #: The model's stated reason for declining. Only meaningful when
+    #: ``is_noop``. Defaulted, so an older pickled/constructed entry is
+    #: still valid.
+    noop_reason: str = ""
     created_at: float = field(default_factory=time.monotonic)
     schema_version: str = PROVIDER_RESPONSE_CACHE_SCHEMA_VERSION
 
@@ -318,6 +322,7 @@ def _trajectory_from_generation_result(
             provider_name=str(getattr(gr, "provider_name", "")),
             model_id=str(getattr(gr, "model_id", "")),
             is_noop=bool(getattr(gr, "is_noop", False)),
+            noop_reason=str(getattr(gr, "noop_reason", "") or ""),
             prompt_preloaded_files=tuple(
                 getattr(gr, "prompt_preloaded_files", ()) or ()
             ),
@@ -354,6 +359,7 @@ def reconstruct_generation_result(traj: CachedTrajectory) -> Optional[Any]:
             generation_duration_s=0.0,
             model_id=traj.model_id,
             is_noop=traj.is_noop,
+            noop_reason=getattr(traj, "noop_reason", "") or "",
             prompt_preloaded_files=tuple(traj.prompt_preloaded_files),
             total_input_tokens=traj.total_input_tokens,
             total_output_tokens=traj.total_output_tokens,

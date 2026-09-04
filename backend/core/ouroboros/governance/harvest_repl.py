@@ -224,11 +224,24 @@ def _render_groups(limit: int) -> str:
     ]
     for key, members in multi[:limit]:
         fps = []
+        # A REFUSAL is its own answer class. Its body is a decline
+        # envelope, not Python, so `structural_fingerprint` returns None
+        # and it would be dropped from the set entirely -- making a
+        # {refusal, patch} group report one answer and read "collapsed",
+        # which is precisely the "rows healthy, pairs zero" blindness this
+        # view exists to expose. The recorder already decided this and
+        # stamped `metadata.structure_id`; trust that rather than
+        # re-deriving a second opinion here.
+        n_refusals = 0
         for row in members:
+            meta = row.get("metadata") or {}
+            if str(meta.get("candidate_status", "") or "") == "noop":
+                n_refusals += 1
+                continue
             fp = ent.structural_fingerprint(row.get("assistant_output") or "")
             if fp is not None:
                 fps.append(fp)
-        distinct = len({*fps})
+        distinct = len({*fps}) + (1 if n_refusals else 0)
         sims = [
             ent.structural_similarity(fps[i], fps[j])
             for i in range(len(fps))

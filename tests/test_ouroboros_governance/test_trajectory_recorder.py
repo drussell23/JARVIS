@@ -519,3 +519,240 @@ def test_emit_without_running_loop_is_silent_not_fatal(
         generation_result=_FakeGenerationResult(candidates=(_candidate(),)),
     ) is False
     assert r.stats()["dropped_no_loop"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# A refusal is an answer: it gets a row (soak 19: 8 of 15 singletons)
+# ---------------------------------------------------------------------------
+
+
+def _noop_result(reason: str = "already fully implemented"):
+    """What the provider builds for `2b.1-noop`: no candidates, is_noop,
+    and the model's stated reason carried alongside."""
+    r = _FakeGenerationResult(candidates=(), is_noop=True)
+    r.noop_reason = reason  # type: ignore[attr-defined]
+    return r
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_is_persisted_as_a_row(rec: TrajectoryRecorder) -> None:
+    """The whole change. Before, this returned False and wrote nothing:
+    the model answered the prompt and the corpus kept no trace."""
+    assert rec.record_generation(
+        op_id="op-refuse", prompt="fix the recursion guard",
+        generation_result=_noop_result("the guard is already present"),
+    ) is True
+    rec.record_outcome(op_id="op-refuse", terminal_reason="2b.1-noop")
+    await rec.drain()
+
+    rows = _lines(rec.path)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["metadata"]["candidate_status"] == "noop"
+    assert row["metadata"]["should_train"] is True
+    assert row["outcome"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_the_body_is_the_envelope_not_the_prose(
+    rec: TrajectoryRecorder,
+) -> None:
+    """Load-bearing: reactor's grader reads the ENVELOPE and scores it at
+    the syntax ceiling. Bare prose fails json.loads, falls through to the
+    source grader and is scored as BROKEN PYTHON -- teaching the model
+    that declining is no better than emitting garbage."""
+    rec.record_generation(
+        op_id="op-env", prompt="p",
+        generation_result=_noop_result("already correct"),
+    )
+    rec.record_outcome(op_id="op-env", terminal_reason="2b.1-noop")
+    await rec.drain()
+
+    body = _lines(rec.path)[0]["assistant_output"]
+    parsed = json.loads(body)  # must be a real envelope
+    assert parsed["schema_version"] == "2b.1-noop"
+    assert parsed["reason"] == "already correct"
+
+
+@pytest.mark.asyncio
+async def test_an_empty_non_noop_result_is_still_dropped(
+    rec: TrajectoryRecorder,
+) -> None:
+    """The old guard survives for what it was actually protecting: an
+    empty result that is NOT a refusal is a fault, not an answer."""
+    assert rec.record_generation(
+        op_id="op-empty2", prompt="p",
+        generation_result=_FakeGenerationResult(candidates=()),
+    ) is False
+    await rec.drain()
+    assert _lines(rec.path) == []
+
+
+@pytest.mark.asyncio
+async def test_two_different_refusals_are_two_rows(
+    rec: TrajectoryRecorder,
+) -> None:
+    """Different reasoning is a different answer, so the (op, hash) dedupe
+    must not collapse them."""
+    rec.record_generation(op_id="op-two", prompt="p",
+                          generation_result=_noop_result("reason A"))
+    rec.record_generation(op_id="op-two", prompt="p",
+                          generation_result=_noop_result("reason B"))
+    rec.record_outcome(op_id="op-two", terminal_reason="2b.1-noop")
+    await rec.drain()
+
+    rows = _lines(rec.path)
+    assert len(rows) == 2
+    hashes = {r["metadata"]["candidate_hash"] for r in rows}
+    assert len(hashes) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_refusal_is_deduped(rec: TrajectoryRecorder) -> None:
+    """Saying the same thing twice is one answer given twice -- the
+    existing (op_id, candidate_hash) dedupe must absorb it, so a model
+    that noop-spams cannot flood the corpus with identical rows."""
+    for _ in range(4):
+        rec.record_generation(op_id="op-spam", prompt="p",
+                              generation_result=_noop_result("same reason"))
+    rec.record_outcome(op_id="op-spam", terminal_reason="2b.1-noop")
+    await rec.drain()
+    assert len(_lines(rec.path)) == 1
+
+
+@pytest.mark.asyncio
+async def test_refusal_and_patch_are_two_distinct_structures(
+    rec: TrajectoryRecorder,
+) -> None:
+    """The pair this whole change exists to create.
+
+    A refusal has no AST, so without its own structure class it would
+    contribute nothing and a {refusal, patch} group would report
+    n_distinct_structures=1 -- reading as unpairable when it is the
+    widest-separated pair in the corpus.
+    """
+    rec.record_generation(op_id="op-mix", prompt="p",
+                          generation_result=_noop_result("declining"))
+    rec.record_generation(
+        op_id="op-mix", prompt="p",
+        generation_result=_FakeGenerationResult(candidates=(_candidate(),)),
+    )
+    rec.record_outcome(op_id="op-mix", terminal_reason="applied")
+    await rec.drain()
+
+    rows = _lines(rec.path)
+    assert len(rows) == 2
+    assert {r["metadata"]["candidate_status"] for r in rows} == {"noop", "patch"}
+    # `n_distinct_structures` is stamped PER GENERATION and every local
+    # draw is its own generation, so it reads 1 on both rows by
+    # construction. The key that groups ACROSS draws is `structure_id`.
+    sids = {r["metadata"]["structure_id"] for r in rows}
+    assert len(sids) == 2, sids
+    assert "noop" in sids
+
+
+@pytest.mark.asyncio
+async def test_all_refusal_group_reports_one_structure(
+    rec: TrajectoryRecorder,
+) -> None:
+    """Declining twice is ONE answer given twice. The group must report a
+    single structure so it stays out of the pairable count and, downstream,
+    out of advantage normalisation."""
+    rec.record_generation(op_id="op-allnoop", prompt="p",
+                          generation_result=_noop_result("reason A"))
+    rec.record_generation(op_id="op-allnoop", prompt="p",
+                          generation_result=_noop_result("reason B"))
+    rec.record_outcome(op_id="op-allnoop", terminal_reason="2b.1-noop")
+    await rec.drain()
+
+    rows = _lines(rec.path)
+    assert len(rows) == 2
+    # Two refusals are ONE answer given twice: a single structure class,
+    # so the group stays out of the pairable count.
+    assert {r["metadata"]["structure_id"] for r in rows} == {"noop"}
+
+
+@pytest.mark.asyncio
+async def test_a_patch_row_is_tagged_patch(rec: TrajectoryRecorder) -> None:
+    """The tag is deterministic on BOTH sides -- a consumer never has to
+    infer 'not a refusal' from an absent field."""
+    rec.record_generation(
+        op_id="op-patch", prompt="p",
+        generation_result=_FakeGenerationResult(candidates=(_candidate(),)),
+    )
+    rec.record_outcome(op_id="op-patch", terminal_reason="applied")
+    await rec.drain()
+    assert _lines(rec.path)[0]["metadata"]["candidate_status"] == "patch"
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_row_keeps_the_dpo_contract(
+    rec: TrajectoryRecorder,
+) -> None:
+    """A synthesised row is still a row: every key the pair generator
+    reads must be present, or the corpus silently stops pairing."""
+    rec.record_generation(op_id="op-contract", prompt="p",
+                          generation_result=_noop_result("nope"))
+    rec.record_outcome(op_id="op-contract", terminal_reason="2b.1-noop")
+    await rec.drain()
+    row = _lines(rec.path)[0]
+    assert _DPO_CONTRACT_KEYS.issubset(row.keys())
+    assert row["event_type"] == "interaction"
+    assert row["metadata"]["draw_kind"] == "primary"
+
+
+def test_noop_candidate_is_deterministic() -> None:
+    """Same refusal -> same hash, in-process and across runs. The dedupe
+    and the retract seam both key on it."""
+    from backend.core.ouroboros.governance.observability.trajectory_recorder import (  # noqa: E501
+        noop_candidate,
+    )
+
+    a = noop_candidate("identical")
+    b = noop_candidate("identical")
+    c = noop_candidate("different")
+    assert a["candidate_hash"] == b["candidate_hash"]
+    assert a["candidate_hash"] != c["candidate_hash"]
+    assert a["candidate_status"] == "noop"
+    assert json.loads(a["full_content"])["schema_version"] == "2b.1-noop"
+
+
+def test_noop_candidate_survives_a_missing_reason() -> None:
+    """A provider that declined without saying why still yields a valid,
+    gradable envelope rather than an empty body the writer would skip."""
+    from backend.core.ouroboros.governance.observability.trajectory_recorder import (  # noqa: E501
+        noop_candidate,
+    )
+
+    cand = noop_candidate("")
+    assert cand["full_content"]
+    assert json.loads(cand["full_content"])["reason"] == ""
+
+
+@pytest.mark.asyncio
+async def test_harvest_counts_a_refusal_as_its_own_answer(
+    rec: TrajectoryRecorder, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The diagnostic must not deny the pair the corpus just gained.
+
+    `_render_groups` recomputes a fingerprint from `assistant_output`; a
+    refusal's body is an envelope, not Python, so it fingerprints as None
+    and a {refusal, patch} group would read `collapsed` -- the exact
+    "healthy row count, zero pairs" blindness /harvest exists to expose.
+    """
+    from backend.core.ouroboros.governance import harvest_repl
+
+    rec.record_generation(op_id="op-hv", prompt="p",
+                          generation_result=_noop_result("declining"))
+    rec.record_generation(
+        op_id="op-hv", prompt="p",
+        generation_result=_FakeGenerationResult(candidates=(_candidate(),)),
+    )
+    rec.record_outcome(op_id="op-hv", terminal_reason="applied")
+    await rec.drain()
+
+    monkeypatch.setenv("JARVIS_TRAJECTORY_RECORDER_DIR", str(rec.path.parent))
+    text = harvest_repl._render_groups(10)
+    assert "op-hv" in text
+    line = next(ln for ln in text.splitlines() if "op-hv" in ln)
+    assert "PAIRABLE" in line, line
