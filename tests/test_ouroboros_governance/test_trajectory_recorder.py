@@ -858,3 +858,85 @@ async def test_parse_error_is_its_own_structure_class(
     assert {r["metadata"]["candidate_status"] for r in rows} == {
         "noop", "parse_error", "patch",
     }
+
+# ---------------------------------------------------------------------------
+# A refusal is self-evidencing: it does not need the op's verdict
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_noop_is_trainable_even_when_the_op_never_reported(
+    rec: TrajectoryRecorder,
+) -> None:
+    """The measured loss: 70 noop/primary rows written, 24 survived.
+
+    An op that declines never reaches a verdict-bearing phase, so
+    classify_terminal_reason falls through to _UNKNOWN (should_train
+    False) and the refusal is discarded downstream. But the refusal's
+    outcome is not unseen — the generation declared it.
+    """
+    rec.record_generation(
+        op_id="op-unvouched", prompt="p",
+        generation_result=_noop_result("already correct"),
+    )
+    # a reason the policy does not name -> _UNKNOWN
+    rec.record_outcome(op_id="op-unvouched", terminal_reason="")
+    await rec.drain()
+
+    row = _lines(rec.path)[0]
+    assert row["outcome"] == "partial"
+    assert row["metadata"]["should_train"] is True
+    assert row["metadata"]["candidate_status"] == "noop"
+
+
+@pytest.mark.asyncio
+async def test_a_judged_failure_still_outranks_the_declaration(
+    rec: TrajectoryRecorder,
+) -> None:
+    """`failure` is NOT overridable: a candidate judged bad on its own
+    merits outranks what the generation declared about itself."""
+    rec.record_generation(
+        op_id="op-judged", prompt="p",
+        generation_result=_noop_result("claims nothing to do"),
+    )
+    rec.record_outcome(op_id="op-judged", terminal_reason="validation_failed")
+    await rec.drain()
+
+    row = _lines(rec.path)[0]
+    assert row["outcome"] == "failure"
+    assert row["metadata"]["should_train"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_caged_noop_stays_untrainable(rec: TrajectoryRecorder) -> None:
+    """Governance denials are never model quality — the cage outcome must
+    survive the refusal override, or the corpus learns from ops whose
+    death the model did not cause."""
+    rec.record_generation(
+        op_id="op-caged", prompt="p",
+        generation_result=_noop_result("declining"),
+    )
+    rec.record_outcome(
+        op_id="op-caged", terminal_reason="self_modification_unsanctioned_source",
+    )
+    await rec.drain()
+
+    row = _lines(rec.path)[0]
+    assert row["metadata"]["should_train"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_patch_with_no_verdict_is_still_untrainable(
+    rec: TrajectoryRecorder,
+) -> None:
+    """The override is for REFUSALS only. A patch whose op never reported
+    is genuinely unseen — nothing declares whether the code was good."""
+    rec.record_generation(
+        op_id="op-patch-unvouched", prompt="p",
+        generation_result=_FakeGenerationResult(candidates=(_candidate(),)),
+    )
+    rec.record_outcome(op_id="op-patch-unvouched", terminal_reason="")
+    await rec.drain()
+
+    row = _lines(rec.path)[0]
+    assert row["metadata"]["should_train"] is False

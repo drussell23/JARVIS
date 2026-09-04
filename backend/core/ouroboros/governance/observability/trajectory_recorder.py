@@ -252,6 +252,43 @@ _CAGED: _OutcomePolicy = ("unknown", "policy_denied", False)
 _INFRA: _OutcomePolicy = ("unknown", "no_journal_lease", False)
 _UNKNOWN: _OutcomePolicy = ("unknown", "intent_written", False)
 
+#: Op-level outcomes that a generation's OWN ``is_noop`` may override.
+#:
+#: A refusal is SELF-EVIDENCING. The model returned ``2b.1-noop`` — that IS
+#: the answer, and unlike a patch it needs no external verdict to be known:
+#: its diff is verifiably null BY CONSTRUCTION, because no candidate was
+#: produced and the recorded body is the decline envelope itself. Running an
+#: AST check over it would parse a JSON object that contains no code and
+#: prove nothing the schema has not already stated.
+#:
+#: ``success`` was the original member: an op that ended well but whose
+#: generation declined is ``partial``, not ``applied``.
+#:
+#: ``unknown`` is added because it was silently costing the corpus its
+#: refusals. ``classify_terminal_reason`` falls through to ``_UNKNOWN``
+#: (should_train FALSE) whenever an op terminates without a reason the
+#: policy names — which is the common case for a declining op, since it
+#: never reaches a verdict-bearing phase. Measured on soak
+#: bt-2026-09-04-213313: 70 ``noop``/``primary`` rows were written and only
+#: 24 survived to the trainer; the rest carried should_train=False from this
+#: fall-through. The ``_UNKNOWN`` policy exists so an UNSEEN outcome is
+#: never guessed — but a refusal's outcome is not unseen, it is declared by
+#: the generation itself, so deferring to the op-level silence discards a
+#: fact the row already carries.
+#:
+#: Deliberately NOT overridable: ``failure`` (the candidate was judged bad
+#: on its own merits and that judgement outranks the declaration) and the
+#: governance-cage outcomes, whose whole point is that model quality was
+#: never the reason the op died.
+#:
+#: Matched on the POLICY TUPLE, never on the outcome string. ``_CAGED``,
+#: ``_INFRA`` and ``_UNKNOWN`` ALL carry outcome ``"unknown"`` and are told
+#: apart only by their ``autonomy_event_type``, so an outcome-string test
+#: silently makes a governance-denied refusal trainable — the one thing this
+#: must not do. The first version of this constant did exactly that and its
+#: own test caught it.
+_NOOP_OVERRIDABLE_POLICIES: frozenset = frozenset({_SUCCESS, _UNKNOWN})
+
 #: Validation failure classes that mean "never judged", not "judged bad".
 #: Mirrors reactor-core's autonomy_classifier policy -- infrastructure is
 #: not quality -- and the op-level mapping that already sends
@@ -1125,7 +1162,9 @@ class TrajectoryRecorder:
         lineage = self._validate_lineage(evt.op_id, list(lineage or []))
         for _n, _gen in enumerate(lineage or []):
             _outcome, _autonomy, _train = outcome, autonomy_type, should_train
-            if _gen.is_noop and _outcome == "success":
+            if _gen.is_noop and (
+                _outcome, _autonomy, _train
+            ) in _NOOP_OVERRIDABLE_POLICIES:
                 _outcome, _autonomy, _train = _NOOP
             _gen.lineage_size = len(lineage or [])
             await self._write(_gen, _outcome, _autonomy, _train, evt)
