@@ -188,6 +188,48 @@ def noop_candidate(reason: str) -> Dict[str, Any]:
     }
 
 
+#: Candidate id for a synthesised unparseable row.
+_PARSE_ERROR_CANDIDATE_ID = "parse_error"
+
+#: The structure class every unparseable draw shares. A candidate that does
+#: not parse has no AST to digest, and `_structure_stamps` would drop it —
+#: leaving a {parse_error, patch} group reading as one answer.
+_PARSE_ERROR_STRUCTURE_ID = "parse_error"
+
+
+def parse_error_candidate(
+    raw: str, failures: "Optional[List[Dict[str, Any]]]" = None,
+) -> Dict[str, Any]:
+    """One candidate dict standing for a draw that did not parse.
+
+    The body is the model's RAW response, verbatim. That is the whole
+    point: reactor's `extract_sources` reaches through the envelope to the
+    candidate bodies and hands the invalid Python to `_grade_source`,
+    which scores it by HOW FAR the parse got — measured 0.250 for a
+    failure on line 1 of 3, 0.393 for line 6 of 7. Storing a summary, a
+    truncated preview, or a synthetic marker instead would throw that
+    gradient away and collapse every parse error onto one value.
+
+    `candidate_preview` on the provider's exception is `raw[:800]`; using
+    it here would fabricate a truncation the model never emitted and the
+    grader would score the cut, not the code.
+
+    The hash is the digest of the raw body, so the existing
+    (op_id, candidate_hash) dedupe absorbs a model that fails identically
+    twice while keeping two different failures as two rows. NEVER raises.
+    """
+    body = str(raw or "")
+    digest = hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()[:32]
+    first = (failures or [{}])[0] if failures else {}
+    return {
+        "candidate_id": _PARSE_ERROR_CANDIDATE_ID,
+        "candidate_hash": digest,
+        "file_path": str((first or {}).get("file_path", "") or ""),
+        "full_content": body,
+        "candidate_status": "parse_error",
+    }
+
+
 def events_dir() -> Path:
     """Directory the Trinity experience receiver already watches."""
     raw = os.getenv(_ENV_DIR, "").strip()
@@ -314,11 +356,21 @@ def _structure_stamps(
         for cand in candidates or ():
             if not isinstance(cand, dict):
                 continue
-            if str(cand.get("candidate_status", "") or "") == "noop":
+            _status = str(cand.get("candidate_status", "") or "")
+            if _status == "noop":
                 ids[str(cand.get("candidate_hash", "") or "")] = (
                     _NOOP_STRUCTURE_ID
                 )
                 distinct.add(_NOOP_STRUCTURE_ID)
+                continue
+            if _status == "parse_error":
+                # Unparseable answers are REAL and must not be folded
+                # together with each other OR dropped: they are their own
+                # answer class, distinct from a refusal and from any patch.
+                ids[str(cand.get("candidate_hash", "") or "")] = (
+                    _PARSE_ERROR_STRUCTURE_ID
+                )
+                distinct.add(_PARSE_ERROR_STRUCTURE_ID)
                 continue
             fp = _ent.structural_fingerprint(_ent.candidate_source(cand))
             if fp is None:
@@ -1792,6 +1844,7 @@ __all__ = [
     "classify_terminal_reason",
     "events_dir",
     "noop_candidate",
+    "parse_error_candidate",
     "get_recorder",
     "harvest_snapshot",
     "record_candidate_verdict",

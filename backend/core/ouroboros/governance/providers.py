@@ -6499,16 +6499,74 @@ class PrimeProvider:
             except OSError:
                 pass
 
-        result = _parse_generation_response(
-            raw,
-            self.provider_name,
-            duration,
-            context,
-            source_hash,
-            source_path,
-            repo_roots=self._repo_roots,
-            repo_root=repo_root,
-        )
+        try:
+            result = _parse_generation_response(
+                raw,
+                self.provider_name,
+                duration,
+                context,
+                source_hash,
+                source_path,
+                repo_roots=self._repo_roots,
+                repo_root=repo_root,
+            )
+        except Exception as _parse_exc:  # noqa: BLE001 — recorded, then re-raised
+            # An UNPARSEABLE DRAW IS AN ANSWER — a bad one, which is exactly
+            # what a preference pair needs on its losing side. The parser
+            # raises before the recorder hook below is ever reached, so
+            # every `all_candidates_syntax_error` left the corpus nothing:
+            # 2 of soak 19's 15 singleton ops and 3 of one soak-22 op's
+            # draws died here silently.
+            #
+            # Recorded against the SAME seam as every other draw
+            # (`record_generation`), carrying the raw response as the
+            # candidate body so reactor's grader can reach the invalid
+            # Python and score it by how far the parse got (measured
+            # 0.250 for a line-1 failure, 0.393 for line-6). No second
+            # recording hook, no new provider path.
+            #
+            # Only a SYNTAX exception qualifies: `syntax_failures` is the
+            # provider's own contract for "valid envelope, invalid code",
+            # the same attribute the syntax-repair retry keys on. A
+            # transport error or a cancellation is not an answer and must
+            # stay unrecorded.
+            if getattr(_parse_exc, "syntax_failures", None):
+                try:
+                    from backend.core.ouroboros.governance.observability.trajectory_recorder import (  # noqa: E501, PLC0415
+                        parse_error_candidate as _traj_parse_error,
+                        record_generation as _traj_record_parse_fail,
+                    )
+                    _traj_record_parse_fail(
+                        op_id=str(getattr(context, "op_id", "") or ""),
+                        prompt=prompt,
+                        generation_result=GenerationResult(
+                            candidates=(_traj_parse_error(
+                                raw,
+                                getattr(_parse_exc, "syntax_failures", None),
+                            ),),
+                            provider_name=self.provider_name,
+                            generation_duration_s=duration,
+                        ),
+                        latency_ms=duration * 1000.0,
+                        task_type="code_repair",
+                        session_id=str(getattr(context, "session_id", "") or ""),
+                        route=str(getattr(context, "provider_route", "") or "local"),
+                        model_id_override=str(
+                            getattr(response, "model", "") if response else ""
+                        ) or str(
+                            getattr(getattr(self, "_cfg", None), "model_name", "")
+                            or os.environ.get("JARVIS_LOCAL_MODEL_NAME", "")
+                        ),
+                        is_repair=repair_context is not None,
+                        sampling=sampling,
+                        temperature=temperature,
+                    )
+                except Exception as _traj_exc:  # noqa: BLE001 — fail-open
+                    logger.debug(
+                        "[TrajectoryRecorder] parse-error emit degraded: %s",
+                        _traj_exc,
+                    )
+            raise
         if _preloaded_files:
             result = dataclasses.replace(
                 result, prompt_preloaded_files=tuple(_preloaded_files),

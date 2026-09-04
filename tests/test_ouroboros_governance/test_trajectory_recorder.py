@@ -756,3 +756,105 @@ async def test_harvest_counts_a_refusal_as_its_own_answer(
     assert "op-hv" in text
     line = next(ln for ln in text.splitlines() if "op-hv" in ln)
     assert "PAIRABLE" in line, line
+
+
+# ---------------------------------------------------------------------------
+# An unparseable draw is an answer too (soak 19: 2 of 15 singletons)
+# ---------------------------------------------------------------------------
+
+
+_RAW_BAD = (
+    '{"schema_version":"2b.1","candidates":[{"candidate_id":"c1",'
+    '"file_path":"m.py","full_content":"def broken(:\\n    return 1\\n",'
+    '"rationale":"attempt"}]}'
+)
+
+
+def test_parse_error_candidate_keeps_the_raw_body() -> None:
+    """The body must be the model's RAW response, verbatim.
+
+    reactor's grader reaches through the envelope to the invalid Python and
+    scores it by how far the parse got (0.250 line-1/3, 0.393 line-6/7).
+    A summary, a marker, or the exception's `candidate_preview` (raw[:800])
+    would throw that gradient away — and the preview would fabricate a
+    truncation the model never emitted.
+    """
+    from backend.core.ouroboros.governance.observability.trajectory_recorder import (  # noqa: E501
+        parse_error_candidate,
+    )
+
+    cand = parse_error_candidate(_RAW_BAD, [{"file_path": "m.py", "line": 1}])
+    assert cand["full_content"] == _RAW_BAD
+    assert cand["candidate_status"] == "parse_error"
+    assert cand["file_path"] == "m.py"
+    # deterministic + distinguishing
+    assert cand["candidate_hash"] == parse_error_candidate(_RAW_BAD)["candidate_hash"]
+    assert cand["candidate_hash"] != parse_error_candidate("other")["candidate_hash"]
+
+
+def test_parse_error_candidate_survives_empty_input() -> None:
+    from backend.core.ouroboros.governance.observability.trajectory_recorder import (  # noqa: E501
+        parse_error_candidate,
+    )
+
+    cand = parse_error_candidate("", None)
+    assert cand["candidate_status"] == "parse_error"
+    assert cand["candidate_hash"]
+
+
+@pytest.mark.asyncio
+async def test_a_parse_error_row_is_persisted(rec: TrajectoryRecorder) -> None:
+    from backend.core.ouroboros.governance.observability.trajectory_recorder import (  # noqa: E501
+        parse_error_candidate,
+    )
+
+    rec.record_generation(
+        op_id="op-pe", prompt="p",
+        generation_result=_FakeGenerationResult(
+            candidates=(parse_error_candidate(_RAW_BAD),),
+        ),
+    )
+    rec.record_outcome(op_id="op-pe", terminal_reason="all_candidates_syntax_error")
+    await rec.drain()
+
+    row = _lines(rec.path)[0]
+    assert row["metadata"]["candidate_status"] == "parse_error"
+    # `all_candidates_syntax_error` is the trainable failure, by policy.
+    assert row["outcome"] == "failure"
+    assert row["metadata"]["should_train"] is True
+    assert row["assistant_output"] == _RAW_BAD
+
+
+@pytest.mark.asyncio
+async def test_parse_error_is_its_own_structure_class(
+    rec: TrajectoryRecorder,
+) -> None:
+    """Three answer kinds, three classes: a parse error is neither a
+    refusal nor any patch, and two parse errors are one class."""
+    from backend.core.ouroboros.governance.observability.trajectory_recorder import (  # noqa: E501
+        parse_error_candidate,
+    )
+
+    rec.record_generation(
+        op_id="op-3way", prompt="p",
+        generation_result=_FakeGenerationResult(
+            candidates=(parse_error_candidate(_RAW_BAD),),
+        ),
+    )
+    rec.record_generation(op_id="op-3way", prompt="p",
+                          generation_result=_noop_result("declining"))
+    rec.record_generation(
+        op_id="op-3way", prompt="p",
+        generation_result=_FakeGenerationResult(candidates=(_candidate(),)),
+    )
+    rec.record_outcome(op_id="op-3way", terminal_reason="applied")
+    await rec.drain()
+
+    rows = _lines(rec.path)
+    assert len(rows) == 3
+    sids = {r["metadata"]["structure_id"] for r in rows}
+    assert len(sids) == 3, sids
+    assert {"noop", "parse_error"} <= sids
+    assert {r["metadata"]["candidate_status"] for r in rows} == {
+        "noop", "parse_error", "patch",
+    }
