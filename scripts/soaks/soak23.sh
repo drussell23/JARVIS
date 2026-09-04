@@ -59,10 +59,16 @@
 # PRECONDITION: main must carry 4c8f4d3af9 (merge feat/noop-ingestion
 # after soak 22 exits -- the main tree is executing main until then).
 cd /mnt/c/Users/Jarvis/Desktop/TrinityAi/jarvis || exit 1
-if ! git merge-base --is-ancestor 4c8f4d3af9 HEAD 2>/dev/null; then
-  echo "REFUSING: HEAD does not contain 4c8f4d3af9 (the noop-ingestion fix)" >&2
-  exit 2
-fi
+# A soak that silently runs WITHOUT the code it exists to exercise produces
+# a confident wrong answer. Both commits are required, by sha.
+_require_commit() {
+  if ! git merge-base --is-ancestor "$1" HEAD 2>/dev/null; then
+    echo "REFUSING: HEAD does not contain $1 ($2)" >&2
+    exit 2
+  fi
+}
+_require_commit 4c8f4d3af9 "noop ingestion — refusals become rows"
+_require_commit 06c0d51705 "parse-error capture — unparseable draws become rows"
 
 export JARVIS_SIBLING_DIVERSITY_THRESHOLD=0.999
 export JARVIS_PIPELINE_DEADLINE_AT_START=true
