@@ -244,3 +244,52 @@ def test_candidate_source_reads_the_envelope_fields() -> None:
     assert se.candidate_source({"diff": "d"}) == "d"
     assert se.candidate_source({"candidate_hash": "h"}) == ""
     assert se.candidate_source("not a dict") == ""
+
+
+# --------------------------------------------------------------------------
+# The escalation multiplier: leave an exhausted region, do not step in it
+# --------------------------------------------------------------------------
+
+
+def test_multiplier_off_is_byte_identical(monkeypatch) -> None:
+    """Default 1.0: a collapse streak changes NOTHING about the schedule."""
+    monkeypatch.delenv("JARVIS_SIBLING_ESCALATION_MULTIPLIER", raising=False)
+    assert se.escalation_multiplier() == 1.0
+    for streak in (0, 1, 2, 5):
+        assert se.collapse_bump(streak) == 0
+        assert se.sampling_for(3, op_id="o", collapse_streak=streak) == \
+            se.sampling_for(3, op_id="o")
+
+
+def test_multiplier_climbs_exponentially_with_the_streak(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_SIBLING_ESCALATION_MULTIPLIER", "2.0")
+    assert [se.collapse_bump(k) for k in (0, 1, 2, 3)] == [0, 1, 3, 7]
+    base = se.sampling_for(2, op_id="o")
+    one = se.sampling_for(2, op_id="o", collapse_streak=1)
+    two = se.sampling_for(2, op_id="o", collapse_streak=2)
+    assert base.temperature < one.temperature <= two.temperature
+    assert len({base.seed, one.seed, two.seed}) == 3, "a jump must move the seed"
+
+
+def test_multiplier_is_bounded_by_the_ceiling(monkeypatch) -> None:
+    """Exponential in rungs, never in temperature: the ceiling holds."""
+    monkeypatch.setenv("JARVIS_SIBLING_ESCALATION_MULTIPLIER", "4.0")
+    monkeypatch.setenv("JARVIS_SIBLING_TEMP_CEILING", "1.15")
+    for streak in (1, 2, 3, 10, 100):
+        assert se.sampling_for(2, op_id="o", collapse_streak=streak).temperature <= 1.15
+
+
+def test_multiplier_is_clamped(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_SIBLING_ESCALATION_MULTIPLIER", "0.2")
+    assert se.escalation_multiplier() == 1.0
+    monkeypatch.setenv("JARVIS_SIBLING_ESCALATION_MULTIPLIER", "99")
+    assert se.escalation_multiplier() == 4.0
+    monkeypatch.setenv("JARVIS_SIBLING_ESCALATION_MULTIPLIER", "banana")
+    assert se.escalation_multiplier() == 1.0
+
+
+def test_multiplier_never_touches_draw_one_or_entropy_off(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_SIBLING_ESCALATION_MULTIPLIER", "3.0")
+    assert se.sampling_for(1, op_id="o", collapse_streak=4).is_legacy
+    monkeypatch.setenv("JARVIS_SIBLING_ENTROPY_ENABLED", "false")
+    assert se.sampling_for(3, op_id="o", collapse_streak=4).is_legacy

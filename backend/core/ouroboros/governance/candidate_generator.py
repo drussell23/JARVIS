@@ -6035,6 +6035,39 @@ class CandidateGenerator:
         was the wrong predicate: two candidates differing in one docstring
         word have different hashes and identical logic, which is exactly
         the pair the corpus was full of. It is kept as a cheap first pass.
+
+        ## An answer is not a dead lane
+
+        Soak bt-2026-09-03-072129 recorded 36 ops with a primary and 15
+        of them with no sibling row at all. Joining the corpus to the log
+        accounted for every one:
+
+          8  the sibling came back ``2b.1-noop`` ("already implemented").
+             Zero candidates, so it read as EMPTY, and empty meant
+             ``_stop`` -- the remaining slot was never attempted.
+          6  redundant after the one re-draw allowed, at similarity
+             1.0000 in 14 of the 15 drops session-wide: the re-draw was
+             taken one rung up, INSIDE the region that had just collapsed.
+          2  (session-wide) ``all_candidates_syntax_error`` -- an
+             exception, so ``_stop`` again.
+
+        A no-op is the model answering the prompt -- contradicting the
+        primary it just produced -- and an unparseable draw is a bad
+        answer. Neither is evidence the engine is gone. Both now escalate
+        and re-draw within the slot like a redundant draw does, and when
+        the slot's re-draw budget is spent the SLOT is dropped and the
+        next one is tried. ``None`` and any other exception still stop:
+        those are the lane, not the answer.
+
+        Every slot that collapses (redundant / no-op / unparseable at the
+        cap) extends a streak; a merged draw resets it. The streak is
+        handed to ``sibling_entropy.sampling_for`` where, with the
+        multiplier on, it jumps rungs exponentially instead of stepping.
+
+        The exit line ``sibling_fulfillment`` is emitted for EVERY op with
+        n_want > 1, singletons included. The summary that follows it only
+        ever fired when something merged, which is why an op that lost
+        every slot left no trace and the pathology hid in aggregates.
         """
         n_want = _sibling_candidate_count()
         if first is None or n_want <= 1 or not getattr(first, "candidates", None):
@@ -6076,16 +6109,27 @@ class CandidateGenerator:
             0.05, float(getattr(first, "generation_duration_s", 0.0) or 0.0),
         )
 
+        _noops = 0
+        _unparseable = 0
         _stop = False
+        # Consecutive slots that COLLAPSED -- every draw they were allowed
+        # came back redundant, a no-op, or unparseable. A merged draw
+        # resets it: the region is not dead after all.
+        _streak = 0
+        # One entry per slot, every transition it went through. This is the
+        # fulfillment ledger: it is what makes a lost slot a logged fact.
+        _ledger: List[str] = []
         for _i in range(2, n_want + 1):
             if _stop:
-                break
+                _ledger.append(f"{_i}:not_attempted")
+                continue
             # One SLOT, possibly several draws: a redundant draw is re-taken
             # at higher entropy rather than persisted. Bounded by
             # `_max_resample`, and every re-draw still pays the same budget
             # test as a first draw -- a diversity retry can never overrun
             # the op any more than a sibling could.
             _escalation = 0
+            _trail: List[str] = []
             while True:
                 _t0 = time.monotonic()
                 remaining = self._remaining_seconds(deadline)
@@ -6099,14 +6143,49 @@ class CandidateGenerator:
                         "%.1fs budget left, previous sibling cost %.1fs",
                         _i, n_want, _op, remaining, _last_cost,
                     )
+                    _trail.append("budget")
                     _stop = True
                     break
                 _sampling = _ent.sampling_for(
                     _i, escalation=_escalation, op_id=_op,
+                    collapse_streak=_streak,
                 )
                 try:
                     _sib = await self._profiler_for_siblings(attempt, _sampling)
                 except Exception as _sib_exc:  # noqa: BLE001
+                    _last_cost = max(0.05, time.monotonic() - _t0)
+                    # Unparseable Python is a BAD ANSWER, not a dead engine:
+                    # the provider parsed valid JSON and found invalid code
+                    # inside it, and says so through the same
+                    # `syntax_failures` attribute the primary path's repair
+                    # keys on. Re-draw it like a redundant draw. Nothing to
+                    # retract -- the provider raised before the recorder
+                    # was ever told.
+                    if getattr(_sib_exc, "syntax_failures", None):
+                        _unparseable += 1
+                        if _escalation < _max_resample:
+                            _resamples += 1
+                            _escalation += 1
+                            logger.info(
+                                "[CandidateGenerator] sibling %d/%d op=%s "
+                                "unparseable at %s -- re-drawing at higher "
+                                "entropy (%s)",
+                                _i, n_want, _op, _sampling.describe(),
+                                _ent.sampling_for(
+                                    _i, escalation=_escalation, op_id=_op,
+                                    collapse_streak=_streak,
+                                ).describe(),
+                            )
+                            _trail.append("unparseable")
+                            continue
+                        logger.info(
+                            "[CandidateGenerator] sibling %d/%d op=%s still "
+                            "unparseable after %d re-draw(s) -- slot dropped",
+                            _i, n_want, _op, _escalation,
+                        )
+                        _trail.append("unparseable(dropped)")
+                        _streak += 1
+                        break
                     # A sibling is a bonus. Losing one must never cost the op
                     # the candidate it already has -- so this swallows, where
                     # the FIRST attempt deliberately propagates.
@@ -6116,14 +6195,48 @@ class CandidateGenerator:
                         _i, n_want, _op, type(_sib_exc).__name__,
                         _trim_exc_msg(_sib_exc), len(merged),
                     )
+                    _trail.append(f"failed:{type(_sib_exc).__name__}")
                     _stop = True
                     break
                 _last_cost = max(0.05, time.monotonic() - _t0)
-                if _sib is None or not getattr(_sib, "candidates", None):
+                _has_cands = bool(getattr(_sib, "candidates", None))
+                if _sib is not None and not _has_cands and getattr(_sib, "is_noop", False):
+                    # The model answered "already done" at this point in
+                    # sampling space. That is an ANSWER to the prompt -- the
+                    # one the primary just contradicted -- and the recorder
+                    # never queued it (no candidates), so there is nothing to
+                    # retract. Re-draw at higher entropy; at the cap, drop
+                    # the SLOT, not the loop.
+                    _noops += 1
+                    if _escalation < _max_resample:
+                        _resamples += 1
+                        _escalation += 1
+                        logger.info(
+                            "[CandidateGenerator] sibling %d/%d op=%s "
+                            "declined (2b.1-noop at %s) -- re-drawing at "
+                            "higher entropy (%s)",
+                            _i, n_want, _op, _sampling.describe(),
+                            _ent.sampling_for(
+                                _i, escalation=_escalation, op_id=_op,
+                                collapse_streak=_streak,
+                            ).describe(),
+                        )
+                        _trail.append("noop")
+                        continue
+                    logger.info(
+                        "[CandidateGenerator] sibling %d/%d op=%s still a "
+                        "no-op after %d re-draw(s) -- slot dropped",
+                        _i, n_want, _op, _escalation,
+                    )
+                    _trail.append("noop(dropped)")
+                    _streak += 1
+                    break
+                if _sib is None or not _has_cands:
                     logger.info(
                         "[CandidateGenerator] sibling %d/%d empty op=%s -- stopping",
                         _i, n_want, _op,
                     )
+                    _trail.append("empty")
                     _stop = True
                     break
 
@@ -6145,8 +6258,10 @@ class CandidateGenerator:
                         _sampling.describe(),
                         _ent.sampling_for(
                             _i, escalation=_escalation, op_id=_op,
+                            collapse_streak=_streak,
                         ).describe(),
                     )
+                    _trail.append(f"redundant:{_peak:.4f}")
                     # The provider already reported this draw to the
                     # recorder; without a retraction it lands in the corpus
                     # as a twin of the candidate it duplicates. Retract ONLY
@@ -6180,6 +6295,8 @@ class CandidateGenerator:
                          if str(_c.get("candidate_hash", "") or "") not in seen],
                         reason=f"redundant_dropped:{_peak:.4f}",
                     )
+                    _trail.append(f"redundant(dropped):{_peak:.4f}")
+                    _streak += 1
                     break
 
                 for _c in _fresh:
@@ -6191,8 +6308,22 @@ class CandidateGenerator:
                         seen.add(_h)
                     merged.append(_c)
                 _seen_fps.extend(_new_fps)
+                _trail.append("merged")
+                _streak = 0
                 break
+            _ledger.append(f"{_i}:" + ">".join(_trail or ["?"]))
 
+        # The fulfillment line fires for EVERY op that wanted siblings. It
+        # is the one place a singleton is a fact rather than an absence.
+        _got = len(merged) - len(first.candidates)
+        logger.info(
+            "[CandidateGenerator] sibling_fulfillment op=%s wanted=%d got=%d "
+            "slots=[%s]%s%s%s",
+            _op, n_want - 1, _got, ", ".join(_ledger),
+            f" noops={_noops}" if _noops else "",
+            f" unparseable={_unparseable}" if _unparseable else "",
+            " -- SINGLETON" if _got == 0 else "",
+        )
         if len(merged) == len(first.candidates):
             return first
         _distinct = _ent.distinct_structure_count(merged)

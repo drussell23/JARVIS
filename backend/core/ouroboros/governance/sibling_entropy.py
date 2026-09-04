@@ -90,6 +90,14 @@ _LEGACY_TEMPERATURE = 0.2
 #: than a redundant one -- it cannot even reach the substance tier.
 _ENV_TEMP_CEILING = "JARVIS_SIBLING_TEMP_CEILING"
 
+#: Rung multiplier applied per CONSECUTIVE collapsed slot. A slot collapses
+#: when every draw it was allowed came back redundant, a no-op, or
+#: unparseable. One collapse says "this rung is exhausted"; two in a row
+#: say the whole region is, and stepping one rung at a time from inside
+#: it is how soak 19 re-drew at T=0.95 and got similarity 1.0000 fourteen
+#: times out of fifteen. 1.0 is OFF and leaves the ladder byte-identical.
+_ENV_ESCALATION_MULT = "JARVIS_SIBLING_ESCALATION_MULTIPLIER"
+
 
 def _envf(name: str, default: float) -> float:
     try:
@@ -123,6 +131,35 @@ def max_resample_attempts() -> int:
 
 def temperature_ceiling() -> float:
     return max(_LEGACY_TEMPERATURE, _envf(_ENV_TEMP_CEILING, 1.15))
+
+
+def escalation_multiplier() -> float:
+    """Per-collapse rung multiplier. 1.0 = off. Clamped to [1.0, 4.0].
+
+    Bounded above because the ladder is bounded above: past the last rung
+    every step is ``_ESCALATION_STEP`` of temperature toward
+    ``temperature_ceiling()``, so a multiplier that overshoots the ceiling
+    on the first collapse has nothing left to escalate to on the second.
+    """
+    return max(1.0, min(4.0, _envf(_ENV_ESCALATION_MULT, 1.0)))
+
+
+def collapse_bump(collapse_streak: int) -> int:
+    """Extra rungs a draw climbs after ``collapse_streak`` consecutive
+    collapsed slots: ``mult**streak - 1``, so 0 at streak 0 and 0 whenever
+    the multiplier is off. Exponential by design -- a collapse is evidence
+    that the current region is exhausted, and the answer is to LEAVE it,
+    not to take one more step inside it.
+    """
+    streak = max(0, int(collapse_streak or 0))
+    if streak <= 0:
+        return 0
+    mult = escalation_multiplier()
+    if mult <= 1.0:
+        return 0
+    # The ladder + overflow saturate at the ceiling within a handful of
+    # rungs; cap the bump so an absurd streak cannot overflow an int.
+    return int(min(64.0, mult ** streak)) - 1
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +238,7 @@ _ESCALATION_STEP = 0.15
 
 
 def sampling_for(draw_index: int, *, escalation: int = 0,
-                 op_id: str = "") -> SiblingSampling:
+                 op_id: str = "", collapse_streak: int = 0) -> SiblingSampling:
     """Sampling point for draw ``draw_index`` (1-based) at ``escalation``.
 
     Draw 1 at escalation 0 returns the LEGACY point: an op that draws one
@@ -210,13 +247,20 @@ def sampling_for(draw_index: int, *, escalation: int = 0,
     ``op_id`` only seeds the RNG stream so two ops working the same prompt
     do not walk identical sampling trajectories; it never changes the
     temperature/top_p schedule, so a rung stays reproducible per op.
+
+    ``collapse_streak`` is how many slots in a row have collapsed before
+    this draw. With the multiplier off (the default) it changes nothing;
+    on, it climbs ``collapse_bump(streak)`` extra rungs and moves the seed
+    with them, so a draw after two dead slots is neither the rung nor the
+    trajectory that just produced twins.
     """
     if draw_index <= 1 and escalation <= 0:
         return SiblingSampling()
     if not entropy_enabled():
         return SiblingSampling()
 
-    rung = max(0, draw_index - 2) + max(0, escalation)
+    bump = collapse_bump(collapse_streak)
+    rung = max(0, draw_index - 2) + max(0, escalation) + bump
     temp, top_p, top_k, rp = _LADDER[min(rung, len(_LADDER) - 1)]
     # Past the last rung, keep climbing temperature rather than repeating
     # a rung that has already produced a redundant draw.
@@ -227,7 +271,7 @@ def sampling_for(draw_index: int, *, escalation: int = 0,
         top_p=top_p,
         top_k=top_k,
         repeat_penalty=rp,
-        seed=_derive_seed(op_id, draw_index, escalation),
+        seed=_derive_seed(op_id, draw_index, escalation + bump),
     )
 
 
@@ -568,6 +612,7 @@ __all__ = [
     "diversity_threshold", "entropy_enabled", "fingerprint_candidates",
     "is_structurally_redundant", "max_resample_attempts", "sampling_for",
     "structural_fingerprint", "structural_similarity", "temperature_ceiling",
+    "escalation_multiplier", "collapse_bump",
 ]
 
 
@@ -655,6 +700,25 @@ def register_flags(registry: Any) -> int:
             source_file=src,
             example="1.15",
             since="sibling entropy arc (2026-09-01)",
+        ),
+        FlagSpec(
+            name=_ENV_ESCALATION_MULT,
+            type=FlagType.FLOAT,
+            default=1.0,
+            description=(
+                "Rung multiplier applied per CONSECUTIVE collapsed sibling "
+                "slot (every draw redundant, no-op, or unparseable). A draw "
+                "after N collapsed slots climbs mult**N - 1 extra rungs and "
+                "takes a matching seed, bounded by JARVIS_SIBLING_TEMP_"
+                "CEILING. 1.0 is OFF: the ladder is byte-identical. Soak 19 "
+                "re-drew inside an exhausted region and measured similarity "
+                "1.0000 in 14 of 15 dropped siblings; this is the knob that "
+                "leaves the region instead. Clamped to [1.0, 4.0]."
+            ),
+            category=Category.TUNING,
+            source_file=src,
+            example="2.0",
+            since="sibling fulfillment arc (2026-09-04)",
         ),
     ]
     n = 0

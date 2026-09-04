@@ -575,3 +575,200 @@ def test_master_switch_off_restores_byte_wise_behaviour(
     assert n_calls == 1
     assert all(s.is_legacy for s in log)
     assert [c["candidate_hash"] for c in out.candidates] == ["a", "b"]
+
+
+# --------------------------------------------------------------------------
+# An answer is not a dead lane (soak bt-2026-09-03-072129: 15 singletons)
+# --------------------------------------------------------------------------
+
+
+def _noop_result(duration: float = 1.0) -> Any:
+    """What the provider hands back for ``2b.1-noop``: no candidates,
+    ``is_noop=True``. The recorder never queues it."""
+    from backend.core.ouroboros.governance.op_context import GenerationResult
+
+    return GenerationResult(
+        candidates=(), provider_name="local",
+        generation_duration_s=duration, is_noop=True,
+    )
+
+
+def _syntax_exc() -> RuntimeError:
+    """The provider's real contract for unparseable Python: a RuntimeError
+    carrying ``syntax_failures`` -- the attribute the primary path's repair
+    already keys on."""
+    exc = RuntimeError("local_schema_invalid:all_candidates_syntax_error")
+    exc.syntax_failures = [{"file_path": "m.py", "line": 3,   # type: ignore[attr-defined]
+                            "message": "unexpected indent"}]
+    return exc
+
+
+def test_a_noop_sibling_is_redrawn_not_a_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """8 of soak 19's 15 singletons: the sibling said "already done".
+
+    That is the model answering the prompt, not the engine dying. It must
+    be re-drawn at a hotter point, exactly like a redundant draw.
+    """
+    monkeypatch.setenv(_ENV_N, "2")
+    monkeypatch.setenv("JARVIS_SIBLING_MAX_RESAMPLE", "1")
+    log: List[Any] = []
+    first = _real_result([_shaped("a", 1)])
+    out, n_calls = _run(
+        first, [_noop_result(), _real_result([_shaped("b", 2)])],
+        sampling_log=log,
+    )
+    assert n_calls == 2, "the no-op was treated as a stop"
+    assert [c["candidate_hash"] for c in out.candidates] == ["a", "b"]
+    assert log[1].temperature > log[0].temperature
+    assert log[0].seed != log[1].seed
+
+
+def test_a_noop_at_the_cap_drops_the_slot_and_tries_the_next(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The slot is dropped, the LOOP is not: slot 3 still gets its draw."""
+    monkeypatch.setenv(_ENV_N, "3")
+    monkeypatch.setenv("JARVIS_SIBLING_MAX_RESAMPLE", "1")
+    first = _real_result([_shaped("a", 1)])
+    out, n_calls = _run(
+        first,
+        [_noop_result(), _noop_result(),            # slot 2: noop, noop -> dropped
+         _real_result([_shaped("c", 2)])],          # slot 3: merged
+    )
+    assert n_calls == 3
+    assert [c["candidate_hash"] for c in out.candidates] == ["a", "c"]
+
+
+def test_a_none_result_still_stops(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The lane, not the answer: an engine that returns nothing is still a
+    stop, byte-for-byte the pinned behaviour above."""
+    monkeypatch.setenv(_ENV_N, "4")
+    first = _real_result([_cand("a")])
+    out, n_calls = _run(first, [None, _real_result([_cand("b")])])
+    assert [c["candidate_hash"] for c in out.candidates] == ["a"]
+    assert n_calls == 1
+
+
+def test_an_unparseable_sibling_is_redrawn_not_a_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``all_candidates_syntax_error`` is a bad answer. Its carrier is the
+    provider's own ``syntax_failures`` attribute -- no type sniffing."""
+    monkeypatch.setenv(_ENV_N, "2")
+    monkeypatch.setenv("JARVIS_SIBLING_MAX_RESAMPLE", "1")
+    log: List[Any] = []
+    first = _real_result([_shaped("a", 1)])
+    out, n_calls = _run(
+        first, [_syntax_exc(), _real_result([_shaped("b", 2)])],
+        sampling_log=log,
+    )
+    assert n_calls == 2
+    assert [c["candidate_hash"] for c in out.candidates] == ["a", "b"]
+    assert log[1].temperature > log[0].temperature
+
+
+def test_a_plain_exception_still_stops(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the syntax contract is an answer; anything else is the lane."""
+    monkeypatch.setenv(_ENV_N, "4")
+    first = _real_result([_cand("a")])
+    out, n_calls = _run(
+        first, [RuntimeError("engine died"), _real_result([_cand("z")])],
+    )
+    assert [c["candidate_hash"] for c in out.candidates] == ["a"]
+    assert n_calls == 1
+
+
+def test_unparseable_at_the_cap_drops_the_slot_not_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_ENV_N, "3")
+    monkeypatch.setenv("JARVIS_SIBLING_MAX_RESAMPLE", "1")
+    first = _real_result([_shaped("a", 1)])
+    out, n_calls = _run(
+        first,
+        [_syntax_exc(), _syntax_exc(), _real_result([_shaped("c", 2)])],
+    )
+    assert n_calls == 3
+    assert [c["candidate_hash"] for c in out.candidates] == ["a", "c"]
+
+
+def test_collapsed_slots_feed_the_streak(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two collapsed slots in a row; the third draw must sit on a HIGHER
+    rung than a fresh slot would, once the multiplier is on. With it off
+    (the default) the schedule is the plain ladder."""
+    monkeypatch.setenv(_ENV_N, "4")
+    monkeypatch.setenv("JARVIS_SIBLING_MAX_RESAMPLE", "0")   # one draw per slot
+    first = _real_result([_shaped("a", 1)])
+
+    def _drive() -> List[Any]:
+        log: List[Any] = []
+        _run(
+            first,
+            [_noop_result(), _noop_result(), _real_result([_shaped("d", 2)])],
+            sampling_log=log,
+        )
+        return log
+
+    monkeypatch.delenv("JARVIS_SIBLING_ESCALATION_MULTIPLIER", raising=False)
+    off = _drive()
+    monkeypatch.setenv("JARVIS_SIBLING_ESCALATION_MULTIPLIER", "2.0")
+    on = _drive()
+    assert len(off) == len(on) == 3
+    # slot 2 (streak 0) identical either way; the multiplier never touches
+    # a draw that has no collapse behind it.
+    assert off[0] == on[0]
+    # after two collapses the multiplied draw is hotter than the ladder's.
+    assert on[2].temperature >= off[2].temperature
+    assert on[2].seed != off[2].seed
+
+
+def test_fulfillment_line_fires_for_a_singleton(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The telemetry: an op that lost every slot leaves a ledger, not silence.
+
+    Before, the exit summary fired only when something merged, so a
+    singleton was an ABSENCE in the log -- and 15 of them hid inside
+    healthy-looking aggregates for a whole soak.
+    """
+    import logging
+
+    monkeypatch.setenv(_ENV_N, "3")
+    monkeypatch.setenv("JARVIS_SIBLING_MAX_RESAMPLE", "0")
+    caplog.set_level(
+        logging.INFO,
+        logger="backend.core.ouroboros.governance.candidate_generator",
+    )
+    first = _real_result([_shaped("a", 1)])
+    out, _ = _run(first, [_noop_result(), _syntax_exc()])
+    assert out is first
+    lines = [r.getMessage() for r in caplog.records
+             if "sibling_fulfillment" in r.getMessage()]
+    assert len(lines) == 1, lines
+    line = lines[0]
+    assert "wanted=2 got=0" in line
+    assert "SINGLETON" in line
+    assert "2:noop(dropped)" in line
+    assert "3:unparseable(dropped)" in line
+    assert "noops=1" in line and "unparseable=1" in line
+
+
+def test_fulfillment_line_names_a_stop(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    monkeypatch.setenv(_ENV_N, "4")
+    caplog.set_level(
+        logging.INFO,
+        logger="backend.core.ouroboros.governance.candidate_generator",
+    )
+    first = _real_result([_shaped("a", 1)])
+    _run(first, [_real_result([_shaped("b", 2)]), None])
+    line = next(r.getMessage() for r in caplog.records
+                if "sibling_fulfillment" in r.getMessage())
+    assert "wanted=3 got=1" in line
+    assert "2:merged" in line and "3:empty" in line and "4:not_attempted" in line
+    assert "SINGLETON" not in line
