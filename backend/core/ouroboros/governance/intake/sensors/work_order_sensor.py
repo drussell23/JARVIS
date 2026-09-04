@@ -21,7 +21,10 @@ Everything is env-tunable (no hardcoded paths, markers, urgencies, or bounds).
 Master ``JARVIS_WORK_ORDER_SENSOR_ENABLED`` default-FALSE (§33.1). Fail-soft:
 an unreadable artifact, a torn ledger, or a bad item NEVER perturbs intake.
 Cross-session dedup (a persisted seen-hash ledger) so a stable roadmap is not
-re-emitted every boot.
+re-emitted every boot. ``JARVIS_ALLOW_ROADMAP_REVISIT`` shadows that ledger in
+memory for deep-sampling runs: hashes loaded from disk stop SUPPRESSING without
+ever being deleted, so a deliberate re-run of a stable roadmap emits its work
+again while the on-disk record stays truthful and complete.
 """
 from __future__ import annotations
 
@@ -51,6 +54,7 @@ _ENV_MAX_BYTES = "JARVIS_WORK_ORDER_MAX_BYTES"
 _ENV_INTERVAL_S = "JARVIS_WORK_ORDER_INTERVAL_S"
 _ENV_SEEN_LEDGER = "JARVIS_WORK_ORDER_SEEN_LEDGER"
 _ENV_SEEN_CAP = "JARVIS_WORK_ORDER_SEEN_CAP"
+_ENV_ALLOW_REVISIT = "JARVIS_ALLOW_ROADMAP_REVISIT"
 
 # Operator intent is, by construction, an EXPLICIT declaration of what should
 # happen next — so it defaults to a high urgency, which is exactly the
@@ -73,11 +77,31 @@ _BACKTICK_PATH = re.compile(r"`([^`\n]+?)`")
 _BARE_PATH = re.compile(r"(?<![`\w])([\w./-]+\.[A-Za-z0-9]{1,6})(?::\d+)?")
 
 
+_TRUTHY = ("1", "true", "yes", "on")
+
+
+def _truthy_env(name: str, default: str = "false") -> bool:
+    """One truthiness rule for every gate in this module. NEVER raises."""
+    try:
+        return os.getenv(name, default).strip().lower() in _TRUTHY
+    except Exception:  # noqa: BLE001 — a hostile env never breaks a gate
+        return False
+
+
 def sensor_enabled() -> bool:
     """Master gate — default-FALSE per §33.1. NEVER raises."""
-    return os.getenv(_ENV_MASTER, "false").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
+    return _truthy_env(_ENV_MASTER)
+
+
+def revisit_enabled() -> bool:
+    """Deep-sampling gate — default-FALSE, so a normal boot keeps the dedup.
+
+    Read once at INIT rather than per scan: the shadow is a property of the
+    ledger snapshot THIS process loaded. A flag flipped mid-session must not
+    retroactively un-suppress hashes this session has already emitted, which
+    is exactly what a per-scan read would do on the next poll.
+    """
+    return _truthy_env(_ENV_ALLOW_REVISIT)
 
 
 def _csv_env(name: str, default: str) -> List[str]:
@@ -132,6 +156,13 @@ class WorkOrderSensor:
         )
         self._seen: "list[str]" = []  # ordered (bounded ring); membership via set
         self._seen_set: set = set()
+        # Hashes that were on DISK when this process started and are therefore
+        # exempt from suppression under JARVIS_ALLOW_ROADMAP_REVISIT. Empty
+        # unless the flag is on, so the default path is byte-for-byte the old
+        # behaviour. _record_seen discharges an entry once this session has
+        # actually re-emitted it — the exemption is worth exactly one re-emit,
+        # so a multi-poll session does not re-emit the same roadmap each hour.
+        self._revisit_shadow: set = set()
         self._running = False
         self._poll_task: Optional[asyncio.Task] = None
         self._load_seen()
@@ -214,6 +245,19 @@ class WorkOrderSensor:
             _consider(m.group(1))
         return tuple(found)
 
+    def _suppressed(self, item_hash: str) -> bool:
+        """Has this item already been emitted, for purposes of THIS scan?
+
+        The ledger carries two meanings that are normally the same answer:
+        "we have seen this" (accumulation) and "do not emit this"
+        (suppression). Revisit mode separates them — the shadow keeps
+        accumulation intact while standing down suppression for the hashes
+        that predate this process. NEVER raises.
+        """
+        if item_hash not in self._seen_set:
+            return False
+        return item_hash not in self._revisit_shadow
+
     def _item_hash(self, source_rel: str, item_text: str) -> str:
         h = hashlib.sha256()
         h.update(source_rel.encode("utf-8", "replace"))
@@ -254,7 +298,7 @@ class WorkOrderSensor:
                 candidates: List[Tuple[str, IntentEnvelope]] = []
                 for marker, item_text in self._extract_items(text):
                     ih = self._item_hash(source_rel, item_text)
-                    if ih in self._seen_set:
+                    if self._suppressed(ih):
                         continue
                     env = self._build_envelope(
                         source_rel, marker, item_text, urgency,
@@ -361,10 +405,25 @@ class WorkOrderSensor:
                     self._seen_set = set(self._seen)
         except Exception:  # noqa: BLE001 — a torn ledger just starts empty
             self._seen, self._seen_set = [], set()
+        # Shadow the snapshot, never the file: the ledger is left on disk
+        # exactly as found, so turning the flag off restores suppression for
+        # every hash it ever recorded. A torn ledger shadows nothing, which
+        # is correct — there is no suppression to stand down.
+        if revisit_enabled():
+            self._revisit_shadow = set(self._seen_set)
+            if self._revisit_shadow:
+                logger.info(
+                    "[WorkOrderSensor] revisit ON — %d seen hash(es) shadowed "
+                    "for re-emission; ledger %s left intact",
+                    len(self._revisit_shadow), self._seen_ledger_path,
+                )
 
     def _record_seen(self, hashes: List[str]) -> None:
         cap = _int_env(_ENV_SEEN_CAP, _DEFAULT_SEEN_CAP, floor=1)
         for h in hashes:
+            # Spend the exemption: re-emitted once is what revisit buys, so
+            # the next poll in this same session suppresses normally.
+            self._revisit_shadow.discard(h)
             if h not in self._seen_set:
                 self._seen.append(h)
                 self._seen_set.add(h)
@@ -424,4 +483,4 @@ class WorkOrderSensor:
                 raise
 
 
-__all__ = ["WorkOrderSensor", "sensor_enabled"]
+__all__ = ["WorkOrderSensor", "sensor_enabled", "revisit_enabled"]
