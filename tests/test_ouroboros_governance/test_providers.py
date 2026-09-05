@@ -227,19 +227,42 @@ class TestBuildCodegenPrompt:
         assert "JSON" in prompt
 
     def test_includes_file_content_constraint(self) -> None:
+        """BOTH single- and multi-file tasks ask for full_content.
+
+        This test used to assert that a single-file context produced the
+        `2b.1-diff` schema (Task 4). That behaviour was deliberately
+        removed: `_build_codegen_prompt` now hardcodes
+        `_single_file_task = False`, and the comment above it gives the
+        reason — models could not reliably reproduce verbatim context
+        lines, so the diff shape failed at APPLY with diff_apply_failed on
+        most operations.
+
+        The test was never updated, so it has been red on `main` ever
+        since, independently of any candidate under evaluation. That
+        matters beyond tidiness: VALIDATE runs this file, so every
+        governance operation touching providers.py inherited a failing
+        suite and was judged on it. A stale assertion had become a
+        gate on unrelated work.
+
+        `_SCHEMA_VERSION_DIFF` is deliberately still asserted absent
+        rather than simply not mentioned. If the diff schema is ever
+        re-enabled — the capability gating in `should_force_full_content`
+        exists and is currently unreachable for this path — this test
+        should fail and be rewritten, not silently keep passing.
+        """
         from backend.core.ouroboros.governance.providers import (
             _build_codegen_prompt,
             _SCHEMA_VERSION_DIFF,
         )
 
-        # Single-file context → diff schema (Task 4)
         ctx_single = _make_context(target_files=("tests/test_utils.py",))
         prompt_single = _build_codegen_prompt(ctx_single)
         assert "file" in prompt_single
-        assert _SCHEMA_VERSION_DIFF in prompt_single
-        assert "unified_diff" in prompt_single
+        assert "full_content" in prompt_single
+        assert _SCHEMA_VERSION_DIFF not in prompt_single, (
+            "the diff schema is disabled; if it is back, update this test"
+        )
 
-        # Multi-file context → full_content schema
         ctx_multi = _make_context(target_files=("tests/test_a.py", "tests/test_b.py"))
         prompt_multi = _build_codegen_prompt(ctx_multi)
         assert "file" in prompt_multi
