@@ -109,6 +109,13 @@ export JARVIS_VALIDATION_RESERVE_ENABLED=true
 # candidate tree (pytest-timeout thread dump, JSON report unparseable). The
 # timeout is a guard against a HUNG suite, not a budget for a slow one.
 export JARVIS_TEST_TIMEOUT_S=600
+# L2 on the local lane cannot re-emit providers.py (521 KB): the 2026-09-05
+# baseline got 30-32 KB back, twice, and died full_content_too_short. This
+# routes a big-file repair through the same symbol-scoped swarm GENERATE
+# uses -- regenerate the failing symbols, stitch them into the original --
+# and declines to the single-shot path for everything else. Default OFF in
+# code (unproven); ON here because this run is what proves it.
+export JARVIS_L2_SYMBOL_SCOPED_ENABLED=true
 export JARVIS_THROUGHPUT_GOVERNOR_ENABLED=false
 export JARVIS_BG_POOL_SIZE=2
 

@@ -34,6 +34,87 @@ from typing import Any, Dict, Optional, Set, Tuple
 
 _logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Symbol-scoped repair for big files (composes the GENERATE swarm's pieces)
+# ---------------------------------------------------------------------------
+# The 2026-09-05 baseline: L2 asked the local lane for a full-file candidate
+# of providers.py (521,613 bytes); the model returned 30-32 KB, twice, and
+# the op died `full_content too short`. A repair that needs the whole file
+# re-emitted cannot work for any module that size on a local model.
+#
+# GENERATE already solves this for big files -- the swarm short-circuit in
+# CandidateGenerator resolves target symbols, runs one agent turn per
+# symbol and stitches the result into the original source. L2 never reached
+# it: governed_loop_service hands L2 the PROVIDER and L2 awaits
+# `provider.generate` directly (Slice 9's single-shot fast path). This is
+# the same composition on the L2 path, from the same four functions, gated
+# the same way, and it declines to None on every miss so the single-shot
+# call below it stays byte-identical for every file it already handles.
+
+#: Master switch. Default OFF: an unproven path stays opt-in until a run
+#: has measured it (devtest_baseline.sh turns it on for the baseline).
+L2_SYMBOL_SCOPED_ENV = "JARVIS_L2_SYMBOL_SCOPED_ENABLED"
+#: How much of the failure summary the agent is shown, in characters.
+L2_SYMBOL_SCOPED_FEEDBACK_CHARS_ENV = "JARVIS_L2_SYMBOL_SCOPED_FEEDBACK_CHARS"
+#: Stamped on the result so the record shows HOW the candidate was made.
+L2_SYMBOL_SCOPED_PROVIDER = "l2-symbol-scoped-swarm"
+
+
+def _symbol_scoped_enabled() -> bool:
+    return (os.environ.get(L2_SYMBOL_SCOPED_ENV, "false") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _feedback_chars() -> int:
+    raw = (os.environ.get(L2_SYMBOL_SCOPED_FEEDBACK_CHARS_ENV, "") or "").strip()
+    try:
+        v = int(raw)
+        return v if v > 0 else 4000
+    except ValueError:
+        return 4000
+
+
+def _swarm_stack():
+    """The GENERATE swarm's building blocks, imported at call time.
+
+    One seam, so a test can stand the whole stack in and so an absent
+    stack is a DECLINE (ImportError caught by the caller), never a crash.
+    Order: (is_big_file, resolve_target_symbols, intercept_full_content,
+    ProductionAgentTurnFn, _declared_symbols_for).
+    """
+    from backend.core.ouroboros.governance.chunked_generation import is_big_file
+    from backend.core.ouroboros.governance.target_symbol_resolver import (
+        resolve_target_symbols,
+    )
+    from backend.core.ouroboros.governance.full_content_interceptor import (
+        intercept_full_content,
+    )
+    from backend.core.ouroboros.governance.agent_turn_adapter import (
+        ProductionAgentTurnFn,
+    )
+    from backend.core.ouroboros.governance.candidate_generator import (
+        _declared_symbols_for,
+    )
+    return (is_big_file, resolve_target_symbols, intercept_full_content,
+            ProductionAgentTurnFn, _declared_symbols_for)
+
+
+def _frames_from_failure(repair_context: Any) -> Tuple[str, ...]:
+    """Traceback-looking lines of the failure summary, for the resolver's
+    deterministic pass. Empty on any miss -- the resolver then falls to
+    declared symbols and the goal-keyword pass."""
+    text = getattr(repair_context, "failure_summary", "") or ""
+    if not isinstance(text, str):
+        return ()
+    out = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("File ") or ", line " in s:
+            out.append(s)
+    return tuple(out[:64])
+
+
 
 # ---------------------------------------------------------------------------
 # L2 test target resolution (Slice 9 — real failing tests, not the candidate)
@@ -1803,6 +1884,134 @@ class RepairEngine:
             _logger.debug("[StructuralGate] validate unavailable (non-fatal, ACCEPT): %s", exc)
             return None
 
+    async def _symbol_scoped_repair(self, ctx: Any, repair_context: Any) -> Optional[Any]:
+        """Regenerate the failing SYMBOLS of a big file and stitch them in.
+
+        Returns a ``GenerationResult`` carrying the STITCHED file as its one
+        candidate, or ``None`` -- on which the caller runs the whole-file
+        single-shot call exactly as before. Every miss is a decline: gate
+        off, no target, small file, stack absent, resolver fail-closed, no
+        agent client, no stitch, drift, any exception. ``CancelledError``
+        propagates (structured concurrency). Never raises otherwise.
+        """
+        if not _symbol_scoped_enabled():
+            return None
+        targets = tuple(getattr(ctx, "target_files", ()) or ())
+        if not targets:
+            return None
+        path = str(targets[0])
+        try:
+            is_big_file, resolve_target_symbols, intercept_full_content, \
+                ProductionAgentTurnFn, declared_symbols_for = _swarm_stack()
+        except Exception as exc:  # noqa: BLE001 -- stack absent -> standard route
+            _logger.info("[L2 Repair] symbol-scoped decline: stack unavailable (%s: %s)",
+                         type(exc).__name__, exc)
+            return None
+        try:
+            abs_path = path
+            repo_root = getattr(self, "_repo_root", None)
+            if repo_root and not os.path.isabs(path):
+                abs_path = os.path.join(str(repo_root), path)
+            with open(abs_path, encoding="utf-8", errors="replace") as fh:
+                source = fh.read()
+        except Exception:  # noqa: BLE001
+            _logger.info("[L2 Repair] symbol-scoped decline: source unreadable for %s", path)
+            return None
+        if not is_big_file(source):
+            return None   # the single-shot path handles it; nothing to log
+        try:
+            res = resolve_target_symbols(
+                source=source, file_path=path,
+                traceback_frames=_frames_from_failure(repair_context),
+                source_loci=targets,
+                goal=getattr(ctx, "description", "") or "",
+                declared_symbols=declared_symbols_for(ctx, path),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _logger.info("[L2 Repair] symbol-scoped decline: resolver raised %s", exc)
+            return None
+        if not getattr(res, "resolved", False):
+            _logger.info("[L2 Repair] symbol-scoped decline: resolver FAIL-CLOSED for %s", path)
+            return None
+        try:
+            from backend.core.ouroboros.governance.candidate_generator import (  # noqa: PLC0415
+                agent_client_from,
+            )
+            client = agent_client_from([self._prime])
+        except Exception:  # noqa: BLE001
+            client = None
+        if client is None:
+            _logger.info("[L2 Repair] symbol-scoped decline: no agent client on the provider seat")
+            return None
+        try:
+            from backend.core.ouroboros.governance.providers import (  # noqa: PLC0415
+                _CODEGEN_SYSTEM_PROMPT as _sys_prompt,
+            )
+        except Exception:  # noqa: BLE001
+            _sys_prompt = ""
+        # The one thing L2 knows that GENERATE did not: WHY the last
+        # candidate failed. Bounded, so a 500 KB pytest dump cannot become
+        # the prompt.
+        failing = ", ".join(str(t) for t in (getattr(repair_context, "failing_tests", ()) or ())[:8])
+        summary = (getattr(repair_context, "failure_summary", "") or "")[: _feedback_chars()]
+        feedback = (
+            "\n\n## L2 REPAIR CONTEXT\nThe previous candidate for this file FAILED "
+            f"validation.\nFailing tests: {failing or '(unknown)'}\n"
+            f"Failure summary:\n{summary}\n"
+            "Repair ONLY the symbol you are given so that these tests pass."
+        )
+        op_id = getattr(ctx, "op_id", "") or ""
+        agent = ProductionAgentTurnFn(
+            client=client,
+            tool_backend=None,                        # pure-completion node repair
+            repo_root=str(repo_root or "."),
+            op_id=op_id,
+            model_name=getattr(client, "_model", "") or "",
+            system_prompt=(_sys_prompt or "") + feedback,
+            parse_fn=lambda raw: None,                # single-shot node completion
+            max_turns=1,
+        )
+        t0 = time.monotonic()
+        try:
+            result = await intercept_full_content(
+                source, path, list(getattr(res, "symbol_names", ())), agent, op_id=op_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- any swarm fault -> standard route
+            _logger.warning("[L2 Repair] symbol-scoped error for %s: %s -- standard route", path, exc)
+            return None
+        if (
+            getattr(result, "drifted", False)
+            or not getattr(result, "stitched", False)
+            or not getattr(result, "content", "")
+        ):
+            _logger.info("[L2 Repair] symbol-scoped no-stitch/drift for %s -- standard route", path)
+            return None
+        dur = time.monotonic() - t0
+        rationale = (
+            f"L2 symbol-scoped swarm ({getattr(res, 'method', '?')}, "
+            f"conf={float(getattr(res, 'confidence', 0.0) or 0.0):.2f}): "
+            f"symbols={list(getattr(res, 'symbol_names', ()))} "
+            f"converged={list(getattr(result, 'converged_nodes', []))} "
+            f"failing_tests={failing or '(unknown)'}"
+        )
+        _logger.info("[L2 Repair] SYMBOL-SCOPED repair LANDED for %s: %s [%.1fs]", path, rationale, dur)
+        from backend.core.ouroboros.governance.op_context import GenerationResult  # noqa: PLC0415
+        return GenerationResult(
+            candidates=(
+                {
+                    "candidate_id": f"l2swarm-{op_id[:8]}",
+                    "file_path": path,
+                    "full_content": result.content,
+                    "rationale": rationale,
+                },
+            ),
+            provider_name=L2_SYMBOL_SCOPED_PROVIDER,
+            generation_duration_s=dur,
+            model_id=getattr(client, "_model", "") or "",
+        )
+
     async def _generate_repair_candidate(
         self,
         ctx: Any,
@@ -1941,9 +2150,19 @@ class RepairEngine:
                 ctx, _provider_deadline, repair_context=repair_context,
             )
 
+        async def _invoke_or_scoped() -> Any:
+            # Big file? Regenerate the failing SYMBOLS through the swarm
+            # composition GENERATE already uses, and stitch them into the
+            # original. A decline (None) runs the single-shot call
+            # exactly as before. Inside the same per-iteration timeout.
+            _scoped = await self._symbol_scoped_repair(ctx, repair_context)
+            if _scoped is not None:
+                return _scoped
+            return await _invoke_generate()
+
         try:
             gen_result = await asyncio.wait_for(
-                _invoke_generate(),
+                _invoke_or_scoped(),
                 timeout=_effective_timeout_s,
             )
         except asyncio.CancelledError:

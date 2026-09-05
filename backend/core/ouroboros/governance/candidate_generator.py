@@ -3216,6 +3216,39 @@ def _truncation_reshape_enabled() -> bool:
     return _envb("JARVIS_TRUNCATION_RESHAPE_ENABLED", True)
 
 
+def agent_client_from(providers, *, injected=None):
+    """The provider CLIENT an agent turn speaks to, or None.
+
+    ``ProductionAgentTurnFn`` wants a *client* -- something with
+    ``async generate(prompt=..., system_prompt=..., model_name=...,
+    task_profile=...)``: a ``PrimeClient`` / ``LocalPrimeClient``. Callers
+    hold PROVIDERS (``generate(context, deadline)``); the client lives one
+    level down. This is the ONE place that knows where, so the GENERATE
+    swarm and the L2 repair path can never disagree about it -- the swarm
+    wire once read a ``_client`` no constructor set and took every
+    generation down with it (2026-09-05).
+
+    ``injected`` wins when it carries a callable ``generate`` (the test
+    seam, kept honest by name). Then each provider in order, probing the
+    known client attributes. None means "no agent brain here"; the caller
+    DECLINES and its standard route runs byte-identical. Never raises.
+    """
+    if injected is not None and callable(getattr(injected, "generate", None)):
+        return injected
+    for provider in providers:
+        if provider is None:
+            continue
+        for path in (("_client",), ("_state", "client"), ("_prime_client",), ("client",)):
+            obj = provider
+            for attr in path:
+                obj = getattr(obj, attr, None)
+                if obj is None:
+                    break
+            if obj is not None and callable(getattr(obj, "generate", None)):
+                return obj
+    return None
+
+
 def _declared_symbols_for(context: Any, file_path: str) -> Tuple[str, ...]:
     """Operator-declared repair targets for *file_path*, from the SIGNED goal.
 
@@ -4380,22 +4413,10 @@ class CandidateGenerator:
         means "no agent brain on this box"; the caller DECLINES the swarm
         route and the standard route runs byte-identical. Never raises.
         """
-        injected = getattr(self, "_client", None)
-        if injected is not None and callable(getattr(injected, "generate", None)):
-            return injected
-        for seat in ("_jprime", "_primary", "_fallback"):
-            provider = getattr(self, seat, None)
-            if provider is None:
-                continue
-            for path in (("_client",), ("_state", "client"), ("_prime_client",), ("client",)):
-                obj: Any = provider
-                for attr in path:
-                    obj = getattr(obj, attr, None)
-                    if obj is None:
-                        break
-                if obj is not None and callable(getattr(obj, "generate", None)):
-                    return obj
-        return None
+        return agent_client_from(
+            (getattr(self, seat, None) for seat in ("_jprime", "_primary", "_fallback")),
+            injected=getattr(self, "_client", None),
+        )
 
     def _swarm_routing_enabled(self) -> bool:
         """Dynamic toggle (env ``JARVIS_SWARM_ROUTING_ENABLED``, default OFF) —
