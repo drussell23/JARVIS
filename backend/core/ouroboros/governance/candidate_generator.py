@@ -4359,6 +4359,44 @@ class CandidateGenerator:
             "provider_override_unavailable:gcp-jprime:no_endpoint"
         )
 
+    def _swarm_agent_client(self) -> Optional[Any]:
+        """The provider CLIENT the swarm's agent turn speaks to, or None.
+
+        ``ProductionAgentTurnFn`` wants a *client* -- something with
+        ``async generate(prompt=..., system_prompt=..., model_name=...,
+        task_profile=...)``: a ``PrimeClient`` / ``LocalPrimeClient``. This
+        generator holds PROVIDERS (``CandidateProvider.generate(context,
+        deadline)``); the client lives one level down, inside
+        ``PrimeProvider._state.client``. The swarm wire (#70029) read
+        ``self._client``, which no constructor ever set, so with
+        ``JARVIS_SWARM_ROUTING_ENABLED=true`` every generation died at
+        ``AttributeError`` before any provider was asked -- the devtest
+        baseline of 2026-09-05 could not reach GENERATE at all. Its tests
+        passed because they injected ``g._client`` by hand.
+
+        Resolution order: an explicitly injected ``_client`` (the test seam,
+        kept honest by name), then the J-Prime seat, then primary, then
+        fallback -- the first that carries a callable ``generate``. None
+        means "no agent brain on this box"; the caller DECLINES the swarm
+        route and the standard route runs byte-identical. Never raises.
+        """
+        injected = getattr(self, "_client", None)
+        if injected is not None and callable(getattr(injected, "generate", None)):
+            return injected
+        for seat in ("_jprime", "_primary", "_fallback"):
+            provider = getattr(self, seat, None)
+            if provider is None:
+                continue
+            for path in (("_client",), ("_state", "client"), ("_prime_client",), ("client",)):
+                obj: Any = provider
+                for attr in path:
+                    obj = getattr(obj, attr, None)
+                    if obj is None:
+                        break
+                if obj is not None and callable(getattr(obj, "generate", None)):
+                    return obj
+        return None
+
     def _swarm_routing_enabled(self) -> bool:
         """Dynamic toggle (env ``JARVIS_SWARM_ROUTING_ENABLED``, default OFF) —
         WORKSPACE_PROMOTION-style, no code mutation to flip. Off → the
@@ -4367,6 +4405,27 @@ class CandidateGenerator:
         return os.environ.get(
             "JARVIS_SWARM_ROUTING_ENABLED", "false",
         ).strip().lower() in ("1", "true", "yes", "on")
+
+    async def _swarm_or_none(
+        self, context: OperationContext, deadline: datetime,
+    ) -> Optional[GenerationResult]:
+        """The swarm short-circuit with its documented contract enforced at
+        the seam: any fault inside it -- not only the resolver's -- means
+        "standard route", never a failed generation. The wire's own
+        ``AttributeError`` escaped this way on 2026-09-05 and took BOTH
+        generation attempts of every op with it. ``CancelledError`` still
+        propagates (structured concurrency)."""
+        try:
+            return await self._maybe_swarm_short_circuit(context, deadline)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — a swarm fault is not an op failure
+            logger.warning(
+                "[CandidateGenerator] swarm short-circuit raised %s: %s — "
+                "standard route preserved",
+                type(exc).__name__, exc,
+            )
+            return None
 
     def _read_source_for_swarm(self, rel_or_abs: str) -> Optional[str]:
         """Read a target file's current on-disk content (repo_root-joined).
@@ -4516,12 +4575,20 @@ class CandidateGenerator:
         except Exception:  # noqa: BLE001
             _sys_prompt = ""
 
+        client = self._swarm_agent_client()
+        if client is None:
+            logger.info(
+                "[CandidateGenerator] swarm decline for %s: no provider seat "
+                "exposes an agent client — standard route preserved", path,
+            )
+            return None
+
         agent = ProductionAgentTurnFn(
-            client=self._client,
+            client=client,
             tool_backend=None,                       # pure-completion node repair (v1)
             repo_root=getattr(self, "_repo_root", "."),
             op_id=getattr(context, "op_id", ""),
-            model_name=getattr(self._client, "_model", "") or "",  # client default, no hardcode
+            model_name=getattr(client, "_model", "") or "",  # client default, no hardcode
             system_prompt=_sys_prompt,
             parse_fn=lambda raw: None,               # single-shot node completion
             max_turns=1,
@@ -4580,7 +4647,7 @@ class CandidateGenerator:
             ),
             provider_name="doubleword-agentic-swarm",
             generation_duration_s=dur,
-            model_id=getattr(self._client, "_model", "") or "",
+            model_id=getattr(client, "_model", "") or "",
         )
 
     async def _generate_dispatch(
@@ -4614,7 +4681,7 @@ class CandidateGenerator:
         # interceptor instead of whole-file generation. Returns None (standard
         # route, byte-identical) on the flag being off / small file / resolver
         # fail-closed. CancelledError propagates (structured concurrency).
-        _swarm_result = await self._maybe_swarm_short_circuit(context, deadline)
+        _swarm_result = await self._swarm_or_none(context, deadline)
         if _swarm_result is not None:
             return _swarm_result
 
