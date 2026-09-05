@@ -1175,10 +1175,49 @@ class TrajectoryRecorder:
             _seen.pop(evt.op_id, None)
 
     @staticmethod
+    def _self_evidencing_policy(
+        gen: "_PendingGeneration",
+    ) -> "Optional[_OutcomePolicy]":
+        """The policy a generation ESTABLISHES about itself, or None.
+
+        A draw is self-evidencing when its own content settles its outcome,
+        with no downstream phase required:
+
+        * a REFUSAL (``is_noop``) declared the outcome and its diff is null
+          by construction -- no candidate was produced and the recorded body
+          is the decline envelope itself;
+        * an UNPARSEABLE draw failed at the AST parser. That is a
+          deterministic fact established at generation time -- the parser IS
+          the verdict -- and it is a stronger claim than a refusal's, since
+          nothing downstream could have rescued code that does not parse.
+          It maps to _FAILURE: the candidate was bad on its own merits,
+          which is precisely the trainable failure.
+
+        A PATCH is deliberately absent. Whether its code is CORRECT is
+        genuinely unknown until VALIDATE runs, and guessing would put a
+        fabricated label in the corpus.
+
+        Pure; NEVER raises.
+        """
+        try:
+            if gen.is_noop:
+                return _NOOP
+            cands = gen.candidates or ()
+            if cands and all(
+                isinstance(c, dict)
+                and str(c.get("candidate_status", "") or "") == "parse_error"
+                for c in cands
+            ):
+                return _FAILURE
+        except Exception:  # noqa: BLE001 - a label rule never breaks a write
+            return None
+        return None
+
+    @classmethod
     def _noop_override(
-        gen: "_PendingGeneration", policy: "_OutcomePolicy",
+        cls, gen: "_PendingGeneration", policy: "_OutcomePolicy",
     ) -> "_OutcomePolicy":
-        """Apply the self-evidencing-refusal rule. ONE place, both writers.
+        """Apply the self-evidencing rule. ONE place, both writers.
 
         The verdict-joined path and the pending-EXPIRY path each decide a
         row's policy, and the first version of this rule lived only in the
@@ -1186,11 +1225,16 @@ class TrajectoryRecorder:
         so a refusal whose op never reported was still discarded -- 6 of
         soak 24's first 40 rows. Its comment ("an outcome we never saw is
         not a label") is right for a PATCH, whose correctness genuinely is
-        unknown, and wrong for a REFUSAL, which declared its own outcome
-        and whose diff is null by construction.
+        unknown, and wrong for a draw that already settled its own outcome.
+
+        Measured on soak bt-2026-09-05-010735: three ops carried a patch AND
+        a parse_error/noop sibling -- the exact {good, bad} pair the corpus
+        exists to produce -- and every one read as UNMIXED downstream because
+        the contrasting half was dropped `not_train`.
         """
-        if gen.is_noop and policy in _NOOP_OVERRIDABLE_POLICIES:
-            return _NOOP
+        established = cls._self_evidencing_policy(gen)
+        if established is not None and policy in _NOOP_OVERRIDABLE_POLICIES:
+            return established
         return policy
 
     def _validate_lineage(

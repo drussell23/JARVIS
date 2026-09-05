@@ -995,3 +995,99 @@ async def test_a_PATCH_that_expires_stays_untrainable(
             if r["metadata"]["op_id"] == "op-patch-expires"]
     assert rows
     assert rows[0]["metadata"]["should_train"] is False
+
+# ---------------------------------------------------------------------------
+# A parse error is self-evidencing too — the parser IS the verdict
+# ---------------------------------------------------------------------------
+
+
+def _parse_error_result():
+    from backend.core.ouroboros.governance.observability.trajectory_recorder import (  # noqa: E501
+        parse_error_candidate,
+    )
+    return _FakeGenerationResult(candidates=(parse_error_candidate(_RAW_BAD),))
+
+
+@pytest.mark.asyncio
+async def test_parse_error_is_trainable_without_a_verdict(
+    rec: TrajectoryRecorder,
+) -> None:
+    """Soak 25 measured 3 ops carrying a patch AND a parse_error sibling —
+    the exact {good, bad} pair — every one reading as UNMIXED because the
+    parse_error half was dropped not_train."""
+    rec.record_generation(op_id="op-pe-unvouched", prompt="p",
+                          generation_result=_parse_error_result())
+    rec.record_outcome(op_id="op-pe-unvouched", terminal_reason="")
+    await rec.drain()
+
+    row = _lines(rec.path)[0]
+    assert row["metadata"]["candidate_status"] == "parse_error"
+    assert row["metadata"]["should_train"] is True
+    # A parse error is the TRAINABLE FAILURE, not a partial.
+    assert row["outcome"] == "failure"
+
+
+@pytest.mark.asyncio
+async def test_parse_error_that_EXPIRES_is_trainable(
+    rec: TrajectoryRecorder,
+) -> None:
+    rec.record_generation(op_id="op-pe-exp", prompt="p",
+                          generation_result=_parse_error_result())
+    await rec.drain()
+    for lineage in rec._pending.values():
+        for gen in lineage:
+            gen.created_monotonic = 0.0
+    await rec._expire_pending()
+    await rec.drain()
+
+    rows = [r for r in _lines(rec.path)
+            if r["metadata"]["op_id"] == "op-pe-exp"]
+    assert rows and rows[0]["metadata"]["should_train"] is True
+    assert rows[0]["outcome"] == "failure"
+
+
+@pytest.mark.asyncio
+async def test_a_caged_parse_error_stays_untrainable(
+    rec: TrajectoryRecorder,
+) -> None:
+    """Governance denials are never model quality, whatever the draw was."""
+    rec.record_generation(op_id="op-pe-caged", prompt="p",
+                          generation_result=_parse_error_result())
+    rec.record_outcome(op_id="op-pe-caged",
+                       terminal_reason="self_modification_unsanctioned_source")
+    await rec.drain()
+    assert _lines(rec.path)[0]["metadata"]["should_train"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_MIXED_op_keeps_both_halves(rec: TrajectoryRecorder) -> None:
+    """The whole point: one op, a patch and a parse_error, both surviving —
+    that pair is what becomes a trainable group."""
+    rec.record_generation(op_id="op-mixed", prompt="p",
+                          generation_result=_FakeGenerationResult(
+                              candidates=(_candidate(),)))
+    rec.record_generation(op_id="op-mixed", prompt="p",
+                          generation_result=_parse_error_result())
+    rec.record_outcome(op_id="op-mixed", terminal_reason="applied")
+    await rec.drain()
+
+    rows = [r for r in _lines(rec.path)
+            if r["metadata"]["op_id"] == "op-mixed"]
+    assert len(rows) == 2
+    assert all(r["metadata"]["should_train"] for r in rows)
+    assert {r["metadata"]["candidate_status"] for r in rows} == {
+        "patch", "parse_error"}
+
+
+@pytest.mark.asyncio
+async def test_a_patch_is_still_NOT_self_evidencing(
+    rec: TrajectoryRecorder,
+) -> None:
+    """The rule must not leak to patches: whether code is CORRECT is
+    genuinely unknown until VALIDATE, and guessing fabricates a label."""
+    rec.record_generation(op_id="op-plain-patch", prompt="p",
+                          generation_result=_FakeGenerationResult(
+                              candidates=(_candidate(),)))
+    rec.record_outcome(op_id="op-plain-patch", terminal_reason="")
+    await rec.drain()
+    assert _lines(rec.path)[0]["metadata"]["should_train"] is False
