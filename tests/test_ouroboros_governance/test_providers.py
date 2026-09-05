@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time as _time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple
 from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
@@ -460,7 +460,7 @@ class TestClaudeProvider:
         provider._client = mock_client
 
         ctx = _make_context()
-        deadline = datetime(2026, 3, 7, 12, 5, 0, tzinfo=timezone.utc)
+        deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=300)  # live, not frozen: an expired deadline is REFUSED by design
         result = await provider.generate(ctx, deadline)
         assert len(result.candidates) == 1
         assert result.provider_name == "claude-api"
@@ -474,7 +474,7 @@ class TestClaudeProvider:
         )
         provider._daily_spend = 0.01
         ctx = _make_context()
-        deadline = datetime(2026, 3, 7, 12, 5, 0, tzinfo=timezone.utc)
+        deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=300)
         with pytest.raises(RuntimeError, match="claude_budget_exhausted"):
             await provider.generate(ctx, deadline)
 

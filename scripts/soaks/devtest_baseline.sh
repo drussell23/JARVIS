@@ -104,7 +104,11 @@ export JARVIS_SIBLING_ENTROPY_ENABLED=true
 export JARVIS_LOCAL_SIBLING_CANDIDATES=3
 export JARVIS_SIBLING_MAX_RESAMPLE=1
 export JARVIS_VALIDATION_RESERVE_ENABLED=true
-export JARVIS_TEST_TIMEOUT_S=180
+# 600, not 180: VALIDATE scoped the 2026-09-05 baseline to test_providers.py,
+# 65 tests that take ~57 s standalone and blew 180 s under the sandboxed
+# candidate tree (pytest-timeout thread dump, JSON report unparseable). The
+# timeout is a guard against a HUNG suite, not a budget for a slow one.
+export JARVIS_TEST_TIMEOUT_S=600
 export JARVIS_THROUGHPUT_GOVERNOR_ENABLED=false
 export JARVIS_BG_POOL_SIZE=2
 
