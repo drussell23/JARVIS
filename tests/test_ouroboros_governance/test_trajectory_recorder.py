@@ -940,3 +940,58 @@ async def test_a_patch_with_no_verdict_is_still_untrainable(
 
     row = _lines(rec.path)[0]
     assert row["metadata"]["should_train"] is False
+
+@pytest.mark.asyncio
+async def test_a_refusal_that_EXPIRES_is_still_trainable(
+    rec: TrajectoryRecorder,
+) -> None:
+    """The second write path. An op that declines often never reports at
+    all, so its row is written by the pending-EXPIRY sweep — which
+    hardcoded (unknown, intent_written, False) and discarded the refusal
+    even after the verdict-joined path was fixed. 6 of soak 24's first 40
+    rows died here.
+    """
+    rec.record_generation(
+        op_id="op-expires", prompt="p",
+        generation_result=_noop_result("nothing to change"),
+    )
+    await rec.drain()
+    # TTL is floored at 30s, so age the entry rather than shrink the TTL --
+    # the same move aclose() makes for its final flush.
+    for lineage in rec._pending.values():
+        for gen in lineage:
+            gen.created_monotonic = 0.0
+    await rec._expire_pending()
+    await rec.drain()
+
+    rows = [r for r in _lines(rec.path)
+            if r["metadata"]["op_id"] == "op-expires"]
+    assert rows, "the expiry sweep wrote no row at all"
+    row = rows[0]
+    assert row["metadata"]["candidate_status"] == "noop"
+    assert row["outcome"] == "partial"
+    assert row["metadata"]["should_train"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_PATCH_that_expires_stays_untrainable(
+    rec: TrajectoryRecorder,
+) -> None:
+    """The override must not leak to patches. A patch whose op never
+    reported is genuinely unlabelled — nothing declares whether its code
+    was correct."""
+    rec.record_generation(
+        op_id="op-patch-expires", prompt="p",
+        generation_result=_FakeGenerationResult(candidates=(_candidate(),)),
+    )
+    await rec.drain()
+    for lineage in rec._pending.values():
+        for gen in lineage:
+            gen.created_monotonic = 0.0
+    await rec._expire_pending()
+    await rec.drain()
+
+    rows = [r for r in _lines(rec.path)
+            if r["metadata"]["op_id"] == "op-patch-expires"]
+    assert rows
+    assert rows[0]["metadata"]["should_train"] is False

@@ -1162,10 +1162,9 @@ class TrajectoryRecorder:
         lineage = self._validate_lineage(evt.op_id, list(lineage or []))
         for _n, _gen in enumerate(lineage or []):
             _outcome, _autonomy, _train = outcome, autonomy_type, should_train
-            if _gen.is_noop and (
-                _outcome, _autonomy, _train
-            ) in _NOOP_OVERRIDABLE_POLICIES:
-                _outcome, _autonomy, _train = _NOOP
+            _outcome, _autonomy, _train = self._noop_override(
+                _gen, (_outcome, _autonomy, _train),
+            )
             _gen.lineage_size = len(lineage or [])
             await self._write(_gen, _outcome, _autonomy, _train, evt)
         # The op's lineage is on disk: release its dedupe set. The map is
@@ -1174,6 +1173,25 @@ class TrajectoryRecorder:
         _seen = getattr(self, "_persisted", None)
         if _seen:
             _seen.pop(evt.op_id, None)
+
+    @staticmethod
+    def _noop_override(
+        gen: "_PendingGeneration", policy: "_OutcomePolicy",
+    ) -> "_OutcomePolicy":
+        """Apply the self-evidencing-refusal rule. ONE place, both writers.
+
+        The verdict-joined path and the pending-EXPIRY path each decide a
+        row's policy, and the first version of this rule lived only in the
+        former. The expiry path hardcoded (unknown, intent_written, False),
+        so a refusal whose op never reported was still discarded -- 6 of
+        soak 24's first 40 rows. Its comment ("an outcome we never saw is
+        not a label") is right for a PATCH, whose correctness genuinely is
+        unknown, and wrong for a REFUSAL, which declared its own outcome
+        and whose diff is null by construction.
+        """
+        if gen.is_noop and policy in _NOOP_OVERRIDABLE_POLICIES:
+            return _NOOP
+        return policy
 
     def _validate_lineage(
         self, op_id: str, lineage: "List[_PendingGeneration]",
@@ -1273,11 +1291,14 @@ class TrajectoryRecorder:
                 "the TTL (%s) or never reaching a terminal phase.",
                 op_id, ttl, len(gen.candidates), _ENV_PENDING_TTL_S,
             )
+            _exp_outcome, _exp_autonomy, _exp_train = self._noop_override(
+                gen, _UNKNOWN,
+            )
             await self._write(
                 gen,
-                "unknown",
-                "intent_written",
-                False,
+                _exp_outcome,
+                _exp_autonomy,
+                _exp_train,
                 _OutcomeEvent(
                     op_id=op_id, terminal_phase="", terminal_reason="",
                 ),
