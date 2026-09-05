@@ -105,6 +105,61 @@ diffs. Full campaign detail: `docs/architecture/OUROBOROS_VENOM_PRD.md` (v3.34 h
 
 ---
 
+## 🧪 The Preference-Corpus Arc — snapshot, 2026-09-04: soaks 19–26
+
+> **A dated snapshot, deliberately not maintained.** It records what eight instrumented soaks showed on that date and is left unedited so the trajectory stays legible. For current state read the git log.
+
+The July campaign proved O+V could *land a fix*. This one asks a different question: can the
+organism produce a corpus good enough to **train the model it runs on**? GRPO learns from
+within-group **contrast** — a good answer beside a bad one on the same prompt — and every
+layer between the model and the trainer was silently discarding the losing half. Trainable
+groups went **4 → 20**; row survival **21% → 79%**.
+
+**What failed → what killed it** (each soak exposed exactly one structural defect):
+
+| Soak | Died at | Root cause | Fix (merged) |
+|---|---|---|---|
+| 20 | work supply | The work-order seen-ledger is **cross-session**, so re-running a stable roadmap emitted **0** orders. 2.5h, 22 rows, none trainable. | `JARVIS_ALLOW_ROADMAP_REVISIT` *shadows* the ledger in memory — never deletes the operator's record (`5dc973d6c7`) |
+| 19/21 | sibling loop | A `2b.1-noop` sibling read as **EMPTY** and set `_stop`, forfeiting every remaining slot — 8 of 15 singleton ops | A refusal is an **answer**, not a dead lane: re-draw in-slot, drop the *slot* not the loop, + a per-slot `sibling_fulfillment` ledger (`95c1031e51`) |
+| 22 | the corpus | The recorder returned `False` for a refusal (`not traj.candidates`) — the cleanest negative answer never became a row | Synthesise it; body = the decline **envelope**, because prose falls through to `_grade_source` and grades as *broken Python*, inverting the ladder (`4c8f4d3af9`) |
+| 23 | the corpus | Unparseable draws **raised before** the recorder hook — `all_candidates_syntax_error` left nothing behind | Capture at the raise, body = the **raw** response so the grader scores by how far the parse got (`06c0d51705`) |
+| 24 | the filters | Reactor's `genuine_only` discarded **156 of 330** rows — every `retry` draw — on a rationale written for `repair` | `is_genuine_row` admits a retry whose answer is *categorical*; a refusal re-answers the **same** prompt (reactor `8f36af0`) |
+| 24 | the filters | `_UNKNOWN` discarded refusals whose op never reported — and a declining op is the *least* likely to reach a verdict | A refusal is **self-evidencing**; matched on the **policy tuple**, never the outcome string (`fbf227d4ca`) |
+| 24 | the filters | The same rule was missing on the **expiry** write path — where a declining op's rows actually land. Survival slid 100% → 25%. | One `_noop_override`, consulted by *both* writers (`525ba81739`) |
+| 25 | the pairs | Three ops held a patch **and** a parse_error sibling — the exact {good, bad} pair — every one reading as unmixed downstream | `_self_evidencing_policy`: `_NOOP` for a refusal, `_FAILURE` for an unparseable draw — **the parser is the verdict** (`93cce42284`) |
+
+**The reward ladder, measured end-to-end against an unmodified Reactor**:
+
+```
+parse_error 0.300  <  noop 0.450  <  patch 0.812     spread 0.5121 vs a 0.01 gate
+breaking           <  declining   <  delivering
+```
+
+**Two structural facts that bound the approach** (both measured, both cost a soak to learn):
+GRPO groups on the exact prompt and **every prompt embeds its own Op-ID** — 85/85 rows, zero
+prompts shared across ops — so a new soak always mints *new* groups and can never deepen an
+existing one; re-running buys **breadth, never depth**. And a **noop-primary op can never draw
+a sibling** (the loop returns at its first guard), so it is all-refusal by construction — only
+patch-primary ops can ever be mixed.
+
+**What worked without qualification**: every fix was a *root cause*, never a workaround —
+the ledger is shadowed rather than deleted, the filter distinguishes categorical answers
+rather than blanket-admitting retries, the override matches a policy tuple rather than a
+string that three policies share. Two mandated designs were **measured and rejected** on
+evidence: a static `0.0` floor for parse errors (it collapses a real 0.1429 spread and ranks
+a parse error *below* envelope garbage) and hot-reloading the recorder mid-run (Python loads
+a module once per process; the launch-time sha guard is the actual fix).
+
+**Not proven**: no training run has executed. The corpus stands at **20 trainable groups**
+against a 25 target, and no mixed-shape op has yet survived a soak that had every fix at
+launch. `scripts/soaks/devtest_{prepare,baseline,report}.sh` exists to answer the prior
+question first — **can O+V land a sanctioned change untrained?** O+V has 0 autonomous commits
+and its wall has been *governance*, not candidate quality; if the chain does not close
+untrained, a fine-tuned model will not close it either. Full detail:
+`docs/architecture/OUROBOROS_VENOM_PRD.md` (v3.35 header).
+
+---
+
 ## Symbiotic AI-Native Manifesto: Trinity Ecosystem Unification
 
 This initiative is **not a software refactor**. It is the genesis of an autonomous, self-evolving **Artificial Intelligence Operating System**. The project explicitly rejects the rigid paradigms of traditional software engineering in favor of a symbiotic design: **the models and agents carry intelligence; the codebase is the nervous system** that connects senses, cognition, and safe execution.
