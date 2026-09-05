@@ -26,6 +26,10 @@ MAIN="${OV_MAIN_TREE:-/mnt/c/Users/Jarvis/Desktop/TrinityAi/jarvis}"
 WT="${OV_DEVTEST_TREE:-/mnt/c/Users/Jarvis/Desktop/TrinityAi/jarvis-devtest}"
 BASE_TAG="${OV_BASE_MODEL:-qwen3-coder:30b}"
 FREE_MIB="${OV_GPU_FREE_MIB:-2048}"
+# Everything that may hold the card after the trainer itself exits: the
+# launcher script, and the GGUF bridge it runs on a clean exit (ollama
+# create + a serving probe both LOAD a model).
+HOLDERS="${OV_GPU_HOLDER_PATTERN:-run_grpo_training.py|train[0-9]*.sh|lora_to_ollama.sh}"
 ARCHIVE="${OV_DEVTEST_ARCHIVE:-$HOME/ov-archive}"
 OLLAMA_API="${JARVIS_LOCAL_MODEL_BASE_URL:-http://127.0.0.1:11434}"
 
@@ -36,12 +40,12 @@ gpu_used_mib() { nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounit
 
 # --- 1. the card must be free ---------------------------------------------
 if [ "${1:-}" = "wait" ]; then
-  while pgrep -f run_grpo_training.py >/dev/null || [ "$(gpu_used_mib)" -gt "$FREE_MIB" ]; do
-    log "waiting: training=$(pgrep -f run_grpo_training.py | wc -l) proc, gpu=$(gpu_used_mib) MiB used"
+  while pgrep -f "$HOLDERS" >/dev/null || [ "$(gpu_used_mib)" -gt "$FREE_MIB" ]; do
+    log "waiting: holders=$(pgrep -f "$HOLDERS" | wc -l) proc, gpu=$(gpu_used_mib) MiB used"
     sleep 60
   done
 fi
-pgrep -f run_grpo_training.py >/dev/null && die "a training run is still alive; pass 'wait'"
+pgrep -f "$HOLDERS" >/dev/null && die "a training run or its bridge is still alive; pass 'wait'"
 USED=$(gpu_used_mib); [ -n "$USED" ] || die "nvidia-smi gave no reading"
 [ "$USED" -le "$FREE_MIB" ] || die "card has $USED MiB in use (> $FREE_MIB); something still holds it"
 
