@@ -14561,10 +14561,12 @@ class GovernedOrchestrator:
                                             remaining_s - (time.monotonic() - _v_t0)
                                         ),
                                         op_id=ctx.op_id,
-                                        original_paths={
-                                            p: _ae_effective_repo_root / p.relative_to(_troot)
-                                            for p in _dv_files
-                                        },
+                                        # identity mapping: the candidate tree IS a
+                                        # full repo; mapping back to the sovereignty
+                                        # worktree fails the runner's safety check
+                                        # (skip -> whole-tests-dir fallback -> no
+                                        # baseline). Same shape as the candidate run.
+                                        original_paths={p: p for p in _dv_files},
                                     )
                                     if _dv_baseline:
                                         logger.warning(
