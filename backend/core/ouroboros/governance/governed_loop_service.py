@@ -1125,6 +1125,50 @@ class GovernedLoopConfig:
 # ---------------------------------------------------------------------------
 
 
+_SERVED_CAP_ANNOUNCED: "set" = set()
+
+
+def _local_lane_endpoint() -> str:
+    """The endpoint the generation lane dispatches to (one resolver:
+    ``candidate_generator.local_lane_endpoint``)."""
+    try:
+        from backend.core.ouroboros.governance.candidate_generator import local_lane_endpoint
+        return local_lane_endpoint()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def _resolve_served_capability(gls: Any, brain: Any) -> "Tuple[str, str]":
+    """``(served_model, schema_capability)`` for the routing intent: the slot's
+    declared capability corrected by the model the lane actually serves
+    (memoised per endpoint via ``candidate_generator._resolve_served_model``,
+    the SAME lookup the num_ctx negotiator uses). Fail-soft: any fault stamps
+    the declaration unchanged. Announces a corrected verdict ONCE per
+    (served, declared → effective) at WARNING so a headless soak shows it."""
+    declared = str(getattr(brain, "schema_capability", "full_content_only") or "full_content_only")
+    try:
+        from backend.core.ouroboros.governance.candidate_generator import _resolve_served_model
+        endpoint = _local_lane_endpoint()
+        served = (await _resolve_served_model(endpoint)) if endpoint else None
+        selector = getattr(gls, "_brain_selector", None)
+        if selector is None or not hasattr(selector, "effective_schema_capability"):
+            return (served or "", declared)
+        verdict = selector.effective_schema_capability(declared=declared, served_model=served)
+        key = (verdict.served_model, verdict.declared, verdict.capability)
+        if verdict.changed and key not in _SERVED_CAP_ANNOUNCED:
+            _SERVED_CAP_ANNOUNCED.add(key)
+            logger.warning(
+                "[GovernedLoop] schema capability resolved from the SERVED model: %s -> %s "
+                "(served=%s, slot=%s, %s)",
+                verdict.declared, verdict.capability, verdict.served_model,
+                getattr(brain, "brain_id", "?"), verdict.reason,
+            )
+        return (verdict.served_model, verdict.capability)
+    except Exception:  # noqa: BLE001 — capability resolution never blocks submit
+        logger.debug("[GovernedLoop] served capability resolution degraded", exc_info=True)
+        return ("", declared)
+
+
 def _wrap_subagent_narration(gls: Any, inner: Any) -> Any:
     """Add cockpit narration to a CommSink. Returns `inner` unchanged on any
     failure — a missing narrator must never cost observability.
@@ -3922,6 +3966,11 @@ class GovernedLoopService:
                 )
                 return result
 
+            # The capability that decides 2b.1-diff vs full_content belongs to the
+            # model that will ANSWER. On the local lane every slot is served by
+            # one physical model, so the slot's declaration is corrected by the
+            # served model's (policy + evidence) before it is stamped.
+            _served_model, _served_cap = await _resolve_served_capability(self, brain)
             intent_tel = RoutingIntentTelemetry(
                 # Phase 1 P0: use brain-derived fields, NOT local Mac pressure.
                 # expected_provider and policy_reason now reflect the actual brain
@@ -3934,7 +3983,8 @@ class GovernedLoopService:
                 task_complexity=brain.task_complexity,
                 estimated_prompt_tokens=brain.estimated_prompt_tokens,
                 daily_spend_usd=self._brain_selector.daily_spend,
-                schema_capability=getattr(brain, "schema_capability", "full_content_only"),
+                schema_capability=_served_cap,
+                served_model=_served_model,
             )
             tc = TelemetryContext(local_node=host_tel, routing_intent=intent_tel)
             ctx = ctx.with_telemetry(tc)

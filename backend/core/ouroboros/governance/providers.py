@@ -670,6 +670,23 @@ def single_file_diff_schema_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def _note_diff_outcome(ctx, ok: bool) -> None:
+    """Record whether a 2b.1-diff from the SERVED model applied — the evidence
+    :mod:`served_model_capability` weighs against the policy's declaration.
+    Fire-and-forget on the running loop; never touches the apply path."""
+    try:
+        ri = getattr(getattr(ctx, "telemetry", None), "routing_intent", None)
+        served = str(getattr(ri, "served_model", "") or "")
+        if not served:
+            return
+        import asyncio as _asyncio
+        from backend.core.ouroboros.governance.served_model_capability import note_diff_outcome
+        loop = _asyncio.get_running_loop()
+        loop.create_task(note_diff_outcome(served, ok, op_id=str(getattr(ctx, "op_id", "") or "")))
+    except Exception:  # noqa: BLE001 — evidence never perturbs the apply path
+        pass
+
+
 def _ctx_schema_capability(ctx) -> str:
     """The brain's ``schema_capability`` off ``ctx.telemetry.routing_intent`` —
     the one field ``governed_loop_service`` stamps from the selected brain.
@@ -5500,7 +5517,9 @@ def _parse_generation_response(
                         pfx, ctx_exc.hunk_line, ctx_exc,
                     )
                 patched = _apply_unified_diff(orig_content, unified_diff)
+                _note_diff_outcome(ctx, True)
             except StaleDiffError as exc:
+                _note_diff_outcome(ctx, False)
                 logger.warning(
                     "[%s] Stale diff rejected for %s at hunk line %d: %s",
                     pfx, cand.get("candidate_id"), exc.hunk_line, exc,
@@ -5533,6 +5552,7 @@ def _parse_generation_response(
                     pass  # never block on feedback emission
                 continue
             except ValueError as exc:
+                _note_diff_outcome(ctx, False)
                 logger.warning("[%s] Diff application failed for %s: %s", pfx, cand.get("candidate_id"), exc)
                 continue
             rewritten.append({

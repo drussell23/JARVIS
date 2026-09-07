@@ -448,6 +448,30 @@ class BrainSelector:
             schema_capability=schema_cap,
         )
 
+    def effective_schema_capability(self, *, declared: str, served_model: "Optional[str]"):
+        """The capability of the model that will ANSWER — the slot's declaration
+        corrected by the policy's ``served_models`` section and by observed
+        diff-apply evidence (see :mod:`served_model_capability`). Reads the
+        policy this selector has loaded, so the section hot-reloads with it."""
+        from backend.core.ouroboros.governance.served_model_capability import (
+            effective_schema_capability as _effective,
+        )
+        try:
+            self._maybe_reload_policy()
+        except Exception:  # noqa: BLE001 — a reload fault never blocks routing
+            pass
+        return _effective(declared=declared, served_model=served_model, policy=self._policy)
+
+    def _maybe_reload_policy(self) -> None:
+        """Re-read the policy file when its mtime moved (the same signal the
+        loader records), so an operator edit is honoured without a restart."""
+        try:
+            mtime = self._policy_path.stat().st_mtime
+        except OSError:
+            return
+        if mtime != self._policy_mtime:
+            self._load_policy()
+
     # -------------------------------------------------------------------------
     # Internal — Policy Hot-Reload
     # -------------------------------------------------------------------------

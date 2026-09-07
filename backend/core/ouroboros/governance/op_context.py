@@ -779,6 +779,9 @@ class RoutingIntentTelemetry:
     estimated_prompt_tokens: int = 0
     daily_spend_usd: float = 0.0  # snapshot of daily spend at intake
     schema_capability: str = "full_content_only"  # "full_content_only" | "full_content_and_diff"
+    #: The model the lane actually serves (resolved from the node), the
+    #: one ``schema_capability`` describes; "" when unresolved.
+    served_model: str = ""
     # Urgency-aware provider routing (Phase 5)
     provider_route: str = ""      # "immediate" | "standard" | "complex" | "background" | "speculative"
     provider_route_reason: str = ""  # causal code from UrgencyRouter

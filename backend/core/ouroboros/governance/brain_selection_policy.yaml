@@ -623,3 +623,21 @@ hosted_provider_candidates:
       endpoint: "https://openrouter.ai/api/v1"
       api_key_env: "JARVIS_OPENROUTER_API_KEY"
       model_name: "meituan/longcat-flash-chat"
+
+# ---------------------------------------------------------------------------
+# Served-model capability (2026-09-07)
+# ---------------------------------------------------------------------------
+# On the local lane every brain slot above is served by ONE physical model,
+# resolved from the node's /api/tags. A slot's schema_capability therefore
+# describes a model that is not the one answering: a simple edit routed to the
+# slot named "7b" inherited full_content_only and the 30B coder that actually
+# answered re-emitted a 683-line file to add twelve lines. The SERVED model's
+# capability is declared here, keyed by a case-insensitive glob on its id and a
+# minimum parameter count parsed from its size tag — the same stance the slots
+# take (coder families emit verbatim diffs from ~30B; smaller coders do not).
+# Evidence overrules declaration: a served model whose diffs keep failing to
+# apply is demoted for a cooldown (served_model_capability.observed_demotion).
+served_models:
+  - match: "*coder*"
+    min_params_b: 30
+    schema_capability: "full_content_and_diff"
