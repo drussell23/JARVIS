@@ -337,9 +337,10 @@ class PatchBenchmarker:
                 # process-group isolation + bounded timeout + provenance).
                 from backend.core.ouroboros.governance.test_subprocess_helper import (  # noqa: E501
                     run_pytest_subprocess_sync,
+                    resolve_python_bin,
                 )
                 _slice9 = run_pytest_subprocess_sync(
-                    ["python3", "-m", "pytest", "--tb=no", "--no-header", "-q",
+                    [resolve_python_bin(), "-m", "pytest", "--tb=no", "--no-header", "-q",
                      "--ignore=docs", "--ignore=.worktrees"]
                     + cov_report_args + cov_args + test_paths,
                     cwd=str(self._root),
@@ -418,8 +419,11 @@ class PatchBenchmarker:
 
     def _complexity_sync(self, target_files: list) -> tuple:
         try:
+            from backend.core.ouroboros.governance.test_subprocess_helper import (  # noqa: E501
+                resolve_python_bin,
+            )
             r_after = subprocess.run(
-                ["python3", "-m", "radon", "cc", "-s", "-a"] + target_files,
+                [resolve_python_bin(), "-m", "radon", "cc", "-s", "-a"] + target_files,
                 capture_output=True, text=True, cwd=self._root, timeout=_COMPLEXITY_BUDGET,
             )
             after_cc = self._parse_radon_average(r_after.stdout)
@@ -436,7 +440,7 @@ class PatchBenchmarker:
                         written.append(str(dest))
                     if written:
                         r_before = subprocess.run(
-                            ["python3", "-m", "radon", "cc", "-s", "-a"] + written,
+                            [resolve_python_bin(), "-m", "radon", "cc", "-s", "-a"] + written,
                             capture_output=True, text=True, cwd=tmp, timeout=_COMPLEXITY_BUDGET,
                         )
                         before_cc = self._parse_radon_average(r_before.stdout)
