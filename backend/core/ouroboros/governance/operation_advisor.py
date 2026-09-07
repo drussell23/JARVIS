@@ -622,6 +622,35 @@ _READ_ONLY_NEGATIVE: Tuple[str, ...] = (
     "upgrade",
     "upgrades",
     "upgrading",
+    # Authoring / creation family (2026-09-06): a goal that CREATES or
+    # AUTHORS a new file (e.g. "author a new test file, do not modify the
+    # source") is unambiguously MUTATING, but the set previously lacked
+    # these verbs, so such ops were misclassified read-only whenever the
+    # description also carried a read-only positive phrase like "do not
+    # modify" (meaning: leave the SOURCE untouched, not "mutate nothing").
+    # Whole-word matched (\b...\b) so "created"/"regenerate"/"metadata"
+    # etc. cannot collide.
+    "create",
+    "creates",
+    "creating",
+    "author",
+    "authors",
+    "authoring",
+    "write",
+    "writes",
+    "writing",
+    "add",
+    "adds",
+    "adding",
+    "generate",
+    "generates",
+    "generating",
+    "append",
+    "appends",
+    "appending",
+    "insert",
+    "inserts",
+    "inserting",
     # Two-word phrases kept as substring checks below — they can't
     # collide with compound words the way single verbs can.
 )
@@ -636,7 +665,13 @@ _READ_ONLY_NEGATIVE_PHRASES: Tuple[str, ...] = (
 # \b treats "-" as a word boundary in Python re, which is what we want
 # for hyphenated verbs like "re-write" if they ever appear.
 _READ_ONLY_NEGATIVE_RE = re.compile(
-    r"\b(?:" + "|".join(re.escape(w) for w in _READ_ONLY_NEGATIVE) + r")\b",
+    # (?<!not ) — a NEGATED mutation verb ("do not write", "do not modify")
+    # is a read-only SIGNAL, not a mutation. Without this guard the authoring
+    # verbs (write/create/author/add...) added to _READ_ONLY_NEGATIVE would
+    # fire on the "do not write" / "do not change" read-only POSITIVE phrases.
+    # Fixed-width lookbehind; the description is lowercased before search so
+    # "not " matches regardless of original case.
+    r"(?<!not )\b(?:" + "|".join(re.escape(w) for w in _READ_ONLY_NEGATIVE) + r")\b",
     re.IGNORECASE,
 )
 

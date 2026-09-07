@@ -359,3 +359,34 @@ def test_create_factory_accepts_is_read_only_directly() -> None:
         is_read_only=True,
     )
     assert ctx.is_read_only is True
+
+
+# ---------------------------------------------------------------------------
+# 1b. Authoring-verb regression (2026-09-06) — the model_physics first-order
+# proof surfaced that a goal which AUTHORS a new file ("author a new test file,
+# do not modify the source") was misclassified read-only: the mutation-verb set
+# lacked the authoring family (create/author/write/add/generate/...) while
+# "do not modify" is a read-only positive, so the op could never write. The fix
+# completes the verb set AND adds a (?<!not ) guard so negated verbs stay
+# read-only signals.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("desc", [
+    "AUTHOR a new pytest test file. Do NOT modify model_physics.py itself.",
+    "write tests that import the module; do not modify the source",
+    "create a new test file, do not change the source module",
+    "add a unit test for the parser; do not touch the implementation",
+    "generate coverage for the untested module without changing it",
+    "append a new test function to the suite",
+])
+def test_infer_read_only_intent_authoring_verbs_are_mutating(desc: str) -> None:
+    assert infer_read_only_intent(desc) is False
+
+
+@pytest.mark.parametrize("desc", [
+    "do not write any source files; pure exploration audit",
+    "read-only cartography: survey the call graph, do not mutate",
+    "do not modify anything; just read and understand",
+    "do not change the file; do not write any source files",
+])
+def test_infer_read_only_intent_negated_verbs_stay_read_only(desc: str) -> None:
+    assert infer_read_only_intent(desc) is True
