@@ -643,6 +643,68 @@ def _model_family(model_id: str) -> str:
         return ""
 
 
+# ---------------------------------------------------------------------------
+# Single-file 2b.1-diff re-enablement (root-cause of the full_content docstring
+# mangle). Commit c7b518aabb hardcoded ``_single_file_task = False`` in
+# ``_build_codegen_prompt`` — a GLOBAL diff kill ("force full_content") added
+# when every served model produced unappliable diffs. Slice 235 later built the
+# capability + size gate (``resolve_force_full_content``) to turn the diff path
+# back on for diff-capable brains on large files, but never removed the hardcode,
+# so the gate's ``force_full_content=False`` verdict was silently dropped and the
+# diff branch stayed dead. Re-emitting a large file verbatim is exactly where a
+# mid-size model drops a closing ``"""`` (the mangle); a diff never reproduces
+# the docstring, so it cannot mangle it. This restores the gate's authority
+# behind a master switch (default OFF = byte-identical to the hardcoded-off
+# legacy) and gives BOTH the prompt builder and the response parser ONE shared
+# predicate, so "which schema to emit" and "is a diff reply expected vs drift"
+# can never disagree.
+# ---------------------------------------------------------------------------
+_SINGLE_FILE_DIFF_SCHEMA_ENV = "JARVIS_SINGLE_FILE_DIFF_SCHEMA_ENABLED"
+
+
+def single_file_diff_schema_enabled() -> bool:
+    """Master switch (default FALSE) re-enabling the 2b.1-diff schema for
+    single-file ops whose brain is diff-capable. OFF is byte-identical to the
+    hardcoded-off legacy (commit c7b518aabb). NEVER raises."""
+    raw = (os.environ.get(_SINGLE_FILE_DIFF_SCHEMA_ENV, "false") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _ctx_schema_capability(ctx) -> str:
+    """The brain's ``schema_capability`` off ``ctx.telemetry.routing_intent`` —
+    the one field ``governed_loop_service`` stamps from the selected brain.
+    Unknown → conservative ``'full_content_only'``. NEVER raises."""
+    try:
+        ri = getattr(getattr(ctx, "telemetry", None), "routing_intent", None)
+        return getattr(ri, "schema_capability", "full_content_only") or "full_content_only"
+    except Exception:  # noqa: BLE001
+        return "full_content_only"
+
+
+def single_file_diff_requested(ctx, *, force_full_content: bool) -> bool:
+    """The ONE predicate for whether the 2b.1-diff schema is in play for a
+    single-file op — shared by the prompt builder (which schema to EMIT) and the
+    response parser (whether a diff reply is EXPECTED, not schema drift), so the
+    two can never drift apart. True iff ALL hold: the master switch is on; the
+    capability + size gate did NOT force full_content (``force_full_content`` is
+    the authoritative Slice-235 verdict — a diff-capable brain on a large-enough
+    file); exactly one target file; not cross-repo. Pure; fail-soft to False.
+    NEVER raises."""
+    try:
+        if not single_file_diff_schema_enabled():
+            return False
+        if bool(force_full_content):
+            return False
+        tfs = getattr(ctx, "target_files", ()) or ()
+        if len(tfs) != 1:
+            return False
+        if bool(getattr(ctx, "cross_repo", False)):
+            return False
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def select_diff_capable_model(
     *, available_models, family_preference, diff_capable_families,
 ) -> "Optional[str]":
@@ -3718,12 +3780,17 @@ def _build_codegen_prompt(
         )
 
     # ── 3. Output schema instruction ────────────────────────────────────
-    # force_full_content disables the diff schema — smaller models (≤13B) can't
-    # generate verbatim context lines; they hallucinate from training data.
-    # Diff schema (2b.1-diff) disabled — models cannot reliably produce
-    # verbatim context lines, causing diff_apply_failed on most operations.
-    # Always use full_content (2b.1) for single-file tasks.
-    _single_file_task = False
+    # Single-file diff schema (2b.1-diff) is gated by the capability + size
+    # verdict Slice 235 computed (``force_full_content``): a diff-capable brain
+    # (e.g. the served coder model) on a large-enough file emits a unified diff
+    # instead of reproducing the whole file — which is where a mid-size model
+    # drops a closing ``"""`` (the full_content docstring mangle). Weak brains
+    # and small files keep ``force_full_content=True`` → full_content (2b.1).
+    # Master switch default OFF ⇒ byte-identical to the historic hardcoded-off
+    # path (commit c7b518aabb) until graduated. See single_file_diff_requested.
+    _single_file_task = single_file_diff_requested(
+        ctx, force_full_content=force_full_content,
+    )
 
     # Read-only schema swap (Option α — Manifesto §7 Attention Mechanism
     # Supremacy). When ctx.is_read_only=True the code-gen schema is
@@ -5318,19 +5385,41 @@ def _parse_generation_response(
     # NOTE: With full_content forced in all providers, this path should rarely fire.
     # When it does, it means the model ignored the full_content instruction.
     if actual_version == _SCHEMA_VERSION_DIFF:
-        logger.warning(
-            "[%s] Model returned 2b.1-diff schema despite full_content instruction. "
-            "Attempting diff→full_content reconstruction as fallback.", pfx,
-        )
+        # A diff reply is EXPECTED — not drift — when we deliberately requested
+        # the 2b.1-diff schema. Recomputing the SAME predicate the prompt builder
+        # used (single_file_diff_requested, with force_full_content re-derived
+        # from ctx) keeps the parser's "expected vs drift" judgment tied to the
+        # builder's "which schema to emit" decision so the two cannot disagree.
+        # Fail-soft to "not expected" (legacy behaviour) on any error.
+        _diff_expected = False
+        try:
+            _ff_here = resolve_force_full_content(
+                schema_capability=_ctx_schema_capability(ctx),
+                target_files=getattr(ctx, "target_files", ()) or (),
+                repo_root=repo_root,
+            )
+            _diff_expected = single_file_diff_requested(ctx, force_full_content=_ff_here)
+        except Exception:  # noqa: BLE001 — the judgment must never gate recovery
+            _diff_expected = False
+        if _diff_expected:
+            logger.info(
+                "[%s] Model returned the requested 2b.1-diff schema; "
+                "reconstructing full_content.", pfx,
+            )
+        else:
+            logger.warning(
+                "[%s] Model returned 2b.1-diff schema despite full_content instruction. "
+                "Attempting diff→full_content reconstruction as fallback.", pfx,
+            )
         # Slice 20D — parser-level schema_id_hallucination drift record.
         # The model returned a schema_version the route prompt explicitly
         # directed against. Record drift for the active op so the next
         # GENERATE_RETRY rotates to a sibling model (Slice 20C). The
         # recovery attempt below still runs — drift is op-scoped and
         # only affects FUTURE attempts for this op_id, not the current
-        # one. ALWAYS records (even if recovery succeeds) because the
-        # pattern itself indicates trap-prone model behavior worth
-        # rotating away from on subsequent retries.
+        # one. Records even if recovery succeeds — EXCEPT when the diff was
+        # the schema we requested (_diff_expected): a requested diff is the
+        # correct response, never drift, and must not rotate the model away.
         try:
             from backend.core.ouroboros.governance.topology_sentinel import (
                 get_dw_model_override as _get_dw_model_override,
@@ -5346,7 +5435,7 @@ def _parse_generation_response(
             # coarse provider_name so the drift record still carries
             # meaningful provenance.
             _model_id = _get_dw_model_override() or provider_name or ""
-            if _op_id and _model_id:
+            if (not _diff_expected) and _op_id and _model_id:
                 _get_drift_tracker().record(
                     op_id=_op_id,
                     model_id=_model_id,
