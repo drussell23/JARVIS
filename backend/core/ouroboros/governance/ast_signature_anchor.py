@@ -49,6 +49,12 @@ _DEFAULT_MAX_MODULES = 4
 _DEFAULT_MAX_CHARS = 6000
 _DEFAULT_DOC_CHARS = 420
 _DEFAULT_DOC_CHARS_MAX = 1200
+#: Data-access pattern: how many ``x.get('k')`` / ``x['k']`` / helper('k')
+#: expressions a def may list, and the per-expression length cap.
+_ENV_ACCESS_ITEMS = "JARVIS_AST_SIGNATURE_ANCHOR_ACCESS_ITEMS"
+_DEFAULT_ACCESS_ITEMS = 24
+_ACCESS_EXPR_MAX_CHARS = 80
+_ACCESS_METHODS = frozenset({"get", "pop", "setdefault", "getlist", "getattr"})
 _SENTENCE_END_RE = re.compile(r"[.!?](?:\s|$)")
 
 _PY_PATH_RE = re.compile(r"[A-Za-z0-9_./\\-]+\.py")
@@ -126,19 +132,84 @@ def _doc_excerpt(node, max_chars: int) -> str:
     return head[:cut].rstrip() + " …"
 
 
+def _has_key_literal(expr) -> bool:
+    """True when *expr* contains a non-empty string constant — the marker of
+    a literal key (``'model_info'``, ``arch + '.' + name``)."""
+    return any(
+        isinstance(c, ast.Constant) and isinstance(c.value, str) and c.value
+        for c in ast.walk(expr)
+    )
+
+
+def _access_lines(node, indent: str) -> List[str]:
+    """The data-access pattern of a def: every ``x.get('k')`` / ``x['k']`` /
+    ``'k' in x`` / nested-helper call carrying a string-literal key,
+    unparsed verbatim in source order. This is the INPUT SHAPE the docstring
+    describes in prose — the exact key vocabulary and nesting the function
+    reads (measured 2026-09-07: with prose alone the model invented
+    ``qwen2.kv_heads`` for the real ``qwen2.attention.head_count_kv`` and
+    dropped the ``model_info`` nesting). Bounded by
+    ``JARVIS_AST_SIGNATURE_ANCHOR_ACCESS_ITEMS``; NEVER raises."""
+    max_items = _int_env(_ENV_ACCESS_ITEMS, _DEFAULT_ACCESS_ITEMS)
+    try:
+        helpers = {
+            n.name for n in ast.walk(node)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n is not node
+        }
+        found: List[Tuple[int, int, str]] = []
+        seen: set = set()
+        for sub in ast.walk(node):
+            expr = None
+            if isinstance(sub, ast.Call):
+                f = sub.func
+                if sub.args and _has_key_literal(sub.args[0]) and (
+                    (isinstance(f, ast.Attribute) and f.attr in _ACCESS_METHODS)
+                    or (isinstance(f, ast.Name) and f.id in helpers)
+                ):
+                    expr = sub
+            elif isinstance(sub, ast.Subscript) and _has_key_literal(sub.slice):
+                expr = sub
+            elif (
+                isinstance(sub, ast.Compare) and len(sub.ops) == 1
+                and isinstance(sub.ops[0], (ast.In, ast.NotIn))
+                and _has_key_literal(sub.left)
+            ):
+                expr = sub
+            if expr is None:
+                continue
+            try:
+                s = ast.unparse(expr)
+            except Exception:  # noqa: BLE001
+                continue
+            if len(s) > _ACCESS_EXPR_MAX_CHARS or s in seen:
+                continue
+            seen.add(s)
+            found.append((getattr(expr, "lineno", 0), getattr(expr, "col_offset", 0), s))
+        if not found:
+            return []
+        found.sort()
+        items = [s for _, _, s in found[:max_items]]
+        return [indent + "    # reads: " + "; ".join(items)]
+    except Exception:  # noqa: BLE001 — additive, never fatal
+        return []
+
+
 def _def_lines(node, indent: str, doc_chars: int) -> List[str]:
-    """Signature line for a def, expanded with its docstring contract when
-    one exists (``def f(...) -> T:`` / docstring / ``...``). Without a
-    docstring the legacy one-liner ``def f(...) -> T: ...`` is emitted."""
+    """Signature line for a def, expanded with its contract when one exists:
+    ``def f(...) -> T:`` / docstring excerpt / ``# reads:`` access pattern /
+    ``...``. Without either the legacy one-liner ``def f(...) -> T: ...`` is
+    emitted."""
     sig = _sig_line(node)
     doc = _doc_excerpt(node, doc_chars) if doc_chars > 0 else ""
-    if not doc or not sig.endswith(" ..."):
+    access = _access_lines(node, indent)
+    if (not doc and not access) or not sig.endswith(" ..."):
         return [indent + sig]
-    return [
-        indent + sig[: -len(" ...")],
-        indent + '    """' + doc + '"""',
-        indent + "    ...",
-    ]
+    lines = [indent + sig[: -len(" ...")]]
+    if doc:
+        lines.append(indent + '    """' + doc + '"""')
+    lines.extend(access)
+    lines.append(indent + "    ...")
+    return lines
 
 
 def _field_lines(cls_node, indent: str) -> List[str]:

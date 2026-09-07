@@ -177,6 +177,14 @@ def test_real_model_physics_contract_reaches_the_anchor():
     assert "/api/show" in out and "architecture-prefixed" in out
     assert "Returns ``None``" in out
     assert "    kv_bytes_per_token: int" in out
+    # the access pattern: nesting + exact key vocabulary
+    reads = [l for l in out.splitlines() if "# reads:" in l and "model_info" in l][0]
+    for frag in (
+        "payload.get('model_info')", "info.get('general.architecture')",
+        "info.get(arch + '.' + name)", "field('context_length')",
+        "field('attention.head_count_kv')", "field('attention.key_length')",
+    ):
+        assert frag in reads, frag
 
 
 def test_adaptive_budget_raises_cap_for_small_modules_and_floors_for_large():
@@ -206,3 +214,40 @@ def test_waterfill_gives_unused_short_doc_share_to_long_docs():
     assert A._waterfill_level([50, 50], 1000, 1200) == 1200      # all fit
     assert A._waterfill_level([600, 600, 600], 900, 1200) == 300  # even split
     assert A._waterfill_level([], 0, 1200) == 1200
+
+
+ACCESS_MOD = textwrap.dedent('''
+    def parse(payload):
+        """Doc."""
+        info = payload.get("model_info")
+        arch = info.get("general.architecture")
+        def field(name):
+            return info.get(arch + "." + name)
+        n = field("block_count")
+        if "extra" in payload:
+            return payload["extra"]
+        return n
+    def plain(x):
+        return x + 1
+''')
+
+
+def test_access_pattern_lines_expose_key_vocabulary_and_nesting():
+    out = A.extract_public_api(ACCESS_MOD, "m")
+    line = [l for l in out.splitlines() if "# reads:" in l][0]
+    for frag in (
+        "payload.get('model_info')", "info.get('general.architecture')",
+        "info.get(arch + '.' + name)", "field('block_count')",
+        "'extra' in payload", "payload['extra']",
+    ):
+        assert frag in line, frag
+    assert line.index("payload.get('model_info')") < line.index("field('block_count')")
+    assert "def plain(x): ..." in out
+    _ast.parse(out)
+
+
+def test_access_items_env_bound(monkeypatch):
+    monkeypatch.setenv("JARVIS_AST_SIGNATURE_ANCHOR_ACCESS_ITEMS", "2")
+    out = A.extract_public_api(ACCESS_MOD, "m")
+    line = [l for l in out.splitlines() if "# reads:" in l][0]
+    assert line.count("; ") == 1
