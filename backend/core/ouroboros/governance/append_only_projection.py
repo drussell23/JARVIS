@@ -156,6 +156,33 @@ class ProjectionReport:
     notes: Tuple[str, ...]
 
 
+def project_candidate_in_place(candidate: Dict[str, Any], project_root: Path) -> Tuple[str, ...]:
+    """Project ONE candidate and write the projected content back into the
+    SAME dict (its ``files[i]['full_content']`` / ``full_content``). The
+    candidate dict is the pipeline's shared artifact: VALIDATE receives it
+    and APPLY applies the very same object as ``best_candidate``, so an
+    in-place projection is the only way validated == applied on every
+    phase path (the inline orchestrator path AND the extracted runners).
+    Returns the projection notes (empty when nothing changed). NEVER raises."""
+    try:
+        rep = project_candidates([candidate], project_root)
+        if not rep.changed:
+            return ()
+        projected = rep.candidates[0]
+        files = candidate.get("files")
+        if isinstance(files, list) and files and isinstance(projected.get("files"), list):
+            by_path = {str(e.get("file_path")): e for e in projected["files"] if isinstance(e, dict)}
+            for e in files:
+                if isinstance(e, dict) and str(e.get("file_path")) in by_path:
+                    e["full_content"] = by_path[str(e.get("file_path"))].get("full_content", e.get("full_content"))
+        elif isinstance(candidate.get("full_content"), str):
+            candidate["full_content"] = projected.get("full_content", candidate["full_content"])
+        return rep.notes
+    except Exception:  # noqa: BLE001 — additive, never fatal
+        logger.debug("[Orchestrator] in-place projection degraded", exc_info=True)
+        return ()
+
+
 def project_candidates(candidates: Sequence[Dict[str, Any]], project_root: Path) -> ProjectionReport:
     """Project every test-authoring candidate file that already exists on
     disk. Candidates are copied, never mutated. NEVER raises."""

@@ -108,3 +108,25 @@ def test_wiring():
     assert "project_candidates" in inspect.getsource(orch)
     assert "Name the findings" in inspect.getsource(ce)
     assert "guardian_hard_finding" in LM._MITIGATIONS
+
+
+def test_in_place_projection_mutates_the_shared_candidate(tmp_path):
+    tdir = tmp_path / "tests"; tdir.mkdir()
+    (tdir / "test_x.py").write_text(OLD)
+    edited = OLD.replace('"```" not in user', '"`" not in user') + "\ndef test_new():\n    assert True\n"
+    cand = {"candidate_id": "c1", "files": [{"file_path": "tests/test_x.py", "full_content": edited}]}
+    entry = cand["files"][0]
+    notes = P.project_candidate_in_place(cand, tmp_path)
+    assert notes and "test_x.py" in notes[0]
+    assert cand["files"][0] is entry                       # same dict objects — APPLY sees it
+    assert '"```" not in user' in entry["full_content"] and "def test_new" in entry["full_content"]
+    single = {"file_path": "tests/test_x.py", "full_content": edited}
+    assert P.project_candidate_in_place(single, tmp_path) and '"```" not in user' in single["full_content"]
+    clean = {"file_path": "tests/test_x.py", "full_content": OLD + "\ndef test_new():\n    assert True\n"}
+    assert P.project_candidate_in_place(clean, tmp_path) == ()
+
+
+def test_validation_seam_is_wired():
+    import inspect
+    from backend.core.ouroboros.governance import orchestrator as orch
+    assert "project_candidate_in_place" in inspect.getsource(orch.GovernedOrchestrator._run_validation)

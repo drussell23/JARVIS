@@ -14162,6 +14162,24 @@ class GovernedOrchestrator:
         non-``test`` failures are byte-identical. Wrapping HERE covers all three
         callers — the inline VALIDATE block, the extracted VALIDATERunner, and
         L2 re-validation — so the advisory holds on every validation path."""
+        # Append-only projection — at THIS seam because it is the one every
+        # phase path crosses (inline FSM, extracted VALIDATERunner, L2) and
+        # because the candidate dict validated here is the very object APPLY
+        # applies as best_candidate: projecting it IN PLACE keeps validated
+        # == applied. (The inline post-GENERATE seam is unreachable under
+        # GENERATERunner delegation — observed 2026-09-07: zero projections,
+        # guardian test_assertion_weakened at APPLY.)
+        try:
+            from backend.core.ouroboros.governance.append_only_projection import (
+                project_candidate_in_place as _aop_in_place,
+            )
+            for _aop_note in _aop_in_place(candidate or {}, self._config.project_root):
+                logger.warning(
+                    "[Validation] append-only projection op=%s — %s",
+                    str(getattr(ctx, "op_id", ""))[:16], _aop_note,
+                )
+        except Exception:  # noqa: BLE001 — projection is additive
+            logger.debug("[Validation] append-only projection skipped", exc_info=True)
         # Declared-symbol contract (VALIDATE side): a candidate for a goal
         # that declares symbols must DEFINE them — otherwise no test can
         # prove the goal and the run would only measure existing tests.
