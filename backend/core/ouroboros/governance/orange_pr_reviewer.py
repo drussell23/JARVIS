@@ -69,6 +69,20 @@ def is_orange_pr_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def remote_push_allowed() -> bool:
+    """The operator's push policy, composed — never a lane-local default.
+    Pushing a review branch to origin is OUTWARD-FACING: it is allowed only
+    when the operator declared an auto-push target (``JARVIS_AUTO_PUSH_BRANCH``,
+    the same declaration :mod:`auto_committer` honours) or explicitly enabled
+    it for this lane (``JARVIS_ORANGE_PR_PUSH_ENABLED=1``). Unset ⇒ LOCAL
+    review branches only (2026-09-07: 22 branches reached origin from an
+    isolated soak because the lane pushed unconditionally)."""
+    explicit = os.environ.get("JARVIS_ORANGE_PR_PUSH_ENABLED", "").strip().lower()
+    if explicit:
+        return explicit in ("1", "true", "yes", "on")
+    return bool(os.environ.get("JARVIS_AUTO_PUSH_BRANCH", "").strip())
+
+
 def _token_enforcer_enabled() -> bool:
     """True when the Iron Triad token enforcer gates ``create_review_pr``.
 
@@ -424,6 +438,19 @@ class OrangePRReviewer:
                 )
                 return None
 
+            if not remote_push_allowed():
+                # Local review lane: the commit is the deliverable; a human
+                # merges it (Tier-1: oversight migrates, never removed). No
+                # origin mutation, no gh.
+                logger.warning(
+                    "[OrangePR] op=%s review branch %s committed LOCALLY — remote push "
+                    "not allowed by policy (set JARVIS_AUTO_PUSH_BRANCH or "
+                    "JARVIS_ORANGE_PR_PUSH_ENABLED=1 to push); PR not created",
+                    op_id, branch,
+                )
+                return PRReviewResult(
+                    url=f"local://{branch}", branch=branch, base_branch=base_branch,
+                )
             rc, _, err = await self._run_git("push", "-u", "origin", branch)
             if rc != 0:
                 logger.warning(
