@@ -25,6 +25,5 @@ async def test_dw_provider_yields_completion_text():
 async def test_dw_provider_failure_yields_nothing():
     sp = DWSpeechProvider(_FakeDW(boom=True))
     assert [c async for c in sp.source(system_prompt="s", user_prompt="u")] == []
-
 def test_tier1_multi_proof_speech():
     assert sum(range(6)) == 15
