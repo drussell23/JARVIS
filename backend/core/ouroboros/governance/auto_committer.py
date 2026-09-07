@@ -320,6 +320,8 @@ class AutoCommitter:
         signal_source: str = "",
         signal_urgency: str = "",
         rationale: str = "",
+        roadmap_goal_id: str = "",
+        roadmap_goal_digest: str = "",
     ) -> CommitResult:
         """Create a structured git commit for the applied operation.
 
@@ -558,6 +560,8 @@ class AutoCommitter:
                     signal_source=signal_source,
                     signal_urgency=signal_urgency,
                     rationale=rationale,
+                    roadmap_goal_id=roadmap_goal_id,
+                    roadmap_goal_digest=roadmap_goal_digest,
                 )
 
             lock_path = self._intent_lock_path(intent_token)
@@ -593,6 +597,8 @@ class AutoCommitter:
                     signal_source=signal_source,
                     signal_urgency=signal_urgency,
                     rationale=rationale,
+                    roadmap_goal_id=roadmap_goal_id,
+                    roadmap_goal_digest=roadmap_goal_digest,
                 )
 
         except Exception as exc:
@@ -615,6 +621,8 @@ class AutoCommitter:
         signal_source: str,
         signal_urgency: str,
         rationale: str,
+        roadmap_goal_id: str = "",
+        roadmap_goal_digest: str = "",
     ) -> "CommitResult":
         """The TOCTOU-critical section extracted from
         :meth:`commit` so it can be invoked under the
@@ -705,6 +713,8 @@ class AutoCommitter:
                 signal_source=signal_source,
                 signal_urgency=signal_urgency,
                 rationale=rationale,
+                roadmap_goal_id=roadmap_goal_id,
+                roadmap_goal_digest=roadmap_goal_digest,
             )
 
             # Commit
@@ -714,6 +724,22 @@ class AutoCommitter:
                     committed=False,
                     error="git commit returned no hash",
                 )
+
+            # Goal reconciliation: bind the landed sha to its signed goal so
+            # the roadmap reader derives SATISFIED from git reachability and
+            # never re-dispatches completed operator intent. Fail-soft: the
+            # trailers in the message already let the ledger rebuild itself.
+            if roadmap_goal_id:
+                try:
+                    from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: E501,PLC0415
+                        record_landing,
+                    )
+                    await record_landing(
+                        goal_id=roadmap_goal_id, goal_digest_hex=roadmap_goal_digest,
+                        commit_sha=commit_hash, op_id=op_id,
+                    )
+                except Exception:  # noqa: BLE001 — never block a commit on the ledger
+                    logger.debug("[AutoCommit] goal reconciliation record skipped", exc_info=True)
 
             # §24.6.2 — Store intent token in git notes post-commit.
             await self._store_intent_token(intent_token, commit_hash)
@@ -771,6 +797,8 @@ class AutoCommitter:
         signal_source: str = "",
         signal_urgency: str = "",
         rationale: str = "",
+        roadmap_goal_id: str = "",
+        roadmap_goal_digest: str = "",
     ) -> str:
         """Build a structured commit message with O+V signature.
 
@@ -862,6 +890,18 @@ class AutoCommitter:
         else:
             files_str = ", ".join(target_files[:4]) + f" +{len(target_files) - 4} more"
         body_parts.append(f"Files: {files_str}")
+
+        # Roadmap provenance trailers — the goal this commit satisfies, spelled
+        # from the reconciliation ledger so writer and reader cannot drift.
+        # Git history then carries the binding even if the ledger is lost.
+        if roadmap_goal_id:
+            try:
+                from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: E501,PLC0415
+                    trailer_lines,
+                )
+                body_parts.extend(trailer_lines(roadmap_goal_id, roadmap_goal_digest))
+            except Exception:  # noqa: BLE001 — never block a commit on a trailer
+                logger.debug("[AutoCommit] roadmap trailers skipped", exc_info=True)
 
         # O+V Signature block
         body_parts.append("")

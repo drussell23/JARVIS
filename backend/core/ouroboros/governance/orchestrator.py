@@ -146,6 +146,21 @@ from backend.core.ouroboros.governance.epistemic_shedder import shed_to_fit
 logger = logging.getLogger("Ouroboros.Orchestrator")
 
 
+def _goal_binding_kwargs(evidence_json: str) -> Dict[str, str]:
+    """``roadmap_goal_id`` / ``roadmap_goal_digest`` kwargs for the
+    auto-committer from an op's intake evidence; empty for non-roadmap ops
+    or when the ledger is unavailable. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.goal_reconciliation_ledger import (
+            binding_from_evidence,
+        )
+        gid, digest = binding_from_evidence(evidence_json)
+        return {"roadmap_goal_id": gid, "roadmap_goal_digest": digest} if gid else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+
 @dataclass(frozen=True)
 class _BlockGoal:
     """Duck-typed RoadmapGoal-like view of a BLOCKed op for B5 decomposition.
@@ -11870,6 +11885,11 @@ class GovernedOrchestrator:
                                 signal_source=getattr(ctx, "signal_source", ""),
                                 signal_urgency=getattr(ctx, "signal_urgency", ""),
                                 rationale=ctx.description,
+                                # goal reconciliation: bind the landing to the
+                                # signed goal stamped in the intake evidence
+                                **_goal_binding_kwargs(
+                                    getattr(ctx, "intake_evidence_json", "") or ""
+                                ),
                             ),
                             timeout=30.0,
                         )

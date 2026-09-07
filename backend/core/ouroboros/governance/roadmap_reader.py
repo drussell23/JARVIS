@@ -377,6 +377,9 @@ class GoalEmitOutcome:
     idempotency_key: str
     error: str  # empty when emitted=True
     schema_version: str = ROADMAP_READER_SCHEMA_VERSION
+    #: Goal reconciliation: the landed commit that already satisfies this
+    #: goal (not emitted, not an error — completed operator intent).
+    satisfied_by: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -385,6 +388,7 @@ class GoalEmitOutcome:
             "emitted": bool(self.emitted),
             "idempotency_key": self.idempotency_key[:64],
             "error": self.error[:256],
+            "satisfied_by": self.satisfied_by[:64],
             "schema_version": self.schema_version,
         }
 
@@ -628,6 +632,16 @@ def _make_envelope_for_goal(
             "max_duration_s": goal.max_duration_s,
             "signature": goal.goal_id,  # dedup signature
         }
+        # Goal reconciliation: the cryptographic identity of THIS goal text,
+        # carried to the commit so a landed sha binds to exactly this intent
+        # (a re-signed, changed goal under the same id is a new goal).
+        try:
+            from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: E501
+                goal_digest as _goal_digest,
+            )
+            evidence["goal_digest"] = _goal_digest(goal)
+        except Exception:  # noqa: BLE001 — additive, never fatal
+            pass
         # ── Slice 20 — Delegated Provenance ──
         # This envelope originates from the operator-SIGNED document itself,
         # so attach the goal's claim POINTER; the risk engine re-verifies the
@@ -770,7 +784,31 @@ async def emit_roadmap_envelopes(
     outcomes: List[GoalEmitOutcome] = []
     if document is None or not document.goals:
         return ()
+    # Goal reconciliation: goals whose bound commit is reachable from the
+    # landing ref are SATISFIED — completed operator intent is never
+    # re-dispatched. Derived from git at every read (bi-directional: a
+    # rolled-back landing reactivates the goal here automatically).
+    _satisfied: Dict[str, str] = {}
+    try:
+        from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: E501
+            GoalState as _GoalState,
+            reconcile as _reconcile,
+        )
+        for _gid, _rec in (await _reconcile(document.goals)).items():
+            if _rec.state is _GoalState.SATISFIED:
+                _satisfied[_gid] = _rec.commit_sha
+    except Exception:  # noqa: BLE001 — reconciliation is additive, never fatal
+        _satisfied = {}
     for goal in document.goals:
+        if goal.goal_id in _satisfied:
+            outcomes.append(GoalEmitOutcome(
+                goal_id=goal.goal_id,
+                emitted=False,
+                idempotency_key="",
+                error="",
+                satisfied_by=_satisfied[goal.goal_id],
+            ))
+            continue
         env = _make_envelope_for_goal(goal)
         if env is None:
             outcomes.append(GoalEmitOutcome(
