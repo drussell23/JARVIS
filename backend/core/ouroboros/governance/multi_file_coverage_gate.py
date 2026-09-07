@@ -290,3 +290,127 @@ def render_missing_block(
         "\nMISSING TARGET FILES (your candidate did not cover these):\n"
         f"{lines}\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# Candidate-set normalization (Iron Gate 5 companion) — root cause of the
+# multi-file cadence wall (2026-09-06): a mid-size model tends to split ONE
+# multi-file change across sibling SINGLE-file candidates (c1=fileA, c2=fileB)
+# instead of emitting one files:[...] candidate. ``check_candidate`` is applied
+# to EVERY candidate and rejects the whole generation if ANY is partial, so the
+# split never lands even though every file WAS generated. This normalizes the
+# candidate SET so every surviving candidate covers all targets — reusing the
+# gate's OWN path primitives (``_candidate_paths`` / ``_normalize_path``) so the
+# composed set can never drift from what ``check_candidate`` judges.
+# ---------------------------------------------------------------------------
+_ENV_COMPOSE = "JARVIS_MULTIFILE_COMPOSE_ENABLED"
+
+
+def compose_enabled() -> bool:
+    """Default ON. Off → normalization is a byte-identical no-op. Also gated by
+    ``is_enabled()`` — no point composing a shape the gate is not enforcing."""
+    raw = os.environ.get(_ENV_COMPOSE, "true").strip().lower()
+    if raw in ("false", "0", "no", "off"):
+        return False
+    return is_enabled()
+
+
+def normalize_candidate_set(
+    candidates: "Sequence[Dict[str, Any]]",
+    target_files: "Sequence[str]",
+    project_root: "Optional[Path]" = None,
+) -> "Tuple[Dict[str, Any], ...]":
+    """Return a candidate set in which EVERY candidate covers all *target_files*,
+    when the model already produced all the content (just in the wrong shape).
+    Two adaptive normalizations for a multi-target op, in order:
+
+      1. If >=1 candidate already covers all targets (a proper files:[...] set),
+         keep ONLY those complete candidates (drop partial single-file siblings
+         that would otherwise trip the all-candidates coverage check).
+      2. Else, if the DISTINCT single-file candidates together cover the target
+         set, COMPOSE them into ONE files:[...] candidate — the model split one
+         change across candidates; reassemble it for the atomic APPLY.
+
+    Otherwise (genuine partial coverage, single target, or disabled) return the
+    input unchanged so ``check_candidate`` rejects and drives the existing
+    targeted retry. Pure; NEVER raises — any fault returns the input untouched."""
+    try:
+        cands = list(candidates or ())
+        targets = [str(t) for t in (target_files or ()) if str(t).strip()]
+        if not compose_enabled() or len(targets) <= 1 or not cands:
+            return tuple(cands)
+        tset = {
+            _normalize_path(t, project_root)
+            for t in targets
+            if _normalize_path(t, project_root)
+        }
+        if not tset:
+            return tuple(cands)
+
+        # (1) complete candidates already present -> keep only them
+        complete = [
+            c for c in cands if tset.issubset(_candidate_paths(c, project_root))
+        ]
+        if complete:
+            if len(complete) == len(cands):
+                return tuple(cands)  # nothing partial to drop -> byte-identical
+            logger.info(
+                "[MultiFileCoverageGate] normalize: kept %d complete candidate(s), "
+                "dropped %d partial sibling(s)",
+                len(complete), len(cands) - len(complete),
+            )
+            return tuple(complete)
+
+        # (2) compose disjoint single-file candidates covering the target set
+        import hashlib
+        by_path = {}
+        for c in cands:
+            paths = _candidate_paths(c, project_root)
+            if len(paths) != 1:
+                continue  # only genuine single-file candidates are compose sources
+            p = next(iter(paths))
+            fc = c.get("full_content")
+            if p in tset and isinstance(fc, str) and fc and p not in by_path:
+                by_path[p] = c
+        if not tset.issubset(set(by_path)):
+            return tuple(cands)  # cannot fully cover -> let the gate reject + retry
+
+        composed_files = []
+        for t in targets:
+            tn = _normalize_path(t, project_root)
+            if tn not in by_path:
+                continue
+            src = by_path[tn]
+            fc = src["full_content"]
+            composed_files.append({
+                "file_path": t,
+                "full_content": fc,
+                "rationale": (src.get("rationale") or "composed from per-file candidate"),
+                "file_hash": hashlib.sha256(fc.encode()).hexdigest(),
+            })
+        if len(composed_files) < len(targets):
+            return tuple(cands)
+        _primary = composed_files[0]
+        composed = {
+            "candidate_id": "composed-multifile",
+            "file_path": _primary["file_path"],
+            "full_content": _primary["full_content"],
+            "rationale": (
+                "auto-composed: model returned per-file candidates that together "
+                "cover all target files"
+            ),
+            "files": composed_files,
+            "candidate_hash": hashlib.sha256(
+                "".join(f["file_hash"] for f in composed_files).encode()
+            ).hexdigest(),
+            "source_hash": cands[0].get("source_hash", ""),
+            "source_path": cands[0].get("source_path", ""),
+        }
+        logger.info(
+            "[MultiFileCoverageGate] normalize: composed %d per-file candidate(s) "
+            "into one multi-file candidate covering %d target(s)",
+            len(composed_files), len(targets),
+        )
+        return (composed,)
+    except Exception:  # noqa: BLE001 — normalization is additive, never fatal
+        return tuple(candidates or ())

@@ -7213,6 +7213,41 @@ class GovernedOrchestrator:
                     # The retry-feedback builder names the missing paths and
                     # reiterates the multi-file contract. Master switch:
                     # JARVIS_MULTI_FILE_ENFORCEMENT (default true).
+                    #
+                    # Root cause of the multi-file cadence wall (2026-09-06):
+                    # a mid-size model splits ONE multi-file change across
+                    # sibling single-file candidates (c1=fileA, c2=fileB)
+                    # rather than emitting one files:[...] candidate. The
+                    # gate below rejects the whole generation if ANY candidate
+                    # is partial, so the split never lands even though every
+                    # file WAS generated. Normalize the candidate SET first —
+                    # keep complete candidates / compose per-file splits into
+                    # one files:[...] candidate — reusing the gate's OWN path
+                    # primitives so coverage cannot drift. Fail-soft; the
+                    # helper no-ops for single-target ops and when disabled.
+                    try:
+                        from backend.core.ouroboros.governance.multi_file_coverage_gate import (
+                            normalize_candidate_set as _mf_normalize,
+                        )
+                        _mf_orig = generation.candidates
+                        _mf_norm = _mf_normalize(
+                            _mf_orig,
+                            ctx.target_files,
+                            self._config.project_root,
+                        )
+                        if tuple(_mf_norm) != tuple(_mf_orig):
+                            import dataclasses as _dc_mf
+                            generation = _dc_mf.replace(
+                                generation, candidates=tuple(_mf_norm),
+                            )
+                            logger.info(
+                                "[Orchestrator] multi-file candidate set "
+                                "normalized (%d -> %d) for op=%s",
+                                len(_mf_orig), len(_mf_norm),
+                                ctx.op_id[:12],
+                            )
+                    except Exception:  # noqa: BLE001 — normalization is additive
+                        pass
                     try:
                         from backend.core.ouroboros.governance.multi_file_coverage_gate import (
                             check_candidate as _mf_check,
