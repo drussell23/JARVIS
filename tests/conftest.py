@@ -285,8 +285,24 @@ async def _cancel_pending_async_tasks():
     This is the structural fix for zombie pytest processes.
     """
     yield
-    loop = asyncio.get_event_loop()
-    tasks = [t for t in asyncio.all_tasks(loop) if not t.done() and t is not asyncio.current_task()]
+    # Root-cause of the intermittent ``Task ... is bound to a different event
+    # loop`` flake in the VALIDATE/VERIFY scoped runner: under ``asyncio_mode =
+    # auto`` pytest-asyncio runs each test in its OWN loop, but the deprecated
+    # ``asyncio.get_event_loop()`` can return a DIFFERENT (stale/default) loop
+    # than the one actually running this teardown. Gathering tasks bound to that
+    # other loop from inside the running loop then raises cross-loop — which, in
+    # a teardown, wedges pytest until the runner's timeout fires (empty JSON
+    # report → ``validation failed``). ``get_running_loop()`` is the canonical,
+    # always-correct answer inside a coroutine; the guard keeps a teardown edge
+    # (no running loop) from ever failing an otherwise-green test.
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    tasks = [
+        t for t in asyncio.all_tasks(loop)
+        if not t.done() and t is not asyncio.current_task()
+    ]
     if tasks:
         for task in tasks:
             task.cancel()
