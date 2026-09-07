@@ -1224,6 +1224,10 @@ class UnifiedIntakeRouter:
         )  # file_path -> (op_id, time.monotonic())
         self._active_file_ops_lock: threading.Lock = threading.Lock()
         self._queued_behind: Dict[str, List[IntentEnvelope]] = {}  # op_id -> [envelopes]
+        # Goal reconciliation: claims taken during an ingest, keyed by op
+        # (causal_id); released by ``ingest`` when the envelope is NOT
+        # admitted so a rejected op never holds its goal until the TTL.
+        self._goal_claims: Dict[str, Any] = {}
         self._file_lock_ttl_s: float = float(os.environ.get("JARVIS_FILE_LOCK_TTL_S", "300"))
 
         # ── Signal coalescing buffer ──
@@ -1333,27 +1337,10 @@ class UnifiedIntakeRouter:
                 # + resume markers ride intake_evidence_json so the prefill
                 # re-ignition reaches the LLM (model continues the exact char).
                 _kw = _resume_envelope_kwargs(env)
-                # Goal reconciliation: never revive a second op for a goal
-                # that already has a live one (duplicates shed each other on
-                # STATE DRIFT at APPLY). The skipped checkpoint is closed as
-                # terminal so the ledger stays consistent.
-                try:
-                    from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: PLC0415
-                        record_terminal as _gr_terminal,
-                        superseding_op as _gr_superseding,
-                    )
-                    _gr_goal = str(_kw["evidence"].get("goal_id") or "")
-                    _gr_op = str(env.get("op_id") or "")
-                    _gr_live = _gr_superseding(_gr_goal, _gr_op) if _gr_goal else ""
-                    if _gr_live:
-                        logger.warning(
-                            "[Intake] fsm_resume skipped for op=%s: goal %s already in flight as %s",
-                            _gr_op[:12], _gr_goal, _gr_live[:12],
-                        )
-                        await _gr_terminal(goal_id=_gr_goal, op_id=_gr_op, outcome="superseded_on_resume")
-                        return
-                except Exception:  # noqa: BLE001 -- dedupe is additive, never fatal
-                    pass
+                # Goal reconciliation: admission is decided by the atomic
+                # claim inside ``ingest`` (one live op per goal). A resume the
+                # claim refuses is closed as terminal below so the ledger
+                # stays consistent and the checkpoint is consumed, not looped.
                 _lin = _kw["evidence"].get("trace_lineage") or {}
                 if _lin.get("emit_source"):
                     # Re-establish the window-1 emit hop from HMAC-verified
@@ -1372,7 +1359,22 @@ class UnifiedIntakeRouter:
                     except Exception:  # noqa: BLE001 -- lineage is observability
                         pass
                 envelope = _make_env(**_kw)
-                await self.ingest(envelope)
+                _status = await self.ingest(envelope)
+                if _status == "deduplicated":
+                    try:
+                        from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: PLC0415
+                            record_terminal as _gr_terminal,
+                        )
+                        _gr_goal = str(_kw["evidence"].get("goal_id") or "")
+                        _gr_op = str(env.get("op_id") or "")
+                        logger.warning(
+                            "[Intake] fsm_resume superseded for op=%s: goal %s has a live op",
+                            _gr_op[:12], _gr_goal,
+                        )
+                        if _gr_goal and _gr_op:
+                            await _gr_terminal(goal_id=_gr_goal, op_id=_gr_op, outcome="superseded_on_resume")
+                    except Exception:  # noqa: BLE001 -- bookkeeping is additive, never fatal
+                        pass
 
             # hydrate_pending_checkpoints wants a sync ingest_fn; bridge to async by
             # scheduling each re-inject and consuming the checkpoint on success.
@@ -1490,8 +1492,39 @@ class UnifiedIntakeRouter:
             sink_async as _ls_sink_async,
         )
 
-        async with _ls_sink_async("intake.UnifiedIntakeRouter.ingest"):
-            return await self._ingest_impl(envelope)
+        _op = str(getattr(envelope, "causal_id", "") or "")
+        status = ""
+        try:
+            async with _ls_sink_async("intake.UnifiedIntakeRouter.ingest"):
+                status = await self._ingest_impl(envelope)
+                return status
+        finally:
+            await self._release_goal_claim(_op, status)
+
+    async def _release_goal_claim(self, op_id: str, status: str) -> None:
+        """An op the router did not admit must not hold its goal: close the
+        claim taken during this ingest with a terminal row unless the status
+        is an admission (enqueued, queued behind a conflicting op, or parked
+        for a human ack — the op exists and will run). Fail-soft."""
+        claim = self._goal_claims.pop(op_id, None) if op_id else None
+        if claim is None or not getattr(claim, "recorded", False):
+            return
+        if status in _ADMITTED_STATUSES:
+            return
+        try:
+            from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: PLC0415
+                record_terminal as _gr_terminal,
+            )
+            logger.warning(
+                "[Intake] goal %s released: op=%s not admitted (%s)",
+                claim.goal_id, op_id[:12], status or "exception",
+            )
+            await _gr_terminal(
+                goal_id=claim.goal_id, op_id=op_id,
+                outcome=f"not_admitted:{status or 'exception'}",
+            )
+        except Exception:  # noqa: BLE001 -- bookkeeping is additive, never fatal
+            logger.debug("[Intake] goal claim release degraded", exc_info=True)
 
     async def _ingest_impl(self, envelope: IntentEnvelope) -> str:
         # A1-T4 — hop 2/5 (ingest): the live router accepts the envelope.
@@ -1534,28 +1567,35 @@ class UnifiedIntakeRouter:
         # 1. Dedup check
         if self._is_duplicate(envelope):
             return "deduplicated"
-        # Goal reconciliation: ONE live op per signed roadmap goal. A goal
-        # whose dispatched op has not reached a terminal state (and is
-        # younger than the in-flight TTL) is not admitted again — duplicate
-        # ops on the same files shed each other on STATE DRIFT at APPLY.
-        if str(getattr(envelope, "source", "") or "") == "roadmap":
-            try:
+        # Goal reconciliation: ONE live op per signed roadmap goal, decided
+        # and recorded in ONE locked step (``claim_dispatch``). A goal whose
+        # dispatched op has not reached a terminal state (and is younger
+        # than the in-flight TTL) is not admitted again. The check and the
+        # DISPATCHED row used to be separate — a checkpoint resume and a
+        # fresh roadmap emission entering together at boot both read "no
+        # live op" before either wrote (2026-09-07). fsm_resume is the same
+        # op re-admitting itself in THIS session (its old row is dead with
+        # that process); the claim is idempotent for the holder.
+        if str(getattr(envelope, "source", "") or "") in _GOAL_BOUND_SOURCES:
+            _gr_ev = getattr(envelope, "evidence", None) or {}
+            _gr_goal = str(_gr_ev.get("goal_id") or "")
+            _gr_op = str(getattr(envelope, "causal_id", "") or "")
+            if _gr_goal and _gr_op:
                 from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: PLC0415
-                    superseding_op as _gr_superseding,
+                    claim_dispatch as _gr_claim,
                 )
-                _gr_goal = str((getattr(envelope, "evidence", None) or {}).get("goal_id") or "")
-                _gr_live = (
-                    _gr_superseding(_gr_goal, str(getattr(envelope, "causal_id", "") or ""))
-                    if _gr_goal else ""
+                _gr_claimed = await _gr_claim(
+                    goal_id=_gr_goal,
+                    goal_digest_hex=str(_gr_ev.get("goal_digest") or ""),
+                    op_id=_gr_op,
                 )
-                if _gr_live:
+                if not _gr_claimed.claimed:
                     logger.info(
-                        "[Intake] roadmap goal %s already in flight as %s — deduplicated",
-                        _gr_goal, _gr_live[:12],
+                        "[Intake] goal %s not admitted for op=%s (%s) — deduplicated",
+                        _gr_goal, _gr_op[:12], _gr_claimed.reason,
                     )
                     return "deduplicated"
-            except Exception:  # noqa: BLE001 -- dedupe is additive, never fatal
-                pass
+                self._goal_claims[_gr_op] = _gr_claimed
 
         # 2. Human ack gate
         if envelope.requires_human_ack:
@@ -1932,25 +1972,9 @@ class UnifiedIntakeRouter:
             except Exception as _hook_exc:
                 logger.debug("[Router] on_ingest_hook error: %s", _hook_exc)
 
-        # Goal reconciliation: this envelope IS the op (causal_id) — record
-        # the dispatch so the goal stays out of re-admission until terminal.
-        # fsm_resume re-dispatches a surviving op in THIS session (its
-        # original session's row is dead with that process).
-        if str(getattr(envelope, "source", "") or "") in ("roadmap", "fsm_resume"):
-            try:
-                from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: PLC0415
-                    record_dispatch as _gr_dispatch,
-                )
-                _gr_ev = getattr(envelope, "evidence", None) or {}
-                _gr_goal = str(_gr_ev.get("goal_id") or "")
-                if _gr_goal:
-                    await _gr_dispatch(
-                        goal_id=_gr_goal,
-                        goal_digest_hex=str(_gr_ev.get("goal_digest") or ""),
-                        op_id=str(getattr(envelope, "causal_id", "") or ""),
-                    )
-            except Exception:  # noqa: BLE001 -- bookkeeping is additive, never fatal
-                pass
+        # Goal reconciliation: the DISPATCHED row was written by the claim
+        # at admission (step 1); ``ingest`` keeps it because this status is
+        # an admission.
         return "enqueued"
 
     # ------------------------------------------------------------------
@@ -3498,6 +3522,12 @@ def _stamp_resume_pipeline_deadline(ctx: Any, source: str) -> Any:
 #: Evidence keys that identify the signed goal an op serves (stamped by
 #: roadmap_reader._make_envelope_for_goal); the only keys a resume carries.
 _GOAL_BINDING_KEYS = ("goal_id", "goal_digest")
+#: Sources whose envelopes are bound to a signed goal and therefore pass
+#: the atomic dispatch claim at admission.
+_GOAL_BOUND_SOURCES = frozenset({"roadmap", "fsm_resume"})
+#: ``ingest`` statuses under which the op EXISTS and will run — its goal
+#: claim is kept. Every other status releases the claim.
+_ADMITTED_STATUSES = frozenset({"enqueued", "queued_behind", "pending_ack"})
 
 
 def _resume_envelope_kwargs(env: "Dict[str, Any]") -> "Dict[str, Any]":

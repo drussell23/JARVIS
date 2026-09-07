@@ -306,7 +306,10 @@ def test_router_ingest_wires_inflight_dedupe_and_dispatch():
     import inspect
     from backend.core.ouroboros.governance.intake import unified_intake_router as R
     src = inspect.getsource(R.UnifiedIntakeRouter._ingest_impl)
-    assert "superseding_op" in src and "record_dispatch" in src
+    # ONE locked step decides and records admission; the enqueue-time
+    # record is gone (it was the second half of the race).
+    assert "claim_dispatch" in src and "record_dispatch" not in src and "superseding_op" not in src
+    assert "_release_goal_claim" in inspect.getsource(R.UnifiedIntakeRouter.ingest)
 
 
 def test_inflight_ttl_defaults_to_twice_pipeline_wall(monkeypatch):
@@ -393,3 +396,111 @@ def test_dispatch_from_previous_session_is_dead_unless_resumed(repo, monkeypatch
     assert _run(L.reconcile_goal(goal)).in_flight_op == "op-old"
     # repair preserves the hint
     assert L.repair_chain() >= 2 and L.read_records()[0].session == "bt-old"
+
+
+# ---------------------------------------------------------------------------
+# Atomic dispatch claim — admission decided and recorded in ONE locked step
+# ---------------------------------------------------------------------------
+
+def test_claim_is_granted_once_and_refused_for_every_other_op(repo):
+    goal = _goal()
+    first = _run(L.claim_dispatch(goal_id="goal-a", goal_digest_hex=L.goal_digest(goal), op_id="op-1"))
+    assert first.claimed and first.recorded and first.reason == "claimed_new"
+    second = _run(L.claim_dispatch(goal_id="goal-a", goal_digest_hex="", op_id="op-2"))
+    assert not second.claimed and second.holder_op == "op-1" and second.reason == "holder_live"
+    again = _run(L.claim_dispatch(goal_id="goal-a", goal_digest_hex="", op_id="op-1"))
+    assert again.claimed and not again.recorded and again.reason == "already_held"
+    rows = [r for r in L.read_records() if r.event == L.ReconciliationEvent.DISPATCHED.value]
+    assert [r.op_id for r in rows] == ["op-1"], "one row per claim, none for the refused or repeated"
+
+
+def test_concurrent_claims_for_one_goal_yield_exactly_one_holder(repo):
+    """The boot-time race: N admissions of the same goal enter together."""
+    goal = _goal()
+
+    async def _race(n: int):
+        return await asyncio.gather(*(
+            L.claim_dispatch(goal_id="goal-a", goal_digest_hex=L.goal_digest(goal), op_id=f"op-{i}")
+            for i in range(n)
+        ))
+
+    claims = _run(_race(12))
+    winners = [c for c in claims if c.claimed]
+    assert len(winners) == 1 and winners[0].recorded
+    losers = [c for c in claims if not c.claimed]
+    assert len(losers) == 11 and all(c.holder_op == winners[0].op_id and c.reason == "holder_live" for c in losers)
+    rows = [r for r in L.read_records() if r.event == L.ReconciliationEvent.DISPATCHED.value]
+    assert len(rows) == 1 and rows[0].op_id == winners[0].op_id
+    assert L.repair_chain() == len(L.read_records()), "the chain is intact after the race"
+
+
+def test_claim_releases_on_terminal_ttl_and_dead_session(repo, monkeypatch):
+    goal = _goal()
+    assert _run(L.claim_dispatch(goal_id="goal-a", goal_digest_hex="", op_id="op-1")).claimed
+    assert _run(L.record_terminal(goal_id="goal-a", op_id="op-1", outcome="failed"))
+    assert _run(L.claim_dispatch(goal_id="goal-a", goal_digest_hex="", op_id="op-2")).reason == "claimed_new"
+    # TTL lapse frees a crashed holder
+    monkeypatch.setenv(L._ENV_INFLIGHT_TTL, "0.001")
+    import time as _t; _t.sleep(0.01)
+    assert _run(L.claim_dispatch(goal_id="goal-a", goal_digest_hex="", op_id="op-3")).reason == "claimed_new"
+    monkeypatch.delenv(L._ENV_INFLIGHT_TTL, raising=False)
+    # a holder from a dead session does not block; the SAME op resuming in the new session re-claims with a row
+    monkeypatch.setenv(L._ENV_SESSION, "bt-old")
+    assert _run(L.claim_dispatch(goal_id="goal-b", goal_digest_hex="", op_id="op-old")).reason == "claimed_new"
+    monkeypatch.setenv(L._ENV_SESSION, "bt-new")
+    resumed = _run(L.claim_dispatch(goal_id="goal-b", goal_digest_hex="", op_id="op-old"))
+    assert resumed.claimed and resumed.recorded and resumed.reason == "claimed_new"
+    assert L.read_records()[-1].session == "bt-new"
+    fresh = _run(L.claim_dispatch(goal_id="goal-b", goal_digest_hex="", op_id="op-fresh"))
+    assert not fresh.claimed and fresh.holder_op == "op-old"
+
+
+def test_claim_fails_closed_when_the_lock_is_busy(repo, monkeypatch):
+    import threading
+    from backend.core.ouroboros.governance.cross_process_jsonl import flock_critical_section
+    monkeypatch.setenv(L._ENV_CLAIM_TIMEOUT, "0.2")
+    path = L.ledger_path()
+    held = threading.Event(); release = threading.Event()
+
+    def _hold():
+        with flock_critical_section(path, timeout_s=5.0) as ok:
+            assert ok
+            held.set(); release.wait(5.0)
+
+    t = threading.Thread(target=_hold, daemon=True); t.start(); held.wait(5.0)
+    try:
+        claim = _run(L.claim_dispatch(goal_id="goal-a", goal_digest_hex="", op_id="op-1"))
+    finally:
+        release.set(); t.join(5.0)
+    assert not claim.claimed and claim.reason == "lock_busy"
+    assert not [r for r in L.read_records() if r.op_id == "op-1"]
+    # and the same claim succeeds once the lock is free
+    assert _run(L.claim_dispatch(goal_id="goal-a", goal_digest_hex="", op_id="op-1")).reason == "claimed_new"
+
+
+def test_claim_degrades_open_and_loud_on_an_unverifiable_ledger(repo, monkeypatch, caplog):
+    assert _run(L.claim_dispatch(goal_id="goal-a", goal_digest_hex="", op_id="op-1")).claimed
+    monkeypatch.setenv("JARVIS_ROADMAP_READER_HMAC_SECRET", "another-secret")
+    with caplog.at_level(logging.WARNING):
+        claim = _run(L.claim_dispatch(goal_id="goal-a", goal_digest_hex="", op_id="op-2"))
+    assert claim.claimed and not claim.recorded and claim.reason == "ledger_unverifiable"
+    assert any("UNCLAIMED" in r.getMessage() for r in caplog.records)
+    monkeypatch.setenv("JARVIS_ROADMAP_READER_HMAC_SECRET", SECRET)
+    assert len(L.read_records()) == 1, "nothing was appended on top of an unverifiable chain"
+
+
+def test_claim_is_granted_without_a_row_when_disabled_or_unbound(repo, monkeypatch):
+    assert _run(L.claim_dispatch(goal_id="", goal_digest_hex="", op_id="op-1")).reason == "unbound"
+    assert _run(L.claim_dispatch(goal_id="goal-a", goal_digest_hex="", op_id="")).reason == "unbound"
+    monkeypatch.setenv(L._ENV_ENABLED, "false")
+    c = _run(L.claim_dispatch(goal_id="goal-a", goal_digest_hex="", op_id="op-1"))
+    assert c.claimed and not c.recorded and c.reason == "disabled"
+    assert not L._ledger_has_rows(L.ledger_path())
+
+
+def test_claim_timeout_defaults_to_the_cross_process_lock_timeout(monkeypatch):
+    monkeypatch.delenv(L._ENV_CLAIM_TIMEOUT, raising=False)
+    monkeypatch.setenv("JARVIS_CROSS_PROCESS_LOCK_TIMEOUT_S", "3.5")
+    assert L.claim_lock_timeout_s() == 3.5
+    monkeypatch.setenv(L._ENV_CLAIM_TIMEOUT, "0.75")
+    assert L.claim_lock_timeout_s() == 0.75

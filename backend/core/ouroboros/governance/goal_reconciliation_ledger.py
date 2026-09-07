@@ -67,6 +67,7 @@ import json
 import logging
 import os
 import time
+import contextlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -82,6 +83,7 @@ _ENV_SCAN_DEPTH = "JARVIS_GOAL_RECONCILIATION_SCAN_DEPTH"
 _ENV_INFLIGHT_TTL = "JARVIS_GOAL_RECONCILIATION_INFLIGHT_TTL_S"
 _ENV_PIPELINE_TIMEOUT = "JARVIS_PIPELINE_TIMEOUT_S"
 _ENV_SESSION = "JARVIS_OUROBOROS_SESSION_ID"   # same anchor the auto-commit trailer uses
+_ENV_CLAIM_TIMEOUT = "JARVIS_GOAL_RECONCILIATION_CLAIM_TIMEOUT_S"
 
 _DEFAULT_LEDGER_REL = ".jarvis/goal_reconciliation_ledger.jsonl"
 _DEFAULT_LANDING_REF = "HEAD"
@@ -170,6 +172,25 @@ def inflight_ttl_s() -> float:
         return 2.0 * max(1.0, float(os.environ.get(_ENV_PIPELINE_TIMEOUT, "").strip() or 600.0))
     except ValueError:
         return 1200.0
+
+
+def claim_lock_timeout_s() -> float:
+    """How long an admission claim waits for the ledger flock
+    (``JARVIS_GOAL_RECONCILIATION_CLAIM_TIMEOUT_S``). Defaults to the
+    cross-process lock's own timeout so one knob governs every ledger."""
+    raw = os.environ.get(_ENV_CLAIM_TIMEOUT, "").strip()
+    if raw:
+        try:
+            v = float(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    try:
+        from backend.core.ouroboros.governance.cross_process_jsonl import lock_timeout_s
+        return float(lock_timeout_s())
+    except Exception:  # noqa: BLE001
+        return 5.0
 
 
 def repo_root() -> Path:
@@ -419,29 +440,60 @@ def _ledger_has_rows(path: Path) -> bool:
         return False
 
 
+@dataclass(frozen=True)
+class ChainHead:
+    """The verified head of the ledger, held under its cross-process flock.
+
+    ``acquired`` — the flock was obtained; ``verified`` — every row verifies
+    (or the ledger is empty), so a record built on ``prev_hash`` links
+    correctly. A head that is not ``usable`` has already been logged."""
+
+    acquired: bool
+    verified: bool
+    records: Tuple[ReconciliationRecord, ...] = ()
+    prev_hash: str = ""
+
+    @property
+    def usable(self) -> bool:
+        return self.acquired and self.verified
+
+
+@contextlib.contextmanager
+def _chain_head(path: Path, secret: Optional[str], *, timeout_s: Optional[float] = None):
+    """Yield the :class:`ChainHead` under the ledger's flock — the ONE
+    read-modify-write section every linked write (landing, dispatch claim,
+    terminal) goes through, so two writers can never both link to the same
+    head (the chain-break class observed 2026-09-07). Fail-CLOSED on an
+    unverifiable ledger: appending at genesis on top of rows that do not
+    verify would break the chain for everyone. NEVER raises."""
+    from backend.core.ouroboros.governance.cross_process_jsonl import flock_critical_section
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with flock_critical_section(path, timeout_s=timeout_s) as acquired:
+        if not acquired:
+            logger.warning("[GoalReconciliation] ledger lock busy (%.1fs) — no linked write", float(timeout_s or claim_lock_timeout_s()))
+            yield ChainHead(acquired=False, verified=False)
+            return
+        existing = read_records(path, secret=secret)
+        if not existing and _ledger_has_rows(path):
+            logger.warning("[GoalReconciliation] ledger has rows but none verify (secret/corruption) — refusing to append; run repair_chain()")
+            yield ChainHead(acquired=True, verified=False)
+            return
+        yield ChainHead(
+            acquired=True, verified=True, records=existing,
+            prev_hash=existing[-1].record_hash if existing else _genesis(),
+        )
+
+
 def append_linked(
     build: "Callable[[str], ReconciliationRecord]", path: Path, secret: Optional[str],
 ) -> Optional[ReconciliationRecord]:
-    """Read the verified chain head, build the record ON that head and append
-    it — all under the ledger's cross-process flock, so two concurrent
-    writers can never both link to the same head (the chain-break class
-    observed 2026-09-07). Fail-CLOSED: a non-empty ledger whose rows cannot
-    be verified (wrong/missing secret, corruption) is never appended to —
-    appending at genesis on top of it would break the chain for everyone.
-    NEVER raises."""
+    """Build the record ON the verified chain head and append it, all under
+    the ledger's flock (see :func:`_chain_head`). NEVER raises."""
     try:
-        from backend.core.ouroboros.governance.cross_process_jsonl import flock_critical_section
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with flock_critical_section(path) as acquired:
-            if not acquired:
-                logger.warning("[GoalReconciliation] ledger lock busy — event not recorded")
+        with _chain_head(path, secret) as head:
+            if not head.usable:
                 return None
-            existing = read_records(path, secret=secret)
-            if not existing and _ledger_has_rows(path):
-                logger.warning("[GoalReconciliation] ledger has rows but none verify (secret/corruption) — refusing to append; run repair_chain()")
-                return None
-            prev = existing[-1].record_hash if existing else _genesis()
-            rec = build(prev)
+            rec = build(head.prev_hash)
             # The section already holds the ledger's flock; flock_append_line
             # would try to take it again (nested acquisition times out).
             return rec if _append_unlocked(rec, path) else None
@@ -574,6 +626,91 @@ async def record_terminal(*, goal_id: str, op_id: str, outcome: str = "", path: 
     if rec:
         logger.info("[GoalReconciliation] goal=%s op=%s terminal (%s)", goal_id, op_id[:12], outcome or "-")
     return rec
+
+
+@dataclass(frozen=True)
+class DispatchClaim:
+    """Outcome of :func:`claim_dispatch` — admission decided and recorded in
+    ONE locked step.
+
+    ``claimed`` — the caller's op may proceed for this goal. ``holder_op`` —
+    the live op that holds the goal when the claim is refused. ``recorded``
+    — a DISPATCHED row was appended under the lock (false when the same op
+    already held the goal, when reconciliation is disabled, or when the
+    ledger could not be written and admission proceeded unclaimed).
+    ``reason`` is a stable, grep-friendly code."""
+
+    claimed: bool
+    goal_id: str
+    op_id: str
+    holder_op: str = ""
+    recorded: bool = False
+    reason: str = ""
+
+
+def _claim_locked(
+    goal_id: str, goal_digest_hex: str, op_id: str, path: Path, secret: Optional[str],
+) -> DispatchClaim:
+    """Check-and-record under the ledger flock. The read that decides and the
+    write that records are ONE critical section, so N concurrent admissions
+    of the same goal — the boot-time race of 2026-09-07 (a checkpoint resume
+    and a fresh roadmap emission entering together) — yield exactly one
+    claim. Fail-CLOSED when the lock cannot be obtained or the row cannot be
+    written: an op the ledger did not admit does not run. An UNVERIFIABLE
+    ledger (secret/corruption) is the one degraded case: admission proceeds
+    unclaimed, loudly, so a broken ledger halts dedupe rather than the
+    organism."""
+    with _chain_head(path, secret, timeout_s=claim_lock_timeout_s()) as head:
+        if not head.acquired:
+            return DispatchClaim(False, goal_id, op_id, reason="lock_busy")
+        if not head.verified:
+            logger.warning(
+                "[GoalReconciliation] goal=%s op=%s admitted UNCLAIMED — ledger unverifiable, dedupe degraded",
+                goal_id, op_id[:12],
+            )
+            return DispatchClaim(True, goal_id, op_id, reason="ledger_unverifiable")
+        live = in_flight_op(head.records, goal_id)
+        if live and live != op_id:
+            return DispatchClaim(False, goal_id, op_id, holder_op=live, reason="holder_live")
+        if live == op_id:
+            return DispatchClaim(True, goal_id, op_id, reason="already_held")
+        rec = _make_record(
+            event=ReconciliationEvent.DISPATCHED, goal_id=goal_id, goal_digest_hex=goal_digest_hex,
+            commit_sha="", op_id=op_id, prev_hash=head.prev_hash, secret=secret,
+        )
+        if not _append_unlocked(rec, path):
+            return DispatchClaim(False, goal_id, op_id, reason="append_failed")
+        return DispatchClaim(True, goal_id, op_id, recorded=True, reason="claimed_new")
+
+
+async def claim_dispatch(
+    *, goal_id: str, goal_digest_hex: str, op_id: str,
+    path: Optional[Path] = None, secret: Optional[str] = None,
+) -> DispatchClaim:
+    """Atomically admit *op_id* as the ONE live op for *goal_id* (see
+    :func:`_claim_locked`). Replaces the read-then-write pair
+    ``superseding_op`` + ``record_dispatch`` at the intake router. With
+    reconciliation disabled or an unbound envelope the claim is granted
+    without a row (nothing to reconcile). NEVER raises."""
+    if not enabled():
+        return DispatchClaim(True, goal_id, op_id, reason="disabled")
+    if not goal_id or not op_id:
+        return DispatchClaim(True, goal_id, op_id, reason="unbound")
+    try:
+        target = path or ledger_path()
+        secret = secret if secret is not None else _roadmap_secret()
+        claim = await asyncio.to_thread(_claim_locked, goal_id, goal_digest_hex, op_id, target, secret)
+    except Exception:  # noqa: BLE001
+        logger.warning("[GoalReconciliation] claim degraded for goal=%s op=%s — admitted unclaimed", goal_id, op_id[:12], exc_info=True)
+        return DispatchClaim(True, goal_id, op_id, reason="error")
+    if claim.claimed:
+        logger.info("[GoalReconciliation] goal=%s claimed by op=%s (%s)", goal_id, op_id[:12], claim.reason)
+    else:
+        logger.warning(
+            "[GoalReconciliation] goal=%s NOT admitted for op=%s (%s%s)",
+            goal_id, op_id[:12], claim.reason, f"; live op={claim.holder_op[:12]}" if claim.holder_op else "",
+        )
+    return claim
 
 
 def in_flight_op(records: Sequence[ReconciliationRecord], goal_id: str, *, now_ts: Optional[float] = None) -> str:
