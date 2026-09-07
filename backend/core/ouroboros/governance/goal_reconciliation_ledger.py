@@ -81,6 +81,7 @@ _ENV_GIT_TIMEOUT = "JARVIS_GOAL_RECONCILIATION_GIT_TIMEOUT_S"
 _ENV_SCAN_DEPTH = "JARVIS_GOAL_RECONCILIATION_SCAN_DEPTH"
 _ENV_INFLIGHT_TTL = "JARVIS_GOAL_RECONCILIATION_INFLIGHT_TTL_S"
 _ENV_PIPELINE_TIMEOUT = "JARVIS_PIPELINE_TIMEOUT_S"
+_ENV_SESSION = "JARVIS_OUROBOROS_SESSION_ID"   # same anchor the auto-commit trailer uses
 
 _DEFAULT_LEDGER_REL = ".jarvis/goal_reconciliation_ledger.jsonl"
 _DEFAULT_LANDING_REF = "HEAD"
@@ -146,6 +147,11 @@ def scan_depth() -> int:
         return v if v > 0 else _DEFAULT_SCAN_DEPTH
     except ValueError:
         return _DEFAULT_SCAN_DEPTH
+
+
+def current_session() -> str:
+    """The running organism's session id (``""`` outside a soak/cockpit)."""
+    return os.environ.get(_ENV_SESSION, "").strip()
 
 
 def inflight_ttl_s() -> float:
@@ -281,6 +287,10 @@ class ReconciliationRecord:
     record_hash: str
     mac: str
     schema_version: str = SCHEMA_VERSION
+    #: Process session that wrote the row. NOT part of the MAC'd payload: an
+    #: attacker who forges it can only make a dispatch look stale (a
+    #: duplicate op), never hide a goal (fail-closed for suppression).
+    session: str = ""
 
     def payload(self) -> Dict[str, Any]:
         return {k: getattr(self, k) for k in _PAYLOAD_FIELDS}
@@ -290,6 +300,7 @@ class ReconciliationRecord:
         d.update({
             "prev_hash": self.prev_hash, "record_hash": self.record_hash,
             "mac": self.mac, "schema_version": self.schema_version,
+            "session": self.session,
         })
         return d
 
@@ -368,7 +379,8 @@ def read_records(path: Optional[Path] = None, *, secret: Optional[str] = None) -
                     logger.warning("[GoalReconciliation] MAC invalid for goal=%s — ignoring tail", payload["goal_id"])
                     break
             rec = ReconciliationRecord(
-                prev_hash=prev, record_hash=expected, mac=mac, **payload,
+                prev_hash=prev, record_hash=expected, mac=mac,
+                session=str(row.get("session", "") or ""), **payload,
             )
             records.append(rec)
             prev = expected
@@ -464,7 +476,8 @@ def repair_chain(
                     if k != "ts":
                         payload[k] = str(payload.get(k) or "")
                 rec = ReconciliationRecord(
-                    prev_hash=prev, record_hash=_chain_hash(prev, payload), mac=_mac(payload, secret), **payload,
+                    prev_hash=prev, record_hash=_chain_hash(prev, payload), mac=_mac(payload, secret),
+                    session=str(row.get("session", "") or ""), **payload,
                 )
                 out.append(rec)
                 prev = rec.record_hash
@@ -490,7 +503,7 @@ def _make_record(
     }
     return ReconciliationRecord(
         prev_hash=prev_hash, record_hash=_chain_hash(prev_hash, payload),
-        mac=_mac(payload, secret), **payload,
+        mac=_mac(payload, secret), session=current_session(), **payload,
     )
 
 
@@ -568,11 +581,17 @@ def in_flight_op(records: Sequence[ReconciliationRecord], goal_id: str, *, now_t
     than the in-flight TTL, else ``""``."""
     now = float(now_ts if now_ts is not None else time.time())
     ttl = inflight_ttl_s()
+    session = current_session()
     terminal = {r.op_id for r in records if r.goal_id == goal_id and r.event == ReconciliationEvent.TERMINAL.value}
     for rec in reversed(records):
         if rec.goal_id != goal_id or rec.event != ReconciliationEvent.DISPATCHED.value:
             continue
         if rec.op_id in terminal:
+            continue
+        # A dispatch written by ANOTHER process session is dead with that
+        # process (an op that survived via fsm_resume is re-dispatched in
+        # this session and shows up as a newer row).
+        if session and rec.session and rec.session != session:
             continue
         if now - float(rec.ts) <= ttl:
             return rec.op_id

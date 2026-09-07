@@ -374,3 +374,22 @@ def test_superseding_op_for_resume_dedupe(repo):
     assert L.superseding_op("goal-a", "op-old") == "op-live"
     assert L.superseding_op("goal-a", "op-live") == ""      # the live op itself resumes freely
     assert L.superseding_op("goal-none", "op-old") == ""
+
+
+def test_dispatch_from_previous_session_is_dead_unless_resumed(repo, monkeypatch):
+    goal = _goal()
+    monkeypatch.setenv(L._ENV_SESSION, "bt-old")
+    assert _run(L.record_dispatch(goal_id="goal-a", goal_digest_hex="", op_id="op-old"))
+    assert L.read_records()[-1].session == "bt-old"
+    assert _run(L.reconcile_goal(goal)).in_flight_op == "op-old"        # same session: live
+    monkeypatch.setenv(L._ENV_SESSION, "bt-new")
+    assert _run(L.reconcile_goal(goal)).in_flight_op == ""              # new process: dead
+    assert L.superseding_op("goal-a", "op-fresh") == ""
+    # a resumed op re-dispatches in the new session and is live again
+    assert _run(L.record_dispatch(goal_id="goal-a", goal_digest_hex="", op_id="op-old"))
+    assert _run(L.reconcile_goal(goal)).in_flight_op == "op-old"
+    # no session anywhere (tests / cockpit): TTL-only legacy behaviour
+    monkeypatch.delenv(L._ENV_SESSION, raising=False)
+    assert _run(L.reconcile_goal(goal)).in_flight_op == "op-old"
+    # repair preserves the hint
+    assert L.repair_chain() >= 2 and L.read_records()[0].session == "bt-old"

@@ -1934,7 +1934,9 @@ class UnifiedIntakeRouter:
 
         # Goal reconciliation: this envelope IS the op (causal_id) — record
         # the dispatch so the goal stays out of re-admission until terminal.
-        if str(getattr(envelope, "source", "") or "") == "roadmap":
+        # fsm_resume re-dispatches a surviving op in THIS session (its
+        # original session's row is dead with that process).
+        if str(getattr(envelope, "source", "") or "") in ("roadmap", "fsm_resume"):
             try:
                 from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: PLC0415
                     record_dispatch as _gr_dispatch,
