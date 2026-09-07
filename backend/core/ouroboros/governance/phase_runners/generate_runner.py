@@ -1191,8 +1191,43 @@ class GENERATERunner(PhaseRunner):
                 # is_noop=True means the model signalled the change is already present.
                 # Empty candidates is correct in this case — do not treat as a failure.
                 if generation is not None and generation.is_noop:
+                    # Declared-symbol contract: a no-op is a CLAIM that the
+                    # change is already present. When the signed goal declares
+                    # the symbols that must exist, verify the claim on disk;
+                    # refuse it (and retry with the missing names) otherwise.
+                    try:
+                        from backend.core.ouroboros.governance.declared_symbols import (
+                            missing_declared_symbols as _ds_missing,
+                            refusal_feedback as _ds_feedback,
+                        )
+                        _ds_gap = _ds_missing(
+                            getattr(ctx, "target_symbols", ()) or (),
+                            getattr(ctx, "target_files", ()) or (),
+                            orch._config.project_root,
+                        )
+                    except Exception:  # noqa: BLE001 — contract is additive
+                        _ds_gap = ()
+                    if _ds_gap:
+                        logger.warning(
+                            "[Orchestrator] no-op REFUSED op=%s — declared symbols missing "
+                            "on disk: %s (retrying with feedback)",
+                            ctx.op_id[:12], ", ".join(_ds_gap),
+                        )
+                        try:
+                            from backend.core.ouroboros.governance.lesson_memory import (
+                                record_lesson as _ds_record_lesson,
+                            )
+                            await _ds_record_lesson(
+                                op_id=str(ctx.op_id), target_files=tuple(ctx.target_files),
+                                phase="GENERATE", failure_class="content",
+                                error_text="noop_refused_declared_symbols: " + ", ".join(_ds_gap),
+                                error_class="noop_refused_declared_symbols",
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        generation = None
+                        raise RuntimeError(_ds_feedback(_ds_gap, getattr(ctx, "target_files", ()) or ()))
                     break
-
                 if generation is None or len(generation.candidates) == 0:
                     generation = None
                     raise RuntimeError("no_candidates_returned")

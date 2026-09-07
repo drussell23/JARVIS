@@ -3381,6 +3381,30 @@ class GovernedOrchestrator:
                 _phase8_terminal_ctx = ctx
                 return ctx
         finally:
+            # Goal reconciliation: EVERY op exit — complete, no-op, shed,
+            # unhandled — releases its signed goal (only a landing keeps it
+            # out, as a `satisfied` binding). The outcome-seam record stays
+            # for richer outcomes; this is the catch-all.
+            try:
+                from backend.core.ouroboros.governance.goal_reconciliation_ledger import (
+                    binding_from_evidence as _gr_exit_binding,
+                    record_terminal as _gr_exit_terminal,
+                )
+                _gr_exit_ctx = _phase8_terminal_ctx if _phase8_terminal_ctx is not None else ctx
+                _gr_exit_gid, _ = _gr_exit_binding(
+                    getattr(_gr_exit_ctx, "intake_evidence_json", "") or ""
+                )
+                if _gr_exit_gid:
+                    await _gr_exit_terminal(
+                        goal_id=_gr_exit_gid,
+                        op_id=str(getattr(_gr_exit_ctx, "op_id", "") or ""),
+                        outcome=(
+                            str(getattr(getattr(_gr_exit_ctx, "phase", None), "name", "") or "")
+                            + ":" + str(getattr(_gr_exit_ctx, "terminal_reason_code", "") or "")
+                        ),
+                    )
+            except Exception:  # noqa: BLE001 — never perturbs op exit
+                logger.debug("[Orchestrator] goal exit terminal skipped", exc_info=True)
             # Phase 9.5 Part B — terminal-phase Phase 8 producer hooks.
             # NEVER raises. Records (a) op-level latency for the
             # terminal phase, (b) one decision-trace row tagged
@@ -14138,6 +14162,35 @@ class GovernedOrchestrator:
         non-``test`` failures are byte-identical. Wrapping HERE covers all three
         callers — the inline VALIDATE block, the extracted VALIDATERunner, and
         L2 re-validation — so the advisory holds on every validation path."""
+        # Declared-symbol contract (VALIDATE side): a candidate for a goal
+        # that declares symbols must DEFINE them — otherwise no test can
+        # prove the goal and the run would only measure existing tests.
+        try:
+            from backend.core.ouroboros.governance.declared_symbols import (
+                symbols_missing_from_candidate as _ds_cand_missing,
+            )
+            _ds_cand_gap = _ds_cand_missing(
+                getattr(ctx, "target_symbols", ()) or (), candidate or {},
+            )
+        except Exception:  # noqa: BLE001 — contract is additive
+            _ds_cand_gap = ()
+        if _ds_cand_gap:
+            logger.warning(
+                "[Validation] declared symbols missing from candidate op=%s: %s",
+                str(getattr(ctx, "op_id", ""))[:16], ", ".join(_ds_cand_gap),
+            )
+            return ValidationResult(
+                passed=False,
+                best_candidate=None,
+                validation_duration_s=0.0,
+                error="declared_symbol_missing: " + ", ".join(_ds_cand_gap),
+                failure_class="test",
+                short_summary=(
+                    "declared symbols missing from candidate: " + ", ".join(_ds_cand_gap)
+                    + " — the goal requires these definitions"
+                ),
+                adapter_names_run=(),
+            )
         result = await self._run_validation_core(ctx, candidate, remaining_s)
         # Lesson confidence: a pass after injected lessons boosts them.
         try:

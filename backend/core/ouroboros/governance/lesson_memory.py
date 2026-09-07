@@ -160,6 +160,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 #: SHAPE of a failure, never a module or symbol name.
 _ERROR_CLASSES: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
     ("no_tests_collected", re.compile(r"no tests ran|collected 0 items|found no collectors|no tests collected", re.I)),
+    ("declared_symbol_missing", re.compile(r"declared_symbol_missing|declared symbols missing", re.I)),
     ("syntax_error", re.compile(r"\b(SyntaxError|IndentationError)\b")),
     ("import_error", re.compile(r"\b(ModuleNotFoundError|ImportError: No module)\b")),
     ("api_signature_mismatch", re.compile(
@@ -188,6 +189,8 @@ _MITIGATIONS: Dict[str, str] = {
     "exception": "Read the previous failure evidence carefully before retrying; do not repeat the same construction.",
     "ambient_red": "These tests fail in this environment WITHOUT your change and are excluded from the verdict — do not chase them; make your NEW tests pass and leave the existing ones untouched.",
     "guardian_hard_finding": "APPLY was refused by the semantic guardian: the candidate edited or weakened EXISTING code/tests. Append new definitions only; reproduce every existing line byte-for-byte.",
+    "declared_symbol_missing": "The goal DECLARES symbols that must exist; the candidate did not define them. Add exactly those definitions (append at the end) — a candidate without them cannot satisfy the goal.",
+    "noop_refused_declared_symbols": "A no-op was refused: the goal's declared symbols do not exist on disk, so the change is NOT already present. Add the declared definitions instead of returning 2b.1-noop.",
 }
 
 
