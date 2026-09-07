@@ -1,5 +1,8 @@
 # [Ouroboros] Modified by Ouroboros (op=op-01a07b16-) at 2026-09-07 09:06 UTC
 # [Ouroboros] Modified by Ouroboros (op=op-01a07b18-) at 2026-09-07 09:10 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-01a07b19-) at 2026-09-07 09:16 UTC
+# Reason: First-order proof #2: author a real unit test for the untested production_oracle aggregator  AUTHOR a new pytest test fi
+
 # Reason: First-order proof #2: author a real unit test for the untested production_oracle aggregator  AUTHOR a new pytest test fi
 
 # Reason: First-order proof #2: author a real unit test for the untested production_oracle aggregator  AUTHOR a new pytest test fi
@@ -10,26 +13,22 @@ from unittest.mock import Mock
 
 import pytest
 
-test_signals = [
-    Mock(
-        oracle_name="test_oracle",
-        kind=enum.auto(),
-        verdict=enum.auto(),
-        observed_at_ts=1.0,
-        summary="test_summary",
-        payload={"key": "value"},
-        severity=0.5
-    )
-]
+from backend.core.ouroboros.governance.production_oracle import (
+    OracleKind,
+    OracleSignal,
+    OracleVerdict,
+    compute_aggregate_verdict,
+    project_signal_for_observability,
+)
 
 def test_compute_aggregate_verdict_empty_input():
-    from backend.core.ouroboros.governance.production_oracle import compute_aggregate_verdict, OracleVerdict
+    """Test that empty input returns INSUFFICIENT_DATA."""
     result = compute_aggregate_verdict([])
     assert result == OracleVerdict.INSUFFICIENT_DATA
 
 
 def test_compute_aggregate_verdict_insufficient_signals():
-    from backend.core.ouroboros.governance.production_oracle import compute_aggregate_verdict, OracleVerdict, OracleSignal, OracleKind
+    """Test that fewer signals than minimum_signals returns INSUFFICIENT_DATA."""
     signal = OracleSignal(
         oracle_name="test",
         kind=OracleKind.ERROR,
@@ -43,7 +42,7 @@ def test_compute_aggregate_verdict_insufficient_signals():
 
 
 def test_compute_aggregate_verdict_all_disabled():
-    from backend.core.ouroboros.governance.production_oracle import compute_aggregate_verdict, OracleVerdict, OracleSignal, OracleKind
+    """Test that all DISABLED signals returns DISABLED."""
     signal = OracleSignal(
         oracle_name="test",
         kind=OracleKind.ERROR,
@@ -57,7 +56,7 @@ def test_compute_aggregate_verdict_all_disabled():
 
 
 def test_compute_aggregate_verdict_failed_signal():
-    from backend.core.ouroboros.governance.production_oracle import compute_aggregate_verdict, OracleVerdict, OracleSignal, OracleKind
+    """Test that FAILED signal with severity >= fail_threshold_severity returns FAILED."""
     signal = OracleSignal(
         oracle_name="test",
         kind=OracleKind.ERROR,
@@ -72,7 +71,7 @@ def test_compute_aggregate_verdict_failed_signal():
 
 
 def test_compute_aggregate_verdict_degraded_signal():
-    from backend.core.ouroboros.governance.production_oracle import compute_aggregate_verdict, OracleVerdict, OracleSignal, OracleKind
+    """Test that DEGRADED signal with severity >= degrade_threshold_severity returns DEGRADED."""
     signal = OracleSignal(
         oracle_name="test",
         kind=OracleKind.ERROR,
@@ -87,7 +86,7 @@ def test_compute_aggregate_verdict_degraded_signal():
 
 
 def test_compute_aggregate_verdict_healthy_signal():
-    from backend.core.ouroboros.governance.production_oracle import compute_aggregate_verdict, OracleVerdict, OracleSignal, OracleKind
+    """Test that HEALTHY signal with no FAILED/DEGRADED signals returns HEALTHY."""
     signal = OracleSignal(
         oracle_name="test",
         kind=OracleKind.ERROR,
@@ -102,7 +101,7 @@ def test_compute_aggregate_verdict_healthy_signal():
 
 
 def test_project_signal_for_observability():
-    from backend.core.ouroboros.governance.production_oracle import project_signal_for_observability, OracleSignal, OracleKind, OracleVerdict
+    """Test that project_signal_for_observability returns correct keys with enum .value strings."""
     signal = OracleSignal(
         oracle_name="test_oracle",
         kind=OracleKind.ERROR,
@@ -121,8 +120,9 @@ def test_project_signal_for_observability():
     assert result["payload"] == {"key": "value"}
     assert result["severity"] == 0.5
 
+
 def test_project_signal_for_observability_summary_truncation():
-    from backend.core.ouroboros.governance.production_oracle import project_signal_for_observability, OracleSignal, OracleKind, OracleVerdict
+    """Test that project_signal_for_observability truncates summary to 200 chars."""
     long_summary = "x" * 250
     signal = OracleSignal(
         oracle_name="test_oracle",
@@ -134,4 +134,4 @@ def test_project_signal_for_observability_summary_truncation():
         severity=0.5
     )
     result = project_signal_for_observability(signal)
-    assert len(result["summary"] ) == 200
+    assert len(result["summary"]) == 200
