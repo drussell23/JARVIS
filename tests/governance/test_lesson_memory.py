@@ -63,6 +63,8 @@ def _record(files=("tests/governance/test_model_physics.py",), error="AssertionE
     ("AttributeError: module 'model_physics' has no attribute 'effective'", "api_signature_mismatch"),
     ("AssertionError: assert None is not None", "input_shape_mismatch"),
     ("AssertionError: assert 524288 == 16384", "expected_value_mismatch"),
+    ("AssertionError: assert <OracleVerdict.HEALTHY: 'healthy'> == <OracleVerdict.FAILED: 'failed'>", "expected_value_mismatch"),
+    ("assert ['Hello! It s...'] == ['Fix applied. Tests green.']", "expected_value_mismatch"),
     ("verify_regression: 3 previously passing tests failed", "verify_regression"),
     ("SyntaxError: invalid syntax", "syntax_error"),
     ("ModuleNotFoundError: No module named 'foo'", "import_error"),
@@ -215,3 +217,15 @@ def test_hook_is_wired_into_candidate_generator_and_orchestrator_seams():
     assert "inject_lessons" in inspect.getsource(cg.CandidateGenerator.generate)
     assert "record_lesson" in inspect.getsource(orch.Orchestrator._run_validation)
     assert "_goal_binding_kwargs" in inspect.getsource(s4b)
+
+
+def test_fsm_resume_envelope_carries_goal_binding():
+    from backend.core.ouroboros.governance.intake.unified_intake_router import _resume_envelope_kwargs
+    env = {"op_id": "op-x", "target_files": ["a.py"], "resume_phase": "APPLY",
+           "intake_evidence_json": json.dumps({"goal_id": "g-1", "goal_digest": "d" * 64, "success_criteria": "not carried"})}
+    kw = _resume_envelope_kwargs(env)
+    ev = kw["evidence"]
+    assert ev["goal_id"] == "g-1" and ev["goal_digest"] == "d" * 64 and "success_criteria" not in ev
+    assert json.loads(ev["intake_evidence_json"])["goal_id"] == "g-1"
+    plain = _resume_envelope_kwargs({"op_id": "op-y", "intake_evidence_json": "not json"})
+    assert "goal_id" not in plain["evidence"]

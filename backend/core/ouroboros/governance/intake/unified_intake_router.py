@@ -3433,6 +3433,11 @@ def _stamp_resume_pipeline_deadline(ctx: Any, source: str) -> Any:
         return ctx
 
 
+#: Evidence keys that identify the signed goal an op serves (stamped by
+#: roadmap_reader._make_envelope_for_goal); the only keys a resume carries.
+_GOAL_BINDING_KEYS = ("goal_id", "goal_digest")
+
+
 def _resume_envelope_kwargs(env: "Dict[str, Any]") -> "Dict[str, Any]":
     """Build the ``make_envelope`` kwargs for an FSM-resume re-injection.
 
@@ -3442,8 +3447,22 @@ def _resume_envelope_kwargs(env: "Dict[str, Any]") -> "Dict[str, Any]":
     verify) and carry the HMAC-verified lineage in the evidence so a further
     suspension preserves window-1's identity."""
     import json as _rj  # noqa: PLC0415
-
     _lineage = dict(env.get("trace_lineage") or {})
+    # Goal reconciliation: a resumed op IS the same signed goal — carry the
+    # binding keys the roadmap reader stamped (goal_id / goal_digest) from
+    # the checkpointed evidence so the landing still gets its Roadmap-Goal
+    # trailers and ledger row. Identity keys only; nothing else is trusted.
+    _binding: "Dict[str, Any]" = {}
+    try:
+        _prior = _rj.loads(str(env.get("intake_evidence_json") or "") or "{}")
+        if isinstance(_prior, dict):
+            _binding = {
+                k: str(_prior[k])[:128]
+                for k in _GOAL_BINDING_KEYS
+                if _prior.get(k)
+            }
+    except Exception:  # noqa: BLE001 -- malformed prior evidence carries nothing
+        _binding = {}
     _ev_json = _rj.dumps(
         {
             "resume": True,
@@ -3451,6 +3470,7 @@ def _resume_envelope_kwargs(env: "Dict[str, Any]") -> "Dict[str, Any]":
             "partial_completion": env.get("partial_completion", ""),
             "resumed_op_id": env.get("op_id", ""),
             "trace_lineage": _lineage,
+            **_binding,
         }
     )
     _ev = {
@@ -3463,6 +3483,7 @@ def _resume_envelope_kwargs(env: "Dict[str, Any]") -> "Dict[str, Any]":
         "trace_lineage": _lineage,
         "intake_evidence_json": _ev_json,
         "signature": "fsm_resume:%s" % (env.get("op_id", "")),
+        **_binding,
     }
     return {
         "source": "fsm_resume",

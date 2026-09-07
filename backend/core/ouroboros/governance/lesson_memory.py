@@ -137,7 +137,8 @@ _ERROR_CLASSES: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
         r"|AttributeError: .*has no attribute|NameError: name .* is not defined|ImportError: cannot import name", re.S)),
     ("verify_regression", re.compile(r"verify_regression|regression gate", re.I)),
     ("input_shape_mismatch", re.compile(r"assert None is not None|assert .*? is not None|returned None|is None\b.*assert", re.S)),
-    ("expected_value_mismatch", re.compile(r"assert(?:ion)?\s*(?:Error:)?\s*(?:assert )?\S+ (?:==|!=|<|>|<=|>=) \S+|assert \d+ == \d+")),
+    # operands may carry spaces (enum reprs, lists): match the whole clause
+    ("expected_value_mismatch", re.compile(r"\bassert .+? (?:==|!=|<=|>=|<|>) .+")),
     ("timeout", re.compile(r"\b(timed out|Timeout)\b", re.I)),
     ("assertion_failure", re.compile(r"AssertionError|\bassert\b")),
 )
