@@ -142,12 +142,47 @@ def _mark_passed(r: Any) -> Any:
     return dataclasses.replace(r, **kw) if kw else r
 
 
-def apply_differential(multi: Any, baseline: frozenset) -> Tuple[Any, Tuple[str, ...]]:
+def _test_name(node_id: str) -> str:
+    """``tests/t.py::Cls::test_x[param]`` -> ``test_x``."""
+    tail = str(node_id).rsplit("::", 1)[-1]
+    return tail.split("[", 1)[0].strip()
+
+
+def acceptance_names(description: str, target_symbols: Iterable[str] = ()) -> frozenset:
+    """Test function names the op is explicitly asked to deliver or fix —
+    declared target symbols plus every ``test_*`` token in the description.
+    An ambient-red id carrying one of these names is the op's ACCEPTANCE
+    criterion and is never excluded."""
+    import re as _re
+    names = {str(s).strip() for s in (target_symbols or ()) if str(s).strip()}
+    names.update(_re.findall(r"\btest_[A-Za-z0-9_]+", description or ""))
+    return frozenset(names)
+
+
+def candidate_is_test_authoring(all_files: Iterable[Tuple[str, str]]) -> bool:
+    """True when every candidate file is a test module. A candidate that
+    changes PRODUCTION code is judged by every test of that code (a red
+    test mapped to it may be exactly what the op must fix); only a
+    test-authoring candidate is judged by the tests it delivers."""
+    try:
+        from backend.core.ouroboros.governance.ast_signature_anchor import is_test_path
+    except Exception:  # noqa: BLE001
+        return False
+    files = [fp for fp, _ in all_files]
+    return bool(files) and all(is_test_path(fp) for fp in files)
+
+
+def apply_differential(
+    multi: Any, baseline: frozenset, *, protected: Iterable[str] = (),
+    test_authoring: bool = True,
+) -> Tuple[Any, Tuple[str, ...]]:
     """Exclude failures that are entirely ambient (every failing id was red
-    at baseline) from the verdict. A residual failure keeps the adapter
+    at baseline, none of them an acceptance test, and the candidate only
+    authors tests) from the verdict. A residual failure keeps the adapter
     result untouched. Returns ``(multi, ignored_ids)``."""
-    if baseline is None or not baseline or getattr(multi, "passed", False):
+    if baseline is None or not baseline or getattr(multi, "passed", False) or not test_authoring:
         return multi, ()
+    protected_names = {str(p) for p in (protected or ())}
     new_results = []
     ignored = []
     for r in getattr(multi, "adapter_results", ()) or ():
@@ -155,7 +190,7 @@ def apply_differential(multi: Any, baseline: frozenset) -> Tuple[Any, Tuple[str,
         if getattr(r, "passed", False) or _timed_out(r) or not failed:
             new_results.append(r)
             continue
-        residual = [t for t in failed if t not in baseline]
+        residual = [t for t in failed if t not in baseline or _test_name(t) in protected_names]
         if residual:
             new_results.append(r)
             continue

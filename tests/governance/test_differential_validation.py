@@ -113,3 +113,22 @@ def test_gate_is_wired_into_candidate_tree_validation_and_lessons():
     rec = LM.build_lesson_record(op_id="o", target_files=("tests/x.py",), phase="VALIDATE", failure_class="test",
                                  error_text="ambient red: tests/x.py::a", error_class=DV.AMBIENT_ERROR_CLASS)
     assert rec.error_class == "ambient_red" and "excluded from the verdict" in rec.mitigation_summary
+
+
+def test_acceptance_tests_are_never_excluded():
+    base = frozenset({"tests/t.py::test_old", "tests/t.py::test_fix_me[1]"})
+    names = DV.acceptance_names("Fix test_fix_me so it passes", target_symbols=("test_declared",))
+    assert names == frozenset({"test_fix_me", "test_declared"})
+    m, ignored = DV.apply_differential(_multi(_ar(failed=("tests/t.py::test_fix_me[1]",))), base, protected=names)
+    assert not m.passed and ignored == ()                      # the op's own acceptance test stays red
+    m2, ignored2 = DV.apply_differential(_multi(_ar(failed=("tests/t.py::test_old",))), base, protected=names)
+    assert m2.passed and ignored2 == ("tests/t.py::test_old",)  # unrelated ambient test excluded
+
+
+def test_production_code_candidates_are_never_differential():
+    base = frozenset({"tests/test_mod.py::test_f"})
+    failed = _multi(_ar(failed=("tests/test_mod.py::test_f",)))
+    assert DV.apply_differential(failed, base, test_authoring=False) == (failed, ())
+    assert DV.candidate_is_test_authoring([("tests/governance/test_x.py", "")])
+    assert not DV.candidate_is_test_authoring([("pkg/mod.py", ""), ("tests/test_mod.py", "")])
+    assert not DV.candidate_is_test_authoring([])

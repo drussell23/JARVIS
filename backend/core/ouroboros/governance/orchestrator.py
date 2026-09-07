@@ -14545,10 +14545,14 @@ class GovernedOrchestrator:
                             from backend.core.ouroboros.governance.differential_validation import (
                                 baseline_budget_s as _dv_budget,
                                 baseline_failed_tests as _dv_baseline_fn,
+                                candidate_is_test_authoring as _dv_authoring,
                                 differential_enabled as _dv_enabled,
                                 existing_runnable_targets as _dv_targets,
                             )
-                            if _dv_enabled():
+                            # Only a test-AUTHORING candidate is judged by
+                            # the tests it delivers; a production-code
+                            # change owns every test of that code.
+                            if _dv_enabled() and _dv_authoring(_all_files):
                                 _dv_files = _dv_targets(_all_files, _troot, _RUNNABLE_EXTENSIONS)
                                 if _dv_files:
                                     _dv_baseline = await _dv_baseline_fn(
@@ -14670,9 +14674,17 @@ class GovernedOrchestrator:
                                     try:
                                         from backend.core.ouroboros.governance.differential_validation import (
                                             AMBIENT_ERROR_CLASS as _dv_class,
+                                            acceptance_names as _dv_acceptance,
                                             apply_differential as _dv_apply,
                                         )
-                                        multi, _dv_ignored = _dv_apply(multi, _dv_baseline)
+                                        multi, _dv_ignored = _dv_apply(
+                                            multi, _dv_baseline,
+                                            protected=_dv_acceptance(
+                                                getattr(ctx, "description", "") or "",
+                                                getattr(ctx, "target_symbols", ()) or (),
+                                            ),
+                                            test_authoring=True,  # baseline exists only for authoring candidates
+                                        )
                                         if _dv_ignored:
                                             logger.warning(
                                                 "[Validation] differential gate: %d ambient-red "
