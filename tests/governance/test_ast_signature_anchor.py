@@ -194,6 +194,11 @@ def test_real_model_physics_contract_reaches_the_anchor():
     assert "not isinstance(payload, dict)" in guards
     assert "min(native_context, block_count, kv_heads, key_len, val_len) <= 0" in guards
     assert "source=source" in ret            # branch-dependent rebind stays symbolic
+    shape = [l for l in out.splitlines() if "# input shape: payload = " in l][0]
+    assert shape.startswith("    # input shape: payload = {'model_info': {'general.architecture': ..., "
+                            "'<general.architecture>.context_length': ..., ")
+    assert "'<general.architecture>.attention.head_count_kv': ..." in shape
+    assert shape.rstrip().endswith("}}")      # every key lives INSIDE model_info
     assert "# returns: _as_int(" not in out  # nested helper's return is not a shape
     assert "LITERAL flat keys" in A.build_signature_anchor(
         ("tests/governance/test_model_physics.py",), "cover model_physics.py", root)
@@ -291,9 +296,17 @@ def test_contract_lines_inline_helpers_formulas_and_none_guards():
     assert "b=field('alpha') * 2" in ret          # self-referential rebind skipped
     guards = [l for l in out.splitlines() if "# returns None if:" in l][0]
     assert "not isinstance(payload, dict)" in guards and "b <= 0" in guards
+    assert "# input shape: payload = {'info': {'p.alpha': ...}}" in out
     _ast.parse(out)
 
 
 def test_contract_lines_absent_for_plain_defs():
     out = A.extract_public_api("def f(x):\n    return x\n", "m")
     assert out.strip().endswith("def f(x): ...")
+
+
+def test_input_shape_absent_without_param_reads():
+    out = A.extract_public_api("def f(x):\n    return x + 1\n", "m")
+    assert "# input shape" not in out
+    out = A.extract_public_api("import os\ndef g():\n    return os.environ.get('K')\n", "m")
+    assert "# input shape" not in out

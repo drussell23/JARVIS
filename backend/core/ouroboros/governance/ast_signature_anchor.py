@@ -316,15 +316,155 @@ def _contract_lines(node, indent: str) -> List[str]:
     return lines
 
 
+def _access_of(expr):
+    """``(base, key)`` when *expr* is ``base.get(key)``-style or ``base[key]``."""
+    if (
+        isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr in _ACCESS_METHODS and expr.args
+    ):
+        return expr.func.value, expr.args[0]
+    if isinstance(expr, ast.Subscript):
+        return expr.value, expr.slice
+    return None
+
+
+def _input_shape_lines(node, indent: str) -> List[str]:
+    """Synthesised INPUT SHAPE of a def's parameters, resolved statically
+    from its access pattern: ``info = payload.get('model_info')`` makes
+    ``info`` the container at ``payload['model_info']``; a key built as
+    ``arch + '.' + name`` renders with ``arch`` as ``<general.architecture>``
+    (the key it was read from) and ``name`` as each literal a nested helper
+    was called with. The result is a literal skeleton the consumer can copy:
+    ``payload = {'model_info': {'general.architecture': ...,
+    '<general.architecture>.context_length': ...}}`` — nesting and flat
+    dotted keys SHOWN, not described (measured 2026-09-07: told in prose,
+    the model still nested 'general.architecture' and put prefixed keys
+    beside model_info instead of inside it). Bounded; NEVER raises."""
+    try:
+        a = node.args
+        params = [p.arg for p in list(getattr(a, "posonlyargs", []) or []) + list(a.args) + list(a.kwonlyargs)]
+        if not params:
+            return []
+        assigns = _local_assignments(node)
+        helpers = {
+            n.name: n for n in ast.walk(node)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n is not node
+        }
+        # helper param -> literal strings it is called with (own body only)
+        bindings: dict = {}
+        for c in _own_body_nodes(node):
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in helpers:
+                hp = [p.arg for p in helpers[c.func.id].args.args]
+                for p, arg in zip(hp, c.args):
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        bindings.setdefault(c.func.id, {}).setdefault(p, []).append(arg.value)
+        # node id -> enclosing helper name (for param binding lookup)
+        owner: dict = {}
+        for hname, h in helpers.items():
+            for x in ast.walk(h):
+                owner[id(x)] = hname
+
+        def _first_access(expr):
+            for n in ast.walk(expr):
+                acc = _access_of(n)
+                if acc:
+                    return acc
+            return None
+
+        def _resolve_path(expr, depth: int = 0) -> Optional[List[str]]:
+            """Container path (keys from the parameter) for a base expr."""
+            if depth > 6 or not isinstance(expr, ast.Name):
+                return None
+            if expr.id in params:
+                return []
+            defs = [v for v in assigns.get(expr.id, []) if expr.id not in _names_in(v)]
+            if len(defs) != 1:
+                return None
+            acc = _first_access(defs[0])
+            if not acc:
+                return None
+            base_path = _resolve_path(acc[0], depth + 1)
+            if base_path is None:
+                return None
+            keys = _render_key(acc[1], None, depth + 1)
+            return base_path + [keys[0]] if keys else None
+
+        def _render_key(expr, hname, depth: int = 0) -> List[str]:
+            if depth > 6:
+                return []
+            if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+                return [expr.value]
+            if isinstance(expr, ast.Name):
+                bound = bindings.get(hname or "", {}).get(expr.id)
+                if bound:
+                    return list(dict.fromkeys(bound))[:_CONTRACT_MAX_ITEMS * 2]
+                path = _resolve_path(expr, depth + 1)
+                return ["<" + path[-1] + ">"] if path else []
+            if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+                left = _render_key(expr.left, hname, depth + 1)
+                right = _render_key(expr.right, hname, depth + 1)
+                return [l + r for l in left for r in right][:_CONTRACT_MAX_ITEMS * 2]
+            return []
+
+        tree: dict = {}
+        root_name: Optional[str] = None
+        # Source order (ast.walk is breadth-first): the first key a function
+        # reads is the first key the skeleton shows.
+        ordered = sorted(
+            (n for n in ast.walk(node) if _access_of(n)),
+            key=lambda n: (getattr(n, "lineno", 0), getattr(n, "col_offset", 0)),
+        )
+        for n in ordered:
+            acc = _access_of(n)
+            base_path = _resolve_path(acc[0])
+            if base_path is None:
+                continue
+            # the parameter this access ultimately reads from
+            cur = acc[0]
+            while isinstance(cur, ast.Name) and cur.id not in params:
+                defs = [v for v in assigns.get(cur.id, []) if cur.id not in _names_in(v)]
+                fa = _first_access(defs[0]) if len(defs) == 1 else None
+                if not fa:
+                    break
+                cur = fa[0]
+            pname = cur.id if isinstance(cur, ast.Name) and cur.id in params else None
+            if pname is None or (root_name is not None and pname != root_name):
+                continue
+            root_name = pname
+            for key in _render_key(acc[1], owner.get(id(n))):
+                sub = tree
+                for k in base_path:
+                    sub = sub.setdefault(k, {})
+                sub.setdefault(key, {})
+        if not tree or root_name is None:
+            return []
+
+        def _render(t: dict) -> str:
+            return "{" + ", ".join(
+                f"{k!r}: {_render(v) if v else '...'}" for k, v in t.items()
+            ) + "}"
+
+        text = f"{root_name} = {_render(tree)}"
+        if len(text) > _CONTRACT_SHAPE_MAX_CHARS:
+            text = text[:_CONTRACT_SHAPE_MAX_CHARS] + " …"
+        return [indent + "    # input shape: " + text]
+    except Exception:  # noqa: BLE001 — additive, never fatal
+        return []
+
+
 def _def_lines(node, indent: str, doc_chars: int) -> List[str]:
     """Signature line for a def, expanded with its contract when one exists:
     ``def f(...) -> T:`` / docstring excerpt / ``# reads:`` access pattern /
+    ``# input shape:`` synthesised parameter skeleton /
     ``# where / returns / returns None if`` derived semantics / ``...``.
     Without any of those the legacy one-liner ``def f(...) -> T: ...`` is
     emitted."""
     sig = _sig_line(node)
     doc = _doc_excerpt(node, doc_chars) if doc_chars > 0 else ""
-    extra = _access_lines(node, indent) + _contract_lines(node, indent)
+    extra = (
+        _access_lines(node, indent) + _input_shape_lines(node, indent)
+        + _contract_lines(node, indent)
+    )
     if (not doc and not extra) or not sig.endswith(" ..."):
         return [indent + sig]
     lines = [indent + sig[: -len(" ...")]]
@@ -623,8 +763,10 @@ def build_signature_anchor(
             "`# returns:` / `# returns None if:` lines are extracted from the "
             "function bodies: quoted dotted names such as 'general.architecture' "
             "are LITERAL flat keys (never nested sub-dicts), helper calls "
-            "compose keys exactly as shown, and returned fields hold exactly "
-            "the formulas shown — derive every expected value from them.\n\n"
+            "compose keys exactly as shown, `# input shape:` is the literal "
+            "nesting to reproduce (copy it, fill the `...` leaves), and "
+            "returned fields hold exactly the formulas shown — derive every "
+            "expected value from them.\n\n"
             "```python\n" + body + "\n```"
         )
     except Exception:  # noqa: BLE001 — the anchor is additive, never fatal
