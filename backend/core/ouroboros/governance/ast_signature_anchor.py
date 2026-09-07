@@ -229,17 +229,29 @@ def _substitute(expr, assigns: dict, depth: int):
     class _Sub(ast.NodeTransformer):
         def visit_Name(self, n):  # noqa: N802 — ast visitor API
             if isinstance(n.ctx, ast.Load) and n.id in assigns:
-                for v in reversed(assigns[n.id]):
-                    if n.id not in _names_in(v):
-                        try:
-                            if len(ast.unparse(v)) <= _CONTRACT_EXPR_MAX_CHARS:
-                                return _substitute(copy.deepcopy(v), assigns, depth - 1)
-                        except Exception:  # noqa: BLE001
-                            pass
-                        break
+                defs = [v for v in assigns[n.id] if n.id not in _names_in(v)]
+                # Exactly one real definition — otherwise the value is
+                # branch-dependent and the NAME is the honest rendering.
+                if len(defs) == 1:
+                    try:
+                        if len(ast.unparse(defs[0])) <= _CONTRACT_EXPR_MAX_CHARS:
+                            return _substitute(copy.deepcopy(defs[0]), assigns, depth - 1)
+                    except Exception:  # noqa: BLE001
+                        pass
             return n
 
     return _Sub().visit(copy.deepcopy(expr))
+
+
+def _own_body_nodes(node):
+    """Every AST node of *node*'s body EXCLUDING nested def/lambda subtrees."""
+    skip: set = set()
+    for n in ast.walk(node):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and n is not node:
+            skip.update(id(x) for x in ast.walk(n))
+    for n in ast.walk(node):
+        if id(n) not in skip:
+            yield n
 
 
 def _contract_lines(node, indent: str) -> List[str]:
@@ -275,7 +287,7 @@ def _contract_lines(node, indent: str) -> List[str]:
         assigns = _local_assignments(node)
         none_guards: List[str] = []
         shapes: List[str] = []
-        for sub in ast.walk(node):
+        for sub in _own_body_nodes(node):
             if isinstance(sub, ast.If):
                 body = sub.body
                 if (

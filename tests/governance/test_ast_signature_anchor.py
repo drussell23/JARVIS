@@ -193,6 +193,8 @@ def test_real_model_physics_contract_reaches_the_anchor():
     guards = [l for l in out.splitlines() if "# returns None if:" in l][0]
     assert "not isinstance(payload, dict)" in guards
     assert "min(native_context, block_count, kv_heads, key_len, val_len) <= 0" in guards
+    assert "source=source" in ret            # branch-dependent rebind stays symbolic
+    assert "# returns: _as_int(" not in out  # nested helper's return is not a shape
     assert "LITERAL flat keys" in A.build_signature_anchor(
         ("tests/governance/test_model_physics.py",), "cover model_physics.py", root)
 
