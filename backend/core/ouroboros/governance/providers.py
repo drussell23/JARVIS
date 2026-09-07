@@ -8030,16 +8030,54 @@ class ClaudeProvider:
                 # Slice 2B-ii — Aegis transport swap (see comment above).
                 # http_client + max_retries pass through verbatim via
                 # **kwargs in both Aegis-enabled + legacy paths.
-                self._client = _aegis_make_anthropic(
-                    api_key=self._api_key,
-                    http_client=_http_client,
-                    # SDK-level retries hide signal and consume our timebox
-                    # silently. We do our own visible retry in _call_with_backoff.
-                    max_retries=0,
-                    # Policy-resolved endpoint override (resilience lane);
-                    # empty dict = byte-identical legacy construction.
-                    **({"base_url": self._base_url} if self._base_url else {}),
-                )
+                # httpx version-drift TYPE-GUARD: some installed anthropic
+                # SDKs vendor their own httpx (imported as ``httpx2``) and
+                # reject a stock ``httpx.AsyncClient`` passed as
+                # ``http_client=`` with a TypeError ("Expected httpx2.
+                # AsyncClient but got httpx.AsyncClient"). That TypeError was
+                # crashing the control plane on the FALLBACK path whenever the
+                # local lane hiccuped. Fail SAFE: intercept the mismatch, emit
+                # structured telemetry, and reconstruct via the SAME
+                # stdlib_default path (SDK-default transport — no custom
+                # http_client), which the SDK accepts regardless of which
+                # httpx it vendors. D2 per-request timeout + max_retries=0 are
+                # preserved there; only the pool tuning is dropped. Never a
+                # crash, never extra credit usage.
+                try:
+                    self._client = _aegis_make_anthropic(
+                        api_key=self._api_key,
+                        http_client=_http_client,
+                        # SDK-level retries hide signal and consume our timebox
+                        # silently. We do our own visible retry in _call_with_backoff.
+                        max_retries=0,
+                        # Policy-resolved endpoint override (resilience lane);
+                        # empty dict = byte-identical legacy construction.
+                        **({"base_url": self._base_url} if self._base_url else {}),
+                    )
+                except TypeError as _http_client_drift:
+                    logger.warning(
+                        "[ClaudeProvider] custom http_client rejected by the "
+                        "anthropic SDK (httpx version drift: %s) — failing SAFE "
+                        "to SDK-default transport; no control-plane crash, no "
+                        "extra credit usage", _http_client_drift,
+                    )
+                    try:
+                        _orphan_close = _http_client.aclose()
+                        import asyncio as _asyncio_close
+                        if _asyncio_close.iscoroutine(_orphan_close):
+                            try:
+                                _asyncio_close.get_running_loop().create_task(
+                                    _orphan_close
+                                )
+                            except RuntimeError:
+                                _orphan_close.close()
+                    except Exception:  # noqa: BLE001 — best-effort cleanup only
+                        pass
+                    self._client = _aegis_make_anthropic(
+                        api_key=self._api_key,
+                        max_retries=0,
+                        **({"base_url": self._base_url} if self._base_url else {}),
+                    )
                 logger.info(
                     "[ClaudeProvider] anthropic client initialized "
                     "(mode=custom; connect=%.0fs read=%.0fs write=%.0fs "

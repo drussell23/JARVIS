@@ -394,6 +394,18 @@ class PatchBenchmarker:
                     # blocked the first sustained APPLY by treating this as
                     # `pass_rate=0.00 < threshold=1.00` and rolling back.
                     pass_rate = 1.0
+                if pass_rate == 0.0:
+                    # Diagnostic: pass_rate=0.0 means pytest exited non-zero/non-5
+                    # with no "X passed" — a collection/import error, NOT test
+                    # failures. Surface the exact subprocess output so the VERIFY
+                    # regression that sheds a correct APPLY can be root-caused.
+                    logger.warning(
+                        "[PatchBenchmarker] pass_rate=0.0 DIAGNOSTIC rc=%s "
+                        "cov_available=%s test_paths=%s cwd=%s\n"
+                        "--- pytest stdout+stderr tail (last 1800 chars) ---\n%s",
+                        r.returncode, cov_available, test_paths, str(self._root),
+                        (summary or "")[-1800:],
+                    )
                 return float(cov_pct), pass_rate
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             return 0.0, 0.0
