@@ -814,6 +814,64 @@ _ALLOWED_SANDBOX_PREFIXES: Tuple[str, ...] = (
 )
 
 
+def tree_language_router(tree_root: Path, map_root: Path) -> "LanguageRouter":
+    """The router every CANDIDATE-TREE validation uses — the orchestrator's
+    candidate tree and an L3 unit's worktree alike.
+
+    ``map_root`` keys the Python adapter's test index to the base tree the
+    candidate tree is a copy of: the index is identical to the base's, so
+    without it a 14k-key index is rebuilt per candidate, spending the budget
+    pytest needed. One construction site so the two paths cannot drift.
+    """
+    tree_root = Path(tree_root)
+    return LanguageRouter(
+        repo_root=tree_root,
+        adapters={
+            "python": PythonAdapter(repo_root=tree_root, map_root=Path(map_root)),
+            "cpp": CppAdapter(repo_root=tree_root),
+        },
+    )
+
+
+def failure_digest(multi: Any, *, limit: int = 600) -> str:
+    """A compact, evidence-bearing description of a failed
+    :class:`MultiAdapterResult`: the failure class, the failing test ids and
+    the tail of the runner output — what a lesson, a ledger row or an
+    operator needs, instead of the literal ``"validation failed"``.
+    NEVER raises."""
+    try:
+        if multi is None:
+            return "validation failed"
+        if getattr(multi, "passed", False):
+            return ""
+        dom = getattr(multi, "dominant_failure", None)
+        results = list(getattr(multi, "adapter_results", ()) or ())
+        if dom is None:
+            dom = next((r for r in results if not getattr(r, "passed", False)), None)
+        if dom is None:
+            return "validation failed"
+        tr = getattr(dom, "test_result", None)
+        fc = str(getattr(dom, "failure_class", "") or "test")
+        parts = [f"{getattr(dom, 'adapter', 'adapter')} {fc}"]
+        if tr is not None and getattr(tr, "timed_out", False):
+            parts.append("timed out")
+        failed = tuple(getattr(tr, "failed_tests", ()) or ()) if tr is not None else ()
+        if failed:
+            shown = ", ".join(failed[:6]) + (f" (+{len(failed) - 6})" if len(failed) > 6 else "")
+            parts.append(f"{len(failed)} failed: {shown}")
+        elif tr is not None and getattr(tr, "total", 0) == 0:
+            parts.append("no tests collected")
+        out = "; ".join(parts)
+        tail = " ".join(str(getattr(tr, "stdout", "") or "").split()) if tr is not None else ""
+        if tail:
+            room = max(0, limit - len(out) - 3)
+            if room > 40:
+                out = out + " | " + tail[-room:]
+        return out[:limit]
+    except Exception:  # noqa: BLE001
+        return "validation failed"
+
+
 def _effective_sandbox_prefixes() -> Tuple[str, ...]:
     """Return the effective allowed sandbox prefixes.
 

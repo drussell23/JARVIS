@@ -655,6 +655,7 @@ def test_fanout_outcome_enum_values_stable():
         "failed",
         "cancelled",
         "timeout",
+        "crashed",  # guarded boundary: primitive raised, graph collapsed
     }
     assert {o.value for o in FanoutOutcome} == expected
 

@@ -1095,15 +1095,18 @@ async def dispatch_pipeline(
                 _plan_drives = False
             _legacy_enforce = _master_on() and _enforce_on()
             if _legacy_enforce or _plan_drives:
-                # Enforce path — fail loud on unexpected errors
-                # (operator directive: narrow catches only on hot
-                # path). asyncio.CancelledError cooperates with
-                # Ticket A1 wall-clock; TimeoutError is classified
-                # internally. Structural bugs (ValueError from graph
-                # validators, RuntimeError from non-terminal phase)
-                # propagate and abort the pipeline.
+                # Enforce path — fail CLOSED at the FSM boundary. The
+                # primitive keeps its loud contract; the guarded wrapper
+                # turns an unexpected exception (graph validator, scheduler
+                # bug, crashed wait) into ONE deterministic outcome —
+                # WARNING with traceback, graph collapsed to CANCELLED,
+                # lesson recorded, FanoutOutcome.CRASHED — so the op
+                # proceeds on the legacy serial path instead of aborting
+                # or leaving a graph running for nobody.
+                # asyncio.CancelledError still cooperates with the Ticket
+                # A1 wall-clock (never swallowed).
                 from backend.core.ouroboros.governance.parallel_dispatch import (
-                    enforce_evaluate_fanout as _enforce_evaluate_fanout,
+                    enforce_evaluate_fanout_guarded as _enforce_evaluate_fanout,
                 )
                 _scheduler = getattr(orchestrator, "_subagent_scheduler", None)
                 if _scheduler is None:

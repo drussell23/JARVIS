@@ -102,6 +102,21 @@ def _retire_from_roster(result: "WorkUnitResult", branch: str = "") -> None:
         pass
 
 
+async def _record_unit_failure(graph: "ExecutionGraph", unit: "WorkUnitSpec", result: "WorkUnitResult") -> None:
+    """Route a failed unit into LessonMemory through the diagnostic
+    interceptor (one seam for swarm-synthesised and legacy units). Fail-soft:
+    a diagnostics fault never touches the graph's control flow."""
+    try:
+        from backend.core.ouroboros.governance.subagent_diagnostic_interceptor import (
+            record_unit_failure,
+        )
+        await record_unit_failure(getattr(graph, "op_id", ""), unit, result)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        logger.debug("[SubagentScheduler] unit failure diagnostics degraded", exc_info=True)
+
+
 def _emit_unit_telemetry(result: "WorkUnitResult", branch: str) -> None:
     """Emit the per-unit [L3Telemetry] breadcrumb. Fail-soft + gated."""
     if not _l3_telemetry_enabled():
@@ -371,6 +386,8 @@ class GenerationSubagentExecutor:
                     subctx,
                     candidate,
                     remaining_s,
+                    tree_root=_worktree_path,
+                    map_root=self._repo_roots.get(unit.repo),
                 )
                 if passed:
                     best_candidate = candidate
@@ -532,8 +549,24 @@ class GenerationSubagentExecutor:
         ctx: OperationContext,
         candidate: Dict[str, Any],
         remaining_s: float,
+        *,
+        tree_root: Optional[Path] = None,
+        map_root: Optional[Path] = None,
     ) -> Tuple[bool, str, str]:
-        """Validate a work-unit candidate using the existing validation runner."""
+        """Validate a work-unit candidate using the existing validation runner.
+
+        With a ``tree_root`` (the unit's isolated worktree) the candidate is
+        validated IN THAT TREE at its real relative path — the same
+        candidate-tree contract the orchestrator's VALIDATE uses (repo
+        conftest, sibling fixtures, the differential baseline for
+        test-authoring candidates) — and the tree is restored afterwards so
+        the unit's patch is still computed against the pre-image.
+
+        Without a tree (no worktree isolation) the legacy temp-dir path is
+        kept byte-identical, except that a failure now carries the runner's
+        evidence (failing test ids, output tail) instead of the literal
+        ``"validation failed"`` that hid every unit failure of 2026-09-07.
+        """
         target_file = str(candidate.get("file_path", ctx.target_files[0]))
         content = str(candidate.get("full_content", ""))
         if target_file.endswith(".py"):
@@ -552,6 +585,15 @@ class GenerationSubagentExecutor:
         if remaining_s <= 0.0:
             return False, "budget", "pipeline budget exhausted"
 
+        if tree_root is not None:
+            return await self._validate_in_tree(
+                ctx, target_file, content, remaining_s,
+                tree_root=Path(tree_root),
+                map_root=Path(map_root) if map_root is not None else Path(tree_root),
+            )
+
+        from backend.core.ouroboros.governance.test_runner import failure_digest
+
         with tempfile.TemporaryDirectory(prefix="ouroboros_l3_validate_") as sandbox_dir:
             sandbox = Path(sandbox_dir)
             sandbox_file = sandbox / Path(target_file).name
@@ -566,11 +608,130 @@ class GenerationSubagentExecutor:
             except BlockedPathError as exc:
                 return False, "security", str(exc)
             except Exception as exc:  # noqa: BLE001
-                return False, "infra", str(exc)
+                return False, "infra", f"{type(exc).__name__}: {exc}"
 
         if result.passed:
             return True, "", ""
-        return False, str(result.failure_class or "test"), "validation failed"
+        return False, str(result.failure_class or "test"), failure_digest(result)
+
+    async def _validate_in_tree(
+        self,
+        ctx: OperationContext,
+        target_file: str,
+        content: str,
+        remaining_s: float,
+        *,
+        tree_root: Path,
+        map_root: Path,
+    ) -> Tuple[bool, str, str]:
+        """Candidate-tree validation for one unit (see ``_validate_candidate``)."""
+        from backend.core.ouroboros.governance.test_runner import (
+            failure_digest,
+            tree_language_router,
+        )
+
+        rel = Path(target_file)
+        if rel.is_absolute():
+            try:
+                rel = rel.resolve().relative_to(Path(map_root).resolve())
+            except ValueError:
+                return False, "security", f"candidate path outside repo: {target_file}"
+        tf = tree_root / rel
+        resolved_tf = Path(os.path.normpath(str(tf)))
+        if not str(resolved_tf).startswith(os.path.normpath(str(tree_root)) + os.sep):
+            return (
+                False, "security",
+                f"candidate file_path {target_file!r} escapes the unit worktree — write refused",
+            )
+
+        t0 = time.monotonic()
+        runner = tree_language_router(tree_root, map_root)
+
+        # Differential baseline — the tests of THIS file that are red before
+        # the candidate lands (only a test-authoring candidate is judged by
+        # the tests it delivers; the orchestrator's VALIDATE applies the same
+        # rule). Fail-safe: an unavailable baseline ignores nothing.
+        baseline: frozenset = frozenset()
+        try:
+            from backend.core.ouroboros.governance.differential_validation import (
+                baseline_budget_s,
+                baseline_failed_tests,
+                candidate_is_test_authoring,
+                differential_enabled,
+            )
+            if differential_enabled() and tf.is_file() and candidate_is_test_authoring(((str(rel), content),)):
+                baseline = await baseline_failed_tests(
+                    runner, (tf,), sandbox_dir=tree_root,
+                    budget_s=baseline_budget_s(remaining_s), op_id=ctx.op_id,
+                    original_paths={tf: tf},
+                )
+                if baseline:
+                    logger.warning(
+                        "[SubagentExecutor] differential baseline op=%s: %d test(s) already red "
+                        "before the candidate: %s",
+                        str(ctx.op_id)[:24], len(baseline), ", ".join(sorted(baseline))[:300],
+                    )
+        except Exception:  # noqa: BLE001 — baseline is additive
+            logger.debug("[SubagentExecutor] differential baseline skipped", exc_info=True)
+
+        original: Optional[bytes] = tf.read_bytes() if tf.is_file() else None
+        try:
+            tf.parent.mkdir(parents=True, exist_ok=True)
+            tf.write_text(content, encoding="utf-8")
+            rem = max(0.0, remaining_s - (time.monotonic() - t0))
+            if rem <= 0.0:
+                return False, "budget", "pipeline budget exhausted"
+            try:
+                multi = await runner.run(
+                    changed_files=(tf,),
+                    sandbox_dir=tree_root,
+                    timeout_budget_s=rem,
+                    op_id=ctx.op_id,
+                    original_paths={tf: tf},
+                )
+            except BlockedPathError as exc:
+                return False, "security", str(exc)
+            except Exception as exc:  # noqa: BLE001
+                return False, "infra", f"{type(exc).__name__}: {exc}"
+        finally:
+            # The unit's patch is computed against the tree's pre-image AFTER
+            # validation — restore it so the candidate never becomes its own
+            # baseline.
+            try:
+                if original is None:
+                    if tf.exists():
+                        tf.unlink()
+                else:
+                    tf.write_bytes(original)
+            except OSError:
+                logger.debug("[SubagentExecutor] tree restore degraded for %s", tf, exc_info=True)
+
+        if baseline and not getattr(multi, "passed", False):
+            try:
+                from backend.core.ouroboros.governance.differential_validation import (
+                    acceptance_names,
+                    apply_differential,
+                )
+                multi, ignored = apply_differential(
+                    multi, baseline,
+                    protected=acceptance_names(
+                        getattr(ctx, "description", "") or "",
+                        getattr(ctx, "target_symbols", ()) or (),
+                    ),
+                    test_authoring=True,
+                )
+                if ignored:
+                    logger.warning(
+                        "[SubagentExecutor] differential verdict op=%s: %d ambient failure(s) "
+                        "excluded: %s",
+                        str(ctx.op_id)[:24], len(ignored), ", ".join(ignored)[:300],
+                    )
+            except Exception:  # noqa: BLE001
+                logger.debug("[SubagentExecutor] differential verdict skipped", exc_info=True)
+
+        if getattr(multi, "passed", False):
+            return True, "", ""
+        return False, str(getattr(multi, "failure_class", "") or "test"), failure_digest(multi)
 
     @staticmethod
     def _candidate_to_patch(
@@ -774,6 +935,29 @@ class SubagentScheduler:
             return await fut
         return await asyncio.wait_for(fut, timeout=timeout_s)
 
+    async def cancel_graphs_for_op(self, op_id: str) -> int:
+        """Collapse every running graph of *op_id* to a persisted CANCELLED
+        state (the ``_run_graph`` cancellation branch) and await it. Returns
+        the number of graphs cancelled. Used by the fan-out boundary when the
+        primitive above the scheduler crashed and would otherwise leave the
+        graph running for nobody. NEVER raises."""
+        cancelled = []
+        try:
+            for graph_id, task in list(self._graph_tasks.items()):
+                state = self._graphs.get(graph_id)
+                graph_op = getattr(getattr(state, "graph", None), "op_id", "")
+                if graph_op != op_id or task.done():
+                    continue
+                task.cancel()
+                cancelled.append(task)
+            if cancelled:
+                await asyncio.gather(*cancelled, return_exceptions=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.debug("[SubagentScheduler] cancel_graphs_for_op degraded", exc_info=True)
+        return len(cancelled)
+
     def get_merged_patches(self, graph_id: str) -> Dict[str, RepoPatch]:
         """Return merged repo patches for a completed graph."""
         return dict(self._merged_patches.get(graph_id, {}))
@@ -960,6 +1144,7 @@ class SubagentScheduler:
                     self._emit_result_command(graph, result)
                     if result.status is not WorkUnitState.COMPLETED:
                         failure_seen = True
+                        await _record_unit_failure(graph, graph.unit_map[unit_id], result)
 
                 if failure_seen:
                     terminal_phase = (

@@ -191,6 +191,14 @@ _MITIGATIONS: Dict[str, str] = {
     "guardian_hard_finding": "APPLY was refused by the semantic guardian: the candidate edited or weakened EXISTING code/tests. Append new definitions only; reproduce every existing line byte-for-byte.",
     "declared_symbol_missing": "The goal DECLARES symbols that must exist; the candidate did not define them. Add exactly those definitions (append at the end) — a candidate without them cannot satisfy the goal.",
     "noop_refused_declared_symbols": "A no-op was refused: the goal's declared symbols do not exist on disk, so the change is NOT already present. Add the declared definitions instead of returning 2b.1-noop.",
+    "subagent_timeout": "The worker ran out of time: narrow the goal, read fewer files, and answer from evidence already gathered instead of another tool round.",
+    "cage_breach": "The worker tried a tool or path outside its cage; stay within the allowlisted tools and the target files — a caged action is refused, never retried.",
+    "schema_hallucination": "The worker returned a malformed structure; emit EXACTLY the documented result schema (field names, types, DAG shape) and nothing else.",
+    "diversity_rejected": "The worker's findings were rejected for using a single tool; corroborate with at least two distinct tools before returning.",
+    "budget_exhausted": "The cost/iteration budget was exhausted; plan fewer, more targeted actions before the first tool call.",
+    "subagent_infra": "The unit failed on infrastructure, not on the code; do not change the candidate for this — the harness owner must fix the environment.",
+    "worktree_isolation": "The unit's isolated worktree could not be created; no candidate was judged — retry when the tree is clean.",
+    "fanout_crash": "The parallel fan-out crashed before a verdict; the op continued on the serial path — do not treat this as a verdict on the candidate.",
 }
 
 

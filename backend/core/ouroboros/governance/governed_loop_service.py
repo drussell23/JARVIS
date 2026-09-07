@@ -6297,6 +6297,9 @@ class GovernedLoopService:
                 from backend.core.ouroboros.governance.subagent_comm_sink import (
                     build_comm_sink_from_gls,
                 )
+                from backend.core.ouroboros.governance.subagent_diagnostic_interceptor import (
+                    wrap_subagent_diagnostics as _wrap_subagent_diagnostics,
+                )
                 from backend.core.ouroboros.governance.subagent_ledger_sink import (
                     build_ledger_sink_from_gls,
                 )
@@ -6327,7 +6330,13 @@ class GovernedLoopService:
                     # line uses — resolved late, per event, because
                     # SerpentFlow attaches after this stack is built and a
                     # handle captured here would be permanently None.
-                    comm=_wrap_subagent_narration(self, _sub_comm),
+                    #
+                    # The diagnostic interceptor wraps the same way, one
+                    # layer in: a FAILED result reaches the spine unchanged
+                    # and is then routed into LessonMemory (+ one WARNING).
+                    comm=_wrap_subagent_narration(
+                        self, _wrap_subagent_diagnostics(_sub_comm),
+                    ),
                     ledger=_sub_ledger,
                 )
                 self._subagent_orchestrator_ref = _sub_orch

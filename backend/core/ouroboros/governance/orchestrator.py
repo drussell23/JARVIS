@@ -14601,9 +14601,7 @@ class GovernedOrchestrator:
                     _working_tree_mirror_enabled,
                 )
                 from backend.core.ouroboros.governance.test_runner import (
-                    CppAdapter,
-                    LanguageRouter,
-                    PythonAdapter,
+                    tree_language_router,
                 )
                 async with RepairSandbox(
                     _ae_effective_repo_root, max(remaining_s, 30.0),
@@ -14631,20 +14629,7 @@ class GovernedOrchestrator:
                     else:
                         _troot = _tree.sandbox_root
                         _tree_changed: list = []
-                        _tree_runner = LanguageRouter(
-                            repo_root=_troot,
-                            adapters={
-                                # map_root: the sandbox is a COPY of the
-                                # working tree at a fresh /tmp path, so
-                                # its test index is identical to the
-                                # base's.
-                                "python": PythonAdapter(
-                                    repo_root=_troot,
-                                    map_root=_ae_effective_repo_root,
-                                ),
-                                "cpp": CppAdapter(repo_root=_troot),
-                            },
-                        )
+                        _tree_runner = tree_language_router(_troot, _ae_effective_repo_root)
                         # Differential gate: which target tests are ALREADY
                         # red in this tree + env before the candidate lands.
                         # Failures entirely within that set are ambient —
@@ -14729,23 +14714,7 @@ class GovernedOrchestrator:
                                 _tree_changed.append(_tf)
 
                         if _tree_changed:
-                            _tree_runner = LanguageRouter(
-                                repo_root=_troot,
-                                adapters={
-                                    # map_root: the sandbox is a COPY of the
-                                    # working tree at a fresh /tmp path, so
-                                    # its test index is identical to the
-                                    # base's. Without this the cache key is
-                                    # unique per candidate and an identical
-                                    # 14k-key index is rebuilt every time,
-                                    # spending the budget pytest needed.
-                                    "python": PythonAdapter(
-                                        repo_root=_troot,
-                                        map_root=_ae_effective_repo_root,
-                                    ),
-                                    "cpp": CppAdapter(repo_root=_troot),
-                                },
-                            )
+                            _tree_runner = tree_language_router(_troot, _ae_effective_repo_root)
                             # Slice 9 review F7: the grant must reflect the
                             # ~14s materialization just paid — freshly
                             # decrement from the pre-tree-block anchor

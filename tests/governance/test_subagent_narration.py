@@ -262,7 +262,13 @@ def test_the_switch_silences_narration_without_touching_dispatch(
 def test_the_orchestrator_is_wrapped_at_its_one_construction_site() -> None:
     src = (_REPO / "backend/core/ouroboros/governance/"
            "governed_loop_service.py").read_text()
-    assert "_wrap_subagent_narration(self, _sub_comm)" in src
+    # Narration is the OUTER wrap; the diagnostic interceptor sits one layer
+    # in, so a FAILED result reaches the spine unchanged, is routed into
+    # LessonMemory, and is narrated — in that order.
+    import re
+    assert re.search(
+        r"_wrap_subagent_narration\(\s*self,\s*_wrap_subagent_diagnostics\(_sub_comm\),?\s*\)", src,
+    ), "orchestrator comm must be narration(diagnostics(spine))"
 
 
 def test_the_mirror_is_resolved_LATE() -> None:

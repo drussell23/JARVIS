@@ -769,3 +769,26 @@ def pytest_runtest_setup(item):
     except Exception:  # noqa: BLE001
         return
     gate_item(item)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_live_inference_tiers(monkeypatch):
+    """Unit tests never reach a live inference tier.
+
+    The RT gate (``rt_gate.gate_completion``) makes the LOCAL model the
+    PRIMARY tier whenever ``JARVIS_LOCAL_PRIME_ENABLED`` is true. The daemon
+    loads that flag from ``.env`` and every pytest it spawns for VALIDATE
+    inherits it — so a test that injects a fake provider and asserts on its
+    text was answered by the 30B model on the busy GPU instead
+    (``test_speech_provider.py`` on 2026-09-07: both tests red, or timed out
+    while the soak was generating; every L3 unit for that file failed with
+    ``"validation failed"`` for a full day). CI never showed it because CI
+    has no local lane.
+
+    Pinned HERE, not in the gate: a production tier that behaves differently
+    under pytest is the shortcut that makes green meaningless. Tests that
+    exercise the local lane set the flag themselves (``monkeypatch.setenv``
+    applies after this autouse fixture) — ``test_local_lane_arc.py`` already
+    does.
+    """
+    monkeypatch.setenv("JARVIS_LOCAL_PRIME_ENABLED", "false")

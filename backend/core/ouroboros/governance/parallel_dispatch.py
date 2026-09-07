@@ -1154,6 +1154,7 @@ class FanoutOutcome(str, enum.Enum):
     FAILED = "failed"                # graph reached FAILED phase
     CANCELLED = "cancelled"          # graph reached CANCELLED / wait aborted
     TIMEOUT = "timeout"              # wait_for_graph timeout
+    CRASHED = "crashed"              # primitive raised; graph collapsed, legacy path proceeds
 
 
 @dataclass(frozen=True)
@@ -1793,3 +1794,106 @@ __all__ = [
     "parallel_dispatch_wait_timeout_s",
     "posture_weight_for",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed boundary — the FSM never inherits a crashed graph
+# ---------------------------------------------------------------------------
+
+_ENV_COLLAPSE_TIMEOUT_S = "JARVIS_FANOUT_COLLAPSE_TIMEOUT_S"
+
+
+def fanout_collapse_timeout_s(default: float = 15.0) -> float:
+    """Bound on collapsing a crashed/timed-out graph's tasks
+    (``JARVIS_FANOUT_COLLAPSE_TIMEOUT_S``)."""
+    raw = os.environ.get(_ENV_COLLAPSE_TIMEOUT_S, "").strip()
+    try:
+        return max(1.0, float(raw)) if raw else default
+    except ValueError:
+        return default
+
+
+async def _collapse_graphs_for_op(scheduler: Any, op_id: str) -> int:
+    """Ask the scheduler to cancel (and persist as CANCELLED) every graph of
+    *op_id*. Bounded, fail-soft; returns the count or 0."""
+    fn = getattr(scheduler, "cancel_graphs_for_op", None)
+    if not callable(fn):
+        return 0
+    try:
+        return int(await asyncio.wait_for(fn(op_id), timeout=fanout_collapse_timeout_s()))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[ParallelDispatch collapse_degraded] op=%s error=%s: %s",
+            op_id[:16], type(exc).__name__, str(exc)[:200],
+        )
+        return 0
+
+
+async def enforce_evaluate_fanout_guarded(
+    *,
+    op_id: str,
+    generation: Any,
+    scheduler: Any,
+    **kwargs: Any,
+) -> FanoutResult:
+    """:func:`enforce_evaluate_fanout` behind a fail-closed boundary.
+
+    The primitive keeps its loud contract (unexpected exceptions propagate)
+    so its tests and its callers that WANT the exception are unchanged. The
+    FSM does not want it: a structural fault inside a fan-out — a graph
+    validator, a scheduler bug, a crashed wait — used to abort the whole
+    pipeline, or (on a timeout) leave the graph running for nobody.
+
+    Here every such fault becomes ONE deterministic outcome:
+
+    * the exception is logged at WARNING with its traceback (a headless soak
+      carries WARNING and above);
+    * every graph the scheduler still runs for this op is collapsed to a
+      persisted CANCELLED state (bounded by ``JARVIS_FANOUT_COLLAPSE_TIMEOUT_S``);
+    * the crash is routed into LessonMemory (``fanout_crash``);
+    * :attr:`FanoutOutcome.CRASHED` is returned, which every consumer already
+      treats as "not COMPLETED → legacy serial path".
+
+    A TIMEOUT from the primitive is collapsed the same way (the graph must
+    not outlive the decision made about it) and returned unchanged.
+    ``asyncio.CancelledError`` is never swallowed.
+    """
+    try:
+        result = await enforce_evaluate_fanout(
+            op_id=op_id, generation=generation, scheduler=scheduler, **kwargs,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — the boundary the FSM relies on
+        logger.warning(
+            "[ParallelDispatch enforce_crashed] op=%s error=%s: %s — graph collapsed, "
+            "legacy serial path proceeds",
+            op_id[:16], type(exc).__name__, str(exc)[:300], exc_info=True,
+        )
+        n_collapsed = await _collapse_graphs_for_op(scheduler, op_id)
+        try:
+            from backend.core.ouroboros.governance.subagent_diagnostic_interceptor import (
+                record_fanout_crash,
+            )
+            files = extract_candidate_files(generation) or ()
+            await record_fanout_crash(
+                op_id, exc, target_files=tuple(getattr(f, "file_path", "") for f in files),
+            )
+        except Exception:  # noqa: BLE001 — memory never perturbs the boundary
+            logger.debug("[ParallelDispatch] crash lesson skipped", exc_info=True)
+        return FanoutResult(
+            outcome=FanoutOutcome.CRASHED,
+            skip_reason="unexpected_exception",
+            error=f"{type(exc).__name__}: {str(exc)[:300]}"
+                  + (f" (collapsed {n_collapsed} graph(s))" if n_collapsed else ""),
+        )
+    if result.outcome is FanoutOutcome.TIMEOUT:
+        n_collapsed = await _collapse_graphs_for_op(scheduler, op_id)
+        if n_collapsed:
+            logger.warning(
+                "[ParallelDispatch enforce_timeout_collapsed] op=%s graphs=%d",
+                op_id[:16], n_collapsed,
+            )
+    return result
