@@ -1,3 +1,6 @@
+# [Ouroboros] Modified by Ouroboros (op=op-01a07a11-) at 2026-09-07 04:22 UTC
+# Reason: Tier-1 multi-file atomic proof #2 (two docstring-free suites)  Make ONE coordinated multi-file change across two EXISTIN
+
 from __future__ import annotations
 from backend.core.ouroboros.governance.comms.voice_build.classifier import (
     HeuristicClassifier, VoiceIntent,
@@ -19,3 +22,6 @@ def test_verb_set_is_injectable_not_hardcoded():
     c = HeuristicClassifier(build_verbs={"frobnicate"})
     assert c.classify("frobnicate the widget") == VoiceIntent.BUILD
     assert c.classify("add a feature") == VoiceIntent.IGNORE   # 'add' not in the custom set
+
+def test_tier1_multi_proof_classifier():
+    assert sum(range(4)) == 6
