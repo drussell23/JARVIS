@@ -172,7 +172,7 @@ def test_real_model_physics_contract_reaches_the_anchor():
     needs — model_info + architecture-prefixed keys + None-on-missing."""
     root = Path(__file__).resolve().parents[2]
     src = (root / "backend/core/ouroboros/governance/model_physics.py").read_text()
-    out = A.extract_public_api(src, "model_physics", budget=6000)
+    out = A.extract_public_api(src, "model_physics", budget=9000)
     assert "def parse_model_physics(payload: Any)" in out
     assert "/api/show" in out and "architecture-prefixed" in out
     assert "Returns ``None``" in out
@@ -192,8 +192,20 @@ def test_real_model_physics_contract_reaches_the_anchor():
     assert "kv_bytes_per_token=field('block_count') * field('attention.head_count_kv') * (field('attention.key_length') + field('attention.value_length')) * kv_cache_dtype_bytes()" in ret
     guards = [l for l in out.splitlines() if "# returns None if:" in l][0]
     assert "not isinstance(payload, dict)" in guards
-    assert "min(native_context, block_count, kv_heads, key_len, val_len) <= 0" in guards
+    # guards are substituted like return values: the model sees the KEYS
+    assert "min(field('context_length'), field('block_count'), field('attention.head_count_kv')" in guards
     assert "source=source" in ret            # branch-dependent rebind stays symbolic
+    where = [l for l in out.splitlines() if "# where:" in l and "field(name)" in l][0]
+    assert "source in {'metadata', 'metadata+derived_head_dim'}" in where
+    assert "DTYPE_BYTES_ENV = 'JARVIS_KV_CACHE_DTYPE_BYTES'" in out
+    assert "_TRUTHY = " not in out   # private constants are not listed (may still appear inside formulas)
+    assert "    source: str = 'metadata'" in out
+    ceil = [l for l in out.splitlines() if "# returns:" in l and "physics.native_context" in l][0]
+    assert "if physics is None or physics.native_context <= 0: max(0, int(configured_ceiling))" in ceil
+    assert "if max(0, int(configured_ceiling)) <= 0: physics.native_context" in ceil
+    assert "min(max(0, int(configured_ceiling)), physics.native_context)" in ceil
+    assert "; on Exception: configured_ceiling" in ceil
+    assert "if on Exception" not in ceil
     shape = [l for l in out.splitlines() if "# input shape: payload = " in l][0]
     assert shape.startswith("    # input shape: payload = {'model_info': {'general.architecture': ..., "
                             "'<general.architecture>.context_length': ..., ")
@@ -295,7 +307,8 @@ def test_contract_lines_inline_helpers_formulas_and_none_guards():
     assert "a=field('alpha')" in ret
     assert "b=field('alpha') * 2" in ret          # self-referential rebind skipped
     guards = [l for l in out.splitlines() if "# returns None if:" in l][0]
-    assert "not isinstance(payload, dict)" in guards and "b <= 0" in guards
+    assert "not isinstance(payload, dict)" in guards
+    assert "field('alpha') * 2 <= 0" in guards   # guards are substituted too
     assert "# input shape: payload = {'info': {'p.alpha': ...}}" in out
     _ast.parse(out)
 
@@ -310,3 +323,24 @@ def test_input_shape_absent_without_param_reads():
     assert "# input shape" not in out
     out = A.extract_public_api("import os\ndef g():\n    return os.environ.get('K')\n", "m")
     assert "# input shape" not in out
+
+
+def test_return_paths_carry_guard_chains_and_else_negation():
+    src = textwrap.dedent('''
+        LIMIT = 10
+        _PRIV = 1
+        def pick(x, y):
+            if x is None:
+                return y
+            if x > LIMIT:
+                return LIMIT
+            else:
+                return x + y
+    ''')
+    out = A.extract_public_api(src, "m")
+    assert "LIMIT = 10" in out and "_PRIV" not in out
+    ret = [l for l in out.splitlines() if "# returns:" in l][0]
+    assert "if x is None: y" in ret
+    assert "if x > LIMIT: LIMIT" in ret
+    assert "if not (x > LIMIT): x + y" in ret
+    _ast.parse(out)

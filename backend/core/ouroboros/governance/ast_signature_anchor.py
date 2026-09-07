@@ -46,7 +46,7 @@ _ENV_DOC_CHARS = "JARVIS_AST_SIGNATURE_ANCHOR_DOC_CHARS"
 #: its full contracts, a module with dozens degrades gracefully to the floor.
 _ENV_DOC_CHARS_MAX = "JARVIS_AST_SIGNATURE_ANCHOR_DOC_CHARS_MAX"
 _DEFAULT_MAX_MODULES = 4
-_DEFAULT_MAX_CHARS = 6000
+_DEFAULT_MAX_CHARS = 9000
 _DEFAULT_DOC_CHARS = 420
 _DEFAULT_DOC_CHARS_MAX = 1200
 #: Data-access pattern: how many ``x.get('k')`` / ``x['k']`` / helper('k')
@@ -59,6 +59,9 @@ _ACCESS_METHODS = frozenset({"get", "pop", "setdefault", "getlist", "getattr"})
 _CONTRACT_EXPR_MAX_CHARS = 90
 _CONTRACT_SHAPE_MAX_CHARS = 600
 _CONTRACT_MAX_ITEMS = 8
+#: Guard prefixes that are already a clause (except handlers, loops, match
+#: cases) — everything else is rendered as an ``if``.
+_CLAUSE_PREFIXES = ("on ", "in loop", "case ")
 _SENTENCE_END_RE = re.compile(r"[.!?](?:\s|$)")
 
 _PY_PATH_RE = re.compile(r"[A-Za-z0-9_./\\-]+\.py")
@@ -254,21 +257,89 @@ def _own_body_nodes(node):
             yield n
 
 
+def _literal_text(expr) -> Optional[str]:
+    """``ast.unparse`` of a pure literal (constants and tuples/lists/dicts of
+    constants), bounded; ``None`` for anything computed."""
+    try:
+        for n in ast.walk(expr):
+            if not isinstance(n, (ast.Constant, ast.Tuple, ast.List, ast.Dict, ast.Set, ast.UnaryOp, ast.USub, ast.Load)):
+                return None
+        s = ast.unparse(expr)
+        return s if len(s) <= _CONTRACT_EXPR_MAX_CHARS else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _is_trivial_body(node) -> bool:
+    """True when the def's body is a single ``return`` (after an optional
+    docstring) — nothing to derive beyond the signature."""
+    body = list(node.body)
+    if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant)             and isinstance(body[0].value.value, str):
+        body = body[1:]
+    return len(body) == 1 and isinstance(body[0], (ast.Return, ast.Pass))
+
+
+def _return_paths(node, assigns: dict) -> List[Tuple[List[str], object]]:
+    """Every ``return`` in the def's OWN body with the guard chain that
+    reaches it: ``([guard, ...], value_expr)`` in source order. ``if`` bodies
+    contribute their test, ``else`` branches its negation, ``except``
+    handlers ``on <Type>``. Nested defs are skipped."""
+    out: List[Tuple[List[str], object]] = []
+
+    def _g(expr) -> str:
+        try:
+            return ast.unparse(_substitute(expr, assigns, 2))
+        except Exception:  # noqa: BLE001
+            return "?"
+
+    def _walk(stmts, guards: List[str]) -> None:
+        for st in stmts:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(st, ast.Return):
+                out.append((list(guards), st.value))
+            elif isinstance(st, ast.If):
+                _walk(st.body, guards + [_g(st.test)])
+                if st.orelse:
+                    _walk(st.orelse, guards + ["not (" + _g(st.test) + ")"])
+            elif isinstance(st, ast.Try):
+                _walk(st.body, guards)
+                for h in st.handlers:
+                    _walk(h.body, guards + ["on " + (_g(h.type) if h.type is not None else "Exception")])
+                _walk(st.orelse, guards)
+                _walk(st.finalbody, guards)
+            elif isinstance(st, (ast.For, ast.AsyncFor, ast.While)):
+                _walk(st.body, guards + ["in loop"])
+                _walk(st.orelse, guards)
+            elif isinstance(st, (ast.With, ast.AsyncWith)):
+                _walk(st.body, guards)
+            elif hasattr(ast, "Match") and isinstance(st, getattr(ast, "Match")):
+                for case in st.cases:
+                    _walk(case.body, guards + ["case " + _g(case.pattern)])
+
+    _walk(node.body, [])
+    return out
+
+
 def _contract_lines(node, indent: str) -> List[str]:
     """Derived semantics the docstring and access pattern cannot state:
-    ``# where``   nested single-return helpers, inlined (``field(name) = ...``);
-    ``# returns`` the constructed return value with locals substituted, so a
-                  consumer sees the FORMULA behind each field;
+    ``# where``   nested single-return helpers inlined (``field(name) = ...``)
+                  and branch-dependent locals with their literal candidates
+                  (``source in {'metadata', 'metadata+derived_head_dim'}``);
+    ``# returns`` EVERY return path with its guard chain, locals substituted,
+                  so a consumer sees the FORMULA behind each result and the
+                  condition that selects it (measured 2026-09-07: shown only
+                  the final ``min(cfg, native)`` the model expected 0 for
+                  ``configured_ceiling=0`` where ``if cfg <= 0: return
+                  native`` runs first);
     ``# returns None if`` every guard that short-circuits to ``None``.
-    Measured 2026-09-07: with keys alone the model still asserted
-    ``kv_bytes_per_token == 2`` against a value that is
-    ``block_count * kv_heads * (key_len + val_len) * kv_cache_dtype_bytes()``.
     Bounded; NEVER raises."""
     lines: List[str] = []
     try:
         pad = indent + "    # "
-        # -- helpers ---------------------------------------------------
-        helpers: List[str] = []
+        assigns = _local_assignments(node)
+        # -- helpers + ambiguous locals -----------------------------------
+        where: List[str] = []
         for n in ast.walk(node):
             if (
                 isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n is not node
@@ -280,35 +351,44 @@ def _contract_lines(node, indent: str) -> List[str]:
                 except Exception:  # noqa: BLE001
                     continue
                 if len(s) <= _CONTRACT_EXPR_MAX_CHARS:
-                    helpers.append(s)
-        if helpers:
-            lines.append(pad + "where: " + "; ".join(helpers[:_CONTRACT_MAX_ITEMS]))
-        # -- return shape ----------------------------------------------
-        assigns = _local_assignments(node)
+                    where.append(s)
+        for name, values in assigns.items():
+            defs = [v for v in values if name not in _names_in(v)]
+            if len(defs) > 1:
+                lits = [_literal_text(v) for v in defs]
+                if all(lits):
+                    where.append(f"{name} in {{" + ", ".join(dict.fromkeys(lits)) + "}")
+        if where:
+            lines.append(pad + "where: " + "; ".join(where[:_CONTRACT_MAX_ITEMS]))
+        # -- return paths ---------------------------------------------------
+        paths: List[str] = []
         none_guards: List[str] = []
-        shapes: List[str] = []
-        for sub in _own_body_nodes(node):
-            if isinstance(sub, ast.If):
-                body = sub.body
-                if (
-                    len(body) == 1 and isinstance(body[0], ast.Return)
-                    and isinstance(body[0].value, ast.Constant) and body[0].value.value is None
-                ):
-                    try:
-                        g = ast.unparse(sub.test)
-                    except Exception:  # noqa: BLE001
-                        continue
-                    if len(g) <= _CONTRACT_EXPR_MAX_CHARS and g not in none_guards:
-                        none_guards.append(g)
-            elif isinstance(sub, ast.Return) and isinstance(sub.value, (ast.Call, ast.Dict, ast.Tuple)):
-                try:
-                    s = ast.unparse(_substitute(sub.value, assigns, 2))
-                except Exception:  # noqa: BLE001
-                    continue
-                if s not in shapes:
-                    shapes.append(s)
-        for s in shapes[:2]:
-            lines.append(pad + "returns: " + s[: _CONTRACT_SHAPE_MAX_CHARS])
+        for guards, value in _return_paths(node, assigns):
+            is_none = value is None or (isinstance(value, ast.Constant) and value.value is None)
+            if is_none:
+                g = " and ".join(guards) if guards else "always"
+                if g not in none_guards:
+                    none_guards.append(g)
+                continue
+            try:
+                s = ast.unparse(_substitute(value, assigns, 2))
+            except Exception:  # noqa: BLE001
+                continue
+            if len(s) > _CONTRACT_SHAPE_MAX_CHARS:
+                s = s[:_CONTRACT_SHAPE_MAX_CHARS] + " …"
+            if guards:
+                chain = " and ".join(guards)
+                entry = (chain if chain.startswith(_CLAUSE_PREFIXES) else "if " + chain) + ": " + s
+            else:
+                entry = s
+            if entry not in paths:
+                paths.append(entry)
+        if _is_trivial_body(node):
+            # The body IS the return (``def f(x): return x + 1``): the
+            # signature already says everything — keep the one-line form.
+            return lines
+        if paths:
+            lines.append(pad + "returns: " + "; ".join(paths[:_CONTRACT_MAX_ITEMS]))
         if none_guards:
             lines.append(pad + "returns None if: " + "; ".join(none_guards[:_CONTRACT_MAX_ITEMS]))
     except Exception:  # noqa: BLE001 — additive, never fatal
@@ -476,8 +556,10 @@ def _def_lines(node, indent: str, doc_chars: int) -> List[str]:
 
 
 def _field_lines(cls_node, indent: str) -> List[str]:
-    """Public annotated class-body fields (``name: T``) — the data contract
-    of dataclasses / attrs / plain annotated classes. NEVER raises."""
+    """Public annotated class-body fields (``name: T = default``) — the data
+    contract of dataclasses / attrs / plain annotated classes, defaults
+    included when literal (measured 2026-09-07: without ``source: str =
+    'metadata'`` the model asserted ``source == ''``). NEVER raises."""
     out: List[str] = []
     try:
         for item in cls_node.body:
@@ -489,8 +571,39 @@ def _field_lines(cls_node, indent: str) -> List[str]:
                 ann = ast.unparse(item.annotation)
             except Exception:  # noqa: BLE001
                 ann = "Any"
-            out.append(f"{indent}{item.target.id}: {ann}")
+            default = _literal_text(item.value) if item.value is not None else None
+            out.append(
+                f"{indent}{item.target.id}: {ann}" + (f" = {default}" if default is not None else "")
+            )
     except Exception:  # noqa: BLE001 — partial extraction beats a crash
+        pass
+    return out
+
+
+def _module_constant_lines(tree) -> List[str]:
+    """Public module-level names bound to LITERALS (``DTYPE_BYTES_ENV =
+    'JARVIS_KV_CACHE_DTYPE_BYTES'``): the env-var names, defaults and
+    sentinels a consumer must spell exactly (measured 2026-09-07: shown
+    only ``os.environ.get(DTYPE_BYTES_ENV, '2')`` the model guessed the
+    variable name and asserted ``2 == 1``). Bounded; NEVER raises."""
+    out: List[str] = []
+    try:
+        for node in tree.body:
+            target = None
+            value = None
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                target, value = node.targets[0].id, node.value
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+                target, value = node.target.id, node.value
+            if target is None or not _is_public(target):
+                continue
+            lit = _literal_text(value)
+            if lit is None:
+                continue
+            out.append(f"{target} = {lit}")
+            if len(out) >= _CONTRACT_MAX_ITEMS * 2:
+                break
+    except Exception:  # noqa: BLE001
         pass
     return out
 
@@ -613,6 +726,7 @@ def extract_public_api(
         mod_doc = ""
     if mod_doc:
         head.append('"""' + mod_doc + '"""')
+    head.extend(_module_constant_lines(tree))
     return "\n".join(head + lines)
 
 
@@ -765,8 +879,11 @@ def build_signature_anchor(
             "are LITERAL flat keys (never nested sub-dicts), helper calls "
             "compose keys exactly as shown, `# input shape:` is the literal "
             "nesting to reproduce (copy it, fill the `...` leaves), and "
-            "returned fields hold exactly the formulas shown — derive every "
-            "expected value from them.\n\n"
+            "returned fields hold exactly the formulas shown, selected by the "
+            "guard that precedes them. Derive every expected value from those "
+            "formulas INSIDE the test from your own inputs (e.g. "
+            "`expected = blocks * heads * (k + v) * 2`) — never hand-compute a "
+            "numeric literal.\n\n"
             "```python\n" + body + "\n```"
         )
     except Exception:  # noqa: BLE001 — the anchor is additive, never fatal
