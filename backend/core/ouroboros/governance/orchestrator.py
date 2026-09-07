@@ -11741,6 +11741,19 @@ class GovernedOrchestrator:
                     "[Orchestrator] VERIFY regression gate fired: %s [%s]",
                     _verify_error, ctx.op_id,
                 )
+                # Lesson memory: a VERIFY regression is the most expensive
+                # lesson there is — record it before the rollback erases it.
+                try:
+                    from backend.core.ouroboros.governance.lesson_memory import (
+                        record_lesson as _record_lesson,
+                    )
+                    await _record_lesson(
+                        op_id=str(ctx.op_id), target_files=tuple(ctx.target_files),
+                        phase="VERIFY", failure_class="verify_regression",
+                        error_text=f"verify_regression: {_verify_error}",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("[Orchestrator] verify lesson record skipped", exc_info=True)
                 # Emit gate event for VoiceNarrator
                 try:
                     await self._stack.comm.emit_postmortem(
@@ -14093,6 +14106,27 @@ class GovernedOrchestrator:
                     (result.error or "")[:280],
                     ",".join(result.adapter_names_run or ()),
                 )
+                # Lesson memory: every VALIDATE failure becomes a durable,
+                # module-keyed lesson (bounded, fail-soft, never raises).
+                # This seam covers the inline VALIDATE block, the extracted
+                # runner and L2 re-validation alike.
+                try:
+                    from backend.core.ouroboros.governance.lesson_memory import (
+                        record_lesson as _record_lesson,
+                    )
+                    _files = tuple(getattr(ctx, "target_files", ()) or ())
+                    _cf = str((candidate or {}).get("file_path", "") or "")
+                    if _cf and _cf not in _files:
+                        _files = _files + (_cf,)
+                    await _record_lesson(
+                        op_id=str(getattr(ctx, "op_id", "") or ""),
+                        target_files=_files, phase="VALIDATE",
+                        failure_class=result.failure_class or "test",
+                        error_text=result.error or "",
+                        summary=result.short_summary or "",
+                    )
+                except Exception:  # noqa: BLE001 — memory never perturbs VALIDATE
+                    logger.debug("[Validation] lesson record skipped", exc_info=True)
         except Exception:  # noqa: BLE001 — logging must never perturb VALIDATE
             pass
         return _swe_bench_test_advisory(

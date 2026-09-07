@@ -115,6 +115,18 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger("Ouroboros.Orchestrator")
 
+
+def _goal_binding_kwargs(evidence_json: str) -> dict:
+    """Delegates to the orchestrator's helper so both commit call sites
+    resolve the roadmap-goal binding identically. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.orchestrator import (
+            _goal_binding_kwargs as _impl,
+        )
+        return _impl(evidence_json)
+    except Exception:  # noqa: BLE001
+        return {}
+
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
@@ -1432,6 +1444,12 @@ class Slice4bRunner(PhaseRunner):
                         signal_source=getattr(ctx, "signal_source", ""),
                         signal_urgency=getattr(ctx, "signal_urgency", ""),
                         rationale=ctx.description,
+                        # goal reconciliation: bind the landing to the signed
+                        # goal stamped in the intake evidence (same seam as
+                        # the inline orchestrator commit path)
+                        **_goal_binding_kwargs(
+                            getattr(ctx, "intake_evidence_json", "") or ""
+                        ),
                     ),
                     timeout=30.0,
                 )

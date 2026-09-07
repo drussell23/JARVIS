@@ -286,6 +286,19 @@ class FailureModeRecord:
     schema_version: str = field(
         default=FAILURE_MODE_MEMORY_SCHEMA_VERSION,
     )
+    # ---- Lesson memory (2026-09-07, additive; absent in legacy rows) ----
+    target_files: Tuple[str, ...] = ()
+    """Canonicalized target files of the failing op — the module key a
+    lesson is retrieved by (``lesson_memory.module_keys``). Legacy rows
+    carry ``()`` and match by situation kind only."""
+    error_class: str = ""
+    """Open-set error class from :mod:`lesson_memory` (``api_signature_
+    mismatch``, ``input_shape_mismatch``, ``expected_value_mismatch`` ...)
+    — finer than the closed :class:`FailureModeKind`, which stays closed."""
+    lesson: str = ""
+    """Bounded evidence excerpt — the concrete thing that failed."""
+    phase: str = ""
+    """``VALIDATE`` / ``VERIFY`` — where the failure was observed."""
 
     # ---- Serialization -------------------------------------------
 
@@ -303,6 +316,10 @@ class FailureModeRecord:
             "op_id": self.op_id,
             "weight": int(self.weight),
             "schema_version": self.schema_version,
+            "target_files": list(self.target_files),
+            "error_class": self.error_class,
+            "lesson": self.lesson,
+            "phase": self.phase,
         }
 
     @classmethod
@@ -351,6 +368,12 @@ class FailureModeRecord:
                 ),
                 op_id=str(payload.get("op_id", "")),
                 weight=int(payload.get("weight", 1)),
+                target_files=tuple(
+                    str(f) for f in (payload.get("target_files") or ()) if f
+                ),
+                error_class=str(payload.get("error_class", "") or ""),
+                lesson=str(payload.get("lesson", "") or ""),
+                phase=str(payload.get("phase", "") or ""),
             )
         except (TypeError, ValueError) as exc:
             logger.debug(
@@ -1363,6 +1386,14 @@ def record_failure_mode(
                                     int(old.weight)
                                     + int(record.weight)
                                 ),
+                                target_files=(
+                                    record.target_files or old.target_files
+                                ),
+                                error_class=(
+                                    record.error_class or old.error_class
+                                ),
+                                lesson=record.lesson or old.lesson,
+                                phase=record.phase or old.phase,
                             )
                         )
                         deduped = True
@@ -1819,8 +1850,13 @@ def retrieve_failure_modes(
             # bound below is the conservative fallback. The full
             # combined score still ranks correctly via recency *
             # weight; the constant Jaccard cancels out.
-            jaccard = _jaccard_similarity(
-                candidate_files, candidate_files,
+            # Lesson memory (2026-09-07): the shipped line compared the
+            # query file set with ITSELF (always 1.0). Legacy rows carry no
+            # files and keep the old behaviour; rows with files match on
+            # real overlap.
+            jaccard = (
+                _jaccard_similarity(candidate_files, record.target_files)
+                if record.target_files and candidate_files else 1.0
             )
             weight_s = _weight_score(record.weight)
             combined = recency * jaccard * weight_s

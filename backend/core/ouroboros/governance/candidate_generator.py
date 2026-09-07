@@ -4098,6 +4098,17 @@ class CandidateGenerator:
         asyncio.TimeoutError
             If the deadline is already past and no provider can be tried.
         """
+        # Memory RAG hook: before ANY provider builds its prompt (and its
+        # AST-Signature Anchor), stamp the cross-op lessons for this op's
+        # modules onto the strategic-memory channel. Bounded, fail-soft —
+        # a locked/corrupt store degrades to the base prompt with a warning.
+        try:
+            from backend.core.ouroboros.governance.lesson_memory import (
+                inject_lessons as _inject_lessons,
+            )
+            context = await _inject_lessons(context)
+        except Exception:  # noqa: BLE001 — memory never blocks generation
+            logger.debug("[CandidateGenerator] lesson injection skipped", exc_info=True)
         try:
             result = await self._generate_dispatch(context, deadline)
         except RuntimeError as exc:
