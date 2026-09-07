@@ -7255,6 +7255,29 @@ class GovernedOrchestrator:
                         from backend.core.ouroboros.governance.multi_file_coverage_gate import (
                             normalize_candidate_set as _mf_normalize,
                         )
+                        # Append-only projection: a test-AUTHORING candidate
+                        # for an existing file keeps that file's code intact
+                        # and contributes only its new definitions — a full
+                        # file rewrite must never carry accidental edits to
+                        # existing tests into VALIDATE/APPLY (guardian
+                        # test_assertion_weakened, observed 2026-09-07).
+                        try:
+                            from backend.core.ouroboros.governance.append_only_projection import (
+                                project_candidates as _aop_project,
+                            )
+                            _aop = _aop_project(generation.candidates, self._config.project_root)
+                            if _aop.changed:
+                                import dataclasses as _dc_aop
+                                generation = _dc_aop.replace(
+                                    generation, candidates=tuple(_aop.candidates),
+                                )
+                                for _aop_note in _aop.notes:
+                                    logger.warning(
+                                        "[Orchestrator] append-only projection op=%s — %s",
+                                        ctx.op_id[:12], _aop_note,
+                                    )
+                        except Exception:  # noqa: BLE001 — projection is additive
+                            logger.debug("[Orchestrator] append-only projection skipped", exc_info=True)
                         _mf_orig = generation.candidates
                         _mf_norm = _mf_normalize(
                             _mf_orig,
@@ -15131,6 +15154,20 @@ class GovernedOrchestrator:
                 f"(file {idx + 1}/{len(files)}): {per_result.error or 'unknown'}"
             )
             logger.error("[Orchestrator] %s", last_error)
+            # Lesson memory: an APPLY refusal (guardian / gate) is a lesson
+            # the next op must see before it writes the same edit again.
+            try:
+                from backend.core.ouroboros.governance.lesson_memory import (
+                    record_lesson as _record_apply_lesson,
+                )
+                _apply_err = str(per_result.error or "")
+                await _record_apply_lesson(
+                    op_id=str(ctx.op_id), target_files=tuple(ctx.target_files),
+                    phase="APPLY", failure_class="apply", error_text=last_error,
+                    error_class="guardian_hard_finding" if "guardian" in _apply_err else "",
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("[Orchestrator] apply lesson record skipped", exc_info=True)
             rolled_back_any = False
             for done_fp, done_abs in applied:
                 if done_fp in snapshots:

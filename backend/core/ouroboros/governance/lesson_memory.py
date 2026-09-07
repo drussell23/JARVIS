@@ -187,6 +187,7 @@ _MITIGATIONS: Dict[str, str] = {
     "assertion_failure": "Assert only on documented behaviour you can derive from the signatures, docstrings and formulas provided.",
     "exception": "Read the previous failure evidence carefully before retrying; do not repeat the same construction.",
     "ambient_red": "These tests fail in this environment WITHOUT your change and are excluded from the verdict — do not chase them; make your NEW tests pass and leave the existing ones untouched.",
+    "guardian_hard_finding": "APPLY was refused by the semantic guardian: the candidate edited or weakened EXISTING code/tests. Append new definitions only; reproduce every existing line byte-for-byte.",
 }
 
 

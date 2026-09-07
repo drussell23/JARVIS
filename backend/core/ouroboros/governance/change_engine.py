@@ -814,9 +814,18 @@ class ChangeEngine:
                 raise BlockedPathError(
                     f"guardian raised on {rel_norm} — fail-closed: {exc}"
                 )
-            if any(getattr(f, "severity", "") == "hard" for f in findings):
+            _hard = [f for f in findings if getattr(f, "severity", "") == "hard"]
+            if _hard:
+                # Name the findings: postmortems, lessons and operators need
+                # WHAT was refused, not just that something was.
+                _why = "; ".join(
+                    f"{getattr(f, 'kind', getattr(f, 'pattern', '?'))}"
+                    + (f" ({str(getattr(f, 'detail', getattr(f, 'message', '')))[:160]})"
+                       if getattr(f, 'detail', getattr(f, 'message', '')) else "")
+                    for f in _hard[:4]
+                )
                 raise BlockedPathError(
-                    f"guardian hard finding on {rel_norm}"
+                    f"guardian hard finding on {rel_norm}: {_why}"
                 )
         except BlockedPathError:
             raise
