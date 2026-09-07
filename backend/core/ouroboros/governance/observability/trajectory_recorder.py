@@ -596,6 +596,13 @@ class TrajectoryRecorder:
     def __init__(self, path: Optional[Path] = None) -> None:
         self._path_override = path
         self._queue: Optional[asyncio.Queue] = None
+        # The event loop the queue/lock/tasks are bound to. A persistent
+        # recorder singleton can outlive an event loop (pytest-asyncio's
+        # per-test loops; a daemon restart onto a fresh loop). An asyncio
+        # primitive is bound to its creating loop, so reusing one across loops
+        # raises "bound to a different event loop" — the exact flake that failed
+        # the autonomous VALIDATE/VERIFY. ``_ensure_writer`` rebinds on change.
+        self._bound_loop: "Optional[asyncio.AbstractEventLoop]" = None
         self._writer: Optional[asyncio.Task] = None
         # Wall-clock expiry watchdog. Separate from the drain loop because
         # expiry that only runs when a queue item arrives is not expiry at
@@ -638,6 +645,24 @@ class TrajectoryRecorder:
         except RuntimeError:
             self._stats["dropped_no_loop"] += 1
             return False
+        # Loop-awareness (root-cause of the cross-loop VALIDATE flake): if the
+        # running loop has changed since we bound our primitives, the old queue/
+        # lock/tasks belong to a now-defunct loop. Drop them so they are
+        # recreated on THIS loop below; awaiting a stale queue would raise
+        # "bound to a different event loop". Cancelling the stale tasks is
+        # best-effort — their loop may already be closed.
+        if self._bound_loop is not None and self._bound_loop is not loop:
+            for _t in (self._writer, self._watchdog):
+                try:
+                    if _t is not None and not _t.done():
+                        _t.cancel()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._queue = None
+            self._lock = None
+            self._writer = None
+            self._watchdog = None
+        self._bound_loop = loop
         if self._queue is None:
             self._queue = asyncio.Queue(
                 maxsize=_env_int(
