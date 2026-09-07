@@ -32,8 +32,24 @@ logger = logging.getLogger("Ouroboros.SigAnchor")
 _ENV_ENABLED = "JARVIS_AST_SIGNATURE_ANCHOR_ENABLED"
 _ENV_MAX_MODULES = "JARVIS_AST_SIGNATURE_ANCHOR_MAX_MODULES"
 _ENV_MAX_CHARS = "JARVIS_AST_SIGNATURE_ANCHOR_MAX_CHARS"
+#: Per-symbol docstring excerpt cap (chars). The docstring IS the semantic
+#: contract a signature cannot carry — ``payload: Any`` says nothing, while
+#: the docstring says "an Ollama /api/show payload, architecture-prefixed
+#: keys under model_info, None when any load-bearing field is missing".
+#: Measured 2026-09-07: with signatures alone the model built flat
+#: ``{"context_length": 2048, "num_layers": 32}`` payloads and every test
+#: failed on ``assert None is not None``.
+_ENV_DOC_CHARS = "JARVIS_AST_SIGNATURE_ANCHOR_DOC_CHARS"
+#: Ceiling for the ADAPTIVE per-symbol excerpt: the module's remaining char
+#: budget is spread evenly across its public symbols, floored at
+#: ``_DEFAULT_DOC_CHARS`` and capped here — a module with few symbols keeps
+#: its full contracts, a module with dozens degrades gracefully to the floor.
+_ENV_DOC_CHARS_MAX = "JARVIS_AST_SIGNATURE_ANCHOR_DOC_CHARS_MAX"
 _DEFAULT_MAX_MODULES = 4
-_DEFAULT_MAX_CHARS = 4000
+_DEFAULT_MAX_CHARS = 6000
+_DEFAULT_DOC_CHARS = 420
+_DEFAULT_DOC_CHARS_MAX = 1200
+_SENTENCE_END_RE = re.compile(r"[.!?](?:\s|$)")
 
 _PY_PATH_RE = re.compile(r"[A-Za-z0-9_./\\-]+\.py")
 
@@ -85,21 +101,153 @@ def _is_public(name: str) -> bool:
     return not name.startswith("_")
 
 
-def extract_public_api(source: str, module_import_path: str = "") -> str:
-    """Compact authoritative signature block for the PUBLIC top-level API of
-    *source* — public functions and public classes (public methods + __init__).
-    ``""`` when there is no extractable public API or the source cannot be
-    parsed. NEVER raises."""
+def _doc_excerpt(node, max_chars: int) -> str:
+    """Single-line excerpt of *node*'s docstring, bounded to *max_chars* and
+    cut at the last sentence boundary (else the last word) before the cap.
+    ``""`` when there is no docstring. Triple double-quotes are neutralised so
+    the excerpt can be re-embedded as a docstring in the anchor block. NEVER
+    raises."""
+    try:
+        raw = ast.get_docstring(node, clean=True)
+    except Exception:  # noqa: BLE001 — exotic node/body shapes
+        return ""
+    if not raw:
+        return ""
+    text = " ".join(raw.split()).replace('"""', "'''").replace("\\", "/")
+    if len(text) <= max_chars:
+        return text
+    head = text[:max_chars]
+    cut = -1
+    for m in _SENTENCE_END_RE.finditer(head):
+        cut = m.end()
+    if cut < max_chars // 3:
+        sp = head.rfind(" ")
+        cut = sp if sp >= max_chars // 3 else max_chars
+    return head[:cut].rstrip() + " …"
+
+
+def _def_lines(node, indent: str, doc_chars: int) -> List[str]:
+    """Signature line for a def, expanded with its docstring contract when
+    one exists (``def f(...) -> T:`` / docstring / ``...``). Without a
+    docstring the legacy one-liner ``def f(...) -> T: ...`` is emitted."""
+    sig = _sig_line(node)
+    doc = _doc_excerpt(node, doc_chars) if doc_chars > 0 else ""
+    if not doc or not sig.endswith(" ..."):
+        return [indent + sig]
+    return [
+        indent + sig[: -len(" ...")],
+        indent + '    """' + doc + '"""',
+        indent + "    ...",
+    ]
+
+
+def _field_lines(cls_node, indent: str) -> List[str]:
+    """Public annotated class-body fields (``name: T``) — the data contract
+    of dataclasses / attrs / plain annotated classes. NEVER raises."""
+    out: List[str] = []
+    try:
+        for item in cls_node.body:
+            if not isinstance(item, ast.AnnAssign) or not isinstance(item.target, ast.Name):
+                continue
+            if not _is_public(item.target.id):
+                continue
+            try:
+                ann = ast.unparse(item.annotation)
+            except Exception:  # noqa: BLE001
+                ann = "Any"
+            out.append(f"{indent}{item.target.id}: {ann}")
+    except Exception:  # noqa: BLE001 — partial extraction beats a crash
+        pass
+    return out
+
+
+def _public_doc_nodes(tree) -> List[object]:
+    """Module, public top-level defs, public classes and their public /
+    __init__ methods — every node whose docstring the anchor may carry."""
+    nodes: List[object] = [tree]
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if _is_public(node.name):
+                nodes.append(node)
+        elif isinstance(node, ast.ClassDef) and _is_public(node.name):
+            nodes.append(node)
+            nodes.extend(
+                m for m in node.body
+                if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and (_is_public(m.name) or m.name == "__init__")
+            )
+    return nodes
+
+
+def _waterfill_level(lengths: Sequence[int], budget: int, ceiling: int) -> int:
+    """Highest per-item cap such that ``sum(min(len, cap)) <= budget``: short
+    docstrings stay whole and their unused share flows to the long ones.
+    Returns ``ceiling`` when everything fits."""
+    remaining = max(0, budget)
+    level = ceiling
+    pending = sorted(int(x) for x in lengths if x > 0)
+    for i, ln in enumerate(pending):
+        share = remaining // (len(pending) - i)
+        take = min(ln, share, ceiling)
+        if ln > share or ln > ceiling:
+            level = min(level, share, ceiling)
+        remaining -= take
+    return max(0, level)
+
+
+def _adaptive_doc_chars(tree, budget: Optional[int], skeleton_len: int = 0) -> int:
+    """Per-symbol excerpt cap: the env floor when no budget is known;
+    otherwise the water-fill level of every public docstring inside
+    ``budget - skeleton_len`` (the chars left after signatures), floored at
+    the env floor and capped at the env ceiling."""
+    floor = _int_env(_ENV_DOC_CHARS, _DEFAULT_DOC_CHARS)
+    if budget is None or budget <= 0:
+        return floor
+    ceiling = max(floor, _int_env(_ENV_DOC_CHARS_MAX, _DEFAULT_DOC_CHARS_MAX))
+    lengths: List[int] = []
+    for node in _public_doc_nodes(tree):
+        try:
+            doc = ast.get_docstring(node, clean=True) or ""
+        except Exception:  # noqa: BLE001
+            doc = ""
+        if doc:
+            # +12: the quotes / indent / newline each embedded excerpt costs.
+            lengths.append(len(" ".join(doc.split())) + 12)
+    if not lengths:
+        return floor
+    level = _waterfill_level(lengths, budget - skeleton_len, ceiling)
+    return max(floor, min(ceiling, level))
+
+
+def extract_public_api(
+    source: str,
+    module_import_path: str = "",
+    doc_chars: Optional[int] = None,
+    budget: Optional[int] = None,
+) -> str:
+    """Compact authoritative block for the PUBLIC top-level API of *source* —
+    public functions and public classes (annotated fields, public methods +
+    __init__), each carrying a bounded docstring excerpt: the semantic
+    contract (accepted input shape, return semantics) that a bare signature
+    cannot express. ``doc_chars`` bounds each excerpt (``None`` → env
+    ``JARVIS_AST_SIGNATURE_ANCHOR_DOC_CHARS``, default 420, raised adaptively
+    toward ``budget / public symbols`` when a char ``budget`` is given, capped
+    by ``JARVIS_AST_SIGNATURE_ANCHOR_DOC_CHARS_MAX``). ``""`` when there
+    is no extractable public API or the source cannot be parsed. NEVER
+    raises."""
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return ""
+    if doc_chars is None:
+        skeleton = extract_public_api(source, module_import_path, doc_chars=0)
+        doc_chars = _adaptive_doc_chars(tree, budget, len(skeleton))
     lines: List[str] = []
     try:
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 if _is_public(node.name):
-                    lines.append(_sig_line(node))
+                    lines.extend(_def_lines(node, "", doc_chars))
             elif isinstance(node, ast.ClassDef):
                 if not _is_public(node.name):
                     continue
@@ -108,19 +256,30 @@ def extract_public_api(source: str, module_import_path: str = "") -> str:
                 except Exception:  # noqa: BLE001
                     bases = ""
                 header = f"class {node.name}" + (f"({bases})" if bases else "") + ":"
-                methods = [
-                    "    " + _sig_line(m)
-                    for m in node.body
-                    if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and (_is_public(m.name) or m.name == "__init__")
-                ]
+                body: List[str] = []
+                cls_doc = _doc_excerpt(node, doc_chars) if doc_chars > 0 else ""
+                if cls_doc:
+                    body.append('    """' + cls_doc + '"""')
+                body.extend(_field_lines(node, "    "))
+                for m in node.body:
+                    if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+                        _is_public(m.name) or m.name == "__init__"
+                    ):
+                        body.extend(_def_lines(m, "    ", doc_chars))
                 lines.append(header)
-                lines.extend(methods if methods else ["    ..."])
+                lines.extend(body if body else ["    ..."])
     except Exception:  # noqa: BLE001 — partial extraction beats a crash
         pass
     if not lines:
         return ""
-    return f"# {module_import_path or 'module'}\n" + "\n".join(lines)
+    head = [f"# {module_import_path or 'module'}"]
+    try:
+        mod_doc = _doc_excerpt(tree, doc_chars) if doc_chars > 0 else ""
+    except Exception:  # noqa: BLE001
+        mod_doc = ""
+    if mod_doc:
+        head.append('"""' + mod_doc + '"""')
+    return "\n".join(head + lines)
 
 
 def _import_label(path: Path, repo_root: Path) -> str:
@@ -239,7 +398,7 @@ def build_signature_anchor(
                 src = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            block = extract_public_api(src, label)
+            block = extract_public_api(src, label, budget=max_chars - used)
             if not block:
                 continue
             if used + len(block) > max_chars:

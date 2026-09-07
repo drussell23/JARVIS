@@ -85,3 +85,124 @@ def test_nothing_resolves_yields_empty(tmp_path):
 
 def test_never_raises_on_garbage(tmp_path):
     assert A.build_signature_anchor(None, None, tmp_path) == ""  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Semantic contract (2026-09-07): signatures alone left the model building
+# flat payloads against parse_model_physics(payload: Any) -> every test failed
+# on ``assert None is not None``. The docstring IS the contract; the anchor
+# now carries a bounded excerpt per public symbol, public annotated class
+# fields, and the module docstring.
+# ---------------------------------------------------------------------------
+import ast as _ast
+
+DOC_MOD = textwrap.dedent('''
+    """Module contract: parses Ollama /api/show payloads.
+
+    Second paragraph detail."""
+    from dataclasses import dataclass
+    from typing import Any, Optional
+
+    @dataclass(frozen=True)
+    class Physics:
+        """Per-model physics."""
+        native_context: int
+        kv_heads: int
+        _hidden: int = 0
+        def to_dict(self) -> dict:
+            return {}
+
+    def parse(payload: Any) -> "Optional[Physics]":
+        """Build Physics from an Ollama ``/api/show`` payload.
+
+        Keys are architecture-prefixed under ``model_info``. Returns ``None``
+        when any load-bearing field is missing. NEVER raises."""
+        return None
+
+    def bare(x):
+        return x
+''')
+
+
+def test_docstring_contract_is_embedded_under_signature():
+    out = A.extract_public_api(DOC_MOD, "pkg.phys")
+    assert "def parse(payload: Any) -> 'Optional[Physics]':" in out
+    assert "architecture-prefixed under ``model_info``" in out
+    assert "Returns ``None`` when any load-bearing field is missing" in out
+    assert "def bare(x): ..." in out  # no docstring keeps the one-liner
+
+
+def test_class_fields_and_class_doc_are_embedded():
+    out = A.extract_public_api(DOC_MOD, "pkg.phys")
+    assert "    native_context: int" in out and "    kv_heads: int" in out
+    assert "_hidden" not in out
+    assert '"""Per-model physics."""' in out
+
+
+def test_module_docstring_and_block_is_valid_python():
+    out = A.extract_public_api(DOC_MOD, "pkg.phys")
+    assert "Module contract: parses Ollama /api/show payloads." in out
+    _ast.parse(out)  # the anchor block must remain syntactically valid Python
+
+
+def test_doc_excerpt_cuts_at_sentence_boundary():
+    first = "First sentence is reasonably long enough to pass the floor rule here."
+    src = f'def f(a):\n    """{first} ' + "x" * 600 + ' tail."""\n    return a\n'
+    out = A.extract_public_api(src, "m", doc_chars=120)
+    assert first + " …" in out
+    assert "x" * 100 not in out
+
+
+def test_doc_chars_env_override(monkeypatch):
+    monkeypatch.setenv("JARVIS_AST_SIGNATURE_ANCHOR_DOC_CHARS", "40")
+    out = A.extract_public_api(DOC_MOD, "pkg.phys")
+    assert "load-bearing" not in out  # truncated before the second sentence
+    assert "…" in out
+
+
+def test_triple_quotes_in_docstring_are_neutralised():
+    src = "def f():\n    '''Has \"\"\" inside.'''\n    return 1\n"
+    out = A.extract_public_api(src, "m")
+    assert "inside." in out
+    _ast.parse(out)
+
+
+def test_real_model_physics_contract_reaches_the_anchor():
+    """The live case: the excerpt must carry the payload SHAPE the model
+    needs — model_info + architecture-prefixed keys + None-on-missing."""
+    root = Path(__file__).resolve().parents[2]
+    src = (root / "backend/core/ouroboros/governance/model_physics.py").read_text()
+    out = A.extract_public_api(src, "model_physics", budget=6000)
+    assert "def parse_model_physics(payload: Any)" in out
+    assert "/api/show" in out and "architecture-prefixed" in out
+    assert "Returns ``None``" in out
+    assert "    kv_bytes_per_token: int" in out
+
+
+def test_adaptive_budget_raises_cap_for_small_modules_and_floors_for_large():
+    small = _ast.parse(DOC_MOD)
+    assert A._adaptive_doc_chars(small, budget=6000) > A._DEFAULT_DOC_CHARS
+    assert A._adaptive_doc_chars(small, budget=6000) <= A._DEFAULT_DOC_CHARS_MAX
+    many = _ast.parse("\n".join(f"def f{i}(x):\n    return x" for i in range(200)))
+    assert A._adaptive_doc_chars(many, budget=6000) == A._DEFAULT_DOC_CHARS
+    assert A._adaptive_doc_chars(small, budget=None) == A._DEFAULT_DOC_CHARS
+
+
+def test_build_anchor_stays_within_max_chars(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_AST_SIGNATURE_ANCHOR_MAX_CHARS", "1500")
+    mod = tmp_path / "big.py"
+    mod.write_text("\n".join(
+        f'def f{i}(x):\n    """{"sentence. " * 80}"""\n    return x' for i in range(30)
+    ))
+    out = A.build_signature_anchor(("tests/test_big.py",), "cover big.py", tmp_path)
+    body = out.split("```python", 1)[1].rsplit("```", 1)[0]
+    assert 0 < len(body) <= 1500 + 2
+
+
+def test_waterfill_gives_unused_short_doc_share_to_long_docs():
+    # three short docs + one long: budget 1000 must let the long one reach
+    # 1000 - 3*50 = 850, not 1000 // 4 = 250.
+    assert A._waterfill_level([50, 50, 50, 5000], 1000, 1200) == 850
+    assert A._waterfill_level([50, 50], 1000, 1200) == 1200      # all fit
+    assert A._waterfill_level([600, 600, 600], 900, 1200) == 300  # even split
+    assert A._waterfill_level([], 0, 1200) == 1200
