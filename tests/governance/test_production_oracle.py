@@ -1,10 +1,4 @@
-# [Ouroboros] Modified by Ouroboros (op=op-01a07b16-) at 2026-09-07 09:06 UTC
-# [Ouroboros] Modified by Ouroboros (op=op-01a07b18-) at 2026-09-07 09:10 UTC
-# [Ouroboros] Modified by Ouroboros (op=op-01a07b19-) at 2026-09-07 09:16 UTC
-# Reason: First-order proof #2: author a real unit test for the untested production_oracle aggregator  AUTHOR a new pytest test fi
-
-# Reason: First-order proof #2: author a real unit test for the untested production_oracle aggregator  AUTHOR a new pytest test fi
-
+# [Ouroboros] Modified by Ouroboros (op=op-01a07b1b-) at 2026-09-07 09:23 UTC
 # Reason: First-order proof #2: author a real unit test for the untested production_oracle aggregator  AUTHOR a new pytest test fi
 
 import enum
@@ -64,7 +58,7 @@ def test_compute_aggregate_verdict_failed_signal():
         observed_at_ts=1.0,
         summary="test",
         payload={},
-        severity=0.9
+        severity=0.9  # Set severity to meet threshold
     )
     result = compute_aggregate_verdict([signal])
     assert result == OracleVerdict.FAILED
@@ -79,7 +73,7 @@ def test_compute_aggregate_verdict_degraded_signal():
         observed_at_ts=1.0,
         summary="test",
         payload={},
-        severity=0.6
+        severity=0.6  # Set severity to meet threshold
     )
     result = compute_aggregate_verdict([signal])
     assert result == OracleVerdict.DEGRADED
