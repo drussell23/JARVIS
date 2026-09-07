@@ -1,6 +1,10 @@
+# [Ouroboros] Modified by Ouroboros (op=op-01a07c06-) at 2026-09-07 17:49 UTC
+# Reason: Tier-1 multi-file atomic proof #3 (two docstring-free suites)  Make ONE coordinated multi-file change across two EXISTIN
+
 from __future__ import annotations
 import pytest
 from backend.core.ouroboros.governance.comms.karen_synth.speech_provider import DWSpeechProvider
+
 
 class _Res:
     def __init__(self, content): self.content = content
@@ -25,3 +29,7 @@ async def test_dw_provider_yields_completion_text():
 async def test_dw_provider_failure_yields_nothing():
     sp = DWSpeechProvider(_FakeDW(boom=True))
     assert [c async for c in sp.source(system_prompt="s", user_prompt="u")] == []
+
+
+def test_tier1_multi_proof_speech():
+    assert sum(range(6)) == 15

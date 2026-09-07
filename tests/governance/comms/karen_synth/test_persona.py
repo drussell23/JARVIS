@@ -1,6 +1,10 @@
+# [Ouroboros] Modified by Ouroboros (op=op-01a07c06-) at 2026-09-07 17:49 UTC
+# Reason: Tier-1 multi-file atomic proof #3 (two docstring-free suites)  Make ONE coordinated multi-file change across two EXISTIN
+
 from __future__ import annotations
 from backend.core.ouroboros.governance.comms.karen_synth.ledger_view import LedgerView
 from backend.core.ouroboros.governance.comms.karen_synth.persona import build_prompt
+
 
 def test_system_prompt_encodes_persona_and_safety_rules():
     sys, _ = build_prompt(LedgerView(phase="generate"))
@@ -11,12 +15,17 @@ def test_system_prompt_encodes_persona_and_safety_rules():
     assert "never" in low and ("code" in low and ("stack" in low or "traceback" in low))
     assert "two sentences" in low or "2 sentences" in low or "one or two" in low
 
+
 def test_user_prompt_carries_ledger_context_no_code():
     sys, user = build_prompt(LedgerView.from_payload(
         "postmortem", {"root_cause": "boom ```code```", "target_files": ["a/x.py"]}))
     assert "x.py" in user
     assert "```" not in user and "```" not in sys
 
+
 def test_persona_ctx_injected_when_present():
     sys, _ = build_prompt(LedgerView(phase="intent"), {"user_name": "Derek", "time_of_day": "evening"})
     assert "Derek" in sys and "evening" in sys
+
+def test_tier1_multi_proof_persona():
+    assert sum(range(5)) == 10
