@@ -22,9 +22,12 @@ from __future__ import annotations
 import ast
 import copy
 import os
+import logging
 import re
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
+
+logger = logging.getLogger("Ouroboros.SigAnchor")
 
 _ENV_ENABLED = "JARVIS_AST_SIGNATURE_ANCHOR_ENABLED"
 _ENV_MAX_MODULES = "JARVIS_AST_SIGNATURE_ANCHOR_MAX_MODULES"
@@ -248,6 +251,14 @@ def build_signature_anchor(
         if not blocks:
             return ""
         body = "\n\n".join(blocks)
+        try:
+            logger.info(
+                "[SigAnchor] injected %d chars for %d module(s): %s",
+                len(body), len(blocks),
+                ", ".join(lbl for lbl, _ in sources[:max_modules]),
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return (
             "## AUTHORITATIVE API SIGNATURES (ground truth — use EXACTLY)\n\n"
             "The signatures below are parsed from the real, current source on "

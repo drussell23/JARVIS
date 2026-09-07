@@ -4132,31 +4132,31 @@ Rules:
     # Multi-file contract suppressed under read-only contract: the block
     # tells the model "emit files: [...]" which is code-gen shape and
     # directly contradicts the CRITICAL_SYSTEM_DIRECTIVE we just emitted.
+    # AST-Signature Anchor (route-independent) — inject the EXACT public API
+    # of the module(s) the candidate must call, parsed from the real source on
+    # disk, so the model cannot invent signatures / arg-counts / return-shapes.
+    # Runs on EVERY route (BACKGROUND included — its pruned prompt makes the
+    # ground-truth signatures matter MORE). Additive + fail-soft: empty ⇒
+    # byte-identical legacy prompt.
+    try:
+        from backend.core.ouroboros.governance.ast_signature_anchor import (
+            build_signature_anchor as _build_sig_anchor,
+        )
+        _sig_anchor = _build_sig_anchor(
+            getattr(ctx, "target_files", ()) or (),
+            getattr(ctx, "description", "") or "",
+            repo_root,
+        )
+        if _sig_anchor:
+            parts.append(_sig_anchor)
+    except Exception:  # noqa: BLE001 — anchor is additive, never fatal
+        pass
     _is_read_only_ctx = bool(getattr(ctx, "is_read_only", False))
     if (
         not _is_bg_route
         and not getattr(ctx, "cross_repo", False)
         and not _is_read_only_ctx
     ):
-        # AST-Signature Anchor — inject the EXACT public API of the module(s)
-        # the candidate must call, parsed from the real source on disk, so the
-        # model cannot invent signatures / arg-counts / return-shapes (the
-        # measured local-model failure when writing against a module it only
-        # skimmed). Additive + fail-soft: empty ⇒ byte-identical legacy prompt.
-        try:
-            from backend.core.ouroboros.governance.ast_signature_anchor import (
-                build_signature_anchor as _build_sig_anchor,
-            )
-            _sig_anchor = _build_sig_anchor(
-                getattr(ctx, "target_files", ()) or (),
-                getattr(ctx, "description", "") or "",
-                repo_root,
-            )
-            if _sig_anchor:
-                parts.append(_sig_anchor)
-        except Exception:  # noqa: BLE001 — anchor is additive, never fatal
-            pass
-
         _mf_block = _build_multi_file_contract_block(
             getattr(ctx, "target_files", ()) or ()
         )
