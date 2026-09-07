@@ -1333,6 +1333,27 @@ class UnifiedIntakeRouter:
                 # + resume markers ride intake_evidence_json so the prefill
                 # re-ignition reaches the LLM (model continues the exact char).
                 _kw = _resume_envelope_kwargs(env)
+                # Goal reconciliation: never revive a second op for a goal
+                # that already has a live one (duplicates shed each other on
+                # STATE DRIFT at APPLY). The skipped checkpoint is closed as
+                # terminal so the ledger stays consistent.
+                try:
+                    from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: PLC0415
+                        record_terminal as _gr_terminal,
+                        superseding_op as _gr_superseding,
+                    )
+                    _gr_goal = str(_kw["evidence"].get("goal_id") or "")
+                    _gr_op = str(env.get("op_id") or "")
+                    _gr_live = _gr_superseding(_gr_goal, _gr_op) if _gr_goal else ""
+                    if _gr_live:
+                        logger.warning(
+                            "[Intake] fsm_resume skipped for op=%s: goal %s already in flight as %s",
+                            _gr_op[:12], _gr_goal, _gr_live[:12],
+                        )
+                        await _gr_terminal(goal_id=_gr_goal, op_id=_gr_op, outcome="superseded_on_resume")
+                        return
+                except Exception:  # noqa: BLE001 -- dedupe is additive, never fatal
+                    pass
                 _lin = _kw["evidence"].get("trace_lineage") or {}
                 if _lin.get("emit_source"):
                     # Re-establish the window-1 emit hop from HMAC-verified
@@ -1513,6 +1534,28 @@ class UnifiedIntakeRouter:
         # 1. Dedup check
         if self._is_duplicate(envelope):
             return "deduplicated"
+        # Goal reconciliation: ONE live op per signed roadmap goal. A goal
+        # whose dispatched op has not reached a terminal state (and is
+        # younger than the in-flight TTL) is not admitted again — duplicate
+        # ops on the same files shed each other on STATE DRIFT at APPLY.
+        if str(getattr(envelope, "source", "") or "") == "roadmap":
+            try:
+                from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: PLC0415
+                    superseding_op as _gr_superseding,
+                )
+                _gr_goal = str((getattr(envelope, "evidence", None) or {}).get("goal_id") or "")
+                _gr_live = (
+                    _gr_superseding(_gr_goal, str(getattr(envelope, "causal_id", "") or ""))
+                    if _gr_goal else ""
+                )
+                if _gr_live:
+                    logger.info(
+                        "[Intake] roadmap goal %s already in flight as %s — deduplicated",
+                        _gr_goal, _gr_live[:12],
+                    )
+                    return "deduplicated"
+            except Exception:  # noqa: BLE001 -- dedupe is additive, never fatal
+                pass
 
         # 2. Human ack gate
         if envelope.requires_human_ack:
@@ -1889,6 +1932,23 @@ class UnifiedIntakeRouter:
             except Exception as _hook_exc:
                 logger.debug("[Router] on_ingest_hook error: %s", _hook_exc)
 
+        # Goal reconciliation: this envelope IS the op (causal_id) — record
+        # the dispatch so the goal stays out of re-admission until terminal.
+        if str(getattr(envelope, "source", "") or "") == "roadmap":
+            try:
+                from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: PLC0415
+                    record_dispatch as _gr_dispatch,
+                )
+                _gr_ev = getattr(envelope, "evidence", None) or {}
+                _gr_goal = str(_gr_ev.get("goal_id") or "")
+                if _gr_goal:
+                    await _gr_dispatch(
+                        goal_id=_gr_goal,
+                        goal_digest_hex=str(_gr_ev.get("goal_digest") or ""),
+                        op_id=str(getattr(envelope, "causal_id", "") or ""),
+                    )
+            except Exception:  # noqa: BLE001 -- bookkeeping is additive, never fatal
+                pass
         return "enqueued"
 
     # ------------------------------------------------------------------

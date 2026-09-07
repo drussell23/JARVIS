@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import subprocess
 from pathlib import Path
 
@@ -270,12 +271,15 @@ def test_orchestrator_binding_kwargs():
     assert _goal_binding_kwargs("") == {}
 
 
-def test_in_flight_goal_is_not_reemitted_until_terminal_or_ttl(repo, monkeypatch):
+def test_in_flight_goal_is_deduplicated_at_ingest_until_terminal_or_ttl(repo, monkeypatch):
     goal = _goal()
     assert _run(L.record_dispatch(goal_id="goal-a", goal_digest_hex=L.goal_digest(goal), op_id="op-live"))
     rec = _run(L.reconcile_goal(goal))
     assert rec.state is L.GoalState.ACTIVE and rec.in_flight_op == "op-live"
-    # the reader skips it
+    # the router's admission check: a different op for the same goal is superseded
+    assert L.superseding_op("goal-a", "op-new") == "op-live"
+    assert L.superseding_op("goal-a", "op-live") == ""
+    # the READER keeps emitting (the composer discovers goals from envelopes)
     from backend.core.ouroboros.governance import roadmap_reader as rr
     doc = rr.RoadmapDocument(version=1, operator_id="op", signed_at_iso="", signature_hex="", signature_valid=True, goals=(goal,), raw_bytes=0)
 
@@ -283,23 +287,26 @@ def test_in_flight_goal_is_not_reemitted_until_terminal_or_ttl(repo, monkeypatch
         seen: list = []
 
         async def ingest(self, env):
-            self.seen.append(env); return "ikey"
+            self.seen.append(env); return "enqueued"
 
     r = _Router()
     out = _run(rr.emit_roadmap_envelopes(doc, router=r))
-    assert out[0].emitted is False and out[0].in_flight_op == "op-live" and r.seen == []
-    # terminal releases it; the next emission records a NEW dispatch with the envelope's causal_id
+    assert out[0].emitted is True and len(r.seen) == 1
+    # terminal releases the goal
     assert _run(L.record_terminal(goal_id="goal-a", op_id="op-live", outcome="failed"))
-    assert _run(L.reconcile_goal(goal)).in_flight_op == ""
-    out2 = _run(rr.emit_roadmap_envelopes(doc, router=r))
-    assert out2[0].emitted is True and len(r.seen) == 1
-    recs = L.read_records()
-    assert recs[-1].event == "dispatched" and recs[-1].op_id == r.seen[0].causal_id
-    assert _run(L.reconcile_goal(goal)).in_flight_op == r.seen[0].causal_id
+    assert _run(L.reconcile_goal(goal)).in_flight_op == "" and L.superseding_op("goal-a", "op-new") == ""
     # TTL lapse releases a crashed op
+    assert _run(L.record_dispatch(goal_id="goal-a", goal_digest_hex="", op_id="op-crashed"))
     monkeypatch.setenv(L._ENV_INFLIGHT_TTL, "0.001")
     import time as _t; _t.sleep(0.01)
     assert _run(L.reconcile_goal(goal)).in_flight_op == ""
+
+
+def test_router_ingest_wires_inflight_dedupe_and_dispatch():
+    import inspect
+    from backend.core.ouroboros.governance.intake import unified_intake_router as R
+    src = inspect.getsource(R.UnifiedIntakeRouter._ingest_impl)
+    assert "superseding_op" in src and "record_dispatch" in src
 
 
 def test_inflight_ttl_defaults_to_twice_pipeline_wall(monkeypatch):
@@ -314,3 +321,56 @@ def test_terminal_seam_is_wired():
     import inspect
     from backend.core.ouroboros.governance import orchestrator as orch
     assert "record_terminal" in inspect.getsource(orch.GovernedOrchestrator._publish_outcome)
+
+
+def test_concurrent_appends_keep_the_chain_intact(repo):
+    import threading
+    goal = _goal()
+
+    def _w(i):
+        _run(L.record_dispatch(goal_id="goal-a", goal_digest_hex=L.goal_digest(goal), op_id=f"op-{i}"))
+
+    ts = [threading.Thread(target=_w, args=(i,)) for i in range(8)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    recs = L.read_records()
+    assert len(recs) == 8                      # every row verifies: no chain break
+    assert {r.op_id for r in recs} == {f"op-{i}" for i in range(8)}
+
+
+def test_unverifiable_ledger_is_never_appended_to(repo, monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="Ouroboros.GoalReconciliation")
+    _run(L.record_dispatch(goal_id="goal-a", goal_digest_hex="", op_id="op-1"))
+    monkeypatch.setenv("JARVIS_ROADMAP_READER_HMAC_SECRET", "other-secret")
+    assert _run(L.record_dispatch(goal_id="goal-a", goal_digest_hex="", op_id="op-2")) is None
+    assert any("refusing to append" in r.getMessage() for r in caplog.records)
+    assert sum(1 for l in L.ledger_path().read_text().splitlines() if l.strip()) == 1
+
+
+def test_repair_chain_relinks_and_filters(repo):
+    _run(L.record_dispatch(goal_id="goal-a", goal_digest_hex="", op_id="op-1"))
+    _run(L.record_dispatch(goal_id="junk", goal_digest_hex="", op_id="op-x"))
+    _run(L.record_dispatch(goal_id="goal-a", goal_digest_hex="", op_id="op-2"))
+    p = L.ledger_path()
+    rows = [json.loads(l) for l in p.read_text().splitlines()]
+    rows[1]["prev_hash"] = "0" * 64                # break the chain
+    p.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    assert len(L.read_records()) == 1
+    assert L.repair_chain(keep=lambda r: r.get("goal_id") != "junk") == 2
+    recs = L.read_records()
+    assert [r.op_id for r in recs] == ["op-1", "op-2"] and all(r.mac for r in recs)
+
+
+def test_default_ledger_path_is_colocated_with_reader_ledger(monkeypatch, tmp_path):
+    monkeypatch.delenv(L._ENV_LEDGER_PATH, raising=False)
+    monkeypatch.setenv("JARVIS_ROADMAP_READER_LEDGER_PATH", str(tmp_path / "iso" / "roadmap_reader_ledger.jsonl"))
+    from backend.core.ouroboros.governance import roadmap_reader as rr
+    assert L.ledger_path().parent == rr.ledger_path().parent
+    assert L.ledger_path().name == "goal_reconciliation_ledger.jsonl"
+
+
+def test_superseding_op_for_resume_dedupe(repo):
+    goal = _goal()
+    _run(L.record_dispatch(goal_id="goal-a", goal_digest_hex=L.goal_digest(goal), op_id="op-live"))
+    assert L.superseding_op("goal-a", "op-old") == "op-live"
+    assert L.superseding_op("goal-a", "op-live") == ""      # the live op itself resumes freely
+    assert L.superseding_op("goal-none", "op-old") == ""

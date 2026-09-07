@@ -69,7 +69,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger("Ouroboros.GoalReconciliation")
 
@@ -109,7 +109,17 @@ def ledger_path() -> Path:
     resolve_durable_path`` — the SAME re-anchor ``flock_append_line`` applies
     on write — so reads and writes agree under a per-run durable root."""
     raw = os.environ.get(_ENV_LEDGER_PATH, "").strip()
-    p = Path(raw).expanduser() if raw else Path(_DEFAULT_LEDGER_REL)
+    if raw:
+        p = Path(raw).expanduser()
+    else:
+        # Colocated with the roadmap reader's ledger: whoever isolates that
+        # (every reader test does) isolates this one — production rows are
+        # never polluted by a test that forgot an env var.
+        try:
+            from backend.core.ouroboros.governance.roadmap_reader import ledger_path as _rr_ledger
+            p = _rr_ledger().parent / Path(_DEFAULT_LEDGER_REL).name
+        except Exception:  # noqa: BLE001
+            p = Path(_DEFAULT_LEDGER_REL)
     try:
         from backend.core.ouroboros.governance.workspace_resolver import resolve_durable_path
         return Path(resolve_durable_path(p))
@@ -377,6 +387,97 @@ def _append(record: ReconciliationRecord, path: Path) -> bool:
         return False
 
 
+def _append_unlocked(record: ReconciliationRecord, path: Path) -> bool:
+    """Append one JSONL row while the caller HOLDS the ledger flock."""
+    try:
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record.to_dict(), sort_keys=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        return True
+    except OSError:
+        logger.debug("[GoalReconciliation] append (locked) degraded", exc_info=True)
+        return False
+
+
+def _ledger_has_rows(path: Path) -> bool:
+    try:
+        return path.is_file() and any(l.strip() for l in path.read_text(encoding="utf-8", errors="replace").splitlines())
+    except OSError:
+        return False
+
+
+def append_linked(
+    build: "Callable[[str], ReconciliationRecord]", path: Path, secret: Optional[str],
+) -> Optional[ReconciliationRecord]:
+    """Read the verified chain head, build the record ON that head and append
+    it — all under the ledger's cross-process flock, so two concurrent
+    writers can never both link to the same head (the chain-break class
+    observed 2026-09-07). Fail-CLOSED: a non-empty ledger whose rows cannot
+    be verified (wrong/missing secret, corruption) is never appended to —
+    appending at genesis on top of it would break the chain for everyone.
+    NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.cross_process_jsonl import flock_critical_section
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with flock_critical_section(path) as acquired:
+            if not acquired:
+                logger.warning("[GoalReconciliation] ledger lock busy — event not recorded")
+                return None
+            existing = read_records(path, secret=secret)
+            if not existing and _ledger_has_rows(path):
+                logger.warning("[GoalReconciliation] ledger has rows but none verify (secret/corruption) — refusing to append; run repair_chain()")
+                return None
+            prev = existing[-1].record_hash if existing else _genesis()
+            rec = build(prev)
+            # The section already holds the ledger's flock; flock_append_line
+            # would try to take it again (nested acquisition times out).
+            return rec if _append_unlocked(rec, path) else None
+    except Exception:  # noqa: BLE001
+        logger.debug("[GoalReconciliation] append_linked degraded", exc_info=True)
+        return None
+
+
+def repair_chain(
+    path: Optional[Path] = None, *, secret: Optional[str] = None,
+    keep: "Optional[Callable[[Dict[str, Any]], bool]]" = None,
+) -> int:
+    """Operator repair: re-link every row (optionally filtered by ``keep``)
+    into a fresh chain from genesis and re-MAC with the roadmap secret,
+    atomically under the flock. Returns the number of rows kept. Payload
+    fields are preserved verbatim; only prev_hash/record_hash/mac change.
+    NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.cross_process_jsonl import flock_critical_section
+        target = path or ledger_path()
+        secret = secret if secret is not None else _roadmap_secret()
+        with flock_critical_section(target) as acquired:
+            if not acquired:
+                return 0
+            rows = [r for r in _read_lines(target) if keep is None or keep(r)]
+            out: List[ReconciliationRecord] = []
+            prev = _genesis()
+            for row in rows:
+                payload = {k: row.get(k) for k in _PAYLOAD_FIELDS}
+                payload["ts"] = float(payload.get("ts") or 0.0)
+                for k in _PAYLOAD_FIELDS:
+                    if k != "ts":
+                        payload[k] = str(payload.get(k) or "")
+                rec = ReconciliationRecord(
+                    prev_hash=prev, record_hash=_chain_hash(prev, payload), mac=_mac(payload, secret), **payload,
+                )
+                out.append(rec)
+                prev = rec.record_hash
+            tmp = target.with_suffix(target.suffix + ".tmp")
+            tmp.write_text("".join(json.dumps(r.to_dict(), sort_keys=True) + "\n" for r in out), encoding="utf-8")
+            os.replace(tmp, target)
+            logger.warning("[GoalReconciliation] chain repaired: %d row(s) re-linked at %s", len(out), target)
+            return len(out)
+    except Exception:  # noqa: BLE001
+        logger.debug("[GoalReconciliation] repair_chain degraded", exc_info=True)
+        return 0
+
+
 def _make_record(
     *, event: ReconciliationEvent, goal_id: str, goal_digest_hex: str,
     commit_sha: str, op_id: str, prev_hash: str, secret: Optional[str],
@@ -405,17 +506,18 @@ async def record_landing(
     try:
         target = path or ledger_path()
         secret = secret if secret is not None else _roadmap_secret()
-        existing = await asyncio.to_thread(read_records, target, secret=secret)
-        prev = existing[-1].record_hash if existing else _genesis()
-        rec = _make_record(
-            event=ReconciliationEvent.SATISFIED, goal_id=goal_id,
-            goal_digest_hex=goal_digest_hex, commit_sha=commit_sha, op_id=op_id,
-            prev_hash=prev, secret=secret,
+        rec = await asyncio.to_thread(
+            append_linked,
+            lambda prev: _make_record(
+                event=ReconciliationEvent.SATISFIED, goal_id=goal_id,
+                goal_digest_hex=goal_digest_hex, commit_sha=commit_sha, op_id=op_id,
+                prev_hash=prev, secret=secret,
+            ),
+            target, secret,
         )
-        ok = await asyncio.to_thread(_append, rec, target)
-        if ok:
+        if rec:
             logger.info("[GoalReconciliation] bound goal=%s -> %s (op=%s)", goal_id, commit_sha[:12], op_id[:12])
-        return rec if ok else None
+        return rec
     except Exception:  # noqa: BLE001
         logger.debug("[GoalReconciliation] record_landing degraded", exc_info=True)
         return None
@@ -430,14 +532,14 @@ async def _append_event(
     try:
         target = path or ledger_path()
         secret = secret if secret is not None else _roadmap_secret()
-        existing = await asyncio.to_thread(read_records, target, secret=secret)
-        prev = existing[-1].record_hash if existing else _genesis()
-        rec = _make_record(
-            event=event, goal_id=goal_id, goal_digest_hex=goal_digest_hex,
-            commit_sha="", op_id=op_id, prev_hash=prev, secret=secret,
+        return await asyncio.to_thread(
+            append_linked,
+            lambda prev: _make_record(
+                event=event, goal_id=goal_id, goal_digest_hex=goal_digest_hex,
+                commit_sha="", op_id=op_id, prev_hash=prev, secret=secret,
+            ),
+            target, secret,
         )
-        ok = await asyncio.to_thread(_append, rec, target)
-        return rec if ok else None
     except Exception:  # noqa: BLE001
         logger.debug("[GoalReconciliation] %s event degraded", event.value, exc_info=True)
         return None
@@ -600,23 +702,29 @@ async def reconcile_goal(
             # Bi-directional sync: the landed commit vanished (reset / amend /
             # branch rewind). Audit the transition, then fall through to the
             # trailer scan — an amend that KEPT the work re-binds to the new sha.
-            prev = recs[-1].record_hash if recs else _genesis()
-            rec = _make_record(
-                event=ReconciliationEvent.REACTIVATED, goal_id=goal_id, goal_digest_hex=digest,
-                commit_sha=latest.commit_sha, op_id="reconcile", prev_hash=prev, secret=secret,
+            rec = await asyncio.to_thread(
+                append_linked,
+                lambda prev: _make_record(
+                    event=ReconciliationEvent.REACTIVATED, goal_id=goal_id, goal_digest_hex=digest,
+                    commit_sha=latest.commit_sha, op_id="reconcile", prev_hash=prev, secret=secret,
+                ),
+                target, secret,
             )
-            if await asyncio.to_thread(_append, rec, target):
+            if rec:
                 recs.append(rec)
             logger.warning("[GoalReconciliation] goal=%s REACTIVATED — %s no longer reachable from %s", goal_id, latest.commit_sha[:12], landing_ref())
 
         sha = await find_landed_commit(goal_id, digest, tuple(getattr(goal, "target_files", ()) or ()), cwd=cwd)
         if sha:
-            prev = recs[-1].record_hash if recs else _genesis()
-            rec = _make_record(
-                event=ReconciliationEvent.SATISFIED, goal_id=goal_id, goal_digest_hex=digest,
-                commit_sha=sha, op_id="rebuilt-from-git", prev_hash=prev, secret=secret,
+            rec = await asyncio.to_thread(
+                append_linked,
+                lambda prev: _make_record(
+                    event=ReconciliationEvent.SATISFIED, goal_id=goal_id, goal_digest_hex=digest,
+                    commit_sha=sha, op_id="rebuilt-from-git", prev_hash=prev, secret=secret,
+                ),
+                target, secret,
             )
-            if await asyncio.to_thread(_append, rec, target):
+            if rec:
                 logger.info("[GoalReconciliation] goal=%s SATISFIED by trailer-bearing %s (rebuilt from git)", goal_id, sha[:12])
             return GoalReconciliation(goal_id, GoalState.SATISFIED, sha, True, "trailer-bearing commit reachable from landing ref")
         diag = "no binding" if latest is None else f"last event={latest.event}"
@@ -654,6 +762,20 @@ async def reconcile(
 # ---------------------------------------------------------------------------
 # Envelope binding (commit path helper)
 # ---------------------------------------------------------------------------
+
+def superseding_op(goal_id: str, op_id: str, *, path: Optional[Path] = None, secret: Optional[str] = None) -> str:
+    """When *goal_id* already has a LIVE op other than *op_id*, return that
+    op's id — the caller (fsm_resume re-injection) must not revive a second
+    op for the same goal (duplicates shed each other on STATE DRIFT).
+    ``""`` otherwise. NEVER raises."""
+    try:
+        if not enabled() or not goal_id:
+            return ""
+        live = in_flight_op(read_records(path or ledger_path(), secret=secret), goal_id)
+        return live if live and live != op_id else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
 
 def binding_from_evidence(evidence_json: str) -> Tuple[str, str]:
     """``(goal_id, goal_digest)`` from an op's ``intake_evidence_json`` —
