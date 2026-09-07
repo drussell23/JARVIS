@@ -437,6 +437,13 @@ def resolve_target_symbols(
 
     # ── Call-Graph Expansion: pull local siblings/helpers into the cluster ──
     cluster: List[_SymDef] = []
+    # A DECLARED symbol is the operator's contract — exactly that node. The
+    # call-graph expansion exists to widen a GUESS (a goal keyword, a trace
+    # frame); widening a declaration dispatched six sibling workers per goal
+    # that had nothing to change and burned five refine turns each returning
+    # "empty node" (2026-09-07). An explicit ``expand_cluster=True`` still wins.
+    if method == METHOD_DECLARED and expand_cluster is None:
+        do_cluster = False
     if do_cluster:
         max_cluster = _int_env(_MAX_CLUSTER_ENV, _DEFAULT_MAX_CLUSTER)
         seen = set(primary_names)

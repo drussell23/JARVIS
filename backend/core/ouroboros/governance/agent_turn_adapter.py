@@ -48,6 +48,7 @@ Env-driven; pure asyncio.
 from __future__ import annotations
 
 import ast
+import textwrap
 import logging
 import os
 import time
@@ -385,6 +386,30 @@ class ProductionAgentTurnFn:
                 for n in tree.body
             )
 
+        def _method_in_class(text: str) -> str:
+            """The target when the model answered in the shape it was SHOWN —
+            the method inside its class shell (the Radius of Relevance renders
+            a method that way). Every worker of the first huge-file goal did
+            exactly this and was read as an empty node (2026-09-07). The
+            method's own source segment is returned, dedented to column 0;
+            the stitch re-indents it to the chunk's original nesting."""
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                return ""
+            for cls in tree.body:
+                if not isinstance(cls, ast.ClassDef):
+                    continue
+                for member in cls.body:
+                    if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and member.name == want:
+                        seg = ast.get_source_segment(text, member)
+                        if not seg:
+                            lines = text.splitlines()
+                            lo = min((d.lineno for d in member.decorator_list), default=member.lineno)
+                            seg = "\n".join(lines[lo - 1: member.end_lineno])
+                        return textwrap.dedent(seg).strip()
+            return ""
+
         # 1) bare function source
         if _has_target(raw):
             return raw.strip()
@@ -392,6 +417,11 @@ class ProductionAgentTurnFn:
         for block in _iter_code_fences(raw):
             if _has_target(block):
                 return block.strip()
+        # 2b) the method inside its class shell — the shape the radius showed it
+        for text in (raw, *_iter_code_fences(raw)):
+            wrapped = _method_in_class(text)
+            if wrapped and _has_target(wrapped):
+                return wrapped
         # 3) full_content candidate → slice the node out
         fc = _extract_full_content(raw)
         if fc:

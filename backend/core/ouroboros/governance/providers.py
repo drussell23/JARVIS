@@ -687,6 +687,31 @@ def _note_diff_outcome(ctx, ok: bool) -> None:
         pass
 
 
+_SCHEMA_DECISION_SEEN: "set" = set()
+
+
+def _announce_schema_decision(ctx, *, force_full_content: bool, diff: bool) -> None:
+    """One WARNING per op stating which output schema the model was asked for
+    and why — the graduation evidence for the 2b.1-diff path in a headless
+    soak (INFO never reaches its log). Never raises."""
+    try:
+        op = str(getattr(ctx, "op_id", "") or "")
+        if not op or op in _SCHEMA_DECISION_SEEN:
+            return
+        _SCHEMA_DECISION_SEEN.add(op)
+        ri = getattr(getattr(ctx, "telemetry", None), "routing_intent", None)
+        logger.warning(
+            "[Schema] op=%s output=%s capability=%s served=%s brain=%s force_full=%s "
+            "targets=%d enabled=%s",
+            op[:16], "2b.1-diff" if diff else "full_content",
+            getattr(ri, "schema_capability", "?"), getattr(ri, "served_model", "") or "-",
+            getattr(ri, "brain_id", "") or "-", bool(force_full_content),
+            len(getattr(ctx, "target_files", ()) or ()), single_file_diff_schema_enabled(),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _ctx_schema_capability(ctx) -> str:
     """The brain's ``schema_capability`` off ``ctx.telemetry.routing_intent`` —
     the one field ``governed_loop_service`` stamps from the selected brain.
@@ -3808,6 +3833,7 @@ def _build_codegen_prompt(
     _single_file_task = single_file_diff_requested(
         ctx, force_full_content=force_full_content,
     )
+    _announce_schema_decision(ctx, force_full_content=force_full_content, diff=_single_file_task)
 
     # Read-only schema swap (Option α — Manifesto §7 Attention Mechanism
     # Supremacy). When ctx.is_read_only=True the code-gen schema is

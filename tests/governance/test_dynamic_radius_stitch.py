@@ -220,3 +220,44 @@ def test_the_soak_no_longer_pins_the_interceptor_off():
     soak = Path("/mnt/c/Users/Jarvis/AppData/Local/Temp/claude/C--Users-Jarvis-Desktop-TrinityAi/ebb29656-c1bb-499d-9a1a-7df2e9565afe/scratchpad/goal_soak.sh")
     if soak.is_file():
         assert "export JARVIS_FULL_CONTENT_INTERCEPT_ENABLED=false" not in soak.read_text(encoding="utf-8")
+
+
+
+# --------------------------------------------------------------------------
+# the worker's answer is accepted in the shape it was shown
+# --------------------------------------------------------------------------
+
+def _wrap_in_class(node: str, cls: str = "Engine") -> str:
+    return f"class {cls}:\n" + "\n".join(("    " + l) if l.strip() else l for l in node.splitlines())
+
+
+def test_a_method_returned_inside_its_class_is_extracted():
+    """Every worker of the first huge-file goal answered this way and was read
+    as an empty node; five refine turns each, all wasted."""
+    from backend.core.ouroboros.governance.agent_turn_adapter import ProductionAgentTurnFn
+    chunk = extract_target_chunk(BIG, "engine.py", "Engine.target")
+    target = ChunkTarget(symbol="Engine.target", chunk=chunk, instruction="x")
+    fn = ProductionAgentTurnFn(client=None, tool_backend=None)
+    node = "def target(self, a, b):\n    return a + b\n"
+    for raw in (_wrap_in_class(node), "```python\n" + _wrap_in_class(node) + "\n```",
+                "Here is the fix:\n```python\n" + _wrap_in_class(node, "Other") + "\n```\nDone."):
+        got = fn._extract_node(raw, target)
+        assert got.startswith("def target(self, a, b):"), raw
+        assert "class " not in got
+    assert fn._extract_node(_wrap_in_class("def other(self):\n    return 1\n"), target) == "", "a different method is not the target"
+
+
+def test_an_extracted_class_wrapped_method_stitches_back_correctly():
+    from backend.core.ouroboros.governance.agent_turn_adapter import ProductionAgentTurnFn
+    from backend.core.ouroboros.governance.chunked_generation import stitch_replacement
+    chunk = extract_target_chunk(BIG, "engine.py", "Engine.target")
+    target = ChunkTarget(symbol="Engine.target", chunk=chunk, instruction="x")
+    fn = ProductionAgentTurnFn(client=None, tool_backend=None)
+    node = fn._extract_node(_wrap_in_class("def target(self, a, b):\n    return a - b\n"), target)
+    stitched = stitch_replacement(BIG, chunk, node)
+    assert stitched is not None
+    import ast as _ast
+    tree = _ast.parse(stitched)
+    eng = next(n for n in tree.body if isinstance(n, _ast.ClassDef) and n.name == "Engine")
+    names = [m.name for m in eng.body if isinstance(m, _ast.FunctionDef)]
+    assert names == ["other", "target"] and "return a - b" in stitched and "filler_39" in stitched
