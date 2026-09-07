@@ -3418,13 +3418,22 @@ def _declared_symbols_for(context: Any, file_path: str) -> Tuple[str, ...]:
     simply absent, and absence degrades to inference.
     """
     try:
-        claim = None
         evidence = getattr(context, "evidence", None)
-        if isinstance(evidence, Mapping):
-            claim = evidence.get("provenance")
-        if not isinstance(claim, Mapping):
+        if not isinstance(evidence, Mapping):
             return ()
-        goal_id = str(claim.get("goal_id", "")).strip()
+        # The pointer: a delegated-provenance CLAIM when one exists, else the
+        # roadmap intake's own ``goal_id`` (roadmap_reader stamps it on every
+        # goal envelope; delegated provenance is a separate, optional feature
+        # and was the ONLY pointer honoured until 2026-09-07 — so a signed
+        # goal's declared symbol never reached the resolver and the swarm
+        # dispatched a worker per inferred sibling). Either way the value is
+        # only a POINTER: what it names is re-read from the signed roadmap.
+        claim = evidence.get("provenance")
+        goal_id = ""
+        if isinstance(claim, Mapping):
+            goal_id = str(claim.get("goal_id", "") or "").strip()
+        if not goal_id:
+            goal_id = str(evidence.get("goal_id", "") or "").strip()
         if not goal_id:
             return ()
 

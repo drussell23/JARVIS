@@ -108,6 +108,11 @@ class _StubGLS:
         GovernedLoopService, "has_background_capacity", lambda self: True
     )
 
+    async def _admit_routing(self, ctx, trigger_source: str = "unknown"):
+        # Routing admission is exercised in test_background_submit_admission;
+        # this stub isolates the capacity boundary, so admission is identity.
+        return ctx
+
     def __init__(self, pool: _GatedPool) -> None:
         self._bg_pool = pool
         self.sync_fallback_calls = 0

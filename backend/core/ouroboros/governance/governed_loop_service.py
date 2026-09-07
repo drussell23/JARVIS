@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple, Union
 
 from backend.core.ouroboros.governance.approval_provider import CLIApprovalProvider  # noqa: F401  (kept for back-compat reference; factory selects)
 from backend.core.ouroboros.governance.inline_approval_provider import (
@@ -3536,6 +3536,15 @@ class GovernedLoopService:
             from backend.core.ouroboros.governance.background_agent_pool import (
                 QueueFullError,
             )
+            # The pool's worker runs the orchestrator directly, so the op must
+            # be ADMITTED here — the same routing admission submit() performs
+            # (brain, served-capability telemetry, frozen tier, instructions).
+            # A refusal is terminal and already narrated; hand back its id.
+            _raw_ctx = ctx
+            _admitted = await self._admit_routing(ctx, trigger_source)
+            if isinstance(_admitted, OperationResult):
+                return _admitted.op_id
+            ctx = _admitted
             try:
                 op_id = await self._bg_pool.submit(ctx)
                 logger.info(
@@ -3569,6 +3578,7 @@ class GovernedLoopService:
                     "[GovernedLoop] Background submit failed (non-capacity), "
                     "falling back to sync: %s", exc
                 )
+                ctx = _raw_ctx  # submit() admits exactly once, from the raw ctx
         # Fallback: run synchronously (no pool, or a non-capacity pool fault).
         result = await self.submit(ctx, trigger_source)
         return result.op_id
@@ -3722,6 +3732,204 @@ class GovernedLoopService:
             self._active_file_ops.add(_c)
         return _canonicals, None
 
+    async def _admit_routing(
+        self,
+        ctx: OperationContext,
+        trigger_source: str = "unknown",
+    ) -> "Union[OperationContext, OperationResult]":
+        """Routing admission — the ONE place an op is bound to the brain that
+        will answer it and stamped with what every downstream phase reads off
+        the context: ``TelemetryContext`` (host telemetry + ``RoutingIntent``
+        incl. the served model's ``schema_capability``), the frozen autonomy
+        tier, L4 strategic memory and the OUROBOROS.md instruction block.
+
+        Shared by BOTH entry points. ``submit()`` ran this inline while
+        ``submit_background()`` handed the RAW context to the pool, whose
+        worker calls ``orchestrator.run`` directly — so every background op
+        (all roadmap goals in a soak) reached the prompt builder with
+        ``ctx.telemetry is None``: no brain, no served capability, the
+        2b.1-diff schema structurally unreachable (``[Schema] capability=?``,
+        2026-09-07), GATE on the default tier, prompts without the
+        operator's instructions. One admission, two dispatch strategies.
+
+        Returns the admitted context, or an ``OperationResult`` when the
+        admission REFUSED the op (brain not in the admitted set, cost gate
+        queued) — terminal events already emitted; the caller returns it.
+        """
+        # Stamp TelemetryContext exactly once at intake
+        snap = await self._stack.resource_monitor.snapshot()
+        now_ns = time.monotonic_ns()
+        host_tel = HostTelemetry(
+            schema_version="1.0",
+            arch=snap.platform_arch,
+            cpu_percent=snap.cpu_percent,           # already quantized
+            ram_available_gb=snap.ram_available_gb, # already quantized
+            pressure=snap.pressure_for_load(len(self._active_ops)).name,
+            sampled_at_utc=datetime.now(tz=timezone.utc).isoformat(),
+            sampled_monotonic_ns=snap.sampled_monotonic_ns,
+            collector_status=snap.collector_status,
+            sample_age_ms=(now_ns - snap.sampled_monotonic_ns) // 1_000_000,
+        )
+        # Phase 4: 3-layer brain selection gate (task → resource → cost)
+        brain = await self._brain_selector.select(
+            description=ctx.description,
+            target_files=ctx.target_files,
+            snapshot=snap,
+            blast_radius=len(ctx.target_files),
+        )
+        logger.info(
+            "[GovernedLoop] Brain selected: %s (%s) reason=%s complexity=%s spend=$%.4f",
+            brain.brain_id, brain.model_name, brain.routing_reason,
+            brain.task_complexity, self._brain_selector.daily_spend,
+        )
+
+        # Phase 4: ActiveBrainSet gate — reject brains not admitted by supervisor
+        if self._active_brain_set and brain.brain_id not in self._active_brain_set:
+            logger.warning(
+                "[GovernedLoop] Brain %r not in admitted set %s — rejecting op %s",
+                brain.brain_id, sorted(self._active_brain_set), ctx.op_id,
+            )
+            result = OperationResult(
+                op_id=ctx.op_id,
+                terminal_phase=OperationPhase.CANCELLED,
+                reason_code="brain_not_admitted",
+                trigger_source=trigger_source,
+                terminal_class="DEGRADED",
+            )
+            await self._emit_terminal_events(
+                ctx=ctx,
+                result=result,
+                brain_id=brain.brain_id,
+                model_name=brain.model_name,
+            )
+            return result
+
+        # Phase 4: create per-op FSM context (starts in RUNNING)
+        _fsm_ctx = LoopRuntimeContext(op_id=ctx.op_id)
+        self._fsm_contexts[ctx.op_id] = _fsm_ctx
+        self._fsm_checkpoint_seq[ctx.op_id] = 0
+
+        # Emit routing narration via CommProtocol
+        try:
+            await self._stack.comm.emit_heartbeat(
+                op_id=ctx.op_id,
+                phase="brain_routing",
+                progress_pct=3.0,
+            )
+            # Narrate to voice — uses VoiceNarrator transport if active
+            narration = brain.narration()
+            await self._stack.comm.emit_intent(
+                op_id=ctx.op_id,
+                goal=narration,
+                target_files=list(ctx.target_files),
+                risk_tier="routing",
+                blast_radius=len(ctx.target_files),
+            )
+        except Exception:
+            pass  # narration is best-effort
+
+        # Short-circuit: cost gate queued heavy task
+        if brain.provider_tier == "queued":
+            logger.warning(
+                "[GovernedLoop] Cost gate queued op %s (daily_spend=$%.4f)",
+                ctx.op_id, self._brain_selector.daily_spend,
+            )
+            result = OperationResult(
+                op_id=ctx.op_id,
+                terminal_phase=OperationPhase.CANCELLED,
+                reason_code="cost_gate_triggered_queue",
+                trigger_source=trigger_source,
+                routing_reason=brain.routing_reason,
+                terminal_class="DEGRADED",
+            )
+            await self._emit_terminal_events(
+                ctx=ctx,
+                result=result,
+                brain_id=brain.brain_id,
+                model_name=brain.model_name,
+            )
+            return result
+
+        # The capability that decides 2b.1-diff vs full_content belongs to the
+        # model that will ANSWER. On the local lane every slot is served by
+        # one physical model, so the slot's declaration is corrected by the
+        # served model's (policy + evidence) before it is stamped.
+        _served_model, _served_cap = await _resolve_served_capability(self, brain)
+        intent_tel = RoutingIntentTelemetry(
+            # Phase 1 P0: use brain-derived fields, NOT local Mac pressure.
+            # expected_provider and policy_reason now reflect the actual brain
+            # selection outcome (host-binding invariant).
+            expected_provider=_expected_provider_from_brain(brain),
+            policy_reason=_policy_reason_from_brain(brain),
+            brain_id=brain.brain_id,
+            brain_model=brain.model_name,
+            routing_reason=brain.routing_reason,
+            task_complexity=brain.task_complexity,
+            estimated_prompt_tokens=brain.estimated_prompt_tokens,
+            daily_spend_usd=self._brain_selector.daily_spend,
+            schema_capability=_served_cap,
+            served_model=_served_model,
+        )
+        tc = TelemetryContext(local_node=host_tel, routing_intent=intent_tel)
+        ctx = ctx.with_telemetry(tc)
+
+        # Freeze autonomy tier at submit time — GATE reads ctx.frozen_autonomy_tier
+        # not live TrustGraduator (prevents promotion races under concurrent ops).
+        _canary_slice = _infer_canary_slice(ctx.target_files)
+        _frozen_tier = "governed"  # default: backward compat
+        if self._trust_graduator is not None:
+            _tier_cfg = self._trust_graduator.get_config(
+                trigger_source=trigger_source,
+                repo=ctx.primary_repo,
+                canary_slice=_canary_slice,
+            )
+            if _tier_cfg is not None:
+                _frozen_tier = _tier_cfg.current_tier.value.lower()
+        ctx = ctx.with_frozen_autonomy_tier(_frozen_tier)
+
+        if self._advanced_autonomy is not None:
+            try:
+                memory_ctx = self._advanced_autonomy.build_strategic_memory_context(
+                    goal=ctx.description,
+                    target_files=ctx.target_files,
+                )
+                active_intent = self._advanced_autonomy.remember_user_intent(
+                    op_id=ctx.op_id,
+                    description=ctx.description,
+                    target_files=ctx.target_files,
+                    repo_scope=ctx.repo_scope,
+                )
+                ctx = ctx.with_strategic_memory_context(
+                    strategic_intent_id=active_intent.intent_id,
+                    strategic_memory_fact_ids=memory_ctx.fact_ids,
+                    strategic_memory_prompt=memory_ctx.prompt_block,
+                    strategic_memory_digest=memory_ctx.context_digest,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[GovernedLoop] L4 strategic memory unavailable for op=%s: %s",
+                    ctx.op_id,
+                    exc,
+                )
+
+        # ── OUROBOROS.md human instruction injection ─────────────────────────
+        # Load 3-tier instruction hierarchy and stamp onto ctx before pipeline.
+        # Providers prepend this block to every generation prompt.
+        try:
+            from backend.core.ouroboros.governance.context_memory_loader import (
+                ContextMemoryLoader,
+            )
+            _instructions = ContextMemoryLoader(
+                project_root=self._config.project_root,
+            ).load()
+            if _instructions:
+                ctx = ctx.with_human_instructions(_instructions)
+        except Exception as _cml_exc:
+            logger.debug(
+                "[GovernedLoop] ContextMemoryLoader error (non-fatal): %s", _cml_exc
+            )
+        return ctx
+
     async def submit(
         self,
         ctx: OperationContext,
@@ -3872,178 +4080,12 @@ class GovernedLoopService:
                 datetime.now(tz=timezone.utc) + timedelta(seconds=self._config.pipeline_timeout_s)
             )
 
-            # Stamp TelemetryContext exactly once at intake
-            snap = await self._stack.resource_monitor.snapshot()
-            now_ns = time.monotonic_ns()
-            host_tel = HostTelemetry(
-                schema_version="1.0",
-                arch=snap.platform_arch,
-                cpu_percent=snap.cpu_percent,           # already quantized
-                ram_available_gb=snap.ram_available_gb, # already quantized
-                pressure=snap.pressure_for_load(len(self._active_ops)).name,
-                sampled_at_utc=datetime.now(tz=timezone.utc).isoformat(),
-                sampled_monotonic_ns=snap.sampled_monotonic_ns,
-                collector_status=snap.collector_status,
-                sample_age_ms=(now_ns - snap.sampled_monotonic_ns) // 1_000_000,
-            )
-            # Phase 4: 3-layer brain selection gate (task → resource → cost)
-            brain = await self._brain_selector.select(
-                description=ctx.description,
-                target_files=ctx.target_files,
-                snapshot=snap,
-                blast_radius=len(ctx.target_files),
-            )
-            logger.info(
-                "[GovernedLoop] Brain selected: %s (%s) reason=%s complexity=%s spend=$%.4f",
-                brain.brain_id, brain.model_name, brain.routing_reason,
-                brain.task_complexity, self._brain_selector.daily_spend,
-            )
-
-            # Phase 4: ActiveBrainSet gate — reject brains not admitted by supervisor
-            if self._active_brain_set and brain.brain_id not in self._active_brain_set:
-                logger.warning(
-                    "[GovernedLoop] Brain %r not in admitted set %s — rejecting op %s",
-                    brain.brain_id, sorted(self._active_brain_set), ctx.op_id,
-                )
-                result = OperationResult(
-                    op_id=ctx.op_id,
-                    terminal_phase=OperationPhase.CANCELLED,
-                    reason_code="brain_not_admitted",
-                    trigger_source=trigger_source,
-                    terminal_class="DEGRADED",
-                )
-                await self._emit_terminal_events(
-                    ctx=ctx,
-                    result=result,
-                    brain_id=brain.brain_id,
-                    model_name=brain.model_name,
-                )
-                return result
-
-            # Phase 4: create per-op FSM context (starts in RUNNING)
-            _fsm_ctx = LoopRuntimeContext(op_id=ctx.op_id)
-            self._fsm_contexts[ctx.op_id] = _fsm_ctx
-            self._fsm_checkpoint_seq[ctx.op_id] = 0
-
-            # Emit routing narration via CommProtocol
-            try:
-                await self._stack.comm.emit_heartbeat(
-                    op_id=ctx.op_id,
-                    phase="brain_routing",
-                    progress_pct=3.0,
-                )
-                # Narrate to voice — uses VoiceNarrator transport if active
-                narration = brain.narration()
-                await self._stack.comm.emit_intent(
-                    op_id=ctx.op_id,
-                    goal=narration,
-                    target_files=list(ctx.target_files),
-                    risk_tier="routing",
-                    blast_radius=len(ctx.target_files),
-                )
-            except Exception:
-                pass  # narration is best-effort
-
-            # Short-circuit: cost gate queued heavy task
-            if brain.provider_tier == "queued":
-                logger.warning(
-                    "[GovernedLoop] Cost gate queued op %s (daily_spend=$%.4f)",
-                    ctx.op_id, self._brain_selector.daily_spend,
-                )
-                result = OperationResult(
-                    op_id=ctx.op_id,
-                    terminal_phase=OperationPhase.CANCELLED,
-                    reason_code="cost_gate_triggered_queue",
-                    trigger_source=trigger_source,
-                    routing_reason=brain.routing_reason,
-                    terminal_class="DEGRADED",
-                )
-                await self._emit_terminal_events(
-                    ctx=ctx,
-                    result=result,
-                    brain_id=brain.brain_id,
-                    model_name=brain.model_name,
-                )
-                return result
-
-            # The capability that decides 2b.1-diff vs full_content belongs to the
-            # model that will ANSWER. On the local lane every slot is served by
-            # one physical model, so the slot's declaration is corrected by the
-            # served model's (policy + evidence) before it is stamped.
-            _served_model, _served_cap = await _resolve_served_capability(self, brain)
-            intent_tel = RoutingIntentTelemetry(
-                # Phase 1 P0: use brain-derived fields, NOT local Mac pressure.
-                # expected_provider and policy_reason now reflect the actual brain
-                # selection outcome (host-binding invariant).
-                expected_provider=_expected_provider_from_brain(brain),
-                policy_reason=_policy_reason_from_brain(brain),
-                brain_id=brain.brain_id,
-                brain_model=brain.model_name,
-                routing_reason=brain.routing_reason,
-                task_complexity=brain.task_complexity,
-                estimated_prompt_tokens=brain.estimated_prompt_tokens,
-                daily_spend_usd=self._brain_selector.daily_spend,
-                schema_capability=_served_cap,
-                served_model=_served_model,
-            )
-            tc = TelemetryContext(local_node=host_tel, routing_intent=intent_tel)
-            ctx = ctx.with_telemetry(tc)
-
-            # Freeze autonomy tier at submit time — GATE reads ctx.frozen_autonomy_tier
-            # not live TrustGraduator (prevents promotion races under concurrent ops).
-            _canary_slice = _infer_canary_slice(ctx.target_files)
-            _frozen_tier = "governed"  # default: backward compat
-            if self._trust_graduator is not None:
-                _tier_cfg = self._trust_graduator.get_config(
-                    trigger_source=trigger_source,
-                    repo=ctx.primary_repo,
-                    canary_slice=_canary_slice,
-                )
-                if _tier_cfg is not None:
-                    _frozen_tier = _tier_cfg.current_tier.value.lower()
-            ctx = ctx.with_frozen_autonomy_tier(_frozen_tier)
-
-            if self._advanced_autonomy is not None:
-                try:
-                    memory_ctx = self._advanced_autonomy.build_strategic_memory_context(
-                        goal=ctx.description,
-                        target_files=ctx.target_files,
-                    )
-                    active_intent = self._advanced_autonomy.remember_user_intent(
-                        op_id=ctx.op_id,
-                        description=ctx.description,
-                        target_files=ctx.target_files,
-                        repo_scope=ctx.repo_scope,
-                    )
-                    ctx = ctx.with_strategic_memory_context(
-                        strategic_intent_id=active_intent.intent_id,
-                        strategic_memory_fact_ids=memory_ctx.fact_ids,
-                        strategic_memory_prompt=memory_ctx.prompt_block,
-                        strategic_memory_digest=memory_ctx.context_digest,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "[GovernedLoop] L4 strategic memory unavailable for op=%s: %s",
-                        ctx.op_id,
-                        exc,
-                    )
-
-            # ── OUROBOROS.md human instruction injection ─────────────────────────
-            # Load 3-tier instruction hierarchy and stamp onto ctx before pipeline.
-            # Providers prepend this block to every generation prompt.
-            try:
-                from backend.core.ouroboros.governance.context_memory_loader import (
-                    ContextMemoryLoader,
-                )
-                _instructions = ContextMemoryLoader(
-                    project_root=self._config.project_root,
-                ).load()
-                if _instructions:
-                    ctx = ctx.with_human_instructions(_instructions)
-            except Exception as _cml_exc:
-                logger.debug(
-                    "[GovernedLoop] ContextMemoryLoader error (non-fatal): %s", _cml_exc
-                )
+            # Routing admission (brain, telemetry, tier, memory, instructions) —
+            # ONE method shared with submit_background(); see _admit_routing.
+            _admitted = await self._admit_routing(ctx, trigger_source)
+            if isinstance(_admitted, OperationResult):
+                return _admitted
+            ctx = _admitted
 
             # ── Semantic Triage (DW 35B pre-analysis) ────────────────────────
             # Cheap LLM-powered pre-scan: detects no-ops, redirects, and enriches
