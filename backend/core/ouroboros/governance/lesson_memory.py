@@ -186,6 +186,7 @@ _MITIGATIONS: Dict[str, str] = {
     "timeout": "Keep tests fast and free of network/subprocess/sleep; the sandbox budget is bounded.",
     "assertion_failure": "Assert only on documented behaviour you can derive from the signatures, docstrings and formulas provided.",
     "exception": "Read the previous failure evidence carefully before retrying; do not repeat the same construction.",
+    "ambient_red": "These tests fail in this environment WITHOUT your change and are excluded from the verdict — do not chase them; make your NEW tests pass and leave the existing ones untouched.",
 }
 
 
@@ -262,6 +263,7 @@ def _overlap(a: frozenset, b: frozenset) -> float:
 def build_lesson_record(
     *, op_id: str, target_files: Sequence[str], phase: str, failure_class: str,
     error_text: str, summary: str = "", now_ts: Optional[float] = None,
+    error_class: str = "",
 ) -> Optional[Any]:
     """A :class:`FailureModeRecord` carrying the structured lesson. ``None``
     when the arc is unavailable. NEVER raises."""
@@ -269,7 +271,7 @@ def build_lesson_record(
         from backend.core.ouroboros.governance import failure_mode_memory as fmm
         files = tuple(str(f) for f in target_files if f)
         situation = fmm.classify_situation_from_ctx(target_files=files)
-        error_class = classify_error((error_text or "") + "\n" + (summary or ""))
+        error_class = (error_class or "").strip() or classify_error((error_text or "") + "\n" + (summary or ""))
         kind = fmm._classify_failure_mode(root_cause=error_text or summary or "")
         mitigation = _MITIGATIONS.get(error_class, _MITIGATIONS["exception"])
         if kind is not fmm.FailureModeKind.OTHER:
@@ -314,14 +316,16 @@ def record_lesson_sync(record: Any) -> str:
 
 async def record_lesson(
     *, op_id: str, target_files: Sequence[str], phase: str, failure_class: str,
-    error_text: str, summary: str = "",
+    error_text: str, summary: str = "", error_class: str = "",
 ) -> str:
-    """Async, bounded, fail-soft recording seam for the orchestrator."""
+    """Async, bounded, fail-soft recording seam for the orchestrator.
+    ``error_class`` overrides the regex taxonomy when the caller KNOWS the
+    class (the differential gate's ``ambient_red``)."""
     if not enabled():
         return "disabled"
     rec = build_lesson_record(
         op_id=op_id, target_files=target_files, phase=phase, failure_class=failure_class,
-        error_text=error_text, summary=summary,
+        error_text=error_text, summary=summary, error_class=error_class,
     )
     if rec is None:
         return "unavailable"

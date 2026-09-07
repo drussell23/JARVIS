@@ -14522,6 +14522,55 @@ class GovernedOrchestrator:
                     else:
                         _troot = _tree.sandbox_root
                         _tree_changed: list = []
+                        _tree_runner = LanguageRouter(
+                            repo_root=_troot,
+                            adapters={
+                                # map_root: the sandbox is a COPY of the
+                                # working tree at a fresh /tmp path, so
+                                # its test index is identical to the
+                                # base's.
+                                "python": PythonAdapter(
+                                    repo_root=_troot,
+                                    map_root=_ae_effective_repo_root,
+                                ),
+                                "cpp": CppAdapter(repo_root=_troot),
+                            },
+                        )
+                        # Differential gate: which target tests are ALREADY
+                        # red in this tree + env before the candidate lands.
+                        # Failures entirely within that set are ambient —
+                        # the environment's, not the candidate's.
+                        _dv_baseline: frozenset = frozenset()
+                        try:
+                            from backend.core.ouroboros.governance.differential_validation import (
+                                baseline_budget_s as _dv_budget,
+                                baseline_failed_tests as _dv_baseline_fn,
+                                differential_enabled as _dv_enabled,
+                                existing_runnable_targets as _dv_targets,
+                            )
+                            if _dv_enabled():
+                                _dv_files = _dv_targets(_all_files, _troot, _RUNNABLE_EXTENSIONS)
+                                if _dv_files:
+                                    _dv_baseline = await _dv_baseline_fn(
+                                        _tree_runner, _dv_files, sandbox_dir=_troot,
+                                        budget_s=_dv_budget(
+                                            remaining_s - (time.monotonic() - _v_t0)
+                                        ),
+                                        op_id=ctx.op_id,
+                                        original_paths={
+                                            p: _ae_effective_repo_root / p.relative_to(_troot)
+                                            for p in _dv_files
+                                        },
+                                    )
+                                    if _dv_baseline:
+                                        logger.warning(
+                                            "[Validation] differential baseline: %d target test(s) "
+                                            "already red before the candidate op=%s: %s",
+                                            len(_dv_baseline), ctx.op_id[:12],
+                                            ", ".join(sorted(_dv_baseline))[:400],
+                                        )
+                        except Exception:  # noqa: BLE001 — baseline is additive; nothing ignored on fault
+                            logger.debug("[Validation] differential baseline skipped", exc_info=True)
                         for _fp, _fc in _all_files:
                             _rel = Path(_fp)
                             if _rel.is_absolute():
@@ -14617,6 +14666,41 @@ class GovernedOrchestrator:
                                     ctx.op_id[:12], len(_tree_changed),
                                     getattr(multi, "passed", None),
                                 )
+                                if _dv_baseline and not getattr(multi, "passed", False):
+                                    try:
+                                        from backend.core.ouroboros.governance.differential_validation import (
+                                            AMBIENT_ERROR_CLASS as _dv_class,
+                                            apply_differential as _dv_apply,
+                                        )
+                                        multi, _dv_ignored = _dv_apply(multi, _dv_baseline)
+                                        if _dv_ignored:
+                                            logger.warning(
+                                                "[Validation] differential gate: %d ambient-red "
+                                                "test(s) excluded from the verdict op=%s "
+                                                "passed_now=%s: %s",
+                                                len(_dv_ignored), ctx.op_id[:12],
+                                                getattr(multi, "passed", None),
+                                                ", ".join(_dv_ignored)[:400],
+                                            )
+                                            try:
+                                                from backend.core.ouroboros.governance.lesson_memory import (
+                                                    record_lesson as _record_env_lesson,
+                                                )
+                                                await _record_env_lesson(
+                                                    op_id=str(ctx.op_id),
+                                                    target_files=tuple(ctx.target_files),
+                                                    phase="VALIDATE", failure_class="test",
+                                                    error_text=(
+                                                        "ambient red: these tests fail in this "
+                                                        "environment WITHOUT any change — excluded "
+                                                        "from the verdict: " + ", ".join(_dv_ignored)
+                                                    ),
+                                                    error_class=_dv_class,
+                                                )
+                                            except Exception:  # noqa: BLE001
+                                                logger.debug("[Validation] ambient lesson skipped", exc_info=True)
+                                    except Exception:  # noqa: BLE001 — gate is additive
+                                        logger.debug("[Validation] differential gate skipped", exc_info=True)
                             except BlockedPathError as exc:
                                 return _map_tree_run_exception(exc, t0)
                             except Exception as exc:
