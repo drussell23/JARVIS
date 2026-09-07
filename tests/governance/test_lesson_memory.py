@@ -229,3 +229,85 @@ def test_fsm_resume_envelope_carries_goal_binding():
     assert json.loads(ev["intake_evidence_json"])["goal_id"] == "g-1"
     plain = _resume_envelope_kwargs({"op_id": "op-y", "intake_evidence_json": "not json"})
     assert "goal_id" not in plain["evidence"]
+
+
+# -- confidence scorer ------------------------------------------------------
+
+def _sig():
+    return fmm.read_failure_mode_history()[0].signature_hash
+
+
+def test_note_injections_escalates_after_n_and_clamps(monkeypatch):
+    monkeypatch.setenv(LM._ENV_ESCALATE_AFTER, "2")
+    monkeypatch.setenv(LM._ENV_MAX_SEVERITY, "2")
+    _record()
+    sig = _sig()
+    sevs = [ _run(LM.note_injections("op-i", [sig])).get(sig) for _ in range(6) ]
+    assert sevs == [0, 1, 1, 2, 2, 2]          # rises every 2 unresolved injections, clamps at 2
+    rec = fmm.read_failure_mode_history()[0]
+    assert rec.injections == 6 and rec.severity == 2 and rec.resolutions == 0
+
+
+def test_reinforce_after_validate_pass_boosts_and_decays(monkeypatch):
+    monkeypatch.setenv(LM._ENV_ESCALATE_AFTER, "1")
+    monkeypatch.setenv(LM._ENV_BOOST, "3")
+    _record()
+    ctx = Ctx(op_id="op-p")
+    out = _run(LM.inject_lessons(ctx))          # injection #1 -> severity 1
+    assert LM.injected_signatures("op-p") == (_sig(),)
+    before = fmm.read_failure_mode_history()[0]
+    assert before.severity == 1 and before.injections == 1
+    assert _run(LM.reinforce_validation_pass("op-p")) == 1
+    after = fmm.read_failure_mode_history()[0]
+    assert after.weight == before.weight + 3 and after.resolutions == 1
+    assert after.unresolved_streak == 0 and after.severity == 0
+    assert LM.injected_signatures("op-p") == ()  # registry entry consumed
+    assert _run(LM.reinforce_validation_pass("op-unknown")) == 0
+
+
+def test_hard_constraint_is_derived_from_evidence_and_ordered_first(monkeypatch):
+    from dataclasses import replace as _replace
+    _record(error="AssertionError: assert ['Hello! It s...'] == ['Fix applied. Tests green.']", summary="test_dw")
+    _record(files=("tests/test_model_physics.py",), error="TypeError: f() takes 1 positional argument but 2 were given", summary="test_kv")
+    recs = fmm.read_failure_mode_history()
+    dw = [r for r in recs if "Fix applied" in r.lesson][0]
+    assert fmm.update_failure_mode(dw.signature_hash[:16], lambda r: _replace(r, severity=2, injections=4))
+    hits = _run(LM.retrieve_lessons(("tests/governance/test_model_physics.py",)))
+    block = LM.compose_lessons_block(hits)
+    first = block.split("\n- ", 1)[1]
+    assert first.startswith("⛔ HARD CONSTRAINT [expected_value_mismatch]")
+    assert "NEVER assert `== ['Fix applied. Tests green.']`" in first
+    assert "observed was `['Hello! It s...']`" in first and "REJECTED" in first
+    assert block.index("HARD CONSTRAINT") < block.index("takes 1 positional")
+
+
+def test_severity_render_clamps_entry_and_budget(monkeypatch):
+    from dataclasses import replace as _replace
+    monkeypatch.setenv(LM._ENV_ENTRY_CHARS, "160")
+    _record(error="AssertionError: assert ['x' * 10] == ['y' * 10]", summary="t")
+    _record(files=("tests/test_model_physics.py",), error="TypeError: g() takes 1 positional argument but 3 were given", summary="t2")
+    hits = _run(LM.retrieve_lessons(("tests/governance/test_model_physics.py",)))
+    hard = [h for h in hits if "'x'" in h.record.lesson][0]
+    fmm.update_failure_mode(hard.record.signature_hash, lambda r: _replace(r, severity=9))
+    hits = _run(LM.retrieve_lessons(("tests/governance/test_model_physics.py",)))
+    entries = [l for l in LM.compose_lessons_block(hits).split("\n- ")[1:]]
+    assert all(len(e) <= 160 for e in entries)
+    assert entries[0].startswith("⛔")                      # severity 9 clamps to max_severity, still hard
+    tight = LM.compose_lessons_block(hits, budget=len(LM.SECTION_HEADER) + 320)
+    assert tight == "" or (tight.count("\n- ") == 1 and "⛔" in tight)  # the constraint survives the clamp
+
+
+def test_update_failure_mode_prefix_and_missing():
+    from dataclasses import replace as _replace
+    _record()
+    sig = _sig()
+    assert fmm.update_failure_mode(sig[:12], lambda r: _replace(r, severity=1))
+    assert fmm.read_failure_mode_history()[0].severity == 1
+    assert fmm.update_failure_mode("0" * 40, lambda r: r) is False
+    assert fmm.update_failure_mode("short", lambda r: r) is False
+
+
+def test_pass_reinforcement_is_wired_into_validation_seam():
+    import inspect
+    from backend.core.ouroboros.governance import orchestrator as orch
+    assert "reinforce_validation_pass" in inspect.getsource(orch.GovernedOrchestrator._run_validation)

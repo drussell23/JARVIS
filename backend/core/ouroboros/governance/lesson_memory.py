@@ -65,6 +65,11 @@ _ENV_MIN_WEIGHT = "JARVIS_LESSON_MEMORY_MIN_WEIGHT"
 _ENV_HALFLIFE = "JARVIS_LESSON_MEMORY_HALFLIFE_DAYS"
 _ENV_EVIDENCE = "JARVIS_LESSON_MEMORY_EVIDENCE_CHARS"
 _ENV_SITUATION_REL = "JARVIS_LESSON_MEMORY_SITUATION_RELEVANCE"
+_ENV_BOOST = "JARVIS_LESSON_MEMORY_BOOST"
+_ENV_ESCALATE_AFTER = "JARVIS_LESSON_MEMORY_ESCALATE_AFTER"
+_ENV_MAX_SEVERITY = "JARVIS_LESSON_MEMORY_MAX_SEVERITY"
+_ENV_ENTRY_CHARS = "JARVIS_LESSON_MEMORY_ENTRY_CHARS"
+_ENV_REGISTRY_MAX = "JARVIS_LESSON_MEMORY_REGISTRY_MAX"
 
 SECTION_HEADER = "## LESSONS LEARNED (cross-op memory — do not repeat these failures)"
 INDEX_FILENAME = "LESSONS.md"
@@ -118,6 +123,31 @@ def evidence_chars() -> int:
 def situation_relevance() -> float:
     v = _float(_ENV_SITUATION_REL, 0.4)
     return min(1.0, v)
+
+
+def boost() -> int:
+    """Weight added to a lesson when an injection is followed by a pass."""
+    return _int(_ENV_BOOST, 2, 1)
+
+
+def escalate_after() -> int:
+    """Consecutive unresolved injections before the severity modifier
+    rises one level."""
+    return _int(_ENV_ESCALATE_AFTER, 2, 1)
+
+
+def max_severity() -> int:
+    """Hard clamp on the severity modifier (prompt-starvation guard)."""
+    return _int(_ENV_MAX_SEVERITY, 3, 1)
+
+
+def entry_chars() -> int:
+    """Per-lesson render cap inside the block budget."""
+    return _int(_ENV_ENTRY_CHARS, 600, 120)
+
+
+def registry_max() -> int:
+    return _int(_ENV_REGISTRY_MAX, 512, 16)
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +393,145 @@ def retrieve_lessons_sync(
     return tuple(ranked[: top_k()])
 
 
+# ---------------------------------------------------------------------------
+# Lesson Confidence Scorer — reinforcement + escalation on the flock store
+# ---------------------------------------------------------------------------
+
+#: op_id -> (signature hashes injected, monotonic ts). The context stamped in
+#: CandidateGenerator.generate is a local copy, so VALIDATE learns which
+#: lessons this op saw from here. Bounded (registry_max), oldest evicted.
+_INJECTED: Dict[str, Tuple[Tuple[str, ...], float]] = {}
+
+_ASSERT_EQ_RE = re.compile(r"assert (.+?) (==|!=|<=|>=|<|>) (.+?)(?: \||$)")
+
+
+def _remember_injection(op_id: str, sigs: Sequence[str]) -> None:
+    if not op_id:
+        return
+    _INJECTED[op_id] = (tuple(sigs), time.monotonic())
+    cap = registry_max()
+    while len(_INJECTED) > cap:
+        oldest = min(_INJECTED, key=lambda k: _INJECTED[k][1])
+        _INJECTED.pop(oldest, None)
+
+
+def injected_signatures(op_id: str) -> Tuple[str, ...]:
+    return _INJECTED.get(op_id, ((), 0.0))[0]
+
+
+def _note_injection_sync(sig: str) -> Optional[int]:
+    """Durable: injections+1, unresolved_streak+1, escalate when the streak
+    reaches ``escalate_after`` (clamped at ``max_severity``). Returns the
+    new severity or None."""
+    from backend.core.ouroboros.governance import failure_mode_memory as fmm
+    from dataclasses import replace as _replace
+    out: Dict[str, int] = {}
+
+    def _mut(rec):
+        streak = int(rec.unresolved_streak) + 1
+        sev = int(rec.severity)
+        if streak >= escalate_after():
+            sev = min(max_severity(), sev + 1)
+            streak = 0  # each escalation restarts the streak
+        out["sev"] = sev
+        return _replace(rec, injections=int(rec.injections) + 1, unresolved_streak=streak, severity=sev)
+
+    return out.get("sev") if fmm.update_failure_mode(sig, _mut) else None
+
+
+def _reinforce_sync(sig: str) -> bool:
+    """Durable: a VALIDATE pass after injection — weight += boost,
+    resolutions+1, streak reset, severity decays one level."""
+    from backend.core.ouroboros.governance import failure_mode_memory as fmm
+    from dataclasses import replace as _replace
+    return fmm.update_failure_mode(sig, lambda rec: _replace(
+        rec, weight=int(rec.weight) + boost(), resolutions=int(rec.resolutions) + 1,
+        unresolved_streak=0, severity=max(0, int(rec.severity) - 1),
+    ))
+
+
+async def note_injections(op_id: str, sigs: Sequence[str]) -> Dict[str, int]:
+    """Async, bounded, fail-soft. Returns ``{sig: new_severity}``."""
+    _remember_injection(op_id, sigs)
+    out: Dict[str, int] = {}
+    for sig in sigs:
+        try:
+            sev = await asyncio.wait_for(asyncio.to_thread(_note_injection_sync, sig), timeout=timeout_s())
+            if sev is not None:
+                out[sig] = sev
+        except asyncio.TimeoutError:
+            logger.warning("[LessonMemory] injection bookkeeping timed out (store busy) for %s", sig[:12])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[LessonMemory] injection bookkeeping degraded (%s)", exc)
+    return out
+
+
+async def reinforce_validation_pass(op_id: str) -> int:
+    """VALIDATE passed for an op that had lessons injected: boost those
+    lessons' confidence in the flock store. Returns the count boosted.
+    NEVER raises."""
+    if not enabled():
+        return 0
+    sigs = injected_signatures(op_id)
+    if not sigs:
+        return 0
+    n = 0
+    for sig in sigs:
+        try:
+            if await asyncio.wait_for(asyncio.to_thread(_reinforce_sync, sig), timeout=timeout_s()):
+                n += 1
+        except asyncio.TimeoutError:
+            logger.warning("[LessonMemory] reinforcement timed out (store busy) for %s", sig[:12])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[LessonMemory] reinforcement degraded (%s)", exc)
+    _INJECTED.pop(op_id, None)
+    if n:
+        logger.info("[LessonMemory] reinforced %d lesson(s) after VALIDATE pass op=%s", n, str(op_id)[:12])
+    return n
+
+
+def negative_constraint(rec: Any) -> str:
+    """The hard negative constraint derived from the lesson's evidence: for
+    an assertion mismatch, the literal expected value that was wrong and
+    the value actually observed; otherwise the evidence itself."""
+    lesson = (getattr(rec, "lesson", "") or "").strip()
+    m = _ASSERT_EQ_RE.search(lesson)
+    if m:
+        actual, op, expected = m.group(1).strip(), m.group(2), m.group(3).strip()
+        return (
+            f"NEVER assert `{op} {expected}` here — the value actually observed was `{actual}`. "
+            f"Do not hardcode that expectation; assert on the observed shape/type, or stub the dependency."
+        )
+    return f"NEVER repeat this construction: {lesson}" if lesson else "NEVER repeat the recorded failure."
+
+
+def _render_entry(rec: Any, now: float) -> str:
+    mods = ",".join(sorted(module_keys(getattr(rec, "target_files", ()) or ()))) or rec.situation_kind.value
+    cls = getattr(rec, "error_class", "") or rec.failure_mode_kind.value
+    lesson = (getattr(rec, "lesson", "") or "").strip()
+    age = _age_label(max(0.0, now - float(rec.observed_at_unix)))
+    sev = min(max_severity(), int(getattr(rec, "severity", 0) or 0))
+    mitigation = (rec.mitigation_summary or "").strip()
+    if sev >= 2:
+        entry = (
+            f"- ⛔ HARD CONSTRAINT [{cls}] {mods} ({getattr(rec, 'phase', '') or 'VALIDATE'}, seen x{rec.weight}, "
+            f"injected {int(getattr(rec, 'injections', 0) or 0)}x without resolution, {age}): {negative_constraint(rec)}"
+            f"\n  A candidate that violates this is REJECTED. Then: {mitigation}"
+        )
+    elif sev == 1:
+        entry = (
+            f"- REQUIRED [{cls}] {mods} ({getattr(rec, 'phase', '') or 'VALIDATE'}, seen x{rec.weight}, {age})"
+            + (f": {lesson}" if lesson else "") + f"\n  You MUST: {mitigation}"
+        )
+    else:
+        entry = (
+            f"- [{cls}] {mods} ({getattr(rec, 'phase', '') or 'VALIDATE'}, seen x{rec.weight}, {age})"
+            + (f": {lesson}" if lesson else "") + f"\n  Do instead: {mitigation}"
+        )
+    cap = entry_chars()
+    return entry if len(entry) <= cap else entry[: cap - 1].rstrip() + "…"
+
+
 def _age_label(seconds: float) -> str:
     if seconds < 3600:
         return f"{int(seconds // 60)}m ago"
@@ -386,19 +555,13 @@ def compose_lessons_block(matches: Iterable[LessonMatch], *, budget: Optional[in
     ]
     used = sum(len(l) + 1 for l in lines)
     n = 0
+    # Escalated lessons first: a hard constraint must survive the budget
+    # clamp ahead of advisories. Within a level, best score first.
+    items.sort(key=lambda m: (-min(max_severity(), int(getattr(m.record, "severity", 0) or 0)), -m.score))
     for m in items:
-        rec = m.record
-        mods = ",".join(sorted(module_keys(getattr(rec, "target_files", ()) or ()))) or rec.situation_kind.value
-        cls = getattr(rec, "error_class", "") or rec.failure_mode_kind.value
-        lesson = (getattr(rec, "lesson", "") or "").strip()
-        entry = (
-            f"- [{cls}] {mods} ({getattr(rec, 'phase', '') or 'VALIDATE'}, seen x{rec.weight}, "
-            f"{_age_label(max(0.0, now - float(rec.observed_at_unix)))})"
-            + (f": {lesson}" if lesson else "")
-            + f"\n  Do instead: {(rec.mitigation_summary or '').strip()}"
-        )
+        entry = _render_entry(m.record, now)
         if used + len(entry) + 1 > cap:
-            break
+            continue  # try a smaller later entry; the budget is the clamp
         lines.append(entry)
         used += len(entry) + 1
         n += 1
@@ -448,6 +611,15 @@ async def inject_lessons(context: Any) -> Any:
             strategic_memory_prompt=prompt,
             strategic_memory_digest=hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest(),
         )
+        # Confidence scorer: count this injection durably; escalate lessons
+        # that keep being injected without resolving the failure.
+        escalated = await note_injections(
+            str(getattr(context, "op_id", "") or ""),
+            [m.record.signature_hash for m in matches if m.record.signature_hash],
+        )
+        for _sig, _sev in escalated.items():
+            if _sev >= 2:
+                logger.warning("[LessonMemory] lesson %s escalated to severity %d (hard constraint) — unresolved after repeated injection", _sig[:12], _sev)
         logger.info(
             "[LessonMemory] injected %d lesson(s) (%d chars) for modules=%s op=%s",
             len(matches), len(block), ",".join(sorted(module_keys(getattr(context, "target_files", ()) or ()))) or "-",

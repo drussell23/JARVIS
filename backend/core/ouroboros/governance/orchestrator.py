@@ -14090,6 +14090,15 @@ class GovernedOrchestrator:
         callers — the inline VALIDATE block, the extracted VALIDATERunner, and
         L2 re-validation — so the advisory holds on every validation path."""
         result = await self._run_validation_core(ctx, candidate, remaining_s)
+        # Lesson confidence: a pass after injected lessons boosts them.
+        try:
+            if result is not None and result.passed:
+                from backend.core.ouroboros.governance.lesson_memory import (
+                    reinforce_validation_pass as _reinforce,
+                )
+                await _reinforce(str(getattr(ctx, "op_id", "") or ""))
+        except Exception:  # noqa: BLE001 — memory never perturbs VALIDATE
+            logger.debug("[Validation] lesson reinforcement skipped", exc_info=True)
         # Slice 8 §7 — a failed validation MUST be operator-visible.
         # Run #18: a BlockedPathError → fc='security' rejection carried
         # its reason ONLY inside the ValidationResult; nothing logged it,

@@ -74,7 +74,7 @@ import hashlib
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Callable, Any, Dict, Iterable, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -299,6 +299,17 @@ class FailureModeRecord:
     """Bounded evidence excerpt — the concrete thing that failed."""
     phase: str = ""
     """``VALIDATE`` / ``VERIFY`` — where the failure was observed."""
+    # ---- Lesson confidence (2026-09-07, additive) --------------------
+    injections: int = 0
+    """How many GENERATE prompts this lesson has been injected into."""
+    resolutions: int = 0
+    """How many injections were followed by a VALIDATE pass."""
+    unresolved_streak: int = 0
+    """Consecutive injections since the last resolution — the escalation
+    trigger (``lesson_memory.escalate_after``)."""
+    severity: int = 0
+    """Prompt severity modifier: 0 advisory, 1 required, >=2 hard negative
+    constraint. Clamped by ``lesson_memory.max_severity``."""
 
     # ---- Serialization -------------------------------------------
 
@@ -320,6 +331,10 @@ class FailureModeRecord:
             "error_class": self.error_class,
             "lesson": self.lesson,
             "phase": self.phase,
+            "injections": int(self.injections),
+            "resolutions": int(self.resolutions),
+            "unresolved_streak": int(self.unresolved_streak),
+            "severity": int(self.severity),
         }
 
     @classmethod
@@ -374,6 +389,10 @@ class FailureModeRecord:
                 error_class=str(payload.get("error_class", "") or ""),
                 lesson=str(payload.get("lesson", "") or ""),
                 phase=str(payload.get("phase", "") or ""),
+                injections=int(payload.get("injections", 0) or 0),
+                resolutions=int(payload.get("resolutions", 0) or 0),
+                unresolved_streak=int(payload.get("unresolved_streak", 0) or 0),
+                severity=int(payload.get("severity", 0) or 0),
             )
         except (TypeError, ValueError) as exc:
             logger.debug(
@@ -1394,6 +1413,12 @@ def record_failure_mode(
                                 ),
                                 lesson=record.lesson or old.lesson,
                                 phase=record.phase or old.phase,
+                                # confidence counters live on the stored
+                                # row; a fresh observation never resets them
+                                injections=old.injections,
+                                resolutions=old.resolutions,
+                                unresolved_streak=old.unresolved_streak,
+                                severity=old.severity,
                             )
                         )
                         deduped = True
@@ -2159,6 +2184,49 @@ def publish_failure_mode_recalled(
 # Single-record lookup — for /failures for <signature> + HTTP
 # /observability/failure-modes/signature/{hash}
 # ---------------------------------------------------------------------------
+
+
+def update_failure_mode(
+    signature_hash: str,
+    mutate: "Callable[[FailureModeRecord], FailureModeRecord]",
+) -> bool:
+    """Rewrite the (most recent) record matching ``signature_hash`` through
+    ``mutate`` under the SAME cross-process flock + atomic rewrite the
+    recorder uses. ``signature_hash`` may be a hex PREFIX (>= 12 chars).
+    Returns True when a record was rewritten. NEVER raises."""
+    try:
+        sig = (signature_hash or "").strip().lower()
+        if len(sig) < 12:
+            return False
+        path = history_path()
+        with flock_critical_section(path) as acquired:
+            if not acquired:
+                return False
+            records = list(_read_existing_records(path))
+            idx = None
+            for i, rec in enumerate(records):
+                if (rec.signature_hash or "").lower().startswith(sig):
+                    if idx is None or rec.observed_at_unix > records[idx].observed_at_unix:
+                        idx = i
+            if idx is None:
+                return False
+            new = mutate(records[idx])
+            if not isinstance(new, FailureModeRecord):
+                return False
+            records[idx] = new
+            payload = "\n".join(_serialize_record(r) or "" for r in records)
+            if payload:
+                payload += "\n"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with tmp.open("w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+            os.replace(tmp, path)
+            return True
+    except Exception as exc:  # noqa: BLE001 — defensive
+        logger.debug("[failure_mode_memory] update_failure_mode raised: %s", exc)
+        return False
 
 
 def find_failure_mode_by_signature(
