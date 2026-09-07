@@ -30,7 +30,22 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _TEST_TIMEOUT_S = float(os.environ.get("JARVIS_TEST_TIMEOUT_S", "120"))
-_TEST_PER_TEST_TIMEOUT_S = int(os.environ.get("JARVIS_TEST_PER_TEST_TIMEOUT_S", "10"))
+#: A single test may hold at most this FRACTION of the whole-run budget
+#: before the harness calls it hung (``JARVIS_TEST_PER_TEST_FRACTION``).
+#: DERIVED, not an unrelated constant: the previous flat 10s sat BELOW this
+#: repo's own longest legitimate test — ``test_dream_engine.py::
+#: test_hanging_primary_is_bounded_by_wait_for`` deliberately holds for 10.01s
+#: to prove a wait_for bound — so pytest-timeout killed the run, no JSON
+#: report was written, and EVERY validation of a candidate touching
+#: dw_capacity_probe.py was reported as a TEST failure (2026-09-07 soak).
+#: A cap tied to the run budget cannot drift below the suite it must run.
+_TEST_PER_TEST_FRACTION = float(
+    os.environ.get("JARVIS_TEST_PER_TEST_FRACTION", "0.25")
+)
+_TEST_PER_TEST_TIMEOUT_S = int(os.environ.get(
+    "JARVIS_TEST_PER_TEST_TIMEOUT_S",
+    str(max(1, int(_TEST_PER_TEST_FRACTION * _TEST_TIMEOUT_S))),
+))
 _TEST_RETRY_ENABLED = os.environ.get(
     "JARVIS_TEST_RETRY_ENABLED", "true"
 ).lower() in ("1", "true", "yes")
@@ -870,6 +885,12 @@ def failure_digest(multi: Any, *, limit: int = 600) -> str:
         return out[:limit]
     except Exception:  # noqa: BLE001
         return "validation failed"
+
+
+#: ``pytest-timeout``'s own banner ("+++ Timeout +++") and its per-test
+#: header ("Timeout: 10.0s ..."). Matching the PLUGIN's output rather than
+#: an exit code, because the kill leaves no report and no exit convention.
+_PYTEST_TIMEOUT_RE = re.compile(r"\+{3,}\s*Timeout\s*\+{3,}|^Timeout:\s", re.M)
 
 
 def _effective_sandbox_prefixes() -> Tuple[str, ...]:
@@ -2041,8 +2062,19 @@ class TestRunner:
         duration: float,
         stdout: str,
     ) -> TestResult:
-        """Best-effort parse when JSON report is unavailable."""
+        """Best-effort parse when JSON report is unavailable.
+
+        A per-test ``pytest-timeout`` kill lands HERE: the plugin tears the
+        process down mid-run, so no JSON report is ever written and the tests
+        that already passed are unattributable. Reporting that as a ``test``
+        failure teaches the model its correct code was bad — the exact
+        mislabelling :class:`AdapterResult` documents for the wall-clock
+        timeout. Detecting the plugin's own banner sets ``timed_out``, and the
+        existing adapter mapping then classifies it ``infra``. One rule, one
+        place, both timeout shapes.
+        """
         passed = returncode == 0
+        timed_out = bool(_PYTEST_TIMEOUT_RE.search(stdout or ""))
         total = 0
         failed = 0
         for line in stdout.splitlines():
@@ -2065,6 +2097,7 @@ class TestRunner:
             duration_seconds=duration,
             stdout=stdout,
             flake_suspected=False,
+            timed_out=timed_out,
         )
 
     @staticmethod
