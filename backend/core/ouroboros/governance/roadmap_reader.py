@@ -380,6 +380,9 @@ class GoalEmitOutcome:
     #: Goal reconciliation: the landed commit that already satisfies this
     #: goal (not emitted, not an error — completed operator intent).
     satisfied_by: str = ""
+    #: Goal reconciliation: an op already in flight for this goal (not
+    #: emitted — a duplicate would shed both on STATE DRIFT).
+    in_flight_op: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -389,6 +392,7 @@ class GoalEmitOutcome:
             "idempotency_key": self.idempotency_key[:64],
             "error": self.error[:256],
             "satisfied_by": self.satisfied_by[:64],
+            "in_flight_op": self.in_flight_op[:128],
             "schema_version": self.schema_version,
         }
 
@@ -789,16 +793,23 @@ async def emit_roadmap_envelopes(
     # re-dispatched. Derived from git at every read (bi-directional: a
     # rolled-back landing reactivates the goal here automatically).
     _satisfied: Dict[str, str] = {}
+    _in_flight: Dict[str, str] = {}
+    _record_dispatch = None
+    _goal_digest_fn = None
     try:
         from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: E501
             GoalState as _GoalState,
+            goal_digest as _goal_digest_fn,
             reconcile as _reconcile,
+            record_dispatch as _record_dispatch,
         )
         for _gid, _rec in (await _reconcile(document.goals)).items():
             if _rec.state is _GoalState.SATISFIED:
                 _satisfied[_gid] = _rec.commit_sha
+            elif getattr(_rec, "in_flight_op", ""):
+                _in_flight[_gid] = _rec.in_flight_op
     except Exception:  # noqa: BLE001 — reconciliation is additive, never fatal
-        _satisfied = {}
+        _satisfied, _in_flight = {}, {}
     for goal in document.goals:
         if goal.goal_id in _satisfied:
             outcomes.append(GoalEmitOutcome(
@@ -807,6 +818,15 @@ async def emit_roadmap_envelopes(
                 idempotency_key="",
                 error="",
                 satisfied_by=_satisfied[goal.goal_id],
+            ))
+            continue
+        if goal.goal_id in _in_flight:
+            outcomes.append(GoalEmitOutcome(
+                goal_id=goal.goal_id,
+                emitted=False,
+                idempotency_key="",
+                error="",
+                in_flight_op=_in_flight[goal.goal_id],
             ))
             continue
         env = _make_envelope_for_goal(goal)
@@ -837,6 +857,17 @@ async def emit_roadmap_envelopes(
                 idempotency_key=str(result or "")[:64],
                 error="",
             ))
+            # Goal reconciliation: hold the goal out of re-emission while
+            # this op is in flight (the envelope's causal_id IS the op id).
+            if _record_dispatch is not None:
+                try:
+                    await _record_dispatch(
+                        goal_id=goal.goal_id,
+                        goal_digest_hex=_goal_digest_fn(goal) if _goal_digest_fn else "",
+                        op_id=str(getattr(env, "causal_id", "") or ""),
+                    )
+                except Exception:  # noqa: BLE001 — additive, never fatal
+                    pass
         except Exception as exc:  # noqa: BLE001
             outcomes.append(GoalEmitOutcome(
                 goal_id=goal.goal_id,

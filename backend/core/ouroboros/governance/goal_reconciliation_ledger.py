@@ -79,6 +79,8 @@ _ENV_LANDING_REF = "JARVIS_GOAL_RECONCILIATION_LANDING_REF"
 _ENV_REPO_ROOT = "JARVIS_GOAL_RECONCILIATION_REPO_ROOT"
 _ENV_GIT_TIMEOUT = "JARVIS_GOAL_RECONCILIATION_GIT_TIMEOUT_S"
 _ENV_SCAN_DEPTH = "JARVIS_GOAL_RECONCILIATION_SCAN_DEPTH"
+_ENV_INFLIGHT_TTL = "JARVIS_GOAL_RECONCILIATION_INFLIGHT_TTL_S"
+_ENV_PIPELINE_TIMEOUT = "JARVIS_PIPELINE_TIMEOUT_S"
 
 _DEFAULT_LEDGER_REL = ".jarvis/goal_reconciliation_ledger.jsonl"
 _DEFAULT_LANDING_REF = "HEAD"
@@ -134,6 +136,24 @@ def scan_depth() -> int:
         return v if v > 0 else _DEFAULT_SCAN_DEPTH
     except ValueError:
         return _DEFAULT_SCAN_DEPTH
+
+
+def inflight_ttl_s() -> float:
+    """How long a dispatched op keeps its goal out of re-emission when no
+    terminal event arrives (a crashed op must not block forever). Default:
+    twice the pipeline wall (``JARVIS_PIPELINE_TIMEOUT_S``)."""
+    raw = os.environ.get(_ENV_INFLIGHT_TTL, "").strip()
+    if raw:
+        try:
+            v = float(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    try:
+        return 2.0 * max(1.0, float(os.environ.get(_ENV_PIPELINE_TIMEOUT, "").strip() or 600.0))
+    except ValueError:
+        return 1200.0
 
 
 def repo_root() -> Path:
@@ -231,6 +251,8 @@ class GoalState(str, enum.Enum):
 class ReconciliationEvent(str, enum.Enum):
     SATISFIED = "satisfied"
     REACTIVATED = "reactivated"
+    DISPATCHED = "dispatched"   # an op for this goal was emitted (op_id)
+    TERMINAL = "terminal"       # that op reached a terminal state
 
 
 _PAYLOAD_FIELDS = ("event", "goal_id", "goal_digest", "commit_sha", "landing_ref", "op_id", "ts")
@@ -269,12 +291,16 @@ class GoalReconciliation:
     commit_sha: str = ""
     verified: bool = False
     diagnostic: str = ""
+    #: A dispatched, non-terminal op currently serving this goal — the
+    #: reader must not emit a second one (duplicate ops on the same files
+    #: shed each other on STATE DRIFT).
+    in_flight_op: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "goal_id": self.goal_id[:128], "state": self.state.value,
             "commit_sha": self.commit_sha[:64], "verified": bool(self.verified),
-            "diagnostic": self.diagnostic[:256],
+            "diagnostic": self.diagnostic[:256], "in_flight_op": self.in_flight_op[:128],
         }
 
 
@@ -393,6 +419,62 @@ async def record_landing(
     except Exception:  # noqa: BLE001
         logger.debug("[GoalReconciliation] record_landing degraded", exc_info=True)
         return None
+
+
+async def _append_event(
+    *, event: ReconciliationEvent, goal_id: str, goal_digest_hex: str, op_id: str,
+    path: Optional[Path], secret: Optional[str],
+) -> Optional[ReconciliationRecord]:
+    if not enabled() or not goal_id or not op_id:
+        return None
+    try:
+        target = path or ledger_path()
+        secret = secret if secret is not None else _roadmap_secret()
+        existing = await asyncio.to_thread(read_records, target, secret=secret)
+        prev = existing[-1].record_hash if existing else _genesis()
+        rec = _make_record(
+            event=event, goal_id=goal_id, goal_digest_hex=goal_digest_hex,
+            commit_sha="", op_id=op_id, prev_hash=prev, secret=secret,
+        )
+        ok = await asyncio.to_thread(_append, rec, target)
+        return rec if ok else None
+    except Exception:  # noqa: BLE001
+        logger.debug("[GoalReconciliation] %s event degraded", event.value, exc_info=True)
+        return None
+
+
+async def record_dispatch(*, goal_id: str, goal_digest_hex: str, op_id: str, path: Optional[Path] = None, secret: Optional[str] = None) -> Optional[ReconciliationRecord]:
+    """An op was emitted for this goal: hold the goal out of re-emission
+    until that op is terminal or the in-flight TTL lapses. NEVER raises."""
+    rec = await _append_event(event=ReconciliationEvent.DISPATCHED, goal_id=goal_id, goal_digest_hex=goal_digest_hex, op_id=op_id, path=path, secret=secret)
+    if rec:
+        logger.info("[GoalReconciliation] goal=%s dispatched as op=%s (in flight)", goal_id, op_id[:12])
+    return rec
+
+
+async def record_terminal(*, goal_id: str, op_id: str, outcome: str = "", path: Optional[Path] = None, secret: Optional[str] = None) -> Optional[ReconciliationRecord]:
+    """The op serving this goal reached a terminal state (any outcome); the
+    goal may be re-emitted unless a landing satisfied it. NEVER raises."""
+    rec = await _append_event(event=ReconciliationEvent.TERMINAL, goal_id=goal_id, goal_digest_hex="", op_id=op_id, path=path, secret=secret)
+    if rec:
+        logger.info("[GoalReconciliation] goal=%s op=%s terminal (%s)", goal_id, op_id[:12], outcome or "-")
+    return rec
+
+
+def in_flight_op(records: Sequence[ReconciliationRecord], goal_id: str, *, now_ts: Optional[float] = None) -> str:
+    """The op id of a dispatched-but-not-terminal op for *goal_id* younger
+    than the in-flight TTL, else ``""``."""
+    now = float(now_ts if now_ts is not None else time.time())
+    ttl = inflight_ttl_s()
+    terminal = {r.op_id for r in records if r.goal_id == goal_id and r.event == ReconciliationEvent.TERMINAL.value}
+    for rec in reversed(records):
+        if rec.goal_id != goal_id or rec.event != ReconciliationEvent.DISPATCHED.value:
+            continue
+        if rec.op_id in terminal:
+            continue
+        if now - float(rec.ts) <= ttl:
+            return rec.op_id
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +620,9 @@ async def reconcile_goal(
                 logger.info("[GoalReconciliation] goal=%s SATISFIED by trailer-bearing %s (rebuilt from git)", goal_id, sha[:12])
             return GoalReconciliation(goal_id, GoalState.SATISFIED, sha, True, "trailer-bearing commit reachable from landing ref")
         diag = "no binding" if latest is None else f"last event={latest.event}"
+        flying = in_flight_op(recs, goal_id)
+        if flying:
+            return GoalReconciliation(goal_id, GoalState.ACTIVE, "", False, f"in flight as {flying[:12]}", in_flight_op=flying)
         return GoalReconciliation(goal_id, GoalState.ACTIVE, "", False, diag)
     except Exception as exc:  # noqa: BLE001
         return GoalReconciliation(goal_id=goal_id, state=GoalState.ACTIVE, diagnostic=f"reconcile degraded: {exc!r}"[:200])

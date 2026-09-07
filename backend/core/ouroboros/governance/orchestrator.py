@@ -12471,6 +12471,21 @@ class GovernedOrchestrator:
         Fault-isolated — never raises. Records both failures (LearningBridge)
         and successes (SuccessPatternStore) for the adaptive learning loop.
         """
+        # Goal reconciliation: the op serving a signed goal is terminal —
+        # release the goal for re-emission (unless a landing satisfied it).
+        try:
+            from backend.core.ouroboros.governance.goal_reconciliation_ledger import (
+                binding_from_evidence as _gr_binding,
+                record_terminal as _gr_terminal,
+            )
+            _gid, _ = _gr_binding(getattr(ctx, "intake_evidence_json", "") or "")
+            if _gid:
+                await _gr_terminal(
+                    goal_id=_gid, op_id=str(getattr(ctx, "op_id", "") or ""),
+                    outcome=str(getattr(final_state, "value", final_state) or ""),
+                )
+        except Exception:  # noqa: BLE001 — never perturbs outcome publishing
+            logger.debug("[Orchestrator] goal terminal record skipped", exc_info=True)
         if self._stack.learning_bridge is None:
             return
         try:

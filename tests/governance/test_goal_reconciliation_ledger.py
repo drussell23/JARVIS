@@ -268,3 +268,49 @@ def test_orchestrator_binding_kwargs():
         "roadmap_goal_id": "g", "roadmap_goal_digest": "d",
     }
     assert _goal_binding_kwargs("") == {}
+
+
+def test_in_flight_goal_is_not_reemitted_until_terminal_or_ttl(repo, monkeypatch):
+    goal = _goal()
+    assert _run(L.record_dispatch(goal_id="goal-a", goal_digest_hex=L.goal_digest(goal), op_id="op-live"))
+    rec = _run(L.reconcile_goal(goal))
+    assert rec.state is L.GoalState.ACTIVE and rec.in_flight_op == "op-live"
+    # the reader skips it
+    from backend.core.ouroboros.governance import roadmap_reader as rr
+    doc = rr.RoadmapDocument(version=1, operator_id="op", signed_at_iso="", signature_hex="", signature_valid=True, goals=(goal,), raw_bytes=0)
+
+    class _Router:
+        seen: list = []
+
+        async def ingest(self, env):
+            self.seen.append(env); return "ikey"
+
+    r = _Router()
+    out = _run(rr.emit_roadmap_envelopes(doc, router=r))
+    assert out[0].emitted is False and out[0].in_flight_op == "op-live" and r.seen == []
+    # terminal releases it; the next emission records a NEW dispatch with the envelope's causal_id
+    assert _run(L.record_terminal(goal_id="goal-a", op_id="op-live", outcome="failed"))
+    assert _run(L.reconcile_goal(goal)).in_flight_op == ""
+    out2 = _run(rr.emit_roadmap_envelopes(doc, router=r))
+    assert out2[0].emitted is True and len(r.seen) == 1
+    recs = L.read_records()
+    assert recs[-1].event == "dispatched" and recs[-1].op_id == r.seen[0].causal_id
+    assert _run(L.reconcile_goal(goal)).in_flight_op == r.seen[0].causal_id
+    # TTL lapse releases a crashed op
+    monkeypatch.setenv(L._ENV_INFLIGHT_TTL, "0.001")
+    import time as _t; _t.sleep(0.01)
+    assert _run(L.reconcile_goal(goal)).in_flight_op == ""
+
+
+def test_inflight_ttl_defaults_to_twice_pipeline_wall(monkeypatch):
+    monkeypatch.delenv(L._ENV_INFLIGHT_TTL, raising=False)
+    monkeypatch.setenv(L._ENV_PIPELINE_TIMEOUT, "300")
+    assert L.inflight_ttl_s() == 600.0
+    monkeypatch.setenv(L._ENV_INFLIGHT_TTL, "42")
+    assert L.inflight_ttl_s() == 42.0
+
+
+def test_terminal_seam_is_wired():
+    import inspect
+    from backend.core.ouroboros.governance import orchestrator as orch
+    assert "record_terminal" in inspect.getsource(orch.GovernedOrchestrator._publish_outcome)
