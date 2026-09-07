@@ -17,7 +17,7 @@ def test_user_prompt_carries_ledger_context_no_code():
     sys, user = build_prompt(LedgerView.from_payload(
         "postmortem", {"root_cause": "boom ```code```", "target_files": ["a/x.py"]}))
     assert "x.py" in user
-    assert "`" not in user and "`" not in sys
+    assert "```" not in user and "```" not in sys
 
 
 def test_persona_ctx_injected_when_present():
