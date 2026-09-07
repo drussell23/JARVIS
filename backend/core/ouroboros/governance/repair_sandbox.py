@@ -729,6 +729,7 @@ class RepairSandbox:
             raise RuntimeError(
                 f"patch failed (exit {proc.returncode}) for {file_path}: {_details}"
             )
+        await self._register_candidate_path(target)
 
     async def apply_full_content(self, content: str, file_path: str) -> None:
         """Write ``content`` verbatim to ``file_path`` inside the sandbox.
@@ -769,6 +770,77 @@ class RepairSandbox:
             raise RuntimeError(
                 f"apply_full_content write failed for {file_path}: {exc}"
             ) from exc
+        await self._register_candidate_path(target)
+
+    # ------------------------------------------------------------------
+    # Candidate registration (git index intent-to-add)
+    # ------------------------------------------------------------------
+
+    async def _register_candidate_path(self, target: Path) -> None:
+        """Register a materialized candidate path with the sandbox's git
+        index as intent-to-add (``git add --intent-to-add``) so it is
+        VISIBLE to index-driven test collection.
+
+        Root cause (2026-09-07, first-order "author a test for X" goal):
+        ``tests/conftest.py`` refuses to collect anything ``git ls-files``
+        does not report (untracked-artifact amputation). A brand-new
+        candidate file landed in the worktree sandbox as an untracked
+        file, so VALIDATE ran ZERO tests ("no tests ran" -> FAIL) on a
+        perfectly good candidate, every retry, forever. Intent-to-add is
+        git's own primitive for "this path exists in the index with no
+        content yet": ``ls-files`` reports it, ``diff`` sees it as a new
+        file, nothing is staged for commit -- the standard collection
+        and AST gates keep running unchanged on a now-visible file.
+
+        Semantics (verified against git): idempotent on already-tracked
+        paths (no-op, rc=0); gitignored paths are refused (rc=1) and
+        logged -- an ignored candidate could never be committed anyway,
+        so the "no tests ran" it then produces is honest. Pathspec magic
+        is disabled (``--literal-pathspecs``) because the path is
+        MODEL-CHOSEN. Only meaningful in worktree mode: the rsync sandbox
+        carries no ``.git``, ``git ls-files`` fails there and conftest
+        ABSTAINS (collects everything). NEVER raises -- the write has
+        already landed and materialization must stay fail-soft.
+        """
+        if not self._worktree_mode or self._sandbox_dir is None:
+            return
+        rel = os.path.relpath(str(target), str(self._sandbox_dir))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "--literal-pathspecs", "add", "--intent-to-add",
+                "--", rel,
+                cwd=str(self._sandbox_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    proc.communicate(), timeout=15.0,
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                _logger.warning(
+                    "repair_sandbox: intent-to-add timed out for %s -- a "
+                    "new-file candidate may be invisible to index-driven "
+                    "test collection", rel,
+                )
+                return
+            if proc.returncode:
+                _out = stdout_b.decode(errors="replace").strip()
+                _err = stderr_b.decode(errors="replace").strip()
+                _logger.warning(
+                    "repair_sandbox: intent-to-add refused for %s (exit %d): "
+                    "%s -- a new-file candidate may be invisible to "
+                    "index-driven test collection",
+                    rel, proc.returncode, _err or _out or "no diagnostic",
+                )
+        except Exception as exc:  # noqa: BLE001 -- fail-soft by contract
+            _logger.warning(
+                "repair_sandbox: intent-to-add failed for %s (%s) -- a "
+                "new-file candidate may be invisible to index-driven test "
+                "collection", rel, exc,
+            )
 
     # ------------------------------------------------------------------
     # Test execution
