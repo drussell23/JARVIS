@@ -1,4 +1,7 @@
 # [Ouroboros] Modified by Ouroboros (op=op-01a07b16-) at 2026-09-07 09:06 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-01a07b18-) at 2026-09-07 09:10 UTC
+# Reason: First-order proof #2: author a real unit test for the untested production_oracle aggregator  AUTHOR a new pytest test fi
+
 # Reason: First-order proof #2: author a real unit test for the untested production_oracle aggregator  AUTHOR a new pytest test fi
 
 import enum
@@ -24,6 +27,7 @@ def test_compute_aggregate_verdict_empty_input():
     result = compute_aggregate_verdict([])
     assert result == OracleVerdict.INSUFFICIENT_DATA
 
+
 def test_compute_aggregate_verdict_insufficient_signals():
     from backend.core.ouroboros.governance.production_oracle import compute_aggregate_verdict, OracleVerdict, OracleSignal, OracleKind
     signal = OracleSignal(
@@ -37,6 +41,7 @@ def test_compute_aggregate_verdict_insufficient_signals():
     result = compute_aggregate_verdict([signal], minimum_signals=2)
     assert result == OracleVerdict.INSUFFICIENT_DATA
 
+
 def test_compute_aggregate_verdict_all_disabled():
     from backend.core.ouroboros.governance.production_oracle import compute_aggregate_verdict, OracleVerdict, OracleSignal, OracleKind
     signal = OracleSignal(
@@ -49,6 +54,7 @@ def test_compute_aggregate_verdict_all_disabled():
     )
     result = compute_aggregate_verdict([signal])
     assert result == OracleVerdict.DISABLED
+
 
 def test_compute_aggregate_verdict_failed_signal():
     from backend.core.ouroboros.governance.production_oracle import compute_aggregate_verdict, OracleVerdict, OracleSignal, OracleKind
@@ -64,6 +70,7 @@ def test_compute_aggregate_verdict_failed_signal():
     result = compute_aggregate_verdict([signal])
     assert result == OracleVerdict.FAILED
 
+
 def test_compute_aggregate_verdict_degraded_signal():
     from backend.core.ouroboros.governance.production_oracle import compute_aggregate_verdict, OracleVerdict, OracleSignal, OracleKind
     signal = OracleSignal(
@@ -78,6 +85,7 @@ def test_compute_aggregate_verdict_degraded_signal():
     result = compute_aggregate_verdict([signal])
     assert result == OracleVerdict.DEGRADED
 
+
 def test_compute_aggregate_verdict_healthy_signal():
     from backend.core.ouroboros.governance.production_oracle import compute_aggregate_verdict, OracleVerdict, OracleSignal, OracleKind
     signal = OracleSignal(
@@ -91,6 +99,7 @@ def test_compute_aggregate_verdict_healthy_signal():
     )
     result = compute_aggregate_verdict([signal])
     assert result == OracleVerdict.HEALTHY
+
 
 def test_project_signal_for_observability():
     from backend.core.ouroboros.governance.production_oracle import project_signal_for_observability, OracleSignal, OracleKind, OracleVerdict
