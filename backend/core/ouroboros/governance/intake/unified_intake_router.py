@@ -2629,8 +2629,14 @@ class UnifiedIntakeRouter:
             )
         except (TypeError, ValueError):
             _intake_evidence_json = ""
+        # The signed goal's declared symbols travel in the envelope's
+        # evidence; the contract that enforces them reads ctx. Carry them
+        # across at the ONE seam every op crosses. A resume carries them
+        # too — ``_resume_envelope_kwargs`` copies the evidence forward.
+        _decl_symbols = _declared_symbols_from_evidence(envelope.evidence)
         ctx = OperationContext.create(
             target_files=envelope.target_files,
+            target_symbols=_decl_symbols,
             description=envelope.description,
             op_id=envelope.causal_id,
             signal_urgency=envelope.urgency,
@@ -3522,6 +3528,27 @@ def _stamp_resume_pipeline_deadline(ctx: Any, source: str) -> Any:
 #: Evidence keys that identify the signed goal an op serves (stamped by
 #: roadmap_reader._make_envelope_for_goal); the only keys a resume carries.
 _GOAL_BINDING_KEYS = ("goal_id", "goal_digest")
+#: Evidence key carrying the signed goal's declared symbols.
+_DECLARED_SYMBOLS_KEY = "target_symbols"
+
+
+def _declared_symbols_from_evidence(evidence: Any) -> "Tuple[str, ...]":
+    """The signed goal's declared symbols, normalised. ``()`` when the
+    envelope carries none or the payload is malformed. NEVER raises."""
+    try:
+        raw = (evidence or {}).get(_DECLARED_SYMBOLS_KEY)
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, (list, tuple)):
+            return ()
+        out: "List[str]" = []
+        for sym in raw:
+            name = str(sym or "").strip()[:128]
+            if name and name not in out:
+                out.append(name)
+        return tuple(out)
+    except Exception:  # noqa: BLE001 -- a malformed payload declares nothing
+        return ()
 #: Sources whose envelopes are bound to a signed goal and therefore pass
 #: the atomic dispatch claim at admission.
 _GOAL_BOUND_SOURCES = frozenset({"roadmap", "fsm_resume"})
@@ -3555,6 +3582,15 @@ def _resume_envelope_kwargs(env: "Dict[str, Any]") -> "Dict[str, Any]":
             }
     except Exception:  # noqa: BLE001 -- malformed prior evidence carries nothing
         _binding = {}
+    # The declared-symbol contract survives a suspension: a resumed op IS
+    # the same signed goal, so it is still held to the names that goal
+    # declared. Normalised (never stringified through _binding, which would
+    # turn the list into "['x']") and carried in BOTH the envelope evidence
+    # the router reads and the nested blob a further suspension re-reads.
+    _resume_symbols = _declared_symbols_from_evidence(_prior)
+    _resume_decl = (
+        {_DECLARED_SYMBOLS_KEY: list(_resume_symbols)} if _resume_symbols else {}
+    )
     _ev_json = _rj.dumps(
         {
             "resume": True,
@@ -3563,6 +3599,7 @@ def _resume_envelope_kwargs(env: "Dict[str, Any]") -> "Dict[str, Any]":
             "resumed_op_id": env.get("op_id", ""),
             "trace_lineage": _lineage,
             **_binding,
+            **_resume_decl,
         }
     )
     _ev = {
@@ -3576,6 +3613,7 @@ def _resume_envelope_kwargs(env: "Dict[str, Any]") -> "Dict[str, Any]":
         "intake_evidence_json": _ev_json,
         "signature": "fsm_resume:%s" % (env.get("op_id", "")),
         **_binding,
+        **_resume_decl,
     }
     return {
         "source": "fsm_resume",

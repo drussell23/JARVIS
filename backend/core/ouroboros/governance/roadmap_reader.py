@@ -636,6 +636,14 @@ def _make_envelope_for_goal(
             "max_duration_s": goal.max_duration_s,
             "signature": goal.goal_id,  # dedup signature
         }
+        # The declared symbols are the goal's CONTRACT — the names that
+        # must exist on disk when it is satisfied. They were parsed here
+        # and then dropped, so the downstream contract that enforces them
+        # never saw one (2026-09-07). Identity keys only; bounded.
+        if goal.target_symbols:
+            evidence["target_symbols"] = [
+                str(sym)[:128] for sym in goal.target_symbols
+            ]
         # Goal reconciliation: the cryptographic identity of THIS goal text,
         # carried to the commit so a landed sha binds to exactly this intent
         # (a re-signed, changed goal under the same id is a new goal).

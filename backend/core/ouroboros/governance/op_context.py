@@ -1089,6 +1089,13 @@ class OperationContext:
     cross_repo: bool = dataclasses.field(default=False, init=False)
     dependency_edges: Tuple[Tuple[str, str], ...] = ()
     apply_plan: Tuple[str, ...] = ()
+    #: Symbols the SIGNED goal declares must exist when the op is done.
+    #: Read by the no-op refusal (generate_runner), the VALIDATE gate and
+    #: the differential gate's acceptance names — all three via
+    #: ``getattr(ctx, "target_symbols", ())``, which returned ``()`` for
+    #: every op until this field existed (2026-09-07: the contract was
+    #: unreachable, so a hallucinated no-op could never be refused).
+    target_symbols: Tuple[str, ...] = ()
     repo_snapshots: Tuple[Tuple[str, str], ...] = ()
     saga_id: str = ""
     saga_state: Tuple[RepoSagaStatus, ...] = ()
@@ -1305,6 +1312,7 @@ class OperationContext:
         *,
         target_files: Tuple[str, ...],
         description: str,
+        target_symbols: Tuple[str, ...] = (),
         op_id: Optional[str] = None,
         policy_version: str = "",
         pipeline_deadline: Optional[datetime] = None,
@@ -1384,6 +1392,7 @@ class OperationContext:
             "cross_repo": len(resolved_repo_scope) > 1,
             "dependency_edges": dependency_edges,
             "apply_plan": apply_plan,
+            "target_symbols": tuple(target_symbols or ()),
             "repo_snapshots": repo_snapshots,
             "saga_id": saga_id,
             "saga_state": saga_state,
@@ -1446,6 +1455,7 @@ class OperationContext:
             repo_scope=resolved_repo_scope,
             dependency_edges=dependency_edges,
             apply_plan=apply_plan,
+            target_symbols=tuple(target_symbols or ()),
             repo_snapshots=repo_snapshots,
             saga_id=saga_id,
             saga_state=saga_state,
