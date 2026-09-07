@@ -344,3 +344,35 @@ def test_return_paths_carry_guard_chains_and_else_negation():
     assert "if x > LIMIT: LIMIT" in ret
     assert "if not (x > LIMIT): x + y" in ret
     _ast.parse(out)
+
+
+TEST_MOD = textwrap.dedent('''
+    import pytest
+    class _FakeDW:
+        def __init__(self, content="Fix applied. Tests green.", boom=False):
+            self.content = content
+        async def complete_sync(self, prompt, *, system_prompt, caller_id, max_tokens=512, **kw):
+            return self.content
+    def _make():
+        return _FakeDW()
+    async def test_yields(): ...
+''')
+
+
+def test_test_files_expose_private_fixtures(tmp_path):
+    hidden = A.extract_public_api(TEST_MOD, "m")
+    assert "_FakeDW" not in hidden and "async def test_yields" in hidden
+    shown = A.extract_public_api(TEST_MOD, "m", include_private=True)
+    assert "class _FakeDW:" in shown
+    assert "def __init__(self, content='Fix applied. Tests green.', boom=False)" in shown
+    assert "async def complete_sync(self, prompt, *, system_prompt, caller_id, max_tokens=512, **kw)" in shown
+    assert "def _make()" in shown
+    # path policy: tests dir or test_*.py / *_test.py, env-driven dir names
+    assert A.is_test_path("tests/governance/comms/x/test_speech_provider.py")
+    assert A.is_test_path("pkg/foo_test.py") and A.is_test_path("tests/helpers/fixtures.py")
+    assert not A.is_test_path("backend/core/ouroboros/governance/model_physics.py")
+    # end-to-end: a test target on disk is rendered with its fixtures + guidance
+    tdir = tmp_path / "tests"; tdir.mkdir()
+    (tdir / "test_speech.py").write_text(TEST_MOD)
+    out = A.build_signature_anchor(("tests/test_speech.py",), "add a test", tmp_path)
+    assert "class _FakeDW:" in out and "REUSE them" in out

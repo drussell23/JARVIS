@@ -4373,6 +4373,17 @@ class GovernedOrchestrator:
             except Exception:
                 logger.debug("[Orchestrator] User preference injection skipped", exc_info=True)
 
+            # ---- Lesson memory: stamp cross-op lessons on the PIPELINE ctx ----
+            # so GENERATE retries and L2 repair prompts carry them too (the
+            # CandidateGenerator hook stays as the catch-all; it is idempotent).
+            try:
+                from backend.core.ouroboros.governance.lesson_memory import (
+                    inject_lessons as _inject_lessons,
+                )
+                ctx = await _inject_lessons(ctx)
+            except Exception:  # noqa: BLE001 — memory never blocks the pipeline
+                logger.debug("[Orchestrator] lesson injection skipped", exc_info=True)
+
             # ---- Policy engine check (declarative YAML rules) ----
             # Evaluated BEFORE the risk-engine BLOCKED short-circuit so that
             # explicit deny rules in policy files can override the risk engine.

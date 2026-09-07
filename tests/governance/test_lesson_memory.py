@@ -276,8 +276,8 @@ def test_hard_constraint_is_derived_from_evidence_and_ordered_first(monkeypatch)
     block = LM.compose_lessons_block(hits)
     first = block.split("\n- ", 1)[1]
     assert first.startswith("⛔ HARD CONSTRAINT [expected_value_mismatch]")
-    assert "NEVER assert `== ['Fix applied. Tests green.']`" in first
-    assert "observed was `['Hello! It s...']`" in first and "REJECTED" in first
+    assert "expected `== ['Fix applied. Tests green.']`, observed `['Hello! It s...']`" in first
+    assert "reuse the fixtures/stubs" in first and "REJECTED" in first
     assert block.index("HARD CONSTRAINT") < block.index("takes 1 positional")
 
 
@@ -311,3 +311,10 @@ def test_pass_reinforcement_is_wired_into_validation_seam():
     import inspect
     from backend.core.ouroboros.governance import orchestrator as orch
     assert "reinforce_validation_pass" in inspect.getsource(orch.GovernedOrchestrator._run_validation)
+
+
+def test_pipeline_ctx_carries_lessons_for_retries_and_l2():
+    import inspect
+    from backend.core.ouroboros.governance import orchestrator as orch
+    src = inspect.getsource(orch)
+    assert src.count("inject_lessons as _inject_lessons") >= 1 and "ctx = await _inject_lessons(ctx)" in src

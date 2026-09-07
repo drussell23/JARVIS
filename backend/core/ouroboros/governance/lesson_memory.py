@@ -498,9 +498,13 @@ def negative_constraint(rec: Any) -> str:
     m = _ASSERT_EQ_RE.search(lesson)
     if m:
         actual, op, expected = m.group(1).strip(), m.group(2), m.group(3).strip()
+        # Neutral on purpose: the expectation may be right and the SETUP
+        # wrong (a fixture's canned reply asserted against a live call).
         return (
-            f"NEVER assert `{op} {expected}` here — the value actually observed was `{actual}`. "
-            f"Do not hardcode that expectation; assert on the observed shape/type, or stub the dependency."
+            f"This exact construction FAILED before: expected `{op} {expected}`, observed `{actual}`. "
+            f"Either the expectation or the setup producing `{actual}` is wrong — reuse the fixtures/stubs "
+            f"already defined in the target file (listed in the API SIGNATURES block) instead of a live "
+            f"dependency, and do not repeat the identical construction."
         )
     return f"NEVER repeat this construction: {lesson}" if lesson else "NEVER repeat the recorded failure."
 

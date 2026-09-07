@@ -114,6 +114,28 @@ def _is_public(name: str) -> bool:
     return not name.startswith("_")
 
 
+def _test_dir_names() -> frozenset:
+    """Same convention the sandbox uses (``JARVIS_TEST_DIR_NAMES``)."""
+    raw = os.environ.get("JARVIS_TEST_DIR_NAMES", "tests,test")
+    return frozenset(n.strip() for n in raw.split(",") if n.strip())
+
+
+def is_test_path(path) -> bool:
+    """A test module: ``test_*.py`` / ``*_test.py`` or anything under a test
+    directory. Its PRIVATE top-level helpers (``_FakeDW``, ``_make_ctx``) are
+    the fixtures existing tests reuse — for a test target they ARE the API
+    (measured 2026-09-07: hidden, the model wired the live provider and
+    asserted the fixture's canned reply, forever)."""
+    try:
+        p = Path(str(path))
+        stem = p.stem
+        if stem.startswith("test_") or stem.endswith("_test"):
+            return True
+        return any(part in _test_dir_names() for part in p.parts[:-1])
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _doc_excerpt(node, max_chars: int) -> str:
     """Single-line excerpt of *node*'s docstring, bounded to *max_chars* and
     cut at the last sentence boundary (else the last word) before the cap.
@@ -671,6 +693,7 @@ def extract_public_api(
     module_import_path: str = "",
     doc_chars: Optional[int] = None,
     budget: Optional[int] = None,
+    include_private: bool = False,
 ) -> str:
     """Compact authoritative block for the PUBLIC top-level API of *source* —
     public functions and public classes (annotated fields, public methods +
@@ -690,13 +713,14 @@ def extract_public_api(
         skeleton = extract_public_api(source, module_import_path, doc_chars=0)
         doc_chars = _adaptive_doc_chars(tree, budget, len(skeleton))
     lines: List[str] = []
+    _vis = (lambda _n: True) if include_private else _is_public
     try:
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if _is_public(node.name):
+                if _vis(node.name):
                     lines.extend(_def_lines(node, "", doc_chars))
             elif isinstance(node, ast.ClassDef):
-                if not _is_public(node.name):
+                if not _vis(node.name):
                     continue
                 try:
                     bases = ", ".join(ast.unparse(b) for b in node.bases)
@@ -710,7 +734,7 @@ def extract_public_api(
                 body.extend(_field_lines(node, "    "))
                 for m in node.body:
                     if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
-                        _is_public(m.name) or m.name == "__init__"
+                        _vis(m.name) or m.name == "__init__"
                     ):
                         body.extend(_def_lines(m, "    ", doc_chars))
                 lines.append(header)
@@ -846,7 +870,10 @@ def build_signature_anchor(
                 src = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            block = extract_public_api(src, label, budget=max_chars - used)
+            block = extract_public_api(
+                src, label, budget=max_chars - used,
+                include_private=is_test_path(path),
+            )
             if not block:
                 continue
             if used + len(block) > max_chars:
@@ -877,7 +904,10 @@ def build_signature_anchor(
             "`# returns:` / `# returns None if:` lines are extracted from the "
             "function bodies: quoted dotted names such as 'general.architecture' "
             "are LITERAL flat keys (never nested sub-dicts), helper calls "
-            "compose keys exactly as shown, `# input shape:` is the literal "
+            "compose keys exactly as shown. For TEST files the private "
+            "helpers/fixtures/stubs listed (e.g. `_FakeX`) are what the "
+            "existing tests use — REUSE them; never call a live provider, "
+            "network or model from a test. `# input shape:` is the literal "
             "nesting to reproduce (copy it, fill the `...` leaves), and "
             "returned fields hold exactly the formulas shown, selected by the "
             "guard that precedes them. Derive every expected value from those "
