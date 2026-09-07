@@ -55,6 +55,10 @@ _ENV_ACCESS_ITEMS = "JARVIS_AST_SIGNATURE_ANCHOR_ACCESS_ITEMS"
 _DEFAULT_ACCESS_ITEMS = 24
 _ACCESS_EXPR_MAX_CHARS = 80
 _ACCESS_METHODS = frozenset({"get", "pop", "setdefault", "getlist", "getattr"})
+#: Derived-semantics lines (# where / # returns / # returns None if).
+_CONTRACT_EXPR_MAX_CHARS = 90
+_CONTRACT_SHAPE_MAX_CHARS = 600
+_CONTRACT_MAX_ITEMS = 8
 _SENTENCE_END_RE = re.compile(r"[.!?](?:\s|$)")
 
 _PY_PATH_RE = re.compile(r"[A-Za-z0-9_./\\-]+\.py")
@@ -194,20 +198,127 @@ def _access_lines(node, indent: str) -> List[str]:
         return []
 
 
+def _local_assignments(node) -> dict:
+    """``name -> [value exprs in source order]`` for single-Name assignments in
+    the def's own body (nested defs excluded)."""
+    out: dict = {}
+    nested = {
+        id(n) for n in ast.walk(node)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and n is not node
+    }
+    for sub in ast.walk(node):
+        if id(sub) in nested:
+            continue
+        if isinstance(sub, ast.Assign) and len(sub.targets) == 1 and isinstance(sub.targets[0], ast.Name):
+            out.setdefault(sub.targets[0].id, []).append(sub.value)
+        elif isinstance(sub, ast.AnnAssign) and isinstance(sub.target, ast.Name) and sub.value is not None:
+            out.setdefault(sub.target.id, []).append(sub.value)
+    return out
+
+
+def _names_in(expr) -> set:
+    return {n.id for n in ast.walk(expr) if isinstance(n, ast.Name)}
+
+
+def _substitute(expr, assigns: dict, depth: int):
+    """Inline single-assignment locals into *expr* (depth-bounded), skipping
+    self-referential rebinds (``x = x or y`` keeps the earlier definition)."""
+    if depth <= 0:
+        return expr
+
+    class _Sub(ast.NodeTransformer):
+        def visit_Name(self, n):  # noqa: N802 — ast visitor API
+            if isinstance(n.ctx, ast.Load) and n.id in assigns:
+                for v in reversed(assigns[n.id]):
+                    if n.id not in _names_in(v):
+                        try:
+                            if len(ast.unparse(v)) <= _CONTRACT_EXPR_MAX_CHARS:
+                                return _substitute(copy.deepcopy(v), assigns, depth - 1)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        break
+            return n
+
+    return _Sub().visit(copy.deepcopy(expr))
+
+
+def _contract_lines(node, indent: str) -> List[str]:
+    """Derived semantics the docstring and access pattern cannot state:
+    ``# where``   nested single-return helpers, inlined (``field(name) = ...``);
+    ``# returns`` the constructed return value with locals substituted, so a
+                  consumer sees the FORMULA behind each field;
+    ``# returns None if`` every guard that short-circuits to ``None``.
+    Measured 2026-09-07: with keys alone the model still asserted
+    ``kv_bytes_per_token == 2`` against a value that is
+    ``block_count * kv_heads * (key_len + val_len) * kv_cache_dtype_bytes()``.
+    Bounded; NEVER raises."""
+    lines: List[str] = []
+    try:
+        pad = indent + "    # "
+        # -- helpers ---------------------------------------------------
+        helpers: List[str] = []
+        for n in ast.walk(node):
+            if (
+                isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n is not node
+                and len(n.body) == 1 and isinstance(n.body[0], ast.Return) and n.body[0].value is not None
+            ):
+                try:
+                    args = ", ".join(a.arg for a in n.args.args)
+                    s = f"{n.name}({args}) = {ast.unparse(n.body[0].value)}"
+                except Exception:  # noqa: BLE001
+                    continue
+                if len(s) <= _CONTRACT_EXPR_MAX_CHARS:
+                    helpers.append(s)
+        if helpers:
+            lines.append(pad + "where: " + "; ".join(helpers[:_CONTRACT_MAX_ITEMS]))
+        # -- return shape ----------------------------------------------
+        assigns = _local_assignments(node)
+        none_guards: List[str] = []
+        shapes: List[str] = []
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.If):
+                body = sub.body
+                if (
+                    len(body) == 1 and isinstance(body[0], ast.Return)
+                    and isinstance(body[0].value, ast.Constant) and body[0].value.value is None
+                ):
+                    try:
+                        g = ast.unparse(sub.test)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if len(g) <= _CONTRACT_EXPR_MAX_CHARS and g not in none_guards:
+                        none_guards.append(g)
+            elif isinstance(sub, ast.Return) and isinstance(sub.value, (ast.Call, ast.Dict, ast.Tuple)):
+                try:
+                    s = ast.unparse(_substitute(sub.value, assigns, 2))
+                except Exception:  # noqa: BLE001
+                    continue
+                if s not in shapes:
+                    shapes.append(s)
+        for s in shapes[:2]:
+            lines.append(pad + "returns: " + s[: _CONTRACT_SHAPE_MAX_CHARS])
+        if none_guards:
+            lines.append(pad + "returns None if: " + "; ".join(none_guards[:_CONTRACT_MAX_ITEMS]))
+    except Exception:  # noqa: BLE001 — additive, never fatal
+        return lines
+    return lines
+
+
 def _def_lines(node, indent: str, doc_chars: int) -> List[str]:
     """Signature line for a def, expanded with its contract when one exists:
     ``def f(...) -> T:`` / docstring excerpt / ``# reads:`` access pattern /
-    ``...``. Without either the legacy one-liner ``def f(...) -> T: ...`` is
+    ``# where / returns / returns None if`` derived semantics / ``...``.
+    Without any of those the legacy one-liner ``def f(...) -> T: ...`` is
     emitted."""
     sig = _sig_line(node)
     doc = _doc_excerpt(node, doc_chars) if doc_chars > 0 else ""
-    access = _access_lines(node, indent)
-    if (not doc and not access) or not sig.endswith(" ..."):
+    extra = _access_lines(node, indent) + _contract_lines(node, indent)
+    if (not doc and not extra) or not sig.endswith(" ..."):
         return [indent + sig]
     lines = [indent + sig[: -len(" ...")]]
     if doc:
         lines.append(indent + '    """' + doc + '"""')
-    lines.extend(access)
+    lines.extend(extra)
     lines.append(indent + "    ...")
     return lines
 
@@ -496,7 +607,12 @@ def build_signature_anchor(
             "these signatures EXACTLY — the same name, argument names/order/"
             "count, and return shape. Do NOT invent parameters, overloads, or "
             "return types. If a needed capability is absent here, it does not "
-            "exist — do not assume it.\n\n"
+            "exist — do not assume it. The `# reads:` / `# where:` / "
+            "`# returns:` / `# returns None if:` lines are extracted from the "
+            "function bodies: quoted dotted names such as 'general.architecture' "
+            "are LITERAL flat keys (never nested sub-dicts), helper calls "
+            "compose keys exactly as shown, and returned fields hold exactly "
+            "the formulas shown — derive every expected value from them.\n\n"
             "```python\n" + body + "\n```"
         )
     except Exception:  # noqa: BLE001 — the anchor is additive, never fatal

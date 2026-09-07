@@ -185,6 +185,16 @@ def test_real_model_physics_contract_reaches_the_anchor():
         "field('attention.head_count_kv')", "field('attention.key_length')",
     ):
         assert frag in reads, frag
+    # derived semantics: helper inlining, return formula, None guards
+    assert "# where: field(name) = _as_int(info.get(arch + '.' + name))" in out
+    ret = [l for l in out.splitlines() if "# returns: ModelPhysics(" in l][0]
+    assert "native_context=field('context_length')" in ret
+    assert "kv_bytes_per_token=field('block_count') * field('attention.head_count_kv') * (field('attention.key_length') + field('attention.value_length')) * kv_cache_dtype_bytes()" in ret
+    guards = [l for l in out.splitlines() if "# returns None if:" in l][0]
+    assert "not isinstance(payload, dict)" in guards
+    assert "min(native_context, block_count, kv_heads, key_len, val_len) <= 0" in guards
+    assert "LITERAL flat keys" in A.build_signature_anchor(
+        ("tests/governance/test_model_physics.py",), "cover model_physics.py", root)
 
 
 def test_adaptive_budget_raises_cap_for_small_modules_and_floors_for_large():
@@ -251,3 +261,37 @@ def test_access_items_env_bound(monkeypatch):
     out = A.extract_public_api(ACCESS_MOD, "m")
     line = [l for l in out.splitlines() if "# reads:" in l][0]
     assert line.count("; ") == 1
+
+
+CONTRACT_MOD = textwrap.dedent('''
+    class Out:
+        def __init__(self, a, b): ...
+    def build(payload):
+        if not isinstance(payload, dict):
+            return None
+        info = payload.get("info")
+        def field(name):
+            return int(info.get("p." + name))
+        a = field("alpha")
+        b = a * 2
+        b = b or a
+        if b <= 0:
+            return None
+        return Out(a=a, b=b)
+''')
+
+
+def test_contract_lines_inline_helpers_formulas_and_none_guards():
+    out = A.extract_public_api(CONTRACT_MOD, "m")
+    assert "# where: field(name) = int(info.get('p.' + name))" in out
+    ret = [l for l in out.splitlines() if "# returns: Out(" in l][0]
+    assert "a=field('alpha')" in ret
+    assert "b=field('alpha') * 2" in ret          # self-referential rebind skipped
+    guards = [l for l in out.splitlines() if "# returns None if:" in l][0]
+    assert "not isinstance(payload, dict)" in guards and "b <= 0" in guards
+    _ast.parse(out)
+
+
+def test_contract_lines_absent_for_plain_defs():
+    out = A.extract_public_api("def f(x):\n    return x\n", "m")
+    assert out.strip().endswith("def f(x): ...")
