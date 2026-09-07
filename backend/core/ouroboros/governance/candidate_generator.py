@@ -3039,6 +3039,20 @@ def _absolute_route_sealing(context: "Any") -> bool:
     ).strip().lower() in ("1", "true", "yes", "on")
 
 
+def local_lane_endpoint() -> str:
+    """The endpoint the generation lane dispatches to: the failover-wired
+    ``JARVIS_PRIME_URL`` first, else the local lane's configured base URL.
+    One resolver for every reader (capability stamping, budget priming)."""
+    url = (os.environ.get("JARVIS_PRIME_URL", "") or "").strip()
+    if url:
+        return url
+    try:
+        from backend.core.ouroboros.governance.local_inference_director import LocalConfig
+        return str(getattr(LocalConfig.from_env(), "base_url", "") or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 async def _resolve_served_model(
     endpoint: Optional[str],
     *,
@@ -4712,10 +4726,20 @@ class CandidateGenerator:
                 "[CandidateGenerator] swarm decline: stack unavailable (%s: %s)",
                 type(_swarm_imp_exc).__name__, _swarm_imp_exc)
             return None
+        # Phase 1 — the ceiling is the served model's negotiated window, primed
+        # here by the lane that negotiates it (VRAM, model bytes, KV physics),
+        # so `is_big_file` below judges TOKENS against a real budget.
+        from backend.core.ouroboros.governance import context_budget as _cb
+        _endpoint = local_lane_endpoint()
+        _budget = await _cb.prime_budget(
+            _endpoint, self._negotiate_num_ctx,
+            served_model=str(await _resolve_served_model(_endpoint) or "") if _endpoint else "",
+        )
         if not is_big_file(source):
             logger.info(
-                "[CandidateGenerator] swarm decline: %s is under the big-file "
-                "threshold (%d lines)", path, source.count("\n"))
+                "[CandidateGenerator] swarm decline: %s fits the ingest ceiling "
+                "(%d tokens <= %d, window=%d)", path, _cb.estimate_tokens(source),
+                _budget.ingest_ceiling_tokens, _budget.window_tokens)
             return None
 
         res = resolve_target_symbols(
@@ -4751,20 +4775,49 @@ class CandidateGenerator:
             )
             return None
 
+        # Phase 2 — the worker's view is the structural map (AST-Signature
+        # Anchor) + the map-reduce framing + a READ-ONLY Radius of Relevance
+        # around its node, shrunk to the budget that remains after those fixed
+        # parts. It never sees, and can never re-emit, the whole file.
+        from backend.core.ouroboros.governance.chunked_generation_bridge import MAP_REDUCE_FRAMING
+        from backend.core.ouroboros.governance.intelligent_chunking import shrink_radius_to_budget
+        _anchor = ""
+        try:
+            from backend.core.ouroboros.governance.ast_signature_anchor import extract_public_api
+            _anchor = extract_public_api(source, path) or ""
+        except Exception:  # noqa: BLE001 — the map is additive
+            _anchor = ""
+        _system = "\n\n".join(t for t in (_sys_prompt, MAP_REDUCE_FRAMING, _anchor) if t)
+        _node_budget = _budget.with_overhead(_system).node_budget_tokens
+
+        def _radius_for(target: Any) -> str:
+            shrunk = shrink_radius_to_budget(source, path, getattr(target, "symbol", ""), _node_budget)
+            return shrunk.context if shrunk is not None else ""
+
         agent = ProductionAgentTurnFn(
             client=client,
             tool_backend=None,                       # pure-completion node repair (v1)
             repo_root=getattr(self, "_repo_root", "."),
             op_id=getattr(context, "op_id", ""),
             model_name=getattr(client, "_model", "") or "",  # client default, no hardcode
-            system_prompt=_sys_prompt,
+            system_prompt=_system,
             parse_fn=lambda raw: None,               # single-shot node completion
             max_turns=1,
+            node_context_fn=_radius_for,
         )
+
+        async def _rag_reprompt(target: Any, rag_ctx: str) -> str:
+            """Phase 3 — an unconverged node is re-prompted with retrieved
+            snippets as feedback; the swarm around it is untouched."""
+            try:
+                return await agent(target, f"Retrieved context for this node:\n{rag_ctx}")
+            except Exception:  # noqa: BLE001 — an isolated node fault never drops the op
+                return ""
         t0 = time.monotonic()
         try:
             result = await intercept_full_content(
                 source, path, list(res.symbol_names), agent,
+                rag_agent_fn=_rag_reprompt,
                 op_id=getattr(context, "op_id", ""),
             )
         except asyncio.CancelledError:

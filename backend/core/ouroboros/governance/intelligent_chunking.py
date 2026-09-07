@@ -32,11 +32,9 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger("Ouroboros.IntelligentChunking")
 
-_CEILING_ENV = "JARVIS_DW_MAX_CONTEXT_TOKENS"
-_DEFAULT_CEILING = 8000
+_CEILING_ENV = "JARVIS_DW_MAX_CONTEXT_TOKENS"   # legacy name: honoured ONLY as an explicit override
 _RAG_K_ENV = "JARVIS_DW_RAG_TOP_K"
 _DEFAULT_RAG_K = 6
-_CHARS_PER_TOKEN = 4
 
 _STRATEGY_AST = "ast"
 _STRATEGY_RAG = "rag"
@@ -51,18 +49,30 @@ _TELEMETRY_TABLE = "chunk_strategy_outcomes"
 
 
 def estimate_tokens(text: str) -> int:
-    """Coarse ~4-chars-per-token estimate. Deterministic; never raises."""
-    return max(0, len(text or "")) // _CHARS_PER_TOKEN
+    """The package's one coarse token estimate (``context_budget``). Never raises."""
+    from backend.core.ouroboros.governance.context_budget import estimate_tokens as _est
+    return _est(text)
 
 
 def dynamic_token_ceiling() -> int:
-    """The context-token ceiling above which whole-file ingestion is FORBIDDEN
-    (env ``JARVIS_DW_MAX_CONTEXT_TOKENS``, default 8000). Dynamic — an operator
-    tunes it to the live DW RT context budget. Clamped >= 512."""
-    try:
-        return max(512, int(os.environ.get(_CEILING_ENV, str(_DEFAULT_CEILING))))
-    except (TypeError, ValueError):
-        return _DEFAULT_CEILING
+    """The context-token ceiling above which whole-file ingestion is FORBIDDEN.
+
+    DERIVED, not declared: the served model's negotiated window minus its output
+    reserve and the prompt's fixed overhead (``context_budget``), primed by the
+    lane that negotiates it. The legacy ``JARVIS_DW_MAX_CONTEXT_TOKENS`` is
+    honoured only when an operator sets it explicitly — it no longer carries a
+    default of its own (the flat 8000 described a cloud lane, not the model
+    answering). Never raises."""
+    raw = (os.environ.get(_CEILING_ENV, "") or "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    from backend.core.ouroboros.governance.context_budget import ingest_ceiling_tokens
+    return ingest_ceiling_tokens()
 
 
 def exceeds_ceiling(source: str) -> bool:
@@ -163,6 +173,92 @@ def radius_of_relevance(
         parts.append(_segment(target_node))
 
     return "\n\n\n".join(p for p in parts if p.strip())
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed recursive shrinker — a radius that does not fit is narrowed, never sent
+# ---------------------------------------------------------------------------
+
+#: Shrink levels, widest first. Each drops the least task-relevant context.
+SHRINK_LEVELS = ("radius", "radius_no_imports", "node", "node_compressed")
+
+
+@dataclass(frozen=True)
+class ShrunkRadius:
+    """A Radius of Relevance narrowed until it fits a token budget."""
+    context: str
+    level: str
+    tokens: int
+    budget_tokens: int
+    chunk: object = None
+
+
+def shrink_radius_to_budget(
+    source: str, file_path: str, symbol: str, budget_tokens: int,
+) -> Optional[ShrunkRadius]:
+    """Narrow the Radius of Relevance for *symbol* until it fits *budget_tokens*:
+    full radius → radius without imports → the node alone → the node compressed
+    (head + tail, the lane's own ``fit_prompt_to_window``). FAIL-CLOSED: when
+    even the compressed node exceeds the budget, return ``None`` — the caller
+    must decline rather than overflow the window. Never raises."""
+    try:
+        budget = max(1, int(budget_tokens))
+        from backend.core.ouroboros.governance.chunked_generation import extract_target_chunk
+        chunk = extract_target_chunk(source, file_path, symbol)
+        node_src = (getattr(chunk, "source_code", "") or "") if chunk is not None else ""
+        radius = radius_of_relevance(source, file_path, symbol) or ""
+        candidates = []
+        if radius:
+            candidates.append(("radius", radius))
+            no_imports = _drop_module_imports(radius)
+            if no_imports and no_imports != radius:
+                candidates.append(("radius_no_imports", no_imports))
+        if node_src:
+            candidates.append(("node", node_src))
+        for level, text in candidates:
+            t = estimate_tokens(text)
+            if t <= budget:
+                return ShrunkRadius(text, level, t, budget, chunk)
+        if node_src:
+            from backend.core.ouroboros.governance.local_inference_director import fit_prompt_to_window
+            # fit_prompt_to_window is best-effort (its compression marker costs
+            # tokens of its own), so the target is tightened until the MEASURED
+            # size fits; a budget the marker alone would dominate is declined.
+            target = budget
+            for _ in range(6):
+                _sys, compressed, _c = fit_prompt_to_window("", node_src, max_tokens=max(1, target))
+                t = estimate_tokens(compressed)
+                if compressed.strip() and t <= budget and not compressed.startswith("[context omitted") and "def " in compressed:
+                    return ShrunkRadius(compressed, "node_compressed", t, budget, chunk)
+                if target <= 1:
+                    break
+                target = int(target * 0.7)
+        logger.warning(
+            "[IntelligentChunking] %s::%s does not fit %d tokens at ANY shrink level — declining (fail-closed)",
+            file_path, symbol, budget,
+        )
+        return None
+    except Exception:  # noqa: BLE001
+        logger.debug("[IntelligentChunking] shrink degraded", exc_info=True)
+        return None
+
+
+def _drop_module_imports(radius: str) -> str:
+    """The radius without its module-level import block (the first shrink)."""
+    try:
+        tree = ast.parse(radius)
+    except (SyntaxError, ValueError):
+        return radius
+    keep = [n for n in tree.body if not isinstance(n, (ast.Import, ast.ImportFrom))]
+    if len(keep) == len(tree.body):
+        return radius
+    lines = radius.splitlines()
+    out = []
+    for n in keep:
+        lo, hi = getattr(n, "lineno", None), getattr(n, "end_lineno", None)
+        if lo and hi:
+            out.append("\n".join(lines[lo - 1: hi]))
+    return "\n\n\n".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +433,7 @@ def select_extraction_strategy(
     query: str = "",
     *,
     conn: Optional[sqlite3.Connection] = None,
+    node_budget_tokens: Optional[int] = None,
 ) -> ChunkPlan:
     """Choose how to feed *source* to DoubleWord. Under the ceiling → whole-file
     is fine (small files). OVER the ceiling → whole-file is FORBIDDEN: try
@@ -355,20 +452,18 @@ def select_extraction_strategy(
     def _try_ast() -> Optional[ChunkPlan]:
         if not symbol:
             return None
-        radius = radius_of_relevance(source, file_path, symbol)
-        if not radius:
-            return None
-        chunk = None
-        try:
-            from backend.core.ouroboros.governance.chunked_generation import (
-                extract_target_chunk,
+        budget = node_budget_tokens if node_budget_tokens is not None else dynamic_token_ceiling()
+        shrunk = shrink_radius_to_budget(source, file_path, symbol, budget)
+        if shrunk is None:
+            return None   # fail-closed: nothing that fits → RAG, never whole-file
+        if shrunk.level != "radius":
+            logger.info(
+                "[IntelligentChunking] %s::%s radius narrowed to level=%s (%d/%d tokens)",
+                file_path, symbol, shrunk.level, shrunk.tokens, shrunk.budget_tokens,
             )
-            chunk = extract_target_chunk(source, file_path, symbol)
-        except Exception:  # noqa: BLE001
-            chunk = None
         return ChunkPlan(
-            strategy=_STRATEGY_AST, context=radius,
-            forbade_whole_file=True, chunk=chunk,
+            strategy=_STRATEGY_AST, context=shrunk.context,
+            forbade_whole_file=True, chunk=shrunk.chunk,
         )
 
     def _rag() -> ChunkPlan:
@@ -396,6 +491,8 @@ def select_extraction_strategy(
 
 __all__ = [
     "ChunkPlan",
+    "SHRINK_LEVELS",
+    "ShrunkRadius",
     "best_strategy",
     "dynamic_token_ceiling",
     "estimate_tokens",
@@ -404,5 +501,6 @@ __all__ = [
     "radius_of_relevance",
     "record_strategy_outcome",
     "select_extraction_strategy",
+    "shrink_radius_to_budget",
     "strategy_weights",
 ]

@@ -278,7 +278,15 @@ class ProductionAgentTurnFn:
         task_profile: str = "code_repair",
         compactor: Optional[Any] = None,
         compaction_config: Optional[Any] = None,
+        framing: str = "",
+        node_context_fn: Optional[Callable[[ChunkTarget], str]] = None,
     ) -> None:
+        # Map-reduce view (2026-09-07): the node prompt may carry a strict framing
+        # and a READ-ONLY Radius of Relevance from ``node_context_fn`` — the zoomed
+        # region around the node, already shrunk to the model's budget — so the
+        # worker sees structure without ever seeing (or re-emitting) the file.
+        self._framing = framing or ""
+        self._node_context_fn = node_context_fn
         self._client = client
         self._tool_backend = tool_backend
         self._repo_root = repo_root
@@ -329,8 +337,21 @@ class ProductionAgentTurnFn:
         start = int(getattr(chunk, "start_line", 0) or 0)
         end = int(getattr(chunk, "end_line", 0) or 0)
         fp = getattr(chunk, "file_path", "") or getattr(chunk, "path", "") or ""
+        context_block = ""
+        if self._node_context_fn is not None:
+            try:
+                ctx_text = self._node_context_fn(target) or ""
+            except Exception:  # noqa: BLE001 — a context fault never blocks the node
+                ctx_text = ""
+            if ctx_text.strip() and ctx_text.strip() != src.strip():
+                context_block = (
+                    "Read-only surrounding context (Radius of Relevance — NOT the whole "
+                    "file; do not reproduce or modify it):\n```python\n" + ctx_text + "\n```\n\n"
+                )
         base = (
-            f"You are repairing exactly ONE function: `{target.symbol}` in "
+            (self._framing + "\n\n" if self._framing else "")
+            + context_block
+            + f"You are repairing exactly ONE function: `{target.symbol}` in "
             f"{fp} (lines {start}-{end}). Do NOT touch any other function or "
             f"line. Your entire write scope is those lines.\n\n"
             f"Task: {target.instruction or ('repair ' + target.symbol)}\n\n"

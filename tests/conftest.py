@@ -792,3 +792,27 @@ def _isolate_live_inference_tiers(monkeypatch):
     does.
     """
     monkeypatch.setenv("JARVIS_LOCAL_PRIME_ENABLED", "false")
+
+
+
+@pytest.fixture(autouse=True)
+def _isolate_context_budget(monkeypatch):
+    """Every large-file limit now DERIVES from the served model's negotiated
+    window (``context_budget``); the flat 300-line / 8000-token defaults are
+    gone from the code. Two things follow for the suite:
+
+    * the process cache of primed budgets must not leak between tests, and a
+      unit test must never negotiate against the live node — so the cache is
+      reset around every test;
+    * the historical fixtures ("an 830-line file is big", "a 9k-token file
+      exceeds the ceiling") were written against those old numbers. They keep
+      them HERE, as the explicit operator overrides the code documents, so the
+      intent lives in the test layer rather than in a production default.
+      Tests of the derivation itself ``delenv`` these.
+    """
+    from backend.core.ouroboros.governance import context_budget as cb
+    cb.reset_cache()
+    monkeypatch.setenv("JARVIS_DW_BIG_FILE_LINE_THRESHOLD", "300")
+    monkeypatch.setenv("JARVIS_DW_MAX_CONTEXT_TOKENS", "8000")
+    yield
+    cb.reset_cache()

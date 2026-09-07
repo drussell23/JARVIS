@@ -77,6 +77,31 @@ class AgentOutcome:
 # itself may take multiple tool rounds; here it is the injection seam.
 AgentTurnFn = Callable[[ChunkTarget, str], Awaitable[str]]
 
+_LESSON_TASKS: "set" = set()
+
+
+def _note_stitch_lesson(target: ChunkTarget, error_class: str, error_text: str, *, turn: int) -> None:
+    """Route a boundary hallucination / unconverged node into the LessonMemory
+    JSONL substrate — fire-and-forget on the running loop, never on the
+    worker's critical path, never raising. The op id is not known here; the
+    lesson is keyed by the node's file, which is what the next generation for
+    that module retrieves on."""
+    try:
+        import asyncio as _asyncio
+        from backend.core.ouroboros.governance.lesson_memory import record_lesson
+        chunk = getattr(target, "chunk", None)
+        fp = getattr(chunk, "file_path", "") or getattr(chunk, "path", "") or ""
+        loop = _asyncio.get_running_loop()
+        task = loop.create_task(record_lesson(
+            op_id="", target_files=(fp,) if fp else (), phase="STITCH",
+            failure_class="content", error_class=error_class,
+            error_text=f"{target.symbol} turn {turn}: {error_text}"[:600],
+            summary=f"map-reduce node {target.symbol}: {error_class}",
+        ))
+        _LESSON_TASKS.add(task); task.add_done_callback(_LESSON_TASKS.discard)
+    except Exception:  # noqa: BLE001
+        pass
+
 
 def _verify_node_against_ast(node: str, target: ChunkTarget) -> tuple:
     """VERIFY step — the agent's output must be a single, syntactically-valid
@@ -158,6 +183,7 @@ async def run_agentic_repair(
                     "[AgenticSuperAgent] %s turn %d SEAM FRACTURE: %s — refining "
                     "(disk write blocked)", target.symbol, turn, last_error,
                 )
+                _note_stitch_lesson(target, "stitch_boundary_hallucination", last_error, turn=turn)
                 continue
         # Local AST symbol check — Python only. A polyglot node (json/yaml/tsx)
         # is not a Python function; its whole-file structural validate at the
@@ -197,6 +223,7 @@ async def run_agentic_repair(
         "[AgenticSuperAgent] %s UNCONVERGED after %d turns — emitting "
         "agent_unconverged", target.symbol, turns,
     )
+    _note_stitch_lesson(target, "stitch_node_unconverged", last_error or "no converging node", turn=turns)
     return AgentOutcome(
         symbol=target.symbol, status=STATUS_UNCONVERGED, node=None,
         turns=turns, last_error=last_error,

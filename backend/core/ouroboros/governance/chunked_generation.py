@@ -27,8 +27,7 @@ from typing import Optional
 logger = logging.getLogger("Ouroboros.ChunkedGeneration")
 
 _ENABLED_ENV = "JARVIS_DW_BIG_FILE_CHUNKING_ENABLED"
-_THRESHOLD_ENV = "JARVIS_DW_BIG_FILE_LINE_THRESHOLD"
-_DEFAULT_THRESHOLD = 300
+_THRESHOLD_ENV = "JARVIS_DW_BIG_FILE_LINE_THRESHOLD"   # legacy: honoured ONLY as an explicit override
 
 
 def chunking_enabled() -> bool:
@@ -39,13 +38,26 @@ def chunking_enabled() -> bool:
     )
 
 
-def big_file_line_threshold() -> int:
-    """A file with more than this many lines is a chunking candidate (default
-    300). Env ``JARVIS_DW_BIG_FILE_LINE_THRESHOLD``. Clamped >= 50."""
-    try:
-        return max(50, int(os.environ.get(_THRESHOLD_ENV, str(_DEFAULT_THRESHOLD))))
-    except (TypeError, ValueError):
-        return _DEFAULT_THRESHOLD
+def big_file_line_threshold(source: Optional[str] = None) -> int:
+    """The line count at which *source* crosses the ingest ceiling — DERIVED
+    from the served model's budget and the file's own average line length
+    (``ContextBudget.line_threshold_for``). Without a source, the ceiling
+    expressed in tokens. The legacy env is honoured only as an explicit
+    override; it no longer carries a default (the flat 300 described a cloud
+    lane, not the model answering). Never raises."""
+    raw = (os.environ.get(_THRESHOLD_ENV, "") or "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    from backend.core.ouroboros.governance import context_budget as cb
+    budget = cb.current_budget()
+    if budget is not None and source:
+        return budget.line_threshold_for(source)
+    return cb.ingest_ceiling_tokens()
 
 
 def is_big_file(source: str, *, threshold: Optional[int] = None) -> bool:
@@ -53,8 +65,16 @@ def is_big_file(source: str, *, threshold: Optional[int] = None) -> bool:
     choke — the PROACTIVE gate. Never raises."""
     if not source:
         return False
-    lines = source.count("\n") + 1
-    return lines > (threshold if threshold is not None else big_file_line_threshold())
+    if threshold is not None:                      # explicit caller threshold: lines
+        return source.count("\n") + 1 > int(threshold)
+    raw = (os.environ.get(_THRESHOLD_ENV, "") or "").strip()
+    if raw:                                        # explicit operator override: lines
+        try:
+            return source.count("\n") + 1 > int(raw)
+        except ValueError:
+            pass
+    from backend.core.ouroboros.governance.context_budget import exceeds_ceiling
+    return exceeds_ceiling(source)                 # derived: tokens vs the primed budget
 
 
 def should_chunk(source: str, symbol: Optional[str]) -> bool:
