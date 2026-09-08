@@ -87,6 +87,83 @@ def loop_interval_s() -> float:
     return 60.0
 
 
+#: How far a record's wall-clock stamp may sit BEFORE our dispatch and still
+#: plausibly belong to it. The reconciliation ledger is written by other
+#: processes — subprocess workers, and on this host a WSL guest whose clock can
+#: step relative to the Windows host — so two stamps taken "at the same time"
+#: are not guaranteed to be ordered. Derived from the loop's own cadence rather
+#: than fixed: a slow session tolerates more drift than a fast one, and a
+#: tolerance larger than the gap between passes would start admitting the
+#: PREVIOUS pass's verdict, which is the bug this whole filter exists to close.
+def _skew_tolerance_s() -> float:
+    try:
+        raw = (os.environ.get("JARVIS_LEDGER_SKEW_TOLERANCE_S", "") or "").strip()
+        if raw:
+            return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        pass
+    return max(2.0, min(30.0, loop_interval_s() / 4.0))
+
+
+def _record_is_ours(rec: Any, since_ts: float, goal_id: str) -> Optional[bool]:
+    """Does *rec* describe the dispatch that started at *since_ts*?
+
+    True / False / None, where None means AMBIGUOUS — an undatable or
+    skew-boundary record. Ambiguity is resolved by the caller, not here,
+    because "cannot tell" is not the same answer as "no" and collapsing them
+    would let a clock step hide a real landing.
+
+    NEVER raises.
+    """
+    # `getattr(..., default)` does NOT protect against an attribute that
+    # RAISES — a property, a lazy field, a proxy whose backing store is gone.
+    # The default only covers absence.
+    try:
+        raw = getattr(rec, "ts", None)
+    except Exception:  # noqa: BLE001
+        _warn_skew(goal_id, "timestamp attribute raised on read")
+        return None
+    if raw is None:
+        _warn_skew(goal_id, "record carries no timestamp")
+        return None
+    try:
+        ts = float(raw)
+    except (TypeError, ValueError):
+        _warn_skew(goal_id, f"unparseable timestamp {raw!r}")
+        return None
+    if ts >= since_ts:
+        return True
+    tolerance = _skew_tolerance_s()
+    if ts >= (since_ts - tolerance):
+        _warn_skew(
+            goal_id,
+            f"record {since_ts - ts:.1f}s before dispatch, inside the "
+            f"{tolerance:.0f}s skew window — evaluating rather than discarding",
+        )
+        return None
+    return False
+
+
+_SKEW_WARNED: set = set()
+
+
+def _warn_skew(goal_id: str, detail: str) -> None:
+    """One LedgerTimeSkewWarning per (goal, cause). NEVER raises.
+
+    Deduplicated because a skewed clock produces the SAME warning on every
+    poll — several times a second — and a warning that floods is a warning
+    nobody reads.
+    """
+    try:
+        key = (str(goal_id), detail.split(",")[0])
+        if key in _SKEW_WARNED:
+            return
+        _SKEW_WARNED.add(key)
+        logger.warning("[Sentinel] LedgerTimeSkewWarning goal=%s %s", goal_id, detail)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @dataclass(frozen=True)
 class PassOutcome:
     """What one pass of the loop did — the operator's telemetry row."""
@@ -420,11 +497,12 @@ class SentinelLoop:
                 if str(getattr(rec, "goal_id", "")).strip() != wanted:
                     continue
                 if since_ts:
-                    try:
-                        if float(getattr(rec, "ts", 0.0) or 0.0) < since_ts:
-                            continue      # a previous session's verdict
-                    except (TypeError, ValueError):
-                        continue          # undatable => cannot attribute to us
+                    decision = _record_is_ours(rec, since_ts, wanted)
+                    if decision is False:
+                        continue          # a previous session's verdict
+                    # None => ambiguous. Fall through and evaluate it: a record
+                    # we cannot date must not be able to HIDE a landing, and
+                    # the op-id check below is the stronger signal anyway.
                 event = str(getattr(rec, "event", ""))
                 if event == ReconciliationEvent.SATISFIED.value:
                     sha = str(getattr(rec, "commit_sha", "") or "")[:10]

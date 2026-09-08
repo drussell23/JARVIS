@@ -722,6 +722,56 @@ def _announce_schema_decision(ctx, *, force_full_content: bool, diff: bool) -> N
         pass
 
 
+def reported_model_name(ctx: Any, response: Any = None) -> str:
+    """The model to NAME as the one that answered. NEVER raises.
+
+    The provider used to report ``response.model``, which on the local lane is
+    the NOMINAL brain-catalog slot — `brain_selector._DEFAULT_POLICY` still
+    carries legacy GCP ids (`qwen-2.5-coder-7b`, `mistral-7b`) and has no entry
+    for the locally-served 30B at all. So a 19k-token generation running at 161
+    tok/s on `qwen3-coder-ov:30b` was logged, recorded into the trajectory
+    corpus, and read by the operator as a 7B.
+
+    Capability resolution was never wrong — `_served_capability_for` already
+    corrects the slot's declaration against `_resolve_served_model`. Only the
+    NAME was, which is worse than it sounds: it is the field a human uses to
+    decide whether a result is worth anything, and the field the corpus keys a
+    training row on.
+
+    Resolution order, most-authoritative first:
+      1. the routing intent's `served_model` — resolved from the endpoint at
+         admission, the same value the capability verdict used;
+      2. the memoised per-endpoint served-model cache — the SAME map the
+         Context-Hardware Negotiator reads, so the two cannot disagree;
+      3. the response's own claim;
+      4. the operator's local pin.
+    """
+    try:
+        ri = getattr(getattr(ctx, "telemetry", None), "routing_intent", None)
+        served = str(getattr(ri, "served_model", "") or "").strip()
+        if served:
+            return served
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from backend.core.ouroboros.governance.candidate_generator import (
+            _JPRIME_SERVED_MODEL_CACHE,
+        )
+        if len(_JPRIME_SERVED_MODEL_CACHE) == 1:
+            only = next(iter(_JPRIME_SERVED_MODEL_CACHE.values()))
+            if str(only or "").strip():
+                return str(only).strip()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        claimed = str(getattr(response, "model", "") or "").strip()
+        if claimed:
+            return claimed
+    except Exception:  # noqa: BLE001
+        pass
+    return (os.environ.get("JARVIS_LOCAL_MODEL_NAME", "") or "unknown").strip()
+
+
 def _ctx_schema_capability(ctx) -> str:
     """The brain's ``schema_capability`` off ``ctx.telemetry.routing_intent`` —
     the one field ``governed_loop_service`` stamps from the selected brain.
@@ -7001,12 +7051,11 @@ class PrimeProvider:
                         task_type="code_repair",
                         session_id=str(getattr(context, "session_id", "") or ""),
                         route=str(getattr(context, "provider_route", "") or "local"),
-                        model_id_override=str(
-                            getattr(response, "model", "") if response else ""
-                        ) or str(
-                            getattr(getattr(self, "_cfg", None), "model_name", "")
-                            or os.environ.get("JARVIS_LOCAL_MODEL_NAME", "")
-                        ),
+                        # The corpus keys training rows on this. A row
+                        # attributed to a 7B that was actually produced by the
+                        # 30B is worse than a missing row: it teaches the
+                        # wrong thing about which model can do what.
+                        model_id_override=reported_model_name(context, response),
                         is_repair=repair_context is not None,
                         sampling=sampling,
                         temperature=temperature,
@@ -7038,7 +7087,7 @@ class PrimeProvider:
             len(result.candidates),
             duration,
             tool_rounds,
-            getattr(response, "model", "unknown") if response else "unknown",
+            reported_model_name(context, response),
             int(_prime_meta.get("prompt_tokens", 0) or 0),
             _prime_ct,
             # Say which it is, in the log as well as the corpus. A number
