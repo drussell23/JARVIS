@@ -479,16 +479,6 @@ async def run_pytest_subprocess(
 PYTEST_ISOLATION_ARGS: Tuple[str, ...] = ("-o", "addopts=")
 
 
-#: The arguments EVERY governed pytest invocation carries so an inherited
-#: ``addopts`` cannot change what runs: the nearest ``pytest.ini`` (the
-#: repo's ``backend/pytest.ini``) demands ``--cov`` and ``-n auto``, plugins
-#: this venv does not carry, and pytest exits 4 ("unrecognized arguments")
-#: before collecting a test. The TestRunner neutralised it; the VERIFY
-#: benchmark did not, and every production APPLY was rolled back as
-#: ``pass_rate=0.00`` (2026-09-08). One constant, both callers.
-PYTEST_ISOLATION_ARGS: Tuple[str, ...] = ("-o", "addopts=")
-
-
 def run_pytest_subprocess_sync(
     argv: Sequence[str],
     *,
