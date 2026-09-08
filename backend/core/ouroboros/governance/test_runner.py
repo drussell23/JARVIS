@@ -1518,10 +1518,17 @@ class TestRunner:
             if _is_safe_path(tf, self._repo_root):
                 safe_files.append(str(tf))
             else:
-                logger.warning("[TestRunner] Skipping test path outside repo root: %s", tf)
+                logger.warning(
+                    "[TestRunner] Skipping test path outside repo root %s: %s",
+                    self._repo_root, tf,
+                )
 
         if not safe_files:
-            logger.info("[TestRunner] No safe test files to run — returning vacuous pass")
+            logger.warning(
+                "[TestRunner] No safe test files to run (%d declared, all outside %s) — "
+                "returning VACUOUS pass; this run proves nothing",
+                len(test_files), self._repo_root,
+            )
             return TestResult(
                 passed=True,
                 total=0,

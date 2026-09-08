@@ -2062,89 +2062,215 @@ class StaleDiffError(ValueError):
         self.actual_lines = actual_lines
 
 
-def validate_diff_context(original: str, diff_text: str) -> None:
-    """Pre-apply validation gate: verify every hunk's context lines are
-    verbatim substrings of *original* BEFORE any file mutation.
+def _diff_fuzzy_window() -> int:
+    """How far (±lines) a hunk may sit from the position its header states —
+    ``OUROBOROS_DIFF_FUZZY_WINDOW`` (default 15). ONE accessor for the
+    pre-check and the apply, so the two can never disagree about a hunk."""
+    try:
+        return max(0, int(os.environ.get("OUROBOROS_DIFF_FUZZY_WINDOW", "15") or 15))
+    except (TypeError, ValueError):
+        return 15
 
-    This is a pure read operation — it never writes to disk.
+
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def _parse_unified_hunks(diff_text: str) -> List[Tuple[int, List[Tuple[str, str]]]]:
+    """``[(orig_start_0idx, ops)]`` per hunk, ``ops`` = ``(kind, text)`` with
+    kind in ``' '``/``'-'``/``'+'`` and text keeping its newline. ``---``/``+++``
+    headers are skipped; a bare empty line inside a hunk is a blank context
+    line whose leading space the model dropped; any other stray line
+    (``\\ No newline at end of file``) is ignored. The ONE parser."""
+    diff_lines = diff_text.splitlines(keepends=True)
+    hunks: List[Tuple[int, List[Tuple[str, str]]]] = []
+    i = 0
+    while i < len(diff_lines) and not diff_lines[i].startswith("@@"):
+        i += 1
+    while i < len(diff_lines):
+        m = _HUNK_RE.match(diff_lines[i])
+        if m is None:
+            i += 1
+            continue
+        orig_start = int(m.group(1)) - 1
+        i += 1
+        ops: List[Tuple[str, str]] = []
+        while i < len(diff_lines) and not _HUNK_RE.match(diff_lines[i]):
+            line = diff_lines[i]
+            if line[:1] in ("-", "+", " "):
+                ops.append((line[0], line[1:]))
+            elif line.strip() == "":
+                ops.append((" ", line))
+            i += 1
+        hunks.append((orig_start, ops))
+    return hunks
+
+
+def _norm_lines(lines: List[str]) -> List[str]:
+    return [ln.rstrip("\n\r") for ln in lines]
+
+
+def _find_hunk_start(result: List[str], orig_start: int, hunk_orig: List[str], window: int) -> int:
+    """The first index within ±window of *orig_start* where *hunk_orig* sits
+    verbatim (line endings ignored), else whitespace-stripped; -1 if neither.
+    Tolerates the off-by-N line numbers models commonly state."""
+    norm_hunk = _norm_lines(hunk_orig)
+    hunk_len = len(hunk_orig)
+    lo = max(0, orig_start - window)
+    hi = min(len(result) - hunk_len + 1, orig_start + window + 1)
+    for candidate in range(lo, hi):
+        if _norm_lines(result[candidate:candidate + hunk_len]) == norm_hunk:
+            return candidate
+    ws_hunk = [ln.strip() for ln in norm_hunk]
+    for candidate in range(lo, hi):
+        if [ln.strip() for ln in _norm_lines(result[candidate:candidate + hunk_len])] == ws_hunk:
+            return candidate
+    return -1
+
+
+def _hunk_anchors(ops: List[Tuple[str, str]]) -> List[Tuple[int, str]]:
+    """The hunk's original-side NON-BLANK lines — its locators — as
+    ``(op_index, stripped_text)``."""
+    return [(i, t.strip()) for i, (k, t) in enumerate(ops) if k in (" ", "-") and t.strip()]
+
+
+def _align_hunk(
+    file_lines: List[str], orig_start: int, ops: List[Tuple[str, str]], window: int,
+) -> Optional[Tuple[int, int, List[str]]]:
+    """ANCHORED placement — the hunk's context is a locator, not a verbatim
+    requirement. Its non-blank original-side lines are matched, in order and
+    whitespace-normalised, against the file within ±window of the stated
+    position, skipping only BLANK file lines between them; a blank line the
+    model hallucinated (or omitted) is tolerated, a non-blank line the file
+    does not have is a fracture. Returns ``(start, end, new_span)`` — replace
+    ``file_lines[start:end]`` with ``new_span``, whose context lines are the
+    FILE's own text (the model's rendering of them is never written) — or
+    None when the anchors cannot be placed.
+
+    Why: the served 30B emits diffs whose context carries one phantom blank
+    line (soak 2026-09-08 00:11Z, hunk 2 of the tracer goal) and the
+    equal-length matchers refused an otherwise exact edit twice, tripping
+    forward-progress. Nearest placement to the stated position wins."""
+    anchors = _hunk_anchors(ops)
+    if not anchors:
+        return None
+    n = len(file_lines)
+    lo = max(0, orig_start - window)
+    hi = min(n, orig_start + window + 1)
+    first_key = anchors[0][1]
+    for cand in sorted(range(lo, hi), key=lambda c: (abs(c - orig_start), c)):
+        if file_lines[cand].strip() != first_key:
+            continue
+        mapping: Dict[int, int] = {}
+        fi = cand
+        ok = True
+        for op_i, key in anchors:
+            while fi < n and not file_lines[fi].strip():
+                fi += 1
+            if fi >= n or file_lines[fi].strip() != key:
+                ok = False
+                break
+            mapping[op_i] = fi
+            fi += 1
+        if not ok:
+            continue
+        start = mapping[anchors[0][0]]
+        end = mapping[anchors[-1][0]] + 1
+        new: List[str] = []
+        fpos = start
+        for i, (kind, text) in enumerate(ops):
+            if kind == "+":
+                new.append(text)
+                continue
+            target = mapping.get(i)
+            if target is not None:
+                new.extend(file_lines[fpos:target])  # the file's own blank lines in between
+                if kind == " ":
+                    new.append(file_lines[target])
+                fpos = target + 1
+            elif fpos < end and not file_lines[fpos].strip():
+                # a blank context / removal line: honoured only where the file has one
+                if kind == " ":
+                    new.append(file_lines[fpos])
+                fpos += 1
+        new.extend(file_lines[fpos:end])
+        return start, end, new
+    return None
+
+
+def _diagnose_hunk(file_lines: List[str], orig_start: int, ops: List[Tuple[str, str]], window: int) -> str:
+    """WHY a hunk could not be placed — the first locator the file does not
+    have near the stated position, so the model (and the operator) see the
+    fracture instead of two lines that matched."""
+    anchors = _hunk_anchors(ops)
+    if not anchors:
+        return "the hunk carries no non-blank context or removal lines to anchor on"
+    n = len(file_lines)
+    lo = max(0, orig_start - window)
+    hi = min(n, orig_start + window + 1)
+    best: Tuple[int, int, str, str] = (-1, 0, "", "")  # matched, file_line_no, expected, got
+    for cand in range(lo, hi):
+        if file_lines[cand].strip() != anchors[0][1]:
+            continue
+        fi = cand
+        matched = 0
+        for _op_i, key in anchors:
+            while fi < n and not file_lines[fi].strip():
+                fi += 1
+            if fi >= n or file_lines[fi].strip() != key:
+                got = file_lines[fi].rstrip("\n\r") if fi < n else "<end of file>"
+                if matched > best[0]:
+                    best = (matched, fi + 1, key, got)
+                break
+            matched += 1
+            fi += 1
+        else:
+            return "anchors align but the hunk could not be placed"
+    if best[0] < 0:
+        return (
+            f"context line {anchors[0][1]!r} not found within ±{window} lines of line {orig_start + 1}"
+        )
+    return (
+        f"context diverges after {best[0]} matching line(s): expected {best[2]!r}, "
+        f"file line {best[1]} is {best[3]!r}"
+    )
+
+
+def validate_diff_context(original: str, diff_text: str) -> None:
+    """Pre-apply validation gate: every hunk must be PLACEABLE in *original*
+    BEFORE any file mutation — the same ladder ``_apply_unified_diff`` walks
+    (verbatim → ±window offset → whitespace-stripped → anchored), so the
+    pre-check and the apply can never disagree. Pure read; never writes.
 
     Raises
     ------
     StaleDiffError
-        If any hunk's context lines cannot be located in *original*
-        (indicating the model generated against a stale or hallucinated
-        version of the file).
+        If a hunk's locators cannot be placed (the model generated against a
+        stale or hallucinated version of the file). The message names the
+        first locator the file does not have.
     """
-    _hunk_re = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
     orig_lines = original.splitlines(keepends=True)
-
-    def _norm(lines: List[str]) -> List[str]:
-        return [ln.rstrip("\n\r") for ln in lines]
-
-    diff_lines = diff_text.splitlines(keepends=True)
-    i = 0
-    # Skip --- / +++ header
-    while i < len(diff_lines) and not diff_lines[i].startswith("@@"):
-        i += 1
-
-    while i < len(diff_lines):
-        m = _hunk_re.match(diff_lines[i])
-        if m is None:
-            i += 1
-            continue
-
-        orig_start = int(m.group(1)) - 1  # 0-indexed
-        i += 1
-
-        # Collect context + removed lines (the "original" side of the hunk)
-        hunk_orig: List[str] = []
-        while i < len(diff_lines) and not _hunk_re.match(diff_lines[i]):
-            line = diff_lines[i]
-            if line.startswith("-") or line.startswith(" "):
-                hunk_orig.append(line[1:])
-            i += 1
-
+    window = _diff_fuzzy_window()
+    for orig_start, ops in _parse_unified_hunks(diff_text):
+        hunk_orig = [t for k, t in ops if k in (" ", "-")]
         if not hunk_orig:
             continue
-
-        hunk_len = len(hunk_orig)
-        norm_hunk = _norm(hunk_orig)
-
-        # Exact match first
-        actual = orig_lines[orig_start:orig_start + hunk_len]
-        if _norm(actual) == norm_hunk:
+        actual = orig_lines[orig_start:orig_start + len(hunk_orig)]
+        if _norm_lines(actual) == _norm_lines(hunk_orig):
             continue
+        if _find_hunk_start(orig_lines, orig_start, hunk_orig, window) != -1:
+            continue
+        if _align_hunk(orig_lines, orig_start, ops, window) is not None:
+            continue
+        raise StaleDiffError(
+            f"Diff hunk at line {orig_start + 1} does not match source — "
+            f"{_diagnose_hunk(orig_lines, orig_start, ops, window)}. "
+            f"Searched ±{window} lines.",
+            hunk_line=orig_start + 1,
+            expected_context=hunk_orig,
+            actual_lines=actual,
+        )
 
-        # Bounded fuzzy search (±15 lines) to tolerate off-by-N from LLM
-        window = int(os.environ.get("OUROBOROS_DIFF_FUZZY_WINDOW", "15"))
-        lo = max(0, orig_start - window)
-        hi = min(len(orig_lines) - hunk_len + 1, orig_start + window + 1)
-        found = -1
-        for candidate in range(lo, hi):
-            if _norm(orig_lines[candidate:candidate + hunk_len]) == norm_hunk:
-                found = candidate
-                break
 
-        # Secondary: whitespace-stripped comparison (Claude often gets indent wrong)
-        if found == -1:
-            _ws_norm = lambda lines: [ln.strip() for ln in _norm(lines)]
-            ws_hunk = _ws_norm(hunk_orig)
-            for candidate in range(lo, hi):
-                if _ws_norm(orig_lines[candidate:candidate + hunk_len]) == ws_hunk:
-                    found = candidate
-                    break
-
-        if found == -1:
-            raise StaleDiffError(
-                f"Diff hunk at line {orig_start + 1} does not match source — "
-                f"model likely generated against stale/hallucinated content. "
-                f"Expected context: {hunk_orig[:2]!r}, "
-                f"got: {orig_lines[orig_start:orig_start + 2]!r}. "
-                f"Searched ±{window} lines with no match.",
-                hunk_line=orig_start + 1,
-                expected_context=hunk_orig,
-                actual_lines=orig_lines[orig_start:orig_start + hunk_len],
-            )
 
 
 def is_change_needed(file_path: Path, sentinel: str) -> bool:
@@ -2186,96 +2312,43 @@ def _apply_unified_diff(original: str, diff_text: str) -> str:
       '-' removed line
       '+' added line
 
-    Hunks are applied in reverse order so earlier-hunk indices remain valid
-    after later-hunk edits.
+    Each hunk is placed by a ladder: verbatim at the stated position →
+    verbatim / whitespace-stripped within ±``_diff_fuzzy_window()`` lines →
+    ANCHORED (``_align_hunk``: the non-blank context/removal lines locate
+    the edit; blank lines are not locators; the file's own context text is
+    kept). Hunks are applied in reverse order so earlier-hunk indices remain
+    valid after later-hunk edits.
 
     Raises
     ------
     ValueError
-        If a hunk's context lines do not match the original at the expected
-        position, indicating a stale or malformed diff.
+        If a hunk cannot be placed — the message names the first locator the
+        file does not have, not two lines that happened to match.
     """
-    orig_lines = original.splitlines(keepends=True)
-    result: List[str] = list(orig_lines)
-
-    _hunk_re = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
-
-    diff_lines = diff_text.splitlines(keepends=True)
-
-    # Skip --- / +++ header lines
-    i = 0
-    while i < len(diff_lines) and not diff_lines[i].startswith("@@"):
-        i += 1
-
-    hunks: List[Tuple[int, List[str], List[str]]] = []
-    while i < len(diff_lines):
-        m = _hunk_re.match(diff_lines[i])
-        if m is None:
-            i += 1
-            continue
-
-        orig_start = int(m.group(1)) - 1  # 0-indexed
-        i += 1
-
-        hunk_orig: List[str] = []
-        hunk_new: List[str] = []
-        while i < len(diff_lines) and not _hunk_re.match(diff_lines[i]):
-            line = diff_lines[i]
-            if line.startswith("-"):
-                hunk_orig.append(line[1:])
-            elif line.startswith("+"):
-                hunk_new.append(line[1:])
-            elif line.startswith(" "):
-                hunk_orig.append(line[1:])
-                hunk_new.append(line[1:])
-            # Ignore "\\ No newline at end of file" and stray lines
-            i += 1
-
-        hunks.append((orig_start, hunk_orig, hunk_new))
-
-    def _normalize(lines: List[str]) -> List[str]:
-        return [ln.rstrip("\n\r") for ln in lines]
-
-    def _find_hunk_start(result: List[str], orig_start: int, hunk_orig: List[str], window: int = 15) -> int:
-        """Search for hunk_orig within a ±window line window of orig_start.
-
-        Returns the best matching start index, or -1 if not found.
-        This tolerates off-by-N line numbers that LLMs commonly generate.
-        Falls back to whitespace-stripped comparison if exact match fails.
-        """
-        norm_hunk = _normalize(hunk_orig)
-        hunk_len = len(hunk_orig)
-        lo = max(0, orig_start - window)
-        hi = min(len(result) - hunk_len + 1, orig_start + window + 1)
-        for candidate in range(lo, hi):
-            if _normalize(result[candidate:candidate + hunk_len]) == norm_hunk:
-                return candidate
-        # Secondary: whitespace-stripped comparison
-        ws_hunk = [ln.strip() for ln in norm_hunk]
-        for candidate in range(lo, hi):
-            if [ln.rstrip("\n\r").strip() for ln in result[candidate:candidate + hunk_len]] == ws_hunk:
-                return candidate
-        return -1
-
-    # Apply hunks bottom-to-top so earlier indices stay valid
-    for orig_start, hunk_orig, hunk_new in reversed(hunks):
+    result: List[str] = list(original.splitlines(keepends=True))
+    window = _diff_fuzzy_window()
+    for orig_start, ops in reversed(_parse_unified_hunks(diff_text)):
+        hunk_orig = [t for k, t in ops if k in (" ", "-")]
+        hunk_new = [t for k, t in ops if k in (" ", "+")]
         end = orig_start + len(hunk_orig)
-        actual = result[orig_start:end]
-        # Normalise line endings for comparison only
-        if _normalize(actual) != _normalize(hunk_orig):
-            # Exact match failed — try fuzzy search within ±3 lines (LLMs commonly
-            # generate diffs with off-by-1 or off-by-2 line numbers)
-            found = _find_hunk_start(result, orig_start, hunk_orig, window=3)
-            if found == -1:
-                raise ValueError(
-                    f"Diff hunk at line {orig_start + 1} does not match source — "
-                    f"expected {hunk_orig[:2]!r}, got {actual[:2]!r}"
-                )
-            orig_start = found
-            end = orig_start + len(hunk_orig)
-        result[orig_start:end] = hunk_new
-
+        if _norm_lines(result[orig_start:end]) == _norm_lines(hunk_orig):
+            result[orig_start:end] = hunk_new
+            continue
+        found = _find_hunk_start(result, orig_start, hunk_orig, window)
+        if found != -1:
+            result[found:found + len(hunk_orig)] = hunk_new
+            continue
+        aligned = _align_hunk(result, orig_start, ops, window)
+        if aligned is None:
+            raise ValueError(
+                f"Diff hunk at line {orig_start + 1} does not match source — "
+                f"{_diagnose_hunk(result, orig_start, ops, window)}"
+            )
+        start, stop, new_span = aligned
+        result[start:stop] = new_span
     return "".join(result)
+
+
 
 
 def _find_context_files(
