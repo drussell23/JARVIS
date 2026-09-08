@@ -259,6 +259,11 @@ class SentinelLoop:
                 )
 
         op_id = ""
+        # Wall time, not monotonic: the reconciliation ledger stamps `ts` in
+        # wall seconds and is written by OTHER processes. The small margin
+        # absorbs clock skew between them without letting a previous
+        # session's verdict through — which is the bug being closed.
+        dispatched_at = time.time() - 2.0
         try:
             # The intake submitter REFUSES to run on the event loop — it would
             # have to await intake from inside the loop intake runs on, which
@@ -308,7 +313,7 @@ class SentinelLoop:
                 detail="not dispatched", duration_s=time.monotonic() - started,
             )
 
-        state, detail = await self._await_outcome(op_id, goal_id)
+        state, detail = await self._await_outcome(op_id, goal_id, dispatched_at)
         elapsed = time.monotonic() - started
 
         # Feed the controller regardless of verdict: a failed op still tells
@@ -337,7 +342,8 @@ class SentinelLoop:
 
     # -- seams ------------------------------------------------------------
 
-    async def _await_outcome(self, op_id: str, goal_id: str = "") -> Tuple[str, str]:
+    async def _await_outcome(self, op_id: str, goal_id: str = "",
+                             since_ts: float = 0.0) -> Tuple[str, str]:
         """Terminal state for this GOAL, bounded.
 
         Correlated on the goal, not the op id, because the two are different
@@ -360,16 +366,30 @@ class SentinelLoop:
                 raise
             except Exception as exc:  # noqa: BLE001
                 return "failed", f"outcome probe failed: {type(exc).__name__}"
-        return await self._await_via_goal_ledger(goal_id or op_id)
+        return await self._await_via_goal_ledger(goal_id or op_id, since_ts)
 
-    async def _await_via_goal_ledger(self, goal_id: str) -> Tuple[str, str]:
-        """Poll the reconciliation ledger for this goal. NEVER raises."""
+    async def _await_via_goal_ledger(
+        self, goal_id: str, since_ts: float = 0.0,
+    ) -> Tuple[str, str]:
+        """Poll the reconciliation ledger for THIS dispatch. NEVER raises.
+
+        ``since_ts`` is load-bearing. The ledger is cross-session and
+        append-only, so a goal dispatched in an earlier run leaves a TERMINAL
+        record behind forever. Reading the whole history meant every retry
+        resolved instantly against a verdict from a previous session — the
+        goal never ran, the target was cooled, and the backoff escalated on a
+        failure that had already been counted. Observed live: ops appearing in
+        the Sentinel's own log lines and nowhere in the session that supposedly
+        produced them.
+
+        Only records at or after our own dispatch can describe our own op.
+        """
         deadline = time.monotonic() + self._outcome_deadline_s()
         poll = max(2.0, loop_interval_s() / 10.0)
         while time.monotonic() < deadline:
             if self._stopping.is_set():
                 return "failed", "loop stopping"
-            verdict = await asyncio.to_thread(self._goal_verdict, goal_id)
+            verdict = await asyncio.to_thread(self._goal_verdict, goal_id, since_ts)
             if verdict is not None:
                 return verdict
             try:
@@ -380,9 +400,14 @@ class SentinelLoop:
         return "timed_out", f"no terminal state within {self._outcome_deadline_s():.0f}s"
 
     @staticmethod
-    def _goal_verdict(goal_id: str) -> "Optional[Tuple[str, str]]":
+    def _goal_verdict(
+        goal_id: str, since_ts: float = 0.0,
+    ) -> "Optional[Tuple[str, str]]":
         """('landed'|'failed', detail) once this goal reaches a verdict, else
-        None. NEVER raises — an unreadable ledger means 'not yet'."""
+        None. NEVER raises — an unreadable ledger means 'not yet'.
+
+        Records older than *since_ts* are HISTORY, not this dispatch's outcome.
+        """
         try:
             from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: E501
                 ReconciliationEvent, read_records,
@@ -394,6 +419,12 @@ class SentinelLoop:
             for rec in read_records() or ():
                 if str(getattr(rec, "goal_id", "")).strip() != wanted:
                     continue
+                if since_ts:
+                    try:
+                        if float(getattr(rec, "ts", 0.0) or 0.0) < since_ts:
+                            continue      # a previous session's verdict
+                    except (TypeError, ValueError):
+                        continue          # undatable => cannot attribute to us
                 event = str(getattr(rec, "event", ""))
                 if event == ReconciliationEvent.SATISFIED.value:
                     sha = str(getattr(rec, "commit_sha", "") or "")[:10]

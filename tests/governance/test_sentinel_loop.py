@@ -344,6 +344,34 @@ def test_a_terminal_op_that_did_not_satisfy_is_a_failure_not_a_wait():
     assert "goal unsatisfied" in probe
 
 
+def test_a_previous_sessions_verdict_is_not_this_dispatchs_outcome():
+    """The reconciliation ledger is cross-session and append-only, so a goal
+    dispatched in an earlier run leaves a TERMINAL record behind forever.
+    Reading the whole history made every retry resolve INSTANTLY against a
+    verdict from a previous session — the goal never ran, the target was
+    cooled, and the backoff escalated on a failure already counted. Observed
+    live: ops named in the Sentinel's log appearing nowhere in the session
+    that supposedly produced them."""
+    src = inspect.getsource(SentinelLoop._goal_verdict)
+    assert "since_ts" in src, "the probe still reads the whole history"
+    assert "previous session" in src or "History" in src or "history" in src
+
+    stamp = inspect.getsource(SentinelLoop.run_once)
+    assert "dispatched_at = time.time()" in stamp, (
+        "nothing records WHEN this dispatch happened, so records cannot be "
+        "attributed to it"
+    )
+
+
+def test_the_dispatch_stamp_is_wall_time_not_monotonic():
+    """The ledger stamps `ts` in wall seconds and is written by OTHER
+    processes; a monotonic stamp would be incomparable across them."""
+    src = inspect.getsource(SentinelLoop.run_once)
+    assert "time.time()" in src
+    idx = src.index("dispatched_at")
+    assert "monotonic" not in src[idx:idx + 120]
+
+
 def test_an_unreadable_reconciliation_ledger_means_not_yet():
     """A probe that cannot read must not invent a verdict."""
     assert SentinelLoop._goal_verdict("") is None
