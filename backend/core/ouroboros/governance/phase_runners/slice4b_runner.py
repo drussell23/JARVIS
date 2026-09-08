@@ -1087,6 +1087,24 @@ class Slice4bRunner(PhaseRunner):
                         ),
                         timeout=_verify_budget_s + 5.0,
                     )
+                    from backend.core.ouroboros.governance.differential_validation import (  # noqa: PLC0415
+                        apply_context_baseline as _apply_ctx_baseline,
+                    )
+                    _multi, _v_ambient = _apply_ctx_baseline(_multi, ctx)
+                    if _v_ambient:
+                        logger.warning(
+                            "[Orchestrator] VERIFY: %d ambient-red test(s) excluded — red before "
+                            "the candidate (VALIDATE's verdict) op=%s", len(_v_ambient), ctx.op_id[:16],
+                        )
+                    from backend.core.ouroboros.governance.differential_validation import (  # noqa: PLC0415
+                        apply_context_baseline as _apply_ctx_baseline,
+                    )
+                    _multi, _v_ambient = _apply_ctx_baseline(_multi, ctx)
+                    if _v_ambient:
+                        logger.warning(
+                            "[Orchestrator] VERIFY: %d ambient-red test(s) excluded — red before "
+                            "the candidate (VALIDATE's verdict) op=%s", len(_v_ambient), ctx.op_id[:16],
+                        )
                     _verify_test_passed = _multi.passed
                     for _ar in _multi.adapter_results:
                         _verify_test_total += _ar.test_result.total

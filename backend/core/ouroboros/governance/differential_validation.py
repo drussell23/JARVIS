@@ -185,6 +185,40 @@ def candidate_is_test_authoring(all_files: Iterable[Tuple[str, str]]) -> bool:
     return bool(files) and all(is_test_path(fp) for fp in files)
 
 
+def apply_context_baseline(multi: Any, ctx: Any) -> Tuple[Any, Tuple[str, ...]]:
+    """``apply_differential`` against the ambient verdict the op CARRIES
+    (``ctx.ambient_red_tests``, stamped by VALIDATE) with the op's acceptance
+    tests protected — the ONE way VERIFY reads the baseline, so VALIDATE
+    and VERIFY can never disagree about which reds are the environment's.
+    Identity when the op carries none."""
+    baseline = frozenset(str(t) for t in (getattr(ctx, "ambient_red_tests", ()) or ()))
+    if not baseline:
+        return multi, ()
+    return apply_differential(
+        multi, baseline,
+        protected=acceptance_names(
+            getattr(ctx, "description", "") or "", getattr(ctx, "target_symbols", ()) or (),
+        ),
+    )
+
+
+def apply_context_baseline(multi: Any, ctx: Any) -> Tuple[Any, Tuple[str, ...]]:
+    """``apply_differential`` against the ambient verdict the op CARRIES
+    (``ctx.ambient_red_tests``, stamped by VALIDATE) with the op's acceptance
+    tests protected — the ONE way VERIFY reads the baseline, so VALIDATE
+    and VERIFY can never disagree about which reds are the environment's.
+    Identity when the op carries none."""
+    baseline = frozenset(str(t) for t in (getattr(ctx, "ambient_red_tests", ()) or ()))
+    if not baseline:
+        return multi, ()
+    return apply_differential(
+        multi, baseline,
+        protected=acceptance_names(
+            getattr(ctx, "description", "") or "", getattr(ctx, "target_symbols", ()) or (),
+        ),
+    )
+
+
 def apply_differential(
     multi: Any, baseline: frozenset, *, protected: Iterable[str] = (),
     test_authoring: bool = True,

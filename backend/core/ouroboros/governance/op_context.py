@@ -39,7 +39,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any, Dict, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Set, Tuple, Sequence
 
 if TYPE_CHECKING:
     from backend.core.ouroboros.governance.patch_benchmarker import BenchmarkResult
@@ -1105,6 +1105,16 @@ class OperationContext:
     schema_version: str = "3.0"
     expanded_context_files: Tuple[str, ...] = ()
     benchmark_result: Optional["BenchmarkResult"] = None
+    #: Test ids VALIDATE's differential gate found red BEFORE the candidate
+    #: (ambient — the environment's, not the candidate's). VERIFY judges by
+    #: what the candidate changes, so it deselects them; pinned out of the
+    #: hash chain like ``benchmark_result``.
+    ambient_red_tests: Tuple[str, ...] = ()
+    #: Test ids VALIDATE's differential gate found red BEFORE the candidate
+    #: (ambient — the environment's, not the candidate's). VERIFY judges by
+    #: what the candidate changes, so it deselects them; pinned out of the
+    #: hash chain like ``benchmark_result``.
+    ambient_red_tests: Tuple[str, ...] = ()
     pre_apply_snapshots: Dict[str, str] = field(default_factory=dict)
     execution_graph_id: str = ""
     execution_plan_digest: str = ""
@@ -1726,6 +1736,18 @@ class OperationContext:
         fields_for_hash = _context_to_hash_dict(intermediate)
         new_hash = _compute_hash(fields_for_hash)
         return dataclasses.replace(intermediate, context_hash=new_hash)
+
+    def with_ambient_red_tests(self, ids: "Sequence[str]") -> "OperationContext":
+        """Carry VALIDATE's ambient-red verdict to VERIFY (no phase change)."""
+        return dataclasses.replace(
+            self, ambient_red_tests=tuple(str(i) for i in (ids or ()) if str(i)),
+        )
+
+    def with_ambient_red_tests(self, ids: "Sequence[str]") -> "OperationContext":
+        """Carry VALIDATE's ambient-red verdict to VERIFY (no phase change)."""
+        return dataclasses.replace(
+            self, ambient_red_tests=tuple(str(i) for i in (ids or ()) if str(i)),
+        )
 
     def with_benchmark_result(self, result: "BenchmarkResult") -> "OperationContext":
         """Return a new context with benchmark_result set (no phase change)."""

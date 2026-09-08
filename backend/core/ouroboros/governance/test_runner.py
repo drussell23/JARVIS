@@ -1662,11 +1662,12 @@ class TestRunner:
         # resolve_python_bin — NEVER bare "python3" (PATH-dependent argv[0]
         # blinded VERIFY on minimal-PATH nodes; see test_subprocess_helper).
         from backend.core.ouroboros.governance.test_subprocess_helper import (
+            PYTEST_ISOLATION_ARGS,
             resolve_python_bin,
         )
         cmd = [
             resolve_python_bin(), "-m", "pytest",
-            "-o", "addopts=",
+            *PYTEST_ISOLATION_ARGS,
             "--continue-on-collection-errors",
             "--timeout=" + str(_TEST_PER_TEST_TIMEOUT_S),
             "--timeout-method=thread",

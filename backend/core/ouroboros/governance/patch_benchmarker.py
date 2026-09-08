@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple, Any
 
 if TYPE_CHECKING:
     from backend.core.ouroboros.governance.op_context import OperationContext
@@ -227,7 +227,7 @@ class PatchBenchmarker:
         pass_rate = 0.0
         try:
             coverage_pct, pass_rate = await asyncio.wait_for(
-                self._run_coverage(bench_files), timeout=cov_budget
+                self._run_coverage(bench_files, ctx=ctx), timeout=cov_budget
             )
             coverage_score = min(1.0, coverage_pct / 100.0)
         except asyncio.TimeoutError:
@@ -290,13 +290,56 @@ class PatchBenchmarker:
         score = max(0.0, 1.0 - violations / max(1, lines * 0.05))
         return violations, score
 
-    async def _run_coverage(self, target_files: list) -> tuple:
+    async def _run_coverage(self, target_files: list, *, ctx: Any = None) -> tuple:
         if not target_files:
             return 0.0, 0.0
+        test_paths = await self._tests_covering(target_files)
+        deselect = tuple(getattr(ctx, "ambient_red_tests", ()) or ())
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._coverage_sync, target_files)
+        return await loop.run_in_executor(
+            None, self._coverage_sync, target_files, test_paths, deselect,
+        )
 
-    def _coverage_sync(self, target_files: list) -> tuple:
+    async def _tests_covering(self, target_files: list) -> list:
+        """The pytest targets for the benchmark: a test module is its own
+        target; a PRODUCTION module's targets are the tests that cover it,
+        resolved exactly as VALIDATE resolves them. Handing pytest the
+        production file itself collects nothing (a production APPLY was
+        benchmarked as ``test_paths=[dw_capacity_probe.py]``, 2026-09-08).
+        Never raises; an unresolvable target contributes nothing."""
+        out: list = []
+        seen: set = set()
+        try:
+            from backend.core.ouroboros.governance.ast_signature_anchor import is_test_path
+        except Exception:  # noqa: BLE001
+            def is_test_path(_p: str) -> bool:  # type: ignore[misc]
+                return False
+        production: list = []
+        for f in target_files:
+            if not (self._root / f).exists():
+                continue
+            if is_test_path(str(f)):
+                if f not in seen:
+                    seen.add(f); out.append(f)
+            else:
+                production.append(self._root / f)
+        if production:
+            try:
+                from backend.core.ouroboros.governance.test_runner import TestRunner
+                resolved = await TestRunner(repo_root=self._root).resolve_affected_tests(tuple(production))
+                for r in resolved:
+                    try:
+                        rel = str(Path(r).resolve().relative_to(Path(self._root).resolve()))
+                    except ValueError:
+                        rel = str(r)
+                    if rel not in seen:
+                        seen.add(rel); out.append(rel)
+            except Exception:  # noqa: BLE001 — resolution is best-effort
+                logger.debug("[PatchBenchmarker] test resolution skipped", exc_info=True)
+        return out
+
+    def _coverage_sync(self, target_files: list, test_paths: Optional[list] = None,
+                       deselect: Tuple[str, ...] = ()) -> tuple:
         try:
             import re
             with tempfile.TemporaryDirectory() as tmp:
@@ -314,7 +357,8 @@ class PatchBenchmarker:
                 # are under tests/, otherwise fall back to pytest discovery
                 # for that test's owning module. For reflex-style repairs
                 # the target IS a test module, so test_paths == target_files.
-                test_paths = existing if existing else []
+                if test_paths is None:  # legacy callers: the targets themselves
+                    test_paths = existing if existing else []
 
                 # pytest-cov plugin check: without it, passing --cov=... makes
                 # pytest exit 4 with "unrecognized arguments" before running
@@ -336,13 +380,18 @@ class PatchBenchmarker:
                 # Slice 9 — canonical sync helper (stdin=DEVNULL +
                 # process-group isolation + bounded timeout + provenance).
                 from backend.core.ouroboros.governance.test_subprocess_helper import (  # noqa: E501
+                    PYTEST_ISOLATION_ARGS,
                     run_pytest_subprocess_sync,
                     resolve_python_bin,
                 )
+                # Ambient reds VALIDATE established are the environment's, not
+                # the candidate's: deselected here so VERIFY judges the change.
+                deselect_args = [f"--deselect={d}" for d in (deselect or ())]
                 _slice9 = run_pytest_subprocess_sync(
-                    [resolve_python_bin(), "-m", "pytest", "--tb=no", "--no-header", "-q",
+                    [resolve_python_bin(), "-m", "pytest", *PYTEST_ISOLATION_ARGS,
+                     "--tb=no", "--no-header", "-q",
                      "--ignore=docs", "--ignore=.worktrees"]
-                    + cov_report_args + cov_args + test_paths,
+                    + cov_report_args + cov_args + deselect_args + test_paths,
                     cwd=str(self._root),
                     timeout_s=float(_COVERAGE_BUDGET),
                     caller="patch_benchmarker._run_with_coverage",
