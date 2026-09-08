@@ -85,6 +85,24 @@ from backend.core.ouroboros.ui.theme import (  # noqa: E402
 )
 
 
+def _approval_deadline_s() -> Optional[float]:
+    """How long the Iron Gate may wait for a HUMAN, or None for unbounded.
+
+    Delegated to :mod:`inline_approval`, which owns every other approval
+    policy in the process — a second reader here is how the gate and the
+    queue would come to disagree about the same operator. Fail-soft: if that
+    module cannot be reached the gate keeps its legacy unbounded behaviour
+    rather than shedding an op on an import error.
+    """
+    try:
+        from backend.core.ouroboros.governance.inline_approval import (  # noqa: PLC0415
+            approval_deadline_s,
+        )
+        return approval_deadline_s()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _bridge_only_wait_s() -> float:
     """How long the Iron Gate waits for a COCKPIT answer when no local
     prompt surface exists (prompt_toolkit unavailable). Bounded so the
@@ -4369,7 +4387,31 @@ class SerpentFlow:
             except Exception:  # noqa: BLE001 — no local surface
                 local_task = None
             race = {t for t in (local_task, bridge_fut) if t is not None}
-            deadline = (
+            # The gate is bounded even while a local [Y/n] prompt is alive.
+            # It used to pass timeout=None in that case, so an operator who
+            # walked away from a live prompt held a background worker for the
+            # life of the process — with production budgets and a bg pool
+            # running roadmap ops, that is the whole pool, one op at a time.
+            #
+            # Tracked as an ABSOLUTE monotonic instant, not a per-wait
+            # timeout: the loop re-enters `asyncio.wait` on every surface
+            # that dies, and a relative timeout would silently restart the
+            # clock each time round.
+            _gate_budget = _approval_deadline_s()
+            _gate_expiry = (
+                None if _gate_budget is None
+                else time.monotonic() + float(_gate_budget)
+            )
+            self._gate_timed_out = False
+
+            def _remaining(cap: Optional[float]) -> Optional[float]:
+                """The tighter of `cap` and what is left of the gate budget."""
+                if _gate_expiry is None:
+                    return cap
+                left = max(0.0, _gate_expiry - time.monotonic())
+                return left if cap is None else min(cap, left)
+
+            deadline = _remaining(
                 None if local_task is not None else _bridge_only_wait_s()
             )
             while race:
@@ -4377,8 +4419,25 @@ class SerpentFlow:
                     race, timeout=deadline,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                if not done:                      # bridge-only wait timed out
-                    return None
+                if not done:
+                    if _gate_expiry is not None and time.monotonic() >= _gate_expiry:
+                        # A human was asked and did not answer. Fail CLOSED:
+                        # the op is shed with an auditable reason instead of
+                        # holding its worker forever. SYNTHETIC provenance —
+                        # nobody said this, so it can never be replayed to the
+                        # model as something the operator wanted.
+                        self._gate_timed_out = True
+                        _waited = float(_gate_budget or 0.0)
+                        logger.warning(
+                            "[IronGate] approval_timeout after %.0fs — no human "
+                            "answered; op shed fail-closed (raise or disable with "
+                            "JARVIS_APPROVAL_DEADLINE_S)", _waited,
+                        )
+                        return _synthetic_gate_decision(
+                            approved=False,
+                            detail=f"approval_timeout:{_waited:.0f}s",
+                        )
+                    return None                   # bridge-only wait timed out
                 for w in done:
                     race.discard(w)
                     if bridge_fut is not None and w is bridge_fut:
@@ -4409,10 +4468,10 @@ class SerpentFlow:
                             # Ctrl-D is not an explanation, and recording
                             # it as one is the bug this file just lost.
                             return _wordless_reject()
-                        deadline = _bridge_only_wait_s()
+                        deadline = _remaining(_bridge_only_wait_s())
                         continue
                     except Exception:  # noqa: BLE001 — dead stdin: race on
-                        deadline = _bridge_only_wait_s()
+                        deadline = _remaining(_bridge_only_wait_s())
                         continue
             return None                            # every surface exhausted
         finally:
@@ -4575,6 +4634,33 @@ class SerpentFlow:
                 approved = _decision.choice.name == "APPROVE"
                 if getattr(self, "_gate_answered_via_cockpit", False):
                     answered_via = "cockpit"
+                if getattr(self, "_gate_timed_out", False):
+                    # The op is shed, not hung. Record WHY into the same op
+                    # ledger every phase writes to, so the row appears in
+                    # order next to the GATE that produced it — "the human
+                    # never answered" must be readable months later, not
+                    # inferred from a gap in the timeline.
+                    answered_via = "nobody (deadline)"
+                    try:
+                        from backend.core.ouroboros.governance.inline_approval import (  # noqa: E501,PLC0415
+                            approval_deadline_s, record_approval_timeout,
+                        )
+                        record_approval_timeout(
+                            op_id, waited_s=float(approval_deadline_s() or 0.0),
+                            target_files=tuple(target_files or ()),
+                        )
+                    except Exception:  # noqa: BLE001 — never block the shed
+                        pass
+                    try:
+                        self._mirror_markup(
+                            f"  [{_SEM['dim']}]⎿[/{_SEM['dim']}]  "
+                            f"[{_SEM['death']}]⏱ approval timed out[/"
+                            f"{_SEM['death']}] [{_SEM['dim']}]— no answer "
+                            f"within the deadline; op shed (fail-closed)"
+                            f"[/{_SEM['dim']}]"
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001

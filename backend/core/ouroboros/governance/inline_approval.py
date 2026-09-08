@@ -95,6 +95,97 @@ def decision_timeout_s() -> float:
         return DEFAULT_DECISION_TIMEOUT_S
 
 
+#: How long the Iron Gate waits for a HUMAN before shedding the op. The
+#: interactive gate previously declared no deadline at all while a local
+#: [Y/n] prompt was alive, so an operator who walked away held a background
+#: worker for the life of the process. A human at a prompt is a resource with
+#: a timeout like any other.
+DEFAULT_APPROVAL_DEADLINE_S: float = 1800.0
+_ENV_APPROVAL_DEADLINE = "JARVIS_APPROVAL_DEADLINE_S"
+
+
+def approval_deadline_s() -> Optional[float]:
+    """Seconds the gate may wait for a human, or ``None`` for unbounded.
+
+    ``production_envelope`` derives this per profile and keeps it strictly
+    BELOW the pipeline budget, so the gate always expires before the deadline
+    that would kill the op from underneath it — an op shed by its own gate
+    records why; one killed by the pipeline clock just vanishes.
+
+    ``0`` is the explicit opt-out ("wait forever, I am sitting here"). Unset
+    is NOT unbounded: the default is a bound, because the failure being
+    prevented is precisely nobody having chosen. NEVER raises.
+    """
+    raw = (os.environ.get(_ENV_APPROVAL_DEADLINE, "") or "").strip()
+    if not raw:
+        return DEFAULT_APPROVAL_DEADLINE_S
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_APPROVAL_DEADLINE_S
+    if value <= 0:
+        return None  # operator opted out, explicitly
+    return max(5.0, value)
+
+
+def record_approval_timeout(
+    op_id: str,
+    *,
+    waited_s: float,
+    target_files: Tuple[str, ...] = (),
+    detail: str = "",
+) -> bool:
+    """Append an ``approval_timeout`` row to the operation ledger.
+
+    Written as ``OperationState.BLOCKED`` — the op is blocked awaiting a
+    human, not failed by a defect — into the SAME ledger every other phase
+    writes to (``OUROBOROS_LEDGER_DIR``, else ``~/.jarvis/ouroboros/ledger``),
+    so it appears in op-order alongside the phases that preceded it rather
+    than in some private log nobody reads.
+
+    Returns True when a row was written. NEVER raises: a gate that cannot
+    record its refusal must still refuse.
+    """
+    try:
+        import asyncio  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+
+        from backend.core.ouroboros.governance.ledger import (  # noqa: PLC0415
+            LedgerEntry,
+            OperationLedger,
+            OperationState,
+        )
+
+        storage = Path(os.environ.get(
+            "OUROBOROS_LEDGER_DIR",
+            str(Path.home() / ".jarvis" / "ouroboros" / "ledger"),
+        ))
+        entry = LedgerEntry(
+            op_id=str(op_id or "unknown"),
+            state=OperationState.BLOCKED,
+            data={
+                "reason": "approval_timeout",
+                "waited_s": round(float(waited_s), 1),
+                "target_files": list(target_files or ()),
+                "detail": detail or (
+                    "no human answered the Iron Gate within the approval "
+                    "deadline; the op was shed fail-closed"
+                ),
+            },
+            entry_id="approval_timeout",
+        )
+        coro = OperationLedger(storage_dir=storage).append(entry)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return bool(asyncio.run(coro))
+        # Inside the gate's own loop: schedule rather than block the shed.
+        loop.create_task(coro)
+        return True
+    except Exception:  # noqa: BLE001 — never let bookkeeping block a refusal
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Decision enum + parser
 # ---------------------------------------------------------------------------
