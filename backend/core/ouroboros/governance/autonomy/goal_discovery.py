@@ -64,6 +64,7 @@ __all__ = [
 
 _ENV_ENABLED = "JARVIS_GOAL_DISCOVERY_ENABLED"
 _ENV_MAX_CANDIDATES = "JARVIS_GOAL_DISCOVERY_MAX_CANDIDATES"
+_ENV_CENSUS_BUDGET = "JARVIS_GOAL_DISCOVERY_CENSUS_BUDGET_S"
 
 #: Evidence strength. A failing test outranks an absence of tests, always.
 _KIND_WEIGHT: Dict[str, float] = {
@@ -84,6 +85,34 @@ def _max_candidates() -> int:
         return max(1, int(raw)) if raw else 8
     except (TypeError, ValueError):
         return 8
+
+
+def _census_budget_s() -> float:
+    """How long DISCOVERY may take before it gives up on the census.
+
+    The census runs the repository's test suite. On a large tree that is
+    minutes, and on a wedged one it is forever — and an unbounded await here
+    would hang the entire autonomous loop on its cheapest step, which is the
+    exact failure mode every other part of this system was built to refuse.
+
+    Derived, not chosen: discovery is overhead against the work it finds, so
+    it gets a fraction of one pipeline budget. A census that cannot finish in
+    that time is not a census the loop can use, and the coverage source still
+    answers.
+    """
+    try:
+        raw = (os.environ.get(_ENV_CENSUS_BUDGET, "") or "").strip()
+        if raw:
+            return max(10.0, float(raw))
+    except (TypeError, ValueError):
+        pass
+    try:
+        pipeline = float((os.environ.get("JARVIS_PIPELINE_TIMEOUT_S", "") or "0").strip())
+    except (TypeError, ValueError):
+        pipeline = 0.0
+    if pipeline > 0:
+        return max(30.0, pipeline / 8.0)
+    return 300.0
 
 
 @dataclass(frozen=True)
@@ -180,8 +209,22 @@ async def _from_ambient_reds(
     out: List[DiscoveredWork] = []
     if watcher is None:
         return out
+    budget = _census_budget_s()
     try:
-        failures, _passed, _skipped = await watcher.run_census()
+        failures, _passed, _skipped = await asyncio.wait_for(
+            watcher.run_census(), timeout=budget,
+        )
+    except asyncio.TimeoutError:
+        # Not a fault — a census slower than its budget simply does not get to
+        # decide this pass. The coverage source below still answers, so the
+        # loop degrades to weaker evidence instead of stalling on the strongest.
+        logger.warning(
+            "[GoalDiscovery] census exceeded its %.0fs budget — this pass "
+            "ranks on coverage evidence only", budget,
+        )
+        return out
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("[GoalDiscovery] census unavailable: %r", exc)
         return out

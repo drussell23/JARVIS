@@ -162,6 +162,37 @@ def test_no_watcher_at_all_still_discovers(repo):
     assert found
 
 
+def test_a_hanging_census_does_not_stall_the_loop(repo, monkeypatch):
+    """The census runs the whole suite. An unbounded await here would hang the
+    autonomous loop on its CHEAPEST step — the exact failure every other part
+    of this system refuses."""
+    monkeypatch.setenv("JARVIS_GOAL_DISCOVERY_CENSUS_BUDGET_S", "10")
+
+    class _Hangs:
+        async def run_census(self):
+            await asyncio.sleep(3600)
+
+    import time
+    started = time.monotonic()
+    found = _run(discover(repo_root=repo, watcher=_Hangs(), cooldown=None))
+    elapsed = time.monotonic() - started
+    assert elapsed < 30, "discovery hung on the census"
+    # ...and it still returned the weaker evidence rather than nothing.
+    assert all(f.kind == "uncovered_module" for f in found)
+
+
+def test_the_census_budget_is_derived_from_the_pipeline(monkeypatch):
+    from backend.core.ouroboros.governance.autonomy.goal_discovery import (
+        _census_budget_s,
+    )
+
+    monkeypatch.delenv("JARVIS_GOAL_DISCOVERY_CENSUS_BUDGET_S", raising=False)
+    monkeypatch.setenv("JARVIS_PIPELINE_TIMEOUT_S", "4000")
+    assert _census_budget_s() == 500.0
+    monkeypatch.setenv("JARVIS_GOAL_DISCOVERY_CENSUS_BUDGET_S", "77")
+    assert _census_budget_s() == 77.0
+
+
 def test_a_nonexistent_repo_returns_nothing_rather_than_raising(tmp_path):
     found = _run(discover(repo_root=tmp_path / "nope", watcher=None, cooldown=None))
     assert found == ()
