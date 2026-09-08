@@ -29,6 +29,20 @@ def _clean(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _hydrated():
+    """Capacity may only be derived from a LOADED environment — see
+    init_guard. Production declares this at the boot seam; a test that
+    exercises capacity must declare it too, or it is testing the fail-safe."""
+    from backend.core.ouroboros.governance.init_guard import (
+        mark_hydrated, reset_for_tests,
+    )
+    reset_for_tests()
+    mark_hydrated()
+    yield
+    reset_for_tests()
+
+
 @pytest.fixture
 def local(monkeypatch):
     monkeypatch.setenv("JARVIS_LOCAL_PRIME_ENABLED", "true")

@@ -120,6 +120,18 @@ def resolve_primary_concurrency(
     changes nothing for a hosted fleet.
     """
     try:
+        # Ordering first. This resolver reading `JARVIS_LOCAL_PRIME_ENABLED`
+        # before `.env` had loaded is what made the clamp inert: the flag came
+        # back unset, the lane resolved as CLOUD, and a single GPU was given a
+        # six-worker pool. "Unset" and "the operator set it to false" demand
+        # opposite answers, and only the guard can tell them apart.
+        #
+        # Fail-safe direction on a violation: the SMALLEST lane. An
+        # unanswerable question about capacity must not resolve to "plenty".
+        from backend.core.ouroboros.governance.init_guard import require_hydrated
+        if not require_hydrated("local_lane_capacity"):
+            return LaneCapacity(1, "unhydrated_fail_safe")
+
         forced = _env_int(_ENV_FORCE, 0, minimum=0)
         if forced:
             return LaneCapacity(forced, "operator_override")

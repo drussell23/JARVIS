@@ -25,6 +25,20 @@ from backend.core.ouroboros.governance.production_envelope import (
     hydrate,
 )
 
+@pytest.fixture(autouse=True)
+def _hydrated():
+    """The envelope derives the pool size from the lane, and the lane may only
+    be read from a LOADED environment (init_guard). Production declares this at
+    the boot seam."""
+    from backend.core.ouroboros.governance.init_guard import (
+        mark_hydrated, reset_for_tests,
+    )
+    reset_for_tests()
+    mark_hydrated()
+    yield
+    reset_for_tests()
+
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = REPO_ROOT / "scripts" / "soaks" / "cockpit_interactive.sh"
 

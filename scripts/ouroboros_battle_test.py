@@ -156,6 +156,14 @@ try:
     # all). Idempotent — `_load_env_once` runs again below at its usual site.
     from backend.core.env_bootstrap import load_env_once as _early_load_env
     _early_load_env()
+    # Declare the environment loaded. This is the ONLY caller — every
+    # component that derives a decision from configuration asks the guard
+    # first, so "read too early" becomes a recorded fault instead of a
+    # default-shaped value nobody chose.
+    from backend.core.ouroboros.governance.init_guard import (
+        mark_hydrated as _mark_env_hydrated,
+    )
+    _mark_env_hydrated()
     from backend.core.ouroboros.governance.production_envelope import (
         hydrate as _hydrate_envelope,
     )
