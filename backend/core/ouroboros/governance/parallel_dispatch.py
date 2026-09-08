@@ -1241,6 +1241,7 @@ async def enforce_evaluate_fanout(
     ] = None,
     wait_timeout_s: Optional[float] = None,
     force: bool = False,
+    parent_ctx: Any = None,
 ) -> FanoutResult:
     """Slice 4 — enforce-mode fan-out evaluation + scheduler submit.
 
@@ -1379,6 +1380,17 @@ async def enforce_evaluate_fanout(
         candidate_files=files,
         eligibility=eligibility,
     )
+
+    # The executor sees only (graph, unit), so the parent op's admission —
+    # routing intent (hence the served model's schema capability), the SIGNED
+    # goal pointer and its declared symbols — rides the graph or is lost.
+    # ``parent_ctx=None`` (every legacy caller) leaves the graph untouched.
+    # See autonomy/parent_inheritance.py.
+    if parent_ctx is not None:
+        from backend.core.ouroboros.governance.autonomy.parent_inheritance import (
+            stamp_parent_context,
+        )
+        graph = stamp_parent_context(graph, parent_ctx)
 
     # Guard 6: §2 sovereignty re-check right before submit.
     _gate = gate if gate is not None else get_default_gate()

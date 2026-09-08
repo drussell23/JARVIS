@@ -25,6 +25,10 @@ from backend.core.ouroboros.governance.autonomy.execution_graph_progress import 
 from backend.core.ouroboros.governance.autonomy.execution_graph_store import (
     ExecutionGraphStore,
 )
+from backend.core.ouroboros.governance.autonomy.parent_inheritance import (
+    inherit_into,
+    inherited_create_kwargs,
+)
 from backend.core.ouroboros.governance.autonomy.subagent_types import (
     ExecutionGraph,
     GraphExecutionPhase,
@@ -342,15 +346,34 @@ class GenerationSubagentExecutor:
                     return _result
 
             op_id = f"{graph.op_id}:{unit.unit_id}"
+            # A unit's context is the PARENT's, narrowed to this unit's files —
+            # not a fresh one. Built bare, it reached GENERATE with
+            # ``telemetry is None`` (so ``capability=?`` and the 2b.1-diff
+            # schema was structurally unreachable for every unit) and with
+            # ``target_symbols=()`` and no intake evidence (so the
+            # declared-symbol refusal, which both ``_validate_in_tree`` and
+            # ``_declared_symbols_for`` read on this path, was vacuous). The
+            # parent's admission rides the graph; see parent_inheritance.py.
             subctx = OperationContext.create(
                 target_files=tuple(unit.target_files),
                 description=unit.goal,
                 op_id=op_id,
                 primary_repo=unit.repo,
                 repo_scope=(unit.repo,),
+                **inherited_create_kwargs(graph),
             )
+            subctx = inherit_into(subctx, graph)
             deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=unit.timeout_s)
             subctx = subctx.with_pipeline_deadline(deadline)
+            _inh_ri = getattr(getattr(subctx, "telemetry", None), "routing_intent", None)
+            logger.info(
+                "[SubagentExecutor] unit=%s ctx op=%s goal=%s symbols=%s "
+                "capability=%s served=%s",
+                unit.unit_id, op_id[:32], graph.goal_id or "-",
+                ",".join(getattr(subctx, "target_symbols", ()) or ()) or "-",
+                getattr(_inh_ri, "schema_capability", "?"),
+                getattr(_inh_ri, "served_model", "") or "-",
+            )
 
             generation = await self._generator.generate(subctx, deadline)
             # Telemetry: thread the provider's reported DW cost. Honest-null —

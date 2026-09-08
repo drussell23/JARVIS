@@ -159,6 +159,26 @@ class ExecutionGraph:
     concurrency_limit: int
     plan_digest: str = ""
     causal_trace_id: str = ""
+    # --- Parent-op inheritance (additive; see autonomy/parent_inheritance.py).
+    # A work unit executes against its OWN OperationContext, and the executor's
+    # only inputs are (graph, unit) — so whatever the parent op's admission
+    # produced has to ride the graph or be lost. Empty defaults == the
+    # pre-inheritance behaviour, byte-identical, and they stay empty for a
+    # graph built where no parent context was in scope. All four are excluded
+    # from ``_compute_plan_digest``: they describe the PARENT, not the plan, so
+    # two graphs that differ only here are the same plan and stay coalescable.
+    #: The SIGNED goal's id — a POINTER, exactly as ``_declared_symbols_for``
+    #: treats it. What it names is re-read from the signed roadmap.
+    goal_id: str = ""
+    #: The parent's already-verified ``ctx.target_symbols``.
+    target_symbols: Tuple[str, ...] = ()
+    #: ``TelemetryContext`` as JSON (see ``parent_inheritance.telemetry_to_json``).
+    #: Without it every unit reads ``capability=?`` and the 2b.1-diff schema is
+    #: structurally unreachable on the subagent path.
+    parent_telemetry_json: str = ""
+    #: The parent's ``intake_evidence_json``, verbatim, so a unit's context
+    #: answers ``intake_evidence`` the same way its parent's does.
+    parent_intake_evidence_json: str = ""
 
     def __post_init__(self) -> None:
         if not self.graph_id:
@@ -404,6 +424,13 @@ def execution_graph_to_dict(graph: ExecutionGraph) -> Dict[str, Any]:
         "concurrency_limit": graph.concurrency_limit,
         "plan_digest": graph.plan_digest,
         "causal_trace_id": graph.causal_trace_id,
+        # Parent-op inheritance — persisted so a graph RECOVERED after a
+        # restart still runs its units with the parent's admission. Dropping
+        # them here would make the fix work only until the first restart.
+        "goal_id": graph.goal_id,
+        "target_symbols": list(graph.target_symbols),
+        "parent_telemetry_json": graph.parent_telemetry_json,
+        "parent_intake_evidence_json": graph.parent_intake_evidence_json,
         "units": [
             {
                 "unit_id": unit.unit_id,
@@ -483,6 +510,12 @@ def execution_graph_from_dict(data: Dict[str, Any]) -> ExecutionGraph:
         concurrency_limit=int(data["concurrency_limit"]),
         plan_digest=str(data.get("plan_digest", "")),
         causal_trace_id=str(data.get("causal_trace_id", "")),
+        # Absent in a graph persisted before inheritance existed -> the empty
+        # defaults, i.e. exactly the behaviour that graph was written under.
+        goal_id=str(data.get("goal_id", "")),
+        target_symbols=tuple(str(s) for s in data.get("target_symbols", ())),
+        parent_telemetry_json=str(data.get("parent_telemetry_json", "")),
+        parent_intake_evidence_json=str(data.get("parent_intake_evidence_json", "")),
     )
 
 

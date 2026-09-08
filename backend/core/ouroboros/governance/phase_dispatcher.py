@@ -1127,6 +1127,11 @@ async def dispatch_pipeline(
                         generation=pctx.generation,
                         scheduler=_scheduler,
                         force=(_plan_drives and not _legacy_enforce),
+                        # The op_id alone tells the units nothing about what
+                        # this op was ADMITTED as. Hand over the context so
+                        # each unit inherits the routing intent and the signed
+                        # goal's declared symbols instead of running bare.
+                        parent_ctx=ctx,
                     )
                     # Slice 4 ships the submit + await primitive with
                     # loud-fail error handling. The result is ALWAYS

@@ -5370,6 +5370,16 @@ def _parse_execution_graph_response(
     except ValueError as exc:
         raise RuntimeError(f"{pfx}_schema_invalid:{exc}:2d.1") from exc
 
+    # The planner names the WORK; the parent op's admission (routing intent,
+    # signed-goal pointer, declared symbols) is ours to carry. The executor
+    # only ever sees (graph, unit), so a graph that leaves here unstamped runs
+    # every unit with capability=? and a vacuous declared-symbol contract.
+    # NEVER raises; a stamp that cannot be taken leaves the graph unchanged.
+    from backend.core.ouroboros.governance.autonomy.parent_inheritance import (
+        stamp_parent_context,
+    )
+    graph = stamp_parent_context(graph, ctx)
+
     model_id = data.get("provider_metadata", {}).get("model_id", provider_name)
     candidate = {
         "candidate_id": f"graph:{graph.graph_id}",
