@@ -192,6 +192,20 @@ def build(
         "JARVIS_BG_POOL_SIZE": _bg_pool_size(),
         "JARVIS_BG_QUEUE_SIZE": 64,
         "JARVIS_THROUGHPUT_GOVERNOR_ENABLED": False,
+        # --- backpressure, now that the lane is one deep --------------------
+        # With concurrency clamped to a single GPU, the queue stops being a
+        # formality: goals MUST wait rather than be refused. IntakePriorityQueue
+        # already does exactly this — urgency heap, reserved-slot starvation
+        # guard, per-urgency deadlines, `queue_full` with a retry_after_s, and
+        # a `backpressure_applied` event — and it is wired into
+        # UnifiedIntakeRouter. It was simply never armed. Arming beats building
+        # a second queue that would have to be kept in agreement with this one.
+        #
+        # The threshold is left to the module's own derivation
+        # (JARVIS_INTAKE_BACKPRESSURE_THRESHOLD) rather than pinned here: the
+        # queue owns what saturation means, and stating it twice is how the two
+        # come to disagree.
+        "JARVIS_INTAKE_PRIORITY_SCHEDULER_ENABLED": True,
         # --- validation reserve -------------------------------------------
         "JARVIS_VALIDATION_RESERVE_ENABLED": True,
         "JARVIS_VALIDATION_RESERVE_COLD_S": 240,

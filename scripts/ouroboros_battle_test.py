@@ -146,6 +146,16 @@ try:
             _os_for_boot_exorcism.path.abspath(__file__)))
     if _repo_for_envelope not in _sys_for_boot_exorcism.path:
         _sys_for_boot_exorcism.path.insert(0, _repo_for_envelope)
+    # ``.env`` FIRST. The envelope derives values from the operator's declared
+    # environment — most sharply `JARVIS_LOCAL_PRIME_ENABLED`, which decides
+    # whether the background pool is sized for a hosted fleet or for one GPU.
+    # Hydrating before `.env` loaded meant that flag read as unset, the lane
+    # resolved as CLOUD, and the pool came up at 6 on a single card: the
+    # concurrency clamp was present, tested, and completely inert
+    # (`pool_size=6` in bt-2026-09-08-183738, no LocalLaneCapacity line at
+    # all). Idempotent — `_load_env_once` runs again below at its usual site.
+    from backend.core.env_bootstrap import load_env_once as _early_load_env
+    _early_load_env()
     from backend.core.ouroboros.governance.production_envelope import (
         hydrate as _hydrate_envelope,
     )
