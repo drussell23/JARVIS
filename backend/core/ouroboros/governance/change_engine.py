@@ -570,6 +570,22 @@ class RollbackArtifact:
             )
 
 
+def _upstream_approver(request: "ChangeRequest", op_id: str) -> Optional[str]:
+    """The approver named by the gate's decision when it approved THIS op,
+    else None. Bound to the op (``request_id``), never to a file or a
+    session, so a stamp cannot be carried from one op to another."""
+    decision = getattr(request, "approval", None)
+    if decision is None:
+        return None
+    status = str(getattr(decision, "status", "") or "").lower()
+    if status != "approved":
+        return None
+    bound = str(getattr(decision, "request_id", "") or "")
+    if bound and bound not in (str(op_id or ""), str(getattr(request, "op_id", "") or "")):
+        return None
+    return str(getattr(decision, "approver", "") or "gate")
+
+
 @dataclass
 class ChangeRequest:
     """A request to apply a code change through the transactional pipeline.
@@ -604,6 +620,11 @@ class ChangeRequest:
     # in the correct tree (the cloned benchmark repo), not the JARVIS auto-
     # commit workspace. None = byte-identical legacy resolution.
     write_root: Optional[Path] = None
+    #: The GATE phase's approval decision for THIS op (``OperationContext.
+    #: approval``), when one was obtained. The engine re-classifies the file
+    #: and honours an APPROVAL_REQUIRED tier that the gate already answered
+    #: instead of escalating a second time. Never relaxes BLOCKED.
+    approval: Optional[Any] = None
 
 
 @dataclass
@@ -1030,7 +1051,39 @@ class ChangeEngine:
                     risk_tier=RiskTier.BLOCKED,
                 )
 
-            if risk_tier == RiskTier.APPROVAL_REQUIRED:
+            _upstream = (
+                _upstream_approver(request, op_id)
+                if risk_tier == RiskTier.APPROVAL_REQUIRED else None
+            )
+            if _upstream is not None:
+                # The gate ALREADY answered this tier for this op (a human, or
+                # the headless synthetic approval of a soak). Asking again here
+                # returned success=False with no one left to ask — every
+                # sanctioned production-file goal died as change_engine_failed
+                # (2026-09-08). One decision; the engine acts on it, audibly.
+                logger.warning(
+                    "[ChangeEngine] APPROVAL_REQUIRED (%s) for %s satisfied by the "
+                    "gate's decision: approver=%s op=%s",
+                    classification.reason_code, request.target_file, _upstream, op_id,
+                )
+                await self._comm.emit_decision(
+                    op_id=op_id,
+                    outcome="approved",
+                    reason_code=classification.reason_code,
+                    diff_summary=f"Change to {request.target_file}",
+                )
+                await self._ledger.append(
+                    LedgerEntry(
+                        op_id=op_id,
+                        state=OperationState.GATING,
+                        data={
+                            "approval_satisfied_upstream": True,
+                            "approver": _upstream,
+                            "reason": classification.reason_code,
+                        },
+                    )
+                )
+            elif risk_tier == RiskTier.APPROVAL_REQUIRED:
                 await self._comm.emit_decision(
                     op_id=op_id,
                     outcome="escalated",

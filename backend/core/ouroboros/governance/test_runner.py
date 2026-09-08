@@ -1224,6 +1224,55 @@ class TestRunner:
 
     # -- internal helpers ---------------------------------------------------
 
+    def _rebase_to_run_tree(self, paths: List[Path], discovery_root: Path) -> List[Path]:
+        """Resolved test paths live where they were DISCOVERED — the base tree
+        the import map indexes (``map_root``) or the authoritative tree — but
+        they run in ``repo_root``, the candidate copy. ``run()`` rejects a
+        path outside its root, so a sandbox validate whose targets were all
+        discovered in the session worktree ran ZERO tests and passed
+        vacuously (``test_total: 0``, every production-file op, 2026-09-08).
+        A path under a discovery root is rebased onto the run tree when the
+        same relative file exists there (the alias's own premise: the copy's
+        test tree is the base's); anything else is returned unchanged."""
+        run_root = self._repo_root
+        roots: List[Path] = []
+        for r in (self._map_root, discovery_root):
+            if r is None:
+                continue
+            try:
+                rr = Path(r).resolve()
+            except OSError:
+                rr = Path(r)
+            if rr != run_root and rr not in roots:
+                roots.append(rr)
+        if not roots:
+            return paths
+        out: List[Path] = []
+        rebased = 0
+        for pth in paths:
+            try:
+                resolved = Path(pth).resolve()
+            except OSError:
+                resolved = Path(pth)
+            target = pth
+            for rr in roots:
+                try:
+                    rel = resolved.relative_to(rr)
+                except ValueError:
+                    continue
+                candidate = run_root / rel
+                if candidate.exists():
+                    target = candidate
+                    rebased += 1
+                break
+            out.append(target)
+        if rebased:
+            logger.info(
+                "[TestRunner] Rebased %d/%d resolved test path(s) onto the run tree %s",
+                rebased, len(paths), run_root,
+            )
+        return out
+
     def _import_map_key(self, changed_files: Tuple[Path, ...]) -> Path:
         """Which tree's import map applies to this run.
 
@@ -1478,6 +1527,7 @@ class TestRunner:
                     )
                     break
 
+        matched = self._rebase_to_run_tree(matched, _discovery_root)
         if len(matched) > _TEST_MAX_FILES:
             logger.info(
                 "[TestRunner] Capping test files from %d to %d (JARVIS_TEST_MAX_FILES)",

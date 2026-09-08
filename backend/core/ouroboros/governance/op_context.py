@@ -1903,6 +1903,31 @@ class OperationContext:
         new_hash = _compute_hash(fields_for_hash)
         return dataclasses.replace(intermediate, context_hash=new_hash)
 
+    def with_approval(self, decision: Any) -> "OperationContext":
+        """Stamp the gate's approval decision onto the context (no phase
+        change; ``approval`` is pinned out of the hash chain).
+
+        ``approval`` existed on the context and NOTHING set it: the GATE
+        phase obtained a decision (human, or the headless synthetic
+        approval of a soak), advanced to APPLY, and the change engine —
+        which re-classifies the same file — escalated APPROVAL_REQUIRED a
+        second time with no way to know it had been answered
+        (``change_engine_failed`` on every sanctioned production-file goal,
+        2026-09-08). One decision, carried to the engine that acts on it.
+        Accepts an ``ApprovalResult`` (or anything with ``status`` /
+        ``approver`` / ``reason`` / ``decided_at`` / ``request_id``).
+        """
+        raw_status = getattr(decision, "status", "")
+        status = str(getattr(raw_status, "name", raw_status) or "").lower()
+        stamp = ApprovalDecision(
+            status=status,
+            approver=getattr(decision, "approver", None),
+            reason=getattr(decision, "reason", None),
+            decided_at=getattr(decision, "decided_at", None),
+            request_id=str(getattr(decision, "request_id", "") or self.op_id),
+        )
+        return dataclasses.replace(self, approval=stamp)
+
     def with_frozen_autonomy_tier(self, tier: str) -> "OperationContext":
         """Stamp autonomy tier onto context at submit time (no phase change).
 

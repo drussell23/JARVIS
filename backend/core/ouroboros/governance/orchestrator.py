@@ -10772,7 +10772,10 @@ class GovernedOrchestrator:
 
                     return ctx
 
-                # APPROVED -- continue to APPLY
+                # APPROVED -- continue to APPLY, carrying the decision to the
+                # change engine (which re-classifies the file and must not
+                # ask a second time).
+                ctx = ctx.with_approval(decision)
 
             # ── PreActionNarrator: voice WHAT before APPLY ──
             if self._pre_action_narrator is not None:
@@ -11208,6 +11211,11 @@ class GovernedOrchestrator:
                     return ctx
 
             if not change_result.success:
+                logger.warning(
+                    "[Orchestrator] change engine refused op=%s at %s (risk=%s): %s",
+                    ctx.op_id[:16], getattr(change_result.phase_reached, "name", "?"),
+                    getattr(change_result.risk_tier, "name", "?"), change_result.error or "-",
+                )
                 ctx = ctx.advance(
                     OperationPhase.POSTMORTEM,
                     terminal_reason_code="change_engine_failed",
@@ -11219,6 +11227,9 @@ class GovernedOrchestrator:
                     {
                         "reason": "change_engine_failed",
                         "rolled_back": change_result.rolled_back,
+                        "phase_reached": getattr(change_result.phase_reached, "name", ""),
+                        "risk_tier": getattr(change_result.risk_tier, "name", ""),
+                        "error": change_result.error or "",
                     },
                 )
                 self._record_canary_for_ctx(
@@ -15032,6 +15043,7 @@ class GovernedOrchestrator:
             profile=profile,
             op_id=ctx.op_id,
             write_root=self._swe_bench_write_root(ctx),
+            approval=getattr(ctx, "approval", None),
         )
 
     async def _discover_tests_for_gate(self, sut_path: Path) -> List[Path]:
