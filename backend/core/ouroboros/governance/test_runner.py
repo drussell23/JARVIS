@@ -56,6 +56,99 @@ _TEST_RETRY_ENABLED = os.environ.get(
     "JARVIS_TEST_RETRY_ENABLED", "true"
 ).lower() in ("1", "true", "yes")
 _TEST_MAX_FILES = int(os.environ.get("JARVIS_TEST_MAX_FILES", "50"))
+
+#: Restore the legacy "run the whole suite when nothing matched" behaviour.
+#: Default OFF. See Strategy 4 for the measurement that retired it: handing
+#: pytest the `tests/` DIRECTORY meant 69,353 tests and 200.9s of collection
+#: per candidate, and produced verdicts drawn from tests unrelated to the
+#: change. Kept as an escape hatch, loudly, because an operator running a
+#: deliberate full-suite regression pass has a legitimate use for it.
+_ENV_SUITE_FALLBACK = "JARVIS_TEST_SUITE_FALLBACK"
+
+
+def _suite_fallback_enabled() -> bool:
+    """Whether an unresolved change may substitute the ENTIRE suite.
+    Default False. NEVER raises."""
+    raw = (os.environ.get(_ENV_SUITE_FALLBACK, "") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+#: Largest number of test FILES one candidate validation may run. Derived from
+#: the existing resolution cap so the two cannot disagree about "bounded".
+_ENV_BLEED_MAX_FILES = "JARVIS_TEST_BLEED_MAX_FILES"
+
+
+def _bleed_max_files() -> int:
+    """Upper bound on an admitted target set. NEVER raises."""
+    try:
+        raw = (os.environ.get(_ENV_BLEED_MAX_FILES, "") or "").strip()
+        val = int(raw) if raw else _TEST_MAX_FILES
+        return val if val >= 1 else _TEST_MAX_FILES
+    except (TypeError, ValueError):
+        return _TEST_MAX_FILES
+
+
+def _bound_targets(
+    test_files: Tuple[Path, ...], *, op_id: str = "",
+) -> Tuple[Tuple[Path, ...], Optional[str]]:
+    """Admit only explicit test FILES, within a bounded count.
+
+    Returns ``(admitted, bleed_reason_or_None)``.
+
+    This is the structural guarantee behind the Strategy 4 change: even if some
+    other resolver, a cached map, or a future edit hands this adapter a
+    directory, pytest is never allowed to walk it. A directory target is the
+    one shape that can silently become the whole repository -- measured at
+    69,353 tests and 200.9s of collection, versus 0.67s for one file -- and it
+    arrives looking like a single innocuous entry, which is why counting
+    targets could never detect it.
+
+    Fail-CLOSED in the direction that preserves work: a bleeding set is
+    NARROWED to the files it legitimately contains rather than the whole run
+    being aborted, so a partially-good resolution still validates. Only a set
+    with no usable file at all degrades to "no covering test", which the caller
+    classifies. NEVER raises.
+    """
+    try:
+        items = tuple(test_files or ())
+        if not items:
+            return (), None
+
+        admitted: List[Path] = []
+        directories: List[str] = []
+        for raw in items:
+            try:
+                path = Path(raw)
+            except (TypeError, ValueError):
+                continue
+            try:
+                is_dir = path.is_dir()
+            except OSError:
+                is_dir = False
+            if is_dir:
+                directories.append(str(path))
+                continue
+            admitted.append(path)
+
+        reason: Optional[str] = None
+        if directories:
+            reason = (
+                f"{len(directories)} directory target(s) refused — a directory "
+                f"expands to whatever it contains (this repo's tests/ is 69,353 "
+                f"tests / 200.9s of collection): {', '.join(directories[:3])}"
+            )
+
+        cap = _bleed_max_files()
+        if len(admitted) > cap:
+            extra = len(admitted) - cap
+            admitted = admitted[:cap]
+            trunc = f"target set exceeded {cap} files — dropped {extra}"
+            reason = f"{reason}; {trunc}" if reason else trunc
+
+        return tuple(admitted), reason
+    except Exception:  # noqa: BLE001 — a guard may never fail the validation
+        logger.debug("[TestRunner] target bounding degraded", exc_info=True)
+        return tuple(test_files or ()), None
 _TEST_DIR_NAMES: FrozenSet[str] = frozenset(
     os.environ.get("JARVIS_TEST_DIR_NAMES", "tests,test").split(",")
 )
@@ -411,6 +504,46 @@ class PythonAdapter:
         Python imports resolve correctly against the actual project layout.
         """
         t0 = time.monotonic()
+
+        # --- Collection-bleed guard -------------------------------------
+        # Every target must be an explicit FILE. A directory target makes
+        # pytest walk it, and one directory can be the entire suite -- which
+        # is exactly how `shard_size=1` came to mean 69,353 tests. Bounding
+        # the SET here is what keeps a resolved shard from ever paying the
+        # global discovery tax; no pytest flag can do it, because by the time
+        # pytest sees a directory the decision has already been made.
+        bounded, bleed = _bound_targets(test_files, op_id=_op_id)
+        if bleed is not None:
+            logger.warning("[CollectionBleedFault] op=%s %s", _op_id[:20], bleed)
+        test_files = bounded
+
+        # No covering test is a FACT, not a gap to fill with the whole suite.
+        # Reported as its own class so the ladder can act on it: running
+        # nothing and calling it a pass is the vacuous validation this
+        # pipeline has been bitten by before, and running everything is what
+        # this change exists to stop.
+        if not test_files:
+            logger.info(
+                "[TestRunner] op=%s no covering test — declining to validate "
+                "(TestCoverageEnforcer already asks the model to write one)",
+                _op_id[:20],
+            )
+            return AdapterResult(
+                adapter="python", passed=False, failure_class="no_covering_test",
+                test_result=TestResult(
+                    passed=False, total=0, failed=0, failed_tests=(),
+                    duration_seconds=time.monotonic() - t0,
+                    stdout=(
+                        "no covering test: strategies 0-3 (name convention, "
+                        "suffix search, AST import map) found no test related "
+                        "to the changed file(s). Substituting the whole suite "
+                        "would judge this candidate on unrelated tests."
+                    ),
+                    flake_suspected=False,
+                ),
+                duration_s=time.monotonic() - t0,
+            )
+
         # Dynamic Test Timeout Derivator. The budget the router computed is the
         # authority; `self._timeout` contributes only when an operator pinned
         # one deliberately. Both caps -- the subprocess wall and pytest's own
@@ -1583,28 +1716,66 @@ class TestRunner:
                     )
                     continue
 
-            # Strategy 4: repo fallback — signals "no specific test found".
-            # Uses _discovery_root so tests/ is found even when self._repo_root
-            # is an empty isolation worktree.
-            for tdn in sorted(_TEST_DIR_NAMES):
-                repo_tests = _discovery_root / tdn
-                if repo_tests.is_dir() and repo_tests not in seen:
-                    seen.add(repo_tests)
-                    matched.append(repo_tests)
-                    logger.debug(
-                        "[TestRunner] Strategy 4 (repo fallback): %s → %s",
-                        effective.name, repo_tests,
-                    )
-                    break
+            # Strategy 4: NO COVERING TEST.
+            #
+            # This used to append the repo-level `tests/` DIRECTORY. The
+            # docstring called that "signals to the Synthesizer that no
+            # specific test was located" -- but the signal was delivered by
+            # handing pytest the entire suite, and pytest does the obvious
+            # thing with a directory.
+            #
+            # Measured on this repo: `tests/` is 69,353 tests and 200.9s of
+            # collection ALONE (plus 32 pre-existing collection errors),
+            # against 0.67s for one explicit file. Run twice per candidate by
+            # the flake retry, that is the ~450s/candidate that consumed every
+            # op's budget in bt-2026-09-08-213932 -- and the log's "Resolved 1
+            # test targets" was counting one DIRECTORY, which is why it looked
+            # like a one-file shard to every consumer downstream.
+            #
+            # Worse than slow, it was WRONG. `audio_error_fallback.py` was
+            # failed on `test_generic_batch_round_trip_parses_cleanly` in
+            # tests/adversarial/test_synthetic_adversary.py -- a test with no
+            # relationship to the change, carrying an ambient error. A verdict
+            # drawn from 69,353 unrelated tests is not a verdict about the
+            # candidate.
+            #
+            # Strategies 0-3 have already asked every question that can find a
+            # RELATED test, including the AST import map. Reaching here means
+            # the honest answer is "nothing covers this change" -- which the
+            # pipeline already computes: `intelligence_hooks.TestCoverageEnforcer`
+            # logged exactly that for this same file, in this same op, and
+            # injected a test-generation instruction. Two components asking one
+            # question and answering it oppositely; this one now defers.
+            if _suite_fallback_enabled():
+                for tdn in sorted(_TEST_DIR_NAMES):
+                    repo_tests = _discovery_root / tdn
+                    if repo_tests.is_dir() and repo_tests not in seen:
+                        seen.add(repo_tests)
+                        matched.append(repo_tests)
+                        logger.warning(
+                            "[TestRunner] Strategy 4 LEGACY suite fallback: %s → %s "
+                            "(JARVIS_TEST_SUITE_FALLBACK is on — this runs the "
+                            "WHOLE suite and judges the candidate on unrelated tests)",
+                            effective.name, repo_tests,
+                        )
+                        break
+            else:
+                logger.info(
+                    "[TestRunner] Strategy 4: no covering test for %s — "
+                    "strategies 0-3 (name, suffix, AST-import) found nothing "
+                    "related. Declining to substitute the whole suite.",
+                    effective.name,
+                )
 
-        # Last resort: repo-level test dir if nothing matched at all
-        if not matched:
+        # No last-resort suite run either, for the same reason. An empty result
+        # is a FACT the caller must classify, not a gap to paper over.
+        if not matched and _suite_fallback_enabled():
             for tdn in sorted(_TEST_DIR_NAMES):
                 repo_tests = _discovery_root / tdn
                 if repo_tests.is_dir():
                     matched.append(repo_tests)
-                    logger.info(
-                        "[TestRunner] No strategy matched — falling back to %s",
+                    logger.warning(
+                        "[TestRunner] No strategy matched — LEGACY fallback to %s",
                         repo_tests,
                     )
                     break

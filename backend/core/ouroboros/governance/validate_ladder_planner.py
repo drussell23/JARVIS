@@ -84,10 +84,13 @@ logger = logging.getLogger("Ouroboros.ValidateLadder")
 
 __all__ = [
     "FULL",
+    "DepthNegotiation",
     "LadderPlan",
     "PRUNED",
     "STOP",
+    "admitted_candidates",
     "concurrency_coefficient",
+    "negotiate_depth",
     "plan_iteration",
     "planner_enabled",
     "projected_iteration_cost_s",
@@ -309,6 +312,102 @@ def plan_iteration(
     except Exception:  # noqa: BLE001 — a planner may never fail a validation
         logger.debug("[ValidateLadder] planning degraded", exc_info=True)
         return _full("planner_degraded")
+
+
+@dataclass(frozen=True)
+class DepthNegotiation:
+    """How many ladder iterations the runtime can actually pay for."""
+
+    depth: int
+    configured: int
+    reason: str
+    remaining_s: float
+    iteration_cost_s: float
+    basis: str
+
+    def render(self) -> str:
+        return (
+            f"depth={self.depth} configured={self.configured} "
+            f"remaining={self.remaining_s:.0f}s iter_cost={self.iteration_cost_s:.0f}s "
+            f"basis={self.basis} reason={self.reason}"
+        )
+
+
+def negotiate_depth(
+    *,
+    remaining_s: float,
+    configured_depth: int,
+    n_candidates: int,
+    shard_size: int = 1,
+) -> DepthNegotiation:
+    """The ladder's retry ceiling, derived from budget ÷ measured cost.
+
+    ``max_validate_retries`` is a config constant chosen before anyone had
+    measured what an iteration costs. When the measured cost was ~570s against
+    a ~890s validation budget, "3 iterations" was arithmetically impossible and
+    the ladder simply discovered that at iteration 2, having already spent the
+    budget getting there.
+
+    Now the physics decides: ``floor(remaining / iteration_cost)``, clamped to
+    the configured value so this can only ever REDUCE the ceiling. It may not
+    raise it, because the configured depth also encodes non-time limits -- how
+    many times it is useful to re-ask a model that already failed -- and this
+    function knows nothing about those.
+
+    Cold start returns the configured depth unchanged, so arming it changes
+    nothing until an iteration has been measured. NEVER raises.
+    """
+    try:
+        cfg = max(0, int(configured_depth))
+    except (TypeError, ValueError):
+        cfg = 0
+
+    try:
+        rem = float(remaining_s)
+        if not math.isfinite(rem):
+            rem = 0.0
+    except (TypeError, ValueError):
+        rem = 0.0
+
+    def _keep(reason: str, cost: float = 0.0, basis: str = "cold_start") -> DepthNegotiation:
+        return DepthNegotiation(
+            depth=cfg, configured=cfg, reason=reason, remaining_s=rem,
+            iteration_cost_s=cost, basis=basis,
+        )
+
+    try:
+        if not planner_enabled():
+            return _keep("planner_disabled")
+        n = max(1, int(n_candidates or 1))
+        per, basis = _per_candidate_cost_s(shard_size)
+        if per <= 0.0:
+            return _keep("cold_start_keeps_configured", 0.0, basis)
+
+        cost = projected_iteration_cost_s(n, shard_size)
+        if cost <= 0.0:
+            return _keep("no_cost_projection", 0.0, basis)
+        if rem <= 0.0:
+            return DepthNegotiation(
+                depth=0, configured=cfg, reason="no_budget", remaining_s=rem,
+                iteration_cost_s=cost, basis=basis,
+            )
+
+        affordable = int(rem // cost)
+        # `depth` here is the RETRY count, matching max_validate_retries: the
+        # loop runs `1 + depth` iterations, so N affordable iterations means
+        # N-1 retries.
+        depth = max(0, min(cfg, affordable - 1))
+        return DepthNegotiation(
+            depth=depth, configured=cfg,
+            reason=(
+                f"{rem:.0f}s / {cost:.0f}s per iteration affords {affordable} "
+                f"iteration(s) → {depth} retr{'y' if depth == 1 else 'ies'}"
+            ),
+            remaining_s=rem, iteration_cost_s=cost, basis=basis,
+        )
+    except Exception:  # noqa: BLE001 — a negotiator may never fail a validation
+        logger.debug("[ValidateLadder] depth negotiation degraded", exc_info=True)
+        return _keep("negotiator_degraded")
 
 
 def admitted_candidates(

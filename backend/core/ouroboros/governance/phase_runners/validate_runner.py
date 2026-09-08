@@ -119,6 +119,34 @@ def _plan_ladder_iteration(
         return None
 
 
+def _negotiate_ladder_depth(*, ctx: Any, orch: Any, candidates: Any) -> Optional[Any]:
+    """Retry ceiling derived from the op's remaining budget ÷ iteration cost.
+
+    Reads the SAME `pipeline_deadline` the loop's own budget check reads, so
+    the negotiation and the per-iteration guard cannot disagree about how much
+    time exists. Fail-soft: ``None`` leaves the configured depth in force.
+    NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.governance.validate_ladder_planner import (  # noqa: PLC0415
+            negotiate_depth,
+        )
+        if ctx.pipeline_deadline is not None:
+            remaining_s = (
+                ctx.pipeline_deadline - datetime.now(tz=timezone.utc)
+            ).total_seconds()
+        else:
+            remaining_s = orch._config.validation_timeout_s
+        return negotiate_depth(
+            remaining_s=remaining_s,
+            configured_depth=orch._config.max_validate_retries,
+            n_candidates=len(candidates or ()),
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[ValidateLadder] depth negotiation unavailable", exc_info=True)
+        return None
+
+
 def _admitted_candidates(candidates: Any, plan: Any) -> Any:
     """The sibling subset *plan* admits. NEVER raises."""
     try:
@@ -275,7 +303,31 @@ class VALIDATERunner(PhaseRunner):
 
         best_candidate: Optional[Dict[str, Any]] = None
         best_validation: Optional[ValidationResult] = None
-        validate_retries_remaining = orch._config.max_validate_retries
+
+        # ── Adaptive Depth Negotiator ────────────────────────────────────
+        # `max_validate_retries` is a constant chosen before anyone had
+        # measured what an iteration costs. At ~570s per iteration against a
+        # ~890s validation budget, "3 iterations" was arithmetically
+        # impossible -- and the ladder discovered that at iteration 2, having
+        # already spent the budget getting there.
+        #
+        # The ceiling is now derived from budget / measured iteration cost, and
+        # can only ever REDUCE the configured value: the config also encodes
+        # non-time limits (how often it is useful to re-ask a model that just
+        # failed) that this negotiation knows nothing about.
+        _negotiated = _negotiate_ladder_depth(
+            ctx=ctx, orch=orch, candidates=generation.candidates,
+        )
+        _ladder_depth = (
+            _negotiated.depth if _negotiated is not None
+            else orch._config.max_validate_retries
+        )
+        if _negotiated is not None and _negotiated.depth != _negotiated.configured:
+            logger.info(
+                "[ValidateLadder] depth negotiated op=%s %s",
+                ctx.op_id[:16], _negotiated.render(),
+            )
+        validate_retries_remaining = _ladder_depth
 
         # ── [ValidateRetryFSM] instrumentation (§8 Observability) ──
         def _fsm_log(state: str, extra: str = "") -> None:
@@ -296,7 +348,7 @@ class VALIDATERunner(PhaseRunner):
                 f" {extra}" if extra else "",
             )
 
-        for _iter_idx in range(1 + orch._config.max_validate_retries):
+        for _iter_idx in range(1 + _ladder_depth):
             _fsm_log("iter_start", f"iter={_iter_idx}")
             if ctx.pipeline_deadline is not None:
                 remaining_s = (
