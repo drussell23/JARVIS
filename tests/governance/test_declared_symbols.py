@@ -59,3 +59,43 @@ def test_wiring():
     assert "_gr_exit_terminal" in inspect.getsource(orch.GovernedOrchestrator.run)
     assert LM.classify_error("declared_symbol_missing: test_new") == "declared_symbol_missing"
     assert "noop_refused_declared_symbols" in LM._MITIGATIONS
+
+
+# --------------------------------------------------------------------------
+# a declared symbol must CHANGE — a comment edit or the gate's punctuation
+# rewrite is not a change (f97f8195d6, 2026-09-08)
+# --------------------------------------------------------------------------
+
+_ORIG = (
+    "class Engine:\n"
+    "    def route(self, files):\n"
+    "        # DIAGNOSABILITY — five decline points\n"
+    "        if not files:\n"
+    "            return None\n"
+    "        return files[0]\n"
+)
+
+
+def test_a_declared_symbol_left_semantically_unchanged_is_reported(monkeypatch):
+    from backend.core.ouroboros.governance.declared_symbols import symbols_unchanged_in_candidate
+    monkeypatch.setenv("JARVIS_DECLARED_SYMBOLS_ENABLED", "true")
+    comment_only = _ORIG.replace("DIAGNOSABILITY — five", "DIAGNOSABILITIY - five")
+    assert symbols_unchanged_in_candidate(("_route",), {"full_content": comment_only}, _ORIG) == ()
+    assert symbols_unchanged_in_candidate(("route",), {"full_content": comment_only}, _ORIG) == ("route",)
+    assert symbols_unchanged_in_candidate(("Engine.route",), {"full_content": comment_only}, _ORIG) == ("Engine.route",)
+    changed = _ORIG.replace("        return files[0]\n", "        if len(files) != 1:\n            return None\n        return files[0]\n")
+    assert symbols_unchanged_in_candidate(("route",), {"full_content": changed}, _ORIG) == ()
+    # a new symbol is not "unchanged"; an unknown original judges nothing; no content judges nothing
+    assert symbols_unchanged_in_candidate(("brand_new",), {"full_content": comment_only}, _ORIG) == ()
+    assert symbols_unchanged_in_candidate(("route",), {"full_content": comment_only}, None) == ()
+    assert symbols_unchanged_in_candidate(("route",), {"unified_diff": "@@"}, _ORIG) == ()
+
+
+def test_validate_refuses_an_unchanged_declared_symbol_and_the_runner_gate_sees_the_original():
+    import inspect
+    from backend.core.ouroboros.governance import orchestrator
+    from backend.core.ouroboros.governance.phase_runners import generate_runner
+    src = inspect.getsource(orchestrator)
+    assert "declared_symbol_unchanged: " in src
+    assert src.index("declared_symbol_unchanged: ") < src.index("result = await self._run_validation_core(ctx, candidate, remaining_s)")
+    assert "original=orch._original_text_for(_cand)" in inspect.getsource(generate_runner)

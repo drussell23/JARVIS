@@ -107,6 +107,60 @@ def symbols_missing_from_candidate(symbols: Iterable[str], candidate: Dict[str, 
         return ()
 
 
+def _node_dump(source: str, symbol: str) -> Optional[str]:
+    """``ast.dump`` of the def/class named *symbol* (its last dotted
+    segment) anywhere in *source*; None when absent or unparsable."""
+    want = str(symbol).rsplit(".", 1)[-1]
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == want:
+            return ast.dump(n)
+    return None
+
+
+def symbols_unchanged_in_candidate(
+    symbols: Iterable[str], candidate: Dict[str, Any], original: Optional[str],
+) -> Tuple[str, ...]:
+    """Declared symbols whose definition in the candidate is semantically
+    the ORIGINAL's (same AST): the goal asked for a change inside them and
+    none was made. ``()`` when nothing is declared, the contract is
+    disabled, the original is unknown, the candidate carries no full
+    content, or the symbol is new (absent from the original). NEVER raises.
+
+    Why: a swarm candidate landed as f97f8195d6 (2026-09-08) that differed
+    from its parent only by the ASCII gate's punctuation rewrite and one
+    comment typo — the multi-file decline the goal asked for was absent —
+    and VALIDATE, the change engine and VERIFY all passed because nothing
+    the candidate changed is observable by a test. Comments are not in the
+    AST, so a comment-only edit is unchanged; a docstring edit is a change.
+    """
+    declared = _clean(symbols)
+    if not declared or not contract_enabled() or not isinstance(original, str) or not original:
+        return ()
+    try:
+        contents = _candidate_contents(candidate)
+        if not contents:
+            return ()
+        unchanged: List[str] = []
+        for sym in declared:
+            before = _node_dump(original, sym)
+            if before is None:
+                continue
+            after = None
+            for content in contents:
+                after = _node_dump(content, sym)
+                if after is not None:
+                    break
+            if after is not None and after == before:
+                unchanged.append(sym)
+        return tuple(unchanged)
+    except Exception:  # noqa: BLE001
+        return ()
+
+
 def refusal_feedback(missing: Sequence[str], target_files: Iterable[str]) -> str:
     """The retry instruction for a refused no-op — names exactly what must
     be added and where; nothing else changes."""

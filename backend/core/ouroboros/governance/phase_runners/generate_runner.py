@@ -1603,7 +1603,9 @@ class GENERATERunner(PhaseRunner):
                 _ascii_gate = AsciiStrictGate()
                 if _ascii_gate.enabled:
                     for _cand in generation.candidates:
-                        _ok, _ascii_err, _bad_list = _ascii_gate.check(_cand)
+                        _ok, _ascii_err, _bad_list = _ascii_gate.check(
+                            _cand, original=orch._original_text_for(_cand),
+                        )
                         _repairs = _cand.get("_ascii_repair_count", 0) if isinstance(_cand, dict) else 0
                         if _repairs:
                             logger.info(

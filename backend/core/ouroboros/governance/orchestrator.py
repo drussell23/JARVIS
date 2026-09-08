@@ -14231,6 +14231,40 @@ class GovernedOrchestrator:
                 ),
                 adapter_names_run=(),
             )
+        # …and must CHANGE them: a candidate whose declared symbol is the
+        # original's AST made no change a test could observe (f97f8195d6
+        # landed exactly that, 2026-09-08). Refused here, so the L2 loop
+        # re-prompts instead of the change engine applying nothing.
+        try:
+            from backend.core.ouroboros.governance.declared_symbols import (
+                symbols_unchanged_in_candidate as _ds_cand_unchanged,
+            )
+            _ds_unchanged = _ds_cand_unchanged(
+                getattr(ctx, "target_symbols", ()) or (), candidate or {},
+                self._original_text_for(candidate or {}),
+            )
+        except Exception:  # noqa: BLE001 — contract is additive
+            _ds_unchanged = ()
+        if _ds_unchanged:
+            logger.warning(
+                "[Validation] declared symbols unchanged in candidate op=%s: %s — "
+                "refusing a candidate that changes nothing the goal asked for",
+                str(getattr(ctx, "op_id", ""))[:16], ", ".join(_ds_unchanged),
+            )
+            return ValidationResult(
+                passed=False,
+                best_candidate=None,
+                validation_duration_s=0.0,
+                error="declared_symbol_unchanged: " + ", ".join(_ds_unchanged),
+                failure_class="test",
+                short_summary=(
+                    "declared symbols are semantically unchanged in the candidate: "
+                    + ", ".join(_ds_unchanged)
+                    + " — the goal asks for a change INSIDE these definitions; a "
+                    "comment or punctuation edit is not a change"
+                ),
+                adapter_names_run=(),
+            )
         result = await self._run_validation_core(ctx, candidate, remaining_s)
         # Lesson confidence: a pass after injected lessons boosts them.
         try:
