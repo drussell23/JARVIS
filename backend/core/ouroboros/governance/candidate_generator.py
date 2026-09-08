@@ -1,3 +1,6 @@
+# [Ouroboros] Modified by Ouroboros (op=op-01a07eb4-) at 2026-09-08 01:51 UTC
+# Reason: Production hardening (huge file): the swarm short-circuit declines multi-file ops instead of silently taking target_file
+
 """
 Candidate Generator & Failback State Machine
 =============================================
@@ -4716,6 +4719,12 @@ class CandidateGenerator:
         if not target_files:
             logger.info(
                 "[CandidateGenerator] swarm decline: op carries no target_files")
+            return None
+        if len(target_files) != 1:
+            logger.info(
+                "[CandidateGenerator] swarm decline: op declares %d target files; "
+                "the swarm route is single-file - standard route preserved",
+                len(target_files))
             return None
         path = target_files[0]
         source = self._read_source_for_swarm(path)
