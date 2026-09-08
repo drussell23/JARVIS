@@ -261,3 +261,115 @@ def test_an_extracted_class_wrapped_method_stitches_back_correctly():
     eng = next(n for n in tree.body if isinstance(n, _ast.ClassDef) and n.name == "Engine")
     names = [m.name for m in eng.body if isinstance(m, _ast.FunctionDef)]
     assert names == ["other", "target"] and "return a - b" in stitched and "filler_39" in stitched
+
+
+# --------------------------------------------------------------------------
+# the worker's contract is the node — one instruction, every answer shape
+# --------------------------------------------------------------------------
+
+def test_the_swarm_worker_system_prompt_carries_no_whole_file_mandate():
+    """providers._CODEGEN_SYSTEM_PROMPT demands one JSON object with the
+    COMPLETE file and forbids partial content — the opposite of the
+    map-reduce node contract. It must not prefix a worker's system prompt."""
+    import inspect
+    from backend.core.ouroboros.governance.candidate_generator import CandidateGenerator
+    src = inspect.getsource(CandidateGenerator._maybe_swarm_short_circuit)
+    assert "_CODEGEN_SYSTEM_PROMPT as _sys_prompt" not in src
+    assert "(MAP_REDUCE_FRAMING, _anchor)" in src
+
+
+def test_a_node_echoed_at_its_original_nesting_is_extracted():
+    from backend.core.ouroboros.governance.agent_turn_adapter import ProductionAgentTurnFn
+    chunk = extract_target_chunk(BIG, "engine.py", "Engine.target")
+    target = ChunkTarget(symbol="Engine.target", chunk=chunk, instruction="x")
+    fn = ProductionAgentTurnFn(client=None, tool_backend=None)
+    indented = "    def target(self, a, b):\n        return a * b\n"
+    for raw in (indented, "```python\n" + indented + "```"):
+        got = fn._extract_node(raw, target)
+        assert got.startswith("def target(self, a, b):") and "return a * b" in got, raw
+
+
+def test_a_node_wrapped_in_a_2b1_envelope_is_extracted():
+    """A model trained on the whole-file schema wraps the ONE function it was
+    asked for in ``{"candidates":[{"full_content": ...}]}``."""
+    import json
+    from backend.core.ouroboros.governance.agent_turn_adapter import ProductionAgentTurnFn
+    chunk = extract_target_chunk(BIG, "engine.py", "Engine.target")
+    target = ChunkTarget(symbol="Engine.target", chunk=chunk, instruction="x")
+    fn = ProductionAgentTurnFn(client=None, tool_backend=None)
+    node = "def target(self, a, b):\n    return a - b\n"
+    for body in (node, "    " + node.replace("\n    ", "\n        "), "class Engine:\n    " + node.replace("\n    ", "\n        ")):
+        raw = json.dumps({"schema_version": "2b.1", "candidates": [{"file_path": "engine.py", "full_content": body}]})
+        got = fn._extract_node(raw, target)
+        assert got.startswith("def target(self, a, b):") and "return a - b" in got, body
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_answer_is_said_and_remembered(monkeypatch, caplog):
+    """The loop only ever saw "empty node"; now the answer head is in the
+    WARNING and in the LessonMemory substrate as stitch_node_unparsed."""
+    import logging
+    from backend.core.ouroboros.governance import lesson_memory, agentic_super_agent
+    from backend.core.ouroboros.governance.agent_turn_adapter import _note_unparsed_answer
+    recorded: list = []
+
+    async def _record(**kw):
+        recorded.append(kw); return "ok"
+    monkeypatch.setattr(lesson_memory, "record_lesson", _record)
+    chunk = extract_target_chunk(BIG, "engine.py", "Engine.target")
+    target = ChunkTarget(symbol="Engine.target", chunk=chunk, instruction="x")
+    with caplog.at_level(logging.WARNING):
+        _note_unparsed_answer(target, '{"schema_version": "2b.1-noop", "reason": "already done"}' + "x" * 2000)
+    await asyncio.gather(*list(agentic_super_agent._LESSON_TASKS))
+    assert any("no readable node" in r.getMessage() and "2b.1-noop" in r.getMessage() for r in caplog.records)
+    assert recorded and recorded[0]["error_class"] == "stitch_node_unparsed" and recorded[0]["phase"] == "STITCH"
+    assert len(recorded[0]["error_text"]) <= 600
+
+
+# --------------------------------------------------------------------------
+# the worker's completion is code, not a candidate envelope
+# --------------------------------------------------------------------------
+
+class _RecordingClient:
+    def __init__(self, explicit: bool) -> None:
+        self.calls: list = []
+        if explicit:
+            async def generate(*, prompt, system_prompt=None, max_tokens=4096, temperature=0.0,
+                               model_name=None, task_profile=None, response_format="LADDER"):
+                self.calls.append({"response_format": response_format, "max_tokens": max_tokens})
+                return "def target(self, a, b):\n    return a + b\n"
+        else:
+            async def generate(*, prompt, system_prompt=None, max_tokens=4096, temperature=0.0,
+                               model_name=None, task_profile=None):
+                self.calls.append({"max_tokens": max_tokens})
+                return "def target(self, a, b):\n    return a + b\n"
+        self.generate = generate
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit", [True, False])
+async def test_the_node_worker_asks_for_no_json_grammar(explicit, tmp_path):
+    """The local client's per-call default is the JSON-grammar ladder; a node
+    worker must send the documented ``None`` — and a client that cannot take
+    the argument is called exactly as before."""
+    from backend.core.ouroboros.governance.agent_turn_adapter import ProductionAgentTurnFn
+    chunk = extract_target_chunk(BIG, "engine.py", "Engine.target")
+    target = ChunkTarget(symbol="Engine.target", chunk=chunk, instruction="x")
+    client = _RecordingClient(explicit)
+    fn = ProductionAgentTurnFn(client=client, tool_backend=None, repo_root=tmp_path,
+                               parse_fn=lambda raw: None, max_turns=1, max_tokens=9999)
+    node = await fn(target)
+    assert node.startswith("def target(")
+    assert len(client.calls) == 1 and client.calls[0]["max_tokens"] == 9999
+    if explicit:
+        assert client.calls[0]["response_format"] is None
+    else:
+        assert "response_format" not in client.calls[0]
+
+
+def test_the_swarm_worker_output_budget_derives_from_the_window():
+    import inspect
+    from backend.core.ouroboros.governance.candidate_generator import CandidateGenerator
+    src = inspect.getsource(CandidateGenerator._maybe_swarm_short_circuit)
+    assert "max_tokens=_budget.output_reserve_tokens" in src
+    assert "response_format=None" in src

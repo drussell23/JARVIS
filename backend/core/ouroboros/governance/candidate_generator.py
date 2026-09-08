@@ -3418,7 +3418,14 @@ def _declared_symbols_for(context: Any, file_path: str) -> Tuple[str, ...]:
     simply absent, and absence degrades to inference.
     """
     try:
-        evidence = getattr(context, "evidence", None)
+        # The envelope's evidence rides the context as ``intake_evidence_json``
+        # and is decoded by ``OperationContext.intake_evidence``. (This read
+        # was ``context.evidence`` — a field the context never had, so the
+        # declaration was unreachable for EVERY op until 2026-09-07.) A
+        # duck-typed context may still carry a plain ``evidence`` mapping.
+        evidence = getattr(context, "intake_evidence", None)
+        if not isinstance(evidence, Mapping) or not evidence:
+            evidence = getattr(context, "evidence", None)
         if not isinstance(evidence, Mapping):
             return ()
         # The pointer: a delegated-provenance CLAIM when one exists, else the
@@ -4769,12 +4776,15 @@ class CandidateGenerator:
             )
             return None
 
-        try:
-            from backend.core.ouroboros.governance.providers import (
-                _CODEGEN_SYSTEM_PROMPT as _sys_prompt,
-            )
-        except Exception:  # noqa: BLE001
-            _sys_prompt = ""
+        # The worker's system prompt is the NODE contract only. It used to be
+        # prefixed with providers._CODEGEN_SYSTEM_PROMPT — the whole-file
+        # mandate ("respond with valid JSON only … full_content containing the
+        # COMPLETE modified file … NEVER partial file content") — directly
+        # contradicting the map-reduce framing that follows it ("return ONLY
+        # the modified AST node"). A 30B obeys the louder, first instruction:
+        # every worker of the first huge-file goals answered in a shape the
+        # node extractor could not read ("empty node", 5 turns each,
+        # 2026-09-07). One contract per prompt.
 
         client = self._swarm_agent_client()
         if client is None:
@@ -4796,7 +4806,7 @@ class CandidateGenerator:
             _anchor = extract_public_api(source, path) or ""
         except Exception:  # noqa: BLE001 — the map is additive
             _anchor = ""
-        _system = "\n\n".join(t for t in (_sys_prompt, MAP_REDUCE_FRAMING, _anchor) if t)
+        _system = "\n\n".join(t for t in (MAP_REDUCE_FRAMING, _anchor) if t)
         _node_budget = _budget.with_overhead(_system).node_budget_tokens
 
         def _radius_for(target: Any) -> str:
@@ -4813,6 +4823,11 @@ class CandidateGenerator:
             parse_fn=lambda raw: None,               # single-shot node completion
             max_turns=1,
             node_context_fn=_radius_for,
+            # The node may be as long as the window's output reserve allows —
+            # derived from the negotiated budget, not a flat 4096 (a 230-line
+            # method JSON-escaped already overran that).
+            max_tokens=_budget.output_reserve_tokens,
+            response_format=None,                    # code, not a candidate envelope
         )
 
         async def _rag_reprompt(target: Any, rag_ctx: str) -> str:

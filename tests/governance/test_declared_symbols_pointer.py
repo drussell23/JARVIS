@@ -74,3 +74,23 @@ def test_an_unknown_pointer_degrades_to_inference(monkeypatch):
     _roadmap(monkeypatch)
     assert _declared_symbols_for(_ctx({"goal_id": "never-signed"}), _FILE) == ()
     assert _declared_symbols_for(_ctx(None), _FILE) == ()
+
+
+def test_the_pointer_is_read_off_the_real_context_snapshot(monkeypatch):
+    """The envelope's evidence rides the context as ``intake_evidence_json``;
+    the deriver read a field the context never had, so no declaration was
+    ever reachable through a real OperationContext."""
+    import json
+    from backend.core.ouroboros.governance.op_context import OperationContext
+
+    goal = _roadmap(monkeypatch)
+    ctx = OperationContext.create(
+        description="x", target_files=(_FILE,),
+        intake_evidence_json=json.dumps({"goal_id": goal.goal_id, "source": "roadmap"}),
+    )
+    assert ctx.intake_evidence["goal_id"] == goal.goal_id
+    assert _declared_symbols_for(ctx, _FILE) == goal.target_symbols
+    bare = OperationContext.create(description="x", target_files=(_FILE,))
+    assert bare.intake_evidence == {} and _declared_symbols_for(bare, _FILE) == ()
+    corrupt = OperationContext.create(description="x", target_files=(_FILE,), intake_evidence_json="{not json")
+    assert corrupt.intake_evidence == {}

@@ -48,6 +48,7 @@ Env-driven; pure asyncio.
 from __future__ import annotations
 
 import ast
+import inspect
 import textwrap
 import logging
 import os
@@ -56,6 +57,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from backend.core.ouroboros.governance.agentic_super_agent import (
+    _note_stitch_lesson,
     _verify_node_against_ast,
     agent_max_turns,
 )
@@ -281,6 +283,7 @@ class ProductionAgentTurnFn:
         compaction_config: Optional[Any] = None,
         framing: str = "",
         node_context_fn: Optional[Callable[[ChunkTarget], str]] = None,
+        response_format: Any = None,
     ) -> None:
         # Map-reduce view (2026-09-07): the node prompt may carry a strict framing
         # and a READ-ONLY Radius of Relevance from ``node_context_fn`` — the zoomed
@@ -288,6 +291,13 @@ class ProductionAgentTurnFn:
         # worker sees structure without ever seeing (or re-emitting) the file.
         self._framing = framing or ""
         self._node_context_fn = node_context_fn
+        # The answer is ONE function definition — code, not a candidate
+        # envelope. ``None`` is the local client's documented "no constraint"
+        # (its per-call default is the JSON-grammar LADDER, which forced every
+        # worker's node into the whole-file 2b.1 schema the extractor could
+        # not read: "empty node" ×5 turns per worker, 2026-09-07 — while the
+        # same prompt answered plainly through a bare /api/chat replay).
+        self._response_format = response_format
         self._client = client
         self._tool_backend = tool_backend
         self._repo_root = repo_root
@@ -377,14 +387,20 @@ class ProductionAgentTurnFn:
         want = target.symbol.split(".")[-1]
 
         def _has_target(text: str) -> bool:
+            # A method echoed at its ORIGINAL nesting (the way the radius
+            # shows it) is an IndentationError to ast.parse; dedent first —
+            # the stitch re-indents whatever node is returned.
             try:
-                tree = ast.parse(text)
+                tree = ast.parse(textwrap.dedent(text))
             except SyntaxError:
                 return False
             return any(
                 isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == want
                 for n in tree.body
             )
+
+        def _node(text: str) -> str:
+            return textwrap.dedent(text).strip()
 
         def _method_in_class(text: str) -> str:
             """The target when the model answered in the shape it was SHOWN —
@@ -412,19 +428,26 @@ class ProductionAgentTurnFn:
 
         # 1) bare function source
         if _has_target(raw):
-            return raw.strip()
+            return _node(raw)
         # 2) fenced code block(s)
         for block in _iter_code_fences(raw):
             if _has_target(block):
-                return block.strip()
+                return _node(block)
         # 2b) the method inside its class shell — the shape the radius showed it
         for text in (raw, *_iter_code_fences(raw)):
             wrapped = _method_in_class(text)
             if wrapped and _has_target(wrapped):
                 return wrapped
-        # 3) full_content candidate → slice the node out
+        # 3) full_content candidate → the node itself (a model trained on the
+        #    whole-file schema wraps the ONE function it was asked for in a
+        #    2b.1 envelope), else slice the node out of a larger body
         fc = _extract_full_content(raw)
         if fc:
+            if _has_target(fc):
+                return _node(fc)
+            wrapped = _method_in_class(fc)
+            if wrapped and _has_target(wrapped):
+                return wrapped
             chunk = extract_target_chunk(fc, target.symbol.replace(".", "/") + ".py", target.symbol)
             if chunk is None:
                 fp = (
@@ -461,6 +484,7 @@ class ProductionAgentTurnFn:
             )
             node = self._extract_node(raw or "", target)
             if not node:
+                _note_unparsed_answer(target, raw or "", op_id=self._op_id)
                 return ""
             # Polymorphic verify: a Python CodeChunk has no ``language`` attr →
             # defaults to "python" (byte-identical AST gate). A polyglot Chunk
@@ -484,6 +508,10 @@ class ProductionAgentTurnFn:
     def _make_generate_fn(self) -> Callable[[str], Awaitable[str]]:
         """Wrap the injected provider client's ``generate`` as the tool loop's
         ``generate_fn`` — the real DoubleWord brain call."""
+        kwargs: Dict[str, Any] = {}
+        if _accepts_kwarg(self._client.generate, "response_format"):
+            kwargs["response_format"] = self._response_format
+
         async def _generate(p: str) -> str:
             resp = await self._client.generate(
                 prompt=p,
@@ -492,6 +520,7 @@ class ProductionAgentTurnFn:
                 temperature=self._temperature,
                 model_name=self._model_name,
                 task_profile=self._task_profile,
+                **kwargs,
             )
             content = getattr(resp, "content", None)
             if content is None and isinstance(resp, str):
@@ -606,6 +635,45 @@ def _iter_code_fences(text: str) -> List[str]:
             body = body[nl + 1:]  # drop the language tag line
         blocks.append(body)
     return blocks
+
+
+def _accepts_kwarg(fn: Any, name: str) -> bool:
+    """True when ``fn`` names ``name`` explicitly or takes ``**kwargs`` (a
+    tiered client forwards its kwargs to the client that does). A client
+    that accepts neither is called exactly as before. Never raises."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _note_unparsed_answer(target: ChunkTarget, raw: str, *, op_id: str = "") -> None:
+    """An answer with no readable node is the seam the swarm was blind at:
+    the loop only ever saw ``empty node`` and refined five times against a
+    shape it never learned. Say what came back — one WARNING with a bounded
+    excerpt (the LessonMemory evidence width) — and route it into the
+    LessonMemory substrate as ``stitch_node_unparsed`` so the next
+    generation for this module retrieves it. Never raises."""
+    try:
+        from backend.core.ouroboros.governance.lesson_memory import evidence_chars
+        width = max(40, int(evidence_chars()))
+    except Exception:  # noqa: BLE001
+        width = 280
+    try:
+        excerpt = (raw or "").strip()[:width]
+        logger.warning(
+            "[AgentTurnAdapter] %s: no readable node in the answer (%d chars) — "
+            "answer head: %r", target.symbol, len(raw or ""), excerpt,
+        )
+        _note_stitch_lesson(
+            target, "stitch_node_unparsed",
+            f"no readable node in {len(raw or '')} chars; head: {excerpt!r}", turn=0,
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _extract_full_content(raw: str) -> str:

@@ -1843,6 +1843,23 @@ class OperationContext:
         new_hash = _compute_hash(fields_for_hash)
         return dataclasses.replace(intermediate, context_hash=new_hash)
 
+    @property
+    def intake_evidence(self) -> Dict[str, Any]:
+        """The originating envelope's ``evidence`` dict, decoded from
+        ``intake_evidence_json`` — the ONE reader every consumer shares
+        (``goal_id`` pointer, provenance claim, resume markers). ``{}`` when
+        the op was constructed without an envelope or the snapshot is not a
+        JSON object. Never raises: an unreadable snapshot is "no signal"."""
+        raw = getattr(self, "intake_evidence_json", "") or ""
+        if not raw:
+            return {}
+        try:
+            import json as _json  # noqa: PLC0415
+            data = _json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
     def with_telemetry(self, tc: TelemetryContext) -> "OperationContext":
         """Stamp TelemetryContext onto the context (no phase change).
 

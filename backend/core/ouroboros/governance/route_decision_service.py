@@ -291,3 +291,16 @@ class RouteDecisionService:
 
     def record_cost(self, provider: str, cost_usd: float) -> None:
         self._brain_selector.record_cost(provider, cost_usd)
+
+    def effective_schema_capability(self, *, declared: str, served_model: Optional[str]):
+        """The capability of the model that will ANSWER — forwarded to the
+        wrapped :class:`BrainSelector`, which owns the policy's
+        ``served_models`` section and the diff-apply evidence ledger. The
+        governed loop's selector IS this facade, and
+        ``_resolve_served_capability`` probes for this method by name: until
+        it was forwarded, every op was stamped with the slot's declaration
+        (``capability=full_content_only served=qwen3-coder-ov:30b``,
+        2026-09-07) and the served coder model never earned its diff schema."""
+        return self._brain_selector.effective_schema_capability(
+            declared=declared, served_model=served_model,
+        )
