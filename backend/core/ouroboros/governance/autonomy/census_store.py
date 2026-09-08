@@ -62,6 +62,26 @@ __all__ = [
 
 _ENV_MAX_AGE = "JARVIS_CENSUS_MAX_AGE_S"
 _ENV_REFRESH_BUDGET = "JARVIS_CENSUS_REFRESH_BUDGET_S"
+_ENV_REFRESH_ENABLED = "JARVIS_CENSUS_REFRESH_ENABLED"
+
+
+def census_refresh_enabled() -> bool:
+    """Whether the Sentinel may TRIGGER a census. Default FALSE. NEVER raises.
+
+    Moving the census off the critical path stopped it blocking a pass, but it
+    did not make it cheap: a refresh shards the suite across many concurrent
+    pytest subprocesses, and on this tree that destabilised the whole session
+    — a 2400s run died at 79s with six ops in flight and no shutdown sequence,
+    while the census was spawning its swarm.
+
+    So triggering one is opt-in. Reading a census someone else produced stays
+    free and always on, because reads cost nothing; what is gated is the
+    organism deciding, on its own, to run the entire test suite while it is
+    also trying to do work. The cheap tier alone yields candidates in ~1s and
+    dispatches, which is the behaviour a landing needs first.
+    """
+    raw = (os.environ.get(_ENV_REFRESH_ENABLED, "") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -161,6 +181,9 @@ class CensusStore:
         """Start a refresh if one is due and none is running. Returns whether
         a new refresh was started. Never awaits the census."""
         if watcher is None or self.refreshing:
+            return False
+        if not census_refresh_enabled():
+            # Reads stay free; TRIGGERING the suite is the expensive act.
             return False
         snap = self._snapshot
         if snap is not None and snap.is_fresh():

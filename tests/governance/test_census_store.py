@@ -37,6 +37,12 @@ class _Watcher:
         return self._failures, [], []
 
 
+@pytest.fixture
+def refresh_armed(monkeypatch):
+    """Triggering a census is opt-in — these tests exercise the mechanism."""
+    monkeypatch.setenv("JARVIS_CENSUS_REFRESH_ENABLED", "true")
+
+
 class _BlockingWatcher:
     """Blocks the THREAD, the way real pytest subprocesses do — the case a
     timeout on a coroutine cannot rescue."""
@@ -93,7 +99,7 @@ def test_the_budget_is_derived_from_the_pipeline(monkeypatch):
 # Refreshes are background, single-flight, and bounded
 # --------------------------------------------------------------------------
 
-def test_a_refresh_populates_the_store():
+def test_a_refresh_populates_the_store(refresh_armed):
     async def _go():
         store = CensusStore()
         watcher = _Watcher(failures=["red_1"])
@@ -109,7 +115,7 @@ def test_a_refresh_populates_the_store():
     assert snap is not None and len(snap.failures) == 1
 
 
-def test_only_one_refresh_runs_at_a_time():
+def test_only_one_refresh_runs_at_a_time(refresh_armed):
     async def _go():
         store = CensusStore()
         watcher = _Watcher(delay=0.5)
@@ -123,7 +129,7 @@ def test_only_one_refresh_runs_at_a_time():
     assert calls == 1, "a second refresh doubled the subprocess load"
 
 
-def test_a_fresh_store_does_not_refresh():
+def test_a_fresh_store_does_not_refresh(refresh_armed):
     async def _go():
         store = CensusStore()
         store._snapshot = CensusSnapshot(failures=(), taken_at=time.time())
@@ -132,7 +138,7 @@ def test_a_fresh_store_does_not_refresh():
     assert asyncio.run(_go()) is False
 
 
-def test_ensure_refreshing_returns_immediately_even_for_a_slow_census():
+def test_ensure_refreshing_returns_immediately_even_for_a_slow_census(refresh_armed):
     """The whole point: asking for a refresh must not cost the caller time."""
     async def _go():
         store = CensusStore()
@@ -149,7 +155,7 @@ def test_ensure_refreshing_returns_immediately_even_for_a_slow_census():
 # The wedge case — a suite that blocks its THREAD
 # --------------------------------------------------------------------------
 
-def test_a_blocking_census_is_abandoned_not_awaited(monkeypatch):
+def test_a_blocking_census_is_abandoned_not_awaited(monkeypatch, refresh_armed):
     """`wait_for` cannot cancel synchronous work, so the deadline is enforced
     on the WAITER and the late result dropped. The store must come back
     usable, and fast."""
@@ -170,7 +176,7 @@ def test_a_blocking_census_is_abandoned_not_awaited(monkeypatch):
     assert store.snapshot() is None      # nothing poisoned the store
 
 
-def test_a_failed_refresh_leaves_the_previous_snapshot_standing():
+def test_a_failed_refresh_leaves_the_previous_snapshot_standing(refresh_armed):
     """Eventual consistency: slightly stale truth beats no truth. Clearing on
     failure would let one flaky run downgrade the organism to blindness."""
     async def _go():
@@ -191,7 +197,7 @@ def test_a_failed_refresh_leaves_the_previous_snapshot_standing():
     assert store.stale_snapshot().failures == ("keep_me",)
 
 
-def test_repeated_failure_backs_off():
+def test_repeated_failure_backs_off(refresh_armed):
     """A broken suite must not be re-run every single pass."""
     async def _go():
         store = CensusStore()
@@ -202,14 +208,14 @@ def test_repeated_failure_backs_off():
     assert asyncio.run(_go()) is False
 
 
-def test_no_watcher_is_a_no_op():
+def test_no_watcher_is_a_no_op(refresh_armed):
     async def _go():
         return CensusStore().ensure_refreshing(None)
 
     assert asyncio.run(_go()) is False
 
 
-def test_ensure_refreshing_outside_a_loop_does_not_raise():
+def test_ensure_refreshing_outside_a_loop_does_not_raise(refresh_armed):
     assert CensusStore().ensure_refreshing(_Watcher()) is False
 
 
@@ -221,3 +227,33 @@ def test_the_snapshot_renders_for_telemetry():
     snap = CensusSnapshot(failures=(1, 2), taken_at=time.time(), duration_s=12.0)
     text = snap.render()
     assert "2 red" in text and "took 12s" in text
+
+
+# --------------------------------------------------------------------------
+# Triggering a census is OPT-IN
+# --------------------------------------------------------------------------
+
+def test_triggering_a_census_is_off_by_default(monkeypatch):
+    """Moving the census off the critical path stopped it BLOCKING a pass; it
+    did not make it cheap. A refresh shards the suite across many concurrent
+    pytest subprocesses, and on this tree that destabilised the whole session
+    — a 2400s run died at 79s with six ops in flight and no shutdown sequence
+    while the census was spawning its swarm.
+
+    Reading a census stays free and always on. What is gated is the organism
+    deciding, unprompted, to run the entire suite while it is also working.
+    """
+    monkeypatch.delenv("JARVIS_CENSUS_REFRESH_ENABLED", raising=False)
+
+    async def _go():
+        return CensusStore().ensure_refreshing(_Watcher())
+
+    assert asyncio.run(_go()) is False
+
+
+def test_reads_are_never_gated(monkeypatch):
+    """A gate on reads would make stale evidence unreachable for no benefit."""
+    monkeypatch.delenv("JARVIS_CENSUS_REFRESH_ENABLED", raising=False)
+    store = CensusStore()
+    store._snapshot = CensusSnapshot(failures=("r",), taken_at=time.time())
+    assert store.snapshot() is not None

@@ -311,6 +311,17 @@ class SentinelLoop:
         state, detail = await self._await_outcome(op_id)
         elapsed = time.monotonic() - started
 
+        # Feed the controller regardless of verdict: a failed op still tells
+        # the truth about how long ops on this lane take, and learning only
+        # from successes would bias every future deadline short.
+        try:
+            from backend.core.ouroboros.governance.autonomy.adaptive_deadline import (  # noqa: E501,PLC0415
+                observe_op_duration,
+            )
+            observe_op_duration(str(getattr(self, "_route", "sentinel")), elapsed)
+        except Exception:  # noqa: BLE001
+            logger.debug("[Sentinel] deadline observation dropped", exc_info=True)
+
         if state == "landed":
             self._cooldown.record_success(work.target_file)
             return PassOutcome("landed", work.target_file, goal_id, op_id,
@@ -338,9 +349,54 @@ class SentinelLoop:
         return await self._await_via_ledger(op_id)
 
     def _outcome_deadline_s(self) -> float:
-        """An op gets its own pipeline budget, plus slack for teardown."""
-        pipeline = _env_float("JARVIS_PIPELINE_TIMEOUT_S", 0.0)
-        return (pipeline if pipeline > 0 else 900.0) * 1.2
+        """How long to wait for this op — measured, not multiplied.
+
+        Was ``pipeline * 1.2``. A fixed multiplier is wrong in both directions
+        and no value is right: too small sheds ops that were about to land,
+        too large lets a wedged one hold the loop for the session. The
+        multiplier cannot know what the machine is doing, which is the only
+        thing that determines how long an op takes.
+
+        Delegated to :mod:`adaptive_deadline`, which learns from completed
+        ops, generation latency and the validation estimator
+        ``adaptive_gen_budget`` already feeds — bounded below by the pipeline
+        budget and above by the session wall, so it chooses only WITHIN the
+        envelope the operator declared. Cold start reproduces the old value
+        exactly, so arming it changes nothing until it has evidence.
+        """
+        pipeline = _env_float("JARVIS_PIPELINE_TIMEOUT_S", 0.0) or 900.0
+        wall = _env_float("OUROBOROS_BATTLE_MAX_WALL_SECONDS", 0.0)
+        try:
+            from backend.core.ouroboros.governance.autonomy.adaptive_deadline import (  # noqa: E501,PLC0415
+                compute_outcome_deadline,
+            )
+            estimate = compute_outcome_deadline(
+                pipeline_budget_s=pipeline,
+                wall_ceiling_s=wall or pipeline * 2.0,
+                route=str(getattr(self, "_route", "sentinel")),
+                queue_depth=self._queue_depth(),
+            )
+            logger.info("[Sentinel] %s", estimate.render())
+            return estimate.seconds
+        except Exception:  # noqa: BLE001 — a deadline must always exist
+            logger.debug("[Sentinel] adaptive deadline degraded", exc_info=True)
+            return pipeline * 1.2
+
+    def _queue_depth(self) -> int:
+        """Ops currently in flight. Contention moves every deadline together.
+
+        Read from whatever the harness exposes rather than counted here — a
+        private tally would drift from the pool's own view the moment either
+        changed.
+        """
+        for attr in ("_active_ops", "active_ops"):
+            try:
+                value = getattr(self, attr, None)
+                if value is not None:
+                    return max(1, len(value))
+            except Exception:  # noqa: BLE001
+                continue
+        return 1
 
     async def _await_via_ledger(self, op_id: str) -> Tuple[str, str]:
         """Poll the op ledger the rest of the pipeline already writes to.
