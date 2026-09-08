@@ -76,6 +76,25 @@ PROFILES: Dict[str, Tuple[int, int, float]] = {
 }
 
 
+def _bg_pool_size() -> int:
+    """Concurrent ops the background pool may execute.
+
+    Derived from the LANE. On a paid fleet, concurrency is somebody else's
+    capacity problem; on one local GPU it is the whole problem — every extra
+    in-flight generation contends for the same card, and the streams come back
+    empty rather than slow. Composed from :mod:`local_lane_capacity` so the
+    pool and the generator's own semaphore cannot disagree about how much the
+    hardware can take. NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.governance.autonomy.local_lane_capacity import (
+            resolve_primary_concurrency,
+        )
+        return max(1, int(resolve_primary_concurrency(cloud_default=6).concurrency))
+    except Exception:  # noqa: BLE001 — an unknown lane is a SMALL lane
+        return 1
+
+
 def _fmt(value) -> str:
     """Env values are strings. ``True`` must render as ``true``, not ``True``
     — every reader in this repo lowercases and compares to ``("1","true",...)``,
@@ -160,7 +179,17 @@ def build(
         "JARVIS_PIPELINE_DEADLINE_AT_START": True,
         "JARVIS_TEST_TIMEOUT_S": 180,
         # --- the background pool that actually runs roadmap ops -----------
-        "JARVIS_BG_POOL_SIZE": 6,
+        # Sized for the LANE, not copied from soak26. Six workers is right for
+        # a hosted fleet and structurally wrong for one local GPU: measured
+        # 2026-09-08, four ops entering GENERATE together against a 30B at 32k
+        # context each returned `tokens=0 tps=0.0`, recorded as
+        # `no_candidates_returned` → `generation_failed`. Thirteen of thirty
+        # ops died that way. It reads like a model-quality problem and is not
+        # one — the model never ran.
+        #
+        # The queue stays deep: work should QUEUE, not be refused. What must
+        # be bounded is how much of it executes at once.
+        "JARVIS_BG_POOL_SIZE": _bg_pool_size(),
         "JARVIS_BG_QUEUE_SIZE": 64,
         "JARVIS_THROUGHPUT_GOVERNOR_ENABLED": False,
         # --- validation reserve -------------------------------------------
