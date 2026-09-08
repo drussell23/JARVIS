@@ -163,6 +163,24 @@ def test_a_failing_console_does_not_break_the_loop():
 # The launcher
 # --------------------------------------------------------------------------
 
+def test_the_injected_envelope_declares_an_urgency():
+    """Urgency decides the LANE. Unset, a source="roadmap" envelope goes down
+    the background lane to DoubleWord, which on this host is blocked by
+    topology (no cloud credit) — so the op dies
+    `background_dw_blocked_by_topology` AFTER passing provenance, PLAN and
+    every gate. The PRD records the same trap costing "every roadmap op in
+    five soaks", because UrgencyRouter keys on SOURCE, not urgency."""
+    src = inspect.getsource(BattleTestHarness._inject_sanctioned_goal)
+    assert "urgency=" in src, (
+        "the envelope declares no urgency — it will be routed to the blocked "
+        "background lane"
+    )
+    assert "JARVIS_WORK_ORDER_DEFAULT_URGENCY" in src, (
+        "urgency must come from the same knob WorkOrderSensor reads, or the "
+        "two lanes will disagree about the operator's policy"
+    )
+
+
 def test_the_launcher_requires_an_explicit_flag():
     if not LAUNCHER.exists():  # pragma: no cover
         pytest.skip("launcher not present")

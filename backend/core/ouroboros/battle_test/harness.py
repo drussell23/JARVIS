@@ -6991,9 +6991,20 @@ class BattleTestHarness:
             from backend.core.ouroboros.governance.operation_id import (  # noqa: E501,PLC0415
                 generate_operation_id,
             )
+            # Urgency decides the LANE, and an unset urgency sends a
+            # source="roadmap" envelope down the background lane to DoubleWord
+            # — which on this host is blocked by topology (no cloud credit), so
+            # the op dies `background_dw_blocked_by_topology` after passing
+            # every gate. The PRD records the same trap costing "every roadmap
+            # op in five soaks", because UrgencyRouter keys on SOURCE.
+            #
+            # Read from the SAME knob WorkOrderSensor uses so the operator's
+            # lane policy is stated once and the two paths cannot disagree.
             envelope = build_scoped_envelope(
                 goal_id=goal_id, description=description,
                 target_files=tuple(target_files),
+                urgency=(os.environ.get("JARVIS_WORK_ORDER_DEFAULT_URGENCY", "")
+                         or "high").strip(),
             )
             if envelope is None:
                 return None
