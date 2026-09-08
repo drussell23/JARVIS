@@ -89,6 +89,27 @@ _DEFAULT_MAX_OUTPUT_CHARS = 24_000
 _TRUNC_MARKER = "\n...[truncated by trajectory_recorder]"
 
 
+def _lease_ttl_for(op_id: str, static_ttl_s: float) -> float:
+    """How long to hold *op_id*'s generations — its lease, or the constant.
+
+    Composed from ``recorder_lease`` rather than reading an op's ceiling here:
+    the recorder knows only an op id, and the pool is the only component that
+    knows what envelope it actually granted. Imported lazily so the recorder
+    keeps no import-time dependency on the pool's side of the contract.
+
+    FAIL-CLOSED means keeping the row: any fault degrades to *static_ttl_s*,
+    which is exactly today's behaviour. NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.governance.observability.recorder_lease import (  # noqa: PLC0415
+            effective_ttl_s,
+        )
+        return float(effective_ttl_s(op_id, static_ttl_s))
+    except Exception:  # noqa: BLE001 — a lease read may not break a sweep
+        logger.debug("[TrajectoryRecorder] lease read degraded", exc_info=True)
+        return static_ttl_s
+
+
 def _env_flag(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in _TRUTHY
 
@@ -1330,7 +1351,7 @@ class TrajectoryRecorder:
         that would block every concurrent emit for the duration of disk
         I/O.
         """
-        ttl = _env_float(
+        static_ttl = _env_float(
             _ENV_PENDING_TTL_S, _DEFAULT_PENDING_TTL_S, 30.0, 86_400.0
         )
         now = time.monotonic()
@@ -1343,6 +1364,18 @@ class TrajectoryRecorder:
             # op keeps retrying -- the leak this structure has to avoid.
             for op_id in list(self._pending.keys()):
                 lineage = self._pending.get(op_id) or []
+                # PER-OP TTL. The static constant is a floor; an op that
+                # declared a longer runtime envelope keeps its generations for
+                # as long as it is entitled to run.
+                #
+                # The constant alone was an arithmetic guarantee of data loss:
+                # the pool's ceiling is adaptive and this was not, so once the
+                # ceiling passed 900s EVERY long op was destined to be written
+                # as unknown. Measured in bt-2026-09-08-193049 -- op
+                # op-01a08280-f4f2 expired at 900s holding 1 candidate, and its
+                # real verdict (failed/l2_stopped) arrived 8 minutes later
+                # against a 1530s ceiling, with nothing left to attach it to.
+                ttl = _lease_ttl_for(op_id, static_ttl)
                 fresh = [
                     g for g in lineage
                     if (now - g.created_monotonic) <= ttl
@@ -1351,13 +1384,13 @@ class TrajectoryRecorder:
                     continue
                 for g in lineage:
                     if (now - g.created_monotonic) > ttl:
-                        expired.append((op_id, g))
+                        expired.append((op_id, g, ttl))
                 if fresh:
                     self._pending[op_id] = fresh
                 else:
                     self._pending.pop(op_id, None)
 
-        for op_id, gen in expired:
+        for op_id, gen, ttl in expired:
             self._stats["pending_expired"] += 1
             # The breakpoint, named: this generation produced candidates
             # and its op never reported a terminal reason. Recorded as
@@ -1365,11 +1398,18 @@ class TrajectoryRecorder:
             # label -- but recorded, because the candidate text is still
             # evidence about the model.
             logger.warning(
-                "[TrajectoryRecorder] op=%s expired after %.0fs with %d "
+                "[TrajectoryRecorder] op=%s expired after %.0fs (%s) with %d "
                 "candidate(s) and NO verdict — writing outcome=unknown, "
                 "should_train=false. If this is common, ops are outliving "
                 "the TTL (%s) or never reaching a terminal phase.",
-                op_id, ttl, len(gen.candidates), _ENV_PENDING_TTL_S,
+                op_id, ttl,
+                # WHICH clock ran out, named at the point of loss. "lease"
+                # means the op's own declared envelope elapsed and it still
+                # never reported — a real stall. "static" means no lease was
+                # ever published for this op, which is the condition that made
+                # the constant silently wrong for every long op.
+                "lease" if ttl > static_ttl else "static",
+                len(gen.candidates), _ENV_PENDING_TTL_S,
             )
             _exp_outcome, _exp_autonomy, _exp_train = self._noop_override(
                 gen, _UNKNOWN,

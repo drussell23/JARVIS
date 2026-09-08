@@ -23,6 +23,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, List, Literal, Optional, Tuple
 
+from backend.core.ouroboros.governance.test_timeout_derivation import (
+    derive_test_timeouts,
+    observe_per_file_rate,
+    observe_shard_cost,
+)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -353,13 +359,24 @@ class PythonAdapter:
 
     name = "python"
 
-    def __init__(self, repo_root: Path, timeout: float = 120.0,
+    def __init__(self, repo_root: Path, timeout: Optional[float] = None,
                  map_root: Optional[Path] = None) -> None:
         self._repo_root = repo_root
         #: Base tree whose test index applies when this adapter runs
         #: against a sandbox COPY -- see TestRunner._import_map_key.
         self._map_root = map_root
-        self._timeout = timeout
+        #: An EXPLICIT operator ceiling, or None for "the envelope governs".
+        #:
+        #: This defaulted to a literal 120.0 and every production construction
+        #: site omits it, so `run()`'s `min(timeout_budget_s, self._timeout)`
+        #: admitted the live budget and then discarded it: min(anything, 120)
+        #: is 120. Measured in bt-2026-09-08-193049, op op-01a08280-f4f2 -- a
+        #: 1530s ceiling spent entirely on three pytest runs killed at 120s,
+        #: 120s and 109s, ending failed/l2_stopped with the candidate never
+        #: judged. None restores the budget as the authority; an operator who
+        #: deliberately pins a cap still gets one, and a deliberate pin is a
+        #: different thing from a forgotten default.
+        self._timeout: Optional[float] = timeout
 
     async def resolve(
         self,
@@ -373,7 +390,8 @@ class PythonAdapter:
         to repo-relative paths for correct test directory discovery.
         """
         runner = TestRunner(
-            repo_root=self._repo_root, timeout=self._timeout,
+            repo_root=self._repo_root,
+            timeout=self._timeout if self._timeout is not None else _TEST_TIMEOUT_S,
             map_root=self._map_root,
         )
         return await runner.resolve_affected_tests(
@@ -393,12 +411,31 @@ class PythonAdapter:
         Python imports resolve correctly against the actual project layout.
         """
         t0 = time.monotonic()
+        # Dynamic Test Timeout Derivator. The budget the router computed is the
+        # authority; `self._timeout` contributes only when an operator pinned
+        # one deliberately. Both caps -- the subprocess wall and pytest's own
+        # --timeout -- come out of ONE derivation, so raising the wall can no
+        # longer leave the per-test cap pinned to a stale constant and simply
+        # move the failure.
+        plan = derive_test_timeouts(
+            budget_s=timeout_budget_s,
+            shard_size=len(test_files or ()),
+            operator_ceiling_s=self._timeout,
+        )
+        logger.info("[TestTimeout] op=%s %s", _op_id[:20], plan.render())
         runner = TestRunner(
             repo_root=self._repo_root,
-            timeout=min(timeout_budget_s, self._timeout),
+            timeout=plan.invocation_s,
+            per_test_timeout_s=plan.per_test_s,
         )
         test_result = await runner.run(test_files=test_files, sandbox_dir=None)
         elapsed = time.monotonic() - t0
+        # Learn -- but ONLY from runs that finished. A timed-out run's duration
+        # is the cap we chose, not the cost of the work; feeding it back would
+        # let the cap confirm itself and freeze the estimate at the ceiling.
+        if not test_result.timed_out:
+            observe_shard_cost(len(test_files or ()), elapsed)
+            observe_per_file_rate(len(test_files or ()), elapsed)
         return AdapterResult(
             adapter="python",
             passed=test_result.passed,
@@ -1212,9 +1249,17 @@ class TestRunner:
         map_root: Optional[Path] = None,
         *,
         event_callback: Optional[Callable[[Dict[str, object]], None]] = None,
+        per_test_timeout_s: Optional[int] = None,
     ) -> None:
         self._repo_root = repo_root.resolve()
         self._timeout = timeout
+        #: pytest's own ``--timeout``. None keeps the module default, which is
+        #: computed AT IMPORT TIME from the static whole-run cap and therefore
+        #: cannot follow a per-op budget: raising the invocation wall alone
+        #: would have left this pinned at 0.25 * 120 = 30s and merely moved the
+        #: timeout from the subprocess to pytest. Derived together with the
+        #: wall by ``test_timeout_derivation`` so the two cannot disagree.
+        self._per_test_timeout_s = per_test_timeout_s
         #: The tree whose TEST index applies here. A validation sandbox is
         #: a copy of the working tree at a fresh /tmp path every time, so
         #: keying the import map by its own root guarantees a cache MISS
@@ -1223,6 +1268,43 @@ class TestRunner:
         self._event_callback = event_callback
 
     # -- internal helpers ---------------------------------------------------
+
+    def _effective_per_test_timeout_s(self) -> int:
+        """pytest's ``--timeout`` for THIS invocation.
+
+        A derived cap when the caller supplied one; otherwise the module
+        default, UNTOUCHED — every legacy construction site stays byte-identical.
+
+        The legacy path is deliberately not clamped against the wall, and that
+        is a correctness requirement rather than caution. An earlier version
+        clamped it to ``wall - 1`` everywhere; ``TestRunner(repo_root,
+        timeout=2.0)`` then ran pytest with ``--timeout=1``, so pytest-timeout
+        killed the test at 1s and the run RETURNED a report instead of the
+        subprocess being killed at 2s. A wall of 2s is the harness handing out
+        impossible time — infrastructure — and relabelling that as a named test
+        failure is precisely the mislabeling ``failure_class=infra`` exists to
+        prevent (measured previously at 20 of 36 per-candidate rows carrying
+        infra with should_train=True). Caught by
+        ``TestRunTimeout::test_timeout_kills_subprocess``, not by a soak.
+
+        On the DERIVED path the ordering is already guaranteed upstream:
+        ``derive_test_timeouts`` computes both caps from one number, so
+        ``per_test_s < invocation_s`` holds by construction. The clamp here is
+        a second, local proof of that invariant for an explicitly-supplied
+        value. NEVER raises.
+        """
+        try:
+            candidate = self._per_test_timeout_s
+            if candidate is None:
+                # Legacy: the module constant, exactly as before.
+                return _TEST_PER_TEST_TIMEOUT_S
+            value = max(1, int(candidate))
+            wall = int(self._timeout) if self._timeout else 0
+            if wall > 1:
+                value = min(value, wall - 1)
+            return max(1, value)
+        except (TypeError, ValueError):
+            return _TEST_PER_TEST_TIMEOUT_S
 
     def _rebase_to_run_tree(self, paths: List[Path], discovery_root: Path) -> List[Path]:
         """Resolved test paths live where they were DISCOVERED — the base tree
@@ -1669,7 +1751,7 @@ class TestRunner:
             resolve_python_bin(), "-m", "pytest",
             *PYTEST_ISOLATION_ARGS,
             "--continue-on-collection-errors",
-            "--timeout=" + str(_TEST_PER_TEST_TIMEOUT_S),
+            "--timeout=" + str(self._effective_per_test_timeout_s()),
             "--timeout-method=thread",
             "--json-report",
             "--json-report-file=" + report_path,

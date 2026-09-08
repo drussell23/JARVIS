@@ -288,6 +288,137 @@ def _sovereign_pool_priority() -> int:
     return _resurrection_pool_priority() - _sovereign_primacy_margin()
 
 
+# ---------------------------------------------------------------------------
+# Autonomous Priority Boost — self-directed work must not queue behind bulk
+#
+# Measured, session bt-2026-09-08-193049 (pool_size=1, one GPU lane):
+#
+#   12:31:24  8 harness batch ops submitted        -> queue_depth 1..7
+#   12:31:37  the Sentinel's OWN self-signed goal  -> queue_depth=8, priority=3
+#   12:55:32  worker 0 finished op #1 in 1447.48s, picked up op #2
+#
+# The organism discovered its own work, sanctioned it, dispatched it — and then
+# waited behind seven ops it had not chosen, at IDENTICAL priority, on a lane
+# that retires roughly one op every 24 minutes. Its goal was about three hours
+# down a queue inside a 40-minute session wall. Nothing refused the work; the
+# ordering simply never let it run. An engine that selects its own work and
+# cannot reach a worker is not autonomous, it is merely opinionated.
+#
+# WHY NOT `signal_source == "roadmap"`: it does not discriminate. Every batch op
+# in that session also carried source='roadmap' (see the pool's own ceiling log
+# line: "(source='roadmap', file_count=1, read_only=False)"). Boosting on it
+# would boost the entire queue and change no ordering at all.
+#
+# The discriminator that DOES separate them is the signed goal pointer. The
+# Sentinel's op carried one ("DelegatedProvenance VERIFIED goal_id=ov-auto-
+# uncovered-module-apply-emergency-cpu-fix signer=drussell23"); the batch ops
+# carried none, and said so in their own telemetry ("this op carries no
+# signed-goal pointer, so the envelope promised it nothing"). Read via
+# `parent_inheritance.goal_pointer_for` — the same accessor the capability
+# envelope and the declared-symbol contract read, so the three cannot disagree
+# about which ops are sanctioned self-directed work.
+# ---------------------------------------------------------------------------
+
+_ENV_AUTONOMOUS_PRIMACY = "JARVIS_AUTONOMOUS_PRIMACY_ENABLED"
+
+
+def autonomous_primacy_enabled() -> bool:
+    """Kill switch for the boost. Default ON — this closes a live starvation,
+    and the ladder it joins is already bounded and fully reversible."""
+    raw = (os.environ.get(_ENV_AUTONOMOUS_PRIMACY, "") or "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return True
+
+
+def _autonomous_pool_priority() -> int:
+    """Precedence for a SANCTIONED SELF-DIRECTED op: strictly between a
+    resurrected survivor and the fastest normal route.
+
+    Derived as the MIDPOINT of that span, never a literal. A midpoint cannot
+    collide with either neighbour and stays correct without edit if either
+    margin or the route table moves — the property `_resurrection_pool_priority`
+    established and this tier has to preserve.
+
+    Ordering, highest precedence first:
+
+        human  <  resurrected  <  self-signed autonomous  <  normal routes
+
+    Above bulk because the organism chose this work and can defend the choice;
+    below a survivor because that op already paid for its progress once; below
+    the human unconditionally.
+
+    Degenerate span: when the two neighbours are adjacent there is no integer
+    between them, and this returns the resurrection tier. That is a TIE, not an
+    inversion — the PriorityQueue's `submission_order` tie-break then applies,
+    so a survivor submitted first still runs first. NEVER raises.
+    """
+    try:
+        low = _resurrection_pool_priority()      # numerically smallest = first
+        high = min(_ROUTE_PRIORITY.values())     # fastest normal route
+        if high - low < 2:
+            return low
+        return (low + high) // 2
+    except Exception:  # noqa: BLE001 — priority derivation never blocks a submit
+        logger.debug("[BGPool] autonomous priority derivation degraded", exc_info=True)
+        return _ROUTE_PRIORITY.get("immediate", 1)
+
+
+def _register_recorder_lease(
+    ctx_op_id: str, ceiling_s: float, *, source: str = "pool_pickup",
+) -> None:
+    """Publish this op's runtime envelope for the trajectory recorder.
+
+    The recorder holds a generation until its op reports a verdict and sweeps
+    on a static TTL; the pool is the ONLY component that knows the adaptive
+    ceiling it actually granted, so the ceiling has to travel from here. Lazy
+    import keeps the pool free of an import-time dependency on observability.
+    NEVER raises — a telemetry lease may not fail the op it measures.
+    """
+    try:
+        if not ctx_op_id:
+            return
+        from backend.core.ouroboros.governance.observability.recorder_lease import (  # noqa: PLC0415
+            register_lease,
+        )
+        register_lease(ctx_op_id, ceiling_s, source=source)
+    except Exception:  # noqa: BLE001
+        logger.debug("[BGPool] recorder lease registration degraded", exc_info=True)
+
+
+def _release_recorder_lease(ctx_op_id: str) -> None:
+    """Drop this op's recorder lease. Best-effort; NEVER raises."""
+    try:
+        if not ctx_op_id:
+            return
+        from backend.core.ouroboros.governance.observability.recorder_lease import (  # noqa: PLC0415
+            release_lease,
+        )
+        release_lease(ctx_op_id)
+    except Exception:  # noqa: BLE001
+        logger.debug("[BGPool] recorder lease release degraded", exc_info=True)
+
+
+def _self_directed_goal_id(op_context: Any) -> str:
+    """The signed goal id this op was dispatched to satisfy, or ``""``.
+
+    Delegates to `parent_inheritance.goal_pointer_for` rather than re-reading
+    the intake evidence here: a second reader of one contract is a second
+    opinion about which ops are self-directed, and the whole point of the
+    pointer is that there is exactly one answer. Imported lazily to keep the
+    pool free of an import-time dependency on the autonomy package.
+    NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.governance.autonomy.parent_inheritance import (  # noqa: PLC0415
+            goal_pointer_for,
+        )
+        return str(goal_pointer_for(op_context) or "").strip()
+    except Exception:  # noqa: BLE001
+        logger.debug("[BGPool] goal pointer read degraded", exc_info=True)
+        return ""
+
+
 def _read_env_int(key: str, default: int) -> int:
     """Read an integer from the environment with a safe fallback."""
     raw = os.environ.get(key, "")
@@ -837,12 +968,34 @@ class BackgroundAgentPool:
         # outranks EVERYTHING (including a resurrected survivor). Checked first.
         # Slice 245 — a hibernation survivor jumps ahead of EVERY normal route
         # (dynamic absolute-max), so dark-window backlog can't starve it.
+        # Autonomous Priority Boost — a SANCTIONED SELF-DIRECTED op outranks
+        # bulk batch work. Checked after the two primacy tiers so it can only
+        # ever lift an op out of the undifferentiated route tier, never past a
+        # human or a survivor. See _autonomous_pool_priority for the measured
+        # starvation this closes.
+        _autonomous_goal = ""
         if _signal_src in _SOVEREIGN_SOURCES:
             _priority = _sovereign_pool_priority()
         elif getattr(op_context, "resurrected_from_hibernation", False):
             _priority = _resurrection_pool_priority()
         else:
             _priority = _ROUTE_PRIORITY.get(_route, 3)
+            if autonomous_primacy_enabled():
+                _autonomous_goal = _self_directed_goal_id(op_context)
+                if _autonomous_goal:
+                    _boosted = _autonomous_pool_priority()
+                    # Only ever a BOOST. A route that already outranks the
+                    # autonomous tier (a genuine `immediate`) keeps its place;
+                    # min() makes the rule monotone, so arming this can never
+                    # demote an op that was going to run sooner.
+                    if _boosted < _priority:
+                        logger.info(
+                            "[BGPool] AUTONOMOUS PRIMACY goal=%s op=%s "
+                            "priority %d -> %d — self-signed work does not "
+                            "queue behind unseeded batch",
+                            _autonomous_goal, op_id, _priority, _boosted,
+                        )
+                        _priority = _boosted
         self._submit_counter += 1
 
         try:
@@ -1594,6 +1747,13 @@ class BackgroundAgentPool:
                     # op for the time it is actually RUNNING, which is what
                     # the budget was ever meant to measure.
                     _ctx_to_run = restamp_pipeline_deadline_at_start(op.context)
+                    # Publish the envelope the trajectory recorder must wait
+                    # out. Keyed by the CONTEXT op id -- the id the recorder
+                    # keys _pending by -- not this worker's bgop id, which the
+                    # recorder has never seen. The recorder cannot know an op's
+                    # ceiling; this worker is the only place that does.
+                    _lease_op_id = str(getattr(_ctx_to_run, "op_id", "") or "")
+                    _register_recorder_lease(_lease_op_id, _op_timeout_s)
                     _run_task = asyncio.ensure_future(_orch.run(_ctx_to_run))
                     _fsm_granted_s = 0.0
                     _next_timeout_s = _op_timeout_s
@@ -1616,6 +1776,16 @@ class BackgroundAgentPool:
                                     raise
                                 _fsm_granted_s += _ext_s
                                 _next_timeout_s = _ext_s
+                                # The op just earned more wall; the recorder's
+                                # lease has to learn it too, or a generation
+                                # that is still legitimately in flight is swept
+                                # into the corpus as `unknown` while the op
+                                # that will label it is still running. This IS
+                                # the extension mechanism -- a later deadline
+                                # simply reads as later at the next sweep.
+                                _register_recorder_lease(
+                                    _lease_op_id, _ext_s, source="fsm_extension",
+                                )
                                 logger.info(
                                     "Worker %d: %s bg_timebox reached but failover "
                                     "FSM engaged (cold-start/heavy path) -- extending "
@@ -1729,6 +1899,12 @@ class BackgroundAgentPool:
                     op.completed_at = time.monotonic()
                     op.task = None
                     self._queue.task_done()
+                    # Drop the recorder lease. An OPTIMISATION, not a
+                    # requirement: the registry sweeps its own stale entries,
+                    # so a worker that dies here leaks nothing. Released on
+                    # every exit path -- including `parked`, where the
+                    # continuation re-registers on its own re-dispatch.
+                    _release_recorder_lease(_ctx_op_id)
                     # Stage 1.6 — clear the resume mark IF this was a
                     # resumed dispatch that reached a real terminal
                     # state (completed/failed/cancelled). If status is
