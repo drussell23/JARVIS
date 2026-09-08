@@ -2942,6 +2942,13 @@ class BattleTestHarness:
         # source token, defaults safe, no dilution of P9.2
         # graduation contract.
         await self._inject_phase_9_synthetic_workload()
+
+        # Autonomous Sentinel Mode — ignited HERE, after intake, because the
+        # loop dispatches THROUGH intake: starting it earlier would have it
+        # discover work it cannot yet submit, fail the dispatch, and cool down
+        # a target for a reason that was never the target's fault.
+        await self._start_sentinel_loop()
+
         _boot_mark("harness_boot_sequence_done")
 
         # Wire SerpentApprovalProvider — wraps the inner CLIApprovalProvider
@@ -5101,6 +5108,137 @@ class BattleTestHarness:
             return
 
     # -- Cockpit Attach Bridge (CLI item #6) --------------------------------
+
+    def _resolve_test_watcher(self):
+        """The TestWatcher the census reads from, or None. NEVER raises.
+
+        Prefers an instance something else already owns — the IntentEngine
+        keeps one per repo and it is already polling — so the Sentinel reads
+        the SAME census the rest of the organism reacts to rather than running
+        a second, divergent one. Constructs one only when no owner is
+        reachable, using the same constructor the engine uses.
+        """
+        for attr in ("_intent_engine", "_intent_service", "_engine"):
+            engine = getattr(self, attr, None)
+            watchers = getattr(engine, "_watchers", None) if engine else None
+            if isinstance(watchers, dict) and watchers:
+                # The primary repo's watcher; the Sentinel is single-repo by
+                # construction (its goals declare exactly one target file).
+                return watchers.get("jarvis") or next(iter(watchers.values()))
+        try:
+            from backend.core.ouroboros.governance.intent.test_watcher import (
+                TestWatcher,
+            )
+            return TestWatcher(
+                repo="jarvis",
+                test_dir="tests/",
+                repo_path=self._config.repo_path,
+            )
+        except Exception:  # noqa: BLE001 — no census is a degraded sensor, not a dead one
+            logger.debug("[Sentinel] no TestWatcher available", exc_info=True)
+            return None
+
+    def _render_sentinel_outcome(self, outcome: Any) -> None:
+        """Stream one autonomous pass to the cockpit. NEVER raises.
+
+        Routed through ``_repl_print`` — THE design-language chokepoint — so
+        the autonomous stream obeys the same glyph ration, density and
+        telemetry recast as every operator-facing line. A second rendering
+        path would make the organism's own work look foreign in its own
+        cockpit.
+        """
+        try:
+            state = str(getattr(outcome, "state", "") or "?")
+            colour = {
+                "landed": _SEM["success"],
+                "failed": _SEM["death"],
+                "timed_out": _SEM["death"],
+                "refused": _SEM["heal"],
+                "idle": _SEM["dim"],
+            }.get(state, _SEM["dim"])
+            glyph = {
+                "landed": "✅", "failed": "⛔", "timed_out": "⏱",
+                "refused": "↩", "idle": "·",
+            }.get(state, "·")
+            target = str(getattr(outcome, "target", "") or "")
+            detail = str(getattr(outcome, "detail", "") or "")
+            secs = float(getattr(outcome, "duration_s", 0.0) or 0.0)
+            head = f"[{colour}]{glyph} sentinel {state}[/{colour}]"
+            if target:
+                head += f" [{_SEM['neural']}]{target}[/{_SEM['neural']}]"
+            tail = f" [{_SEM['dim']}]{detail}[/{_SEM['dim']}]" if detail else ""
+            if secs >= 1.0:
+                tail += f" [{_SEM['dim']}]({secs:.0f}s)[/{_SEM['dim']}]"
+            self._repl_print(head + tail)
+        except Exception:  # noqa: BLE001 — the view must never break the loop
+            logger.debug("[Sentinel] render degraded", exc_info=True)
+
+    async def _start_sentinel_loop(self) -> None:
+        """Ignite Autonomous Sentinel Mode. NEVER raises.
+
+        Requires BOTH switches. They are separable capabilities — discovery
+        without sentinel files goals a human still approves; sentinel without
+        discovery auto-approves goals a human still writes — and unattended
+        application of self-authored code is the composition of the two. The
+        most consequential capability in this system is not reachable by
+        setting one variable.
+        """
+        try:
+            from backend.core.ouroboros.governance.autonomy.goal_discovery import (
+                discovery_enabled,
+            )
+            from backend.core.ouroboros.governance.autonomy.sentinel import (
+                sentinel_enabled, tier_ceiling,
+            )
+            from backend.core.ouroboros.governance.autonomy.sentinel_loop import (
+                SentinelLoop, loop_interval_s,
+            )
+
+            if not sentinel_enabled() or not discovery_enabled():
+                logger.info(
+                    "[Sentinel] dormant (sentinel=%s discovery=%s) — the "
+                    "organism executes only goals a human files",
+                    sentinel_enabled(), discovery_enabled(),
+                )
+                return
+
+            loop = SentinelLoop(
+                repo_root=self._config.repo_path,
+                # The SAME seam the /goal verb dispatches through: envelope
+                # built by operator_goal_sanction, submitted via the shared
+                # intake router. A synthesized goal and a typed one are
+                # indistinguishable downstream, which is what makes the
+                # autonomous path auditable by the tools that already exist.
+                dispatch=self._inject_sanctioned_goal,
+                watcher=self._resolve_test_watcher(),
+                observer=self._render_sentinel_outcome,
+            )
+            await loop.start()
+            self._sentinel_loop = loop
+            self._repl_print(
+                f"[{_SEM['neural']}]🛡 Autonomous Sentinel armed[/{_SEM['neural']}] "
+                f"[{_SEM['dim']}]— discovering its own work every "
+                f"{loop_interval_s():.0f}s; auto-approving up to "
+                f"{tier_ceiling()}; red always escalates[/{_SEM['dim']}]"
+            )
+        except Exception:  # noqa: BLE001 — a dead sentinel must not stop the organism
+            logger.warning(
+                "[Sentinel] ignition failed — the organism runs, but only on "
+                "goals a human files", exc_info=True,
+            )
+
+    async def _stop_sentinel_loop(self) -> None:
+        """Retire the autonomous loop before teardown. NEVER raises."""
+        loop = getattr(self, "_sentinel_loop", None)
+        if loop is None:
+            return
+        self._sentinel_loop = None
+        try:
+            await loop.stop()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.debug("[Sentinel] stop degraded", exc_info=True)
 
     async def _start_cockpit_attach_bridge(self) -> None:
         """Mount the ov-attach UDS bridge. Fail-soft: a bind failure
@@ -10016,6 +10154,13 @@ class BattleTestHarness:
         not prevent the remaining components from being cleaned up.
         """
         logger.info("Shutting down session %s ...", self._session_id)
+
+        # Autonomous Sentinel FIRST — before anything it dispatches into is
+        # torn down. A loop still discovering work while intake is closing
+        # would file goals that cannot be submitted, and cool down targets for
+        # a failure that was the shutdown's, not theirs. Stopping it first
+        # also means no new op can enter the pipeline mid-teardown.
+        await self._stop_sentinel_loop()
 
         # Slice 49 — clean shutdown has begun, so the main loop is no longer
         # the concern; retire the external sentinel before teardown so it

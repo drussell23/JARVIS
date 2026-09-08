@@ -44,6 +44,26 @@ WALL_S="${OV_MAX_WALL_S:-3600}"
 
 die() { echo "REFUSING: $*" >&2; exit 2; }
 
+SENTINEL=0
+for arg in "$@"; do
+  case "$arg" in
+    --sentinel) SENTINEL=1 ;;
+    --help|-h)
+      echo "usage: cockpit_interactive.sh [--sentinel]"
+      echo "  --sentinel   the organism discovers, sanctions and applies its"
+      echo "               own work; you observe. Red tier still escalates."
+      exit 0 ;;
+  esac
+done
+if [ "$SENTINEL" = "1" ]; then
+  export JARVIS_SENTINEL_MODE_ENABLED=true
+  export JARVIS_GOAL_DISCOVERY_ENABLED=true
+  echo "sentinel: ARMED — the organism will select and apply its own work"
+  echo "          auto-approve ceiling: ${JARVIS_SENTINEL_AUTO_APPROVE_MAX_TIER:-APPROVAL_REQUIRED} (red always escalates)"
+else
+  echo "sentinel: off (pass --sentinel to let the organism drive)"
+fi
+
 # --- 1. a real terminal, or nothing ---------------------------------------
 [ -t 0 ] && [ -t 1 ] || die "not a TTY. The cockpit's stream, diff overlay and
   status line all gate on an interactive terminal and would silently render
@@ -106,6 +126,19 @@ echo "envelope: $(echo "$ENVELOPE" | grep -c '^export') vars from production_env
 # (2026-09-07: 22 ouroboros/review/* branches escaped from isolated soaks).
 export JARVIS_REMOTE_PUSH_AIRGAP=true
 export JARVIS_ORANGE_PR_ENABLED=false
+
+# --- 5. Autonomous Sentinel Mode (OPT-IN, never implicit) ------------------
+# Unattended application of code the organism authored ITSELF is the most
+# consequential capability in this system, so it is not reachable by starting
+# the cockpit -- it takes a deliberate flag, every time, and the flag arms BOTH
+# switches together because either alone is a different (weaker) thing:
+#   discovery without sentinel -> it files goals a human still approves
+#   sentinel without discovery -> it approves goals a human still writes
+#
+#   bash scripts/soaks/cockpit_interactive.sh --sentinel
+#
+# Red-tier work, the governance substrate, Order-2 self-modification and any
+# recursion-bound breach still stop for a human -- no flag lifts that floor.
 
 echo
 echo "cockpit starting — interactive, cost cap \$${COST_CAP}, wall ${WALL_S}s"
