@@ -4475,9 +4475,47 @@ class SerpentFlow:
                         continue
             return None                            # every surface exhausted
         finally:
-            for t in (local_task, ):
-                if t is not None and not t.done():
-                    t.cancel()
+            # Teardown ORDER is load-bearing, and both halves used to leak.
+            #
+            # (1) `cancel()` was called but never AWAITED. Cancellation is a
+            #     request, not an event: a prompt_toolkit task unwinding its
+            #     terminal state stays alive after the call returns, so the
+            #     gate returned while its own reader was still attached to
+            #     stdin. Under an approval deadline that fires while the
+            #     human is away, that is one orphaned task per shed op — the
+            #     leak this gate would now produce at exactly the moment it
+            #     is designed to fire. Awaiting also RETRIEVES the task's
+            #     exception, without which every cancelled prompt logs an
+            #     "exception was never retrieved" at GC.
+            #
+            # (2) The `patch_stdout` context was exited while that task could
+            #     still be reading. Restoring stdout under a live reader is
+            #     how a TUI ends up writing into a torn-down patcher. The
+            #     task is now fully settled BEFORE the context unwinds.
+            #
+            # Bounded: a task that refuses to die must not convert a shed op
+            # into a hang — that would reinstate the very wedge the deadline
+            # exists to prevent. We wait briefly, then abandon it and say so.
+            if local_task is not None and not local_task.done():
+                local_task.cancel()
+                try:
+                    await asyncio.wait({local_task}, timeout=2.0)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    pass
+            if local_task is not None and local_task.done():
+                try:
+                    local_task.exception()   # retrieve; never re-raise here
+                except (asyncio.CancelledError, asyncio.InvalidStateError):
+                    pass
+                except Exception:  # noqa: BLE001
+                    pass
+            elif local_task is not None:
+                logger.warning(
+                    "[IronGate] local prompt task did not settle within 2s of "
+                    "cancellation — abandoning it so the op can still be shed",
+                )
             if ctx is not None:
                 try:
                     ctx.__exit__(None, None, None)

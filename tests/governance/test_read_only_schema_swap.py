@@ -37,6 +37,22 @@ from backend.core.ouroboros.governance.op_context import OperationContext
 from backend.core.ouroboros.governance.providers import _build_codegen_prompt
 
 
+@pytest.fixture(autouse=True)
+def _pin_the_default_schema(monkeypatch):
+    """These tests assert the CODE default (full_content). Pin it.
+
+    They read "Default schema is full_content" straight from the ambient
+    environment, which was safe only while nothing could turn the diff schema
+    on. As of 2026-09-08 the production envelope arms
+    ``JARVIS_SINGLE_FILE_DIFF_SCHEMA_ENABLED`` for both profiles, so whether
+    these tests pass depended on whatever else in the suite had touched the
+    variable first — they began failing on collection ORDER alone, which is
+    the least useful kind of red. A test that asserts a default must state
+    the default.
+    """
+    monkeypatch.delenv("JARVIS_SINGLE_FILE_DIFF_SCHEMA_ENABLED", raising=False)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

@@ -3918,6 +3918,45 @@ def _build_codegen_prompt(
     )
     _announce_schema_decision(ctx, force_full_content=force_full_content, diff=_single_file_task)
 
+    # Capability assurance at the ONE seam where the schema is actually
+    # decided. This is where degradation becomes invisible: from here on the
+    # op runs normally and reports success, having been asked for the weaker
+    # thing. The check passes for every case where full content is CORRECT
+    # (multi-file, a non-diff-capable model, the flag deliberately off) and
+    # fires only when the capability was promised and silently lost — which
+    # is the `capability=? brain=-` shape of a missing routing admission.
+    try:
+        from backend.core.ouroboros.governance.capability_assurance import (
+            assert_generation_capability, enforcement_enabled,
+        )
+        _cap = assert_generation_capability(
+            ctx, force_full_content=force_full_content,
+        )
+        if not _cap.ok:
+            logger.warning(
+                "[CapabilityAssurance] op=%s %s%s",
+                str(getattr(ctx, "op_id", "?"))[:24], _cap.render(),
+                "" if _cap.enforceable else " (reported only — this op carries "
+                "no signed-goal pointer, so the envelope promised it nothing)",
+            )
+            # Abort ONLY a sanctioned op. The envelope's promise is about the
+            # operator's declared work; an ambient tool call or a probe that
+            # builds a prompt with no routing admission is ordinary, and
+            # aborting those turns a diagnostic into a hard failure on paths
+            # that were previously fine.
+            if enforcement_enabled() and _cap.enforceable:
+                # Fail CLOSED. A RuntimeError here is caught by the same
+                # generation error path that already classifies provider
+                # faults, so the op is shed with a reason instead of landing
+                # a lower-fidelity candidate nobody knew was lower-fidelity.
+                raise RuntimeError(
+                    f"capability_degraded:{_cap.reason}"
+                )
+    except RuntimeError:
+        raise
+    except Exception:  # noqa: BLE001 — assurance never breaks the prompt build
+        logger.debug("[CapabilityAssurance] skipped", exc_info=True)
+
     # Read-only schema swap (Option α — Manifesto §7 Attention Mechanism
     # Supremacy). When ctx.is_read_only=True the code-gen schema is
     # semantically incoherent — the op is structurally forbidden from

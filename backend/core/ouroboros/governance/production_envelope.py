@@ -196,6 +196,30 @@ def build(
         "JARVIS_INTAKE_BACKLOG_SCAN_INTERVAL_S": 86400,
         "JARVIS_TESTWATCHER_BOOT_HYDRATION_ENABLED": False,
         "JARVIS_TEST_FAILURE_CACHE_FIRST_ENABLED": False,
+        # --- PRODUCTION CAPABILITIES ---------------------------------------
+        # Shipped, tested, and dormant behind default-FALSE graduation flags.
+        # Armed HERE, in the shared base, so the cockpit and the headless soak
+        # cannot differ in what the organism can DO — a cockpit that runs a
+        # weaker pipeline than the soak is a cockpit whose results mean
+        # nothing.
+        #
+        # The diff schema is the load-bearing one: FALSE means every candidate
+        # is a whole-file re-emission, which is precisely where a mid-size
+        # model drops a closing docstring quote on a large file. A diff cannot
+        # mangle a docstring it never reproduces.
+        "JARVIS_SINGLE_FILE_DIFF_SCHEMA_ENABLED": True,
+        # The L3 fan-out. Without the master pair, the parent-inheritance fix
+        # (ec6bb92c9a) engages only when an authoritative multi-node PLAN DAG
+        # drives it; the legacy route stays dead code.
+        "JARVIS_WAVE3_PARALLEL_DISPATCH_ENABLED": True,
+        "JARVIS_WAVE3_PARALLEL_DISPATCH_ENFORCE": True,
+        # NOT armed, deliberately, each for a stated reason:
+        #   JARVIS_EXPLORATION_LEDGER_ENABLED — its decision path applies score
+        #     floors that REFUSE the swarm route; arming it is a regression,
+        #     not a capability.
+        #   JARVIS_WORKSPACE_PROMOTION_ENABLED — changes where landed work
+        #     goes. It belongs to its own change with its own evidence, not to
+        #     a capability sweep.
         # --- corpus --------------------------------------------------------
         "JARVIS_TRAJECTORY_RECORDER_ENABLED": True,
         # --- outward-facing: air-gapped in BOTH profiles -------------------

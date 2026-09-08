@@ -1556,6 +1556,37 @@ SEED_SPECS: list = [
         since="v1.0",
     ),
     # ====================================================================
+    # Output schema — the single-file 2b.1-diff path
+    # Registered 2026-09-08. It was NEVER in this registry, so it was
+    # invisible to /help, to the typo checker, and to any operator asking
+    # "what governs the output schema" — while being the flag that decides
+    # whether a mid-size model re-emits a whole file (and drops a closing
+    # docstring quote doing it) or emits a bounded diff. An unregistered
+    # flag is a flag nobody can find.
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_SINGLE_FILE_DIFF_SCHEMA_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Re-enables the 2b.1-diff output schema for single-file ops "
+            "whose brain is diff-capable. Commit c7b518aabb hardcoded "
+            "_single_file_task=False (a global diff kill added when every "
+            "served model produced unappliable diffs); Slice 235 later built "
+            "the capability+size gate but never removed the hardcode, so the "
+            "gate's verdict was silently dropped and the diff branch stayed "
+            "dead. FALSE is byte-identical to that legacy: every candidate "
+            "is a whole-file re-emission, which is exactly where the "
+            "docstring mangle happens on large files. TRUE lets the gate "
+            "decide. Consulted by BOTH the prompt builder (which schema to "
+            "emit) and the response parser (whether a diff reply is "
+            "expected vs schema drift) via one shared predicate."
+        ),
+        category=Category.SAFETY,
+        source_file="backend/core/ouroboros/governance/providers.py",
+        example="true",
+        since="v1.0",
+    ),
+    # ====================================================================
     # Wave 3 (6) — Parallel L3 fan-out (parallel_dispatch) — 5 flags
     # Operator directive 2026-04-23: env knobs operator-visible via /help.
     # ====================================================================

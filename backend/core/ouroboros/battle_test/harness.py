@@ -762,6 +762,17 @@ def _goal_scope_from_roadmap(goal_id: str):
     return tuple(getattr(g, "target_files", ()) or ()) if g is not None else ()
 
 
+def _goal_symbols_from_roadmap(goal_id: str):
+    """A signed goal's declared ``target_symbols``, or (). NEVER raises.
+
+    Read from the SIGNED document, never from the caller's argv: the symbols
+    are what the candidate must be proven to have CHANGED, so a value the
+    operator could mistype at the prompt is not evidence of anything.
+    """
+    g = _roadmap_goal(goal_id)
+    return tuple(getattr(g, "target_symbols", ()) or ()) if g is not None else ()
+
+
 def _goal_desc_from_roadmap(goal_id: str) -> str:
     """A signed goal's description (the model's task), or \"\". NEVER raises."""
     g = _roadmap_goal(goal_id)
@@ -6763,7 +6774,55 @@ class BattleTestHarness:
     def _inject_and_report(self, goal_id: str, description: str,
                            target_files) -> None:
         """Build the scoped envelope and dispatch it through the shared
-        intake router, printing an honest receipt. NEVER raises."""
+        intake router, printing an honest receipt. NEVER raises.
+
+        Capability assurance runs FIRST. Every capability in this organism
+        degrades quietly — the diff schema off means whole-file re-emission,
+        a missing routing admission means `capability=?` — and in each case
+        the op still runs and still reports success, just producing the weaker
+        thing. Refusing at the keystroke is the only point where the operator
+        can still see the difference between what was promised and what would
+        actually run.
+        """
+        try:
+            from backend.core.ouroboros.governance.capability_assurance import (  # noqa: E501,PLC0415
+                enforcement_enabled, preflight_verdict,
+            )
+            _symbols = _goal_symbols_from_roadmap(goal_id)
+            _verdict = preflight_verdict(
+                target_files=tuple(target_files or ()),
+                target_symbols=_symbols,
+            )
+            if not _verdict.ok:
+                _col = _SEM["death"] if enforcement_enabled() else _SEM["heal"]
+                self._repl_print(f"[{_col}]{_verdict.render()}[/]")
+                for _name, _passed in sorted(_verdict.checks.items()):
+                    if _passed:
+                        continue
+                    self._repl_print(
+                        f"  [{_SEM['dim']}]⎿[/{_SEM['dim']}]  "
+                        f"[{_col}]{_name}[/{_col}] "
+                        f"[{_SEM['dim']}]{_verdict.detail.get(_name, '')}"
+                        f"[/{_SEM['dim']}]")
+                if enforcement_enabled():
+                    self._repl_print(
+                        f"[{_SEM['death']}]NOT dispatched[/] [dim]— the op would "
+                        f"have run below the capability the envelope declares. "
+                        f"Fix the flag(s) above, or set "
+                        f"JARVIS_CAPABILITY_ASSURANCE_ENFORCE=false to run "
+                        f"degraded on purpose.[/dim]")
+                    return
+                self._repl_print(
+                    f"[{_SEM['heal']}]dispatching DEGRADED[/] [dim]— enforcement "
+                    f"is off; this run is not comparable to a full-capability "
+                    f"one.[/dim]")
+            else:
+                self._repl_print(
+                    f"[{_SEM['dim']}]⎿  {_verdict.render()}[/{_SEM['dim']}]")
+        except Exception:  # noqa: BLE001 — assurance must never eat the verb
+            logger.warning("[OperatorGoal] capability assurance degraded",
+                           exc_info=True)
+
         op_id = self._inject_sanctioned_goal(
             goal_id=goal_id, description=description, target_files=target_files,
         )
