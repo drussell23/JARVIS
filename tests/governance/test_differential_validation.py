@@ -125,10 +125,24 @@ def test_acceptance_tests_are_never_excluded():
     assert m2.passed and ignored2 == ("tests/t.py::test_old",)  # unrelated ambient test excluded
 
 
-def test_production_code_candidates_are_never_differential():
-    base = frozenset({"tests/test_mod.py::test_f"})
-    failed = _multi(_ar(failed=("tests/test_mod.py::test_f",)))
-    assert DV.apply_differential(failed, base, test_authoring=False) == (failed, ())
+def test_production_code_candidates_are_differential_with_acceptance_protected():
+    """A production change's ambient reds are excused; the tests it is asked
+    to deliver never are; the legacy opt-out still disables the gate."""
+    base = frozenset({"tests/test_mod.py::test_f", "tests/test_mod.py::test_fix_me"})
+    ambient = _multi(_ar(failed=("tests/test_mod.py::test_f",)))
+    m, ignored = DV.apply_differential(ambient, base, protected=DV.acceptance_names("fix test_fix_me"))
+    assert m.passed and ignored == ("tests/test_mod.py::test_f",)
+    acceptance = _multi(_ar(failed=("tests/test_mod.py::test_fix_me",)))
+    assert DV.apply_differential(acceptance, base, protected=DV.acceptance_names("fix test_fix_me")) == (acceptance, ())
+    assert DV.apply_differential(ambient, base, test_authoring=False) == (ambient, ())
     assert DV.candidate_is_test_authoring([("tests/governance/test_x.py", "")])
     assert not DV.candidate_is_test_authoring([("pkg/mod.py", ""), ("tests/test_mod.py", "")])
     assert not DV.candidate_is_test_authoring([])
+
+
+def test_the_gates_no_longer_key_on_test_authoring():
+    import inspect
+    from backend.core.ouroboros.governance import orchestrator
+    from backend.core.ouroboros.governance.autonomy import subagent_scheduler
+    assert "_dv_authoring(" not in inspect.getsource(orchestrator)
+    assert "candidate_is_test_authoring(" not in inspect.getsource(subagent_scheduler)

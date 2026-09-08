@@ -25,6 +25,19 @@ VALIDATE exactly as before. A baseline that cannot be established (timeout,
 runner fault, adapter crash with no test ids) ignores nothing: fail-safe
 toward the stricter verdict.
 
+Why it covers PRODUCTION candidates too (2026-09-08)
+----------------------------------------------------
+The gate was scoped to test-authoring candidates on the argument that a
+red test mapped to production code "may be exactly what the op must fix".
+That case is what ``protected`` (``acceptance_names``: the declared target
+symbols and every ``test_*`` token of the description) already guards — an
+acceptance test is never excluded. Without the baseline, a production file
+whose test module carries ambient reds can never be changed: the first
+swarm candidate that edited ``candidate_generator.py`` correctly (soak
+2026-09-08 00:54Z) failed VALIDATE on 17 tests that fail identically at
+HEAD (they reach live provider paths). The verdict was, again, never about
+the candidate.
+
 Env: JARVIS_DIFFERENTIAL_VALIDATE_ENABLED (true),
 JARVIS_DIFFERENTIAL_VALIDATE_BUDGET_FRACTION (0.3 of the remaining budget),
 JARVIS_DIFFERENTIAL_VALIDATE_MIN_S (5.0).
@@ -160,10 +173,10 @@ def acceptance_names(description: str, target_symbols: Iterable[str] = ()) -> fr
 
 
 def candidate_is_test_authoring(all_files: Iterable[Tuple[str, str]]) -> bool:
-    """True when every candidate file is a test module. A candidate that
-    changes PRODUCTION code is judged by every test of that code (a red
-    test mapped to it may be exactly what the op must fix); only a
-    test-authoring candidate is judged by the tests it delivers."""
+    """True when every candidate file is a test module. Kept for callers
+    that classify a candidate; the differential gate no longer keys on it
+    — a production candidate's acceptance tests are protected by name
+    instead (see the module docstring, 2026-09-08)."""
     try:
         from backend.core.ouroboros.governance.ast_signature_anchor import is_test_path
     except Exception:  # noqa: BLE001
@@ -177,9 +190,11 @@ def apply_differential(
     test_authoring: bool = True,
 ) -> Tuple[Any, Tuple[str, ...]]:
     """Exclude failures that are entirely ambient (every failing id was red
-    at baseline, none of them an acceptance test, and the candidate only
-    authors tests) from the verdict. A residual failure keeps the adapter
-    result untouched. Returns ``(multi, ignored_ids)``."""
+    at baseline and none of them an acceptance test) from the verdict. A
+    residual failure keeps the adapter result untouched. ``test_authoring``
+    is the legacy opt-out (False disables the gate for a caller that must
+    judge by every test); the gate itself no longer keys on it. Returns
+    ``(multi, ignored_ids)``."""
     if baseline is None or not baseline or getattr(multi, "passed", False) or not test_authoring:
         return multi, ()
     protected_names = {str(p) for p in (protected or ())}

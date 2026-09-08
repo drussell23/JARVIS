@@ -224,7 +224,29 @@ def test_the_governed_loop_stamps_the_served_capability():
 def test_the_diff_apply_seam_records_evidence():
     from backend.core.ouroboros.governance import providers as P
     src = inspect.getsource(P)
-    assert "_note_diff_outcome(ctx, True)" in src and src.count("_note_diff_outcome(ctx, False)") == 2
+    assert "_note_diff_outcome(ctx, True, source=orig_content)" in src
+    assert src.count("_note_diff_outcome(ctx, False, source=orig_content)") == 2
+
+
+@pytest.mark.asyncio
+async def test_a_source_the_model_never_saw_whole_is_not_evidence(monkeypatch):
+    """A diff that failed against a file beyond the ingest ceiling says nothing
+    about the served model's diff capability."""
+    import asyncio
+    from types import SimpleNamespace
+    from backend.core.ouroboros.governance import context_budget as cb, providers as P
+    recorded: list = []
+
+    async def _note(served, ok, *, op_id=""):
+        recorded.append((served, ok)); return True
+    monkeypatch.setattr(smc, "note_diff_outcome", _note)
+    monkeypatch.setattr(cb, "exceeds_ceiling", lambda source, endpoint=None: len(source) > 100)
+    ctx = SimpleNamespace(op_id="op-x", telemetry=SimpleNamespace(routing_intent=SimpleNamespace(served_model="qwen3-coder-ov:30b")))
+    P._note_diff_outcome(ctx, False, source="x" * 1000)
+    P._note_diff_outcome(ctx, False, source="small")
+    P._note_diff_outcome(ctx, True)
+    await asyncio.sleep(0)
+    assert recorded == [("qwen3-coder-ov:30b", False), ("qwen3-coder-ov:30b", True)]
 
 
 @pytest.mark.asyncio

@@ -670,11 +670,21 @@ def single_file_diff_schema_enabled() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
-def _note_diff_outcome(ctx, ok: bool) -> None:
+def _note_diff_outcome(ctx, ok: bool, *, source: "Optional[str]" = None) -> None:
     """Record whether a 2b.1-diff from the SERVED model applied — the evidence
     :mod:`served_model_capability` weighs against the policy's declaration.
-    Fire-and-forget on the running loop; never touches the apply path."""
+    Fire-and-forget on the running loop; never touches the apply path.
+
+    A source the model never saw WHOLE (beyond the ingest ceiling — a 15k-line
+    requirements file, 2026-09-08) says nothing about its diff capability:
+    the context it invented was never in the prompt. Such outcomes are not
+    evidence, so an unrelated huge-file op cannot demote the schema for the
+    production goal that fits."""
     try:
+        if source is not None:
+            from backend.core.ouroboros.governance.context_budget import exceeds_ceiling
+            if exceeds_ceiling(source):
+                return
         ri = getattr(getattr(ctx, "telemetry", None), "routing_intent", None)
         served = str(getattr(ri, "served_model", "") or "")
         if not served:
@@ -5616,9 +5626,9 @@ def _parse_generation_response(
                         pfx, ctx_exc.hunk_line, ctx_exc,
                     )
                 patched = _apply_unified_diff(orig_content, unified_diff)
-                _note_diff_outcome(ctx, True)
+                _note_diff_outcome(ctx, True, source=orig_content)
             except StaleDiffError as exc:
-                _note_diff_outcome(ctx, False)
+                _note_diff_outcome(ctx, False, source=orig_content)
                 logger.warning(
                     "[%s] Stale diff rejected for %s at hunk line %d: %s",
                     pfx, cand.get("candidate_id"), exc.hunk_line, exc,
@@ -5651,7 +5661,7 @@ def _parse_generation_response(
                     pass  # never block on feedback emission
                 continue
             except ValueError as exc:
-                _note_diff_outcome(ctx, False)
+                _note_diff_outcome(ctx, False, source=orig_content)
                 logger.warning("[%s] Diff application failed for %s: %s", pfx, cand.get("candidate_id"), exc)
                 continue
             rewritten.append({

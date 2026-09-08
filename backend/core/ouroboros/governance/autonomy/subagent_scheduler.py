@@ -656,10 +656,10 @@ class GenerationSubagentExecutor:
             from backend.core.ouroboros.governance.differential_validation import (
                 baseline_budget_s,
                 baseline_failed_tests,
-                candidate_is_test_authoring,
                 differential_enabled,
             )
-            if differential_enabled() and tf.is_file() and candidate_is_test_authoring(((str(rel), content),)):
+            # production units too — acceptance tests stay protected by name
+            if differential_enabled() and tf.is_file():
                 baseline = await baseline_failed_tests(
                     runner, (tf,), sandbox_dir=tree_root,
                     budget_s=baseline_budget_s(remaining_s), op_id=ctx.op_id,

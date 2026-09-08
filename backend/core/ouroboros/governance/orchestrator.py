@@ -14650,14 +14650,16 @@ class GovernedOrchestrator:
                             from backend.core.ouroboros.governance.differential_validation import (
                                 baseline_budget_s as _dv_budget,
                                 baseline_failed_tests as _dv_baseline_fn,
-                                candidate_is_test_authoring as _dv_authoring,
                                 differential_enabled as _dv_enabled,
                                 existing_runnable_targets as _dv_targets,
                             )
                             # Only a test-AUTHORING candidate is judged by
                             # the tests it delivers; a production-code
                             # change owns every test of that code.
-                            if _dv_enabled() and _dv_authoring(_all_files):
+                            # Every runnable candidate — production code included —
+                            # is judged by what it CHANGES; its acceptance tests are
+                            # protected by name below (differential_validation, 2026-09-08).
+                            if _dv_enabled():
                                 _dv_files = _dv_targets(_all_files, _troot, _RUNNABLE_EXTENSIONS)
                                 if _dv_files:
                                     _dv_baseline = await _dv_baseline_fn(
@@ -14774,7 +14776,7 @@ class GovernedOrchestrator:
                                                 getattr(ctx, "description", "") or "",
                                                 getattr(ctx, "target_symbols", ()) or (),
                                             ),
-                                            test_authoring=True,  # baseline exists only for authoring candidates
+                                            test_authoring=True,
                                         )
                                         if _dv_ignored:
                                             logger.warning(
