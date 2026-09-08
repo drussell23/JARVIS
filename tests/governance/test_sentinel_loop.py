@@ -22,7 +22,10 @@ from backend.core.ouroboros.governance.autonomy.sentinel_loop import (
     loop_interval_s,
 )
 
-TARGET = "backend/api/widget.py"
+#: What the loop acts on is the file a goal WRITES. For an uncovered module
+#: that is the test file to be created, not the module itself — the goal's
+#: scope must name what gets written or the cage refuses the op.
+TARGET = "tests/test_widget.py"
 
 
 @pytest.fixture
@@ -159,25 +162,38 @@ def test_a_refused_dispatch_cools_and_does_not_raise(repo, tmp_path, restore_sig
     assert cd.is_cooling(TARGET) is True
 
 
-def test_an_already_sanctioned_goal_is_refused_not_failed(repo, tmp_path, restore_sign):
-    """A duplicate id means the work is already on the roadmap — deferring is
-    correct; treating it as a defect would teach the wrong lesson."""
+def test_an_already_signed_goal_is_re_dispatched_not_stranded(repo, tmp_path,
+                                                              restore_sign):
+    """A duplicate id is the normal state for a RETRY: the goal was filed on
+    an earlier pass and did not land. Treating it as a dead end permanently
+    strands every goal the organism ever filed but failed to dispatch — the
+    first attempt writes it, the failure cools the target, and the id collides
+    forever after. The signed goal is the asset; dispatch THAT."""
     cd = TargetCooldownLedger(tmp_path / "cd.json")
+    dispatched = {}
 
     class _Dup:
         ok = False
         goal_id = "ov-auto-x"
-        reason = "duplicate_goal_id"
+        reason = "duplicate_id"
         detail = ""
 
-    async def outcome(op_id, deadline):
-        raise AssertionError("should not dispatch")
+    def dispatch(**kw):
+        dispatched.update(kw)
+        return "op-redispatch"
 
-    loop = _loop(repo, dispatch=lambda **kw: "op-y", outcome=outcome,
+    async def outcome(op_id, deadline):
+        return "landed", "applied"
+
+    loop = _loop(repo, dispatch=dispatch, outcome=outcome,
                  cooldown=cd, sign=lambda w, **kw: _Dup())
     res = asyncio.run(loop.run_once())
-    assert res.state == "refused"
-    assert "already on the roadmap" in res.detail
+    assert res.state == "landed", res.detail
+    assert res.op_id == "op-redispatch"
+    assert dispatched["goal_id"] == "ov-auto-x", (
+        "the EXISTING signed goal must be the one dispatched"
+    )
+    assert cd.is_cooling(TARGET) is False, "a re-dispatch that landed must not cool"
 
 
 # --------------------------------------------------------------------------
@@ -256,6 +272,54 @@ def test_the_observer_never_breaks_the_loop(repo, tmp_path, restore_sign):
     res = asyncio.run(loop.run_once())
     loop._emit(res)                      # must not raise
     assert res.state == "landed"
+
+
+def test_dispatch_is_called_off_the_event_loop(repo, tmp_path, restore_sign):
+    """The intake submitter REFUSES to run on the event loop — it would have
+    to await intake from inside the loop intake runs on. Every early
+    autonomous pass hit exactly that:
+
+        [OperatorGoal] submitter called ON the event loop (expected a
+        to_thread worker) — goal will be FILED, not run
+
+    so goals were signed and filed but never dispatched, and the loop then
+    cooled targets for a fault that was purely this call's thread affinity.
+    """
+    import threading
+
+    cd = TargetCooldownLedger(tmp_path / "cd.json")
+    seen = {}
+
+    def dispatch(**kw):
+        seen["thread"] = threading.current_thread()
+        seen["main"] = threading.main_thread()
+        return "op-thread"
+
+    async def outcome(op_id, deadline):
+        return "landed", "applied"
+
+    loop = _loop(repo, dispatch=dispatch, outcome=outcome, cooldown=cd,
+                 sign=lambda w, **kw: _Signed())
+    res = asyncio.run(loop.run_once())
+    assert res.state == "landed"
+    assert seen["thread"] is not seen["main"], (
+        "dispatch ran on the event loop thread — the submitter will refuse it"
+    )
+
+
+def test_an_async_dispatch_is_awaited_directly(repo, tmp_path, restore_sign):
+    """A coroutine submitter must NOT be shoved into a thread."""
+    cd = TargetCooldownLedger(tmp_path / "cd.json")
+
+    async def dispatch(**kw):
+        return "op-async"
+
+    async def outcome(op_id, deadline):
+        return "landed", "applied"
+
+    loop = _loop(repo, dispatch=dispatch, outcome=outcome, cooldown=cd,
+                 sign=lambda w, **kw: _Signed())
+    assert asyncio.run(loop.run_once()).op_id == "op-async"
 
 
 def test_outcomes_render_for_the_telemetry_view():

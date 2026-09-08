@@ -117,7 +117,15 @@ def _census_budget_s() -> float:
 
 @dataclass(frozen=True)
 class DiscoveredWork:
-    """One unit of work the repository is asking for, with its evidence."""
+    """One unit of work the repository is asking for, with its evidence.
+
+    ``target_file`` is the file that will be WRITTEN, which is not always the
+    file the evidence points at. A signed goal's scope is what the cage checks
+    an edit against, so declaring the subject instead of the target is refused
+    as ``self_modification_unsanctioned_source`` — the op tries to write a path
+    its own mandate never covered. Found live: an "add tests for X.py" goal
+    declared ``X.py`` and then tried to create ``tests/test_X.py``.
+    """
 
     target_file: str
     kind: str
@@ -125,6 +133,9 @@ class DiscoveredWork:
     symbols: Tuple[str, ...] = ()
     weight: float = 0.0
     detail: Dict[str, Any] = field(default_factory=dict)
+    #: The file the EVIDENCE is about, when it differs from what gets written
+    #: (an uncovered module is the subject; the new test file is the target).
+    subject_file: str = ""
 
     @property
     def goal_id(self) -> str:
@@ -135,7 +146,10 @@ class DiscoveredWork:
         as a duplicate. That refusal is a feature: it stops the sensor filing
         the same work twice.
         """
-        stem = Path(self.target_file).stem[:32]
+        # Keyed on the SUBJECT, not the target: "tests for X" is the same work
+        # however the test file ends up named, and the id is what stops the
+        # sensor filing it twice.
+        stem = Path(self.subject_file or self.target_file).stem[:32]
         slug = re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-") or "target"
         return f"ov-auto-{self.kind.replace('_', '-')}-{slug}"
 
@@ -149,10 +163,15 @@ class DiscoveredWork:
                 f"is genuinely wrong, decline and say so rather than editing "
                 f"the assertion."
             )
+        subject = self.subject_file or self.target_file
         return (
-            f"`{self.target_file}` has no corresponding test module. Add "
-            f"focused tests covering its public behaviour and edge cases. "
-            f"Do not modify the production file."
+            f"`{subject}` has no corresponding test module. CREATE "
+            f"`{self.target_file}` containing focused tests for its public "
+            f"behaviour and edge cases: an import smoke test, tests for the "
+            f"key public functions, and the edge cases those functions "
+            f"actually branch on. Read `{subject}` to derive the tests; do "
+            f"NOT modify it — the only file this goal authorises you to write "
+            f"is `{self.target_file}`."
         )
 
 
@@ -202,32 +221,41 @@ def _subject_of_test(test_path: str, repo_root: Path) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-async def _from_ambient_reds(
-    repo_root: Path, watcher: Any,
+def _from_ambient_reds(
+    repo_root: Path, census: Any, watcher: Any,
 ) -> List[DiscoveredWork]:
-    """Failing tests at HEAD, via the TestWatcher census. NEVER raises."""
+    """Failing tests at HEAD, READ from the census store. NEVER raises.
+
+    Deliberately synchronous and instant. It used to ``await
+    watcher.run_census()``, which runs pytest subprocesses that do not
+    cooperate with the event loop — so the Sentinel's first pass sat behind
+    minutes of test execution, and an ``asyncio.wait_for`` around it could not
+    help (a timeout only fires at an await boundary; blocking work inside runs
+    to completion regardless).
+
+    Now the census is an eventual-consistency store this READS. Fresh data
+    sharpens the ranking; its absence costs precision for one pass and nothing
+    else. A refresh is kicked off in the background and awaited by nobody.
+    """
     out: List[DiscoveredWork] = []
-    if watcher is None:
+    if census is None:
         return out
-    budget = _census_budget_s()
+    snapshot = None
     try:
-        failures, _passed, _skipped = await asyncio.wait_for(
-            watcher.run_census(), timeout=budget,
-        )
-    except asyncio.TimeoutError:
-        # Not a fault — a census slower than its budget simply does not get to
-        # decide this pass. The coverage source below still answers, so the
-        # loop degrades to weaker evidence instead of stalling on the strongest.
-        logger.warning(
-            "[GoalDiscovery] census exceeded its %.0fs budget — this pass "
-            "ranks on coverage evidence only", budget,
-        )
-        return out
-    except asyncio.CancelledError:
-        raise
+        snapshot = census.snapshot()
+        # Ask for a refresh whenever the data is stale. Returns immediately;
+        # single-flight and back-off live in the store, not here.
+        census.ensure_refreshing(watcher)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("[GoalDiscovery] census unavailable: %r", exc)
+        logger.debug("[GoalDiscovery] census store unavailable: %r", exc)
         return out
+    if snapshot is None:
+        logger.info(
+            "[GoalDiscovery] no fresh census — ranking on coverage evidence "
+            "this pass (a refresh runs in the background)",
+        )
+        return out
+    failures = snapshot.failures
     for failure in failures or ():
         try:
             test_path = str(getattr(failure, "file_path", "") or "")
@@ -276,8 +304,12 @@ def _from_uncovered_modules(repo_root: Path, limit: int) -> List[DiscoveredWork]
                     continue
             except OSError:
                 continue
+            # The TARGET is the test file to be created — the goal's scope
+            # must name what gets WRITTEN, or the cage refuses the op as
+            # unsanctioned when it tries to create a path outside its mandate.
             out.append(DiscoveredWork(
-                target_file=rel,
+                target_file=f"tests/test_{src.stem}.py",
+                subject_file=rel,
                 kind="uncovered_module",
                 evidence=f"no tests/**/test_{src.stem}.py exists",
                 weight=_KIND_WEIGHT["uncovered_module"],
@@ -297,16 +329,32 @@ async def discover(
     repo_root: Path,
     watcher: Any = None,
     cooldown: Any = None,
+    census: Any = None,
     limit: Optional[int] = None,
 ) -> Tuple[DiscoveredWork, ...]:
     """Rank the work the repository is asking for. NEVER raises.
+
+    Dual-tier by design. Tier 1 is CHEAP and always available — a filesystem
+    walk, executed off the event loop. Tier 2 is the census, read from a store
+    that may or may not have fresh data. Nothing here ever waits on a pytest
+    subprocess, so a pass completes at the speed of the cheap tier no matter
+    what the test suite is doing.
 
     Returns highest-evidence first, with the cage, cooling targets and
     ambiguous test-subjects already removed.
     """
     cap = int(limit or _max_candidates())
+    if census is None and watcher is not None:
+        try:
+            from backend.core.ouroboros.governance.autonomy.census_store import (  # noqa: E501,PLC0415
+                get_default_store,
+            )
+            census = get_default_store()
+        except Exception:  # noqa: BLE001
+            census = None
     try:
-        reds = await _from_ambient_reds(Path(repo_root), watcher)
+        # Synchronous and instant — a store read, not a census run.
+        reds = _from_ambient_reds(Path(repo_root), census, watcher)
     except Exception:  # noqa: BLE001
         reds = []
     uncovered: List[DiscoveredWork] = []

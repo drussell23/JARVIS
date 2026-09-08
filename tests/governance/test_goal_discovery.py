@@ -32,16 +32,45 @@ class _Failure:
 
 
 class _Watcher:
+    """A watcher discovery must NEVER await — only hand to the store."""
+
     def __init__(self, failures=()):
         self._failures = list(failures)
+        self.census_calls = 0
 
     async def run_census(self):
+        self.census_calls += 1
         return self._failures, [], []
 
 
-class _BrokenWatcher:
+class _HangingWatcher:
     async def run_census(self):
-        raise RuntimeError("census exploded")
+        await asyncio.sleep(3600)
+
+
+class _Store:
+    """A census store: reads are instant, refreshes are somebody else's job."""
+
+    def __init__(self, failures=None, fresh=True, raises=False):
+        self._failures = list(failures or ())
+        self._fresh = fresh
+        self._raises = raises
+        self.refresh_requests = 0
+
+    def snapshot(self, **_kw):
+        if self._raises:
+            raise RuntimeError("store exploded")
+        if not self._fresh:
+            return None
+
+        class _Snap:
+            failures = tuple(self._failures)
+
+        return _Snap()
+
+    def ensure_refreshing(self, watcher):
+        self.refresh_requests += 1
+        return True
 
 
 @pytest.fixture
@@ -85,9 +114,9 @@ def test_synthesis_refuses_while_discovery_is_off(monkeypatch):
 
 def test_a_red_test_is_mapped_to_the_code_under_test(repo):
     """The fix belongs in the production file, never in the assertion."""
-    w = _Watcher([_Failure("tests/test_widget.py::test_a",
-                           "tests/test_widget.py", "AssertionError")])
-    found = _run(discover(repo_root=repo, watcher=w, cooldown=None))
+    store = _Store([_Failure("tests/test_widget.py::test_a",
+                             "tests/test_widget.py", "AssertionError")])
+    found = _run(discover(repo_root=repo, census=store, cooldown=None))
     reds = [f for f in found if f.kind == "ambient_red"]
     assert reds, "the red produced no candidate"
     assert reds[0].target_file == "backend/api/widget.py"
@@ -99,22 +128,44 @@ def test_a_red_whose_subject_is_ambiguous_is_skipped(repo):
     confidence."""
     (repo / "backend" / "api" / "dup.py").write_text("a = 1\n" * 200)
     (repo / "backend" / "core" / "dup.py").write_text("a = 1\n" * 200)
-    w = _Watcher([_Failure("tests/test_dup.py::t", "tests/test_dup.py")])
-    found = _run(discover(repo_root=repo, watcher=w, cooldown=None))
+    store = _Store([_Failure("tests/test_dup.py::t", "tests/test_dup.py")])
+    found = _run(discover(repo_root=repo, census=store, cooldown=None))
     assert not [f for f in found if f.kind == "ambient_red"]
 
 
 def test_reds_outrank_uncovered_modules(repo):
-    w = _Watcher([_Failure("tests/test_widget.py::t", "tests/test_widget.py")])
-    found = _run(discover(repo_root=repo, watcher=w, cooldown=None))
+    store = _Store([_Failure("tests/test_widget.py::t", "tests/test_widget.py")])
+    found = _run(discover(repo_root=repo, census=store, cooldown=None))
     assert found[0].kind == "ambient_red", [f.kind for f in found]
 
 
 def test_uncovered_modules_are_found_when_nothing_is_red(repo):
     found = _run(discover(repo_root=repo, watcher=_Watcher(), cooldown=None))
-    targets = {f.target_file for f in found}
-    assert "backend/api/widget.py" in targets
-    assert "backend/api/covered.py" not in targets, "a covered module is not a gap"
+    subjects = {f.subject_file for f in found}
+    assert "backend/api/widget.py" in subjects
+    assert "backend/api/covered.py" not in subjects, "a covered module is not a gap"
+
+
+def test_an_uncovered_goal_declares_the_file_it_will_WRITE(repo):
+    """The cage checks an edit against the goal's declared scope. Declaring
+    the subject and then creating a test file is refused live as
+    `self_modification_unsanctioned_source` — the op writes a path its own
+    mandate never covered."""
+    found = _run(discover(repo_root=repo, watcher=_Watcher(), cooldown=None))
+    work = next(f for f in found if f.subject_file == "backend/api/widget.py")
+    assert work.target_file == "tests/test_widget.py", (
+        "the goal must be scoped to the file that gets written"
+    )
+    text = work.describe()
+    assert "CREATE `tests/test_widget.py`" in text
+    assert "do\n    NOT modify it" in text or "NOT modify it" in text
+
+
+def test_the_goal_id_is_keyed_on_the_subject_not_the_test_path(repo):
+    """'tests for X' is the same work however the test file is named."""
+    found = _run(discover(repo_root=repo, watcher=_Watcher(), cooldown=None))
+    work = next(f for f in found if f.subject_file == "backend/api/widget.py")
+    assert work.goal_id == "ov-auto-uncovered-module-widget"
 
 
 # --------------------------------------------------------------------------
@@ -137,11 +188,11 @@ def test_a_cooling_target_is_skipped(repo, tmp_path):
 
 
 def test_the_same_target_is_never_offered_twice_in_one_pass(repo):
-    w = _Watcher([
+    store = _Store([
         _Failure("tests/test_widget.py::a", "tests/test_widget.py"),
         _Failure("tests/test_widget.py::b", "tests/test_widget.py"),
     ])
-    found = _run(discover(repo_root=repo, watcher=w, cooldown=None))
+    found = _run(discover(repo_root=repo, census=store, cooldown=None))
     targets = [f.target_file for f in found]
     assert len(targets) == len(set(targets))
 
@@ -152,9 +203,18 @@ def test_the_same_target_is_never_offered_twice_in_one_pass(repo):
 
 def test_a_broken_census_degrades_to_the_coverage_source(repo):
     """One dead source must not blind the sensor."""
-    found = _run(discover(repo_root=repo, watcher=_BrokenWatcher(), cooldown=None))
-    assert found, "a failing census killed discovery entirely"
+    found = _run(discover(repo_root=repo, census=_Store(raises=True), cooldown=None))
+    assert found, "a failing census store killed discovery entirely"
     assert all(f.kind == "uncovered_module" for f in found)
+
+
+def test_no_fresh_census_still_ranks_on_coverage(repo):
+    """Tier 2 absent is a precision cost for ONE pass, never a stall."""
+    store = _Store(fresh=False)
+    found = _run(discover(repo_root=repo, census=store, cooldown=None))
+    assert found
+    assert all(f.kind == "uncovered_module" for f in found)
+    assert store.refresh_requests == 1, "a stale store must be asked to refresh"
 
 
 def test_no_watcher_at_all_still_discovers(repo):
@@ -162,23 +222,30 @@ def test_no_watcher_at_all_still_discovers(repo):
     assert found
 
 
-def test_a_hanging_census_does_not_stall_the_loop(repo, monkeypatch):
-    """The census runs the whole suite. An unbounded await here would hang the
-    autonomous loop on its CHEAPEST step — the exact failure every other part
-    of this system refuses."""
-    monkeypatch.setenv("JARVIS_GOAL_DISCOVERY_CENSUS_BUDGET_S", "10")
-
-    class _Hangs:
-        async def run_census(self):
-            await asyncio.sleep(3600)
-
+def test_discovery_never_awaits_the_census(repo):
+    """The root cause of the first live stall. A timeout cannot save you here:
+    `wait_for` only cancels at an await boundary, and pytest subprocesses do
+    not yield. So the census must never be ON the critical path at all — the
+    store is READ, and a hanging watcher is simply handed to it and forgotten."""
     import time
+
+    watcher = _HangingWatcher()
+    store = _Store(fresh=False)
     started = time.monotonic()
-    found = _run(discover(repo_root=repo, watcher=_Hangs(), cooldown=None))
-    elapsed = time.monotonic() - started
-    assert elapsed < 30, "discovery hung on the census"
-    # ...and it still returned the weaker evidence rather than nothing.
-    assert all(f.kind == "uncovered_module" for f in found)
+    found = _run(discover(repo_root=repo, watcher=watcher, census=store,
+                          cooldown=None))
+    assert time.monotonic() - started < 20, "discovery waited on the census"
+    assert found, "discovery returned nothing instead of cheap evidence"
+    assert store.refresh_requests == 1
+
+
+def test_the_watcher_is_never_run_by_discovery(repo):
+    """Proof by counter: discovery hands the watcher to the store and never
+    calls run_census itself."""
+    watcher = _Watcher([_Failure("tests/test_widget.py::t", "tests/test_widget.py")])
+    store = _Store(fresh=False)
+    _run(discover(repo_root=repo, watcher=watcher, census=store, cooldown=None))
+    assert watcher.census_calls == 0
 
 
 def test_the_census_budget_is_derived_from_the_pipeline(monkeypatch):

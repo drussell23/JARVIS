@@ -46,6 +46,7 @@ session cannot wedge on one.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import time
@@ -202,49 +203,93 @@ class SentinelLoop:
         started = time.monotonic()
         from backend.core.ouroboros.governance.autonomy import goal_discovery as gd
 
+        # Breadcrumbs at WARNING, deliberately. A headless soak's log carries
+        # WARNING and above, so an INFO trace of the loop's own liveness is
+        # invisible in exactly the run where you need it. These two lines
+        # separate the only two ways a pass can fail to appear:
+        #
+        #   neither line  -> the task never got scheduled (event-loop starved)
+        #   entry only    -> it stalled INSIDE discovery (the census boundary)
+        #
+        # Cheap: two lines per pass, and a pass is minutes.
+        logger.warning("[Sentinel] pass %d starting — discovering", self.passes + 1)
         candidates = await gd.discover(
             repo_root=self._repo_root,
             watcher=self._watcher,
             cooldown=self._cooldown,
+        )
+        logger.warning(
+            "[Sentinel] pass %d discovery returned %d candidate(s) in %.1fs",
+            self.passes + 1, len(candidates), time.monotonic() - started,
         )
         if not candidates:
             return PassOutcome("idle", detail="no eligible work", duration_s=0.0)
 
         work = candidates[0]
         result = gd.synthesize_and_sign(work)
+        # The SIGNER is authoritative about the id — including on a duplicate
+        # refusal, where the id it reports is the one already on the roadmap.
+        goal_id = str(getattr(result, "goal_id", "") or "") or work.goal_id
         if result is None or not getattr(result, "ok", False):
             reason = getattr(result, "reason", "unknown") if result else "unknown"
-            # A duplicate id means this exact work is ALREADY on the roadmap —
-            # not a fault, and not something a cooldown should punish.
+            # A duplicate id means this exact work is ALREADY SIGNED on the
+            # roadmap. That is the normal state for a RETRY — the goal was
+            # filed on an earlier pass and, for whatever reason, did not land.
+            # Treating it as a dead end permanently strands every goal the
+            # organism ever filed but failed to dispatch: the first attempt
+            # writes the goal, the failure cools the target, and from then on
+            # the id collides forever. The signed goal is the ASSET here, so
+            # the pass continues and dispatches THAT — precisely what the
+            # `/goal inject <id>` verb does with a pre-signed goal.
             if "duplicate" in str(reason).lower():
-                self._cooldown.record_failure(
-                    work.target_file, reason="already sanctioned; deferring",
+                logger.info(
+                    "[Sentinel] %s already signed — re-dispatching the existing "
+                    "goal rather than re-filing it", goal_id,
                 )
+            else:
+                await self._record_lesson(
+                    work, phase="SANCTION", failure_class="sanction_refused",
+                    error_text=str(reason),
+                )
+                self._cooldown.record_failure(work.target_file, reason=str(reason))
                 return PassOutcome(
-                    "refused", work.target_file, work.goal_id,
-                    detail=f"already on the roadmap ({reason})",
+                    "failed", work.target_file, work.goal_id,
+                    detail=f"sanction refused: {reason}",
                     duration_s=time.monotonic() - started,
                 )
-            await self._record_lesson(
-                work, phase="SANCTION", failure_class="sanction_refused",
-                error_text=str(reason),
-            )
-            self._cooldown.record_failure(work.target_file, reason=str(reason))
-            return PassOutcome(
-                "failed", work.target_file, work.goal_id,
-                detail=f"sanction refused: {reason}",
-                duration_s=time.monotonic() - started,
-            )
 
         op_id = ""
         try:
-            dispatched = self._dispatch(
-                goal_id=result.goal_id,
-                description=work.describe(),
-                target_files=(work.target_file,),
-            )
-            if asyncio.iscoroutine(dispatched):
-                dispatched = await dispatched
+            # The intake submitter REFUSES to run on the event loop — it would
+            # have to await intake from inside the loop intake runs on, which
+            # deadlocks. It is written for the REPL path, where the verb
+            # handler is already on a worker thread. The Sentinel is not, so
+            # it must cross into one deliberately:
+            #
+            #   [OperatorGoal] submitter called ON the event loop (expected a
+            #   to_thread worker) — goal will be FILED, not run
+            #
+            # That warning is what every early autonomous pass hit: the goal
+            # was signed and filed, never dispatched, and the next pass then
+            # correctly refused it as a duplicate — so the loop cooled targets
+            # for a fault that was purely this call's thread affinity.
+            if asyncio.iscoroutinefunction(self._dispatch):
+                dispatched = await self._dispatch(
+                    goal_id=goal_id,
+                    description=work.describe(),
+                    target_files=(work.target_file,),
+                )
+            else:
+                dispatched = await asyncio.to_thread(
+                    functools.partial(
+                        self._dispatch,
+                        goal_id=goal_id,
+                        description=work.describe(),
+                        target_files=(work.target_file,),
+                    )
+                )
+                if asyncio.iscoroutine(dispatched):
+                    dispatched = await dispatched
             op_id = str(dispatched or "")
         except asyncio.CancelledError:
             raise
@@ -259,7 +304,7 @@ class SentinelLoop:
             )
             self._cooldown.record_failure(work.target_file, reason="not dispatched")
             return PassOutcome(
-                "failed", work.target_file, result.goal_id,
+                "failed", work.target_file, goal_id,
                 detail="not dispatched", duration_s=time.monotonic() - started,
             )
 
@@ -268,7 +313,7 @@ class SentinelLoop:
 
         if state == "landed":
             self._cooldown.record_success(work.target_file)
-            return PassOutcome("landed", work.target_file, result.goal_id, op_id,
+            return PassOutcome("landed", work.target_file, goal_id, op_id,
                                detail, elapsed)
 
         await self._record_lesson(
@@ -276,7 +321,7 @@ class SentinelLoop:
             error_text=detail or state, op_id=op_id,
         )
         self._cooldown.record_failure(work.target_file, reason=f"{state}: {detail}")
-        return PassOutcome(state, work.target_file, result.goal_id, op_id,
+        return PassOutcome(state, work.target_file, goal_id, op_id,
                            detail, elapsed)
 
     # -- seams ------------------------------------------------------------
