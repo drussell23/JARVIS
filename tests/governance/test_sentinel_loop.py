@@ -322,6 +322,34 @@ def test_an_async_dispatch_is_awaited_directly(repo, tmp_path, restore_sign):
     assert asyncio.run(loop.run_once()).op_id == "op-async"
 
 
+def test_the_outcome_is_correlated_on_the_GOAL_not_the_op_id():
+    """The Sentinel dispatches an ORIGIN id (`op-…-goal`); the pipeline runs
+    the work under an id of its own (`op-…-cau`). Zero `*-goal*.jsonl` ledgers
+    exist, so polling the origin id timed out by construction every pass, no
+    matter how generous the deadline. The goal id is the identity that
+    survives the intake boundary."""
+    src = inspect.getsource(SentinelLoop._await_outcome)
+    assert "goal_id" in src
+    assert "_await_via_goal_ledger" in src, (
+        "the probe still watches an op id the pipeline never uses"
+    )
+    probe = inspect.getsource(SentinelLoop._goal_verdict)
+    assert "read_records" in probe, "reconciliation ledger not consulted"
+    assert "SATISFIED" in probe and "TERMINAL" in probe
+
+
+def test_a_terminal_op_that_did_not_satisfy_is_a_failure_not_a_wait():
+    """Waiting longer cannot change a verdict that has already been reached."""
+    probe = inspect.getsource(SentinelLoop._goal_verdict)
+    assert "goal unsatisfied" in probe
+
+
+def test_an_unreadable_reconciliation_ledger_means_not_yet():
+    """A probe that cannot read must not invent a verdict."""
+    assert SentinelLoop._goal_verdict("") is None
+    assert SentinelLoop._goal_verdict("no-such-goal-id-at-all") is None
+
+
 def test_outcomes_render_for_the_telemetry_view():
     o = PassOutcome("landed", TARGET, "ov-auto-x", "op-1", "applied", 3.0)
     text = o.render()

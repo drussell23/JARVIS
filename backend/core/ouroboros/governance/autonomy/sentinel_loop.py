@@ -308,7 +308,7 @@ class SentinelLoop:
                 detail="not dispatched", duration_s=time.monotonic() - started,
             )
 
-        state, detail = await self._await_outcome(op_id)
+        state, detail = await self._await_outcome(op_id, goal_id)
         elapsed = time.monotonic() - started
 
         # Feed the controller regardless of verdict: a failed op still tells
@@ -337,8 +337,22 @@ class SentinelLoop:
 
     # -- seams ------------------------------------------------------------
 
-    async def _await_outcome(self, op_id: str) -> Tuple[str, str]:
-        """Terminal state for *op_id*, bounded. ('landed'|'failed'|'timed_out', detail)."""
+    async def _await_outcome(self, op_id: str, goal_id: str = "") -> Tuple[str, str]:
+        """Terminal state for this GOAL, bounded.
+
+        Correlated on the goal, not the op id, because the two are different
+        identities across the intake boundary. The Sentinel dispatches an
+        ORIGIN id (``op-…-goal``); the pipeline then runs the work under an id
+        of its own (``op-…-cau``). Polling the origin id could therefore never
+        succeed — zero ``*-goal*.jsonl`` ledgers exist — so every pass timed
+        out by construction, no matter how generous the deadline.
+
+        The goal id is the identity that survives that boundary, and
+        :mod:`goal_reconciliation_ledger` already speaks it: DISPATCHED
+        carries the real op id, TERMINAL says that op finished, SATISFIED says
+        the goal landed. Reusing it also means the loop's idea of "landed" is
+        the SAME one that stops a satisfied goal being re-dispatched.
+        """
         if self._outcome_fn is not None:
             try:
                 return await self._outcome_fn(op_id, self._outcome_deadline_s())
@@ -346,7 +360,53 @@ class SentinelLoop:
                 raise
             except Exception as exc:  # noqa: BLE001
                 return "failed", f"outcome probe failed: {type(exc).__name__}"
-        return await self._await_via_ledger(op_id)
+        return await self._await_via_goal_ledger(goal_id or op_id)
+
+    async def _await_via_goal_ledger(self, goal_id: str) -> Tuple[str, str]:
+        """Poll the reconciliation ledger for this goal. NEVER raises."""
+        deadline = time.monotonic() + self._outcome_deadline_s()
+        poll = max(2.0, loop_interval_s() / 10.0)
+        while time.monotonic() < deadline:
+            if self._stopping.is_set():
+                return "failed", "loop stopping"
+            verdict = await asyncio.to_thread(self._goal_verdict, goal_id)
+            if verdict is not None:
+                return verdict
+            try:
+                await asyncio.wait_for(self._stopping.wait(), timeout=poll)
+                return "failed", "loop stopping"
+            except asyncio.TimeoutError:
+                continue
+        return "timed_out", f"no terminal state within {self._outcome_deadline_s():.0f}s"
+
+    @staticmethod
+    def _goal_verdict(goal_id: str) -> "Optional[Tuple[str, str]]":
+        """('landed'|'failed', detail) once this goal reaches a verdict, else
+        None. NEVER raises — an unreadable ledger means 'not yet'."""
+        try:
+            from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: E501
+                ReconciliationEvent, read_records,
+            )
+            wanted = str(goal_id or "").strip()
+            if not wanted:
+                return None
+            terminal_op = ""
+            for rec in read_records() or ():
+                if str(getattr(rec, "goal_id", "")).strip() != wanted:
+                    continue
+                event = str(getattr(rec, "event", ""))
+                if event == ReconciliationEvent.SATISFIED.value:
+                    sha = str(getattr(rec, "commit_sha", "") or "")[:10]
+                    return "landed", f"satisfied{(' at ' + sha) if sha else ''}"
+                if event == ReconciliationEvent.TERMINAL.value:
+                    terminal_op = str(getattr(rec, "op_id", "") or "")
+            if terminal_op:
+                # The op finished without satisfying the goal. That IS a
+                # verdict — waiting longer cannot change it.
+                return "failed", f"op {terminal_op[:16]} terminal, goal unsatisfied"
+            return None
+        except Exception:  # noqa: BLE001
+            return None
 
     def _outcome_deadline_s(self) -> float:
         """How long to wait for this op — measured, not multiplied.
