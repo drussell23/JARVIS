@@ -99,6 +99,78 @@ try:
 except Exception:  # noqa: BLE001 — never raise during boot
     pass
 
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║ Execution envelope hydration — ONE source of truth for budgets   ║
+# ║                                                                  ║
+# ║ Must run HERE: after the exorcism above (which claims absolute   ║
+# ║ boot-time supremacy), but before ``backend.*`` is imported by    ║
+# ║ the harness, because modules read these at IMPORT time --        ║
+# ║ ``auto_committer._PUSH_BRANCH`` and                              ║
+# ║ ``orange_pr_reviewer._GIT_TIMEOUT_S`` are module-level env       ║
+# ║ reads, so hydrating after the harness import would be too late   ║
+# ║ for them and silently inconsistent for everything else.          ║
+# ║                                                                  ║
+# ║ ``production_envelope`` is deliberately dependency-free (stdlib  ║
+# ║ only, ~9ms, no chromadb/posthog/torch), so importing it here     ║
+# ║ does not resurrect what the exorcism just killed.                ║
+# ║                                                                  ║
+# ║ Operator intent wins: hydration is setdefault-shaped, so every   ║
+# ║ ``export`` a launcher already made -- including all the numbered ║
+# ║ soak scripts -- survives untouched, and the envelope only fills  ║
+# ║ what nobody spoke for. That is what makes the interactive        ║
+# ║ cockpit inherit the soak's budgets without any launcher          ║
+# ║ transcribing forty variables into bash.                          ║
+# ╚══════════════════════════════════════════════════════════════════╝
+try:
+    # The profile is readable from argv before argparse runs; the flag is
+    # the same one that decides whether a REPL is attached at all.
+    _envelope_profile = (
+        "cockpit" if "--no-headless" in _sys_for_boot_exorcism.argv else "soak"
+    )
+    _envelope_wall = None
+    for _i, _tok in enumerate(_sys_for_boot_exorcism.argv):
+        if _tok == "--max-wall-seconds" and _i + 1 < len(_sys_for_boot_exorcism.argv):
+            try:
+                _envelope_wall = int(_sys_for_boot_exorcism.argv[_i + 1])
+            except (TypeError, ValueError):
+                _envelope_wall = None
+            break
+        if _tok.startswith("--max-wall-seconds="):
+            try:
+                _envelope_wall = int(_tok.split("=", 1)[1])
+            except (TypeError, ValueError):
+                _envelope_wall = None
+            break
+    _repo_for_envelope = _os_for_boot_exorcism.path.dirname(
+        _os_for_boot_exorcism.path.dirname(
+            _os_for_boot_exorcism.path.abspath(__file__)))
+    if _repo_for_envelope not in _sys_for_boot_exorcism.path:
+        _sys_for_boot_exorcism.path.insert(0, _repo_for_envelope)
+    from backend.core.ouroboros.governance.production_envelope import (
+        hydrate as _hydrate_envelope,
+    )
+    _env_applied, _env_overridden = _hydrate_envelope(
+        _envelope_profile, wall_s=_envelope_wall,
+    )
+    if _ov_mode_for_boot_exorcism != "cockpit":
+        _sys_for_boot_exorcism.stderr.write(
+            f"[ProductionEnvelope] profile={_envelope_profile} "
+            f"applied={len(_env_applied)} operator-set={len(_env_overridden)}\n"
+        )
+        _sys_for_boot_exorcism.stderr.flush()
+except Exception as _env_exc:  # noqa: BLE001 — never raise during boot
+    # A missing envelope is a DEGRADED boot, not a dead one: the organism
+    # still runs on defaults exactly as it did before this existed. Say so
+    # loudly, because "why were my budgets default" must never be a mystery.
+    try:
+        _sys_for_boot_exorcism.stderr.write(
+            f"[ProductionEnvelope] NOT hydrated ({type(_env_exc).__name__}: "
+            f"{_env_exc}) — running on defaults\n"
+        )
+        _sys_for_boot_exorcism.stderr.flush()
+    except Exception:  # noqa: BLE001
+        pass
+
 import argparse
 import asyncio
 import atexit

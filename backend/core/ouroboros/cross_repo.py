@@ -539,7 +539,16 @@ class RepoConnector:
             if commit_result.returncode != 0:
                 return False, f"Commit failed: {stderr.decode()}"
 
-            # Push
+            # Push — OUTWARD-FACING, so the composed policy decides, not this
+            # lane. This call site had NO guard at all: it pushed on every
+            # successful sync commit. The commit above is local and stands;
+            # a refusal simply leaves the work on the local branch.
+            from backend.core.ouroboros.governance.remote_push_guard import (  # noqa: PLC0415
+                remote_push_allowed,
+            )
+            if not remote_push_allowed(lane="cross_repo"):
+                self._state.last_sync = time.time()
+                return True, None
             push_result = await asyncio.create_subprocess_exec(
                 "git", "push",
                 cwd=self.path,

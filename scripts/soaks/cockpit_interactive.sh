@@ -75,29 +75,37 @@ else
   echo "model: from .env pin ($(grep -m1 '^JARVIS_LOCAL_MODEL_NAME=' .env 2>/dev/null | cut -d= -f2-))"
 fi
 
-# --- 3. the flags the cockpit's surfaces need ------------------------------
-# All default-TRUE in code; exported so a session is reproducible from the
-# script rather than from whatever the shell happened to carry.
-export JARVIS_PRESENTATION_RESTRAINT_ENABLED=true
-export JARVIS_REPL_COMPLETION_ENABLED=true
-export JARVIS_REPL_INPUT_POLISH_ENABLED=true
-export JARVIS_LIVE_STATUS_LINE_ENABLED=true
-export JARVIS_OP_COLLAPSE_ENABLED=true
-export JARVIS_TOOL_RENDER_REGISTRY_ENABLED=true
-export JARVIS_NARRATIVE_INTENT_ENABLED=true
-export JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED=true
-export JARVIS_BTW_ENABLED=true
-export JARVIS_REVIEW_BRANCH_ENABLED=true
+# --- 3. the execution envelope --------------------------------------------
+# NOTHING is transcribed here. This launcher used to carry a hand-copied list
+# of presentation flags and NONE of the ~40 execution budgets soak26.sh set,
+# so a /goal sanction typed into the cockpit ran the same production pipeline
+# on DEFAULT budgets -- which is where the huge-file goals kept dying.
+#
+# The values live in ONE place, governance/production_envelope.py, and are
+# DERIVED from the wall clock (pipeline = wall * f, generation = pipeline * f)
+# rather than written down three times and left to drift apart.
+#
+# ouroboros_battle_test.py hydrates the same envelope in-process at boot, so
+# this eval is belt-and-braces: it makes the values visible to anything the
+# launcher runs BEFORE python starts, and to an operator reading `env`. Both
+# paths use setdefault semantics -- ${VAR:-value} here, `if name not in
+# environ` there -- so an operator override always wins, identically.
+if ! ENVELOPE="$("$PY" -m backend.core.ouroboros.governance.production_envelope \
+      --profile cockpit --wall-seconds "$WALL_S" --shell 2>/dev/null)"; then
+  die "could not build the execution envelope. The cockpit will NOT be started
+  on default budgets -- that is the failure this indirection exists to prevent.
+  Check: $PY -m backend.core.ouroboros.governance.production_envelope --profile cockpit"
+fi
+eval "$ENVELOPE"
+echo "envelope: $(echo "$ENVELOPE" | grep -c '^export') vars from production_envelope (profile=cockpit)"
 
-# What the recent work added, so this session actually exercises it.
-export JARVIS_SWARM_ROUTING_ENABLED=true
-export JARVIS_L2_SYMBOL_SCOPED_ENABLED=true
-export JARVIS_TEST_TIMEOUT_S="${JARVIS_TEST_TIMEOUT_S:-600}"
-
-# Yellow-tier work pauses for a human here -- that pause IS the surface
-# under test, so the review timeout is generous and auto-apply is off.
-export JARVIS_NOTIFY_APPLY_DELAY_S="${JARVIS_NOTIFY_APPLY_DELAY_S:-8}"
-export JARVIS_REVIEW_TIMEOUT_S="${JARVIS_REVIEW_TIMEOUT_S:-900}"
+# --- 4. outward-facing acts stay inside this machine -----------------------
+# The envelope already air-gaps pushes; re-stated here so an operator reading
+# the launcher sees it without opening a Python module. The review lane may
+# still BUILD local branches -- the air-gap is what stops them reaching origin
+# (2026-09-07: 22 ouroboros/review/* branches escaped from isolated soaks).
+export JARVIS_REMOTE_PUSH_AIRGAP=true
+export JARVIS_ORANGE_PR_ENABLED=false
 
 echo
 echo "cockpit starting — interactive, cost cap \$${COST_CAP}, wall ${WALL_S}s"

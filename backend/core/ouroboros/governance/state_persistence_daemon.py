@@ -97,12 +97,20 @@ def build_backup_commands(backend: str, src: str, target: str) -> List[List[str]
         return []
     if b == "git":
         # A self-contained git repo INSIDE src pushing to a private remote.
+        # The snapshot commit is LOCAL and always taken — losing the vault's
+        # history to an air-gap would be worse than not shipping it. Only the
+        # outward-facing leg is policed, by the one composed policy.
         msg = f"state-vault snapshot {int(time.time())}"
-        return [
+        argv = [
             ["git", "-C", src, "add", "-A"],
             ["git", "-C", src, "commit", "-m", msg, "--allow-empty"],
-            ["git", "-C", src, "push", target, "HEAD"],
         ]
+        from backend.core.ouroboros.governance.remote_push_guard import (  # noqa: PLC0415
+            remote_push_allowed,
+        )
+        if remote_push_allowed(lane="state_vault"):
+            argv.append(["git", "-C", src, "push", target, "HEAD"])
+        return argv
     return []
 
 

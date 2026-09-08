@@ -1180,12 +1180,26 @@ class AutoCommitter:
         return stdout.decode().strip()
 
     async def _git_push(self, branch: str) -> bool:
-        """Push to a branch. Refuses protected branches (Iron Gate)."""
+        """Push to a branch. Refuses protected branches (Iron Gate), and any
+        push at all unless the composed policy allows one.
+
+        The protected-branch list gates the DESTINATION; it never asked
+        whether this process may reach a remote in the first place. The
+        module-level ``_PUSH_BRANCH`` that gates the caller is read once at
+        IMPORT, so a later env change cannot close it either. The air-gap is
+        read live, on every call, and outranks both.
+        """
         if branch in _PROTECTED_BRANCHES:
             logger.warning(
                 "[AutoCommitter] Refusing to push to protected branch %r",
                 branch,
             )
+            return False
+
+        from backend.core.ouroboros.governance.remote_push_guard import (  # noqa: PLC0415
+            remote_push_allowed,
+        )
+        if not remote_push_allowed(lane="auto_committer"):
             return False
 
         # Slice 199 — the network/credential subprocess runs under the

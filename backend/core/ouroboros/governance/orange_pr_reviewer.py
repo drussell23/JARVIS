@@ -70,17 +70,19 @@ def is_orange_pr_enabled() -> bool:
 
 
 def remote_push_allowed() -> bool:
-    """The operator's push policy, composed — never a lane-local default.
-    Pushing a review branch to origin is OUTWARD-FACING: it is allowed only
-    when the operator declared an auto-push target (``JARVIS_AUTO_PUSH_BRANCH``,
-    the same declaration :mod:`auto_committer` honours) or explicitly enabled
-    it for this lane (``JARVIS_ORANGE_PR_PUSH_ENABLED=1``). Unset ⇒ LOCAL
-    review branches only (2026-09-07: 22 branches reached origin from an
-    isolated soak because the lane pushed unconditionally)."""
-    explicit = os.environ.get("JARVIS_ORANGE_PR_PUSH_ENABLED", "").strip().lower()
-    if explicit:
-        return explicit in ("1", "true", "yes", "on")
-    return bool(os.environ.get("JARVIS_AUTO_PUSH_BRANCH", "").strip())
+    """The operator's push policy — DELEGATED, never a lane-local copy.
+
+    This lane owned the only push policy in the process while three other
+    call sites pushed with none, which is how 22 review branches reached
+    origin from an isolated soak (2026-09-07). The policy now lives in
+    :mod:`remote_push_guard` — one composed answer, air-gapped by default —
+    and this function is the lane's name for it. Keeping a second copy here
+    is exactly how the two would drift apart.
+    """
+    from backend.core.ouroboros.governance.remote_push_guard import (  # noqa: PLC0415
+        remote_push_allowed as _guard,
+    )
+    return _guard(lane="orange_pr")
 
 
 def _token_enforcer_enabled() -> bool:
