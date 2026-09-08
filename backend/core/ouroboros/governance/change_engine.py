@@ -1396,6 +1396,10 @@ class ChangeEngine:
                     data={
                         "target_file": str(target),
                         "rollback_hash": rollback.snapshot_hash,
+                        # what APPLY wrote — boot reconcile tells an intact
+                        # apply from an interrupted one by this, not by the
+                        # absence of a terminal row
+                        "applied_hash": _actual_sha,
                     },
                 )
             )

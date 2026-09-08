@@ -378,6 +378,9 @@ class ValidationResult:
     failed_tests: Tuple[str, ...] = ()           # failing node ids
     test_total: int = 0                          # tests run
     test_failed: int = 0                         # tests failed
+    #: ids the differential gate excluded as ambient (red BEFORE the
+    #: candidate) — the verdict VERIFY judges by; rides ``ctx.validation``.
+    ambient_red_tests: Tuple[str, ...] = ()
 
 
 #: Cap on the summary handed to the re-planner. The field's own comment

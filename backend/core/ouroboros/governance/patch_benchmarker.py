@@ -294,7 +294,8 @@ class PatchBenchmarker:
         if not target_files:
             return 0.0, 0.0
         test_paths = await self._tests_covering(target_files)
-        deselect = tuple(getattr(ctx, "ambient_red_tests", ()) or ())
+        from backend.core.ouroboros.governance.differential_validation import ambient_red_ids
+        deselect = ambient_red_ids(ctx) if ctx is not None else ()
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, self._coverage_sync, target_files, test_paths, deselect,

@@ -7792,6 +7792,25 @@ class GovernedLoopService:
                 continue
 
             current_hash = _hashlib.sha256(target.read_bytes()).hexdigest()
+            applied_hash = latest.data.get("applied_hash")
+            if applied_hash and current_hash == applied_hash:
+                # The apply completed exactly as written (the change engine
+                # records APPLIED only after its own VERIFY). The previous
+                # session ended between APPLY and the terminal bookkeeping —
+                # a landing rotates the session worktree and re-boots this
+                # loop: op-01a07e98-8a21 landed as 3a7d155218 and was then
+                # marked "needs manual rollback" and BLOCKED (2026-09-08).
+                # Nothing to recover; say so and leave the file alone.
+                await ledger.append(LedgerEntry(
+                    op_id=op_id, state=OperationState.APPLIED,
+                    data={**latest.data, "reason": "boot_recovery_apply_intact",
+                          "recovery_attempt_id": recovery_id},
+                ))
+                logger.warning(
+                    "[GovernedLoop] Boot recovery: op=%s apply intact (on-disk == applied_hash) "
+                    "— no rollback needed", op_id,
+                )
+                continue
             if current_hash == rollback_hash:
                 # File already matches pre-apply content — change was undone externally
                 await ledger.append(LedgerEntry(

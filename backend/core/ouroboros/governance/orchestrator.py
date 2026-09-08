@@ -6998,7 +6998,9 @@ class GovernedOrchestrator:
                     _ascii_gate = AsciiStrictGate()
                     if _ascii_gate.enabled:
                         for _cand in generation.candidates:
-                            _ok, _ascii_err, _bad_list = _ascii_gate.check(_cand)
+                            _ok, _ascii_err, _bad_list = _ascii_gate.check(
+                                _cand, original=self._original_text_for(_cand),
+                            )
                             _repairs = _cand.get("_ascii_repair_count", 0) if isinstance(_cand, dict) else 0
                             if _repairs:
                                 logger.info(
@@ -14655,6 +14657,7 @@ class GovernedOrchestrator:
                         # Failures entirely within that set are ambient —
                         # the environment's, not the candidate's.
                         _dv_baseline: frozenset = frozenset()
+                        _dv_ignored: tuple = ()
                         try:
                             from backend.core.ouroboros.governance.differential_validation import (
                                 baseline_budget_s as _dv_budget,
@@ -14788,8 +14791,8 @@ class GovernedOrchestrator:
                                             test_authoring=True,
                                         )
                                         if _dv_ignored:
-                                            # VERIFY judges by the same verdict
-                                            ctx = ctx.with_ambient_red_tests(_dv_ignored)
+                                            # VERIFY judges by the same verdict — it rides the
+                                            # ValidationResult (this ctx is local to the core).
                                             logger.warning(
                                                 "[Validation] differential gate: %d ambient-red "
                                                 "test(s) excluded from the verdict op=%s "
@@ -14996,6 +14999,7 @@ class GovernedOrchestrator:
             short_summary=short_summary,
             adapter_names_run=adapter_names,
             failure_detail=_failure_detail,
+            ambient_red_tests=tuple(_dv_ignored),
             failed_tests=_failed_tests,
             test_total=_test_total,
             test_failed=_test_failed,
@@ -15028,6 +15032,26 @@ class GovernedOrchestrator:
                 "for op=%s — falling back to legacy write root",
                 getattr(ctx, "op_id", "?"), exc_info=True,
             )
+            return None
+
+    def _original_text_for(self, candidate: Any) -> Optional[str]:
+        """The on-disk text of a single-file candidate's target, or None.
+        The ASCII gate judges what the MODEL introduced against it: a diff-
+        applied candidate is the original file plus a few lines, and the
+        gate's whole-content auto-repair rewrote 50 em-dash/section-sign
+        lines the file had carried for months (first landed production
+        goal, 3a7d155218, 2026-09-08). Never raises."""
+        try:
+            if not isinstance(candidate, dict) or candidate.get("files"):
+                return None
+            rel = str(candidate.get("file_path", "") or "")
+            if not rel or Path(rel).is_absolute():
+                return None
+            target = Path(self._config.project_root) / rel
+            if not target.is_file():
+                return None
+            return target.read_text(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 — the gate falls back to judging everything
             return None
 
     def _build_change_request(

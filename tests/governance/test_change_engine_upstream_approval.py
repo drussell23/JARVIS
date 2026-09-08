@@ -113,3 +113,34 @@ def test_both_runners_carry_the_decision_and_name_a_refusal():
         assert "change engine refused op=" in src, mod.__name__
     assert "approval=getattr(ctx, \"approval\", None)" in inspect.getsource(orchestrator._build_change_request) \
         if hasattr(orchestrator, "_build_change_request") else True
+
+
+@pytest.mark.asyncio
+async def test_the_applied_row_records_what_apply_wrote(tmp_path):
+    """Boot reconcile tells an intact apply from an interrupted one by this
+    hash — a landed op was marked "needs manual rollback" without it."""
+    import hashlib
+    from backend.core.ouroboros.governance.ledger import OperationLedger
+    target = _target(tmp_path)
+    ledger = OperationLedger(storage_dir=tmp_path / "ledger")
+    engine = ChangeEngine(project_root=tmp_path, ledger=ledger)
+    ctx = OperationContext.create(description="g", target_files=(str(target),)).with_approval(_approved("op-h"))
+    result = await engine.execute(ChangeRequest(
+        goal="g", target_file=target, proposed_content=NEW, profile=_profile(target),
+        op_id="op-h", approval=ctx.approval,
+    ))
+    assert result.success is True
+    rows = await ledger.get_history("op-h")
+    applied = [r for r in rows if getattr(r.state, "value", r.state) == "applied"]
+    assert applied, [getattr(r.state, "value", r.state) for r in rows]
+    on_disk = hashlib.sha256(target.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+    assert applied[-1].data.get("applied_hash") == on_disk
+    assert applied[-1].data.get("rollback_hash") and applied[-1].data["rollback_hash"] != on_disk
+
+
+def test_boot_reconcile_recognises_an_intact_apply():
+    import inspect
+    from backend.core.ouroboros.governance import governed_loop_service as GLS
+    src = inspect.getsource(GLS.GovernedLoopService._reconcile_on_boot)
+    assert "boot_recovery_apply_intact" in src
+    assert src.index("boot_recovery_apply_intact") < src.index("boot_recovery_needs_manual_rollback")

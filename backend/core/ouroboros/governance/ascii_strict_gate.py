@@ -204,8 +204,18 @@ _UNICODE_REPAIR_MAP: Dict[int, str] = {
 }
 
 
-def repair_content(content: str) -> Tuple[str, int]:
+def _original_line_set(original: Optional[str]) -> Optional[frozenset]:
+    return frozenset(original.splitlines()) if isinstance(original, str) and original else None
+
+
+def repair_content(content: str, original: Optional[str] = None) -> Tuple[str, int]:
     """Apply the punctuation safe-list to a content string.
+
+    With ``original`` (the target's on-disk text) only lines the ORIGINAL
+    does not already contain are repaired: the gate exists for what the
+    model introduced, and a diff-applied candidate is mostly the file it
+    was applied to (2026-09-08: 50 pre-existing em-dash / section-sign
+    lines rewritten in the first landed production goal).
 
     Returns ``(repaired_content, num_repairs)``. Fast-paths when the
     content has no non-ASCII codepoints (the common success case) by
@@ -234,7 +244,20 @@ def repair_content(content: str) -> Tuple[str, int]:
     if repairs == 0:
         return content, 0
 
-    return content.translate(_UNICODE_REPAIR_MAP), repairs
+    keep = _original_line_set(original)
+    if keep is None:
+        return content.translate(_UNICODE_REPAIR_MAP), repairs
+    out: List[str] = []
+    repaired_count = 0
+    for line in content.splitlines(keepends=True):
+        bare = line.rstrip("\r\n")
+        if bare in keep or bare.isascii():
+            out.append(line)
+            continue
+        fixed = line.translate(_UNICODE_REPAIR_MAP)
+        repaired_count += sum(1 for ch in line if ord(ch) in _UNICODE_REPAIR_MAP)
+        out.append(fixed)
+    return "".join(out), repaired_count
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -711,7 +734,7 @@ class AsciiStrictGate:
             return []
         return scan_candidate(candidate, max_samples=self.max_samples)
 
-    def repair(self, candidate: Dict[str, Any]) -> int:
+    def repair(self, candidate: Dict[str, Any], original: Optional[str] = None) -> int:
         """Apply the punctuation auto-repair to a candidate **in-place**.
 
         Walks both the multi-file (``candidate["files"]``) and
@@ -748,7 +771,7 @@ class AsciiStrictGate:
                 for key in ("full_content", "raw_content"):
                     val = entry.get(key)
                     if isinstance(val, str) and val:
-                        repaired, n = repair_content(val)
+                        repaired, n = repair_content(val, original)
                         if n > 0:
                             entry[key] = repaired
                             total_repairs += n
@@ -757,7 +780,7 @@ class AsciiStrictGate:
         for key in ("full_content", "raw_content"):
             val = candidate.get(key)
             if isinstance(val, str) and val:
-                repaired, n = repair_content(val)
+                repaired, n = repair_content(val, original)
                 if n > 0:
                     candidate[key] = repaired
                     total_repairs += n
@@ -768,7 +791,7 @@ class AsciiStrictGate:
         return total_repairs
 
     def check(
-        self, candidate: Dict[str, Any],
+        self, candidate: Dict[str, Any], *, original: Optional[str] = None,
     ) -> Tuple[bool, Optional[str], List[BadCodepoint]]:
         """Run the gate and return ``(ok, reason, samples)``.
 
@@ -793,7 +816,7 @@ class AsciiStrictGate:
 
         # Phase 1 — punctuation auto-repair (mutating). Does nothing
         # when JARVIS_ASCII_GATE_AUTO_REPAIR=false.
-        repairs = self.repair(candidate)
+        repairs = self.repair(candidate, original)
         if repairs > 0 and isinstance(candidate, dict):
             # Annotate for orchestrator logging. Non-load-bearing — any
             # downstream consumer that doesn't know about this key just
@@ -803,6 +826,16 @@ class AsciiStrictGate:
         # Phase 2 — hard-reject scan over what's left. Letters + any
         # codepoint not in the safe-list will show up here.
         offenders = scan_candidate(candidate, max_samples=self.max_samples)
+        if offenders and original is not None and not candidate.get("files"):
+            # what the ORIGINAL already carried is not the model's doing
+            keep = _original_line_set(original) or frozenset()
+            content = candidate.get("full_content") or candidate.get("raw_content") or ""
+            lines = content.splitlines() if isinstance(content, str) else []
+            offenders = [
+                o for o in offenders
+                if not (1 <= int(getattr(o, "line", 0) or 0) <= len(lines)
+                        and lines[int(o.line) - 1] in keep)
+            ]
         if not offenders:
             return True, None, []
         record_rejection(len(offenders))

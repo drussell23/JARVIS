@@ -93,5 +93,22 @@ def test_both_verify_sites_read_the_verdict_and_validate_stamps_it():
     from backend.core.ouroboros.governance.phase_runners import slice4b_runner
     for mod in (orchestrator, slice4b_runner):
         assert "_apply_ctx_baseline(_multi, ctx)" in inspect.getsource(mod), mod.__name__
-    assert "ctx = ctx.with_ambient_red_tests(_dv_ignored)" in inspect.getsource(orchestrator)
+    assert "ambient_red_tests=tuple(_dv_ignored)" in inspect.getsource(orchestrator), "VALIDATE hands VERIFY its verdict on the ValidationResult"
     assert "*PYTEST_ISOLATION_ARGS" in inspect.getsource(test_runner)
+
+
+def test_the_verdict_rides_the_validation_result():
+    """The validate core returns a ValidationResult, not the ctx it stamps;
+    the ids reach VERIFY through ctx.validation."""
+    import inspect
+    from backend.core.ouroboros.governance import orchestrator
+    from backend.core.ouroboros.governance.op_context import OperationPhase, ValidationResult
+    assert "ambient_red_tests=tuple(_dv_ignored)" in inspect.getsource(orchestrator.GovernedOrchestrator._run_validation_core)
+    vr = ValidationResult(passed=True, best_candidate={}, validation_duration_s=0.1, error=None,
+                          ambient_red_tests=("tests/t.py::test_old",))
+    ctx = OperationContext.create(description="x", target_files=("pkg/probe.py",))
+    import dataclasses as _dc
+    ctx = _dc.replace(ctx, validation=vr)
+    assert DV.ambient_red_ids(ctx) == ("tests/t.py::test_old",)
+    assert DV.ambient_red_ids(ctx.with_ambient_red_tests(("tests/t.py::explicit",))) == ("tests/t.py::explicit",)
+    assert DV.ambient_red_ids(OperationContext.create(description="x", target_files=("a.py",))) == ()

@@ -185,13 +185,25 @@ def candidate_is_test_authoring(all_files: Iterable[Tuple[str, str]]) -> bool:
     return bool(files) and all(is_test_path(fp) for fp in files)
 
 
+def ambient_red_ids(ctx: Any) -> Tuple[str, ...]:
+    """The ambient-red ids the op carries: the explicit context field when
+    stamped, else the ValidationResult riding ``ctx.validation`` (the
+    validate core returns a result, not the context it stamped — the field
+    was never populated and VERIFY deselected nothing, 2026-09-08)."""
+    ids = tuple(str(t) for t in (getattr(ctx, "ambient_red_tests", ()) or ()) if str(t))
+    if ids:
+        return ids
+    vr = getattr(ctx, "validation", None)
+    return tuple(str(t) for t in (getattr(vr, "ambient_red_tests", ()) or ()) if str(t))
+
+
 def apply_context_baseline(multi: Any, ctx: Any) -> Tuple[Any, Tuple[str, ...]]:
     """``apply_differential`` against the ambient verdict the op CARRIES
     (``ctx.ambient_red_tests``, stamped by VALIDATE) with the op's acceptance
     tests protected — the ONE way VERIFY reads the baseline, so VALIDATE
     and VERIFY can never disagree about which reds are the environment's.
     Identity when the op carries none."""
-    baseline = frozenset(str(t) for t in (getattr(ctx, "ambient_red_tests", ()) or ()))
+    baseline = frozenset(ambient_red_ids(ctx))
     if not baseline:
         return multi, ()
     return apply_differential(
