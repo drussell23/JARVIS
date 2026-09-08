@@ -1,6 +1,3 @@
-# [Ouroboros] Modified by Ouroboros (op=op-01a07eab-) at 2026-09-08 01:41 UTC
-# Reason: Production hardening (huge file): the swarm short-circuit declines multi-file ops instead of silently taking target_file
-
 """
 Candidate Generator & Failback State Machine
 =============================================
@@ -116,7 +113,7 @@ except Exception:  # noqa: BLE001 -- defensive; keep except-clauses evaluable
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Deadline budget allocation - deterministic split (Manifesto S5)
+# Deadline budget allocation — deterministic split (Manifesto §5)
 # ---------------------------------------------------------------------------
 # The skeleton (deterministic budget) decides how time is partitioned across
 # tiers; the nervous system (agentic providers) works within its allocation.
@@ -124,7 +121,7 @@ logger = logging.getLogger(__name__)
 #
 # Tier 0 (DoubleWord batch): gets a capped fraction, MUST leave Tier 1 reserve.
 # Tier 1 primary (J-Prime): gets a capped fraction, MUST leave fallback reserve.
-# Tier 1 fallback (Claude): gets whatever remains - guaranteed minimum.
+# Tier 1 fallback (Claude): gets whatever remains — guaranteed minimum.
 
 _TIER0_BUDGET_FRACTION = float(os.environ.get("OUROBOROS_TIER0_BUDGET_FRACTION", "0.65"))
 _TIER0_MAX_WAIT_S = float(os.environ.get("OUROBOROS_TIER0_MAX_WAIT_S", "90"))
@@ -132,10 +129,10 @@ _TIER1_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_TIER1_MIN_RESERVE_S", "25
 
 
 # ---------------------------------------------------------------------------
-# Slice 238 - cascade-to-dead-Claude guard (layer 8).
+# Slice 238 — cascade-to-dead-Claude guard (layer 8).
 #
 # The sentinel's ``fallback_tolerance=cascade_to_claude`` path invoked
-# ``_call_fallback`` (the Claude lane) with NO breaker consult - so a DW
+# ``_call_fallback`` (the Claude lane) with NO breaker consult — so a DW
 # transient hiccup poisoned the op via the credit-dead Claude lane
 # (terminal_quota). The PRIMARY Claude lane already gates on the economic
 # breaker; this makes the cascade read the SAME source-of-truth (the read-only
@@ -146,7 +143,7 @@ _TIER1_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_TIER1_MIN_RESERVE_S", "25
 
 
 def cascade_breaker_consult_enabled() -> bool:
-    """Master switch for the Slice-238 cascade breaker consult. Default TRUE -
+    """Master switch for the Slice-238 cascade breaker consult. Default TRUE —
     failure-path-only (only changes behavior when the Claude breaker is OPEN,
     which is exactly when cascading to it is wrong); breaker-CLOSED is byte-
     identical to the legacy cascade. Kill switch is pure rollback. NEVER raises."""
@@ -156,7 +153,7 @@ def cascade_breaker_consult_enabled() -> bool:
 
 def _latency_quarantine_enabled() -> bool:
     """Master for the cold-storage latency quarantine at the DW selector seam.
-    Default TRUE - failure-path-only: it only skips a model the TtftObserver has
+    Default TRUE — failure-path-only: it only skips a model the TtftObserver has
     flagged as COLD_STORAGE (a real TTFT spike) AND only when another candidate
     remains. When the observer is absent/disabled it short-circuits, so this is a
     free no-op unless there's positive latency evidence. =0 reverts to the legacy
@@ -168,7 +165,7 @@ def _latency_quarantine_enabled() -> bool:
 def autarky_backoff_wait_enabled() -> bool:
     """Master switch for the Sovereign Autarky Backoff-Wait (2026-06-20).
 
-    Default TRUE - failure-path-only + autarky-only: it ONLY changes behavior
+    Default TRUE — failure-path-only + autarky-only: it ONLY changes behavior
     when (a) the sole-provider primary is in transient backoff AND (b) there is
     NO fallback configured (DW-only mode). In every other state (fallback
     present, primary healthy) it is byte-identical. Without it, a transient DW
@@ -192,7 +189,7 @@ def _autarky_backoff_max_wait_s() -> float:
 
 
 def _autarky_retry_margin_s() -> float:
-    """Budget that MUST remain AFTER the wait to attempt the primary call - so we
+    """Budget that MUST remain AFTER the wait to attempt the primary call — so we
     never burn the whole budget sleeping and then have nothing left to generate.
     Env-tunable; defensive default 30s. NEVER raises."""
     raw = (os.environ.get("JARVIS_AUTARKY_RETRY_MARGIN_S", "") or "").strip()
@@ -218,7 +215,7 @@ def autarky_should_wait_and_retry(
 
     Yes IFF: enabled AND no fallback AND a real positive backoff exists AND the
     bounded wait + the post-wait call margin fit inside the remaining budget.
-    Pure + total - NEVER raises; trivially unit-testable."""
+    Pure + total — NEVER raises; trivially unit-testable."""
     if not enabled or has_fallback:
         return None
     try:
@@ -241,16 +238,16 @@ def should_cascade_to_claude(
     """Pure decision: should the sentinel actually cascade to the Claude fallback
     after DW exhaustion? Cascade ONLY when a fallback is configured AND it is not
     suppressed by an OPEN economic breaker. When *enabled* and the breaker is OPEN
-    (Claude known-dead), suppress the cascade (-> caller routes to the immortal
+    (Claude known-dead), suppress the cascade (→ caller routes to the immortal
     DW-retry / degrade branch). When *enabled* is False (kill switch), legacy
-    behavior: cascade iff a fallback exists. No env / breaker reads here - the
-    caller injects both - so this stays deterministic + unit-testable. Pure.
+    behavior: cascade iff a fallback exists. No env / breaker reads here — the
+    caller injects both — so this stays deterministic + unit-testable. Pure.
 
     ``route_masked`` (Pre-emptive Route Masking, 2026-07-18): the caller
     evaluated the COST CONTRACT (cost_contract_assertion.
-    classify_route_compatibility - the SAME policy the dispatch-time
+    classify_route_compatibility — the SAME policy the dispatch-time
     assert enforces) BEFORE building the pool. True = this route may not
-    buy Claude (BG/SPEC non-read-only) - the cascade is omitted
+    buy Claude (BG/SPEC non-read-only) — the cascade is omitted
     ENTIRELY, so the envelope exhausts its cheap pool natively instead
     of detonating a CostContractViolation mid-dispatch (the violent
     abort whose transport teardown bled onto the cockpit). Checked
@@ -260,17 +257,17 @@ def should_cascade_to_claude(
     if not has_fallback:
         return False
     if enabled and claude_breaker_open:
-        return False  # Claude lane is dead - do not poison the op via it
+        return False  # Claude lane is dead — do not poison the op via it
     return True
 
 
 def claude_route_masked(context: Any) -> bool:
-    """Pre-emptive Route Masking predicate - pure composition over the
+    """Pre-emptive Route Masking predicate — pure composition over the
     cost contract's OWN classifier (zero duplicated budget rules).
     True iff dispatching *context* to Claude would violate the
     contract (BG/SPEC and not read-only). Consulted when BUILDING the
     fallback pool; the dispatch-time assert stays as defense-in-depth.
-    NEVER raises (unknown metadata -> not masked, the assert still
+    NEVER raises (unknown metadata → not masked, the assert still
     guards)."""
     try:
         from backend.core.ouroboros.governance.cost_contract_assertion import (
@@ -278,7 +275,7 @@ def claude_route_masked(context: Any) -> bool:
             cost_contract_runtime_assert_enabled,
         )
         if not cost_contract_runtime_assert_enabled():
-            return False           # contract off -> legacy pool shape
+            return False           # contract off → legacy pool shape
         verdict = classify_route_compatibility(
             provider_route=getattr(context, "provider_route", ""),
             provider_tier="claude",
@@ -291,17 +288,17 @@ def claude_route_masked(context: Any) -> bool:
 # Complexity-aware multipliers applied on top of _TIER0_BUDGET_FRACTION.
 # Higher complexity => more time for DW 397B code generation.
 _TIER0_COMPLEXITY_MULTIPLIER: Dict[str, float] = {
-    "trivial": 0.31,           # 0.65 * 0.31 ~= 0.20 -> ~24s DW (one-file edits, RT SSE fast enough)
-    "simple": 0.50,            # 0.65 * 0.50 ~= 0.33 -> ~39s DW, ~81s Claude
-    "moderate": 1.077,         # 0.65 * 1.077 ~= 0.70
+    "trivial": 0.31,           # 0.65 * 0.31 ≈ 0.20 → ~24s DW (one-file edits, RT SSE fast enough)
+    "simple": 0.50,            # 0.65 * 0.50 ≈ 0.33 → ~39s DW, ~81s Claude
+    "moderate": 1.077,         # 0.65 * 1.077 ≈ 0.70
     "standard": 1.077,         # alias for moderate
-    "complex": 1.231,          # 0.65 * 1.231 ~= 0.80
+    "complex": 1.231,          # 0.65 * 1.231 ≈ 0.80
     "heavy_code": 1.231,       # alias for complex
 }
 _PRIMARY_BUDGET_FRACTION = float(os.environ.get("OUROBOROS_PRIMARY_BUDGET_FRACTION", "0.65"))
 _FALLBACK_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_FALLBACK_MIN_RESERVE_S", "30"))
 
-# Tier 3 Reflex (Manifesto S5): aggressive hard cap on DoubleWord 397B
+# Tier 3 Reflex (Manifesto §5): aggressive hard cap on DoubleWord 397B
 # across ALL cost-optimized call paths. If DW stalls on stream rendering
 # or token generation for longer than this cap, the deterministic router
 # severs the thread and cascades to the high-reliability frontier model
@@ -309,28 +306,28 @@ _FALLBACK_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_FALLBACK_MIN_RESERVE_S
 # path (_compute_tier0_budget) and the Primary-first path
 # (_compute_primary_budget) reference it via the aliases below.
 #
-# Problem this fixes - F1 Slice 4 S3 (bt-2026-04-24-204029) + S4
+# Problem this fixes — F1 Slice 4 S3 (bt-2026-04-24-204029) + S4
 # (bt-2026-04-24-213248):
 #   S3: primary held semaphore for up to 153.76s (DW SSE stream stall),
 #       exceeding the then-current fraction-based cap of ~143s.
-#   S4: patch landed but didn't fire - DW was promoted to BOTH Tier 0 AND
+#   S4: patch landed but didn't fire — DW was promoted to BOTH Tier 0 AND
 #       primary (J-Prime unhealthy), which routes via the Tier 0 fast path
 #       (_compute_tier0_budget, max_wait=_TIER0_MAX_WAIT_S=90s), NOT via
 #       _call_primary where the S3 patch lived. The _PRIMARY_MAX_TIMEOUT_S
 #       cap was inert for this configuration because _call_primary was
 #       never invoked. Same 153s DW semaphore hold pattern repeated.
 #
-# Manifesto S5 Tier 3 quote (verbatim):
+# Manifesto §5 Tier 3 quote (verbatim):
 #   "If a cost-optimized inference node (e.g., DW 397B) exhausts its
 #    temporal budget without returning a valid execution plan, the
 #    deterministic router autonomously severs the thread and triggers
 #    an instant cascade to a high-reliability frontier model."
 #
 # This cap is a HARD TIME BOX applied at TWO sites:
-#   1. _compute_primary_budget - for the "call primary first" path
+#   1. _compute_primary_budget — for the "call primary first" path
 #      (FSM PRIMARY_READY / PRIMARY_DEGRADED with J-Prime as primary).
-#   2. _compute_tier0_budget - for the "Tier 0 fast-path first" (the
-#      Manifesto S5 default cascade; DW-as-Tier-0 always tries here).
+#   2. _compute_tier0_budget — for the "Tier 0 fast-path first" (the
+#      Manifesto §5 default cascade; DW-as-Tier-0 always tries here).
 #
 # Fraction + route-specific max_wait logic stays inside each function as
 # inner floors; this cap is the strict outer ceiling that enforces the
@@ -351,30 +348,30 @@ _TIER3_REFLEX_HARD_CAP_S = float(
 )
 
 # ──────────────────────────────────────────────────────────────────────
-# Slice 18c (2026-05-26) - route-aware Tier 0 RT budget cap
+# Slice 18c (2026-05-26) — route-aware Tier 0 RT budget cap
 #
 # Closes the cascade-to-Claude-on-premature-timeout pattern surfaced by
 # soak bt-2026-05-26-070049 (FLEET v13): Slice 10A correctly routed
 # SWE-Bench-Pro to STANDARD; Slice 10B-iii promoted Qwen 397B; Slice
 # 10B-ii bridge unblocked the topology; candidate_generator dispatched
-# DW Tier 0 RT - but the 30s default cap (above) clamped the budget
+# DW Tier 0 RT — but the 30s default cap (above) clamped the budget
 # below the 397B's actual TTFT envelope. Result: 8 EXHAUSTION events,
 # each cascading to Claude which then refused on credit-balance.
 #
 # The 30s default was designed for IMMEDIATE-equivalent "reflex"
-# semantics (per Manifesto S5 - speed permanently supersedes cost).
-# Applying it to STANDARD + COMPLEX routes - which are explicitly
-# cost-optimized (DW primary) and have no reflex-time SLA - is a
+# semantics (per Manifesto §5 — speed permanently supersedes cost).
+# Applying it to STANDARD + COMPLEX routes — which are explicitly
+# cost-optimized (DW primary) and have no reflex-time SLA — is a
 # category error.
 #
 # Fix: route-aware cap selector. STANDARD + COMPLEX use the new
-# JARVIS_DW_TIER0_RT_BUDGET_S (default 90s - matches Qwen 397B + Kimi
-# K2.6 TTFT envelope per S46.2). BG/SPEC + everything else keeps the
+# JARVIS_DW_TIER0_RT_BUDGET_S (default 90s — matches Qwen 397B + Kimi
+# K2.6 TTFT envelope per §46.2). BG/SPEC + everything else keeps the
 # 30s reflex cap (those are either cost-floored or DW-only routes
 # where 30s is the right ceiling).
 #
 # Operator override per route via the env knob; future Slice 13B
-# bandit (S45.7.2) can replace this static cap with per-shape
+# bandit (§45.7.2) can replace this static cap with per-shape
 # empirical p95 envelope. Until then, 90s is the empirical floor
 # observed on 397B cold-start cold-cache runs.
 # ──────────────────────────────────────────────────────────────────────
@@ -384,7 +381,7 @@ _TIER0_RT_BUDGET_STANDARD_COMPLEX_S = float(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Slice 27 Phase 3 - Context-Aware Adaptive Timeboxing
+# Slice 27 Phase 3 — Context-Aware Adaptive Timeboxing
 # ──────────────────────────────────────────────────────────────────────
 #
 # v20 forensic (bt-2026-05-27-011121): 12 EXHAUSTION events, ALL with
@@ -392,7 +389,7 @@ _TIER0_RT_BUDGET_STANDARD_COMPLEX_S = float(
 # Kimi-K2.6). DW was reachable (cost recorded $0.0149) but every
 # GENERATE call exceeded the static 90s Tier 0 budget. The model is
 # given a fixed budget regardless of how heavy the prompt is or which
-# model is processing it - defeating the purpose of having a
+# model is processing it — defeating the purpose of having a
 # multi-model fleet.
 #
 # Per operator directive: compute the streaming timeout window
@@ -400,18 +397,18 @@ _TIER0_RT_BUDGET_STANDARD_COMPLEX_S = float(
 #
 #   base               = 60s
 #   +15s per 5000 chars of input payload (step bonus)
-#   x 1.5 scalar for heavy reasoning / long-context models
+#   × 1.5 scalar for heavy reasoning / long-context models
 #                        (Qwen3.5-397B-A17B-FP8, Kimi-K2.6)
-#   hard cap           = 240s (safe ceiling - no unbounded cost bleed)
-#   non STANDARD/COMPLEX routes -> preserve legacy 30s reflex cap
+#   hard cap           = 240s (safe ceiling — no unbounded cost bleed)
+#   non STANDARD/COMPLEX routes → preserve legacy 30s reflex cap
 #
 # Examples (STANDARD/COMPLEX route):
-#   0 chars   + 397B  -> 60.0 * 1.5  = 90.0s   (matches v18c default)
-#   10000     + 397B  -> (60+30)*1.5 = 135.0s  (50% more for 10KB SWE prompt)
-#   30000     + 397B  -> (60+90)*1.5 = 225.0s  (heavy prompt + heavy model)
-#   50000     + 397B  -> (60+150)*1.5 = 315 -> capped 240.0s
-#   0         + 35B   -> 60.0s       (workhorse - no scalar)
-#   10000     + 35B   -> (60+30)     = 90.0s
+#   0 chars   + 397B  → 60.0 * 1.5  = 90.0s   (matches v18c default)
+#   10000     + 397B  → (60+30)*1.5 = 135.0s  (50% more for 10KB SWE prompt)
+#   30000     + 397B  → (60+90)*1.5 = 225.0s  (heavy prompt + heavy model)
+#   50000     + 397B  → (60+150)*1.5 = 315 → capped 240.0s
+#   0         + 35B   → 60.0s       (workhorse — no scalar)
+#   10000     + 35B   → (60+30)     = 90.0s
 #
 # Hardcoding-free: every threshold reads from env at call time so
 # operators can tune without code edits. Defaults match the operator's
@@ -423,24 +420,24 @@ _ADAPTIVE_STEP_BONUS_S_DEFAULT = 15.0 # Additional timeout in seconds added for 
 _ADAPTIVE_HEAVY_SCALAR_DEFAULT = 1.5 # Scalar multiplier applied to the timeout when the model is identified as a heavy model (e.g., Qwen-397B or Kimi-K2.6). This accounts for the longer TTFT of heavy models. Default is 1.5x as per operator spec.
 _ADAPTIVE_CAP_S_DEFAULT = 240.0 # Maximum timeout in seconds that can be returned by the adaptive formula, regardless of prompt size or model. This prevents unbounded timeouts for extremely large prompts. Default is 240s as a safe ceiling per operator spec.
 
-# Slice 28 Phase 2 - Adaptive Streaming TTFT Horizon
+# Slice 28 Phase 2 — Adaptive Streaming TTFT Horizon
 # Heavy-reasoning / long-context models legitimately need more cold-start
 # TTFT runway than the static 30s _PRIMARY_MAX_TIMEOUT_S allows. Scale
 # _PRIMARY_MAX_TIMEOUT_S by this factor when the dispatched model is
-# heavy (matched via _is_heavy_model - same Qwen-397B / Kimi-K2.6 markers
+# heavy (matched via _is_heavy_model — same Qwen-397B / Kimi-K2.6 markers
 # Slice 27 Phase 3 uses). Hard ceiling at 240s prevents unbounded cost
-# bleed. Per operator directive: base 30s x 2.5 = 75s for heavy models.
+# bleed. Per operator directive: base 30s × 2.5 = 75s for heavy models.
 # v21 forensic (bt-2026-05-27-025855) showed 12 EXHAUSTION events on
-# 397B all at elapsed=30.01s with remaining=329.86s - the static cap
+# 397B all at elapsed=30.01s with remaining=329.86s — the static cap
 # was the binding constraint, killing primary calls before the streaming
 # layer's 120s TTFT could even fire on the wire.
 _PRIMARY_HEAVY_TTFT_SCALAR_DEFAULT = 2.5 # Scalar multiplier for heavy models' TTFT horizon. When the dispatched model is identified as heavy (e.g., Qwen-397B or Kimi-K2.6), the primary timeout cap is scaled by this factor to allow for longer cold-start TTFT. This is applied on top of the existing _PRIMARY_MAX_TIMEOUT_S cap, which serves as a base for all models. Default is 2.5x as per operator directive, giving heavy models a 75s cap instead of 30s.
 _PRIMARY_HEAVY_TTFT_CAP_S_DEFAULT = 240.0 # Maximum timeout in seconds for heavy models on the primary path. This serves as a hard ceiling to prevent unbounded timeouts even for heavy models. Default is 240s as a safe ceiling per operator directive, ensuring that even with the heavy scalar, the timeout does not exceed this limit.
 
-# Slice 28 Phase 3 - Inline Fault Discriminator probe timeout.
+# Slice 28 Phase 3 — Inline Fault Discriminator probe timeout.
 # When the adaptive primary timeout fires on TimeoutError, this
 # bounded probe (default 5s) discriminates context-lag vs
-# infrastructure-outage. Short by design - the probe MUST NOT
+# infrastructure-outage. Short by design — the probe MUST NOT
 # itself become a wedge.
 _TTFT_PROBE_TIMEOUT_S_DEFAULT = 5.0
 _TTFT_PROBE_PROMPT = "ping"
@@ -454,12 +451,12 @@ def _envb(name: str, default: bool = False) -> bool:
         return default
     return raw in ("1", "true", "yes", "on")
 
-# Heavy-model substring matchers - checked case-insensitively against
+# Heavy-model substring matchers — checked case-insensitively against
 # model_id. CSV-extensible via env var so operators can add new heavy
 # variants without code edits (a Qwen3.5-512B-MoE release wouldn't need
-# a code change to get the 1.5x scalar). Default set codifies operator's
-# S46 fleet inventory: the 397B MoE workhorse + Kimi's 200K-context
-# specialist (both warrant the heavy budget per S46 strengths).
+# a code change to get the 1.5× scalar). Default set codifies operator's
+# §46 fleet inventory: the 397B MoE workhorse + Kimi's 200K-context
+# specialist (both warrant the heavy budget per §46 strengths).
 _HEAVY_MODEL_DEFAULT_MARKERS = ("397B", "Kimi") # Default heavy model markers. 
 
 # Defensive: this function is called on every Tier 0 dispatch, so we read and parse the env var once per call. The parsing logic is robust to empty/malformed env vars, falling back to the default marker set when necessary. The tuple of markers is returned for efficient substring checks in the hot path.
@@ -490,12 +487,12 @@ def _envi_or_default(name: str, default: int) -> int:
     except ValueError: # If the raw value cannot be parsed as an integer, return the default. This ensures that invalid env var values don't cause crashes and instead fall back to safe defaults.
         return default # Return the default value if parsing fails due to invalid format.
 
-# Slice 84 - param-aware heavy threshold. The marker fast-path ("397B","Kimi")
+# Slice 84 — param-aware heavy threshold. The marker fast-path ("397B","Kimi")
 # only covered two models; Slice 83 then ranked DeepSeek-V4-Pro (1000B) and
-# GLM-5.1 (754B) FIRST, but they carried NO marker -> got the bare 30s TTFT cap ->
+# GLM-5.1 (754B) FIRST, but they carried NO marker → got the bare 30s TTFT cap →
 # killed at elapsed=30.01s before first token (the v44-v64 "DW down" mirage).
 # Any model at/above this parameter count is treated as heavy (deserves the
-# longer TTFT runway), so the whole frontier-coder fleet - present AND future -
+# longer TTFT runway), so the whole frontier-coder fleet — present AND future —
 # qualifies WITHOUT a per-model marker. 100B cleanly separates the 397B+/754B+
 # workhorses (+ DeepSeek-V4-Flash 100B) from the cheap Qwen-35B fast-path model.
 _HEAVY_MODEL_MIN_PARAMS_B_DEFAULT: float = 100.0
@@ -515,19 +512,19 @@ def _is_heavy_model(model_id: str) -> bool:
     """True iff ``model_id`` warrants the heavy-model TTFT runway.
 
     A model qualifies if EITHER it matches a curated/CSV marker
-    (``397B``/``Kimi``, operator-extensible) OR - Slice 84 - its resolved
+    (``397B``/``Kimi``, operator-extensible) OR — Slice 84 — its resolved
     parameter count is at/above ``JARVIS_HEAVY_MODEL_MIN_PARAMS_B`` (default
     100B). The param path reuses Slice 82's catalog resolver (curated map +
     ``\\d+B`` regex), so the strong DW coders (DeepSeek-V4-Pro 1000B, GLM-5.1
-    754B, ...) auto-qualify with no per-model hardcoding. Fail-soft: an
-    unresolvable param count + no marker -> not heavy. Pure; never raises."""
+    754B, …) auto-qualify with no per-model hardcoding. Fail-soft: an
+    unresolvable param count + no marker → not heavy. Pure; never raises."""
     if not model_id:  # Defensive: empty model_id is not heavy.
         return False
     mid_lower = model_id.lower()  # Lowercase once for efficiency.
     # (1) curated / CSV marker fast-path
     if any(m.lower() in mid_lower for m in _heavy_model_markers()):
         return True
-    # (2) Slice 84 - param-aware fallback
+    # (2) Slice 84 — param-aware fallback
     try:
         from backend.core.ouroboros.governance.dw_catalog_client import (
             parse_parameter_count,
@@ -535,31 +532,31 @@ def _is_heavy_model(model_id: str) -> bool:
         pb = parse_parameter_count(model_id)
         if pb is not None and pb >= _heavy_model_min_params_b():
             return True
-    except Exception:  # noqa: BLE001 - never block dispatch on a catalog hiccup
+    except Exception:  # noqa: BLE001 — never block dispatch on a catalog hiccup
         pass
     return False
 
 # Pure function for the adaptive Tier 0 timeout formula. Called by the route-aware cap selector (:func:`_tier0_rt_cap_for_route`) when the caller
 def _compute_adaptive_tier0_timeout_s(
     *,
-    prompt_chars: int, # Caller-provided prompt size in chars - used to compute the step bonus. Defensive: negative treated as zero.
-    model_id: str, # Caller-provided model ID - used to determine if the heavy-model scalar applies. Defensive: empty treated as non-heavy.
+    prompt_chars: int, # Caller-provided prompt size in chars — used to compute the step bonus. Defensive: negative treated as zero.
+    model_id: str, # Caller-provided model ID — used to determine if the heavy-model scalar applies. Defensive: empty treated as non-heavy.
     base_s: Optional[float] = None, # Optional override for the base timeout in seconds. If not provided, reads from env var JARVIS_ADAPTIVE_TIER0_BASE_S or defaults to _ADAPTIVE_BASE_S_DEFAULT.
     step_chars: Optional[int] = None, # Optional override for the number of chars per step in the adaptive formula. If not provided, reads from env var JARVIS_ADAPTIVE_TIER0_STEP_CHARS or defaults to _ADAPTIVE_STEP_CHARS_DEFAULT.
     step_bonus_s: Optional[float] = None, # Optional override for the step bonus in seconds. If not provided, reads from env var JARVIS_ADAPTIVE_TIER0_STEP_BONUS_S or defaults to _ADAPTIVE_STEP_BONUS_S_DEFAULT. 
     heavy_scalar: Optional[float] = None, # Optional override for the heavy model scalar. If not provided, reads from env var JARVIS_ADAPTIVE_TIER0_HEAVY_SCALAR or defaults to _ADAPTIVE_HEAVY_SCALAR_DEFAULT.
     cap_s: Optional[float] = None, # Optional override for the maximum timeout cap in seconds. If not provided, reads from env var JARVIS_ADAPTIVE_TIER0_CAP_S or defaults to _ADAPTIVE_CAP_S_DEFAULT.
 ) -> float:
-    """Slice 27 Phase 3 - pure-function adaptive Tier 0 timeout.
+    """Slice 27 Phase 3 — pure-function adaptive Tier 0 timeout.
 
     Operator's formula, fully env-tunable:
 
-        timeout = (base + step_bonus x floor(prompt_chars / step_chars))
-                  x (heavy_scalar if _is_heavy_model(model_id) else 1.0)
+        timeout = (base + step_bonus × floor(prompt_chars / step_chars))
+                  × (heavy_scalar if _is_heavy_model(model_id) else 1.0)
         timeout = min(timeout, cap)
 
     Caller-provided kwargs win over env defaults; env defaults win over
-    code defaults. Pure function - no side effects, deterministic.
+    code defaults. Pure function — no side effects, deterministic.
     """
     b = base_s if base_s is not None else _envf_or_default(
         "JARVIS_ADAPTIVE_TIER0_BASE_S", _ADAPTIVE_BASE_S_DEFAULT,
@@ -577,7 +574,7 @@ def _compute_adaptive_tier0_timeout_s(
         "JARVIS_ADAPTIVE_TIER0_CAP_S", _ADAPTIVE_CAP_S_DEFAULT,
     )
 
-    # Defensive - negative payload chars treated as zero
+    # Defensive — negative payload chars treated as zero
     safe_chars = max(0, int(prompt_chars or 0)) # Ensure prompt_chars is a non-negative integer. If prompt_chars is None or negative, treat it as zero. This prevents the formula from producing a smaller timeout due to negative char counts.
     steps = safe_chars // max(1, sc)  # avoid div-by-zero on misconfigured env
     timeout = b + sb * steps # Calculate the timeout based on the base, step bonus, and number of steps determined by the prompt size. The step bonus increases the timeout for larger prompts according to the operator's formula.
@@ -592,15 +589,15 @@ def _tier0_rt_cap_for_route(
     model_id: str = "",
     prompt_chars: int = 0,
 ) -> float:
-    """Tier 0 RT cap - adaptive when model_id/prompt_chars provided,
+    """Tier 0 RT cap — adaptive when model_id/prompt_chars provided,
     legacy 90s/30s wall when not.
 
     Slice 18c semantics preserved for callers that don't pass the new
     kwargs (byte-identical to pre-Slice-27 behavior):
-      STANDARD + COMPLEX -> 90s default (env-tunable)
-      everything else    -> 30s reflex cap
+      STANDARD + COMPLEX → 90s default (env-tunable)
+      everything else    → 30s reflex cap
 
-    Slice 27 Phase 3 - when EITHER model_id or prompt_chars is provided,
+    Slice 27 Phase 3 — when EITHER model_id or prompt_chars is provided,
     the STANDARD/COMPLEX path switches to the adaptive formula
     (:func:`_compute_adaptive_tier0_timeout_s`). The 30s reflex cap for
     other routes is preserved unconditionally (IMMEDIATE/BG/SPEC have
@@ -611,7 +608,7 @@ def _tier0_rt_cap_for_route(
     if r not in ("standard", "complex"):
         return _TIER3_REFLEX_HARD_CAP_S
 
-    # Slice 27 Phase 3 - adaptive only when caller has context.
+    # Slice 27 Phase 3 — adaptive only when caller has context.
     # Legacy callers that pass only the route get the historical
     # 90s static cap (matches Slice 18c byte-identically).
     if not model_id and prompt_chars <= 0:
@@ -624,7 +621,7 @@ def _tier0_rt_cap_for_route(
 
 # Legacy alias retained for downstream imports + existing test surface.
 # Do not change to a different default without updating the test pins.
-# Reads OUROBOROS_PRIMARY_MAX_TIMEOUT_S as a per-primary override - when
+# Reads OUROBOROS_PRIMARY_MAX_TIMEOUT_S as a per-primary override — when
 # set, wins over the shared Tier 3 cap for the _call_primary path only
 # (the _compute_tier0_budget path continues to use _TIER3_REFLEX_HARD_CAP_S).
 _PRIMARY_MAX_TIMEOUT_S = float(
@@ -635,14 +632,14 @@ _PRIMARY_MAX_TIMEOUT_S = float(
 # the call will almost certainly timeout before the model finishes; skip it
 # and raise immediately to avoid burning network round-trip time.
 #
-# ONE AUTHORITY - `admission_gate.min_viable_call_s()`.
+# ONE AUTHORITY — `admission_gate.min_viable_call_s()`.
 #
 # This used to be an independent `OUROBOROS_MIN_VIABLE_FALLBACK_S` env read
 # defaulting to 10s, while the admission gate answered the SAME question
 # ("what is the least budget in which a Claude fallback can do useful work")
 # with `JARVIS_ADMISSION_MIN_VIABLE_CALL_S`, default 25s. Two floors for one
 # decision: the gate sheds first and is strictly tighter, so with the gate at
-# its default the 10s constant was dead as a decision boundary - the classic
+# its default the 10s constant was dead as a decision boundary — the classic
 # "the tighter authority silently becomes the real budget for reasons no log
 # explains". It was not merely redundant: the gate is disableable
 # (`JARVIS_ADMISSION_GATE_ENABLED=0`), and with it off the 10s floor came back
@@ -652,16 +649,16 @@ _PRIMARY_MAX_TIMEOUT_S = float(
 # The gate's number is authoritative because its rationale is the reasoned
 # one: 25s is where a single Venom tool round with no thinking budget can
 # land; below that we admit ops that time out at the API layer instead of at
-# the gate, defeating the gate's purpose. Its clamp floor is 10.0 - exactly
-# the old default - so the legacy value survives as the gate's own lower
+# the gate, defeating the gate's purpose. Its clamp floor is 10.0 — exactly
+# the old default — so the legacy value survives as the gate's own lower
 # bound rather than as a second opinion.
 #
 # Read per call (not bound at import) so an operator's flip hot-reverts
 # without a restart, matching the gate's own discipline.
 
 #: Mirrors `admission_gate.min_viable_call_s()`'s documented default. Used
-#: ONLY if that import fails - impossible in a healthy tree, since both
-#: modules ship in the same package - and set to the conservative value
+#: ONLY if that import fails — impossible in a healthy tree, since both
+#: modules ship in the same package — and set to the conservative value
 #: because admitting a doomed call is the worse failure direction.
 _MIN_VIABLE_FALLBACK_FAILSOFT_S: float = 25.0
 
@@ -684,14 +681,14 @@ def _min_viable_fallback_s() -> float:
 def _warn_legacy_min_viable_env_once() -> None:
     """Tell an operator whose `OUROBOROS_MIN_VIABLE_FALLBACK_S` no longer does
     anything. Silently ignoring it would be the same class of lie this whole
-    reconciliation removes - a number that looks like a control and is not.
+    reconciliation removes — a number that looks like a control and is not.
     NEVER raises."""
     try:
         raw = (os.environ.get("OUROBOROS_MIN_VIABLE_FALLBACK_S", "") or "").strip()
         if raw:
             logger.warning(
                 "[CandidateGenerator] OUROBOROS_MIN_VIABLE_FALLBACK_S=%s is "
-                "SUPERSEDED and ignored - the minimum viable fallback budget "
+                "SUPERSEDED and ignored — the minimum viable fallback budget "
                 "is now JARVIS_ADMISSION_MIN_VIABLE_CALL_S (currently %.1fs), "
                 "so the gate and the retry loop cannot disagree.",
                 raw, _min_viable_fallback_s(),
@@ -706,7 +703,7 @@ _warn_legacy_min_viable_env_once()
 # parent-deadline budget Tier 0 consumed before failing. When the parent
 # deadline is depleted (e.g. DW timed out after 80s of a 120s window),
 # `_call_fallback` REFRESHES its own deadline so Claude gets at least this
-# many seconds - otherwise legitimate doc-gen / patch streams (60-100s)
+# many seconds — otherwise legitimate doc-gen / patch streams (60-100s)
 # get cut off mid-flight and the whole op fails to `all_providers_exhausted`.
 # Diagnosed in bt-2026-04-11-211131 (24x exhaustion, 0 commits).
 # This OVERRIDES the parent wall-clock deadline; the orchestrator's outer
@@ -716,17 +713,17 @@ _FALLBACK_MIN_GUARANTEED_S = float(
 )
 
 # Tier 3 reflex cap for PLAN phase (item B from F1 Slice 4 S5 triage,
-# bt-2026-04-24-220418). PLAN is soft-fail - callers (PlanGenerator) catch
+# bt-2026-04-24-220418). PLAN is soft-fail — callers (PlanGenerator) catch
 # exceptions and fall through to GENERATE without plan, so an aggressive cap
 # is even more appropriate here than at GENERATE. Two surfaces:
 #   (a) primary path reuses the same `_TIER3_REFLEX_HARD_CAP_S` as the
-#       GENERATE Tier-0 budget (default 30s) - see plan() below.
+#       GENERATE Tier-0 budget (default 30s) — see plan() below.
 #   (b) fallback (Claude) path uses this PLAN-specific override (default 60s,
 #       half the GENERATE fallback cap) because PLAN's structured plan.1 JSON
-#       is short - Claude doesn't need the full 120s reserve.
+#       is short — Claude doesn't need the full 120s reserve.
 # S5 surfaced the gap: CandidateGenerator.plan() at line ~2244 was passing
-# raw `remaining` (~=parent deadline) to wait_for, so DW could stall up to
-# 90s before failing and Claude could stall up to 120s, total 210s - eating
+# raw `remaining` (≈parent deadline) to wait_for, so DW could stall up to
+# 90s before failing and Claude could stall up to 120s, total 210s — eating
 # the entire BG worker pool ceiling (360s) before GENERATE got to run.
 _PLAN_FALLBACK_MAX_TIMEOUT_S = float(
     os.environ.get("OUROBOROS_PLAN_FALLBACK_MAX_TIMEOUT_S", "60"),
@@ -746,7 +743,7 @@ _PLAN_FALLBACK_MAX_TIMEOUT_S = float(
 #     before the API even responds), all 3 internal attempts can exhaust
 #     in ~70-80s.
 #   * `_call_fallback` then catches the propagated CancelledError and
-#     fires `EXHAUSTION cause=fallback_failed` - even when 100+s of
+#     fires `EXHAUSTION cause=fallback_failed` — even when 100+s of
 #     parent budget remains.
 #
 # The budget JARVIS authorized at ROUTE goes unused. Network conditions
@@ -757,20 +754,20 @@ _PLAN_FALLBACK_MAX_TIMEOUT_S = float(
 #    artificially inflating the timeout boundaries (Option D). The
 #    internal architecture is mathematically sound."
 #
-# This fix adds NO new budget - it just CONSUMES the budget already
+# This fix adds NO new budget — it just CONSUMES the budget already
 # authorized. Outer retry loop re-invokes the provider (head-of-queue
 # preserved by holding `_fallback_sem`) on transient failures while
 # remaining budget exceeds `_min_viable_fallback_s()` and the failure
 # mode is in `_FALLBACK_TRANSIENT_MODES`. Cooperative cancel via
 # `OperationCancelledError` (W3(7) cancel-token) is honored immediately
-# - never retried.
+# — never retried.
 # Read per call rather than bound at import, for the same reason the
 # minimum-viable floor is: an import-bound env constant cannot be changed
 # without re-executing the module, and `importlib.reload` is not a local
 # operation. It replaces every class object the module owns while leaving the
 # `sys.modules` key intact, so any module that already did
 # ``from ... import FailureMode`` keeps a stale class and every subsequent
-# ``mode is FailureMode.X`` silently becomes False - two enums with identical
+# ``mode is FailureMode.X`` silently becomes False — two enums with identical
 # reprs, which is about as confusing as a failure gets.
 #
 # `test_outer_retry_cap_bounds_attempts` reloaded this module for exactly that
@@ -794,20 +791,20 @@ def _fallback_outer_retry_backoff_s() -> float:
 
 
 # ---------------------------------------------------------------------------
-# Slice 12N - ProviderRoute -> CircuitTripOrigin mapping
+# Slice 12N — ProviderRoute → CircuitTripOrigin mapping
 # ---------------------------------------------------------------------------
 #
 # Blast-radius isolation: only FOREGROUND-origin per-op breakers
 # escalate structural trips to the global session_exhausted
 # threshold. Background / speculative ops get their own per-op
-# breaker but their structural trips are ISOLATED - they cannot
+# breaker but their structural trips are ISOLATED — they cannot
 # assassinate a healthy in-flight foreground op (the wedge that
 # killed the SWE-Bench-Pro fixture in bt-2026-05-23-015723).
 #
 # Lookup is by lowercased provider_route string so this map stays
 # robust to either Enum-as-value or bare-string population of
 # ``context.provider_route``. Unknown / empty routes default to
-# FOREGROUND at the call site (safer - preserves legacy escalation).
+# FOREGROUND at the call site (safer — preserves legacy escalation).
 #
 # Lazy import inside the dict construction is unavoidable here
 # because circuit_breaker would otherwise cycle through
@@ -828,7 +825,7 @@ def _slice12n_build_route_origin_map() -> Dict[str, Any]:
 
 _SLICE12N_ROUTE_TO_ORIGIN: Dict[str, Any] = _slice12n_build_route_origin_map()
 
-# Anthropic resilience pack 2026-04-25 - failure-rate-aware outer-retry.
+# Anthropic resilience pack 2026-04-25 — failure-rate-aware outer-retry.
 # When the FailbackStateMachine has logged transient failures recently
 # (a window of consecutive_failures > 0 within the past few cycles), bump
 # the outer-retry cap from `_FALLBACK_OUTER_RETRY_MAX` to
@@ -838,7 +835,7 @@ _SLICE12N_ROUTE_TO_ORIGIN: Dict[str, Any] = _slice12n_build_route_origin_map()
 # Observed live in F1 Slice 4 S4b: 6 Claude transient failures + 8 pool
 # recycles in 30min. The seed's 1 outer-retry attempt wasn't enough to
 # survive the full anthropic_transport instability window. Bumping to 5
-# attempts during instability gives ~3x more headroom to catch a
+# attempts during instability gives ~3× more headroom to catch a
 # recovery window.
 #
 # Default = 5 (vs base 3). Set via JARVIS_FALLBACK_OUTER_RETRY_MAX_DEGRADED.
@@ -850,13 +847,13 @@ _FALLBACK_OUTER_RETRY_MAX_DEGRADED = int(
 )
 
 # ---------------------------------------------------------------------------
-# Nervous System Reflex - BACKGROUND cascade for read-only ops
+# Nervous System Reflex — BACKGROUND cascade for read-only ops
 # ---------------------------------------------------------------------------
 #
-# Manifesto S5: "Intelligence-driven routing", but survival and execution
+# Manifesto §5: "Intelligence-driven routing", but survival and execution
 # speed permanently supersede cost optimization. For read-only ops on the
 # BACKGROUND route we sever the DW thread on a strict temporal budget and
-# cascade to Claude - regardless of topology skip_and_queue flags or the
+# cascade to Claude — regardless of topology skip_and_queue flags or the
 # JARVIS_BACKGROUND_ALLOW_FALLBACK gate that gates the same reflex for
 # mutating BG ops.
 #
@@ -884,10 +881,10 @@ def _attribute_cancel(
     Pure-observation helper added 2026-04-24 (post-S6 / bt-2026-04-24-225137)
     to disambiguate three cancel classes seen in F1 Slice 4 graduation:
 
-    - **A** - `_FALLBACK_MAX_TIMEOUT_S=120s` per-call cap (`TimeoutError`).
-    - **B** - ToolLoop per-round budget (`TimeoutError` at the per-round mark).
-    - **C** - external cooperative cancel (`CancelledError` with non-zero
-      remaining budget) - sibling-task cancel / retry-harness deadline /
+    - **A** — `_FALLBACK_MAX_TIMEOUT_S=120s` per-call cap (`TimeoutError`).
+    - **B** — ToolLoop per-round budget (`TimeoutError` at the per-round mark).
+    - **C** — external cooperative cancel (`CancelledError` with non-zero
+      remaining budget) — sibling-task cancel / retry-harness deadline /
       mid-flight TopologyBlock reroute.
 
     Walks `asyncio.current_task()` to capture this task's `cancelling()`
@@ -896,7 +893,7 @@ def _attribute_cancel(
     surface a likely-canceller name (best-effort; no guarantee).
 
     Returns a single-line structured string suitable for logging.
-    Never raises - attribution failure is logged as `attribution_error=...`.
+    Never raises — attribution failure is logged as `attribution_error=...`.
     """
     err_class = type(exc).__name__
 
@@ -927,9 +924,9 @@ def _attribute_cancel(
         except RuntimeError:
             canceller = "no_running_loop"
         # Heuristic class assignment:
-        #   - TimeoutError + own_cancelling==0 + remaining~=0 -> Class A/B (own deadline)
-        #   - CancelledError + own_cancelling>0              -> Class C (external)
-        #   - CancelledError + own_cancelling==0             -> ambiguous (loop teardown?)
+        #   - TimeoutError + own_cancelling==0 + remaining≈0 → Class A/B (own deadline)
+        #   - CancelledError + own_cancelling>0              → Class C (external)
+        #   - CancelledError + own_cancelling==0             → ambiguous (loop teardown?)
         if isinstance(exc, asyncio.TimeoutError):
             klass = "A_or_B_timeout"
         elif isinstance(exc, asyncio.CancelledError) and own_cancelling > 0:
@@ -963,7 +960,7 @@ def _attribute_cancel(
 # ``fallback_disabled_by_env:{route}`` sentinel through the existing
 # exhaustion path. Used by the Qwen 397B isolation benchmark to collect raw
 # DW completion telemetry without Claude masking failures or burning tokens.
-# Default unset -> normal cascade behavior.
+# Default unset → normal cascade behavior.
 _DISABLE_FALLBACK_ROUTES_ENV = "JARVIS_DISABLE_CLAUDE_FALLBACK_ROUTES"
 
 
@@ -976,49 +973,49 @@ def _fallback_disabled_for_route(route: str) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Slice 23 - Autonomous Registry-Driven Sentinel Activation
+# Slice 23 — Autonomous Registry-Driven Sentinel Activation
 # ──────────────────────────────────────────────────────────────────────
 #
 # v16/v17 forensic exposed that locking dispatch to a single DW model
 # when an entire trusted-seed fleet sits in the PromotionLedger is an
-# architectural bottleneck. The fix is NOT a per-soak env flag - it is
+# architectural bottleneck. The fix is NOT a per-soak env flag — it is
 # a structural decision the dispatcher makes at every call from the
 # active registry state.
 #
 # Decision matrix (first-match-wins; closed and deterministic):
 #
 #   1. Operator explicit-on  (JARVIS_TOPOLOGY_SENTINEL_ENABLED=true)
-#      -> ACTIVATE (legacy explicit-on contract, preserved verbatim).
+#      → ACTIVATE (legacy explicit-on contract, preserved verbatim).
 #
 #   2. Operator explicit-off (JARVIS_TOPOLOGY_SENTINEL_ENABLED=false)
-#      -> DO NOT activate (operator rollback wins over every structural
-#        condition - single-knob hot-revert preserved per S33).
+#      → DO NOT activate (operator rollback wins over every structural
+#        condition — single-knob hot-revert preserved per §33).
 #
 #   3. Claude tier structurally absent  (JARVIS_PROVIDER_CLAUDE_DISABLED=true)
-#      -> ACTIVATE. Slice 19a declares "Claude removed -> DW fleet IS
+#      → ACTIVATE. Slice 19a declares "Claude removed → DW fleet IS
 #        the only intelligence". Iterating the fleet is the architectural
 #        contract that operator-binding implies. Composes with Slice 22
-#        tier-decay (IMMEDIATE->STANDARD demotion when Claude absent).
+#        tier-decay (IMMEDIATE→STANDARD demotion when Claude absent).
 #
-#   4. Multi-model trusted fleet for this route  (>=2 promoted ledger
+#   4. Multi-model trusted fleet for this route  (≥2 promoted ledger
 #      entries that pass the route's eligibility gate)
-#      -> ACTIVATE. A multi-model fleet exists precisely so dispatch can
+#      → ACTIVATE. A multi-model fleet exists precisely so dispatch can
 #        rotate among them on failure. Locking to one when 2+ are
 #        promoted defeats the PromotionLedger's purpose.
 #
 #   5. Default  (Claude enabled + single-model fleet + env unset)
-#      -> DO NOT activate. Phase 10 graduation contract preserved for
+#      → DO NOT activate. Phase 10 graduation contract preserved for
 #        the Claude-enabled posture this contract was written about.
 #
 # The structural conditions (3, 4) compose `JARVIS_PROVIDER_CLAUDE_DISABLED`
-# (Slice 19a) and `_trusted_seed_dw_models_for_route` (Slice 10B-ii) -
+# (Slice 19a) and `_trusted_seed_dw_models_for_route` (Slice 10B-ii) —
 # both already-existing substrate. No new env knobs, no new state,
 # no parallel ledgers. The PromotionLedger is the autonomous registry;
 # the trusted-seed bridge already enforces per-route eligibility gates.
 #
 # The Phase 10 graduation contract AST pin
 # (`phase10_graduation_contract.py`) asserts the master flag DEFAULT
-# stays false - which it does. Slice 23 adds structural OVERRIDES on
+# stays false — which it does. Slice 23 adds structural OVERRIDES on
 # top of that default; the literal env-var default is unchanged.
 
 
@@ -1029,11 +1026,11 @@ _SLICE23_MIN_PROMOTED_FOR_AUTO = 2
 
 def _claude_config_disabled() -> bool:
     """True when the Claude fallback tier is STRUCTURALLY disabled via
-    ``JARVIS_PROVIDER_CLAUDE_DISABLED`` - the deadest possible fallback (the
+    ``JARVIS_PROVIDER_CLAUDE_DISABLED`` — the deadest possible fallback (the
     provider is never even constructed), distinct from a tripped circuit breaker.
 
     DW-autarky's full-runway grant (Slice 225) keys off ``_claude_breaker_open``,
-    which reads only the breaker STATE - and a config-disabled Claude never trips
+    which reads only the breaker STATE — and a config-disabled Claude never trips
     the breaker, so it stays CLOSED and autarky NEVER engaged under
     ``JARVIS_PROVIDER_CLAUDE_DISABLED=true``. The sole-lane DW was then held to
     the 90s reflex cap and TIMED OUT on slow hosts (live container soak,
@@ -1044,12 +1041,12 @@ def _claude_config_disabled() -> bool:
         return os.environ.get(_CLAUDE_DISABLED_ENV, "").strip().lower() in (
             "1", "true", "yes", "on",
         )
-    except Exception:  # noqa: BLE001 - fail-closed to legacy cascade
+    except Exception:  # noqa: BLE001 — fail-closed to legacy cascade
         return False
 
 
 def _slice23_should_activate_sentinel(provider_route: str) -> Tuple[bool, str]:
-    """Slice 23 - autonomous registry-driven sentinel activation.
+    """Slice 23 — autonomous registry-driven sentinel activation.
 
     Returns ``(activate, reason)`` where ``reason`` is a short
     classifier string suitable for logging (one of: ``env_explicit_on``,
@@ -1057,7 +1054,7 @@ def _slice23_should_activate_sentinel(provider_route: str) -> Tuple[bool, str]:
     ``default_off_phase10_contract``, ``trusted_seed_probe_failed``).
 
     Pure function over env + PromotionLedger snapshot. No side effects.
-    Defensive against trusted-seed probe failures - falls through to
+    Defensive against trusted-seed probe failures — falls through to
     default-off rather than raising into dispatch.
     """
     env_raw = os.environ.get(_SENTINEL_ENABLED_ENV, "").strip().lower()
@@ -1070,9 +1067,9 @@ def _slice23_should_activate_sentinel(provider_route: str) -> Tuple[bool, str]:
     if claude_raw in ("1", "true", "yes", "on"):
         return True, "claude_disabled"
 
-    # Multi-model fleet probe - lazy import keeps candidate_generator
+    # Multi-model fleet probe — lazy import keeps candidate_generator
     # bootable when provider_topology is unavailable (e.g., isolated
-    # unit tests). Defensive try/except - bridge failure must NEVER
+    # unit tests). Defensive try/except — bridge failure must NEVER
     # block dispatch; fall through to default-off if the probe raises.
     try:
         from backend.core.ouroboros.governance.provider_topology import (
@@ -1083,7 +1080,7 @@ def _slice23_should_activate_sentinel(provider_route: str) -> Tuple[bool, str]:
         )
         if len(promoted_for_route) >= _SLICE23_MIN_PROMOTED_FOR_AUTO:
             return True, "multi_model_fleet"
-    except Exception:  # noqa: BLE001 - defensive probe
+    except Exception:  # noqa: BLE001 — defensive probe
         return False, "trusted_seed_probe_failed"
 
     return False, "default_off_phase10_contract"
@@ -1105,7 +1102,7 @@ def gen_call_likely_thinking(route: str, task_complexity: str) -> bool:
     240+15s before the inner 360s window completes (CancelledError@
     255s, psf never generated). Both inner and outer consume THIS
     function so the invariant `outer >= inner` holds by construction
-    - no duplicated predicate, no per-path drift.
+    — no duplicated predicate, no per-path drift.
     """
     _tc = (task_complexity or "").strip().lower()
     _r = (route or "").strip().lower()
@@ -1125,18 +1122,18 @@ def fallback_thinking_cap_s() -> float:
 
 
 def force_batch_gen_timeout_floor_s() -> float:
-    """Slice 50 Phase 2 - minimum GENERATE-phase deadline for a force-batch op.
+    """Slice 50 Phase 2 — minimum GENERATE-phase deadline for a force-batch op.
 
     The DW BATCH lane's async poll legitimately runs up to
     ``JARVIS_DW_BATCH_TIMEOUT_S`` (Slice 43, default 300s). The OUTER
     GENERATE deadline must STRICTLY exceed that lease so the batch poll is
-    never severed by the outer ``wait_for`` at exactly its own expiry -
+    never severed by the outer ``wait_for`` at exactly its own expiry —
     add a small overhead (``JARVIS_FORCE_BATCH_GEN_OVERHEAD_S``, default
     30s) for the sentinel + Iron-Gate processing that follows the poll.
 
     Derived from the Slice 43 batch-timeout constant, NOT a second
     hardcoded value: change ``JARVIS_DW_BATCH_TIMEOUT_S`` and the floor
-    tracks it. Mirror of :func:`fallback_thinking_cap_s` - a single shared
+    tracks it. Mirror of :func:`fallback_thinking_cap_s` — a single shared
     resolver for the outer/inner deadline-coherence invariant.
     """
     batch_cap = _envf_or_default("JARVIS_DW_BATCH_TIMEOUT_S", 300.0)
@@ -1147,13 +1144,13 @@ def force_batch_gen_timeout_floor_s() -> float:
 # ---------------------------------------------------------------------------
 # Sovereign Infinite-Horizon Batch Matrix (2026-06-20)
 # ---------------------------------------------------------------------------
-# A PARKED ASYNC_BATCH_PAYLOAD op has had its worker slot freed - it costs ZERO
+# A PARKED ASYNC_BATCH_PAYLOAD op has had its worker slot freed — it costs ZERO
 # CPU while DoubleWord's batch queue churns. Severing it at the 300s/330s legacy
 # budget while DW is ACTIVELY processing the batch (validating / in_progress /
 # finalizing) is pure waste: the live wedge is mode=TIMEOUT "Batch retrieval
-# failed" (NOT a 403 - the retrieval HTTP path never returned >=300; the batch
+# failed" (NOT a 403 — the retrieval HTTP path never returned >=300; the batch
 # simply hadn't finished). The poll layer (_adaptive_poll_batch) is ALREADY
-# lifecycle-aware - it returns ONLY on `completed` or terminal `failed/expired/
+# lifecycle-aware — it returns ONLY on `completed` or terminal `failed/expired/
 # cancelled`, and otherwise keeps polling up to DOUBLEWORD_MAX_WAIT_S. The only
 # thing cutting it short is the OUTER budget. So: when (and ONLY when) the parked
 # out-of-pool continuation is running a batch-bound op, lift the force-batch cap
@@ -1168,7 +1165,7 @@ _PARKED_BATCH_HORIZON: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
 
 
 def batch_sla_horizon_s() -> float:
-    """The async-batch SLA horizon in seconds - how long a PARKED batch op may
+    """The async-batch SLA horizon in seconds — how long a PARKED batch op may
     wait for DW while the worker slot is free. Default mirrors the poll horizon
     (``DOUBLEWORD_MAX_WAIT_S``, 3600s). Clamped [300s, 24h]. Env override:
     ``JARVIS_DW_BATCH_SLA_HORIZON_S``. NEVER raises."""
@@ -1209,10 +1206,10 @@ def apply_force_batch_deadline_floor(
     """Floor a GENERATE-phase deadline so a force-batch op's outer window
     exceeds the DW batch lease (Slice 50 Phase 2).
 
-    Forensic basis - v45 probe ``bt-2026-06-01-034745``: a
+    Forensic basis — v45 probe ``bt-2026-06-01-034745``: a
     ``route=standard, complexity=trivial`` op force-batched (Slice 36:
     Claude disabled + standard route) but its route-base GENERATE deadline
-    was only ``JARVIS_GEN_TIMEOUT_STANDARD_S=220s`` - the R1 thinking-cap
+    was only ``JARVIS_GEN_TIMEOUT_STANDARD_S=220s`` — the R1 thinking-cap
     floor (-> 360s) does not fire for trivial ops. So
     ``_compute_primary_budget(remaining=220, force_batch=True) =
     min(220, 300) = 220`` and the async batch poll was severed at 220s
@@ -1230,7 +1227,7 @@ def apply_force_batch_deadline_floor(
 
 
 def structural_fast_cascade_enabled() -> bool:
-    """Slice 73 master flag - default TRUE. When off, the dispatch loop tries
+    """Slice 73 master flag — default TRUE. When off, the dispatch loop tries
     every ranked DW model before cascading (byte-identical legacy behavior)."""
     raw = os.environ.get(
         "JARVIS_DW_STRUCTURAL_FAST_CASCADE_ENABLED", "true",
@@ -1239,55 +1236,55 @@ def structural_fast_cascade_enabled() -> bool:
 
 
 def should_sever_dw_lane(failure_source: Any) -> bool:
-    """Slice 73 - True iff this failure is a STRUCTURAL transport break.
+    """Slice 73 — True iff this failure is a STRUCTURAL transport break.
 
     A ``LIVE_TRANSPORT`` failure (socket/connection break, ``live_transport:
-    RuntimeError``) means the transport to the DW endpoint is down - every
+    RuntimeError``) means the transport to the DW endpoint is down — every
     ranked sibling model shares that dead transport, so trying the next one
     just burns another ~30s before the inevitable cascade. Sever the lane and
     hand Claude the full remaining budget.
 
-    Model-SPECIFIC failures (429 rate-limit, 5xx, parse) are NOT severed - a
+    Model-SPECIFIC failures (429 rate-limit, 5xx, parse) are NOT severed — a
     sibling model may be healthy, so the loop still rotates to it. Pure;
-    never raises (unknown source -> don't sever).
+    never raises (unknown source → don't sever).
     """
     try:
         from backend.core.ouroboros.governance.topology_sentinel import (
             FailureSource,
         )
         return failure_source is FailureSource.LIVE_TRANSPORT
-    except Exception:  # noqa: BLE001 - never block dispatch
+    except Exception:  # noqa: BLE001 — never block dispatch
         return False
 
 
 def _live_transport_sever_threshold() -> int:
-    """Slice 83 Phase 2 - consecutive LIVE_TRANSPORT failures required before
+    """Slice 83 Phase 2 — consecutive LIVE_TRANSPORT failures required before
     the whole DW lane is severed (Slice 73 behavior).
 
     Slice 73 severed the lane on the FIRST ``live_transport`` failure on the
     theory that all ranked siblings share one dead transport. But Slice 82/83
-    made the ranked stack HETEROGENEOUS - DeepSeek-V4-Pro, Kimi-K2.6, GLM-5.1,
+    made the ranked stack HETEROGENEOUS — DeepSeek-V4-Pro, Kimi-K2.6, GLM-5.1,
     Qwen397B, Qwen35B are distinct served endpoints. One model being briefly
     unavailable (deploy bounce, per-model 5xx surfacing as a transport break)
     is NOT a lane outage: the next coder may be perfectly healthy. So we now
     ROTATE to the next model on a single failure and only sever once
-    ``threshold`` consecutive models have all failed with LIVE_TRANSPORT - the
+    ``threshold`` consecutive models have all failed with LIVE_TRANSPORT — the
     signature of a genuine endpoint-wide blackout. A success (or a non-transport
     failure on a reachable model) resets the streak. Default 3; floored at 1 so
     ``=1`` reproduces exact Slice 73 first-failure sever. Env-tunable."""
     try:
         raw = os.environ.get("JARVIS_DW_LIVE_TRANSPORT_SEVER_THRESHOLD", "3")
         return max(1, int(str(raw).strip()))
-    except Exception:  # noqa: BLE001 - bad value -> safe default
+    except Exception:  # noqa: BLE001 — bad value → safe default
         return 3
 
 
 def _note_dw_total_outage(diagnostic: str) -> None:
-    """Slice 53 - record one GENERATE op that exhausted ALL DW models with no
+    """Slice 53 — record one GENERATE op that exhausted ALL DW models with no
     candidate from streaming OR batch (the total-vendor-blackout signature).
 
     Routed through the dual-lane breaker singleton. NEVER raises (defensive
-    lazy import) - recording is best-effort observability + breaker state, it
+    lazy import) — recording is best-effort observability + breaker state, it
     must not perturb the generation error path it sits on.
     """
     try:
@@ -1295,12 +1292,12 @@ def _note_dw_total_outage(diagnostic: str) -> None:
             get_dual_lane_breaker,
         )
         get_dual_lane_breaker().record_total_outage(diagnostic or "all_models_open")
-    except Exception:  # noqa: BLE001 - never perturb the error path
+    except Exception:  # noqa: BLE001 — never perturb the error path
         pass
 
 
 def _note_dw_candidate_success() -> None:
-    """Slice 53 - record that some DW lane (or fallback) yielded a candidate,
+    """Slice 53 — record that some DW lane (or fallback) yielded a candidate,
     resetting the breaker's consecutive-outage counter. Preserves Slice 41
     single-lane resilience. NEVER raises."""
     try:
@@ -1310,7 +1307,7 @@ def _note_dw_candidate_success() -> None:
         get_dual_lane_breaker().record_success()
     except Exception:  # noqa: BLE001
         pass
-    # Slice 127 P3 - a DW completion succeeded -> reset the dynamic-recovery
+    # Slice 127 P3 — a DW completion succeeded → reset the dynamic-recovery
     # episode counter to 0 instantly so the next transient blip recovers at
     # ``base`` (gated, best-effort; never perturbs the success path).
     try:
@@ -1325,13 +1322,13 @@ def _note_dw_candidate_success() -> None:
 
 
 def _note_dw_live_transport_degraded(diagnostic: str = "", model_id: str = "") -> None:
-    """Slice 77 - the millisecond a LIVE dispatch hits a transport break
+    """Slice 77 — the millisecond a LIVE dispatch hits a transport break
     (``live_transport:RuntimeError`` / socket drop), stamp the
-    ``dw_surface_health`` ledger ``DIRECT_STREAMING -> TRANSPORT_DEGRADED`` so
+    ``dw_surface_health`` ledger ``DIRECT_STREAMING → TRANSPORT_DEGRADED`` so
     the NEXT op's Slice 76 P2 pre-flight gate (:func:`dw_transport_degraded_preflight`)
-    fires and cascades straight to Claude with the full budget - instead of
+    fires and cascades straight to Claude with the full budget — instead of
     burning the next op's allowance on the same dead transport (the EVAL-2
-    Phase-4 ``deadline_exhausted_pre_fallback`` failure, PRD S50.11).
+    Phase-4 ``deadline_exhausted_pre_fallback`` failure, PRD §50.11).
 
     This converts the ledger from a one-shot BOOT probe into a live,
     event-driven status map. Recovery is automatic: once live generations stop
@@ -1351,9 +1348,9 @@ def _note_dw_live_transport_degraded(diagnostic: str = "", model_id: str = "") -
             SurfaceVerdict.TRANSPORT_DEGRADED,
             diagnostic=(diagnostic or "live_transport")[:120],
         )
-    except Exception:  # noqa: BLE001 - never perturb the dispatch error path
+    except Exception:  # noqa: BLE001 — never perturb the dispatch error path
         pass
-    # Slice 127 P3 - register a dynamic-recovery rupture episode (debounced by
+    # Slice 127 P3 — register a dynamic-recovery rupture episode (debounced by
     # ``base`` so a burst inside one outage = ONE episode). The dynamic window
     # grows the next probe interval exponentially for a chronically-rupturing
     # lane (gated, best-effort; never perturbs the dispatch error path).
@@ -1364,19 +1361,19 @@ def _note_dw_live_transport_degraded(diagnostic: str = "", model_id: str = "") -
         )
         if _s127_dyn_on():
             _s127_dwr().note_degraded()
-    except Exception:  # noqa: BLE001 - never perturb the dispatch error path
+    except Exception:  # noqa: BLE001 — never perturb the dispatch error path
         pass
-    # Slice 172 - feed the predictive cortex the SAME rupture event (its own bounded
+    # Slice 172 — feed the predictive cortex the SAME rupture event (its own bounded
     # timestamp ring drives the recency-weighted Poisson forecast). Fire-and-forget,
     # lock-guarded append; never perturbs the dispatch error path. Record is
-    # UNCONDITIONAL (the master flag gates *routing*, not data collection - so the
+    # UNCONDITIONAL (the master flag gates *routing*, not data collection — so the
     # forecast is already warm the moment predictive routing is switched on).
     try:
         from backend.core.ouroboros.governance.dw_failure_predictor import (
             get_dw_failure_predictor as _s172_pred,
         )
-        _s172_pred().record_rupture(model_id=model_id)  # Slice 175 - per-model ring
-    except Exception:  # noqa: BLE001 - never perturb the dispatch error path
+        _s172_pred().record_rupture(model_id=model_id)  # Slice 175 — per-model ring
+    except Exception:  # noqa: BLE001 — never perturb the dispatch error path
         pass
 
 
@@ -1394,7 +1391,7 @@ def _record_quota_outage_safely(provider: str, reason: str) -> None:
 
 
 def _record_dw_failure_signal(model_id: str, failure_source: Any) -> None:
-    """Slice 176 - fuse a classified NON-transport DW FailureSource into the predictive
+    """Slice 176 — fuse a classified NON-transport DW FailureSource into the predictive
     cortex as a weighted failure vector (economic 429 / upstream 5xx+parse / stall), per
     model. Transport ruptures are already fed via _note_dw_live_transport_degraded; this
     covers the rest of the spectrum (Blindspot D). Fire-and-forget, never perturbs the
@@ -1402,11 +1399,11 @@ def _record_dw_failure_signal(model_id: str, failure_source: Any) -> None:
     try:
         from backend.core.ouroboros.governance.topology_sentinel import FailureSource
         _kind = {
-            FailureSource.LIVE_HTTP_429: "economic",   # quota / rate-limit - imminent lockdown
+            FailureSource.LIVE_HTTP_429: "economic",   # quota / rate-limit — imminent lockdown
             FailureSource.LIVE_HTTP_4XX_QUOTA: "economic",  # wallet death (council finding)
-            FailureSource.LIVE_HTTP_5XX: "upstream",    # server error - localized
+            FailureSource.LIVE_HTTP_5XX: "upstream",    # server error — localized
             FailureSource.LIVE_PARSE_ERROR: "upstream",  # malformed/empty completion
-            FailureSource.LIVE_STREAM_STALL: "transport",  # stalled stream - transport class
+            FailureSource.LIVE_STREAM_STALL: "transport",  # stalled stream — transport class
         }.get(failure_source)
         if _kind is None:
             return
@@ -1414,7 +1411,7 @@ def _record_dw_failure_signal(model_id: str, failure_source: Any) -> None:
             get_dw_failure_predictor as _s176_pred,
         )
         _s176_pred().record_failure(model_id=model_id, kind=_kind)
-    except Exception:  # noqa: BLE001 - never perturb the dispatch error path
+    except Exception:  # noqa: BLE001 — never perturb the dispatch error path
         pass
 
 
@@ -1655,7 +1652,7 @@ def dw_preflight_gate_enabled() -> bool:
 def _dw_preflight_freshness_s() -> float:
     """Max age (seconds) of a TRANSPORT_DEGRADED surface verdict for the
     pre-flight gate to act on it. Stale evidence is ignored so the gate never
-    starves DW on an old reading. Env-tunable; non-positive / invalid -> 120s."""
+    starves DW on an old reading. Env-tunable; non-positive / invalid → 120s."""
     raw = os.environ.get("JARVIS_DW_PREFLIGHT_FRESHNESS_S", "120").strip()
     try:
         val = float(raw)
@@ -1665,19 +1662,19 @@ def _dw_preflight_freshness_s() -> float:
 
 
 def dw_transport_degraded_preflight() -> bool:
-    """Slice 76 Phase 2 - pre-flight DW transport health gate.
+    """Slice 76 Phase 2 — pre-flight DW transport health gate.
 
     Consults the EXISTING ``dw_surface_health`` ledger (kept fresh by the
-    surface probes - NO new probe is issued here): returns True iff the
+    surface probes — NO new probe is issued here): returns True iff the
     ``DIRECT_STREAMING`` surface carries a FRESH ``TRANSPORT_DEGRADED`` verdict.
-    That means the socket/TLS to the DW endpoint is down RIGHT NOW - every
+    That means the socket/TLS to the DW endpoint is down RIGHT NOW — every
     ranked sibling model shares that dead transport (cf.
     :func:`should_sever_dw_lane`), so the op should cascade to Claude with its
     full budget BEFORE the ``_primary_sem`` wait + per-model timeout cascade
-    burns it (the EVAL-2 ``terminal_timeout``, PRD S50.11).
+    burns it (the EVAL-2 ``terminal_timeout``, PRD §50.11).
 
     Conservative by construction: unknown / stale / HEALTHY / UPSTREAM_DEGRADED
-    (server responded - transport is up) all return False, so the DW lane
+    (server responded — transport is up) all return False, so the DW lane
     proceeds normally and we never starve DW on thin evidence. NEVER raises
     (fail-open: a gate error must not block DW dispatch)."""
     if not dw_preflight_gate_enabled():
@@ -1694,11 +1691,11 @@ def dw_transport_degraded_preflight() -> bool:
         if rec is None or rec.verdict is not SurfaceVerdict.TRANSPORT_DEGRADED:
             return False
         age_s = time.time() - float(rec.last_probe_unix or 0.0)
-        # Slice 127 P3 - the freshness window is how long the DW lane stays
+        # Slice 127 P3 — the freshness window is how long the DW lane stays
         # severed before the next probe. When the dynamic-recovery master is ON,
         # use the full-jitter EXPONENTIAL window (widens for a chronically-
         # rupturing lane, resets on DW success) instead of the static default.
-        # OFF -> byte-identical to the pre-P3 fixed window. Fail-safe: a 0/invalid
+        # OFF → byte-identical to the pre-P3 fixed window. Fail-safe: a 0/invalid
         # dynamic window falls back to the static one (never starve DW).
         _window_s = _dw_preflight_freshness_s()
         try:
@@ -1710,27 +1707,27 @@ def dw_transport_degraded_preflight() -> bool:
                 _dyn = _s127_dwr().dynamic_recovery_window_s()
                 if _dyn and _dyn > 0:
                     _window_s = _dyn
-        except Exception:  # noqa: BLE001 - fail-open to the static window
+        except Exception:  # noqa: BLE001 — fail-open to the static window
             pass
         return 0.0 <= age_s <= _window_s
-    except Exception:  # noqa: BLE001 - never block dispatch on a gate error
+    except Exception:  # noqa: BLE001 — never block dispatch on a gate error
         return False
 
 
 # ---------------------------------------------------------------------------
-# Slice 127 P2.1 - fallback-skip gate (IMMEDIATE reroute to DW)
+# Slice 127 P2.1 — fallback-skip gate (IMMEDIATE reroute to DW)
 # ---------------------------------------------------------------------------
 #
 # The live soak proved P1+P2 (no terminal_config brick; economic reclassify +
 # ECONOMIC TRIP). But `_generate_immediate` does "Claude direct, skip DW", so an
 # IMMEDIATE op keeps grinding against a depleted Claude lane and exhausts instead
-# of failing over to the funded DW lane - the existing should_allow_request gate
+# of failing over to the funded DW lane — the existing should_allow_request gate
 # only covers Claude-as-PRIMARY. This gate makes the Claude-direct path consult
 # the Claude lane breaker first and reroute to the DW primary when it's OPEN.
 
 
 def fallback_skip_gate_enabled() -> bool:
-    """Slice 127 P2.1 master. Slice 146: graduated default-TRUE - when the Claude
+    """Slice 127 P2.1 master. Slice 146: graduated default-TRUE — when the Claude
     lane breaker is OPEN, IMMEDIATE ops skip the depleted fallback and reroute to
     funded DW (live-proven). Operator can still force-off with =0. NEVER raises."""
     try:
@@ -1742,13 +1739,13 @@ def fallback_skip_gate_enabled() -> bool:
 
 
 def _dw_autarky_enabled() -> bool:
-    """Slice 225 Phase 2 master. Default-TRUE - when the Claude fallback breaker
+    """Slice 225 Phase 2 master. Default-TRUE — when the Claude fallback breaker
     is OPEN/HALF_OPEN (terminal_quota / out-of-credits / transport), STANDARD and
     COMPLEX ops keep the DW primary on the full op budget instead of severing it
     at the 30s/75s reflex cap into a dead lane (the live GOAL-001::file-00
     generation_failed wedge). Sibling to the P2.1 IMMEDIATE-route gate above, for
     the STANDARD/COMPLEX primary-budget path. Operator force-off with =0. NEVER
-    raises - fail-closed to legacy cascade."""
+    raises — fail-closed to legacy cascade."""
     try:
         return os.environ.get(
             "JARVIS_DW_AUTARKY_ENABLED", "true",
@@ -1758,12 +1755,12 @@ def _dw_autarky_enabled() -> bool:
 
 
 def _provider_quota_isolation_enabled() -> bool:
-    """Sovereign State Isolation (2026-06-19) master. Default-TRUE - a
+    """Sovereign State Isolation (2026-06-19) master. Default-TRUE — a
     provider's economic/quota death (e.g. Claude 402 'credit balance too
     low') is recorded on THAT provider's own lane breaker only, and is NOT
     allowed to trip the provider-NEUTRAL per-op circuit breaker into
     OPEN_TERMINAL. Without this, Claude's credit-death poisons the whole op
-    so DW autarky can never carry it - the empirically-confirmed
+    so DW autarky can never carry it — the empirically-confirmed
     cross-provider contamination (terminal_quota 5->0 once isolated).
     Operator force-off with =0 -> byte-identical legacy. NEVER raises."""
     try:
@@ -1779,7 +1776,7 @@ def quota_isolation_skips_op_breaker(
 ) -> bool:
     """PURE predicate: should the per-op breaker trip be SKIPPED for this
     failure? True iff the failure is a provider economic block AND
-    isolation is enabled - the provider's OWN lane breaker already owns the
+    isolation is enabled — the provider's OWN lane breaker already owns the
     death, so tripping the op-neutral breaker would cross-contaminate the op
     for every other (still-viable) provider. NEVER raises."""
     return bool(is_provider_economic_block) and bool(isolation_enabled)
@@ -1796,7 +1793,7 @@ def immediate_reroute_to_dw(
     DW primary? True iff DW is the primary lane, the gate is on, the Claude lane
     breaker is enabled, and the breaker is NOT allowing requests (OPEN within
     its window). When the breaker allows (CLOSED, or a HALF_OPEN probe), we keep
-    Claude-direct so the lane self-heals. Pure - no I/O, no side effects."""
+    Claude-direct so the lane self-heals. Pure — no I/O, no side effects."""
     return bool(
         dw_is_primary
         and gate_enabled
@@ -1810,7 +1807,7 @@ def immediate_reroute_to_dw(
 # ---------------------------------------------------------------------------
 
 # Keywords that identify content/model failures vs infrastructure failures.
-# Content failures do NOT trigger FailbackFSM state transitions - the primary
+# Content failures do NOT trigger FailbackFSM state transitions — the primary
 # provider is still alive; it merely produced bad output (stale diff, invalid
 # schema, etc.).  Infrastructure failures (timeout, connection error) DO
 # trigger state transitions.
@@ -1824,7 +1821,7 @@ _CONTENT_FAILURE_PATTERNS: frozenset = frozenset({
 })
 
 
-# Defect #4 Slice A (2026-05-03) - task-leak prevention.
+# Defect #4 Slice A (2026-05-03) — task-leak prevention.
 #
 # Soak v5 (bt-2026-05-03-060330) recorded 4 "Task exception was never
 # retrieved" asyncio errors. Root cause: ensure_future/create_task
@@ -2010,7 +2007,7 @@ class CandidateProvider(Protocol):
     async def plan(self, prompt: str, deadline: datetime) -> str:
         """Send a lightweight planning prompt; return the raw string response.
 
-        Used by ContextExpander. Planning failures are soft - callers tolerate
+        Used by ContextExpander. Planning failures are soft — callers tolerate
         exceptions and skip expansion rounds gracefully.
         """
         ...  # pragma: no cover
@@ -2036,28 +2033,28 @@ class FailureMode(Enum):
     Different failure modes have vastly different recovery profiles:
     rate limits clear in seconds, connection errors take minutes to hours.
     The FSM uses this to predict when the primary will be available again,
-    minimizing expensive fallback spend (Manifesto S5 - deterministic routing).
+    minimizing expensive fallback spend (Manifesto §5 — deterministic routing).
     """
 
-    RATE_LIMITED = auto()       # 429, CircuitBreakerOpen - seconds to recover
-    TIMEOUT = auto()            # Request/connection timeout - minutes
-    SERVER_ERROR = auto()       # 500/502/503 - minutes
-    CONNECTION_ERROR = auto()   # Can't reach host - minutes to hours
-    CONTENT_FAILURE = auto()    # Bad output, infra healthy - no penalty
-    CONTEXT_OVERFLOW = auto()   # Tool loop prompt exceeded char limit - immediate fallback
-    TRANSIENT_TRANSPORT = auto()  # HTTP/2 disconnect, premature stream close - seconds
-    TEMPORAL_SHED = auto()      # Temporal Veto fast-fail - NOT a DW health fact;
+    RATE_LIMITED = auto()       # 429, CircuitBreakerOpen — seconds to recover
+    TIMEOUT = auto()            # Request/connection timeout — minutes
+    SERVER_ERROR = auto()       # 500/502/503 — minutes
+    CONNECTION_ERROR = auto()   # Can't reach host — minutes to hours
+    CONTENT_FAILURE = auto()    # Bad output, infra healthy — no penalty
+    CONTEXT_OVERFLOW = auto()   # Tool loop prompt exceeded char limit — immediate fallback
+    TRANSIENT_TRANSPORT = auto()  # HTTP/2 disconnect, premature stream close — seconds
+    TEMPORAL_SHED = auto()      # Temporal Veto fast-fail — NOT a DW health fact;
     #                             zero primary penalty, zero retry, immediate cascade.
     #                             The op's budget was too tight for any DW lane; the
     #                             NEXT op with a normal budget must still use DW.
-    LOCAL_DEFECT = auto()       # A bug in OUR code on the primary call path -
+    LOCAL_DEFECT = auto()       # A bug in OUR code on the primary call path —
     #                             TypeError/AttributeError/NameError/ImportError.
     #                             NOT a provider fact at all. Every unrecognised
     #                             exception used to land on the TIMEOUT default,
     #                             so ONE signature drift locked DoubleWord out
     #                             (should_attempt_primary False after a single
     #                             occurrence) and silently billed every
-    #                             subsequent op to Claude - with the logs
+    #                             subsequent op to Claude — with the logs
     #                             blaming an upstream that was never asked.
     #                             Zero primary penalty; still cascades so the
     #                             op is not dropped; logged at ERROR because
@@ -2073,30 +2070,30 @@ _RECOVERY_PARAMS: dict[FailureMode, dict[str, float]] = {
     FailureMode.CONNECTION_ERROR: {"base_s": 120.0, "max_s": 900.0},
     FailureMode.CONTENT_FAILURE: {"base_s": 0.0,   "max_s": 0.0},
     # CONTEXT_OVERFLOW: Tool loop prompt exceeded char limit. The provider
-    # infrastructure is healthy - the prompt was just too large. Immediate
+    # infrastructure is healthy — the prompt was just too large. Immediate
     # fallback to Tier 1 with zero backoff penalty (same profile as
     # CONTENT_FAILURE). No timeout ETA penalty on the FSM.
     FailureMode.CONTEXT_OVERFLOW: {"base_s": 0.0,  "max_s": 0.0},
     # TEMPORAL_SHED: a routing refusal (deadline vs batch plane), not an
-    # infra failure - no backoff, DW immediately eligible for the next op.
+    # infra failure — no backoff, DW immediately eligible for the next op.
     FailureMode.TEMPORAL_SHED:   {"base_s": 0.0,  "max_s": 0.0},
     # TRANSIENT_TRANSPORT: HTTP/2 GOAWAY, RemoteProtocolError, ClosedResourceError.
     # The transport layer flapped (often a single dropped connection in a keep-alive
     # pool) but the upstream API is healthy. A 5s base backs off to 30s after 4
-    # consecutive failures, then immediately retries - much shorter than TIMEOUT
+    # consecutive failures, then immediately retries — much shorter than TIMEOUT
     # (45s/300s) which it would otherwise be misclassified as. Diagnosed in
     # bt-2026-04-12-005521 where 9 consecutive ops died with all_providers_exhausted
     # because RemoteProtocolError fell through to the TIMEOUT default and the
     # CONNECTION_ERROR-only deep-backoff guard never engaged.
     FailureMode.TRANSIENT_TRANSPORT: {"base_s": 5.0, "max_s": 30.0},
-    # LOCAL_DEFECT: our own bug, not the provider's. Zero backoff - there is
+    # LOCAL_DEFECT: our own bug, not the provider's. Zero backoff — there is
     # nothing upstream to wait for, and waiting would only hide the defect
     # behind an outage-shaped delay. Same zero profile as CONTENT_FAILURE.
     FailureMode.LOCAL_DEFECT:    {"base_s": 0.0,   "max_s": 0.0},
 }
 
 
-# Failure modes where the PRIMARY IS INNOCENT - the op still cascades, but the
+# Failure modes where the PRIMARY IS INNOCENT — the op still cascades, but the
 # provider FSM must not be penalised for it. Named once and consulted at both
 # classify-then-record sites (the Tier 0 RT path and
 # ``_try_primary_then_fallback``), which previously kept two hand-maintained
@@ -2109,7 +2106,7 @@ _PRIMARY_INNOCENT_MODES: frozenset = frozenset({
 
 
 # Exception TYPES that can only mean a defect in this codebase, never a
-# provider condition. Matched by type - never by message - because a provider
+# provider condition. Matched by type — never by message — because a provider
 # is perfectly capable of returning prose containing the word "attributeerror",
 # and a string match would let an upstream error masquerade as our bug in
 # exactly the direction that hides real outages.
@@ -2121,7 +2118,7 @@ _PRIMARY_INNOCENT_MODES: frozenset = frozenset({
 # penalty, so they keep the conservative TIMEOUT default until something
 # proves otherwise.
 _LOCAL_DEFECT_TYPES: tuple = (
-    TypeError,          # signature drift - the Slice 30 `model_id=` class
+    TypeError,          # signature drift — the Slice 30 `model_id=` class
     AttributeError,     # a renamed/removed attribute
     NameError,          # includes UnboundLocalError
     ImportError,        # includes ModuleNotFoundError
@@ -2131,7 +2128,7 @@ _LOCAL_DEFECT_TYPES: tuple = (
 
 
 def _local_defect_classification_enabled() -> bool:
-    """Master gate. Default TRUE - failure-path-only: it changes nothing until
+    """Master gate. Default TRUE — failure-path-only: it changes nothing until
     an exception that can only be our bug reaches the primary handler. ``=0``
     restores the byte-identical legacy behaviour where such an exception was
     classified as a provider TIMEOUT. NEVER raises."""
@@ -2142,17 +2139,17 @@ def _local_defect_classification_enabled() -> bool:
 
 # Exception class names that indicate transient transport-layer flap rather than
 # upstream API failure. Match by name (not isinstance) so we don't pull in httpx
-# or anyio at module import time - the actual SDK may not be installed on hosts
+# or anyio at module import time — the actual SDK may not be installed on hosts
 # where the FSM is constructed (battle test harness, planner-only deployments).
 _TRANSIENT_TRANSPORT_NAMES: frozenset = frozenset({
-    "RemoteProtocolError",     # httpx - server disconnected without response
-    "ClosedResourceError",     # anyio - stream got closed mid-read
-    "ProtocolError",           # h11/h2 - generic protocol violation
-    "LocalProtocolError",      # h11 - local-side protocol violation
-    "IncompleteRead",          # http.client - short read
-    "StreamConsumed",          # httpx - re-read of consumed stream
-    "StreamClosed",            # httpx - read after close
-    "ResponseNotRead",         # httpx - async stream race
+    "RemoteProtocolError",     # httpx — server disconnected without response
+    "ClosedResourceError",     # anyio — stream got closed mid-read
+    "ProtocolError",           # h11/h2 — generic protocol violation
+    "LocalProtocolError",      # h11 — local-side protocol violation
+    "IncompleteRead",          # http.client — short read
+    "StreamConsumed",          # httpx — re-read of consumed stream
+    "StreamClosed",            # httpx — read after close
+    "ResponseNotRead",         # httpx — async stream race
 })
 
 
@@ -2160,7 +2157,7 @@ _TRANSIENT_TRANSPORT_NAMES: frozenset = frozenset({
 # mode in this set indicates a transient infrastructure condition where
 # re-invoking the provider may succeed on a fresh TCP connection / fresh
 # pool generation. Permanent failure modes (CONTENT_FAILURE,
-# CONTEXT_OVERFLOW) MUST NOT be retried - they would just re-fail.
+# CONTEXT_OVERFLOW) MUST NOT be retried — they would just re-fail.
 # Defined as a frozenset (not the FailureMode enum directly) to avoid
 # import ordering with the FailureMode definition below; populated lazily
 # by `_is_outer_retry_eligible_mode()`.
@@ -2179,7 +2176,7 @@ def _is_outer_retry_eligible_mode(mode: "FailureMode") -> bool:
 
     Used by `_call_fallback`'s outer retry loop (rooted-problem fix
     2026-04-25). Defined as a free function so unit tests can pin the
-    classification -> retry decision without instantiating the full
+    classification → retry decision without instantiating the full
     `CandidateGenerator`.
     """
     return mode.name in _FALLBACK_OUTER_RETRY_TRANSIENT_MODE_NAMES
@@ -2246,7 +2243,7 @@ class FailbackStateMachine:
         self._consecutive_probes: int = 0
         self._first_probe_at: Optional[float] = None  # monotonic timestamp
         self.content_failure_count: int = 0  # content/model failures (not infra)
-        # Adaptive recovery tracking (Manifesto S5 - deterministic routing)
+        # Adaptive recovery tracking (Manifesto §5 — deterministic routing)
         self._failure_mode: Optional[FailureMode] = None
         self._consecutive_failures: int = 0
         self._last_failure_at: float = 0.0   # monotonic
@@ -2263,7 +2260,7 @@ class FailbackStateMachine:
         """Record a primary provider failure with failure mode classification.
 
         Transitions immediately to FALLBACK_ACTIVE from any non-QUEUE_ONLY state.
-        Tracks failure mode for recovery prediction (Manifesto S5).
+        Tracks failure mode for recovery prediction (Manifesto §5).
 
         Parameters
         ----------
@@ -2280,14 +2277,14 @@ class FailbackStateMachine:
         # increments `_consecutive_failures` for any mode it is handed, so
         # `should_attempt_primary()` goes False after a single call even for
         # CONTENT_FAILURE. The exemption was only ever a property of each
-        # caller remembering to branch - and one of the two callers had already
+        # caller remembering to branch — and one of the two callers had already
         # forgotten TEMPORAL_SHED.
         #
         # Enforced here so the guarantee lives with the invariant instead of
         # with everyone who calls it, and a third call site inherits it.
         if mode in _PRIMARY_INNOCENT_MODES:
             logger.debug(
-                "[FailbackFSM] %s is not a primary-health fact - "
+                "[FailbackFSM] %s is not a primary-health fact — "
                 "penalty refused, state unchanged", mode.name,
             )
             return
@@ -2297,14 +2294,14 @@ class FailbackStateMachine:
             FailbackState.PRIMARY_DEGRADED,
         ):
             self._state = FailbackState.FALLBACK_ACTIVE
-            # Track failure mode for adaptive recovery - do NOT reset these
+            # Track failure mode for adaptive recovery — do NOT reset these
             # in _reset_probe_counters; they persist across probe cycles.
             self._failure_mode = mode
             self._consecutive_failures += 1
             self._last_failure_at = time.monotonic()
             self._reset_probe_counters()
             params = _RECOVERY_PARAMS.get(mode, _RECOVERY_PARAMS[FailureMode.TIMEOUT])
-            # Phase 12.2 Slice C - full-jitter retrofit. Master-flag-off
+            # Phase 12.2 Slice C — full-jitter retrofit. Master-flag-off
             # preserves exact-exponential bit-for-bit. When enabled,
             # uniform jitter desynchronizes our probe waveform from
             # other JARVIS-class clients hammering the same DW endpoint
@@ -2325,7 +2322,7 @@ class FailbackStateMachine:
                         params["base_s"] * (2 ** max(self._consecutive_failures - 1, 0)),
                         params["max_s"],
                     )
-            except Exception:  # noqa: BLE001 - defensive
+            except Exception:  # noqa: BLE001 — defensive
                 eta_s = min(
                     params["base_s"] * (2 ** max(self._consecutive_failures - 1, 0)),
                     params["max_s"],
@@ -2356,13 +2353,13 @@ class FailbackStateMachine:
             # operation will re-evaluate should_attempt_primary() and may
             # succeed. CONTEXT_OVERFLOW is a prompt-size issue, not infra.
             logger.warning(
-                "[FailbackFSM] Fallback transient failure (mode=%s) - "
+                "[FailbackFSM] Fallback transient failure (mode=%s) — "
                 "staying FALLBACK_ACTIVE (recoverable)",
                 mode.name,
             )
             return
 
-        # Permanent failure (CONNECTION_ERROR, auth, unknown) -> QUEUE_ONLY
+        # Permanent failure (CONNECTION_ERROR, auth, unknown) → QUEUE_ONLY
         self._state = FailbackState.QUEUE_ONLY
         self._queue_only_at: float = time.monotonic()
         self._reset_probe_counters()
@@ -2385,13 +2382,13 @@ class FailbackStateMachine:
         if self._state is FailbackState.PRIMARY_READY:
             return
         if self._state is FailbackState.QUEUE_ONLY:
-            # Auto-recovery: primary is alive -> exit dead-end
+            # Auto-recovery: primary is alive → exit dead-end
             self._state = FailbackState.FALLBACK_ACTIVE
             self._reset_probe_counters()
             elapsed = time.monotonic() - getattr(self, "_queue_only_at", 0.0)
             logger.info(
                 "[FailbackFSM] QUEUE_ONLY auto-recovery: probe succeeded "
-                "after %.1fs - transitioning to FALLBACK_ACTIVE",
+                "after %.1fs — transitioning to FALLBACK_ACTIVE",
                 elapsed,
             )
             # Fall through to the FALLBACK_ACTIVE handler below
@@ -2487,7 +2484,7 @@ class FailbackStateMachine:
         self._reset_failure_tracking()
 
     # ------------------------------------------------------------------
-    # Recovery prediction (deterministic - Manifesto S5)
+    # Recovery prediction (deterministic — Manifesto §5)
     # ------------------------------------------------------------------
 
     def recovery_eta(self) -> float:
@@ -2502,11 +2499,11 @@ class FailbackStateMachine:
         if self._consecutive_failures == 0 or self._failure_mode is None:
             return 0.0
         if self._failure_mode is FailureMode.CONTENT_FAILURE:
-            return time.monotonic()  # instant - no infra penalty
+            return time.monotonic()  # instant — no infra penalty
         params = _RECOVERY_PARAMS.get(
             self._failure_mode, _RECOVERY_PARAMS[FailureMode.TIMEOUT],
         )
-        # Phase 12.2 Slice C - full-jitter retrofit (matches the sister
+        # Phase 12.2 Slice C — full-jitter retrofit (matches the sister
         # callsite in record_primary_failure). Master-flag-off preserves
         # exact-exponential bit-for-bit; on, uniform random delay
         # desynchronizes our probe schedule from the global herd.
@@ -2526,7 +2523,7 @@ class FailbackStateMachine:
                     params["base_s"] * (2 ** max(self._consecutive_failures - 1, 0)),
                     params["max_s"],
                 )
-        except Exception:  # noqa: BLE001 - defensive
+        except Exception:  # noqa: BLE001 — defensive
             delay = min(
                 params["base_s"] * (2 ** max(self._consecutive_failures - 1, 0)),
                 params["max_s"],
@@ -2549,9 +2546,9 @@ class FailbackStateMachine:
     def recommended_probe_interval(self) -> float:
         """Adaptive probe interval based on distance to recovery ETA.
 
-        - Far from ETA (>60s away): 60s (relax - no point hammering)
-        - Near ETA (<30s away): 10s (ramp up - catch recovery fast)
-        - Past ETA: 5s (aggressive - recovery is imminent)
+        - Far from ETA (>60s away): 60s (relax — no point hammering)
+        - Near ETA (<30s away): 10s (ramp up — catch recovery fast)
+        - Past ETA: 5s (aggressive — recovery is imminent)
         - Primary healthy: 30s (normal cadence)
 
         Returns seconds to sleep before next health probe.
@@ -2565,13 +2562,13 @@ class FailbackStateMachine:
         distance = eta - time.monotonic()
 
         if distance > 60.0:
-            return 60.0   # Deep backoff - relax probes
+            return 60.0   # Deep backoff — relax probes
         elif distance > 30.0:
-            return 20.0   # Approaching - moderate
+            return 20.0   # Approaching — moderate
         elif distance > 0.0:
-            return 10.0   # Close - ramp up
+            return 10.0   # Close — ramp up
         else:
-            return 5.0    # Past ETA - aggressive probe
+            return 5.0    # Past ETA — aggressive probe
 
     @staticmethod
     def classify_exception(exc: BaseException) -> FailureMode:
@@ -2579,7 +2576,7 @@ class FailbackStateMachine:
 
         Walks the ``__cause__`` / ``__context__`` chain because the Anthropic SDK
         (and other modern HTTP clients) wraps low-level transport errors in a
-        higher-level wrapper class - e.g. ``APIConnectionError(cause=
+        higher-level wrapper class — e.g. ``APIConnectionError(cause=
         RemoteProtocolError("Server disconnected without sending a response."))``.
         Classifying only the outer wrapper would have us treat a 50ms HTTP/2
         keep-alive flap as a 120s CONNECTION_ERROR deep-backoff. Instead we walk
@@ -2589,7 +2586,7 @@ class FailbackStateMachine:
         Uses string-based type checking to avoid hard dependency on httpx/anyio.
         """
         # Content failures first (don't penalize infra). Check the outermost
-        # exception's full message - content failure markers are stamped on
+        # exception's full message — content failure markers are stamped on
         # the wrapper (e.g. RuntimeError("diff_apply_failed: ...")).
         if _is_content_failure(exc):
             return FailureMode.CONTENT_FAILURE
@@ -2599,12 +2596,12 @@ class FailbackStateMachine:
         # so the FSM uses the short 5s/30s recovery profile and cascades
         # to Tier 1 immediately.
         #
-        # Slice 12F-B (2026-05-22) - StreamBudgetTooShortError is the
+        # Slice 12F-B (2026-05-22) — StreamBudgetTooShortError is the
         # diagnostic sibling: not a network-side rupture, but a local
         # decision to refuse dispatch when wall_remaining < the
         # JARVIS_STREAM_MINIMUM_READ_BUDGET_S floor. Same classifier
-        # mapping (TRANSIENT_TRANSPORT) - same Slice 7 fallback
-        # behaviour - but the postmortem can tell the two apart.
+        # mapping (TRANSIENT_TRANSPORT) — same Slice 7 fallback
+        # behaviour — but the postmortem can tell the two apart.
         from backend.core.ouroboros.governance.stream_rupture import (
             StreamBudgetTooShortError,
             StreamRuptureError,
@@ -2630,7 +2627,7 @@ class FailbackStateMachine:
             mode = FailbackStateMachine._classify_single(layer)
             if mode is not FailureMode.TIMEOUT:
                 # Anything more specific than the conservative TIMEOUT default
-                # is preferred - e.g. an inner ConnectionError beats an outer
+                # is preferred — e.g. an inner ConnectionError beats an outer
                 # asyncio.TimeoutError because the connection layer is closer
                 # to the truth.
                 return mode
@@ -2639,7 +2636,7 @@ class FailbackStateMachine:
         #
         # Runs LAST, deliberately. Both passes above get first refusal, so an
         # SDK that wraps a transport flap in a TypeError still classifies as
-        # TRANSIENT_TRANSPORT - the provider layer is closer to the truth
+        # TRANSIENT_TRANSPORT — the provider layer is closer to the truth
         # whenever it can speak at all. Only once every provider-shaped
         # reading has declined do we conclude the fault is ours.
         #
@@ -2648,7 +2645,7 @@ class FailbackStateMachine:
         # cosmetic: `record_primary_failure(TIMEOUT)` flips
         # `should_attempt_primary()` to False after ONE occurrence, so a single
         # `TypeError` on the call path took the whole DoubleWord lane offline
-        # and routed every subsequent op to Claude at ~10x the unit cost -
+        # and routed every subsequent op to Claude at ~10× the unit cost —
         # while the logs read "Primary failed (mode=TIMEOUT)", blaming an
         # upstream that had never been contacted.
         if _local_defect_classification_enabled():
@@ -2671,7 +2668,7 @@ class FailbackStateMachine:
         exc_type = type(exc).__name__
         msg = str(exc).lower()
 
-        # Temporal Veto fast-fail shed - checked FIRST (before the generic
+        # Temporal Veto fast-fail shed — checked FIRST (before the generic
         # DoublewordInfraError status walk: it subclasses that type with
         # status 0, which would otherwise fall through to the TIMEOUT
         # default and earn DW an undeserved penalty + retry).
@@ -2685,7 +2682,7 @@ class FailbackStateMachine:
                 return FailureMode.RATE_LIMITED
             if status in (500, 502, 503):
                 return FailureMode.SERVER_ERROR
-            # status 0 or other - fall through to message analysis
+            # status 0 or other — fall through to message analysis
 
         # Rate limiting signals
         if exc_type == "CircuitBreakerOpen":
@@ -2693,7 +2690,7 @@ class FailbackStateMachine:
         if "429" in msg or "rate" in msg or "too many" in msg:
             return FailureMode.RATE_LIMITED
 
-        # Context overflow - tool loop prompt exceeded char limit.
+        # Context overflow — tool loop prompt exceeded char limit.
         # Must be checked before server errors because the char count
         # in the message (e.g. "155000") can contain "500".
         if "tool_loop_budget_exceeded" in msg or "tool_loop_context_overflow" in msg:
@@ -2901,7 +2898,7 @@ class ModelPinUnavailable(RuntimeError):
 
 
 #: The tag this process WILL dispatch to, resolved once against a registry
-#: that answered. Empty until the boot gate runs - an empty string means
+#: that answered. Empty until the boot gate runs — an empty string means
 #: "not yet resolved", never "no model", so a surface can tell the two
 #: apart instead of rendering a confident blank.
 _ACTIVE_MODEL_TAG = ""
@@ -2926,7 +2923,7 @@ def resolve_active_model(
 
     Note what is NOT a fault here: an EMPTY or unreadable registry. That is
     "we could not ask", not "the model is absent", and the two must not
-    share a verdict - the lane preflight already dies loudly when the
+    share a verdict — the lane preflight already dies loudly when the
     engine cannot serve, and a second opinion here would turn a transient
     blip into a self-kill. Only a registry that ANSWERED and does not
     contain the pin is evidence.
@@ -2954,7 +2951,7 @@ def active_model_tag() -> str:
 
     THE one answer to "which model is answering". The cockpit banner used
     to derive this from the CLIENT's own environment, which is a different
-    process with a different environment - so a correctly pinned daemon
+    process with a different environment — so a correctly pinned daemon
     rendered no model at all, and a stale client export would have
     rendered the wrong one confidently.
     """
@@ -2962,7 +2959,7 @@ def active_model_tag() -> str:
 
 
 def resolve_display_model() -> str:
-    """The model to NAME as the one answering - for the cockpit banner.
+    """The model to NAME as the one answering — for the cockpit banner.
 
     ``active_model_tag`` is the ground truth once the boot gate has run
     against a registry that answered; but a registry BLIP at boot (the gate
@@ -3333,7 +3330,7 @@ def _refresh_paid_lane_credentials() -> None:
 
 #: Parse-error messages that mean "the output stopped early", not "the model
 #: mistyped". CPython's wording for each is stable and is the only signal
-#: available at the parse seam - the generator cannot see its own token budget.
+#: available at the parse seam — the generator cannot see its own token budget.
 _TRUNCATION_SIGNATURES: Tuple[str, ...] = (
     "unterminated string literal",
     "unterminated triple-quoted string literal",
@@ -3405,7 +3402,7 @@ def agent_client_from(providers, *, injected=None):
 def _declared_symbols_for(context: Any, file_path: str) -> Tuple[str, ...]:
     """Operator-declared repair targets for *file_path*, from the SIGNED goal.
 
-    Re-derived from ground truth on every call - the op's evidence contributes
+    Re-derived from ground truth on every call — the op's evidence contributes
     only a POINTER (``goal_id``), exactly as `verify_provenance_claim` treats
     it. Reading the symbol list off the context instead would let a fabricated
     or hallucinated field name a target the operator never authorised, which
@@ -3415,15 +3412,15 @@ def _declared_symbols_for(context: Any, file_path: str) -> Tuple[str, ...]:
     file must be inside that goal's own ``target_files``. A declaration cannot
     reach a file the mandate does not cover.
 
-    Returns () for every op without a verified roadmap claim - which is almost
-    all of them - so the resolver's inference cascade is unchanged for
+    Returns () for every op without a verified roadmap claim — which is almost
+    all of them — so the resolver's inference cascade is unchanged for
     everything else. NEVER raises: a declaration that cannot be proven is
     simply absent, and absence degrades to inference.
     """
     try:
         # The envelope's evidence rides the context as ``intake_evidence_json``
         # and is decoded by ``OperationContext.intake_evidence``. (This read
-        # was ``context.evidence`` - a field the context never had, so the
+        # was ``context.evidence`` — a field the context never had, so the
         # declaration was unreachable for EVERY op until 2026-09-07.) A
         # duck-typed context may still carry a plain ``evidence`` mapping.
         evidence = getattr(context, "intake_evidence", None)
@@ -3434,7 +3431,7 @@ def _declared_symbols_for(context: Any, file_path: str) -> Tuple[str, ...]:
         # The pointer: a delegated-provenance CLAIM when one exists, else the
         # roadmap intake's own ``goal_id`` (roadmap_reader stamps it on every
         # goal envelope; delegated provenance is a separate, optional feature
-        # and was the ONLY pointer honoured until 2026-09-07 - so a signed
+        # and was the ONLY pointer honoured until 2026-09-07 — so a signed
         # goal's declared symbol never reached the resolver and the swarm
         # dispatched a worker per inferred sibling). Either way the value is
         # only a POINTER: what it names is re-read from the signed roadmap.
@@ -3448,18 +3445,18 @@ def _declared_symbols_for(context: Any, file_path: str) -> Tuple[str, ...]:
             return ()
 
         from backend.core.ouroboros.governance.delegated_provenance import (
-            _verified_roadmap,  # noqa: PLC0415 - REPORTS a verdict; see below
+            _verified_roadmap,  # noqa: PLC0415 — REPORTS a verdict; see below
         )
-        # (verdict, document) - NOT the other way round. Getting this
+        # (verdict, document) — NOT the other way round. Getting this
         # backwards yields a verdict object with no `.goals`, and the broad
         # except below would have swallowed the AttributeError into a silent
         # empty result: declared symbols would simply never work, with nothing
         # in the log to say why.
         _verdict, doc = _verified_roadmap()
-        # It RETURNS THE DOCUMENT REGARDLESS OF VERDICT - it reports
+        # It RETURNS THE DOCUMENT REGARDLESS OF VERDICT — it reports
         # verification, it does not enforce it. Gating on `doc is None` alone
         # would honour a roadmap whose signature is invalid, tampered or absent
-        # and hand back its symbols at confidence 1.0 - precisely the forgery
+        # and hand back its symbols at confidence 1.0 — precisely the forgery
         # this function's pointer-only contract exists to prevent, and it would
         # silently defeat an operator's JARVIS_ROADMAP_READER_REQUIRE_SIGNATURE.
         # Demand BOTH properties, the same pair `delegated_provenance` demands
@@ -3482,7 +3479,7 @@ def _declared_symbols_for(context: Any, file_path: str) -> Tuple[str, ...]:
             ):
                 return ()  # declaration does not cover this file
             return tuple(getattr(goal, "target_symbols", ()) or ())
-    except Exception:  # noqa: BLE001 - unprovable => infer, never fabricate
+    except Exception:  # noqa: BLE001 — unprovable ⇒ infer, never fabricate
         return ()
     return ()
 
@@ -3717,18 +3714,18 @@ def _is_l7_recoverable(exc: BaseException) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Dynamic 5xx Resiliency Matrix - DW transient-network absorb loop (2026-07-22)
+# Dynamic 5xx Resiliency Matrix — DW transient-network absorb loop (2026-07-22)
 # ──────────────────────────────────────────────────────────────────────
 #
 # A transient DoubleWord blip (``upstream_error`` in a 400 body, any 5xx,
 # gateway timeout, or a 429 that carries ``Retry-After``) must be absorbed by a
-# bounded exponential-backoff-with-jitter retry on the PRIMARY generate call -
+# bounded exponential-backoff-with-jitter retry on the PRIMARY generate call —
 # BEFORE the loop cascades to a (possibly dead) fallback and BEFORE the session
 # breaker can trip terminally. The empirical foil is bt-2026-07-22-082657, where
 # ONE transient ``upstream_error`` was mis-labeled ``terminal_quota`` and killed
 # the whole soak. The classification lives in ``provider_retry_classifier`` and
 # the jitter primitive is reused from ``circuit_breaker.full_jitter_delay``
-# (DRY - no new jitter maths here).
+# (DRY — no new jitter maths here).
 
 
 def _dw_transient_max_retries() -> int:
@@ -3744,7 +3741,7 @@ def _dw_transient_max_retries() -> int:
 def _is_dw_transient_network(exc: Exception, http_status, retry_after_ts) -> bool:
     """True when *exc* classifies TRANSIENT_NETWORK per the Dynamic 5xx
     Resiliency Matrix (upstream_error / 5xx / gateway timeout / 429-with-
-    Retry-After). Uses the canonical taxonomy - never raises."""
+    Retry-After). Uses the canonical taxonomy — never raises."""
     try:
         from backend.core.ouroboros.governance.provider_retry_classifier import (
             classify, RetryDecision,
@@ -3756,7 +3753,7 @@ def _is_dw_transient_network(exc: Exception, http_status, retry_after_ts) -> boo
             retry_after_present=retry_after_ts is not None,
         )
         return decision is RetryDecision.TRANSIENT_NETWORK
-    except Exception:  # noqa: BLE001 - classification never blocks the caller
+    except Exception:  # noqa: BLE001 — classification never blocks the caller
         return False
 
 
@@ -3787,7 +3784,7 @@ def _dw_transient_backoff_s(attempt: int, retry_after_ts, *, remaining_s: float)
                 full_jitter_delay,
             )
             delay = full_jitter_delay(attempt, base_s=base_s, cap_s=cap_s)
-        except Exception:  # noqa: BLE001 - degrade to plain expo if helper absent
+        except Exception:  # noqa: BLE001 — degrade to plain expo if helper absent
             delay = min(cap_s, base_s * (2 ** max(0, attempt)))
     budget_clamp = (
         max(0.1, remaining_s * 0.25) if remaining_s and remaining_s > 0 else cap_s
@@ -3799,7 +3796,7 @@ try:
     from backend.core.ouroboros.governance.transient_absorb import (
         with_transient_absorb as _with_transient_absorb,
     )
-except Exception:  # noqa: BLE001 - decorator is resilience; degrade to identity
+except Exception:  # noqa: BLE001 — decorator is resilience; degrade to identity
     def _with_transient_absorb(**_kw):  # type: ignore[misc]
         def _identity(fn):
             return fn
@@ -3840,9 +3837,9 @@ class CandidateGenerator:
         self._primary = primary
         self._fallback = fallback
         self._tier0 = tier0
-        # Phase 3 Scope α - J-Prime primacy handle. Only consulted from
+        # Phase 3 Scope α — J-Prime primacy handle. Only consulted from
         # the BACKGROUND and SPECULATIVE dispatch paths, and only when
-        # ``JARVIS_JPRIME_PRIMACY=true``. Can be ``None`` - primacy is
+        # ``JARVIS_JPRIME_PRIMACY=true``. Can be ``None`` — primacy is
         # opt-in and test fixtures often don't build a PrimeProvider.
         # When the caller doesn't hand one in but ``self._primary`` is
         # already a PrimeProvider (the usual production wiring), we
@@ -3869,7 +3866,7 @@ class CandidateGenerator:
         # of TRANSIENT_TRANSPORT) the FSM's `should_attempt_primary()`
         # keeps returning True and consecutive ops all hit the same
         # dead Tier 0. Once N failures land within W seconds, we
-        # hard-skip Tier 0 for the next op regardless of FSM mode -
+        # hard-skip Tier 0 for the next op regardless of FSM mode —
         # buying the human one cheap Claude success while DW recovers.
         self._tier0_skip_threshold: int = int(
             os.environ.get("OUROBOROS_TIER0_SKIP_THRESHOLD", "2")
@@ -3878,20 +3875,20 @@ class CandidateGenerator:
             os.environ.get("OUROBOROS_TIER0_SKIP_WINDOW_S", "30")
         )
 
-        # AdmissionGate Slice 2 - per-route rolling EWMA of
+        # AdmissionGate Slice 2 — per-route rolling EWMA of
         # observed _fallback_sem wait times. Feeds the
         # admission gate's projected_wait_s input. Updated
         # post-acquire in _call_fallback after every successful
         # sem.acquire(). Master flag default-FALSE until Slice 3
         # graduation, so the gate is constructed but doesn't
-        # change behavior - pre-Slice-2 path preserved when
+        # change behavior — pre-Slice-2 path preserved when
         # disabled.
         try:
             from backend.core.ouroboros.governance.admission_estimator import (  # noqa: E501
                 WaitTimeEstimator as _WaitTimeEstimator,
             )
             self._wait_estimator = _WaitTimeEstimator()
-        except Exception:  # noqa: BLE001 - defensive
+        except Exception:  # noqa: BLE001 — defensive
             self._wait_estimator = None
 
         # ── Phase 1 Step 3A: state hoist (un-quarantine blueprint) ──
@@ -3899,11 +3896,11 @@ class CandidateGenerator:
         # `importlib.reload(candidate_generator)` lives on `self._state`
         # (a ``GeneratorState``), not on ``self`` directly. The aliases
         # below are bound once in __init__ and share reference identity
-        # with the state container - for dicts/FSM/sem that is enough;
+        # with the state container — for dicts/FSM/sem that is enough;
         # the ``int``/``float`` counters live on ``self._counters`` (a
         # ``GeneratorCounters`` dataclass) so mutation-via-attribute
         # does not re-bind a local copy. Do NOT add new mutable fields
-        # as ``self._*`` - extend ``GeneratorState`` instead.
+        # as ``self._*`` — extend ``GeneratorState`` instead.
         #
         # When ``JARVIS_UNQUARANTINE_GENERATOR`` is false (default), the
         # state is minted fresh per instance so today's tests and
@@ -3934,10 +3931,10 @@ class CandidateGenerator:
         self._primary_sem = self._state.primary_sem
         self._fallback_sem = self._state.fallback_sem
         self.fsm = self._state.fsm
-        # Manifesto S5: rolling p95 DW RT latency -> dynamic Tier 0 budget.
+        # Manifesto §5: rolling p95 DW RT latency → dynamic Tier 0 budget.
         # Cold endpoints get full ceiling, hot endpoints dial down aggressively.
         self._latency_tracker = self._state.latency_tracker
-        # Async Tier 0 tracking: op_id -> CompletedBatch (dict aliased).
+        # Async Tier 0 tracking: op_id → CompletedBatch (dict aliased).
         self._completed_batches: dict[str, Any] = self._state.completed_batches
         # Background polling tasks (kept to prevent GC; dict aliased).
         self._background_polls: dict[str, asyncio.Task[Any]] = (
@@ -3946,13 +3943,13 @@ class CandidateGenerator:
         # Counters container: lets ``self._counters.exhaustion_events +=
         # 1`` mutate the same dataclass instance stored on the state,
         # which a plain ``int`` alias could not. Do not rebind
-        # ``self._counters`` - only mutate its fields.
+        # ``self._counters`` — only mutate its fields.
         self._counters = self._state.counters
 
         # ── Phase 3 Scope α: J-Prime primacy state (process-lifetime) ──
         # The ``jprime_sem`` (Semaphore(1)) and ``model_stickiness``
         # placeholder MUST live on the hoisted ``JPrimeState`` even when
-        # ``JARVIS_JPRIME_PRIMACY`` is off today - same binding
+        # ``JARVIS_JPRIME_PRIMACY`` is off today — same binding
         # discipline as 3A/3B. Per Derek-locked middle path: never place
         # these roots on a hot ``CandidateGenerator`` instance, because
         # ``importlib.reload(candidate_generator)`` would silently reset
@@ -4007,7 +4004,7 @@ class CandidateGenerator:
         """
         self._counters.exhaustion_events += 1
         try:
-            # Slice 197 - durable charter counter: the graduation contract
+            # Slice 197 — durable charter counter: the graduation contract
             # reads provider exhaustions from the registry, not from logs.
             from backend.core.ouroboros.governance.observability_registry import (
                 record_provider_exhaustion as _s197_record_exhaustion,
@@ -4063,7 +4060,7 @@ class CandidateGenerator:
 
         # Rehearsal tier: classify this exhaustion ONCE, here, where the
         # evidence already exists. Every op that follows can then read the
-        # verdict instead of re-walking the cascade to rediscover it -
+        # verdict instead of re-walking the cascade to rediscover it —
         # detection and consumption were disconnected, which is why
         # bt-2026-08-11-230412 paid the full chain eight times for an
         # outage the ledger recorded on the first.
@@ -4084,7 +4081,7 @@ class CandidateGenerator:
                 route=str(report.get("route", "") or ""),
             )
             report["rehearsal"] = _rehearsal.to_dict()
-        except Exception:  # noqa: BLE001 - never mask the raise
+        except Exception:  # noqa: BLE001 — never mask the raise
             pass
 
         err = RuntimeError(f"all_providers_exhausted:{cause}")
@@ -4093,7 +4090,7 @@ class CandidateGenerator:
             if _rehearsal is not None:
                 setattr(err, "rehearsal", _rehearsal)
         except Exception:
-            pass  # attribute attachment is best-effort - never mask the raise
+            pass  # attribute attachment is best-effort — never mask the raise
         if fallback_exc is not None:
             raise err from fallback_exc
         if primary_exc is not None:
@@ -4133,14 +4130,14 @@ class CandidateGenerator:
         """
         # Memory RAG hook: before ANY provider builds its prompt (and its
         # AST-Signature Anchor), stamp the cross-op lessons for this op's
-        # modules onto the strategic-memory channel. Bounded, fail-soft -
+        # modules onto the strategic-memory channel. Bounded, fail-soft —
         # a locked/corrupt store degrades to the base prompt with a warning.
         try:
             from backend.core.ouroboros.governance.lesson_memory import (
                 inject_lessons as _inject_lessons,
             )
             context = await _inject_lessons(context)
-        except Exception:  # noqa: BLE001 - memory never blocks generation
+        except Exception:  # noqa: BLE001 — memory never blocks generation
             logger.debug("[CandidateGenerator] lesson injection skipped", exc_info=True)
         try:
             result = await self._generate_dispatch(context, deadline)
@@ -4163,7 +4160,7 @@ class CandidateGenerator:
                 # #16501 "Unlock Test Suite Failed" observed re-exhausting
                 # across bt-2026-04-15-012736 and bt-2026-04-15-013455)
                 # don't re-emit on the next scan, re-enter generation, and
-                # re-exhaust - each such re-exhaustion currently counts
+                # re-exhaust — each such re-exhaustion currently counts
                 # toward ExhaustionWatcher's global hibernation threshold
                 # even when the reflex path is healthy. The registry is
                 # module-level in the sensor file; env gate
@@ -4189,12 +4186,12 @@ class CandidateGenerator:
                             "hook failed",
                             exc_info=True,
                         )
-                # S3.6.2 vector #12 (2026-05-07) - Tier 3
+                # §3.6.2 vector #12 (2026-05-07) — Tier 3
                 # deterministic fallback. When master flag on,
                 # substitute a structured deferred GenerationResult
                 # instead of re-raising. Prevents the organism
                 # freeze when both Tier 0 + Tier 1 are out.
-                # Master flag default-FALSE per S33.1 - when off,
+                # Master flag default-FALSE per §33.1 — when off,
                 # byte-identical pre-slice behavior (re-raise).
                 # NEVER raises into the dispatch path.
                 try:
@@ -4218,14 +4215,14 @@ class CandidateGenerator:
                                 cause=str(exc)[:200],
                             )
                             return _deferred
-                except Exception:  # noqa: BLE001 - defensive
+                except Exception:  # noqa: BLE001 — defensive
                     logger.debug(
                         "[CandidateGenerator] tier3 fallback "
                         "intercept failed (non-fatal); "
                         "re-raising original exhaustion",
                         exc_info=True,
                     )
-                # Phase 3.3 Task 2 - J-Prime last-resort local handoff.
+                # Phase 3.3 Task 2 — J-Prime last-resort local handoff.
                 # When JARVIS_JPRIME_LASTRESORT_ENABLED is true, route the op
                 # to the local 3B tier with a topologically-pruned payload
                 # instead of crashing the loop. Gate default OFF -> re-raise
@@ -4250,9 +4247,9 @@ class CandidateGenerator:
                         )
                 except RuntimeError:
                     # execute_local_last_resort re-raises original_exc on any
-                    # local failure - let it propagate cleanly.
+                    # local failure — let it propagate cleanly.
                     raise
-                except Exception:  # noqa: BLE001 - defensive
+                except Exception:  # noqa: BLE001 — defensive
                     logger.debug(
                         "[CandidateGenerator] jprime lastresort "
                         "intercept failed (non-fatal); "
@@ -4274,14 +4271,14 @@ class CandidateGenerator:
             # Quorum (cost-gated). A single-roll candidate that
             # claims to modify code but produces an AST fingerprint
             # identical to the original is a Quine-class hallucination.
-            # Filter such candidates out - empty result is a
+            # Filter such candidates out — empty result is a
             # correctness win (orchestrator's accept-failure branch
             # handles it gracefully, no apply, no harm).
             try:
                 result = await self._apply_bg_spec_structural_filter(
                     context=context, result=result,
                 )
-            except Exception:  # noqa: BLE001 - never break generate()
+            except Exception:  # noqa: BLE001 — never break generate()
                 logger.debug(
                     "[CandidateGenerator] bg_spec_structural_filter "
                     "raised; passing through unfiltered result",
@@ -4339,14 +4336,14 @@ class CandidateGenerator:
         Routes BACKGROUND/SPECULATIVE structurally skip the
         Quorum gate (``COST_GATED_ROUTES`` in
         ``cost_contract_assertion``). That leaves single-roll
-        generation with no consensus check - a hallucinated
+        generation with no consensus check — a hallucinated
         candidate whose AST equals the original (different text,
         same shape) can ship.
 
         This filter runs ``compute_bg_spec_structural_check`` on
         each candidate's ``(file_path, full_content)`` pair (or
         each entry in a multi-file candidate's ``files`` list)
-        against the on-disk original. Anomaly -> drop the
+        against the on-disk original. Anomaly → drop the
         candidate. New files (no on-disk original) are passed
         through (no AST to compare).
 
@@ -4377,7 +4374,7 @@ class CandidateGenerator:
             change_desc = (
                 getattr(context, "description", "") or ""
             )
-            # No claimed change -> no Quine vector. Skip.
+            # No claimed change → no Quine vector. Skip.
             if not change_desc.strip():
                 return result
 
@@ -4385,7 +4382,7 @@ class CandidateGenerator:
 
             def _check_one(file_path: str, candidate_src: str) -> Tuple[bool, str]:
                 """Return ``(anomaly_detected, reason)``. Best-effort
-                - any failure -> no anomaly (defense in depth)."""
+                — any failure → no anomaly (defense in depth)."""
                 try:
                     if not file_path or not isinstance(candidate_src, str):
                         return (False, "")
@@ -4393,7 +4390,7 @@ class CandidateGenerator:
                     if not p.is_absolute():
                         p = cwd / p
                     if not p.exists() or not p.is_file():
-                        # New file - no original to compare.
+                        # New file — no original to compare.
                         return (False, "")
                     try:
                         original_src = p.read_text(
@@ -4407,7 +4404,7 @@ class CandidateGenerator:
                         change_description=change_desc,
                     )
                     return (chk.anomaly_detected, chk.anomaly_reason)
-                except Exception:  # noqa: BLE001 - defensive
+                except Exception:  # noqa: BLE001 — defensive
                     return (False, "")
 
             def _candidate_anomalous(cand: Dict[str, Any]) -> Tuple[bool, str]:
@@ -4482,13 +4479,13 @@ class CandidateGenerator:
 
             # Replace the candidates tuple. Keep all other
             # GenerationResult fields intact (provider_name,
-            # duration, tool records, token usage, cost - these
+            # duration, tool records, token usage, cost — these
             # describe what the provider actually did, not the
             # filter outcome).
             return dataclasses.replace(
                 result, candidates=tuple(kept),
             )
-        except Exception:  # noqa: BLE001 - last-resort defensive
+        except Exception:  # noqa: BLE001 — last-resort defensive
             return result
 
     async def _honor_provider_override(
@@ -4496,7 +4493,7 @@ class CandidateGenerator:
         context: OperationContext,
         deadline: datetime,
     ) -> Optional[GenerationResult]:
-        """Sovereign Failover Mesh Gap 3b - honor a Cryo-DLQ provider pin.
+        """Sovereign Failover Mesh Gap 3b — honor a Cryo-DLQ provider pin.
 
         When ``context.provider_override == "gcp-jprime"`` (stamped at Cryo-DLQ
         seal time on a DW global outage), route the op STRAIGHT to the awakened
@@ -4599,8 +4596,8 @@ class CandidateGenerator:
         )
 
     def _swarm_routing_enabled(self) -> bool:
-        """Dynamic toggle (env ``JARVIS_SWARM_ROUTING_ENABLED``, default OFF) -
-        WORKSPACE_PROMOTION-style, no code mutation to flip. Off -> the
+        """Dynamic toggle (env ``JARVIS_SWARM_ROUTING_ENABLED``, default OFF) —
+        WORKSPACE_PROMOTION-style, no code mutation to flip. Off → the
         short-circuit is a strict no-op and the standard generation route is
         byte-identical."""
         return os.environ.get(
@@ -4620,9 +4617,9 @@ class CandidateGenerator:
             return await self._maybe_swarm_short_circuit(context, deadline)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 - a swarm fault is not an op failure
+        except Exception as exc:  # noqa: BLE001 — a swarm fault is not an op failure
             logger.warning(
-                "[CandidateGenerator] swarm short-circuit raised %s: %s - "
+                "[CandidateGenerator] swarm short-circuit raised %s: %s — "
                 "standard route preserved",
                 type(exc).__name__, exc,
             )
@@ -4630,7 +4627,7 @@ class CandidateGenerator:
 
     def _read_source_for_swarm(self, rel_or_abs: str) -> Optional[str]:
         """Read a target file's current on-disk content (repo_root-joined).
-        Returns None on any miss -> the short-circuit declines. Never raises."""
+        Returns None on any miss → the short-circuit declines. Never raises."""
         try:
             repo_root = getattr(self, "_repo_root", None)
             path = rel_or_abs
@@ -4644,7 +4641,7 @@ class CandidateGenerator:
     def _swarm_frames_from_ctx(self, context: OperationContext) -> Tuple[str, ...]:
         """Best-effort extraction of failing-test traceback frames from the
         op's intake evidence (feeds the resolver's deterministic pass). Empty
-        on any miss - the resolver then falls to the goal-keyword pass."""
+        on any miss — the resolver then falls to the goal-keyword pass."""
         raw = getattr(context, "intake_evidence_json", "") or ""
         if not raw:
             return ()
@@ -4669,7 +4666,7 @@ class CandidateGenerator:
         """Route a CONFIRMED big-file op through the Agentic Swarm interceptor,
         returning a ``GenerationResult`` that short-circuits normal generation.
 
-        Returns ``None`` - falling through to the standard route BYTE-IDENTICAL -
+        Returns ``None`` — falling through to the standard route BYTE-IDENTICAL —
         whenever the dynamic flag is off, the route is cost-optimized, the file
         is small, the swarm stack is unavailable, or the ``TargetSymbolResolver``
         FAILS CLOSED (no confident target). Structured concurrency: a parent
@@ -4706,7 +4703,7 @@ class CandidateGenerator:
             # sequential chunk processing, slower but free, which is precisely
             # the trade a background op should take.
             return None
-        # DIAGNOSABILITIY. This method declines at five separate points and, until
+        # DIAGNOSABILITY. This method declines at five separate points and, until
         # now, every one of them returned None silently. That is fine when the
         # feature is off and nobody is asking -- and actively obstructive the
         # moment someone enables it and it does nothing, because "no swarm
@@ -4719,12 +4716,6 @@ class CandidateGenerator:
         if not target_files:
             logger.info(
                 "[CandidateGenerator] swarm decline: op carries no target_files")
-            return None
-        if len(target_files) != 1:
-            logger.info(
-                "[CandidateGenerator] swarm decline: op declares %d target files; "
-                "the swarm route is single-file - standard route preserved",
-                len(target_files))
             return None
         path = target_files[0]
         source = self._read_source_for_swarm(path)
@@ -4746,12 +4737,12 @@ class CandidateGenerator:
             from backend.core.ouroboros.governance.agent_turn_adapter import (
                 ProductionAgentTurnFn,
             )
-        except Exception as _swarm_imp_exc:  # noqa: BLE001 - stack absent -> standard route
+        except Exception as _swarm_imp_exc:  # noqa: BLE001 — stack absent → standard route
             logger.info(
                 "[CandidateGenerator] swarm decline: stack unavailable (%s: %s)",
                 type(_swarm_imp_exc).__name__, _swarm_imp_exc)
             return None
-        # Phase 1 - the ceiling is the served model's negotiated window, primed
+        # Phase 1 — the ceiling is the served model's negotiated window, primed
         # here by the lane that negotiates it (VRAM, model bytes, KV physics),
         # so `is_big_file` below judges TOKENS against a real budget.
         from backend.core.ouroboros.governance import context_budget as _cb
@@ -4780,15 +4771,15 @@ class CandidateGenerator:
         )
         if not res.resolved:
             logger.info(
-                "[CandidateGenerator] swarm: resolver FAIL-CLOSED for %s - "
+                "[CandidateGenerator] swarm: resolver FAIL-CLOSED for %s — "
                 "standard route preserved", path,
             )
             return None
 
         # The worker's system prompt is the NODE contract only. It used to be
-        # prefixed with providers._CODEGEN_SYSTEM_PROMPT - the whole-file
-        # mandate ("respond with valid JSON only ... full_content containing the
-        # COMPLETE modified file ... NEVER partial file content") - directly
+        # prefixed with providers._CODEGEN_SYSTEM_PROMPT — the whole-file
+        # mandate ("respond with valid JSON only … full_content containing the
+        # COMPLETE modified file … NEVER partial file content") — directly
         # contradicting the map-reduce framing that follows it ("return ONLY
         # the modified AST node"). A 30B obeys the louder, first instruction:
         # every worker of the first huge-file goals answered in a shape the
@@ -4799,11 +4790,11 @@ class CandidateGenerator:
         if client is None:
             logger.info(
                 "[CandidateGenerator] swarm decline for %s: no provider seat "
-                "exposes an agent client - standard route preserved", path,
+                "exposes an agent client — standard route preserved", path,
             )
             return None
 
-        # Phase 2 - the worker's view is the structural map (AST-Signature
+        # Phase 2 — the worker's view is the structural map (AST-Signature
         # Anchor) + the map-reduce framing + a READ-ONLY Radius of Relevance
         # around its node, shrunk to the budget that remains after those fixed
         # parts. It never sees, and can never re-emit, the whole file.
@@ -4811,14 +4802,14 @@ class CandidateGenerator:
         from backend.core.ouroboros.governance.intelligent_chunking import shrink_radius_to_budget
         _anchor = ""
         # What the SYSTEM reads for the workers is exploration and is
-        # recorded as such - the exploration gate otherwise refuses this
+        # recorded as such — the exploration gate otherwise refuses this
         # route for the tool calls it structurally never makes.
         _reads: List[Any] = []
         _t_anchor = time.monotonic_ns()
         try:
             from backend.core.ouroboros.governance.ast_signature_anchor import extract_public_api
             _anchor = extract_public_api(source, path) or ""
-        except Exception:  # noqa: BLE001 - the map is additive
+        except Exception:  # noqa: BLE001 — the map is additive
             _anchor = ""
         if _anchor:
             try:
@@ -4828,7 +4819,7 @@ class CandidateGenerator:
                     path=path, output_bytes=len(_anchor.encode("utf-8")),
                     started_at_ns=_t_anchor, ended_at_ns=time.monotonic_ns(),
                 ))
-            except Exception:  # noqa: BLE001 - evidence is additive
+            except Exception:  # noqa: BLE001 — evidence is additive
                 pass
         _system = "\n\n".join(t for t in (MAP_REDUCE_FRAMING, _anchor) if t)
         _node_budget = _budget.with_overhead(_system).node_budget_tokens
@@ -4852,7 +4843,7 @@ class CandidateGenerator:
             parse_fn=lambda raw: None,               # single-shot node completion
             max_turns=1,
             node_context_fn=_radius_for,
-            # The node may be as long as the window's output reserve allows -
+            # The node may be as long as the window's output reserve allows —
             # derived from the negotiated budget, not a flat 4096 (a 230-line
             # method JSON-escaped already overran that).
             max_tokens=_budget.output_reserve_tokens,
@@ -4860,11 +4851,11 @@ class CandidateGenerator:
         )
 
         async def _rag_reprompt(target: Any, rag_ctx: str) -> str:
-            """Phase 3 - an unconverged node is re-prompted with retrieved
+            """Phase 3 — an unconverged node is re-prompted with retrieved
             snippets as feedback; the swarm around it is untouched."""
             try:
                 return await agent(target, f"Retrieved context for this node:\n{rag_ctx}")
-            except Exception:  # noqa: BLE001 - an isolated node fault never drops the op
+            except Exception:  # noqa: BLE001 — an isolated node fault never drops the op
                 return ""
         t0 = time.monotonic()
         try:
@@ -4872,21 +4863,21 @@ class CandidateGenerator:
                 source, path, list(res.symbol_names), agent,
                 rag_agent_fn=_rag_reprompt,
                 op_id=getattr(context, "op_id", ""),
-                # The workers are told the TASK - the op's description is the
-                # signed goal's text - not the legacy "repair <symbol>".
+                # The workers are told the TASK — the op's description is the
+                # signed goal's text — not the legacy "repair <symbol>".
                 instruction=(getattr(context, "description", "") or "").strip() or None,
             )
         except asyncio.CancelledError:
             # Structured concurrency: awaiting the interceptor makes its swarm
             # tasks + DW sockets children of THIS task; cancellation has already
-            # torn them down. Re-raise cleanly - NEVER swallow (no ghost tasks).
+            # torn them down. Re-raise cleanly — NEVER swallow (no ghost tasks).
             logger.info(
-                "[CandidateGenerator] swarm CANCELLED for %s - clean teardown", path,
+                "[CandidateGenerator] swarm CANCELLED for %s — clean teardown", path,
             )
             raise
-        except Exception as exc:  # noqa: BLE001 - any swarm fault -> standard route
+        except Exception as exc:  # noqa: BLE001 — any swarm fault → standard route
             logger.warning(
-                "[CandidateGenerator] swarm error for %s: %s - standard route",
+                "[CandidateGenerator] swarm error for %s: %s — standard route",
                 path, exc,
             )
             return None
@@ -4897,7 +4888,7 @@ class CandidateGenerator:
             or not getattr(result, "content", "")
         ):
             logger.info(
-                "[CandidateGenerator] swarm no-stitch/drift for %s - standard route",
+                "[CandidateGenerator] swarm no-stitch/drift for %s — standard route",
                 path,
             )
             return None
@@ -4921,7 +4912,7 @@ class CandidateGenerator:
                     path=path, output_bytes=max(_radius_bytes),
                     started_at_ns=_t_radius, ended_at_ns=time.monotonic_ns(),
                 ))
-            except Exception:  # noqa: BLE001 - evidence is additive
+            except Exception:  # noqa: BLE001 — evidence is additive
                 pass
         return GenerationResult(
             candidates=(
@@ -4943,9 +4934,9 @@ class CandidateGenerator:
         context: OperationContext,
         deadline: datetime,
     ) -> GenerationResult:
-        """Internal dispatch - the original body of :meth:`generate`.
+        """Internal dispatch — the original body of :meth:`generate`.
 
-        Route-based dispatch with Tier 0 -> fallback cascade. This is
+        Route-based dispatch with Tier 0 → fallback cascade. This is
         the hot path; the public ``generate()`` above wraps it only to
         observe exhaustion and success signals.
         """
@@ -4977,14 +4968,14 @@ class CandidateGenerator:
         # ORDER IS LOAD-BEARING, and getting it wrong is measured, not
         # theoretical. This block originally sat ABOVE the swarm short-circuit,
         # which meant that on a host with no paid credential it answered every
-        # op first and the swarm interceptor was never reached - soak
+        # op first and the swarm interceptor was never reached — soak
         # bt-2026-08-28-111858 logged ZERO occurrences of "swarm" with
         # JARVIS_SWARM_ROUTING_ENABLED=true. Enabling the chunker and then
         # short-circuiting past it is worse than leaving it off, because the
         # telemetry says it is on.
         #
         # The two are answering different questions and must run in that
-        # order: the swarm decides WHAT to generate (scope reduction - slice
+        # order: the swarm decides WHAT to generate (scope reduction — slice
         # the 75-line symbol out of a 10,923-line file), this decides WHO
         # generates it (provider selection). Reducing scope first is what
         # makes the local engine's 32,768-token ceiling sufficient; choosing
@@ -4992,7 +4983,7 @@ class CandidateGenerator:
         #
         # Still ahead of every route handler, which is the point: a lane that
         # runs only after the cascade has failed is a fallback, and on a host
-        # with no paid credential the cascade does not fail usefully - it
+        # with no paid credential the cascade does not fail usefully — it
         # exhausts (bt-2026-08-28-100733: a SANCTIONED op died
         # `all_providers_exhausted:circuit_breaker_tripped` on route=standard
         # while a warm 32B sat resident on the GPU).
@@ -5000,10 +4991,10 @@ class CandidateGenerator:
         if _local_first is not None:
             return _local_first
 
-        # ── Route-based dispatch (Manifesto S5 Tier 0: deterministic) ──
+        # ── Route-based dispatch (Manifesto §5 Tier 0: deterministic) ──
         _provider_route = getattr(context, "provider_route", "") or "standard"
 
-        # ── Phase 10 P10.3+P10.3.5 - AsyncTopologySentinel gate ────
+        # ── Phase 10 P10.3+P10.3.5 — AsyncTopologySentinel gate ────
         # Pre-Slice-23: env-only check (``JARVIS_TOPOLOGY_SENTINEL_ENABLED=true``).
         # Slice 23 (autonomous registry-driven): the gate now consults
         # ``_slice23_should_activate_sentinel`` which composes 5
@@ -5011,15 +5002,15 @@ class CandidateGenerator:
         # multi-model trusted fleet / Phase 10 default-off). See helper
         # docstring for the full closed decision matrix. The Phase 10
         # graduation contract pin (env DEFAULT stays false) is preserved
-        # - Slice 23 adds structural overrides on top of that default,
+        # — Slice 23 adds structural overrides on top of that default,
         # the literal default is unchanged.
         #
         # Pre-flight handshake (directive 2026-04-27): instead of a
         # silent try/except that swallows boundary-isolation defects
         # (which is what bit session bt-2026-04-27-194550), we run
         # ``preflight_check()`` at the gate. If the sentinel fails to
-        # initialize inside this subprocess for ANY reason - module
-        # import, topology load, missing dw_models - we raise
+        # initialize inside this subprocess for ANY reason — module
+        # import, topology load, missing dw_models — we raise
         # ``SentinelInitializationError`` so the operator sees the
         # defect at the point of decision, not minutes later in the
         # postmortem. Master-flag-off remains byte-identical legacy
@@ -5030,7 +5021,7 @@ class CandidateGenerator:
         if _slice23_activate:
             logger.info(
                 "[CandidateGenerator] Slice 23 sentinel activation: "
-                "route=%s reason=%s - walking ranked DW fleet "
+                "route=%s reason=%s — walking ranked DW fleet "
                 "(skips OPEN breakers + Slice 20C drifted models)",
                 _provider_route, _slice23_reason,
             )
@@ -5041,7 +5032,7 @@ class CandidateGenerator:
                 )
             except ImportError as _imp_exc:
                 # Master flag explicitly true but the module is
-                # unimportable - this is a deployment defect, NOT a
+                # unimportable — this is a deployment defect, NOT a
                 # silent fall-through. Raise so the orchestrator's
                 # existing accept-failure branch records it visibly.
                 raise RuntimeError(
@@ -5069,29 +5060,29 @@ class CandidateGenerator:
                 context, deadline, _provider_route,
             )
             if _result is not None:
-                _note_dw_candidate_success()  # Slice 53 - a lane yielded a candidate
+                _note_dw_candidate_success()  # Slice 53 — a lane yielded a candidate
                 return _result
             # _dispatch_via_sentinel returns None to signal "fall
             # through to legacy path" (e.g. the route has empty
-            # dw_models - IMMEDIATE by design - so the existing
+            # dw_models — IMMEDIATE by design — so the existing
             # _generate_immediate handler still runs below).
 
-        # Brain Selection Topology - hard segmentation (Manifesto S5).
+        # Brain Selection Topology — hard segmentation (Manifesto §5).
         # When ``doubleword_topology`` marks a route as DW-forbidden,
         # the ``block_mode`` field decides what to do next:
         #
-        #   cascade_to_claude - IMMEDIATE/COMPLEX: route straight to
+        #   cascade_to_claude — IMMEDIATE/COMPLEX: route straight to
         #     Claude via ``_generate_immediate``. Live-fire bbpst3ebf
         #     (2026-04-14) proved BOTH DW 397B and Gemma 4 31B time out
         #     on the 120s Tier 0 RT budget for architectural COMPLEX
         #     GENERATE; Claude is the intended brain for these routes.
         #
-        #   skip_and_queue - BACKGROUND/SPECULATIVE: raise a sentinel
+        #   skip_and_queue — BACKGROUND/SPECULATIVE: raise a sentinel
         #     RuntimeError the orchestrator already handles gracefully
         #     (background_dw_* / speculative_deferred). Do NOT cascade
         #     to Claude. Alignment test bt-2026-04-14-182446 produced
         #     0/13 Gemma BG successes with a right-sized 2.8K-token
-        #     envelope - root cause is provider-side SSE stream stall,
+        #     envelope — root cause is provider-side SSE stream stall,
         #     not prompt size. Routing continuous background daemons
         #     to Claude violates the unit economics of scalable
         #     autonomy. The queue stays dormant until a viable,
@@ -5100,17 +5091,17 @@ class CandidateGenerator:
             get_topology as _get_topology,
         )
         _topology = _get_topology()
-        # Phase 10 Slice 5a - unified deletion-side helper. Branches
+        # Phase 10 Slice 5a — unified deletion-side helper. Branches
         # on JARVIS_TOPOLOGY_SENTINEL_ENABLED internally so v1 yaml
         # fields can be deleted safely in Slice 5b after contract
-        # green. block_mode preserved in v1 vocab - downstream
+        # green. block_mode preserved in v1 vocab — downstream
         # `== "skip_and_queue"` check unchanged.
         _is_blocked, _block_reason, _block_mode = (
             _topology.is_dw_blocked_for_route(_provider_route)
         )
         if _topology.enabled and _is_blocked:
             if _block_mode == "skip_and_queue":
-                # Nervous System Reflex (Manifesto S5 - survival supersedes
+                # Nervous System Reflex (Manifesto §5 — survival supersedes
                 # cost optimization): read-only ops MUST NOT lock up on a
                 # paused DW endpoint. When the topology has skipped DW on
                 # BACKGROUND, cascade straight to Claude for the read-only
@@ -5129,7 +5120,7 @@ class CandidateGenerator:
                     logger.info(
                         "[CandidateGenerator] Nervous-System Reflex: BG "
                         "topology skip_and_queue bypassed for read-only op "
-                        "- cascading to Claude (reason=%s) [%s]",
+                        "— cascading to Claude (reason=%s) [%s]",
                         _block_reason,
                         getattr(context, "op_id", "?")[:16],
                     )
@@ -5145,11 +5136,11 @@ class CandidateGenerator:
                         ) from exc
                 logger.info(
                     "[CandidateGenerator] Topology block: route=%s "
-                    "block_mode=skip_and_queue reason=%s - skipping "
+                    "block_mode=skip_and_queue reason=%s — skipping "
                     "generation (no Claude cascade)",
                     _provider_route, _block_reason,
                 )
-                # Sentinel-Pacemaker handshake (2026-04-29) -
+                # Sentinel-Pacemaker handshake (2026-04-29) —
                 # when the topology layer blocks BG/SPEC ops because
                 # the catalog is purged/empty, ask the Pacemaker to
                 # bypass its 30-min cadence sleep and probe DW now.
@@ -5177,7 +5168,7 @@ class CandidateGenerator:
                                 f"{_block_reason[:80]}"
                             ),
                         )
-                    except Exception:  # noqa: BLE001 - never raise
+                    except Exception:  # noqa: BLE001 — never raise
                         logger.debug(
                             "[CandidateGenerator] force_refresh "
                             "request failed", exc_info=True,
@@ -5224,7 +5215,7 @@ class CandidateGenerator:
                 )
             logger.info(
                 "[CandidateGenerator] Topology block: route=%s "
-                "block_mode=cascade_to_claude reason=%s - routing "
+                "block_mode=cascade_to_claude reason=%s — routing "
                 "direct to Claude",
                 _provider_route, _block_reason,
             )
@@ -5253,23 +5244,23 @@ class CandidateGenerator:
         # topology hard-block in the default yaml (standard sealed as of
         # bt-2026-04-14-203740, complex sealed per bbpst3ebf). They reach
         # this fall-through only if operators explicitly unseal them in
-        # brain_selection_policy.yaml - at which point the full DW->Claude
+        # brain_selection_policy.yaml — at which point the full DW→Claude
         # cascade below applies. Not recommended without fresh empirical
         # evidence that DW's SSE endpoint has recovered.
 
         # ── Tier 0: DoubleWord 397B ──────────────────────────────
         #
-        # Manifesto S3: "Zero polling. Pure reflex."
-        # Manifesto S5: "Tier 0 (Deterministic Fast-Path)"
+        # Manifesto §3: "Zero polling. Pure reflex."
+        # Manifesto §5: "Tier 0 (Deterministic Fast-Path)"
         #
         # Two modes based on DW real-time SSE availability:
-        #   RT enabled  -> tier0.generate() -> _generate_realtime (SSE stream)
+        #   RT enabled  → tier0.generate() → _generate_realtime (SSE stream)
         #                 Zero polling. Token-by-token streaming. Pure reflex.
-        #                 Internal RT->batch fallback on 429/503 (stay cheap).
-        #   RT disabled -> submit_batch() -> background poll (legacy path)
+        #                 Internal RT→batch fallback on 429/503 (stay cheap).
+        #   RT disabled → submit_batch() → background poll (legacy path)
         #                 Used only when DOUBLEWORD_REALTIME_ENABLED=false.
         #
-        # On any Tier 0 failure -> cascade to Claude fallback (Tier 1).
+        # On any Tier 0 failure → cascade to Claude fallback (Tier 1).
 
         _op_id = getattr(context, "operation_id", "")
         _dw_is_primary = (self._tier0 is not None and self._primary is self._tier0)
@@ -5278,7 +5269,7 @@ class CandidateGenerator:
 
         if self._tier0 is not None and getattr(self._tier0, "is_available", False):
             # Skip if DW is in any failure mode whose recovery ETA hasn't elapsed.
-            # Previously this only fired on CONNECTION_ERROR - meaning a misclassified
+            # Previously this only fired on CONNECTION_ERROR — meaning a misclassified
             # TRANSIENT_TRANSPORT or TIMEOUT could keep hammering DW back-to-back
             # and exhaust every op until the human stopped the loop. Generalized
             # in bt-2026-04-12-005521 fix to honor whichever mode is active.
@@ -5309,8 +5300,8 @@ class CandidateGenerator:
                 )
 
             elif getattr(self._tier0, "_realtime_enabled", False):
-                # ── Real-time SSE path (Manifesto S3: zero polling) ──
-                # Call tier0.generate() directly - hits _generate_realtime.
+                # ── Real-time SSE path (Manifesto §3: zero polling) ──
+                # Call tier0.generate() directly — hits _generate_realtime.
                 # Budget-capped via asyncio.wait_for; on timeout or failure,
                 # cascade to Claude fallback with guaranteed reserve time.
                 _tier0_attempted = True
@@ -5341,11 +5332,11 @@ class CandidateGenerator:
                 if tier0_budget > 0:
                     # Stream-aware timeout: use asyncio.shield so we can
                     # grant a grace extension if DW is actively streaming
-                    # tokens when the base budget expires (Manifesto S3).
+                    # tokens when the base budget expires (Manifesto §3).
                     _gen_task = asyncio.ensure_future(
                         self._tier0.generate(context, deadline),
                     )
-                    # Defect #4 Slice A - leak-prevention callback.
+                    # Defect #4 Slice A — leak-prevention callback.
                     # The shield above means _gen_task survives outer
                     # wait_for cancellation; if it later raises with
                     # nobody awaiting, asyncio's default handler logs
@@ -5357,7 +5348,7 @@ class CandidateGenerator:
                             asyncio.shield(_gen_task), timeout=tier0_budget,
                         )
                         if result is not None and len(result.candidates) > 0:
-                            # RT success - record recovery if coming back from failure
+                            # RT success — record recovery if coming back from failure
                             if self.fsm._consecutive_failures > 0:
                                 self.fsm.record_primary_success()
                             self._record_tier0_success()
@@ -5371,16 +5362,16 @@ class CandidateGenerator:
                                 len(result.candidates), result.generation_duration_s,
                             )
                             return result
-                        # Empty result - fall through to Claude
+                        # Empty result — fall through to Claude
                         logger.info(
-                            "[CandidateGenerator] Tier 0 RT: no candidates - "
+                            "[CandidateGenerator] Tier 0 RT: no candidates — "
                             "cascading to Tier 1 (%.1fs remaining)",
                             self._remaining_seconds(deadline),
                         )
                     except asyncio.TimeoutError:
                         # Check if DW is actively streaming SSE tokens.
                         # If so, grant up to 30s extension while preserving
-                        # Tier 1 reserve - don't kill a productive stream.
+                        # Tier 1 reserve — don't kill a productive stream.
                         _last_chunk = getattr(self._tier0, "_last_chunk_at", 0.0)
                         _streaming = _last_chunk > 0 and (time.monotonic() - _last_chunk) < 10.0
                         _ext_cap = self._remaining_seconds(deadline) - _TIER1_MIN_RESERVE_S
@@ -5393,7 +5384,7 @@ class CandidateGenerator:
                                 _extension,
                             )
                             # Use asyncio.wait (not wait_for) so a timeout does
-                            # NOT cancel the task - avoids the race where DW
+                            # NOT cancel the task — avoids the race where DW
                             # completes between timeout fire and cancel delivery.
                             _done, _ = await asyncio.wait(
                                 {_gen_task}, timeout=_extension,
@@ -5424,7 +5415,7 @@ class CandidateGenerator:
                                         result.generation_duration_s,
                                     )
                                     return result
-                        # Task still pending or no extension granted - cancel it.
+                        # Task still pending or no extension granted — cancel it.
                         # Check done() first: task may have completed in the
                         # instant between timeout and here (shield race window).
                         if not _gen_task.done():
@@ -5469,7 +5460,7 @@ class CandidateGenerator:
                         # `_PRIMARY_INNOCENT_MODES` replaces the exemption list
                         # that used to be spelled out here: CONTENT_FAILURE
                         # (model produced bad output, infra healthy) and
-                        # TEMPORAL_SHED (OUR routing refusal - penalizing DW
+                        # TEMPORAL_SHED (OUR routing refusal — penalizing DW
                         # would rotate the funded primary out because ONE op
                         # ran tight), now joined by LOCAL_DEFECT. Two hand-kept
                         # copies of one policy is how they drift.
@@ -5510,7 +5501,7 @@ class CandidateGenerator:
 
             else:
                 # ── Legacy batch path (DOUBLEWORD_REALTIME_ENABLED=false) ──
-                # submit_batch() -> background poll -> await result.
+                # submit_batch() → background poll → await result.
                 _TIER0_COMPLEXITY_CLASSES = frozenset({"heavy_code", "complex"})
                 _complexity = ""
                 if context.routing is not None:
@@ -5527,12 +5518,12 @@ class CandidateGenerator:
                 if _qualifies:
                     _tier0_attempted = True
                     try:
-                        # Slice 18 - CAPACITY BEFORE COMMITMENT.
+                        # Slice 18 — CAPACITY BEFORE COMMITMENT.
                         #
                         # This prune + cap check used to sit AFTER submit_batch().
                         # That ordering was a guaranteed orphan generator: the
                         # batch was created on DW's queue, and only then did we
-                        # discover the background-poll pool was full - at which
+                        # discover the background-poll pool was full — at which
                         # point the `if` simply fell through with no `else`. No
                         # poller was ever created, the batch_id existed nowhere
                         # but in a local variable, and a live job sat on DW's
@@ -5577,7 +5568,7 @@ class CandidateGenerator:
                                 self._background_poll_tier0(pending, context),
                                 name=f"dw-poll-{pending.batch_id[:12]}",
                             )
-                            # Defect #4 Slice A - defensive
+                            # Defect #4 Slice A — defensive
                             # callback (background_poll_tier0
                             # already has try/except internally,
                             # but the callback ensures even an
@@ -5629,7 +5620,7 @@ class CandidateGenerator:
                             )
                             return _result
 
-        # ── Syntax-failure J-Prime escalation (DW -> J-Prime cascade) ──
+        # ── Syntax-failure J-Prime escalation (DW → J-Prime cascade) ──
         # When DW has produced persistent all_candidates_syntax_error
         # failures for this op, escalate to J-Prime with full failure
         # context (candidate previews + anti-hallucination directive).
@@ -5652,7 +5643,7 @@ class CandidateGenerator:
                     logger.warning(
                         "[SyntaxEscalator] ESCALATE op=%s "
                         "consecutive_syntax_failures=%d threshold_met=True "
-                        "target=jprime target_file=%s - routing to J-Prime "
+                        "target=jprime target_file=%s — routing to J-Prime "
                         "with failure dossier (%.1fs remaining)",
                         _sx_op_id[:16],
                         _sx_ctx.consecutive_failures,
@@ -5671,7 +5662,7 @@ class CandidateGenerator:
                         ):
                             logger.info(
                                 "[SyntaxEscalator] J-Prime produced %d "
-                                "candidates for op=%s - escalation "
+                                "candidates for op=%s — escalation "
                                 "SUCCEEDED",
                                 len(_sx_result.candidates),
                                 _sx_op_id[:16],
@@ -5680,28 +5671,28 @@ class CandidateGenerator:
                             return _sx_result
                         logger.warning(
                             "[SyntaxEscalator] J-Prime returned no "
-                            "candidates for op=%s - falling through "
+                            "candidates for op=%s — falling through "
                             "to normal Tier 1 cascade",
                             _sx_op_id[:16],
                         )
                     except Exception as _sx_jprime_exc:
                         logger.warning(
                             "[SyntaxEscalator] J-Prime escalation failed "
-                            "for op=%s: %s - falling through to normal "
+                            "for op=%s: %s — falling through to normal "
                             "Tier 1 cascade",
                             _sx_op_id[:16], _sx_jprime_exc,
                         )
-            except Exception:  # noqa: BLE001 - never block the cascade
+            except Exception:  # noqa: BLE001 — never block the cascade
                 logger.debug(
                     "[SyntaxEscalator] escalation check failed (non-fatal)",
                     exc_info=True,
                 )
 
-        # ── Tier 1: Primary -> Fallback cascade ───────────────────
+        # ── Tier 1: Primary → Fallback cascade ───────────────────
         #
         # If Tier 0 was attempted and DW IS the primary, skip redundant
-        # primary.generate() call - go straight to Claude fallback.
-        # (Manifesto S3: no wasteful retries)
+        # primary.generate() call — go straight to Claude fallback.
+        # (Manifesto §3: no wasteful retries)
 
         state = self.fsm.state
 
@@ -5716,14 +5707,14 @@ class CandidateGenerator:
 
         if _tier0_attempted and _dw_is_primary:
             logger.info(
-                "[CandidateGenerator] Tier 0 IS primary - routing directly "
+                "[CandidateGenerator] Tier 0 IS primary — routing directly "
                 "to Claude fallback (%.1fs remaining)",
                 self._remaining_seconds(deadline),
             )
             return await self._call_fallback(context, deadline)
 
         if state is FailbackState.PRIMARY_READY:
-            # P2.3: Model-selection learning - check if historical data
+            # P2.3: Model-selection learning — check if historical data
             # recommends the fallback for this complexity class.  Only
             # applies when both providers are healthy (PRIMARY_READY);
             # infrastructure health always takes precedence.
@@ -5736,7 +5727,7 @@ class CandidateGenerator:
             ):
                 logger.info(
                     "[CandidateGenerator] Learning override: '%s' recommended "
-                    "for complexity=%s - trying fallback first (%.1fs remaining)",
+                    "for complexity=%s — trying fallback first (%.1fs remaining)",
                     _recommended, _complexity, self._remaining_seconds(deadline),
                 )
                 try:
@@ -5744,7 +5735,7 @@ class CandidateGenerator:
                 except Exception as _fb_exc:
                     logger.info(
                         "[CandidateGenerator] Learning-recommended fallback failed: %s "
-                        "- falling back to primary",
+                        "— falling back to primary",
                         type(_fb_exc).__name__,
                     )
                     return await self._call_primary(context, deadline)
@@ -5772,7 +5763,7 @@ class CandidateGenerator:
         return await self._call_fallback(context, deadline)
 
     # ------------------------------------------------------------------
-    # Route-specific generation strategies (Manifesto S5)
+    # Route-specific generation strategies (Manifesto §5)
     # ------------------------------------------------------------------
 
     async def _local_jprime_endpoint(self) -> Optional[str]:
@@ -6726,11 +6717,11 @@ class CandidateGenerator:
         in soak bt-2026-08-28-100733, which routed STANDARD by SOURCE (the
         UrgencyRouter keys on source, not urgency alone, so `source="roadmap"`
         never reaches BACKGROUND however low its urgency), then died
-        `all_providers_exhausted:circuit_breaker_tripped` - with a warm 32B
+        `all_providers_exhausted:circuit_breaker_tripped` — with a warm 32B
         resident on the GPU the whole time.
 
         The gate is `_free_lane_active()`, and the choice of predicate is the
-        whole design. It does not ask "which route is this" - route names are
+        whole design. It does not ask "which route is this" — route names are
         exactly the hardcoded mapping that produced the bug. It asks whether
         any PAID lane exists at all: it requires the local lane to be
         configured AND both provider credentials to be absent, re-reading
@@ -6743,7 +6734,7 @@ class CandidateGenerator:
         anything is dispatched. A configured-but-dead engine falls through to
         the legacy cascade rather than swallowing the op.
 
-        Returns the result, or None to fall through - including on dispatch
+        Returns the result, or None to fall through — including on dispatch
         failure, so the local lane can only ever ADD a way for an op to
         succeed, never a new way for it to die.
         """
@@ -6758,7 +6749,7 @@ class CandidateGenerator:
         route = (getattr(context, "provider_route", "") or "standard").lower()
         try:
             endpoint = await self._discover_jprime_endpoint()
-        except Exception:  # noqa: BLE001 - discovery is advisory
+        except Exception:  # noqa: BLE001 — discovery is advisory
             return None
         if not endpoint:
             logger.debug(
@@ -6781,7 +6772,7 @@ class CandidateGenerator:
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "[CandidateGenerator] local-primary dispatch failed "
-                "(%s: %.120s) - falling through to the legacy cascade [%s]",
+                "(%s: %.120s) — falling through to the legacy cascade [%s]",
                 type(exc).__name__, str(exc), op_id_short,
             )
             return None
@@ -6803,12 +6794,12 @@ class CandidateGenerator:
         """Local dispatch that shows the model its own parse errors once.
 
         `all_candidates_syntax_error` was the top non-governance failure on the
-        local lane - 6 dispatches in soak bt-2026-08-28-061124, the model
+        local lane — 6 dispatches in soak bt-2026-08-28-061124, the model
         emitting VALID JSON wrapping INVALID Python. That is a recoverable
         slip, and it was being treated as terminal.
 
-        `syntax_escalation` exists for this class, but it cascades DW ->
-        J-Prime, and on a workstation topology the local 32B *is* J-Prime - so
+        `syntax_escalation` exists for this class, but it cascades DW →
+        J-Prime, and on a workstation topology the local 32B *is* J-Prime — so
         it escalates to the model that just failed. The escalation is sound and
         simply has nowhere to go here; the missing move is not another provider
         but the feedback the first attempt never received.
@@ -6827,7 +6818,7 @@ class CandidateGenerator:
             return await self._failover_local_dispatch(context, deadline, endpoint)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 - inspected, then re-raised
+        except Exception as exc:  # noqa: BLE001 — inspected, then re-raised
             failures = getattr(exc, "syntax_failures", None)
             if not failures or not _syntax_repair_enabled():
                 raise
@@ -6838,7 +6829,7 @@ class CandidateGenerator:
             # Unified recursion ceiling (Phase 3): the one-shot syntax retry
             # PARTICIPATES in the shared per-op recovery budget alongside the
             # Iron-Gate GENERATE_RETRY loop, so their SUM cannot exceed the
-            # bound. The check itself never crashes a diagnosed syntax error -
+            # bound. The check itself never crashes a diagnosed syntax error —
             # any ledger fault falls through to the existing one-shot behaviour;
             # the terminating ``raise`` lives OUTSIDE the try so the swallow-all
             # except can never suppress it.
@@ -6854,7 +6845,7 @@ class CandidateGenerator:
                     _oid = (getattr(context, "op_id", "") or "?")[:16]
                     logger.info(
                         "[CandidateGenerator] generation recursion ceiling "
-                        "reached (depth=%d bound=%d) - not spending a "
+                        "reached (depth=%d bound=%d) — not spending a "
                         "syntax-repair round [%s]",
                         _rb.depth, _rb.bound, _oid,
                     )
@@ -6865,7 +6856,7 @@ class CandidateGenerator:
                     )
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - ledger fault must not crash
+            except Exception:  # noqa: BLE001 — ledger fault must not crash
                 _rb_ceiling = False
             if _rb_ceiling:
                 raise
@@ -6874,14 +6865,14 @@ class CandidateGenerator:
                     _format_syntax_feedback,  # noqa: PLC0415
                 )
                 feedback = _format_syntax_feedback(failures)
-            except Exception:  # noqa: BLE001 - no feedback -> no retry
+            except Exception:  # noqa: BLE001 — no feedback → no retry
                 raise exc from None
             if not feedback:
                 raise
             op_id_short = (getattr(context, "op_id", "") or "?")[:16]
             logger.info(
                 "[CandidateGenerator] local lane returned unparseable Python "
-                "(%d file(s), first: %s line %s) - retrying ONCE with the "
+                "(%d file(s), first: %s line %s) — retrying ONCE with the "
                 "parse errors fed back [%s]",
                 len(failures),
                 (failures[0] or {}).get("file_path", "?"),
@@ -6897,7 +6888,7 @@ class CandidateGenerator:
             if not callable(_stamp):
                 logger.debug(
                     "[CandidateGenerator] context cannot carry syntax feedback "
-                    "(%s) - not retrying [%s]",
+                    "(%s) — not retrying [%s]",
                     type(context).__name__, op_id_short,
                 )
                 raise
@@ -6905,7 +6896,7 @@ class CandidateGenerator:
             #
             # The first live firing (soak bt-2026-08-28-100733) showed the
             # distinction in one trace: line 231 "unterminated string literal"
-            # -> retry -> line 196 "unterminated string literal". The model did
+            # → retry → line 196 "unterminated string literal". The model did
             # not mis-type a quote; its OUTPUT WAS CUT OFF, and the second
             # attempt was cut off earlier. Telling it "fix line 231" asks it to
             # repair a line it never finished writing, and a full-file retry
@@ -6920,7 +6911,7 @@ class CandidateGenerator:
                 _reshape = getattr(context, "with_forced_diff_retry", None)
                 logger.info(
                     "[CandidateGenerator] the parse failure is TRUNCATION-"
-                    "shaped (%s) - retrying with a reduced output shape rather "
+                    "shaped (%s) — retrying with a reduced output shape rather "
                     "than another whole-file attempt [%s]",
                     (failures[0] or {}).get("message", "?")[:60], op_id_short,
                 )
@@ -6932,7 +6923,7 @@ class CandidateGenerator:
                     try:
                         import dataclasses as _dc  # noqa: PLC0415
                         context = _dc.replace(context, force_diff_on_retry=True)
-                    except Exception:  # noqa: BLE001 - reshape is best-effort
+                    except Exception:  # noqa: BLE001 — reshape is best-effort
                         pass
                 _stamp = getattr(context, "with_syntax_retry_feedback", None)
                 if not callable(_stamp):
@@ -6964,14 +6955,14 @@ class CandidateGenerator:
         """Serve a dead-queued cost-optimized op on a zero-marginal-cost lane.
 
         BACKGROUND and SPECULATIVE exist to say "spend nothing you don't have
-        to". Both encode that as a PROVIDER NAME - DoubleWord - and so, when
+        to". Both encode that as a PROVIDER NAME — DoubleWord — and so, when
         the DW catalog is purged or every DW model is exhausted, the only move
         left is to dead-queue the op with ``background_dw_blocked_by_topology``.
         The dormant-queue comment at the block site names its own release
         condition exactly: *"the queue stays dormant until a viable,
         cost-effective inference endpoint is secured."* On a host serving the
         32B locally that endpoint is already secured, permanently, at $0.00 per
-        operation - the gate simply cannot see it, because it is asking after a
+        operation — the gate simply cannot see it, because it is asking after a
         provider's NAME rather than after its COST. Six of six operations in
         soak ``bt-2026-08-24-074121`` died at that gate on a box whose GPU was
         idle the whole time; three of them with this exact code.
@@ -6984,13 +6975,13 @@ class CandidateGenerator:
         question for a cost *interlock* and the wrong one here: the local lane's
         marginal cost is zero whether or not a DW key also exists, so an
         operator who has both should still get the free lane for a route whose
-        entire contract is frugality - rather than a dead queue - when DW is
+        entire contract is frugality — rather than a dead queue — when DW is
         down. What IS required is EVIDENCE: a reachable endpoint that answered,
         never a flag asserting one should exist.
 
         Returns the ``GenerationResult`` on success, or ``None`` to fall
-        through to the caller's existing raise. Every failure mode - flag off,
-        wrong route, no endpoint, empty candidates, dispatch error - returns
+        through to the caller's existing raise. Every failure mode — flag off,
+        wrong route, no endpoint, empty candidates, dispatch error — returns
         ``None``, so a topology with no local lane keeps its byte-identical
         dead-queue behaviour and the cloud deployment is untouched.
         """
@@ -7003,7 +6994,7 @@ class CandidateGenerator:
 
         try:
             endpoint = await self._discover_jprime_endpoint()
-        except Exception:  # noqa: BLE001 - discovery is advisory, never fatal
+        except Exception:  # noqa: BLE001 — discovery is advisory, never fatal
             logger.debug(
                 "[CandidateGenerator] free-lane discovery failed [%s]",
                 op_id_short, exc_info=True,
@@ -7021,7 +7012,7 @@ class CandidateGenerator:
 
         logger.info(
             "[CandidateGenerator] free-lane preemption: route=%s would "
-            "dead-queue (%s) but a zero-marginal-cost lane is SERVING at %s - "
+            "dead-queue (%s) but a zero-marginal-cost lane is SERVING at %s — "
             "dispatching GENERATE locally instead of queueing [%s]",
             route, reason[:80], endpoint, op_id_short,
         )
@@ -7035,7 +7026,7 @@ class CandidateGenerator:
             raise
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "[CandidateGenerator] free-lane dispatch failed (%s: %.120s) - "
+                "[CandidateGenerator] free-lane dispatch failed (%s: %.120s) — "
                 "falling through to the queue path [%s]",
                 type(exc).__name__, str(exc), op_id_short,
             )
@@ -7054,7 +7045,7 @@ class CandidateGenerator:
             # to terminate an `is_noop` result benignly; hand it over.
             if getattr(result, "is_noop", False):
                 logger.info(
-                    "[CandidateGenerator] free-lane returned a NO-OP verdict - "
+                    "[CandidateGenerator] free-lane returned a NO-OP verdict — "
                     "the op is answered, not blocked (route=%s) [%s]",
                     route, op_id_short,
                 )
@@ -7063,7 +7054,7 @@ class CandidateGenerator:
                 return result
 
         logger.info(
-            "[CandidateGenerator] free-lane produced no candidates - falling "
+            "[CandidateGenerator] free-lane produced no candidates — falling "
             "through to the queue path (route=%s) [%s]", route, op_id_short,
         )
         return None
@@ -7077,7 +7068,7 @@ class CandidateGenerator:
         _immortal_attempt: int = 0,
         _immortal_budget_deadline: Optional[float] = None,
     ) -> Optional[GenerationResult]:
-        """Phase 10 P10.3 - sentinel-driven DW dispatch.
+        """Phase 10 P10.3 — sentinel-driven DW dispatch.
 
         Walks the route's ranked ``dw_models`` list (yaml v2). For each
         model whose breaker is not OPEN, stamps ``ctx._dw_model_override``
@@ -7086,20 +7077,20 @@ class CandidateGenerator:
         the next model. After exhausting all DW models, applies the
         route's ``fallback_tolerance``:
 
-          * ``"cascade_to_claude"`` - invokes ``_call_fallback`` (Claude).
-          * ``"queue"`` - raises the sentinel-already-known
+          * ``"cascade_to_claude"`` — invokes ``_call_fallback`` (Claude).
+          * ``"queue"`` — raises the sentinel-already-known
             ``RuntimeError("dw_severed_queued:...")`` shape that the
             orchestrator's existing accept-failure branch handles.
 
         Returns:
           * ``GenerationResult`` on DW success or Claude cascade.
-          * ``None`` to signal "fall through to legacy path" - used
+          * ``None`` to signal "fall through to legacy path" — used
             when the route has empty ``dw_models`` (e.g. IMMEDIATE,
-            which is Claude-direct by Manifesto S5 design and is
+            which is Claude-direct by Manifesto §5 design and is
             handled by the existing ``_generate_immediate`` dispatcher
             below).
         """
-        # ── Phase 3c - Sovereign Failover DAG re-entry (THE seam) ──────────
+        # ── Phase 3c — Sovereign Failover DAG re-entry (THE seam) ──────────
         # When the Failover FSM is SERVING (J-Prime warm at its :11434
         # endpoint), generation re-enters through the LocalPrimeClient
         # (Tier-2 self-hosted), BYPASSING the DoubleWord sentinel entirely.
@@ -7186,13 +7177,13 @@ class CandidateGenerator:
             set_dw_model_override as _set_override,
         )
 
-        # Phase 12.2 Slice F - discovery is now armed eagerly by the
+        # Phase 12.2 Slice F — discovery is now armed eagerly by the
         # Autonomic Pacemaker in GovernedLoopService at orchestrator
         # boot, before any sensor signal is pulled. The dynamic catalog
         # is populated + the 30-min refresh task is heartbeating before
         # the dispatcher runs, so this code path never needs to bootstrap
         # discovery itself. Operator directive 2026-04-28 mandates a
-        # single source of truth - the Pacemaker. If the Pacemaker fails
+        # single source of truth — the Pacemaker. If the Pacemaker fails
         # to arm, operators see the warning at boot rather than a silent
         # failure on first dispatch.
 
@@ -7204,13 +7195,13 @@ class CandidateGenerator:
             provider_route,
         )
 
-        # Slice 229 - exploration-floor driven route elevation. When this op
+        # Slice 229 — exploration-floor driven route elevation. When this op
         # must satisfy the Iron Gate exploration floor (the SAME Slice-226
         # predicate that opens the tool loop + steers the hedge), prepend the
         # COMPLEX route's agentic-elite pool (active-param-ranked, family-
         # weighted) so tool-loop work is never starved onto low-active models
         # that cannot drive it. The live layer-5 wedge: Kimi/DeepSeek-V4-Pro/
-        # GLM-5.1 all promoted=True yet UNREACHABLE from STANDARD - file-00's
+        # GLM-5.1 all promoted=True yet UNREACHABLE from STANDARD — file-00's
         # 'simple' label kept it in a pool whose only capable member drifts.
         try:
             from backend.core.ouroboros.governance.exploration_engine import (
@@ -7234,20 +7225,20 @@ class CandidateGenerator:
                 if tuple(_s229_pool) != tuple(ranked_models):
                     logger.warning(
                         "[CandidateGenerator] ⚡ ROUTE ELEVATION: op needs "
-                        "Iron-Gate exploration - agentic-elite (COMPLEX) pool "
+                        "Iron-Gate exploration — agentic-elite (COMPLEX) pool "
                         "prepended for route=%s: %s (op=%s)",
                         provider_route, list(_s229_pool)[:4],
                         getattr(context, "op_id", "?")[:16],
                     )
                     ranked_models = list(_s229_pool)
-        except Exception:  # noqa: BLE001 - elevation is enhancement, never blocks
+        except Exception:  # noqa: BLE001 — elevation is enhancement, never blocks
             pass
 
-        # Slice 201 - Contextual Bandit Routing Advisor. ADVISORY-ONLY +
+        # Slice 201 — Contextual Bandit Routing Advisor. ADVISORY-ONLY +
         # structurally fail-closed: the advisor reorders WITHIN ranked_models
         # (the brain_selection_policy active set for this route), so it can
-        # only change the ORDER the sentinel tries policy-permitted models -
-        # never select an out-of-policy arm. Gated (default OFF -> no-op); any
+        # only change the ORDER the sentinel tries policy-permitted models —
+        # never select an out-of-policy arm. Gated (default OFF → no-op); any
         # error keeps the deterministic order. The hand-rolled router stays
         # authoritative.
         try:
@@ -7257,40 +7248,40 @@ class CandidateGenerator:
             _s201_order = _s201_bandit().advise(ranked_models)
             if _s201_order and set(_s201_order) == set(ranked_models):
                 ranked_models = _s201_order
-        except Exception:  # noqa: BLE001 - advisory, never blocks dispatch
+        except Exception:  # noqa: BLE001 — advisory, never blocks dispatch
             pass
 
-        # Empty dw_models -> fall through to legacy dispatch. IMMEDIATE
+        # Empty dw_models → fall through to legacy dispatch. IMMEDIATE
         # has empty models by design (Claude-direct); other routes
         # would fall here only if yaml is misconfigured.
         if not ranked_models:
             logger.debug(
                 "[CandidateGenerator] Sentinel dispatch: route=%s "
-                "has no dw_models - falling through to legacy",
+                "has no dw_models — falling through to legacy",
                 provider_route,
             )
             return None
 
-        # Slice 76 Phase 2 - pre-flight DW transport gate. If the existing
+        # Slice 76 Phase 2 — pre-flight DW transport gate. If the existing
         # dw_surface_health ledger shows the DIRECT_STREAMING surface FRESHLY
         # TRANSPORT_DEGRADED, the whole ranked list shares that dead transport
         # (cf. should_sever_dw_lane). Cascade to Claude with the FULL untouched
-        # budget NOW - before the _primary_sem wait + per-model timeout cascade
-        # burns it (the EVAL-2 terminal_timeout, PRD S50.11). Only when the
+        # budget NOW — before the _primary_sem wait + per-model timeout cascade
+        # burns it (the EVAL-2 terminal_timeout, PRD §50.11). Only when the
         # route already cascades to Claude (a "queue"-tolerance route keeps its
         # contract). Gated + fail-open; default-on.
         if (
             fallback_tolerance == "cascade_to_claude"
             and dw_transport_degraded_preflight()
             # Pre-emptive Route Masking (2026-07-18): the sever-cascade
-            # is ALSO a Claude purchase - same contract consult as the
+            # is ALSO a Claude purchase — same contract consult as the
             # exhaustion cascade; a masked route falls through to the
             # DW path and exhausts cheaply instead.
             and not claude_route_masked(context)
         ):
             logger.info(
                 "[CandidateGenerator] Slice 76 pre-flight: DW DIRECT_STREAMING "
-                "TRANSPORT_DEGRADED (fresh) - severing DW lane pre-budget, "
+                "TRANSPORT_DEGRADED (fresh) — severing DW lane pre-budget, "
                 "cascading to Claude with full budget (op=%s route=%s)",
                 getattr(context, "op_id", "?"), provider_route,
             )
@@ -7311,7 +7302,7 @@ class CandidateGenerator:
         # Walk the ranked list. For each model not OPEN, attempt DW.
         attempts: List[str] = []
         last_failure: Optional[str] = None
-        # Slice 4 T2 - LOCAL session-budget refusal tracking. A $0.00 session
+        # Slice 4 T2 — LOCAL session-budget refusal tracking. A $0.00 session
         # budget makes EVERY ranked model refuse identically via
         # SessionBudgetPreflightRefused. That is a local config gate, NOT a
         # remote provider outage: it must NEVER poison vendor telemetry
@@ -7321,16 +7312,16 @@ class CandidateGenerator:
         # of quarantining a phantom outage or immortal-re-queueing forever.
         _budget_refusal_exc: Optional[BaseException] = None
         _saw_non_refusal_failure: bool = False
-        # Slice 83 Phase 2 - consecutive LIVE_TRANSPORT streak across the
+        # Slice 83 Phase 2 — consecutive LIVE_TRANSPORT streak across the
         # heterogeneous coder stack. A single model's transport break rotates
         # to the next coder; only a `threshold`-long streak (genuine lane-wide
         # blackout) severs. Reset by any success / non-transport failure.
         _consecutive_lt: int = 0
         _lt_sever_threshold: int = _live_transport_sever_threshold()
-        # Slice 182 - SENTINEL BATCH ENFORCEMENT (Gap 1). The per-model frozen context carries
+        # Slice 182 — SENTINEL BATCH ENFORCEMENT (Gap 1). The per-model frozen context carries
         # an EMPTY provider_route, so the downstream _slice36_should_force_batch route gate
         # can't engage and every probe ruptured on RT (the v181 bleed). The sentinel KNOWS the
-        # route + the risk - so if the stream is degraded / rupture-risk is high AND batch is
+        # route + the risk — so if the stream is degraded / rupture-risk is high AND batch is
         # healthy, COMMAND every probe to batch at T=0 via the force-batch ContextVar.
         _s182_force_batch = False
         try:
@@ -7341,19 +7332,19 @@ class CandidateGenerator:
                 _dw_in_cold_start as _s184_cold,
                 _dw_hedge_supersedes as _s192_supersedes,
             )
-            # Slice 183 - LIVE TELEMETRY PROBE. Capture the EXACT boolean state of every
+            # Slice 183 — LIVE TELEMETRY PROBE. Capture the EXACT boolean state of every
             # sub-gate AND the final computed decision, UNCONDITIONALLY (before the if), so the
             # live soak shows precisely why force-batch is False. Each gate is evaluated into
-            # its own local - no short-circuit hiding which one fails.
+            # its own local — no short-circuit hiding which one fails.
             _g_route_ok = provider_route in ("standard", "complex")
             _g_batch = bool(_s182_batch_ok())
             _g_warm = bool(_s182_warm())
             _g_risk = bool(_s182_risk(""))
-            # Slice 184 - cold-start is a degradation TRIGGER: at fresh boot the stream is
+            # Slice 184 — cold-start is a degradation TRIGGER: at fresh boot the stream is
             # unproven, so the sentinel commands batch (fail-safe) even when warm/risk are blind.
             _g_cold = bool(_s184_cold())
-            # Slice 192 - PROACTIVE HIERARCHY: the sentinel DEFERS to the hedge. When the hedge
-            # supersedes (active + no storm), do NOT force batch here - let the op RACE. The
+            # Slice 192 — PROACTIVE HIERARCHY: the sentinel DEFERS to the hedge. When the hedge
+            # supersedes (active + no storm), do NOT force batch here — let the op RACE. The
             # cold-start/warm-boot enforce only fires when the hedge is off or a storm is confirmed.
             _g_hedge = bool(_s192_supersedes(context, model_id))
             _s182_force_batch = (
@@ -7362,18 +7353,18 @@ class CandidateGenerator:
             )
             logger.warning(
                 "[Slice183] dispatch-telemetry: op=%s route=%r route_ok=%s "
-                "batch_lane_healthy=%s warm_degraded=%s rupture_risk=%s cold_start=%s -> FORCE_BATCH=%s",
+                "batch_lane_healthy=%s warm_degraded=%s rupture_risk=%s cold_start=%s → FORCE_BATCH=%s",
                 op_id_short, provider_route, _g_route_ok, _g_batch, _g_warm, _g_risk, _g_cold,
                 _s182_force_batch,
             )
             if _s182_force_batch:
                 logger.warning(
-                    "[Cortex] SENTINEL batch-enforce: stream degraded / rupture-risk high -> "
-                    "ALL probes via BATCH at T=0 (route=%s, op=%s) - RT bypass eradicated",
+                    "[Cortex] SENTINEL batch-enforce: stream degraded / rupture-risk high → "
+                    "ALL probes via BATCH at T=0 (route=%s, op=%s) — RT bypass eradicated",
                     provider_route, op_id_short,
                 )
-        except Exception:  # noqa: BLE001 - enforcement is best-effort, never blocks dispatch
-            # Slice 183 - DO NOT silently swallow. Log the full traceback so a hidden
+        except Exception:  # noqa: BLE001 — enforcement is best-effort, never blocks dispatch
+            # Slice 183 — DO NOT silently swallow. Log the full traceback so a hidden
             # ImportError / attribute error in the gate path is visible in the live soak.
             import traceback as _s183_tb
             logger.warning(
@@ -7397,24 +7388,24 @@ class CandidateGenerator:
                 _s182_force_batch = False
         for model_id in ranked_models:
             state = sentinel.get_state(model_id)
-            # Phase 12 Slice H - TERMINAL_OPEN bypasses dispatch
+            # Phase 12 Slice H — TERMINAL_OPEN bypasses dispatch
             # entirely (deterministic ground-truth ban from a 4xx
             # modality or 401/403 auth failure; doesn't auto-recover
             # via probes, only via explicit reset / catalog refresh).
             # Treated indistinguishably from OPEN at the dispatch
-            # gate - both are "do not attempt"; the difference is
+            # gate — both are "do not attempt"; the difference is
             # purely in the recovery model (probe vs explicit reset).
             if state in ("OPEN", "TERMINAL_OPEN"):
                 logger.info(
                     "[CandidateGenerator] Sentinel dispatch: route=%s "
-                    "model=%s state=%s - skipping (op=%s)",
+                    "model=%s state=%s — skipping (op=%s)",
                     provider_route, model_id, state, op_id_short,
                 )
                 attempts.append(f"{model_id}:skipped_{state.lower()}")
                 continue
             # Latency quarantine (2026-06-20): the entitlement breaker (above)
             # bans 403'd models; this bans models the TtftObserver has flagged as
-            # COLD STORAGE (latest TTFT > mean + Nσ - weights evicted from VRAM ->
+            # COLD STORAGE (latest TTFT > mean + Nσ — weights evicted from VRAM →
             # the 180s-timeout black hole). Reuses the existing observer; only
             # skips when there's at least one OTHER candidate left to try (never
             # quarantines the sole remaining model into a no-op). Gated on the
@@ -7428,15 +7419,15 @@ class CandidateGenerator:
                     if _obs is not None and _obs.is_cold_storage(model_id):
                         logger.info(
                             "[CandidateGenerator] Latency quarantine: route=%s "
-                            "model=%s COLD_STORAGE (TTFT spike) - skipping to a "
+                            "model=%s COLD_STORAGE (TTFT spike) — skipping to a "
                             "warmer candidate (op=%s)",
                             provider_route, model_id, op_id_short,
                         )
                         attempts.append(f"{model_id}:skipped_cold_storage")
                         continue
-                except Exception:  # noqa: BLE001 - observer must never block dispatch
+                except Exception:  # noqa: BLE001 — observer must never block dispatch
                     pass
-            # Slice 20C - schema drift rotation. If this model has
+            # Slice 20C — schema drift rotation. If this model has
             # produced a structurally-bad output earlier in this same
             # op (json_parse_error_after_heal / schema_id_hallucination
             # / zero_candidate_return), skip it indistinguishably from
@@ -7452,21 +7443,21 @@ class CandidateGenerator:
                 if _drift_tracker.has_drifted(_full_op_id_drift, model_id):
                     logger.info(
                         "[CandidateGenerator] Sentinel dispatch: route=%s "
-                        "model=%s drifted_on_op - rotating to sibling (op=%s)",
+                        "model=%s drifted_on_op — rotating to sibling (op=%s)",
                         provider_route, model_id, op_id_short,
                     )
                     attempts.append(f"{model_id}:skipped_drift")
                     continue
-            except Exception:  # noqa: BLE001 - rotation is enhancement, not gate
+            except Exception:  # noqa: BLE001 — rotation is enhancement, not gate
                 # Tracker consultation must NEVER block dispatch. If
                 # the tracker module is missing / unimportable / raises,
                 # fall through to normal attempt (legacy behavior).
                 pass
-            # Slice 194 - race-triage rotation. If BOTH hedge arms died on
+            # Slice 194 — race-triage rotation. If BOTH hedge arms died on
             # this model earlier in this same op (confirmed hard blockage),
-            # skip the corpse - the next iteration IS the next-highest-ranked
+            # skip the corpse — the next iteration IS the next-highest-ranked
             # catalog candidate. OWN master (JARVIS_RACE_TRIAGE_ENABLED,
-            # default TRUE, failure-path-only) - deliberately independent of
+            # default TRUE, failure-path-only) — deliberately independent of
             # the default-FALSE drift-rotation master above.
             try:
                 from backend.core.ouroboros.governance.race_triage import (
@@ -7476,13 +7467,13 @@ class CandidateGenerator:
                 if _s194_is_blacklisted(_s194_op_id, model_id):
                     logger.warning(
                         "[RaceTriage] Sentinel dispatch: route=%s model=%s "
-                        "dual-arm-blacklisted on op - rotating to next ranked "
+                        "dual-arm-blacklisted on op — rotating to next ranked "
                         "candidate (op=%s)",
                         provider_route, model_id, op_id_short,
                     )
                     attempts.append(f"{model_id}:skipped_dual_arm")
                     continue
-            except Exception:  # noqa: BLE001 - rotation is enhancement, not gate
+            except Exception:  # noqa: BLE001 — rotation is enhancement, not gate
                 pass
             attempts.append(f"{model_id}:attempted")
             # Stamp the per-attempt override via ContextVar (async-safe
@@ -7492,7 +7483,7 @@ class CandidateGenerator:
             # cascade-to-Claude after exhaustion doesn't carry a stale
             # override into the fallback provider.
             _override_token = _set_override(model_id)
-            # Slice 182 - alongside the model override, COMMAND batch for this probe when the
+            # Slice 182 — alongside the model override, COMMAND batch for this probe when the
             # sentinel determined degradation (Gap 1). Reset in the same finally as the model
             # override, so neither leaks into the post-exhaustion cascade.
             _s182_fb_token = None
@@ -7521,16 +7512,16 @@ class CandidateGenerator:
                         context, deadline,
                     )
                 else:
-                    # Slice 23 - standard / complex / unknown route uses
+                    # Slice 23 — standard / complex / unknown route uses
                     # the primary-first cascade. The Slice 23 sentinel
                     # walker still stamps the ContextVar for the
                     # provider's INTERNAL routing (DoublewordProvider.
                     # _resolve_effective_model reads it to pick which
                     # model to actually call).
                     #
-                    # Slice 30 - ALSO threads model_id explicitly through
+                    # Slice 30 — ALSO threads model_id explicitly through
                     # the orchestrator-side call chain so
-                    # _compute_primary_budget's heavy-model 2.5x scalar
+                    # _compute_primary_budget's heavy-model 2.5× scalar
                     # (Slice 28 Phase 2) engages deterministically. The
                     # v23 wiring gap (ContextVar invisible across
                     # async/semaphore boundaries) is eliminated for the
@@ -7557,7 +7548,7 @@ class CandidateGenerator:
                 # clean slate AND the post-loop cascade-to-Claude
                 # doesn't carry a stale override into the fallback.
                 _reset_override(_override_token)
-                # Slice 182 - clear the force-batch command too (never leak into cascade).
+                # Slice 182 — clear the force-batch command too (never leak into cascade).
                 if _s182_fb_token is not None:
                     try:
                         from backend.core.ouroboros.governance.doubleword_provider import (
@@ -7568,7 +7559,7 @@ class CandidateGenerator:
                         pass
 
             if _attempt_result is not None:
-                # Success - let the sentinel know. Phase 10 P10.4
+                # Success — let the sentinel know. Phase 10 P10.4
                 # also wires report_failure at existing failure sites
                 # so a stream-stall mid-generation also lands in the
                 # sentinel; this report_success closes the
@@ -7581,7 +7572,7 @@ class CandidateGenerator:
                         exc_info=True,
                     )
                 try:
-                    # Slice 201 - feed the bandit a SUCCESS reward for this arm.
+                    # Slice 201 — feed the bandit a SUCCESS reward for this arm.
                     from backend.core.ouroboros.governance.bandit_router import (
                         get_bandit_router as _s201_bandit_ok,
                     )
@@ -7589,7 +7580,7 @@ class CandidateGenerator:
                 except Exception:  # noqa: BLE001
                     pass
                 try:
-                    # Override Matrix - clear the model-pin soft-lock streak on a
+                    # Override Matrix — clear the model-pin soft-lock streak on a
                     # real success (passive observed outcome; no active probe).
                     from backend.core.ouroboros.governance.model_pinning_heuristic import (
                         note_pin_outcome as _pin_ok,
@@ -7597,11 +7588,11 @@ class CandidateGenerator:
                     _pin_ok(model_id, success=True)
                 except Exception:  # noqa: BLE001
                     pass
-                # Slice 20C - zero-candidate drift detection. The
+                # Slice 20C — zero-candidate drift detection. The
                 # parser succeeded (we're on the success branch) but
                 # may have returned an empty candidates tuple while
                 # NOT signaling no-op. That's the v15 "model judgment
-                # flaw" - Venom exploration ran, model returned valid
+                # flaw" — Venom exploration ran, model returned valid
                 # JSON, but candidates=(). Record drift so the next
                 # GENERATE_RETRY for this op_id rotates to a sibling.
                 try:
@@ -7629,11 +7620,11 @@ class CandidateGenerator:
                             )
                             logger.info(
                                 "[CandidateGenerator] Slice 20C zero-candidate "
-                                "drift recorded: op=%s model=%s - next retry "
+                                "drift recorded: op=%s model=%s — next retry "
                                 "will rotate to sibling",
                                 op_id_short, model_id,
                             )
-                except Exception:  # noqa: BLE001 - drift is enhancement
+                except Exception:  # noqa: BLE001 — drift is enhancement
                     pass
                 # A3 Transport Circuit Breaker -- record success outcome.
                 # Lane: "batch" if force-batch was armed (_s182_fb_token set), else "realtime".
@@ -7674,11 +7665,11 @@ class CandidateGenerator:
 
             if _attempt_exc is not None:
                 exc = _attempt_exc
-                # Slice 4 T2 - classify a LOCAL session-budget refusal BEFORE any
+                # Slice 4 T2 — classify a LOCAL session-budget refusal BEFORE any
                 # vendor-fault taxonomy. It is not a transport rupture: do NOT
                 # report it to the sentinel, the DW surface-health ledger, the
                 # transport breaker, the bandit, or the health gradient. Record
-                # it and rotate - every ranked model refuses identically at
+                # it and rotate — every ranked model refuses identically at
                 # $0.00, so the exhaustion path (below) fails fast instead of
                 # quarantining a phantom provider outage or waking the GCE
                 # failover (Run #14 failure-taxonomy fix).
@@ -7695,17 +7686,17 @@ class CandidateGenerator:
                     logger.warning(
                         "[CandidateGenerator] Sentinel dispatch: model=%s "
                         "REFUSED by LOCAL session-budget gate (not a provider "
-                        "fault) - rotating without vendor-outage telemetry "
+                        "fault) — rotating without vendor-outage telemetry "
                         "(op=%s)", model_id, op_id_short,
                     )
                     continue
                 _saw_non_refusal_failure = True
-                # Slice 185 Phase 2 - STRICT-TYPE EXCEPTION SEGREGATION. A Python LOGICAL error
-                # (NameError/TypeError/AttributeError/...) is OUR codebase bug, NOT a vendor
+                # Slice 185 Phase 2 — STRICT-TYPE EXCEPTION SEGREGATION. A Python LOGICAL error
+                # (NameError/TypeError/AttributeError/…) is OUR codebase bug, NOT a vendor
                 # network rupture. It must bypass the vendor resilience path entirely: never be
                 # classified as live_transport, never recorded to the DW surface-health ledger
                 # (which corrupts the learned rupture rate), never silently degraded. Bubble it
-                # up as an INTERNAL_FAULT and crash LOUDLY so we fix OUR bug - the AI must never
+                # up as an INTERNAL_FAULT and crash LOUDLY so we fix OUR bug — the AI must never
                 # again blame the vendor for its own internal codebase flaws.
                 from backend.core.ouroboros.governance.dw_fault_taxonomy import (
                     is_internal_fault as _s185_internal,
@@ -7713,7 +7704,7 @@ class CandidateGenerator:
                     is_fsm_exhaustion as _fsm_exhausted,
                     is_local_egress_overweight as _egress_overweight,
                 )
-                # Sovereign Egress Interceptor Mesh (T3) - OUR-side egress
+                # Sovereign Egress Interceptor Mesh (T3) — OUR-side egress
                 # interceptor blocked an over-ceiling body. DW never received the
                 # request (good API citizenship); no socket failed. Classify
                 # LOCAL_EGRESS_OVERWEIGHT (weight 0.0) so it NEVER trips the model/
@@ -7733,7 +7724,7 @@ class CandidateGenerator:
                             FailureSource.LOCAL_EGRESS_OVERWEIGHT,
                             f"{type(exc).__name__}:{str(exc)[:120]}",
                         )
-                    except Exception:  # noqa: BLE001 - telemetry, never block
+                    except Exception:  # noqa: BLE001 — telemetry, never block
                         logger.debug(
                             "[CandidateGenerator] egress-overweight report_failure raised",
                             exc_info=True,
@@ -7741,7 +7732,7 @@ class CandidateGenerator:
                     logger.warning(
                         "[CandidateGenerator] LOCAL_EGRESS_OVERWEIGHT (weight 0.0, "
                         "NOT a vendor rupture): our egress interceptor blocked an "
-                        "over-ceiling body for model=%s - re-raising with "
+                        "over-ceiling body for model=%s — re-raising with "
                         "max_allowed_size=%s so the orchestrator re-chunks to fit "
                         "(op=%s)",
                         model_id, getattr(exc, "max_allowed_size", "?"),
@@ -7750,7 +7741,7 @@ class CandidateGenerator:
                     raise exc
                 if _s185_internal(exc):
                     logger.error(
-                        "[CandidateGenerator] INTERNAL_FAULT (%s) - NOT a vendor rupture; "
+                        "[CandidateGenerator] INTERNAL_FAULT (%s) — NOT a vendor rupture; "
                         "bubbling up + crashing loud, NOT touching the DW vendor ledger "
                         "(op=%s, model=%s): %s",
                         type(exc).__name__, op_id_short, model_id, exc,
@@ -7760,13 +7751,13 @@ class CandidateGenerator:
                 err_str = str(exc)
                 err_lower = err_str.lower()
 
-                # Phase 12 Slice F - Substrate Error Unmasking. When
+                # Phase 12 Slice F — Substrate Error Unmasking. When
                 # the exception is a DoublewordInfraError (or any
                 # structurally-unmasked equivalent that carries a
                 # ``status_code`` attribute), classify FROM THE
                 # STRUCTURED FIELD instead of regex on str(exc). This
                 # is the substrate of Slice H's terminal-vs-transient
-                # distinction - we MUST know the actual HTTP status to
+                # distinction — we MUST know the actual HTTP status to
                 # decide TERMINAL_OPEN vs OPEN.
                 _status_code = getattr(exc, "status_code", None)
                 _response_body = getattr(exc, "response_body", "") or ""
@@ -7791,10 +7782,10 @@ class CandidateGenerator:
                         _zs_obs = _zs_get_obs()
                         if _zs_obs is not None and model_id:
                             _zs_obs.record_timeout(model_id, op_id=op_id_short)
-                    except Exception:  # noqa: BLE001 - never block dispatch
+                    except Exception:  # noqa: BLE001 — never block dispatch
                         pass
                 if _s241_gen_timeout(exc):
-                    # Slice 241 - OUR op-level tool-loop budget exhaustion
+                    # Slice 241 — OUR op-level tool-loop budget exhaustion
                     # (tool_loop_deadline / max_rounds / starved), NOT a DW
                     # transport rupture. Classify GENERATION_TIMEOUT so the
                     # ==LIVE_TRANSPORT degrade/sever consumers ignore it and the
@@ -7802,7 +7793,7 @@ class CandidateGenerator:
                     # Stops blaming DoubleWord's network for our generation budget.
                     failure_source = FailureSource.GENERATION_TIMEOUT
                 elif _fsm_exhausted(exc):
-                    # Sovereign Exception Taxonomy (2026-06-20) - OUR-side FSM
+                    # Sovereign Exception Taxonomy (2026-06-20) — OUR-side FSM
                     # dispatch exhaustion (DW produced no candidate AND no Claude
                     # fallback configured under pure-DW autarky). NOT a vendor
                     # rupture: no socket failed, the vendor rejected nothing. The
@@ -7814,7 +7805,7 @@ class CandidateGenerator:
                     # severing the lane or touching the vendor ledger.
                     failure_source = FailureSource.FSM_EXHAUSTED
                 elif _is_modality or _is_auth_terminal:
-                    # Slice H - terminal failure class. Even though we
+                    # Slice H — terminal failure class. Even though we
                     # report it as LIVE_HTTP_5XX semantics here for
                     # back-compat, the breaker (Slice H wiring) will
                     # read the structured exception fields when
@@ -7826,7 +7817,7 @@ class CandidateGenerator:
                 elif _status_code is not None:
                     # Structured HTTP status drives classification.
                     # QUOTA FIRST (the council's 2026-07-21 finding): a 4xx
-                    # whose body is economic is a wallet state - before this
+                    # whose body is economic is a wallet state — before this
                     # branch it fell to LIVE_TRANSPORT and read as latency.
                     from backend.core.ouroboros.governance.economic_router import (  # noqa: E501
                         classify_http_failure_source as _econ_classify,
@@ -7850,7 +7841,7 @@ class CandidateGenerator:
                     else:
                         failure_source = FailureSource.LIVE_TRANSPORT
                 else:
-                    # No status_code attribute -> fall back to regex on
+                    # No status_code attribute → fall back to regex on
                     # str(exc) (legacy path for non-DW exceptions).
                     from backend.core.ouroboros.governance.economic_router import (  # noqa: E501
                         classify_http_failure_source as _econ_classify,
@@ -7862,7 +7853,7 @@ class CandidateGenerator:
                         failure_source = FailureSource.LIVE_STREAM_STALL
                     elif _econ_classify(None, err_str) is not None:
                         # Economic body with no structured status (e.g. an
-                        # SDK BadRequestError repr) - same wallet taxonomy.
+                        # SDK BadRequestError repr) — same wallet taxonomy.
                         failure_source = FailureSource.LIVE_HTTP_4XX_QUOTA
                         _record_quota_outage_safely("doubleword", err_str)
                     elif "429" in err_str:
@@ -7893,7 +7884,7 @@ class CandidateGenerator:
                         )
                     except TypeError:
                         # Sentinel doesn't accept new kwargs yet (pre-
-                        # Slice-H sentinel) - fall back to legacy call
+                        # Slice-H sentinel) — fall back to legacy call
                         sentinel.report_failure(
                             model_id, failure_source,
                             f"{type(exc).__name__}:{err_str[:120]}",
@@ -7907,13 +7898,13 @@ class CandidateGenerator:
                     f"{model_id}:{failure_source.value}:"
                     f"{type(exc).__name__}"
                 )
-                # Slice F - log the unmasked status_code + body excerpt
+                # Slice F — log the unmasked status_code + body excerpt
                 # alongside the legacy WARNING line so operators see
                 # ground truth in debug.log immediately.
                 if _status_code is not None and _status_code > 0:
                     logger.warning(
                         "[CandidateGenerator] Sentinel dispatch: model=%s "
-                        "FAILED (source=%s, http_%d, body=%r%s%s) - "
+                        "FAILED (source=%s, http_%d, body=%r%s%s) — "
                         "trying next (op=%s)",
                         model_id, failure_source.value, _status_code,
                         _response_body[:160],
@@ -7924,10 +7915,10 @@ class CandidateGenerator:
                 else:
                     logger.warning(
                         "[CandidateGenerator] Sentinel dispatch: model=%s "
-                        "FAILED (source=%s, exc=%s) - trying next (op=%s)",
+                        "FAILED (source=%s, exc=%s) — trying next (op=%s)",
                         model_id, failure_source.value,
                         # Observability (2026-06-20): un-swallow the message. The
-                        # prior log emitted only ``type(exc).__name__`` - which hid
+                        # prior log emitted only ``type(exc).__name__`` — which hid
                         # that a "live_transport RuntimeError" was actually an
                         # internal ``...:no_fallback_configured`` FSM exhaustion,
                         # costing two long blind diagnosis passes. Include the
@@ -7967,13 +7958,13 @@ class CandidateGenerator:
                 except Exception:  # noqa: BLE001 -- never perturb the error path
                     pass
                 try:
-                    # Slice 201 - feed the bandit a FAILURE reward for this arm
+                    # Slice 201 — feed the bandit a FAILURE reward for this arm
                     # so its posterior learns which models actually deliver.
                     #
                     # Slice 17 (mandate 3): classify the fault FIRST. A 403
                     # entitlement denial, an RT rupture, or a breaker timeout is
                     # a fact about the ENVIRONMENT, not about this model's
-                    # generation quality - folding it into alpha/beta is how the
+                    # generation quality — folding it into alpha/beta is how the
                     # posterior converged on garbage in Run-25c (it down-weighted
                     # models that generate fine and up-weighted an unreachable
                     # one). Infra faults are quarantined into ``infra_faults``;
@@ -7990,7 +7981,7 @@ class CandidateGenerator:
                 except Exception:  # noqa: BLE001
                     pass
                 try:
-                    # Override Matrix - feed the model-pin soft-lock a real
+                    # Override Matrix — feed the model-pin soft-lock a real
                     # failure (429/500/live-transport). At threshold the pin
                     # enters cooldown and routing yields to the EWMA ranking.
                     from backend.core.ouroboros.governance.model_pinning_heuristic import (
@@ -7999,20 +7990,20 @@ class CandidateGenerator:
                     _pin_fail(model_id, success=False)
                 except Exception:  # noqa: BLE001
                     pass
-                # Slice 77 - dynamic transport telemetry. The moment a LIVE
+                # Slice 77 — dynamic transport telemetry. The moment a LIVE
                 # generation confirms a transport break, feed it into the
                 # dw_surface_health ledger so the NEXT op's Slice 76 P2
                 # pre-flight gate fires and skips the dead DW lane (closes the
                 # stale-boot-probe gap found in the EVAL-2 Phase-4 re-run,
-                # S50.11). Only LIVE_TRANSPORT - 429/5xx/parse are model- or
+                # §50.11). Only LIVE_TRANSPORT — 429/5xx/parse are model- or
                 # request-specific, not a transport-wide break.
                 if failure_source is FailureSource.LIVE_TRANSPORT:
                     _note_dw_live_transport_degraded(
                         f"{model_id}:{type(exc).__name__}",
-                        model_id=model_id,  # Slice 175 - attribute the rupture to THIS model
+                        model_id=model_id,  # Slice 175 — attribute the rupture to THIS model
                     )
                     _consecutive_lt += 1
-                    # Slice 182 Gap 2 - HEDGE AT THE RUPTURE BOUNDARY. The first rupture is the
+                    # Slice 182 Gap 2 — HEDGE AT THE RUPTURE BOUNDARY. The first rupture is the
                     # absolute first line of defense: immediately COMMAND the remaining probes
                     # in THIS dispatch onto batch, so a fresh-session rupture (before Gap 1's
                     # persisted-degraded signal exists) doesn't walk all 6 models through RT.
@@ -8026,27 +8017,27 @@ class CandidateGenerator:
                                 _s182_force_batch = True
                                 logger.warning(
                                     "[Immortal] rupture HEDGE at sentinel boundary: %s ruptured "
-                                    "-> remaining probes switched to BATCH (op=%s)",
+                                    "→ remaining probes switched to BATCH (op=%s)",
                                     model_id, op_id_short,
                                 )
                         except Exception:  # noqa: BLE001
                             pass
                 else:
-                    # Slice 83 Phase 2 - a non-transport failure (429/5xx/parse)
+                    # Slice 83 Phase 2 — a non-transport failure (429/5xx/parse)
                     # proves THIS model's transport is reachable, so the prior
                     # transport breaks were per-model, not lane-wide. Reset the
                     # streak: a genuine blackout is N transport breaks in a row.
                     _consecutive_lt = 0
-                    # Slice 176 - fuse the non-transport vector into the predictor
+                    # Slice 176 — fuse the non-transport vector into the predictor
                     # (economic 429 / upstream 5xx+parse / stall), per-model + weighted.
                     _record_dw_failure_signal(model_id, failure_source)
-                # Slice 73 + Slice 83 Phase 2 - structural transport short-circuit,
+                # Slice 73 + Slice 83 Phase 2 — structural transport short-circuit,
                 # now streak-gated. A LIVE_TRANSPORT break MIGHT mean the whole DW
-                # endpoint is down - but with the Slice 82/83 heterogeneous coder
+                # endpoint is down — but with the Slice 82/83 heterogeneous coder
                 # stack (DeepSeek-V4-Pro / Kimi / GLM / Qwen are distinct served
                 # endpoints) a single break may just be one model bouncing. So we
                 # ROTATE to the next coder on the first break and only sever once
-                # `threshold` consecutive models have ALL failed transport - the
+                # `threshold` consecutive models have ALL failed transport — the
                 # signature of a real lane-wide blackout. Severing too early
                 # starves the Claude fallback (bt-2026-06-03
                 # deadline_exhausted_pre_fallback); rotating too long burns budget
@@ -8060,7 +8051,7 @@ class CandidateGenerator:
                     _severed = len(ranked_models) - len(attempts)
                     logger.warning(
                         "[CandidateGenerator] Slice 73/83 structural fast-cascade: "
-                        "model=%s LIVE_TRANSPORT streak=%d>=%d - severing DW lane, "
+                        "model=%s LIVE_TRANSPORT streak=%d>=%d — severing DW lane, "
                         "cascading to fallback with full budget (op=%s, skipped %d "
                         "sibling model(s))",
                         model_id, _consecutive_lt, _lt_sever_threshold,
@@ -8073,7 +8064,7 @@ class CandidateGenerator:
                 ):
                     logger.info(
                         "[CandidateGenerator] Slice 83 granular isolation: "
-                        "model=%s LIVE_TRANSPORT streak=%d<%d - rotating to next "
+                        "model=%s LIVE_TRANSPORT streak=%d<%d — rotating to next "
                         "coder, DW lane stays open (op=%s)",
                         model_id, _consecutive_lt, _lt_sever_threshold,
                         op_id_short,
@@ -8081,11 +8072,11 @@ class CandidateGenerator:
                 continue
         # All DW models exhausted (either OPEN or failed). The
         # per-attempt ContextVar was already reset by each loop
-        # iteration's finally block (Slice 3.6) - no further cleanup
+        # iteration's finally block (Slice 3.6) — no further cleanup
         # needed before cascade-to-Claude / queue.
         logger.warning(
             "[CandidateGenerator] Sentinel dispatch: route=%s exhausted "
-            "all %d DW models [%s] - applying fallback_tolerance=%s "
+            "all %d DW models [%s] — applying fallback_tolerance=%s "
             "(op=%s, last_failure=%s)",
             provider_route, len(ranked_models),
             ", ".join(attempts),
@@ -8098,22 +8089,22 @@ class CandidateGenerator:
         # trips is_global_outage, consumed at the immortal re-queue intercept
         # below. Fail-soft: gradient errors never perturb the dispatch path.
         #
-        # Slice 4 T2 - a PURE session-budget-refusal exhaustion (every model
+        # Slice 4 T2 — a PURE session-budget-refusal exhaustion (every model
         # refused on the local $0.00 gate, no genuine transport failure) is NOT
         # a provider-outage sweep. Recording success=False here would poison the
-        # gradient's is_global_outage deduction across ops -> spurious DW
+        # gradient's is_global_outage deduction across ops → spurious DW
         # quarantine (Run #14: a phantom 79-minute global outage from 30 budget
         # refusals). Skip the sweep in that case.
         if _budget_refusal_exc is not None and not _saw_non_refusal_failure:
             # NON-TRANSIENT local budget exhaustion: retrying, cascading,
             # quarantining, or waking the J-Prime failover (real GCE $) cannot
-            # help - only an operator refund can. Fail FAST and VISIBLY with a
+            # help — only an operator refund can. Fail FAST and VISIBLY with a
             # distinct terminal cause so the op surfaces the real class instead
             # of masquerading as a provider outage. This raise preempts the
             # cascade decision, the UPSTREAM QUARANTINE intercept, the immortal
             # re-queue loop, AND the budget-driven GCE failover awaken below.
             logger.error(
-                "[Immortal] NON-TRANSIENT budget exhaustion - terminating "
+                "[Immortal] NON-TRANSIENT budget exhaustion — terminating "
                 "retry loop (fail-fast, op fails visibly): op=%s last=%s",
                 op_id_short, (last_failure or "?")[:80],
             )
@@ -8130,7 +8121,7 @@ class CandidateGenerator:
         except Exception:  # noqa: BLE001 -- gradient is advisory, never blocks
             pass
         if fallback_tolerance == "queue":
-            # Zero-cost lane FIRST - before the read-only Claude cascade below.
+            # Zero-cost lane FIRST — before the read-only Claude cascade below.
             # Both branches exist to keep a cost-optimized op moving; this one
             # costs $0.00 and that one costs ~$0.005, so consulting Claude
             # first would be paying for the more expensive of two available
@@ -8144,7 +8135,7 @@ class CandidateGenerator:
             )
             if _free_lane is not None:
                 return _free_lane
-            # Defect #5 fix (2026-05-03) - Read-only cascade reflex.
+            # Defect #5 fix (2026-05-03) — Read-only cascade reflex.
             # Soak v5 (bt-2026-05-03-060330) had 17/19 BG ops terminal-
             # failing here with "background_dw_blocked_by_topology".
             # The legacy reflex in _generate_background() (line ~2806)
@@ -8160,7 +8151,7 @@ class CandidateGenerator:
             # synthesis cost (~$0.005/op).
             #
             # Mutating BG ops still respect JARVIS_BACKGROUND_ALLOW_
-            # FALLBACK env knob - they fall through to the queue
+            # FALLBACK env knob — they fall through to the queue
             # raise below if the operator hasn't opted in.
             _is_read_only = bool(
                 getattr(context, "is_read_only", False),
@@ -8175,14 +8166,14 @@ class CandidateGenerator:
                 self._fallback is not None
                 and (_is_read_only or _allow_mutating_fallback)
             )
-            # Slice 124 - Autonomous Economic Router. On a HARD economic block
+            # Slice 124 — Autonomous Economic Router. On a HARD economic block
             # (DW http_402 balance / 429 rate-limit), a small read-only (or
             # opt-in) BACKGROUND op should not dead-queue: cascade it to the
             # cheap Claude tier to preserve momentum, while MASSIVE ops stay
             # queued (don't pay Claude prices for a big background op). This
             # EXTENDS the read-only cascade with an economic size-gate; the
             # cheap model is resolved from JARVIS_ECONOMIC_FAILOVER_MODEL (no
-            # hardcode). Gated + fail-open; default-off -> byte-identical.
+            # hardcode). Gated + fail-open; default-off → byte-identical.
             try:
                 from backend.core.ouroboros.governance import economic_router as _ER
 
@@ -8198,21 +8189,21 @@ class CandidateGenerator:
                     if _econ.action is _ER.EconomicAction.CASCADE_CHEAP:
                         _can_cascade = True
                         logger.info(
-                            "[CandidateGenerator] EconomicRouter: %s -> cascade to "
+                            "[CandidateGenerator] EconomicRouter: %s → cascade to "
                             "cheap tier '%s' (op=%s, %s)",
                             _econ.reason, _econ.model or "(default fallback)",
                             op_id_short, provider_route,
                         )
                     elif _econ.action is _ER.EconomicAction.QUEUE:
-                        # Massive/unsafe op on a hard block - keep it queued
+                        # Massive/unsafe op on a hard block — keep it queued
                         # (overrides a would-be read-only cascade for cost).
                         _can_cascade = False
                         logger.info(
-                            "[CandidateGenerator] EconomicRouter: %s -> staying "
+                            "[CandidateGenerator] EconomicRouter: %s → staying "
                             "queued for cheap provider (op=%s)",
                             _econ.reason, op_id_short,
                         )
-                    # Slice 136 - economic-router cognitive synapse. Fired from
+                    # Slice 136 — economic-router cognitive synapse. Fired from
                     # OUTSIDE the pure decide() (the AST-pinned classifier has no
                     # side effects), so the organism remembers its economic
                     # failover decisions. Coalesced per op; gated + non-blocking +
@@ -8224,7 +8215,7 @@ class CandidateGenerator:
                         _note_route(
                             op_id=str(op_id_short or ""),
                             router="economic",
-                            summary=(f"economic {_econ.action.value} -> "
+                            summary=(f"economic {_econ.action.value} → "
                                      f"{_econ.model or 'cheap-default'}"),
                             context={
                                 "action": _econ.action.value,
@@ -8233,7 +8224,7 @@ class CandidateGenerator:
                                 "reason": _econ.reason,
                             },
                         )
-                    except Exception:  # noqa: BLE001 - synapse never perturbs routing
+                    except Exception:  # noqa: BLE001 — synapse never perturbs routing
                         pass
             except Exception:  # noqa: BLE001 - economic routing is best-effort
                 logger.debug("[CandidateGenerator] EconomicRouter consult skipped", exc_info=True)
@@ -8247,7 +8238,7 @@ class CandidateGenerator:
                     "[CandidateGenerator] Sentinel queue tolerance "
                     "OVERRIDE: route=%s cascading to Claude (%s, "
                     "op=%s, fallback_tolerance=queue but is_read_only=%s "
-                    "or allow_fallback_env=%s) - Defect #5 fix "
+                    "or allow_fallback_env=%s) — Defect #5 fix "
                     "2026-05-03 lifts the read-only reflex from "
                     "_generate_background where it was unreachable "
                     "after sentinel raise",
@@ -8269,21 +8260,21 @@ class CandidateGenerator:
                 f"dw_severed_queued:"
                 f"{(last_failure or 'all_models_open')[:120]}"
             )
-        # cascade_to_claude - Claude is the explicit cost contract, BUT only when
+        # cascade_to_claude — Claude is the explicit cost contract, BUT only when
         # the Claude lane is actually alive. Slice 238: consult the SAME economic
-        # breaker the primary lane respects (read-only ``_claude_breaker_open`` -
+        # breaker the primary lane respects (read-only ``_claude_breaker_open`` —
         # no probe side-effect) before cascading. When it is OPEN (Claude
         # economically/transport dead) the cascade is suppressed and the op routes
         # to the immortal DW-retry / clean-degrade branch below instead of
         # poisoning the op via a known-dead lane (terminal_quota). Breaker CLOSED
-        # -> byte-identical legacy cascade (a funded Claude is used normally).
+        # → byte-identical legacy cascade (a funded Claude is used normally).
         _claude_lane_open = False
         try:
             from backend.core.ouroboros.governance.doubleword_provider import (
                 _claude_breaker_open as _cascade_breaker_open,
             )
             _claude_lane_open = _cascade_breaker_open()
-        except Exception:  # noqa: BLE001 - advisory; never block dispatch
+        except Exception:  # noqa: BLE001 — advisory; never block dispatch
             _claude_lane_open = False
         _route_masked = claude_route_masked(context)
         _do_cascade = should_cascade_to_claude(
@@ -8294,7 +8285,7 @@ class CandidateGenerator:
         )
         if _route_masked and self._fallback is not None:
             logger.info(
-                "[CandidateGenerator] route MASKED - claude omitted from "
+                "[CandidateGenerator] route MASKED — claude omitted from "
                 "fallback pool by cost contract (route=%s read_only=%s "
                 "op=%s); exhausting cheap pool natively",
                 getattr(context, "provider_route", "?"),
@@ -8303,20 +8294,20 @@ class CandidateGenerator:
         if not _do_cascade and self._fallback is not None and _claude_lane_open:
             logger.warning(
                 "[CandidateGenerator] Slice238 cascade-to-claude SUPPRESSED: "
-                "Claude breaker OPEN (economic/transport) - not poisoning op via "
+                "Claude breaker OPEN (economic/transport) — not poisoning op via "
                 "the known-dead lane (terminal_quota); routing to immortal "
                 "DW-retry/degrade (op=%s, last=%s)",
                 op_id_short, (last_failure or "?")[:60],
             )
-        # cascade_to_claude - Claude is the explicit cost contract.
+        # cascade_to_claude — Claude is the explicit cost contract.
         if not _do_cascade:
-            # Slice 180 - THE IMMORTAL EXECUTION LAYER. Raising here DELETES the op (the
+            # Slice 180 — THE IMMORTAL EXECUTION LAYER. Raising here DELETES the op (the
             # soak's all_providers_exhausted bleed). With NO fallback configured, exhausting
-            # is unacceptable. Instead -> QUEUE_ONLY: exponential-backoff and RE-ATTEMPT the
+            # is unacceptable. Instead → QUEUE_ONLY: exponential-backoff and RE-ATTEMPT the
             # full DW dispatch until the vendor recovers, bounded by the op's own deadline +
             # a capped attempt count. A transient TOTAL DW outage is survived (the warm-boot
             # + intra-DW failover route the recovered attempt to batch); a permanently-dead
-            # DW still fails - but only after exhausting the queue budget, never instantly.
+            # DW still fails — but only after exhausting the queue budget, never instantly.
             # Task T2 -- UPSTREAM QUARANTINE intercept (the keystone). BEFORE the
             # immortal re-queue: if the provider health gradient has DEDUCED a
             # global DW outage (full rolling window of all-failed sweeps for this
@@ -8417,7 +8408,7 @@ class CandidateGenerator:
                 import time as _imm_time
                 from datetime import datetime as _imm_dt, timezone as _imm_tz, timedelta as _imm_td
                 _imm_now = _imm_time.time()
-                # Slice 182 Gap 3 - the immortal budget is DETACHED from the op's 120s generation
+                # Slice 182 Gap 3 — the immortal budget is DETACHED from the op's 120s generation
                 # deadline: a separate, much-longer wall (default 1h) computed ONCE and threaded
                 # across the retry recursion, so a sustained DW outage doesn't expire the op.
                 _imm_budget = (
@@ -8446,7 +8437,7 @@ class CandidateGenerator:
                         pass
                     _imm_delay = _imm_backoff(_immortal_attempt)
                     logger.warning(
-                        "[Immortal] DW exhausted + NO fallback -> QUEUE_ONLY (deadline-detached): "
+                        "[Immortal] DW exhausted + NO fallback → QUEUE_ONLY (deadline-detached): "
                         "backoff %.1fs then re-attempt #%d, budget %.0fs remaining (op NEVER lost; "
                         "op=%s, last=%s)",
                         _imm_delay, _immortal_attempt + 1, max(0.0, _imm_budget - _imm_now),
@@ -8460,7 +8451,7 @@ class CandidateGenerator:
                         _immortal_attempt=_immortal_attempt + 1,
                         _immortal_budget_deadline=_imm_budget,
                     )
-            except Exception as _imm_exc:  # noqa: BLE001 - the immortal layer must never itself break the op
+            except Exception as _imm_exc:  # noqa: BLE001 — the immortal layer must never itself break the op
                 logger.debug("[Immortal] queue-retry path swallowed: %r", _imm_exc)
             _note_dw_total_outage(last_failure or "")  # Slice 53
             raise RuntimeError(
@@ -8503,16 +8494,16 @@ class CandidateGenerator:
         # If DW IS the primary, go straight to Claude (the fallback).
         _dw_is_primary = (self._tier0 is not None and self._primary is self._tier0)
         if _dw_is_primary:
-            # Slice 127 P2.1 - fallback-skip gate. Claude-direct would just
+            # Slice 127 P2.1 — fallback-skip gate. Claude-direct would just
             # grind an IMMEDIATE op against a depleted Claude lane (the live
             # soak: terminal_quota x N, no completion). When the Claude lane
             # breaker is OPEN (economic/transport), reroute to the funded DW
-            # primary instead. Slice 162 - read the breaker STATE (read-only) via the
+            # primary instead. Slice 162 — read the breaker STATE (read-only) via the
             # Slice 161 predicate, NOT should_allow_request(): the latter flickers True
             # during a HALF_OPEN probe AND has a side effect (consumes the probe slot),
             # so an IMMEDIATE op kept hammering a dead-but-probing Claude and exhausted
-            # before the gate. Now CLOSED -> Claude-direct (self-heal); OPEN/HALF_OPEN ->
-            # reroute to funded DW. Gated default-FALSE -> OFF is unchanged Claude-direct.
+            # before the gate. Now CLOSED → Claude-direct (self-heal); OPEN/HALF_OPEN →
+            # reroute to funded DW. Gated default-FALSE → OFF is unchanged Claude-direct.
             if fallback_skip_gate_enabled():
                 try:
                     from backend.core.ouroboros.governance.claude_circuit_breaker import (  # noqa: E501
@@ -8530,14 +8521,14 @@ class CandidateGenerator:
                         claude_allows_request=_p21_allows,
                     ):
                         logger.warning(
-                            "[CandidateGenerator] IMMEDIATE reroute -> DW: "
-                            "Claude lane breaker OPEN (economic/transport) - "
+                            "[CandidateGenerator] IMMEDIATE reroute → DW: "
+                            "Claude lane breaker OPEN (economic/transport) — "
                             "bypassing depleted Claude, routing to funded DW "
                             "primary (op=%s)",
                             getattr(context, "op_id", "?"),
                         )
                         return await self._call_primary(context, deadline)
-                except Exception:  # noqa: BLE001 - never block dispatch
+                except Exception:  # noqa: BLE001 — never block dispatch
                     pass
             return await self._call_fallback(context, deadline)
 
@@ -8555,7 +8546,7 @@ class CandidateGenerator:
         """Phase 3 Scope α: try J-Prime first for BACKGROUND/SPECULATIVE.
 
         Returns the ``GenerationResult`` on success, or ``None`` to
-        signal "fall through to DW". Never raises - all failure modes
+        signal "fall through to DW". Never raises — all failure modes
         (flag off, no handle, sem saturated, generate error, empty
         result) are translated into a ``None`` return plus a counter
         bump so the caller can take the DW-only path unchanged.
@@ -8572,7 +8563,7 @@ class CandidateGenerator:
         Why a pre-check on ``self._jprime_sem.locked()``:
             ``asyncio.Semaphore(1)`` with overflow-fall-through has no
             clean primitive. We want "try to grab it right now, and if
-            already held, don't queue - go to DW instead." The
+            already held, don't queue — go to DW instead." The
             ``locked()`` check is a tiny race (a sibling op could take
             the token in the gap between the check and the acquire),
             but the worst case is that we serialize two ops for one
@@ -8581,7 +8572,7 @@ class CandidateGenerator:
             ``CancelledError`` on some asyncio versions and obscure
             the intent; ``locked()`` is clearer.
         """
-        # Deferred import - ``jprime_primacy_enabled`` is a module-level
+        # Deferred import — ``jprime_primacy_enabled`` is a module-level
         # function in ``_governance_state``, and fetching it at call
         # time keeps the hot-path branch cheap when the flag is off.
         from ._governance_state import jprime_primacy_enabled
@@ -8603,7 +8594,7 @@ class CandidateGenerator:
         ):
             return None
 
-        # Sem saturation - a sibling op is already using the single
+        # Sem saturation — a sibling op is already using the single
         # client-side slot. Don't queue; fall through to DW so the
         # background workload doesn't serialize behind one J-Prime call.
         if self._jprime_sem.locked():
@@ -8611,7 +8602,7 @@ class CandidateGenerator:
             self._jprime_counters.fallthrough_to_dw += 1
             logger.info(
                 "[CandidateGenerator] %s: J-Prime sem saturated (overflows=%d) "
-                "- falling through to DW",
+                "— falling through to DW",
                 route_label,
                 self._jprime_counters.jprime_sem_overflows,
             )
@@ -8619,7 +8610,7 @@ class CandidateGenerator:
 
         remaining = self._remaining_seconds(deadline)
         if remaining <= 0.0:
-            # No budget left - fall through silently so the DW path
+            # No budget left — fall through silently so the DW path
             # can emit its own deadline-exceeded diagnostic.
             return None
 
@@ -8634,7 +8625,7 @@ class CandidateGenerator:
                 self._jprime_counters.fallthrough_to_dw += 1
                 logger.info(
                     "[CandidateGenerator] %s: J-Prime primacy timeout after "
-                    "%.1fs - falling through to DW",
+                    "%.1fs — falling through to DW",
                     route_label,
                     remaining,
                 )
@@ -8644,7 +8635,7 @@ class CandidateGenerator:
                 self._jprime_counters.fallthrough_to_dw += 1
                 logger.info(
                     "[CandidateGenerator] %s: J-Prime primacy error "
-                    "%s(%s) - falling through to DW",
+                    "%s(%s) — falling through to DW",
                     route_label,
                     type(exc).__name__,
                     exc,
@@ -8656,14 +8647,14 @@ class CandidateGenerator:
             self._jprime_counters.fallthrough_to_dw += 1
             logger.info(
                 "[CandidateGenerator] %s: J-Prime primacy returned no "
-                "candidates - falling through to DW",
+                "candidates — falling through to DW",
                 route_label,
             )
             return None
 
         self._jprime_counters.jprime_hits += 1
         logger.info(
-            "[CandidateGenerator] %s: J-Prime primacy hit - %d candidates "
+            "[CandidateGenerator] %s: J-Prime primacy hit — %d candidates "
             "in %.1fs (hits=%d, overflows=%d, failures=%d)",
             route_label,
             len(result.candidates),
@@ -8677,7 +8668,7 @@ class CandidateGenerator:
     def _get_resilience_provider(self, route: str) -> Tuple[Optional[Any], str]:
         """Lazy, fail-soft resolver for the hosted resilience lane's armed
         provider on *route*. Returns ``(provider, reason)``; ``(None, ...)``
-        on any disarm/import failure - a broken lane module can NEVER brick
+        on any disarm/import failure — a broken lane module can NEVER brick
         generator dispatch (Bulletproof mandate). All arm/disarm authority
         lives in hosted_resilience_lane.py, driven by policy shape only."""
         lane = getattr(self, "_hosted_resilience_lane", None)
@@ -8690,11 +8681,11 @@ class CandidateGenerator:
                 )
                 lane = HostedResilienceLane()
                 self._hosted_resilience_lane = lane
-            except Exception as exc:  # noqa: BLE001 - lane must never brick dispatch
+            except Exception as exc:  # noqa: BLE001 — lane must never brick dispatch
                 self._hosted_resilience_lane_broken = True
                 logger.warning(
                     "[CandidateGenerator] hosted resilience lane import "
-                    "failed (%s) - lane dark for this session", exc,
+                    "failed (%s) — lane dark for this session", exc,
                 )
                 return None, "lane_import_failed"
         return lane.provider_for_route(route)
@@ -8708,7 +8699,7 @@ class CandidateGenerator:
         tier0_error: Optional[str],
     ) -> Optional[GenerationResult]:
         """Consult the policy-driven hosted resilience lane after Tier-0
-        exhaustion (LongCat stub Phase 1 - hosted_resilience_lane.py).
+        exhaustion (LongCat stub Phase 1 — hosted_resilience_lane.py).
 
         GENERIC by design: candidates and their routes come exclusively
         from ``brain_selection_policy.yaml`` (``hosted_provider_candidates.
@@ -8719,11 +8710,11 @@ class CandidateGenerator:
 
         Returns a GenerationResult on lane success, ``None`` on ANY
         disarm/failure condition (caller falls through to its legacy
-        behavior unchanged - Bulletproof mandate: never an unhandled
+        behavior unchanged — Bulletproof mandate: never an unhandled
         exception out of a dark lane), with ONE exception class:
         ``SessionBudgetPreflightRefused`` propagates. The lane provider is
         a real ClaudeProvider, so its internal wallet preflight raises the
-        same exception DW/Claude raise - re-raising keeps a $0.00 session
+        same exception DW/Claude raise — re-raising keeps a $0.00 session
         on the Slice 4 T2 ``is_budget_refusal`` axis (local gate, fail
         fast + visible) instead of masquerading as a lane fault or, worse,
         silently igniting the J-Prime GCE failover.
@@ -8732,14 +8723,14 @@ class CandidateGenerator:
         if provider is None:
             return None
         logger.info(
-            "[CandidateGenerator] %s: Tier-0 exhausted (%s) - trying hosted "
+            "[CandidateGenerator] %s: Tier-0 exhausted (%s) — trying hosted "
             "resilience lane (%s) [%s]",
             route.upper(), tier0_error or "unavailable", reason,
             getattr(context, "op_id", "?")[:16],
         )
         try:
             result = await provider.generate(context, deadline)
-        except Exception as exc:  # noqa: BLE001 - classify, then fall through
+        except Exception as exc:  # noqa: BLE001 — classify, then fall through
             from backend.core.ouroboros.governance.session_budget_authority import (  # noqa: E501
                 is_budget_refusal,
             )
@@ -8747,7 +8738,7 @@ class CandidateGenerator:
                 raise  # T2 axis: local wallet gate, NOT a lane/provider fault
             logger.warning(
                 "[CandidateGenerator] %s: resilience lane failed "
-                "(%s: %s) - falling through to legacy path [%s]",
+                "(%s: %s) — falling through to legacy path [%s]",
                 route.upper(), type(exc).__name__, str(exc)[:120],
                 getattr(context, "op_id", "?")[:16],
             )
@@ -8763,7 +8754,7 @@ class CandidateGenerator:
             )
             return result
         logger.info(
-            "[CandidateGenerator] %s: resilience lane returned empty - "
+            "[CandidateGenerator] %s: resilience lane returned empty — "
             "falling through to legacy path [%s]",
             route.upper(), getattr(context, "op_id", "?")[:16],
         )
@@ -8781,18 +8772,18 @@ class CandidateGenerator:
 
         Default behavior (``JARVIS_BACKGROUND_ALLOW_FALLBACK`` unset): DW
         only, no Claude cascade. Cost ~$0.002/op. Raises
-        ``RuntimeError("background_dw_*")`` on failure - the orchestrator
+        ``RuntimeError("background_dw_*")`` on failure — the orchestrator
         accepts it gracefully and the sensor re-detects if still relevant.
 
         Nervous-system reflex (``JARVIS_BACKGROUND_ALLOW_FALLBACK=true``):
         when DW times out, is empty, or errors, cascade to Claude via
         :meth:`_call_fallback`. Diagnosed after bt-2026-04-14-041952
         showed **11/11 BACKGROUND ops dying on `background_dw_timeout:180s`**
-        - every op exhausted its DW window, nothing reached the Iron
+        — every op exhausted its DW window, nothing reached the Iron
         Gate, and the cost-optimization invariant of the route became a
         100% failure mode. Staking survival of background cognition on a
         single latency-bound provider without a safety net violates
-        Manifesto S5 (intelligence-driven routing) and S6
+        Manifesto §5 (intelligence-driven routing) and §6
         (threshold-triggered neuroplasticity). On fallback failure, we
         raise ``RuntimeError("background_fallback_failed:...")`` so the
         orchestrator's existing BACKGROUND accept-failure branch still
@@ -8800,7 +8791,7 @@ class CandidateGenerator:
 
         Bypass (``FORCE_CLAUDE_BACKGROUND=true``): skip DW entirely and
         call Claude directly. Used by the live-fire harness to unblock
-        parity validation when DW 397B is degraded - hands BACKGROUND
+        parity validation when DW 397B is degraded — hands BACKGROUND
         cognition straight to Claude so the generation actually reaches
         the tool loop and the Iron Gate can be exercised.
 
@@ -8829,7 +8820,7 @@ class CandidateGenerator:
 
         # ── FORCE_CLAUDE_BACKGROUND bypass ─────────────────────────────
         # Skip DW entirely and route straight to Claude. No DW attempt,
-        # no timeout, no cascade - used when DW is known-degraded and
+        # no timeout, no cascade — used when DW is known-degraded and
         # we need BACKGROUND ops to actually reach the tool loop.
         if _force_claude:
             if self._fallback is None:
@@ -8838,7 +8829,7 @@ class CandidateGenerator:
                 )
             logger.info(
                 "[CandidateGenerator] BACKGROUND: FORCE_CLAUDE_BACKGROUND=true "
-                "- bypassing DW, calling Claude directly "
+                "— bypassing DW, calling Claude directly "
                 "(urgency=%s, source=%s) [%.1fs budget]",
                 _urgency, _source, remaining,
             )
@@ -8862,7 +8853,7 @@ class CandidateGenerator:
             if _is_read_only else "",
         )
 
-        # Phase 3 Scope α - J-Prime primacy pre-check. Returns
+        # Phase 3 Scope α — J-Prime primacy pre-check. Returns
         # ``None`` when the flag is off, no handle is wired, the sem is
         # saturated, or the J-Prime call failed. On ``None``, drop into
         # the existing DW path below.
@@ -8873,7 +8864,7 @@ class CandidateGenerator:
             return _primacy_result
 
         if self._tier0 is None or not getattr(self._tier0, "is_available", False):
-            # DW not configured - resilience lane, then Claude cascade if
+            # DW not configured — resilience lane, then Claude cascade if
             # allowed, else raise (lane is dark-by-default; see
             # _try_hosted_resilience_lane).
             _lane_result = await self._try_hosted_resilience_lane(
@@ -8884,7 +8875,7 @@ class CandidateGenerator:
                 return _lane_result
             if _allow_fallback and self._fallback is not None:
                 logger.info(
-                    "[CandidateGenerator] BACKGROUND: DW unavailable - "
+                    "[CandidateGenerator] BACKGROUND: DW unavailable — "
                     "cascading to Claude fallback [%s]",
                     getattr(context, "op_id", "?")[:16],
                 )
@@ -8904,13 +8895,13 @@ class CandidateGenerator:
         # Reserve a slice of the BACKGROUND budget for Claude when
         # cascade is enabled so DW can't burn the entire window. The
         # DW cap here and the urgency_router's max_dw_wait_s for
-        # BACKGROUND must agree - both tightened to 150s when fallback
+        # BACKGROUND must agree — both tightened to 150s when fallback
         # is enabled.
         #
         # Nervous-System Reflex: read-only ops get a MUCH tighter DW
         # stall budget (default 60s via JARVIS_BG_DW_STALL_BUDGET_S)
         # so lockup is bounded. The Trinity cartography op is the
-        # canonical case - it needs to reach the tool loop quickly so
+        # canonical case — it needs to reach the tool loop quickly so
         # dispatch_subagent can fan out; spending 150s on a stalled DW
         # stream is dead time the subagent fleet will never recover.
         if _is_read_only:
@@ -8920,21 +8911,21 @@ class CandidateGenerator:
         _dw_timeout = min(remaining, _dw_cap)
         _dw_error: Optional[str] = None
 
-        # DW attempt - RT SSE preferred, batch fallback.
-        # Phase 12 Slice F - Substrate Error Unmasking. Preserve the
+        # DW attempt — RT SSE preferred, batch fallback.
+        # Phase 12 Slice F — Substrate Error Unmasking. Preserve the
         # underlying DoublewordInfraError on this attempt so the
         # sentinel-driven dispatcher can read its status_code +
         # response_body fields directly. The exception is still
         # caught here (so the legacy non-sentinel path can fall
         # through to Claude as before via _dw_error string), but
         # _structured_error captures the structured object for the
-        # caller - when present, the caller re-raises it instead of
+        # caller — when present, the caller re-raises it instead of
         # stringifying it through RuntimeError(_dw_error).
         _structured_error: Optional[Exception] = None
         if getattr(self._tier0, "_realtime_enabled", False):
             # Dynamic 5xx Resiliency Matrix (2026-07-22): absorb a transient
             # upstream/network blip on the DW primary with a bounded
-            # exponential-backoff-with-jitter retry HERE - before cascading and
+            # exponential-backoff-with-jitter retry HERE — before cascading and
             # before any terminal breaker trip. Async sleep only; the ASGI
             # event loop is never dropped.
             _dw_transient_budget = _dw_transient_max_retries()
@@ -8967,7 +8958,7 @@ class CandidateGenerator:
                     _status = getattr(exc, "status_code", None)
                     _body = getattr(exc, "response_body", "") or ""
                     _retry_after_ts = getattr(exc, "ratelimit_reset_ts", None)
-                    # Transient network/upstream blip -> absorb-and-retry (never
+                    # Transient network/upstream blip → absorb-and-retry (never
                     # cascade to a dead fallback, never terminally trip).
                     _budget_ok = (
                         self._remaining_seconds(deadline) > _dw_timeout * 0.5
@@ -8983,7 +8974,7 @@ class CandidateGenerator:
                         )
                         logger.warning(
                             "[CandidateGenerator] BACKGROUND: DW TRANSIENT_NETWORK "
-                            "(%s http_%s) - full-jitter backoff %.1fs, retry %d/%d "
+                            "(%s http_%s) — full-jitter backoff %.1fs, retry %d/%d "
                             "[%s] (absorbed; no cascade, no terminal trip)",
                             type(exc).__name__, _status, _delay,
                             _dw_attempt + 1, _dw_transient_budget,
@@ -9034,7 +9025,7 @@ class CandidateGenerator:
         # + Phase 0 verdict); returns None on any disarm/failure so the
         # legacy cascade/raise below is byte-identical when dark. A
         # SessionBudgetPreflightRefused from the lane propagates (Slice 4
-        # T2 axis - a $0 wallet is a local gate, not a lane fault).
+        # T2 axis — a $0 wallet is a local gate, not a lane fault).
         _lane_result = await self._try_hosted_resilience_lane(
             context, deadline, route="background", tier0_error=_dw_error,
         )
@@ -9045,7 +9036,7 @@ class CandidateGenerator:
         if _allow_fallback and self._fallback is not None:
             _post_dw_remaining = self._remaining_seconds(deadline)
             logger.info(
-                "[CandidateGenerator] BACKGROUND: DW failed (%s) - "
+                "[CandidateGenerator] BACKGROUND: DW failed (%s) — "
                 "cascading to Claude fallback, %.1fs parent remaining [%s]",
                 _dw_error, _post_dw_remaining, getattr(context, "op_id", "?")[:16],
             )
@@ -9059,7 +9050,7 @@ class CandidateGenerator:
                     f"{type(exc).__name__}:{str(exc)[:80]}"
                 ) from exc
 
-        # Phase 12 Slice F - Substrate Error Unmasking. When DW raised
+        # Phase 12 Slice F — Substrate Error Unmasking. When DW raised
         # a structured DoublewordInfraError (status_code + response_body
         # available), re-raise the ORIGINAL object so the sentinel
         # dispatch classifier can introspect status_code directly
@@ -9078,12 +9069,12 @@ class CandidateGenerator:
         """SPECULATIVE route: DW fire-and-forget pre-computation.
 
         For intent discovery, dream engine, proactive exploration.
-        Submit to DW and don't block - store result for later use.
+        Submit to DW and don't block — store result for later use.
 
         Cost: ~$0.001/op (DW batch, tolerate high discard)
         Latency: N/A (async, result consumed later)
 
-        Normally raises ``RuntimeError("speculative_deferred")`` - the
+        Normally raises ``RuntimeError("speculative_deferred")`` — the
         orchestrator should mark this as a deferred operation, not a
         failure.
 
@@ -9091,7 +9082,7 @@ class CandidateGenerator:
         PrimeProvider handle is wired, :meth:`_try_jprime_primacy` is
         consulted first. Because J-Prime on primacy runs synchronously
         inside the sem, a successful primacy hit *returns the result
-        directly* instead of raising ``speculative_deferred`` - the
+        directly* instead of raising ``speculative_deferred`` — the
         caller gets a real synchronous result that can be used
         immediately, which is strictly better than a deferred batch.
         Sem saturation or any failure falls through to the existing
@@ -9106,7 +9097,7 @@ class CandidateGenerator:
             _source, _op_id,
         )
 
-        # Phase 3 Scope α - J-Prime primacy pre-check. Synchronous hit
+        # Phase 3 Scope α — J-Prime primacy pre-check. Synchronous hit
         # upgrades the op from deferred to completed; any miss falls
         # through to the legacy DW fire-and-forget path below.
         _primacy_result = await self._try_jprime_primacy(
@@ -9117,11 +9108,11 @@ class CandidateGenerator:
 
         if self._tier0 is not None and getattr(self._tier0, "is_available", False):
             if getattr(self._tier0, "_realtime_enabled", False):
-                # Use RT path but don't block - create background task.
+                # Use RT path but don't block — create background task.
                 _gen_task = asyncio.ensure_future(
                     self._tier0.generate(context, deadline),
                 )
-                # Defect #4 Slice A - speculative pre-dispatch site.
+                # Defect #4 Slice A — speculative pre-dispatch site.
                 # Stored for later retrieval, but if op completes
                 # without retrieving (timeout / route change /
                 # demotion), the task continues. Callback consumes
@@ -9135,7 +9126,7 @@ class CandidateGenerator:
                     _op_id,
                 )
             else:
-                # Batch path - submit and background poll
+                # Batch path — submit and background poll
                 try:
                     pending = await self._tier0.submit_batch(context)
                     if pending is not None:
@@ -9143,7 +9134,7 @@ class CandidateGenerator:
                             self._background_poll_tier0(pending, context),
                             name=f"speculative-{_op_id[:12]}",
                         )
-                        # Defect #4 Slice A - defensive callback.
+                        # Defect #4 Slice A — defensive callback.
                         task.add_done_callback(_swallow_task_exception)
                         self._background_polls[_op_id] = task
                         logger.info(
@@ -9158,7 +9149,7 @@ class CandidateGenerator:
                     )
 
         else:
-            # Tier-0 unavailable - the hosted resilience lane (dark by
+            # Tier-0 unavailable — the hosted resilience lane (dark by
             # default; policy-driven, see _get_resilience_provider) keeps
             # SPECULATIVE pre-computation alive through a DW outage.
             # Fire-and-forget mirror of the DW RT idiom above: dispatch as
@@ -9174,12 +9165,12 @@ class CandidateGenerator:
                 _lane_task.add_done_callback(_swallow_task_exception)
                 self._background_polls[_op_id] = _lane_task
                 logger.info(
-                    "[CandidateGenerator] SPECULATIVE: Tier-0 unavailable - "
+                    "[CandidateGenerator] SPECULATIVE: Tier-0 unavailable — "
                     "resilience lane task dispatched as background "
                     "(%s, op=%s)", _lane_reason, _op_id,
                 )
 
-        # Always raise - speculative ops are deferred, not completed.
+        # Always raise — speculative ops are deferred, not completed.
         raise RuntimeError("speculative_deferred")
 
     async def _background_poll_tier0(
@@ -9211,7 +9202,7 @@ class CandidateGenerator:
                 )
                 logger.info(
                     "[CandidateGenerator] Tier 0 background poll complete: "
-                    "batch %s -> %d candidates stored for op %s",
+                    "batch %s → %d candidates stored for op %s",
                     pending.batch_id, len(result.candidates), _op_id,
                 )
             else:
@@ -9270,7 +9261,7 @@ class CandidateGenerator:
     ) -> None:
         """Record a Tier 0 batch event in the governance ledger.
 
-        Fails silently - ledger writes must never crash the pipeline.
+        Fails silently — ledger writes must never crash the pipeline.
         """
         if self._ledger is None:
             return
@@ -9321,7 +9312,7 @@ class CandidateGenerator:
     async def plan(self, prompt: str, deadline: datetime) -> str:
         """Send a planning prompt to the active provider, with soft fallback.
 
-        Does NOT update the failback state machine on failure - planning errors
+        Does NOT update the failback state machine on failure — planning errors
         are non-fatal and the orchestrator continues to GENERATE regardless.
 
         Raises RuntimeError("all_providers_exhausted") only if QUEUE_ONLY.
@@ -9347,8 +9338,8 @@ class CandidateGenerator:
                         logger.info(
                             "[CandidateGenerator] Plan Tier3_cap_active: "
                             "primary_budget=%.1fs (hard cap _TIER3_REFLEX_HARD_CAP_S=%.1fs), "
-                            "remaining=%.1fs - PLAN primary will sever at cap "
-                            "for Manifesto S5 cascade",
+                            "remaining=%.1fs — PLAN primary will sever at cap "
+                            "for Manifesto §5 cascade",
                             primary_budget, _TIER3_REFLEX_HARD_CAP_S, remaining,
                         )
                     return await asyncio.wait_for(
@@ -9368,11 +9359,11 @@ class CandidateGenerator:
             "[CandidateGenerator] Plan fallback sem acquire: slots_free=%d/%d",
             self._fallback_sem._value, self._fallback_concurrency,
         )
-        # Slice 12F-A - priority-aware acquisition. The plan() entry
+        # Slice 12F-A — priority-aware acquisition. The plan() entry
         # point doesn't carry context (the prompt was already
         # composed by the orchestrator), so we use the empty-route
         # default which falls through to DEFAULT_PRIORITY (STANDARD
-        # bucket - FIFO-equivalent within the bucket). The dominant
+        # bucket — FIFO-equivalent within the bucket). The dominant
         # starvation wedge is on the call() path which DOES have
         # _op_route in scope. plan() acquisitions are rare relative
         # to call() acquisitions in the soak; keeping them at default
@@ -9408,7 +9399,7 @@ class CandidateGenerator:
 
         Returns a provider name if learning data strongly recommends a
         non-default provider for this complexity class, else None.
-        Fault-isolated - returns None on any error.
+        Fault-isolated — returns None on any error.
         """
         try:
             from backend.core.ouroboros.governance.adaptive_learning import (
@@ -9435,21 +9426,21 @@ class CandidateGenerator:
     ) -> GenerationResult:
         """Try primary, fall back on any failure.
 
-        Slice 30 - Explicit Parameter Threading & Transport Determinism
+        Slice 30 — Explicit Parameter Threading & Transport Determinism
         ─────────────────────────────────────────────────────────────────
         ``model_id`` is now an explicit keyword-only parameter threaded
         from the Slice 23 sentinel walker. Forwarded to ``_call_primary``
-        so Slice 28 Phase 2's heavy-model 2.5x scalar engages
+        so Slice 28 Phase 2's heavy-model 2.5× scalar engages
         deterministically. Legacy callers that don't have a specific
-        model_id (pre-Slice-23 fallthroughs) pass nothing -> empty
-        string -> legacy 30s cap path preserved byte-identically.
+        model_id (pre-Slice-23 fallthroughs) pass nothing → empty
+        string → legacy 30s cap path preserved byte-identically.
 
 
         Note: In Python 3.9, ``CancelledError`` is a ``BaseException`` (not
         ``Exception``), so we must catch it explicitly to handle
         ``asyncio.wait_for`` cancellation of the primary call.
 
-        Move 2 v6 - Dynamic Provider Fallback. Before paying for a
+        Move 2 v6 — Dynamic Provider Fallback. Before paying for a
         primary call we know is statistically likely to fail, consult
         the FSM. If it has classified the primary as in active backoff
         (consecutive transport failures + recovery ETA hasn't elapsed),
@@ -9457,15 +9448,15 @@ class CandidateGenerator:
         (``record_primary_failure`` + ``recovery_eta``); we just need to
         actually consult it at this critical dispatch site. Without
         this, repeated Claude transport failures used to keep retrying
-        Claude - and the resulting cascade left ``_active_ops`` empty
+        Claude — and the resulting cascade left ``_active_ops`` empty
         for an hour, idling the soak even after the v5 fixes.
 
-        Cost-safe: dynamic fallback for IMMEDIATE/COMPLEX is Claude ->
-        DW (~30x cheaper). For STANDARD where DW is primary, fallback
+        Cost-safe: dynamic fallback for IMMEDIATE/COMPLEX is Claude →
+        DW (~30× cheaper). For STANDARD where DW is primary, fallback
         is Claude (more expensive, but the cost contract guard at
         ClaudeProvider boundary still rejects BG/SPEC).
         """
-        # Move 2 v7 - Circuit Breaker pre-call gate. The Claude provider's
+        # Move 2 v7 — Circuit Breaker pre-call gate. The Claude provider's
         # internal _call_with_backoff retry loop absorbs transport failures
         # within its 3-attempt window. The FSM only sees failures that
         # bubble through this dispatcher, missing exhaustions consumed by
@@ -9474,12 +9465,12 @@ class CandidateGenerator:
         # on consecutive transport-exhaustion events regardless of which
         # dispatch path triggered them. When OPEN, route directly to
         # fallback. The breaker only gates calls when the primary is the
-        # Claude/Anthropic tier - it does not block DW/Tier-0 traffic.
+        # Claude/Anthropic tier — it does not block DW/Tier-0 traffic.
         try:
             _is_claude_primary = (
                 self._tier0 is None or self._primary is not self._tier0
             )
-        except Exception:  # noqa: BLE001 - defensive
+        except Exception:  # noqa: BLE001 — defensive
             _is_claude_primary = True
         if _is_claude_primary:
             try:
@@ -9493,7 +9484,7 @@ class CandidateGenerator:
                     if not _breaker.should_allow_request():
                         _snap = _breaker.snapshot()
                         logger.warning(
-                            "[CandidateGenerator] Circuit breaker OPEN - "
+                            "[CandidateGenerator] Circuit breaker OPEN — "
                             "routing %s op to fallback (state=%s, "
                             "consecutive_transport_failures=%d, "
                             "total_trips=%d)",
@@ -9504,7 +9495,7 @@ class CandidateGenerator:
                         )
                         return await self._call_fallback(context, deadline)
             except Exception as _exc:  # noqa: BLE001
-                # Breaker failure must never block dispatch - treat as
+                # Breaker failure must never block dispatch — treat as
                 # CLOSED and fall through to normal flow.
                 logger.debug(
                     "[CandidateGenerator] Circuit breaker check failed "
@@ -9519,12 +9510,12 @@ class CandidateGenerator:
                 if self.fsm._failure_mode is not None else "UNKNOWN"
             )
             # Sovereign Autarky Backoff-Wait (2026-06-20): in DW-only mode there
-            # is no fallback - routing to it is a guaranteed fallback_skipped
+            # is no fallback — routing to it is a guaranteed fallback_skipped
             # failure. If the sole provider's transient backoff clears within our
             # remaining budget, WAIT it out and re-attempt the primary instead of
             # failing the op. Bounded to ONE wait-and-retry per dispatch: if the
             # re-attempt also fails, control falls to the existing degrade path
-            # (record_primary_failure -> _call_fallback -> clean fallback_skipped),
+            # (record_primary_failure → _call_fallback → clean fallback_skipped),
             # so a genuinely-dead provider self-limits and never loops.
             _autarky_wait = autarky_should_wait_and_retry(
                 has_fallback=self._fallback is not None,
@@ -9536,10 +9527,10 @@ class CandidateGenerator:
             )
             if _autarky_wait is not None:
                 logger.info(
-                    "[CandidateGenerator] Sovereign autarky backoff-wait - sole "
+                    "[CandidateGenerator] Sovereign autarky backoff-wait — sole "
                     "provider %s in %s backoff (consecutive_failures=%d, "
                     "eta=+%.0fs); waiting %.0fs then RE-ATTEMPTING primary "
-                    "(remaining_s=%.0f, route=%s) - no absent-fallback failure",
+                    "(remaining_s=%.0f, route=%s) — no absent-fallback failure",
                     self.fsm.primary_name if hasattr(self.fsm, "primary_name")
                     else "primary",
                     _mode_name, self.fsm._consecutive_failures, _eta_s,
@@ -9555,9 +9546,9 @@ class CandidateGenerator:
                 # should_attempt_primary() is True on the next FSM read.
             else:
                 logger.warning(
-                    "[CandidateGenerator] Dynamic fallback engaged - primary "
+                    "[CandidateGenerator] Dynamic fallback engaged — primary "
                     "in %s backoff (consecutive_failures=%d, "
-                    "recovery_eta=+%.0fs) - routing %s op to fallback "
+                    "recovery_eta=+%.0fs) — routing %s op to fallback "
                     "without re-attempting primary",
                     _mode_name,
                     self.fsm._consecutive_failures,
@@ -9567,11 +9558,11 @@ class CandidateGenerator:
                 return await self._call_fallback(context, deadline)
 
         try:
-            # Slice 30 - explicit model_id propagation (no ContextVar magic)
+            # Slice 30 — explicit model_id propagation (no ContextVar magic)
             result = await self._call_primary(
                 context, deadline, model_id=model_id,
             )
-            # Primary succeeded - record recovery if we were in a failure state
+            # Primary succeeded — record recovery if we were in a failure state
             if self.fsm._consecutive_failures > 0:
                 self.fsm.record_primary_success()
             return result
@@ -9598,17 +9589,17 @@ class CandidateGenerator:
             if mode is not FailureMode.LOCAL_DEFECT:
                 # LOCAL_DEFECT gets its own ERROR below, with the traceback.
                 # Emitting this line too would file our bug under the same
-                # "Primary failed ... falling back" heading as every genuine
-                # provider blip - which is precisely how it stayed invisible.
+                # "Primary failed … falling back" heading as every genuine
+                # provider blip — which is precisely how it stayed invisible.
                 logger.warning(
                     "[CandidateGenerator] Primary failed (mode=%s, %s: %s), "
                     "falling back",
                     mode.name, type(exc).__name__, exc,
                 )
             if mode is FailureMode.LOCAL_DEFECT:
-                # OUR bug, not the provider's. The op still cascades - the
+                # OUR bug, not the provider's. The op still cascades — the
                 # operator's payload is never dropped for a defect on the
-                # primary path - but the provider FSM stays untouched, because
+                # primary path — but the provider FSM stays untouched, because
                 # blaming DoubleWord for a TypeError is how a five-character
                 # signature drift becomes a lane-wide outage that bills to
                 # Claude until someone reads the code.
@@ -9620,14 +9611,14 @@ class CandidateGenerator:
                 # watching production.
                 logger.error(
                     "[CandidateGenerator] LOCAL DEFECT on the primary call "
-                    "path (%s: %s) - this is a bug in JARVIS, not a provider "
+                    "path (%s: %s) — this is a bug in JARVIS, not a provider "
                     "failure. Cascading so the op survives; FSM UNCHANGED so "
                     "the primary lane is not falsely quarantined.",
                     type(exc).__name__, exc, exc_info=True,
                 )
             elif mode is FailureMode.CONTENT_FAILURE:
                 # Content failure: model produced bad output, but primary infra is healthy.
-                # Do NOT penalise the FSM - only count for observability.
+                # Do NOT penalise the FSM — only count for observability.
                 self.fsm.content_failure_count += 1
                 logger.info(
                     "[CandidateGenerator] Content failure (count=%d), FSM unchanged",
@@ -9635,7 +9626,7 @@ class CandidateGenerator:
                 )
             # ONE predicate, consulted here and at the Tier 0 RT site. This
             # used to be an `else` on the CONTENT_FAILURE branch, which meant
-            # TEMPORAL_SHED was exempt at the Tier 0 site and penalised HERE -
+            # TEMPORAL_SHED was exempt at the Tier 0 site and penalised HERE —
             # so a temporal shed arriving on this path flipped the primary to
             # FALLBACK_ACTIVE in direct contradiction of its own documented
             # contract ("zero primary penalty ... the NEXT op with a normal
@@ -9677,19 +9668,19 @@ class CandidateGenerator:
         op_id: str,
         elapsed_s: float,
     ) -> None:
-        """Slice 28 Phase 3 - Inline Fault Discriminator.
+        """Slice 28 Phase 3 — Inline Fault Discriminator.
 
         Fires after a TimeoutError in ``_call_primary`` to classify
         the failure as either:
 
-          * ``context_lag`` - endpoint is alive (probe returns fast);
+          * ``context_lag`` — endpoint is alive (probe returns fast);
             THIS prompt+model combo was just too slow. Sentinel walker
             will rotate to the next ranked model and may succeed there.
-          * ``infrastructure_outage`` - endpoint is unresponsive (probe
+          * ``infrastructure_outage`` — endpoint is unresponsive (probe
             also times out). Sentinel rotation is unlikely to help
             because every model shares the same upstream tier.
 
-        Pure-observability hook - NEVER raises into the caller, NEVER
+        Pure-observability hook — NEVER raises into the caller, NEVER
         changes return values. The sentinel walker handles rotation
         structurally on the original raise (which still propagates
         normally after this returns). The classification just
@@ -9708,7 +9699,7 @@ class CandidateGenerator:
         prompt_only_fn = getattr(self._primary, "prompt_only", None)
         if prompt_only_fn is None:
             logger.info(
-                "[Slice28.Phase3] op=%s elapsed=%.1fs model=%s - "
+                "[Slice28.Phase3] op=%s elapsed=%.1fs model=%s — "
                 "primary has no prompt_only lane; classification skipped",
                 op_id[:16], elapsed_s, attempted_model_id,
             )
@@ -9730,13 +9721,13 @@ class CandidateGenerator:
             probe_ok = bool(result_text and result_text.strip())
         except asyncio.TimeoutError:
             probe_err = f"probe_timeout_{probe_timeout}s"
-        except Exception as exc:  # noqa: BLE001 - probe MUST NOT raise
+        except Exception as exc:  # noqa: BLE001 — probe MUST NOT raise
             probe_err = f"probe_exception:{type(exc).__name__}"
 
         probe_elapsed = time.monotonic() - probe_start
         # Classification:
-        #   probe_ok with fast latency -> endpoint alive -> context_lag
-        #   probe failed -> endpoint unresponsive -> infrastructure_outage
+        #   probe_ok with fast latency → endpoint alive → context_lag
+        #   probe failed → endpoint unresponsive → infrastructure_outage
         classification = (
             "context_lag" if probe_ok
             else "infrastructure_outage"
@@ -9744,7 +9735,7 @@ class CandidateGenerator:
         logger.warning(
             "[Slice28.Phase3] op=%s model=%s primary_elapsed=%.1fs "
             "probe_elapsed=%.2fs probe_ok=%s probe_err=%s "
-            "classification=%s - sentinel walker will rotate to next "
+            "classification=%s — sentinel walker will rotate to next "
             "ranked model (structural rotation already engaged by raise)",
             op_id[:16], attempted_model_id, elapsed_s,
             probe_elapsed, probe_ok, probe_err or "(none)",
@@ -9767,8 +9758,8 @@ class CandidateGenerator:
         """Call primary provider with concurrency and budget-capped deadline.
 
         Wrapped by ``@with_transient_absorb`` (2026-07-22): a transient DW round
-        failure on the standard/immediate path - a watchdog fast-abort,
-        ``upstream_error``, 5xx, or 429-with-Retry-After - is absorbed by an
+        failure on the standard/immediate path — a watchdog fast-abort,
+        ``upstream_error``, 5xx, or 429-with-Retry-After — is absorbed by an
         exponential-backoff retry of the whole primary attempt (budget-aware),
         so big-file ReAct rounds self-heal instead of failing the round. The
         decorator is a no-op when disabled / on a non-transient error.
@@ -9777,21 +9768,21 @@ class CandidateGenerator:
         remaining time, guaranteeing ``_FALLBACK_MIN_RESERVE_S`` for the
         fallback provider if the primary hangs until timeout.
 
-        Slice 30 - Explicit Parameter Threading & Transport Determinism
+        Slice 30 — Explicit Parameter Threading & Transport Determinism
         ─────────────────────────────────────────────────────────────────
         ``model_id`` is now an explicit keyword-only parameter threaded
-        from the Slice 23 sentinel walker -> ``_try_primary_then_fallback``
-        -> here. This eliminates the v23 wiring gap where Slice 28's
+        from the Slice 23 sentinel walker → ``_try_primary_then_fallback``
+        → here. This eliminates the v23 wiring gap where Slice 28's
         ContextVar-based model_id resolution silently returned empty
         across async/semaphore task boundaries, causing the heavy-model
-        2.5x scalar to never engage in production (12 EXHAUSTION events
+        2.5× scalar to never engage in production (12 EXHAUSTION events
         across v20/v21/v23 all firing at the static 30s
         _PRIMARY_MAX_TIMEOUT_S cap instead of the adaptive 75s budget).
 
         Legacy callers that don't have a specific model_id (pre-Slice-23
         dispatch paths, IMMEDIATE route fallthrough, etc.) pass nothing
-        -> empty string -> _compute_primary_budget skips the heavy scalar
-        -> legacy 30s cap behavior preserved byte-identically.
+        → empty string → _compute_primary_budget skips the heavy scalar
+        → legacy 30s cap behavior preserved byte-identically.
         """
         _primary_sem_t0 = time.monotonic()
         _primary_phase_hint = getattr(getattr(context, "phase", None), "name", "?")
@@ -9807,33 +9798,33 @@ class CandidateGenerator:
         async with self._primary_sem:
             _primary_sem_wait_s = time.monotonic() - _primary_sem_t0
             remaining = self._remaining_seconds(deadline)
-            # Slice 30 - explicit model_id parameter (no ContextVar magic).
-            # Slice 28 Phase 2's heavy-model 2.5x scalar now engages
+            # Slice 30 — explicit model_id parameter (no ContextVar magic).
+            # Slice 28 Phase 2's heavy-model 2.5× scalar now engages
             # deterministically when the sentinel walker passes a heavy
-            # model_id. Empty model_id from legacy callers -> legacy 30s
+            # model_id. Empty model_id from legacy callers → legacy 30s
             # cap path (byte-identical to pre-Slice-28).
-            # Slice 43 - if this op will force-batch (Slice 36/41), compute a
+            # Slice 43 — if this op will force-batch (Slice 36/41), compute a
             # batch-appropriate budget so the outer wait_for doesn't sever the
             # async batch poll at the 30s RT reflex cap. The force-batch
             # decision is owned by the provider; we consult the same pure
-            # predicate. NEVER raises -> legacy budget on any failure.
+            # predicate. NEVER raises → legacy budget on any failure.
             try:
                 from backend.core.ouroboros.governance.doubleword_provider import (
                     _slice36_should_force_batch,
                 )
                 _force_batch = _slice36_should_force_batch(context)
-            except Exception:  # noqa: BLE001 - defensive, legacy budget
+            except Exception:  # noqa: BLE001 — defensive, legacy budget
                 _force_batch = False
-            # Sovereign Transport Profiler Matrix (2026-06-20) - learn-then-detach.
+            # Sovereign Transport Profiler Matrix (2026-06-20) — learn-then-detach.
             # The transport-hedge (default-on) makes _slice36_should_force_batch
             # return False, so a batch-ONLY model (RT yields done_before_content)
             # gets the RT/autarky budget (180s) even though only the batch arm can
-            # win -> the batch poll is strangled mid-flight (the live-soak TIMEOUT
+            # win → the batch poll is strangled mid-flight (the live-soak TIMEOUT
             # root). When the immortal profile knows this model is batch-only, force
             # the batch budget (reuses the EXISTING force_batch branch in
-            # _compute_primary_budget -> batch cap) AND stamp the op
+            # _compute_primary_budget → batch cap) AND stamp the op
             # ASYNC_BATCH_PAYLOAD so the Zero-Shot quarantine grants it immunity and
-            # the park layer actively detaches it. Gated + fail-soft -> legacy on any
+            # the park layer actively detaches it. Gated + fail-soft → legacy on any
             # failure (byte-identical when the profile is empty/off).
             try:
                 if model_id:
@@ -9842,16 +9833,16 @@ class CandidateGenerator:
                     )
                     if _get_tp().is_batch_only(model_id):
                         _force_batch = True
-                        # NB: OperationContext is FROZEN - we deliberately do NOT
+                        # NB: OperationContext is FROZEN — we deliberately do NOT
                         # stamp a ctx tag (it would raise FrozenInstanceError, and
                         # consumers can't rely on it). Every consumer of "is this op
                         # batch-bound?" checks the immortal profile directly with the
                         # resolved model: the budget here (force_batch), the Zero-Shot
                         # ban-immunity seam below (is_batch_only(_dp_model)), and the
                         # park gate (generate_park_wrapper._resolve_async_batch_payload).
-            except Exception:  # noqa: BLE001 - defensive, legacy budget
+            except Exception:  # noqa: BLE001 — defensive, legacy budget
                 pass
-            # M3 - Transport Circuit Breaker at the primary dynamic transport-selection
+            # M3 — Transport Circuit Breaker at the primary dynamic transport-selection
             # point. A batch choice arriving via the dynamic router (_slice36 or
             # is_batch_only profile) is also rotated when the batch lane is OPEN.
             # When the breaker is disabled (default) or the lane is CLOSED this is a
@@ -9868,11 +9859,11 @@ class CandidateGenerator:
                         _force_batch = False
                 except Exception:  # noqa: BLE001 -- breaker consult never blocks dispatch
                     pass
-            # Slice 225 Phase 2 - Sovereign DW Autarky. Read the Claude fallback
-            # breaker (read-only, no probe side effect - same _claude_breaker_open
+            # Slice 225 Phase 2 — Sovereign DW Autarky. Read the Claude fallback
+            # breaker (read-only, no probe side effect — same _claude_breaker_open
             # predicate the Slice 127 P2.1 IMMEDIATE reroute uses). When the
             # fallback lane is OPEN/HALF_OPEN (incl. terminal_quota / out-of-
-            # credits), there's no live lane to sever DW into - give DW the full
+            # credits), there's no live lane to sever DW into — give DW the full
             # runway instead of the 30s/75s reflex cap. Gated default-TRUE;
             # OFF (or breaker CLOSED) is the byte-identical legacy cascade.
             _fallback_dead = False
@@ -9887,11 +9878,11 @@ class CandidateGenerator:
                 _local_seat = (
                     self._jprime is not None and self._primary is self._jprime
                 )
-            except Exception:  # noqa: BLE001 - defensive
+            except Exception:  # noqa: BLE001 — defensive
                 _local_seat = False
             if _dw_autarky_enabled():
                 # A CONFIG-disabled Claude (JARVIS_PROVIDER_CLAUDE_DISABLED) is the
-                # deadest fallback of all - never constructed - yet it leaves the
+                # deadest fallback of all — never constructed — yet it leaves the
                 # circuit breaker CLOSED, so the breaker-state check below misses it.
                 # Check it first so the sole-lane DW gets the full runway instead of
                 # the reflex cap (the live-soak TIMEOUT root, 2026-06-20).
@@ -9915,7 +9906,7 @@ class CandidateGenerator:
                         _fallback_dead = _autarky_breaker_open()
                         if _fallback_dead:
                             _autarky_reason = "breaker_open"
-                    except Exception:  # noqa: BLE001 - fail-closed to legacy cascade
+                    except Exception:  # noqa: BLE001 — fail-closed to legacy cascade
                         _fallback_dead = False
             primary_budget = self._compute_primary_budget(
                 remaining, model_id=model_id, force_batch=_force_batch,
@@ -9932,16 +9923,16 @@ class CandidateGenerator:
             )
             if _fallback_dead and primary_budget > _PRIMARY_MAX_TIMEOUT_S:
                 # Severity matches reality: STRUCTURAL autarky (operator-attested
-                # JARVIS_PROVIDER_CLAUDE_DISABLED) is the intended steady state ->
+                # JARVIS_PROVIDER_CLAUDE_DISABLED) is the intended steady state →
                 # INFO (observable, not alarming, no warning-count inflation). An
                 # actual breaker OPEN (economic/transport failures) is a real
-                # fallback-lane degradation -> WARNING. The message now states the
+                # fallback-lane degradation → WARNING. The message now states the
                 # ACCURATE reason instead of always claiming "breaker OPEN".
                 _structural = _autarky_reason == "structural"
                 _emit = logger.info if _structural else logger.warning
                 _emit(
                     "[CandidateGenerator] ⚡ DW AUTARKY ENGAGED: Claude fallback "
-                    "%s - granting DW the full %.1fs budget (vs %.1fs reflex cap), "
+                    "%s — granting DW the full %.1fs budget (vs %.1fs reflex cap), "
                     "no dead-lane handoff. route=%s op=%s model=%s",
                     "structurally disabled (autarky)" if _structural
                     else "breaker OPEN (degraded)",
@@ -9950,7 +9941,7 @@ class CandidateGenerator:
                     getattr(context, "op_id", "?")[:16],
                     model_id or "(unspecified)",
                 )
-            # Slice 34 Phase 2 - dispatch profiler (default OFF; zero
+            # Slice 34 Phase 2 — dispatch profiler (default OFF; zero
             # overhead when disabled). Records the sem-wait + budget
             # stages into the per-op summary; STAGE_PROVIDER_GENERATE
             # below brackets the actual provider call so we can see
@@ -9977,14 +9968,14 @@ class CandidateGenerator:
                 ))
                 # And a synthetic ~0 stage for the trivial budget
                 # computation (kept for shape consistency in the
-                # per-op summary - actual sub-ms math is recorded
+                # per-op summary — actual sub-ms math is recorded
                 # below via the dispatch_stage wrap if anyone ever
                 # makes _compute_primary_budget heavy).
                 _dp_summary.stages.append(_dp_mod.StageRecord(
                     stage_name="STAGE_BUDGET_COMPUTATION",
                     duration_ms=0.0,
                 ))
-            # Tier 3 Reflex observability (Manifesto S5): log at INFO when
+            # Tier 3 Reflex observability (Manifesto §5): log at INFO when
             # the hard cap is the binding constraint (not the fraction or
             # the fallback-reserve). Operators can grep for
             # "Tier3_cap_active" to see sessions where the aggressive
@@ -9997,8 +9988,8 @@ class CandidateGenerator:
                 logger.info(
                     "[CandidateGenerator] Tier3_cap_active: primary_budget=%.1fs "
                     "(hard cap _PRIMARY_MAX_TIMEOUT_S=%.1fs), remaining=%.1fs "
-                    "fallback_reserve=%.1fs route=%s phase=%s op=%s - "
-                    "primary will sever at budget expiry for Manifesto S5 cascade",
+                    "fallback_reserve=%.1fs route=%s phase=%s op=%s — "
+                    "primary will sever at budget expiry for Manifesto §5 cascade",
                     primary_budget, _PRIMARY_MAX_TIMEOUT_S, remaining,
                     remaining - primary_budget,
                     getattr(context, "provider_route", "?"),
@@ -10012,19 +10003,19 @@ class CandidateGenerator:
                     primary_budget, remaining, remaining - primary_budget,
                 )
             try:
-                # W3(7) Slice 2 - race against ambient cancel token (if any).
+                # W3(7) Slice 2 — race against ambient cancel token (if any).
                 # `current_cancel_token()` reads the ContextVar set by
                 # `dispatch_pipeline`; None outside dispatcher (unit tests,
-                # pre-W3(7) callers) -> falls through to plain wait_for.
+                # pre-W3(7) callers) → falls through to plain wait_for.
                 from backend.core.ouroboros.governance.cancel_token import (
                     current_cancel_token as _curr_cancel_token,
                     race_or_wait_for as _race_or_wait_for,
                 )
-                # Slice 34 Phase 2 - Stage 3: STAGE_PROVIDER_GENERATE
+                # Slice 34 Phase 2 — Stage 3: STAGE_PROVIDER_GENERATE
                 # brackets the entire provider call so we can see how
                 # much wall-time is spent in the provider's own dispatch
                 # path (Aegis auth + lease + HTTP POST + response parse).
-                # Profiler is fail-closed default-OFF - zero overhead
+                # Profiler is fail-closed default-OFF — zero overhead
                 # when JARVIS_DISPATCH_PROFILER_ENABLED is unset.
                 from backend.core.ouroboros.telemetry.dispatch_profiler import (
                     dispatch_stage as _dp_stage,
@@ -10051,20 +10042,20 @@ class CandidateGenerator:
                     # TimeoutError into RuntimeError('all_providers_exhausted')
                     # before it reaches the outer dispatch handler, so a hook
                     # there never sees TimeoutError. A 180s provider timeout is
-                    # unambiguous -> 1-strike cold-storage (bypass the n>=3 σ
+                    # unambiguous → 1-strike cold-storage (bypass the n>=3 σ
                     # window) so the model is skipped on the very next op rather
                     # than tainting two more soaks. Fail-soft, gated, never
-                    # raises - must not perturb the cascade.
+                    # raises — must not perturb the cascade.
                     try:
                         from backend.core.ouroboros.governance.dw_fault_taxonomy import (  # noqa: E501
                             is_generation_timeout as _zs_is_timeout,
                         )
                         # Ban-immunity (Transport Profiler Matrix): a batch-only
                         # model times out only because the batch poll is async-slow,
-                        # NOT because the model is dead - banning it would blacklist
+                        # NOT because the model is dead — banning it would blacklist
                         # the fleet's best diff-capable models for transport latency.
                         # Checked DIRECTLY against the immortal profile with the
-                        # resolved model (OperationContext is frozen - no ctx tag).
+                        # resolved model (OperationContext is frozen — no ctx tag).
                         _zs_batch_immune = False
                         try:
                             from backend.core.ouroboros.governance.dw_transport_profile import (  # noqa: E501
@@ -10088,11 +10079,11 @@ class CandidateGenerator:
                                 _zs_obs.record_timeout(
                                     _dp_model, op_id=str(_dp_op_id)[:24],
                                 )
-                    except Exception:  # noqa: BLE001 - never raise from quarantine
+                    except Exception:  # noqa: BLE001 — never raise from quarantine
                         pass
                     raise
                 finally:
-                    # Slice 34 Phase 2 - record STAGE_PROVIDER_GENERATE
+                    # Slice 34 Phase 2 — record STAGE_PROVIDER_GENERATE
                     # + emit the per-op summary. Fail-closed if profiler
                     # is disabled or accumulator was never created.
                     try:
@@ -10125,7 +10116,7 @@ class CandidateGenerator:
                                     "[DispatchProfiler] op_summary %s",
                                     _dp_summary2.to_log_kv(),
                                 )
-                    except Exception:  # noqa: BLE001 - never raise from profiler
+                    except Exception:  # noqa: BLE001 — never raise from profiler
                         pass
                 logger.info(
                     "[CandidateGenerator] Primary sem release: "
@@ -10155,20 +10146,20 @@ class CandidateGenerator:
                         remaining_s=self._remaining_seconds(deadline),
                     ),
                 )
-                # Slice 28 Phase 3 - Inline Fault Discriminator
+                # Slice 28 Phase 3 — Inline Fault Discriminator
                 # ────────────────────────────────────────────────
                 # On TimeoutError specifically, fire a lightweight
                 # 2-token probe via the primary's prompt_only lane
                 # (now Aegis-stabilized via Slice 27 Phase 2) to
                 # discriminate between:
-                #   * context_lag - endpoint alive, THIS prompt+model
+                #   * context_lag — endpoint alive, THIS prompt+model
                 #     combination is just slow (probe completes fast)
-                #   * infrastructure_outage - endpoint not responding
+                #   * infrastructure_outage — endpoint not responding
                 #     (probe also times out)
                 # The sentinel walker ALREADY rotates to the next
                 # model in ranked_models on any raise from
                 # _call_primary, so Phase 3 doesn't need to add
-                # rotation - it adds the CLASSIFICATION SIGNAL so
+                # rotation — it adds the CLASSIFICATION SIGNAL so
                 # postmortem analysis can attribute the rotation
                 # reason structurally. Probe is bounded to 5s; on
                 # outage, the cost is small and the diagnostic is
@@ -10178,7 +10169,7 @@ class CandidateGenerator:
                     isinstance(_exc, asyncio.TimeoutError)
                     and _envb("JARVIS_TTFT_FAULT_DISCRIMINATOR_ENABLED", False)
                 ):
-                    # Slice 30 - use explicit model_id param (was ContextVar)
+                    # Slice 30 — use explicit model_id param (was ContextVar)
                     await self._slice28_phase3_classify_ttft_failure(
                         attempted_model_id=model_id,
                         op_id=getattr(context, "op_id", "?"),
@@ -10186,12 +10177,12 @@ class CandidateGenerator:
                     )
                 raise
 
-    # Hard ceiling for fallback provider - fail fast when unreachable
-    # rather than burning the entire pipeline budget (Manifesto S6: Iron Gate).
+    # Hard ceiling for fallback provider — fail fast when unreachable
+    # rather than burning the entire pipeline budget (Manifesto §6: Iron Gate).
     # Raised from 60s to 120s after bt-2026-04-11-085020 diagnosed tool_round
     # full_content patches legitimately needing 60-90s of stream time. IMMEDIATE
     # route also funnels through this cap, and a 60s cap was cutting mid-stream
-    # healthy generation (23KB received at 365 bytes/s - normal Claude rate).
+    # healthy generation (23KB received at 365 bytes/s — normal Claude rate).
     _FALLBACK_MAX_TIMEOUT_S: float = float(
         os.environ.get("JARVIS_FALLBACK_MAX_TIMEOUT_S", "120.0")
     )
@@ -10206,7 +10197,7 @@ class CandidateGenerator:
     # exceed 40KB (44104 chars observed in Session F attempt 2) and
     # Claude needs 150-180s to produce a coherent multi-file patch.
     # 120s remains the default for all other routes; complex gets 180s.
-    # Env-tunable so ops can tune without a code change - the default
+    # Env-tunable so ops can tune without a code change — the default
     # 180.0 is the post-Session-F calibration.
     _FALLBACK_MAX_TIMEOUT_COMPLEX_S: float = float(
         os.environ.get("JARVIS_FALLBACK_MAX_TIMEOUT_COMPLEX_S", "180.0")
@@ -10217,8 +10208,8 @@ class CandidateGenerator:
     # parallel subagents dispatched, 80 findings returned, all with Iron
     # Gate diversity=3. But the parent Claude synthesis round died with
     # TimeoutError because the BG fallback cap (120s) was sized for a
-    # single-shot Claude completion, not "Claude fans out -> 3 subagents
-    # consume 135s -> Claude synthesizes the findings". Per Derek's
+    # single-shot Claude completion, not "Claude fans out → 3 subagents
+    # consume 135s → Claude synthesizes the findings". Per Derek's
     # 2026-04-17 directive, the cap for read-only BG ops must dynamically
     # expand to account for subagent wall-clock PLUS a hard synthesis
     # reserve. The formula is:
@@ -10229,13 +10220,13 @@ class CandidateGenerator:
     #
     # With Phase 1 constants (MAX_PARALLEL_SCOPES=3,
     # PRIMARY_PROVIDER_TIMEOUT_S=90) and the mandated 90s synthesis
-    # reserve, this evaluates to 480s - about 4x the mutating-BG cap,
+    # reserve, this evaluates to 480s — about 4× the mutating-BG cap,
     # but strictly bounded by what the actual wall-clock needs for a
     # 3-subagent cartography op. Env-tunable so operators can retune
     # after graduation data accumulates.
     # Default sized from Session-12 empirical data (bt-2026-04-18-055042).
     # Session 11 synthesized 80 findings in 472s (8s under 480s cap).
-    # Session 12 with 108 findings took 491.93s - 11.93s over. Subagent
+    # Session 12 with 108 findings took 491.93s — 11.93s over. Subagent
     # finding counts are model-driven (exploration depth varies per
     # provider + cache state), so a fixed 90s reserve was too tight for
     # the high-yield end of the distribution. 180s absorbs another ~40%
@@ -10245,11 +10236,11 @@ class CandidateGenerator:
     )
 
     def _fallback_is_claude(self) -> bool:
-        """Slice 238 - True iff the configured fallback is the Claude lane (so the
+        """Slice 238 — True iff the configured fallback is the Claude lane (so the
         Claude economic breaker is the right health signal to gate it). Reads the
         fallback's ``provider_name`` (e.g. ``claude-api``); a non-Claude fallback
         (e.g. Prime) returns False so the Claude breaker never suppresses it.
-        NEVER raises -> fail-soft to False (legacy: don't suppress)."""
+        NEVER raises → fail-soft to False (legacy: don't suppress)."""
         try:
             if self._fallback is None:
                 return False
@@ -10271,11 +10262,11 @@ class CandidateGenerator:
         ``_FALLBACK_MIN_GUARANTEED_S`` regardless of how long the wait was.
 
         The orchestrator's outer ``wait_for(_gen_timeout + _OUTER_GATE_GRACE_S)``
-        is still the absolute Iron Gate - grace raised from 5s to 15s after
+        is still the absolute Iron Gate — grace raised from 5s to 15s after
         bt-2026-04-12-061609 diagnosed 129s Claude streams cut by 125s gate.
         """
         # ──────────────────────────────────────────────────────────────
-        # Slice 19b (2026-05-26) - fallback=None semantic correction
+        # Slice 19b (2026-05-26) — fallback=None semantic correction
         #
         # Pre-Slice-19b: when self._fallback is None (e.g., Slice 19a
         # JARVIS_PROVIDER_CLAUDE_DISABLED=true), _call_fallback fell
@@ -10284,14 +10275,14 @@ class CandidateGenerator:
         # the exception handler at line ~4731 classified it as
         # ``fallback_failed`` cause, and ExhaustionWatcher incremented
         # the consecutive counter. 3 consecutive ops with no-fallback
-        # cascade -> hibernation, even though DW (primary) was healthy.
+        # cascade → hibernation, even though DW (primary) was healthy.
         #
         # bt-2026-05-26-180129 (PURE-DW v14 soak) proved this:
         # DW completed a 265s, 23-tool-call, 76K-token Venom loop on
         # the SWE-Bench Ansible op and returned 0 candidates (model
         # judgment). The orchestrator wanted to retry via fallback,
         # fallback was None (Slice 19a intentional), instant
-        # "fallback_failed", 3 consecutive -> hibernation cycle 1.
+        # "fallback_failed", 3 consecutive → hibernation cycle 1.
         #
         # Fix: emit a DISTINCT cause prefix ``fallback_skipped:`` for
         # the "no fallback configured" case (vs ``fallback_failed:``
@@ -10305,7 +10296,7 @@ class CandidateGenerator:
             logger.info(
                 "[CandidateGenerator] Slice 19b: fallback=None "
                 "(provider intentionally absent, e.g., Slice 19a "
-                "JARVIS_PROVIDER_CLAUDE_DISABLED) - raising "
+                "JARVIS_PROVIDER_CLAUDE_DISABLED) — raising "
                 "fallback_skipped sentinel (NOT counted toward "
                 "ExhaustionWatcher hibernation threshold)"
             )
@@ -10362,7 +10353,7 @@ class CandidateGenerator:
         if _fallback_disabled_for_route(_op_route):
             logger.info(
                 "[CandidateGenerator] Fallback disabled by env for route=%s "
-                "(%s) - raising fallback_disabled_by_env sentinel",
+                "(%s) — raising fallback_disabled_by_env sentinel",
                 _op_route, _DISABLE_FALLBACK_ROUTES_ENV,
             )
             self._raise_exhausted(
@@ -10372,17 +10363,17 @@ class CandidateGenerator:
                 disabled_routes=os.environ.get(_DISABLE_FALLBACK_ROUTES_ENV, ""),
             )
 
-        # Slice 238 - cascade breaker consult (CENTRAL seam). The s237 soak proved
-        # the cascade-to-dead-Claude poison (BadRequestError 400 -> terminal_quota ->
+        # Slice 238 — cascade breaker consult (CENTRAL seam). The s237 soak proved
+        # the cascade-to-dead-Claude poison (BadRequestError 400 → terminal_quota →
         # cooldown cycle) reaches Claude from EVERY _call_fallback caller, not just
         # the sentinel cascade_to_claude path. Guard it here, where all callers
         # converge: when the fallback IS the Claude lane AND the economic breaker
-        # is OPEN (read-only _claude_breaker_open - same source-of-truth the
+        # is OPEN (read-only _claude_breaker_open — same source-of-truth the
         # primary lane respects, no probe side-effect), do NOT call the known-dead
-        # lane. Raise the EXISTING fallback_skipped sentinel (Slice 19b - NOT
+        # lane. Raise the EXISTING fallback_skipped sentinel (Slice 19b — NOT
         # counted toward ExhaustionWatcher hibernation) so the op degrades cleanly
         # instead of burning a 400 and poisoning the consecutive-failure counter.
-        # Breaker CLOSED -> byte-identical (a funded Claude fallback is used).
+        # Breaker CLOSED → byte-identical (a funded Claude fallback is used).
         if cascade_breaker_consult_enabled() and self._fallback_is_claude():
             _claude_lane_open = False
             try:
@@ -10390,12 +10381,12 @@ class CandidateGenerator:
                     _claude_breaker_open as _cf_breaker_open,
                 )
                 _claude_lane_open = _cf_breaker_open()
-            except Exception:  # noqa: BLE001 - advisory; never block dispatch
+            except Exception:  # noqa: BLE001 — advisory; never block dispatch
                 _claude_lane_open = False
             if _claude_lane_open:
                 logger.warning(
                     "[CandidateGenerator] Slice238 fallback SUPPRESSED (central): "
-                    "Claude lane breaker OPEN (economic/transport) - skipping the "
+                    "Claude lane breaker OPEN (economic/transport) — skipping the "
                     "known-dead Claude fallback (no terminal_quota poison); "
                     "raising fallback_skipped so the op degrades cleanly "
                     "(route=%s)", _op_route or "?",
@@ -10411,7 +10402,7 @@ class CandidateGenerator:
         _sem_t0 = time.monotonic()
         _phase_hint = getattr(getattr(context, "phase", None), "name", "?")
 
-        # Defect #4 Slice B (2026-05-03) - pre-fallback budget short-
+        # Defect #4 Slice B (2026-05-03) — pre-fallback budget short-
         # circuit. Soak v5 saw 3 EXHAUSTION events with remaining_s=0.0
         # and fallback_err_class=CancelledError -- ops were entering
         # _call_fallback with insufficient budget, the call attempt
@@ -10465,12 +10456,12 @@ class CandidateGenerator:
         # parallel ExploreAgents consume up to
         # MAX_PARALLEL_SCOPES * PRIMARY_PROVIDER_TIMEOUT_S seconds of
         # wall-clock before the parent Claude begins synthesizing the
-        # rolled-up findings - charging the parent's 120s cap for that
+        # rolled-up findings — charging the parent's 120s cap for that
         # wait is the arithmetic that killed Session 5 at 134.56s.
         _is_read_only = bool(getattr(context, "is_read_only", False))
         if _is_read_only and _op_route == "background":
             # Lazy import to avoid a new top-level dependency on
-            # subagent_contracts - this module is imported eagerly
+            # subagent_contracts — this module is imported eagerly
             # at provider boot, subagent_contracts is imported by
             # the orchestrator later.
             try:
@@ -10482,7 +10473,7 @@ class CandidateGenerator:
                     MAX_PARALLEL_SCOPES * PRIMARY_PROVIDER_TIMEOUT_S
                 )
             except Exception:
-                # Defensive fallback - hardcode the current Phase 1
+                # Defensive fallback — hardcode the current Phase 1
                 # constants so the cap still extends meaningfully if
                 # the import fails for any reason.
                 _subagent_wallclock_budget_s = 3 * 90  # = 270s
@@ -10496,11 +10487,11 @@ class CandidateGenerator:
         else:
             _max_cap = self._FALLBACK_MAX_TIMEOUT_S
 
-        # Task #88b - thinking-aware outer-budget widening (2026-05-13).
+        # Task #88b — thinking-aware outer-budget widening (2026-05-13).
         #
         # v14-rev6 graduation soak proved: Task #88's inner rupture
         # widening (120s -> 360s for thinking-enabled calls) is correct
-        # but insufficient - the OUTER asyncio.wait_for budget computed
+        # but insufficient — the OUTER asyncio.wait_for budget computed
         # from _max_cap fires FIRST and kills the Claude stream before
         # the inner rupture matters.  Log evidence:
         # ``elapsed=290.0s budget=218.7s first_token=NEVER thinking=on``.
@@ -10533,7 +10524,7 @@ class CandidateGenerator:
         if _likely_thinking:
             _max_cap = max(_max_cap, fallback_thinking_cap_s())
 
-        # Seed Arc Path 3 follow-up - PLAN-EXPLOIT per-stream override.
+        # Seed Arc Path 3 follow-up — PLAN-EXPLOIT per-stream override.
         # When ``plan_exploit_active_var`` is True (set by
         # ``try_parallel_generate`` before its gather), the per-stream
         # cap uses ``plan_exploit_per_stream_timeout_s()`` instead of
@@ -10552,12 +10543,12 @@ class CandidateGenerator:
             )
             if _plan_exploit_active.get(False):
                 _max_cap = max(_max_cap, _plan_exploit_timeout())
-        except Exception:  # noqa: BLE001 - override is best-effort
+        except Exception:  # noqa: BLE001 — override is best-effort
             pass
 
         # Promoted to INFO with phase label so traces distinguish first
         # GENERATE from GENERATE_RETRY contention on the shared fallback
-        # semaphore - Session bt-2026-04-15-041413 (2026-04-14) saw a
+        # semaphore — Session bt-2026-04-15-041413 (2026-04-14) saw a
         # retry wait 121.5s behind cohort ops with no visibility into
         # which acquisition phase was queuing. max_cap added after
         # Session F (bt-2026-04-15-065523) so the route-aware ceiling
@@ -10573,11 +10564,11 @@ class CandidateGenerator:
             _max_cap,
         )
 
-        # AdmissionGate Slice 2 - pre-acquire viability check.
+        # AdmissionGate Slice 2 — pre-acquire viability check.
         # Refuses admission when projected wait + min-viable
         # call exceeds remaining budget, sheds load BEFORE
         # consuming a semaphore slot. Master flag default-FALSE
-        # until Slice 3 - disabled gate degrades to ADMIT
+        # until Slice 3 — disabled gate degrades to ADMIT
         # (preserves pre-Slice-2 behavior). NEVER raises;
         # adopting a fail-open posture so a gate bug cannot
         # itself starve a legitimate op.
@@ -10593,7 +10584,7 @@ class CandidateGenerator:
                 if _wait_est is not None else 0.0
             )
             # _fallback_sem._value is "slots free"; depth =
-            # capacity - free.
+            # capacity − free.
             _live_depth = max(
                 0,
                 self._fallback_concurrency
@@ -10611,7 +10602,7 @@ class CandidateGenerator:
                 enabled=_admission_gate_enabled(),
                 decided_at_ts=time.time(),
             )
-            # Slice 3 - record EVERY decision (admit + shed) to
+            # Slice 3 — record EVERY decision (admit + shed) to
             # the bounded ring so the GET /observability/admission-
             # gate route shows recent admission patterns.
             # Best-effort, NEVER raises into the call path.
@@ -10620,7 +10611,7 @@ class CandidateGenerator:
                     get_default_history as _admit_history,
                 )
                 _admit_history().record(_admission.to_dict())
-            except Exception as exc:  # noqa: BLE001 - defensive
+            except Exception as exc:  # noqa: BLE001 — defensive
                 logger.debug(
                     "[CandidateGenerator] admission history "
                     "record degraded: %s", exc,
@@ -10638,7 +10629,7 @@ class CandidateGenerator:
                     _admission.queue_depth,
                     _admission.required_budget_s,
                 )
-                # Slice 3 - publish SSE event for IDE
+                # Slice 3 — publish SSE event for IDE
                 # consumers to surface saturation in real time.
                 # Best-effort.
                 try:
@@ -10686,17 +10677,17 @@ class CandidateGenerator:
                     ),
                 )
         except RuntimeError:
-            # _raise_exhausted raises RuntimeError - don't
+            # _raise_exhausted raises RuntimeError — don't
             # swallow our own structural shed.
             raise
-        except Exception as exc:  # noqa: BLE001 - fail-open
+        except Exception as exc:  # noqa: BLE001 — fail-open
             logger.debug(
                 "[CandidateGenerator] Admission gate "
-                "degraded - proceeding to acquire: %s", exc,
+                "degraded — proceeding to acquire: %s", exc,
             )
 
         try:
-            # Slice 12F-A - priority-aware fallback sem acquire.
+            # Slice 12F-A — priority-aware fallback sem acquire.
             # urgency=high SWE-Bench-Pro foreground ops (IMMEDIATE
             # route, priority=0) now preempt urgency=low /
             # BACKGROUND OpportunityMiner ops (priority=4) on slot
@@ -10710,10 +10701,10 @@ class CandidateGenerator:
                 _sem_wait_s = time.monotonic() - _sem_t0
                 _parent_remaining = self._remaining_seconds(deadline)
 
-                # D2 (Task #95, 2026-05-14) - sem-exhausted fast-fail.
+                # D2 (Task #95, 2026-05-14) — sem-exhausted fast-fail.
                 # Per operator binding: "after the semaphore wait is
                 # charged, remaining_budget_for_network = max(0,
-                # outer_remaining - sem_wait_total); if <= 0, fail fast
+                # outer_remaining - sem_wait_total); if ≤ 0, fail fast
                 # with a structured reason (sem_exhausted_zero_budget)
                 # instead of still opening a stream that will always
                 # violate outer wait_for."
@@ -10721,7 +10712,7 @@ class CandidateGenerator:
                 # This sits BEFORE the post-acquire floor refresh (#88c
                 # territory) by design: #88c's refresh is the explicit
                 # op-envelope extension when budget is tight but
-                # *nonzero* - honest enforcement.  D2 is the new
+                # *nonzero* — honest enforcement.  D2 is the new
                 # invariant for the *zero* case: do not pretend time
                 # exists that does not.  When the entire pre-sem budget
                 # was consumed waiting for the semaphore, the outer
@@ -10731,20 +10722,20 @@ class CandidateGenerator:
                 # surrender latency).  Fast-fail here is observability +
                 # cost win.
                 #
-                # Slice 12F-B (2026-05-22) - raise the D2 floor from
+                # Slice 12F-B (2026-05-22) — raise the D2 floor from
                 # absolute-zero to JARVIS_STREAM_MINIMUM_READ_BUDGET_S
                 # (default 10s). Phase 3A acceptance (bt-2026-05-22-
                 # 184422) proved the gap: sem_wait_total=142.2s drained
-                # the op's wall to ~0.01s - JUST above the 0.0 floor -
+                # the op's wall to ~0.01s — JUST above the 0.0 floor —
                 # so D2 didn't fire and the stream opened with a
                 # 0.01-second read budget. The subsequent inter-chunk
                 # watchdog fired a misleading "no event for 0s" rupture.
                 # That was a budget-too-short refusal masquerading as a
                 # network rupture. Slice 12F-B raises the typed
                 # StreamBudgetTooShortError BEFORE dispatch, which the
-                # classifier maps to TRANSIENT_TRANSPORT ->
+                # classifier maps to TRANSIENT_TRANSPORT →
                 # RetryDecision.RETRY_TRANSIENT (NOT terminal
-                # structural - Slice 7 fallback handles it as a
+                # structural — Slice 7 fallback handles it as a
                 # transient transport fault).
                 from backend.core.ouroboros.governance.stream_rupture import (  # noqa: E501
                     StreamBudgetTooShortError,
@@ -10755,10 +10746,10 @@ class CandidateGenerator:
                     logger.info(
                         "[CandidateGenerator] Post-sem budget-floor "
                         "shed (Slice 12F-B): sem_wait=%.1fs drained "
-                        "pre_sem_remaining=%.1fs -> parent_remaining=%.2fs "
+                        "pre_sem_remaining=%.1fs → parent_remaining=%.2fs "
                         "below floor=%.1fs (route=%s). Refusing to "
                         "dispatch a stream that the wall budget cannot "
-                        "honor; raising StreamBudgetTooShortError -> "
+                        "honor; raising StreamBudgetTooShortError → "
                         "RETRY_TRANSIENT (Slice 7 fallback).",
                         _sem_wait_s, _pre_sem_remaining,
                         _parent_remaining, _min_read_budget_s, _op_route,
@@ -10772,7 +10763,7 @@ class CandidateGenerator:
                         route=str(_op_route or ""),
                     )
 
-                # AdmissionGate Slice 2 - feed observed wait
+                # AdmissionGate Slice 2 — feed observed wait
                 # back to the EWMA estimator so the next op's
                 # projection reflects actual queue pressure.
                 # NEVER raises into the call path.
@@ -10793,7 +10784,7 @@ class CandidateGenerator:
                 if _sem_wait_s > 1.0:
                     logger.info(
                         "[CandidateGenerator] Fallback sem_wait=%.1fs "
-                        "(pre=%.1fs -> post=%.1fs)",
+                        "(pre=%.1fs → post=%.1fs)",
                         _sem_wait_s, _pre_sem_remaining, _parent_remaining,
                     )
 
@@ -10804,13 +10795,13 @@ class CandidateGenerator:
                 # the route-aware ceiling computed at acquire time (180s
                 # for complex, 120s otherwise).
                 #
-                # Task #88c (2026-05-13) - thinking-aware floor reservation.
+                # Task #88c (2026-05-13) — thinking-aware floor reservation.
                 # v14-rev7 proved the third budget layer: even with Task #88
                 # (inner 360s) and #88b (outer _max_cap 360s) widened, the
                 # actual Claude timeout was 90s because the DW cascade had
                 # already consumed ~140s of the ~200s op deadline. The post-
                 # acquire refresh's floor (_FALLBACK_MIN_GUARANTEED_S=90s)
-                # was the binding constraint - and 90s is nowhere near the
+                # was the binding constraint — and 90s is nowhere near the
                 # 360s thinking-on inner/outer single-policy floor.
                 #
                 # Fix: when the call is likely-thinking (signal reused from
@@ -10828,7 +10819,7 @@ class CandidateGenerator:
                 # Claude gets a guaranteed 360s, even when parent_remaining
                 # was nearly exhausted by the DW cascade.  This is the
                 # "Claude-floor reservation against op deadline" the operator
-                # binding mandates - DW cannot force Claude below the floor.
+                # binding mandates — DW cannot force Claude below the floor.
                 _min_guaranteed_s = (
                     float(os.environ.get(
                         "JARVIS_FALLBACK_MIN_GUARANTEED_THINKING_S", "360.0",
@@ -10872,30 +10863,30 @@ class CandidateGenerator:
                         remaining, _max_cap, _sem_wait_s,
                     )
 
-                # W3(7) Slice 2 - race against ambient cancel token (if any).
+                # W3(7) Slice 2 — race against ambient cancel token (if any).
                 # Outer-retry loop (rooted-problem fix 2026-04-25): re-invoke
                 # the provider on transient failures while remaining budget
                 # exceeds `_min_viable_fallback_s()`. Holds `_fallback_sem`
                 # across attempts so head-of-queue position is preserved
                 # (paying the wait fee twice would penalize the op for
-                # provider flakiness - semantically incorrect).
+                # provider flakiness — semantically incorrect).
                 from backend.core.ouroboros.governance.cancel_token import (
                     OperationCancelledError as _OperationCancelledError,
                     current_cancel_token as _curr_cancel_token,
                     race_or_wait_for as _race_or_wait_for,
                 )
-                # Slice 7e (Provider Circuit Breaker) - wire the
+                # Slice 7e (Provider Circuit Breaker) — wire the
                 # state machine into the retry loop. Constructed once
                 # per _call_fallback invocation (per op_id). Consumes
                 # Slice 7a's classify() output; emits SSE telemetry.
                 # On TERMINATE_UNRESOLVED short-circuits the loop +
                 # fires _raise_exhausted with the breaker's reason
-                # code - closing the empirical 35-min retry storm
+                # code — closing the empirical 35-min retry storm
                 # from bt-2026-05-21-214521.
                 #
                 # Master flag ``JARVIS_PROVIDER_CIRCUIT_BREAKER_ENABLED``
                 # default-FALSE. When off, ``breaker.evaluate()`` always
-                # returns RETRY_OK -> byte-identical to the pre-7e retry
+                # returns RETRY_OK → byte-identical to the pre-7e retry
                 # loop (FailureMode / outer-retry cap / backoff constant
                 # stay authoritative).
                 #
@@ -10910,8 +10901,8 @@ class CandidateGenerator:
                 from backend.core.ouroboros.governance.provider_retry_classifier import (  # noqa: E501
                     classify as _slice7e_classify,
                 )
-                # Slice 127 - economic reclassification gate (default-FALSE,
-                # S33.1). Lives in economic_router so the PURE-DATA classifier
+                # Slice 127 — economic reclassification gate (default-FALSE,
+                # §33.1). Lives in economic_router so the PURE-DATA classifier
                 # stays env-free (AST-pinned).
                 from backend.core.ouroboros.governance.economic_router import (  # noqa: E501
                     economic_reclassify_enabled as _s127_econ_reclassify_enabled,
@@ -10925,14 +10916,14 @@ class CandidateGenerator:
                 _slice7e_op_id = str(
                     getattr(context, "op_id", "") or "",
                 )
-                # Slice 12N - blast-radius isolation. Map the op's
+                # Slice 12N — blast-radius isolation. Map the op's
                 # ProviderRoute to a CircuitTripOrigin so background /
                 # speculative ops can trip their per-op breaker
                 # WITHOUT escalating to the global session_exhausted
                 # threshold. Foreground (IMMEDIATE / STANDARD /
                 # COMPLEX) routes still escalate byte-identically to
                 # pre-Slice-12N behavior. Unknown routes default to
-                # FOREGROUND (safer - preserves legacy escalation).
+                # FOREGROUND (safer — preserves legacy escalation).
                 _slice12n_route = str(
                     getattr(context, "provider_route", "") or "",
                 ).strip().lower()
@@ -10946,7 +10937,7 @@ class CandidateGenerator:
                     origin=_slice12n_origin,
                 )
                 _outer_attempt = 0
-                # Anthropic resilience pack 2026-04-25 - failure-rate-aware
+                # Anthropic resilience pack 2026-04-25 — failure-rate-aware
                 # outer-retry max. When the FSM shows recent transient
                 # failures (consecutive_failures > 0), bump the outer-retry
                 # cap to give the op more headroom to catch a recovery
@@ -10959,8 +10950,8 @@ class CandidateGenerator:
                     _outer_max = _FALLBACK_OUTER_RETRY_MAX_DEGRADED
                     logger.info(
                         "[CandidateGenerator] Fallback outer-retry: degraded mode "
-                        "detected (FSM consecutive_failures=%d) - bumping outer-retry "
-                        "cap from %d to %d for op=%s (rooted-problem fix - failure-"
+                        "detected (FSM consecutive_failures=%d) — bumping outer-retry "
+                        "cap from %d to %d for op=%s (rooted-problem fix — failure-"
                         "rate-aware retry headroom)",
                         _fsm_consec_fails,
                         _fallback_outer_retry_max(), _outer_max,
@@ -10969,14 +10960,14 @@ class CandidateGenerator:
                 else:
                     _outer_max = _fallback_outer_retry_max()
                 _last_inner_exc: Optional[BaseException] = None
-                # ── Slice 3C - outer-retry tool-record carryover ──
+                # ── Slice 3C — outer-retry tool-record carryover ──
                 # Iron Gate (post-GENERATE) inspects
                 # ``GenerationResult.tool_execution_records`` to verify the
                 # model met the exploration floor. Each provider attempt
                 # carries only its OWN tool calls (the coordinator resets
                 # ``_last_records`` at run start). If attempt N raises after
                 # genuine exploration but attempt N+1 succeeds with NO tool
-                # calls (the bt-2026-05-25-033000 cascade - direct patch
+                # calls (the bt-2026-05-25-033000 cascade — direct patch
                 # emit after retries), Iron Gate sees 0 records and rejects
                 # even though the model explored the codebase across
                 # attempts. Accumulator harvests records from each failed
@@ -10989,7 +10980,7 @@ class CandidateGenerator:
                     _attempt_t0 = time.monotonic()
                     _attempt_remaining = self._remaining_seconds(deadline)
                     if _attempt_remaining < _min_viable_fallback_s():
-                        # Budget exhausted - break to outer except handler
+                        # Budget exhausted — break to outer except handler
                         # which fires `fallback_budget_starved` if no prior
                         # exception, else fallback_failed with last exc.
                         if _last_inner_exc is not None:
@@ -11004,20 +10995,20 @@ class CandidateGenerator:
                             fallback_budget_s=round(_attempt_remaining, 2),
                             min_viable_fallback_s=_min_viable_fallback_s(),
                         )
-                    # Slice 89 - Build ExplorationManifest from DW's just-
+                    # Slice 89 — Build ExplorationManifest from DW's just-
                     # completed tool loop and stamp onto context BEFORE the
                     # Claude fallback generate() call.  NEVER raises
                     # (try/except guards the full block).  When
                     # JARVIS_EXPLORATION_MANIFEST_ENABLED is OFF (default
-                    # S33.1), behavior is byte-identical to today.
+                    # §33.1), behavior is byte-identical to today.
                     #
-                    # Gate: stamp only on the FIRST Claude attempt -
+                    # Gate: stamp only on the FIRST Claude attempt —
                     # DW's `_last_salient_args`/`_last_records` are only
                     # valid until DW's next run() resets them.  On outer
                     # attempt 1 _carryover_tool_records is always empty
                     # (populated only INSIDE the except block below), so
                     # the old `_carryover_tool_records and _outer_attempt==1`
-                    # condition was mutually exclusive - dead code (C1 fix).
+                    # condition was mutually exclusive — dead code (C1 fix).
                     # We now harvest directly from the primary coordinator.
                     if _outer_attempt == 1:
                         try:
@@ -11029,7 +11020,7 @@ class CandidateGenerator:
                                     ExplorationManifest as _ExplorationManifest,
                                 )
                                 # Harvest BOTH records and salient_args from
-                                # the primary provider's coordinator - these
+                                # the primary provider's coordinator — these
                                 # are the DW tool loop results just before
                                 # DW's generate() failed/timed-out.  Using
                                 # the same coordinator source keeps them
@@ -11060,7 +11051,7 @@ class CandidateGenerator:
                                     len(_s89_manifest.failed_test_commands),
                                     getattr(context, "op_id", "?")[:16],
                                 )
-                        except Exception:  # noqa: BLE001 - never break the cascade
+                        except Exception:  # noqa: BLE001 — never break the cascade
                             pass
                     try:
                         _fb_result = await _race_or_wait_for(
@@ -11088,11 +11079,11 @@ class CandidateGenerator:
                             _phase_hint,
                             getattr(context, "op_id", "?")[:16],
                         )
-                        # Slice 3C - merge carryover records into the
+                        # Slice 3C — merge carryover records into the
                         # winning attempt's GenerationResult so Iron Gate
                         # sees the cumulative exploration across attempts.
                         # No-op when carryover is empty (single-attempt
-                        # success path) - byte-identical legacy behavior.
+                        # success path) — byte-identical legacy behavior.
                         if _carryover_tool_records:
                             try:
                                 _winning_records = tuple(
@@ -11125,20 +11116,20 @@ class CandidateGenerator:
                                             context, "op_id", "?",
                                         )[:16],
                                     )
-                            except Exception:  # noqa: BLE001 - defensive
+                            except Exception:  # noqa: BLE001 — defensive
                                 # Carryover merge must NEVER break a
                                 # successful generate. Log + fall through
                                 # with the unmerged result.
                                 logger.exception(
                                     "[CandidateGenerator] Slice 3C "
-                                    "carryover merge degraded - returning "
+                                    "carryover merge degraded — returning "
                                     "winning-attempt GenerationResult "
                                     "unmodified for op=%s",
                                     getattr(context, "op_id", "?")[:16],
                                 )
                         return _fb_result
                     except _OperationCancelledError:
-                        # W3(7) cooperative cancel - operator/watchdog/signal.
+                        # W3(7) cooperative cancel — operator/watchdog/signal.
                         # NEVER retry; honor the cancel immediately.
                         raise
                     except GovernanceDeadlockError:
@@ -11148,20 +11139,20 @@ class CandidateGenerator:
                         # terminal catch so it stamps deadlock_override_failed.
                         raise
                     except (Exception, asyncio.CancelledError) as inner_exc:
-                        # Slice 3C - harvest tool-records from the failed
+                        # Slice 3C — harvest tool-records from the failed
                         # attempt BEFORE any other handling. Best-effort:
                         # if the exception didn't carry records (legacy
                         # provider, untagged path), getattr returns (),
                         # extend is a no-op, behavior matches pre-Slice-3C.
                         #
-                        # Slice 3D (2026-05-24) - coordinator-attribute
+                        # Slice 3D (2026-05-24) — coordinator-attribute
                         # fallback. The Slice 3C exception attachment only
                         # fires on raises through ToolLoopCoordinator's
                         # ``_attach_tool_records`` sites. When the outer
                         # ``_race_or_wait_for(... timeout=_attempt_remaining)``
                         # hits its deadline, it raises asyncio.TimeoutError
                         # / CancelledError that DOES NOT traverse the tool
-                        # executor's raise sites - the records sit untouched
+                        # executor's raise sites — the records sit untouched
                         # in ``coordinator._last_records``. The
                         # bt-2026-05-25-041717 attempt 1: 244.2s tool loop
                         # made 13+ tool calls then the outer race timed
@@ -11176,14 +11167,14 @@ class CandidateGenerator:
                         # ``[]`` at every ``run()`` start (tool_executor.py
                         # line 5250) and re-populated at each round
                         # boundary, so at except-block time it reflects
-                        # exactly the just-failed attempt's records - no
+                        # exactly the just-failed attempt's records — no
                         # cross-attempt double-counting.
                         try:
                             _harvested = getattr(
                                 inner_exc, "tool_execution_records", (),
                             ) or ()
                             if not _harvested:
-                                # Slice 3D fallback - coordinator probe.
+                                # Slice 3D fallback — coordinator probe.
                                 # Defensive getattr chain: any provider
                                 # without ``_tool_loop`` (tools disabled
                                 # config) or coordinator without
@@ -11213,19 +11204,19 @@ class CandidateGenerator:
                                         )
                             if _harvested:
                                 _carryover_tool_records.extend(_harvested)
-                        except Exception:  # noqa: BLE001 - never block retry
+                        except Exception:  # noqa: BLE001 — never block retry
                             pass
                         # Pre-instrumented (e.g. fallback_budget_starved
-                        # from a different code path) -> propagate as-is.
+                        # from a different code path) → propagate as-is.
                         if hasattr(inner_exc, "exhaustion_report"):
                             raise
                         _last_inner_exc = inner_exc
                         _inner_mode = (
                             FailbackStateMachine.classify_exception(inner_exc)
                         )
-                        # Slice 7e - Consult the Circuit Breaker on
+                        # Slice 7e — Consult the Circuit Breaker on
                         # every failure. When master flag is OFF,
-                        # ``evaluate()`` returns RETRY_OK -> byte-
+                        # ``evaluate()`` returns RETRY_OK → byte-
                         # identical to the pre-7e path. When ON,
                         # TERMINAL_STRUCTURAL / TERMINAL_CONFIG short-
                         # circuit immediately (closing the 35-min
@@ -11233,17 +11224,17 @@ class CandidateGenerator:
                         # RETRY_TRANSIENT trigger Full-Jitter backoff;
                         # the FSM / outer-retry cap / existing
                         # eligibility check below remain as additional
-                        # gates (defense in depth - no breaker bypass
+                        # gates (defense in depth — no breaker bypass
                         # of the pre-existing semantics).
-                        # Slice 127 - pass the raw message + economic gate so a
+                        # Slice 127 — pass the raw message + economic gate so a
                         # "credit balance too low" 400 (class BadRequestError)
                         # reclassifies to recoverable TERMINAL_QUOTA instead of
-                        # sticky TERMINAL_CONFIG. Gate default-FALSE -> OFF is
+                        # sticky TERMINAL_CONFIG. Gate default-FALSE → OFF is
                         # byte-identical to pre-127. (bt-2026-06-07-040933 root
                         # cause: 16 sticky terminal_config trips.)
                         try:
                             _s127_econ_on = _s127_econ_reclassify_enabled()
-                        except Exception:  # noqa: BLE001 - failure-soft
+                        except Exception:  # noqa: BLE001 — failure-soft
                             _s127_econ_on = False
                         _slice7e_decision = _slice7e_classify(
                             failure_class=type(inner_exc).__name__,
@@ -11262,13 +11253,13 @@ class CandidateGenerator:
                                 is not None
                             ),
                         )
-                        # Slice 127 Phase 2 - per-provider economic breaker.
+                        # Slice 127 Phase 2 — per-provider economic breaker.
                         # The fallback IS the Claude/Anthropic lane; when this
                         # failure is an economic block ("credit balance too
                         # low" / 402), trip the per-lane self-healing breaker so
                         # FUTURE ops route around the broke lane (existing
                         # should_allow_request gate) and it recovers after the
-                        # window - no sticky session brick. Gated + defensive;
+                        # window — no sticky session brick. Gated + defensive;
                         # detail is the redacted economic code, never a secret.
                         _claude_econ_block = False
                         try:
@@ -11291,9 +11282,9 @@ class CandidateGenerator:
                                     # consumer sees the dead wallet.
                                     _record_quota_outage_safely(
                                         "anthropic", str(inner_exc)[:160])
-                        except Exception:  # noqa: BLE001 - never block cascade
+                        except Exception:  # noqa: BLE001 — never block cascade
                             pass
-                        # Telemetry - every classification is logged,
+                        # Telemetry — every classification is logged,
                         # regardless of breaker state. Best-effort.
                         _slice7e_publish_classified(
                             failure_class=type(inner_exc).__name__,
@@ -11305,7 +11296,7 @@ class CandidateGenerator:
                         # Sovereign State Isolation (2026-06-19): a confirmed
                         # Claude economic death is OWNED by Claude's lane breaker
                         # (recorded above). Do NOT let it trip the provider-
-                        # NEUTRAL per-op breaker into the sticky OPEN_TERMINAL -
+                        # NEUTRAL per-op breaker into the sticky OPEN_TERMINAL —
                         # that poisons the op for DW too (empirically-confirmed
                         # cross-provider contamination: terminal_quota 5->0 once
                         # isolated). Downgrade ONLY the decision the OP breaker
@@ -11335,7 +11326,7 @@ class CandidateGenerator:
                             and _slice7e_verdict.state_after.value or \
                             _slice7e_breaker.state.value
                         if _slice7e_prior_state != _slice7e_new_state:
-                            # State change -> SSE telemetry. Trip
+                            # State change → SSE telemetry. Trip
                             # events use the more-specific publisher
                             # below; non-trip transitions go here.
                             if _slice7e_verdict.action != (
@@ -11350,7 +11341,7 @@ class CandidateGenerator:
                         if _slice7e_verdict.action == (
                             _Slice7e_VerdictAction.TERMINATE_UNRESOLVED
                         ):
-                            # Breaker trip - emit the trip SSE event
+                            # Breaker trip — emit the trip SSE event
                             # + raise exhausted with the breaker's
                             # reason code. The orchestrator's existing
                             # exhaustion handler picks up the cause
@@ -11380,7 +11371,7 @@ class CandidateGenerator:
                                     _slice7e_decision.value
                                 ),
                             )
-                        # Permanent failures - never retry.
+                        # Permanent failures — never retry.
                         if not _is_outer_retry_eligible_mode(_inner_mode):
                             raise
                         # Hit the outer-retry cap.
@@ -11395,7 +11386,7 @@ class CandidateGenerator:
                             "[CandidateGenerator] Fallback outer-retry: "
                             "attempt %d/%d failed (%s/%s) after %.1fs; "
                             "%.1fs budget remains, retrying op=%s "
-                            "(rooted-problem fix - consuming budget JARVIS "
+                            "(rooted-problem fix — consuming budget JARVIS "
                             "already authorized, not inflating)",
                             _outer_attempt, _outer_max,
                             type(inner_exc).__name__,
@@ -11408,7 +11399,7 @@ class CandidateGenerator:
                         # 1s of it (which would risk underflow into the
                         # min_viable floor on the next attempt).
                         #
-                        # Slice 7e - when the breaker returned
+                        # Slice 7e — when the breaker returned
                         # RETRY_AFTER_BACKOFF with a non-None backoff_s,
                         # use the Full-Jitter delay (AWS algorithm)
                         # instead of the fixed constant. This is the
@@ -11432,7 +11423,7 @@ class CandidateGenerator:
                             )
                         await asyncio.sleep(_backoff)
                         continue
-                # Unreachable - loop either returns or raises.
+                # Unreachable — loop either returns or raises.
         except GovernanceDeadlockError:
             # LR3 terminal: defense-in-depth. The inner-retry handler already
             # re-raises this, but guard the outer catch too so a deadlock can
@@ -11440,7 +11431,7 @@ class CandidateGenerator:
             # reach the orchestrator's deadlock_override_failed terminal catch.
             raise
         except (Exception, asyncio.CancelledError) as exc:
-            # Cooperative cancel via W3(7) cancel-token - propagate
+            # Cooperative cancel via W3(7) cancel-token — propagate
             # immediately (NEVER treat as exhaustion). The inner loop
             # raises OperationCancelledError; this outer handler must
             # not swallow it into the fallback_failed taxonomy or the
@@ -11470,7 +11461,7 @@ class CandidateGenerator:
             mode = FailbackStateMachine.classify_exception(exc)
             self.fsm.record_fallback_failure(mode=mode)
             # Distinct cause tag when the tool-loop pre-round viability
-            # gate fired. This is NOT a transport/API failure - it's a
+            # gate fired. This is NOT a transport/API failure — it's a
             # round-level budget exhaustion that the ToolLoopCoordinator
             # caught before a doomed sub-floor call. Keeping the cause
             # distinct in breadcrumbs lets grep audits see "round_starved"
@@ -11501,7 +11492,7 @@ class CandidateGenerator:
         return max(remaining, 0.0)
 
     # ------------------------------------------------------------------
-    # Per-op Tier 0 rotation (Manifesto S5 - defensive cost guard)
+    # Per-op Tier 0 rotation (Manifesto §5 — defensive cost guard)
     # ------------------------------------------------------------------
 
     def _should_skip_tier0_for_op(self) -> bool:
@@ -11510,7 +11501,7 @@ class CandidateGenerator:
         Skips when ``_consecutive_tier0_failures`` reaches the threshold
         AND the most recent failure happened within ``_tier0_skip_window_s``
         seconds. Outside the window the counter resets implicitly because
-        the elapsed-time check fails - equivalent to a stale-feed reset.
+        the elapsed-time check fails — equivalent to a stale-feed reset.
 
         This is independent of the FSM's mode-based ETA: even if the
         classifier mis-routes a transport flap to TIMEOUT (default), this
@@ -11538,7 +11529,7 @@ class CandidateGenerator:
         self._counters.last_tier0_failure_at = 0.0
 
     # ------------------------------------------------------------------
-    # Deadline budget allocation (deterministic - Manifesto S5)
+    # Deadline budget allocation (deterministic — Manifesto §5)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -11549,9 +11540,9 @@ class CandidateGenerator:
     ) -> float:
         """Deterministic Tier 0 (DoubleWord) budget with Tier 1 reserve.
 
-        Tier 0 is the preferred path (cheap, Manifesto S5 Tier 0 fast-path).
+        Tier 0 is the preferred path (cheap, Manifesto §5 Tier 0 fast-path).
         It gets 65% of the total budget by default.  When the total budget is
-        tight (< 90s), we log a warning - both tiers may starve.
+        tight (< 90s), we log a warning — both tiers may starve.
 
         *complexity* scales the base fraction via ``_TIER0_COMPLEXITY_MULTIPLIER``
         so that complex operations receive proportionally more Tier 0 time
@@ -11574,7 +11565,7 @@ class CandidateGenerator:
         if provider_route == "immediate":
             return 0.0
         if provider_route == "background":
-            # DW only - no Claude reserve needed
+            # DW only — no Claude reserve needed
             return min(total_s, 180.0)
         if provider_route == "speculative":
             return min(total_s, 300.0)
@@ -11599,19 +11590,19 @@ class CandidateGenerator:
             max_wait = _TIER0_MAX_WAIT_S
             min_reserve = _TIER1_MIN_RESERVE_S
 
-        # Reserve Tier 1 budget first (defensive - Tier 1 must always get a chance)
+        # Reserve Tier 1 budget first (defensive — Tier 1 must always get a chance)
         tier1_reserve = min(min_reserve, total_s * (1.0 - effective_fraction))
-        # Tier 3 Reflex (Manifesto S5): absolute hard cap on DW calls.
+        # Tier 3 Reflex (Manifesto §5): absolute hard cap on DW calls.
         # Strictest of four constraints wins (fraction, route max_wait,
         # tier1 reserve, Tier 0 RT cap). Added 2026-04-24 after F1 Slice 4 S4
         # (bt-2026-04-24-213248) proved the previous patch (inside
         # _call_primary) was inert for the DW-is-Tier0-AND-Primary
-        # configuration - this code path is where DW actually gets its
+        # configuration — this code path is where DW actually gets its
         # 90s max_wait in that configuration.
         #
-        # Slice 18c (2026-05-26) - the 4th constraint is now route-aware.
+        # Slice 18c (2026-05-26) — the 4th constraint is now route-aware.
         # STANDARD + COMPLEX get the new JARVIS_DW_TIER0_RT_BUDGET_S
-        # (default 90s - matches 397B/Kimi TTFT envelope) instead of the
+        # (default 90s — matches 397B/Kimi TTFT envelope) instead of the
         # 30s reflex cap. Eliminates the FLEET-v13-soak premature-timeout
         # cascade pattern (8 EXHAUSTION events, each on a DW dispatch
         # that needed >30s to complete). IMMEDIATE/BG/SPEC preserved at
@@ -11630,7 +11621,7 @@ class CandidateGenerator:
         complexity: str = "trivial",
         provider_route: str = "standard",
     ) -> float:
-        """Tier 0 budget with rolling p95 awareness (Manifesto S5).
+        """Tier 0 budget with rolling p95 awareness (Manifesto §5).
 
         Computes the static deterministic budget first (preserving all Tier 1
         reserve invariants), then tightens it using the latency tracker's p95
@@ -11638,7 +11629,7 @@ class CandidateGenerator:
         or recent failures), falls through to the static budget so the first
         calls get full runway.
 
-        The tracker NEVER loosens beyond the static ceiling - it only dials
+        The tracker NEVER loosens beyond the static ceiling — it only dials
         down when DW RT has proven fast enough.
         """
         static_budget = self._compute_tier0_budget(total_s, complexity, provider_route)
@@ -11653,7 +11644,7 @@ class CandidateGenerator:
         if tracker is None:
             return static_budget
 
-        # Use the static budget as the caller-provided ceiling - the tracker
+        # Use the static budget as the caller-provided ceiling — the tracker
         # can only dial down from here, never above it. Tier 1 reserve is
         # already guaranteed by _compute_tier0_budget.
         complexity_mult = _TIER0_COMPLEXITY_MULTIPLIER.get(complexity, 1.0)
@@ -11665,7 +11656,7 @@ class CandidateGenerator:
 
         if final_budget < static_budget - 0.5:
             logger.info(
-                "[CandidateGenerator] DW dynamic budget: %.1fs -> %.1fs "
+                "[CandidateGenerator] DW dynamic budget: %.1fs → %.1fs "
                 "(hot endpoint, p95=%.1fs)",
                 static_budget, final_budget, tracker.p95() or 0.0,
             )
@@ -11720,7 +11711,7 @@ class CandidateGenerator:
         replaces is already measured and owned elsewhere, so it is read,
         not redeclared.
 
-        Invariants (enforced via ``min()`` - strictest wins):
+        Invariants (enforced via ``min()`` — strictest wins):
           - primary_budget <= total_s * _PRIMARY_BUDGET_FRACTION
           - total_s - primary_budget >= _FALLBACK_MIN_RESERVE_S (when possible)
           - primary_budget <= effective_max (Slice 28 adaptive Tier 3 cap)
@@ -11729,7 +11720,7 @@ class CandidateGenerator:
         exposed a 153s DW primary hold that exhausted the session before
         Claude fallback could produce a candidate.
 
-        Slice 28 Phase 2 - Adaptive Streaming TTFT Horizon
+        Slice 28 Phase 2 — Adaptive Streaming TTFT Horizon
         ---------------------------------------------------
         v21 forensic (bt-2026-05-27-025855) revealed the actual wedge: 12
         EXHAUSTION events on the 397B model, all classified as TIMEOUT, all
@@ -11737,19 +11728,19 @@ class CandidateGenerator:
         ``_PRIMARY_MAX_TIMEOUT_S`` (30s default) was killing primary calls
         long before the streaming layer's 120s TTFT could even fire on the
         wire. Cold-start TTFT for a 397B MoE on a contended endpoint
-        legitimately exceeds 30s - per S46 fleet inventory the 397B is
+        legitimately exceeds 30s — per §46 fleet inventory the 397B is
         characterized as a heavy-reasoning workhorse whose TTFT envelope
         is materially larger than the 35B sibling.
 
         When ``model_id`` is a heavy-reasoning / long-context model
         (matched against the same marker set Slice 27 Phase 3 uses for the
         adaptive Tier 0 timeout), multiply ``_PRIMARY_MAX_TIMEOUT_S`` by
-        a heavy scalar (default 2.5x) so the call has runway to receive
+        a heavy scalar (default 2.5×) so the call has runway to receive
         the first token. Hard ceiling at 240s matches the Slice 27 Phase 3
         cap (no unbounded cost bleeding).
 
         Legacy callers that pass only ``total_s`` (no ``model_id``) get the
-        byte-identical pre-Slice-28 behavior - the 30s cap is preserved as
+        byte-identical pre-Slice-28 behavior — the 30s cap is preserved as
         the binding constraint. The adaptive widening engages only when
         the dispatcher has stamped the per-attempt model_id via the
         topology ContextVar.
@@ -11757,16 +11748,16 @@ class CandidateGenerator:
         if total_s <= 0:
             return 0.0
 
-        # Slice 43 - Async Batch Timeout Alignment.
+        # Slice 43 — Async Batch Timeout Alignment.
         # When the op will be dispatched through the BATCH lane (Slice 36/41
         # FORCE_BATCH), the provider's internal poll_and_retrieve legitimately
-        # runs for minutes - the batch_future_registry waits up to
+        # runs for minutes — the batch_future_registry waits up to
         # _DW_MAX_WAIT_S (3600s). Wrapping that in the 30s RT reflex cap
         # (_PRIMARY_MAX_TIMEOUT_S) severs the async batch mid-flight (v37
         # bt-2026-05-28-235234: batch 7b7a7b52 submitted then abandoned at
         # 30s). Give batch ops a batch-appropriate budget instead, capped by
         # remaining session time. force_batch implies Claude is disabled
-        # (Slice 36 precondition) -> no fallback to reserve for, so the batch
+        # (Slice 36 precondition) → no fallback to reserve for, so the batch
         # gets the full remaining runway up to the batch cap.
         if force_batch:
             # Sovereign Infinite-Horizon Batch Matrix: a PARKED batch continuation
@@ -11784,11 +11775,11 @@ class CandidateGenerator:
                 max(min(total_s, batch_cap), 0.0), op_id,
             )
 
-        # Slice 225 Phase 2 - Sovereign DW Autarky. When the Claude fallback
-        # lane is unreliable (breaker OPEN/HALF_OPEN - incl. the terminal_quota
+        # Slice 225 Phase 2 — Sovereign DW Autarky. When the Claude fallback
+        # lane is unreliable (breaker OPEN/HALF_OPEN — incl. the terminal_quota
         # / out-of-credits economic refusal), there is NO live fallback to hand
         # off to. Severing DW at the 30s/75s reflex cap only accelerates
-        # exhaustion into a dead lane - the live-soak GOAL-001::file-00 wedge:
+        # exhaustion into a dead lane — the live-soak GOAL-001::file-00 wedge:
         # DW cut at 30s -> Claude 400 "credit balance too low" -> EXHAUSTION,
         # generation_failed, no patch ever produced. Give DW the full remaining
         # runway up to a cost-safety ceiling instead (default 180s = the COMPLEX
@@ -11811,7 +11802,7 @@ class CandidateGenerator:
                     return CandidateGenerator._apply_lane_dilation(
                         max(min(total_s, local_cap), 0.0), op_id,
                     )
-                except Exception:  # noqa: BLE001 - never lose the op over a budget read
+                except Exception:  # noqa: BLE001 — never lose the op over a budget read
                     pass
             autarky_cap = _envf_or_default(
                 "JARVIS_DW_AUTARKY_MAX_BUDGET_S", 180.0,
@@ -11822,7 +11813,7 @@ class CandidateGenerator:
 
         fb_reserve = min(_FALLBACK_MIN_RESERVE_S, total_s * 0.35)
 
-        # Slice 28 Phase 2 - adaptive Tier 3 cap for heavy models
+        # Slice 28 Phase 2 — adaptive Tier 3 cap for heavy models
         effective_max = _PRIMARY_MAX_TIMEOUT_S
         if model_id and _is_heavy_model(model_id):
             scalar = _envf_or_default(
@@ -11844,7 +11835,7 @@ class CandidateGenerator:
 
 
 # ---------------------------------------------------------------------------
-# Defect #4 fix (2026-05-03) - substrate AST pin
+# Defect #4 fix (2026-05-03) — substrate AST pin
 # ---------------------------------------------------------------------------
 
 
@@ -11878,7 +11869,7 @@ def register_shipped_invariants() -> list:
         "deadline_exhausted_pre_fallback",
         "JARVIS_FALLBACK_MIN_VIABLE_BUDGET_S",
         "_EXPECTED_BACKGROUND_EXC_PATTERNS",
-        # Defect #5 (2026-05-03) - read-only cascade reflex lifted
+        # Defect #5 (2026-05-03) — read-only cascade reflex lifted
         # into _dispatch_via_sentinel queue branch. Pinned via the
         # cascade-reason marker so a regression that re-removes the
         # reflex (e.g., reverting to the unconditional raise that
