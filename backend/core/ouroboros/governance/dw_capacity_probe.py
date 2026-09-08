@@ -1,4 +1,7 @@
-"""DW Capacity Probe — Slice 34 substrate (Phase 0).
+# [Ouroboros] Modified by Ouroboros (op=op-01a07e98-) at 2026-09-08 01:21 UTC
+# Reason: Production fix (single-file diff): the completion tracer backs off an AUTH_FAILED surface  MODIFY EXISTING PRODUCTION CO
+
+"""DW Capacity Probe - Slice 34 substrate (Phase 0).
 
 Out-of-band diagnostic probe. Runs N=10 trials at each of 4 prompt
 sizes against a target DW model, records every call into
@@ -7,14 +10,14 @@ sizes against a target DW model, records every call into
 # Why "out-of-band"
 
 The probe MUST be invokable independently of the full O+V harness +
-sensor + intake + Aegis daemon — operator binding §48.7.2: *"Isolate
-the variable — is it the harness or the endpoint?"* This module
+sensor + intake + Aegis daemon - operator binding S48.7.2: *"Isolate
+the variable - is it the harness or the endpoint?"* This module
 takes only a provider instance + ledger; zero coupling to
 orchestrator, sensors, or governance.
 
 # Composition
 
-  * **Provider:** uses ``DoublewordProvider.prompt_only()`` —
+  * **Provider:** uses ``DoublewordProvider.prompt_only()`` -
     the lowest-level surface that exercises the same HTTP transport
     + Aegis bearer + per-call lease + Slice 28 timeout math that
     production dispatch uses.
@@ -24,28 +27,28 @@ orchestrator, sensors, or governance.
     sees both.
   * **No retry loop, no Venom, no orchestrator:** isolation is the
     point. If the probe succeeds where the harness fails, the
-    delta is the harness — not the endpoint.
+    delta is the harness - not the endpoint.
 
-# Hypotheses the probe disambiguates (§48.7.3)
+# Hypotheses the probe disambiguates (S48.7.3)
 
   (a) **Account capacity:** probe times out across all prompt sizes
-      with relatively uniform latency → endpoint serving capacity
-      hit — operator-side fix needed.
+      with relatively uniform latency -> endpoint serving capacity
+      hit - operator-side fix needed.
   (b) **Slice 28 budget math:** probe succeeds at high latency (e.g.
-      30-60 s) within manually-elevated timeout → static formula was
-      under-budgeting — tune ``JARVIS_ADAPTIVE_TIER0_HEAVY_SCALAR``.
+      30-60 s) within manually-elevated timeout -> static formula was
+      under-budgeting - tune ``JARVIS_ADAPTIVE_TIER0_HEAVY_SCALAR``.
   (c) **Prompt complexity:** probe succeeds at small sizes but
-      timeouts at large → DW's effective input-size ceiling; refactor
-      prompts or compose §48.9.5 prefix trie.
+      timeouts at large -> DW's effective input-size ceiling; refactor
+      prompts or compose S48.9.5 prefix trie.
   (d) **Network/regional latency:** baseline RTT > ½ of typical
-      response time → physical-path issue; operator switches VPN /
+      response time -> physical-path issue; operator switches VPN /
       region.
 
 # Public surface
 
-  * :class:`ProbeResult` — frozen per-size summary
-  * :class:`DWCapacityProbe.probe` — async entry point
-  * :func:`build_capacity_probe_from_default_provider` — convenience
+  * :class:`ProbeResult` - frozen per-size summary
+  * :class:`DWCapacityProbe.probe` - async entry point
+  * :func:`build_capacity_probe_from_default_provider` - convenience
     factory used by the operator-runnable script
 """
 
@@ -78,7 +81,7 @@ _DEFAULT_TRIALS_PER_SIZE: int = 10
 _DEFAULT_TIMEOUT_PER_CALL_S: float = 60.0
 _DEFAULT_PROBE_CALLER: str = "dw_capacity_probe"
 
-# Templated probe prompt — deterministic, repeatable, exercises code-gen
+# Templated probe prompt - deterministic, repeatable, exercises code-gen
 # instinct without depending on any external data.
 _PROBE_TEMPLATE = (
     "You are a helpful assistant. Produce a single Python function "
@@ -93,7 +96,7 @@ def _build_probe_prompt(target_chars: int) -> str:
     """Construct a prompt of approximately ``target_chars`` size.
 
     Uses ``_PROBE_TEMPLATE`` as the load-bearing instruction + ASCII
-    padding ('x') to hit the target size. Deterministic — same input
+    padding ('x') to hit the target size. Deterministic - same input
     size produces same prompt across runs."""
     if target_chars <= len(_PROBE_TEMPLATE):
         return _PROBE_TEMPLATE
@@ -121,7 +124,7 @@ class ProbeTrial:
 @dataclass(frozen=True)
 class ProbeResult:
     """Per-size aggregate. Captures enough data to disambiguate the
-    4 hypotheses from §48.7.1."""
+    4 hypotheses from S48.7.1."""
 
     model_id: str
     target_size: int
@@ -168,7 +171,7 @@ class DWCapacityProbe:
     """Out-of-band capacity diagnostic.
 
     Composes any object that exposes ``async prompt_only(prompt: str,
-    *, model_id: str = ..., timeout_s: float = ...) -> str`` — the
+    *, model_id: str = ..., timeout_s: float = ...) -> str`` - the
     canonical DW provider surface. Tests inject fakes; production
     code uses ``build_capacity_probe_from_default_provider()``.
 
@@ -206,7 +209,7 @@ class DWCapacityProbe:
             ``[1024, 5120, 20480, 51200]`` (1KB, 5KB, 20KB, 50KB).
           trials_per_size: N trials per size (default 10).
           timeout_per_call_s: per-call timeout. Set generously
-            (default 60s) — probe wants to MEASURE actual response
+            (default 60s) - probe wants to MEASURE actual response
             time, not exit at the production Slice 28 budget.
           caller: ledger ``caller`` field for filtering probe data
             from production data in later analysis.
@@ -271,7 +274,7 @@ class DWCapacityProbe:
             error_detail = str(exc)
         elapsed_ms = (time.monotonic() - t0) * 1000.0
         response_chars = len(response_text or "")
-        # Record into ledger (await — but if it fails, trial still
+        # Record into ledger (await - but if it fails, trial still
         # captured)
         try:
             await self._ledger.record_call(DWCallRecord(
@@ -284,12 +287,12 @@ class DWCapacityProbe:
                 total_elapsed_ms=elapsed_ms,
                 response_tokens=None,
                 response_chars=response_chars,
-                cost_usd=0.0,  # probe doesn't track cost — diagnostic only
+                cost_usd=0.0,  # probe doesn't track cost - diagnostic only
                 error_class=error_class,
                 error_detail=error_detail,
                 caller=caller,
             ))
-        except Exception:  # noqa: BLE001 — never raise from probe
+        except Exception:  # noqa: BLE001 - never raise from probe
             pass
         return ProbeTrial(
             target_size=size,
@@ -310,7 +313,7 @@ class DWCapacityProbe:
         with ``async prompt_only(prompt, model_id=...) -> str``.
 
         Falls back to plain ``prompt_only(prompt)`` for older providers
-        that don't accept ``model_id`` kwarg — minimal surface, max
+        that don't accept ``model_id`` kwarg - minimal surface, max
         compatibility."""
         # Try the modern signature first
         try:
@@ -318,7 +321,7 @@ class DWCapacityProbe:
                 prompt, model_id=model_id,
             )
         except TypeError:
-            # Legacy provider — drop the kwarg
+            # Legacy provider - drop the kwarg
             return await self._provider.prompt_only(prompt)
 
 
@@ -384,7 +387,7 @@ def build_capacity_probe_from_default_provider() -> DWCapacityProbe:
     """Build a probe pointing at the default DW provider + default
     ledger. Used by ``scripts/dw_capacity_probe.py``.
 
-    Lazy import — avoids coupling this module's import path to the
+    Lazy import - avoids coupling this module's import path to the
     full provider stack when only the substrate is needed (tests
     import this module without instantiating a real provider).
     """
@@ -396,25 +399,25 @@ def build_capacity_probe_from_default_provider() -> DWCapacityProbe:
 
 
 # ============================================================================
-# Hypothesis classifier (Phase 0 → Phase 1 bridge)
+# Hypothesis classifier (Phase 0 -> Phase 1 bridge)
 # ============================================================================
 
 
 def classify_probe_results(
     results: List[ProbeResult],
 ) -> Dict[str, Any]:
-    """Apply §48.7.1's 4-hypothesis decision matrix to the probe
+    """Apply S48.7.1's 4-hypothesis decision matrix to the probe
     output. Returns a structured verdict for operators + downstream
     Phase 1 tooling.
 
     Verdict keys:
-      hypothesis            : str — "a"|"b"|"c"|"d"|"mixed"|"undetermined"
+      hypothesis            : str - "a"|"b"|"c"|"d"|"mixed"|"undetermined"
       confidence            : float (0-1)
       reasoning             : str (human-readable)
       recommended_action    : str (next operator step)
       per_size_summary      : list of dicts
 
-    This is heuristic — operator binding "intelligent" not "ML-trained."
+    This is heuristic - operator binding "intelligent" not "ML-trained."
     Single-pass deterministic over the probe data. Pure function.
     """
     if not results:
@@ -442,10 +445,10 @@ def classify_probe_results(
     )
 
     if all_failed:
-        # Hypothesis (a) or (d) — endpoint unreachable or fundamentally over budget
+        # Hypothesis (a) or (d) - endpoint unreachable or fundamentally over budget
         smallest = by_size[0]
         if smallest.p95_ms < 5_000.0:
-            # Failed FAST → network/auth, not capacity
+            # Failed FAST -> network/auth, not capacity
             return {
                 "hypothesis": "d",
                 "confidence": 0.7,
@@ -472,13 +475,13 @@ def classify_probe_results(
             "recommended_action": (
                 "Contact DW for capacity diagnosis; consider Slice 22 "
                 "tier-decay with raised JARVIS_CLAUDE_SESSION_CAP_USD "
-                "(§48.11) as temporary fallback."
+                "(S48.11) as temporary fallback."
             ),
             "per_size_summary": summaries,
         }
 
     if size_correlated_failure:
-        # Hypothesis (c) — prompt complexity is the variable
+        # Hypothesis (c) - prompt complexity is the variable
         return {
             "hypothesis": "c",
             "confidence": 0.85,
@@ -494,14 +497,14 @@ def classify_probe_results(
                 "Refactor O+V prompts to stay below the empirical "
                 "ceiling (likely between "
                 f"{by_size[0].target_size}B and "
-                f"{by_size[-1].target_size}B); §48.9.5 prefix-trie "
+                f"{by_size[-1].target_size}B); S48.9.5 prefix-trie "
                 "candidate."
             ),
             "per_size_summary": summaries,
         }
 
     if high_latency_succeeded:
-        # Hypothesis (b) — DW works but slowly; static budget under-sized
+        # Hypothesis (b) - DW works but slowly; static budget under-sized
         max_p95 = max(r.p95_ms for r in by_size if r.success_rate >= 0.5)
         return {
             "hypothesis": "b",
@@ -522,14 +525,14 @@ def classify_probe_results(
         }
 
     if all_succeeded:
-        # No defect detected in probe — issue is harness-side
+        # No defect detected in probe - issue is harness-side
         return {
             "hypothesis": "harness_variable",
             "confidence": 0.9,
             "reasoning": (
                 "All probe sizes succeeded with healthy success rates. "
                 "DW endpoint + auth + network are functional. The "
-                "v25→v29 100% TIMEOUT rate is a harness-side variable "
+                "v25->v29 100% TIMEOUT rate is a harness-side variable "
                 "(orchestrator, sensor load, intake pressure, or "
                 "GIL contention raising effective per-call latency)."
             ),
@@ -546,7 +549,7 @@ def classify_probe_results(
         "confidence": 0.4,
         "reasoning": (
             "Probe results don't cleanly match any single hypothesis. "
-            "Suggests multi-factor interaction — re-run with more "
+            "Suggests multi-factor interaction - re-run with more "
             "trials per size for statistical power."
         ),
         "recommended_action": (
@@ -567,25 +570,25 @@ __all__ = [
 
 
 # ===========================================================================
-# Synthetic Tracer — DIRECT_COMPLETION health (2026-07-17)
+# Synthetic Tracer - DIRECT_COMPLETION health (2026-07-17)
 #
-# Repurposes this module (previously 0 production importers — dead code) into
+# Repurposes this module (previously 0 production importers - dead code) into
 # the active health source for DW's stream-free completions surface.
 #
 # WHY a tracer and not just passive instrumentation: complete_sync records its
 # own outcome on every ORGANIC call, but once the DW-RT tier is bypassed no
-# organic calls occur — the surface would never see a fresh HEALTHY record and
+# organic calls occur - the surface would never see a fresh HEALTHY record and
 # the bypass would become a ONE-WAY DOOR. The tracer is the only thing that can
 # observe recovery on a silent surface, which is what lets cheap tokens resume
 # automatically with no code change.
 #
 # WHY not an HTTP ping: DW proved (bt-2026-07-17-033933) that it returns
-# "ok: 30.25s, 0 chars" — a perfect transport carrying zero inference. A ping
+# "ok: 30.25s, 0 chars" - a perfect transport carrying zero inference. A ping
 # would score that HEALTHY and keep routing dreams into a tier that cannot
 # produce. The tracer therefore demands GENERATED CONTENT, asserting two
 # dimensions at once:
-#     transport  → did the call complete without an HTTP/timeout fault?
-#     inference  → did the model actually emit tokens?
+#     transport  -> did the call complete without an HTTP/timeout fault?
+#     inference  -> did the model actually emit tokens?
 # ===========================================================================
 
 _TRACER_PROMPT = "Reply with the single word: ok"
@@ -603,7 +606,7 @@ def tracer_enabled() -> bool:
 
 def _tracer_max_tokens() -> int:
     """Output ceiling for the tracer. Must leave room for a reasoning model to
-    think AND still emit a token — the entitled 397B carries an effort FLOOR of
+    think AND still emit a token - the entitled 397B carries an effort FLOOR of
     "low", so a tiny budget reproduces the very exhaustion this probe exists to
     detect and would report a false INFERENCE_DEGRADED."""
     try:
@@ -618,17 +621,27 @@ def _tracer_timeout_s() -> float:
     except (TypeError, ValueError):
         return 90.0
 
+def _tracer_auth_recheck_s() -> float:
+    try:
+        raw = os.environ.get("JARVIS_DW_TRACER_AUTH_RECHECK_S", "")
+        if not raw:
+            # Default: 20x the timeout
+            return _tracer_timeout_s() * 20.0
+        return max(5.0, float(raw))
+    except (TypeError, ValueError):
+        return _tracer_timeout_s() * 20.0
+
 
 async def trace_direct_completion(provider: Any, *, model: Optional[str] = None) -> str:
     """Fire one synthetic generation at DW's stream-free completions surface
     and inject the verdict into the EXISTING SurfaceHealthLedger.
 
-    Returns the recorded ``SurfaceVerdict`` value (a plain str) — or
+    Returns the recorded ``SurfaceVerdict`` value (a plain str) - or
     ``"skipped"`` when disabled / no usable provider. NEVER raises: a health
     probe must not be able to break the loop that hosts it.
 
     complete_sync self-records both dimensions internally, so this function
-    does NOT duplicate the recording logic (DRY) — it simply drives a call on a
+    does NOT duplicate the recording logic (DRY) - it simply drives a call on a
     surface that would otherwise be silent, and lets the provider's own
     instrumentation speak.
     """
@@ -637,6 +650,23 @@ async def trace_direct_completion(provider: Any, *, model: Optional[str] = None)
     if provider is None or not hasattr(provider, "complete_sync"):
         return "skipped"
     try:
+        # Auth back-off guard: when last verdict was AUTH_FAILED and
+        # the recheck interval hasn't elapsed, skip this probe.
+        try:
+            from backend.core.ouroboros.governance.dw_surface_health import (
+                SurfaceHealthLedger,
+                SurfaceKind,
+                SurfaceVerdict,
+            )
+            record = SurfaceHealthLedger().verdict_for(SurfaceKind.DIRECT_COMPLETION)
+            if (record is not None and
+                    record.verdict is SurfaceVerdict.AUTH_FAILED and
+                    (time.time() - record.last_probe_unix) < _tracer_auth_recheck_s()):
+                return "auth_backoff"
+        except Exception:  # noqa: BLE001
+            # If ledger access fails, fall through to normal probe
+            pass
+
         res = await asyncio.wait_for(
             provider.complete_sync(
                 _TRACER_PROMPT,
@@ -662,7 +692,7 @@ async def trace_direct_completion(provider: Any, *, model: Optional[str] = None)
     except Exception as exc:  # noqa: BLE001
         # complete_sync's own HTTP branch recorded the transport verdict
         # (AUTH_FAILED / UPSTREAM_DEGRADED / TRANSPORT_DEGRADED). A timeout
-        # never reaches that branch, so record it here — same ledger, same API.
+        # never reaches that branch, so record it here - same ledger, same API.
         if isinstance(exc, asyncio.TimeoutError):
             try:
                 from backend.core.ouroboros.governance.dw_surface_health import (
