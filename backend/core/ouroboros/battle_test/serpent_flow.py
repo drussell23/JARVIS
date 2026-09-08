@@ -4560,6 +4560,45 @@ class SerpentFlow:
         # the human-in-the-loop requirement, which doesn't apply in
         # automation. Short-circuit before any terminal rendering so
         # we don't emit Rich panels into a dead TTY either.
+        # ── Autonomous Sentinel Mode ──────────────────────────────────────
+        # The organism approves its own work when — and only when — the op is
+        # eligible by RISK TIER and the candidate scored 100% on every gate
+        # that already judges quality. This is checked BEFORE the headless
+        # bypass because the two are different claims: headless means "there
+        # is no human here", Sentinel means "a human is not needed for THIS
+        # op". Conflating them is how a red-tier change would ride out on a
+        # missing TTY.
+        #
+        # A refusal here is not a failure — it falls through to exactly the
+        # behaviour that existed before, ending at a human.
+        _sentinel_verdict = None
+        try:
+            from backend.core.ouroboros.governance.autonomy.sentinel import (  # noqa: E501,PLC0415
+                auto_approval_verdict, sentinel_enabled,
+            )
+            if sentinel_enabled():
+                _sentinel_verdict = auto_approval_verdict(
+                    getattr(self, "_gate_ctx", None),
+                    risk_tier=risk_reason or None,
+                    validation=getattr(self, "_gate_validation", None),
+                    guardian_detections=getattr(self, "_gate_guardian", None),
+                )
+                _mark = "🛡 " + _sentinel_verdict.render()
+                self._mirror_markup(
+                    f"  [{_SEM['dim']}]⎿[/{_SEM['dim']}]  "
+                    f"[{_SEM['life'] if _sentinel_verdict.approved else _SEM['heal']}]"
+                    f"{_mark}[/]"
+                )
+                logger.warning("[Sentinel] op=%s %s", short, _sentinel_verdict.render())
+                if _sentinel_verdict.approved:
+                    self._last_gate_decision = _synthetic_gate_decision(
+                        approved=True,
+                        detail=f"sentinel: {_sentinel_verdict.reason}",
+                    )
+                    return True
+        except Exception:  # noqa: BLE001 — never let the sentinel break the gate
+            logger.debug("[Sentinel] gate consult degraded", exc_info=True)
+
         _headless_reason = _headless_auto_approve_reason()
         if _headless_reason is not None:
             try:
