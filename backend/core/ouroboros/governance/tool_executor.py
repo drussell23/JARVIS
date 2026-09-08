@@ -191,6 +191,34 @@ class ToolExecutionRecord:
     status:             ToolExecStatus
 
 
+def system_read_record(
+    *, op_id: str, tool_name: str, path: str, output_bytes: int,
+    started_at_ns: int, ended_at_ns: int, repo: str = "jarvis", round_index: int = 0,
+) -> "ToolExecutionRecord":
+    """The record of a read the SYSTEM performed on the model's behalf — the
+    swarm's AST-signature anchor (``list_symbols``) and Radius of Relevance
+    (``read_file``) are real reads of the target with real timing and size,
+    and the exploration gate must judge what actually happened rather than
+    refuse a route that structurally makes no tool calls (``exploration_
+    insufficient: 0/2`` on every swarm op, 2026-09-08). Same schema, same
+    hashing and manifest version as a model-initiated call; the policy
+    reason names the origin so telemetry can tell the two apart."""
+    manifest = _L1_MANIFESTS.get(tool_name)
+    return ToolExecutionRecord(
+        schema_version="tool.exec.v1",
+        op_id=op_id, call_id=f"{op_id}:r{round_index}:{tool_name}:system",
+        round_index=round_index, tool_name=tool_name,
+        tool_version=getattr(manifest, "version", "") or "",
+        arguments_hash=_compute_args_hash({"path": path}),
+        repo=repo, policy_decision=PolicyDecision.ALLOW.value,
+        policy_reason_code="system.read",
+        started_at_ns=started_at_ns, ended_at_ns=ended_at_ns,
+        duration_ms=max(0.0, (ended_at_ns - started_at_ns) / 1_000_000.0),
+        output_bytes=max(0, int(output_bytes)), error_class=None,
+        status=ToolExecStatus.SUCCESS,
+    )
+
+
 def _compute_args_hash(arguments: Dict[str, Any]) -> str:
     normalized = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(normalized.encode()).hexdigest()

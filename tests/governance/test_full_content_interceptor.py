@@ -186,3 +186,22 @@ async def test_strategy_outcome_logger_writes_sqlite_on_terminal() -> None:
     assert n == 1
     assert best_strategy(conn, file_lines=_BIG.count("\n") + 1, ext=".py") == "agentic_swarm"
     conn.close()
+
+
+async def test_the_workers_are_told_the_task():
+    """``instruction`` reaches every ChunkTarget; absent, the legacy repair
+    wording stands."""
+    seen = {}
+
+    async def agent_fn(target, feedback: str = "") -> str:
+        seen[target.symbol] = target.instruction
+        return _FIX[target.symbol]
+
+    await intercept_full_content(
+        _BIG, "enterprise.py", ["alpha", "beta"], agent_fn,
+        op_id="op-task", max_turns=1, instruction="make alpha subtract",
+    )
+    assert seen == {"alpha": "make alpha subtract", "beta": "make alpha subtract"}
+    seen.clear()
+    await intercept_full_content(_BIG, "enterprise.py", ["alpha"], agent_fn, op_id="op-legacy", max_turns=1)
+    assert seen == {"alpha": "repair alpha"}

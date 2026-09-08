@@ -191,8 +191,15 @@ async def intercept_full_content(
     op_id: str = "",
     max_turns: Optional[int] = None,
     max_concurrency: Optional[int] = None,
+    instruction: Optional[str] = None,
 ) -> InterceptResult:
-    """The egress interception point. Never raises."""
+    """The egress interception point. Never raises.
+
+    ``instruction`` is what every node worker is asked to DO — the op's
+    description for a goal-driven generation. Absent, the legacy repair
+    wording (``repair <symbol>``) stands, which for a goal meant the 30B
+    was handed a healthy function and told to repair it: it returned it
+    unchanged, whitespace-for-whitespace (swarm goal, 2026-09-08)."""
     ext = os.path.splitext(file_path or "")[1] or ""
     file_lines = (source.count("\n") + 1) if source else 0
 
@@ -223,7 +230,9 @@ async def intercept_full_content(
         except Exception:  # noqa: BLE001
             chunk = None
         if chunk is not None:
-            targets.append(ChunkTarget(symbol=sym, chunk=chunk, instruction=f"repair {sym}"))
+            targets.append(ChunkTarget(
+                symbol=sym, chunk=chunk, instruction=instruction or f"repair {sym}",
+            ))
 
     if not targets:
         # No AST-resolvable symbol → whole-file is STILL forbidden → RAG only.
@@ -268,7 +277,7 @@ async def intercept_full_content(
         rag_ctx = "\n".join(keyword_rag_chunks(source, sym))
         try:
             node = await rag_agent_fn(
-                ChunkTarget(symbol=sym, chunk=fresh, instruction=f"repair {sym}"),
+                ChunkTarget(symbol=sym, chunk=fresh, instruction=instruction or f"repair {sym}"),
                 rag_ctx,
             )
         except Exception:  # noqa: BLE001 — an isolated RAG failure never drops the op

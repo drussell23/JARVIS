@@ -373,3 +373,32 @@ def test_the_swarm_worker_output_budget_derives_from_the_window():
     src = inspect.getsource(CandidateGenerator._maybe_swarm_short_circuit)
     assert "max_tokens=_budget.output_reserve_tokens" in src
     assert "response_format=None" in src
+
+
+# --------------------------------------------------------------------------
+# a node echoed in the mixed shape is canonicalised
+# --------------------------------------------------------------------------
+
+def test_a_mixed_shape_node_is_canonicalised():
+    from backend.core.ouroboros.governance.agent_turn_adapter import ProductionAgentTurnFn
+    chunk = extract_target_chunk(BIG, "engine.py", "Engine.target")
+    target = ChunkTarget(symbol="Engine.target", chunk=chunk, instruction="x")
+    fn = ProductionAgentTurnFn(client=None, tool_backend=None)
+    mixed = (
+        "async def target(\n"
+        "        self, a, b,\n"
+        "    ) -> int:\n"
+        "        \"\"\"doc\"\"\"\n"
+        "        if a:\n"
+        "            return a - b\n"
+        "        return b\n"
+    )
+    got = fn._extract_node(mixed, target)
+    assert got.splitlines() == [
+        "async def target(", "    self, a, b,", ") -> int:", '    """doc"""',
+        "    if a:", "        return a - b", "    return b",
+    ]
+    canonical = "def target(self, a, b):\n    if a:\n        return a - b\n    return b\n"
+    assert fn._extract_node(canonical, target) == canonical.strip()
+    single = "def target(self, a, b):\n        return a\n"
+    assert fn._extract_node(single, target) == single.strip(), "a single-line header keeps its body indent"

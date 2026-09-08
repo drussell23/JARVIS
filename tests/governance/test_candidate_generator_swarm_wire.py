@@ -127,6 +127,9 @@ async def test_big_file_confident_symbol_routes_to_swarm(tmp_path, monkeypatch) 
     async def _fake_intercept(source, file_path, symbols, agent_fn, **kwargs):
         seen["symbols"] = list(symbols)
         seen["file_path"] = file_path
+        seen["instruction"] = kwargs.get("instruction")
+        # the workers' view is built lazily; touch it as a worker would
+        seen["radius"] = agent_fn._node_context_fn(SimpleNamespace(symbol="alpha"))
         return InterceptResult(
             strategy="agentic_swarm", content="STITCHED_CONTENT",
             stitched=True, converged_nodes=["alpha"],
@@ -146,6 +149,16 @@ async def test_big_file_confident_symbol_routes_to_swarm(tmp_path, monkeypatch) 
     assert cand["file_path"] == "big.py"
     # The resolver fed the confident symbol into the swarm.
     assert "alpha" in seen["symbols"]
+    # The workers are told the TASK, not "repair alpha".
+    assert seen["instruction"] == "the alpha function returns the wrong value"
+    # The system's reads for the workers are exploration evidence: the
+    # AST-signature anchor (list_symbols) and the Radius of Relevance
+    # (read_file) — what the Iron Gate judges instead of "0/2 tool calls".
+    tools = sorted(r.tool_name for r in out.tool_execution_records)
+    assert tools == ["list_symbols", "read_file"], tools
+    for r in out.tool_execution_records:
+        assert r.status.value == "success" and r.policy_reason_code == "system.read"
+        assert r.output_bytes > 0 and r.duration_ms is not None and r.op_id
 
 
 async def test_swarm_drift_falls_through_to_standard(tmp_path, monkeypatch) -> None:

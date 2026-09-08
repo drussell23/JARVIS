@@ -4801,17 +4801,37 @@ class CandidateGenerator:
         from backend.core.ouroboros.governance.chunked_generation_bridge import MAP_REDUCE_FRAMING
         from backend.core.ouroboros.governance.intelligent_chunking import shrink_radius_to_budget
         _anchor = ""
+        # What the SYSTEM reads for the workers is exploration and is
+        # recorded as such — the exploration gate otherwise refuses this
+        # route for the tool calls it structurally never makes.
+        _reads: List[Any] = []
+        _t_anchor = time.monotonic_ns()
         try:
             from backend.core.ouroboros.governance.ast_signature_anchor import extract_public_api
             _anchor = extract_public_api(source, path) or ""
         except Exception:  # noqa: BLE001 — the map is additive
             _anchor = ""
+        if _anchor:
+            try:
+                from backend.core.ouroboros.governance.tool_executor import system_read_record
+                _reads.append(system_read_record(
+                    op_id=getattr(context, "op_id", "") or "", tool_name="list_symbols",
+                    path=path, output_bytes=len(_anchor.encode("utf-8")),
+                    started_at_ns=_t_anchor, ended_at_ns=time.monotonic_ns(),
+                ))
+            except Exception:  # noqa: BLE001 — evidence is additive
+                pass
         _system = "\n\n".join(t for t in (MAP_REDUCE_FRAMING, _anchor) if t)
         _node_budget = _budget.with_overhead(_system).node_budget_tokens
 
+        _radius_bytes: List[int] = []
+        _t_radius = time.monotonic_ns()
+
         def _radius_for(target: Any) -> str:
             shrunk = shrink_radius_to_budget(source, path, getattr(target, "symbol", ""), _node_budget)
-            return shrunk.context if shrunk is not None else ""
+            text = shrunk.context if shrunk is not None else ""
+            _radius_bytes.append(len(text.encode("utf-8")))
+            return text
 
         agent = ProductionAgentTurnFn(
             client=client,
@@ -4843,6 +4863,9 @@ class CandidateGenerator:
                 source, path, list(res.symbol_names), agent,
                 rag_agent_fn=_rag_reprompt,
                 op_id=getattr(context, "op_id", ""),
+                # The workers are told the TASK — the op's description is the
+                # signed goal's text — not the legacy "repair <symbol>".
+                instruction=(getattr(context, "description", "") or "").strip() or None,
             )
         except asyncio.CancelledError:
             # Structured concurrency: awaiting the interceptor makes its swarm
@@ -4881,6 +4904,16 @@ class CandidateGenerator:
             "[CandidateGenerator] SWARM short-circuit LANDED for %s: %s [%.1fs]",
             path, rationale, dur,
         )
+        if _radius_bytes:
+            try:
+                from backend.core.ouroboros.governance.tool_executor import system_read_record
+                _reads.append(system_read_record(
+                    op_id=getattr(context, "op_id", "") or "", tool_name="read_file",
+                    path=path, output_bytes=max(_radius_bytes),
+                    started_at_ns=_t_radius, ended_at_ns=time.monotonic_ns(),
+                ))
+            except Exception:  # noqa: BLE001 — evidence is additive
+                pass
         return GenerationResult(
             candidates=(
                 {
@@ -4893,6 +4926,7 @@ class CandidateGenerator:
             provider_name="doubleword-agentic-swarm",
             generation_duration_s=dur,
             model_id=getattr(client, "_model", "") or "",
+            tool_execution_records=tuple(_reads),
         )
 
     async def _generate_dispatch(

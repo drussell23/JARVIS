@@ -400,7 +400,7 @@ class ProductionAgentTurnFn:
             )
 
         def _node(text: str) -> str:
-            return textwrap.dedent(text).strip()
+            return _canonical_node(textwrap.dedent(text).strip())
 
         def _method_in_class(text: str) -> str:
             """The target when the model answered in the shape it was SHOWN —
@@ -635,6 +635,43 @@ def _iter_code_fences(text: str) -> List[str]:
             body = body[nl + 1:]  # drop the language tag line
         blocks.append(body)
     return blocks
+
+
+def _canonical_node(text: str) -> str:
+    """A definition whose header the model put at column 0 while the rest
+    of the node kept its ORIGINAL nesting (``async def f(\\n        self, …\\n    ) -> X:\\n        body``) parses, so it passed every gate, and the stitch
+    then re-indented the whole node by the chunk's nesting: a body four
+    columns deeper than the file's (swarm goal, 2026-09-08 — the only
+    change in the candidate). Lines after the header line are dedented by
+    the indent of the line that closes the signature, which in a canonical
+    node is 0. A well-formed node is returned unchanged; anything that does
+    not parse is returned as is."""
+    lines = text.splitlines(keepends=True)
+    if len(lines) < 2 or lines[0][:1].isspace():
+        return text
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return text
+    fn = next((n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+    if fn is None or not fn.body:
+        return text
+    close = fn.body[0].lineno - 1  # 1-based line that ends the signature
+    if close <= fn.lineno:
+        return text  # single-line header: the body's own indent is canonical
+    closing = lines[close - 1]
+    k = len(closing) - len(closing.lstrip(" "))
+    if k == 0:
+        return text
+    out = [lines[0]]
+    for ln in lines[1:]:
+        out.append(ln[k:] if ln[:k] == " " * k else ln.lstrip(" ") if ln.strip() else ln)
+    fixed = "".join(out)
+    try:
+        ast.parse(fixed)
+    except SyntaxError:
+        return text
+    return fixed
 
 
 def _accepts_kwarg(fn: Any, name: str) -> bool:
