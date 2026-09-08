@@ -230,8 +230,22 @@ def spec_compliance_verdict(
         cap = assert_generation_capability(
             ctx, force_full_content=force_full_content,
         )
-        checks["capability_intact"] = bool(cap.ok)
-        detail["capability_intact"] = cap.reason or "ok"
+        # The SAME policy the generation seam applies, for the same reason. A
+        # bare `cap.ok` here would simply move the block from GENERATE to
+        # approval: the op would generate a usable candidate and then be denied
+        # auto-approval for the fidelity it lost, so no self-directed work could
+        # ever land while the diff schema stays broken. Fidelity loss is not a
+        # RISK signal, and this check gates a risk decision.
+        #
+        # Only a FATAL degradation -- one that cannot produce a usable
+        # candidate -- breaks compliance. A recoverable one is recorded in the
+        # detail so the verdict still SAYS what happened.
+        checks["capability_intact"] = bool(cap.ok) or cap.degraded_but_usable
+        detail["capability_intact"] = (
+            cap.reason or "ok" if cap.ok
+            else f"degraded_but_usable:{cap.reason}" if cap.degraded_but_usable
+            else cap.reason
+        )
     except Exception as exc:  # noqa: BLE001
         checks["capability_intact"] = False
         detail["capability_intact"] = f"assurance_unavailable:{type(exc).__name__}"

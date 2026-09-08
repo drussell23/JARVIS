@@ -94,6 +94,44 @@ if TYPE_CHECKING:  # pragma: no cover
 logger = logging.getLogger("Ouroboros.Orchestrator")
 
 
+def _plan_ladder_iteration(
+    *, remaining_s: float, candidates: Any, iteration: int,
+) -> Optional[Any]:
+    """Affordability plan for one ladder iteration, or ``None`` if unavailable.
+
+    Lazily imported and fully fail-soft: a planner that cannot answer must
+    leave the ladder exactly as it was rather than becoming a new way for
+    VALIDATE to fail. NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.governance.validate_ladder_planner import (  # noqa: PLC0415
+            plan_iteration,
+        )
+        # Shard size is per candidate; the resolved test set is the same for
+        # every sibling, so one candidate's count is the right unit of cost.
+        return plan_iteration(
+            remaining_s=remaining_s,
+            candidates=candidates,
+            iteration=iteration,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[ValidateLadder] plan unavailable", exc_info=True)
+        return None
+
+
+def _admitted_candidates(candidates: Any, plan: Any) -> Any:
+    """The sibling subset *plan* admits. NEVER raises."""
+    try:
+        if plan is None:
+            return candidates
+        from backend.core.ouroboros.governance.validate_ladder_planner import (  # noqa: PLC0415
+            admitted_candidates,
+        )
+        return admitted_candidates(candidates, plan)
+    except Exception:  # noqa: BLE001
+        return candidates
+
+
 # ---------------------------------------------------------------------------
 # L2 storm breaker (run a1-brain-20260705-233225): 60 background-route ops
 # each re-dispatched L2 on the IDENTICAL sticky stop reason
@@ -285,13 +323,62 @@ class VALIDATERunner(PhaseRunner):
                     artifacts={"best_candidate": None, "best_validation": None},
                 )
 
-            # Try all candidates in parallel; pick first that passes
+            # ── Adaptive Ladder Pruning ──────────────────────────────────
+            # The check above asks whether ANY time is left. It never asked
+            # whether there is ENOUGH, so an iteration that could not finish
+            # was started anyway: measured at remaining_s=-138.3, i.e. the
+            # ladder noticed 138s AFTER it had overrun, having spent that
+            # entire time on work no one could use.
+            #
+            # Pruning removes SIBLINGS, never tests: each admitted candidate
+            # still faces the identical resolved test set, so a pruned
+            # iteration applies the same gate to a smaller field.
+            _ladder_plan = _plan_ladder_iteration(
+                remaining_s=remaining_s,
+                candidates=generation.candidates,
+                iteration=_iter_idx,
+            )
+            _iter_candidates = _admitted_candidates(
+                generation.candidates, _ladder_plan,
+            )
+            if _ladder_plan is not None and _ladder_plan.mode != "full":
+                _fsm_log("ladder_plan", _ladder_plan.render())
+            if _ladder_plan is not None and _ladder_plan.should_stop:
+                # A CLEAN end, not a failure of the candidates. Whatever the
+                # earlier iterations established is preserved and returned;
+                # the alternative is to start work that will be truncated and
+                # then report `best_candidate=None` for three candidates that
+                # were never given a chance to be judged.
+                _fsm_log("ladder_stop_pre", _ladder_plan.render())
+                ctx = ctx.advance(
+                    OperationPhase.CANCELLED,
+                    terminal_reason_code="validation_budget_insufficient",
+                )
+                await orch._record_ledger(
+                    ctx,
+                    OperationState.FAILED,
+                    {
+                        "reason": "validation_budget_insufficient",
+                        "detail": _ladder_plan.render(),
+                    },
+                )
+                _fsm_log("ladder_stop_return")
+                return PhaseResult(
+                    next_ctx=ctx, next_phase=None, status="fail",
+                    reason="validation_budget_insufficient",
+                    artifacts={
+                        "best_candidate": best_candidate,
+                        "best_validation": best_validation,
+                    },
+                )
+
+            # Try all admitted candidates in parallel; pick first that passes
             async def _validate_one(cand: Dict[str, Any]) -> Tuple[Dict[str, Any], "ValidationResult", float]:
                 _t0 = time.monotonic()
                 _val = await orch._run_validation(ctx, cand, remaining_s)
                 return (cand, _val, time.monotonic() - _t0)
 
-            _validation_tasks = [_validate_one(c) for c in generation.candidates]
+            _validation_tasks = [_validate_one(c) for c in _iter_candidates]
             _validation_results = await asyncio.gather(*_validation_tasks, return_exceptions=True)
 
             _early_return_ctx: Optional[OperationContext] = None

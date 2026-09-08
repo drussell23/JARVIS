@@ -3976,6 +3976,9 @@ def _build_codegen_prompt(
     # fires only when the capability was promised and silently lost — which
     # is the `capability=? brain=-` shape of a missing routing admission.
     try:
+        from backend.core.ouroboros.governance import (
+            capability_assurance as _ca,
+        )
         from backend.core.ouroboros.governance.capability_assurance import (
             assert_generation_capability, enforcement_enabled,
         )
@@ -3984,21 +3987,36 @@ def _build_codegen_prompt(
         )
         if not _cap.ok:
             logger.warning(
-                "[CapabilityAssurance] op=%s %s%s",
+                "[CapabilityDegradedWarning] op=%s %s severity=%s%s",
                 str(getattr(ctx, "op_id", "?"))[:24], _cap.render(),
+                _cap.severity,
                 "" if _cap.enforceable else " (reported only — this op carries "
                 "no signed-goal pointer, so the envelope promised it nothing)",
             )
-            # Abort ONLY a sanctioned op. The envelope's promise is about the
-            # operator's declared work; an ambient tool call or a probe that
-            # builds a prompt with no routing admission is ordinary, and
-            # aborting those turns a diagnostic into a hard failure on paths
-            # that were previously fine.
-            if enforcement_enabled() and _cap.enforceable:
+            # Degraded-but-usable: REPORT, REMEMBER, PROCEED.
+            #
+            # This used to abort every sanctioned op. The reasoning was that
+            # landing a lower-fidelity candidate nobody knew was lower-fidelity
+            # is worse than shedding the op -- but that traded a KNOWN
+            # degradation for no work at all, and the trade only became visible
+            # once Phase 2 started delivering sanctioned ops to a worker: in
+            # bt-2026-09-08-202025 the Sentinel's own goal died in 64.79s with
+            # tokens=0, and every self-directed op would have died identically.
+            #
+            # "Nobody knew" was the actual defect, and it is answered by
+            # knowing: the warning above, a CapabilityDegradedWarning lesson
+            # keyed to these modules, and an op-scoped flag every later phase
+            # can read. VALIDATE then judges the candidate on its merits --
+            # which is the only place output soundness can honestly be
+            # decided, because this seam runs BEFORE a single token exists.
+            _ca.record_degradation(ctx, _cap)
+            # An abort now requires BOTH a sanctioned op and a severity that
+            # says no usable candidate is possible. No observed failure mode is
+            # FATAL; the branch is kept for one that genuinely cannot generate.
+            if enforcement_enabled() and _cap.is_fatal:
                 # Fail CLOSED. A RuntimeError here is caught by the same
                 # generation error path that already classifies provider
-                # faults, so the op is shed with a reason instead of landing
-                # a lower-fidelity candidate nobody knew was lower-fidelity.
+                # faults, so the op is shed with a reason.
                 raise RuntimeError(
                     f"capability_degraded:{_cap.reason}"
                 )

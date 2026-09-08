@@ -77,6 +77,7 @@ __all__ = [
     "RecorderLeaseFault",
     "effective_ttl_s",
     "lease_buffer_fraction",
+    "lease_deadline",
     "lease_remaining_s",
     "register_lease",
     "release_lease",
@@ -307,18 +308,72 @@ def lease_remaining_s(op_id: Any) -> float:
         return 0.0
 
 
-def effective_ttl_s(op_id: Any, static_ttl_s: float) -> float:
-    """How long the recorder should hold *op_id*'s generations.
+def lease_deadline(op_id: Any) -> Optional[float]:
+    """*op_id*'s absolute lease deadline on the monotonic clock, or ``None``.
 
-    ``max(static_ttl, lease_remaining + buffer)`` — a lease is a reason to wait
-    LONGER and can never shorten the wait, so arming this cannot cause a single
-    expiry that would not have happened anyway. An op with no lease (a fake
-    provider in a unit test, a direct orchestrator call, a disabled registry)
-    gets exactly today's constant.
+    The deadline, not the remaining time: see :func:`effective_ttl_s` for why
+    that distinction is the whole fix. NEVER raises.
+    """
+    try:
+        oid = str(op_id or "").strip()
+        if not oid:
+            return None
+        with _lock:
+            lease = _leases.get(oid)
+        return float(lease.deadline_monotonic) if lease is not None else None
+    except Exception:  # noqa: BLE001
+        logger.debug("[RecorderLease] deadline read degraded", exc_info=True)
+        return None
 
-    NEVER raises: on any fault it returns *static_ttl_s*, which is the
-    behaviour this module replaces — failing closed means keeping the row, not
-    dropping it.
+
+def effective_ttl_s(
+    op_id: Any,
+    static_ttl_s: float,
+    *,
+    created_monotonic: Optional[float] = None,
+    force: bool = False,
+) -> float:
+    """How long the recorder should hold a generation created at
+    *created_monotonic* for *op_id*.
+
+    ## Creation-relative, because remaining-relative shrinks
+
+    The first version compared ``lease_remaining_s(op_id) * (1 + buffer)``
+    against the static TTL. ``remaining`` is measured from NOW, so it shrinks as
+    the op runs -- and the recorder's own test is ``now - created > ttl``, which
+    GROWS. Late in a long op the lease therefore falls below the constant and
+    the constant wins, which is exactly when the verdict is closest.
+
+    Measured live, session bt-2026-09-08-202025, op op-01a08280-f4f5::
+
+        13:21:53  queued generation (1)
+        13:36:53  EXPIRED (static)      <- 900s after (1); lease said 725s
+        13:45:24  candidate verdict x3 -> "no pending generation"
+
+    The lease was published, valid, and useless. The generations were deleted
+    eight minutes before their verdicts arrived, and the corpus recorded three
+    candidates as ``outcome=unknown`` while the op that would have labelled them
+    was still running. (This also disproves the "the op ids disagree" reading of
+    that log line: the ids matched exactly. There was one defect here, not two.)
+
+    The fix is to anchor on the op's DEADLINE and the generation's BIRTH, both
+    fixed points::
+
+        ttl = max(static, (deadline - created) * (1 + buffer))
+
+    That span does not move as ``now`` advances, so a generation admitted at any
+    moment of an op lives until that op is genuinely out of time. For the op
+    above it yields ~1849s against a verdict at 1411s -- the join holds.
+
+    ## force
+
+    ``force=True`` bypasses the lease entirely and returns the caller's TTL.
+    Shutdown uses it: ``aclose`` deliberately drops the TTL to flush everything
+    still in flight, and a lease that overrode that back up would silently
+    discard exactly the records the flush exists to save.
+
+    NEVER raises: any fault returns *static_ttl_s*, which is the behaviour this
+    module replaces -- failing closed means keeping the row, not dropping it.
     """
     try:
         base = float(static_ttl_s)
@@ -328,12 +383,28 @@ def effective_ttl_s(op_id: Any, static_ttl_s: float) -> float:
         _fault("unusable static ttl", str(op_id or ""))
         return _DEFAULT_MAX_LEASE_S if static_ttl_s is None else 0.0
 
+    if force:
+        # The operator (or shutdown) asked for THIS window. A lease is an
+        # argument for waiting longer, and there is nothing left to wait for.
+        return base
+
     try:
-        remaining = lease_remaining_s(op_id)
-        if remaining <= 0.0:
+        deadline = lease_deadline(op_id)
+        if deadline is None:
             return base
-        want = remaining * (1.0 + lease_buffer_fraction())
-        want = min(want, _max_lease_s())
+
+        if created_monotonic is None:
+            # No birth timestamp: fall back to remaining-relative. Strictly
+            # worse -- it is the shrinking form above -- but it is what a caller
+            # that cannot supply a creation time can be given, and it still
+            # only ever LENGTHENS the wait.
+            span = max(0.0, deadline - time.monotonic())
+        else:
+            span = max(0.0, deadline - float(created_monotonic))
+
+        if span <= 0.0:
+            return base
+        want = min(span * (1.0 + lease_buffer_fraction()), _max_lease_s())
         if want > base:
             with _lock:
                 _stats["extended_ttl"] += 1

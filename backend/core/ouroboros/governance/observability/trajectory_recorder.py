@@ -89,13 +89,23 @@ _DEFAULT_MAX_OUTPUT_CHARS = 24_000
 _TRUNC_MARKER = "\n...[truncated by trajectory_recorder]"
 
 
-def _lease_ttl_for(op_id: str, static_ttl_s: float) -> float:
-    """How long to hold *op_id*'s generations — its lease, or the constant.
+def _lease_ttl_for(
+    op_id: str,
+    static_ttl_s: float,
+    *,
+    created_monotonic: Optional[float] = None,
+    force: bool = False,
+) -> float:
+    """How long to hold a generation born at *created_monotonic* for *op_id*.
 
     Composed from ``recorder_lease`` rather than reading an op's ceiling here:
     the recorder knows only an op id, and the pool is the only component that
     knows what envelope it actually granted. Imported lazily so the recorder
     keeps no import-time dependency on the pool's side of the contract.
+
+    ``created_monotonic`` is what makes the lease work: anchored to the
+    generation's birth and the op's deadline -- two fixed points -- the window
+    stops shrinking as the op runs. See ``recorder_lease.effective_ttl_s``.
 
     FAIL-CLOSED means keeping the row: any fault degrades to *static_ttl_s*,
     which is exactly today's behaviour. NEVER raises.
@@ -104,7 +114,10 @@ def _lease_ttl_for(op_id: str, static_ttl_s: float) -> float:
         from backend.core.ouroboros.governance.observability.recorder_lease import (  # noqa: PLC0415
             effective_ttl_s,
         )
-        return float(effective_ttl_s(op_id, static_ttl_s))
+        return float(effective_ttl_s(
+            op_id, static_ttl_s,
+            created_monotonic=created_monotonic, force=force,
+        ))
     except Exception:  # noqa: BLE001 — a lease read may not break a sweep
         logger.debug("[TrajectoryRecorder] lease read degraded", exc_info=True)
         return static_ttl_s
@@ -1343,16 +1356,34 @@ class TrajectoryRecorder:
             logger.debug("[TrajectoryRecorder] lineage guard degraded", exc_info=True)
             return list(lineage)
 
-    async def _expire_pending(self) -> None:
+    async def _expire_pending(
+        self, *, force: bool = False, ttl_override_s: Optional[float] = None,
+    ) -> None:
         """Flush generations whose op never reported a verdict.
 
         Collects under the lock and writes OUTSIDE it: the write awaits a
         cross-process file lock, and holding the pending-map lock across
         that would block every concurrent emit for the duration of disk
         I/O.
+
+        ``force=True`` is the SHUTDOWN flush: leases are bypassed entirely and
+        the caller's TTL governs. Without it a lease -- whose whole purpose is
+        to argue for waiting longer -- overrides the very window ``aclose``
+        narrows in order to save in-flight records, and silently discards
+        exactly what the flush exists to preserve.
         """
-        static_ttl = _env_float(
-            _ENV_PENDING_TTL_S, _DEFAULT_PENDING_TTL_S, 30.0, 86_400.0
+        # An explicit override beats the env, and needs no global mutation to
+        # express itself. The shutdown flush used to assign
+        # os.environ[_ENV_PENDING_TTL_S] = "30" and restore it afterwards,
+        # which made the TTL a process-wide side effect for the duration of
+        # teardown -- visible in the live log as an expiry labelled "(lease)"
+        # at 803s, i.e. a lease "extending" a window the operator had
+        # deliberately narrowed to 30s.
+        static_ttl = (
+            float(ttl_override_s) if ttl_override_s is not None
+            else _env_float(
+                _ENV_PENDING_TTL_S, _DEFAULT_PENDING_TTL_S, 30.0, 86_400.0
+            )
         )
         now = time.monotonic()
         expired: list = []
@@ -1364,9 +1395,17 @@ class TrajectoryRecorder:
             # op keeps retrying -- the leak this structure has to avoid.
             for op_id in list(self._pending.keys()):
                 lineage = self._pending.get(op_id) or []
-                # PER-OP TTL. The static constant is a floor; an op that
-                # declared a longer runtime envelope keeps its generations for
-                # as long as it is entitled to run.
+                # PER-GENERATION TTL. The static constant is a floor; a
+                # generation whose op declared a longer runtime envelope lives
+                # until that op is genuinely out of time.
+                #
+                # Anchored on the generation's BIRTH, not on time remaining:
+                # a remaining-relative window shrinks while the age it is
+                # compared against grows, so it collapses below the constant
+                # exactly when the verdict is closest. Measured: op
+                # op-01a08280-f4f5 queued 3 generations at 13:21:53-13:22:37,
+                # they were expired from 13:36:53 on a 900s constant, and all
+                # three verdicts arrived at 13:45:24 to find nothing pending.
                 #
                 # The constant alone was an arithmetic guarantee of data loss:
                 # the pool's ceiling is adaptive and this was not, so once the
@@ -1375,16 +1414,20 @@ class TrajectoryRecorder:
                 # op-01a08280-f4f2 expired at 900s holding 1 candidate, and its
                 # real verdict (failed/l2_stopped) arrived 8 minutes later
                 # against a 1530s ceiling, with nothing left to attach it to.
-                ttl = _lease_ttl_for(op_id, static_ttl)
-                fresh = [
-                    g for g in lineage
-                    if (now - g.created_monotonic) <= ttl
-                ]
-                if len(fresh) == len(lineage):
-                    continue
+                fresh = []
+                aged = []
                 for g in lineage:
-                    if (now - g.created_monotonic) > ttl:
-                        expired.append((op_id, g, ttl))
+                    g_ttl = _lease_ttl_for(
+                        op_id, static_ttl,
+                        created_monotonic=g.created_monotonic, force=force,
+                    )
+                    if (now - g.created_monotonic) > g_ttl:
+                        aged.append((op_id, g, g_ttl))
+                    else:
+                        fresh.append(g)
+                if not aged:
+                    continue
+                expired.extend(aged)
                 if fresh:
                     self._pending[op_id] = fresh
                 else:
@@ -1654,20 +1697,19 @@ class TrajectoryRecorder:
         # clean shutdown silently discards the trajectories of every op
         # that was still in flight.
         try:
-            prev = os.environ.get(_ENV_PENDING_TTL_S)
-            os.environ[_ENV_PENDING_TTL_S] = "30"
-            # Values are LINEAGES now, not single generations. Iterating
-            # them as objects would set an attribute on a list and raise
-            # into the fail-open below -- turning the final flush back into
-            # the silent no-op it was before it had a caller at all.
-            for lineage in list(self._pending.values()):
-                for gen in lineage:
-                    gen.created_monotonic = 0.0
-            await self._expire_pending()
-            if prev is None:
-                os.environ.pop(_ENV_PENDING_TTL_S, None)
-            else:
-                os.environ[_ENV_PENDING_TTL_S] = prev
+            # Flush EVERYTHING still awaiting a verdict, stated directly:
+            # ttl_override_s=0 makes every generation older than its window by
+            # construction, and force=True stops a lease from arguing for more
+            # time when there is no more time to have.
+            #
+            # This replaces two indirect mechanisms that both had teeth. The
+            # env assignment made the TTL a process-wide side effect during
+            # teardown, and zeroing `created_monotonic` only appeared to work:
+            # it flushes when the process has been up longer than the effective
+            # TTL, so a SHORT session -- exactly the case where a crash loses
+            # the most -- would have silently discarded the in-flight records
+            # this flush exists to save.
+            await self._expire_pending(force=True, ttl_override_s=0.0)
         except Exception:  # noqa: BLE001
             logger.debug("[TrajectoryRecorder] final flush failed", exc_info=True)
 

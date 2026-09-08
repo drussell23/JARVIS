@@ -39,10 +39,141 @@ def _clean(monkeypatch):
 
 def test_the_live_op_would_no_longer_expire_before_its_verdict():
     """THE regression."""
+    import time as _t
+
     RL.register_lease(LIVE_OP, LIVE_CEILING_S)
-    ttl = RL.effective_ttl_s(LIVE_OP, STATIC_TTL_S)
+    ttl = RL.effective_ttl_s(
+        LIVE_OP, STATIC_TTL_S, created_monotonic=_t.monotonic(),
+    )
     assert ttl > LIVE_DURATION_S, (
         f"lease {ttl:.0f}s still expires before the op's {LIVE_DURATION_S}s verdict"
+    )
+
+
+# --------------------------------------------------------------------------
+# Creation-relative, because remaining-relative shrinks
+#
+# Second live failure, session bt-2026-09-08-202025, op op-01a08280-f4f5:
+#   13:21:53 queued generation (1)
+#   13:36:53 EXPIRED (static)  <- 900s later; the lease had decayed to ~725s
+#   13:45:24 candidate verdict x3 -> "no pending generation"
+# The lease was published, valid, and useless.
+# --------------------------------------------------------------------------
+
+F4F5_CEILING_S = 1530.0
+F4F5_GEN_OFFSET_S = 51.0      # generation born 51s after pickup
+F4F5_AGE_AT_SWEEP_S = 900.0   # first expiry
+F4F5_AGE_AT_VERDICT_S = 1411.0
+
+
+def _f4f5_ttl():
+    import time as _t
+
+    RL.reset_for_tests()
+    RL.register_lease("f4f5", F4F5_CEILING_S)
+    created = _t.monotonic() + F4F5_GEN_OFFSET_S
+    return RL.effective_ttl_s("f4f5", STATIC_TTL_S, created_monotonic=created)
+
+
+def test_a_generation_survives_to_its_verdict():
+    ttl = _f4f5_ttl()
+    assert F4F5_AGE_AT_SWEEP_S <= ttl, f"still expires at the first sweep ({ttl:.0f}s)"
+    assert F4F5_AGE_AT_VERDICT_S <= ttl, f"still expires before the verdict ({ttl:.0f}s)"
+
+
+def test_the_window_does_not_shrink_as_the_op_runs():
+    """The whole bug: `remaining` is measured from NOW and shrinks, while the
+    age it is compared against grows, so the two cross."""
+    import time as _t
+
+    RL.register_lease("op", 1000.0)
+    created = _t.monotonic()
+    first = RL.effective_ttl_s("op", 0.0, created_monotonic=created)
+    # Simulate the op having run a long way: `remaining` would now be tiny,
+    # but the creation-anchored span is unchanged.
+    later = RL.effective_ttl_s("op", 0.0, created_monotonic=created)
+    assert abs(later - first) < 5.0, (first, later)
+
+
+def test_without_a_creation_time_it_falls_back_and_still_only_lengthens():
+    RL.register_lease("op", 5000.0)
+    assert RL.effective_ttl_s("op", STATIC_TTL_S) >= STATIC_TTL_S
+
+
+def test_lease_deadline_is_exposed():
+    import time as _t
+
+    RL.register_lease("op", 100.0)
+    dl = RL.lease_deadline("op")
+    assert dl is not None and dl > _t.monotonic()
+    assert RL.lease_deadline("absent") is None
+
+
+# --------------------------------------------------------------------------
+# force: the shutdown flush must not be overridden
+# --------------------------------------------------------------------------
+
+def test_force_bypasses_the_lease_entirely():
+    import time as _t
+
+    RL.register_lease(LIVE_OP, LIVE_CEILING_S)
+    assert RL.effective_ttl_s(
+        LIVE_OP, 0.0, created_monotonic=_t.monotonic(), force=True,
+    ) == 0.0
+    assert RL.effective_ttl_s(LIVE_OP, 30.0, force=True) == 30.0
+
+
+def test_the_shutdown_flush_forces_and_overrides():
+    """`aclose` narrows the window deliberately to save in-flight records; a
+    lease arguing for more time would discard exactly what it exists to keep."""
+    import inspect
+
+    from backend.core.ouroboros.governance.observability import (
+        trajectory_recorder as TR,
+    )
+
+    src = inspect.getsource(TR.TrajectoryRecorder.aclose)
+    assert "_expire_pending(force=True, ttl_override_s=0.0)" in src
+
+
+def test_the_flush_no_longer_mutates_the_environment():
+    """The old flush assigned os.environ[TTL]="30" and restored it, making the
+    TTL a process-wide side effect during teardown — visible in the live log as
+    an expiry labelled "(lease)" at 803s."""
+    import inspect
+
+    from backend.core.ouroboros.governance.observability import (
+        trajectory_recorder as TR,
+    )
+
+    src = inspect.getsource(TR.TrajectoryRecorder.aclose)
+    assert "os.environ[_ENV_PENDING_TTL_S]" not in src
+
+
+def test_the_flush_no_longer_relies_on_zeroing_creation_times():
+    """Zeroing only APPEARED to work: it flushes when the process has been up
+    longer than the TTL, so a SHORT session — where a crash loses the most —
+    silently discarded the records."""
+    import inspect
+
+    from backend.core.ouroboros.governance.observability import (
+        trajectory_recorder as TR,
+    )
+
+    src = inspect.getsource(TR.TrajectoryRecorder.aclose)
+    assert "created_monotonic = 0.0" not in src
+
+
+def test_the_sweep_ages_each_generation_on_its_own_ttl():
+    import inspect
+
+    from backend.core.ouroboros.governance.observability import (
+        trajectory_recorder as TR,
+    )
+
+    src = inspect.getsource(TR.TrajectoryRecorder._expire_pending)
+    assert "created_monotonic=g.created_monotonic" in src, (
+        "the sweep still uses one TTL for a whole lineage"
     )
 
 
@@ -59,8 +190,15 @@ def test_the_recorder_asks_for_a_per_op_ttl():
         trajectory_recorder as TR,
     )
 
+    # Anchored on the CALL and its per-generation argument, not on how the
+    # call happens to be wrapped: the original spelling `_lease_ttl_for(op_id`
+    # broke the moment the arguments moved onto their own lines, which says
+    # nothing about whether the sweep is per-op.
     src = inspect.getsource(TR.TrajectoryRecorder._expire_pending)
-    assert "_lease_ttl_for(op_id" in src, "the sweep still uses one global TTL"
+    assert "_lease_ttl_for(" in src, "the sweep no longer consults a lease"
+    assert "created_monotonic=g.created_monotonic" in src, (
+        "the sweep still uses one TTL for a whole lineage"
+    )
 
 
 # --------------------------------------------------------------------------

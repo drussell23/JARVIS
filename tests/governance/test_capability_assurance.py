@@ -218,15 +218,40 @@ def test_a_sanctioned_op_is_enforceable(armed):
 
 
 def test_the_generation_seam_aborts_only_when_enforceable():
+    """The guarantee this test was written for, now strictly stronger.
+
+    It originally pinned ``enforcement_enabled() and _cap.enforceable`` so an
+    ambient, telemetry-less prompt build could not raise. That still holds --
+    ``is_fatal`` requires ``enforceable`` -- and a second condition was added
+    on top: the degradation must also be one that prevents a usable candidate.
+
+    The reason is live evidence. Conditioning on ``enforceable`` alone meant
+    every SANCTIONED op aborted, which stayed invisible only while sanctioned
+    ops never reached a worker. The moment queue precedence delivered one
+    (bt-2026-09-08-202025), the Sentinel's own goal died in 64.79s with
+    ``tokens=0`` for a fidelity loss it could have generated straight through.
+    """
     import inspect
 
     from backend.core.ouroboros.governance import providers
+    from backend.core.ouroboros.governance.capability_assurance import (
+        FATAL, RECOVERABLE, CapabilityVerdict,
+    )
 
     src = inspect.getsource(providers)
-    assert "enforcement_enabled() and _cap.enforceable" in src, (
-        "the abort is not conditioned on the op being sanctioned — every "
-        "telemetry-less prompt build in the process would raise"
+    assert "enforcement_enabled() and _cap.is_fatal" in src, (
+        "the abort is not conditioned on the op being sanctioned AND the "
+        "degradation being fatal — every telemetry-less prompt build in the "
+        "process would raise, and every sanctioned op would die on a "
+        "recoverable one"
     )
+    # The original guarantee, asserted on behaviour rather than on spelling.
+    assert CapabilityVerdict(
+        False, "x", enforceable=False, severity=FATAL,
+    ).is_fatal is False, "an unsanctioned op can still abort"
+    assert CapabilityVerdict(
+        False, "x", enforceable=True, severity=RECOVERABLE,
+    ).is_fatal is False, "a sanctioned op still aborts on a recoverable loss"
 
 
 # --------------------------------------------------------------------------
