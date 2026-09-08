@@ -35,7 +35,7 @@ from backend.core.ouroboros.governance.roadmap_reader import (
     _make_envelope_for_goal,
 )
 
-SYM = "_tracer_auth_recheck_s"
+SYM = "_tracer_auth_recheck_s_not_yet_defined"  # the real one LANDED (3a7d155218); the contract is about a symbol that does not exist yet
 
 
 def _goal(symbols=(SYM,), files=("backend/core/ouroboros/governance/dw_capacity_probe.py",)):
