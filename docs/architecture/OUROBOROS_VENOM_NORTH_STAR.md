@@ -452,7 +452,46 @@ A verify-first cost/token audit + 2026 LLM-cost research (FrugalGPT/RouteLLM cas
 
 **THE BLUNT TRUTH THE ARC SURFACED:** quieting the noise gave GOAL-001 a clear worker pool — and `file-00` STILL did NOT dispatch (`done=0`, IMMEDIATE ops=0). **The cost work, though excellent, did NOT unblock the goal.** The real unsolved question is non-economic: *why does a funded, attested, awake, quiet organism still not dispatch its own enqueued strategic sub-goal?*
 
-### §51.11.34-ROADMAP — Next-Slices Priority Stack (2026-06-12)
+### §51.11.37-ROADMAP — Priority Stack (2026-09-08, supersedes §51.11.34)
+
+**The gate is no longer dispatch, and it is no longer cadence. It is ONE
+LANDING.** Everything from discovery through PLAN is proven live and
+unobstructed; nothing downstream of GENERATE has ever completed autonomously.
+
+**P0 — the first autonomous landing.** A Sentinel goal must reach
+`SATISFIED` in the GoalReconciliationLedger. Every other item below is
+speculative until this happens once, because until then we are reasoning about
+a pipeline whose last third has no evidence. Blockers now believed cleared:
+capacity (concurrency clamped to the card), routing (urgency declared),
+outcome correlation (goal-keyed), scope (write-target declared).
+
+**P1 — measure generation QUALITY on a clean capacity budget.** The
+`generation_failed` cluster was starvation, so the model's actual output
+quality on this host is genuinely unknown. This is the input to every decision
+about prompts, few-shot lessons, AST repair and model choice — and none of
+those should be built before it, on pain of optimising a symptom that is not
+occurring. (An AST-syntax preflight repair loop and a lesson injector are
+DESIGNED and deliberately UNBUILT for exactly this reason.)
+
+**P2 — KV-cache quantization.** `OLLAMA_KV_CACHE_TYPE=q8_0` halves KV
+(96 → 48 KiB/token), roughly doubling safe concurrency on the same card. The
+single highest-leverage hardware change available, and it is configuration.
+
+**P3 — the interactive cockpit as a daily driver.** `/goal sanction` is wired,
+capability-assured and gated, and has NEVER been driven by a human for real
+work. This is the nearest bar to everyday usefulness and is largely a matter of
+one real session plus whatever it exposes.
+
+**P4 — retire the dormant-capability debt.** `EXPLORATION_LEDGER` (score floors
+would refuse the swarm route), `WORKSPACE_PROMOTION`, and the 22 remote review
+branches.
+
+**Explicitly NOT on this stack**: anything that assumes the model is the
+bottleneck. That assumption has been wrong twice.
+
+---
+
+*(superseded)* ### §51.11.34-ROADMAP — Next-Slices Priority Stack (2026-06-12)
 
 **Tier A — THE AUTONOMY BLOCKER (do first; not a cost question):**
 - **A1. Trace `file-00` enqueued→dispatched.** With a clear pool it still won't move. Suspect chain: the roadmap envelope reaches `dispatch_queue` but the dequeuer (`UnifiedIntakeRouter._dispatch_loop` → `GLS.submit`) either never pulls it, or `IntakeLayerService` isn't fully booting in `--production-soak --headless` (zero `IntakeLayerService booted` lines observed in stdout — verify against the in-container `debug.log`, the authoritative sink). **This is the single highest-value next action — the milestone (first autonomous PR) is gated on it, nothing else.**
