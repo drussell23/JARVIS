@@ -52,7 +52,7 @@ def _patch_roadmap(monkeypatch, goals, verdict="valid", doc=True):
 def test_a_signed_goal_is_surfaced_at_all(monkeypatch, tmp_path):
     """THE regression: 14 signed goals, 0 dispatches."""
     _patch_roadmap(monkeypatch, [_Goal("ov-dag-repair-x", ["backend/api/x.py"])])
-    got = GD._from_roadmap_goals(tmp_path, 10)
+    got = GD._from_roadmap_goals(tmp_path)
     assert len(got) == 1
     assert got[0].goal_id == "ov-dag-repair-x"
 
@@ -81,7 +81,7 @@ def test_a_signed_goal_keeps_its_own_id(monkeypatch, tmp_path):
     id — and the ledger, the DAG edges and the signer's duplicate guard all key
     on it."""
     _patch_roadmap(monkeypatch, [_Goal("ov-dag-testsynth-x", ["tests/test_x.py"])])
-    got = GD._from_roadmap_goals(tmp_path, 10)
+    got = GD._from_roadmap_goals(tmp_path)
     assert got[0].goal_id == "ov-dag-testsynth-x"
     assert not got[0].goal_id.startswith("ov-auto-")
 
@@ -114,14 +114,14 @@ def test_the_signed_description_is_handed_to_the_model(monkeypatch, tmp_path):
     _patch_roadmap(monkeypatch, [
         _Goal("ov-dag-repair-x", ["backend/api/x.py"], desc="Repair the retry contract"),
     ])
-    got = GD._from_roadmap_goals(tmp_path, 10)
+    got = GD._from_roadmap_goals(tmp_path)
     assert got[0].describe() == "Repair the retry contract"
     assert "has no corresponding test module" not in got[0].describe()
 
 
 def test_a_titleless_goal_still_describes_something(monkeypatch, tmp_path):
     _patch_roadmap(monkeypatch, [_Goal("g", ["a.py"], desc="", title="Only a title")])
-    got = GD._from_roadmap_goals(tmp_path, 10)
+    got = GD._from_roadmap_goals(tmp_path)
     assert got[0].describe()
 
 
@@ -133,7 +133,7 @@ def test_depends_on_reaches_the_candidate(monkeypatch, tmp_path):
     _patch_roadmap(monkeypatch, [
         _Goal("b", ["backend/x.py"], deps=("a",)),
     ])
-    got = GD._from_roadmap_goals(tmp_path, 10)
+    got = GD._from_roadmap_goals(tmp_path)
     assert got[0].detail.get("depends_on") == ["a"]
 
 
@@ -185,14 +185,14 @@ def test_a_signature_cannot_authorise_governance(monkeypatch, tmp_path):
     _patch_roadmap(monkeypatch, [
         _Goal("g", ["backend/core/ouroboros/governance/risk_engine.py"]),
     ])
-    assert GD._from_roadmap_goals(tmp_path, 10) == []
+    assert GD._from_roadmap_goals(tmp_path) == []
 
 
 def test_battle_test_internals_are_refused_too(monkeypatch, tmp_path):
     _patch_roadmap(monkeypatch, [
         _Goal("g", ["backend/core/ouroboros/battle_test/harness.py"]),
     ])
-    assert GD._from_roadmap_goals(tmp_path, 10) == []
+    assert GD._from_roadmap_goals(tmp_path) == []
 
 
 # --------------------------------------------------------------------------
@@ -230,21 +230,70 @@ def test_an_unsigned_or_missing_roadmap_yields_nothing(monkeypatch, tmp_path):
     """Read through the same reader the CAGE consults, so a tampered document
     yields no work rather than unverified work."""
     _patch_roadmap(monkeypatch, [], verdict="invalid_signature", doc=False)
-    assert GD._from_roadmap_goals(tmp_path, 10) == []
+    assert GD._from_roadmap_goals(tmp_path) == []
 
 
 def test_a_goal_with_no_target_files_is_skipped(monkeypatch, tmp_path):
     """An unscoped goal authorises every file — the one shape that makes the
     cage meaningless."""
     _patch_roadmap(monkeypatch, [_Goal("g", [])])
-    assert GD._from_roadmap_goals(tmp_path, 10) == []
+    assert GD._from_roadmap_goals(tmp_path) == []
 
 
-def test_the_limit_is_honoured(monkeypatch, tmp_path):
+def test_the_source_does_NOT_truncate_by_document_order(monkeypatch, tmp_path):
+    """The defect that made the whole DAG unreachable in production.
+
+    The roadmap is append-only, so its order is the opposite of arbitrary: the
+    NEWEST goals sit at the end. Applying the pass cap here — while iterating in
+    document order — silently decided WHICH goals were eligible before any
+    filter or weight ran, and removed exactly the work that had just been filed.
+
+    Measured live: the Sentinel passes no limit, so the cap is
+    ``_max_candidates()`` = 8; the first 8 roadmap entries were all old goals
+    that were governance-refused, satisfied or cooling; and every DAG goal was
+    truncated away unseen. ``0 candidate(s): 0 signed`` for 48 consecutive
+    passes, while the same call with limit=40 returned 8 signed.
+    """
     _patch_roadmap(monkeypatch, [
         _Goal(f"g{i}", [f"backend/x{i}.py"]) for i in range(50)
     ])
-    assert len(GD._from_roadmap_goals(tmp_path, 5)) == 5
+    got = GD._from_roadmap_goals(tmp_path)
+    assert len(got) == 50, "the source truncates, hiding the newest goals"
+    assert got[-1].goal_id == "g49", "the most recently filed goal was dropped"
+
+
+def test_the_cap_is_applied_after_ranking_not_during_collection(monkeypatch, tmp_path):
+    """A newly-filed goal at the END of the document must still be reachable at
+    a small cap."""
+    _patch_roadmap(monkeypatch, [
+        _Goal(f"old{i}", [f"backend/old{i}.py"]) for i in range(30)
+    ] + [_Goal("brand-new", ["backend/new.py"])])
+    monkeypatch.setattr(GD, "_from_ambient_reds", lambda *a, **k: [])
+    monkeypatch.setattr(GD, "_from_uncovered_modules", lambda *a, **k: [])
+
+    class _Ledger:
+        def satisfied_goal_ids(self, ids):
+            return frozenset()
+
+    got = asyncio.run(GD.discover(repo_root=tmp_path, settled=_Ledger(), limit=8))
+    assert len(got) <= 8, "the pass cap is not enforced"
+    assert len(got) == 8
+
+
+def test_the_pass_cap_is_still_enforced(monkeypatch, tmp_path):
+    _patch_roadmap(monkeypatch, [
+        _Goal(f"g{i}", [f"backend/x{i}.py"]) for i in range(50)
+    ])
+    monkeypatch.setattr(GD, "_from_ambient_reds", lambda *a, **k: [])
+    monkeypatch.setattr(GD, "_from_uncovered_modules", lambda *a, **k: [])
+
+    class _Ledger:
+        def satisfied_goal_ids(self, ids):
+            return frozenset()
+
+    for cap in (1, 3, 8):
+        got = asyncio.run(GD.discover(repo_root=tmp_path, settled=_Ledger(), limit=cap))
+        assert len(got) == cap, (cap, len(got))
 
 
 def test_the_roadmap_is_read_from_the_AUTHORITATIVE_tree(tmp_path):
@@ -292,7 +341,7 @@ def test_a_raising_reader_never_breaks_a_pass(monkeypatch, tmp_path):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(rr, "read_roadmap", _boom)
-    assert GD._from_roadmap_goals(tmp_path, 10) == []
+    assert GD._from_roadmap_goals(tmp_path) == []
 
 
 def test_the_source_does_not_duplicate_the_ranking_filters():

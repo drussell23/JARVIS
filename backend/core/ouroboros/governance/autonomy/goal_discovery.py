@@ -369,7 +369,7 @@ def _priority_weight(priority: Any) -> float:
         return max(_KIND_WEIGHT.values()) * 0.5
 
 
-def _from_roadmap_goals(repo_root: Path, limit: int) -> List[DiscoveredWork]:
+def _from_roadmap_goals(repo_root: Path) -> List[DiscoveredWork]:
     """Signed roadmap goals that nothing has dispatched yet.
 
     ## Why this source has to exist
@@ -448,9 +448,27 @@ def _from_roadmap_goals(repo_root: Path, limit: int) -> List[DiscoveredWork]:
                 )
             return out
 
+        # NO truncation by document order.
+        #
+        # `limit` is a cap on how much work a PASS may take on, and the ranking
+        # loop applies it after weight-sorting — so imposing it here as a
+        # collection cap silently decides WHICH goals are eligible before any
+        # filter or weight has run.
+        #
+        # For a filesystem scan that is harmless: order is arbitrary. The
+        # roadmap is append-only, so its order is the opposite of arbitrary —
+        # the NEWEST goals sit at the end, and a cap applied here removes
+        # exactly the work that was most recently filed. Measured live: the
+        # Sentinel passes no limit, so the cap is `_max_candidates()` = 8, the
+        # first 8 roadmap entries are all old goals that are governance-refused,
+        # satisfied or cooling, and every DAG goal was truncated away unseen —
+        # `0 candidate(s): 0 signed` for 48 consecutive passes while the same
+        # call with limit=40 returned 8 signed.
+        #
+        # The document is already bounded by `roadmap_reader.max_goals()`, so
+        # collecting all of it is cheap and finite. Let the ranking loop pick
+        # the BEST `limit`, not the FIRST-LISTED `limit`.
         for goal in list(getattr(doc, "goals", ()) or ()):
-            if len(out) >= limit:
-                break
             gid = str(getattr(goal, "goal_id", "") or "").strip()
             files = tuple(str(f) for f in (getattr(goal, "target_files", ()) or ()))
             if not gid or not files:
@@ -649,18 +667,28 @@ async def discover(
     # resolve — one document read, no filesystem walk.
     signed: List[DiscoveredWork] = []
     try:
+        # Deliberately NOT capped here — see `_from_roadmap_goals`. The
+        # document is already bounded; the ranking loop applies `cap` after
+        # weighting, so the pass takes the best work rather than the
+        # first-listed work.
         signed = await asyncio.to_thread(
-            _from_roadmap_goals, Path(repo_root), cap,
+            _from_roadmap_goals, Path(repo_root),
         )
     except Exception:  # noqa: BLE001
         signed = []
 
     uncovered: List[DiscoveredWork] = []
-    if len(reds) + len(signed) < cap:
+    # The coverage scan IS still capped: it walks the filesystem, its order is
+    # arbitrary so truncation costs nothing meaningful, and enumerating every
+    # module on every pass is the expensive tier this loop exists to avoid.
+    # `signed` is not subtracted from its budget — signed goals are frequently
+    # filtered out downstream (satisfied, cooling, dependency-blocked), and
+    # letting them pre-empt the cheap tier's budget would leave a pass with
+    # nothing to fall back on.
+    if len(reds) < cap:
         try:
             uncovered = await asyncio.to_thread(
-                _from_uncovered_modules, Path(repo_root),
-                cap - len(reds) - len(signed),
+                _from_uncovered_modules, Path(repo_root), cap - len(reds),
             )
         except Exception:  # noqa: BLE001
             uncovered = []
