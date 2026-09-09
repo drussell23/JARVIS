@@ -136,6 +136,12 @@ class DiscoveredWork:
     #: The file the EVIDENCE is about, when it differs from what gets written
     #: (an uncovered module is the subject; the new test file is the target).
     subject_file: str = ""
+    #: The id of an ALREADY-SIGNED roadmap goal this work came from.
+    #:
+    #: Empty for work discovered from evidence, which derives its id. Set only
+    #: by the roadmap source, where the goal already has an identity that the
+    #: ledger, the DAG edges and the signer's duplicate guard all key on.
+    declared_goal_id: str = ""
 
     @property
     def goal_id(self) -> str:
@@ -145,7 +151,16 @@ class DiscoveredWork:
         later collides with its own prior goal id — which the signer refuses
         as a duplicate. That refusal is a feature: it stops the sensor filing
         the same work twice.
+
+        EXCEPT when the work came from an already-signed roadmap goal, which
+        carries its own id. Deriving one there would mint a second identity for
+        a goal that already has one, and every id-keyed contract in the system
+        — the reconciliation ledger, the DAG's ``depends_on`` edges, the
+        duplicate-id guard in the signer — would then be looking at the wrong
+        name for the same work.
         """
+        if self.declared_goal_id:
+            return self.declared_goal_id
         # Keyed on the SUBJECT, not the target: "tests for X" is the same work
         # however the test file ends up named, and the id is what stops the
         # sensor filing it twice.
@@ -155,6 +170,13 @@ class DiscoveredWork:
 
     def describe(self) -> str:
         """The task text handed to the model."""
+        if self.kind == "roadmap_goal":
+            # A signed goal already CARRIES its task text, written and attested
+            # when it was authored. Re-deriving one here would hand the model a
+            # different instruction than the one the signature covers — and for
+            # a DAG's repair half, the derived text would be the "write tests
+            # for X" template, i.e. exactly the wrong job.
+            return str(self.detail.get("description") or self.evidence or "")
         if self.kind == "ambient_red":
             return (
                 f"A test is failing at HEAD against `{self.target_file}`: "
@@ -319,6 +341,137 @@ def _from_uncovered_modules(repo_root: Path, limit: int) -> List[DiscoveredWork]
     return out
 
 
+def _priority_weight(priority: Any) -> float:
+    """Evidence weight for an already-SIGNED goal, from its own priority.
+
+    Derived from ``_KIND_WEIGHT``, never a new literal: a signed goal is work
+    the operator (or the organism, through the operator's signer) has already
+    committed to, so it starts at the strongest evidence the table knows and is
+    scaled DOWN by its own declared priority. If the weight table is retuned,
+    this moves with it.
+
+    The scale is the priority enum's own ordering, so adding a tier to
+    ``GoalPriority`` cannot leave this stale.
+    """
+    try:
+        from backend.core.ouroboros.governance.roadmap_reader import (  # noqa: PLC0415
+            GoalPriority,
+        )
+        order = list(GoalPriority)                      # critical..low
+        raw = str(getattr(priority, "value", priority) or "").strip().lower()
+        idx = next((i for i, p in enumerate(order) if p.value == raw), None)
+        top = max(_KIND_WEIGHT.values())
+        if idx is None:
+            return top * 0.5
+        # critical -> top, low -> top/len(order); linear in the declared rank.
+        return top * (len(order) - idx) / len(order)
+    except Exception:  # noqa: BLE001
+        return max(_KIND_WEIGHT.values()) * 0.5
+
+
+def _from_roadmap_goals(repo_root: Path, limit: int) -> List[DiscoveredWork]:
+    """Signed roadmap goals that nothing has dispatched yet.
+
+    ## Why this source has to exist
+
+    Discovery had exactly two sources — ``ambient_red`` and
+    ``uncovered_module`` — and both scan the FILESYSTEM. Neither can surface a
+    goal by id. So the substitution DAG filed 14 correctly-signed goals in one
+    session (7 A→B pairs, edges intact, scopes disjoint) and the ledger
+    recorded ZERO dispatches of any of them: a correct graph nothing reads.
+    ``_roadmap_goal`` in the harness is a LOOKUP that resolves scope for a goal
+    somebody already chose; it does not enumerate.
+
+    That also made the DAG gate look like it was working when it was merely
+    never consulted — ``blocked=0, dependency_failed=0`` because no candidate
+    with edges ever reached it.
+
+    ## What it emits
+
+    One ``DiscoveredWork`` per signed goal, carrying the goal's OWN id, so
+    every id-keyed contract downstream — the reconciliation ledger, the DAG's
+    ``depends_on`` edges, the settled filter — refers to the same work by the
+    same name.
+
+    Deliberately does NOT filter on satisfaction, dependencies or cooldown:
+    those are the ranking loop's job and are already implemented there. A
+    second copy of that logic here is exactly the duplication that lets two
+    filters disagree.
+
+    Reads through ``roadmap_reader.read_roadmap`` — the same reader the CAGE
+    consults — so a goal this surfaces is a goal the cage will accept, and an
+    unsigned or tampered document yields nothing rather than unverified work.
+    """
+    out: List[DiscoveredWork] = []
+    try:
+        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+            roadmap_reader as rr,
+        )
+        # Resolve the roadmap against the repo we were ASKED about.
+        #
+        # `roadmap_path()` returns a RELATIVE path by default, which resolves
+        # against the process cwd — so this source read the live repository's
+        # roadmap no matter which `repo_root` it was given, and discovery for
+        # one tree returned another tree's work. Harmless while exactly one
+        # repo exists; wrong the moment that stops being true, and it broke
+        # every existing discovery test that passes a tmp_path.
+        _rm = rr.roadmap_path()
+        _override = _rm if _rm.is_absolute() else (Path(repo_root) / _rm)
+        verdict, doc, diag = rr.read_roadmap(path_override=_override)
+        if doc is None:
+            if verdict is not None and str(getattr(verdict, "value", verdict)) not in (
+                "no_roadmap",
+            ):
+                logger.info(
+                    "[GoalDiscovery] roadmap unusable (%s) — no signed goals "
+                    "this pass: %s", verdict, str(diag)[:120],
+                )
+            return out
+
+        for goal in list(getattr(doc, "goals", ()) or ()):
+            if len(out) >= limit:
+                break
+            gid = str(getattr(goal, "goal_id", "") or "").strip()
+            files = tuple(str(f) for f in (getattr(goal, "target_files", ()) or ()))
+            if not gid or not files:
+                continue
+            target = files[0].replace("\\", "/")
+            # The un-signable floor still applies: a signature cannot authorise
+            # the organism to rewrite its own governance.
+            if _is_governance(target):
+                logger.info(
+                    "[GoalDiscovery] %s targets governance — refused at "
+                    "discovery, signature or not", gid,
+                )
+                continue
+            out.append(DiscoveredWork(
+                target_file=target,
+                subject_file=target,
+                kind="roadmap_goal",
+                evidence=(
+                    str(getattr(goal, "title", "") or gid)[:200]
+                ),
+                weight=_priority_weight(getattr(goal, "priority", None)),
+                declared_goal_id=gid,
+                detail={
+                    "depends_on": list(getattr(goal, "depends_on", ()) or ()),
+                    "priority": str(
+                        getattr(getattr(goal, "priority", None), "value", "") or ""
+                    ),
+                    # The SIGNED task text, carried verbatim. `describe()`
+                    # returns this rather than deriving one, so the model is
+                    # handed the instruction the signature actually covers.
+                    "description": str(
+                        getattr(goal, "description", "")
+                        or getattr(goal, "title", "") or ""
+                    ),
+                },
+            ))
+    except Exception as exc:  # noqa: BLE001 — a source may never break a pass
+        logger.warning("[GoalDiscovery] roadmap scan degraded: %r", exc)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # The sensor
 # ---------------------------------------------------------------------------
@@ -471,11 +624,23 @@ async def discover(
         reds = _from_ambient_reds(Path(repo_root), census, watcher)
     except Exception:  # noqa: BLE001
         reds = []
+    # Signed goals FIRST: work the operator's signer has already sanctioned
+    # outranks work discovered from evidence, and it is also the cheapest to
+    # resolve — one document read, no filesystem walk.
+    signed: List[DiscoveredWork] = []
+    try:
+        signed = await asyncio.to_thread(
+            _from_roadmap_goals, Path(repo_root), cap,
+        )
+    except Exception:  # noqa: BLE001
+        signed = []
+
     uncovered: List[DiscoveredWork] = []
-    if len(reds) < cap:
+    if len(reds) + len(signed) < cap:
         try:
             uncovered = await asyncio.to_thread(
-                _from_uncovered_modules, Path(repo_root), cap - len(reds),
+                _from_uncovered_modules, Path(repo_root),
+                cap - len(reds) - len(signed),
             )
         except Exception:  # noqa: BLE001
             uncovered = []
@@ -489,7 +654,7 @@ async def discover(
         except Exception:  # noqa: BLE001
             cooldown = None
 
-    pool = sorted(reds + uncovered, key=lambda w: -w.weight)
+    pool = sorted(signed + reds + uncovered, key=lambda w: -w.weight)
     # Work already SATISFIED is not work. Resolved once for the whole pool
     # (one ledger read, one git pass) rather than per candidate.
     settled_ids = await _settled_goal_ids(pool, repo_root=Path(repo_root), settled=settled)
@@ -498,7 +663,7 @@ async def discover(
 
     seen: set = set()
     ranked: List[DiscoveredWork] = []
-    for item in sorted(reds + uncovered, key=lambda w: -w.weight):
+    for item in pool:
         target = item.target_file
         if target in seen or _is_governance(target):
             continue
@@ -549,8 +714,9 @@ async def discover(
         if len(ranked) >= cap:
             break
     logger.info(
-        "[GoalDiscovery] %d candidate(s): %d red, %d uncovered",
+        "[GoalDiscovery] %d candidate(s): %d signed, %d red, %d uncovered",
         len(ranked),
+        sum(1 for r in ranked if r.kind == "roadmap_goal"),
         sum(1 for r in ranked if r.kind == "ambient_red"),
         sum(1 for r in ranked if r.kind == "uncovered_module"),
     )
