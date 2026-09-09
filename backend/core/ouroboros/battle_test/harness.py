@@ -46,6 +46,92 @@ _SEM = _role_palette()
 logger = logging.getLogger(__name__)
 
 
+def _autonomous_branch_stats(session_id: str):
+    """Commit/diff stats for the branch autonomous work actually lands on.
+
+    The harness's ``BranchManager`` measures its OWN branch; the organism
+    commits inside an isolation worktree onto ``ouroboros/auto/<session>``.
+    Both numbers are legitimate and they answer different questions -- this one
+    answers "what did the organism build", which is the number the session
+    summary is read for.
+
+    Derived from the session id via ``autonomous_workspace.workspace_branch``,
+    the same function the workspace uses to CREATE the branch, so the reader
+    and the writer cannot spell it differently. Returns ``None`` when the
+    branch does not exist (a session that landed nothing), leaving the
+    harness's own stats in place. NEVER raises.
+    """
+    import subprocess  # noqa: PLC0415
+
+    try:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return None
+        from backend.core.ouroboros.governance.autonomous_workspace import (  # noqa: PLC0415
+            workspace_branch,
+        )
+
+        def _git(*args: str) -> str:
+            return subprocess.run(
+                ("git", *args), capture_output=True, text=True, timeout=15,
+                check=False,
+            ).stdout.strip()
+
+        # The branch carries a PER-BOOT nonce (`workspace_branch` says so:
+        # "collision-proof across runs"), so it cannot be recomputed from the
+        # session id by a later process -- re-deriving it here produced
+        # `...-cbb9be` for a branch actually named `...-48fd5c`. The session id
+        # is the stable half, so match on that prefix and let the nonce be
+        # whatever the run chose.
+        #
+        # The prefix is taken from `workspace_branch` itself rather than spelled
+        # again, so a change to the naming scheme moves both together.
+        prefix = workspace_branch(sid).rsplit("-", 1)[0]
+        listing = _git("branch", "--list", "--format=%(refname:short)", f"{prefix}-*")
+        branches = [b.strip() for b in listing.splitlines() if b.strip()]
+        if not branches:
+            return None
+        # A session should own exactly one; if a crashed run left more, the
+        # newest is the one this session actually committed to.
+        branch = branches[-1]
+        if len(branches) > 1:
+            logger.debug(
+                "[Harness] %d autonomous branches for %s — reporting %s",
+                len(branches), sid, branch,
+            )
+        # The fork point is where this branch left the tree it was cut from;
+        # everything after it is the organism's own work.
+        base = _git("merge-base", branch, "HEAD") or ""
+        span = f"{base}..{branch}" if base else branch
+        commits = _git("rev-list", "--count", span)
+        numstat = _git("diff", "--numstat", span) if base else ""
+        files = ins = dels = 0
+        for line in numstat.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            files += 1
+            for idx, bucket in ((0, "ins"), (1, "del")):
+                try:
+                    val = int(parts[idx])
+                except (TypeError, ValueError):
+                    continue  # binary files report "-"
+                if bucket == "ins":
+                    ins += val
+                else:
+                    dels += val
+        return {
+            "commits": int(commits or 0),
+            "files_changed": files,
+            "insertions": ins,
+            "deletions": dels,
+            "branch": branch,
+        }
+    except Exception:  # noqa: BLE001
+        logger.debug("[Harness] autonomous branch stats unavailable", exc_info=True)
+        return None
+
+
 #: The live session CostTracker, published for out-of-harness spenders.
 #: A module seam rather than an import of the harness object because the
 #: harness is constructed once and consulted from everywhere; anything
@@ -1131,6 +1217,24 @@ class BattleTestHarness:
                     branch_stats = self._branch_manager.get_diff_stats()
             except Exception:  # noqa: BLE001
                 pass
+            # Autonomous work does NOT land on the harness's own branch. It is
+            # committed inside the isolation worktree, onto
+            # `ouroboros/auto/<session>-<nonce>` -- so `get_diff_stats`, which
+            # measures the branch manager's HEAD, reported commits=0 for the
+            # session that produced this system's first autonomous landing
+            # (bb575e9b28, 919f8ea443). A summary that reads zero while two
+            # commits exist is worse than no summary: it is the number an
+            # operator checks FIRST.
+            #
+            # The branch name is derived from the session id by the same
+            # `workspace_branch` the workspace itself uses, so there is no
+            # second spelling to drift.
+            try:
+                _auto = _autonomous_branch_stats(self._session_id)
+                if _auto is not None and _auto.get("commits", 0) > 0:
+                    branch_stats = _auto
+            except Exception:  # noqa: BLE001 — a counter never fails a summary
+                logger.debug("[Harness] autonomous branch stats degraded", exc_info=True)
 
             # Ticket B (v1.1b): stamp session_outcome when caller provided
             # it (signal-driven path sends "incomplete_kill"). Best-effort

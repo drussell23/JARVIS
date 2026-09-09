@@ -70,7 +70,9 @@ import time
 import contextlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple,
+)
 
 logger = logging.getLogger("Ouroboros.GoalReconciliation")
 
@@ -828,6 +830,73 @@ def _latest_binding(records: Sequence[ReconciliationRecord], goal_id: str, diges
         if rec.goal_id == goal_id and (not digest or rec.goal_digest == digest):
             return rec
     return None
+
+
+def satisfied_goal_ids(
+    goal_ids: Sequence[str], *,
+    records: Optional[Sequence[ReconciliationRecord]] = None,
+    path: Optional[Path] = None,
+    secret: Optional[str] = None,
+) -> FrozenSet[str]:
+    """Which of *goal_ids* this repository has ALREADY DONE the work for.
+
+    A deliberately narrower question than :func:`reconcile_goal`, and the two
+    must not be confused:
+
+    * ``reconcile_goal`` asks **"is this goal's commit reachable from
+      ``landing_ref``"** — i.e. has it been PROMOTED. Autonomous work commits to
+      an ``ouroboros/auto/<session>`` accumulation branch by design, so that
+      answer is legitimately ``ACTIVE`` until an operator merges. It is the
+      right question for promotion and the wrong one for scheduling.
+    * This asks **"have I already built this"** — a fact about the ledger
+      alone, needing no git and no landing ref.
+
+    Conflating them is what produced the re-dispatch spin in session
+    bt-2026-09-08-225144. The ledger's own rows tell the story exactly::
+
+        dispatched  op-01a0834a
+        satisfied   sha=bb575e9b28  op-01a0834a   <- the landing
+        terminal    op-01a0834a
+        dispatched  op-01a0834d                   <- re-dispatched anyway
+        terminal    op-01a0834d
+        dispatched  op-01a08352                   <- and again
+        terminal    op-01a08352
+
+    The record was written, correct, and read by nobody before choosing the
+    next piece of work.
+
+    A later ``REACTIVATED`` row (the binding's commit vanished to a reset,
+    amend or branch rewind) RETIRES the satisfaction, so a goal whose work was
+    undone becomes selectable again. That is why the scan is ordered rather
+    than a membership test: the newest satisfaction-relevant event wins.
+
+    NEVER raises: an unreadable ledger yields an empty set, which is exactly
+    the behaviour that preceded this function.
+    """
+    try:
+        wanted = {str(g).strip() for g in (goal_ids or ()) if str(g or "").strip()}
+        if not wanted or not enabled():
+            return frozenset()
+        recs = records if records is not None else read_records(
+            path or ledger_path(), secret=secret,
+        )
+        verdict: Dict[str, bool] = {}
+        for rec in recs or ():
+            try:
+                gid = str(getattr(rec, "goal_id", "") or "")
+                if gid not in wanted:
+                    continue
+                event = str(getattr(rec, "event", "") or "")
+                if event == ReconciliationEvent.SATISFIED.value:
+                    verdict[gid] = True
+                elif event == ReconciliationEvent.REACTIVATED.value:
+                    verdict[gid] = False
+            except Exception:  # noqa: BLE001 — one bad row is not a verdict
+                continue
+        return frozenset(g for g, ok in verdict.items() if ok)
+    except Exception:  # noqa: BLE001
+        logger.debug("[GoalReconciliation] satisfied_goal_ids degraded", exc_info=True)
+        return frozenset()
 
 
 async def reconcile_goal(

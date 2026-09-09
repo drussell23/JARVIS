@@ -324,6 +324,51 @@ def _from_uncovered_modules(repo_root: Path, limit: int) -> List[DiscoveredWork]
 # ---------------------------------------------------------------------------
 
 
+async def _settled_goal_ids(
+    pool: Sequence["DiscoveredWork"], *, repo_root: Path, settled: Any = None,
+) -> frozenset:
+    """The goal ids in *pool* the repository has already SATISFIED.
+
+    Composes ``goal_reconciliation_ledger.satisfied_goal_ids`` — one ledger
+    read for the whole pool, and deliberately NOT ``reconcile``, which asks
+    whether a goal's commit is reachable from ``landing_ref``. That is the
+    PROMOTION question: autonomous work lands on an ``ouroboros/auto/<session>``
+    accumulation branch by design, so reconcile correctly answers ACTIVE until
+    an operator merges, and scheduling on it would re-select finished work
+    forever. "Have I already built this" is the scheduling question, and it is
+    a fact about the ledger alone.
+
+    *settled* is an injection seam mirroring ``cooldown``: any object exposing
+    ``satisfied_goal_ids(ids)``. ``None`` resolves the real ledger.
+
+    NEVER raises: an unreadable ledger yields an empty set, which is exactly
+    the behaviour this function replaces.
+    """
+    try:
+        goal_ids = []
+        for item in pool or ():
+            gid = str(getattr(item, "goal_id", "") or "").strip()
+            if gid and gid not in goal_ids:
+                goal_ids.append(gid)
+        if not goal_ids:
+            return frozenset()
+
+        oracle = settled
+        if oracle is None:
+            from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                goal_reconciliation_ledger as grl,
+            )
+            oracle = grl
+        # Off the loop: the ledger read is file I/O, and discovery's whole
+        # contract is that a pass completes at the speed of the cheap tier.
+        return frozenset(
+            await asyncio.to_thread(oracle.satisfied_goal_ids, goal_ids)
+        )
+    except Exception:  # noqa: BLE001 — suppression must never break discovery
+        logger.debug("[GoalDiscovery] satisfaction filter degraded", exc_info=True)
+        return frozenset()
+
+
 async def discover(
     *,
     repo_root: Path,
@@ -331,6 +376,7 @@ async def discover(
     cooldown: Any = None,
     census: Any = None,
     limit: Optional[int] = None,
+    settled: Any = None,
 ) -> Tuple[DiscoveredWork, ...]:
     """Rank the work the repository is asking for. NEVER raises.
 
@@ -375,11 +421,39 @@ async def discover(
         except Exception:  # noqa: BLE001
             cooldown = None
 
+    pool = sorted(reds + uncovered, key=lambda w: -w.weight)
+    # Work already SATISFIED is not work. Resolved once for the whole pool
+    # (one ledger read, one git pass) rather than per candidate.
+    settled_ids = await _settled_goal_ids(pool, repo_root=Path(repo_root), settled=settled)
+
     seen: set = set()
     ranked: List[DiscoveredWork] = []
     for item in sorted(reds + uncovered, key=lambda w: -w.weight):
         target = item.target_file
         if target in seen or _is_governance(target):
+            continue
+        # THE re-discovery spin. Discovery reads the WORKING TREE; autonomous
+        # work commits to an accumulation branch. So a landed goal is still
+        # "uncovered" here, gets re-selected, and the only brake -- the
+        # cooldown -- had just been CLEARED by its own success.
+        #
+        # Measured, bt-2026-09-08-225144: after
+        # ov-auto-uncovered-module-apply-emergency-cpu-fix landed at 16:14:41
+        # (sha bb575e9b28, recorded SATISFIED), passes 8-36 re-dispatched it
+        # 29 times in 8 seconds. Each repeat was correctly refused downstream
+        # (`fc=duplication`), so nothing corrupt was written -- but it consumed
+        # the discoverable targets and left the last 17 minutes of the session
+        # idle.
+        #
+        # The ledger's own docstring already called itself "the SAME one that
+        # stops a satisfied goal being re-dispatched". It was, at the point of
+        # SCORING a dispatch that had already happened. Nothing asked it before
+        # choosing. This is that question, asked first.
+        if item.goal_id and item.goal_id in settled_ids:
+            logger.info(
+                "[GoalDiscovery] %s already SATISFIED (%s) — not re-selecting "
+                "work that has landed", target, item.goal_id,
+            )
             continue
         if cooldown is not None:
             try:

@@ -1264,6 +1264,7 @@ class Slice4bRunner(PhaseRunner):
                     )
                 except Exception:
                     pass
+                _rolled_back = False
                 try:
                     _snapshots = getattr(ctx, "pre_apply_snapshots", {})
                     if _snapshots:
@@ -1275,8 +1276,48 @@ class Slice4bRunner(PhaseRunner):
                             target_files=list(ctx.target_files),
                             repo_root=_exec_root,
                         )
+                        _rolled_back = True
                 except Exception as exc:
                     logger.error("[Orchestrator] Verify rollback failed: %s", exc)
+
+                # VerificationRollback — the edit was applied, VERIFY refused
+                # it, and the tree was restored. That is a fact worth REMEMBERING
+                # rather than only logging: a candidate that passes VALIDATE and
+                # then fails VERIFY is the most expensive shape of failure this
+                # pipeline produces (it paid for generation, validation, apply
+                # AND the restore), and it is the shape a future attempt on the
+                # same modules most needs to have been warned about.
+                #
+                # Fire-and-forget through the SAME `record_lesson` seam the
+                # subagent interceptor and the capability policy use, so there
+                # is one lesson store and one taxonomy. A telemetry write may
+                # never delay a rollback that has already happened.
+                try:
+                    from backend.core.ouroboros.governance.lesson_memory import (  # noqa: PLC0415
+                        record_lesson,
+                    )
+                    _rb_task = asyncio.get_running_loop().create_task(
+                        record_lesson(
+                            op_id=ctx.op_id,
+                            target_files=tuple(ctx.target_files or ()),
+                            phase="VERIFY",
+                            failure_class="verify_regression",
+                            error_class="verification_rollback",
+                            error_text=str(_verify_error or "")[:2000],
+                            summary=(
+                                "VerificationRollback: the candidate passed "
+                                "VALIDATE, failed VERIFY after APPLY, and the "
+                                f"working tree was restored "
+                                f"({'snapshots' if _rolled_back else 'NO snapshot — tree may be dirty'})"
+                            ),
+                        )
+                    )
+                    _rb_task.add_done_callback(lambda _t: _t.exception())
+                except Exception:  # noqa: BLE001 — never blocks the rollback path
+                    logger.debug(
+                        "[Orchestrator] VerificationRollback lesson skipped",
+                        exc_info=True,
+                    )
 
                 if _checkpoint is not None and _ckpt_mgr is not None:
                     try:
@@ -1446,12 +1487,39 @@ class Slice4bRunner(PhaseRunner):
                 from backend.core.ouroboros.governance.auto_committer import AutoCommitter
                 _committer = AutoCommitter(repo_root=orch._config.project_root)
                 _gen = ctx.generation
+                # Name the ENGINE THAT ANSWERED, not the routing seat.
+                #
+                # `provider_name` is the seat the router chose. On the local
+                # lane that read "gcp-jprime" while `qwen3-coder-ov:30b` did
+                # the work -- so the first autonomous landing
+                # (bb575e9b28 / 919f8ea443, session bt-2026-09-08-225144)
+                # carries a trailer attributing it to a node that never saw it.
+                # A commit message is the most durable record this system
+                # produces; misattributing the engine there outlives every log.
+                #
+                # `reported_model_name` is the SAME resolver the generation log
+                # already uses, so the commit and the telemetry cannot disagree
+                # about who wrote the code. Falls back to the seat name when it
+                # cannot resolve, which is strictly better than nothing.
                 _provider = getattr(_gen, "provider_name", "") if _gen else ""
-                _cost = 0.0
-                if _gen:
-                    _in_tok = getattr(_gen, "total_input_tokens", 0) or 0
-                    _out_tok = getattr(_gen, "total_output_tokens", 0) or 0
-                    _cost = (_in_tok * 0.0000001 + _out_tok * 0.0000004)
+                try:
+                    from backend.core.ouroboros.governance.providers import (  # noqa: PLC0415
+                        reported_model_name,
+                    )
+                    _served = str(reported_model_name(ctx) or "").strip()
+                    if _served:
+                        _provider = _served
+                except Exception:  # noqa: BLE001 — naming never blocks a commit
+                    logger.debug("[AutoCommit] served-model naming degraded", exc_info=True)
+                # The provider's OWN reported cost, not a synthetic price.
+                #
+                # This used to be `in*1e-7 + out*4e-7` regardless of lane, so a
+                # free local generation was stamped "$0.0006" while the session
+                # cost tracker -- correctly -- reported $0.00. Two numbers for
+                # one fact, and the invented one is the one that lands in git.
+                # `cost_usd` is documented as "0.0 = not reported by provider",
+                # and 0.0 is exactly right for a lane that charges nothing.
+                _cost = float(getattr(_gen, "cost_usd", 0.0) or 0.0) if _gen else 0.0
                 _commit_result = await asyncio.wait_for(
                     _committer.commit(
                         op_id=ctx.op_id,

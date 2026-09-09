@@ -1,7 +1,9 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
-**Version**: 3.37 (2026-09-08 — **Autonomous Sentinel Mode: the organism discovers, sanctions and dispatches its own work; and the `generation_failed` cluster turns out to be HARDWARE, not model quality.** Commits `8989636260`..`4799cc9cf3`. **Proven live**: discovery ranks work from evidence in ~0.3s (ambient reds + uncovered modules), synthesises a goal, SELF-SIGNS it into `.jarvis/roadmap.yaml` through the one operator signer, dispatches it, and the cage ACCEPTS it — `[DelegatedProvenance] VERIFIED signer=drussell23 → ceiling APPROVAL_REQUIRED`, `chain_ok=True`, claimed in the GoalReconciliationLedger, reaching PLAN. A goal the organism wrote itself passed the cryptographic cage. **Not yet proven**: a landing — there is still no autonomous Sentinel commit. **Safety model as built** (operator's own): green/yellow/orange auto-approve behind a configurable tier ceiling, RED always escalates, and an un-liftable floor reusing `layer4_roadmap_authority.is_safety_operation` — BLOCKED, Order-2 RSI, recursion breach, or any op touching `ouroboros/governance` ALWAYS goes to a human. Both switches (`JARVIS_SENTINEL_MODE_ENABLED` + `JARVIS_GOAL_DISCOVERY_ENABLED`) required; launcher flag `--sentinel`. **Seven defects, each found by a LIVE run and none visible from the tests**: the census on the critical path (and an `asyncio.wait_for` "fix" that was FAKE — it cancels only at an await boundary, and the test timed a sleep that yields); dispatch called on the event loop, which the intake submitter correctly refuses; filed-but-undispatched goals stranded forever by their own duplicate-id guard; a goal declaring the file it READS instead of the file it WRITES (the cage caught it: `self_modification_unsanctioned_source`); the census swarm killing a 2400s session at 79s; the outcome probe watching an op id the pipeline never uses (zero `*-goal*.jsonl` ledgers exist, so it timed out BY CONSTRUCTION at any deadline); and an unset urgency routing a `source=roadmap` envelope to a DoubleWord lane with no credit. **The headline correction**: `generation_failed` (13/30 ops) is NOT the local model writing bad code — it is VRAM starvation. Four ops entered GENERATE together, each negotiating 32k context against a 30B on ONE card; every stream returned `tokens=0 tps=0.0`. The model never ran. `docs/architecture/HARDWARE_CONSTRAINTS.md` now records the measured envelope (RTX 5090 31.8 GiB; 17.3 GiB weights; KV = 96 KiB/token so a 32k context costs 3.0 GiB; four of them = 92% of the card) and `local_lane_capacity.py` derives concurrency from it. The model demonstrably generates — 119.2 tok/s, 18596+3177 tokens — so its capability is not in question; its output QUALITY under a clean capacity budget remains unmeasured. **Composite unchanged** — this moved activated capability, not the 85%.)
+**Version**: 3.38 (2026-09-08 — **THE FIRST AUTONOMOUS LANDING. The gate named in v3.37 as "Not yet proven: a landing" is closed.** Session `bt-2026-09-08-225144` produced two commits authored by O+V on the accumulation branch `ouroboros/auto/bt-2026-09-08-225144-48fd5c`: `bb575e9b28` created `tests/test_apply_emergency_cpu_fix.py` (80 lines) for a module the organism itself identified as uncovered, under the self-signed goal `ov-auto-uncovered-module-apply-emergency-cpu-fix`; and `919f8ea443` modified a PRODUCTION file, `backend/api/sse_contract.py` (+8/-7), making broad `except` blocks log with `exc_info` so a swallowed SSE fault leaves evidence. Both `SAFE_AUTO (Green)`, both `Co-Authored-By: Ouroboros+Venom`, both served by the LOCAL `qwen3-coder-ov:30b` at `cost_total = 0.0`. The GoalReconciliationLedger closes the loop with a real sha: `satisfied ov-auto-uncovered-module-apply-emergency-cpu-fix sha=bb575e9b28`. The post-commit hook mirrored both to the Windows clone. **What unblocked it** was not model quality but four measured harness defects, in order: (1) a literal `120.0` default in `PythonAdapter.__init__` that overrode the live budget the router had already computed — `min(budget, 120)` is 120 forever; (2) queue precedence — the Sentinel's own signed goal was submitted NINTH at the same `priority=3` as bulk batch work, ~3 hours down a one-worker lane inside a 40-minute session; (3) the capability interceptor aborting every SANCTIONED op for a RECOVERABLE schema degradation, which stayed invisible only while sanctioned ops never reached a worker; (4) `Strategy 4 (repo fallback)`, which answered "no test covers this file" by handing pytest the entire `tests/` DIRECTORY — **69,353 tests and 200.9s of collection alone**, versus 0.67s for one explicit file, run twice per candidate by the flake retry. That is the ~450s/candidate that consumed every op budget, and it was WRONG as well as slow: `audio_error_fallback.py` was failed on a test in `tests/adversarial/test_synthetic_adversary.py` with no relationship to the change. **Measured after**: validation of a covered file 450s → 1.31s; of an uncovered file 450s → 0.02s (`no_covering_test`, an honest refusal). **Composite unchanged** — one landing is not a cadence; see §32.6.)
 >
+> 3.37 (2026-09-08 — **Autonomous Sentinel Mode: the organism discovers, sanctions and dispatches its own work; and the `generation_failed` cluster turns out to be HARDWARE, not model quality.** Commits `8989636260`..`4799cc9cf3`. **Proven live**: discovery ranks work from evidence in ~0.3s (ambient reds + uncovered modules), synthesises a goal, SELF-SIGNS it into `.jarvis/roadmap.yaml` through the one operator signer, dispatches it, and the cage ACCEPTS it — `[DelegatedProvenance] VERIFIED signer=drussell23 → ceiling APPROVAL_REQUIRED`, `chain_ok=True`, claimed in the GoalReconciliationLedger, reaching PLAN. A goal the organism wrote itself passed the cryptographic cage. **Not yet proven**: a landing — there is still no autonomous Sentinel commit. **Safety model as built** (operator's own): green/yellow/orange auto-approve behind a configurable tier ceiling, RED always escalates, and an un-liftable floor reusing `layer4_roadmap_authority.is_safety_operation` — BLOCKED, Order-2 RSI, recursion breach, or any op touching `ouroboros/governance` ALWAYS goes to a human. Both switches (`JARVIS_SENTINEL_MODE_ENABLED` + `JARVIS_GOAL_DISCOVERY_ENABLED`) required; launcher flag `--sentinel`. **Seven defects, each found by a LIVE run and none visible from the tests**: the census on the critical path (and an `asyncio.wait_for` "fix" that was FAKE — it cancels only at an await boundary, and the test timed a sleep that yields); dispatch called on the event loop, which the intake submitter correctly refuses; filed-but-undispatched goals stranded forever by their own duplicate-id guard; a goal declaring the file it READS instead of the file it WRITES (the cage caught it: `self_modification_unsanctioned_source`); the census swarm killing a 2400s session at 79s; the outcome probe watching an op id the pipeline never uses (zero `*-goal*.jsonl` ledgers exist, so it timed out BY CONSTRUCTION at any deadline); and an unset urgency routing a `source=roadmap` envelope to a DoubleWord lane with no credit. **The headline correction**: `generation_failed` (13/30 ops) is NOT the local model writing bad code — it is VRAM starvation. Four ops entered GENERATE together, each negotiating 32k context against a 30B on ONE card; every stream returned `tokens=0 tps=0.0`. The model never ran. `docs/architecture/HARDWARE_CONSTRAINTS.md` now records the measured envelope (RTX 5090 31.8 GiB; 17.3 GiB weights; KV = 96 KiB/token so a 32k context costs 3.0 GiB; four of them = 92% of the card) and `local_lane_capacity.py` derives concurrency from it. The model demonstrably generates — 119.2 tok/s, 18596+3177 tokens — so its capability is not in question; its output QUALITY under a clean capacity budget remains unmeasured. **Composite unchanged** — this moved activated capability, not the 85%.)
+
 > 3.36 (2026-09-08 — **A1 IS CLOSED. The autonomy blocker named in §51.11.34-ROADMAP as "the single highest-value next action — the milestone (first autonomous PR) is gated on it, nothing else" no longer holds: roadmap-signed goals now dispatch, generate, validate, gate, apply and COMMIT autonomously.** The evidence is three landings on the local 30B lane, each from a signed roadmap goal carrying `Signal: roadmap` + `Roadmap-Goal-Digest`: `6b85a9f438`/`c66a92e093` (first-order proof), `3a7d155218` (`dw_capacity_probe.py`, the 30B's own 2b.1-diff), `e7b3bdfec2` (`candidate_generator.py`, 12k lines, Radius & Stitch — exactly the 6-line multi-file decline requested, 0 collateral). **This supersedes the v3.35 line "O+V has 0 autonomous commits"**, which was true when written on 2026-09-04 and is kept unedited as the record of when that belief changed. **Also this arc**: the L3 fan-out boundary was dropping the parent op's admission, so every work unit ran with `telemetry=None` (the 2b.1-diff schema structurally unreachable) and `target_symbols=()` (the declared-symbol refusal vacuous) — closed at `ec6bb92c9a`; a global zero-push air-gap replaced a lane-local push policy that had let 22 review branches reach origin from isolated soaks, with an AST invariant that fails on any unguarded remote-push argv (`c3272ef9bd`); ~40 execution budgets that lived as literals in one bash script became ONE derived envelope both the cockpit and the headless soak hydrate from, reproducing soak26's hand-tuned 4968/3726/4968 exactly (`c3272ef9bd`); and the Iron Gate, which declared no deadline at all while a local prompt was alive AND failed OPEN when its surfaces died, is now bounded, fails closed, and writes an `approval_timeout` row to the op ledger (`9d8ba44097`). **Composite**: the ~35% figure is NOT re-scored here — it is gated on reviewed autonomous PR track record and a 12–18mo shadow clock, neither of which three commits satisfy. What changed is that the named blocker is gone and the next gate is cadence, not dispatch. **Not yet proven**: no production goal has been driven from the interactive cockpit — every landing so far came from a headless soak.)
 >
 > 3.35 (2026-09-04 — **The Preference-Corpus Arc: soaks 19–26 turned a farming harness that recorded only successes into one that records every ANSWER. Trainable groups 4 → 20; row survival 21% → 79%.** This arc built the *data curation pipeline* half of **M12 — `JPrimeLoRA`** (§Phase 11), and is human-directed work, NOT autonomous O+V output. **The defect class, stated once**: GRPO learns from within-group CONTRAST, and every layer between the model and the trainer was silently discarding the losing half of every pair. Eight defects, each found by one soak and each fixed at its cause: (1) **the work-order seen-ledger is CROSS-SESSION**, so re-running a stable roadmap emitted 0 orders — soak 20 spent 2.5h on ambient ops and produced 22 rows, none trainable → `JARVIS_ALLOW_ROADMAP_REVISIT` *shadows* the ledger in memory rather than deleting the operator's record (`5dc973d6c7`); (2) **a `2b.1-noop` sibling read as EMPTY and set `_stop`**, forfeiting every remaining slot — 8 of soak 19's 15 singleton ops died there → a refusal and an unparseable draw are ANSWERS: re-drawn at higher entropy within the slot, then the SLOT is dropped, never the loop (`95c1031e51`, + `sibling_fulfillment` per-slot ledger so a singleton is a logged fact rather than an absence); (3) **the recorder returned False for a refusal** (`not traj.candidates`) so the model's cleanest negative answer never became a row → synthesise it, body = the decline ENVELOPE not the prose, because reactor's `extract_sources` already scores `2b.1-noop` at the syntax ceiling while prose falls through to `_grade_source` and grades as broken Python, inverting the ladder (`4c8f4d3af9`); (4) **unparseable draws raised before the recorder hook** → captured at the raise, body = the RAW response so `_grade_source` scores by how far the parse got (0.250 line-1/3 … 0.393 line-6/7), a static 0.0 floor was measured and REJECTED because it collapses that 0.1429 spread and ranks a parse error below envelope garbage (`06c0d51705`); (5) **reactor's `genuine_only` discarded every `retry` draw** — 156 of soak 24's 330 rows — on a rationale written for `repair` ("answered a DIFFERENT prompt") that does not hold for a refusal, which re-answers the SAME one → `is_genuine_row` admits a retry whose status is CATEGORICAL; `parse_error` deliberately excluded, its score varies with parse depth so a re-draw carries the soak-17 twin hazard (reactor `8f36af0`); (6) **`_UNKNOWN` discarded refusals whose op never reported** — an op that DECLINES is the least likely to reach a verdict-bearing phase → a refusal is SELF-EVIDENCING, matched on the POLICY TUPLE never the outcome string, since `_CAGED`/`_INFRA`/`_UNKNOWN` all carry `"unknown"` and a string test silently made governance-denied refusals trainable (`fbf227d4ca`); (7) **the same rule was missing on the EXPIRY write path**, which is where a declining op's rows actually land — survival slid 100% → 25% across soak 24 → one `_noop_override` consulted by both writers (`525ba81739`); (8) **`parse_error` was not covered by that rule** — soak 25 carried three ops holding a patch AND a parse_error/noop sibling, the exact {good, bad} pair, every one reading as UNMIXED downstream → `_self_evidencing_policy` returns `_NOOP` for a refusal and `_FAILURE` for an all-parse_error draw (the parser IS the verdict, established deterministically at generation time); a PATCH stays excluded because its correctness is genuinely unknown until VALIDATE (`93cce42284`). **The reward ladder now measured end-to-end against reactor UNMODIFIED**: `parse_error 0.300 < noop 0.450 < patch 0.812`, spread 0.5121 against a 0.01 gate — breaking < declining < delivering. **Two structural facts that bound the whole approach**: GRPO groups on the exact `user_input` and every prompt embeds its own Op-ID (measured: 85/85 rows, 0 prompts shared across ops), so a new soak always mints NEW groups and can never deepen an existing one — re-running buys BREADTH, never depth; and a NOOP-primary op can never draw a sibling (`_extend_with_siblings` returns at its first guard), so it is all-refusal by construction and only PATCH-primary ops can be mixed. **Also shipped**: reactor `main` cleaned to a single branch (`153cb22` dynamic VRAM deployment gate — sizes the ceiling from measured VRAM instead of a hardcoded 20GB that rejected Q5/Q6 on a 32GB card; `3e7fcb2` the 30B model-acquisition search including the GPTQ path that FAILED, kept because the negative result is expensive to rediscover), 18 soak launchers tracked under `scripts/soaks/` with the arc documented, and `scripts/soaks/devtest_{prepare,baseline,report}.sh` — the untrained baseline development test, built to run BEFORE training because O+V has 0 autonomous commits and its wall has been GOVERNANCE, not candidate quality: if the chain does not close untrained, a fine-tuned model will not close it either. **Not yet proven**: no training run has executed; the corpus stands at 20 trainable groups against a 25 target; and no mixed-shape op has yet survived a soak that had every fix at launch — soak 26 (`bt-2026-09-05-014355`) is the first, in flight at time of writing.)
@@ -5253,3 +5255,185 @@ session per op) and that two models never share one ledger entry.
 6. **The local tier is bounded by the route budget, not by VRAM.** A model is
    admissible when its per-op cost fits the window — see §31.4.1 for the
    arithmetic that turns this into a purchasing criterion.
+
+---
+
+## 32. The First Autonomous Landing — and the four numbers that were in the way *(NEW 2026-09-08)*
+
+For sixteen months the gate was one sentence: *no autonomous commit exists.*
+It exists now, and this section records what it took, because none of it was
+what anyone expected.
+
+### 32.1 The landing itself
+
+Session `bt-2026-09-08-225144`, branch
+`ouroboros/auto/bt-2026-09-08-225144-48fd5c`:
+
+```
+bb575e9b28  fix(tests): backend/apply_emergency_cpu_fix.py has no corresponding test
+            tests/test_apply_emergency_cpu_fix.py | +80 (new file)
+            Roadmap-Goal: ov-auto-uncovered-module-apply-emergency-cpu-fix
+            Risk: SAFE_AUTO (Green)
+
+919f8ea443  feat(api): make the broad except blocks observable
+            backend/api/sse_contract.py | +8 / -7          <- PRODUCTION FILE
+            Risk: SAFE_AUTO (Green)
+
+Co-Authored-By: Ouroboros+Venom <ouroboros@jarvis.trinity>
+```
+
+The reconciliation ledger closes it with a real sha:
+
+```
+satisfied  ov-auto-uncovered-module-apply-emergency-cpu-fix  sha=bb575e9b28
+```
+
+Served by the local `qwen3-coder-ov:30b`; `cost_total = 0.0`. The organism
+selected the work, justified it, wrote it, validated it, passed the gate,
+applied it and committed it, and a human saw the result rather than the
+request.
+
+One of the two is a production change, not a test. That distinction matters:
+writing tests for uncovered modules is safe, bounded, and could be dismissed
+as busywork. `sse_contract.py` is the system's own error-reporting surface.
+
+### 32.2 Why it took four fixes, none of them about the model
+
+Every blocker was a HARNESS defect, and each stayed invisible until the one
+before it was removed. That ordering is the finding: a pipeline hides its next
+defect behind its current one, so the only way to enumerate them is to keep
+removing the front one and re-running.
+
+**(1) A literal that outranked a live budget.** `PythonAdapter.__init__`
+declared `timeout: float = 120.0` and every production construction site
+omitted it, so `run()`'s `min(timeout_budget_s, self._timeout)` admitted the
+router's computed budget and immediately discarded it. Measured: an op with a
+1530 s ceiling spent its entire life on three pytest runs killed at 120 s,
+120 s and 109 s, ending `failed / l2_stopped` with the candidate never judged.
+The operator's own `production_envelope` had been exporting
+`JARVIS_TEST_TIMEOUT_S: 180` the whole time; the literal silently outranked it.
+
+**(2) Self-signed work queued behind bulk.** The Sentinel's own goal was
+submitted NINTH, at the same `priority=3` as eight seeded batch ops, on a
+one-worker lane retiring an op every ~24 minutes — roughly three hours away
+inside a forty-minute session. `signal_source` could not discriminate: every
+batch op also carried `source='roadmap'`. The signed **goal pointer** does —
+present on self-directed work, absent on bulk, and read through the one shared
+accessor the capability envelope already uses.
+
+**(3) A guard that refused to let the work happen.** The capability
+interceptor aborted any SANCTIONED op whose schema decision came out
+`full_content` when a diff was promised. That is a genuine fidelity loss and
+NOT an inability to generate — `full_content` is the historic, always-supported
+schema. Aborting traded a known degradation for no work at all. It stayed
+invisible only while sanctioned ops never reached a worker; the moment fix (2)
+delivered one, the Sentinel's own goal died in 64.79 s with `tokens=0`.
+
+**(4) "No test for this file" answered with the entire test suite.**
+`resolve_affected_tests` Strategy 4 appended the repo-level `tests/`
+DIRECTORY. Pytest does the obvious thing with a directory:
+
+```
+pytest --collect-only tests/                200.9s   69,353 tests   32 errors
+pytest --collect-only <one explicit file>     0.67s
+```
+
+Twice per candidate via the flake retry ≈ the 450 s/candidate that consumed
+every op budget. And the log's `Resolved 1 test targets` was counting one
+DIRECTORY, which is why it reached every downstream consumer — the shard-cost
+estimator, the ladder planner — looking like a one-file shard.
+
+It was wrong as well as slow. `audio_error_fallback.py` was failed on
+`test_generic_batch_round_trip_parses_cleanly`, which lives in
+`tests/adversarial/test_synthetic_adversary.py` and has no relationship to the
+change. **A verdict drawn from 69,353 unrelated tests is not a verdict about
+the candidate.**
+
+Measured after: a covered file validates in **1.31 s** (450 s before, judging
+40 real tests); an uncovered file returns `no_covering_test` in **0.02 s** —
+an honest refusal rather than a wrong answer bought with the whole budget.
+
+### 32.3 The re-discovery spin
+
+Immediately after landing, the same goal was re-dispatched **29 times in 8
+seconds**. The ledger shows exactly why:
+
+```
+dispatched  op-01a0834a
+satisfied   sha=bb575e9b28  op-01a0834a     <- the landing
+terminal    op-01a0834a
+dispatched  op-01a0834d                     <- re-dispatched anyway
+dispatched  op-01a08352                     <- and again
+```
+
+Discovery reads the WORKING TREE; autonomous work commits to an accumulation
+branch. So a landed goal is still "uncovered" from the tree's point of view,
+gets re-selected, and the only brake — the cooldown — had just been CLEARED by
+its own success. Each repeat was correctly refused downstream (`fc=duplication`),
+so nothing corrupt was written; it simply consumed the discoverable targets and
+left the last 17 minutes of the session idle.
+
+The fix required distinguishing two questions the ledger had been answering
+with one function:
+
+* **`reconcile_goal`** — "is this goal's commit reachable from `landing_ref`?"
+  i.e. has it been **promoted**. Autonomous work lands on an accumulation
+  branch by design, so this correctly answers ACTIVE until an operator merges.
+  Right for promotion, fatal for scheduling.
+* **`satisfied_goal_ids`** (new) — "have I already built this?" A fact about
+  the ledger alone, needing no git and no landing ref. A later `REACTIVATED`
+  row retires it, so work undone by a reset becomes selectable again.
+
+### 32.4 Two counters that misreported the landing
+
+Both were found by reading the system's own account of its first success and
+not believing it.
+
+* **The commit trailer said `Provider: gcp-jprime ($0.0006)`.** The op ran
+  `local-primary` on `qwen3-coder-ov:30b` at `cost_total = 0.0`. The trailer
+  named the routing SEAT, and the cost was a synthetic per-token price
+  (`in*1e-7 + out*4e-7`) applied regardless of lane. A commit message is the
+  most durable record this system produces; misattributing the engine there
+  outlives every log. Now composed from `reported_model_name` — the same
+  resolver the generation log uses — and the provider's own `cost_usd`.
+* **`branch_stats.commits` read 0** for the session that produced two commits.
+  It measures the harness's own branch; the organism commits inside an
+  isolation worktree onto `ouroboros/auto/<session>`. A summary that reads zero
+  while two commits exist is worse than no summary — it is the number an
+  operator checks first.
+
+### 32.5 Invariants this section adds
+
+1. **A default parameter value is a decision.** `timeout: float = 120.0` that
+   no caller overrides is not a fallback; it is the policy, and it silently
+   outranks every dynamic value computed upstream.
+2. **A guard may not be more expensive than what it guards.** Converting a
+   degraded-but-usable result into no result is a net loss. Aborts require
+   both *whose work this is* and *whether a usable result is possible* — two
+   separate questions that the first version conflated.
+3. **"I found nothing" must not be answered with "everything".** A fallback
+   whose cost is unbounded is not a fallback; and a verdict computed from
+   unrelated evidence is not a verdict.
+4. **Scheduling and promotion are different questions about the same fact.**
+   One function answering both will be wrong for one of them.
+5. **A count of targets cannot bound work; only their SHAPE can.** One
+   directory and one file are both "1".
+6. **Read the system's own account of its success sceptically.** Two counters
+   misreported the first landing, in opposite directions.
+
+### 32.6 What is proven, and what is not
+
+| | |
+|---|---|
+| Self-directed work reaches a worker | **proven** — 2nd of 9 |
+| The Sentinel iterates passes | **proven** — 70 in one session |
+| VALIDATE returns a named verdict | **proven** |
+| The ladder refuses to overrun | **proven** — 0 overruns |
+| Trajectory rows survive to their verdict | **proven** |
+| **An autonomous commit** | **PROVEN — `bb575e9b28`, `919f8ea443`** |
+| A *cadence* of landings | **not proven** — one session, two commits |
+| Landings on `main` | **not proven** — accumulation branch, operator promotes |
+| Degraded-but-usable generation | **not exercised** — the condition did not recur |
+
+The composite readiness figure is deliberately NOT re-scored here. One landing
+closes a gate; it does not establish a rate. The next gate is cadence.
