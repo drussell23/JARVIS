@@ -119,6 +119,67 @@ def _plan_ladder_iteration(
         return None
 
 
+async def _substitute_for_coverage_deficit(ctx: Any) -> str:
+    """File the A→B goal DAG for an op that has no covering test.
+
+    Returns a short outcome string for the ledger row. Composes
+    ``goal_dag.plan_substitution`` / ``file_substitution`` — which in turn
+    compose the ONE operator signer — and records a ``TestCoverageDeficit``
+    lesson through the same ``record_lesson`` seam every other diagnostic uses.
+
+    The signing is synchronous file I/O, so it runs off the loop. NEVER raises:
+    a failed substitution leaves the op shed exactly as it would have been.
+    """
+    try:
+        from backend.core.ouroboros.governance.autonomy import (  # noqa: PLC0415
+            goal_dag,
+        )
+        files = tuple(getattr(ctx, "target_files", ()) or ())
+        if not files:
+            return "no_target"
+        plan = goal_dag.plan_substitution(
+            subject_file=str(files[0]),
+            original_description=str(getattr(ctx, "description", "") or ""),
+        )
+        if plan is None:
+            return "not_applicable"
+
+        res_a, res_b = await asyncio.to_thread(goal_dag.file_substitution, plan)
+        ok_a = bool(getattr(res_a, "ok", False))
+        ok_b = bool(getattr(res_b, "ok", False))
+        outcome = f"A={'ok' if ok_a else getattr(res_a, 'reason', 'fail')}," \
+                  f"B={'ok' if ok_b else getattr(res_b, 'reason', 'fail')}"
+
+        try:
+            from backend.core.ouroboros.governance.lesson_memory import (  # noqa: PLC0415
+                record_lesson,
+            )
+            _t = asyncio.get_running_loop().create_task(
+                record_lesson(
+                    op_id=str(getattr(ctx, "op_id", "") or ""),
+                    target_files=files,
+                    phase="VALIDATE",
+                    failure_class="no_covering_test",
+                    error_class="test_coverage_deficit",
+                    error_text=plan.render(),
+                    summary=(
+                        "TestCoverageDeficit: the change could not be validated "
+                        f"because `{plan.subject_file}` has no covering test. "
+                        f"Filed {plan.goal_a_id} (writes {plan.test_file}) and "
+                        f"{plan.goal_b_id} (depends on it). The running goal "
+                        "was shed, never widened."
+                    ),
+                )
+            )
+            _t.add_done_callback(lambda t: t.exception())
+        except Exception:  # noqa: BLE001
+            logger.debug("[GoalDAG] deficit lesson skipped", exc_info=True)
+        return outcome
+    except Exception:  # noqa: BLE001
+        logger.debug("[GoalDAG] substitution unavailable", exc_info=True)
+        return "degraded"
+
+
 def _negotiate_ladder_depth(*, ctx: Any, orch: Any, candidates: Any) -> Optional[Any]:
     """Retry ceiling derived from the op's remaining budget ÷ iteration cost.
 
@@ -515,6 +576,40 @@ class VALIDATERunner(PhaseRunner):
                     )
                     _early_return_ctx = ctx
                     _fsm_log("infra_early_return_set")
+
+                # TestCoverageDeficit — non-retryable, and SUBSTITUTED.
+                #
+                # Retrying cannot help: no amount of re-generation creates a
+                # test that does not exist, and widening this op's scope so it
+                # could write one would forge its signature — `target_files` is
+                # what the operator attested, and writing outside it is exactly
+                # `self_modification_unsanctioned_source`.
+                #
+                # So the op is SHED and two new goals are filed instead:
+                # A writes the test, B carries this work and is signed
+                # `depends_on=(A,)`. The running goal is never mutated.
+                if (
+                    validation.failure_class == "no_covering_test"
+                    and _early_return_ctx is None
+                ):
+                    _sub = await _substitute_for_coverage_deficit(ctx)
+                    ctx = ctx.advance(
+                        OperationPhase.POSTMORTEM,
+                        validation=validation,
+                        terminal_reason_code="test_coverage_deficit",
+                    )
+                    await orch._record_ledger(
+                        ctx,
+                        OperationState.FAILED,
+                        {
+                            "reason": "test_coverage_deficit",
+                            "failure_class": "no_covering_test",
+                            "substitution": _sub or "not_filed",
+                            "short_summary": validation.short_summary,
+                        },
+                    )
+                    _early_return_ctx = ctx
+                    _fsm_log("coverage_deficit_early_return_set", _sub or "not_filed")
 
                 if validation.failure_class == "budget" and _early_return_ctx is None:
                     ctx = ctx.advance(

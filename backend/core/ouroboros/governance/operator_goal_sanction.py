@@ -144,6 +144,16 @@ class GoalSpec:
     success_criteria: str = ""
     max_duration_s: int = 0
     note: str = ""
+    #: Goal ids that must be SATISFIED before this goal may run.
+    #:
+    #: `roadmap_reader` has parsed and carried this field all along, describing
+    #: it as "(advisory)" — and advisory it was: nothing in the governance path
+    #: read it. Emitting it here puts it INSIDE the signed payload, so a
+    #: dependency becomes part of what the operator's signature attests rather
+    #: than a hint a scheduler may ignore. That is the whole reason the
+    #: substitution DAG can be trusted: an op cannot acquire a prerequisite it
+    #: was not signed with, and cannot drop one either.
+    depends_on: Tuple[str, ...] = ()
 
     def to_entry(self) -> Dict[str, Any]:
         """The roadmap-goal dict, in the schema ``roadmap_reader.
@@ -164,6 +174,8 @@ class GoalSpec:
             entry["success_criteria"] = self.success_criteria
         if self.max_duration_s and self.max_duration_s > 0:
             entry["max_duration_s"] = int(self.max_duration_s)
+        if self.depends_on:
+            entry["depends_on"] = [str(d) for d in self.depends_on]
         return entry
 
 

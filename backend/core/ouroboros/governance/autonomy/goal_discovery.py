@@ -369,6 +369,74 @@ async def _settled_goal_ids(
         return frozenset()
 
 
+async def _dag_index() -> Dict[str, Dict[str, Any]]:
+    """``{goal_id: {"depends_on": (...), "target": str}}`` from the roadmap.
+
+    One read per discovery pass, off the event loop. The roadmap is the
+    authority on edges because that is where the SIGNATURE covers them —
+    reading them from anywhere else would be trusting an unattested copy.
+    NEVER raises; an unreadable roadmap yields an empty index, i.e. no gating.
+    """
+    def _read() -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        try:
+            from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                roadmap_reader as rr,
+            )
+            _verdict, doc, _diag = rr.read_roadmap()
+            for goal in list(getattr(doc, "goals", ()) or ()):
+                gid = str(getattr(goal, "goal_id", "") or getattr(goal, "id", "") or "")
+                if not gid:
+                    continue
+                files = tuple(getattr(goal, "target_files", ()) or ())
+                out[gid] = {
+                    "depends_on": tuple(getattr(goal, "depends_on", ()) or ()),
+                    "target": str(files[0]) if files else "",
+                }
+        except Exception:  # noqa: BLE001
+            logger.debug("[GoalDiscovery] roadmap DAG index degraded", exc_info=True)
+        return out
+
+    try:
+        return await asyncio.to_thread(_read)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _dependency_state(
+    goal_id: str,
+    dag_index: Dict[str, Dict[str, Any]],
+    settled_ids: Any,
+    cooldown: Any,
+) -> Any:
+    """The DAG verdict for *goal_id*, or ``None`` when it has no edges.
+    NEVER raises — a gate that fails closed would wedge every goal."""
+    try:
+        entry = (dag_index or {}).get(str(goal_id or ""))
+        if not entry:
+            return None
+        deps = tuple(entry.get("depends_on") or ())
+        if not deps:
+            return None
+        from backend.core.ouroboros.governance.autonomy import (  # noqa: PLC0415
+            goal_dag,
+        )
+        targets = {
+            gid: str((meta or {}).get("target") or "")
+            for gid, meta in (dag_index or {}).items()
+        }
+        exhausted = goal_dag.exhausted_goal_ids(
+            deps, roadmap_targets=targets, cooldown=cooldown,
+        )
+        return goal_dag.dependency_verdict(
+            goal_id, deps, satisfied=frozenset(settled_ids or ()),
+            exhausted=exhausted,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[GoalDiscovery] dependency gate degraded", exc_info=True)
+        return None
+
+
 async def discover(
     *,
     repo_root: Path,
@@ -425,6 +493,8 @@ async def discover(
     # Work already SATISFIED is not work. Resolved once for the whole pool
     # (one ledger read, one git pass) rather than per candidate.
     settled_ids = await _settled_goal_ids(pool, repo_root=Path(repo_root), settled=settled)
+    # The roadmap's dependency edges, read once for the whole pass.
+    dag_index = await _dag_index()
 
     seen: set = set()
     ranked: List[DiscoveredWork] = []
@@ -454,6 +524,16 @@ async def discover(
                 "[GoalDiscovery] %s already SATISFIED (%s) — not re-selecting "
                 "work that has landed", target, item.goal_id,
             )
+            continue
+        # DAG gate. A goal whose prerequisite has not landed must not be
+        # scheduled; enforcing it HERE, at selection, is what makes "B never
+        # runs before A" structural rather than a check somebody has to
+        # remember at execution time. A DEPENDENCY_FAILED goal is dropped
+        # outright — a dependent whose prerequisite is unreachable is a queue
+        # entry nothing can ever satisfy.
+        _dep = _dependency_state(item.goal_id, dag_index, settled_ids, cooldown)
+        if _dep is not None and not _dep.runnable:
+            logger.info("[GoalDiscovery] %s %s", target, _dep.render())
             continue
         if cooldown is not None:
             try:
