@@ -407,16 +407,36 @@ def _from_roadmap_goals(repo_root: Path, limit: int) -> List[DiscoveredWork]:
         from backend.core.ouroboros.governance import (  # noqa: PLC0415
             roadmap_reader as rr,
         )
-        # Resolve the roadmap against the repo we were ASKED about.
+        # Resolve the roadmap against the AUTHORITATIVE tree.
         #
-        # `roadmap_path()` returns a RELATIVE path by default, which resolves
-        # against the process cwd — so this source read the live repository's
-        # roadmap no matter which `repo_root` it was given, and discovery for
-        # one tree returned another tree's work. Harmless while exactly one
-        # repo exists; wrong the moment that stops being true, and it broke
-        # every existing discovery test that passes a tmp_path.
+        # Two wrong answers were possible here and the first fix hit the other
+        # one. `roadmap_path()` is RELATIVE by default, so resolving it against
+        # the process cwd made this read the live repo's roadmap whatever
+        # `repo_root` said (breaking every test that passes a tmp_path).
+        # Resolving it against `repo_root` alone then made it INVISIBLE in
+        # production: an op runs inside `.worktrees/<session>/`, `.jarvis/` is
+        # gitignored, and so the worktree has no roadmap at all — measured live
+        # as `0 candidate(s): 0 signed` while the same call returned 26 from
+        # the main clone.
+        #
+        # The roadmap is a property of the REPOSITORY, not of whichever
+        # worktree an op happens to execute in, and reading it is a READ.
+        # `authoritative_repo_root` is the seam this codebase already uses for
+        # exactly that distinction — reads from the authoritative tree, writes
+        # to the worktree — so coverage lookups, blast-radius scans, test
+        # discovery and now goal discovery all resolve the same way.
         _rm = rr.roadmap_path()
-        _override = _rm if _rm.is_absolute() else (Path(repo_root) / _rm)
+        if _rm.is_absolute():
+            _override = _rm
+        else:
+            try:
+                from backend.core.ouroboros.governance.execution_context import (  # noqa: E501,PLC0415
+                    authoritative_repo_root,
+                )
+                _base = authoritative_repo_root(Path(repo_root))
+            except Exception:  # noqa: BLE001 — fail-soft to the given root
+                _base = Path(repo_root)
+            _override = _base / _rm
         verdict, doc, diag = rr.read_roadmap(path_override=_override)
         if doc is None:
             if verdict is not None and str(getattr(verdict, "value", verdict)) not in (

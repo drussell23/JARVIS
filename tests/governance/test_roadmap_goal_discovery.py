@@ -247,6 +247,44 @@ def test_the_limit_is_honoured(monkeypatch, tmp_path):
     assert len(GD._from_roadmap_goals(tmp_path, 5)) == 5
 
 
+def test_the_roadmap_is_read_from_the_AUTHORITATIVE_tree(tmp_path):
+    """The production regression, and it cost a cadence run.
+
+    An op executes inside `.worktrees/<session>/`, and `.jarvis/` is
+    gitignored — so a worktree has no roadmap of its own. Resolving the
+    roadmap against the raw `repo_root` made this source return NOTHING in
+    production (`0 candidate(s): 0 signed` live, versus 26 from the main clone)
+    while every unit test passed, because tests never run from a worktree.
+
+    The roadmap is a property of the REPOSITORY, not of whichever worktree an
+    op happens to run in, and reading it is a READ — which is exactly the
+    distinction `authoritative_repo_root` already exists to make.
+    """
+    import inspect
+
+    src = inspect.getsource(GD._from_roadmap_goals)
+    assert "authoritative_repo_root" in src, (
+        "a worktree cannot see the roadmap — production goes blind"
+    )
+
+    # Behavioural: a path under .worktrees/ resolves to the parent repo.
+    from backend.core.ouroboros.governance.execution_context import (
+        authoritative_repo_root,
+    )
+    wt = tmp_path / ".worktrees" / "ouroboros__auto__bt-x"
+    wt.mkdir(parents=True)
+    assert authoritative_repo_root(wt) == tmp_path
+
+
+def test_an_absolute_roadmap_path_is_not_rebased(monkeypatch, tmp_path):
+    """An operator who pins an absolute path means that path, not one joined
+    onto whatever tree happens to be executing."""
+    import inspect
+
+    src = inspect.getsource(GD._from_roadmap_goals)
+    assert "_rm.is_absolute()" in src
+
+
 def test_a_raising_reader_never_breaks_a_pass(monkeypatch, tmp_path):
     import backend.core.ouroboros.governance.roadmap_reader as rr
 
