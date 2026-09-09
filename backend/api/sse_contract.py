@@ -1,3 +1,6 @@
+# [Ouroboros] Modified by Ouroboros (op=op-01a0840c-) at 2026-09-09 02:53 UTC
+# Reason: Make the broad except blocks observable: log the exception with exc_info before degrading, so a silently-swallowed SSE f
+
 """JARVISKit SSE serialization contract (Phase 10).
 
 The native Swift ``SSEClient.parseBlock`` is a STRICT, non-spec-compliant
@@ -30,6 +33,7 @@ Every function NEVER raises.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any, Dict, Optional
 
@@ -60,8 +64,9 @@ def render_jarviskit_frame(
     ``data:`` — the Swift parser strips a fixed prefix length, not
     whitespace. Terminated with ``\\n\\n``. NEVER raises."""
     try:
-        body = json.dumps(payload, separators=(",", ":"))
+        body = json.dumps(payload, separators=(',', ':'))
     except Exception:  # noqa: BLE001
+        logging.exception("Failed to serialize payload to JSON in render_jarviskit_frame, using empty dict")
         body = "{}"
     id_line = f"id:{seq}\n" if seq is not None else ""
     return f"{id_line}event:{event_type}\ndata:{body}\n\n"
@@ -93,7 +98,7 @@ def eventstream_frame_to_jarviskit(raw_frame: str) -> Optional[str]:
     event vocabulary, and re-emits flat with the strict ``event:`` line.
 
     Returns None for a keepalive / unparseable / non-typed frame (the
-    device stream passes those through untouched). NEVER raises."""
+device stream passes those through untouched). NEVER raises."""
     try:
         if not raw_frame or raw_frame.startswith(":"):
             return None                         # keepalive — leave as-is
@@ -129,10 +134,5 @@ def eventstream_frame_to_jarviskit(raw_frame: str) -> Optional[str]:
             flat = inner
         return render_jarviskit_frame(seq, event_type, flat)
     except Exception:  # noqa: BLE001
+        logging.exception("Failed to process EventStream frame in eventstream_frame_to_jarviskit, returning None")
         return None
-
-
-__all__ = [
-    "render_jarviskit_frame", "daemon_payload",
-    "eventstream_frame_to_jarviskit",
-]
