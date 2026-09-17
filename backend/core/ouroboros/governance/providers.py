@@ -587,6 +587,57 @@ def _max_target_line_count(target_files, repo_root) -> "Optional[int]":
         return None
 
 
+def _arm_diff_context_realignment(ctx: Any, target_file: str, rejection: str) -> None:
+    """Hand the NEXT attempt the exact reason this patch would not place.
+
+    ## Why the specific error and not just "try again"
+
+    A rejected hunk names the first locator the file does not have
+    (``_apply_unified_diff`` raises with that, deliberately). Re-prompting
+    without it asks the model to guess which of its context lines was wrong,
+    and the most likely repair is the one this whole chain exists to prevent:
+    give up on the patch and re-emit the file.
+
+    ## Reuses the retry channel that already exists
+
+    ``ctx.strategic_memory_prompt`` is the established
+    retry-after-rejection seam — ``adaptive_system_prompt`` already wraps a
+    populated one in a ``<previous_failure_context>`` envelope so the model
+    processes the violated constraint BEFORE generating. A second feedback
+    path would be a second thing to keep in agreement with it. Appended, never
+    replaced: a lesson injector or planner may have put something there first,
+    and clobbering it would trade one correction for another.
+
+    Mutates in place when the context allows it and does nothing when it does
+    not — a frozen ctx is not an error here, just an attempt that will retry
+    without the hint. NEVER raises.
+    """
+    try:
+        block = (
+            "<diff_context_realignment>\n"
+            f"Your previous unified_diff for `{target_file}` was REJECTED: "
+            f"{str(rejection)[:300]}\n"
+            "The context lines you emitted do not appear verbatim in the file. "
+            "Re-read the target region, copy the surrounding lines EXACTLY as "
+            "they are written there — including indentation and blank lines — "
+            "and emit a corrected unified_diff. Do NOT switch to full_content; "
+            "a whole-file rewrite is not an acceptable repair for a patch that "
+            "did not apply.\n"
+            "</diff_context_realignment>"
+        )
+        existing = str(getattr(ctx, "strategic_memory_prompt", "") or "")
+        merged = f"{existing}\n\n{block}" if existing else block
+        try:
+            object.__setattr__(ctx, "strategic_memory_prompt", merged)
+        except Exception:  # noqa: BLE001 — frozen ctx: retry without the hint
+            logger.debug(
+                "[DiffContextReAlignment] ctx is not writable; the retry will "
+                "not carry the rejection detail",
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _observe_prime_candidates(ctx: Any, result: Any) -> None:
     """Measure every candidate the LOCAL lane produced. NEVER raises.
 
@@ -3394,6 +3445,7 @@ def _build_lean_codegen_prompt(
     secure.  Agentic intelligence is the nervous system — adaptive,
     creative, fluid."
     """
+    _lean_primary_sha = ""
     from backend.core.ouroboros.governance.test_runner import BlockedPathError
 
     if repo_root is None:
@@ -3503,6 +3555,9 @@ def _build_lean_codegen_prompt(
 
         content = abs_path.read_text(encoding="utf-8", errors="replace")
         source_hash = _file_source_hash(content)
+        if not _lean_primary_sha:
+            # First target file's hash — what the diff schema echoes back.
+            _lean_primary_sha = source_hash
         size_bytes = len(content.encode())
         line_count = content.count("\n")
 
@@ -3561,7 +3616,33 @@ def _build_lean_codegen_prompt(
     # emitted ```json\n{...} without a closing ``` and the response was
     # truncated mid-string, breaking the extractor. Plain indentation
     # teaches the model to output raw JSON with no wrapper.
-    schema_instruction = f"""## Output Schema
+    # The 2b.1-diff branch, which this builder did not have.
+    #
+    # Measured: the lean builder is the LOCAL lane's — the only one the 30B
+    # ever sees — and it carried ZERO diff-schema references, so every local
+    # candidate came back full_content while the gate recorded
+    # "schema requested: diff" 14/14. The harness was asking for a patch in a
+    # language it never spoke to the model, and the resulting whole-file
+    # re-emissions measured 80-98% null churn.
+    #
+    # Same predicate the gate and the response parser use, and the SAME
+    # template the DW/Claude builder emits — `diff_schema_instruction` is one
+    # definition with a parameterised anchor, because the two prompts carry
+    # their source differently: the full builder front-loads a "## Source
+    # Snapshot", this one embeds a "### Target Region" and leaves the rest to
+    # `read_file`. Naming the wrong section would be worse than naming none:
+    # the model would copy context lines from a section that does not exist
+    # and every hunk would fail to place.
+    if single_file_diff_requested(ctx, force_full_content=force_full_content):
+        schema_instruction = diff_schema_instruction(
+            _lean_primary_sha,
+            source_label=(
+                'the "### Target Region" section above (call `read_file` '
+                "first if a hunk needs context outside it)"
+            ),
+        )
+    else:
+        schema_instruction = f"""## Output Schema
 
 CRITICAL OUTPUT CONTRACT: Your very first character MUST be `{{`. Do not write any prose, analysis, headers, or markdown fences before or after the JSON. The response is parsed by `json.loads` on the raw text — anything else breaks the parser.
 
@@ -3884,6 +3965,67 @@ def _should_use_lean_prompt(
     if os.environ.get("JARVIS_LEAN_PROMPT", "true").lower() == "false":
         return False
     return True
+
+
+def diff_schema_instruction(
+    primary_sha: str = "", source_label: str = 'the "## Source Snapshot" section above',
+) -> str:
+    """The 2b.1-diff output schema, verbatim — the ONE definition.
+
+    Extracted from ``_build_codegen_prompt`` so the LEAN builder (the
+    local lane's, and the only one the 30B ever sees) can emit the same
+    instruction instead of a second copy that would drift from it.
+
+    Measured before this existed: the lean builder had ZERO diff-schema
+    references, so every local candidate came back ``full_content`` while
+    the gate recorded ``schema requested: diff`` 14/14 — the harness asking
+    for a patch in a language it never spoke to the model.
+    """
+    _primary_sha = str(primary_sha or "")
+    _anchor = str(source_label or 'the "## Source Snapshot" section above')
+    return f"""## Output Schema
+## Output Schema
+
+⚠️  CRITICAL ANCHORING REQUIREMENT ⚠️
+Your unified_diff MUST use verbatim context lines copied EXACTLY from
+{_anchor}. Do NOT use your trained memory of this file.
+Count actual line numbers from the source provided — not from any cached knowledge.
+
+Idempotency check: If the required change is ALREADY PRESENT in the source shown
+above, return {{"no_op": true, "reason": "<why no change needed>"}} instead of a diff.
+
+Return a JSON object matching **exactly** this structure (schema_version: "{_SCHEMA_VERSION_DIFF}"):
+
+```json
+{{
+  "schema_version": "{_SCHEMA_VERSION_DIFF}",
+  "source_sha256": "{_primary_sha[:12] if _primary_sha else '<first-12-chars-of-sha256-from-header>'}",
+  "candidates": [
+    {{
+      "candidate_id": "c1",
+      "file_path": "<repo-relative path matching the target file>",
+      "unified_diff": "@@ -5,3 +5,4 @@\\n context\\n-old line\\n+new line\\n context",
+      "rationale": "<one sentence, max 200 chars>"
+    }}
+  ],
+  "provider_metadata": {{
+    "model_id": "<your model identifier>",
+    "reasoning_summary": "<max 200 chars>"
+  }}
+}}
+```
+
+Rules:
+- Return 1–3 candidates. c1 = primary approach, c2 = alternative.
+- `source_sha256`: echo back the first 12 chars of the SHA-256 shown in the source header.
+- `unified_diff` must be a valid GNU unified diff (no --- / +++ header needed).
+  - @@ hunk headers: `@@ -start[,count] +start[,count] @@`
+  - Prefix context lines with a space, removed lines with `-`, added lines with `+`.
+  - Context lines MUST be verbatim copies from {_anchor}.
+  - Include 3 lines of unchanged context around each change.
+- The diff must apply cleanly to the file as shown in {_anchor}.
+- Python changes must result in syntactically valid code.
+- No extra keys at any level. Return ONLY the JSON object (or the no_op object)."""
 
 
 def _build_codegen_prompt(
@@ -4331,48 +4473,7 @@ Rules:
             except OSError:
                 pass
 
-        schema_instruction = f"""## Output Schema
-
-⚠️  CRITICAL ANCHORING REQUIREMENT ⚠️
-Your unified_diff MUST use verbatim context lines copied EXACTLY from the
-"## Source Snapshot" section above. Do NOT use your trained memory of this file.
-Count actual line numbers from the source provided — not from any cached knowledge.
-
-Idempotency check: If the required change is ALREADY PRESENT in the source shown
-above, return {{"no_op": true, "reason": "<why no change needed>"}} instead of a diff.
-
-Return a JSON object matching **exactly** this structure (schema_version: "{_SCHEMA_VERSION_DIFF}"):
-
-```json
-{{
-  "schema_version": "{_SCHEMA_VERSION_DIFF}",
-  "source_sha256": "{_primary_sha[:12] if _primary_sha else '<first-12-chars-of-sha256-from-header>'}",
-  "candidates": [
-    {{
-      "candidate_id": "c1",
-      "file_path": "<repo-relative path matching the target file>",
-      "unified_diff": "@@ -5,3 +5,4 @@\\n context\\n-old line\\n+new line\\n context",
-      "rationale": "<one sentence, max 200 chars>"
-    }}
-  ],
-  "provider_metadata": {{
-    "model_id": "<your model identifier>",
-    "reasoning_summary": "<max 200 chars>"
-  }}
-}}
-```
-
-Rules:
-- Return 1–3 candidates. c1 = primary approach, c2 = alternative.
-- `source_sha256`: echo back the first 12 chars of the SHA-256 from the Source Snapshot header.
-- `unified_diff` must be a valid GNU unified diff (no --- / +++ header needed).
-  - @@ hunk headers: `@@ -start[,count] +start[,count] @@`
-  - Prefix context lines with a space, removed lines with `-`, added lines with `+`.
-  - Context lines MUST be verbatim copies from the Source Snapshot shown above.
-  - Include 3 lines of unchanged context around each change.
-- The diff must apply cleanly to the source file shown above.
-- Python changes must result in syntactically valid code.
-- No extra keys at any level. Return ONLY the JSON object (or the no_op object)."""
+        schema_instruction = diff_schema_instruction(_primary_sha)
     elif _is_bg_route:
         # BACKGROUND variant — minimal, single-candidate, explicit rationale
         # enforcement. Gemma 4 31B drops the rationale field unless we
@@ -5969,6 +6070,7 @@ def _parse_generation_response(
                     pfx, cand.get("candidate_id"), exc,
                 )
                 _record_malformed_diff_lesson(ctx, source_path, str(exc))
+                _arm_diff_context_realignment(ctx, source_path, str(exc))
                 try:
                     from backend.core.ouroboros.governance.semantic_quality_observer import (  # noqa: E501,PLC0415
                         note_malformed,
