@@ -98,6 +98,24 @@ def _quarantine_prefix() -> str:
     return raw or _DEFAULT_QUARANTINE_PREFIX
 
 
+class QuarantineIsolationFault(RuntimeError):
+    """The conflicting state could not be pinned where it would be findable.
+
+    Distinct from :class:`PromotionConflictFault`, which says the merge did not
+    apply. This says the RECORD of that failure could not be written — a
+    quarantine ref name already taken by a different commit, or a ref write
+    the repository refused. Nothing about ``main`` changes either way; what is
+    lost is the ability to find the wreckage later, which is the whole reason
+    the ref exists.
+    """
+
+    def __init__(self, reason: str, detail: str = "", ref: str = ""):
+        super().__init__(f"{reason}: {detail}"[:400])
+        self.reason = reason
+        self.detail = detail
+        self.ref = ref
+
+
 class PromotionConflictFault(RuntimeError):
     """A promotion could not complete against the tree as it stands.
 
@@ -473,15 +491,77 @@ async def _quarantine(
     it without reconstructing which branch was involved.
     """
     ref = f"{_quarantine_prefix()}/{branch.rsplit('/', 1)[-1]}-{reason}"[:200]
-    rc, _ = _git(["rev-parse", "--verify", "--quiet", ref], repo_root)
+    rc, existing = _git(["rev-parse", "--verify", "--quiet", ref], repo_root)
     if rc == 0:
-        return ref                       # already pinned; do not move it
+        pinned = (existing or "").strip()
+        rc2, want = _git(["rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"], repo_root)
+        want = (want or "").strip() if rc2 == 0 else ""
+        if pinned and want and pinned != want:
+            # A COLLISION, not a repeat: this name already describes a
+            # different failure. Overwriting it would erase one forensic
+            # record to write another, and both matter. Fail closed, keep the
+            # existing pin, and say which ref is contested.
+            raise QuarantineIsolationFault(
+                "ref_collision",
+                f"{ref} already pins {pinned[:12]}, refusing to repoint it "
+                f"at {want[:12]}",
+                ref=ref,
+            )
+        return ref                       # same state, already pinned
     rc, _ = _git(["branch", ref, sha], repo_root)
     if rc != 0:
-        logger.warning("[PromotionGate] could not pin quarantine ref %s", ref)
-        return ""
+        raise QuarantineIsolationFault(
+            "ref_write_failed", f"git refused to create {ref}", ref=ref,
+        )
     logger.warning("[PromotionGate] conflicting state pinned at %s", ref)
     return ref
+
+
+def gc_stale_worktrees(repo_root: Path) -> Tuple[int, Tuple[str, ...]]:
+    """Drop worktree administrative entries whose directories are gone.
+
+    Soaks leave these behind — an abandoned session's worktree, a repair
+    sandbox under /tmp that the OS cleared. Each one keeps a branch checked
+    out, and a branch that git believes is checked out somewhere cannot be
+    checked out here: the first attempt to work on the promoted branch failed
+    with exactly that ("already used by worktree at ...").
+
+    ``git worktree prune`` is the right tool and the safe one: it removes only
+    entries whose working directory no longer exists, so it cannot discard a
+    live tree or any uncommitted work inside one. Run AFTER forensic
+    extraction, never before — the quarantine ref is what makes the state
+    survivable, and this only cleans up bookkeeping.
+
+    Returns ``(pruned_count, names)``. NEVER raises.
+    """
+    try:
+        rc, before = _git(["worktree", "list", "--porcelain"], repo_root)
+        if rc != 0:
+            return 0, ()
+        prunable: List[str] = []
+        current = ""
+        for line in before.splitlines():
+            if line.startswith("worktree "):
+                current = line.split(" ", 1)[1].strip()
+            # `prunable` carries git's REASON on the same line ("gitdir file
+            # points to non-existent location"), so this is a prefix test, not
+            # an equality one.
+            elif line.startswith("prunable") and current:
+                prunable.append(current)
+        if not prunable:
+            return 0, ()
+        rc, _ = _git(["worktree", "prune"], repo_root)
+        if rc != 0:
+            logger.warning("[PromotionGate] worktree prune failed")
+            return 0, ()
+        logger.info(
+            "[PromotionGate] pruned %d stale worktree entr(ies): %s",
+            len(prunable), ", ".join(p.rsplit("/", 1)[-1] for p in prunable[:4]),
+        )
+        return len(prunable), tuple(prunable)
+    except Exception:  # noqa: BLE001
+        logger.debug("[PromotionGate] worktree gc degraded", exc_info=True)
+        return 0, ()
 
 
 async def promote_accumulation_commit(
@@ -555,7 +635,30 @@ async def promote_accumulation_commit(
         # A conflict is not a policy refusal: the tree moved under us. The
         # mechanism has already restored the target byte-identical, so the
         # only thing left is to make the state addressable and say so.
-        ref = await _quarantine(sha, branch, repo_root, reason=str(reason)[:40])
+        try:
+            ref = await _quarantine(sha, branch, repo_root, reason=str(reason)[:40])
+        except QuarantineIsolationFault as iso:
+            # The record could not be written. main is still untouched — that
+            # is the mechanism's guarantee, not this function's — so the
+            # verdict stands and says BOTH things went wrong, rather than
+            # silently reporting a conflict whose evidence was never pinned.
+            logger.error(
+                "[PromotionGate] %s CONFLICT and its quarantine could not be "
+                "written: %s", sha[:12], iso,
+            )
+            await _record(
+                record_lesson, sha=sha, files=_touched_files(sha, repo_root),
+                failure_class="quarantine_isolation",
+                detail=f"{reason}; quarantine failed: {iso}",
+            )
+            return PromotionVerdict(
+                False, "quarantine_isolation_fault", (sha,), findings=findings,
+                detail=f"{reason}; {iso}"[:300],
+            )
+        # Bookkeeping only, and only now that the state is pinned: a stale
+        # entry keeps a branch "checked out" somewhere that no longer exists,
+        # which is what blocked the first attempt to work on this very branch.
+        gc_stale_worktrees(repo_root)
         detail = f"{reason}: {exc}"[:300]
         logger.warning("[PromotionGate] %s CONFLICT — %s", sha[:12], detail)
         await _record(
