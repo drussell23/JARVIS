@@ -196,3 +196,16 @@ def test_no_second_retry_constant_was_introduced():
     assert "retries_remaining" in body
     for suspect in ("== 3", "> 3", "MAX_RETRIES", "= 5"):
         assert suspect not in body
+
+
+def test_an_unreadable_budget_never_cascades():
+    """Measured in bt-2026-09-17-205140: the budget was read off `ctx`, which
+    does not carry it, so every call saw 0, the ceiling collapsed to 1, and a
+    SINGLE malformed diff terminated the op — TerminalDiffCascade fired 7 times
+    and the realignment retry never ran once."""
+    SQ.note_malformed("op-unknown")
+    SQ.note_malformed("op-unknown")
+    assert SQ.diff_cascade_exhausted("op-unknown", retries_remaining=0) is False
+    assert SQ.diff_cascade_exhausted("op-unknown", retries_remaining=-1) is False
+    # ...and still fires when the budget IS known and spent.
+    assert SQ.diff_cascade_exhausted("op-unknown", retries_remaining=2) is True

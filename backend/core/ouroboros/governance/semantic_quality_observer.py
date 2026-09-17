@@ -311,11 +311,28 @@ def diff_cascade_exhausted(op_id: str, *, retries_remaining: int) -> bool:
     session, holding a worker the whole time. The lessons recorded on each
     attempt are the correction; this is the point at which we stop waiting for
     it to land.
+
+    ## An unreadable budget never cascades
+
+    Measured the hard way in soak bt-2026-09-17-205140: ``retries_remaining``
+    was read off ``ctx``, which does not carry it — the counter lives on the
+    validate runner — so every call got ``0``, the ceiling collapsed to 1, and
+    a SINGLE malformed diff terminated the op. ``TerminalDiffCascade`` fired 7
+    times and the realignment retry never ran once, because there was no retry
+    left to carry it.
+
+    A budget of zero or less is now "unknown", not "exhausted". Shedding an op
+    on a signal that could not be read is the aggressive answer to an
+    unanswerable question, and this file has argued against that three times
+    already.
     """
     try:
+        budget = int(retries_remaining)
+        if budget <= 0:
+            return False
         with _lock:
             seen = _malformed_by_op.get(str(op_id or "")[:64], 0)
-        return seen > 0 and seen >= max(1, int(retries_remaining))
+        return seen > 0 and seen >= budget
     except Exception:  # noqa: BLE001
         return False
 
