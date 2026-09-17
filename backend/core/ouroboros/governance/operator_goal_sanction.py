@@ -53,7 +53,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -221,6 +221,62 @@ def normalize_target_files(
 # ---------------------------------------------------------------------------
 
 
+def _symbol_binding_enabled() -> bool:
+    """Default ON. Binding a scope makes the cage tighter, never looser: the
+    worst case is a goal that declares symbols nothing enforces, which is
+    exactly today's state for every goal."""
+    return os.environ.get(
+        "JARVIS_GOAL_SYMBOL_BINDING_ENABLED", "true",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _bind_target_symbols(spec: "GoalSpec") -> "GoalSpec":
+    """Resolve and attach ``target_symbols`` when the spec declares none.
+
+    Composes ``target_symbol_resolver.resolve_for_goal`` — the module that owns
+    symbol parsing — against the AUTHORITATIVE tree, because a goal is a
+    property of the repository and not of whichever worktree happens to be
+    authoring it (the same distinction that made the roadmap invisible in
+    production once already).
+
+    Returns the spec unchanged on every failure path. NEVER raises.
+    """
+    try:
+        if spec.target_symbols or not _symbol_binding_enabled():
+            return spec
+        try:
+            from backend.core.ouroboros.governance.execution_context import (  # noqa: E501,PLC0415
+                authoritative_repo_root,
+            )
+            root = authoritative_repo_root(Path.cwd())
+        except Exception:  # noqa: BLE001 — fail-soft to the process root
+            root = Path.cwd()
+        from backend.core.ouroboros.governance.target_symbol_resolver import (  # noqa: E501,PLC0415
+            resolve_for_goal,
+        )
+        symbols = resolve_for_goal(
+            target_files=spec.target_files,
+            goal_text=f"{spec.title}\n{spec.description}",
+            project_root=root,
+        )
+        if not symbols:
+            logger.info(
+                "[GoalSanction] %s authored WITHOUT target_symbols — the "
+                "resolver found none in %s. The declared-symbol and scope "
+                "contracts cannot constrain this goal.",
+                spec.goal_id, ", ".join(spec.target_files[:2]) or "?",
+            )
+            return spec
+        logger.info(
+            "[GoalSanction] %s bound %d target symbol(s): %s",
+            spec.goal_id, len(symbols), ", ".join(symbols[:6]),
+        )
+        return _dc_replace(spec, target_symbols=tuple(symbols))
+    except Exception:  # noqa: BLE001
+        logger.debug("[GoalSanction] symbol binding degraded", exc_info=True)
+        return spec
+
+
 def author_and_sign_goal(
     spec: GoalSpec,
     *,
@@ -247,6 +303,26 @@ def author_and_sign_goal(
                 False, goal_id=spec.goal_id, reason="unscoped_goal",
                 detail="a goal with no target_files authorizes every file",
             )
+        # Bind the goal's SYMBOLS here, at the one seam every authoring path
+        # already funnels through — the operator CLI, the `/goal` verb, goal
+        # discovery's synthesizer and the substitution DAG.
+        #
+        # 22 of 28 roadmap goals carried none (soak bt-2026-09-17-180722), so
+        # every contract keyed on target_symbols — the declared-symbol no-op
+        # refusal and the surgical scope validator — was inert for the work
+        # the lane actually dispatches. The resolver existed, was
+        # deterministic, and ran only at GENERATE: far too late to constrain
+        # what a goal AUTHORISES. A scope declared after the fact is not a
+        # declaration, it is a description.
+        #
+        # An explicit declaration is never overridden: the operator's word
+        # outranks a resolver, always. An unresolvable file (a test synthesis
+        # goal names a file nothing has written yet) leaves the goal exactly as
+        # unscoped as it is today and says so — inventing a scope would be
+        # worse than none, because the validator would then ENFORCE the
+        # invention.
+        spec = _bind_target_symbols(spec)
+
         secret = _hmac_secret()
         if not secret:
             return SanctionResult(

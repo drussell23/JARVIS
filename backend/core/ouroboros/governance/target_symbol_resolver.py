@@ -42,6 +42,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger("Ouroboros.TargetSymbolResolver")
@@ -493,5 +494,83 @@ __all__ = [
     "METHOD_UNRESOLVED",
     "ResolutionResult",
     "ResolvedSymbol",
+    "resolve_for_goal",
     "resolve_target_symbols",
 ]
+
+
+def resolve_for_goal(
+    *,
+    target_files: Sequence[str],
+    goal_text: str,
+    project_root: "Path",
+    min_confidence: Optional[float] = None,
+) -> Tuple[str, ...]:
+    """Symbols a goal is really about, resolved from the files it names.
+
+    The goal-level wrapper around :func:`resolve_target_symbols`, which works
+    one file at a time and needs its source read for it. Lives here, beside the
+    cascade, so the one place that knows how to turn a file into symbols stays
+    the one place.
+
+    ## Why this exists
+
+    Measured in soak bt-2026-09-17-180722: **22 of 28 roadmap goals carried no
+    ``target_symbols`` at all**, so every contract keyed on them — the
+    declared-symbol no-op refusal and the surgical scope validator — was
+    silently inert for the work the lane actually dispatches. Two breaks, one
+    chain:
+
+    * no discovery source ever populated ``DiscoveredWork.symbols``, so
+      ``synthesize_and_sign`` signed every auto-authored goal with ``()``;
+    * goals authored before symbol resolution existed never acquired any.
+
+    The resolver was already built, already deterministic, and was only ever
+    called at GENERATE time — far too late to constrain what a goal AUTHORISES.
+    Resolution belongs at authoring, where the declaration is made.
+
+    ## Contract
+
+    Returns ``()`` rather than guessing when the files do not exist yet (a test
+    synthesis goal names a file nothing has written), do not parse, or resolve
+    below the cascade's confidence floor. An empty result is HONEST — it leaves
+    the goal exactly as unscoped as it is today, and the caller decides what to
+    do about that. Deliberately does NOT invent a scope: a wrong declared scope
+    is worse than none, because the validator would then enforce it.
+
+    NEVER raises.
+    """
+    out: List[str] = []
+    try:
+        root = Path(project_root)
+        for rel in list(target_files or ())[:8]:
+            name = str(rel or "").strip()
+            if not name.endswith(".py"):
+                continue
+            path = root / name
+            try:
+                if not path.is_file():
+                    continue            # nothing to read — a file yet to exist
+                source = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            result = resolve_target_symbols(
+                source=source, file_path=name, goal=str(goal_text or ""),
+                min_confidence=min_confidence,
+            )
+            # PRIMARY only — never the call-graph cluster.
+            #
+            # A declared symbol is not a hint, it is an obligation: the
+            # existing no-op contract refuses any candidate in which even ONE
+            # declared symbol is semantically unchanged. Binding the cluster
+            # would therefore demand that every call-graph neighbour be
+            # rewritten too, and refuse the correct surgical fix for touching
+            # only the function the goal was about. The cluster is blast
+            # radius — useful for context, ruinous as a promise.
+            for sym in (result.primary or ()):
+                if sym and sym not in out:
+                    out.append(sym)
+    except Exception:  # noqa: BLE001 — authoring must never break on this
+        logger.debug("[TargetSymbolResolver] goal-level resolution degraded", exc_info=True)
+        return tuple(out)
+    return tuple(out)
