@@ -64,7 +64,7 @@ def render_jarviskit_frame(
     ``data:`` — the Swift parser strips a fixed prefix length, not
     whitespace. Terminated with ``\\n\\n``. NEVER raises."""
     try:
-        body = json.dumps(payload, separators=(',', ':'))
+        body = json.dumps(payload, separators=(",", ":"))
     except Exception:  # noqa: BLE001
         logging.exception("Failed to serialize payload to JSON in render_jarviskit_frame, using empty dict")
         body = "{}"
@@ -98,7 +98,7 @@ def eventstream_frame_to_jarviskit(raw_frame: str) -> Optional[str]:
     event vocabulary, and re-emits flat with the strict ``event:`` line.
 
     Returns None for a keepalive / unparseable / non-typed frame (the
-device stream passes those through untouched). NEVER raises."""
+    device stream passes those through untouched). NEVER raises."""
     try:
         if not raw_frame or raw_frame.startswith(":"):
             return None                         # keepalive — leave as-is
@@ -136,3 +136,9 @@ device stream passes those through untouched). NEVER raises."""
     except Exception:  # noqa: BLE001
         logging.exception("Failed to process EventStream frame in eventstream_frame_to_jarviskit, returning None")
         return None
+
+
+__all__ = [
+    "render_jarviskit_frame", "daemon_payload",
+    "eventstream_frame_to_jarviskit",
+]
