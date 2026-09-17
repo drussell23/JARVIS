@@ -629,6 +629,19 @@ def _arm_diff_context_realignment(ctx: Any, target_file: str, rejection: str) ->
         merged = f"{existing}\n\n{block}" if existing else block
         try:
             object.__setattr__(ctx, "strategic_memory_prompt", merged)
+            # Armed ONLY on a successful write. The cascade is defined as "a
+            # malformed diff after the model was told why", so claiming the
+            # feedback landed when it did not would shed an op that never
+            # actually received a correction.
+            from backend.core.ouroboros.governance.semantic_quality_observer import (  # noqa: E501,PLC0415
+                note_realignment_armed,
+            )
+            note_realignment_armed(str(getattr(ctx, "op_id", "") or ""))
+            logger.info(
+                "[DiffContextReAlignment] op=%s armed for %s — the retry "
+                "carries the exact locator that failed",
+                str(getattr(ctx, "op_id", ""))[:20], target_file,
+            )
         except Exception:  # noqa: BLE001 — frozen ctx: retry without the hint
             logger.debug(
                 "[DiffContextReAlignment] ctx is not writable; the retry will "
@@ -2447,7 +2460,28 @@ def _align_hunk(
         return None
     n = len(file_lines)
     lo = max(0, orig_start - window)
-    hi = min(n, orig_start + window + 1)
+    # ANCHORED placement searches the WHOLE FILE, nearest-to-stated first.
+    #
+    # The ±window bound was the root cause of a 43% malformed-diff rate
+    # measured on the local 30B (soak bt-2026-09-17-205140). Its rejections
+    # read "Diff hunk at line 1 does not match source ... file line 26 is
+    # ...": the model stated 1, the anchor sat at 25, and the default window
+    # of 15 refused to look that far. The hunk was CORRECT and placeable; the
+    # search gave up before reaching it.
+    #
+    # A window is the wrong shape for this tier anyway. The earlier tiers use
+    # it legitimately — they compare a hunk's full text slice against a
+    # position, so a bound keeps that O(window). This tier asks a different
+    # question: WHERE does this anchor sequence occur? That question has an
+    # answer in the file or it does not, and a line number the model guessed
+    # is a hint for disambiguation, never a constraint on the search.
+    #
+    # Precision is preserved by the sequence, not the bound: every anchor must
+    # match in order, and candidates are still tried nearest-to-stated first,
+    # so a file with several matching regions still resolves to the one the
+    # model meant. Cost is one scan of a file already in memory.
+    _ = window        # retained for signature parity with the bounded tiers
+    lo, hi = 0, n
     first_key = anchors[0][1]
     for cand in sorted(range(lo, hi), key=lambda c: (abs(c - orig_start), c)):
         if file_lines[cand].strip() != first_key:
@@ -2556,7 +2590,8 @@ def validate_diff_context(original: str, diff_text: str) -> None:
         raise StaleDiffError(
             f"Diff hunk at line {orig_start + 1} does not match source — "
             f"{_diagnose_hunk(orig_lines, orig_start, ops, window)}. "
-            f"Searched ±{window} lines.",
+            f"Searched the whole file by anchor; the bounded tiers used "
+            f"±{window} lines.",
             hunk_line=orig_start + 1,
             expected_context=hunk_orig,
             actual_lines=actual,
@@ -6105,12 +6140,10 @@ def _parse_generation_response(
             # there is no second budget to keep in agreement with the FSM's.
             try:
                 from backend.core.ouroboros.governance.semantic_quality_observer import (  # noqa: E501,PLC0415
-                    diff_cascade_exhausted,
+                    diff_cascade_exhausted_after_feedback,
                 )
-                _remaining = int(getattr(ctx, "generate_retries_remaining", 0) or 0)
-                if diff_cascade_exhausted(
+                if diff_cascade_exhausted_after_feedback(
                     str(getattr(ctx, "op_id", "") or ""),
-                    retries_remaining=_remaining,
                 ):
                     logger.error(
                         "[%s] TerminalDiffCascade op=%s — every diff attempt "

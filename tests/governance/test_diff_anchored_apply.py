@@ -115,14 +115,29 @@ def test_a_context_line_the_file_lacks_is_named_in_the_error():
     assert se.value.hunk_line == 9 and "provider.is_dead()" in str(se.value)
 
 
-def test_the_window_is_one_accessor_for_both(monkeypatch):
+def test_the_precheck_and_the_apply_never_disagree(monkeypatch):
+    """The surviving intent: one placement function for both paths.
+
+    This used to also pin that a far-from-stated hunk was REJECTED at the
+    default window and accepted only at 40. That bound was the root cause of a
+    43% malformed-diff rate on the local 30B (soak bt-2026-09-17-205140) — the
+    model stated line 1 for an anchor sitting at line 25 — so the anchored tier
+    is deliberately unbounded now. What must NOT drift is the two paths' answer
+    about the same hunk, and they cannot: `validate_diff_context` and
+    `_apply_unified_diff` both place through `_align_hunk`.
+    """
     far = "@@ -40,2 +40,3 @@\n     try:\n+    y = 2\n         res = await asyncio.wait_for(provider.complete_sync())\n"
-    with pytest.raises(ValueError, match="not found within"):
-        _apply_unified_diff(FILE, far)
+    validate_diff_context(FILE, far)                    # pre-check accepts
+    assert "    y = 2\n" in _apply_unified_diff(FILE, far)   # apply agrees
+
+    # And a hunk neither can place is refused by BOTH, at any window.
+    absent = "@@ -1,2 +1,3 @@\n     this_is_not_in_the_file()\n+    z = 3\n"
     monkeypatch.setenv("OUROBOROS_DIFF_FUZZY_WINDOW", "40")
     assert _diff_fuzzy_window() == 40
-    assert "    y = 2\n" in _apply_unified_diff(FILE, far)
-    validate_diff_context(FILE, far)
+    with pytest.raises(Exception):
+        validate_diff_context(FILE, absent)
+    with pytest.raises(ValueError):
+        _apply_unified_diff(FILE, absent)
 
 
 def test_a_bare_empty_line_is_a_blank_context_line():

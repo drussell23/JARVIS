@@ -282,6 +282,11 @@ def render_report() -> str:
 #: Per-op tally of malformed diffs, for the cascade ceiling.
 _malformed_by_op: Dict[str, int] = {}
 
+#: Ops that have already been handed the reason their patch was rejected.
+#: A malformed diff from one of these is the feedback loop failing, which is
+#: what a cascade IS — no counter, no budget, no threshold.
+_realigned_ops: set = set()
+
 
 def note_malformed(op_id: str) -> int:
     """Count a malformed diff for *op_id* and return the running total."""
@@ -289,6 +294,40 @@ def note_malformed(op_id: str) -> int:
     with _lock:
         _malformed_by_op[key] = _malformed_by_op.get(key, 0) + 1
         return _malformed_by_op[key]
+
+
+def note_realignment_armed(op_id: str) -> None:
+    """Record that this op has been handed the reason its patch was rejected."""
+    with _lock:
+        _realigned_ops.add(str(op_id or "")[:64])
+
+
+def diff_cascade_exhausted_after_feedback(op_id: str) -> bool:
+    """Whether this op produced a malformed diff AFTER being told why.
+
+    ## The budget read was the bug, so there is no budget read
+
+    The previous version took ``retries_remaining`` and got it from ``ctx``,
+    which does not carry it — the counter lives on the validate runner. Every
+    call therefore saw ``0``, the ceiling collapsed to 1, and a SINGLE
+    malformed diff shed the op: ``TerminalDiffCascade`` fired 7 times while the
+    realignment retry ran 0 times. Threading the real counter down to a
+    provider would mean plumbing validate-phase state into the generation path
+    to answer a question that does not need it.
+
+    The question this actually wants to ask is not "how many tries are left"
+    but "is the feedback working". That is answerable from state this module
+    already owns: a first malformed diff arms
+    :func:`note_realignment_armed`, and a malformed diff arriving when the flag
+    is already set means the model was shown the exact locator it got wrong and
+    got it wrong again.
+
+    So there is no threshold, no budget and no constant — the cascade is
+    defined by the failure of its own correction. An op that has never been
+    given feedback is never shed by this; an op whose feedback did not land is
+    shed immediately, because the next attempt has nothing new to work with.
+    """
+    return str(op_id or "")[:64] in _realigned_ops
 
 
 def diff_cascade_exhausted(op_id: str, *, retries_remaining: int) -> bool:
@@ -341,3 +380,4 @@ def reset_for_tests() -> None:
     with _lock:
         _observations.clear()
         _malformed_by_op.clear()
+        _realigned_ops.clear()
