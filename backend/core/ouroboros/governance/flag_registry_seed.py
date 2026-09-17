@@ -1587,6 +1587,41 @@ SEED_SPECS: list = [
         since="v1.0",
     ),
     # ====================================================================
+    # Control-plane backpressure — the load-shed latch (CD-2)
+    # Registered 2026-09-17, for the same reason the diff schema above was:
+    # it governed real behaviour and was invisible to /help and the typo
+    # checker, so "is shedding on?" had no answer short of reading the
+    # module. It had also never been armed anywhere, which is why a
+    # 1739ms lag spike shed nothing.
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_CONTROL_PLANE_LOAD_SHED_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Master gate for control-plane load shedding. FALSE is "
+            "byte-identical to no shedding at all. TRUE arms two bounded "
+            "consumers: the SensorGovernor brake (low-priority sensor work "
+            "yields while an LLM stream is active AND the loop is critically "
+            "lagged) and telemetry backpressure (the TrinityEventBus "
+            "observability COPY of an already-delivered autonomy event is "
+            "dropped while loop lag exceeds the control-plane watchdog's own "
+            "starvation threshold). Never sheds subscriber delivery and never "
+            "cancels an execution thread — the shed surface is fixed at the "
+            "call sites. Drops are counted per topic "
+            "(control_plane_load_shed.shed_counts) so the gap is on the "
+            "record. Thresholds: JARVIS_LOAD_SHED_LAG_THRESHOLD_MS (sensor "
+            "latch) and JARVIS_TELEMETRY_SHED_LAG_THRESHOLD_MS (telemetry; "
+            "defaults to the watchdog's threshold rather than a second "
+            "constant)."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/control_plane_load_shed.py"
+        ),
+        example="true",
+        since="v1.0",
+    ),
+    # ====================================================================
     # Wave 3 (6) — Parallel L3 fan-out (parallel_dispatch) — 5 flags
     # Operator directive 2026-04-23: env knobs operator-visible via /help.
     # ====================================================================

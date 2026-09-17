@@ -256,6 +256,20 @@ def build(
         # drives it; the legacy route stays dead code.
         "JARVIS_WAVE3_PARALLEL_DISPATCH_ENABLED": True,
         "JARVIS_WAVE3_PARALLEL_DISPATCH_ENFORCE": True,
+        # Control-plane backpressure. The latch has existed since CD-2 and had
+        # never been armed anywhere — not here, not in `.env`, not in the flag
+        # registry — so the one thing it is for could not happen. Measured in
+        # bt-2026-09-09-024244: lag_ms=1739.6 against a 500ms threshold, 11x
+        # over, with health-probe telemetry still fanning out into the starved
+        # loop and nothing shed.
+        #
+        # Arming it turns on BOTH consumers: the SensorGovernor brake (shed
+        # low-priority sensor work while a stream is starving) and the
+        # telemetry bridge (drop the observability copy of an already-delivered
+        # event). Neither can touch a subscriber delivery or an execution
+        # thread — the shed surface is bounded at the call sites, not by this
+        # flag.
+        "JARVIS_CONTROL_PLANE_LOAD_SHED_ENABLED": True,
         # NOT armed, deliberately, each for a stated reason:
         #   JARVIS_EXPLORATION_LEDGER_ENABLED — its decision path applies score
         #     floors that REFUSE the swarm route; arming it is a regression,

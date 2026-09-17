@@ -20,6 +20,13 @@ from dataclasses import dataclass, replace as _dc_replace
 from typing import Any, Deque, Dict, List, NamedTuple, Optional, Tuple
 
 from .memory_pressure_gate import PressureLevel, get_default_gate, is_enabled as memory_gate_enabled
+from .control_plane_watchdog import recent_lag_ms as _recent_lag_ms
+from .stream_rupture import (
+    # Named for its first caller, generic in what it does: base + capped
+    # loop-lag credit, under one flag. Reused here so the local budget and the
+    # stream watchdog cannot disagree about what starvation is worth.
+    lag_compensated_inter_chunk_timeout_s as _lag_compensated_timeout_s,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2143,18 +2150,52 @@ class LocalPrimeClient:
             prompt_tokens=prompt_tokens, temperature=temperature,
             sampling=sampling,
         )
+        # Loop starvation is not model latency, and this budget could not tell
+        # the difference. `asyncio.wait_for` measures WALL time, so every
+        # millisecond the event loop spends starved is charged to the model —
+        # and then charged again, because the timeout handler feeds
+        # `record_timeout_penalty` and inflates every future budget on evidence
+        # about the loop rather than about inference.
+        #
+        # Measured in bt-2026-09-09-024244: `LocalLatencyLockup: budget=4000ms
+        # warm=True` on the plan path, 2 seconds before the watchdog reported
+        # lag_ms=1739.6 on the same loop. Roughly half that budget was never
+        # available to the model at all.
+        #
+        # CD-1 already solved this for streams (`lag_credit_s` widens the
+        # inter-chunk window by exactly the loop-busy time). Same primitive,
+        # same cap, same enable flag — a second credit policy would be a second
+        # thing to keep in agreement.
+        _lag_credit_s = _recent_lag_ms() / 1000.0
+        _budget_s = _lag_compensated_timeout_s(
+            base_s=timeout_ms / 1000.0, lag_credit_s=_lag_credit_s,
+        )
         try:
             return await asyncio.wait_for(
                 self.complete(system=system, user=user, prompt_tokens=prompt_tokens,
                               temperature=temperature, max_tokens=max_tokens,
                               sampling=sampling, response_format=response_format,
                               on_token=on_token),
-                timeout=timeout_ms / 1000.0,
+                timeout=_budget_s,
             )
         except asyncio.TimeoutError as e:
-            self.profiler.record_timeout_penalty(timeout_ms)
+            # Only penalise the profiler for latency the MODEL owns. A timeout
+            # that the credited starvation already explains says nothing about
+            # inference speed, and recording it would teach the profiler to buy
+            # ever-larger budgets to survive a busy loop.
+            _credited = max(0.0, _budget_s - timeout_ms / 1000.0)
+            if _credited <= 0.0:
+                self.profiler.record_timeout_penalty(timeout_ms)
+            else:
+                logger.warning(
+                    "[LocalPrimeClient] timeout after %.0fms budget (+%.0fms "
+                    "credited loop lag) — starvation-explained, NOT recorded "
+                    "as a model latency penalty",
+                    timeout_ms, _credited * 1000.0,
+                )
             raise LocalLatencyLockup(
                 f"local_inference timeout: budget={timeout_ms:.0f}ms "
+                f"lag_credit={_credited * 1000.0:.0f}ms "
                 f"warm={self.profiler.is_warm()}"
             ) from e
 

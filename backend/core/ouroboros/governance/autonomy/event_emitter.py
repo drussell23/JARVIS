@@ -167,17 +167,35 @@ class EventEmitter:
         await self._bridge_to_spine(event)
 
     async def _bridge_to_spine(self, event: EventEnvelope) -> None:
-        """Forward autonomy event to TrinityEventBus (non-fatal)."""
+        """Forward autonomy event to TrinityEventBus (non-fatal).
+
+        Shed under control-plane backpressure. This is the one part of ``emit``
+        that may be dropped: it is the observability COPY of an event that has
+        ALREADY been delivered to every subscriber above, it is explicitly
+        ``persist=False``, and nothing reads it to make a decision. Subscriber
+        delivery is never shed — a subscriber is a control path, and an event it
+        misses is a decision that does not happen.
+
+        Measured: lag_ms=1739.6 against a 500ms threshold while an 8-agent
+        exploration fleet ran, with health-probe telemetry still fanning out
+        into the starved loop.
+        """
         try:
-            from backend.core.trinity_event_bus import get_event_bus_if_exists
-            bus = get_event_bus_if_exists()
-            if bus is None:
-                return
             key = (
                 event.event_type.value
                 if isinstance(event.event_type, EventType)
                 else str(event.event_type)
             )
+            from backend.core.ouroboros.governance import (
+                control_plane_load_shed as _shed,
+            )
+            if _shed.telemetry_shedding():
+                _shed.note_shed(f"autonomy.{key}")
+                return
+            from backend.core.trinity_event_bus import get_event_bus_if_exists
+            bus = get_event_bus_if_exists()
+            if bus is None:
+                return
             await bus.publish_raw(
                 topic=f"autonomy.{key}",
                 data=event.payload if hasattr(event, "payload") else {},
