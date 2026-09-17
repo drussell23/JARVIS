@@ -33,6 +33,44 @@ _ENV_SCOPE_ENFORCE = "JARVIS_SURGICAL_SCOPE_ENFORCE"
 #: The failure code a candidate earns for changing what it did not declare.
 DIFF_SCOPE_VIOLATION = "diff_scope_violation"
 
+#: Prefix of a violation raised against the module's own statements rather
+#: than against a named definition. Callers distinguish these because the
+#: module-level class is the NEWEST thing the validator can see and has never
+#: been enforced in production.
+MODULE_SCOPE_MARKER = "<module scope>"
+
+
+def is_module_scope_violation(violation: str) -> bool:
+    """Whether *violation* is about module-level statements, not a definition."""
+    return str(violation or "").startswith(MODULE_SCOPE_MARKER)
+
+
+def scope_verdict(violations: Sequence[str], *, enforced: bool) -> str:
+    """What to DO about a set of scope violations: ``refuse``, ``calibrate`` or
+    ``report``.
+
+    Extracted so the policy is testable on its own. It lived inline in a
+    14,000-line orchestrator method, which is where decisions go to stop being
+    reviewable.
+
+    * nothing found, or enforcement unarmed → ``report`` (log, continue);
+    * every violation is module-level → ``calibrate``. That class is the newest
+      thing the validator can see — the resolver only just learned to name
+      bindings — so no production run has exercised it. It is credited with a
+      ``ModuleScopeCalibrationEvent`` and allowed through, which is safe rather
+      than merely hopeful: a module-level DELETION is still refused at
+      promotion by the gate's structural check, a different check in a
+      different process reading git;
+    * anything symbol-level → ``refuse``, including a mixed verdict. The
+      symbol-level half is already calibrated, and a candidate that breached
+      both does not earn the benefit of the doubt for the half that is new.
+    """
+    if not violations or not enforced:
+        return "report"
+    if all(is_module_scope_violation(v) for v in violations):
+        return "calibrate"
+    return "refuse"
+
 
 def contract_enabled() -> bool:
     return os.environ.get(_ENV_ENABLED, "true").strip().lower() not in ("0", "false", "no", "off")
@@ -178,6 +216,118 @@ def symbols_unchanged_in_candidate(
         return ()
 
 
+class _DefaultKwargPruner(ast.NodeTransformer):
+    """Drop keyword arguments that restate a stdlib callable's own default.
+
+    ``logging.exception(msg, exc_info=True)`` and ``logging.exception(msg)``
+    call the same code with the same values — ``Logger.exception`` defaults
+    ``exc_info`` to ``True``. A candidate that adds only that has changed the
+    AST and changed nothing else, which is how soak bt-2026-09-17-184946
+    produced a "real" delta out of nothing.
+
+    ## Derived, never tabulated
+
+    The defaults come from :func:`inspect.signature` of the actual callable.
+    A hardcoded list of "redundant kwargs" would freeze one stdlib version's
+    behaviour into a constant and rot silently — the same mistake the SDK
+    surface shim exists to avoid.
+
+    ## Three conditions, all required
+
+    * the call is ``module.attr(...)`` where ``module`` is bound by a plain
+      ``import module`` in this same file — a local name that merely looks
+      like a module is not one;
+    * that module is in :data:`sys.stdlib_module_names`. **Importing a project
+      module to read its signature would execute project code during
+      validation**, which is not a trade this check may make;
+    * the passed value is a literal that compares equal to the default, with
+      the same type — ``1`` is not ``True`` here, because a candidate that
+      swapped one for the other changed the source for a reader even if Python
+      would not notice.
+
+    Anything unresolvable is left alone. The failure direction matters: a
+    wrongly-pruned kwarg makes real work look trivial and refuses it, while a
+    wrongly-kept one only lets a redundant change through to the tests.
+    """
+
+    def __init__(self, module_aliases: Dict[str, str]):
+        self._aliases = module_aliases
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:  # noqa: N802
+        self.generic_visit(node)
+        try:
+            defaults = self._defaults_for(node.func)
+            if not defaults:
+                return node
+            kept = []
+            for kw in node.keywords:
+                if kw.arg is None or not isinstance(kw.value, ast.Constant):
+                    kept.append(kw)
+                    continue
+                if kw.arg not in defaults:
+                    kept.append(kw)
+                    continue
+                default = defaults[kw.arg]
+                value = kw.value.value
+                if type(default) is type(value) and default == value:
+                    continue        # restates the default — semantically null
+                kept.append(kw)
+            node.keywords = kept
+        except Exception:  # noqa: BLE001 — never let normalisation break a diff
+            pass
+        return node
+
+    def _defaults_for(self, func: ast.AST) -> Dict[str, Any]:
+        if not isinstance(func, ast.Attribute) or not isinstance(func.value, ast.Name):
+            return {}
+        module_name = self._aliases.get(func.value.id)
+        if not module_name:
+            return {}
+        import sys  # noqa: PLC0415
+
+        root = module_name.split(".", 1)[0]
+        if root not in getattr(sys, "stdlib_module_names", frozenset()):
+            return {}
+        import importlib  # noqa: PLC0415
+        import inspect as _inspect  # noqa: PLC0415
+
+        module = importlib.import_module(module_name)
+        target = getattr(module, func.attr, None)
+        if target is None or not callable(target):
+            return {}
+        out: Dict[str, Any] = {}
+        for name, param in _inspect.signature(target).parameters.items():
+            if param.default is not _inspect.Parameter.empty:
+                out[name] = param.default
+        return out
+
+
+def _module_aliases(tree: ast.Module) -> Dict[str, str]:
+    """``{local name: dotted module}`` for plain ``import x`` / ``import x as y``.
+
+    ``from x import y`` is deliberately absent: it binds a callable, not a
+    module, so ``y(...)`` is a bare call this pruner does not attempt.
+    """
+    out: Dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                out[alias.asname or alias.name.split(".")[0]] = alias.name
+    return out
+
+
+def canonical_ast_dump(source: str) -> str:
+    """``ast.dump`` of *source* with semantically null detail normalised away.
+
+    Raises ``SyntaxError`` for unparsable input — the caller decides what an
+    unparsable candidate means; it is not this function's verdict to give.
+    """
+    tree = ast.parse(source)
+    tree = _DefaultKwargPruner(_module_aliases(tree)).visit(tree)
+    ast.fix_missing_locations(tree)
+    return ast.dump(tree)
+
+
 def candidate_is_functional_noop(
     candidate: Dict[str, Any], original: Optional[str],
 ) -> bool:
@@ -219,9 +369,9 @@ def candidate_is_functional_noop(
         contents = _candidate_contents(candidate)
         if not contents:
             return False
-        before = ast.dump(ast.parse(original))
+        before = canonical_ast_dump(original)
         for content in contents:
-            if ast.dump(ast.parse(content)) != before:
+            if canonical_ast_dump(content) != before:
                 return False
         return True
     except (SyntaxError, ValueError):
@@ -230,7 +380,39 @@ def candidate_is_functional_noop(
         return False
 
 
-def _module_residue(source: str) -> Optional[str]:
+def _assign_names(node: ast.AST) -> Tuple[str, ...]:
+    """Names bound by a module-level assignment statement, or ``()``."""
+    targets: List[ast.AST] = []
+    if isinstance(node, ast.Assign):
+        targets = list(node.targets)
+    elif isinstance(node, ast.AnnAssign):
+        targets = [node.target]
+    else:
+        return ()
+    out: List[str] = []
+    stack = list(targets)
+    while stack:
+        t = stack.pop()
+        if isinstance(t, ast.Name):
+            out.append(t.id)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            stack.extend(t.elts)
+    return tuple(out)
+
+
+def _binds_only(node: ast.AST, declared: set) -> bool:
+    """Whether *node* is an assignment binding ONLY declared names.
+
+    ``A = B = ...`` is in scope only when every name it binds was declared;
+    half a declaration is not authorisation for the other half.
+    """
+    names = _assign_names(node)
+    return bool(names) and all(n in declared for n in names)
+
+
+def _module_residue(
+    source: str, declared_bindings: Optional[Iterable[str]] = None,
+) -> Optional[str]:
     """``ast.dump`` of the module's own statements — everything at module level
     that is neither a def/class nor an import.
 
@@ -249,12 +431,19 @@ def _module_residue(source: str) -> Optional[str]:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return None
+    declared = set(_clean(declared_bindings or ()))
     kept = [
         n for n in tree.body
         if not isinstance(
             n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
                 ast.Import, ast.ImportFrom),
         )
+        # A DECLARED module-level binding is in scope by definition. Without
+        # this, declaring `_FAILURE_MODE_DEFAULT` and then editing it would
+        # report a violation for doing exactly what the goal authorised — the
+        # resolver can now name such a target, so the validator has to honour
+        # the declaration or the new reach only manufactures false positives.
+        and not _binds_only(n, declared)
     ]
     return ast.dump(ast.Module(body=kept, type_ignores=[]))
 
@@ -339,13 +528,17 @@ def out_of_scope_changes(
             elif after != before:
                 violations.append(f"{name} (modified)")
         # The module's own statements — where __all__ and constants live.
-        res_before = _module_residue(original)
-        res_after = _module_residue(content)
+        # Declared bindings are excluded from BOTH sides: the goal named them,
+        # so changing them is the work, not a breach.
+        res_before = _module_residue(original, declared)
+        res_after = _module_residue(content, declared)
         if (
             res_before is not None and res_after is not None
             and res_before != res_after
         ):
-            violations.append("<module scope> (module-level statements changed)")
+            violations.append(
+                f"{MODULE_SCOPE_MARKER} (module-level statements changed)",
+            )
         return tuple(violations)
     except Exception:  # noqa: BLE001
         return ()

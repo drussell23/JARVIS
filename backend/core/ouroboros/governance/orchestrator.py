@@ -14318,16 +14318,21 @@ class GovernedOrchestrator:
         # Reported always, refused only when JARVIS_SURGICAL_SCOPE_ENFORCE is
         # armed: a brand-new refusal inside VALIDATE can only be calibrated by
         # first watching what it WOULD have refused.
+        _ds_verdict = "report"
         try:
             from backend.core.ouroboros.governance.declared_symbols import (
                 DIFF_SCOPE_VIOLATION as _ds_scope_code,
                 out_of_scope_changes as _ds_out_of_scope,
                 scope_enforced as _ds_scope_enforced,
                 scope_feedback as _ds_scope_feedback,
+                scope_verdict as _ds_scope_verdict,
             )
             _ds_scope = _ds_out_of_scope(
                 getattr(ctx, "target_symbols", ()) or (), candidate or {},
                 self._original_text_for(candidate or {}),
+            )
+            _ds_verdict = _ds_scope_verdict(
+                _ds_scope, enforced=_ds_scope_enforced(),
             )
         except Exception:  # noqa: BLE001 — contract is additive
             _ds_scope = ()
@@ -14339,7 +14344,31 @@ class GovernedOrchestrator:
                 "REFUSING" if _ds_scope_enforced() else "reporting only "
                 "(JARVIS_SURGICAL_SCOPE_ENFORCE is off)",
             )
-        if _ds_scope and _ds_scope_enforced():
+        # Shadow mode for the module-level class ONLY.
+        #
+        # Module-level statements are the newest thing this validator can see:
+        # the resolver only learned to name bindings in this change, so no
+        # production run has ever exercised a module-scope verdict. Enforcing
+        # it blind is how the governor becomes a handbrake, so a candidate
+        # whose violations are ALL module-level is reported, credited with a
+        # calibration event, and allowed through to VALIDATE.
+        #
+        # This is safe rather than merely optimistic, because the case that
+        # actually matters keeps its teeth elsewhere: a module-level SHRINK —
+        # the deleted `__all__` that started all of this — is still refused at
+        # promotion by the gate's structural check, which is a different check
+        # in a different process reading git rather than a candidate.
+        #
+        # A mixed verdict enforces: the symbol-level half is already calibrated.
+        if _ds_verdict == "calibrate":
+            logger.warning(
+                "[Validation] ModuleScopeCalibrationEvent op=%s: %s — "
+                "module-level scope is in shadow mode; NOT refusing, "
+                "proceeding to VALIDATE. A module-level deletion is still "
+                "refused at promotion by the structural check.",
+                str(getattr(ctx, "op_id", ""))[:16], ", ".join(_ds_scope),
+            )
+        if _ds_verdict == "refuse":
             return ValidationResult(
                 passed=False,
                 best_candidate=None,

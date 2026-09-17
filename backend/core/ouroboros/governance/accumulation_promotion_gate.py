@@ -439,7 +439,13 @@ def _check_semantic_delta(sha: str, repo_root: Path, base: str = "") -> Finding:
             unchanged.append(path)
             continue
         try:
-            b, a = ast.dump(ast.parse(before)), ast.dump(ast.parse(after))
+            # The SAME canonicalisation VALIDATE uses — one normaliser, or the
+            # two seams disagree about what "no change" means and a candidate
+            # refused upstream becomes promotable downstream.
+            from backend.core.ouroboros.governance.declared_symbols import (  # noqa: E501,PLC0415
+                canonical_ast_dump,
+            )
+            b, a = canonical_ast_dump(before), canonical_ast_dump(after)
         except SyntaxError:
             # Unparsable either side: fall back to bytes rather than claim a
             # no-op we cannot actually demonstrate.

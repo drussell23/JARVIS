@@ -187,10 +187,48 @@ def _safe_unparse(node: ast.AST) -> str:
         return getattr(node, "id", "") or getattr(node, "attr", "") or "?"
 
 
+def _mk_binding_symdef(node: ast.AST, name: str) -> _SymDef:
+    """A ``_SymDef`` for a module-level binding — same shape as a def's.
+
+    Deliberately the same record: every consumer downstream (the span anchor,
+    the confidence cascade, ``ResolvedSymbol``) already speaks ``_SymDef``, and
+    a parallel record for "the other kind of symbol" would be a second thing to
+    keep in agreement. A binding has no decorators and calls nothing, so those
+    fields are empty rather than absent.
+    """
+    line = int(getattr(node, "lineno", 1))
+    return _SymDef(
+        name=name,
+        basename=name,
+        start_line=line,
+        def_line=line,
+        end_line=int(getattr(node, "end_lineno", line)),
+        kind="binding",
+        decorators=(),
+        calls=set(),
+    )
+
+
 def _index(source: str) -> List[_SymDef]:
-    """Flat index of top-level functions + one level of class methods. Nested
-    functions are intentionally excluded — the swarm repairs top-level defs and
-    methods, not closures. Never raises."""
+    """Flat index of top-level functions, one level of class methods, and
+    module-level bindings. Nested functions are intentionally excluded — the
+    swarm repairs top-level defs and methods, not closures. Never raises.
+
+    ## Why bindings are indexed
+
+    The resolver knew only ``def`` and ``class``, so a goal whose work IS a
+    module-level constant could never be scoped. Measured: a real ambient red
+    asks for a ``LOCAL_DEFECT`` entry in ``_FAILURE_MODE_DEFAULT`` — a dict
+    literal at module level — and no declaration could name it. Worse, the
+    scope validator counts every module-level change as out-of-scope, so such a
+    goal was unscopeable AND would trip the validator the moment it carried any
+    symbol at all. Indexing bindings makes the declaration expressible, which
+    is what turns that from a false positive into a stated scope.
+
+    Private names are included. ``_FAILURE_MODE_DEFAULT`` is exactly the kind
+    of target a repair goal names, and privacy is a convention about importers,
+    not about what a goal may declare.
+    """
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -203,7 +241,35 @@ def _index(source: str) -> List[_SymDef]:
             for sub in node.body:
                 if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     out.append(_mk_symdef(sub, node.name))
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                for name in _binding_names(target):
+                    out.append(_mk_binding_symdef(node, name))
+        elif isinstance(node, ast.AnnAssign):
+            # An annotation without a value is a declaration, not a binding —
+            # there is nothing there for a goal to change.
+            if node.value is not None:
+                for name in _binding_names(node.target):
+                    out.append(_mk_binding_symdef(node, name))
     return out
+
+
+def _binding_names(target: ast.AST) -> List[str]:
+    """Names bound by one assignment target, tuple-unpacking included.
+
+    ``A = B = {...}`` and ``X, Y = 1, 2`` both bind more than one name, and a
+    goal may legitimately name any of them. Subscript and attribute targets
+    (``CONFIG["k"] = v``) bind nothing new and are skipped — the name they
+    mutate is already indexed at its own assignment.
+    """
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        out: List[str] = []
+        for element in target.elts:
+            out.extend(_binding_names(element))
+        return out
+    return []
 
 
 def _plan_extract_symbols(source: str) -> Set[str]:
