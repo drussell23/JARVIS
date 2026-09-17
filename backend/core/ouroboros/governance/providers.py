@@ -6038,6 +6038,21 @@ def _parse_generation_response(
         raw_cands = data.get("candidates", [])
         if not isinstance(raw_cands, list) or not raw_cands:
             raise RuntimeError(f"{pfx}_schema_invalid:candidates_empty")
+        # Snapshot the feedback state BEFORE this pass can arm it.
+        #
+        # The cascade asks "did a malformed diff arrive AFTER the model was
+        # told why", and a check made further down would read the flag THIS
+        # pass just set — the op would shed on its first rejection having never
+        # seen the correction, which is the exact failure the budget read
+        # caused before it. Measured live in bt-2026-09-17-212359: 2 malformed,
+        # 2 armed, 2 cascades, no retry in between.
+        try:
+            from backend.core.ouroboros.governance.semantic_quality_observer import (  # noqa: E501,PLC0415
+                diff_cascade_exhausted_after_feedback as _cascade_state,
+            )
+            _was_already_told = _cascade_state(str(getattr(ctx, "op_id", "") or ""))
+        except Exception:  # noqa: BLE001
+            _was_already_told = False
         rewritten: List[Dict[str, Any]] = []
         for cand in raw_cands:
             if not isinstance(cand, dict):
@@ -6136,15 +6151,13 @@ def _parse_generation_response(
             # the wall clock: with the schema now strictly diff for a
             # single-file op, a model that cannot produce a parseable patch for
             # this particular file would otherwise hold a worker until the
-            # session ends. The ceiling is the op's OWN remaining retries, so
-            # there is no second budget to keep in agreement with the FSM's.
+            # session ends.
+            #
+            # Reads the snapshot taken BEFORE this pass armed anything, so the
+            # question stays "was the model already told, and failed anyway"
+            # rather than "did we just tell it".
             try:
-                from backend.core.ouroboros.governance.semantic_quality_observer import (  # noqa: E501,PLC0415
-                    diff_cascade_exhausted_after_feedback,
-                )
-                if diff_cascade_exhausted_after_feedback(
-                    str(getattr(ctx, "op_id", "") or ""),
-                ):
+                if _was_already_told:
                     logger.error(
                         "[%s] TerminalDiffCascade op=%s — every diff attempt "
                         "failed to apply and the retry budget is spent. "

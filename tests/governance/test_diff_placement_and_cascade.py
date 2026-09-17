@@ -160,3 +160,18 @@ def test_a_writable_ctx_arms_and_carries_the_locator():
     P._arm_diff_context_realignment(ctx, "x.py", "hunk 1: 'def foo' not found")
     assert "hunk 1: 'def foo' not found" in ctx.strategic_memory_prompt
     assert SQ.diff_cascade_exhausted_after_feedback("op-w") is True
+
+
+def test_the_cascade_reads_state_from_BEFORE_this_pass():
+    """Measured live in bt-2026-09-17-212359: 2 malformed, 2 armed, 2 cascades,
+    no retry in between. The check was reading the flag the same pass had just
+    set, so the op shed on its first rejection having never seen the
+    correction — the same failure the budget read caused, by a new route."""
+    import inspect
+
+    src = inspect.getsource(P)
+    i = src.index("_was_already_told = _cascade_state")
+    j = src.index("if _was_already_told:")
+    k = src.index("_arm_diff_context_realignment(ctx, source_path, str(exc))")
+    assert i < k, "the snapshot is taken after this pass can arm the flag"
+    assert k < j, "the cascade is evaluated before the pass could arm it"
