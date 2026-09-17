@@ -57,19 +57,58 @@ def test_a_signed_goal_is_surfaced_at_all(monkeypatch, tmp_path):
     assert got[0].goal_id == "ov-dag-repair-x"
 
 
-def test_discovery_has_a_third_source():
-    src = inspect.getsource(GD.discover)
-    assert "_from_roadmap_goals" in src
-    assert "signed + reds + uncovered" in src
+def test_discovery_has_a_third_source(monkeypatch, tmp_path):
+    """Collected AND returned — asserted through the front door.
+
+    This used to pin the literal ``"signed + reds + uncovered"`` in
+    ``discover``'s source. A source-text pin cannot tell a refactor from a
+    regression: it broke when the pool was split so the coverage walk could
+    stay lazy, while the property it was guarding never moved.
+    """
+    assert "_from_roadmap_goals" in inspect.getsource(GD.discover)
+    _patch_roadmap(monkeypatch, [_Goal("ov-dag-repair-x", ["backend/api/x.py"])])
+    monkeypatch.setattr(GD, "_from_ambient_reds", lambda *a, **k: [])
+    monkeypatch.setattr(GD, "_iter_uncovered_modules", lambda *a, **k: [])
+
+    class _Ledger:
+        def satisfied_goal_ids(self, ids):
+            return frozenset()
+
+    got = asyncio.run(GD.discover(repo_root=tmp_path, settled=_Ledger(), limit=20))
+    assert [w.goal_id for w in got] == ["ov-dag-repair-x"]
 
 
-def test_the_signed_source_is_ranked_with_the_others():
+def test_the_signed_source_is_ranked_with_the_others(monkeypatch, tmp_path):
     """A source that is collected but never ranked is the same defect one step
-    later."""
-    src = inspect.getsource(GD.discover)
-    pool = src.index("pool = sorted(signed + reds + uncovered")
-    loop = src.index("for item in pool:")
-    assert pool < loop
+    later — so prove the ORDER, not the line of code that produces it.
+
+    A ``low`` priority signed goal weighs less than an ambient red. If the
+    sources were concatenated with signed privileged at the front, the signed
+    goal would take the only slot; ranked together, the red does.
+    """
+    from backend.core.ouroboros.governance.roadmap_reader import GoalPriority
+
+    _lowest = list(GoalPriority)[-1]
+    assert GD._priority_weight(_lowest) < GD._KIND_WEIGHT["ambient_red"]
+    _patch_roadmap(monkeypatch, [
+        _Goal("ov-low", ["backend/api/low.py"], priority=_lowest),
+    ])
+    monkeypatch.setattr(GD, "_iter_uncovered_modules", lambda *a, **k: [])
+    monkeypatch.setattr(GD, "_from_ambient_reds", lambda *a, **k: [
+        DiscoveredWork(
+            target_file="backend/api/red.py", kind="ambient_red",
+            evidence="t", weight=GD._KIND_WEIGHT["ambient_red"],
+        ),
+    ])
+
+    class _Ledger:
+        def satisfied_goal_ids(self, ids):
+            return frozenset()
+
+    got = asyncio.run(GD.discover(repo_root=tmp_path, settled=_Ledger(), limit=1))
+    assert [w.kind for w in got] == ["ambient_red"], (
+        "the signed source was not ranked against the others"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -145,7 +184,7 @@ def test_a_dependent_is_withheld_until_its_prerequisite_lands(monkeypatch, tmp_p
         _Goal("b", ["backend/x.py"], deps=("a",)),
     ])
     monkeypatch.setattr(GD, "_from_ambient_reds", lambda *a, **k: [])
-    monkeypatch.setattr(GD, "_from_uncovered_modules", lambda *a, **k: [])
+    monkeypatch.setattr(GD, "_iter_uncovered_modules", lambda *a, **k: [])
 
     class _Ledger:
         def satisfied_goal_ids(self, ids):
@@ -163,7 +202,7 @@ def test_the_dependent_is_released_once_the_prerequisite_lands(monkeypatch, tmp_
         _Goal("b", ["backend/x.py"], deps=("a",)),
     ])
     monkeypatch.setattr(GD, "_from_ambient_reds", lambda *a, **k: [])
-    monkeypatch.setattr(GD, "_from_uncovered_modules", lambda *a, **k: [])
+    monkeypatch.setattr(GD, "_iter_uncovered_modules", lambda *a, **k: [])
 
     class _Ledger:
         def satisfied_goal_ids(self, ids):
@@ -269,7 +308,7 @@ def test_the_cap_is_applied_after_ranking_not_during_collection(monkeypatch, tmp
         _Goal(f"old{i}", [f"backend/old{i}.py"]) for i in range(30)
     ] + [_Goal("brand-new", ["backend/new.py"])])
     monkeypatch.setattr(GD, "_from_ambient_reds", lambda *a, **k: [])
-    monkeypatch.setattr(GD, "_from_uncovered_modules", lambda *a, **k: [])
+    monkeypatch.setattr(GD, "_iter_uncovered_modules", lambda *a, **k: [])
 
     class _Ledger:
         def satisfied_goal_ids(self, ids):
@@ -285,7 +324,7 @@ def test_the_pass_cap_is_still_enforced(monkeypatch, tmp_path):
         _Goal(f"g{i}", [f"backend/x{i}.py"]) for i in range(50)
     ])
     monkeypatch.setattr(GD, "_from_ambient_reds", lambda *a, **k: [])
-    monkeypatch.setattr(GD, "_from_uncovered_modules", lambda *a, **k: [])
+    monkeypatch.setattr(GD, "_iter_uncovered_modules", lambda *a, **k: [])
 
     class _Ledger:
         def satisfied_goal_ids(self, ids):

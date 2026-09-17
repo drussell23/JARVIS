@@ -51,7 +51,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("Ouroboros.GoalDiscovery")
 
@@ -305,15 +305,27 @@ def _from_ambient_reds(
     return out
 
 
-def _from_uncovered_modules(repo_root: Path, limit: int) -> List[DiscoveredWork]:
-    """Production modules with no test file of the conventional name."""
-    out: List[DiscoveredWork] = []
+def _iter_uncovered_modules(repo_root: Path) -> Iterator[DiscoveredWork]:
+    """Production modules with no test file of the conventional name.
+
+    A GENERATOR, and that is the whole point. Every source in this module is
+    now UNCAPPED at collection, because a cap applied before the pass's filters
+    have run decides WHICH work is eligible rather than how much of it a pass
+    takes on — the defect measured live on the roadmap source (48 passes at
+    ``0 candidate(s)``, see ``_from_roadmap_goals``).
+
+    The roadmap could simply be collected whole: the document is bounded. A
+    filesystem walk is not, and enumerating every module on every pass is the
+    expensive tier this loop exists to avoid. Yielding lazily gets both
+    properties at once — the ranking loop pulls exactly as far as it needs, so
+    truncation happens AFTER the filters, and the walk still stops early.
+
+    Raises nothing: a walk that breaks mid-iteration yields what it had.
+    """
     try:
         tests_root = repo_root / "tests"
         known = {p.name for p in tests_root.rglob("test_*.py")} if tests_root.exists() else set()
         for src in (repo_root / "backend").rglob("*.py"):
-            if len(out) >= limit:
-                break
             rel = str(src.relative_to(repo_root)).replace("\\", "/")
             if _is_test_file(rel) or _is_governance(rel):
                 continue
@@ -329,15 +341,29 @@ def _from_uncovered_modules(repo_root: Path, limit: int) -> List[DiscoveredWork]
             # The TARGET is the test file to be created — the goal's scope
             # must name what gets WRITTEN, or the cage refuses the op as
             # unsanctioned when it tries to create a path outside its mandate.
-            out.append(DiscoveredWork(
+            yield DiscoveredWork(
                 target_file=f"tests/test_{src.stem}.py",
                 subject_file=rel,
                 kind="uncovered_module",
                 evidence=f"no tests/**/test_{src.stem}.py exists",
                 weight=_KIND_WEIGHT["uncovered_module"],
-            ))
+            )
     except Exception as exc:  # noqa: BLE001
         logger.warning("[GoalDiscovery] coverage scan degraded: %r", exc)
+
+
+def _from_uncovered_modules(repo_root: Path, limit: int) -> List[DiscoveredWork]:
+    """The first *limit* uncovered modules, as a list.
+
+    Retained as the named seam the tests and any direct caller already use;
+    ``discover`` consumes :func:`_iter_uncovered_modules` directly so the cap
+    lands after filtering rather than before it.
+    """
+    out: List[DiscoveredWork] = []
+    for item in _iter_uncovered_modules(repo_root):
+        if len(out) >= limit:
+            break
+        out.append(item)
     return out
 
 
@@ -628,6 +654,120 @@ def _dependency_state(
         return None
 
 
+class _EligibilityGate:
+    """The pass's one filter. Every source is judged by this and nothing else.
+
+    Extracted from ``discover``'s ranking loop so the coverage walk can be
+    truncated AFTER filtering instead of before it. A second copy of these
+    rules living next to a source is the duplication that lets two filters
+    disagree — the reason ``_from_roadmap_goals`` deliberately filters nothing.
+
+    Two entry points, because the checks have different costs:
+
+    * :meth:`cheap_ok` — dedupe, the governance cage and the cooldown. Pure
+      in-memory; safe to run against a lazy walk.
+    * :meth:`admit` — everything in ``cheap_ok`` plus the two id-keyed
+      questions that need a resolved ``settled_ids`` set. Marks the target seen
+      ON ACCEPTANCE ONLY, so a candidate dropped for satisfaction never
+      shadows a later one.
+    """
+
+    def __init__(self, *, dag_index: Dict[str, Dict[str, Any]], cooldown: Any) -> None:
+        self._dag_index = dag_index
+        self._cooldown = cooldown
+        self.seen: set = set()
+
+    def cheap_ok(self, item: "DiscoveredWork") -> bool:
+        """The ledger-free half of the gate. NEVER raises."""
+        target = item.target_file
+        if target in self.seen or _is_governance(target):
+            return False
+        if self._cooldown is not None:
+            try:
+                if self._cooldown.is_cooling(target):
+                    logger.info(
+                        "[GoalDiscovery] %s is cooling — skipped this pass", target,
+                    )
+                    return False
+            except Exception:  # noqa: BLE001
+                pass
+        return True
+
+    def admit(self, item: "DiscoveredWork", settled_ids: frozenset) -> bool:
+        """Whether this pass may take *item* on. NEVER raises."""
+        if not self.cheap_ok(item):
+            return False
+        target = item.target_file
+        # THE re-discovery spin. Discovery reads the WORKING TREE; autonomous
+        # work commits to an accumulation branch. So a landed goal is still
+        # "uncovered" here, gets re-selected, and the only brake -- the
+        # cooldown -- had just been CLEARED by its own success.
+        #
+        # Measured, bt-2026-09-08-225144: after
+        # ov-auto-uncovered-module-apply-emergency-cpu-fix landed at 16:14:41
+        # (sha bb575e9b28, recorded SATISFIED), passes 8-36 re-dispatched it
+        # 29 times in 8 seconds. Each repeat was correctly refused downstream
+        # (`fc=duplication`), so nothing corrupt was written -- but it consumed
+        # the discoverable targets and left the last 17 minutes of the session
+        # idle.
+        #
+        # The ledger's own docstring already called itself "the SAME one that
+        # stops a satisfied goal being re-dispatched". It was, at the point of
+        # SCORING a dispatch that had already happened. Nothing asked it before
+        # choosing. This is that question, asked first.
+        if item.goal_id and item.goal_id in settled_ids:
+            logger.info(
+                "[GoalDiscovery] %s already SATISFIED (%s) — not re-selecting "
+                "work that has landed", target, item.goal_id,
+            )
+            return False
+        # DAG gate. A goal whose prerequisite has not landed must not be
+        # scheduled; enforcing it HERE, at selection, is what makes "B never
+        # runs before A" structural rather than a check somebody has to
+        # remember at execution time. A DEPENDENCY_FAILED goal is dropped
+        # outright — a dependent whose prerequisite is unreachable is a queue
+        # entry nothing can ever satisfy.
+        _dep = _dependency_state(
+            item.goal_id, self._dag_index, settled_ids, self._cooldown,
+        )
+        if _dep is not None and not _dep.runnable:
+            logger.info("[GoalDiscovery] %s %s", target, _dep.render())
+            return False
+        self.seen.add(target)
+        return True
+
+
+def _take_cheap(
+    walk: Iterator["DiscoveredWork"], gate: "_EligibilityGate", limit: int,
+) -> List["DiscoveredWork"]:
+    """Pull up to *limit* items off *walk* that clear the gate's cheap half.
+
+    Blocking by design — the walk is filesystem I/O, so ``discover`` runs this
+    in a thread. Resumable: the generator keeps its position, so a batch whose
+    members are later dropped for satisfaction is followed by the NEXT
+    candidates rather than by the same ones.
+
+    Intra-batch dedupe is its own set because the gate marks a target seen only
+    when it is accepted, and two modules in different packages can share a stem
+    (``backend/a/foo.py`` and ``backend/b/foo.py`` both name
+    ``tests/test_foo.py``).
+    """
+    out: List["DiscoveredWork"] = []
+    pending: set = set()
+    if limit <= 0:
+        return out
+    for item in walk:
+        if item.target_file in pending:
+            continue
+        if not gate.cheap_ok(item):
+            continue
+        pending.add(item.target_file)
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
+
+
 async def discover(
     *,
     repo_root: Path,
@@ -677,22 +817,6 @@ async def discover(
     except Exception:  # noqa: BLE001
         signed = []
 
-    uncovered: List[DiscoveredWork] = []
-    # The coverage scan IS still capped: it walks the filesystem, its order is
-    # arbitrary so truncation costs nothing meaningful, and enumerating every
-    # module on every pass is the expensive tier this loop exists to avoid.
-    # `signed` is not subtracted from its budget — signed goals are frequently
-    # filtered out downstream (satisfied, cooling, dependency-blocked), and
-    # letting them pre-empt the cheap tier's budget would leave a pass with
-    # nothing to fall back on.
-    if len(reds) < cap:
-        try:
-            uncovered = await asyncio.to_thread(
-                _from_uncovered_modules, Path(repo_root), cap - len(reds),
-            )
-        except Exception:  # noqa: BLE001
-            uncovered = []
-
     if cooldown is None:
         try:
             from backend.core.ouroboros.governance.autonomy.sentinel_cooldown import (  # noqa: E501,PLC0415
@@ -702,65 +826,71 @@ async def discover(
         except Exception:  # noqa: BLE001
             cooldown = None
 
-    pool = sorted(signed + reds + uncovered, key=lambda w: -w.weight)
-    # Work already SATISFIED is not work. Resolved once for the whole pool
-    # (one ledger read, one git pass) rather than per candidate.
-    settled_ids = await _settled_goal_ids(pool, repo_root=Path(repo_root), settled=settled)
+    # Both document sources are collected WHOLE; the filesystem walk stays
+    # lazy. Nothing is truncated before the filters run.
+    documented = sorted(signed + reds, key=lambda w: -w.weight)
     # The roadmap's dependency edges, read once for the whole pass.
     dag_index = await _dag_index()
-
-    seen: set = set()
+    gate = _EligibilityGate(dag_index=dag_index, cooldown=cooldown)
     ranked: List[DiscoveredWork] = []
-    for item in pool:
-        target = item.target_file
-        if target in seen or _is_governance(target):
-            continue
-        # THE re-discovery spin. Discovery reads the WORKING TREE; autonomous
-        # work commits to an accumulation branch. So a landed goal is still
-        # "uncovered" here, gets re-selected, and the only brake -- the
-        # cooldown -- had just been CLEARED by its own success.
-        #
-        # Measured, bt-2026-09-08-225144: after
-        # ov-auto-uncovered-module-apply-emergency-cpu-fix landed at 16:14:41
-        # (sha bb575e9b28, recorded SATISFIED), passes 8-36 re-dispatched it
-        # 29 times in 8 seconds. Each repeat was correctly refused downstream
-        # (`fc=duplication`), so nothing corrupt was written -- but it consumed
-        # the discoverable targets and left the last 17 minutes of the session
-        # idle.
-        #
-        # The ledger's own docstring already called itself "the SAME one that
-        # stops a satisfied goal being re-dispatched". It was, at the point of
-        # SCORING a dispatch that had already happened. Nothing asked it before
-        # choosing. This is that question, asked first.
-        if item.goal_id and item.goal_id in settled_ids:
-            logger.info(
-                "[GoalDiscovery] %s already SATISFIED (%s) — not re-selecting "
-                "work that has landed", target, item.goal_id,
-            )
-            continue
-        # DAG gate. A goal whose prerequisite has not landed must not be
-        # scheduled; enforcing it HERE, at selection, is what makes "B never
-        # runs before A" structural rather than a check somebody has to
-        # remember at execution time. A DEPENDENCY_FAILED goal is dropped
-        # outright — a dependent whose prerequisite is unreachable is a queue
-        # entry nothing can ever satisfy.
-        _dep = _dependency_state(item.goal_id, dag_index, settled_ids, cooldown)
-        if _dep is not None and not _dep.runnable:
-            logger.info("[GoalDiscovery] %s %s", target, _dep.render())
-            continue
-        if cooldown is not None:
+
+    async def _rank(batch: Sequence[DiscoveredWork]) -> None:
+        """Admit as much of *batch* as the cap still allows.
+
+        One batched ledger read per call — ``satisfied_goal_ids`` answers for a
+        whole group, so asking it per candidate would turn one file read into
+        N. Splitting the pass into a few batches is the price of never
+        truncating before the filter, and a ledger read is not a git pass.
+        """
+        if not batch or len(ranked) >= cap:
+            return
+        settled_ids = await _settled_goal_ids(
+            batch, repo_root=Path(repo_root), settled=settled,
+        )
+        for item in batch:
+            if len(ranked) >= cap:
+                return
+            if gate.admit(item, settled_ids):
+                ranked.append(item)
+
+    # The cheap tier's weight is FIXED for every item it yields, so the global
+    # ranking is exact without materialising the walk: everything that outranks
+    # an uncovered module is considered first, the walk fills whatever the cap
+    # still has room for, and the lower-weight tail follows.
+    _uncovered_weight = _KIND_WEIGHT["uncovered_module"]
+    await _rank([w for w in documented if w.weight >= _uncovered_weight])
+
+    # THE BUDGET DEFECT, second instance — same class as the roadmap cap, and
+    # it survived that fix. The coverage scan used to be sized
+    # `cap - len(reds)` and skipped entirely when `len(reds) >= cap`, both read
+    # from the RAW red count. Reds are filtered downstream (satisfied, cooling,
+    # dependency-blocked) and several failing tests routinely collapse onto one
+    # subject file, so a pass could hold `cap` reds, admit one, and still
+    # refuse to look at the cheap tier — the same "decide eligibility before
+    # filtering" mistake, one source over.
+    #
+    # The shortfall is now measured from candidates that SURVIVED the gate, and
+    # the walk is pulled until that shortfall is filled or the tree is
+    # exhausted. `_take_cheap` runs off the loop: it is filesystem I/O.
+    if len(ranked) < cap:
+        # `iter()` is load-bearing, not decoration: the batches must resume
+        # where the previous one stopped. A source that returns a re-iterable
+        # (a list — which is exactly what a test double supplies) would
+        # otherwise hand back the same candidates every round, and a batch the
+        # ledger prunes without marking anything seen would never terminate.
+        walk = iter(_iter_uncovered_modules(Path(repo_root)))
+        while len(ranked) < cap:
             try:
-                if cooldown.is_cooling(target):
-                    logger.info(
-                        "[GoalDiscovery] %s is cooling — skipped this pass", target,
-                    )
-                    continue
-            except Exception:  # noqa: BLE001
-                pass
-        seen.add(target)
-        ranked.append(item)
-        if len(ranked) >= cap:
-            break
+                batch = await asyncio.to_thread(
+                    _take_cheap, walk, gate, cap - len(ranked),
+                )
+            except Exception:  # noqa: BLE001 — a source may never break a pass
+                break
+            if not batch:
+                break
+            await _rank(batch)
+
+    await _rank([w for w in documented if w.weight < _uncovered_weight])
     logger.info(
         "[GoalDiscovery] %d candidate(s): %d signed, %d red, %d uncovered",
         len(ranked),
