@@ -48,6 +48,8 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -148,6 +150,130 @@ def _graduation_ledger_path() -> Path:
 
 def _sessions_root() -> Path:
     return _resolve_repo_root() / ".ouroboros" / "sessions"
+
+
+# ---------------------------------------------------------------------------
+# State reconciliation — a session that never wrote its own ending
+# ---------------------------------------------------------------------------
+
+#: Outcomes that describe a session still believed to be running. A session
+#: sitting in one of these long after its own wall deadline is not running; it
+#: is unreconciled, and reconciling it is what this exists for.
+_NON_TERMINAL_OUTCOMES: frozenset = frozenset({"", "in_flight", "running", "unknown"})
+
+
+def _derive_terminal_state(
+    payload: Dict[str, Any], session_dir: Optional[Path],
+) -> Optional[Tuple[str, str, str]]:
+    """``(outcome, stop_reason, notes)`` for a session that never recorded one.
+
+    Derived ONLY from what the session itself durably wrote — its declared wall
+    deadline (``wall_deadline.json``) and its last heartbeat
+    (``heartbeat.tick``). Nothing here estimates, and nothing here invents a
+    staleness constant: the session already declared the instant after which it
+    cannot still be running, so that is the instant used.
+
+    Returns ``None`` when the evidence does not settle the question — a session
+    whose deadline has not passed may genuinely still be running, and guessing
+    would replace an honest "unreconciled" with a confident wrong answer.
+
+    The two terminal shapes mean opposite things about the run:
+
+    * ``wall_clock_exhausted`` — it used its whole budget. A capacity fact.
+    * ``abandoned`` before the deadline — the heartbeat stopped with budget
+      still on the clock: the process vanished (terminal closed, host killed
+      it, crash). Measured on bt-2026-09-09-024244: 802s left unspent.
+
+    NEVER raises.
+    """
+    if session_dir is None:
+        return None
+    try:
+        deadline = 0.0
+        cap_s = 0.0
+        wall_path = session_dir / "wall_deadline.json"
+        if wall_path.is_file():
+            with wall_path.open("r", encoding="utf-8") as f:
+                wall = json.load(f)
+            deadline = float(wall.get("deadline_wall", 0) or 0)
+            cap_s = float(wall.get("cap_s", 0) or 0)
+        if deadline <= 0:
+            return None
+        if time.time() <= deadline:
+            return None                    # may still be running — say nothing
+
+        last_beat = 0.0
+        beat_path = session_dir / "heartbeat.tick"
+        if beat_path.is_file():
+            try:
+                last_beat = float(beat_path.read_text(encoding="utf-8").strip() or 0)
+            except (OSError, ValueError):
+                last_beat = 0.0
+        if last_beat <= 0:
+            try:
+                last_beat = float(payload.get("last_activity_ts", 0) or 0)
+            except (TypeError, ValueError):
+                last_beat = 0.0
+
+        if last_beat <= 0:
+            return (
+                "abandoned", "no_heartbeat",
+                f"derived: {time.time() - deadline:.0f}s past its own deadline, "
+                f"no heartbeat recorded",
+            )
+        silence_s = deadline - last_beat
+        if silence_s <= 0:
+            return (
+                "wall_clock_exhausted", "wall_deadline",
+                f"derived: heartbeat ran to its {cap_s:.0f}s wall",
+            )
+        return (
+            "abandoned", "abandoned_before_deadline",
+            f"derived: heartbeat stopped {silence_s:.0f}s before its own "
+            f"{cap_s:.0f}s wall deadline",
+        )
+    except Exception:  # noqa: BLE001 — reconciliation may never break ingest
+        logger.debug("[SessionArchive] terminal derivation failed", exc_info=True)
+        return None
+
+
+def _landing_commits(session_id: str) -> Tuple[str, ...]:
+    """Commits the autonomous lane produced for *session_id*.
+
+    Autonomous work lands on an ``ouroboros/auto/<session>-<n>`` accumulation
+    branch and stays there until an operator promotes it, so a landing is
+    invisible to anything that only looks at the checked-out tree. The branch
+    NAME carries the session id — the harness put it there — so the binding
+    needs no trailer parse and no full-history scan.
+
+    Bounded and best-effort: refs only, a short timeout, and any failure yields
+    an empty tuple. NEVER raises.
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return ()
+    try:
+        root = _resolve_repo_root()
+        refs = subprocess.run(
+            ["git", "for-each-ref", "--format=%(refname:short)",
+             "refs/heads/ouroboros/auto"],
+            cwd=str(root), capture_output=True, text=True, timeout=10.0,
+        )
+        if refs.returncode != 0:
+            return ()
+        branches = [b for b in refs.stdout.split() if sid in b]
+        out: List[str] = []
+        for branch in branches:
+            log = subprocess.run(
+                ["git", "log", "--format=%H", "main.." + branch],
+                cwd=str(root), capture_output=True, text=True, timeout=10.0,
+            )
+            if log.returncode == 0:
+                out.extend(s for s in log.stdout.split() if s)
+        return tuple(dict.fromkeys(out))
+    except Exception:  # noqa: BLE001
+        logger.debug("[SessionArchive] landing lookup degraded", exc_info=True)
+        return ()
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +550,7 @@ class SessionArchive:
                 continue
             record = self._record_from_summary(
                 session_id=str(entry.name), payload=payload,
+                session_dir=entry,
             )
             if record is None:
                 continue
@@ -502,7 +629,22 @@ class SessionArchive:
     @staticmethod
     def _record_from_summary(
         *, session_id: str, payload: Dict[str, Any],
+        session_dir: Optional[Path] = None,
     ) -> Optional[SessionRecord]:
+        """One archive row from a session's own ``summary.json``.
+
+        ``session_outcome`` used to be read by nobody here, so a session that
+        never wrote a terminal state could never acquire one: the field was
+        dropped on the floor at ingest and ``_merge_row`` did not carry
+        ``outcome`` at all. Measured on bt-2026-09-09-024244, cut off mid-op —
+        ``session_outcome: in_flight, stop_reason: unknown``, eight days later
+        still in flight as far as anything reading this index was concerned.
+
+        A session that recorded its own outcome is AUTHORITATIVE and is passed
+        through untouched. Derivation runs only where the record is absent or
+        still in flight, and only from the session's own durable evidence —
+        see :func:`_derive_terminal_state`.
+        """
         sid = str(session_id).strip()
         if not sid:
             return None
@@ -516,17 +658,45 @@ class SessionArchive:
             cost = 0.0
         stats = payload.get("stats") or {}
         try:
+            # Schema v2 summaries carry no op stats at all; this stays 0 rather
+            # than inventing a count the file does not contain.
             ops = int(stats.get("attempted", 0) or 0)
         except (TypeError, ValueError):
             ops = 0
+        outcome = str(payload.get("session_outcome", "") or "").strip()
+        stop_reason = str(payload.get("stop_reason", "") or "")
+        notes = ""
+        if outcome in _NON_TERMINAL_OUTCOMES:
+            derived = _derive_terminal_state(payload, session_dir)
+            if derived is not None:
+                outcome, stop_reason, notes = derived
+        try:
+            started = float(payload.get("started_at", 0) or 0)
+        except (TypeError, ValueError):
+            started = 0.0
+        try:
+            ended = float(payload.get("last_activity_ts", 0) or 0)
+        except (TypeError, ValueError):
+            ended = 0.0
+        landings = _landing_commits(sid)
+        if landings:
+            # The session's work product, bound to the session that made it.
+            # Without this the index cannot tell a run that LANDED from one
+            # that produced nothing — which is the only metric the current
+            # milestone is measured by.
+            notes = "; ".join(
+                x for x in (notes, "landed=" + ",".join(s[:12] for s in landings)) if x
+            )
         return SessionRecord(
             session_id=sid,
+            started_at_epoch=started,
+            ended_at_epoch=ended,
             duration_s=dur,
+            outcome=outcome,
             cost_usd=cost,
             ops_count=ops,
-            stop_reason=str(
-                payload.get("stop_reason", "") or "",
-            ),
+            stop_reason=stop_reason,
+            notes=notes,
             session_type="manual",
         )
 
@@ -566,7 +736,14 @@ class SessionArchive:
         """COALESCE-style merge: preserve existing non-empty
         fields, fill empty/zero fields from the new record.
         Used when later sources (graduation ledger, summary.json)
-        complement an existing live_fire row."""
+        complement an existing live_fire row.
+
+        ``outcome`` was absent from this UPDATE entirely, so a row that
+        arrived without one could never acquire one from a later source —
+        the other half of why a cut-off session stayed unreconciled. It is
+        merged under the same rule as every other field: an outcome the
+        session RECORDED wins over a derived one, always. A snapshot is
+        completed here, never corrected."""
         cur = conn.execute(
             "SELECT session_id FROM session_index "
             "WHERE session_id = ?",
@@ -595,6 +772,10 @@ class SessionArchive:
             "ops_count = CASE "
             "  WHEN ops_count <= 0 THEN ? "
             "  ELSE ops_count END, "
+            "outcome = CASE "
+            "  WHEN outcome = '' OR outcome IN "
+            "       ('in_flight', 'running', 'unknown') THEN ? "
+            "  ELSE outcome END, "
             "stop_reason = CASE "
             "  WHEN stop_reason = '' THEN ? "
             "  ELSE stop_reason END, "
@@ -611,6 +792,7 @@ class SessionArchive:
                 float(rec.duration_s),
                 float(rec.cost_usd),
                 int(rec.ops_count),
+                rec.outcome[:64],
                 rec.stop_reason[:128],
                 rec.notes[:512],
                 rec.recorded_by[:64],
