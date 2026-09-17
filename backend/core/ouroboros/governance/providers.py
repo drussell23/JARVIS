@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import threading
 import base64
 import contextlib
 import contextvars
@@ -26,6 +27,7 @@ import hashlib
 import json
 import logging
 import os
+from collections import OrderedDict
 import re
 import time
 from dataclasses import dataclass
@@ -585,6 +587,86 @@ def _max_target_line_count(target_files, repo_root) -> "Optional[int]":
         return best
     except Exception:  # noqa: BLE001
         return None
+
+
+#: Rejected hunks awaiting a heal, keyed by op. Bounded; the newest op wins.
+_HEALABLE: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
+_HEALABLE_LOCK = threading.Lock()
+
+
+def _healable_max() -> int:
+    """How many ops may hold parked rejections — derived from the pool, so a
+    bigger fleet keeps more and a single-worker lane keeps almost none."""
+    try:
+        return max(4, int(os.environ.get("JARVIS_BG_POOL_SIZE", "3") or 3) * 4)
+    except (TypeError, ValueError):
+        return 12
+
+
+def _park_healable_rejection(
+    ctx: Any, *, file_path: str, unified_diff: str, rejection: str,
+    candidate_id: str, source: str,
+) -> None:
+    """Record a rejected hunk for the async layer to attempt a heal on."""
+    try:
+        oid = str(getattr(ctx, "op_id", "") or "")
+        if not oid or not unified_diff:
+            return
+        with _HEALABLE_LOCK:
+            rows = _HEALABLE.setdefault(oid, [])
+            rows.append({
+                "file_path": file_path, "unified_diff": unified_diff,
+                "rejection": rejection, "candidate_id": candidate_id,
+                "source": source,
+            })
+            _HEALABLE.move_to_end(oid)
+            while len(_HEALABLE) > _healable_max():
+                _HEALABLE.popitem(last=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def take_healable_rejections(op_id: str) -> List[Dict[str, Any]]:
+    """Drain the parked rejections for an op. Draining is the point: a heal is
+    attempted once per rejection, never re-attempted from stale state."""
+    try:
+        with _HEALABLE_LOCK:
+            return _HEALABLE.pop(str(op_id or ""), []) or []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _attest_declare(ctx: Any, capability: str, detail: str = "") -> None:
+    """Declare a capability armed for this op. NEVER raises, never blocks."""
+    try:
+        from backend.core.ouroboros.governance.capability_assurance import (  # noqa: E501,PLC0415
+            declare_capability,
+        )
+        declare_capability(str(getattr(ctx, "op_id", "") or ""), capability, detail)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _attest_redeem(ctx: Any, capability: str, detail: str = "") -> None:
+    """Record that a declared capability was actually exercised."""
+    try:
+        from backend.core.ouroboros.governance.capability_assurance import (  # noqa: E501,PLC0415
+            redeem_capability,
+        )
+        redeem_capability(str(getattr(ctx, "op_id", "") or ""), capability, detail)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _attest_revoke(ctx: Any, capability: str, reason: str) -> None:
+    """Record a legitimate branch away from a declared capability."""
+    try:
+        from backend.core.ouroboros.governance.capability_assurance import (  # noqa: E501,PLC0415
+            revoke_capability,
+        )
+        revoke_capability(str(getattr(ctx, "op_id", "") or ""), capability, reason)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _arm_diff_context_realignment(ctx: Any, target_file: str, rejection: str) -> None:
@@ -3669,6 +3751,11 @@ def _build_lean_codegen_prompt(
     # the model would copy context lines from a section that does not exist
     # and every hunk would fail to place.
     if single_file_diff_requested(ctx, force_full_content=force_full_content):
+        # DECLARE: this prompt asks for a patch. If nothing downstream redeems
+        # it, the op emitted whole content against a schema that was armed,
+        # capability-resolved and requested — the exact 14/14 case measured in
+        # bt-2026-09-17-205140, which no test could see.
+        _attest_declare(ctx, "diff_schema", "lean builder emitted 2b.1-diff")
         schema_instruction = diff_schema_instruction(
             _lean_primary_sha,
             source_label=(
@@ -6058,6 +6145,14 @@ def _parse_generation_response(
             if not isinstance(cand, dict):
                 continue
             unified_diff = cand.get("unified_diff", "")
+            if unified_diff:
+                # REDEEM: the model answered in the schema the prompt asked
+                # for. Redeemed on ARRIVAL, not on successful apply — the
+                # capability is "the model was asked for a patch and produced
+                # one"; whether that patch places is the diff ladder's
+                # question, and conflating the two would report a wiring
+                # defect every time a model emitted a bad hunk.
+                _attest_redeem(ctx, "diff_schema", "unified_diff returned")
             if not unified_diff or not orig_content:
                 logger.warning("[%s] Skipping diff candidate %s: no diff/source", pfx, cand.get("candidate_id"))
                 continue
@@ -6121,6 +6216,16 @@ def _parse_generation_response(
                 )
                 _record_malformed_diff_lesson(ctx, source_path, str(exc))
                 _arm_diff_context_realignment(ctx, source_path, str(exc))
+                # Park the rejection for the ASYNC layer to heal. The healer
+                # needs a model call and this parser is synchronous; driving a
+                # coroutine from here would mean reaching into the running loop
+                # from a frame it is already executing. The caller owns the
+                # await, this owns the evidence.
+                _park_healable_rejection(
+                    ctx, file_path=source_path, unified_diff=unified_diff,
+                    rejection=str(exc), candidate_id=str(cand.get("candidate_id", "")),
+                    source=orig_content,
+                )
                 try:
                     from backend.core.ouroboros.governance.semantic_quality_observer import (  # noqa: E501,PLC0415
                         note_malformed,
@@ -6861,6 +6966,70 @@ class PrimeProvider:
                 ),
             )
 
+    async def _heal_rejected_diffs(
+        self, context: "OperationContext", exc: Exception, *, deadline: Any,
+    ) -> "Optional[GenerationResult]":
+        """One heal round over the hunks this op's parse rejected.
+
+        Composes :mod:`diff_healer` (the repair policy), ``self.plan`` (the
+        one-shot local seam the ContextExpander already uses) and
+        ``_apply_unified_diff`` (the existing ladder). Nothing here talks to a
+        transport or parses a diff itself.
+
+        Returns a ``GenerationResult`` built from the healed candidates, or
+        ``None`` when nothing could be healed — in which case the caller
+        re-raises the original failure unchanged, so a heal that does not take
+        is indistinguishable from never having tried.
+        """
+        if "diff_apply_failed_all_candidates" not in str(exc):
+            return None
+        try:
+            from backend.core.ouroboros.governance import diff_healer as _healer
+            if not _healer.healer_enabled():
+                return None
+            rows = take_healable_rejections(str(getattr(context, "op_id", "") or ""))
+            if not rows:
+                return None
+            # Radius is DERIVED from the hunk the model got wrong: a bigger
+            # hunk needs more surrounding text to re-anchor against, and a
+            # three-line edit does not need fifty. No constant to tune.
+            healed: List[Dict[str, Any]] = []
+            for row in rows[:3]:
+                hunk_lines = len((row.get("unified_diff") or "").splitlines())
+                rejection = _healer.HealableRejection(
+                    file_path=str(row.get("file_path", "")),
+                    unified_diff=str(row.get("unified_diff", "")),
+                    rejection=str(row.get("rejection", "")),
+                    candidate_id=str(row.get("candidate_id", "")),
+                )
+                patched = await _healer.heal_rejection(
+                    rejection, str(row.get("source", "")),
+                    ask=self.plan, apply_fn=_apply_unified_diff,
+                    radius=max(hunk_lines * 2, 12), deadline=deadline,
+                )
+                if patched:
+                    healed.append({
+                        "candidate_id": rejection.candidate_id or "c1",
+                        "file_path": rejection.file_path,
+                        "full_content": patched,
+                        "rationale": "context realigned by the diff healer",
+                    })
+            if not healed:
+                return None
+            _attest_redeem(context, "diff_schema", "healed after context drift")
+            logger.info(
+                "[DiffHealer] op=%s recovered %d of %d rejected hunk(s)",
+                str(getattr(context, "op_id", ""))[:20], len(healed), len(rows),
+            )
+            return GenerationResult(
+                candidates=tuple(healed),
+                provider_name=self.provider_name,
+                generation_duration_s=0.0,
+            )
+        except Exception:  # noqa: BLE001 — a failed heal never masks the original failure
+            logger.debug("[DiffHealer] heal round degraded", exc_info=True)
+            return None
+
     async def _generate_impl(
         self,
         context: OperationContext,
@@ -7403,16 +7572,29 @@ class PrimeProvider:
                 pass
 
         try:
-            result = _parse_generation_response(
-                raw,
-                self.provider_name,
-                duration,
-                context,
-                source_hash,
-                source_path,
-                repo_roots=self._repo_roots,
-                repo_root=repo_root,
-            )
+            try:
+                result = _parse_generation_response(
+                    raw,
+                    self.provider_name,
+                    duration,
+                    context,
+                    source_hash,
+                    source_path,
+                    repo_roots=self._repo_roots,
+                    repo_root=repo_root,
+                )
+            except RuntimeError as _diff_exc:
+                # Every candidate's patch was rejected. Before the op loses the
+                # work, ask for the ONE thing that was wrong — the context
+                # lines — and re-parse if a heal takes. Measured: 26 of 28
+                # rejections across two soaks were mid-hunk context drift, not
+                # a wrong change.
+                _healed = await self._heal_rejected_diffs(
+                    context, _diff_exc, deadline=deadline,
+                )
+                if _healed is None:
+                    raise
+                result = _healed
         except Exception as _parse_exc:  # noqa: BLE001 — recorded, then re-raised
             # An UNPARSEABLE DRAW IS AN ANSWER — a bad one, which is exactly
             # what a preference pair needs on its losing side. The parser

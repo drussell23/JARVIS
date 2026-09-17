@@ -266,6 +266,175 @@ def clear_degradations_for_tests() -> None:
             _degraded_stats[key] = 0
 
 
+# ---------------------------------------------------------------------------
+# Execution attestation — did the capability we armed actually get USED?
+# ---------------------------------------------------------------------------
+#
+# The generalisation of `CapabilityExecutionDrift`, which guards exactly one
+# decision today and had to be written by hand for it. Thirteen defects in one
+# session shared a single shape: a capability built, tested, armed — and the
+# thing that consumes it never asked. The load-shed latch armed nowhere. The
+# promotion machinery never called. `target_symbols` read by three consumers
+# and populated by none. The diff schema armed, capability-resolved, and
+# overridden by a threshold; and in the lane that actually runs, the branch did
+# not exist. Every one passed its unit tests, because the defect was never in a
+# component — it was in whether anything consulted it, and seams have no owner.
+#
+# So a component that arms a capability DECLARES it for the op, and the
+# component that uses it REDEEMS it. A declaration with no redemption at the
+# end of the op is a capability that was promised and never delivered.
+#
+# ## Deliberately not cryptographic
+#
+# The threat is a developer forgetting to wire a seam, not an adversary forging
+# state. The roadmap is HMAC-signed because an unsigned goal authorises
+# arbitrary file writes; a voucher authorises nothing and crosses no trust
+# boundary. Signing it would be ceremony that buys no safety and costs a key to
+# manage.
+#
+# ## Checked at op TERMINAL, not at VALIDATE
+#
+# Many ops are shed at GENERATE and never reach VALIDATE, and capabilities like
+# promotion are exercised after it. Redeeming at VALIDATE would turn every
+# early-shed op into an attestation failure — a deadlock manufactured by the
+# checker rather than found by it.
+
+_attest_lock = threading.Lock()
+_attested: "OrderedDict[str, Dict[str, Dict[str, Any]]]" = OrderedDict()
+
+
+def _attest_registry_max() -> int:
+    return _registry_max()
+
+
+def declare_capability(op_id: Any, capability: str, detail: str = "") -> None:
+    """A component announces it armed *capability* for this op. NEVER raises."""
+    try:
+        oid, cap = str(op_id or "").strip(), str(capability or "").strip()
+        if not oid or not cap:
+            return
+        with _attest_lock:
+            caps = _attested.setdefault(oid, {})
+            caps.setdefault(cap, {
+                "state": "declared", "detail": str(detail)[:200],
+                "ts": time.time(),
+            })
+            _attested.move_to_end(oid)
+            while len(_attested) > _attest_registry_max():
+                _attested.popitem(last=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def redeem_capability(op_id: Any, capability: str, detail: str = "") -> None:
+    """The consumer announces it actually used *capability*. NEVER raises.
+
+    Redeeming something never declared is recorded rather than dropped: it
+    means the USE is wired and the declaration is not, which is the same seam
+    defect seen from the other end.
+    """
+    try:
+        oid, cap = str(op_id or "").strip(), str(capability or "").strip()
+        if not oid or not cap:
+            return
+        with _attest_lock:
+            caps = _attested.setdefault(oid, {})
+            entry = caps.setdefault(cap, {"state": "undeclared_use", "ts": time.time()})
+            if entry.get("state") in ("declared", "undeclared_use"):
+                entry["state"] = "redeemed" if entry.get("state") == "declared" else "undeclared_use"
+            entry["redeemed_detail"] = str(detail)[:200]
+            _attested.move_to_end(oid)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def revoke_capability(op_id: Any, capability: str, reason: str) -> None:
+    """A downstream state legitimately removed the need for *capability*.
+
+    The escape hatch that keeps attestation from deadlocking honest work: a
+    file-deletion goal has no AST to scope, a multi-file op cannot emit a
+    single-file diff. Revocation is RECORDED, not silent — an unbroken chain of
+    "declared → revoked, because X" is what separates a legitimate branch from
+    a capability quietly going missing.
+    """
+    try:
+        oid, cap = str(op_id or "").strip(), str(capability or "").strip()
+        if not oid or not cap:
+            return
+        with _attest_lock:
+            caps = _attested.setdefault(oid, {})
+            entry = caps.setdefault(cap, {"state": "declared", "ts": time.time()})
+            entry["state"] = "revoked"
+            entry["reason"] = str(reason)[:200]
+            _attested.move_to_end(oid)
+        logger.info(
+            "[CapabilityRevocationEvent] op=%s capability=%s — %s",
+            oid[:20], cap, str(reason)[:160],
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def unredeemed_capabilities(op_id: Any) -> Tuple[str, ...]:
+    """Capabilities declared for this op that were neither used nor revoked."""
+    try:
+        oid = str(op_id or "").strip()
+        with _attest_lock:
+            caps = _attested.get(oid) or {}
+            return tuple(
+                sorted(c for c, e in caps.items() if e.get("state") == "declared")
+            )
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+def attest_execution(op_id: Any, *, enforced: Optional[bool] = None) -> "CapabilityVerdict":
+    """Was every capability armed for this op actually exercised?
+
+    Report-only unless ``JARVIS_CAPABILITY_ATTESTATION_ENFORCE`` is set. A new
+    fatal path spanning every capability is exactly the change that should not
+    be armed before a soak has shown what it would have refused — the same
+    discipline the surgical scope validator shipped under, for the same reason.
+    """
+    try:
+        pending = unredeemed_capabilities(op_id)
+        if not pending:
+            return CapabilityVerdict(True, "all declared capabilities redeemed")
+        armed = (
+            enforced if enforced is not None
+            else _flag("JARVIS_CAPABILITY_ATTESTATION_ENFORCE", False)
+        )
+        reason = (
+            "CapabilityAttestationDrift: declared but never exercised: "
+            + ", ".join(pending)
+        )
+        logger.warning(
+            "[CapabilityAttestation] op=%s %s — %s", str(op_id)[:20], reason,
+            "FAILING" if armed else "reporting only "
+            "(JARVIS_CAPABILITY_ATTESTATION_ENFORCE is off)",
+        )
+        return CapabilityVerdict(
+            False, reason, {}, "", enforceable=bool(armed),
+            severity=FATAL if armed else RECOVERABLE,
+        )
+    except Exception:  # noqa: BLE001
+        return CapabilityVerdict(True, "attestation unavailable")
+
+
+def attestation_snapshot(op_id: Any) -> Dict[str, Any]:
+    """The full declared/redeemed/revoked chain for one op. Tests + operators."""
+    try:
+        with _attest_lock:
+            return {k: dict(v) for k, v in (_attested.get(str(op_id or "")) or {}).items()}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def clear_attestations_for_tests() -> None:
+    with _attest_lock:
+        _attested.clear()
+
+
 def degradation_lesson_kwargs(
     ctx: Any, verdict: "CapabilityVerdict",
 ) -> Optional[Dict[str, Any]]:
