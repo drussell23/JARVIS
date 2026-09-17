@@ -504,15 +504,33 @@ def assert_generation_capability(
 
         return CapabilityVerdict(
             False,
-            "silent capability degradation: the diff schema is armed and "
+            "CapabilityExecutionDrift: the diff schema is armed and "
             f"{served or 'the served model'} is diff-capable on a single-file "
-            "op, but the schema decision came out full_content",
+            "op, but the schema decision came out full_content with no "
+            "explicit fallback trigger",
             checks, detail, enforceable=sanctioned,
-            # RECOVERABLE, and this is THE one that killed the Sentinel's op.
-            # full_content is the historic schema: lower fidelity on a large
-            # file, but a working candidate every time. Refusing to generate
-            # cannot be the response to "you will generate slightly worse".
-            severity=RECOVERABLE,
+            # FATAL now, and the reason it was not before has been removed.
+            #
+            # This verdict fired six times in soak bt-2026-09-17-184946 and
+            # nothing acted on it, because at the time a full_content decision
+            # on a diff-capable single-file op was LEGITIMATE: the size gate
+            # forced it for any file under 800 lines. Refusing to generate
+            # could not be the response to a deliberate, documented heuristic,
+            # so RECOVERABLE was the honest severity.
+            #
+            # With the size gate gone, `single_file_diff_requested` returns
+            # True for exactly the conditions this branch has already
+            # confirmed. Reaching here therefore means the schema decision
+            # disagrees with the capability that was negotiated for it — a
+            # silent downgrade with no stated cause, which is the defect class
+            # that produced three damaged commits while every precondition
+            # reported ok.
+            #
+            # Still bounded by `enforceable`: only an op carrying a signed-goal
+            # pointer is failed. An ambient tool call or a probe reports and
+            # proceeds, because a diagnostic must not become the thing that
+            # breaks unsanctioned work.
+            severity=FATAL,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("[CapabilityAssurance] runtime check degraded: %r", exc)

@@ -488,12 +488,32 @@ def should_force_full_content(
     (``schema_capability == 'full_content_and_diff'``) AND the target file is
     large enough (> ``threshold_lines``) to warrant a bounded diff. Conservative
     by construction: unknown capability or unknown/small line count → force full.
-    Pure; never raises."""
-    if schema_capability != "full_content_and_diff":
-        return True
-    if not isinstance(target_line_count, int) or target_line_count <= int(threshold_lines):
-        return True
-    return False
+    Pure; never raises.
+
+    ## The size gate is gone, and it was the defect
+
+    This used to also force full_content for any file at or under
+    ``threshold_lines`` (default **800**). Measured consequence: three separate
+    autonomous commits re-emitted ``backend/api/sse_contract.py`` — **144
+    lines** — in full to make a three-line change, and each one drifted on the
+    141 lines it had no reason to touch: a deleted ``__all__``, two
+    de-indented docstring continuation lines, quote-style churn. The capability
+    was resolved correctly (``full_content_only -> full_content_and_diff``,
+    served=qwen3-coder-ov:30b), the op was single-file, the flag was armed, and
+    the size gate overrode all of it.
+
+    The threshold answered a COST question — a bounded diff saves tokens on a
+    large file — and was then used to decide a CORRECTNESS one. Re-emission
+    drift does not scale with file size; the trade is in fact worst on small
+    files, where 141 lines of drift surface buy nothing. A model cannot mangle
+    a docstring it never reproduces.
+
+    The decision is now exactly what the capability says: a diff-capable served
+    model on a single-file op gets the diff schema, whatever the file's length.
+    ``target_line_count`` and ``threshold_lines`` are accepted and ignored so
+    the call sites and their pins keep their shape; they carry no authority.
+    """
+    return schema_capability != "full_content_and_diff"
 
 
 # Elite agentic families verified to emit verbatim unified-diff context (the
@@ -567,22 +587,66 @@ def _max_target_line_count(target_files, repo_root) -> "Optional[int]":
         return None
 
 
+def _record_malformed_diff_lesson(ctx: Any, target_file: str, detail: str) -> None:
+    """Route a malformed diff into LessonMemory. NEVER raises, never blocks.
+
+    A rejected patch is exactly the signal the generating lane needs and has
+    never received: the op simply retried with no record that the previous
+    attempt produced unparseable hunks. Recorded through the same seam every
+    other failure class uses, so it reaches the few-shot injector rather than
+    a log nobody reads.
+
+    Fire-and-forget on the running loop when there is one — this sits inside a
+    synchronous candidate loop and must not wait on the ledger.
+    """
+    try:
+        from backend.core.ouroboros.governance.lesson_memory import (  # noqa: PLC0415
+            record_lesson,
+        )
+        coro = record_lesson(
+            op_id=str(getattr(ctx, "op_id", "") or "")[:128],
+            target_files=[target_file] if target_file else [],
+            phase="GENERATE",
+            failure_class="malformed_diff",
+            error_text=detail[:400],
+            summary=(
+                "the unified diff could not be applied: "
+                f"{detail[:160]} — emit hunks whose context lines appear "
+                "VERBATIM in the file, and do not re-emit the whole file"
+            ),
+            error_class="malformed_diff",
+        )
+        try:
+            asyncio.get_running_loop().create_task(coro)
+        except RuntimeError:
+            coro.close()      # no loop here — drop cleanly rather than warn
+    except Exception:  # noqa: BLE001
+        logger.debug("[Providers] malformed-diff lesson degraded", exc_info=True)
+
+
 def resolve_force_full_content(
     *, schema_capability: str, target_files, repo_root,
 ) -> bool:
     """Decoupled seam (no inline conditionals in the provider hot loops): decide
-    force_full_content from the model's diff capability + the largest target
-    file's line count. Fail-soft → ``True`` (conservative full_content) on any
-    error, so a bad read can never push an op into an un-emittable diff."""
-    try:
-        lines = _max_target_line_count(target_files, repo_root)
-        return should_force_full_content(
-            schema_capability=schema_capability,
-            target_line_count=lines,
-            threshold_lines=_diff_schema_threshold_lines(),
-        )
-    except Exception:  # noqa: BLE001
-        return True
+    force_full_content from the served model's diff capability, and nothing
+    else.
+
+    It used to read the largest target file's line count and fail soft to
+    ``True`` if that read broke. Neither step survives, because neither is a
+    question about the schema: the decision now depends on a capability that
+    was already negotiated, so there is no file to read and no read that can
+    fail. An unreadable target can no longer push an op into a whole-file
+    rewrite — which is what it did for every file under 800 lines, three
+    damaged commits' worth.
+
+    ``target_files`` / ``repo_root`` are kept so the call sites and their pins
+    keep their shape.
+    """
+    return should_force_full_content(
+        schema_capability=schema_capability,
+        target_line_count=None,
+        threshold_lines=0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +680,24 @@ def op_warrants_diff_capable_model(*, target_files, repo_root) -> bool:
     reads — ``_max_target_line_count`` + ``_diff_schema_threshold_lines`` — so the
     selector's "needs a diff-capable model" decision and the gate's size decision
     cannot drift apart. Fail-soft → ``False`` (no special routing) on any error."""
+    # DELIBERATELY still size-based, and this is a scope decision rather than
+    # an oversight.
+    #
+    # This asks which MODEL to route to, not which SCHEMA to emit — a cost
+    # question, where a line count is a legitimate input. The schema gate
+    # (`resolve_force_full_content`) no longer consults size at all, so the two
+    # now answer different questions and the old "they must agree" invariant is
+    # retired with them.
+    #
+    # KNOWN RESIDUAL RISK, stated rather than silently fixed: on a multi-model
+    # lane a small single-file op does not warrant a diff-capable model, so the
+    # selector may pick one that cannot diff — and the schema gate will then
+    # correctly force full_content on a capability the op was never given.
+    # That is the same drift defect arrived at by routing instead of by
+    # thresholding. It does not bite the local lane (one served model, and it
+    # is diff-capable), and closing it means changing paid-lane model selection
+    # — a cost decision that belongs to its own change with its own evidence,
+    # not to a schema fix.
     try:
         lines = _max_target_line_count(target_files, repo_root)
         return isinstance(lines, int) and lines > _diff_schema_threshold_lines()
@@ -5782,7 +5864,15 @@ def _parse_generation_response(
                 continue
             except ValueError as exc:
                 _note_diff_outcome(ctx, False, source=orig_content)
-                logger.warning("[%s] Diff application failed for %s: %s", pfx, cand.get("candidate_id"), exc)
+                logger.warning(
+                    "[%s] MalformedDiffException for %s: %s — REJECTING the "
+                    "candidate. The diff schema is NOT downgraded to "
+                    "full_content: a malformed patch is the model's to fix on "
+                    "retry, and silently re-emitting the whole file is how the "
+                    "drift this schema exists to prevent gets back in.",
+                    pfx, cand.get("candidate_id"), exc,
+                )
+                _record_malformed_diff_lesson(ctx, source_path, str(exc))
                 continue
             rewritten.append({
                 "candidate_id": cand.get("candidate_id", "c1"),

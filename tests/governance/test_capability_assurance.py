@@ -144,9 +144,26 @@ def test_missing_routing_admission_is_degradation_not_a_model_limit(armed):
 
 
 def test_full_content_on_a_diff_capable_single_file_op_is_caught(armed):
+    """Renamed verdict, and it is FATAL now.
+
+    It fired six times in soak bt-2026-09-17-184946 and nothing acted on it,
+    because a full_content decision on a diff-capable single-file op was then
+    LEGITIMATE — the size gate forced it for any file under 800 lines, so
+    refusing to generate could not be the response to a documented heuristic.
+    With the gate gone, reaching this branch means the executed schema
+    disagrees with the negotiated capability for no stated reason.
+
+    The SEVERITY is what changed. ``is_fatal`` additionally requires
+    ``enforceable`` — only an op carrying a signed-goal pointer is ever failed,
+    and this fixture's context is unsanctioned — so asserting it here would be
+    asserting the wrong half of the contract.
+    """
+    from backend.core.ouroboros.governance.capability_assurance import FATAL
+
     v = assert_generation_capability(_ctx(), force_full_content=True)
     assert not v.ok
-    assert "silent capability degradation" in v.reason
+    assert "CapabilityExecutionDrift" in v.reason
+    assert v.severity == FATAL, "a silent downgrade is still only advisory"
 
 
 def test_the_diff_path_passes(armed):

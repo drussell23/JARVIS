@@ -73,24 +73,40 @@ class TestOpWarrantsDiffCapableModel:
         ) is False
 
     def test_size_signal_matches_gate_no_drift(self, tmp_path, monkeypatch):
-        """The selector's 'needs a diff-capable model' MUST equal the gate's
-        'would emit a diff IF the model were capable' — same threshold, same
-        line-count primitive — so the two can never drift apart."""
+        """The two seams now answer DIFFERENT questions, and this pins the
+        difference rather than an agreement that no longer holds.
+
+        The selector asks which MODEL to route to — a cost question, where a
+        line count is a legitimate input. The gate asks which SCHEMA to emit —
+        a correctness question, where it never was: a size threshold there sent
+        a 144-line file down the whole-file path and three autonomous commits
+        drifted on the lines they had no reason to retype.
+
+        The residual risk is real and deliberately left open: on a multi-model
+        lane a small single-file op does not warrant a diff-capable model, so
+        a model that cannot diff may be selected and the gate will then force
+        full_content correctly. That does not bite the local lane (one served
+        model, diff-capable), and closing it changes paid-lane model selection
+        — its own change, with its own evidence.
+        """
         monkeypatch.delenv("JARVIS_DIFF_SCHEMA_THRESHOLD_LINES", raising=False)
         thr = _diff_schema_threshold_lines()
         (tmp_path / "big.py").write_text("\n".join(str(i) for i in range(thr + 500)))
         (tmp_path / "small.py").write_text("\n".join(str(i) for i in range(10)))
+        # The selector still reads size...
+        assert op_warrants_diff_capable_model(
+            target_files=["big.py"], repo_root=tmp_path,
+        ) is True
+        assert op_warrants_diff_capable_model(
+            target_files=["small.py"], repo_root=tmp_path,
+        ) is False
+        # ...and the gate no longer does, for either file.
         for rel in ("big.py", "small.py"):
             n = _max_target_line_count([rel], tmp_path)
-            warrants = op_warrants_diff_capable_model(
-                target_files=[rel], repo_root=tmp_path,
-            )
-            gate_would_use_diff = should_force_full_content(
+            assert should_force_full_content(
                 schema_capability="full_content_and_diff",
-                target_line_count=n,
-                threshold_lines=thr,
-            ) is False
-            assert warrants == gate_would_use_diff
+                target_line_count=n, threshold_lines=thr,
+            ) is False, rel
 
 
 class TestSelectDiffCapableModel:

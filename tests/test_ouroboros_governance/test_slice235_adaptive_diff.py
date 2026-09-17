@@ -38,21 +38,32 @@ class TestShouldForceFullContent:
             schema_capability=_CAPABLE, target_line_count=5000, threshold_lines=800,
         ) is False
 
-    def test_capable_model_small_file_stays_full(self):
+    def test_capable_model_small_file_ALSO_uses_diff(self):
+        """Re-emission drift does not scale with file size; if anything the
+        trade is worst on small files, where retyping 141 lines to change 3
+        buys nothing."""
         assert should_force_full_content(
             schema_capability=_CAPABLE, target_line_count=120, threshold_lines=800,
-        ) is True
+        ) is False
 
-    def test_exactly_threshold_stays_full(self):
-        # strictly greater-than → at the threshold we stay full_content
-        assert should_force_full_content(
-            schema_capability=_CAPABLE, target_line_count=800, threshold_lines=800,
-        ) is True
+    def test_the_threshold_no_longer_decides_anything(self):
+        """A cost heuristic must never again decide a correctness question: at,
+        below and above the old threshold the answer is identical."""
+        answers = {
+            should_force_full_content(
+                schema_capability=_CAPABLE, target_line_count=n,
+                threshold_lines=800,
+            )
+            for n in (1, 799, 800, 801, 5000)
+        }
+        assert answers == {False}
 
-    def test_unknown_line_count_is_conservative_full(self):
+    def test_unknown_line_count_is_irrelevant(self):
+        """There is nothing to be conservative ABOUT — the decision reads a
+        negotiated capability, not a file."""
         assert should_force_full_content(
             schema_capability=_CAPABLE, target_line_count=None, threshold_lines=800,
-        ) is True
+        ) is False
 
     def test_unknown_capability_is_conservative_full(self):
         assert should_force_full_content(
@@ -130,18 +141,27 @@ class TestResolveForceFullContentSeam:
         )
         assert out is True
 
-    def test_capable_small_forces_full(self, tmp_path):
+    def test_capable_small_ALSO_uses_diff(self, tmp_path):
+        """Inverted deliberately. The size gate WAS the defect: a 144-line file
+        took the whole-file path and three autonomous commits drifted on the
+        141 lines they had no reason to retype."""
         (tmp_path / "small.py").write_text("a\nb\nc\n")
         out = resolve_force_full_content(
             schema_capability="full_content_and_diff",
             target_files=["small.py"], repo_root=tmp_path,
         )
-        assert out is True
+        assert out is False
 
-    def test_fail_soft_true_on_bad_input(self):
-        # Unreadable / None repo_root → conservative full_content, never raise.
-        out = resolve_force_full_content(
+    def test_an_unreadable_target_can_no_longer_change_the_schema(self):
+        """It used to fail soft to full_content on a bad read. There is no read
+        left to fail — the decision consults a capability that was already
+        negotiated — so an unreadable path can no longer push an op into a
+        whole-file rewrite. Capability still decides in both directions."""
+        assert resolve_force_full_content(
             schema_capability="full_content_and_diff",
             target_files=["x.py"], repo_root=None,
-        )
-        assert out is True
+        ) is False
+        assert resolve_force_full_content(
+            schema_capability="full_content_only",
+            target_files=["x.py"], repo_root=None,
+        ) is True
