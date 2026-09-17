@@ -14265,6 +14265,49 @@ class GovernedOrchestrator:
                 ),
                 adapter_names_run=(),
             )
+        # …and must change ONLY them. The other half of the same contract:
+        # 7f8c686ce0 made its requested change AND deleted its module's
+        # __all__, de-indented a docstring and churned quote style, with every
+        # test green — nothing asserts __all__. Whole-file re-emission
+        # reproduces MOST of a file and the drift lands wherever it lands, so
+        # a test-shaped gate cannot see it and an AST-shaped one can.
+        #
+        # Reported always, refused only when JARVIS_SURGICAL_SCOPE_ENFORCE is
+        # armed: a brand-new refusal inside VALIDATE can only be calibrated by
+        # first watching what it WOULD have refused.
+        try:
+            from backend.core.ouroboros.governance.declared_symbols import (
+                DIFF_SCOPE_VIOLATION as _ds_scope_code,
+                out_of_scope_changes as _ds_out_of_scope,
+                scope_enforced as _ds_scope_enforced,
+                scope_feedback as _ds_scope_feedback,
+            )
+            _ds_scope = _ds_out_of_scope(
+                getattr(ctx, "target_symbols", ()) or (), candidate or {},
+                self._original_text_for(candidate or {}),
+            )
+        except Exception:  # noqa: BLE001 — contract is additive
+            _ds_scope = ()
+            _ds_scope_enforced = lambda: False  # noqa: E731
+        if _ds_scope:
+            logger.warning(
+                "[Validation] out-of-scope change op=%s: %s — %s",
+                str(getattr(ctx, "op_id", ""))[:16], ", ".join(_ds_scope),
+                "REFUSING" if _ds_scope_enforced() else "reporting only "
+                "(JARVIS_SURGICAL_SCOPE_ENFORCE is off)",
+            )
+        if _ds_scope and _ds_scope_enforced():
+            return ValidationResult(
+                passed=False,
+                best_candidate=None,
+                validation_duration_s=0.0,
+                error=f"{_ds_scope_code}: " + ", ".join(_ds_scope),
+                failure_class="test",
+                short_summary=_ds_scope_feedback(
+                    _ds_scope, getattr(ctx, "target_symbols", ()) or (),
+                ),
+                adapter_names_run=(),
+            )
         result = await self._run_validation_core(ctx, candidate, remaining_s)
         # Lesson confidence: a pass after injected lessons boosts them.
         try:
