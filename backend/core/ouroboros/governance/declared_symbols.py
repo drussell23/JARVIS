@@ -178,6 +178,58 @@ def symbols_unchanged_in_candidate(
         return ()
 
 
+def candidate_is_functional_noop(
+    candidate: Dict[str, Any], original: Optional[str],
+) -> bool:
+    """Whether this candidate would change nothing a caller can observe.
+
+    ## Why it is needed even though a no-op check already exists
+
+    ``symbols_unchanged_in_candidate`` answers this ONLY for goals that declare
+    symbols, and most do not — 22 of 28 roadmap goals carried none. So the
+    common case had no no-op refusal at all, and soak bt-2026-09-17-180722
+    committed the proof: an already-landed work order was re-emitted
+    (``JARVIS_ALLOW_ROADMAP_REVISIT`` shadows seen hashes on purpose), the
+    model correctly found the work already done, and the pipeline still
+    produced ``7e7fe18c3c`` — a duplicated banner comment, quote churn and a
+    stripped newline. Every gate downstream passed it, because none of them
+    asked the simplest question.
+
+    ## Threshold-free by construction
+
+    No score, no bar, no "how much changed" — the normalized AST either differs
+    or it does not. ``ast.dump`` already erases exactly what should not count:
+    comments are absent from the AST entirely, whitespace and indentation are
+    structure rather than text, quote style is unrepresented, and a trailing
+    newline is invisible. Whatever survives that is something a caller could
+    observe.
+
+    A new file (no original) is never a no-op. An unparsable candidate is not
+    judged here — syntax has its own gate, and failing it here would
+    misattribute the refusal.
+
+    NEVER raises; ``False`` on every uncertain path, because refusing real work
+    is worse than letting a redundant candidate reach the tests that follow.
+    """
+    if not contract_enabled():
+        return False
+    if not isinstance(original, str) or not original:
+        return False
+    try:
+        contents = _candidate_contents(candidate)
+        if not contents:
+            return False
+        before = ast.dump(ast.parse(original))
+        for content in contents:
+            if ast.dump(ast.parse(content)) != before:
+                return False
+        return True
+    except (SyntaxError, ValueError):
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _module_residue(source: str) -> Optional[str]:
     """``ast.dump`` of the module's own statements — everything at module level
     that is neither a def/class nor an import.

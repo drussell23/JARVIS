@@ -75,6 +75,9 @@ __all__ = [
     "promote_accumulation_commit",
 ]
 
+#: The verdict a promotion earns when it changes nothing a caller can observe.
+TRIVIAL_CHANGE_VIOLATION = "trivial_change_violation"
+
 _ENV_ENABLED = "JARVIS_ACCUMULATION_PROMOTION_ENABLED"
 _ENV_QUARANTINE_PREFIX = "JARVIS_PROMOTION_QUARANTINE_PREFIX"
 _DEFAULT_QUARANTINE_PREFIX = "ouroboros/quarantine"
@@ -382,6 +385,78 @@ def _check_structure(sha: str, repo_root: Path, base: str = "") -> Finding:
     return Finding("structure", True, "no public surface lost")
 
 
+def _check_semantic_delta(sha: str, repo_root: Path, base: str = "") -> Finding:
+    """Does this promotion change what the code DOES?
+
+    ## The commit that forced it
+
+    Soak bt-2026-09-17-180722 re-dispatched an already-landed goal and produced
+    ``7e7fe18c3c``. Its entire diff: a duplicated ``# [Ouroboros] Modified
+    by...`` banner, ``separators=(",", ":")`` re-quoted to single quotes, and a
+    stripped trailing newline. The logging it claimed to add was already on
+    main from the earlier landing. Provenance passed, structure passed, tests
+    were green — the gate would have promoted a commit that does nothing.
+
+    ## No threshold, because the right answer is an equality
+
+    The temptation is to score "how much" changed and reject below some bar.
+    That bar would be a constant nobody can justify, and it would eventually
+    reject a real one-character fix. There is no bar here: the normalized AST
+    either differs or it does not.
+
+    ``ast.dump`` already erases exactly the churn that matters and nothing
+    else — comments are not in the AST at all, whitespace and indentation are
+    structure rather than text, quote style is not represented, and a trailing
+    newline is invisible. What survives is what a caller could observe.
+
+    ## What is deliberately NOT excluded
+
+    "Redundant logging" is not filtered out, though it was asked for. Judging a
+    logging call redundant needs semantics no AST comparison has — and the
+    change that started this whole thread (``7f8c686ce0``) was *precisely* the
+    addition of two logging calls, and it was real work. A rule that discards
+    added logging would have rejected the one genuine autonomous landing this
+    repository has produced.
+
+    Non-Python files are counted as changed on a byte basis: this module has no
+    business deciding whether a YAML edit is meaningful.
+    """
+    parent = base or f"{sha}^"
+    files = _touched_files(sha, repo_root, base=base)
+    if not files:
+        return Finding("semantic_delta", False, "the range changes no files at all")
+    unchanged: List[str] = []
+    for path in files:
+        before = _file_at(parent, path, repo_root)
+        after = _file_at(sha, path, repo_root)
+        if before is None or after is None:
+            return Finding(
+                "semantic_delta", True, f"{path} added or deleted — a real change",
+            )
+        if not path.endswith(".py"):
+            if before != after:
+                return Finding("semantic_delta", True, f"{path} changed")
+            unchanged.append(path)
+            continue
+        try:
+            b, a = ast.dump(ast.parse(before)), ast.dump(ast.parse(after))
+        except SyntaxError:
+            # Unparsable either side: fall back to bytes rather than claim a
+            # no-op we cannot actually demonstrate.
+            if before != after:
+                return Finding("semantic_delta", True, f"{path} changed (unparsable)")
+            unchanged.append(path)
+            continue
+        if a != b:
+            return Finding("semantic_delta", True, f"{path} has a functional delta")
+        unchanged.append(path)
+    return Finding(
+        "semantic_delta", False,
+        "no functional change in " + ", ".join(unchanged[:3])
+        + " — comments, formatting and quote style only",
+    )
+
+
 def _test_paths_for(files: Sequence[str], repo_root: Path) -> Tuple[str, ...]:
     """The conventional test files for the touched sources.
 
@@ -471,6 +546,7 @@ async def verify_commit(
             return (Finding("exists", False, f"{sha[:12]} is not a commit here"),)
         findings.append(_check_provenance(sha, repo_root, branch, base=base))
         findings.append(_check_structure(sha, repo_root, base=base))
+        findings.append(_check_semantic_delta(sha, repo_root, base=base))
         findings.append(await _check_coverage(
             sha, repo_root, python_bin=python_bin, timeout_s=test_timeout_s,
             base=base,
@@ -590,6 +666,8 @@ async def promote_accumulation_commit(
     blocking = [f for f in findings if not f.passed and f.blocking]
     if blocking:
         detail = "; ".join(f.detail for f in blocking)[:400]
+        if any(f.check == "semantic_delta" for f in blocking):
+            detail = f"{TRIVIAL_CHANGE_VIOLATION}: {detail}"
         logger.warning(
             "[PromotionGate] %s REFUSED — %s. The accumulation branch is "
             "untouched and remains the reviewable artifact.", sha[:12], detail,

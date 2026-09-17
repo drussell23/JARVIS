@@ -131,17 +131,50 @@ def test_discovery_drops_a_settled_candidate(tmp_path):
     assert got == frozenset({LANDED})
 
 
-def test_the_ranking_loop_skips_settled_work():
-    src = inspect.getsource(GD.discover)
-    assert "settled_ids" in src
-    assert "item.goal_id in settled_ids" in src
+def test_the_ranking_loop_skips_settled_work(monkeypatch, tmp_path):
+    """Asserted through the front door.
+
+    This used to pin the literal ``"item.goal_id in settled_ids"`` inside
+    ``discover``. The filter later moved into ``_EligibilityGate.admit`` so the
+    lazy coverage walk could consult it too, and the pin broke on a refactor
+    while the property it guarded never moved — which is exactly what a
+    source-text pin cannot tell you.
+    """
+    landed = _Work("ov-landed", "tests/test_a.py")
+    monkeypatch.setattr(GD, "_from_roadmap_goals", lambda *a, **k: [landed])
+    monkeypatch.setattr(GD, "_from_ambient_reds", lambda *a, **k: [])
+    monkeypatch.setattr(GD, "_iter_uncovered_modules", lambda *a, **k: [])
+
+    got = asyncio.run(GD.discover(
+        repo_root=tmp_path, settled=_Oracle(["ov-landed"]), limit=8,
+    ))
+    assert got == (), "settled work was selected again"
 
 
-def test_the_skip_happens_before_the_cooldown_check():
+def test_the_skip_happens_before_the_cooldown_check(monkeypatch, tmp_path, caplog):
     """Success CLEARS the cooldown, so after a landing the cooldown is not a
-    brake. Settlement has to be the one that stops re-selection."""
-    src = inspect.getsource(GD.discover)
-    assert src.index("settled_ids") < src.index("is_cooling")
+    brake. Settlement has to be the one that stops re-selection — AND the one
+    reported, or the re-discovery spin reads as back-pressure instead of a bug.
+    """
+    landed = _Work("ov-landed", "tests/test_a.py")
+    monkeypatch.setattr(GD, "_from_roadmap_goals", lambda *a, **k: [landed])
+    monkeypatch.setattr(GD, "_from_ambient_reds", lambda *a, **k: [])
+    monkeypatch.setattr(GD, "_iter_uncovered_modules", lambda *a, **k: [])
+
+    class _AlsoCooling:
+        def is_cooling(self, target):
+            return True
+
+    with caplog.at_level("INFO"):
+        got = asyncio.run(GD.discover(
+            repo_root=tmp_path, settled=_Oracle(["ov-landed"]),
+            cooldown=_AlsoCooling(), limit=8,
+        ))
+    assert got == ()
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "already SATISFIED" in messages, (
+        "a landed goal that is also cooling was reported as merely cooling"
+    )
 
 
 def test_discovery_is_injectable_and_defaults_to_the_real_ledger():

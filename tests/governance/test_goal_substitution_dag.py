@@ -278,14 +278,66 @@ def test_the_deficit_is_recorded_as_a_lesson():
     assert "TestCoverageDeficit" in src
 
 
-def test_discovery_enforces_the_edge_at_SELECTION():
+def test_discovery_enforces_the_edge_at_SELECTION(monkeypatch, tmp_path):
     """Enforcing at selection is what makes "B never runs before A" structural
-    rather than something checked at execution time."""
-    from backend.core.ouroboros.governance.autonomy import goal_discovery as GD
+    rather than something checked at execution time.
 
-    src = inspect.getsource(GD.discover)
-    assert "_dependency_state(" in src
-    assert "_dep.runnable" in src
+    Asserted through ``discover`` rather than by grepping its source: the
+    dependency gate later moved into ``_EligibilityGate.admit`` so the lazy
+    coverage walk could be judged by the same rules, and a text pin broke on
+    that refactor while the guarantee never moved.
+    """
+    import asyncio
+
+    from backend.core.ouroboros.governance.autonomy import goal_discovery as GD
+    from backend.core.ouroboros.governance.autonomy.goal_discovery import (
+        DiscoveredWork,
+    )
+
+    a = DiscoveredWork(
+        target_file="tests/test_a.py", kind="roadmap_goal", evidence="A",
+        weight=1.0, declared_goal_id="ov-a",
+    )
+    b = DiscoveredWork(
+        target_file="backend/b.py", kind="roadmap_goal", evidence="B",
+        weight=1.0, declared_goal_id="ov-b",
+        detail={"depends_on": ["ov-a"]},
+    )
+    monkeypatch.setattr(GD, "_from_roadmap_goals", lambda *_a, **_k: [a, b])
+    monkeypatch.setattr(GD, "_from_ambient_reds", lambda *_a, **_k: [])
+    monkeypatch.setattr(GD, "_iter_uncovered_modules", lambda *_a, **_k: [])
+
+    async def _index():
+        # BOTH nodes: the real index is built from the whole roadmap, and a
+        # prerequisite missing from it reads as unreachable ("exhausted"),
+        # which is a different verdict from "not landed yet".
+        return {
+            "ov-a": {"depends_on": (), "target": "tests/test_a.py"},
+            "ov-b": {"depends_on": ("ov-a",), "target": "backend/b.py"},
+        }
+
+    monkeypatch.setattr(GD, "_dag_index", _index)
+
+    class _Ledger:
+        def __init__(self, landed):
+            self.landed = set(landed)
+
+        def satisfied_goal_ids(self, ids):
+            return frozenset(i for i in ids if i in self.landed)
+
+    blocked = asyncio.run(GD.discover(
+        repo_root=tmp_path, settled=_Ledger([]), limit=8,
+    ))
+    assert "ov-b" not in [w.goal_id for w in blocked], (
+        "a dependent was selectable before its prerequisite landed"
+    )
+
+    released = asyncio.run(GD.discover(
+        repo_root=tmp_path, settled=_Ledger(["ov-a"]), limit=8,
+    ))
+    assert "ov-b" in [w.goal_id for w in released], (
+        "the dependent stayed blocked after its prerequisite landed"
+    )
 
 
 def test_the_edges_are_read_from_the_ROADMAP():

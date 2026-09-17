@@ -677,25 +677,43 @@ class _EligibilityGate:
         self._cooldown = cooldown
         self.seen: set = set()
 
-    def cheap_ok(self, item: "DiscoveredWork") -> bool:
-        """The ledger-free half of the gate. NEVER raises."""
+    def _basic_ok(self, item: "DiscoveredWork") -> bool:
+        """Dedupe and the governance cage. No ledger, no cooldown."""
         target = item.target_file
-        if target in self.seen or _is_governance(target):
+        return not (target in self.seen or _is_governance(target))
+
+    def _cooling(self, item: "DiscoveredWork") -> bool:
+        target = item.target_file
+        if self._cooldown is None:
             return False
-        if self._cooldown is not None:
-            try:
-                if self._cooldown.is_cooling(target):
-                    logger.info(
-                        "[GoalDiscovery] %s is cooling — skipped this pass", target,
-                    )
-                    return False
-            except Exception:  # noqa: BLE001
-                pass
-        return True
+        try:
+            if self._cooldown.is_cooling(target):
+                logger.info(
+                    "[GoalDiscovery] %s is cooling — skipped this pass", target,
+                )
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def cheap_ok(self, item: "DiscoveredWork") -> bool:
+        """The ledger-free half of the gate — everything :meth:`admit` can
+        decide without a settled set. A PRE-filter for the lazy walk only; the
+        authoritative order lives in :meth:`admit`. NEVER raises."""
+        return self._basic_ok(item) and not self._cooling(item)
 
     def admit(self, item: "DiscoveredWork", settled_ids: frozenset) -> bool:
-        """Whether this pass may take *item* on. NEVER raises."""
-        if not self.cheap_ok(item):
+        """Whether this pass may take *item* on. NEVER raises.
+
+        Order is load-bearing, not incidental: SETTLEMENT is asked before
+        cooling. A landing CLEARS its own target's cooldown, so after a
+        successful op the cooldown is not a brake at all — settlement is the
+        only thing that stops re-selection, and it must also be the reason
+        REPORTED, or a landed goal that happens to be cooling is logged as
+        merely cooling and the re-discovery spin looks like back-pressure
+        instead of the bug it is.
+        """
+        if not self._basic_ok(item):
             return False
         target = item.target_file
         # THE re-discovery spin. Discovery reads the WORKING TREE; autonomous
@@ -732,6 +750,8 @@ class _EligibilityGate:
         )
         if _dep is not None and not _dep.runnable:
             logger.info("[GoalDiscovery] %s %s", target, _dep.render())
+            return False
+        if self._cooling(item):
             return False
         self.seen.add(target)
         return True

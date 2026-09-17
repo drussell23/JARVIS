@@ -14265,6 +14265,49 @@ class GovernedOrchestrator:
                 ),
                 adapter_names_run=(),
             )
+        # Before anything else: does this candidate change ANYTHING?
+        #
+        # The declared-symbol no-op refusal above only fires for goals that
+        # declare symbols, and most do not (22 of 28 roadmap goals carried
+        # none), so the common case had no no-op check at all. Soak
+        # bt-2026-09-17-180722 committed the proof: an already-landed work
+        # order was re-emitted on purpose (JARVIS_ALLOW_ROADMAP_REVISIT
+        # shadows seen hashes), the model correctly found the work already
+        # done, and the pipeline produced 7e7fe18c3c anyway — a duplicated
+        # banner, quote churn and a stripped newline. Refused here, the op
+        # ends with a name for what happened instead of a commit that says
+        # nothing.
+        try:
+            from backend.core.ouroboros.governance.declared_symbols import (
+                candidate_is_functional_noop as _ds_is_noop,
+            )
+            _ds_noop = _ds_is_noop(
+                candidate or {}, self._original_text_for(candidate or {}),
+            )
+        except Exception:  # noqa: BLE001 — contract is additive
+            _ds_noop = False
+        if _ds_noop:
+            logger.warning(
+                "[Validation] candidate is a functional no-op op=%s — the "
+                "change this goal asks for is already present; refusing "
+                "rather than committing comment/format churn",
+                str(getattr(ctx, "op_id", ""))[:16],
+            )
+            return ValidationResult(
+                passed=False,
+                best_candidate=None,
+                validation_duration_s=0.0,
+                error="redundant_already_landed: candidate AST is identical "
+                      "to the file on disk",
+                failure_class="test",
+                short_summary=(
+                    "this candidate changes nothing a caller can observe — "
+                    "comments, formatting and quote style only. The work this "
+                    "goal describes already exists in the file; it does not "
+                    "need doing again"
+                ),
+                adapter_names_run=(),
+            )
         # …and must change ONLY them. The other half of the same contract:
         # 7f8c686ce0 made its requested change AND deleted its module's
         # __all__, de-indented a docstring and churned quote style, with every
