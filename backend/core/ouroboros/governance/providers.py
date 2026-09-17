@@ -104,6 +104,9 @@ from backend.core.ouroboros.governance.stream_rupture import (
 from backend.core.ouroboros.governance.control_plane_watchdog import (
     recent_lag_ms as _recent_lag_ms,
 )
+from backend.core.ouroboros.governance import (
+    anthropic_sdk_surface as _sdk_surface,
+)
 
 try:
     from backend.core.prime_client import TaskProfile as _TaskProfile
@@ -7468,6 +7471,30 @@ _CLAUDE_HTTP_CLIENT_MODES = frozenset({
 })
 
 
+def _resolve_sdk_http_module(anthropic_mod: Any, fallback: Any) -> Any:
+    """The http library the installed Anthropic SDK actually speaks.
+
+    Derived from the SDK's own client class rather than named, because the
+    vendored module has already changed once (``httpx`` -> ``httpx2``) and the
+    failure mode when it changes again is a silently-discarded transport
+    config, not an error. Falls back to the module the caller imported when the
+    SDK's shape cannot be read — the same class the type-guard below catches.
+    NEVER raises.
+    """
+    try:
+        import inspect as _inspect  # noqa: PLC0415
+
+        _cls = getattr(anthropic_mod, "DefaultAsyncHttpxClient", None)
+        if _cls is not None:
+            for _base in _cls.__mro__[1:]:
+                _mod = _inspect.getmodule(_base)
+                if _mod is not None and hasattr(_mod, "Timeout") and hasattr(_mod, "Limits"):
+                    return _mod
+    except Exception:  # noqa: BLE001
+        logger.debug("[ClaudeProvider] SDK http module unresolved", exc_info=True)
+    return fallback
+
+
 def _resolve_http_client_mode() -> str:
     """Resolve ``JARVIS_CLAUDE_HTTP_CLIENT_MODE`` to a member of the closed
     taxonomy.  Unknown values fall back to ``custom`` per operator binding
@@ -8377,25 +8404,48 @@ class ClaudeProvider:
                     if self._extended_thinking
                     else _CLAUDE_HTTP_READ_TIMEOUT_DEFAULT_S
                 )
-                _http_timeout = httpx.Timeout(
+                # Build the transport out of the SDK'S OWN http classes, not
+                # the stock ``httpx`` import above.
+                #
+                # The type-guard below used to be the whole story: the SDK
+                # vendors its http library (``httpx2``), rejects a stock
+                # ``httpx.AsyncClient`` with a TypeError, and we fell back to
+                # the SDK-default transport — which meant this entire Transport
+                # Resilience Layer was silently DISCARDED on every boot. The
+                # observed log line, once per client generation:
+                #
+                #   custom http_client rejected by the anthropic SDK (httpx
+                #   version drift: Expected an instance of `httpx2.AsyncClient`
+                #   but got <class 'httpx.AsyncClient'>) — failing SAFE
+                #
+                # Failing safe was right; staying there was not. The classes
+                # are RESOLVED from the SDK (``DefaultAsyncHttpxClient`` is its
+                # own subclass of the http client it vendors, and carries its
+                # default connection behaviour), so the pool caps land on the
+                # real transport again and the guard below returns to being
+                # what it was meant to be — a guard, not the normal path.
+                _sdk_http = _resolve_sdk_http_module(anthropic, httpx)
+                _http_timeout = _sdk_http.Timeout(
                     connect=_CLAUDE_HTTP_CONNECT_TIMEOUT_S,
                     read=_read_timeout,
                     write=_CLAUDE_HTTP_WRITE_TIMEOUT_S,
                     pool=_CLAUDE_HTTP_POOL_TIMEOUT_S,
                 )
                 # Transport Resilience Layer — explicit Limits + segmented
-                # Timeout. Constructing our own ``httpx.AsyncClient`` and
-                # passing it to the SDK as ``http_client=`` ensures the
-                # pool caps land on the actual transport, not just on a
-                # wrapper.  Stale keepalives die fast (30s); pool stays
-                # bounded (10/5) so dead connections can't masquerade as
-                # connect timeouts under load.
-                _http_limits = httpx.Limits(
+                # Timeout. Constructing our own client and passing it to the
+                # SDK as ``http_client=`` ensures the pool caps land on the
+                # actual transport, not just on a wrapper.  Stale keepalives
+                # die fast (30s); pool stays bounded (10/5) so dead connections
+                # can't masquerade as connect timeouts under load.
+                _http_limits = _sdk_http.Limits(
                     max_connections=_CLAUDE_HTTP_MAX_CONNECTIONS,
                     max_keepalive_connections=_CLAUDE_HTTP_MAX_KEEPALIVE,
                     keepalive_expiry=_CLAUDE_HTTP_KEEPALIVE_EXPIRY_S,
                 )
-                _http_client = httpx.AsyncClient(
+                _http_client_cls = getattr(
+                    anthropic, "DefaultAsyncHttpxClient", _sdk_http.AsyncClient,
+                )
+                _http_client = _http_client_cls(
                     timeout=_http_timeout,
                     limits=_http_limits,
                 )
@@ -9324,6 +9374,18 @@ class ClaudeProvider:
         create_kwargs["timeout"] = _derive_per_request_httpx_timeout(
             _live_create,
         )
+        # SDK-surface reconciliation. The installed SDK decides what a request
+        # may contain; parameters it no longer accepts are removed HERE, at the
+        # one seam every create passes through, rather than at each of the
+        # call sites that build kwargs. Mutated in place so the caller's
+        # create_kwargs reflects what was actually sent — the same contract the
+        # timeout override above already relies on.
+        _dropped = _sdk_surface.sanitize(
+            create_kwargs, method="create",
+            model=str(create_kwargs.get("model", "")),
+        )[1]
+        for _k in _dropped:
+            create_kwargs.pop(_k, None)
         # Slice 2B-ii — per-call Aegis lease. Computed once per attempt
         # and passed as an explicit ``extra_headers=`` kwarg (AST pin
         # #3 requires the literal kwarg form at the call site to prove
@@ -9812,6 +9874,16 @@ class ClaudeProvider:
             deadline_s=_bcg_deadline_s,
             on_overrun=_bcg_on_overrun,
         )
+
+        # SDK-surface reconciliation — the streaming twin of the check in
+        # _claude_create_with_prefill_fallback. stream() carries its own
+        # signature (it accepts ``output_format``, it has no ``stream``), so
+        # the accepted set is resolved per method rather than shared.
+        for _k in _sdk_surface.sanitize(
+            _stream_kwargs, method="stream",
+            model=str(_stream_kwargs.get("model", "")),
+        )[1]:
+            _stream_kwargs.pop(_k, None)
 
         # Slice 2B-ii — per-call Aegis lease for the streaming path.
         # The SDK's stream() also hits /v1/messages; the lease header

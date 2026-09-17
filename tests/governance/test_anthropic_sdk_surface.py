@@ -153,7 +153,17 @@ def test_the_transport_config_reaches_the_sdks_own_client():
 
 
 def test_the_http_module_is_derived_not_named():
+    """Naming the vendored module is how this breaks the next time it moves.
+
+    Checked against the function BODY — the docstring names ``httpx2`` on
+    purpose, to record which rename caused the defect.
+    """
+    import ast
+
     from backend.core.ouroboros.governance import providers as P
 
-    src = inspect.getsource(P._resolve_sdk_http_module)
-    assert "httpx2" not in src, "the vendored module name must not be hardcoded"
+    tree = ast.parse(inspect.getsource(P._resolve_sdk_http_module))
+    fn = tree.body[0]
+    body = fn.body[1:] if ast.get_docstring(fn) else fn.body
+    code = "\n".join(ast.dump(n) for n in body)
+    assert "httpx2" not in code, "the vendored module name must not be hardcoded"
