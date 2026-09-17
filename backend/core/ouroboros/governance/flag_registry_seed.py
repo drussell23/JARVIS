@@ -1587,6 +1587,35 @@ SEED_SPECS: list = [
         since="v1.0",
     ),
     # ====================================================================
+    # Accumulation promotion — moving a landing onto the operator's branch
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_ACCUMULATION_PROMOTION_ENABLED",
+        type=FlagType.BOOL, default=False,
+        description=(
+            "Master gate for post-hoc promotion of an accumulation branch "
+            "onto main. FALSE (the production posture) means landings stay "
+            "quarantined on ouroboros/auto/<session> for operator review. "
+            "TRUE lets accumulation_promotion_gate verify a range and "
+            "DELEGATE the merge to WorktreeManager.promote_commits — it owns "
+            "no git mutation of its own. Three checks, all fail-closed: "
+            "provenance (every commit in the range is the sanctioned lane's "
+            "or the repo owner's, and at least one is autonomous), structure "
+            "(no public symbol or __all__ export silently lost — the "
+            "whole-file re-emission signature, which no test in this repo can "
+            "see), and coverage (the touched modules' conventional tests exist "
+            "and are green). A refusal leaves the branch exactly where it was; "
+            "a conflict pins the state under "
+            "JARVIS_PROMOTION_QUARANTINE_PREFIX and records a lesson."
+        ),
+        category=Category.SAFETY,
+        source_file=(
+            "backend/core/ouroboros/governance/accumulation_promotion_gate.py"
+        ),
+        example="true",
+        since="v1.0",
+    ),
+    # ====================================================================
     # Control-plane backpressure — the load-shed latch (CD-2)
     # Registered 2026-09-17, for the same reason the diff schema above was:
     # it governed real behaviour and was invisible to /help and the typo
