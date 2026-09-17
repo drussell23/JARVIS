@@ -30,9 +30,12 @@ whose telemetry was dropped, so the gap in the record is itself in the record.
 """
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from typing import Dict, Optional
+
+logger = logging.getLogger("Ouroboros.LoadShed")
 
 _TRUE = {"1", "true", "yes", "on"}
 _lock = threading.Lock()
@@ -198,13 +201,48 @@ def telemetry_shedding(lag_ms: Optional[float] = None) -> bool:
 
 
 def note_shed(topic: str) -> None:
-    """Record that *topic*'s telemetry was dropped. NEVER raises."""
+    """Record that *topic*'s telemetry was dropped. NEVER raises.
+
+    The FIRST drop for a topic is logged, because "shedding started" is the
+    event an operator needs and a counter nobody reads is not an event at all
+    — the first supervised soak could only answer "did it over-shed?" by
+    inference, since the tally existed in memory and reached no log, no
+    summary and no metric. Subsequent drops stay silent and accumulate in
+    :func:`shed_counts`: the volume is a number, the onset is news.
+    """
     try:
         key = str(topic or "?")[:120]
         with _lock:
+            first = key not in _shed_counts
             _shed_counts[key] = _shed_counts.get(key, 0) + 1
+        if first:
+            logger.warning(
+                "[LoadShed] telemetry shedding BEGAN for %s — loop lag is "
+                "above the adaptive trip point; the observability copy of "
+                "this event is being dropped, delivery to subscribers is "
+                "not", key,
+            )
     except Exception:  # noqa: BLE001
         pass
+
+
+def shed_report() -> str:
+    """One line naming every topic shed this process, or that none were.
+
+    Written for a session summary: a soak that sheds nothing and a soak with
+    no instrumentation look identical in a log, and only one of them is good
+    news.
+    """
+    counts = shed_counts()
+    if not counts:
+        return "[LoadShed] no telemetry shed this session"
+    total = sum(counts.values())
+    top = sorted(counts.items(), key=lambda kv: -kv[1])[:5]
+    return (
+        f"[LoadShed] {total} telemetry event(s) shed across "
+        f"{len(counts)} topic(s): "
+        + ", ".join(f"{k}={v}" for k, v in top)
+    )
 
 
 def shed_counts() -> Dict[str, int]:

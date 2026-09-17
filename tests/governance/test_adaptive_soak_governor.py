@@ -139,3 +139,34 @@ def test_no_tuning_constant_was_introduced():
     assert "centre + spread" in body
     for suspect in ("* 1.5", "* 2", "* 3", "0.9", "p90", "percentile"):
         assert suspect not in body, f"a tuning constant crept in: {suspect}"
+
+
+# --------------------------------------------------------------------------
+# Observability — a counter nobody reads is not an event
+# --------------------------------------------------------------------------
+
+def test_the_onset_of_shedding_is_logged_once(caplog, monkeypatch):
+    """The first supervised soak could only answer 'did it over-shed?' by
+    inference: the tally lived in memory and reached no log or summary."""
+    with caplog.at_level("WARNING"):
+        for _ in range(5):
+            LS.note_shed("autonomy.health_probe_result")
+        LS.note_shed("autonomy.op_completed")
+    began = [r for r in caplog.records if "shedding BEGAN" in r.getMessage()]
+    assert len(began) == 2, "onset must be logged once per topic, not per drop"
+    assert LS.shed_counts()["autonomy.health_probe_result"] == 5
+
+
+def test_a_quiet_session_says_so_explicitly():
+    """A soak that sheds nothing and a soak with no instrumentation look
+    identical in a log, and only one of them is good news."""
+    assert "no telemetry shed" in LS.shed_report()
+
+
+def test_the_report_names_the_topics():
+    LS.note_shed("autonomy.health_probe_result")
+    LS.note_shed("autonomy.health_probe_result")
+    LS.note_shed("autonomy.saga_state_changed")
+    report = LS.shed_report()
+    assert "3 telemetry event(s) shed across 2 topic(s)" in report
+    assert "autonomy.health_probe_result=2" in report
