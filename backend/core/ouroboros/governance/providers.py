@@ -587,6 +587,102 @@ def _max_target_line_count(target_files, repo_root) -> "Optional[int]":
         return None
 
 
+def _observe_prime_candidates(ctx: Any, result: Any) -> None:
+    """Measure every candidate the LOCAL lane produced. NEVER raises.
+
+    Reads the original from the authoritative tree rather than the worktree:
+    the candidate is judged against the file it was asked to change, and an op
+    executing inside `.worktrees/<session>` may not have one.
+
+    The schema REQUESTED is re-derived from the same predicate the prompt
+    builder used, so adherence compares like with like instead of a guess. The
+    schema RETURNED is read from the candidate's own shape.
+    """
+    try:
+        from backend.core.ouroboros.governance.semantic_quality_observer import (  # noqa: E501,PLC0415
+            observer_enabled,
+        )
+        if not observer_enabled():
+            return
+        _force_full = resolve_force_full_content(
+            schema_capability=_schema_capability_of(ctx),
+            target_files=getattr(ctx, "target_files", ()) or (),
+            repo_root=None,
+        )
+        requested = (
+            "diff" if single_file_diff_requested(ctx, force_full_content=_force_full)
+            else "full_content"
+        )
+        try:
+            from backend.core.ouroboros.governance.execution_context import (  # noqa: E501,PLC0415
+                authoritative_repo_root,
+            )
+            root = authoritative_repo_root(Path.cwd())
+        except Exception:  # noqa: BLE001
+            root = Path.cwd()
+        for cand in (getattr(result, "candidates", None) or ())[:8]:
+            path = str(
+                (cand.get("file_path") if isinstance(cand, dict)
+                 else getattr(cand, "file_path", "")) or "",
+            )
+            content = (
+                cand.get("full_content") if isinstance(cand, dict)
+                else getattr(cand, "full_content", None)
+            )
+            returned = "diff" if (
+                isinstance(content, str) and content.lstrip().startswith(("@@", "---", "diff "))
+            ) else "full_content"
+            original = None
+            try:
+                p = root / path
+                if path and p.is_file():
+                    original = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                original = None
+            _observe_candidate_quality(
+                ctx, target_file=path, original=original,
+                candidate_content=content if isinstance(content, str) else None,
+                schema_requested=requested, schema_returned=returned,
+            )
+    except Exception:  # noqa: BLE001 — an observer never perturbs generation
+        logger.debug("[SemanticQuality] prime observation degraded", exc_info=True)
+
+
+def _schema_capability_of(ctx: Any) -> str:
+    """The served model's schema capability as the routing admission recorded
+    it, or ``""`` when nobody asked. Read-only."""
+    try:
+        ri = getattr(getattr(ctx, "telemetry", None), "routing_intent", None)
+        return str(getattr(ri, "schema_capability", "") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _observe_candidate_quality(
+    ctx: Any, *, target_file: str, original: "Optional[str]",
+    candidate_content: "Optional[str]", schema_requested: str,
+    schema_returned: str, malformed: bool = False, detail: str = "",
+) -> None:
+    """Hand one candidate to the semantic-quality observer. NEVER raises.
+
+    A thin adapter, deliberately: the measurement lives in its own module and
+    the generation path only tells it what it already knows. An observer that
+    can break the thing it observes is worse than no observer.
+    """
+    try:
+        from backend.core.ouroboros.governance.semantic_quality_observer import (  # noqa: E501,PLC0415
+            observe_candidate,
+        )
+        observe_candidate(
+            ctx=ctx, target_file=target_file, original=original,
+            candidate_content=candidate_content,
+            schema_requested=schema_requested, schema_returned=schema_returned,
+            malformed_diff=malformed, detail=detail,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _record_malformed_diff_lesson(ctx: Any, target_file: str, detail: str) -> None:
     """Route a malformed diff into LessonMemory. NEVER raises, never blocks.
 
@@ -5873,7 +5969,24 @@ def _parse_generation_response(
                     pfx, cand.get("candidate_id"), exc,
                 )
                 _record_malformed_diff_lesson(ctx, source_path, str(exc))
+                try:
+                    from backend.core.ouroboros.governance.semantic_quality_observer import (  # noqa: E501,PLC0415
+                        note_malformed,
+                    )
+                    note_malformed(str(getattr(ctx, "op_id", "") or ""))
+                except Exception:  # noqa: BLE001
+                    pass
+                _observe_candidate_quality(
+                    ctx, target_file=source_path, original=orig_content,
+                    candidate_content=None, schema_requested="diff",
+                    schema_returned="diff", malformed=True, detail=str(exc),
+                )
                 continue
+            _observe_candidate_quality(
+                ctx, target_file=source_path, original=orig_content,
+                candidate_content=patched, schema_requested="diff",
+                schema_returned="diff",
+            )
             rewritten.append({
                 "candidate_id": cand.get("candidate_id", "c1"),
                 "file_path": cand.get("file_path", source_path),
@@ -5881,6 +5994,37 @@ def _parse_generation_response(
                 "rationale": cand.get("rationale", ""),
             })
         if not rewritten:
+            # TerminalDiffCascade — every candidate's patch failed to parse or
+            # place, repeatedly. The op is shed HERE rather than retried into
+            # the wall clock: with the schema now strictly diff for a
+            # single-file op, a model that cannot produce a parseable patch for
+            # this particular file would otherwise hold a worker until the
+            # session ends. The ceiling is the op's OWN remaining retries, so
+            # there is no second budget to keep in agreement with the FSM's.
+            try:
+                from backend.core.ouroboros.governance.semantic_quality_observer import (  # noqa: E501,PLC0415
+                    diff_cascade_exhausted,
+                )
+                _remaining = int(getattr(ctx, "generate_retries_remaining", 0) or 0)
+                if diff_cascade_exhausted(
+                    str(getattr(ctx, "op_id", "") or ""),
+                    retries_remaining=_remaining,
+                ):
+                    logger.error(
+                        "[%s] TerminalDiffCascade op=%s — every diff attempt "
+                        "failed to apply and the retry budget is spent. "
+                        "Shedding the op; the goal stays quarantined and the "
+                        "pool moves on.",
+                        pfx, str(getattr(ctx, "op_id", ""))[:20],
+                    )
+                    raise RuntimeError(
+                        f"{pfx}_terminal_diff_cascade:"
+                        "diff_unparseable_after_retry_budget"
+                    )
+            except RuntimeError:
+                raise
+            except Exception:  # noqa: BLE001 — the ceiling never invents a failure
+                pass
             # content_failure (not schema_invalid) so the cascade correctly
             # classifies this as a soft failure — no FSM penalty, clean fallback.
             raise RuntimeError(f"{pfx}_content_failure:diff_apply_failed_all_candidates")
@@ -7181,6 +7325,16 @@ class PrimeProvider:
             result = dataclasses.replace(
                 result, prompt_preloaded_files=tuple(_preloaded_files),
             )
+
+        # Observe what the LOCAL lane actually produced.
+        #
+        # Wired here as well as at the diff-rewrite loop because the two are
+        # different paths and the local lane takes this one: the observer's
+        # first soak captured zero candidates while `[PrimeProvider] Generated
+        # 1 candidates` appeared eight times. Measuring the lane that is not
+        # running is the same defect this repository keeps finding in itself,
+        # and an observer is not exempt from it.
+        _observe_prime_candidates(context, result)
 
         # The local director carries the token split + its provenance here.
         # Read once: both the log line and the recorder hook below need it,
