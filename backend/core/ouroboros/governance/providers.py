@@ -866,6 +866,62 @@ def _record_malformed_diff_lesson(ctx: Any, target_file: str, detail: str) -> No
         logger.debug("[Providers] malformed-diff lesson degraded", exc_info=True)
 
 
+def target_is_creation(target_files, repo_root) -> "Optional[bool]":
+    """Whether this op must CREATE its target rather than edit an existing one.
+
+    ``True`` create, ``False`` edit, ``None`` CANNOT BE ESTABLISHED — and the
+    third value is the whole point. "Unknown" is not "no"; collapsing them is
+    precisely how the previous change here turned a transient read failure into
+    a whole-file rewrite, and inverting that mistake would be the same error
+    wearing the other sign.
+
+    ## Absent is not unreadable
+
+    The size gate was removed from this decision because a failed READ was
+    pushing small-file edits into whole-file re-emission — three damaged
+    commits' worth. That fix was right, and it collapsed two states that are
+    not the same:
+
+    * **unreadable** — the file is there and the read failed. Transient, and it
+      must not change the schema. Unchanged here: this asks ``exists()``, never
+      ``read_text()``, so there is no read left to fail.
+    * **absent** — there is no file, because the op's entire job is to write
+      one. A unified diff has nothing to anchor to, and no capability of the
+      model can change that.
+
+    Measured live in ``bt-2026-09-18-033008``: every test-synthesis goal failed
+    ``_schema_invalid:diff_source_unreadable`` — the 30B was asked for a diff
+    against a file the goal existed to create, the reply could not validate,
+    and the op went terminal with the goal unsatisfied. Fifteen of the
+    twenty-seven goals on the queue are that shape, so the largest tier could
+    never land. The message said "unreadable"; the state was "absent".
+
+    This is the same fact :data:`goal_discovery.LIVENESS_CREATES_TEST` already
+    ranks on, derived independently rather than imported — discovery ranks a
+    QUEUE and this gates a SCHEMA, and a dependency between them would tie the
+    generator's correctness to a sensor it should not need.
+    """
+    try:
+        if repo_root is None:
+            # Without a root, absence cannot be established. Fail soft to
+            # "not a creation" so an unknown root can never flip the schema.
+            return None
+        paths = [str(p) for p in (target_files or ()) if str(p or "").strip()]
+        if not paths:
+            return None
+        root = Path(repo_root)
+        for raw in paths:
+            p = Path(raw)
+            resolved = p if p.is_absolute() else (root / raw)
+            if not resolved.exists():
+                # ANY absent target makes a diff unsatisfiable for that file,
+                # and the op is judged as a whole.
+                return True
+        return False
+    except Exception:  # noqa: BLE001 — an unanswerable question answers None
+        return None
+
+
 def resolve_force_full_content(
     *, schema_capability: str, target_files, repo_root,
 ) -> bool:
@@ -881,9 +937,15 @@ def resolve_force_full_content(
     rewrite — which is what it did for every file under 800 lines, three
     damaged commits' worth.
 
-    ``target_files`` / ``repo_root`` are kept so the call sites and their pins
-    keep their shape.
+    ``target_files`` / ``repo_root`` now carry authority again — but for a
+    STRUCTURAL question, not the cost heuristic that was removed. See
+    :func:`target_is_creation`: an op whose target does not exist has nothing
+    for a diff to anchor to, so full_content is the only schema it can
+    satisfy, however diff-capable the served model is. Capability answers "can
+    this model emit a diff"; this answers "can THIS op use one".
     """
+    if target_is_creation(target_files, repo_root) is True:
+        return True
     return should_force_full_content(
         schema_capability=schema_capability,
         target_line_count=None,

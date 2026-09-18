@@ -79,8 +79,13 @@ def test_the_drift_verdict_is_now_fatal_for_a_sanctioned_op():
     gate made the downgrade legitimate. With the gate gone it is a defect."""
     import inspect
 
+    # Anchored on the VERDICT CONSTRUCTION, not the first textual mention.
+    # It used to index the first occurrence of the bare name, and a later
+    # comment elsewhere in the module that merely REFERRED to the verdict moved
+    # the anchor and broke this test while the behaviour was untouched — a
+    # source-inspection pin failing on prose.
     src = inspect.getsource(CA)
-    idx = src.index("CapabilityExecutionDrift")
+    idx = src.index('"CapabilityExecutionDrift: the diff schema is armed')
     tail = src[idx:idx + 2000]
     assert "severity=FATAL" in tail, "the silent-downgrade verdict is still advisory"
 

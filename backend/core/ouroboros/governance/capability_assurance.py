@@ -600,6 +600,7 @@ def assert_generation_capability(
             _ctx_schema_capability,
             single_file_diff_requested,
             single_file_diff_schema_enabled,
+            target_is_creation,
         )
 
         # Only a SANCTIONED op may be aborted — see CapabilityVerdict.enforceable.
@@ -663,6 +664,50 @@ def assert_generation_capability(
                 )
             return CapabilityVerdict(
                 True, f"served model is {capability} — full content is correct",
+                checks, detail, enforceable=sanctioned,
+            )
+
+        # A CREATION is the fourth correct outcome, and without this branch the
+        # fix that produced it would be strictly worse than the defect.
+        #
+        # This verdict is FATAL because, with the size gate gone, there was no
+        # legitimate reason left for a diff-capable single-file op to come out
+        # full_content. Making creations take full_content — which they must,
+        # having no source for a diff to anchor to — created one. Every
+        # test-synthesis op would otherwise arrive here and be refused as a
+        # silent downgrade, turning `_schema_invalid:diff_source_unreadable`
+        # into a FATAL capability drift and leaving the largest tier on the
+        # queue exactly as unlandable as before.
+        #
+        # Asked of the SAME seam the schema decision uses, not re-derived: a
+        # second existence check here could disagree with the one that actually
+        # chose the schema, and this verdict exists to catch precisely that
+        # class of disagreement.
+        _creation = None
+        try:
+            from pathlib import Path as _Path  # noqa: PLC0415
+            from backend.core.ouroboros.governance.execution_context import (  # noqa: E501,PLC0415
+                authoritative_repo_root,
+            )
+            # The SAME idiom the provider's own observer path uses to resolve a
+            # root. A worktree and its parent are both checkouts of the same
+            # tree, so for the only question asked here — does this file exist
+            # at all — they cannot disagree.
+            _root = getattr(ctx, "repo_root", None)
+            if not _root:
+                try:
+                    _root = authoritative_repo_root(_Path.cwd())
+                except Exception:  # noqa: BLE001
+                    _root = _Path.cwd()
+            _creation = target_is_creation(files, _root)
+        except Exception:  # noqa: BLE001 — unknown stays unknown
+            _creation = None
+        checks["target_exists"] = (_creation is False)
+        if _creation is True:
+            return CapabilityVerdict(
+                True,
+                "creation op — the target does not exist yet, so there is no "
+                "source for a diff to anchor to and full content is correct",
                 checks, detail, enforceable=sanctioned,
             )
 
