@@ -76,7 +76,20 @@ ANOMALY_PATTERNS: Dict[str, str] = {
     "dispatch_state_drift": r"STATE DRIFT",
     "duplicate_dispatch": r"already signed — re-dispatching",
     "generation_starved": r"no_candidates_returned|generation_failed",
-    "worktree_conflict": r"quarantin|conflict",
+    # Was `quarantin|conflict`, which was WRONG in the way that matters: it
+    # reported "44x worktree_conflict" on a run that had none. The hits were
+    # `conflicting_processes_async` (a health-probe field) and
+    # ProviderQuarantine lines. A label an operator would act on must match
+    # the thing it names, so these are now separate and specific.
+    "promotion_conflict": r"(worktree|promot\w*|merge)[^\n]{0,40}conflict",
+    "provider_quarantine": r"\[ProviderQuarantine\]",
+    # The dominant L2 failure once the creation-schema fault was fixed: the
+    # model writes a test against a symbol the module does not have.
+    "hallucinated_api": r"has no attribute|cannot import name|ImportError",
+    # The repair loop that exists to fix exactly the above, declining to run
+    # because the target does not exist yet — the same absent-vs-present
+    # confusion as the diff-source fault, one layer up.
+    "micro_fix_skipped_new_file": r"micro_fix_skipped_new_file",
 }
 
 
@@ -239,14 +252,34 @@ def scan_trace(log_paths: Sequence[Path]) -> Dict[str, List[str]]:
         k: re.compile(v) for k, v in
         {**PROOF_PATTERNS, **ANOMALY_PATTERNS}.items()
     }
+    # FIRST FILE WINS, PER KEY. `log_paths` arrives most-authoritative first
+    # (the session's `debug.log`, then the captured stdout).
+    #
+    # Every WARNING is written to BOTH streams, so scanning them additively
+    # counted each proof line twice — the first trace reported 112 Sentinel
+    # passes for a run that made 56, and a number an operator would quote has
+    # to be the real one. Per-line de-duplication does not work either: the
+    # streams format their prefixes differently and the stdout copy carries no
+    # timestamp at all, while a census line is byte-identical across passes
+    # whenever the tiers and the head have not moved. Fingerprinting on the
+    # message collapsed 56 real passes into 21; fingerprinting with a fallback
+    # for the missing timestamp collapsed nothing.
+    #
+    # So the rule is per-KEY, not per-line: whichever stream reports a signal
+    # owns its count entirely. The stdout log still earns its place — it is the
+    # only stream carrying `Autonomous Sentinel armed`, which the REPL prints
+    # and the logger never sees.
     for path in log_paths:
         try:
             if not path.is_file():
                 continue
+            pending = {k: rx for k, rx in compiled.items() if not found[k]}
+            if not pending:
+                break
             with path.open("r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
                     clean = re.sub(r"\x1b\[[0-9;]*m", "", line).rstrip()
-                    for key, rx in compiled.items():
+                    for key, rx in pending.items():
                         if rx.search(clean):
                             found[key].append(clean[-400:])
         except Exception:  # noqa: BLE001 — a partial trace beats none
