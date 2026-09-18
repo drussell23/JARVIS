@@ -141,6 +141,27 @@ def _env_float(name: str, default: float, lo: float, hi: float) -> float:
         return default
 
 
+#: Model identities that are a CLIENT DEFAULT or an empty slot rather than a
+#: statement about which model ran. Each was observed in this corpus:
+#:
+#:   "gpt-4"    the OpenAI-compat client's default, reported by the local lane
+#:              for every generation regardless of the served model;
+#:   ""/unknown nothing resolved at all.
+#:
+#: Deliberately NOT a list of real model names to reject — a placeholder is a
+#: property of the PLUMBING, and enumerating real models here would turn this
+#: into a second, silently-drifting model catalog.
+_PLACEHOLDER_MODEL_IDS = frozenset({"", "gpt-4", "unknown", "none", "null", "-"})
+
+
+def _placeholder_model(model_id: str) -> bool:
+    """Whether *model_id* names a model or merely fills the field. Never raises."""
+    try:
+        return str(model_id or "").strip().lower() in _PLACEHOLDER_MODEL_IDS
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def recorder_enabled() -> bool:
     """Master flag. Default FALSE per §33.1 (shadow-first)."""
     return _env_flag(_ENV_MASTER)
@@ -840,12 +861,37 @@ class TrajectoryRecorder:
                 noop_candidate(str(getattr(traj, "noop_reason", "") or "")),
             )
 
+        # PROVENANCE GUARD — a row nobody can attribute is worse than no row.
+        #
+        # The corpus keys DPO pairs on `model_id`. A row filed under the wrong
+        # model does not merely mislabel itself: it teaches the wrong thing
+        # about which model can do what, and a preference pair built across two
+        # models that were actually one model is not a preference at all.
+        # Measured: 480 of 2,892 rows (16.6%) were 30B output stamped
+        # `qwen-2.5-coder-7b`, because this fell back to `traj.model_id` — the
+        # nominal brain-catalog slot — whenever a caller passed no override.
+        #
+        # The fallback stays (a GenerationResult that genuinely knows its model
+        # is still the right answer), but the KNOWN-BAD placeholders are
+        # refused. Dropping the row protects the corpus; recording it silently
+        # corrupts every future training cycle that reads it.
+        _resolved_model = str(model_id_override).strip() or str(traj.model_id or "")
+        if _placeholder_model(_resolved_model):
+            logger.warning(
+                "[TrajectoryRecorder] ProvenanceDriftWarning: op=%s carries no "
+                "trustworthy model identity (resolved=%r, override=%r) — the "
+                "row is DROPPED rather than filed under a placeholder. The "
+                "generation itself is unaffected.",
+                str(op_id)[:16], _resolved_model, str(model_id_override),
+            )
+            return False
+
         pending = _PendingGeneration(
             op_id=str(op_id),
             prompt=prompt_text,
             prompt_key=prompt_key,
             candidates=_cands,
-            model_id=(str(model_id_override).strip() or traj.model_id),
+            model_id=_resolved_model,
             provider_name=traj.provider_name,
             is_noop=bool(traj.is_noop),
             latency_ms=max(0.0, float(latency_ms or 0.0)),

@@ -7858,15 +7858,17 @@ class PrimeProvider:
                 route=str(getattr(context, "provider_route", "") or "local"),
                 # The GenerationResult on this path reports model_id
                 # "gpt-4" -- the OpenAI-compat default, not the model that
-                # ran. Prefer what the engine itself reported, then the
-                # client's configured model. Recording the placeholder
-                # would make every model in an A/B look identical.
-                model_id_override=str(
-                    getattr(response, "model", "") if response else ""
-                ) or str(
-                    getattr(getattr(self, "_cfg", None), "model_name", "")
-                    or os.environ.get("JARVIS_LOCAL_MODEL_NAME", "")
-                ),
+                # ran. Recording the placeholder would make every model in
+                # an A/B look identical.
+                #
+                # Resolved through `reported_model_name`, the SAME resolver
+                # the log line two calls below uses, rather than reading
+                # `response.model` here: that field is the NOMINAL
+                # brain-catalog slot on the local lane, which is how 480
+                # corpus rows produced by the 30B came to be stamped
+                # `qwen-2.5-coder-7b`. Two spellings of "which model ran" is
+                # how the log and the corpus come to disagree.
+                model_id_override=reported_model_name(context, response),
                 # PrimeResponse names its completion count `tokens_used`;
                 # it has never had an `output_tokens` attribute, so this
                 # read resolved to the -1 default on EVERY local generation
@@ -12444,6 +12446,24 @@ class ClaudeProvider:
                 task_type="code_repair",
                 session_id=str(getattr(context, "session_id", "") or ""),
                 route=(_route_str if _route_str != "?" else "standard"),
+                # THE SITE THAT POISONED THE CORPUS.
+                #
+                # This is the main codegen finalisation path and it passed no
+                # override at all, so the recorder fell back to
+                # `traj.model_id` — the nominal brain-catalog slot. Measured:
+                # 480 of 2,892 corpus rows (16.6%) stamped
+                # `qwen-2.5-coder-7b` across 34 sessions in which
+                # `ModelPhysics` — which reads the served model's OWN
+                # metadata and so cannot echo the catalog — named
+                # `qwen3-coder-ov:30b` and nothing else. Every one of those
+                # rows was 30B output filed under a 7B.
+                #
+                # `reported_model_name` already existed for exactly this, with
+                # this defect named in its docstring, and was wired into the
+                # parse-error sibling of this call and not into this one. A
+                # capability built, tested, and not consulted at the site that
+                # produces most of the rows.
+                model_id_override=reported_model_name(context, _final),
                 is_repair=bool(is_repair),
                 sampling=sampling,
                 temperature=temperature,
