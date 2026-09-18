@@ -778,6 +778,59 @@ def _norm(p: str) -> str:
     return str(p).replace("\\", "/")
 
 
+def _imported_module_names(source: str) -> List[str]:
+    """Dotted module names this source imports. Order-preserving. Never raises."""
+    out: List[str] = []
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return out
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name and alias.name not in out:
+                    out.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            # `level` > 0 is a relative import; resolving those needs the
+            # importing file's package, which `_resolve_first_party` gets for
+            # free by walking that file's own ancestors.
+            if node.module and node.module not in out:
+                out.append(node.module)
+    return out
+
+
+def _resolve_first_party(module: str, importer: Path, root: Path) -> Optional[Path]:
+    """The in-repo file a dotted *module* name refers to, or ``None``.
+
+    Resolved by walking the IMPORTER's own ancestor directories up to the repo
+    root, which is how Python itself finds it: `backend/trace_live_error.py`
+    importing ``vision.multi_space_intelligence`` resolves against its own
+    package root to ``backend/vision/multi_space_intelligence.py``. Deriving the
+    prefix this way rather than naming ``backend/`` keeps the rule true for any
+    package layout.
+
+    "First-party" means "resolves to a file in this repository". A module that
+    does not resolve is stdlib or a third-party dependency, and the model's
+    training already covers those far better than a signature block would.
+    """
+    rel = Path(str(module or "").replace(".", "/"))
+    if not str(rel) or str(rel) == ".":
+        return None
+    try:
+        anchor = importer.parent.resolve()
+        root = root.resolve()
+        while True:
+            for cand in (anchor / (str(rel) + ".py"), anchor / rel / "__init__.py"):
+                if cand.is_file():
+                    return cand
+            if anchor == root or root not in anchor.parents:
+                break
+            anchor = anchor.parent
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 def collect_anchor_sources(
     target_files: Sequence[str],
     description: str,
@@ -789,7 +842,31 @@ def collect_anchor_sources(
       2. repo-relative ``*.py`` paths named in the op DESCRIPTION that exist
          (operator/roadmap goals name the module-under-test explicitly);
       3. for a ``test_*.py`` / ``*_test.py`` target, the source module it tests,
-         found by a bounded, non-test search under the repo.
+         found by a bounded, non-test search under the repo;
+      4. ONE HOP of first-party imports from everything resolved above.
+
+    ## Why step 4 exists
+
+    Steps 1-3 anchor the module under test, and the model still hallucinated:
+    104 occurrences in soak `bt-2026-09-18-034951`, the dominant failure once
+    creations could generate at all. The invented symbols were not the
+    subject's — they belonged to what the subject IMPORTS.
+
+    Measured: `tests/test_trace_live_error.py` anchored
+    `backend/trace_live_error.py` and nothing else. That module imports
+    ``vision.multi_space_intelligence``, which resolves in-repo to
+    `backend/vision/multi_space_intelligence.py` and was never anchored. The
+    failure was `has no attribute 'ResponseBuilder'` — a symbol invented for
+    exactly that unanchored module. A test exercises its subject THROUGH the
+    subject's collaborators, so anchoring the subject alone leaves the model
+    guessing at every boundary it has to cross.
+
+    ONE hop, deliberately. The transitive closure of a repo this size is most
+    of the repo, and the budget in :func:`build_signature_anchor` would spend
+    itself on modules the test never touches. Dependencies are appended AFTER
+    the primary sources, so when that budget truncates it drops a collaborator
+    rather than the module under test.
+
     De-duplicated, order-preserving. Bounded. NEVER raises."""
     root = Path(repo_root)
     out: List[Tuple[str, Path]] = []
@@ -841,6 +918,28 @@ def collect_anchor_sources(
             found.sort(key=lambda p: len(str(p)))
             for p in found[:1]:
                 _add(p)
+        # (4) one hop of first-party imports from what steps 1-3 resolved.
+        # Snapshotted first: `_add` appends to `out`, and iterating it live
+        # would walk the dependencies' own imports too — the transitive
+        # closure this is explicitly bounded to avoid.
+        primary = list(out)
+        # Bounded by the SAME budget the caller slices with, so a change there
+        # cannot leave this walking modules that will never be rendered.
+        hop_budget = max(0, _int_env(_ENV_MAX_MODULES, _DEFAULT_MAX_MODULES) - len(primary))
+        if hop_budget:
+            for _label, src_path in primary:
+                if len(out) - len(primary) >= hop_budget:
+                    break
+                try:
+                    body = src_path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                for mod in _imported_module_names(body):
+                    if len(out) - len(primary) >= hop_budget:
+                        break
+                    dep = _resolve_first_party(mod, src_path, root)
+                    if dep is not None and not is_test_path(dep):
+                        _add(dep)
     except Exception:  # noqa: BLE001
         pass
     return out
