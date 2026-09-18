@@ -55,6 +55,26 @@ class TerminalReasonClass(str, enum.Enum):
     coordinated shutdown (Slice 12O cooldown_cancelled_shutdown,
     session_exhausted shutdown cascade)."""
 
+    PIPELINE_CONTRACT_FAULT = "pipeline_contract_fault"
+    """The harness could not RUN the work — admission refused the
+    envelope, a duplicate claim superseded it, or the
+    request/reply contract could not be satisfied (a schema the
+    op cannot fulfil, an unparseable reply shape).
+
+    Distinct from STRUCTURAL_GATE_REJECTION, which is a gate
+    refusing a generation the model actually produced. Here there
+    is no model output to judge: the op never got a fair attempt.
+    So it is NOT reflexive-healing eligible (there is nothing to
+    feed back) and NOT eligible for a Sentinel target cooldown —
+    the target did nothing wrong, and cooling it would penalise a
+    file for a defect in the pipeline.
+
+    Added after `bt-2026-09-18-033008`, where every test-synthesis
+    goal died `_schema_invalid:diff_source_unreadable` — a diff
+    requested against a file the goal existed to create — and each
+    one escalated a cooldown on a target that was never at
+    fault, reaching `consecutive_failures: 9`."""
+
     OTHER = "other"
     """Defensive fallback for terminal reasons not yet classified.
     A new terminal_reason_code that lands in OTHER signals a
@@ -90,6 +110,17 @@ _CLASSIFIER_RULES: tuple = (
     ("budget_floor_breached", TerminalReasonClass.COST_BUDGET_EXHAUSTED),
     ("cost_cap_reached", TerminalReasonClass.COST_BUDGET_EXHAUSTED),
     ("budget_exhausted", TerminalReasonClass.COST_BUDGET_EXHAUSTED),
+
+    # PIPELINE_CONTRACT_FAULT — listed BEFORE the gate rules so a
+    # schema fault is never mistaken for a generation a gate
+    # refused. The distinction decides two different things: what
+    # reflexive healing may feed back, and whether the Sentinel
+    # may cool the target.
+    ("not_admitted", TerminalReasonClass.PIPELINE_CONTRACT_FAULT),
+    ("superseded_on_resume", TerminalReasonClass.PIPELINE_CONTRACT_FAULT),
+    ("schema_invalid", TerminalReasonClass.PIPELINE_CONTRACT_FAULT),
+    ("diff_source_unreadable", TerminalReasonClass.PIPELINE_CONTRACT_FAULT),
+    ("candidates_empty", TerminalReasonClass.PIPELINE_CONTRACT_FAULT),
 
     # STRUCTURAL_GATE_REJECTION — Iron Gate + downstream gates.
     # Listed before PROVIDER_EXHAUSTION so an exploration_insufficient
@@ -155,8 +186,52 @@ def is_reflexive_healing_eligible(
         TerminalReasonClass.STRUCTURAL_GATE_REJECTION
 
 
+#: Classes where the failure says nothing about the TARGET. Each is a
+#: property of the machine or the session, not of the file being worked on.
+#: Named as a set rather than an `if` chain so adding a class forces a
+#: decision here instead of silently defaulting.
+_NOT_TARGET_ATTRIBUTABLE = frozenset({
+    TerminalReasonClass.PROVIDER_EXHAUSTION,    # upstream refused
+    TerminalReasonClass.COST_BUDGET_EXHAUSTED,  # our wallet, not the file
+    TerminalReasonClass.WALL_CLOCK_CAP,         # the session ended
+    TerminalReasonClass.CANCELLED_SHUTDOWN,     # we stopped it
+    TerminalReasonClass.PIPELINE_CONTRACT_FAULT,  # it never got a fair attempt
+})
+
+
+def is_target_attributable(code: Optional[str]) -> bool:
+    """Is this failure EVIDENCE ABOUT THE TARGET, or about the machine?
+
+    The Sentinel's cooldown exists to make a target that keeps failing
+    geometrically rarer, so nobody has to choose a retry limit. That brake is
+    only honest if what it counts is the target's difficulty. A provider
+    outage, a wall-clock cap, a shutdown, or a request the pipeline could not
+    even form are facts about the run — counting them penalises a file for the
+    harness's problems and suppresses it long after the harness is fixed.
+
+    Measured: in `bt-2026-09-18-033008` every test-synthesis goal died
+    `_schema_invalid:diff_source_unreadable` and each one escalated the
+    target's cooldown to `consecutive_failures: 9` — nine strikes against files
+    that were never given a runnable request.
+
+    Only a STRUCTURAL_GATE_REJECTION is genuinely about the work: the model
+    produced something and a gate refused it. That is the AI capability failure
+    the brake is for.
+
+    ``OTHER`` is attributable — deliberately. Unknown must fail toward the
+    brake, because the alternative is that any unclassified reason silently
+    disables the only thing stopping the loop spinning on one target. A code
+    that lands in OTHER and should be exempt is a gap to close in the rules
+    above, not a default to invert.
+
+    NEVER raises.
+    """
+    return classify_terminal_reason(code) not in _NOT_TARGET_ATTRIBUTABLE
+
+
 __all__ = [
     "TerminalReasonClass",
     "classify_terminal_reason",
     "is_reflexive_healing_eligible",
+    "is_target_attributable",
 ]

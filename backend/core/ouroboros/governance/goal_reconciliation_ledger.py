@@ -314,6 +314,22 @@ class ReconciliationRecord:
     #: attacker who forges it can only make a dispatch look stale (a
     #: duplicate op), never hide a goal (fail-closed for suppression).
     session: str = ""
+    #: WHY the op terminated, for a TERMINAL row. Empty everywhere else.
+    #:
+    #: `record_terminal` has always ACCEPTED an ``outcome`` and only logged it,
+    #: so the cause died at the write site: the Sentinel read the row back,
+    #: found the op id and nothing else, and reported "goal unsatisfied" for
+    #: every terminal — a provider outage and a model that cannot write the
+    #: file were the same sentence. That is what let a pipeline fault escalate
+    #: a cooldown on a blameless target.
+    #:
+    #: NOT part of the MAC'd payload, for the same reason `session` is not, and
+    #: with a weaker consequence: the payload fields and the hash chain are
+    #: untouched, so every row already on disk stays valid and old rows simply
+    #: read back "". A forged value can only move a failure between "cool the
+    #: target" and "do not", and the unknown case is attributable, so the worst
+    #: an attacker achieves is extra retries the other brakes still bound.
+    terminal_reason: str = ""
 
     def payload(self) -> Dict[str, Any]:
         return {k: getattr(self, k) for k in _PAYLOAD_FIELDS}
@@ -325,6 +341,10 @@ class ReconciliationRecord:
             "mac": self.mac, "schema_version": self.schema_version,
             "session": self.session,
         })
+        # Written only when present, so a row that carries no reason is
+        # byte-identical to one written before this field existed.
+        if self.terminal_reason:
+            d["terminal_reason"] = self.terminal_reason
         return d
 
 
@@ -403,7 +423,9 @@ def read_records(path: Optional[Path] = None, *, secret: Optional[str] = None) -
                     break
             rec = ReconciliationRecord(
                 prev_hash=prev, record_hash=expected, mac=mac,
-                session=str(row.get("session", "") or ""), **payload,
+                session=str(row.get("session", "") or ""),
+                terminal_reason=str(row.get("terminal_reason", "") or ""),
+                **payload,
             )
             records.append(rec)
             prev = expected
@@ -531,7 +553,9 @@ def repair_chain(
                         payload[k] = str(payload.get(k) or "")
                 rec = ReconciliationRecord(
                     prev_hash=prev, record_hash=_chain_hash(prev, payload), mac=_mac(payload, secret),
-                    session=str(row.get("session", "") or ""), **payload,
+                    session=str(row.get("session", "") or ""),
+                    terminal_reason=str(row.get("terminal_reason", "") or ""),
+                    **payload,
                 )
                 out.append(rec)
                 prev = rec.record_hash
@@ -548,16 +572,20 @@ def repair_chain(
 def _make_record(
     *, event: ReconciliationEvent, goal_id: str, goal_digest_hex: str,
     commit_sha: str, op_id: str, prev_hash: str, secret: Optional[str],
-    ts: Optional[float] = None,
+    ts: Optional[float] = None, terminal_reason: str = "",
 ) -> ReconciliationRecord:
     payload = {
         "event": event.value, "goal_id": goal_id[:128], "goal_digest": goal_digest_hex[:64],
         "commit_sha": commit_sha[:64], "landing_ref": landing_ref(), "op_id": op_id[:128],
         "ts": float(ts if ts is not None else time.time()),
     }
+    # `terminal_reason` is deliberately OUTSIDE `payload`: the payload is what
+    # the chain hash and the MAC cover, and adding a field to it would
+    # invalidate every row already on disk.
     return ReconciliationRecord(
         prev_hash=prev_hash, record_hash=_chain_hash(prev_hash, payload),
-        mac=_mac(payload, secret), session=current_session(), **payload,
+        mac=_mac(payload, secret), session=current_session(),
+        terminal_reason=str(terminal_reason or "")[:200], **payload,
     )
 
 
@@ -592,7 +620,7 @@ async def record_landing(
 
 async def _append_event(
     *, event: ReconciliationEvent, goal_id: str, goal_digest_hex: str, op_id: str,
-    path: Optional[Path], secret: Optional[str],
+    path: Optional[Path], secret: Optional[str], terminal_reason: str = "",
 ) -> Optional[ReconciliationRecord]:
     if not enabled() or not goal_id or not op_id:
         return None
@@ -604,6 +632,7 @@ async def _append_event(
             lambda prev: _make_record(
                 event=event, goal_id=goal_id, goal_digest_hex=goal_digest_hex,
                 commit_sha="", op_id=op_id, prev_hash=prev, secret=secret,
+                terminal_reason=terminal_reason,
             ),
             target, secret,
         )
@@ -624,7 +653,14 @@ async def record_dispatch(*, goal_id: str, goal_digest_hex: str, op_id: str, pat
 async def record_terminal(*, goal_id: str, op_id: str, outcome: str = "", path: Optional[Path] = None, secret: Optional[str] = None) -> Optional[ReconciliationRecord]:
     """The op serving this goal reached a terminal state (any outcome); the
     goal may be re-emitted unless a landing satisfied it. NEVER raises."""
-    rec = await _append_event(event=ReconciliationEvent.TERMINAL, goal_id=goal_id, goal_digest_hex="", op_id=op_id, path=path, secret=secret)
+    # `outcome` used to be logged and discarded. It is the ONLY place the
+    # cause of a termination is known, and the Sentinel reads this row back
+    # to decide whether the TARGET deserves a cooldown.
+    rec = await _append_event(
+        event=ReconciliationEvent.TERMINAL, goal_id=goal_id,
+        goal_digest_hex="", op_id=op_id, path=path, secret=secret,
+        terminal_reason=outcome,
+    )
     if rec:
         logger.info("[GoalReconciliation] goal=%s op=%s terminal (%s)", goal_id, op_id[:12], outcome or "-")
     return rec

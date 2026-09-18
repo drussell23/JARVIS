@@ -294,8 +294,17 @@ def test_phase1_envelope_builder_no_hardcoded_instance_ids() -> None:
 # ===============================================================
 
 
-def test_phase2_taxonomy_closed_six_values() -> None:
-    """The closed enum has exactly 6 values."""
+def test_phase2_taxonomy_closed_seven_values() -> None:
+    """The closed enum has exactly 7 values.
+
+    Extended from 6 deliberately, which the module's own contract requires
+    ("New terminal reasons added in future slices MUST extend this enum +
+    classifier"). `pipeline_contract_fault` covers the op that never got a
+    fair attempt — admission refused, a duplicate claim superseded it, or a
+    request the pipeline could not form. It could not be folded into
+    `structural_gate_rejection` without corrupting
+    `is_reflexive_healing_eligible`: there is no model output to feed back.
+    """
     values = {m.value for m in TerminalReasonClass}
     assert values == {
         "provider_exhaustion",
@@ -303,6 +312,7 @@ def test_phase2_taxonomy_closed_six_values() -> None:
         "cost_budget_exhausted",
         "wall_clock_cap",
         "cancelled_shutdown",
+        "pipeline_contract_fault",
         "other",
     }
 
@@ -574,9 +584,12 @@ def _load_ast(rel_path: str) -> ast.Module:
 
 
 def test_ast_pin_terminal_reason_class_taxonomy_closed() -> None:
-    """The 6 TerminalReasonClass values are the closed taxonomy.
+    """The 7 TerminalReasonClass values are the closed taxonomy.
     Adding a new value silently could leave summary.json
-    consumers with unknown enum strings."""
+    consumers with unknown enum strings — so the seventh,
+    PIPELINE_CONTRACT_FAULT, is added here deliberately and in
+    the same commit as the consumer that reads it (the Sentinel's
+    cooldown attribution)."""
     tree = _load_ast(
         "backend/core/ouroboros/governance/terminal_reason.py"
     )
@@ -593,7 +606,7 @@ def test_ast_pin_terminal_reason_class_taxonomy_closed() -> None:
         assert values == {
             "PROVIDER_EXHAUSTION", "STRUCTURAL_GATE_REJECTION",
             "COST_BUDGET_EXHAUSTED", "WALL_CLOCK_CAP",
-            "CANCELLED_SHUTDOWN", "OTHER",
+            "CANCELLED_SHUTDOWN", "PIPELINE_CONTRACT_FAULT", "OTHER",
         }
         return
     pytest.fail("TerminalReasonClass class not found")

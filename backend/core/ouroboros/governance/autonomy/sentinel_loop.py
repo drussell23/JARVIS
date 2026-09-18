@@ -22,8 +22,12 @@ A pass ends in exactly one of four states, and none of them is silent:
 
 * **landed** — the cooldown for that target is CLEARED (backoff measures
   consecutive failure, and this target just proved it can be fixed);
-* **rejected / failed** — a lesson to :mod:`lesson_memory` and an escalating
-  cooldown on that target;
+* **rejected / failed** — a lesson to :mod:`lesson_memory` always, and an
+  escalating cooldown on that target only when the failure is EVIDENCE ABOUT
+  THAT TARGET. A provider outage, a wall-clock cap, a shutdown or a request the
+  pipeline could not even form are facts about the run; counting them would
+  penalise a file for the machine's problems and keep suppressing it long after
+  the machine was fixed (see :meth:`SentinelLoop._cool_if_attributable`);
 * **timed out** — same treatment as a failure. An op that never reached a
   terminal state is not evidence of anything except that this target is
   expensive, which is exactly what a cooldown encodes;
@@ -53,6 +57,11 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
+
+from backend.core.ouroboros.governance.terminal_reason import (
+    classify_terminal_reason,
+    is_target_attributable,
+)
 
 logger = logging.getLogger("Ouroboros.SentinelLoop")
 
@@ -360,7 +369,9 @@ class SentinelLoop:
                     work, phase="SANCTION", failure_class="sanction_refused",
                     error_text=str(reason),
                 )
-                self._cooldown.record_failure(work.target_file, reason=str(reason))
+                self._cool_if_attributable(
+                    work.target_file, "sanction_refused", str(reason),
+                )
                 return PassOutcome(
                     "failed", work.target_file, work.goal_id,
                     detail=f"sanction refused: {reason}",
@@ -416,7 +427,11 @@ class SentinelLoop:
                 work, phase="INTAKE", failure_class="dispatch_refused",
                 error_text="the cage refused the claim, or intake was unreachable",
             )
-            self._cooldown.record_failure(work.target_file, reason="not dispatched")
+            self._cool_if_attributable(
+                work.target_file, "not_dispatched",
+                "not dispatched: the cage refused the claim, or intake was "
+                "unreachable",
+            )
             return PassOutcome(
                 "failed", work.target_file, goal_id,
                 detail="not dispatched", duration_s=time.monotonic() - started,
@@ -445,9 +460,63 @@ class SentinelLoop:
             work, phase="TERMINAL", failure_class=state,
             error_text=detail or state, op_id=op_id,
         )
-        self._cooldown.record_failure(work.target_file, reason=f"{state}: {detail}")
+        self._cool_if_attributable(work.target_file, state, detail)
         return PassOutcome(state, work.target_file, goal_id, op_id,
                            detail, elapsed)
+
+    def _cool_if_attributable(self, target: str, state: str, detail: str) -> bool:
+        """Escalate *target*'s cooldown only if the failure is ABOUT the target.
+
+        ## The brake measures the target, not the machine
+
+        This ledger exists to make a target that keeps failing geometrically
+        rarer, so nobody has to choose a retry limit. That is only honest if
+        what it counts is the target's difficulty. Every terminal used to be
+        counted identically — a provider outage, a wall-clock cap, and a model
+        that cannot write the file were one sentence, "goal unsatisfied" — so a
+        defect in the PIPELINE escalated a penalty against a blameless file and
+        suppressed it long after the defect was fixed. Measured in
+        `bt-2026-09-18-033008`: nine strikes each against test targets that
+        were never handed a runnable request, because a diff was demanded
+        against a file the goal existed to create.
+
+        ONE decision point for all three failure exits rather than a guard
+        copied three times — a second copy is how two of them come to disagree,
+        and the exits differ only in what they can say about the cause.
+
+        The lesson is recorded by the CALLER either way: an exempt failure is
+        still something to learn from, it is simply not evidence about this
+        target.
+
+        Classification is by substring over the whole detail, so an exit that
+        cannot name its cause (``"not dispatched"`` — the cage refused the
+        claim, OR intake was unreachable, and the code cannot yet tell which)
+        lands in ``OTHER`` and still cools. That is the fail-safe direction and
+        it is deliberate: unknown must fail toward the brake, because the
+        alternative is that an unclassified reason silently disables the only
+        thing stopping the loop spinning on one target. Sharpening those exits
+        means giving them a classifiable reason, never inverting this default.
+
+        Returns whether the target was cooled. NEVER raises.
+        """
+        try:
+            if is_target_attributable(detail):
+                self._cooldown.record_failure(target, reason=f"{state}: {detail}")
+                return True
+            logger.warning(
+                "[Sentinel] %s NOT cooled — %s is a %s: a fact about the run, "
+                "not about the target (%s)",
+                target, state, classify_terminal_reason(detail).value,
+                str(detail)[:120],
+            )
+            return False
+        except Exception:  # noqa: BLE001 — a brake that raises is worse than one
+            logger.debug("[Sentinel] cooldown attribution degraded", exc_info=True)
+            try:
+                self._cooldown.record_failure(target, reason=f"{state}: {detail}")
+            except Exception:  # noqa: BLE001
+                pass
+            return True
 
     # -- seams ------------------------------------------------------------
 
@@ -525,6 +594,7 @@ class SentinelLoop:
             if not wanted:
                 return None
             terminal_op = ""
+            terminal_why = ""
             for rec in read_records() or ():
                 if str(getattr(rec, "goal_id", "")).strip() != wanted:
                     continue
@@ -541,9 +611,21 @@ class SentinelLoop:
                     return "landed", f"satisfied{(' at ' + sha) if sha else ''}"
                 if event == ReconciliationEvent.TERMINAL.value:
                     terminal_op = str(getattr(rec, "op_id", "") or "")
+                    terminal_why = str(getattr(rec, "terminal_reason", "") or "")
             if terminal_op:
                 # The op finished without satisfying the goal. That IS a
                 # verdict — waiting longer cannot change it.
+                #
+                # The REASON travels inside the detail rather than through a
+                # wider return type. `classify_terminal_reason` is a substring
+                # classifier by design, so the human-readable sentence IS the
+                # machine-readable one, and the `outcome_fn` contract that the
+                # harness and every test double implement stays `(state,
+                # detail)`. A row written before the reason was persisted
+                # carries "", reads as unclassified, and is treated exactly as
+                # it was before.
+                if terminal_why:
+                    return "failed", f"op {terminal_op[:16]} terminal: {terminal_why}"
                 return "failed", f"op {terminal_op[:16]} terminal, goal unsatisfied"
             return None
         except Exception:  # noqa: BLE001
