@@ -3111,6 +3111,61 @@ async def _fetch_served_model_bytes(endpoint: str, *, timeout_s: float = 8.0) ->
         return 0
 
 
+async def fetch_resident_weights(
+    endpoint: str, *, timeout_s: float = 6.0,
+) -> "Tuple[str, int]":
+    """GET ``<endpoint>/api/ps`` → ``(model_name, vram_bytes)`` for the model
+    the lane currently holds ON THE ACCELERATOR. ``("", 0)`` when nothing is
+    resident, the endpoint is unreachable, or the reply is unreadable.
+
+    ## Why this exists
+
+    `local_model_admission` guards "the act of LOADING model weights" — its own
+    words — by asking whether the footprint fits in FREE VRAM. Once the model
+    is loaded, its bytes have moved from `free` into `used`, so asking the same
+    question again charges the weights a second time against what they
+    themselves are occupying. The gate then refuses to USE the model precisely
+    because it is already there, and the better the lane serves the more
+    certainly it blocks the next op.
+
+    Measured in `bt-2026-09-18-034951`: 42 of 54 failed passes died
+    `background_dw_blocked_by_topology` with ZERO tokens, each preceded by
+    `20.0 GiB of weights plus a 1.6 GiB learned margin exceeds the 7.9 GiB
+    free`. Reproduced on this host — idle 31.4 GiB free; after one warm-up
+    token 10.0 GiB free with `/api/ps` reporting `size_vram=20.3 GiB`.
+
+    NOT memoized, unlike :func:`_resolve_served_model_bytes`. Residency is the
+    one fact here that changes on its own: a model is evicted by an idle timer
+    or by another model loading, and a cached "resident" would keep discounting
+    weights that are no longer on the card — an over-admission that ends in an
+    OOM rather than a deferral. It is a sub-second local call on the path of an
+    op that is about to take minutes.
+    """
+    try:
+        import aiohttp
+        url = endpoint.rstrip("/") + "/api/ps"
+        timeout = aiohttp.ClientTimeout(total=timeout_s)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.get(url) as resp:
+                if resp.status != 200:
+                    return ("", 0)
+                data = await resp.json(content_type=None)
+        best_name, best_vram = "", 0
+        for entry in (data or {}).get("models", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            # `size_vram` is what sits on the ACCELERATOR. `size` includes any
+            # part paged to host RAM, which does not relieve VRAM pressure and
+            # must never be credited against it.
+            vram = int(entry.get("size_vram", 0) or 0)
+            if vram > best_vram:
+                best_vram = vram
+                best_name = str(entry.get("model") or entry.get("name") or "")
+        return (best_name, best_vram)
+    except Exception:  # noqa: BLE001 — residency is evidence, never a gate
+        return ("", 0)
+
+
 async def _resolve_served_model_bytes(
     endpoint: Optional[str],
     *,

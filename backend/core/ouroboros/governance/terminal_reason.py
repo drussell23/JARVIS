@@ -121,6 +121,13 @@ _CLASSIFIER_RULES: tuple = (
     ("schema_invalid", TerminalReasonClass.PIPELINE_CONTRACT_FAULT),
     ("diff_source_unreadable", TerminalReasonClass.PIPELINE_CONTRACT_FAULT),
     ("candidates_empty", TerminalReasonClass.PIPELINE_CONTRACT_FAULT),
+    # The accelerator was busy. A fact about the machine at that instant —
+    # the op never reached the model, and the target is not harder for it.
+    ("memory_pressure", TerminalReasonClass.PIPELINE_CONTRACT_FAULT),
+    ("deferred_due_to_memory", TerminalReasonClass.PIPELINE_CONTRACT_FAULT),
+    # A harness state carried over from a previous session.
+    ("boot_recovery_missing_provenance",
+     TerminalReasonClass.PIPELINE_CONTRACT_FAULT),
 
     # STRUCTURAL_GATE_REJECTION — Iron Gate + downstream gates.
     # Listed before PROVIDER_EXHAUSTION so an exploration_insufficient
@@ -143,6 +150,15 @@ _CLASSIFIER_RULES: tuple = (
      TerminalReasonClass.PROVIDER_EXHAUSTION),
     ("circuit_breaker_tripped:terminal_quota",
      TerminalReasonClass.PROVIDER_EXHAUSTION),
+    # The DW catalog was purged or every model in it is unavailable, so the
+    # route has no provider left to offer. Measured as the single largest
+    # failure class in bt-2026-09-18-034951 — 42 of 54 failed passes, every
+    # one with zero tokens generated. Classified here rather than left in
+    # OTHER because OTHER cools the TARGET, and a file is not harder to test
+    # because a provider catalog was empty when its turn came.
+    ("blocked_by_topology", TerminalReasonClass.PROVIDER_EXHAUSTION),
+    ("topology_block", TerminalReasonClass.PROVIDER_EXHAUSTION),
+    ("dw_severed_queued", TerminalReasonClass.PROVIDER_EXHAUSTION),
     ("all_providers_exhausted",
      TerminalReasonClass.PROVIDER_EXHAUSTION),
     ("provider_exhausted",

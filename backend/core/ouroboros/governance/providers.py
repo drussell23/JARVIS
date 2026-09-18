@@ -6975,6 +6975,61 @@ class PrimeProvider:
             except Exception:  # noqa: BLE001 — an unresolved brain is not a fault
                 _brain_for_adm, _weight_bytes = None, 0
 
+            # ALREADY-RESIDENT WEIGHTS ARE NOT A NEW ALLOCATION.
+            #
+            # `local_model_admission` guards "the act of LOADING model weights"
+            # — its own words — by asking whether the footprint fits in FREE
+            # VRAM. Once the model is loaded those bytes have moved from `free`
+            # into `used`, so charging the footprint again bills the weights
+            # against the space they are themselves occupying. The gate then
+            # refuses to USE the model precisely because it is already there,
+            # and the better this lane serves the more certainly it blocks the
+            # next op.
+            #
+            # Measured in bt-2026-09-18-034951: 42 of 54 failed passes died
+            # `background_dw_blocked_by_topology` with ZERO tokens, each one
+            # preceded by `20.0 GiB of weights plus a 1.6 GiB learned margin
+            # exceeds the 7.9 GiB free`. The error named the DW catalog; the
+            # cause was this double count. Reproduced on this host: idle 31.4
+            # GiB free, and 10.0 GiB free after a single warm-up token with
+            # /api/ps reporting size_vram=20.3 GiB.
+            #
+            # Only the SERVED model's own residency counts. If some OTHER
+            # model holds the card, serving this one evicts it — the footprint
+            # really would be allocated, so it is charged in full. Unknown
+            # residency charges in full too: this discount requires evidence
+            # that answered, never a flag asserting the model should be there.
+            if _weight_bytes:
+                try:
+                    from backend.core.ouroboros.governance.candidate_generator import (  # noqa: E501,PLC0415
+                        fetch_resident_weights, local_lane_endpoint,
+                    )
+                    _ep = local_lane_endpoint()
+                    if _ep:
+                        _res_name, _res_vram = await fetch_resident_weights(_ep)
+                        _served = getattr(_ri, "served_model", "") if _ri else ""
+                        if _res_vram and _res_name and _served and (
+                            _res_name == _served
+                            or _res_name.startswith(str(_served).split(":")[0])
+                        ):
+                            _charged = max(0, _weight_bytes - _res_vram)
+                            logger.info(
+                                "[PrimeProvider] %s is already resident "
+                                "(%.1f GiB on the accelerator) — charging %.1f "
+                                "GiB to admission, not its full %.1f GiB "
+                                "footprint; loaded weights are not a new "
+                                "allocation",
+                                _res_name, _res_vram / (1024 ** 3),
+                                _charged / (1024 ** 3),
+                                _weight_bytes / (1024 ** 3),
+                            )
+                            _weight_bytes = _charged
+                except Exception:  # noqa: BLE001 — no evidence, charge in full
+                    logger.debug(
+                        "[PrimeProvider] residency probe degraded — charging "
+                        "the full footprint", exc_info=True,
+                    )
+
             # JIT: re-read the accelerator's free bytes now rather than
             # trusting a cached reading. We are inside a running loop and
             # about to allocate, which is exactly the case `assess_async`

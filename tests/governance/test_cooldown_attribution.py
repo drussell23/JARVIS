@@ -237,3 +237,44 @@ def test_an_old_row_without_the_field_still_reads(tmp_path, monkeypatch):
     assert len(out) == 1, "a pre-existing row must still read"
     assert out[0].terminal_reason == ""
     assert out[0].op_id == "op"               # the MAC'd payload is intact
+
+
+# --------------------------------------------------------------------------
+# The gap the VRAM finding exposed in this very fix
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("code", [
+    "background_accepted:background_dw_blocked_by_topology:Catalog-driven",
+    "dw_severed_queued:topology_block:Catalog-driven (Phase 12)",
+    "speculative_deferred:blocked_by_topology:Catalog-driven",
+])
+def test_an_empty_provider_catalog_is_not_the_targets_fault(code):
+    """The single largest failure class in bt-2026-09-18-034951 — 42 of 54
+    failed passes, every one with zero tokens generated — and the first
+    version of this fix left all 42 cooling their targets.
+
+    A file is not harder to test because a provider catalog was empty when
+    its turn came.
+    """
+    assert TR.classify_terminal_reason(code) is \
+        TR.TerminalReasonClass.PROVIDER_EXHAUSTION
+    assert TR.is_target_attributable(code) is False
+
+
+@pytest.mark.parametrize("code", [
+    "[SYSTEM: DEFERRED_DUE_TO_MEMORY_PRESSURE]",
+    "deferred_due_to_memory_pressure: 20.0 GiB exceeds the 7.9 GiB free",
+    "boot_recovery_missing_provenance",
+])
+def test_a_busy_accelerator_is_not_the_targets_fault(code):
+    """The op never reached the model. Cooling the target would suppress a
+    blameless file because the card was full for one instant."""
+    assert TR.is_target_attributable(code) is False
+
+
+def test_closing_the_gap_did_not_silence_the_brake():
+    """The rules were ADDED, not the default inverted — which is what the
+    design of this module calls for. A real target failure still cools."""
+    assert TR.is_target_attributable("ascii_gate_failed") is True
+    assert TR.is_target_attributable("exploration_insufficient: 0/2") is True
+    assert TR.is_target_attributable("some_unclassified_new_string") is True
