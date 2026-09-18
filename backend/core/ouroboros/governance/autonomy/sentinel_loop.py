@@ -302,7 +302,39 @@ class SentinelLoop:
         if not candidates:
             return PassOutcome("idle", detail="no eligible work", duration_s=0.0)
 
-        work = candidates[0]
+        # THE LAST FILTER BEFORE AN OP IS SPENT. Discovery RANKS dead work to
+        # the back rather than dropping it — a goal whose target does not exist
+        # yet becomes live the moment the test-synthesis goal ahead of it
+        # lands, and shedding it there would delete half the DAG. But
+        # DISPATCHING one is pure waste: there is no file to edit and no test
+        # to write, so the op can only burn a generation and cool the target.
+        #
+        # `is_dispatchable` carries no covering-test index on purpose. Dead
+        # means "target absent AND not a test file", which the index does not
+        # participate in; building it here would put a second filesystem walk
+        # on the dispatch path to sharpen a distinction this never makes.
+        live = [w for w in candidates if gd.is_dispatchable(w, self._repo_root)]
+        if not live:
+            logger.warning(
+                "[Sentinel] ExecutionQueueStarved: all %d eligible candidate(s) "
+                "target files that do not exist and are not tests to create "
+                "(head: %s). Nothing is dispatchable this pass; the queue is "
+                "held, not drained — these rise on their own once the work "
+                "that creates their targets lands.",
+                len(candidates),
+                ", ".join(w.target_file for w in candidates[:3]) or "?",
+            )
+            return PassOutcome(
+                "idle", detail="ExecutionQueueStarved: no live candidate",
+                duration_s=time.monotonic() - started,
+            )
+        if len(live) < len(candidates):
+            logger.info(
+                "[Sentinel] %d of %d candidate(s) skipped as dead targets",
+                len(candidates) - len(live), len(candidates),
+            )
+
+        work = live[0]
         result = gd.synthesize_and_sign(work)
         # The SIGNER is authoritative about the id — including on a duplicate
         # refusal, where the id it reports is the one already on the roadmap.

@@ -1127,6 +1127,45 @@ class GovernedLoopConfig:
 
 _SERVED_CAP_ANNOUNCED: "set" = set()
 
+#: Last capability OBSERVED from a live probe, per endpoint. Not a cache of the
+#: answer — a record that the answer was once measured. See
+#: :func:`_resolve_served_capability`.
+_LAST_OBSERVED_CAPABILITY: "Dict[str, Tuple[str, str]]" = {}
+#: Per-endpoint suppression window for probe retries + the fault warning.
+_PROBE_FAULT_UNTIL: "Dict[str, float]" = {}
+
+
+def _probe_retries() -> int:
+    try:
+        return max(0, int(os.environ.get("JARVIS_CAPABILITY_PROBE_RETRIES", "2")))
+    except Exception:  # noqa: BLE001
+        return 2
+
+
+def _probe_backoff_s(attempt: int) -> float:
+    """Linear backoff, capped. A model reload is a seconds-scale event, so the
+    ladder is short by design — it is bounding a blip, not waiting out an
+    outage, which is what the fault window is for."""
+    try:
+        unit = max(0.0, float(os.environ.get("JARVIS_CAPABILITY_PROBE_BACKOFF_S", "1.0")))
+    except Exception:  # noqa: BLE001
+        unit = 1.0
+    return min(unit * max(1, attempt), unit * 3)
+
+
+def _probe_fault_window_s() -> float:
+    """How long one announced probe fault suppresses further retries.
+
+    Without it the retry ladder is paid on EVERY submit, so a genuinely dead
+    endpoint would add the full ladder's latency to every op in the soak. The
+    fault is announced once per window and the window is short enough that a
+    model finishing a reload is picked up on the next op or two.
+    """
+    try:
+        return max(0.0, float(os.environ.get("JARVIS_CAPABILITY_PROBE_FAULT_WINDOW_S", "60")))
+    except Exception:  # noqa: BLE001
+        return 60.0
+
 
 def _local_lane_endpoint() -> str:
     """The endpoint the generation lane dispatches to (one resolver:
@@ -1138,21 +1177,85 @@ def _local_lane_endpoint() -> str:
         return ""
 
 
+async def _probe_served_model(endpoint: str) -> "Optional[str]":
+    """The served model, retried across a transient probe fault.
+
+    ## The soak this cost
+
+    An Ollama node reloading the 30B answers ``/api/tags`` with the model
+    absent. The probe returns ``None``, the resolver accepted the NOMINAL slot
+    declaration (``full_content_only``), and the diff schema was never
+    requested — for the whole session, silently, because nothing distinguished
+    "measured as whole-file-only" from "not measured". A reload takes seconds;
+    the session took an hour.
+
+    So a falsy probe is treated as a FAULT, not a verdict: retried with a short
+    backoff, then suppressed for a window so a genuinely dead endpoint does not
+    pay the ladder on every submit. Never raises.
+    """
+    from backend.core.ouroboros.governance.candidate_generator import _resolve_served_model
+    served = await _resolve_served_model(endpoint)
+    if served:
+        _PROBE_FAULT_UNTIL.pop(endpoint, None)
+        return served
+    now = time.monotonic()
+    if now < _PROBE_FAULT_UNTIL.get(endpoint, 0.0):
+        return None                     # inside an announced fault window
+    for attempt in range(1, _probe_retries() + 1):
+        await asyncio.sleep(_probe_backoff_s(attempt))
+        served = await _resolve_served_model(endpoint)
+        if served:
+            logger.info(
+                "[GovernedLoop] capability probe recovered on retry %d (served=%s)",
+                attempt, served,
+            )
+            _PROBE_FAULT_UNTIL.pop(endpoint, None)
+            return served
+    _PROBE_FAULT_UNTIL[endpoint] = now + _probe_fault_window_s()
+    return None
+
+
 async def _resolve_served_capability(gls: Any, brain: Any) -> "Tuple[str, str]":
     """``(served_model, schema_capability)`` for the routing intent: the slot's
     declared capability corrected by the model the lane actually serves
     (memoised per endpoint via ``candidate_generator._resolve_served_model``,
-    the SAME lookup the num_ctx negotiator uses). Fail-soft: any fault stamps
-    the declaration unchanged. Announces a corrected verdict ONCE per
-    (served, declared → effective) at WARNING so a headless soak shows it."""
+    the SAME lookup the num_ctx negotiator uses). Announces a corrected verdict
+    ONCE per (served, declared → effective) at WARNING so a headless soak shows
+    it.
+
+    ## Degradation is never silent
+
+    A failed probe is a ``CapabilityProbeFault``, not evidence the lane is
+    whole-file-only. When the endpoint has been successfully probed before,
+    that OBSERVED capability is reused — the lane served a diff-capable model a
+    minute ago and a reload is not a downgrade. Only when nothing was ever
+    observed does it fall back to the declaration, and it says so at WARNING.
+    """
     declared = str(getattr(brain, "schema_capability", "full_content_only") or "full_content_only")
     try:
-        from backend.core.ouroboros.governance.candidate_generator import _resolve_served_model
         endpoint = _local_lane_endpoint()
-        served = (await _resolve_served_model(endpoint)) if endpoint else None
+        served = (await _probe_served_model(endpoint)) if endpoint else None
         selector = getattr(gls, "_brain_selector", None)
         if selector is None or not hasattr(selector, "effective_schema_capability"):
             return (served or "", declared)
+
+        if endpoint and not served:
+            prior = _LAST_OBSERVED_CAPABILITY.get(endpoint)
+            logger.warning(
+                "[GovernedLoop] CapabilityProbeFault: the lane at %s did not name a "
+                "served model; capability is UNMEASURED, not whole-file-only. %s",
+                endpoint,
+                (
+                    f"Reusing the last observed capability {prior[1]!r} (served={prior[0]})."
+                    if prior else
+                    f"Nothing was ever observed here, so the slot declaration "
+                    f"{declared!r} stands — if that is 'full_content_only' this op "
+                    f"will NOT be offered the diff schema."
+                ),
+            )
+            if prior:
+                return prior
+
         verdict = selector.effective_schema_capability(declared=declared, served_model=served)
         key = (verdict.served_model, verdict.declared, verdict.capability)
         if verdict.changed and key not in _SERVED_CAP_ANNOUNCED:
@@ -1163,6 +1266,11 @@ async def _resolve_served_capability(gls: Any, brain: Any) -> "Tuple[str, str]":
                 verdict.declared, verdict.capability, verdict.served_model,
                 getattr(brain, "brain_id", "?"), verdict.reason,
             )
+        if endpoint and served:
+            # Recorded only from a LIVE probe. Recording the declaration here
+            # would make the fallback self-confirming: the fault path would
+            # "reuse an observation" that was itself never observed.
+            _LAST_OBSERVED_CAPABILITY[endpoint] = (verdict.served_model, verdict.capability)
         return (verdict.served_model, verdict.capability)
     except Exception:  # noqa: BLE001 — capability resolution never blocks submit
         logger.debug("[GovernedLoop] served capability resolution degraded", exc_info=True)

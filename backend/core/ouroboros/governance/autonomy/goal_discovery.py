@@ -49,9 +49,12 @@ import asyncio
 import logging
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from pathlib import Path, PurePosixPath
+from typing import (
+    Any, Dict, FrozenSet, Iterator, List, Optional, Sequence, Tuple,
+)
 
 logger = logging.getLogger("Ouroboros.GoalDiscovery")
 
@@ -59,6 +62,7 @@ __all__ = [
     "DiscoveredWork",
     "discover",
     "discovery_enabled",
+    "is_dispatchable",
     "synthesize_and_sign",
 ]
 
@@ -654,6 +658,120 @@ def _dependency_state(
         return None
 
 
+#: Liveness tiers. Higher sorts first. Ordinals, not weights — they express an
+#: ORDER ("prefer work that can finish"), and mixing them into the evidence
+#: weight would make one number answer two unrelated questions.
+LIVENESS_LANDABLE = 3      # target exists AND has a covering test
+LIVENESS_CREATES_TEST = 2  # target is a test file this goal will write
+LIVENESS_NO_TEST = 1       # target exists, nothing covers it — sheds at VALIDATE
+LIVENESS_DEAD = 0          # target absent and not a test — nothing to edit
+
+
+def _covering_test_stems(repo_root: Path) -> FrozenSet[str]:
+    """Every module stem that has a ``tests/**/test_<stem>.py`` covering it.
+
+    Built ONCE per pass and handed to the ranker, because ``sorted`` calls its
+    key per element and an ``rglob`` of the test tree per candidate would turn
+    one walk into N — a filesystem pass on the Sentinel's critical path, which
+    is the same mistake that put the census there.
+
+    Uses the same ``test_<stem>.py`` convention the coverage sensor uses to
+    call a module uncovered, so "covered" means the same thing to the sorter
+    as it does to the sensor that filed the goal.
+    """
+    try:
+        tests_root = repo_root / "tests"
+        if not tests_root.is_dir():
+            return frozenset()
+        return frozenset(
+            p.stem[5:] for p in tests_root.rglob("test_*.py") if p.is_file()
+        )
+    except Exception:  # noqa: BLE001 — an unreadable tree just means no cover
+        return frozenset()
+
+
+def _liveness_rank(
+    work: "DiscoveredWork",
+    repo_root: Path,
+    covering_stems: FrozenSet[str] = frozenset(),
+) -> int:
+    """How far this work can actually get through the pipeline.
+
+    ## The starvation this fixes
+
+    Every roadmap goal carries the same evidence weight — measured on the live
+    queue, all 27 of them at 0.75 — so ``sorted(key=-weight)`` was a stable
+    sort over equal keys and fell through to DOCUMENT ORDER. The roadmap is
+    append-only and the Sentinel takes ``candidates[0]``, so work was consumed
+    strictly oldest-first, and the cap of 8 was a window onto the OLDEST eight
+    goals rather than the best eight.
+
+    Measured effect on that queue: the one landable production-file goal
+    (``backend/api/sse_contract.py``) sat at index 26 of 27 — permanently
+    outside the cap, which is why soak after soak produced nothing — and ranks
+    to index 4. The seven goals whose target exists with nothing covering it
+    (they shed at VALIDATE) sink to the tail instead of interleaving.
+
+    ## Ranked, never shed
+
+    The instinct is to drop goals whose target file does not exist. That would
+    delete the DAG's entire test-synthesis half, which exists precisely to
+    CREATE those files and is the only thing that can unblock the repair goals
+    waiting behind them. Ranking starves nothing: landable work floats, dead
+    work sinks, and a goal that becomes landable later rises on its own.
+
+    ## What it deliberately does NOT read
+
+    The DAG. Dependency state is already the ``_EligibilityGate``'s job, and it
+    REFUSES a blocked goal rather than deprioritising it. Re-deriving it here
+    would be a second copy of the rules living next to a source — the exact
+    duplication this module's gate was extracted to prevent, and the way two
+    filters come to disagree.
+
+    NEVER raises: an unrankable pass ranks everything equal, which is exactly
+    today's behaviour.
+    """
+    try:
+        target = str(getattr(work, "target_file", "") or "")
+        if not target:
+            return LIVENESS_DEAD
+        # Separators normalised BEFORE the existence check, not just the name
+        # check: the roadmap is authored from both trees, and a backslash path
+        # is one path component on POSIX, so `is_file()` would say no and a
+        # landable goal would rank as one that creates its own target.
+        name = PurePosixPath(target.replace("\\", "/"))
+        is_test = name.name.startswith("test_")
+        if not (repo_root / name).is_file():
+            # A test file this goal is going to WRITE is live work; a source
+            # file that is simply absent is not something to edit.
+            return LIVENESS_CREATES_TEST if is_test else LIVENESS_DEAD
+        if is_test:
+            return LIVENESS_LANDABLE        # a test IS its own cover
+        if str(getattr(work, "kind", "")) == "ambient_red":
+            # A failing test IS the covering test, and it has already proven
+            # it exercises this file. Asking the `test_<stem>.py` convention
+            # about it would demote hard evidence to L1 over a NAMING
+            # question, sinking a real red below speculative test-writing.
+            return LIVENESS_LANDABLE
+        return (
+            LIVENESS_LANDABLE if name.stem in covering_stems else LIVENESS_NO_TEST
+        )
+    except Exception:  # noqa: BLE001 — ranking never breaks a pass
+        return LIVENESS_NO_TEST
+
+
+def is_dispatchable(work: "DiscoveredWork", repo_root: Path) -> bool:
+    """Whether spending an op on *work* could produce a write at all.
+
+    The dispatcher's contract, named here so the Sentinel does not reach into
+    the ranker's internals. False ONLY for :data:`LIVENESS_DEAD` — a target
+    that does not exist and is not a test file this goal would create. Every
+    other tier is dispatchable; being unlikely to land is not the same as
+    having nothing to edit, and deciding THAT is the pipeline's job.
+    """
+    return _liveness_rank(work, repo_root) > LIVENESS_DEAD
+
+
 class _EligibilityGate:
     """The pass's one filter. Every source is judged by this and nothing else.
 
@@ -848,7 +966,34 @@ async def discover(
 
     # Both document sources are collected WHOLE; the filesystem walk stays
     # lazy. Nothing is truncated before the filters run.
-    documented = sorted(signed + reds, key=lambda w: -w.weight)
+    # LIVENESS OUTRANKS EVIDENCE. Every roadmap goal carries the same `high`
+    # weight, so the old `key=-weight` was a stable sort over equal keys and
+    # silently degraded to DOCUMENT ORDER on an append-only roadmap — with the
+    # Sentinel taking `candidates[0]`, the oldest unsatisfiable goals held the
+    # head of the queue and newly authored landable work sat past the cap.
+    # Weight still breaks ties, so within a liveness tier the ranking is
+    # unchanged. The walk is one pass, off the event loop, reused by every key.
+    covering = await asyncio.to_thread(_covering_test_stems, Path(repo_root))
+    root = Path(repo_root)
+    # Ranked ONCE and carried, not recomputed for the sort and again for the
+    # census: each rank costs a `stat`, and a queue-wide double stat every pass
+    # is the kind of cost that arrives unnoticed on the critical path.
+    scored = [(_liveness_rank(w, root, covering), w) for w in signed + reds]
+    scored.sort(key=lambda rw: (-rw[0], -rw[1].weight))
+    documented = [w for _, w in scored]
+    if scored:
+        # WARNING, like the Sentinel's own pass breadcrumbs and for the same
+        # reason: a headless soak's log carries WARNING and above, so an INFO
+        # census of the queue is invisible in exactly the run that needs it.
+        # One line per pass, and a pass is minutes.
+        logger.warning(
+            "[GoalDiscovery] liveness census (L3 landable → L0 dead): %s | head=%s",
+            " ".join(
+                f"L{r}={n}"
+                for r, n in sorted(Counter(r for r, _ in scored).items(), reverse=True)
+            ),
+            documented[0].target_file,
+        )
     # The roadmap's dependency edges, read once for the whole pass.
     dag_index = await _dag_index()
     gate = _EligibilityGate(dag_index=dag_index, cooldown=cooldown)

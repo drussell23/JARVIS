@@ -382,3 +382,91 @@ def test_outcomes_render_for_the_telemetry_view():
     o = PassOutcome("landed", TARGET, "ov-auto-x", "op-1", "applied", 3.0)
     text = o.render()
     assert "landed" in text and TARGET in text and "ov-auto-x" in text
+
+
+# --------------------------------------------------------------------------
+# Queue starvation: an op is never spent on work with nothing to edit
+# --------------------------------------------------------------------------
+
+def _dead_work():
+    from backend.core.ouroboros.governance.autonomy import goal_discovery as gd
+    return gd.DiscoveredWork(
+        target_file="backend/api/deleted_last_year.py", kind="roadmap",
+        evidence="a goal whose target no longer exists", weight=0.75,
+    )
+
+
+def test_a_dead_candidate_is_never_dispatched(repo, tmp_path, monkeypatch, caplog):
+    """Discovery RANKS dead work to the back rather than dropping it — a
+    missing target becomes live the moment the goal that creates it lands. But
+    dispatching one can only burn a generation and cool the target, so the
+    dispatcher is where it stops."""
+    from backend.core.ouroboros.governance.autonomy import goal_discovery as gd
+
+    async def _only_dead(**kw):
+        return (_dead_work(),)
+
+    monkeypatch.setattr(gd, "discover", _only_dead)
+    cd = TargetCooldownLedger(tmp_path / "cd.json")
+
+    def _must_not_dispatch(**kw):
+        raise AssertionError("a dead goal reached dispatch")
+
+    async def outcome(op_id, deadline):
+        raise AssertionError("unreachable")
+
+    loop = _loop(repo, dispatch=_must_not_dispatch, outcome=outcome, cooldown=cd)
+    with caplog.at_level("WARNING"):
+        res = asyncio.run(loop.run_once())
+    assert res.state == "idle"
+    assert "ExecutionQueueStarved" in res.detail
+    assert "ExecutionQueueStarved" in " ".join(r.getMessage() for r in caplog.records)
+
+
+def test_starvation_holds_the_queue_it_does_not_drain_it(repo, tmp_path, monkeypatch):
+    """Nothing is cooled, refused or marked failed. The goals are fine; the
+    repository is simply not yet in a state where they can run."""
+    from backend.core.ouroboros.governance.autonomy import goal_discovery as gd
+
+    async def _only_dead(**kw):
+        return (_dead_work(),)
+
+    monkeypatch.setattr(gd, "discover", _only_dead)
+    cd = TargetCooldownLedger(tmp_path / "cd.json")
+
+    async def outcome(op_id, deadline):
+        raise AssertionError("unreachable")
+
+    loop = _loop(repo, dispatch=lambda **kw: "op", outcome=outcome, cooldown=cd)
+    asyncio.run(loop.run_once())
+    assert cd.is_cooling("backend/api/deleted_last_year.py") is False
+
+
+def test_the_live_candidate_is_taken_past_the_dead_ones(repo, tmp_path, monkeypatch,
+                                                        restore_sign):
+    """The head of the queue is skipped, not the pass."""
+    from backend.core.ouroboros.governance.autonomy import goal_discovery as gd
+
+    live = gd.DiscoveredWork(
+        target_file=TARGET, kind="uncovered_module", evidence="e", weight=0.4,
+    )
+
+    async def _dead_then_live(**kw):
+        return (_dead_work(), live)
+
+    monkeypatch.setattr(gd, "discover", _dead_then_live)
+    seen = {}
+
+    def _dispatch(**kw):
+        seen.update(kw)
+        return "op-live"
+
+    async def outcome(op_id, deadline):
+        return "landed", "applied"
+
+    loop = _loop(repo, dispatch=_dispatch, outcome=outcome,
+                 cooldown=TargetCooldownLedger(tmp_path / "cd.json"),
+                 sign=lambda w, **kw: _Signed())
+    res = asyncio.run(loop.run_once())
+    assert res.state == "landed"
+    assert res.target == TARGET
