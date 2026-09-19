@@ -628,6 +628,104 @@ class VALIDATERunner(PhaseRunner):
                 if not validation.passed:
                     best_validation = validation
 
+                    # WHOSE FAULT IS THIS ImportError?
+                    #
+                    # `import_error` collapsed three unrelated failures into
+                    # one class whose canned advice is "never invent packages".
+                    # For the case that dominates this repo's telemetry that
+                    # advice is FALSE: the package is declared in
+                    # requirements.txt and merely absent, and the candidate
+                    # never imported it — the SUBJECT did. Measured live: 29 of
+                    # 51 roadmap goals could not import their own subject, one
+                    # of them 50 times, each retry failing identically and each
+                    # recording the same useless lesson. That is precisely what
+                    # the operator described as "doing the same thing over and
+                    # over".
+                    #
+                    # Split by PROVENANCE, which needs the candidate and the
+                    # file it would replace — facts the regex taxonomy cannot
+                    # see, which is why this is an explicit `error_class`
+                    # override rather than another pattern in the chain.
+                    try:
+                        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                            environment_integrity as _ei,
+                        )
+                        _imp_root = Path(orch._config.project_root)
+                        # The file the candidate REPLACES. VALIDATE runs before
+                        # APPLY, so what is on disk is still the baseline —
+                        # which is what makes "net-new" answerable at all.
+                        _baseline = ""
+                        try:
+                            _bp = _imp_root / str(
+                                candidate.get("file_path") or ""
+                            )
+                            if _bp.is_file():
+                                _baseline = _bp.read_text(
+                                    encoding="utf-8", errors="replace",
+                                )
+                        except Exception:  # noqa: BLE001
+                            _baseline = ""
+                        _imp = _ei.classify_import_failure(
+                            f"{validation.error or ''}\n"
+                            f"{validation.short_summary or ''}",
+                            repo_root=_imp_root,
+                            candidate_source=str(
+                                candidate.get("full_content")
+                                or candidate.get("unified_diff") or ""
+                            ),
+                            baseline_source=_baseline,
+                        )
+                        if _imp.kind:
+                            from backend.core.ouroboros.governance.lesson_memory import (  # noqa: E501,PLC0415
+                                record_lesson,
+                            )
+                            await record_lesson(
+                                op_id=ctx.op_id,
+                                target_files=[
+                                    str(candidate.get("file_path") or "")
+                                ],
+                                phase="VALIDATE",
+                                failure_class=_imp.kind,
+                                error_text=_imp.lesson,
+                                summary=(
+                                    f"{_imp.kind}: {_imp.module} "
+                                    f"(declared={_imp.declared})"
+                                ),
+                                error_class=_imp.kind,
+                            )
+                            if _imp.is_violation:
+                                # STRICT ROLLBACK. A candidate that adds an
+                                # unsatisfiable import has violated the
+                                # project's dependency graph, and no amount of
+                                # retrying the same ladder changes what is
+                                # installed. Ending the ladder here also stops
+                                # the retry storm that made one broken import
+                                # look like a hundred distinct failures in the
+                                # trace.
+                                validate_retries_remaining = 0
+                                ctx.terminal_reason_code = (
+                                    "candidate_dependency_violation"
+                                )
+                                logger.warning(
+                                    "[Orchestrator] DependencyViolation — the "
+                                    "candidate added `import %s`, which this "
+                                    "environment cannot satisfy; rolling back "
+                                    "without retry [%s]",
+                                    _imp.module, ctx.op_id,
+                                )
+                            else:
+                                logger.warning(
+                                    "[Orchestrator] environment starvation — "
+                                    "`%s` was missing before this candidate "
+                                    "existed; the candidate is not at fault "
+                                    "[%s]", _imp.module, ctx.op_id,
+                                )
+                    except Exception:  # noqa: BLE001 — never break VALIDATE
+                        logger.debug(
+                            "[Orchestrator] import-fault classification "
+                            "degraded", exc_info=True,
+                        )
+
                     if _episodic_memory is not None and validation.failure_class in ("test", "build"):
                         try:
                             from backend.core.ouroboros.governance.structured_critique import CritiqueBuilder

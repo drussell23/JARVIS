@@ -5344,6 +5344,70 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         console.print(msg, markup=False, highlight=False)
         return 0
 
+    # ENVIRONMENT PREFLIGHT — before ANY path that can ignite the organism.
+    #
+    # A starved venv does not fail loudly; it fails identically, forever. The
+    # live measurement that produced this gate: 29 of 51 roadmap goals could
+    # not import their own subject, 17 of them because `fastapi` — DECLARED at
+    # `requirements.txt:162` — was absent. The organism spent soak after soak
+    # writing correct tests for modules that cannot load, and from the
+    # transcript that is indistinguishable from doing the same thing over and
+    # over, which is exactly how the operator described it.
+    #
+    # Placed ABOVE the Thin-Client Split deliberately. The first attempt sat
+    # next to the Sentinel banner, which reads as the right place and is not:
+    # `run_cockpit_thin` RETURNS from that split, so on the default (thin)
+    # path the gate was never reached — it passed its own unit tests and did
+    # nothing at all in a live boot, which is this repo's most-repeated
+    # failure shape.
+    #
+    # What is asserted is the RUNTIME's declared closure (the governance and
+    # ov-surface profiles, each empirically derived and each satisfiable), not
+    # the 322-line root manifest — a superset spanning macOS-only wheels and
+    # the ML monolith, and in fact UNSATISFIABLE (`torchaudio==2.12.0` does
+    # not exist). Asserting THAT would be a fail-closed brake that never
+    # opens: the gate itself would become the outage.
+    if inv.action in ("cockpit", "headless", "daemon", "run"):
+        try:
+            from pathlib import Path as _Path
+
+            from backend.core.ouroboros.governance.environment_integrity import (
+                EnvironmentDesyncFault, assert_environment,
+            )
+            try:
+                from backend.core.ouroboros.governance.execution_context import (
+                    authoritative_repo_root,
+                )
+                _root = authoritative_repo_root(_Path.cwd())
+            except Exception:  # noqa: BLE001 — fall back to this file's tree
+                _root = _Path(__file__).resolve().parents[4]
+            try:
+                assert_environment(_root)
+            except EnvironmentDesyncFault as _fault:
+                console.print(
+                    "[EnvironmentDesyncFault] the declared runtime closure is "
+                    "not installed, so autonomous work would fail identically "
+                    "on every retry. Refusing to boot.",
+                    markup=False, highlight=False,
+                )
+                for _line in _fault.verdict.missing[:12]:
+                    console.print(
+                        f"  missing: {_line}", markup=False, highlight=False,
+                    )
+                for _m in _fault.verdict.manifests:
+                    console.print(
+                        f"  declared by: {_m}", markup=False, highlight=False,
+                    )
+                console.print(
+                    "  fix: install the missing distributions into this "
+                    "interpreter, or set JARVIS_ENV_PREFLIGHT_ENABLED=0 to "
+                    "boot anyway and accept the starvation.",
+                    markup=False, highlight=False,
+                )
+                return 78  # EX_CONFIG — the environment, not the code
+        except Exception:  # noqa: BLE001 — a gate never becomes the outage
+            pass
+
     # ── Thin-Client Split (operator-authorized 2026-07-18) ──────────
     # Bare `ov` is a PRESENTATION SHELL: crest + zero-trust probe +
     # attach. The organism runs in a separate execution boundary
