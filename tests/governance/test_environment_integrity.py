@@ -400,3 +400,152 @@ def test_the_live_repo_declares_backend_as_an_import_root():
     root = Path(__file__).resolve().parents[2]
     roots = EI._pythonpath_roots(root)
     assert any(p.name == "backend" for p in roots), roots
+
+
+# ---------------------------------------------------------------------------
+# Impossible here, or merely not installed?
+# ---------------------------------------------------------------------------
+
+def test_an_objective_c_framework_is_unavailable_off_macos(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    v = EI.platform_capability("Quartz")
+    assert v.available is False
+    assert v.reason == "platform_bound"
+    assert "darwin" in v.detail
+
+
+def test_the_same_framework_is_available_on_macos(monkeypatch):
+    """Quarantine must be a fact about the MACHINE, not a deletion. Driven
+    from a Mac, the identical roadmap goal becomes selectable again."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert EI.platform_capability("Quartz").available is True
+
+
+def test_an_ordinary_missing_package_is_never_platform_bound():
+    """`torch` is absent, not impossible. Quarantining it would delete real
+    work over a judgement the operator has not made."""
+    assert EI.platform_capability("torch").available is True
+    assert EI.platform_capability("chromadb").available is True
+
+
+def test_a_display_bound_module_follows_the_actual_display(monkeypatch):
+    """WSLg publishes a real DISPLAY, so this host is NOT headless and
+    `pyautogui` is a missing package here rather than an impossible one.
+    Asking the machine beats assuming "Linux means headless"."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    assert EI.platform_capability("pyautogui").available is False
+    monkeypatch.setenv("DISPLAY", ":0")
+    assert EI.platform_capability("pyautogui").available is True
+
+
+def test_a_manifest_marker_is_authoritative(tmp_path, monkeypatch):
+    """The self-documenting lever: declaring a marker teaches the gate about a
+    new platform-bound dependency with no code change."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    (tmp_path / "requirements.txt").write_text(
+        'somepkg>=1.0; platform_system == "Darwin"\n', encoding="utf-8",
+    )
+    v = EI.platform_capability("somepkg", repo_root=tmp_path)
+    assert v.available is False
+    assert v.reason == "marker_excluded"
+    # ...and without the marker the same name is just a missing package.
+    (tmp_path / "requirements.txt").write_text("somepkg>=1.0\n", encoding="utf-8")
+    assert EI.platform_capability("somepkg", repo_root=tmp_path).available is True
+
+
+def test_the_live_manifest_marker_for_coremltools_is_honoured():
+    """Regression guard on the real tree, and proof the marker path is wired."""
+    root = Path(__file__).resolve().parents[2]
+    if sys.platform == "darwin":
+        pytest.skip("the marker excludes every platform BUT this one")
+    assert EI.platform_capability("coremltools", repo_root=root).available is False
+
+
+def test_an_unknown_module_is_never_accused():
+    """Silence is not evidence of impossibility."""
+    assert EI.platform_capability("some_package_nobody_has_heard_of").available is True
+    assert EI.platform_capability("").available is True
+
+
+def test_the_operator_can_extend_the_registry(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert EI.platform_capability("weirdlib").available is True
+    monkeypatch.setenv("JARVIS_PLATFORM_BOUND_MODULES", "weirdlib:darwin|win32")
+    assert EI.platform_capability("weirdlib").available is False
+
+
+@pytest.mark.parametrize("junk", ["", None, 42, "a.b.c"])
+def test_platform_capability_never_raises(junk):
+    assert isinstance(EI.platform_capability(junk), EI.PlatformVerdict)
+
+
+def test_the_verdict_separates_impossible_from_unprovisioned(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    src = tmp_path / "subject.py"
+    src.write_text("import Quartz\nimport totally_absent_xyz\n", encoding="utf-8")
+    v = EI.target_import_verdict(["subject.py"], "", tmp_path)
+    assert v.importable is False
+    assert v.impossible is True
+    assert v.structural == ("Quartz",)
+    assert set(v.unresolvable) == {"Quartz", "totally_absent_xyz"}
+    assert EI.PLATFORM_UNAVAILABLE in v.reason
+
+
+def test_an_unprovisioned_only_target_is_not_impossible(tmp_path):
+    src = tmp_path / "subject.py"
+    src.write_text("import totally_absent_xyz\n", encoding="utf-8")
+    v = EI.target_import_verdict(["subject.py"], "", tmp_path)
+    assert v.impossible is False
+    assert EI.UNRESOLVABLE_TARGET_DEPENDENCY in v.reason
+
+
+def test_structural_quarantine_needs_no_operator_switch(tmp_path, monkeypatch):
+    """A macOS framework on Linux is reversed by nothing, so leaving it
+    dispatchable burns an op per pass forever."""
+    from backend.core.ouroboros.governance.autonomy import goal_discovery as GD
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.delenv("JARVIS_QUARANTINE_UNIMPORTABLE_TARGETS", raising=False)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_mac.py").write_text("", encoding="utf-8")
+    (tmp_path / "mac.py").write_text("import Quartz\n", encoding="utf-8")
+    work = GD.DiscoveredWork(
+        target_file="mac.py", kind="roadmap_goal", evidence="m",
+        weight=1.0, subject_file="mac.py",
+    )
+    assert GD.is_dispatchable(work, tmp_path) is False
+
+
+def test_an_unprovisioned_target_stays_dispatchable_without_the_switch(tmp_path, monkeypatch):
+    """The other half of the split: absent is reversed by an install, so the
+    goal is demoted and rises again — never refused."""
+    from backend.core.ouroboros.governance.autonomy import goal_discovery as GD
+
+    monkeypatch.delenv("JARVIS_QUARANTINE_UNIMPORTABLE_TARGETS", raising=False)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_bad.py").write_text("", encoding="utf-8")
+    (tmp_path / "bad.py").write_text("import totally_absent_xyz\n", encoding="utf-8")
+    work = GD.DiscoveredWork(
+        target_file="bad.py", kind="roadmap_goal", evidence="b",
+        weight=1.0, subject_file="bad.py",
+    )
+    assert GD.is_dispatchable(work, tmp_path) is True
+
+
+def test_colorama_is_now_declared():
+    """It is imported by repo code and was declared in NO manifest, which left
+    two roadmap goals permanently unlandable."""
+    root = Path(__file__).resolve().parents[2]
+    assert "colorama" in EI.declared_distribution_names(root)
+
+
+def test_the_pyobjc_declaration_carries_its_platform_marker():
+    """Without the marker the line reads as a dependency Linux is merely
+    missing, and the boot gate would demand an unbuildable wheel."""
+    root = Path(__file__).resolve().parents[2]
+    if sys.platform == "darwin":
+        pytest.skip("the marker excludes every platform BUT this one")
+    v = EI.platform_capability("pyobjc-framework-libdispatch", repo_root=root)
+    assert v.available is False and v.reason == "marker_excluded"

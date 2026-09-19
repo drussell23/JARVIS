@@ -74,6 +74,10 @@ __all__ = [
     "EnvironmentVerdict",
     "TargetImportVerdict",
     "UNRESOLVABLE_TARGET_DEPENDENCY",
+    "PLATFORM_UNAVAILABLE",
+    "PlatformVerdict",
+    "platform_capability",
+    "structurally_unavailable",
     "DEPENDENCY_VIOLATION",
     "ENVIRONMENT_STARVATION",
     "ImportFailureVerdict",
@@ -497,11 +501,29 @@ class TargetImportVerdict:
     importable: bool
     unresolvable: Tuple[str, ...] = ()
     inspected: Tuple[str, ...] = ()
+    #: The subset of ``unresolvable`` that no install on THIS machine can fix.
+    structural: Tuple[str, ...] = ()
+
+    @property
+    def impossible(self) -> bool:
+        """Impossible here, as opposed to merely not provisioned.
+
+        The two demand different answers. An absent package is reversed by an
+        install, so the goal is DEMOTED and rises again the moment its
+        dependency lands. A macOS framework on Linux is reversed by nothing, so
+        the goal is QUARANTINED -- removed from dispatch on this host while
+        staying in the roadmap, selectable again the day the same repository is
+        driven from a Mac. Deleting it would delete Mac functionality; leaving
+        it dispatchable burns an op per pass forever.
+        """
+        return bool(self.structural)
 
     @property
     def reason(self) -> str:
         if self.importable:
             return ""
+        if self.structural:
+            return f"{PLATFORM_UNAVAILABLE}: {', '.join(self.structural)}"
         return f"{UNRESOLVABLE_TARGET_DEPENDENCY}: {', '.join(self.unresolvable)}"
 
 
@@ -547,10 +569,227 @@ def target_import_verdict(
                     bad.append(top)
         if not bad:
             return _IMPORTABLE_OK
-        return TargetImportVerdict(False, tuple(bad), tuple(inspected))
+        return TargetImportVerdict(
+            False, tuple(bad), tuple(inspected),
+            structurally_unavailable(bad, root),
+        )
     except Exception:  # noqa: BLE001
         logger.debug("[EnvIntegrity] target verdict degraded", exc_info=True)
         return _IMPORTABLE_OK
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform capability -- impossible here, or merely not installed?
+# ---------------------------------------------------------------------------
+
+#: An unresolvable import that CANNOT be satisfied on this machine, ever. The
+#: distinction from a merely-absent package is the whole point: absent is a
+#: provisioning fact that an install reverses, and this is not.
+PLATFORM_UNAVAILABLE = "platform_unavailable"
+
+_DARWIN = frozenset({"darwin"})
+_WINDOWS = frozenset({"win32", "cygwin"})
+_ANY = frozenset({"darwin", "win32", "cygwin", "linux"})
+
+#: Modules whose availability is an OS or hardware fact rather than a
+#: provisioning one, as ``(platforms_that_can_run_it, needs_a_display)``.
+#:
+#: ## Why a registry and not pure derivation
+#:
+#: The authoritative mechanism is the PEP 508 environment marker, and it IS
+#: honoured first -- ``coremltools>=7.0.0; platform_system == "Darwin"`` at
+#: ``requirements.txt:159`` is read straight off the manifest. But a marker can
+#: only speak for a DECLARED distribution, and the names that actually block
+#: this queue are not declared at all: ``Quartz`` and ``AppKit`` are import
+#: names from the PyObjC bridge, which no manifest in this repo names. There is
+#: nothing to derive from. So the registry carries the facts that cannot be
+#: derived, markers carry the ones that can, and adding a marker to a manifest
+#: remains the self-documenting way to extend this -- see
+#: ``JARVIS_PLATFORM_BOUND_MODULES`` for the third, operator-level lever.
+_PLATFORM_BOUND: Dict[str, Tuple[FrozenSet[str], bool]] = {
+    # The PyObjC bridge. These are Objective-C frameworks; there is no
+    # non-macOS build and there never will be.
+    "objc": (_DARWIN, False),
+    "Quartz": (_DARWIN, False),
+    "AppKit": (_DARWIN, False),
+    "Foundation": (_DARWIN, False),
+    "CoreFoundation": (_DARWIN, False),
+    "CoreGraphics": (_DARWIN, False),
+    "CoreMedia": (_DARWIN, False),
+    "AVFoundation": (_DARWIN, False),
+    "ApplicationServices": (_DARWIN, False),
+    "ScreenCaptureKit": (_DARWIN, False),
+    "Vision": (_DARWIN, False),
+    "coremltools": (_DARWIN, False),
+    # Windows-only.
+    "win32api": (_WINDOWS, False),
+    "win32gui": (_WINDOWS, False),
+    "winreg": (_WINDOWS, False),
+    # Everywhere, but only with a display server attached. NOT macOS-only and
+    # NOT unavailable under WSLg, which publishes a real DISPLAY -- calling
+    # these "headless-blocked" without asking the machine would quarantine
+    # work that can in fact run here.
+    "pyautogui": (_ANY, True),
+    "pygetwindow": (_ANY, True),
+    "pynput": (_ANY, True),
+    "mss": (_ANY, True),
+}
+
+_ENV_PLATFORM_BOUND = "JARVIS_PLATFORM_BOUND_MODULES"
+
+
+@dataclass(frozen=True)
+class PlatformVerdict:
+    """Whether *module* can exist on this machine at all."""
+
+    available: bool
+    module: str = ""
+    reason: str = ""
+    supported: Tuple[str, ...] = ()
+
+    @property
+    def detail(self) -> str:
+        if self.available:
+            return ""
+        if self.reason == "display_required":
+            return f"{self.module} needs an attached display; this session has none"
+        return (
+            f"{self.module} runs only on {'/'.join(self.supported) or '?'}; "
+            f"this is {sys.platform}"
+        )
+
+
+_PLATFORM_OK = PlatformVerdict(True)
+
+
+def _has_display() -> bool:
+    """Whether a display server is attached. Asked, never assumed.
+
+    macOS and Windows always have one from a process's point of view. On Linux
+    it is ``DISPLAY`` or ``WAYLAND_DISPLAY`` -- and WSLg sets both, which is why
+    this host is NOT headless and ``pyautogui`` is a missing package here
+    rather than an impossible one.
+    """
+    if sys.platform != "linux":
+        return True
+    return bool(
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    )
+
+
+def _operator_platform_bound() -> Dict[str, Tuple[FrozenSet[str], bool]]:
+    """``JARVIS_PLATFORM_BOUND_MODULES='Quartz:darwin,foo:win32|linux'``."""
+    out: Dict[str, Tuple[FrozenSet[str], bool]] = {}
+    raw = os.environ.get(_ENV_PLATFORM_BOUND, "")
+    if not raw.strip():
+        return out
+    try:
+        for entry in raw.split(","):
+            if ":" not in entry:
+                continue
+            name, plats = entry.split(":", 1)
+            name = name.strip()
+            keep = frozenset(p.strip() for p in plats.split("|") if p.strip())
+            if name and keep:
+                out[name] = (keep, False)
+    except Exception:  # noqa: BLE001 -- a malformed override declares nothing
+        logger.debug("[EnvIntegrity] platform override ignored", exc_info=True)
+    return out
+
+
+def _marker_excluded(repo_root: Path) -> FrozenSet[str]:
+    """Canonical distribution names a manifest marker excludes on THIS host.
+
+    Reads the repository's own declarations, so ``coremltools>=7.0.0;
+    platform_system == "Darwin"`` is honoured without this module knowing what
+    coremltools is. The marker is also the self-documenting way to teach the
+    gate about a new platform-bound dependency: declare it with a marker and
+    the queue stops dispatching it here, with no code change.
+    """
+    excluded: List[str] = []
+    try:
+        from packaging.markers import Marker  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 -- no evaluator, no exclusions
+        return frozenset()
+    try:
+        for dirpath, dirnames, filenames in os.walk(Path(repo_root)):
+            dirnames[:] = [d for d in dirnames if not _prunable(d)]
+            for fn in filenames:
+                if not (fn.startswith("requirements") and fn.endswith(".txt")):
+                    continue
+                try:
+                    text = (Path(dirpath) / fn).read_text(
+                        encoding="utf-8", errors="replace",
+                    )
+                except OSError:
+                    continue
+                for line in text.splitlines():
+                    raw = line.split("#", 1)[0].strip()
+                    if ";" not in raw or raw.startswith("-"):
+                        continue
+                    head, marker = raw.split(";", 1)
+                    name = re.split(r"[<>=!~\[ ]", head, 1)[0].strip()
+                    if not name:
+                        continue
+                    try:
+                        if not Marker(marker.strip()).evaluate():
+                            excluded.append(_canonical(name))
+                    except Exception:  # noqa: BLE001 -- unparseable marker
+                        continue
+    except Exception:  # noqa: BLE001
+        logger.debug("[EnvIntegrity] marker scan degraded", exc_info=True)
+    return frozenset(excluded)
+
+
+def platform_capability(
+    module: str, *, repo_root: Optional[Path] = None,
+) -> PlatformVerdict:
+    """Can *module* exist on this machine at all?
+
+    Three sources, most authoritative first: the repository's own PEP 508
+    markers, the operator's ``JARVIS_PLATFORM_BOUND_MODULES`` override, and the
+    empirical registry. Anything not named by any of them is reported AVAILABLE
+    -- silence is not evidence of impossibility, and the demotion path already
+    handles "absent".
+
+    NEVER raises.
+    """
+    try:
+        top = str(module or "").split(".")[0]
+        if not top:
+            return _PLATFORM_OK
+        if repo_root is not None and _canonical(top) in _marker_excluded(repo_root):
+            return PlatformVerdict(
+                False, top, "marker_excluded", (f"not {sys.platform}",),
+            )
+        entry = _operator_platform_bound().get(top) or _PLATFORM_BOUND.get(top)
+        if entry is None:
+            return _PLATFORM_OK
+        platforms, needs_display = entry
+        if sys.platform not in platforms:
+            return PlatformVerdict(
+                False, top, "platform_bound", tuple(sorted(platforms)),
+            )
+        if needs_display and not _has_display():
+            return PlatformVerdict(
+                False, top, "display_required", tuple(sorted(platforms)),
+            )
+        return _PLATFORM_OK
+    except Exception:  # noqa: BLE001
+        logger.debug("[EnvIntegrity] platform capability degraded", exc_info=True)
+        return _PLATFORM_OK
+
+
+def structurally_unavailable(
+    modules: Sequence[str], repo_root: Optional[Path] = None,
+) -> Tuple[str, ...]:
+    """The subset of *modules* that CANNOT be satisfied on this machine."""
+    out: List[str] = []
+    for mod in modules or ():
+        verdict = platform_capability(mod, repo_root=repo_root)
+        if not verdict.available and mod not in out:
+            out.append(mod)
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------

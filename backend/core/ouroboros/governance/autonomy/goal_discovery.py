@@ -49,6 +49,7 @@ import asyncio
 import logging
 import os
 import re
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -672,10 +673,12 @@ LIVENESS_DEAD = 0          # target absent and not a test — nothing to edit
 #: two copies of the same rule always eventually do.
 try:  # pragma: no cover — trivial, and a missing gate must not break discovery
     from backend.core.ouroboros.governance.environment_integrity import (
+        PLATFORM_UNAVAILABLE as _PLATFORM_REASON,
         UNRESOLVABLE_TARGET_DEPENDENCY as _UNRESOLVABLE_REASON,
     )
 except Exception:  # noqa: BLE001
     _UNRESOLVABLE_REASON = "unresolvable_target_dependency"
+    _PLATFORM_REASON = "platform_unavailable"
 
 
 def _covering_test_stems(repo_root: Path) -> FrozenSet[str]:
@@ -850,11 +853,23 @@ def is_dispatchable(work: "DiscoveredWork", repo_root: Path) -> bool:
     other tier is dispatchable; being unlikely to land is not the same as
     having nothing to edit, and deciding THAT is the pipeline's job.
 
-    An unimportable target is DEMOTED by the ranker, not refused here — unless
-    the operator has armed quarantine. Refusing by default would silently
-    delete 21 of the live roadmap's 51 goals over a judgement (install the ML
-    stack? accept that macOS-only targets are unreachable on this host?) that
-    is the operator's to make, not the queue's.
+    ## Two different "cannot import", two different answers
+
+    A target needing ``torch`` is UNPROVISIONED: one install reverses it, so
+    the goal is demoted by the ranker and rises again the moment the package
+    lands. Refusing it here would delete real work over a judgement (install
+    the multi-gigabyte ML stack?) that is the operator's to make.
+
+    A target needing ``Quartz`` is IMPOSSIBLE: it is an Objective-C framework
+    and this is Linux. No install reverses that, so demotion just means the
+    goal sinks to the tail and is re-ranked, forever, every pass. It is
+    quarantined instead — refused on THIS host while staying in the roadmap,
+    and selectable again the day the same repository is driven from a Mac.
+    Deleting it would delete Mac functionality from the queue.
+
+    ``JARVIS_QUARANTINE_UNIMPORTABLE_TARGETS`` remains the operator's blunt
+    switch for the first category; the second needs no switch, because the
+    verdict is a fact about the machine rather than a preference.
     """
     if _liveness_rank(work, repo_root) <= LIVENESS_DEAD:
         return False
@@ -862,14 +877,18 @@ def is_dispatchable(work: "DiscoveredWork", repo_root: Path) -> bool:
         from backend.core.ouroboros.governance import (  # noqa: PLC0415
             environment_integrity as _ei,
         )
-        if not _ei.quarantine_enabled():
-            return True
         verdict = _import_verdict(work, repo_root)
         if _is_importable(verdict):
             return True
+        structural = bool(getattr(verdict, "impossible", False))
+        if not (structural or _ei.quarantine_enabled()):
+            return True
         logger.warning(
-            "[GoalDiscovery] %s quarantined — %s",
-            work.goal_id, getattr(verdict, "reason", "") or "unimportable target",
+            "[GoalDiscovery] %s %s — %s",
+            work.goal_id,
+            "quarantined (impossible on this host)" if structural
+            else "quarantined (operator-armed)",
+            getattr(verdict, "reason", "") or "unimportable target",
         )
         return False
     except Exception:  # noqa: BLE001 — a degraded check never sheds work
@@ -1121,18 +1140,35 @@ async def discover(
             len(blocked), len(scored), documented[0].target_file,
         )
         if blocked:
-            # Named, not just counted. "21 blocked" is a number an operator
-            # cannot act on; the missing distributions are the action.
-            missing = Counter(
-                m
-                for w in blocked
+            # Named, not just counted, and SPLIT — because the two halves ask
+            # the operator for different things. "install these" is an action;
+            # "this machine is not a Mac" is not.
+            impossible = [
+                w for w in blocked
+                if getattr(verdicts.get(w.goal_id), "impossible", False)
+            ]
+            unprovisioned = Counter(
+                m for w in blocked
+                if not getattr(verdicts.get(w.goal_id), "impossible", False)
                 for m in getattr(verdicts.get(w.goal_id), "unresolvable", ())
             )
             logger.warning(
-                "[GoalDiscovery] %s — demoted to the tail: %s",
-                _UNRESOLVABLE_REASON,
-                " ".join(f"{m}x{n}" for m, n in missing.most_common(8)) or "-",
+                "[GoalDiscovery] %s — %d demoted to the tail, install to "
+                "unblock: %s",
+                _UNRESOLVABLE_REASON, len(blocked) - len(impossible),
+                " ".join(f"{m}x{n}" for m, n in unprovisioned.most_common(8)) or "-",
             )
+            if impossible:
+                structural = Counter(
+                    m for w in impossible
+                    for m in getattr(verdicts.get(w.goal_id), "structural", ())
+                )
+                logger.warning(
+                    "[GoalDiscovery] %s — %d quarantined on this host (%s), "
+                    "still selectable where the platform supports them: %s",
+                    _PLATFORM_REASON, len(impossible), sys.platform,
+                    " ".join(f"{m}x{n}" for m, n in structural.most_common(8)),
+                )
     # The roadmap's dependency edges, read once for the whole pass.
     dag_index = await _dag_index()
     gate = _EligibilityGate(dag_index=dag_index, cooldown=cooldown)
