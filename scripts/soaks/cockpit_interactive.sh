@@ -37,7 +37,9 @@ JARVIS_DIR="${OV_MAIN_TREE:-/mnt/c/Users/Jarvis/Desktop/TrinityAi/jarvis}"
 PY="${OV_PYTHON:-$HOME/.venvs/ov/bin/python}"
 MODEL="${JARVIS_LOCAL_MODEL_NAME:-}"          # empty => the .env pin
 OLLAMA_API="${JARVIS_LOCAL_MODEL_BASE_URL:-http://127.0.0.1:11434}"
-FREE_MIB="${OV_GPU_FREE_MIB:-20480}"          # the cockpit needs ~18.6 GB free
+# OV_GPU_FREE_MIB is no longer read: the raw-free comparison it fed was the
+# defect (see the preflight block below). Kept out of the environment
+# deliberately so a stale export cannot resurrect the old arithmetic.
 COST_CAP="${OV_COST_CAP:-0.50}"
 IDLE_S="${OV_IDLE_TIMEOUT_S:-900}"
 WALL_S="${OV_MAX_WALL_S:-3600}"
@@ -77,13 +79,26 @@ cd "$JARVIS_DIR" || die "no tree at $JARVIS_DIR"
 # --- 2. the local lane must be able to answer ------------------------------
 USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' | head -1)
 TOTAL=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' | head -1)
-if [ -n "$USED" ] && [ -n "$TOTAL" ]; then
-  FREE=$((TOTAL - USED))
-  echo "gpu: ${USED}/${TOTAL} MiB used, ${FREE} MiB free"
-  [ "$FREE" -ge "$FREE_MIB" ] || die "only ${FREE} MiB free; the model needs ~${FREE_MIB}.
-  A training run or another soak still holds the card -- wait for it, or
-  lower OV_GPU_FREE_MIB if you know what else is resident."
-fi
+[ -n "$USED" ] && [ -n "$TOTAL" ] && echo "gpu: ${USED}/${TOTAL} MiB used, $((TOTAL - USED)) MiB free"
+
+# RESIDENCY-AWARE, not raw-free.
+#
+# This gate used to read `FREE >= 20480` -- the 30B's own footprint. Once that
+# model is loaded its ~20 GiB have moved from `free` into `used`, so the test
+# compared the footprint against the space the footprint occupies and refused.
+# Measured: 8,431 MiB free against a 20,480 MiB demand, dying with "a training
+# run or another soak still holds the card" when what held the card was THE
+# MODEL THE COCKPIT WANTED. After any soak that is most of the time.
+#
+# The arithmetic now lives in `cockpit_preflight`, which asks the SAME
+# /api/ps probe `local_model_admission` uses, so the launcher and the gate one
+# layer down cannot disagree about what is on the card. Reimplementing it in
+# shell is how they came to disagree in the first place.
+PREFLIGHT=$("$PY" -m backend.core.ouroboros.governance.cockpit_preflight \
+  --model "${MODEL:-${JARVIS_LOCAL_MODEL_NAME:-}}" 2>&1) || PF_RC=$?
+echo "$PREFLIGHT"
+[ "${PF_RC:-0}" = "0" ] || die "the accelerator cannot serve this session.
+  $PREFLIGHT"
 
 TAGS=$(curl -s -m 5 "$OLLAMA_API/api/tags" 2>/dev/null) || true
 [ -n "$TAGS" ] || die "ollama is not answering at $OLLAMA_API"
