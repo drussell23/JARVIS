@@ -46,6 +46,66 @@ _SEM = _role_palette()
 logger = logging.getLogger(__name__)
 
 
+def _render_markup_for_wire(msg: str, serpent_flow: Any = None) -> str:
+    """Resolve Rich markup to what a terminal should actually display.
+
+    The attach bridge's ``line`` channel is plain text and the client prints
+    it verbatim, so markup sent down it arrives as literal tags. Rendering it
+    here means the attached cockpit and the daemon's own console show the
+    same thing, which is the entire premise of a shared chokepoint.
+
+    ANSI is preferred over stripping: the operator's terminal has colour and
+    the design language uses it to carry meaning (a red escalation is not the
+    same line as a dim breadcrumb). Colour support is asked of the console
+    that is actually attached rather than assumed — a piped or dumb terminal
+    gets clean text instead of escape soup.
+
+    Falls back through rendered-plain to the original string. A cockpit line
+    that loses its styling is a cosmetic loss; a cockpit line that does not
+    arrive is an operator flying blind, so nothing here may raise.
+    """
+    try:
+        from io import StringIO
+
+        from rich.console import Console
+
+        console = getattr(serpent_flow, "console", None)
+        # Mirror the real console's capabilities rather than declaring them:
+        # width keeps wrapping identical on both surfaces, and colour follows
+        # what the attached terminal actually negotiated.
+        #
+        # ABSENT and NONE are different answers. `color_system=None` is a
+        # console SAYING it has no colour; a missing attribute is no console
+        # to ask. Collapsing them with `or "truecolor"` forced escape codes
+        # into a dumb terminal — caught by the test for exactly that case.
+        if console is None:
+            force_terminal, color_system, width = True, "truecolor", None
+        else:
+            force_terminal = bool(getattr(console, "is_terminal", True))
+            color_system = getattr(console, "color_system", "truecolor")
+            width = int(getattr(console, "width", 0) or 0) or None
+        buf = StringIO()
+        out = Console(
+            file=buf,
+            force_terminal=force_terminal,
+            color_system=color_system,
+            width=width,
+            markup=True,
+            highlight=False,
+            soft_wrap=True,
+            legacy_windows=False,
+        )
+        out.print(msg, end="")
+        return buf.getvalue()
+    except Exception:  # noqa: BLE001 — styling is never worth losing the line
+        try:
+            from rich.markup import render as _render
+
+            return _render(str(msg)).plain
+        except Exception:  # noqa: BLE001
+            return str(msg)
+
+
 def _autonomous_branch_stats(session_id: str):
     """Commit/diff stats for the branch autonomous work actually lands on.
 
@@ -6315,13 +6375,36 @@ class BattleTestHarness:
             pass
         # Cockpit Attach mirror: every conformed line ALSO streams to
         # attached ov terminals. Non-blocking, per-client fail-drop.
+        #
+        # RENDERED, NOT RAW. `msg` is Rich MARKUP — `[{_SEM['neural']}]…[/…]`
+        # — and `publish_line` is the PLAIN-text channel, which the client
+        # prints verbatim. So an attached terminal showed the tags:
+        #
+        #   [cyan] Autonomous Sentinel armed[/cyan] [dim]— discovering…[/dim]
+        #   [cyan]qwen3-coder-ov:30b[/cyan] · voice: off ('wake') · …
+        #
+        # while the daemon's own console, one line below, rendered the same
+        # string correctly. Two destinations, one string, two different
+        # interpretations of it.
+        #
+        # The markup channel is NOT the fix. `publish_markup`'s contract is
+        # explicit — "Untrusted/raw text must NEVER travel here" — and this
+        # seam carries chat turns, i.e. MODEL-controlled text. Routing that
+        # through a channel the client renders unescaped would let a model
+        # emit styling, or worse, into the operator's terminal.
+        #
+        # So the markup is resolved HERE, once, by Rich's own parser, and the
+        # rendered result goes to both destinations. Whatever the daemon
+        # console shows, the attached terminal now shows identically — which
+        # is what "THE design-language chokepoint" has to mean if the cockpit
+        # and the daemon are to agree about what was said.
+        sf = getattr(self, "_serpent_flow", None)
         try:
             bridge = getattr(self, "_cockpit_attach_bridge", None)
             if bridge is not None:
-                bridge.publish_line(msg)
+                bridge.publish_line(_render_markup_for_wire(msg, sf))
         except Exception:  # noqa: BLE001
             pass
-        sf = getattr(self, "_serpent_flow", None)
         if sf is not None:
             sf.console.print(msg, highlight=False)
         else:
