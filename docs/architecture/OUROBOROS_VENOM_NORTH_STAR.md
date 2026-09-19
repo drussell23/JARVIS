@@ -1,6 +1,6 @@
 # OUROBOROS_VENOM PRD — §51 North Star Galaxy + Slice-Arc Changelog + Active Roadmap
 
-> Part of the [OUROBOROS_VENOM PRD](./OUROBOROS_VENOM_PRD.md) (split for size). Contains §51 (North Star), the §51.11.x per-arc narratives, and the live **§51.11.34-ROADMAP** next-slices stack.
+> Part of the [OUROBOROS_VENOM PRD](./OUROBOROS_VENOM_PRD.md) (split for size). Contains §51 (North Star), the §51.11.x per-arc narratives, and the live **§51.11.38-ROADMAP** next-slices stack.
 
 ---
 
@@ -452,7 +452,123 @@ A verify-first cost/token audit + 2026 LLM-cost research (FrugalGPT/RouteLLM cas
 
 **THE BLUNT TRUTH THE ARC SURFACED:** quieting the noise gave GOAL-001 a clear worker pool — and `file-00` STILL did NOT dispatch (`done=0`, IMMEDIATE ops=0). **The cost work, though excellent, did NOT unblock the goal.** The real unsolved question is non-economic: *why does a funded, attested, awake, quiet organism still not dispatch its own enqueued strategic sub-goal?*
 
-### §51.11.37-ROADMAP — Priority Stack (2026-09-08, supersedes §51.11.34)
+### §51.11.38-ROADMAP — Priority Stack (2026-09-19, supersedes §51.11.37)
+
+**P0 is CLOSED. The gate is no longer one landing — it is the LANDING RATE.**
+
+§51.11.37 opened *"nothing downstream of GENERATE has ever completed
+autonomously"* and made every item below P0 speculative until that changed. It
+has changed, and the evidence is in the ledger rather than in a claim:
+`GoalReconciliationLedger` carries **14 SATISFIED events across 13 distinct
+goals**, four of them landed *after* §51.11.37 was written:
+
+| date | goal | commit |
+|---|---|---|
+| 2026-09-17 | `ov-trace-sse-daemon-payload-guard` | `00c231d19f` |
+| 2026-09-17 | `ov-auto-uncovered-module-apply-multi-space-fixes` | `778dc6674c` (83-line test) |
+| 2026-09-17 | `ov-auto-uncovered-module-apply-hybrid-vision-fix` | `8f54838f45` (148-line test) |
+| 2026-09-18 | `ov-auto-uncovered-module-start-backend-8010` | `b407233d71` |
+
+All four were authored by the locally-served 30B with no human in the loop, on
+accumulation branches, from Sentinel-discovered goals. The last third of the
+pipeline now has evidence.
+
+**What P0's closure cost, and the shape of every blocker found on the way.**
+Six defects stood between a discovered goal and a landed commit. Every one was
+the §51.2 diagnosis — *"the brain is built; the nervous system connecting it is
+the gap"* — at a seam rather than a module:
+
+| # | commit | the capability that existed and was not reached |
+|---|---|---|
+| 1 | `d34f2ebb5f` | Queue ranking existed; all 51 goals carry `high`, so the sort had equal keys everywhere and degraded to DOCUMENT ORDER. With `candidates[0]` and a cap of 8, the queue was a window onto the oldest eight. The one landable production goal sat at index 26 of 27. |
+| 2 | `f796d5d23e` | Capability resolution was correct; the schema gate then demanded a unified diff against a file the goal existed to CREATE. Every test-synthesis op died `_schema_invalid:diff_source_unreadable` — 15 of 27 queued goals, structurally unsatisfiable. |
+| 3 | `f31c49a7db` | `terminal_reason.py` already encoded "NOT eligible for cooldown"; the Sentinel never consulted it, so harness faults escalated penalties on blameless targets to `consecutive_failures: 9` in a PERSISTENT ledger. |
+| 4 | `2a3e204b8c` | `ast_signature_anchor` anchored the module under test and not its collaborators, so every boundary a test had to cross was unanchored. |
+| 5 | `16c530cfd3` | **The 77% killer.** `local_model_admission` guards *"the act of LOADING model weights"* — its own docstring — by asking whether the footprint fits in FREE VRAM. Once the 30B is loaded its 20.3 GiB have moved from `free` into `used`, so charging the footprint again bills the weights against the space they occupy. The gate refused to USE the model because it was already there. |
+| 6 | `e909149f34` | `reported_model_name` existed **with this defect named in its own docstring** and was wired into 1 of 3 emit sites; the main one filed 484 of 2,896 corpus rows (16.7%) under a 7B that never ran. |
+
+**The measured effect of #5, which is the one that matters for the stack
+below.** Before: 42 of 54 failed passes (77%) terminated
+`background_dw_blocked_by_topology` having generated ZERO tokens; the error
+named the DoubleWord catalog and the cause was arithmetic. After, on the
+verification soak: memory deferrals **84 → 0**, topology blocks **211 → 0**,
+provider quarantine **42 → 1**.
+
+**This vindicates §51.11.37's closing line and extends it.** *"Explicitly NOT on
+this stack: anything that assumes the model is the bottleneck. That assumption
+has been wrong twice."* **It has now been wrong three times.** This arc's own
+working diagnosis — "104 hallucinated APIs, the highest-leverage leak" — was an
+OCCURRENCE count inflated by VALIDATE retries re-logging one error. The distinct
+failures numbered **three**, and one of them was the subject module being
+broken (`backend/trace_live_error.py:18` calls `msi.ResponseBuilder`; that module
+defines `MultiSpaceResponseBuilder`), one a genuinely uninstalled package. The
+rule stands and should be read as standing policy, not as arc commentary.
+
+---
+
+**P0 (new) — the LANDING RATE on a clean pipeline, measured once.** Every rate
+this project has quoted (3.6%, 3.9%) was measured while 77% of ops died before
+reaching the model. The pipeline's actual capability is therefore still unknown
+— the same epistemic position §51.11.37's P1 named, one layer further in. A
+full-length soak on `e909149f34` is the first honest measurement. **Nothing
+below should be built before this number exists**, on the exact reasoning
+§51.11.37 gave: optimising a symptom that is not occurring.
+
+**P1 — the repair loop cannot reach the tier that now generates.**
+`micro_fix_skipped_new_file` fired 12-24× per soak. The micro-fix repair loop,
+which exists to fix precisely the validation failures test-synthesis ops
+produce, is gated on `if _repair_abs.is_file()` — so it declines for every
+creation op. This is defect #2's shape (absent-vs-present) one layer up, and it
+is now the largest identified lever, pending P0's number.
+
+**P2 — KV-cache quantization (carried unchanged from §51.11.37, now with a
+sharper reason).** `OLLAMA_KV_CACHE_TYPE=q8_0` remains UNSET — verified; the
+`JARVIS_KV_CACHE_DTYPE_BYTES=2` in `.env` is the negotiator's sizing arithmetic,
+not Ollama's allocation. Defect #5 makes this more valuable than when it was
+written: the admission gate's headroom is exactly what KV quantization widens,
+and the measured residency is 20.3 GiB of weights on a 32 GiB card.
+
+**P3 — goal supply outruns clearance, and priority carries no information.**
+L2 grew 17 → 37 within a single soak: the coverage sensor files goals faster
+than they land, so the backlog diverges. Compounding it, **all 51 roadmap goals
+are priority `high`** — the flat metadata that caused defect #1. The liveness
+sorter is currently doing all the ordering work on one axis, which is fragile.
+Deliberately ranked below P0 because the correct throttle is a function of
+measured clearance velocity.
+
+**P4 — the interactive cockpit as a daily driver (carried from §51.11.37).**
+Still never driven by a human for real work. Now with a specific bill:
+`tests/cli` + `tests/ui` run **1,559 passed / 8 failed**. Two would bite a first
+user immediately — `note_operator_op` is never called in `_submit_operator_goal`
+(so ESC cannot cancel the goal you just typed), and alt-screen enter/leave fails
+to restore the terminal on an exception.
+
+**P5 — dormant-capability debt (carried; grown).** The review branches the
+stack lists as 22 are now **27**. `JARVIS_EXPLORATION_LEDGER_ENABLED` and
+`JARVIS_WORKSPACE_PROMOTION_ENABLED` remain unset, as §51.11.37 intended.
+
+**Bucket A status (§51.3) — re-verified 2026-09-19, largely unchanged.** An
+import check against the five live-path files finds **9 of 10** sampled modules
+still at zero live callers (`counterfactual_rehearsal_mode`,
+`predictive_postmortem`, `postmortem_fusion`, `sleep_consolidation_pass`,
+`meta_prior_learning`, `adversarial_autobiography`, `mirror_self_test`,
+`second_order_doll_metric`, `architecture_proposer`); `proof_carrier_transport`
+now shows 1. **M10 ArchitectureProposer remains 0 references in
+`orchestrator.py`** — §51.2's Order-2 finding holds verbatim.
+
+**HONEST SCORING.** This arc moved the **Mechanic Order (Order 1) from
+nominally wired to actually productive** — which is the first half of the North
+Star's own definition (*"the Mechanic Order fully realized + the first safe step
+into the Neurosurgeon Order"*). It did **not** touch Order 2, Wang convergence
+evidence, or §43 Gap E; per the §51.0 Galaxy thesis (*"these four advance
+together or not at all"*), the composite does not move on Order-1 throughput
+alone. The ~10-15%-to-Tier-D figure stands. What changed is that the Order-1
+axis now has a measurable rate instead of a structural claim — and P0 above is
+the measurement.
+
+---
+
+*(superseded — P0 closed; see §51.11.38)* ### §51.11.37-ROADMAP — Priority Stack (2026-09-08, supersedes §51.11.34)
 
 **The gate is no longer dispatch, and it is no longer cadence. It is ONE
 LANDING.** Everything from discovery through PLAN is proven live and
