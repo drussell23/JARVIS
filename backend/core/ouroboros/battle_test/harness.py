@@ -65,43 +65,20 @@ def _render_markup_for_wire(msg: str, serpent_flow: Any = None) -> str:
     arrive is an operator flying blind, so nothing here may raise.
     """
     try:
-        from io import StringIO
+        from backend.core.ouroboros.ui.markup_ansi import markup_to_ansi
 
-        from rich.console import Console
-
-        console = getattr(serpent_flow, "console", None)
-        # Mirror the real console's capabilities rather than declaring them:
-        # width keeps wrapping identical on both surfaces, and colour follows
-        # what the attached terminal actually negotiated.
-        #
-        # ABSENT and NONE are different answers. `color_system=None` is a
-        # console SAYING it has no colour; a missing attribute is no console
-        # to ask. Collapsing them with `or "truecolor"` forced escape codes
-        # into a dumb terminal — caught by the test for exactly that case.
-        if console is None:
-            force_terminal, color_system, width = True, "truecolor", None
-        else:
-            force_terminal = bool(getattr(console, "is_terminal", True))
-            color_system = getattr(console, "color_system", "truecolor")
-            width = int(getattr(console, "width", 0) or 0) or None
-        buf = StringIO()
-        out = Console(
-            file=buf,
-            force_terminal=force_terminal,
-            color_system=color_system,
-            width=width,
-            markup=True,
-            highlight=False,
-            soft_wrap=True,
-            legacy_windows=False,
+        # width=None DELIBERATELY. This daemon has no TTY — its stdout is a
+        # log file — so Rich reports an 80-column console, and passing that
+        # width pinned a 140-column attached cockpit to 80. The receiving
+        # terminal owns its own geometry; soft wrapping lets it decide.
+        return markup_to_ansi(
+            msg, console=getattr(serpent_flow, "console", None), width=None,
         )
-        out.print(msg, end="")
-        return buf.getvalue()
     except Exception:  # noqa: BLE001 — styling is never worth losing the line
         try:
-            from rich.markup import render as _render
+            from backend.core.ouroboros.ui.markup_ansi import markup_to_plain
 
-            return _render(str(msg)).plain
+            return markup_to_plain(msg)
         except Exception:  # noqa: BLE001
             return str(msg)
 

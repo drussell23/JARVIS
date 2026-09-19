@@ -2128,7 +2128,23 @@ class AttachUI:
             # The cockpit floats the palette as a Z-index overlay, so drawing
             # it here too would render it twice. Only the PromptSession
             # surface — which has nowhere to put a container — opts in.
-            return self._key_hints()
+            #
+            # STRIPPED, not handed over raw. `_key_hints` composes Rich
+            # markup (the design language), and prompt_toolkit has no idea
+            # what `[cyan]` means — it accepts a plain string and prints it
+            # exactly as given, which is why the toolbar read
+            #
+            #   [cyan]qwen3-coder-ov:30b[/cyan] · voice: off ('wake') · …
+            #
+            # This method's contract is a STRING — `test_the_toolbar_falls_
+            # back_to_hints_when_not_completing` asserts `isinstance(str)` and
+            # other callers substring-match it ("held by another terminal").
+            # Returning a prompt_toolkit `ANSI` here satisfied the terminal
+            # and broke every programmatic reader, so the colour is applied
+            # one layer out, at `_toolbar_renderable`, where the only consumer
+            # IS the terminal.
+            from backend.core.ouroboros.ui.markup_ansi import markup_to_plain
+            return markup_to_plain(self._key_hints())
         try:
             from backend.core.ouroboros.battle_test.palette_render import (
                 palette_fragments,
@@ -2503,6 +2519,40 @@ def _maybe_summon_audio_plane(client: Any, cmd: str) -> None:
         loop.create_task(_summon())
     except Exception:  # noqa: BLE001
         pass
+
+
+def _toolbar_renderable(ui: Any) -> Any:
+    """The bottom toolbar as prompt_toolkit should RENDER it. NEVER raises.
+
+    ``ui.toolbar()`` answers two different audiences. Programmatic readers
+    substring-match it and a test pins ``isinstance(str)``, so it returns
+    text. The terminal wants colour, and prompt_toolkit prints a bare string
+    verbatim — which is how ``[cyan]qwen3-coder-ov:30b[/cyan]`` reached a live
+    cockpit.
+
+    Splitting them here keeps both honest: the string contract is untouched,
+    and the styling is applied at the one call site whose consumer IS a
+    terminal. A fragment list (drawn while completing) is already renderable
+    and passes through unchanged.
+    """
+    try:
+        bar = ui.toolbar()
+    except Exception:  # noqa: BLE001 — a toolbar fault must not kill the prompt
+        return ""
+    if not isinstance(bar, str):
+        # Palette fragments: already a prompt_toolkit renderable.
+        return bar
+    try:
+        from backend.core.ouroboros.ui.markup_ansi import toolbar_fragments
+
+        # Re-derived from the MARKED-UP source so the styling survives; the
+        # stripped string is what `toolbar()` owes its other callers.
+        hints = getattr(ui, "_key_hints", None)
+        if callable(hints) and not getattr(ui, "palette_in_toolbar", False):
+            return toolbar_fragments(hints())
+    except Exception:  # noqa: BLE001
+        pass
+    return bar
 
 
 def _extract_mentions(text: str) -> list:
@@ -2891,7 +2941,12 @@ async def _split_plane_loop(
         _em = None
     session: Any = PromptSession(
         message=lambda: ui.prompt(),
-        bottom_toolbar=lambda: ui.toolbar(),
+        # The TERMINAL's view of the toolbar, which is the only consumer that
+        # can render colour. `ui.toolbar()` keeps its string contract for the
+        # programmatic readers that substring-match it; this binding is where
+        # the design language's styling is actually applied, because
+        # prompt_toolkit prints a bare string verbatim — markup and all.
+        bottom_toolbar=lambda: _toolbar_renderable(ui),
         key_bindings=_kb,
         **({"editing_mode": _em} if _em is not None else {}),
         # Native `/` palette over the SAME 60-verb dispatch table the daemon
