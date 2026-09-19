@@ -1,116 +1,89 @@
-#!/usr/bin/env python3
-"""
-JARVIS Post-Commit Hook — Event Spine Integration (Phase 3)
-============================================================
+#!/usr/bin/env bash
+# Mirror every commit in this (WSL) clone into the Windows clone, so the tree
+# VS Code renders is never behind the tree the organism actually commits to.
+#
+# The two clones drifted twice in one session: work landed in WSL and the
+# operator saw an unchanged VS Code. Remembering to sync by hand is not a
+# mechanism -- and the AUTONOMOUS commits (auto_committer) have no human in the
+# loop to remember at all, which is exactly the case that matters.
+#
+# The Windows clone has `receive.denyCurrentBranch = updateInstead`, so a push
+# into its CHECKED-OUT branch updates its working tree as well as the ref.
+# That config also makes git REFUSE when the Windows tree is dirty, so this can
+# never clobber uncommitted work over there -- it just declines and says so.
+#
+# This is a LOCAL filesystem push (/mnt/c/...). It is not an outward-facing act
+# and is unrelated to the zero-push air-gap in remote_push_guard.py, which
+# governs pushes to REMOTES.
+#
+# Always exits 0: a mirror that fails must never fail the commit that
+# succeeded.
 
-Writes structured commit metadata to ``.jarvis/git_events.json`` after
-every commit.  The FileSystemEventBridge detects this file change and
-publishes ``fs.changed.modified`` to TrinityEventBus, where sensors
-(DocStaleness, CrossRepoDrift) react in sub-second time.
+set -u
 
-This hook has ZERO runtime dependencies on the JARVIS backend — it uses
-only stdlib + git.  The async integration happens on the consumer side.
+MIRROR_REMOTE="${OV_MIRROR_REMOTE:-windows}"
 
-Install::
+# Opt out for a single commit with OV_SKIP_MIRROR=1 git commit ...
+if [ "${OV_SKIP_MIRROR:-}" = "1" ]; then
+    exit 0
+fi
 
-    python3 scripts/install_hooks.py install
+if ! git remote get-url "$MIRROR_REMOTE" >/dev/null 2>&1; then
+    exit 0   # no mirror configured on this clone; nothing to do
+fi
 
-Disable via env var::
+BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+if [ -z "$BRANCH" ]; then
+    exit 0   # detached HEAD (a worktree mid-rebase): nothing meaningful to mirror
+fi
 
-    JARVIS_POST_COMMIT_HOOK_DISABLED=1 git commit -m "..."
-"""
-from __future__ import annotations
+# THE SILENT FAILURE THIS GUARD EXISTS FOR.
+#
+# `updateInstead` refreshes the target's WORKING TREE only when the pushed
+# branch IS the branch that tree has checked out. Push `main` at a clone
+# sitting on `some/feature` and git updates the ref, reports success, and
+# leaves every file on disk untouched. The push genuinely succeeded; the
+# mirror did not.
+#
+# That is exactly what happened: the Windows clone was left on a session
+# branch, twelve commits of `main` mirrored "successfully", and `ov` --
+# which is an editable install pointing AT that tree -- kept executing a
+# four-commit-stale AST while this hook printed "VS Code tree updated"
+# each time. A success that is not one is worse than a refusal, because
+# nobody goes looking.
+#
+# Asked BEFORE the push so the operator is told what will happen, not what
+# already silently did. An unreachable target answers "" and is handled by
+# the push's own error path below.
+TARGET_BRANCH="$(git --git-dir="$(git remote get-url "$MIRROR_REMOTE")/.git" \
+    symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
 
-import json
-import os
-import subprocess
-import tempfile
-import time
-from pathlib import Path
+if [ -n "$TARGET_BRANCH" ] && [ "$TARGET_BRANCH" != "$BRANCH" ]; then
+    echo "[mirror] MirrorDesyncFault: the $MIRROR_REMOTE tree is on '$TARGET_BRANCH'," >&2
+    echo "[mirror]   but this commit is on '$BRANCH'." >&2
+    echo "[mirror]   git will update the REF and leave the working tree" >&2
+    echo "[mirror]   untouched -- VS Code, and anything running from that" >&2
+    echo "[mirror]   tree (the 'ov' editable install), keep executing STALE" >&2
+    echo "[mirror]   code while reporting success." >&2
+    echo "[mirror]   fix, in the Windows clone:" >&2
+    echo "[mirror]     git -C \"\$(git remote get-url $MIRROR_REMOTE)\" checkout $BRANCH" >&2
+    echo "[mirror]   then re-mirror:" >&2
+    echo "[mirror]     git -C \"$(pwd)\" push $MIRROR_REMOTE $BRANCH" >&2
+    # Exit 1 is ADVISORY: git ignores post-commit's status, and it must --
+    # the commit already succeeded and is valid. The value is the loud
+    # stderr above and a non-zero status for any wrapper that checks.
+    exit 1
+fi
 
-
-def main() -> None:
-    if os.environ.get("JARVIS_POST_COMMIT_HOOK_DISABLED", "").strip() in ("1", "true"):
-        return
-
-    repo_root = Path(
-        subprocess.check_output(
-            ["git", "rev-parse", "--show-toplevel"],
-            text=True,
-        ).strip()
-    )
-    jarvis_dir = repo_root / ".jarvis"
-    jarvis_dir.mkdir(parents=True, exist_ok=True)
-
-    # Gather commit metadata
-    try:
-        commit_hash = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True,
-        ).strip()
-    except Exception:
-        commit_hash = "unknown"
-
-    try:
-        branch = subprocess.check_output(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True,
-        ).strip()
-    except Exception:
-        branch = "unknown"
-
-    try:
-        author = subprocess.check_output(
-            ["git", "log", "-1", "--format=%an"], text=True,
-        ).strip()
-    except Exception:
-        author = "unknown"
-
-    try:
-        message = subprocess.check_output(
-            ["git", "log", "-1", "--format=%s"], text=True,
-        ).strip()
-    except Exception:
-        message = ""
-
-    try:
-        changed_files = subprocess.check_output(
-            ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
-            text=True,
-        ).strip().split("\n")
-        changed_files = [f for f in changed_files if f]
-    except Exception:
-        changed_files = []
-
-    event = {
-        "schema_version": 1,
-        "event": "commit",
-        "timestamp": time.time(),
-        "commit_hash": commit_hash,
-        "branch": branch,
-        "author": author,
-        "changed_files": changed_files,
-        "message_first_line": message[:200],
-        "py_files_changed": [f for f in changed_files if f.endswith(".py")],
-        "doc_files_changed": [
-            f for f in changed_files
-            if f.endswith((".md", ".rst", ".txt"))
-        ],
-    }
-
-    # Atomic write
-    output_path = jarvis_dir / "git_events.json"
-    try:
-        fd, tmp_path = tempfile.mkstemp(
-            dir=str(jarvis_dir), suffix=".tmp", prefix=".git_events_",
-        )
-        with os.fdopen(fd, "w") as f:
-            json.dump(event, f, indent=2)
-        os.replace(tmp_path, str(output_path))
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-
-
-if __name__ == "__main__":
-    main()
+OUT="$(git push "$MIRROR_REMOTE" "$BRANCH" 2>&1)"
+RC=$?
+if [ $RC -eq 0 ]; then
+    echo "[mirror] $BRANCH -> $MIRROR_REMOTE (VS Code tree updated)"
+else
+    # The common, expected refusal: the Windows tree has uncommitted changes.
+    echo "[mirror] NOT mirrored to $MIRROR_REMOTE -- VS Code is now BEHIND." >&2
+    echo "$OUT" | sed 's/^/[mirror]   /' >&2
+    echo "[mirror]   fix: commit/stash in the Windows clone, then:" >&2
+    echo "[mirror]   git -C /home/jarvis_svc/jarvis push $MIRROR_REMOTE $BRANCH" >&2
+fi
+exit 0
