@@ -5246,6 +5246,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     battle-test bootstrap; status/attach/help are handled locally without
     booting the organism.
     """
+    # Before anything renders: can these streams carry the design language?
+    #
+    # NOT the cure for the `≡ƒÆ¡` an operator reported — that is a Windows
+    # console decoding correct UTF-8 bytes as cp437, downstream of anything
+    # Python controls (see `stream_encoding`). This is for the streams that
+    # genuinely cannot ENCODE: cron, systemd units, `docker exec`, any shell
+    # with LANG unset, where the preferred encoding is ASCII and one `⏺`
+    # raises UnicodeEncodeError from inside a render path.
+    #
+    # A no-op on every host that was already correct.
+    try:
+        from backend.core.ouroboros.ui.stream_encoding import (
+            ensure_glyph_capable_streams,
+        )
+        ensure_glyph_capable_streams()
+    except Exception:  # noqa: BLE001 — a stream guard never blocks a boot
+        pass
+
     inv = resolve(sys.argv[1:] if argv is None else list(argv))
     console = build_console()
 

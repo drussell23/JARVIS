@@ -6376,6 +6376,28 @@ class BattleTestHarness:
         # is what "THE design-language chokepoint" has to mean if the cockpit
         # and the daemon are to agree about what was said.
         sf = getattr(self, "_serpent_flow", None)
+        printer = getattr(sf, "_print_mirrored", None) if sf is not None else None
+        if callable(printer):
+            # ONE SEAM THAT KNOWS BOTH FACTS.
+            #
+            # This method used to publish to the bridge AND print to
+            # `sf.console`. The harness swaps that console for a SPOOLED one
+            # that relays everything printed to it, so both paths reached the
+            # attached cockpit and every line arrived twice — visible in a
+            # live screenshot as a doubled "Autonomous Sentinel armed", and
+            # confirmed as two entries in the daemon log for a call site that
+            # runs exactly once.
+            #
+            # `_print_mirrored` is the existing cure for precisely this: its
+            # docstring records the same defect found in 2026-09 ("Each `⏺ X
+            # queued` arrived at the cockpit as a pair"), and it suppresses
+            # the relay when it has already mirrored. It was simply never
+            # adopted here — the chokepoint that fans out the most lines.
+            try:
+                printer(msg)
+                return
+            except Exception:  # noqa: BLE001 — fall through to the legacy path
+                pass
         try:
             bridge = getattr(self, "_cockpit_attach_bridge", None)
             if bridge is not None:
