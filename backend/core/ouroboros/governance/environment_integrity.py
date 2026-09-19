@@ -364,6 +364,80 @@ def _resolves(top: str) -> bool:
         return True
 
 
+#: ``pythonpath = . backend`` in pytest.ini, or the TOML list form.
+_PYTHONPATH_INI_RE = re.compile(r"^\s*pythonpath\s*=\s*(.+?)\s*$", re.M)
+_PYTHONPATH_TOML_RE = re.compile(r"pythonpath\s*=\s*\[([^\]]*)\]", re.S)
+
+_roots_cache: Dict[Tuple[str, int], Tuple[Path, ...]] = {}
+
+
+def _pythonpath_roots(repo_root: Path) -> Tuple[Path, ...]:
+    """The import roots the repository's OWN pytest configuration declares.
+
+    ## The false positive this exists to kill
+
+    Without it, ``import vision.multi_space_intelligence`` reads as an absent
+    third-party package, because ``vision`` is a subpackage of ``backend/`` and
+    only resolves when ``backend/`` is on ``sys.path``. The live census proved
+    it in production: nine goals demoted for ``vision`` and three for ``core``
+    — all of them perfectly importable under the pytest that actually runs
+    VALIDATE, because ``pytest.ini`` declares ``pythonpath = . backend``.
+
+    Accusing a first-party package of being a missing dependency is the worst
+    outcome this module can produce: it demotes exactly the work that CAN land.
+    So the roots are read from the repo's own config rather than assumed, and a
+    layout that names no pythonpath simply gets none.
+    """
+    out: List[Path] = []
+    root = Path(repo_root)
+    for name in ("pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml"):
+        cfg = root / name
+        try:
+            if not cfg.is_file():
+                continue
+            key = (str(cfg), int(cfg.stat().st_mtime_ns))
+            hit = _roots_cache.get(key)
+            if hit is not None:
+                out.extend(hit)
+                continue
+            text = cfg.read_text(encoding="utf-8", errors="replace")
+            chunks: List[str] = []
+            if name.endswith(".toml"):
+                m = _PYTHONPATH_TOML_RE.search(text)
+                if m:
+                    chunks = re.findall(r"['\"]([^'\"]+)['\"]", m.group(1))
+            else:
+                m = _PYTHONPATH_INI_RE.search(text)
+                if m:
+                    chunks = m.group(1).split()
+            found = tuple(
+                (root / c).resolve()
+                for c in chunks
+                if c and (root / c).is_dir()
+            )
+            _roots_cache[key] = found
+            out.extend(found)
+        except Exception:  # noqa: BLE001 — an unreadable config declares nothing
+            continue
+    # Dedup, order-preserving.
+    seen: List[Path] = []
+    for p in out:
+        if p not in seen:
+            seen.append(p)
+    return tuple(seen)
+
+
+def _resolves_under_roots(top: str, roots: Sequence[Path]) -> bool:
+    """Whether *top* is a package or module under one of the declared roots."""
+    for r in roots:
+        try:
+            if (r / f"{top}.py").is_file() or (r / top / "__init__.py").is_file():
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
 def _third_party_tops(path: Path, repo_root: Path) -> Tuple[str, ...]:
     """Top-level names *path* imports that are NOT first-party, content-cached.
 
@@ -386,13 +460,20 @@ def _third_party_tops(path: Path, repo_root: Path) -> Tuple[str, ...]:
             _resolve_first_party,
         )
         src = path.read_text(encoding="utf-8", errors="replace")
+        roots = _pythonpath_roots(repo_root)
         tops: List[str] = []
         for mod in _imported_module_names(src):
             if _resolve_first_party(mod, path, repo_root) is not None:
                 continue
             top = str(mod).split(".")[0]
-            if top and top not in tops:
-                tops.append(top)
+            if not top or top in tops:
+                continue
+            # `_resolve_first_party` walks the IMPORTER's ancestors, which is
+            # how Python finds a sibling — but not how it finds a package that
+            # is first-party only because pytest puts its parent on sys.path.
+            if _resolves_under_roots(top, roots):
+                continue
+            tops.append(top)
         out: Tuple[str, ...] = tuple(tops)
     except Exception:  # noqa: BLE001 -- an unparseable file accuses nobody
         out = ()

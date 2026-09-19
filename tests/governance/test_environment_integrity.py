@@ -346,3 +346,57 @@ def test_the_reason_constant_is_owned_by_one_module():
     from backend.core.ouroboros.governance.autonomy import goal_discovery as GD
 
     assert GD._UNRESOLVABLE_REASON == EI.UNRESOLVABLE_TARGET_DEPENDENCY
+
+
+# ---------------------------------------------------------------------------
+# The false positive the LIVE census caught
+# ---------------------------------------------------------------------------
+
+def test_a_package_first_party_only_via_pythonpath_is_not_accused(tmp_path):
+    """Found in production, not in review: the first census demoted nine goals
+    for `vision` and three for `core`. Both are subpackages of `backend/` and
+    resolve perfectly under the pytest that actually runs VALIDATE, because
+    `pytest.ini` declares `pythonpath = . backend`.
+
+    Accusing a first-party package of being a missing dependency is the worst
+    thing this module can do -- it demotes exactly the work that CAN land.
+    """
+    (tmp_path / "pytest.ini").write_text(
+        "[pytest]\npythonpath = . backend\n", encoding="utf-8",
+    )
+    (tmp_path / "backend" / "vision").mkdir(parents=True)
+    (tmp_path / "backend" / "vision" / "__init__.py").write_text("", encoding="utf-8")
+    src = tmp_path / "backend" / "caller.py"
+    src.write_text("from vision import thing\n", encoding="utf-8")
+    assert EI.unresolvable_imports(src, tmp_path) == ()
+
+
+def test_the_toml_form_of_pythonpath_is_read_too(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\npythonpath = ["backend", "."]\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "backend" / "core").mkdir(parents=True)
+    (tmp_path / "backend" / "core" / "__init__.py").write_text("", encoding="utf-8")
+    src = tmp_path / "x.py"
+    src.write_text("import core\n", encoding="utf-8")
+    assert EI.unresolvable_imports(src, tmp_path) == ()
+
+
+def test_a_declared_root_that_does_not_exist_is_ignored(tmp_path):
+    (tmp_path / "pytest.ini").write_text(
+        "[pytest]\npythonpath = . nope_not_here\n", encoding="utf-8",
+    )
+    assert all(p.is_dir() for p in EI._pythonpath_roots(tmp_path))
+
+
+def test_a_repo_with_no_pythonpath_declares_no_roots(tmp_path):
+    assert EI._pythonpath_roots(tmp_path) == ()
+
+
+def test_the_live_repo_declares_backend_as_an_import_root():
+    """The regression guard for the real tree: if `pytest.ini` stops declaring
+    it, this gate starts accusing 200+ first-party modules."""
+    root = Path(__file__).resolve().parents[2]
+    roots = EI._pythonpath_roots(root)
+    assert any(p.name == "backend" for p in roots), roots
