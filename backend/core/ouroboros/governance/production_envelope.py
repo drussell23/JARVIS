@@ -169,6 +169,30 @@ def build(
     # that would kill the op from underneath it — an op shed by its own gate
     # records why; one killed by the pipeline clock just vanishes.
     approval = max(30, int(pipeline * 0.5))
+    # THE STALENESS THRESHOLD IS A FUNCTION OF THESE BUDGETS, NOT A DEFAULT.
+    #
+    # `harness._OP_STALE_THRESHOLD_S` states the invariant in its own comment:
+    # "this threshold MUST exceed the largest single-phase budget an op can
+    # legitimately consume, else a long-but-active phase is mis-classified
+    # stale and the session is shut down mid-flight", and "a soak with large
+    # adaptive budgets MUST set OUROBOROS_OP_STALE_THRESHOLD_S above its per-op
+    # budget ceiling".
+    #
+    # Nothing was setting it. Its default is 1200s while THIS module hands the
+    # same session a 3726s generation budget, so the envelope was violating an
+    # invariant it had all the information to satisfy. Measured in
+    # bt-2026-09-19-194820: a VALIDATE pytest legitimately ran 474s, the op
+    # went 33 minutes between FSM transitions, `all_ops_stale` fired and the
+    # session died at 51 of its 150 planned minutes — 4 passes instead of ~20.
+    # Every soak measurement taken on these budgets was truncated the same way.
+    #
+    # Derived from the largest phase budget rather than picked, with headroom
+    # for the retry a phase may legitimately take, so the two cannot drift:
+    # change the wall and this moves with it.
+    stale_threshold = max(1200, int(generation * 1.5))
+    # Force-cancel must sit ABOVE the staleness threshold. Below it, the
+    # canceller reaps an op the monitor has not yet called stale.
+    force_cancel = int(stale_threshold * 1.25)
 
     values: Dict[str, object] = {
         # --- budgets (derived above; never write these as literals) -------
@@ -178,6 +202,10 @@ def build(
         "JARVIS_BG_WORKER_OP_TIMEOUT_S": bg_worker,
         "JARVIS_PIPELINE_DEADLINE_AT_START": True,
         "JARVIS_TEST_TIMEOUT_S": 180,
+        # See the derivation above — the invariant `harness` documents and
+        # nothing was satisfying.
+        "OUROBOROS_OP_STALE_THRESHOLD_S": stale_threshold,
+        "OUROBOROS_OP_FORCE_CANCEL_S": force_cancel,
         # --- the background pool that actually runs roadmap ops -----------
         # Sized for the LANE, not copied from soak26. Six workers is right for
         # a hosted fleet and structurally wrong for one local GPU: measured

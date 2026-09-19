@@ -421,6 +421,55 @@ class Invocation:
     message: str = ""
 
 
+#: The two flags `_start_sentinel_loop` requires. They are separable
+#: capabilities BY DESIGN — discovery without sentinel files goals a human
+#: still approves; sentinel without discovery auto-approves goals a human
+#: still writes — and unattended application of self-authored code is the
+#: composition of the two. That design is preserved here: `--sentinel` is the
+#: one place that sets BOTH, and nothing sets either by default.
+_SENTINEL_FLAGS = (
+    "JARVIS_SENTINEL_MODE_ENABLED",
+    "JARVIS_GOAL_DISCOVERY_ENABLED",
+)
+
+
+def arm_sentinel(environ=None) -> bool:
+    """Arm autonomous work discovery + application. Returns whether it armed.
+
+    ## Why this exists
+
+    `ov` never mentioned these flags, `.env` leaves them unset, and
+    `production_envelope` sets them for neither profile. So an operator running
+    `ov` got a cockpit whose Sentinel logged "dormant — the organism executes
+    only goals a human files" and waited: it would run what you typed and never
+    discover work of its own. The capability was reachable only from
+    `cockpit_interactive.sh --sentinel`, a different entry point than the one
+    people actually use.
+
+    An operator-set value WINS: someone who exported `false` deliberately is
+    not overridden by a flag they also passed, and the caller reports the
+    conflict rather than silently resolving it.
+    """
+    env = os.environ if environ is None else environ
+    armed = True
+    for name in _SENTINEL_FLAGS:
+        current = str(env.get(name, "") or "").strip().lower()
+        if current in ("0", "false", "no", "off"):
+            armed = False          # explicitly refused by the operator
+            continue
+        env[name] = "true"
+    return armed
+
+
+def sentinel_is_armed(environ=None) -> bool:
+    """Whether BOTH switches are on — the composition the loop requires."""
+    env = os.environ if environ is None else environ
+    return all(
+        str(env.get(n, "") or "").strip().lower() in ("1", "true", "yes", "on")
+        for n in _SENTINEL_FLAGS
+    )
+
+
 def resolve(argv: Optional[Sequence[str]] = None) -> Invocation:
     """Translate an ``ov`` argv into an :class:`Invocation`.
 
@@ -464,7 +513,14 @@ def resolve(argv: Optional[Sequence[str]] = None) -> Invocation:
     if verb == "restart":
         return Invocation("restart", list(rest))
     # cockpit (explicit or defaulted)
-    return Invocation("cockpit", rest)
+    #
+    # `--sentinel` is consumed HERE rather than passed through: the legacy
+    # bootstrap has no such flag, and handing it one it does not know would
+    # surface as an argparse error at boot instead of as autonomy.
+    _rest = [a for a in rest if a != "--sentinel"]
+    if len(_rest) != len(rest):
+        arm_sentinel()
+    return Invocation("cockpit", _rest)
 
 
 # ---------------------------------------------------------------------------
@@ -5247,6 +5303,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _mux_engaged = engage_boot_mux()
         except Exception:  # noqa: BLE001 — degrade to the noisy legacy boot
             _mux_engaged = False
+
+    # SAY WHICH MODE THIS IS, ALWAYS.
+    #
+    # The Sentinel's own dormancy line goes to `debug.log` at INFO, so an
+    # operator watching the cockpit could not tell whether the organism was
+    # about to find its own work or was waiting to be told. Both states are
+    # legitimate; being unable to distinguish them is not. Printed before the
+    # boot mux engages so it survives on the TTY either way.
+    if inv.action == "cockpit":
+        try:
+            if sentinel_is_armed():
+                console.print(
+                    "[Sentinel] ARMED — the organism will discover, sanction "
+                    "and apply its own work. Red tier and the governance "
+                    "substrate still escalate to you.",
+                    markup=False,
+                )
+            else:
+                console.print(
+                    "[Sentinel] dormant — it runs only what you ask. "
+                    "Start with `ov --sentinel` to let it drive.",
+                    markup=False,
+                )
+        except Exception:  # noqa: BLE001 — a banner never blocks a boot
+            pass
 
     try:
         from scripts.ouroboros_battle_test import main as battle_main
