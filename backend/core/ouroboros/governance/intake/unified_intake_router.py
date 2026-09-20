@@ -1419,6 +1419,37 @@ class UnifiedIntakeRouter:
                         "Router: hydration-attempt guard faulted op=%s",
                         getattr(_cp, "op_id", "?"), exc_info=True,
                     )
+                # ── Still dispatchable? ─────────────────────────────────────
+                # A checkpoint freezes a DECISION to work on something; resume
+                # is the one entry that skips every gate that decision passed
+                # through. Seen 2026-09-20: discovery learned to refuse a goal
+                # whose subject RUNS A PROGRAM when imported, the very next
+                # boot hydrated yesterday's suspended op for that same goal
+                # straight into VALIDATE_RETRY, and three sandboxes started
+                # the launcher again. The Sentinel had correctly moved on to
+                # other work; the resume path never asked.
+                #
+                # Only a STRUCTURAL verdict refuses — impossible on this host,
+                # or impossible until the subject is refactored. A merely
+                # unprovisioned dependency does not: an install reverses it,
+                # and the op's exploration is worth keeping for that day.
+                # Same verdict, same function, as ``goal_discovery``.
+                _refusal = await self._resume_refusal(_cp)
+                if _refusal:
+                    try:
+                        _ckpt.quarantine_checkpoint(
+                            _cp, reason="undispatchable_on_resume",
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "Router: resume quarantine faulted op=%s",
+                            getattr(_cp, "op_id", "?"), exc_info=True,
+                        )
+                    logger.warning(
+                        "Router: NOT resuming suspended op=%s -> DLQ — %s",
+                        getattr(_cp, "op_id", "?"), _refusal,
+                    )
+                    continue
                 try:
                     _env = _ckpt.build_resume_envelope(_cp)
                     await _reinject(_env)
@@ -1461,6 +1492,33 @@ class UnifiedIntakeRouter:
                 logger.debug("[IntakeRouter] cognitive re-hydration skipped (fail-soft): %s", _e)
         except Exception:  # noqa: BLE001
             logger.debug("Router: FSM checkpoint hydration skipped (fail-soft)", exc_info=True)
+
+    async def _resume_refusal(self, checkpoint: Any) -> str:
+        """Why *checkpoint* must not be resumed, or ``""``. NEVER raises.
+
+        Any fault answers ``""`` — resume. A gate on the recovery path that
+        fails closed would strand every suspended op the day it broke.
+        """
+        try:
+            from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                environment_integrity as _ei,
+            )
+            targets = [str(t) for t in (getattr(checkpoint, "target_files", ()) or ())]
+            description = str(getattr(checkpoint, "goal_description", "") or "")
+            if not targets and not description:
+                return ""
+            verdict = await asyncio.to_thread(
+                _ei.target_import_verdict, targets, description,
+                Path(self._config.project_root),
+            )
+            if getattr(verdict, "impossible", False):
+                return str(getattr(verdict, "reason", "") or "structurally undispatchable")
+            return ""
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.debug("Router: resume dispatchability check degraded", exc_info=True)
+            return ""
 
     async def stop(self) -> None:
         """Gracefully stop the dispatch loop and release the advisory lock."""
