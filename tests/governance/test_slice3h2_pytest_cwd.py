@@ -66,6 +66,15 @@ INTERACTIVE_REPAIR_FILE = (
 )
 
 
+from tests.support.ast_contract import (
+    assert_assigned_from,
+    assert_calls_in_order,
+    assert_constructed_with,
+    assert_never_constructed_with,
+    parse_module,
+)
+
+
 def _parse(path: Path) -> ast.Module:
     return ast.parse(path.read_text(), filename=str(path))
 
@@ -81,44 +90,19 @@ def test_ast_pin_interactive_repair_constructed_with_repair_root() -> None:
     orch._config.project_root``. Without this Slice 3H.2 reorder,
     the subprocess pytest runs in the JARVIS cwd and the
     bt-2026-05-25-082441 hard-guard trap is open again."""
-    src = VALIDATE_RUNNER_FILE.read_text()
-    assert "project_root=_repair_root" in src, (
-        "InteractiveRepairLoop is NOT constructed with _repair_root "
-        "— Slice 3H.2 reorder missing; pytest will run in wrong cwd."
+    tree = parse_module(VALIDATE_RUNNER_FILE)
+    # The repair subprocess must run under the envelope-resolved root, never
+    # the host JARVIS root. Asserted against the parsed construction site, so
+    # reformatting or reordering the keywords cannot break it and a comment
+    # mentioning the name cannot satisfy it.
+    assert_constructed_with(
+        tree, callee="InteractiveRepairLoop",
+        keyword="project_root", expected="_repair_root",
     )
-    # The InteractiveRepairLoop SPECIFICALLY must not be constructed
-    # with the JARVIS project_root. Other callers of
-    # ``project_root=orch._config.project_root`` (e.g. LSPTypeChecker,
-    # resolve_envelope_repo_root's allowlist anchor) are legitimate
-    # and unaffected — they need the host JARVIS root by design.
-    tree = _parse(VALIDATE_RUNNER_FILE)
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        if not isinstance(node.func, ast.Name) and not (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr == "InteractiveRepairLoop"
-        ):
-            # Match either bare name InteractiveRepairLoop(...)
-            # or module.InteractiveRepairLoop(...)
-            if not (
-                isinstance(node.func, ast.Name)
-                and node.func.id == "InteractiveRepairLoop"
-            ):
-                continue
-        if (
-            isinstance(node.func, ast.Name)
-            and node.func.id != "InteractiveRepairLoop"
-        ):
-            continue
-        for kw in node.keywords:
-            if kw.arg == "project_root":
-                kw_src = ast.unparse(kw.value)
-                assert kw_src != "orch._config.project_root", (
-                    f"InteractiveRepairLoop constructed with "
-                    f"project_root=orch._config.project_root — "
-                    f"Slice 3H.2 reorder regressed."
-                )
+    assert_never_constructed_with(
+        tree, callee="InteractiveRepairLoop",
+        keyword="project_root", forbidden="orch._config.project_root",
+    )
 
 
 def test_ast_pin_repair_root_resolved_before_constructor() -> None:
@@ -127,14 +111,15 @@ def test_ast_pin_repair_root_resolved_before_constructor() -> None:
     statements in order — without this textual ordering, the loop is
     constructed with the JARVIS root and the override has no effect
     on the subprocess cwd."""
-    src = VALIDATE_RUNNER_FILE.read_text()
-    repair_root_idx = src.find("_repair_root: Path = orch._config.project_root")
-    constructor_idx = src.find("_repair = InteractiveRepairLoop(")
-    assert repair_root_idx >= 0, "_repair_root init missing"
-    assert constructor_idx >= 0, "InteractiveRepairLoop constructor missing"
-    assert repair_root_idx < constructor_idx, (
-        "_repair_root MUST be initialized BEFORE InteractiveRepairLoop "
-        "construction — Slice 3H.2 ordering invariant broken."
+    tree = parse_module(VALIDATE_RUNNER_FILE)
+    # Python evaluates in order: the root must be resolved before the loop is
+    # constructed with it. Comparing str.find offsets made this pin breakable
+    # by any comment that happened to mention either name first.
+    assert_assigned_from(
+        tree, target="_repair_root", expected="orch._config.project_root",
+    )
+    assert_calls_in_order(
+        tree, first="_slice3h_resolve_root", then="InteractiveRepairLoop",
     )
 
 

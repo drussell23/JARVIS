@@ -84,10 +84,11 @@ def test_ast_pin_candidate_fallback_target_derivation() -> None:
     # best_candidate is only set on PASSED validations and micro-fix
     # runs on FAILED ones. The outer predicate is now ``if not
     # _repair_target:`` with a nested fallback chain inside.
-    assert "_resolve_repair_plan(" in src, (
-        "validate_runner.py is missing the candidate-derived repair plan. "
-        "SWE-Bench-Pro ops will continue to skip micro-fix and exhaust "
-        "retries."
+    from tests.support.ast_contract import calls_to, parse_module
+    assert calls_to(parse_module(VALIDATE_RUNNER_FILE), "_resolve_repair_plan"), (
+        "validate_runner.py never calls _resolve_repair_plan — the "
+        "candidate-derived repair plan is gone and SWE-Bench-Pro ops will "
+        "skip micro-fix and exhaust retries."
     )
     # At minimum the fallback chain must consult best_candidate (the
     # Slice 3H Part 1 contract — strengthened by Slice 3H.1 with an

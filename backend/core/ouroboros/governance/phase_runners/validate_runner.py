@@ -362,6 +362,15 @@ def _retry_regen_remaining_s(ctx: Any, orch: Any) -> float:
         return 0.0
 
 
+def _reach_ledger() -> Any:
+    """The process-wide reachability ledger. Imported lazily so the
+    governance import graph is unchanged for callers that never repair."""
+    from backend.core.ouroboros.governance.reachability_ledger import (  # noqa: PLC0415
+        default_ledger,
+    )
+    return default_ledger()
+
+
 def _micro_fix_scope(
     *,
     fail_to_pass: Sequence[str],
@@ -1571,6 +1580,15 @@ class VALIDATERunner(PhaseRunner):
                                 provider=orch._generator,
                                 project_root=_repair_root,
                                 isolated=True,
+                            )
+                            # REGISTERED: the capability is constructed and
+                            # wired for this op. The weakest of the three
+                            # tiers and the one every dead subsystem in this
+                            # tree satisfied perfectly -- recorded precisely
+                            # so the gap to INVOKED is visible.
+                            await _reach_ledger().registered(
+                                "micro_fix",
+                                detail=f"root={_repair_root}",
                             )
                             _fsm_log(
                                 "micro_fix_sandboxed",

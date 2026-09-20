@@ -150,7 +150,37 @@ class InteractiveRepairLoop:
         self, file_path: str, file_content: str,
         test_argv: List[str], op_id: str = "",
     ) -> InteractiveRepairResult:
-        """Run the interactive repair loop."""
+        """Run the interactive repair loop, under execution provenance.
+
+        One wrapper, so every caller is measured and the three tiers cannot
+        drift apart across call sites. The invocation is recorded on entry
+        -- a repair that raises still ran, and the refusals are the most
+        interesting rows -- and effectiveness is decided on the way out by
+        a criterion the loop does not get to assert: the text it returns
+        must be a structurally different program from the text it was given.
+
+        That criterion is the whole point. The micro-fix reported 532
+        completed invocations while repairing nothing, and under the old
+        accounting all 532 looked alike.
+        """
+        from backend.core.ouroboros.governance.reachability_ledger import (  # noqa: PLC0415
+            track_reachability,
+        )
+        async with track_reachability("micro_fix", op_id=op_id) as _effect:
+            result = await self._repair_inner(
+                file_path, file_content, test_argv, op_id,
+            )
+            _effect.ast_mutation(
+                file_content, result.repaired_content,
+                detail=f"fixed={result.fixed} iters={result.iterations_used}",
+            )
+            return result
+
+    async def _repair_inner(
+        self, file_path: str, file_content: str,
+        test_argv: List[str], op_id: str = "",
+    ) -> InteractiveRepairResult:
+        """The loop itself. Called only by :meth:`repair`."""
         t0 = time.monotonic()
         errors: List[ExtractedError] = []
         fixes: List[MicroFix] = []
@@ -233,6 +263,15 @@ class InteractiveRepairLoop:
                 )
                 break
 
+            # The located failure, on the path where locating SUCCEEDED.
+            # Only the refusal was logged before, so a working extraction was
+            # silent and the one thing worth seeing -- which line the engine
+            # resolved out of a live traceback -- never reached the log.
+            logger.info(
+                "[InteractiveRepair] Iter %d located %s at %s:%d (op=%s) — %s",
+                iteration, err.error_type, err.file_path, err.line_number,
+                op_id, (err.message or "")[:120],
+            )
             prompt = self._build_micro_prompt(file_path, current, err)
             try:
                 from datetime import datetime, timedelta, timezone
@@ -243,6 +282,16 @@ class InteractiveRepairLoop:
                 logger.warning("[InteractiveRepair] Provider failed iter %d: %s", iteration, exc)
                 break
             if fix is None:
+                # The loop's only unnamed exit. `_parse_micro_fix` returns
+                # None for output that is not the JSON micro-fix contract,
+                # which is a model-conformance failure and looks identical in
+                # the log to a loop that was never entered.
+                logger.warning(
+                    "[InteractiveRepair] Iter %d: micro-fix response did not "
+                    "parse as the {start_line,end_line,replacement} contract "
+                    "(op=%s, %d chars) — first 200: %r",
+                    iteration, op_id, len(raw or ""), (raw or "")[:200],
+                )
                 break
 
             fixes.append(fix)
