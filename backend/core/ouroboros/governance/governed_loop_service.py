@@ -28,7 +28,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING, Any, Awaitable, Callable, Dict, FrozenSet, List, Optional,
+    Sequence, Set, Tuple, Union,
+)
 
 from backend.core.ouroboros.governance.approval_provider import CLIApprovalProvider  # noqa: F401  (kept for back-compat reference; factory selects)
 from backend.core.ouroboros.governance.inline_approval_provider import (
@@ -68,6 +71,17 @@ from backend.core.ouroboros.governance.contracts.fsm_contract import (
     LoopState,
     RetryBudget,
 )
+
+if TYPE_CHECKING:  # pragma: no cover — annotations only
+    # Imported for the two `"BrainSelectionResult"` annotations below. Under
+    # `from __future__ import annotations` these are never evaluated, so the
+    # runtime import stays out of the module's eager dependency closure — but
+    # the name has to EXIST for a reader, a type checker or the undefined-name
+    # gate to resolve it. It was silenced with `# type: ignore[name-defined]`
+    # instead, which hides the question rather than answering it.
+    from backend.core.ouroboros.governance.brain_selector import (
+        BrainSelectionResult,
+    )
 from backend.core.ouroboros.governance.autonomy.command_bus import CommandBus
 from backend.core.ouroboros.governance.autonomy.event_emitter import EventEmitter
 from backend.core.ouroboros.governance.autonomy.feedback_engine import (
@@ -663,7 +677,7 @@ def _expected_provider_from_pressure(snap: ResourceSnapshot, active_ops: int = 0
     return "GCP_PRIME_SPOT"
 
 
-def _expected_provider_from_brain(brain: "BrainSelectionResult") -> str:  # type: ignore[name-defined]
+def _expected_provider_from_brain(brain: "BrainSelectionResult") -> str:
     """Derive expected_provider from the BrainSelectionResult, NOT from local psutil.
 
     Respects the host-binding invariant: routing-authority fields in telemetry
@@ -680,13 +694,84 @@ def _expected_provider_from_brain(brain: "BrainSelectionResult") -> str:  # type
     return tier
 
 
-def _policy_reason_from_brain(brain: "BrainSelectionResult") -> str:  # type: ignore[name-defined]
+def _policy_reason_from_brain(brain: "BrainSelectionResult") -> str:
     """Return the causal routing_reason from BrainSelectionResult.
 
     Replaces the pattern of using snap.pressure_for_load().name as policy_reason,
     which incorrectly stamped LOCAL Mac pressure as the routing policy authority.
     """
     return getattr(brain, "routing_reason", "unknown")
+
+
+@dataclass(frozen=True)
+class _RoutingDecision:
+    """The brain bound to an op, as the phase bodies downstream read it.
+
+    Field names mirror :class:`BrainSelectionResult` rather than the telemetry
+    record's (``brain_model`` there, ``model_name`` here) because this is what
+    the call sites mean: "the brain that answers this op". The translation
+    belongs in one accessor, not at twenty read sites.
+    """
+
+    brain_id: str = ""
+    model_name: str = ""
+    routing_reason: str = ""
+
+
+#: The value returned when a context carries no routing stamp. A shared
+#: immutable instance: "unknown routing" is one fact, not one per call.
+_NO_ROUTING = _RoutingDecision()
+
+
+def _routing_decision_from_context(ctx: Any) -> _RoutingDecision:
+    """The brain bound to *ctx*, read off the context it was stamped on.
+
+    ## The defect this closes
+
+    ``_admit_routing`` was extracted from ``submit()`` in 89a9166e05 so that
+    both entry points would share ONE admission. The extraction took
+    ``brain = await self._brain_selector.select(...)`` with it and returned
+    only the admitted context — but ``submit()``'s body still had nineteen
+    references to that local. Every one of them became a free variable, and
+    two sit on the UNCONDITIONAL terminal path (the ledger row's
+    ``routing_reason``, and the ``brain_id``/``model_name`` of the terminal
+    events), so an op that ran the whole pipeline successfully raised
+    ``NameError: name 'brain' is not defined`` at the moment it tried to
+    record what it had done.
+
+    The repository's undefined-name ratchet held
+    ``backend/core/ouroboros/governance`` at zero and reported the regression
+    as ``19 undefined name(s)``; the gate was right and the code had drifted.
+
+    ## Why the context, and not a second return value
+
+    Handing the brain back alongside the context would work and would be
+    wrong. ``_admit_routing`` ALREADY stamps the decision onto
+    ``ctx.telemetry.routing_intent`` — brain id, model, causal reason — and
+    that stamp is the authority every downstream phase, the prompt builder and
+    the ledger already read. A returned local would be a second copy of a fact
+    that has an owner, free to disagree with it, and it could not cross the
+    boundary into ``submit_background()``'s pool worker, which receives only
+    the context. Reading from the stamp means a future refactor that moves the
+    selection again cannot silently break the reader.
+
+    NEVER raises: a context with no telemetry, no routing intent, or a
+    partially-populated one yields empty strings. Degrading to an unattributed
+    ledger row is strictly better than losing a completed op to a NameError,
+    and the empty value is itself the signal that admission did not run.
+    """
+    try:
+        intent = getattr(getattr(ctx, "telemetry", None), "routing_intent", None)
+        if intent is None:
+            return _NO_ROUTING
+        return _RoutingDecision(
+            brain_id=str(getattr(intent, "brain_id", "") or ""),
+            model_name=str(getattr(intent, "brain_model", "") or ""),
+            routing_reason=str(getattr(intent, "routing_reason", "") or ""),
+        )
+    except Exception:  # noqa: BLE001 — reading a stamp never fails an op
+        logger.debug("[GovernedLoop] routing stamp unreadable", exc_info=True)
+        return _NO_ROUTING
 
 
 def _infer_canary_slice(target_files: tuple) -> str:
@@ -4194,6 +4279,15 @@ class GovernedLoopService:
             if isinstance(_admitted, OperationResult):
                 return _admitted
             ctx = _admitted
+            # The brain this op was bound to, read back off the stamp
+            # `_admit_routing` just wrote. The extraction that created that
+            # method took the `brain` local with it and left nineteen
+            # references behind — two of them on the unconditional terminal
+            # path, so a fully successful op died with `NameError` at the
+            # moment it recorded what it had done. Rebound here from the
+            # authoritative source rather than re-selected: selecting twice
+            # would spend the gate twice and could answer differently.
+            brain = _routing_decision_from_context(ctx)
 
             # ── Semantic Triage (DW 35B pre-analysis) ────────────────────────
             # Cheap LLM-powered pre-scan: detects no-ops, redirects, and enriches
