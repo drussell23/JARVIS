@@ -49,6 +49,59 @@ STATUS_CONVERGED = "converged"
 STATUS_UNCONVERGED = "agent_unconverged"
 
 
+def _no_progress_key(symbol: str) -> str:
+    """Detector key for one agent's refinement series."""
+    return f"superagent::{symbol}"
+
+
+def _observe_refinement(symbol: str, signature: str) -> bool:
+    """Has this agent stopped learning from its own feedback?
+
+    Measured, 11 incidents on ``_sibling_candidate_count``: SEAM FRACTURE on
+    turns 1, 2, 3, 4 AND 5 with the byte-identical error ("empty node —
+    return the complete definition"), then ``agent_unconverged``. Five model
+    calls to produce one answer five times. ``max_turns`` bounded the waste
+    but never noticed it -- the loop cannot tell refinement from repetition.
+
+    An error signature that repeats is the agent restating its previous
+    answer to a question it has already been corrected on. Two in a row is
+    not a refinement series, and every further turn buys the same result at
+    full price.
+
+    Cycle detection is not reimplemented here: ``ForwardProgressDetector``
+    already does consecutive-hash detection for the GENERATE retry loop and
+    the micro-fix governor, with TTL pruning and env configuration. NEVER
+    raises -- a detector fault must not end an agent that is still working.
+    """
+    if not signature:
+        return False
+    try:
+        import hashlib
+
+        from backend.core.ouroboros.governance.forward_progress import (
+            ForwardProgressDetector,
+        )
+        global _PROGRESS_DETECTOR  # noqa: PLW0603
+        if _PROGRESS_DETECTOR is None:
+            _PROGRESS_DETECTOR = ForwardProgressDetector()
+        digest = hashlib.sha256(signature.encode("utf-8", "replace")).hexdigest()
+        return bool(_PROGRESS_DETECTOR.observe(_no_progress_key(symbol), digest))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _release_refinement(symbol: str) -> None:
+    """Forget one agent's series once it terminates. NEVER raises."""
+    try:
+        if _PROGRESS_DETECTOR is not None:
+            _PROGRESS_DETECTOR.finish(_no_progress_key(symbol))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_PROGRESS_DETECTOR = None
+
+
 def agent_max_turns() -> int:
     """Strict per-agent reasoning-cycle budget (env ``JARVIS_AGENT_MAX_TURNS``,
     default 5). Clamped [1, 12] — a runaway agent can never exceed this."""
@@ -184,6 +237,21 @@ async def run_agentic_repair(
                     "(disk write blocked)", target.symbol, turn, last_error,
                 )
                 _note_stitch_lesson(target, "stitch_boundary_hallucination", last_error, turn=turn)
+                if _observe_refinement(target.symbol, last_error):
+                    logger.warning(
+                        "[AgenticSuperAgent] %s turn %d NOT REFINING — the "
+                        "same seam error twice in a row; severing rather "
+                        "than spending the remaining %d turn(s) on it",
+                        target.symbol, turn, max(0, turns - turn),
+                    )
+                    _release_refinement(target.symbol)
+                    return AgentOutcome(
+                        symbol=target.symbol,
+                        status=STATUS_UNCONVERGED,
+                        node=None,
+                        turns=turn,
+                        last_error=last_error,
+                    )
                 continue
         # Local AST symbol check — Python only. A polyglot node (json/yaml/tsx)
         # is not a Python function; its whole-file structural validate at the
