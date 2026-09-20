@@ -557,14 +557,84 @@ def is_structurally_redundant(
     # Scale by what the hunks are made of -- see ``hunk_threshold``. Without
     # hunk information (no baseline, whole-file mode) this is the identity.
     thr = hunk_threshold(thr, hunks)
+    return redundancy_scan(list(new_fingerprints), seen, thr)
+
+
+def redundancy_scan(
+    new_fingerprints: Sequence[str],
+    seen: Sequence[str],
+    threshold: float,
+) -> Tuple[bool, float]:
+    """The O(n*m) difflib comparison, as a module-level function.
+
+    Extracted so the sync and off-loop paths share ONE implementation
+    rather than drifting into two answers to the same question, and
+    module-level because ``cooperative_fs_io``'s process path rejects bound
+    methods and closures at submission time -- correctly, since neither
+    pickles.
+
+    Takes and returns only primitives: fingerprints are compact AST
+    skeletons and the verdict is ``(bool, float)``. The candidate dicts they
+    came from are NOT passed -- a single ``full_content`` can be hundreds of
+    kilobytes, and serialising a group of them across IPC would cost more
+    than the comparison being offloaded.
+    """
     peak = 0.0
     all_redundant = True
     for fp in new_fingerprints:
         best = max((structural_similarity(fp, s) for s in seen), default=0.0)
         peak = max(peak, best)
-        if best < thr:
+        if best < threshold:
             all_redundant = False
     return all_redundant, peak
+
+
+async def is_structurally_redundant_async(
+    new_fingerprints: Sequence[str],
+    seen_fingerprints: Iterable[str],
+    *,
+    threshold: Optional[float] = None,
+    hunks: Optional[Sequence[Hunk]] = None,
+) -> Tuple[bool, float]:
+    """Same verdict as :func:`is_structurally_redundant`, off the loop.
+
+    Attributed live by ``StallAttributor``: ``structural_similarity`` ->
+    ``difflib.SequenceMatcher.find_longest_match`` was the top blocker
+    remaining after psutil and ONNX were offloaded. difflib is pure Python
+    and holds the GIL throughout, so a thread would not help -- this is the
+    case ``cpu_bound=True`` exists for.
+
+    Only the comparison crosses the boundary. The enable check, the
+    ``None`` filter and the hunk-derived threshold stay here: they are
+    cheap, and computing the threshold on this side means ``hunks`` (whose
+    element type is not part of any IPC contract) never has to pickle.
+
+    Degrades to the in-process path on any offload fault -- a verdict is
+    required, and the loop being busy is not a reason to return the wrong
+    one. NEVER raises beyond what the sync path raises.
+    """
+    if not entropy_enabled():
+        return False, 0.0
+    seen = [s for s in seen_fingerprints if s is not None]
+    if not new_fingerprints or not seen:
+        return False, 0.0
+    thr = diversity_threshold() if threshold is None else threshold
+    thr = hunk_threshold(thr, hunks)
+    try:
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            is_offload_error,
+            offload,
+        )
+        result = await offload(
+            redundancy_scan, list(new_fingerprints), seen, thr,
+            cpu_bound=True,
+        )
+        if not is_offload_error(result):
+            return result
+        logger.debug("[SiblingEntropy] offload declined — scanning in-process")
+    except Exception:  # noqa: BLE001
+        logger.debug("[SiblingEntropy] offload unavailable", exc_info=True)
+    return redundancy_scan(list(new_fingerprints), seen, thr)
 
 
 def distinct_structure_count(candidates: Sequence[Any]) -> int:

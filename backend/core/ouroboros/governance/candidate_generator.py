@@ -6652,7 +6652,11 @@ class CandidateGenerator:
 
                 _fresh = [_c for _c in _sib.candidates if isinstance(_c, dict)]
                 _new_fps = _ent.fingerprint_candidates(_fresh, _fp_root)
-                _is_red, _peak = _ent.is_structurally_redundant(
+                # Off the loop: difflib is pure Python and holds the GIL,
+                # so this is the cpu_bound=True case. Only fingerprints and
+                # a float threshold cross IPC -- never the candidate dicts,
+                # whose full_content can be hundreds of kilobytes each.
+                _is_red, _peak = await _ent.is_structurally_redundant_async(
                     _new_fps, _seen_fps,
                     hunks=_ent.hunks_for_candidates(_fresh, _fp_root),
                 )
