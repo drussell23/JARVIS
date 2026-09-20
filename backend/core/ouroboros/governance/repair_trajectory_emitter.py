@@ -178,8 +178,45 @@ class RepairTrajectoryEmitter:
             )
         event = scrubbed
 
+        # ── Is anything actually there? ────────────────────────────────
+        # Reactor-Core defaults to http://localhost:8090 -- a LOCAL service,
+        # not a cloud endpoint. On a machine that does not run it, the
+        # client's own health ladder takes 10.61s to conclude what a TCP
+        # connect answers in milliseconds. Probe first; only walk the
+        # ladder when the socket is open.
+        _sunk_locally = False
+        try:
+            from backend.core.ouroboros.governance.local_trajectory_sink import (
+                endpoint_reachable, write_pair,
+            )
+            from backend.clients.reactor_core_client import ReactorCoreConfig
+            _url = ReactorCoreConfig().api_url
+            if not await endpoint_reachable(_url):
+                # Keep the pair. It is the richest training signal this
+                # system produces -- a candidate that failed validation
+                # beside the one that fixed it -- and discarding it because
+                # a consumer is absent is how a corpus never accumulates.
+                _res = await write_pair(event)
+                logger.info(
+                    "[TrajectoryEmitter] %s unreachable — pair kept locally "
+                    "(%s)", _url, _res.render(),
+                )
+                return bool(_res.written)
+        except Exception:  # noqa: BLE001 — probe/sink absent: fall through
+            logger.debug(
+                "[TrajectoryEmitter] local sink unavailable", exc_info=True,
+            )
+
         client = self._get_client()
         if client is None:
+            if not _sunk_locally:
+                try:
+                    from backend.core.ouroboros.governance.local_trajectory_sink import (  # noqa: E501
+                        write_pair as _wp,
+                    )
+                    await _wp(event)
+                except Exception:  # noqa: BLE001
+                    pass
             return False
         try:
             init = getattr(client, "initialize", None)
