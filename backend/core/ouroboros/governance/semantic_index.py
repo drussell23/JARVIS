@@ -159,7 +159,18 @@ def _fastembed_cache_dir() -> Optional[Path]:
     NEVER raises."""
     try:
         raw = os.environ.get("JARVIS_FASTEMBED_CACHE_DIR", "").strip()
-        d = Path(raw).expanduser() if raw else Path(".jarvis/fastembed_cache")
+        # Anchored to the REPOSITORY this module lives in, not to the CWD.
+        # "The organism always runs from the repo root" is an assumption, and
+        # a relative path turns every violation of it into a silent one: from
+        # any other directory this created an EMPTY cache beside the caller
+        # and then failed to download into it -- "ValueError: Could not load
+        # model ... from any source" (reproduced 2026-09-20), which the log
+        # below used to report as a missing dependency. Same structural
+        # resolution ``operator_goal_sanction._repo_root`` uses.
+        d = (
+            Path(raw).expanduser() if raw
+            else Path(__file__).resolve().parents[4] / ".jarvis" / "fastembed_cache"
+        )
         d.mkdir(parents=True, exist_ok=True)
         return d
     except Exception:  # noqa: BLE001 — fall back to fastembed's default
@@ -614,10 +625,19 @@ class _Embedder:
                 return True
             except Exception as exc:
                 self._disabled = True
+                # The message, the cache and the CWD -- not just the class
+                # name. This line used to say "until dep installed" for EVERY
+                # exception, with fastembed 0.8.0 installed and 65 MB of
+                # weights prefetched; two wrong diagnoses were built on it
+                # before anyone looked. PostmortemRecall and the semantic
+                # prompt section both go dark on this path, silently.
                 logger.warning(
-                    "[SemanticIndex] fastembed unavailable (%s) — "
-                    "semantic inference disabled until dep installed",
-                    exc.__class__.__name__,
+                    "[SemanticIndex] fastembed failed to load (%s: %s) — "
+                    "semantic inference disabled for this process. model=%s "
+                    "cache=%s cwd=%s. If the cache is empty run "
+                    "scripts/prefetch_fastembed.py once (needs network).",
+                    exc.__class__.__name__, str(exc)[:300], self._model_name,
+                    _fastembed_cache_dir(), os.getcwd(),
                 )
                 return False
 
