@@ -419,7 +419,7 @@
     "tests/governance/test_plugin_system.py": 6,
     "tests/governance/test_policy_engine.py": 1,
     "tests/governance/test_postmortem_recall_consumer.py": 3,
-    "tests/governance/test_postmortem_recall_graduation_pins.py": 11,
+    "tests/governance/test_postmortem_recall_graduation_pins.py": 9,
     "tests/governance/test_postmortem_recall_index.py": 4,
     "tests/governance/test_postmortem_recall_injector.py": 3,
     "tests/governance/test_postmortem_recall_p0.py": 8,
@@ -756,5 +756,5 @@
     "tests/voice/test_persona_and_tts_validation.py": 3,
     "tests/voice/test_weather_route_precision.py": 3
   },
-  "total": 2620
+  "total": 2618
 }

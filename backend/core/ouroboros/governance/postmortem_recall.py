@@ -408,11 +408,24 @@ class PostmortemRecallService:
         if self._embedder is not None:
             return self._embedder
         try:
+            # The FACTORY, not the class. This used to read
+            # ``_Embedder(model_name=_embedder_name())`` -- but
+            # ``_embedder_name()`` returns the embedder MODE ("fastembed" /
+            # "stdlib", from JARVIS_SEMANTIC_EMBEDDER), so the model it asked
+            # fastembed for was literally named "fastembed":
+            #
+            #   ValueError: Model fastembed is not supported in TextEmbedding
+            #
+            # That is every call, since this module was written: recall has
+            # never embedded a single postmortem, and "matched=0" was its only
+            # possible answer. It went unseen because the loader logged the
+            # exception CLASS under a fixed "until dep installed" diagnosis.
+            # ``_embedder_factory`` is the documented single source of truth:
+            # it maps the mode to an embedder and owns the stdlib fallback.
             from backend.core.ouroboros.governance.semantic_index import (
-                _Embedder as _SemanticEmbedder,
-                _embedder_name as _emb_name,
+                _embedder_factory,
             )
-            emb = _SemanticEmbedder(model_name=_emb_name())
+            emb = _embedder_factory()
             if emb.disabled:
                 return None
             self._embedder = emb

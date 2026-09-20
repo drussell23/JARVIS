@@ -277,13 +277,46 @@ def test_pin_postmortem_recall_helper_extracted() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_pin_uses_semantic_index_embedder() -> None:
-    """Composes with existing SemanticIndex._Embedder (per PRD §9 P0
-    'builds on existing SemanticIndex + ConversationBridge primitives')."""
-    src = _read("backend/core/ouroboros/governance/postmortem_recall.py")
-    assert "from backend.core.ouroboros.governance.semantic_index import" in src
-    assert "_Embedder as _SemanticEmbedder" in src
-    assert "_cosine" in src
+def test_pin_uses_semantic_index_embedder(tmp_path, monkeypatch) -> None:
+    """Composes with the existing SemanticIndex embedder (per PRD §9 P0
+    'builds on existing SemanticIndex + ConversationBridge primitives').
+
+    This pin used to assert that the TEXT ``_Embedder as _SemanticEmbedder``
+    appeared in the source. It did — on the line that constructed the embedder
+    with the MODE string as its model name, so fastembed refused every call and
+    recall never embedded anything. The graduation suite stayed green over a
+    feature that had not worked once: the text was present, the behaviour was
+    not. What the PRD asks for is a relationship between two modules, so that
+    is what is asserted — by object identity and by a real encode.
+    """
+    from pathlib import Path as _Path
+
+    from backend.core.ouroboros.governance import semantic_index as _si
+    from backend.core.ouroboros.governance.postmortem_recall import (
+        PostmortemRecallService,
+    )
+    from tests.support.ast_contract import assert_no_call_to, parse_module
+
+    # 1. It grows no second fastembed binding of its own.
+    tree = parse_module(_Path(
+        "backend/core/ouroboros/governance/postmortem_recall.py"
+    ))
+    assert_no_call_to(tree, "TextEmbedding")
+
+    # 2. What it gets IS one of the semantic index's embedders.
+    monkeypatch.setenv("JARVIS_SEMANTIC_EMBEDDER", "stdlib")
+    service = PostmortemRecallService(
+        sessions_dir=tmp_path / "sessions",
+        ledger_path=tmp_path / "recall.jsonl",
+    )
+    embedder = service._ensure_embedder()
+    assert isinstance(embedder, (
+        _si._Embedder, _si._AdaptiveEmbedder, _si._StdlibHashingEmbedder,
+    ))
+
+    # 3. ...and it works, which is the clause the text pin could never check.
+    vectors = embedder.embed(["one postmortem", "another postmortem"])
+    assert vectors and len(vectors) == 2 and len(vectors[0]) > 0
 
 
 def test_pin_lazy_singleton_pattern() -> None:
