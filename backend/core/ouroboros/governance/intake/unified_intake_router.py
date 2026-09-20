@@ -3571,17 +3571,43 @@ def _resume_envelope_kwargs(env: "Dict[str, Any]") -> "Dict[str, Any]":
     # binding keys the roadmap reader stamped (goal_id / goal_digest) from
     # the checkpointed evidence so the landing still gets its Roadmap-Goal
     # trailers and ledger row. Identity keys only; nothing else is trusted.
+    # `_prior` is bound BEFORE the guard, never inside it.
+    #
+    # It used to be assigned only in the `try` body while the handler rebound
+    # `_binding` alone — so a checkpoint whose `intake_evidence_json` did not
+    # parse raised `UnboundLocalError: _prior` fourteen lines later, crashing
+    # the op-RESUME path on exactly the malformed payload the handler was
+    # written to absorb. A guard that converts a recoverable decode failure
+    # into an unrecoverable one has inverted its own purpose.
+    #
+    # Pre-binding also makes the type unconditional. `json.loads` happily
+    # returns a list, an int or `None` for well-formed JSON, and every later
+    # reader of `_prior` assumes a mapping; narrowing INTO the pre-bound dict
+    # means the non-dict case degrades to "declares nothing" instead of
+    # reaching `_declared_symbols_from_evidence` as a list.
+    #
+    # This is the file's own idiom — `_prior_pid` / `_prior_age_s` at the
+    # lockfile probe above are pre-bound for the same reason.
+    _prior: "Dict[str, Any]" = {}
     _binding: "Dict[str, Any]" = {}
     try:
-        _prior = _rj.loads(str(env.get("intake_evidence_json") or "") or "{}")
-        if isinstance(_prior, dict):
+        _decoded = _rj.loads(str(env.get("intake_evidence_json") or "") or "{}")
+        if isinstance(_decoded, dict):
+            _prior = _decoded
             _binding = {
                 k: str(_prior[k])[:128]
                 for k in _GOAL_BINDING_KEYS
                 if _prior.get(k)
             }
-    except Exception:  # noqa: BLE001 -- malformed prior evidence carries nothing
-        _binding = {}
+    except (ValueError, TypeError, RecursionError):
+        # ValueError covers json.JSONDecodeError; TypeError a non-text payload;
+        # RecursionError a pathologically nested one. Named rather than blanket
+        # so a genuinely unexpected fault still surfaces instead of being
+        # silently downgraded to "this op declared nothing".
+        logger.debug(
+            "[IntakeRouter] resume evidence did not decode — the op resumes "
+            "with no goal binding", exc_info=True,
+        )
     # The declared-symbol contract survives a suspension: a resumed op IS
     # the same signed goal, so it is still held to the names that goal
     # declared. Normalised (never stringified through _binding, which would

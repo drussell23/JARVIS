@@ -152,6 +152,9 @@ charset-normalizer==3.4.4
 chromadb==1.3.6
 click==8.1.8
 coloredlogs==15.0.1
+colorama==0.4.6  # backend/ml_logging_config.py, demo_rust_voice_fix.py — imported
+                 # by repo code and previously declared in NO manifest, which
+                 # left two roadmap goals permanently unlandable.
 decorator==5.2.1
 distro==1.9.0
 docstring_parser==0.17.0
@@ -318,5 +321,11 @@ google-cloud-monitoring>=2.0.0
 # Requires-Python: >=3.12
 
 discord.py>=2.3  # Slice 156 — interactive Discord control gateway (bot)
-pyobjc-framework-libdispatch  # advanced video capture (macos_video_capture_advanced) — dispatch_queue_create
+# Platform-bound: an Objective-C bridge, with no build for any other OS. The
+# marker is not cosmetic — `environment_integrity` reads these declarations to
+# decide whether an unresolvable import is IMPOSSIBLE here (quarantine the
+# goal, keep it selectable on a Mac) or merely NOT INSTALLED (demote it, let it
+# rise when the package lands). Without the marker this line reads as a normal
+# dependency that Linux is simply missing, and the boot gate would demand it.
+pyobjc-framework-libdispatch; platform_system == "Darwin"  # advanced video capture (macos_video_capture_advanced) — dispatch_queue_create
 langgraph  # autonomy.langgraph_engine — falls back to sequential execution when absent

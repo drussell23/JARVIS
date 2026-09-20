@@ -180,6 +180,18 @@ _MITIGATIONS: Dict[str, str] = {
     "no_tests_collected": "Name test functions `test_*` in a `test_*.py` under the tests tree and import the real module; a file that collects nothing fails VALIDATE.",
     "syntax_error": "Emit complete, syntactically valid Python; re-read the file end to end before returning it.",
     "import_error": "Import only modules that exist in this repo (check the AUTHORITATIVE API SIGNATURES block); never invent packages.",
+    # `import_error` conflated three different failures under one piece of
+    # advice, and for the case that DOMINATES this repo's telemetry that advice
+    # is not merely unhelpful but false: the package was not invented, it is
+    # declared in requirements.txt and simply absent — and the candidate never
+    # imported it, the SUBJECT did. Measured: 15 to 50 identical injections per
+    # subject, teaching nothing, because there was nothing the model could have
+    # done differently. These two split that class by PROVENANCE. Both are set
+    # by the caller through `record_lesson(error_class=...)`, never by the
+    # regex chain, because "who added this import" is not a fact about the
+    # error text — it needs the candidate and the file it replaced.
+    "dependency_violation": "The candidate ADDED an import the environment cannot satisfy, so the change is rejected. Adding a dependency is never part of the task: solve it with the repository's own modules, the standard library, and packages that already import successfully here.",
+    "environment_starvation": "The missing module was ALREADY imported by the module under test, before any change — the candidate is not at fault and no rewrite can fix it. Do not attempt this target again until an operator installs the dependency.",
     "api_signature_mismatch": "Call the API EXACTLY as listed in the AUTHORITATIVE API SIGNATURES block — same names, argument count/order, return shape. Do not invent parameters or attributes.",
     "verify_regression": "The change broke previously-passing tests: keep the existing behaviour intact and add, never alter, semantics outside the declared target.",
     "input_shape_mismatch": "Build inputs from the `# input shape:` skeleton and `# reads:` keys — exact nesting, literal dotted keys — so the parser returns a value instead of None.",

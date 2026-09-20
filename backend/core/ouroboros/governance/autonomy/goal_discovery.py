@@ -49,6 +49,7 @@ import asyncio
 import logging
 import os
 import re
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -666,6 +667,19 @@ LIVENESS_CREATES_TEST = 2  # target is a test file this goal will write
 LIVENESS_NO_TEST = 1       # target exists, nothing covers it — sheds at VALIDATE
 LIVENESS_DEAD = 0          # target absent and not a test — nothing to edit
 
+#: The telemetry reason a demoted goal carries. Imported from the module that
+#: OWNS the verdict rather than restated here, so a trace grep and the gate
+#: that files the reason can never fall out of step — the way two filters with
+#: two copies of the same rule always eventually do.
+try:  # pragma: no cover — trivial, and a missing gate must not break discovery
+    from backend.core.ouroboros.governance.environment_integrity import (
+        PLATFORM_UNAVAILABLE as _PLATFORM_REASON,
+        UNRESOLVABLE_TARGET_DEPENDENCY as _UNRESOLVABLE_REASON,
+    )
+except Exception:  # noqa: BLE001
+    _UNRESOLVABLE_REASON = "unresolvable_target_dependency"
+    _PLATFORM_REASON = "platform_unavailable"
+
 
 def _covering_test_stems(repo_root: Path) -> FrozenSet[str]:
     """Every module stem that has a ``tests/**/test_<stem>.py`` covering it.
@@ -760,6 +774,76 @@ def _liveness_rank(
         return LIVENESS_NO_TEST
 
 
+def _import_verdict(work: "DiscoveredWork", repo_root: Path) -> Any:
+    """Whether the modules *work* must honour can be imported in this venv.
+
+    ## The starvation this fixes, which liveness could not see
+
+    ``_liveness_rank`` answers "is there a file to edit". Measured on the live
+    roadmap, that is not the binding constraint: 29 of 51 goals had a target
+    that exists and is perfectly editable, and every one of them was
+    IMPOSSIBLE, because the module the test must import cannot be imported
+    here. Seventeen were blocked on ``fastapi`` alone — declared at
+    ``requirements.txt:162`` and absent from the venv.
+
+    That is what the operator was watching: the model wrote a correct test, the
+    test imported the subject, the subject imported ``fastapi``, VALIDATE
+    failed identically, cooldown expired, and the same goal came back. Fifty
+    times for one subject. No lesson can repair a missing package, so the loop
+    could only repeat.
+
+    Resolution is delegated whole to ``environment_integrity``, which asks
+    ``collect_anchor_sources`` — the SAME ladder that builds the prompt's
+    signature block. If the modules the candidate is told to call cannot be
+    imported, the test it writes cannot pass; one resolution answers both.
+
+    NEVER raises: an unanswerable goal ranks importable, because a wrong
+    accusation deletes real work while a wrong pass costs one already-bounded
+    op.
+    """
+    try:
+        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+            environment_integrity as _ei,
+        )
+        detail = getattr(work, "detail", None) or {}
+        description = str(detail.get("description") or work.evidence or "")
+        targets = [str(work.target_file or "")]
+        subject = str(getattr(work, "subject_file", "") or "")
+        if subject and subject != targets[0]:
+            targets.append(subject)
+        return _ei.target_import_verdict(targets, description, Path(repo_root))
+    except Exception:  # noqa: BLE001 — importability never breaks a pass
+        logger.debug("[GoalDiscovery] import verdict degraded", exc_info=True)
+        return None
+
+
+def _is_importable(verdict: Any) -> bool:
+    """``True`` unless a verdict positively says otherwise (``None`` = unasked)."""
+    return bool(getattr(verdict, "importable", True))
+
+
+def _import_verdicts(
+    works: Sequence["DiscoveredWork"], repo_root: Path,
+) -> Dict[str, Any]:
+    """One verdict per candidate, built ONCE per pass and handed to the sort.
+
+    Off-loop and off the sort key for the same reason ``_covering_test_stems``
+    is: ``sorted`` calls its key per element, and each verdict costs a bounded
+    filesystem resolution. Measured at ~2.9 s for the whole 51-goal roadmap —
+    fine once per pass (a pass is minutes), ruinous per comparison.
+
+    Keyed by ``goal_id``, which every source guarantees and which is what the
+    census, the ledger and the DAG already key on.
+    """
+    out: Dict[str, Any] = {}
+    for work in works:
+        try:
+            out[work.goal_id] = _import_verdict(work, repo_root)
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
 def is_dispatchable(work: "DiscoveredWork", repo_root: Path) -> bool:
     """Whether spending an op on *work* could produce a write at all.
 
@@ -768,8 +852,47 @@ def is_dispatchable(work: "DiscoveredWork", repo_root: Path) -> bool:
     that does not exist and is not a test file this goal would create. Every
     other tier is dispatchable; being unlikely to land is not the same as
     having nothing to edit, and deciding THAT is the pipeline's job.
+
+    ## Two different "cannot import", two different answers
+
+    A target needing ``torch`` is UNPROVISIONED: one install reverses it, so
+    the goal is demoted by the ranker and rises again the moment the package
+    lands. Refusing it here would delete real work over a judgement (install
+    the multi-gigabyte ML stack?) that is the operator's to make.
+
+    A target needing ``Quartz`` is IMPOSSIBLE: it is an Objective-C framework
+    and this is Linux. No install reverses that, so demotion just means the
+    goal sinks to the tail and is re-ranked, forever, every pass. It is
+    quarantined instead — refused on THIS host while staying in the roadmap,
+    and selectable again the day the same repository is driven from a Mac.
+    Deleting it would delete Mac functionality from the queue.
+
+    ``JARVIS_QUARANTINE_UNIMPORTABLE_TARGETS`` remains the operator's blunt
+    switch for the first category; the second needs no switch, because the
+    verdict is a fact about the machine rather than a preference.
     """
-    return _liveness_rank(work, repo_root) > LIVENESS_DEAD
+    if _liveness_rank(work, repo_root) <= LIVENESS_DEAD:
+        return False
+    try:
+        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+            environment_integrity as _ei,
+        )
+        verdict = _import_verdict(work, repo_root)
+        if _is_importable(verdict):
+            return True
+        structural = bool(getattr(verdict, "impossible", False))
+        if not (structural or _ei.quarantine_enabled()):
+            return True
+        logger.warning(
+            "[GoalDiscovery] %s %s — %s",
+            work.goal_id,
+            "quarantined (impossible on this host)" if structural
+            else "quarantined (operator-armed)",
+            getattr(verdict, "reason", "") or "unimportable target",
+        )
+        return False
+    except Exception:  # noqa: BLE001 — a degraded check never sheds work
+        return True
 
 
 class _EligibilityGate:
@@ -975,25 +1098,77 @@ async def discover(
     # unchanged. The walk is one pass, off the event loop, reused by every key.
     covering = await asyncio.to_thread(_covering_test_stems, Path(repo_root))
     root = Path(repo_root)
+    pool = signed + reds
+    # IMPORTABILITY SITS BETWEEN LIVENESS AND EVIDENCE. It is a second, finer
+    # question about the same thing liveness measures — how far this work can
+    # actually get — so it belongs in the same key rather than folded into the
+    # tier ordinals (renumbering those would silently redefine the census and
+    # `is_dispatchable`'s floor) or into the weight (which would make one
+    # number answer two unrelated questions, the mistake the tiers exist to
+    # avoid).
+    #
+    # Measured on the live roadmap: 29 of 51 goals were import-blocked, 17 of
+    # them on `fastapi` alone. Demotion is enough to fix the operator's actual
+    # complaint — with 30 importable goals and a cap of 8, the blocked ones are
+    # simply never reached — and unlike quarantine it starves nothing: a goal
+    # whose dependency gets installed rises again on its own, next pass.
+    verdicts = await asyncio.to_thread(_import_verdicts, pool, root)
     # Ranked ONCE and carried, not recomputed for the sort and again for the
     # census: each rank costs a `stat`, and a queue-wide double stat every pass
     # is the kind of cost that arrives unnoticed on the critical path.
-    scored = [(_liveness_rank(w, root, covering), w) for w in signed + reds]
-    scored.sort(key=lambda rw: (-rw[0], -rw[1].weight))
-    documented = [w for _, w in scored]
+    scored = [
+        (_liveness_rank(w, root, covering), _is_importable(verdicts.get(w.goal_id)), w)
+        for w in pool
+    ]
+    scored.sort(key=lambda rw: (-rw[0], not rw[1], -rw[2].weight))
+    documented = [w for _, _, w in scored]
     if scored:
         # WARNING, like the Sentinel's own pass breadcrumbs and for the same
         # reason: a headless soak's log carries WARNING and above, so an INFO
         # census of the queue is invisible in exactly the run that needs it.
         # One line per pass, and a pass is minutes.
+        blocked = [w for _, ok, w in scored if not ok]
         logger.warning(
-            "[GoalDiscovery] liveness census (L3 landable → L0 dead): %s | head=%s",
+            "[GoalDiscovery] liveness census (L3 landable → L0 dead): %s | "
+            "import-blocked=%d/%d | head=%s",
             " ".join(
                 f"L{r}={n}"
-                for r, n in sorted(Counter(r for r, _ in scored).items(), reverse=True)
+                for r, n in sorted(
+                    Counter(r for r, _, _ in scored).items(), reverse=True,
+                )
             ),
-            documented[0].target_file,
+            len(blocked), len(scored), documented[0].target_file,
         )
+        if blocked:
+            # Named, not just counted, and SPLIT — because the two halves ask
+            # the operator for different things. "install these" is an action;
+            # "this machine is not a Mac" is not.
+            impossible = [
+                w for w in blocked
+                if getattr(verdicts.get(w.goal_id), "impossible", False)
+            ]
+            unprovisioned = Counter(
+                m for w in blocked
+                if not getattr(verdicts.get(w.goal_id), "impossible", False)
+                for m in getattr(verdicts.get(w.goal_id), "unresolvable", ())
+            )
+            logger.warning(
+                "[GoalDiscovery] %s — %d demoted to the tail, install to "
+                "unblock: %s",
+                _UNRESOLVABLE_REASON, len(blocked) - len(impossible),
+                " ".join(f"{m}x{n}" for m, n in unprovisioned.most_common(8)) or "-",
+            )
+            if impossible:
+                structural = Counter(
+                    m for w in impossible
+                    for m in getattr(verdicts.get(w.goal_id), "structural", ())
+                )
+                logger.warning(
+                    "[GoalDiscovery] %s — %d quarantined on this host (%s), "
+                    "still selectable where the platform supports them: %s",
+                    _PLATFORM_REASON, len(impossible), sys.platform,
+                    " ".join(f"{m}x{n}" for m, n in structural.most_common(8)),
+                )
     # The roadmap's dependency edges, read once for the whole pass.
     dag_index = await _dag_index()
     gate = _EligibilityGate(dag_index=dag_index, cooldown=cooldown)
