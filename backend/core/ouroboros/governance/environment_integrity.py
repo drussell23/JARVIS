@@ -167,6 +167,10 @@ class EnvironmentVerdict:
     missing: Tuple[str, ...] = ()
     mismatched: Tuple[Tuple[str, str, str], ...] = ()  # (name, declared, installed)
     manifests: Tuple[str, ...] = ()
+    #: ``[(manifest, gaps), ...]`` per profile that fell short. Populated even
+    #: when ``satisfied`` -- a profile the environment does not hold is worth
+    #: saying out loud, and saying it is not the same as refusing over it.
+    shortfalls: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
 
     def summary(self) -> str:
         if self.satisfied:
@@ -286,32 +290,74 @@ def environment_verdict(repo_root: Path) -> EnvironmentVerdict:
                 True, "environment not introspectable -- refusing to accuse",
                 manifests=tuple(str(m) for m in manifests),
             )
-        missing: List[str] = []
+        # PER PROFILE, and the environment need only match ONE of them.
+        #
+        # The first cut asserted the UNION of every discovered profile, and
+        # that is the same mistake this module was written to avoid, one level
+        # down: it asserts a closure the environment was never meant to hold.
+        # It broke CI within minutes of merging. The `ov-surface` lane installs
+        # ONLY `ci/requirements-ov-surface.txt` -- its workflow says so, and
+        # calls that file its single source of truth -- so the governance
+        # profile is legitimately absent there, the gate refused, and four
+        # routing tests failed with `assert 78 == 0`.
+        #
+        # A profile is a SHAPE the environment may take, not a clause in one
+        # long contract. The governance profile is the organism's closure; the
+        # ov-surface profile is the CLI lane's. An environment satisfying
+        # either is coherent and must boot. Only an environment matching NO
+        # declared shape is starved.
+        #
+        # The unsatisfied profiles are still reported, loudly, because that is
+        # how `pyflakes>=3` was found -- and a warning naming it would have
+        # been just as discoverable as a refusal, without bricking a lane that
+        # is provisioned exactly as intended.
+        satisfied: List[str] = []
+        shortfalls: List[Tuple[str, Tuple[str, ...]]] = []
         mismatched: List[Tuple[str, str, str]] = []
-        seen: set = set()
+        total = 0
         for manifest in manifests:
-            for name, pin, raw in _declared_requirements(manifest):
-                if name in seen:
-                    continue
-                seen.add(name)
+            declared = _declared_requirements(manifest)
+            if not declared:
+                continue
+            total += 1
+            gaps: List[str] = []
+            for name, pin, raw in declared:
                 have = installed.get(name)
                 if have is None:
-                    missing.append(raw)
+                    gaps.append(raw)
                 elif pin and have != pin:
                     # ADVISORY only. A patch-level difference is drift, not
                     # starvation, and refusing to boot over it would make the
                     # gate the thing that stops the organism.
                     mismatched.append((name, pin, have))
-        if missing:
+            if gaps:
+                shortfalls.append((str(manifest), tuple(gaps)))
+            else:
+                satisfied.append(str(manifest))
+
+        if not total:
             return EnvironmentVerdict(
-                False, "declared runtime dependencies are not installed",
-                missing=tuple(missing), mismatched=tuple(mismatched),
+                True, "no runtime requirement declared -- nothing to assert",
                 manifests=tuple(str(m) for m in manifests),
             )
+        if not satisfied:
+            # Flattened for the operator: every profile fell short, so every
+            # gap is a gap, and naming them all is the actionable answer.
+            every_gap = tuple(g for _m, gaps in shortfalls for g in gaps)
+            return EnvironmentVerdict(
+                False,
+                f"no declared runtime profile is satisfied ({len(shortfalls)} "
+                f"checked)",
+                missing=every_gap, mismatched=tuple(mismatched),
+                manifests=tuple(str(m) for m in manifests),
+                shortfalls=tuple(shortfalls),
+            )
         return EnvironmentVerdict(
-            True, f"{len(seen)} declared runtime dependencies satisfied",
+            True,
+            f"{len(satisfied)}/{total} declared runtime profile(s) satisfied",
             mismatched=tuple(mismatched),
             manifests=tuple(str(m) for m in manifests),
+            shortfalls=tuple(shortfalls),
         )
     except Exception:  # noqa: BLE001 -- the gate never becomes the outage
         logger.debug("[EnvIntegrity] verdict degraded", exc_info=True)
@@ -325,6 +371,14 @@ def assert_environment(
     when the closure is starved and the gate is armed."""
     verdict = environment_verdict(Path(repo_root))
     armed = boot_gate_enabled() if raise_on_desync is None else bool(raise_on_desync)
+    for manifest, gaps in verdict.shortfalls:
+        # Said out loud even on a PASS. This is how `pyflakes>=3` surfaced, and
+        # a named warning is as discoverable as a refusal without bricking a
+        # lane that is provisioned exactly as its workflow intends.
+        logger.warning(
+            "[EnvIntegrity] profile %s is not fully installed here (%d gap(s): "
+            "%s)", Path(manifest).name, len(gaps), ", ".join(gaps[:6]),
+        )
     if verdict.mismatched:
         logger.info(
             "[EnvIntegrity] %d declared pin(s) differ from installed: %s",
