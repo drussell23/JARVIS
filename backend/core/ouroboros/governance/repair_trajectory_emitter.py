@@ -146,6 +146,38 @@ class RepairTrajectoryEmitter:
         return self._client
 
     async def _send(self, event: Dict[str, Any]) -> bool:
+        # ── Zero-trust egress: scrub, or do not send ────────────────────
+        # This payload carries whole candidate source in assistant_output /
+        # original_response / corrected_response, and the destination is a
+        # network endpoint off this host. The redactor fails CLOSED on
+        # purpose -- the rest of this tree is fail-soft, but degrading to
+        # pass-through HERE turns a scrubber bug into a credential
+        # disclosure, and bytes that have left cannot be recalled. Losing a
+        # training sample costs one row in a DPO corpus.
+        try:
+            from backend.core.ouroboros.governance.egress_redactor import (
+                redact_payload,
+            )
+            scrubbed, report = redact_payload(event)
+        except Exception as exc:  # noqa: BLE001 — redactor absent == do not send
+            logger.warning(
+                "[TrajectoryEmitter] egress redactor unavailable (%s) — "
+                "refusing to stream unscrubbed source off-host",
+                type(exc).__name__,
+            )
+            return False
+        if report.dropped or scrubbed is None:
+            logger.warning(
+                "[TrajectoryEmitter] payload NOT sent: %s", report.render(),
+            )
+            return False
+        if report.redactions:
+            logger.info(
+                "[TrajectoryEmitter] egress scrubbed before send: %s",
+                report.render(),
+            )
+        event = scrubbed
+
         client = self._get_client()
         if client is None:
             return False
@@ -219,9 +251,26 @@ class RepairTrajectoryEmitter:
                 except RuntimeError:
                     loop = None
                 if loop is not None:
-                    task = loop.create_task(self._send(event))
-                    _PENDING.add(task)
-                    task.add_done_callback(_PENDING.discard)
+                    # Bounded, not unbounded. `create_task` per emission
+                    # accumulates in-flight sends without limit whenever the
+                    # network is slower than L2 converges, and this control
+                    # plane was just dug out of exactly that shape of hole.
+                    # The buffer caps the queue, drops the OLDEST on
+                    # overflow, counts every drop, and quarantines a sink
+                    # that keeps failing instead of retrying it at emission
+                    # rate. `offer` never awaits, so L2 is untouched.
+                    try:
+                        from backend.core.ouroboros.governance.telemetry_backpressure import (  # noqa: E501
+                            get_buffer,
+                        )
+                        get_buffer("repair_trajectory", self._send).offer(event)
+                    except Exception:  # noqa: BLE001 — buffer absent: do not
+                        # fall back to an unbounded task. The bound is the
+                        # reason this is armed at all.
+                        logger.debug(
+                            "[TrajectoryEmitter] buffer unavailable — "
+                            "dropping rather than sending unbounded",
+                        )
                 else:
                     asyncio.run(self._send(event))
                 did = True

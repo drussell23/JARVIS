@@ -97,6 +97,83 @@ class GroundingReport:
         )
 
 
+def rejection_constraint(report: "GroundingReport") -> str:
+    """The refusal, written as an instruction the planner can act on.
+
+    A gate that only says "no" makes the planner guess again from the same
+    prior, and it guesses the same way -- which is how a refusal becomes a
+    loop instead of a correction. Naming the exact symbol turns the refusal
+    into information: the model is told what does not exist, not merely
+    that something did not.
+
+    Deliberately states the negative only. Proposing a replacement symbol
+    would be this gate inventing API, which is the failure it exists to
+    catch. NEVER raises.
+    """
+    try:
+        if not report.missing:
+            return ""
+        lines = [
+            "GROUNDING CONSTRAINT — the previous plan referenced APIs that "
+            "do not exist in this repository:",
+        ]
+        for ref in report.missing[:12]:
+            lines.append(
+                f"  - `{ref.dotted}` — module `{ref.module}` defines no "
+                f"`{ref.symbol}`."
+            )
+        lines.append(
+            "Do NOT reference these symbols again. Read the module's actual "
+            "surface and choose a symbol it defines, or state that the "
+            "capability is absent and must be created."
+        )
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def missing_signature(report: "GroundingReport") -> str:
+    """A stable identity for one set of missing symbols.
+
+    Order-independent, so the same hallucination re-stated in a different
+    order is recognised as the same hallucination.
+    """
+    try:
+        return "|".join(sorted(f"{r.module}.{r.symbol}" for r in report.missing))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def repeated_hallucination(op_id: str, report: "GroundingReport") -> bool:
+    """Has the planner produced this exact missing-symbol set before?
+
+    Composed on ``ForwardProgressDetector`` -- the same primitive the
+    GENERATE retry loop, the micro-fix governor and the super-agent ReAct
+    loop use -- rather than a fourth counter. Keyed per op so two
+    operations hallucinating alike are not read as one looping.
+    NEVER raises.
+    """
+    signature = missing_signature(report)
+    if not signature:
+        return False
+    try:
+        import hashlib
+
+        from backend.core.ouroboros.governance.forward_progress import (
+            ForwardProgressDetector,
+        )
+        global _GROUNDING_DETECTOR  # noqa: PLW0603
+        if _GROUNDING_DETECTOR is None:
+            _GROUNDING_DETECTOR = ForwardProgressDetector()
+        digest = hashlib.sha256(signature.encode("utf-8", "replace")).hexdigest()
+        return bool(_GROUNDING_DETECTOR.observe(f"grounding::{op_id}", digest))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_GROUNDING_DETECTOR = None
+
+
 class APIGroundingFault(Exception):
     """A plan referenced a symbol its own repository does not define."""
 

@@ -1192,6 +1192,33 @@ class PLANRunner(PhaseRunner):
                 )
                 if _report.missing:
                     _effect.mark(_report.render())
+                    # Feed the refusal forward as a constraint. A gate that
+                    # only says "no" makes the planner guess again from the
+                    # same prior and guess the same way; naming the symbol
+                    # turns a refusal into a correction. Injected on
+                    # ``strategic_memory_prompt`` -- the channel the
+                    # VALIDATE_RETRY ladder already uses for failure
+                    # feedback, so GENERATE reads it without a new seam.
+                    from backend.core.ouroboros.governance.api_grounding_gate import (  # noqa: E501,PLC0415
+                        rejection_constraint, repeated_hallucination,
+                    )
+                    _constraint = rejection_constraint(_report)
+                    if _constraint:
+                        # ``with_steering_guidance`` is the hash-chain-safe
+                        # appender to strategic_memory_prompt: it recomputes
+                        # context_hash and never touches
+                        # generate_file_hashes, so the file-drift guillotine
+                        # cannot mistake a constraint for malicious drift.
+                        ctx = ctx.with_steering_guidance(_constraint)
+                    if repeated_hallucination(
+                        getattr(ctx, "op_id", ""), _report,
+                    ):
+                        logger.warning(
+                            "[PLANRunner] op=%s re-referenced the SAME "
+                            "missing symbols after being told they do not "
+                            "exist — the constraint is not landing; %s",
+                            getattr(ctx, "op_id", ""), _report.render(),
+                        )
                 if _report.missing and shed_enabled():
                     logger.warning(
                         "[PLANRunner] shedding op=%s — %s",

@@ -80,6 +80,34 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 logger = logging.getLogger("Ouroboros.Reachability")
 
 _DEFAULT_MAX_RECORDS = 50_000
+_DEFAULT_MAX_BYTES = 5 * 1024 * 1024
+_DEFAULT_KEEP_ROTATIONS = 3
+
+
+def _env_int(name: str, default: int) -> int:
+    """Call-time, never raises."""
+    try:
+        raw = (os.environ.get(name, "") or "").strip()
+        value = int(raw) if raw else default
+        return value if value > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def rotate_at_bytes() -> int:
+    """Size at which the active ledger is rotated aside.
+
+    An append-only file on a multi-day soak grows without bound, and the
+    panel that reads it re-reads a tail every poll -- so an unrotated ledger
+    degrades the very surface it feeds, then the filesystem.
+    """
+    return _env_int("JARVIS_REACHABILITY_ROTATE_BYTES", _DEFAULT_MAX_BYTES)
+
+
+def keep_rotations() -> int:
+    """How many rotated generations survive. Older ones are removed, because
+    unbounded history is the same defect one directory over."""
+    return _env_int("JARVIS_REACHABILITY_KEEP_ROTATIONS", _DEFAULT_KEEP_ROTATIONS)
 
 
 class Tier(str, Enum):
@@ -203,6 +231,7 @@ class ReachabilityLedger:
         self._max_records = max_records or _DEFAULT_MAX_RECORDS
         self._states: Dict[str, CapabilityState] = {}
         self._written = 0
+        self._rotations = 0
         self._lock = asyncio.Lock()
 
     # -- recording -----------------------------------------------------
@@ -260,6 +289,7 @@ class ReachabilityLedger:
         }, sort_keys=True) + "\n"
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._maybe_rotate()
             fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
             try:
                 os.write(fd, line.encode("utf-8"))
@@ -268,6 +298,47 @@ class ReachabilityLedger:
             self._written += 1
         except OSError:
             logger.debug("[Reachability] append degraded", exc_info=True)
+
+    def _maybe_rotate(self) -> None:
+        """Rotate aside when the active file breaches its ceiling.
+
+        Called under the ledger's own lock and BEFORE the append, so no
+        concurrent writer can be mid-write during the rename: every caller
+        reaches this code through :meth:`record`, which holds the lock for
+        the whole read-modify-append. That is what makes the rotation
+        lossless rather than merely atomic -- ``os.rename`` is atomic on its
+        own, but atomicity alone would still let a writer that had already
+        opened the old inode append into a file nobody reads again.
+
+        Generations shift up (``.1`` -> ``.2``) and the oldest is removed;
+        unbounded history is the same defect one directory over. NEVER
+        raises -- a rotation fault must not cost the write that triggered
+        it.
+        """
+        if self._path is None:
+            return
+        try:
+            ceiling = rotate_at_bytes()
+            if not self._path.is_file() or self._path.stat().st_size < ceiling:
+                return
+            keep = keep_rotations()
+            oldest = self._path.with_suffix(self._path.suffix + f".{keep}")
+            if oldest.exists():
+                oldest.unlink()
+            for gen in range(keep - 1, 0, -1):
+                src = self._path.with_suffix(self._path.suffix + f".{gen}")
+                if src.exists():
+                    src.rename(
+                        self._path.with_suffix(self._path.suffix + f".{gen + 1}")
+                    )
+            self._path.rename(self._path.with_suffix(self._path.suffix + ".1"))
+            self._rotations += 1
+            logger.info(
+                "[Reachability] ledger rotated at %d bytes (generation %d, "
+                "keeping %d)", ceiling, self._rotations, keep,
+            )
+        except OSError:
+            logger.debug("[Reachability] rotation degraded", exc_info=True)
 
     # -- reading -------------------------------------------------------
 
