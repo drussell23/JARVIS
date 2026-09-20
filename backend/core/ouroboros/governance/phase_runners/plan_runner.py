@@ -1174,8 +1174,13 @@ class PLANRunner(PhaseRunner):
             from backend.core.ouroboros.governance.reachability_ledger import (  # noqa: E501,PLC0415
                 track_reachability,
             )
+            # implementation_plan is the field PlanGenerator stamps and
+            # GENERATE consumes. An earlier cut of this read ctx.plan,
+            # which does not exist -- so the gate adjudicated an empty
+            # string 48 times and reported every plan grounded. The
+            # reachability ledger caught it: invoked=48, effective=0.
             _plan_text = " ".join(str(p) for p in (
-                getattr(ctx, "plan", "") or "",
+                getattr(ctx, "implementation_plan", "") or "",
                 getattr(ctx, "strategic_memory_prompt", "") or "",
             ) if p)
             async with track_reachability(

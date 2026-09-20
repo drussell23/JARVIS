@@ -179,6 +179,42 @@ def line_patch(original: str, proposed: str) -> Optional[LinePatch]:
         return None
 
 
+def _note_translation(file_path: str, detail: str) -> None:
+    """Record an EFFECTIVE translation. Fire-and-forget, never blocking.
+
+    This function is synchronous and the ledger is async, so the record is
+    scheduled on the running loop when there is one and dropped when there
+    is not. Telemetry that made a translator wait would be a worse defect
+    than the blind spot it fills.
+    """
+    try:
+        import asyncio
+
+        from backend.core.ouroboros.governance.reachability_ledger import (
+            default_ledger,
+        )
+        loop = asyncio.get_running_loop()
+        loop.create_task(default_ledger().effective(
+            "payload_adapter", detail=f"{file_path}:{detail}"[:120],
+        ))
+    except Exception:  # noqa: BLE001 — no loop, or no ledger: drop it
+        pass
+
+
+def _note_attempt() -> None:
+    """Record an INVOKED translation attempt. Same posture as above."""
+    try:
+        import asyncio
+
+        from backend.core.ouroboros.governance.reachability_ledger import (
+            default_ledger,
+        )
+        loop = asyncio.get_running_loop()
+        loop.create_task(default_ledger().invoked("payload_adapter"))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def micro_fix_contract(
     raw: str, *, original: str, file_path: str = "",
 ) -> Optional[Dict[str, Any]]:
@@ -188,6 +224,7 @@ def micro_fix_contract(
     contract fails, so a provider that answers correctly is never routed
     through a comparison it does not need. NEVER raises.
     """
+    _note_attempt()
     proposed = candidate_contents(raw, file_path=file_path)
     if proposed is None:
         return None
@@ -202,6 +239,7 @@ def micro_fix_contract(
         "[PayloadAdapter] translated a caged full-content response for %s "
         "into %s", file_path or "target", patch.render(),
     )
+    _note_translation(file_path, patch.render())
     return patch.as_contract()
 
 

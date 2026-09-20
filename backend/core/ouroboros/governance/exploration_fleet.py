@@ -104,6 +104,10 @@ class ExplorationFleet(FleetTelemetryMixin):
 
     TELEMETRY_METHODS = ("_run_agent",)
     TELEMETRY_PHASE = "EXPLORE"
+    # Reachability: a deployment is EFFECTIVE only when it returns findings.
+    # An agent that explores a scope and reports nothing ran correctly and
+    # informed no decision -- the distinction the ledger exists to keep.
+    REACHABILITY_CAPABILITY = "exploration_fleet"
     """Spawn an army of exploration agents across all Trinity repos.
 
     Usage:
@@ -266,6 +270,26 @@ class ExplorationFleet(FleetTelemetryMixin):
             "[Fleet] Complete: %d agents, %d files, %d findings in %.1fs",
             completed, total_files, len(deduped), elapsed,
         )
+        # EFFECTIVE only when the deployment returned findings. Agents that
+        # explored a scope and reported nothing ran correctly and informed
+        # no decision -- counting those as success is exactly how a
+        # subsystem stays dead while its numbers look healthy.
+        try:
+            from backend.core.ouroboros.governance.reachability_ledger import (
+                default_ledger as _reach_ledger,
+            )
+            _reach = _reach_ledger()
+            await _reach.invoked(
+                self.REACHABILITY_CAPABILITY,
+                detail=f"agents={len(agents)} files={total_files}",
+            )
+            if deduped:
+                await _reach.effective(
+                    self.REACHABILITY_CAPABILITY,
+                    detail=f"findings={len(deduped)}",
+                )
+        except Exception:  # noqa: BLE001 — telemetry never blocks the fleet
+            pass
         return report
 
     async def _run_agent(self, agent: FleetAgent, goal: str) -> None:

@@ -1700,9 +1700,28 @@ class VALIDATERunner(PhaseRunner):
             # frozen pool, so this can only match or beat the old behavior.
             if _retry_regen_enabled():
                 _n_before = len(getattr(generation, "candidates", ()) or ())
+                _prev_generation = generation
                 generation, _regen_outcome = await _regenerate_for_retry(
                     ctx=ctx, orch=orch, previous=generation,
                 )
+                # EFFECTIVE only when the pool actually changed. Returning
+                # the frozen candidates is the inert ladder this replaced
+                # wearing a new name, and it must not read as a success.
+                try:
+                    from backend.core.ouroboros.governance.reachability_ledger import (  # noqa: E501,PLC0415
+                        default_ledger,
+                    )
+                    _reach = default_ledger()
+                    await _reach.invoked(
+                        "validate_retry_regen", op_id=ctx.op_id,
+                    )
+                    if generation is not _prev_generation:
+                        await _reach.effective(
+                            "validate_retry_regen", op_id=ctx.op_id,
+                            detail=f"outcome={_regen_outcome}",
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
                 _fsm_log(
                     "retry_regen",
                     f"outcome={_regen_outcome} n_before={_n_before} "
