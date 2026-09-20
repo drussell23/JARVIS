@@ -7890,6 +7890,29 @@ class GovernedLoopService:
         ledger = self._stack.ledger
         storage_dir = ledger._storage_dir
 
+        async def _settle(entry: LedgerEntry) -> bool:
+            """Persist a recovery verdict, and say so when the ledger refuses.
+
+            ``ledger.append`` deduplicates on ``op_id:state`` and returns False
+            WITHOUT writing. ``get_history`` has just loaded this op's keys, so
+            a verdict whose state already occurs in the history — FAILED after
+            an earlier failed attempt, or the APPLIED marker itself — was
+            dropped silently, the op's latest state stayed APPLIED, and the
+            same op was "recovered", quarantined and escalated again on every
+            boot. Every verdict therefore carries its own ``entry_id``; this
+            wrapper exists so that if one is ever refused anyway, the refusal
+            is a log line instead of an eternal loop.
+            """
+            written = await ledger.append(entry)
+            if not written:
+                logger.warning(
+                    "[GovernedLoop] Boot recovery: ledger REFUSED the verdict "
+                    "for op=%s state=%s entry_id=%s — this op will be "
+                    "re-examined next boot",
+                    entry.op_id, entry.state.value, entry.entry_id,
+                )
+            return written
+
         TERMINAL = {
             OperationState.ROLLED_BACK, OperationState.FAILED,
             OperationState.BLOCKED,
@@ -7917,9 +7940,10 @@ class GovernedLoopService:
                 skew_tol = 60.0
                 age = now_ts - stored_ts
                 if 0 < age < 604800 and age > grace_s + skew_tol:
-                    await ledger.append(LedgerEntry(
+                    await _settle(LedgerEntry(
                         op_id=op_id, state=OperationState.FAILED,
                         data={"reason": "stale_planned_on_boot", "age_s": age},
+                        entry_id=f"boot-recovery:stale-planned:{int(now_ts)}",
                     ))
                 continue
 
@@ -7934,14 +7958,32 @@ class GovernedLoopService:
             # Write recovery marker BEFORE doing any work
             import uuid as _uuid
             recovery_id = _uuid.uuid4().hex
-            await ledger.append(LedgerEntry(
+            await _settle(LedgerEntry(
                 op_id=op_id, state=OperationState.APPLIED,
                 data={
                     **latest.data,
                     "recovery_attempted": True,
                     "recovery_attempt_id": recovery_id,
                 },
+                entry_id=f"boot-recovery:{recovery_id}:marker",
             ))
+
+            # ── No-write completion ─────────────────────────────────────────
+            # A terminal outcome that wrote nothing — a no-op, a read-only
+            # completion — is recorded as APPLIED {reason, provider}. It has
+            # no target_file BY CONSTRUCTION: there was no file. Reading that
+            # as "orphaned apply, provenance missing" turned every correct
+            # no-op into a manual_intervention_required alarm on the next
+            # boot (9 of 9 recurring orphans on 2026-09-20 had this shape,
+            # two of them no-ops from the soak the night before). There is
+            # nothing to reconcile; the marker above settles it.
+            if not latest.data.get("target_file") and latest.data.get("reason"):
+                logger.info(
+                    "[GovernedLoop] Boot recovery: op=%s completed without "
+                    "writing (%s) — nothing to reconcile",
+                    op_id, latest.data.get("reason"),
+                )
+                continue
 
             # Hash-guarded rollback
             target_path_str = latest.data.get("target_file")
@@ -7963,11 +8005,12 @@ class GovernedLoopService:
                     )
                 except Exception:  # noqa: BLE001 - quarantine is best-effort
                     pass
-                await ledger.append(LedgerEntry(
+                await _settle(LedgerEntry(
                     op_id=op_id, state=OperationState.FAILED,
                     data={"reason": "boot_recovery_missing_provenance",
                           "recovery_attempt_id": recovery_id,
                           "quarantined": True},
+                    entry_id=f"boot-recovery:{recovery_id}:missing-provenance",
                 ))
                 await self._stack.comm.emit_decision(
                     op_id=op_id, outcome="manual_intervention_required",
@@ -7990,10 +8033,11 @@ class GovernedLoopService:
             import hashlib as _hashlib
             target = Path(target_path_str)
             if not target.exists():
-                await ledger.append(LedgerEntry(
+                await _settle(LedgerEntry(
                     op_id=op_id, state=OperationState.FAILED,
                     data={"reason": "boot_recovery_file_missing",
                           "recovery_attempt_id": recovery_id},
+                    entry_id=f"boot-recovery:{recovery_id}:file-missing",
                 ))
                 await self._stack.comm.emit_decision(
                     op_id=op_id, outcome="manual_intervention_required",
@@ -8023,10 +8067,12 @@ class GovernedLoopService:
                 # loop: op-01a07e98-8a21 landed as 3a7d155218 and was then
                 # marked "needs manual rollback" and BLOCKED (2026-09-08).
                 # Nothing to recover; say so and leave the file alone.
-                await ledger.append(LedgerEntry(
+                await _settle(LedgerEntry(
                     op_id=op_id, state=OperationState.APPLIED,
                     data={**latest.data, "reason": "boot_recovery_apply_intact",
+                          "recovery_attempted": True,
                           "recovery_attempt_id": recovery_id},
+                    entry_id=f"boot-recovery:{recovery_id}:apply-intact",
                 ))
                 logger.warning(
                     "[GovernedLoop] Boot recovery: op=%s apply intact (on-disk == applied_hash) "
@@ -8035,10 +8081,11 @@ class GovernedLoopService:
                 continue
             if current_hash == rollback_hash:
                 # File already matches pre-apply content — change was undone externally
-                await ledger.append(LedgerEntry(
+                await _settle(LedgerEntry(
                     op_id=op_id, state=OperationState.ROLLED_BACK,
                     data={"reason": "boot_recovery_already_reverted",
                           "recovery_attempt_id": recovery_id},
+                    entry_id=f"boot-recovery:{recovery_id}:already-reverted",
                 ))
                 await self.report_external_outcome(
                     op_id=op_id,
@@ -8057,12 +8104,13 @@ class GovernedLoopService:
                 continue
 
             # File still has post-apply content; original bytes not stored — escalate
-            await ledger.append(LedgerEntry(
+            await _settle(LedgerEntry(
                 op_id=op_id, state=OperationState.FAILED,
                 data={"reason": "boot_recovery_needs_manual_rollback",
                       "current_hash": current_hash,
                       "rollback_hash": rollback_hash,
                       "recovery_attempt_id": recovery_id},
+                entry_id=f"boot-recovery:{recovery_id}:needs-manual-rollback",
             ))
             await self._stack.comm.emit_decision(
                 op_id=op_id, outcome="manual_intervention_required",
