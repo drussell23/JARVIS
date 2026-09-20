@@ -36,6 +36,10 @@ from backend.core.ouroboros.governance.exploration_subagent import (
 
 logger = logging.getLogger(__name__)
 
+from backend.core.ouroboros.governance.fleet_telemetry import (
+    FleetTelemetryMixin,
+)
+
 _MAX_AGENTS = int(os.environ.get("JARVIS_FLEET_MAX_AGENTS", "8"))
 _FLEET_TIMEOUT_S = float(os.environ.get("JARVIS_FLEET_TIMEOUT_S", "120"))
 
@@ -87,7 +91,19 @@ _REACTOR_SCOPES = [
 ]
 
 
-class ExplorationFleet:
+class ExplorationFleet(FleetTelemetryMixin):
+    """Parallel codebase exploration across repos.
+
+    Inherits :class:`FleetTelemetryMixin`, which wraps the coroutines named
+    in ``TELEMETRY_METHODS`` at class creation so each agent run emits
+    start / finish / failure frames to the cockpit. This class previously
+    contained no transport call of any kind: eighty ``[ExploreAgent]``
+    events in one session reached ``debug.log`` and nothing reached the
+    operator watching ``ov --sentinel``.
+    """
+
+    TELEMETRY_METHODS = ("_run_agent",)
+    TELEMETRY_PHASE = "EXPLORE"
     """Spawn an army of exploration agents across all Trinity repos.
 
     Usage:

@@ -6528,6 +6528,26 @@ class GovernedLoopService:
             from backend.core.ouroboros.governance.exploration_fleet import ExplorationFleet
             _fleet = ExplorationFleet(jarvis_root=self._config.project_root)
             self._exploration_fleet_ref = _fleet
+            # Bind the cockpit transport here, at the one site where every
+            # fleet is constructed, rather than resolving it from an
+            # ambient that nobody sets. The fleet had no comm reference at
+            # all, so its agents were invisible while working; a telemetry
+            # channel with no producer bound is the same defect one layer
+            # up, so this is explicit and it announces itself.
+            try:
+                from backend.core.ouroboros.governance.fleet_telemetry import (
+                    attach_transport as _attach_fleet_transport,
+                )
+                _comm_ref = getattr(
+                    getattr(self._orchestrator, "_stack", None), "comm", None,
+                )
+                if not _attach_fleet_transport(_comm_ref, label="GLS"):
+                    logger.warning(
+                        "[GLS] fleet telemetry NOT bound — subagents will "
+                        "run but stay invisible on the cockpit",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[GLS] fleet telemetry bind skipped: %s", exc)
             self._orchestrator.set_exploration_fleet(_fleet)
             # Phase 2: wire the same fleet into the tool backend so
             # Venom's delegate_to_agent tool can spawn isolated sub-agents.
