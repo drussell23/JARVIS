@@ -277,7 +277,7 @@ class InteractiveRepairLoop:
                 from datetime import datetime, timedelta, timezone
                 deadline = datetime.now(timezone.utc) + timedelta(seconds=_micro_timeout_s())
                 raw = await self._provider.plan(prompt, deadline)
-                fix = self._parse_micro_fix(raw, file_path)
+                fix = self._parse_micro_fix(raw, file_path, current)
             except Exception as exc:
                 logger.warning("[InteractiveRepair] Provider failed iter %d: %s", iteration, exc)
                 break
@@ -698,7 +698,20 @@ class InteractiveRepairLoop:
         )
 
     @staticmethod
-    def _parse_micro_fix(raw: str, file_path: str) -> Optional[MicroFix]:
+    def _parse_micro_fix(
+        raw: str, file_path: str, original: str = "",
+    ) -> Optional[MicroFix]:
+        """The micro-fix contract, or a translation of the provider's cage.
+
+        The strict contract is tried first, so a provider that answers
+        correctly never pays for a comparison it does not need. When it
+        fails, *original* lets the adapter recover the same information from
+        a full-content response -- which is what this provider is caged to
+        emit, and what it actually sent when this path was first observed
+        live. Fighting a grammar with prompt text loses; a full file is
+        strictly more information than a line range, and the range is
+        recoverable by comparison.
+        """
         stripped = raw.strip()
         if stripped.startswith("```"):
             stripped = "\n".join(l for l in stripped.split("\n") if not l.startswith("```")).strip()
@@ -708,8 +721,29 @@ class InteractiveRepairLoop:
                 target_file=file_path, line_range=(data["start_line"], data["end_line"]),
                 replacement=data["replacement"], reasoning=data.get("reasoning", ""),
             )
-        except (json.JSONDecodeError, KeyError):
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+
+        if not original:
             return None
+        try:
+            from backend.core.ouroboros.governance.payload_adapter import (  # noqa: PLC0415
+                micro_fix_contract,
+            )
+            contract = micro_fix_contract(
+                raw, original=original, file_path=file_path,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("[InteractiveRepair] adapter unavailable", exc_info=True)
+            return None
+        if not contract:
+            return None
+        return MicroFix(
+            target_file=file_path,
+            line_range=(contract["start_line"], contract["end_line"]),
+            replacement=contract["replacement"],
+            reasoning="translated from a full-content response",
+        )
 
     @staticmethod
     def _apply_fix(content: str, fix: MicroFix) -> str:
