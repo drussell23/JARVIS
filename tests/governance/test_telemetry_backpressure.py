@@ -1,11 +1,13 @@
-"""A telemetry producer must never be able to stall the FSM.
+"""Non-critical telemetry backs off when the loop is starved. Nothing else does.
 
-This control plane was just dug out of exactly that hole: measured
-starvation of p50 2,050ms, p90 4,721ms, max 43.7s, whose top attributed
-causes were a memory monitor and an embedder doing synchronous I/O on the
-loop. REPAIR_TRAJECTORY_EMIT and SHADOW_HARNESS are both high-rate disk
-producers, so the buffer had to exist before either switch flipped -- the
-arming is the easy half.
+Measured, bt-2026-09-09-024244::
+
+    [ControlPlaneStarvation] lag_ms=1739.6 (requested=100.0 observed=1839.6)
+        threshold=500.0 event_n=34 — main asyncio loop is starved
+
+11x the warn threshold with an 8-agent exploration fleet running, and the
+load-shed latch that exists for exactly this did nothing: it requires an LLM
+stream to be active, and no stream was.
 """
 from __future__ import annotations
 
@@ -13,216 +15,140 @@ import asyncio
 
 import pytest
 
-from backend.core.ouroboros.governance.telemetry_backpressure import (
-    BufferStats,
-    TelemetryBuffer,
-    all_stats,
-    get_buffer,
-    reset_buffers,
+from backend.core.ouroboros.governance import control_plane_load_shed as LS
+from backend.core.ouroboros.governance.autonomy.autonomy_types import (
+    EventEnvelope,
+    EventType,
 )
+from backend.core.ouroboros.governance.autonomy.event_emitter import EventEmitter
 
 
 @pytest.fixture(autouse=True)
-def _clean():
-    reset_buffers()
+def _clean(monkeypatch):
+    LS._reset_for_test()
+    monkeypatch.delenv("JARVIS_TELEMETRY_SHED_LAG_THRESHOLD_MS", raising=False)
     yield
-    reset_buffers()
+    LS._reset_for_test()
 
 
-# ---------------------------------------------------------------------------
-# The producer never waits
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_offer_returns_immediately_even_with_a_slow_sink():
-    """The load-bearing property: a sink that takes a second must not make
-    the caller take a second."""
-    async def _slow(_payload):
-        await asyncio.sleep(1.0)
-
-    buf = TelemetryBuffer("slow", _slow, maxsize=8)
-    buf.start()
-    loop = asyncio.get_running_loop()
-    t0 = loop.time()
-    for i in range(8):
-        buf.offer(i)
-    assert loop.time() - t0 < 0.1, "offer awaited the sink"
-    await buf.aclose(drain=False)
-
-
-@pytest.mark.asyncio
-async def test_offer_never_raises_on_a_broken_sink():
-    def _boom(_payload):
-        raise RuntimeError("disk gone")
-
-    buf = TelemetryBuffer("broken", _boom, maxsize=4)
-    buf.start()
-    for i in range(10):
-        assert buf.offer(i) is True
-    await asyncio.sleep(0.1)
-    assert buf.stats().sink_faults > 0
-    await buf.aclose(drain=False)
-
-
-@pytest.mark.asyncio
-async def test_sync_sink_runs_without_blocking_the_loop():
-    """A sync sink is assumed to touch a disk; a disk write on the event
-    loop is the exact fault this module was built after."""
-    ticks = []
-
-    def _sink(_payload):
-        pass
-
-    buf = TelemetryBuffer("sync", _sink, maxsize=16)
-    buf.start()
-
-    async def _heartbeat():
-        for _ in range(5):
-            ticks.append(1)
-            await asyncio.sleep(0.01)
-
-    for i in range(16):
-        buf.offer(i)
-    await _heartbeat()
-    assert len(ticks) == 5
-    await buf.aclose()
-
-
-# ---------------------------------------------------------------------------
-# Bounded, and honest about what it threw away
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_overflow_drops_the_oldest_and_keeps_the_newest():
-    """A sampled record of a live process is most useful at its freshest.
-    Refusing the new payload would freeze the record at the moment the
-    system got interesting."""
-    written = []
-    buf = TelemetryBuffer("bound", written.append, maxsize=4)
-    buf.start()
-    for i in range(20):
-        buf.offer(i)
-    await asyncio.sleep(0.15)
-    assert buf.stats().dropped_full > 0
-    assert written, "nothing was written at all"
-    assert written[-1] == 19, "the freshest payload was discarded"
-    await buf.aclose()
-
-
-@pytest.mark.asyncio
-async def test_drops_are_counted_never_silent():
-    """A gap in the record that is not itself in the record is
-    indistinguishable from a period when nothing happened."""
-    buf = TelemetryBuffer("counted", lambda _p: None, maxsize=2)
-    buf.start()
-    for i in range(30):
-        buf.offer(i)
-    stats = buf.stats()
-    assert stats.offered == 30
-    assert stats.dropped_full >= 20
-    assert "dropped_full" in stats.render()
-    await buf.aclose()
-
-
-@pytest.mark.asyncio
-async def test_queue_never_exceeds_its_bound():
-    buf = TelemetryBuffer("cap", lambda _p: None, maxsize=3)
-    for i in range(50):
-        buf.offer(i)
-    assert buf._queue.qsize() <= 3
-
-
-# ---------------------------------------------------------------------------
-# A broken sink is quarantined, not retried forever
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_repeated_faults_quarantine_the_sink():
-    """Retrying a broken endpoint at emission rate is a busy loop with
-    extra steps."""
-    def _boom(_payload):
-        raise OSError("endpoint down")
-
-    buf = TelemetryBuffer(
-        "quarantine", _boom, maxsize=32, quarantine_after=3, quarantine_s=30.0,
+def _event() -> EventEnvelope:
+    return EventEnvelope(
+        source_layer="L1", event_type=EventType.HEALTH_PROBE_RESULT,
+        payload={"ok": True}, op_id="op-test",
     )
-    buf.start()
-    for i in range(10):
-        buf.offer(i)
-    await asyncio.sleep(0.15)
-    assert buf.stats().quarantined is True
-    await buf.aclose(drain=False)
 
 
-@pytest.mark.asyncio
-async def test_a_recovering_sink_is_not_quarantined():
-    """One transient fault is not a broken endpoint."""
-    calls = {"n": 0}
+# --------------------------------------------------------------------------
+# The gap the soak found
+# --------------------------------------------------------------------------
 
-    def _flaky(_payload):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise OSError("transient")
-
-    buf = TelemetryBuffer("flaky", _flaky, maxsize=8, quarantine_after=3)
-    buf.start()
-    for i in range(5):
-        buf.offer(i)
-    await asyncio.sleep(0.15)
-    assert buf.stats().quarantined is False
-    assert buf.stats().written >= 3
-    await buf.aclose()
+def test_starvation_sheds_without_a_stream(monkeypatch):
+    """THE defect: the latch's stream precondition made lag alone inert."""
+    monkeypatch.setenv("JARVIS_CONTROL_PLANE_LOAD_SHED_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_TELEMETRY_SHED_LAG_THRESHOLD_MS", "500")
+    assert LS.is_shedding() is False, "no stream — the old latch stays closed"
+    assert LS.telemetry_shedding(lag_ms=1739.6) is True
 
 
-# ---------------------------------------------------------------------------
-# Lifecycle
-# ---------------------------------------------------------------------------
+def test_a_healthy_loop_does_not_shed(monkeypatch):
+    monkeypatch.setenv("JARVIS_CONTROL_PLANE_LOAD_SHED_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_TELEMETRY_SHED_LAG_THRESHOLD_MS", "500")
+    assert LS.telemetry_shedding(lag_ms=12.0) is False
 
 
-@pytest.mark.asyncio
-async def test_closed_buffer_refuses_and_counts():
-    buf = TelemetryBuffer("closed", lambda _p: None, maxsize=4)
-    buf.start()
-    await buf.aclose()
-    assert buf.offer("x") is False
-    assert buf.stats().dropped_closed == 1
+def test_unknown_lag_never_sheds(monkeypatch):
+    """0.0 means BOTH 'healthy' and 'unreadable'. Both must keep the data —
+    going blind when the signal fails is the opposite of observability."""
+    monkeypatch.setenv("JARVIS_CONTROL_PLANE_LOAD_SHED_ENABLED", "true")
+    assert LS.telemetry_shedding(lag_ms=0.0) is False
+
+    def _boom():
+        raise RuntimeError("watchdog unavailable")
+
+    import backend.core.ouroboros.governance.control_plane_watchdog as W
+
+    monkeypatch.setattr(W, "recent_lag_ms", _boom)
+    assert LS.telemetry_shedding() is False
 
 
-@pytest.mark.asyncio
-async def test_start_is_idempotent():
-    buf = TelemetryBuffer("once", lambda _p: None, maxsize=4)
-    assert buf.start() is True
-    assert buf.start() is False
-    await buf.aclose()
+def test_the_flag_still_gates_it(monkeypatch):
+    monkeypatch.delenv("JARVIS_CONTROL_PLANE_LOAD_SHED_ENABLED", raising=False)
+    assert LS.telemetry_shedding(lag_ms=99_999.0) is False
 
 
-@pytest.mark.asyncio
-async def test_aclose_is_safe_when_never_started():
-    await TelemetryBuffer("never", lambda _p: None).aclose()
+def test_threshold_is_derived_from_the_watchdogs_own(monkeypatch):
+    """One definition of 'starved'. Two constants drift."""
+    monkeypatch.delenv("JARVIS_TELEMETRY_SHED_LAG_THRESHOLD_MS", raising=False)
+    monkeypatch.setenv("JARVIS_CONTROL_PLANE_WATCHDOG_THRESHOLD_MS", "250")
+    assert LS.telemetry_threshold_ms() == 250.0
 
 
-@pytest.mark.asyncio
-async def test_get_buffer_is_one_per_name():
-    a = get_buffer("stream", lambda _p: None)
-    b = get_buffer("stream", lambda _p: None)
-    assert a is b
-    await a.aclose()
+# --------------------------------------------------------------------------
+# What may be shed, and what may never be
+# --------------------------------------------------------------------------
+
+def test_subscribers_are_delivered_to_even_under_backpressure(monkeypatch):
+    """A subscriber is a control path. An event it misses is a decision that
+    does not happen — that is data loss, not backpressure."""
+    monkeypatch.setenv("JARVIS_CONTROL_PLANE_LOAD_SHED_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_TELEMETRY_SHED_LAG_THRESHOLD_MS", "1")
+    monkeypatch.setattr(LS, "telemetry_shedding", lambda *a, **k: True)
+
+    seen = []
+    em = EventEmitter()
+    em.subscribe(EventType.HEALTH_PROBE_RESULT, lambda e: seen.append(e))
+
+    asyncio.run(em.emit(_event()))
+
+    assert len(seen) == 1, "backpressure dropped a subscriber delivery"
 
 
-@pytest.mark.asyncio
-async def test_all_stats_names_every_stream():
-    get_buffer("one", lambda _p: None)
-    get_buffer("two", lambda _p: None)
-    snapshot = all_stats()
-    assert set(snapshot) == {"one", "two"}
-    assert "dropped_full" in snapshot["one"]
+def test_the_spine_copy_is_shed_and_counted(monkeypatch):
+    published = []
+
+    class _Bus:
+        async def publish_raw(self, **kw):
+            published.append(kw)
+
+    import backend.core.trinity_event_bus as BUS
+
+    monkeypatch.setattr(BUS, "get_event_bus_if_exists", lambda: _Bus())
+    monkeypatch.setattr(LS, "telemetry_shedding", lambda *a, **k: True)
+
+    em = EventEmitter()
+    asyncio.run(em.emit(_event()))
+
+    assert published == [], "the observability copy was published while starved"
+    counts = LS.shed_counts()
+    assert counts.get("autonomy.health_probe_result") == 1, (
+        f"a dropped event left no record: {counts}"
+    )
 
 
-def test_offer_without_a_running_loop_does_not_raise():
-    """Import-time or shutdown-path emission must not explode."""
-    buf = TelemetryBuffer("noloop", lambda _p: None, maxsize=2)
-    assert buf.start() is False
-    assert isinstance(buf.stats(), BufferStats)
+def test_the_spine_copy_flows_when_the_loop_is_healthy(monkeypatch):
+    published = []
+
+    class _Bus:
+        async def publish_raw(self, **kw):
+            published.append(kw)
+
+    import backend.core.trinity_event_bus as BUS
+
+    monkeypatch.setattr(BUS, "get_event_bus_if_exists", lambda: _Bus())
+    monkeypatch.setattr(LS, "telemetry_shedding", lambda *a, **k: False)
+
+    em = EventEmitter()
+    asyncio.run(em.emit(_event()))
+
+    assert len(published) == 1
+    assert published[0]["topic"] == "autonomy.health_probe_result"
+    assert LS.shed_counts() == {}
+
+
+def test_backpressure_lifts_by_itself(monkeypatch):
+    """Unlatched by design: a reading, not a state. The first consumer needs a
+    stream boundary to clear its latch; telemetry has no such boundary."""
+    monkeypatch.setenv("JARVIS_CONTROL_PLANE_LOAD_SHED_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_TELEMETRY_SHED_LAG_THRESHOLD_MS", "500")
+    assert LS.telemetry_shedding(lag_ms=900.0) is True
+    assert LS.telemetry_shedding(lag_ms=10.0) is False
