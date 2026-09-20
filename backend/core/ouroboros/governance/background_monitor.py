@@ -174,8 +174,16 @@ class BackgroundMonitor:
                 *self._cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # A monitored tool never reads OUR terminal: an inherited
+                # stdin is the blocking read that wedged pytest for 11
+                # minutes (test_subprocess_helper, Slice 8).
+                stdin=asyncio.subprocess.DEVNULL,
                 cwd=self._cwd,
                 env=self._env,
+                # The context manager OWNS the tool — and therefore whatever
+                # the tool spawns. Without its own session there is no way to
+                # name those descendants once the leader is gone.
+                start_new_session=True,
             )
         except FileNotFoundError:
             self._exited = True
@@ -226,6 +234,18 @@ class BackgroundMonitor:
                     "[BackgroundMonitor] shutdown of op_id=%s raised",
                     self._op_id, exc_info=True,
                 )
+
+        # Leaving the context ends the tool's lease on the machine — for
+        # everything it started, not only for the leader, and whether the
+        # leader was killed above or had already exited on its own.
+        if self._proc is not None:
+            try:
+                from backend.core.ouroboros.governance.process_session import (  # noqa: PLC0415
+                    reap_session,
+                )
+                reap_session(self._proc.pid, owner=f"monitor:{self._op_id}")
+            except Exception:  # noqa: BLE001
+                logger.debug("[BackgroundMonitor] session reap degraded", exc_info=True)
 
         # Populate exit_code authoritatively BEFORE cancelling readers —
         # the _await_exit task may be cancelled mid-stride before it
@@ -368,15 +388,58 @@ class BackgroundMonitor:
         try:
             if self._proc is None:
                 return
-            await asyncio.gather(
-                *[t for t in self._readers if t is not asyncio.current_task()],
-                return_exceptions=True,
-            )
+            # The LEADER's exit is what ends the run. This used to drain the
+            # readers first and wait on the process second — and a reader only
+            # reaches EOF when EVERY holder of the pipe's write end is gone.
+            # A descendant that inherited stdout (a test that spawned
+            # ``tail -f``) kept it open after the leader died, so the terminal
+            # event never came and the consumer waited on a corpse until some
+            # outer timeout: up to the full invocation cap per candidate.
+            #
+            # The readers run concurrently, so the leader can never block on a
+            # full pipe while this waits for it.
+            #
+            # NOT ``proc.wait()``: asyncio resolves that only after every pipe
+            # has closed, so the descendants this is about to clean up would be
+            # the very thing preventing it from starting. See ``leader_exited``.
+            drain_s = max(self._terminate_grace_s, _DEFAULT_TERMINATE_GRACE_S)
             try:
-                rc = await self._proc.wait()
+                from backend.core.ouroboros.governance.process_session import (  # noqa: PLC0415
+                    leader_exited, reap_session,
+                )
+                await leader_exited(self._proc)
+                # Reaping the session closes every inherited write end, which
+                # is what lets ``wait()`` and the drain below FINISH — and
+                # keeps the guarantee that the terminal event follows all of
+                # the output.
+                reap_session(self._proc.pid, owner=f"monitor:{self._op_id}")
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.debug("[BackgroundMonitor] session reap degraded", exc_info=True)
+
+            try:
+                # Bounded for the one holder a reap cannot reach: a descendant
+                # that left the session with ``setsid``.
+                rc = await asyncio.wait_for(self._proc.wait(), timeout=drain_s)
+            except asyncio.TimeoutError:
+                rc = self._proc.returncode
             except Exception:  # noqa: BLE001
                 rc = -1
             self._exit_code = int(rc) if rc is not None else None
+
+            readers = [t for t in self._readers if t is not asyncio.current_task()]
+            if readers:
+                # Bounded: a descendant that called ``setsid`` has left the
+                # session and may still hold the pipe. It does not get to hold
+                # the run open as well. Never ZERO, though — with the session
+                # reaped EOF is imminent, and a caller's "kill at once" grace
+                # must not be read as "discard the trailing output".
+                _done, pending = await asyncio.wait(readers, timeout=drain_s)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
             if not self._exited_event_emitted:
                 self._exited_event_emitted = True
                 seq = await self._next_sequence()

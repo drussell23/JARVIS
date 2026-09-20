@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, List, Literal, Optional, Tuple
 
+from backend.core.ouroboros.governance.process_session import reap_session
 from backend.core.ouroboros.governance.test_timeout_derivation import (
     derive_test_timeouts,
     observe_per_file_rate,
@@ -1849,6 +1850,18 @@ class TestRunner:
         if first.passed:
             return first
 
+        if first.timed_out:
+            # The retry exists to tell a flake from a failure. A run killed at
+            # its time cap is neither: re-running it re-buys the single most
+            # expensive outcome there is and learns nothing. (Measured: two
+            # candidates x one hung import x this retry = 14 minutes of
+            # VALIDATE for 3 seconds of generation.)
+            logger.info(
+                "[TestRunner] First run was killed at its time cap — not "
+                "retrying; a hang is not a flake",
+            )
+            return first
+
         if not _TEST_RETRY_ENABLED:
             logger.info(
                 "[TestRunner] First run failed (%d/%d), retry disabled (JARVIS_TEST_RETRY_ENABLED=false)",
@@ -1882,6 +1895,12 @@ class TestRunner:
             duration_seconds=first.duration_seconds + retry.duration_seconds,
             stdout=first.stdout + "\n--- RETRY ---\n" + retry.stdout,
             flake_suspected=False,
+            # Rebuilding the result dropped this flag, so a run killed at the
+            # cap was filed as an ordinary ``test`` failure: its duration was
+            # LEARNED as the cost of the work (the next run got a 332s
+            # allowance on the strength of a hang) and the model was told its
+            # code was wrong.
+            timed_out=retry.timed_out,
         )
 
     # -- private ------------------------------------------------------------
@@ -2020,6 +2039,7 @@ class TestRunner:
             stderr=asyncio.subprocess.STDOUT,
             stdin=asyncio.subprocess.DEVNULL,
             cwd=cwd,
+            start_new_session=True,
         )
 
         try:
@@ -2028,11 +2048,8 @@ class TestRunner:
                 timeout=self._timeout,
             )
         except asyncio.TimeoutError:
-            # Kill the process on timeout
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+            # Kill the whole session on timeout, not just the leader.
+            reap_session(proc.pid, owner="test_runner")
             # Wait for process to actually terminate — use
             # ``communicate()`` (not a blind ``.wait()``) so the
             # pipe drains as the child exits. Bounded by 5s.
@@ -2042,6 +2059,7 @@ class TestRunner:
                 pass
             raise
 
+        reap_session(proc.pid, owner="test_runner")
         stdout_text = (
             raw_stdout.decode("utf-8", errors="replace") if raw_stdout else ""
         )

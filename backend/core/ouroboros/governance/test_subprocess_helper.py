@@ -225,13 +225,12 @@ def _killpg_safe(pid: int) -> None:
     Without this, pytest's worker subprocesses can survive the
     parent's death (the empirical signature from
     bt-2026-05-22-000838 — children at STAT=SN orphaned)."""
-    try:
-        # Negative PID to killpg semantics on the underlying syscall;
-        # os.killpg(pid, sig) does this internally on POSIX.
-        os.killpg(pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        # Already gone / cross-uid / Windows — silent.
-        pass
+    # One implementation, three spawn sites: see ``process_session`` for why
+    # a reap enumerates the session before it signals.
+    from backend.core.ouroboros.governance.process_session import (  # noqa: PLC0415
+        reap_session,
+    )
+    reap_session(pid, owner="pytest")
 
 
 # ============================================================================
@@ -435,6 +434,13 @@ async def run_pytest_subprocess(
             caller, pid, exc,
         )
         _killpg_safe(pid)
+
+    # The run is over, however it ended. A leader that exited BY ITSELF can
+    # still have left a group behind — that is what a ``pytest-timeout``
+    # hard-exit looks like from here, and it is how a soak accumulated a
+    # rogue backend server and fifteen orphaned ``tail -f``s. The session was
+    # created here; it is reaped here.
+    _killpg_safe(pid)
 
     elapsed_s = time.monotonic() - started_at
     rc = proc.returncode if proc.returncode is not None else -1

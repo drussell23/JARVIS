@@ -57,6 +57,7 @@ goal alone.
 """
 from __future__ import annotations
 
+import ast
 import importlib.metadata as _md
 import importlib.util
 import logging
@@ -65,7 +66,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
+from typing import Dict, FrozenSet, Iterator, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("Ouroboros.EnvironmentIntegrity")
 
@@ -557,6 +558,9 @@ class TargetImportVerdict:
     inspected: Tuple[str, ...] = ()
     #: The subset of ``unresolvable`` that no install on THIS machine can fix.
     structural: Tuple[str, ...] = ()
+    #: Subjects whose import EXECUTES A PROGRAM (``path: why``). No install and
+    #: no host reverses this either -- only refactoring the subject does.
+    executes: Tuple[str, ...] = ()
 
     @property
     def impossible(self) -> bool:
@@ -570,18 +574,148 @@ class TargetImportVerdict:
         driven from a Mac. Deleting it would delete Mac functionality; leaving
         it dispatchable burns an op per pass forever.
         """
-        return bool(self.structural)
+        return bool(self.structural or self.executes)
 
     @property
     def reason(self) -> str:
         if self.importable:
             return ""
+        if self.executes:
+            return f"{IMPORT_EXECUTES_PROGRAM}: {'; '.join(self.executes)}"
         if self.structural:
             return f"{PLATFORM_UNAVAILABLE}: {', '.join(self.structural)}"
         return f"{UNRESOLVABLE_TARGET_DEPENDENCY}: {', '.join(self.unresolvable)}"
 
 
 _IMPORTABLE_OK = TargetImportVerdict(True)
+
+
+# ---------------------------------------------------------------------------
+# Importing the subject runs a program
+# ---------------------------------------------------------------------------
+
+#: A subject that is a SCRIPT: it exposes nothing a test could call, and the
+#: act of importing it executes it. Every validation this system performs is an
+#: import-based unit test, so such a subject is out of reach until someone puts
+#: its body in a function behind ``if __name__ == "__main__":``.
+IMPORT_EXECUTES_PROGRAM = "import_executes_program"
+
+#: Statements that only DECLARE. Anything else at import scope does work.
+_DECLARATIVE_STMTS = (
+    ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef,
+    ast.ClassDef, ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Pass,
+    ast.Global, ast.Nonlocal, ast.Delete,
+)
+
+
+def _is_main_guard(node: ast.AST) -> bool:
+    if not isinstance(node, ast.If):
+        return False
+    test = node.test
+    if not (isinstance(test, ast.Compare) and len(test.comparators) == 1):
+        return False
+    sides = (test.left, test.comparators[0])
+    return (
+        any(isinstance(s, ast.Name) and s.id == "__name__" for s in sides)
+        and any(isinstance(s, ast.Constant) and s.value == "__main__" for s in sides)
+    )
+
+
+def _import_scope(body: Sequence[ast.stmt]) -> Iterator[ast.stmt]:
+    """Every statement that runs when the module is imported: descends into
+    compound statements, never into a def/class body or a ``__main__`` guard."""
+    for node in body:
+        if _is_main_guard(node):
+            continue
+        yield node
+        if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+            yield from _import_scope(node.body)
+            yield from _import_scope(node.orelse)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            yield from _import_scope(node.body)
+        elif isinstance(node, ast.Try):
+            yield from _import_scope(node.body)
+            for handler in node.handlers:
+                yield from _import_scope(handler.body)
+            yield from _import_scope(node.orelse)
+            yield from _import_scope(node.finalbody)
+
+
+def import_execution_hazard(path: Path, repo_root: Path) -> str:
+    """``""`` when importing *path* only declares; else why it does not.
+
+    ## What it caught, and what it cost before it existed
+
+    The Sentinel chose, unprompted, to write tests for
+    ``backend/start_minimal_with_upgrader.py`` -- 43 lines, no function, no
+    class, no ``__main__`` guard, ending in ``subprocess.run(["tail", "-f",
+    ...])``. The goal text demands "an import smoke test". The import started a
+    backend server on port 8010 and blocked on ``tail`` until ``pytest-timeout``
+    killed it: 14 minutes of VALIDATE per attempt for 3 seconds of generation,
+    a second attempt in which the model invented ``get_version_info`` and
+    ``perform_upgrade`` to have something to call, and a leaked server per
+    candidate. No candidate, from any model, could have passed.
+
+    ## The rule is structural -- there is no list of dangerous calls
+
+    A module is a script when BOTH hold:
+
+    * it exposes no importable API -- no ``def``/``class``, no ``__all__``,
+      and no re-export (a relative import, or a ``from X import`` of a
+      first-party module; a shim or a package ``__init__`` has an API even
+      though it defines nothing itself); and
+    * import scope does work -- an expression statement that is a call, a
+      ``with``, or a ``while`` -- outside any ``__main__`` guard.
+
+    Measured on this repository: 18 of 3,767 modules (0.5%), every one a
+    launcher, a one-off fixer or an archived ad-hoc test. The three false
+    positives of the first draft were all re-exporters, which is where the
+    re-export clause came from.
+
+    ## What it deliberately does not catch
+
+    A module that defines functions AND also runs its program at import. That
+    needs knowing which calls block, which is a list of names and a guess. A
+    wrong accusation here quarantines real work, so the static rule stays
+    narrow and the DYNAMIC backstop carries the rest: a hung import is now
+    killed once, classified ``infra``, never learned as a duration, never
+    retried, and its descendants are reaped (``process_session``).
+
+    NEVER raises; an unreadable or unparseable subject is not a hazard.
+    """
+    try:
+        path = Path(path)
+        if path.suffix != ".py" or path.name == "__init__.py":
+            return ""
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        roots = _pythonpath_roots(Path(repo_root))
+        effectful: List[int] = []
+        for node in _import_scope(tree.body):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                return ""
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = getattr(node, "targets", None) or [getattr(node, "target", None)]
+                if any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets):
+                    return ""
+            elif isinstance(node, ast.ImportFrom):
+                top = (node.module or "").split(".")[0]
+                if node.level or (top and _resolves_under_roots(top, roots)):
+                    return ""
+            elif isinstance(node, ast.Expr):
+                if isinstance(node.value, (ast.Call, ast.Await)):
+                    effectful.append(node.lineno)
+            elif isinstance(node, (ast.With, ast.AsyncWith, ast.While)):
+                effectful.append(node.lineno)
+        if not effectful:
+            return ""
+        return (
+            f"defines nothing importable and executes {len(effectful)} "
+            f"statement(s) at import (first: line {min(effectful)}) -- move the "
+            f"body into a function behind `if __name__ == \"__main__\":` to "
+            f"make it testable"
+        )
+    except Exception:  # noqa: BLE001 -- includes SyntaxError / RecursionError
+        return ""
 
 
 def target_import_verdict(
@@ -613,19 +747,25 @@ def target_import_verdict(
             return _IMPORTABLE_OK
         bad: List[str] = []
         inspected: List[str] = []
+        executes: List[str] = []
         for _label, src in sources:
             try:
-                inspected.append(str(Path(src).relative_to(root)))
+                shown = str(Path(src).relative_to(root))
             except Exception:  # noqa: BLE001
-                inspected.append(str(src))
+                shown = str(src)
+            inspected.append(shown)
             for top in unresolvable_imports(Path(src), root):
                 if top not in bad:
                     bad.append(top)
-        if not bad:
+            hazard = import_execution_hazard(Path(src), root)
+            if hazard:
+                executes.append(f"{shown} {hazard}")
+        if not bad and not executes:
             return _IMPORTABLE_OK
         return TargetImportVerdict(
             False, tuple(bad), tuple(inspected),
-            structurally_unavailable(bad, root),
+            structurally_unavailable(bad, root) if bad else (),
+            tuple(executes),
         )
     except Exception:  # noqa: BLE001
         logger.debug("[EnvIntegrity] target verdict degraded", exc_info=True)
