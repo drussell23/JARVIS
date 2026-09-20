@@ -62,6 +62,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+from pathlib import Path
 import os
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, List, Optional
@@ -1147,6 +1148,69 @@ class PLANRunner(PhaseRunner):
         await _capture_default_claims_at_plan_exit(
             ctx, exit_reason="planned",
         )
+
+        # ── API grounding: adjudicate the plan's claims before paying for
+        # GENERATE ──────────────────────────────────────────────────────
+        # ~63% of validation failures carrying an identifiable exception are
+        # AttributeError / ModuleNotFoundError / ImportError -- the model
+        # calling something that does not exist. Every one is currently
+        # discovered after generation, after a sandbox worktree, after
+        # pytest collection. Whether ``module.symbol`` exists is answerable
+        # from this repository's own AST in milliseconds.
+        #
+        # The gate only speaks about modules this repo defines: a reference
+        # into stdlib or a third-party package resolves to no file here and
+        # is UNKNOWN, never MISSING. A false refusal costs a correct plan
+        # and teaches the loop that grounding checks are noise; a missed
+        # reference costs one validation cycle, which is what happens today
+        # anyway. Shedding is disarmed by default
+        # (``JARVIS_API_GROUNDING_SHED_ENABLED``) so the gate first proves
+        # in the reachability ledger that it fires on real plans and not on
+        # correct ones.
+        try:
+            from backend.core.ouroboros.governance.api_grounding_gate import (  # noqa: E501,PLC0415
+                ground_plan, shed_enabled,
+            )
+            from backend.core.ouroboros.governance.reachability_ledger import (  # noqa: E501,PLC0415
+                track_reachability,
+            )
+            _plan_text = " ".join(str(p) for p in (
+                getattr(ctx, "plan", "") or "",
+                getattr(ctx, "strategic_memory_prompt", "") or "",
+            ) if p)
+            async with track_reachability(
+                "api_grounding_gate", op_id=getattr(ctx, "op_id", ""),
+            ) as _effect:
+                _report = await ground_plan(
+                    _plan_text,
+                    project_root=Path(orch._config.project_root),
+                )
+                if _report.missing:
+                    _effect.mark(_report.render())
+                if _report.missing and shed_enabled():
+                    logger.warning(
+                        "[PLANRunner] shedding op=%s — %s",
+                        getattr(ctx, "op_id", ""), _report.render(),
+                    )
+                    _shed = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code="api_grounding_fault",
+                    )
+                    # Every PLAN exit captures default claims, this one
+                    # included: a shed op is exactly the case where the
+                    # postmortem needs to know what was claimed and why the
+                    # plan never reached GENERATE.
+                    await _capture_default_claims_at_plan_exit(
+                        _shed, exit_reason="api_grounding_fault",
+                    )
+                    return PhaseResult(
+                        next_ctx=_shed,
+                        next_phase=OperationPhase.CANCELLED,
+                        status="error",
+                        reason="api_grounding_fault",
+                    )
+        except Exception:  # noqa: BLE001 — grounding never blocks the plan
+            logger.debug("[PLANRunner] api grounding degraded", exc_info=True)
 
         return PhaseResult(
             next_ctx=ctx,

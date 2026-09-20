@@ -4405,31 +4405,84 @@ def _build_codegen_prompt(
         except BlockedPathError:
             import_files, test_files = [], []
 
-        import_budget = _MAX_IMPORT_CONTEXT_CHARS
-        for ifile in import_files:
+        # ── Dependency context: signatures, not the first N lines ───────
+        # This block used to emit ``text.splitlines()[:30]`` per import
+        # source. For a Python module the first thirty lines are the
+        # docstring and the import block -- they almost never contain a
+        # single function signature. The model was asked to CALL INTO a
+        # dependency and shown that dependency's imports.
+        #
+        # That is the mechanical origin of this lane's dominant failure:
+        # of validation failures carrying an identifiable exception, ~63%
+        # are AttributeError / ModuleNotFoundError / ImportError against
+        # only 6 SyntaxError in the same corpus. The model's structure is
+        # near-perfect; it was inventing APIs because it was never shown
+        # them.
+        #
+        # The pruner keeps what a caller must get right -- names,
+        # arguments, defaults, annotations, docstrings -- and drops the
+        # bodies, which are the largest and least relevant part. The
+        # existing char budgets are preserved exactly and converted to
+        # tokens through the same self-calibrating ledger the rest of the
+        # context path uses, so this changes WHAT fills the budget, never
+        # how much. Fail-soft: any fault falls back to the head-slice this
+        # replaces.
+        def _dependency_sections(
+            files, label: str, char_budget: int, head_lines: int,
+        ) -> None:
+            pairs = []
+            for f in files:
+                try:
+                    pairs.append((
+                        str(f.relative_to(effective_single_repo_root)),
+                        f.read_text(encoding="utf-8", errors="replace"),
+                    ))
+                except (OSError, ValueError):
+                    continue
+            if not pairs:
+                return
             try:
-                text = ifile.read_text(encoding="utf-8", errors="replace")
-                snippet = "\n".join(text.splitlines()[:30])[:import_budget]
-                rel = ifile.relative_to(effective_single_repo_root)
-                context_parts.append(f"### Import source: {rel}\n```\n{snippet}\n```")
-                import_budget -= len(snippet)
-                if import_budget <= 0:
+                from backend.core.ouroboros.governance.ast_signature_pruner import (  # noqa: E501,PLC0415
+                    fit_dependencies,
+                )
+                from backend.core.ouroboros.governance.context_pruner import (  # noqa: E501,PLC0415
+                    get_default_ledger,
+                )
+                budget_tokens = max(
+                    1, get_default_ledger().estimate_tokens("x" * max(1, char_budget)),
+                )
+                pruned, used = fit_dependencies(pairs, budget_tokens=budget_tokens)
+                for module in pruned:
+                    context_parts.append(
+                        f"### {label}: {module.path} [{module.detail.value}]\n"
+                        f"```\n{module.text}\n```"
+                    )
+                logger.info(
+                    "[ContextAssembly] %s: %d module(s) at %s — %d/%d tokens",
+                    label, len(pruned),
+                    pruned[0].detail.value if pruned else "n/a",
+                    used, budget_tokens,
+                )
+                return
+            except Exception:  # noqa: BLE001 — context never blocks generation
+                logger.debug(
+                    "[ContextAssembly] signature pruning degraded for %s",
+                    label, exc_info=True,
+                )
+            remaining = char_budget
+            for rel, text in pairs:
+                snippet = "\n".join(text.splitlines()[:head_lines])[:remaining]
+                context_parts.append(f"### {label}: {rel}\n```\n{snippet}\n```")
+                remaining -= len(snippet)
+                if remaining <= 0:
                     break
-            except OSError:
-                continue
 
-        test_budget = _MAX_TEST_CONTEXT_CHARS
-        for tfile in test_files:
-            try:
-                text = tfile.read_text(encoding="utf-8", errors="replace")
-                snippet = "\n".join(text.splitlines()[:50])[:test_budget]
-                rel = tfile.relative_to(effective_single_repo_root)
-                context_parts.append(f"### Test context: {rel}\n```\n{snippet}\n```")
-                test_budget -= len(snippet)
-                if test_budget <= 0:
-                    break
-            except OSError:
-                continue
+        _dependency_sections(
+            import_files, "Import source", _MAX_IMPORT_CONTEXT_CHARS, 30,
+        )
+        _dependency_sections(
+            test_files, "Test context", _MAX_TEST_CONTEXT_CHARS, 50,
+        )
 
     context_block = (
         "## Surrounding Context (read-only — do not modify)\n\n"
