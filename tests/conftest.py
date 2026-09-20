@@ -794,6 +794,37 @@ def _isolate_live_inference_tiers(monkeypatch):
     monkeypatch.setenv("JARVIS_LOCAL_PRIME_ENABLED", "false")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_signed_roadmap(monkeypatch, tmp_path_factory):
+    """Unit tests never sign as the operator and never resolve the operator's
+    roadmap.
+
+    ``operator_goal_sanction`` finds the roadmap from ITS OWN file location,
+    not from a caller's tree, and signs with ``JARVIS_ROADMAP_READER_HMAC_
+    SECRET``. The daemon loads that secret from ``.env`` and every pytest it
+    spawns inherits it — the TestFailureSensor runs the tests covering any file
+    that changes. So a test that reaches ``author_and_sign_goal`` without a
+    ``path_override`` does not fail: it SUCCEEDS, against the live document.
+
+    Seen 2026-09-20: a fixture repo containing ``backend/foo.py`` had
+    ``ov-dag-testsynth-foo`` / ``ov-dag-repair-foo`` (and ``-bar``) signed into
+    the operator's roadmap by a daemon-spawned run of
+    ``test_work_order_sensor.py`` — four goals the Sentinel would have
+    dispatched against the real repository. A developer shell never showed it,
+    because a developer shell has no signing secret.
+
+    Same shape as ``_isolate_live_inference_tiers``, and pinned HERE for the
+    same reason: a signer that behaves differently under pytest would make its
+    own tests meaningless. Tests that exercise signing set the secret and a
+    path themselves — ``monkeypatch`` inside a test applies after this.
+    """
+    monkeypatch.delenv("JARVIS_ROADMAP_READER_HMAC_SECRET", raising=False)
+    sandbox = tmp_path_factory.getbasetemp() / "isolated_roadmap"
+    monkeypatch.setenv(
+        "JARVIS_ROADMAP_PATH", str(sandbox / ".jarvis" / "roadmap.yaml"),
+    )
+
+
 
 @pytest.fixture(autouse=True)
 def _isolate_context_budget(monkeypatch):

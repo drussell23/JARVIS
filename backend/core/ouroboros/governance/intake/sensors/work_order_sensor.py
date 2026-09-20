@@ -163,6 +163,10 @@ class WorkOrderSensor:
         # actually re-emitted it — the exemption is worth exactly one re-emit,
         # so a multi-poll session does not re-emit the same roadmap each hour.
         self._revisit_shadow: set = set()
+        # Built on first use: the triage owns a TestRunner whose AST import
+        # map is worth building once per process, and not at all when the
+        # gate is off or the scan finds nothing.
+        self._landability: Any = None
         self._running = False
         self._poll_task: Optional[asyncio.Task] = None
         self._load_seen()
@@ -312,6 +316,7 @@ class WorkOrderSensor:
                 # never masks it. RECENT_N=0 keeps all (finite task lists).
                 if recent_n > 0 and len(candidates) > recent_n:
                     candidates = candidates[-recent_n:]
+                candidates = await self._triage(candidates, new_hashes)
                 for ih, env in candidates:
                     if len(emitted) >= max_items:
                         break
@@ -334,6 +339,55 @@ class WorkOrderSensor:
         except Exception:  # noqa: BLE001 — scan is best-effort, never fatal
             logger.debug("[WorkOrderSensor] scan_once failed", exc_info=True)
         return emitted
+
+    async def _triage(
+        self,
+        candidates: List[Tuple[str, IntentEnvelope]],
+        settled: List[str],
+    ) -> List[Tuple[str, IntentEnvelope]]:
+        """Order *candidates* by landability and withhold the ones the signed
+        roadmap already owns. NEVER raises.
+
+        This path used to hand every item to the router in document order.
+        An item whose target nothing covers then cost a full GENERATE before
+        VALIDATE could say so, and the DAG substitution it triggered answered
+        ``duplicate_id`` on every soak after the first — the same futile op,
+        re-bought at every boot. The Sentinel's discovery path refuses such
+        work at selection; this is the same refusal on the path that had none.
+
+        A deferred item is recorded as seen: its work now lives in the
+        dependent goal on the roadmap, which is the end state the VALIDATE
+        route reached too — minus the generation.
+        """
+        try:
+            from backend.core.ouroboros.governance.intake import (  # noqa: PLC0415
+                landability,
+            )
+            if not candidates or not landability.gate_enabled():
+                return candidates
+            if self._landability is None:
+                self._landability = landability.LandabilityTriage(self._root)
+            judged: List[Tuple[int, int, str, IntentEnvelope]] = []
+            for ih, env in candidates:
+                verdict = await self._landability.assess(
+                    tuple(getattr(env, "target_files", ()) or ()),
+                    str(getattr(env, "description", "") or ""),
+                )
+                if not verdict.dispatchable:
+                    settled.append(ih)
+                    logger.info(
+                        "[WorkOrderSensor] deferred %s — %s",
+                        list(verdict.targets), verdict.reason,
+                    )
+                    continue
+                judged.append((verdict.rank, len(judged), ih, env))
+            judged.sort(key=lambda row: (row[0], row[1]))
+            return [(ih, env) for _rank, _seq, ih, env in judged]
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — a broken gate restores legacy order
+            logger.debug("[WorkOrderSensor] triage degraded", exc_info=True)
+            return candidates
 
     def _build_envelope(
         self, source_rel: str, marker: str, item_text: str, urgency: str,

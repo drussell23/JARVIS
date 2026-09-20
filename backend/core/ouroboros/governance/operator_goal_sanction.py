@@ -56,7 +56,7 @@ import shutil
 from dataclasses import dataclass, field, replace as _dc_replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("Ouroboros.OperatorGoalSanction")
 
@@ -392,6 +392,50 @@ def author_and_sign_goal(
         )
 
 
+def governs(repo_root: Path, path_override: Optional[Path] = None) -> bool:
+    """Is *repo_root* the tree the live roadmap governs? NEVER raises.
+
+    The roadmap path is resolved from THIS module's location (or an env
+    override), never from a caller's working tree. So a component rooted
+    somewhere else — a test's ``tmp_path``, a sovereignty worktree — that files
+    a goal would write a relative path from ITS tree into a document that
+    governs ANOTHER one: a signed goal naming a file that means something
+    different where it will be executed. Callers that file on behalf of a tree
+    ask this first.
+    """
+    try:
+        governed = _roadmap_path(path_override).resolve().parent.parent
+        return Path(repo_root).resolve() == governed
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def roadmap_goal_ids(path_override: Optional[Path] = None) -> FrozenSet[str]:
+    """Ids of every goal on the SIGNATURE-VALID roadmap. NEVER raises.
+
+    The read half of ``duplicate_id``: that refusal tells a caller a goal is
+    present only as a side effect of trying to file it. A caller that needs to
+    know what the roadmap already owns — intake triage deciding whether a work
+    item's repair goal is really there — should not have to attempt a write to
+    find out.
+
+    An unverifiable document answers EMPTY, so nothing is ever deferred on the
+    strength of a roadmap the reader itself would refuse.
+    """
+    try:
+        path = _roadmap_path(path_override)
+        valid, _detail = _verify(path)
+        if not valid:
+            return frozenset()
+        doc = _load_roadmap(path)
+        return frozenset(
+            str(g.get("id")) for g in (doc.get("goals") or [])
+            if isinstance(g, dict) and g.get("id")
+        )
+    except Exception:  # noqa: BLE001
+        return frozenset()
+
+
 def withdraw_goal(
     goal_id: str, *, path_override: Optional[Path] = None,
 ) -> SanctionResult:
@@ -593,6 +637,8 @@ def _default_urgency() -> str:
 
 __all__ = [
     "GoalSpec",
+    "governs",
+    "roadmap_goal_ids",
     "SanctionResult",
     "author_and_sign_goal",
     "build_scoped_envelope",

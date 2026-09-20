@@ -273,7 +273,17 @@ def file_substitution(plan: SubstitutionPlan) -> Tuple[Any, Any]:
     )
     try:
         res_a = ogs.author_and_sign_goal(_spec_a(plan))
-        if not getattr(res_a, "ok", False):
+        # ``duplicate_id`` is not a failure to establish the prerequisite: it
+        # is the signer reporting that the prerequisite ALREADY EXISTS. The
+        # orphan this guard prevents is a dependent whose prerequisite is
+        # absent; a dependent filed behind an existing one is the normal
+        # graph. Treating the two alike meant a pair half-filed by an
+        # interrupted soak could never be completed — A blocked B forever by
+        # being there.
+        a_present = getattr(res_a, "ok", False) or (
+            getattr(res_a, "reason", "") == "duplicate_id"
+        )
+        if not a_present:
             logger.info(
                 "[GoalDAG] prerequisite not filed (%s) — NOT filing the "
                 "dependent, an orphan would wait forever",
