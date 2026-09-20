@@ -222,6 +222,119 @@ def _admitted_candidates(candidates: Any, plan: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# VALIDATE_RETRY regeneration (bt-2026-09-20-005641 root)
+#
+# The ladder built a retry-with-feedback prompt out of the accumulated test
+# failures, threaded it onto the VALIDATE_RETRY ctx as
+# ``strategic_memory_prompt`` -- and then the next iteration re-validated
+# ``generation.candidates``: the SAME pool GENERATE froze. Nothing ever sent
+# that prompt to a model. For deterministic failures (NameError, TypeError,
+# psutil.NoSuchProcess) iterations 1..N were byte-identical re-runs of
+# iteration 0, so each retry spent ~41s to learn nothing and still consumed
+# the budget that gates L2 -- the one rung that does regenerate. 524 such
+# iterations across this repo's session logs; ``l2_stopped`` (118) +
+# ``l2_cancelled`` (28) is the largest genuine op-death bucket.
+#
+# ``adaptive_system_prompt.py`` already documents "retry-after-rejection
+# (``ctx.strategic_memory_prompt`` populated)" as a supported generation
+# mode. The capability was built and wired; only the call was missing.
+# ---------------------------------------------------------------------------
+
+# A local-lane GENERATE was observed at ~21s. Doubled for headroom, plus the
+# validation the fresh candidates still owe: below this, the retry is better
+# spent on the frozen pool than on a regeneration that cannot be judged.
+_RETRY_REGEN_MIN_BUDGET_S = 90.0
+
+# Never hand one regeneration more than this, however generous the op clock:
+# L2 and the remaining ladder iterations have to fit in the same envelope.
+_RETRY_REGEN_MAX_BUDGET_S = 240.0
+
+
+def _retry_regen_enabled() -> bool:
+    """Kill-switch for VALIDATE_RETRY regeneration. NEVER raises."""
+    try:
+        return os.environ.get(
+            "JARVIS_VALIDATE_RETRY_REGENERATE", "true",
+        ).strip().lower() not in ("0", "false", "no", "off")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _retry_regen_remaining_s(ctx: Any, orch: Any) -> float:
+    """Seconds left on the op clock, read the way the ladder itself reads it.
+
+    Same ``pipeline_deadline`` source as the loop's own budget guard, so the
+    regeneration decision and the iteration guard cannot disagree.
+    """
+    try:
+        if getattr(ctx, "pipeline_deadline", None) is not None:
+            return (
+                ctx.pipeline_deadline - datetime.now(tz=timezone.utc)
+            ).total_seconds()
+        return float(orch._config.validation_timeout_s)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+async def _regenerate_for_retry(
+    *, ctx: Any, orch: Any, previous: Any,
+) -> Tuple[Any, str]:
+    """Fresh candidates for a VALIDATE_RETRY iteration.
+
+    Returns ``(generation, outcome)``. ``generation`` is *previous* -- the
+    frozen pool, i.e. byte-for-byte the pre-fix behavior -- on every path
+    that does not yield at least one new candidate, so the worst case of
+    this function is the bug it replaces. NEVER raises except
+    ``CancelledError``, which must propagate.
+    """
+    _gen = getattr(orch, "_generator", None)
+    if _gen is None:
+        return previous, "no_generator"
+
+    _remaining_s = _retry_regen_remaining_s(ctx, orch)
+    if _remaining_s < _RETRY_REGEN_MIN_BUDGET_S:
+        return previous, f"budget_floor({_remaining_s:.0f}s)"
+
+    # Half the remaining clock, capped: the fresh candidates still have to be
+    # validated, and L2 still has to fit after them.
+    _budget_s = min(_remaining_s * 0.5, _RETRY_REGEN_MAX_BUDGET_S)
+    try:
+        _deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=_budget_s)
+        _fresh = await asyncio.wait_for(
+            _gen.generate(ctx, _deadline), timeout=_budget_s + 15.0,
+        )
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError:
+        return previous, f"timeout({_budget_s:.0f}s)"
+    except Exception as _exc:  # noqa: BLE001
+        # Manifesto section 8: name the branch, never swallow it silently.
+        logger.warning(
+            "[ValidateRetryRegen] regeneration failed (exc_class=%s): %s",
+            type(_exc).__name__, _exc, exc_info=True,
+        )
+        return previous, f"exception({type(_exc).__name__})"
+
+    if _fresh is None or not getattr(_fresh, "candidates", None):
+        return previous, "empty"
+
+    # Charge the call the way the STANDARD-demotion path charges its own
+    # out-of-phase generate, so a retry cannot spend off the books.
+    try:
+        _cost = float(getattr(_fresh, "cost_usd", 0.0) or 0.0)
+        if _cost > 0.0 and getattr(orch, "_cost_governor", None) is not None:
+            orch._cost_governor.charge(
+                ctx.op_id, _cost,
+                getattr(_fresh, "provider_name", "") or "",
+                phase=getattr(getattr(ctx, "phase", None), "name", "") or "",
+            )
+    except Exception:  # noqa: BLE001 -- accounting must not fail the retry
+        logger.debug("[ValidateRetryRegen] cost charge unavailable", exc_info=True)
+
+    return _fresh, "ok"
+
+
+# ---------------------------------------------------------------------------
 # L2 storm breaker (run a1-brain-20260705-233225): 60 background-route ops
 # each re-dispatched L2 on the IDENTICAL sticky stop reason
 # (class_retries_exhausted:env, 120/120 uniform), burning a fresh 120s
@@ -1278,6 +1391,25 @@ class VALIDATERunner(PhaseRunner):
                 "retry_advance_post",
                 f"old_ctx_id={_pre_ctx_id:x} new_ctx_id={id(ctx):x}",
             )
+
+            # Regenerate against the retry ctx built directly above. Without
+            # this the ladder is inert: the feedback prompt is assembled,
+            # attached, and dropped, and the next iteration re-validates the
+            # frozen pool for a guaranteed-identical verdict. See
+            # ``_regenerate_for_retry`` -- every failure path returns the
+            # frozen pool, so this can only match or beat the old behavior.
+            if _retry_regen_enabled():
+                _n_before = len(getattr(generation, "candidates", ()) or ())
+                generation, _regen_outcome = await _regenerate_for_retry(
+                    ctx=ctx, orch=orch, previous=generation,
+                )
+                _fsm_log(
+                    "retry_regen",
+                    f"outcome={_regen_outcome} n_before={_n_before} "
+                    f"n_after={len(getattr(generation, 'candidates', ()) or ())}",
+                )
+            else:
+                _fsm_log("retry_regen_disabled")
 
         _fsm_log(
             "loop_exit_normal",
