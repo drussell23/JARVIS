@@ -11,6 +11,7 @@ Three gates, three scopes, one question -- can this actually run here?
 """
 from __future__ import annotations
 
+import os
 import sys
 import textwrap
 from pathlib import Path
@@ -549,3 +550,74 @@ def test_the_pyobjc_declaration_carries_its_platform_marker():
         pytest.skip("the marker excludes every platform BUT this one")
     v = EI.platform_capability("pyobjc-framework-libdispatch", repo_root=root)
     assert v.available is False and v.reason == "marker_excluded"
+
+
+# ---------------------------------------------------------------------------
+# A profile is a SHAPE, not a clause in one long contract
+# ---------------------------------------------------------------------------
+
+def test_a_lane_provisioned_for_one_profile_still_boots(tmp_path):
+    """The CI break, reproduced as a unit.
+
+    The first cut asserted the UNION of every discovered profile — the same
+    mistake this module exists to avoid, one level down. The `ov-surface`
+    workflow installs ONLY `ci/requirements-ov-surface.txt` and calls that its
+    single source of truth, so the governance profile is legitimately absent
+    there. The gate refused and four routing tests failed `assert 78 == 0`.
+    """
+    _manifest(tmp_path, "ci/requirements-ov-surface.txt", "pytest\nrich\n")
+    _manifest(
+        tmp_path, "gov/requirements-governance.txt",
+        "pytest\nnot-installed-in-this-lane\n",
+    )
+    verdict = EI.environment_verdict(tmp_path)
+    assert verdict.satisfied is True
+    assert "1/2" in verdict.reason
+
+
+def test_an_unsatisfied_profile_is_still_reported_on_a_pass(tmp_path):
+    """Said out loud, because a named warning is as discoverable as a refusal
+    — which is how `pyflakes>=3` was found — without bricking the lane."""
+    _manifest(tmp_path, "ci/requirements-ov-surface.txt", "pytest\n")
+    _manifest(
+        tmp_path, "gov/requirements-governance.txt", "pytest\nabsent-xyz\n",
+    )
+    verdict = EI.environment_verdict(tmp_path)
+    assert verdict.satisfied is True
+    assert verdict.shortfalls
+    manifest, gaps = verdict.shortfalls[0]
+    assert manifest.endswith("requirements-governance.txt")
+    assert gaps == ("absent-xyz",)
+
+
+def test_an_environment_matching_NO_profile_is_still_refused(tmp_path):
+    """The gate must keep its teeth: matching no declared shape is starvation."""
+    _manifest(tmp_path, "ci/requirements-ov-surface.txt", "absent-a\n")
+    _manifest(tmp_path, "gov/requirements-governance.txt", "absent-b\n")
+    verdict = EI.environment_verdict(tmp_path)
+    assert verdict.satisfied is False
+    assert set(verdict.missing) == {"absent-a", "absent-b"}
+    assert len(verdict.shortfalls) == 2
+
+
+def test_a_manifest_with_only_comments_is_not_a_profile(tmp_path):
+    """An empty profile would otherwise count as trivially satisfied and let a
+    genuinely starved environment through."""
+    _manifest(tmp_path, "ci/requirements-ov-surface.txt", "# nothing here\n")
+    _manifest(tmp_path, "gov/requirements-governance.txt", "absent-xyz\n")
+    verdict = EI.environment_verdict(tmp_path)
+    assert verdict.satisfied is False
+
+
+def test_the_cli_entrypoint_boots_under_a_partial_profile(tmp_path, monkeypatch):
+    """End to end, against the seam CI actually calls. `ov_cli.main([])` must
+    not return EX_CONFIG(78) just because one profile is not installed."""
+    ci = _manifest(tmp_path, "ci/requirements-ov-surface.txt", "pytest\n")
+    gov = _manifest(
+        tmp_path, "gov/requirements-governance.txt", "pytest\nabsent-xyz\n",
+    )
+    monkeypatch.setenv(
+        "JARVIS_RUNTIME_MANIFESTS", f"{ci}{os.pathsep}{gov}",
+    )
+    root = Path(__file__).resolve().parents[2]
+    assert EI.assert_environment(root).satisfied is True
