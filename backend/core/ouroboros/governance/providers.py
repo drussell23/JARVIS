@@ -4443,14 +4443,27 @@ def _build_codegen_prompt(
                 return
             try:
                 from backend.core.ouroboros.governance.ast_signature_pruner import (  # noqa: E501,PLC0415
-                    fit_dependencies,
+                    dependency_budget_tokens, fit_dependencies,
                 )
                 from backend.core.ouroboros.governance.context_pruner import (  # noqa: E501,PLC0415
                     get_default_ledger,
                 )
-                budget_tokens = max(
+                # Derived from the NEGOTIATED window, not from the legacy
+                # char constant. Preserving that constant looked
+                # conservative and measured as the limiting factor: 1500
+                # chars is ~375 tokens, one module's signatures measured
+                # 4,289 chars, so every dependency degraded to the NAMES
+                # rung. Live logs showed "1 module(s) at names — 25/375
+                # tokens": the model went from seeing zero symbols to
+                # seeing a list of bare names with no argument lists, which
+                # is why the grounding-failure share did not move.
+                #
+                # The legacy constant still applies as a floor, so a lane
+                # with no negotiated window is never worse off than before.
+                _legacy = max(
                     1, get_default_ledger().estimate_tokens("x" * max(1, char_budget)),
                 )
+                budget_tokens = max(_legacy, dependency_budget_tokens())
                 pruned, used = fit_dependencies(pairs, budget_tokens=budget_tokens)
                 for module in pruned:
                     context_parts.append(
