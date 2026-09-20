@@ -440,6 +440,20 @@ class ControlPlaneWatchdog:
                 "threshold_ms=%.0f",
                 self._interval_s, self._threshold_ms,
             )
+            # Co-arm the out-of-band sampler. Same lifecycle by
+            # construction: a tick sink with nothing reading it is a
+            # capability that looks armed and reports nothing, and this
+            # tree has enough of those. Never fatal to the watchdog.
+            try:
+                from backend.core.ouroboros.governance.stall_attribution import (  # noqa: E501,PLC0415
+                    get_default_attributor,
+                )
+                get_default_attributor().start()
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[ControlPlaneWatchdog] stall attributor unavailable",
+                    exc_info=True,
+                )
             return True
         except RuntimeError:
             logger.debug(
@@ -478,6 +492,20 @@ class ControlPlaneWatchdog:
         while True:
             try:
                 t0 = time.monotonic()
+                # Prove the loop is turning, for the out-of-band sampler.
+                # This watchdog can measure lag but never attribute it: it
+                # runs ON the loop, so it only regains control once the
+                # blocker has already returned. An OS thread reading this
+                # tick can sample the main thread WHILE it is still stuck.
+                # One float store; no lock, so the instrument does not
+                # become part of what it measures.
+                try:
+                    from backend.core.ouroboros.governance.stall_attribution import (  # noqa: E501,PLC0415
+                        note_tick as _stall_note_tick,
+                    )
+                    _stall_note_tick()
+                except Exception:  # noqa: BLE001 — never perturb the watchdog
+                    pass
                 await asyncio.sleep(self._interval_s)
                 elapsed = time.monotonic() - t0
                 lag_s = elapsed - self._interval_s
