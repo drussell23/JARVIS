@@ -28,12 +28,60 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_MAX_MICRO_ITERATIONS = int(os.environ.get("JARVIS_INTERACTIVE_REPAIR_MAX_ITERS", "3"))
-_MICRO_TIMEOUT_S = float(os.environ.get("JARVIS_INTERACTIVE_REPAIR_TIMEOUT_S", "30"))
-# Default OFF: this path writes to disk outside the Iron Gate / ChangeEngine
-# immune system. Manifesto §6 keeps model-driven mutations behind the gates
-# until this loop is re-homed through ChangeEngine/APPLY.
-_ENABLED = os.environ.get("JARVIS_INTERACTIVE_REPAIR_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+# Budgets resolve at CALL time, not import time. As module constants they
+# froze at the first import of this module -- an operator who changed one had
+# to restart the process, and nothing could adapt a budget to the op actually
+# running. Same env names, same defaults; only the moment of reading moved.
+_DEFAULT_MAX_ITERS = 3
+_DEFAULT_TIMEOUT_S = 30.0
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_FALSEY = frozenset({"0", "false", "no", "off"})
+
+
+def _env_str(name: str) -> str:
+    """Trimmed lowercase env value. NEVER raises."""
+    try:
+        return (os.environ.get(name, "") or "").strip().lower()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _max_iterations() -> int:
+    """Micro-fix iteration ceiling. NEVER raises."""
+    try:
+        v = int(_env_str("JARVIS_INTERACTIVE_REPAIR_MAX_ITERS") or _DEFAULT_MAX_ITERS)
+        return v if v > 0 else _DEFAULT_MAX_ITERS
+    except (ValueError, TypeError):
+        return _DEFAULT_MAX_ITERS
+
+
+def _micro_timeout_s() -> float:
+    """Per-subprocess / per-model-call timeout. NEVER raises."""
+    try:
+        v = float(_env_str("JARVIS_INTERACTIVE_REPAIR_TIMEOUT_S") or _DEFAULT_TIMEOUT_S)
+        return v if v > 0.0 else _DEFAULT_TIMEOUT_S
+    except (ValueError, TypeError):
+        return _DEFAULT_TIMEOUT_S
+
+
+def repair_permitted(*, isolated: bool) -> bool:
+    """Whether the loop may run, and why isolation is what decides it.
+
+    The env switch defaulted OFF for a stated reason: this loop writes to
+    disk, and an unsandboxed write lands outside the Iron Gate / ChangeEngine
+    immune system (Manifesto §6). That is a property of WHERE it writes, not
+    of the loop itself -- so a caller that has already built a throwaway root
+    (``RepairSandbox``) has satisfied the condition the switch was guarding,
+    and passes ``isolated=True``.
+
+    An explicit falsey ``JARVIS_INTERACTIVE_REPAIR_ENABLED`` still wins
+    everywhere: an operator kill switch that isolation cannot override.
+    Unset + not isolated stays OFF, exactly as before. NEVER raises.
+    """
+    raw = _env_str("JARVIS_INTERACTIVE_REPAIR_ENABLED")
+    if raw in _FALSEY:
+        return False
+    return isolated or raw in _TRUTHY
 
 
 @dataclass
@@ -65,6 +113,11 @@ class InteractiveRepairResult:
     fixes_applied: List[MicroFix]
     total_duration_s: float
     final_output: str
+    # The text the loop ended on. Without it a successful repair had nowhere
+    # to go: the caller could only advance to GATE carrying the UNREPAIRED
+    # candidate, so the repair was discarded at the moment it succeeded.
+    # Defaulted, so every existing construction site stays valid.
+    repaired_content: str = ""
 
 
 class InteractiveRepairLoop:
@@ -76,9 +129,20 @@ class InteractiveRepairLoop:
     - Each iteration provides the EXACT error context
     """
 
-    def __init__(self, provider: Any, project_root: Path) -> None:
+    def __init__(
+        self, provider: Any, project_root: Path, *, isolated: bool = False,
+    ) -> None:
+        """``isolated`` asserts that *project_root* is a throwaway tree.
+
+        The loop materializes the text it is repairing and writes each
+        accepted fix, so the root it is handed is mutated. ``isolated=True``
+        is the caller's statement that those writes cannot reach anything the
+        Iron Gate protects -- see :func:`repair_permitted`. Defaults False so
+        no existing caller silently gains write authority.
+        """
         self._provider = provider
         self._project_root = project_root
+        self._isolated = bool(isolated)
 
     async def repair(
         self, file_path: str, file_content: str,
@@ -90,25 +154,31 @@ class InteractiveRepairLoop:
         fixes: List[MicroFix] = []
         current = file_content
 
-        if not _ENABLED:
+        if not repair_permitted(isolated=self._isolated):
             logger.info(
-                "[InteractiveRepair] disabled via JARVIS_INTERACTIVE_REPAIR_ENABLED=false (op=%s) — falling through to VALIDATE_RETRY/L2",
+                "[InteractiveRepair] not permitted (isolated=%s, "
+                "JARVIS_INTERACTIVE_REPAIR_ENABLED=%r) for op=%s — falling "
+                "through to VALIDATE_RETRY/L2",
+                self._isolated,
+                os.environ.get("JARVIS_INTERACTIVE_REPAIR_ENABLED", ""),
                 op_id,
             )
             return InteractiveRepairResult(
                 fixed=False, iterations_used=0,
                 errors_encountered=[], fixes_applied=[],
                 total_duration_s=0.0,
-                final_output="InteractiveRepair disabled (JARVIS_INTERACTIVE_REPAIR_ENABLED=false)",
+                final_output="InteractiveRepair not permitted (unsandboxed and not explicitly enabled)",
+                repaired_content=file_content,
             )
 
-        for iteration in range(_MAX_MICRO_ITERATIONS):
+        for iteration in range(_max_iterations()):
             err = await self._run_and_capture(file_path, current, test_argv)
             if err is None:
                 return InteractiveRepairResult(
                     fixed=True, iterations_used=iteration,
                     errors_encountered=errors, fixes_applied=fixes,
                     total_duration_s=time.monotonic() - t0, final_output="Tests passed",
+                    repaired_content=current,
                 )
             errors.append(err)
 
@@ -130,7 +200,7 @@ class InteractiveRepairLoop:
             prompt = self._build_micro_prompt(file_path, current, err)
             try:
                 from datetime import datetime, timedelta, timezone
-                deadline = datetime.now(timezone.utc) + timedelta(seconds=_MICRO_TIMEOUT_S)
+                deadline = datetime.now(timezone.utc) + timedelta(seconds=_micro_timeout_s())
                 raw = await self._provider.plan(prompt, deadline)
                 fix = self._parse_micro_fix(raw, file_path)
             except Exception as exc:
@@ -141,7 +211,9 @@ class InteractiveRepairLoop:
 
             fixes.append(fix)
             current = self._apply_fix(current, fix)
-            (self._project_root / file_path).write_text(current, encoding="utf-8")
+            # No write here: _run_and_capture materializes `current` at the
+            # top of the next iteration. One write site, so the bytes under
+            # test are always the bytes this loop believes it is repairing.
             logger.info(
                 "[InteractiveRepair] Iter %d: fixed %s at L%d-%d (op=%s)",
                 iteration, err.error_type, fix.line_range[0], fix.line_range[1], op_id,
@@ -152,6 +224,7 @@ class InteractiveRepairLoop:
             errors_encountered=errors, fixes_applied=fixes,
             total_duration_s=time.monotonic() - t0,
             final_output=errors[-1].full_output if errors else "",
+            repaired_content=current,
         )
 
     async def _run_and_capture(
@@ -189,6 +262,30 @@ class InteractiveRepairLoop:
         parent process's ``os.environ`` is NEVER mutated. Stateless,
         bleeds zero into other code paths.
         """
+        # Materialize the text under repair BEFORE running anything against
+        # it. This parameter was accepted and then ignored, so iteration 0
+        # tested whatever happened to be on disk: for a file the op existed
+        # to CREATE there was nothing there at all, and for a modification
+        # the disk still held the pre-edit original -- the loop reported on
+        # code it had not been asked to repair. Parent directories are
+        # created because a candidate may propose a path that does not exist
+        # yet, which is the normal shape of a test-synthesis goal.
+        try:
+            _under_test = self._project_root / file_path
+            _under_test.parent.mkdir(parents=True, exist_ok=True)
+            _under_test.write_text(content, encoding="utf-8")
+        except OSError as _write_exc:
+            logger.warning(
+                "[InteractiveRepair] could not materialize %s under %s: %s",
+                file_path, self._project_root, _write_exc,
+            )
+            return ExtractedError(
+                error_type="UnknownError",
+                message=f"materialize failed: {_write_exc}",
+                file_path=file_path, line_number=0,
+                traceback_excerpt="", full_output=str(_write_exc),
+            )
+
         # Slice 4C-A — build per-subprocess env with PYTHONPATH override
         _proj_root = str(self._project_root)
         _existing_pp = os.environ.get("PYTHONPATH", "")
@@ -216,14 +313,14 @@ class InteractiveRepairLoop:
                 cwd=str(self._project_root),
                 env=_subprocess_env,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_MICRO_TIMEOUT_S)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_micro_timeout_s())
             if proc.returncode == 0:
                 return None
             output = stdout.decode(errors="replace") + stderr.decode(errors="replace")
             return self._extract_error(output, file_path)
         except asyncio.TimeoutError:
             return ExtractedError(
-                error_type="TimeoutError", message=f"Timed out after {_MICRO_TIMEOUT_S}s",
+                error_type="TimeoutError", message=f"Timed out after {_micro_timeout_s()}s",
                 file_path=file_path, line_number=0, traceback_excerpt="", full_output="TIMEOUT",
             )
 

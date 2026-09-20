@@ -34,6 +34,7 @@ import asyncio
 import logging
 import os
 import shutil
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -906,7 +907,14 @@ class RepairSandbox:
         (sandbox / ".tmp").mkdir(exist_ok=True)
 
         cmd = [
-            "python3",
+            # ``python3`` resolves off PATH, which need not contain the venv
+            # this process runs from -- on the O+V host it finds
+            # /usr/bin/python3, which has no pytest, so every sandbox test
+            # run died on ModuleNotFoundError and the lane read it as the
+            # candidate failing. ``sys.executable`` is by construction an
+            # interpreter that can run this repo's tests: it is the one
+            # running them now.
+            sys.executable,
             "-m",
             "pytest",
             "--tb=short",

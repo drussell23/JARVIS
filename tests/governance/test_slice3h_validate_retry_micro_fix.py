@@ -84,24 +84,31 @@ def test_ast_pin_candidate_fallback_target_derivation() -> None:
     # best_candidate is only set on PASSED validations and micro-fix
     # runs on FAILED ones. The outer predicate is now ``if not
     # _repair_target:`` with a nested fallback chain inside.
-    assert "if not _repair_target:" in src, (
-        "validate_runner.py is missing the Slice 3H candidate-derived "
-        "repair-target fallback outer predicate. SWE-Bench-Pro ops "
-        "will continue to skip micro-fix and exhaust retries."
+    assert "_resolve_repair_plan(" in src, (
+        "validate_runner.py is missing the candidate-derived repair plan. "
+        "SWE-Bench-Pro ops will continue to skip micro-fix and exhaust "
+        "retries."
     )
     # At minimum the fallback chain must consult best_candidate (the
     # Slice 3H Part 1 contract — strengthened by Slice 3H.1 with an
     # additional ``generation.candidates`` branch tested in its own
     # AST pin file).
-    assert "if best_candidate is not None:" in src, (
+    assert "best_candidate" in src, (
         "validate_runner.py does not check best_candidate in fallback "
         "chain — Slice 3H Part 1 contract broken."
     )
-    assert (
-        '_fallback_cand.get("file_path", "") or ""' in src
-    ), (
-        "validate_runner.py does not extract file_path from "
-        "_fallback_cand — Slice 3H candidate-contract consumption broken."
+    # The candidate contract (a ``file_path`` naming what the candidate
+    # proposes) must actually be consumed. Asserted against the resolver
+    # rather than against the source text that used to read the field, so a
+    # refactor that keeps the contract keeps this pin green.
+    from backend.core.ouroboros.governance.phase_runners.validate_runner import (  # noqa: PLC0415
+        _candidate_files,
+    )
+    assert _candidate_files(
+        {"file_path": "lib/ansible/cli/doc.py", "full_content": "x = 1\n"},
+    ) == (("lib/ansible/cli/doc.py", "x = 1\n"),), (
+        "the candidate's file_path/full_content contract is no longer "
+        "consumed — Slice 3H candidate-contract consumption broken."
     )
     # The FSM tag is the operator's grep handle for diagnosing
     # whether this path fired in a given soak.
@@ -150,10 +157,14 @@ def test_ast_pin_legacy_path_preserved() -> None:
         "Legacy project_root default for _repair_root removed — "
         "pre-Slice-3H ops without envelope override now break."
     )
-    # The repair file resolution must now use the variable, not the
-    # hardcoded project_root
-    assert "_repair_abs = _repair_root / _repair_target" in src, (
-        "_repair_abs no longer uses _repair_root variable — Slice "
+    # The envelope-resolved root must still be what the repair executes
+    # under. It is no longer used to READ the file -- reading the target off
+    # disk handed the loop the pre-edit original on a modification and
+    # nothing at all on a creation, which is the defect this pin outlived --
+    # but it is what the isolated repair tree is seeded from, so the
+    # override still decides where the repair's pytest runs.
+    assert "repo_root=_repair_root" in src, (
+        "the repair sandbox is no longer seeded from _repair_root — Slice "
         "3H envelope override path is dead."
     )
 

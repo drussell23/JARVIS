@@ -71,6 +71,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -81,6 +82,9 @@ from backend.core.ouroboros.governance.op_context import (
     OperationContext,
     OperationPhase,
     ValidationResult,
+)
+from backend.core.ouroboros.governance.repair_sandbox import (
+    RepairSandbox,
 )
 from backend.core.ouroboros.governance.phase_runner import (
     PhaseResult,
@@ -250,6 +254,86 @@ _RETRY_REGEN_MIN_BUDGET_S = 90.0
 _RETRY_REGEN_MAX_BUDGET_S = 240.0
 
 
+def _candidate_files(candidate: Any) -> Tuple[Tuple[str, str], ...]:
+    """Every ``(file_path, content)`` pair a candidate proposes.
+
+    One reader for the whole candidate contract, so the micro-fix cannot
+    drift from what GATE and APPLY consider the proposal:
+
+    * multi-file -- ``files: [{file_path, full_content}, ...]``
+    * single-file -- ``{file_path, full_content}``, which is also what a
+      ``2b.1-diff`` candidate becomes: providers apply the diff at parse time
+      and store the result as ``full_content``, so by the time VALIDATE sees
+      any candidate the proposed TEXT is already resolved. Nothing here needs
+      to understand diffs.
+
+    ``raw_content`` is accepted as the documented alias (see
+    ``forward_progress.candidate_content_hash``). Entries without both a path
+    and a non-empty body are dropped -- a candidate that proposes no text for
+    a file has nothing for the repair loop to work on. NEVER raises.
+    """
+    out: list = []
+    try:
+        if not isinstance(candidate, dict):
+            return ()
+
+        def _body(entry: Dict[str, Any]) -> str:
+            for key in ("full_content", "raw_content"):
+                val = entry.get(key)
+                if isinstance(val, str) and val:
+                    return val
+            return ""
+
+        files = candidate.get("files")
+        if isinstance(files, (list, tuple)):
+            for entry in files:
+                if not isinstance(entry, dict):
+                    continue
+                path = str(entry.get("file_path", "") or "")
+                body = _body(entry)
+                if path and body:
+                    out.append((path, body))
+
+        path = str(candidate.get("file_path", "") or "")
+        body = _body(candidate)
+        if path and body and not any(p == path for p, _ in out):
+            out.append((path, body))
+    except Exception:  # noqa: BLE001
+        return tuple(out)
+    return tuple(out)
+
+
+def _resolve_repair_plan(
+    *, candidates: Any, target_files: Any,
+) -> Optional[Tuple[str, Tuple[Tuple[str, str], ...]]]:
+    """``(primary_path, files)`` for the micro-fix, or ``None``.
+
+    *files* is everything the chosen candidate proposes -- all of it is
+    materialized, so a multi-file candidate is judged as the coherent change
+    it is rather than one file of it with the rest missing. *primary_path* is
+    the file the repair loop edits: the operator's declared target when the
+    candidate actually proposes content for it, otherwise the candidate's
+    own first file.
+
+    Preferring the declared target keeps the micro-fix inside the scope the
+    op was sanctioned for; falling back to the candidate's own path is what
+    lets SWE-Bench-shaped envelopes (``target_files`` deliberately empty)
+    work at all. NEVER raises.
+    """
+    try:
+        declared = [str(t) for t in (target_files or ()) if str(t)]
+        for cand in (candidates or ()):
+            files = _candidate_files(cand)
+            if not files:
+                continue
+            paths = {p for p, _ in files}
+            primary = next((d for d in declared if d in paths), files[0][0])
+            return primary, files
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 def _retry_regen_enabled() -> bool:
     """Kill-switch for VALIDATE_RETRY regeneration. NEVER raises."""
     try:
@@ -274,6 +358,72 @@ def _retry_regen_remaining_s(ctx: Any, orch: Any) -> float:
         return float(orch._config.validation_timeout_s)
     except Exception:  # noqa: BLE001
         return 0.0
+
+
+def _micro_fix_budget_s(ctx: Any, orch: Any) -> float:
+    """Wall time for one micro-fix, derived rather than declared.
+
+    The old call site spent a flat ``timeout=90.0`` regardless of how much op
+    clock was left or how many iterations the loop was configured for, so the
+    number was wrong in both directions: it truncated a loop that had room,
+    and it overran an op that did not. Derive it instead from the two things
+    that actually bound the work -- the loop's own configured shape (each
+    iteration costs at most one model call plus one test run, both capped by
+    the repair timeout) and whatever remains of the op clock. NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.governance.interactive_repair import (  # noqa: PLC0415
+            _max_iterations, _micro_timeout_s,
+        )
+        # Two capped waits per iteration (model call, then test run), plus one
+        # trailing test run to observe the final state.
+        want_s = _micro_timeout_s() * (2 * _max_iterations() + 1)
+    except Exception:  # noqa: BLE001
+        want_s = 90.0
+    remaining_s = _retry_regen_remaining_s(ctx, orch)
+    if remaining_s <= 0.0:
+        return want_s
+    # Never claim more than half the remaining clock: the retry that follows,
+    # and L2 after it, have to fit in the same envelope.
+    return max(1.0, min(want_s, remaining_s * 0.5))
+
+
+def _repaired_candidate(
+    *, candidates: Any, file_path: str, content: str,
+) -> Optional[Dict[str, Any]]:
+    """The candidate that proposed *file_path*, carrying repaired *content*.
+
+    Copied rather than mutated so the original stays intact for the episodic
+    record and the trajectory corpus, and every other field (``source_hash``,
+    ``candidate_id``, ``source_path``) rides along untouched -- the
+    post-loop source-drift check reads ``source_hash`` and must still see the
+    hash taken at generation time. NEVER raises.
+    """
+    if not content:
+        return None
+    try:
+        for cand in (candidates or ()):
+            files = _candidate_files(cand)
+            if not any(p == file_path for p, _ in files):
+                continue
+            out = dict(cand)
+            nested = out.get("files")
+            if isinstance(nested, (list, tuple)):
+                out["files"] = [
+                    ({**e, "full_content": content}
+                     if isinstance(e, dict)
+                     and str(e.get("file_path", "") or "") == file_path
+                     else e)
+                    for e in nested
+                ]
+            if str(out.get("file_path", "") or "") == file_path:
+                out["full_content"] = content
+                out.pop("raw_content", None)
+                out.pop("unified_diff", None)
+            return out
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 async def _regenerate_for_retry(
@@ -1265,37 +1415,33 @@ class VALIDATERunner(PhaseRunner):
                 #
                 # Both branches feed the same FSM tag with a ``source=``
                 # discriminator so operator grep can attribute correctly.
-                if not _repair_target:
-                    _fallback_cand: Optional[Dict[str, Any]] = None
-                    _fallback_source = ""
-                    if best_candidate is not None:
-                        _fallback_cand = best_candidate
-                        _fallback_source = "best_candidate"
-                    elif generation.candidates:
-                        _fallback_cand = generation.candidates[0]
-                        _fallback_source = "generation_candidates_first"
-                    if _fallback_cand is not None:
-                        _cand_path = (
-                            _fallback_cand.get("file_path", "") or ""
+                # Slice 3H/3H.1 derived a repair TARGET here by walking
+                # ctx.target_files then the candidate's own file_path, and
+                # then read that path off disk. Both halves are now one
+                # resolution in ``_resolve_repair_plan``, because the target
+                # and the text have to come from the same place: the disk read
+                # handed the loop the PRE-EDIT original on a modification
+                # (VALIDATE never applies a candidate to the operator tree)
+                # and nothing at all on a creation, where the ``is_file()``
+                # precondition skipped the loop outright -- 157 times.
+                _repair_plan = _resolve_repair_plan(
+                    candidates=(
+                        [best_candidate] if best_candidate is not None else []
+                    ) + list(generation.candidates or ()),
+                    target_files=ctx.target_files,
+                )
+                if _repair_plan is not None:
+                    _repair_target, _repair_files = _repair_plan
+                    _repair_content = next(
+                        (c for p, c in _repair_files if p == _repair_target), "",
+                    )
+                    if _repair_content:
+                        _fsm_log(
+                            "micro_fix_target_from_candidate",
+                            f"file_path={_repair_target!r} "
+                            f"n_files={len(_repair_files)} "
+                            f"chars={len(_repair_content)}",
                         )
-                        if _cand_path:
-                            _repair_target = _cand_path
-                            _fsm_log(
-                                "micro_fix_target_from_candidate",
-                                f"file_path={_cand_path!r} "
-                                f"source={_fallback_source}",
-                            )
-                # Part 2 (Slice 3H) — note that ``_repair_root`` is now
-                # resolved ABOVE the InteractiveRepairLoop constructor
-                # (Slice 3H.2 reorder) so the loop's subprocess pytest
-                # invocation lands in the worktree. ``_repair_abs`` below
-                # uses the same resolved root for the patched-file lookup
-                # — single source of truth for both the file system path
-                # and the subprocess cwd.
-                if _repair_target:
-                    _repair_abs = _repair_root / _repair_target
-                    if _repair_abs.is_file():
-                        _repair_content = _repair_abs.read_text(errors="replace")
                         # ── Slice 4B — FAIL_TO_PASS pytest scoping ──
                         # Without scoping, ``pytest -x -q`` runs every
                         # test in the worktree cwd. For SWE-Bench-Pro
@@ -1324,7 +1470,14 @@ class VALIDATERunner(PhaseRunner):
                                     ]
                         except (ValueError, TypeError):
                             _fail_to_pass = []
-                        _test_argv = ["python3", "-m", "pytest", "-x", "-q"]
+                        # ``python3`` resolves off PATH, and the daemon's
+                        # PATH does not contain the venv -- it found
+                        # /usr/bin/python3, which has no pytest, so every
+                        # micro-fix subprocess died on ModuleNotFoundError and
+                        # the hard guard broke the loop. ``sys.executable`` is
+                        # by construction an interpreter that can run this
+                        # repo's tests: it is the one running them now.
+                        _test_argv = [sys.executable, "-m", "pytest", "-x", "-q"]
                         if _fail_to_pass:
                             _test_argv.extend(_fail_to_pass)
                             _fsm_log(
@@ -1332,15 +1485,51 @@ class VALIDATERunner(PhaseRunner):
                                 f"n_tests={len(_fail_to_pass)} "
                                 f"first={_fail_to_pass[0]!r}",
                             )
-                        _repair_result = await asyncio.wait_for(
-                            _repair.repair(
-                                file_path=str(_repair_target),
-                                file_content=_repair_content,
-                                test_argv=_test_argv,
-                                op_id=ctx.op_id,
-                            ),
-                            timeout=90.0,
-                        )
+                        # Host the repair in a throwaway tree. The loop
+                        # materializes what it repairs and writes each fix, and
+                        # the env switch that kept it dark says why that
+                        # mattered: "writes to disk outside the Iron Gate ...
+                        # until this loop is re-homed". Re-homing it here means
+                        # those writes cannot reach anything the gate protects,
+                        # which is what ``isolated=True`` asserts below.
+                        _micro_budget_s = _micro_fix_budget_s(ctx, orch)
+                        async with RepairSandbox(
+                            repo_root=_repair_root,
+                            test_timeout_s=_micro_budget_s,
+                        ) as _micro_sbx:
+                            # Materialize the WHOLE proposal, not just the
+                            # file being edited: a multi-file candidate whose
+                            # siblings are missing fails for reasons that have
+                            # nothing to do with the code under repair.
+                            for _p, _c in _repair_files:
+                                await _micro_sbx.apply_full_content(_c, _p)
+                            # ``_repair_root`` now names the tree the repair
+                            # actually executes in -- the sandbox seeded from
+                            # the envelope-resolved root. The Slice 3H.2
+                            # invariant (constructed with _repair_root, never
+                            # the bare JARVIS root) holds, and is now stronger:
+                            # the subprocess cwd is isolated as well as correct.
+                            _repair_root = _micro_sbx.sandbox_root or _repair_root
+                            _repair = InteractiveRepairLoop(
+                                provider=orch._generator,
+                                project_root=_repair_root,
+                                isolated=True,
+                            )
+                            _fsm_log(
+                                "micro_fix_sandboxed",
+                                f"root={_repair_root} "
+                                f"fidelity={_micro_sbx.baseline_fidelity} "
+                                f"budget_s={_micro_budget_s:.0f}",
+                            )
+                            _repair_result = await asyncio.wait_for(
+                                _repair.repair(
+                                    file_path=str(_repair_target),
+                                    file_content=_repair_content,
+                                    test_argv=_test_argv,
+                                    op_id=ctx.op_id,
+                                ),
+                                timeout=_micro_budget_s,
+                            )
                         _fsm_log(
                             "micro_fix_returned",
                             f"fixed={_repair_result.fixed} "
@@ -1351,12 +1540,48 @@ class VALIDATERunner(PhaseRunner):
                                 "[Orchestrator] Micro-fix succeeded in %d iterations for op=%s",
                                 _repair_result.iterations_used, ctx.op_id,
                             )
-                            ctx = ctx.advance(OperationPhase.GATE, validation=best_validation)
-                            _fsm_log("micro_fix_succeeded_break")
-                            break
+                            # The repair produced NEW text, so the candidate
+                            # that carried the old text is not the thing to
+                            # advance. Rebuild it around the repaired content
+                            # and put it back through the ordinary validator:
+                            # a sandbox convergence is evidence, not a verdict,
+                            # and synthesizing a passing ValidationResult here
+                            # would let the micro-fix rubber-stamp itself.
+                            _repaired_cand = _repaired_candidate(
+                                candidates=(
+                                    [best_candidate]
+                                    if best_candidate is not None else []
+                                ) + list(generation.candidates or ()),
+                                file_path=_repair_target,
+                                content=_repair_result.repaired_content,
+                            )
+                            if _repaired_cand is None:
+                                _fsm_log("micro_fix_no_repaired_candidate")
+                            else:
+                                _micro_validation = await orch._run_validation(
+                                    ctx, _repaired_cand, remaining_s,
+                                )
+                                _fsm_log(
+                                    "micro_fix_revalidated",
+                                    f"passed={_micro_validation.passed} "
+                                    f"fc={_micro_validation.failure_class!r}",
+                                )
+                                if _micro_validation.passed:
+                                    best_candidate = _repaired_cand
+                                    best_validation = _micro_validation
+                                    ctx = ctx.advance(
+                                        OperationPhase.GATE,
+                                        validation=best_validation,
+                                    )
+                                    _fsm_log("micro_fix_succeeded_break")
+                                    break
                     else:
+                        # Reached only when the chosen candidate proposes no
+                        # text for its own target. Absence of CONTENT, which
+                        # is a real nothing-to-repair; not absence of a FILE,
+                        # which is what the old precondition confused it with.
                         _fsm_log(
-                            "micro_fix_skipped_new_file",
+                            "micro_fix_no_content_for_target",
                             f"target={_repair_target!r}",
                         )
                 else:

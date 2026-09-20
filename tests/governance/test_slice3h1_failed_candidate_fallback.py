@@ -48,6 +48,10 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from backend.core.ouroboros.governance.phase_runners.validate_runner import (
+    _resolve_repair_plan,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 VALIDATE_RUNNER_FILE = (
     REPO_ROOT / "backend" / "core" / "ouroboros" / "governance"
@@ -64,43 +68,68 @@ def _parse(path: Path) -> ast.Module:
 # ──────────────────────────────────────────────────────────────────────
 
 
-def test_ast_pin_fallback_chain_includes_generation_candidates() -> None:
-    """The micro-fix block must reference ``generation.candidates``
-    in the fallback chain. Without it, the failed-validation path
-    silently re-creates the bt-2026-05-25-075811 dead-code trap."""
-    src = VALIDATE_RUNNER_FILE.read_text()
-    assert "elif generation.candidates:" in src, (
-        "validate_runner.py micro-fix is missing the "
-        "generation.candidates fallback branch — Slice 3H.1 trap "
-        "is open."
+def test_generation_candidates_participate_in_the_fallback() -> None:
+    """A candidate the validator just critiqued must be reachable.
+
+    The bt-2026-05-25-075811 trap: ``best_candidate`` is only assigned on a
+    PASSED validation, and micro-fix runs precisely when validation FAILED,
+    so a chain that consulted only ``best_candidate`` was dead. The op's
+    candidates must therefore be a usable source on their own.
+    """
+    plan = _resolve_repair_plan(
+        candidates=[{"file_path": "lib/ansible/cli/doc.py",
+                     "full_content": "x = 1\n"}],
+        target_files=(),
     )
-    assert "_fallback_cand = generation.candidates[0]" in src, (
-        "validate_runner.py does not assign generation.candidates[0] "
-        "to the fallback — Slice 3H.1 logic broken."
+    assert plan is not None, (
+        "no repair plan derived from generation candidates alone — the "
+        "Slice 3H.1 dead-code trap is open again."
     )
-    assert '"generation_candidates_first"' in src, (
-        "Missing source discriminator 'generation_candidates_first' "
-        "in FSM telemetry — operator grep cannot distinguish paths."
+    assert plan[0] == "lib/ansible/cli/doc.py"
+
+
+def test_best_candidate_precedes_generation_candidates() -> None:
+    """The documented fallback order, asserted as behavior.
+
+    ``best_candidate`` first, then the op's own candidates. The caller hands
+    both to ``_resolve_repair_plan`` in that order; this pins that the first
+    entry actually wins rather than being shadowed by a later one.
+    """
+    best = {"file_path": "from_best.py", "full_content": "x = 1\n"}
+    other = {"file_path": "from_generation.py", "full_content": "y = 2\n"}
+    plan = _resolve_repair_plan(candidates=[best, other], target_files=())
+    assert plan is not None
+    assert plan[0] == "from_best.py", (
+        "generation candidate shadowed best_candidate — documented "
+        "fallback order (best_candidate first) is broken."
     )
 
 
-def test_ast_pin_best_candidate_first_in_chain() -> None:
-    """``best_candidate`` must be checked FIRST in the fallback chain.
-    This preserves the rare passed-validation path that originally
-    motivated Slice 3H Part 1, and matches the operator's documented
-    fallback order: documented source → known source → discovered
-    source."""
-    src = VALIDATE_RUNNER_FILE.read_text()
-    # best_candidate must appear in the same fallback structure
-    # BEFORE the elif generation.candidates branch
-    bc_idx = src.find("if best_candidate is not None:")
-    elif_idx = src.find("elif generation.candidates:")
-    assert bc_idx >= 0, "best_candidate branch missing"
-    assert elif_idx >= 0, "elif generation.candidates branch missing"
-    assert bc_idx < elif_idx, (
-        "best_candidate must be checked BEFORE generation.candidates "
-        "fallback — Slice 3H.1 chain ordering broken."
-    )
+def test_declared_target_outranks_candidate_order() -> None:
+    """An operator-declared target wins when the candidate proposes it.
+
+    Keeps the micro-fix inside the scope the op was sanctioned for, rather
+    than repairing whichever file the model happened to list first.
+    """
+    cand = {"files": [
+        {"file_path": "first.py", "full_content": "x = 1\n"},
+        {"file_path": "declared.py", "full_content": "y = 2\n"},
+    ]}
+    plan = _resolve_repair_plan(candidates=[cand], target_files=("declared.py",))
+    assert plan is not None
+    assert plan[0] == "declared.py"
+
+
+def test_no_plan_without_proposed_content() -> None:
+    """A candidate that proposes no TEXT yields no repair plan.
+
+    Absence of content is a real nothing-to-repair. It is not the same thing
+    as absence of a FILE, which is what the old ``is_file()`` precondition
+    confused it with -- and which skipped every creation goal.
+    """
+    assert _resolve_repair_plan(
+        candidates=[{"file_path": "empty.py"}], target_files=(),
+    ) is None
 
 
 # ──────────────────────────────────────────────────────────────────────
