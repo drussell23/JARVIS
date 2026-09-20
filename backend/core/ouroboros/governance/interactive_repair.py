@@ -317,7 +317,54 @@ class InteractiveRepairLoop:
             if proc.returncode == 0:
                 return None
             output = stdout.decode(errors="replace") + stderr.decode(errors="replace")
-            return self._extract_error(output, file_path)
+
+            # Locating the failure is the traceback engine's job, and it
+            # answers ``None`` when the innermost frame this repo owns
+            # cannot be established. The regex cascade below stays for what
+            # it is genuinely good at -- naming the exception in shapes that
+            # carry no frames at all -- but it no longer decides WHERE,
+            # because it could not tell a real line from a placeholder and
+            # the hard guard only ever rejected line <= 0.
+            from backend.core.ouroboros.governance.pytest_traceback import (  # noqa: PLC0415
+                parse_failure,
+            )
+            parsed = await parse_failure(
+                output,
+                repo_root=self._project_root,
+                preferred_paths=(file_path,),
+            )
+            if parsed is not None:
+                return ExtractedError(
+                    error_type=parsed.error_type,
+                    message=parsed.message,
+                    file_path=parsed.file_path,
+                    line_number=parsed.line_number,
+                    traceback_excerpt="\n".join(
+                        f"{f.file_path}:{f.line_number}"
+                        f"{' in ' + f.function if f.function else ''}"
+                        for f in parsed.frames[-8:]
+                    )[-500:],
+                    full_output=output[-2000:],
+                )
+
+            # Unattributable: keep the real exception name so the refusal
+            # log says WHAT failed, and pin line 0 so the hard guard refuses.
+            # A failure we cannot map to one of our own lines is not a
+            # failure we may patch -- that is how the standard library and
+            # line 1 of an unrelated file became patch targets.
+            legacy = self._extract_error(output, file_path)
+            return ExtractedError(
+                error_type=(
+                    legacy.error_type
+                    if legacy.error_type != "UnknownError"
+                    else "UnattributableFailure"
+                ),
+                message=legacy.message,
+                file_path=legacy.file_path,
+                line_number=0,
+                traceback_excerpt=legacy.traceback_excerpt,
+                full_output=output[-2000:],
+            )
         except asyncio.TimeoutError:
             return ExtractedError(
                 error_type="TimeoutError", message=f"Timed out after {_micro_timeout_s()}s",
@@ -476,7 +523,12 @@ class InteractiveRepairLoop:
                 error_type=s_etype.strip(),
                 message=s_msg.strip(),
                 file_path=s_path,
-                line_number=1,
+                # A short summary states no line, so neither do we. This was
+                # ``1``, which is not a location but a placeholder shaped
+                # like one: the hard guard rejects ``<= 0``, so a fabricated
+                # 1 passed it and the loop patched the top of the file --
+                # the blind-patching corruption the guard exists to prevent.
+                line_number=0,
                 traceback_excerpt=output[-500:],
                 full_output=output[-2000:],
             )

@@ -92,13 +92,51 @@ def test_ast_pin_validate_runner_scopes_pytest_to_fail_to_pass() -> None:
         "validate_runner is missing the _fail_to_pass extraction — "
         "Slice 4B plumbing chain broken at consumer."
     )
-    assert "_test_argv.extend(_fail_to_pass)" in src, (
-        "validate_runner does NOT extend _test_argv with fail_to_pass "
-        "list — pytest still runs unscoped."
-    )
     assert '"micro_fix_pytest_scoped"' in src, (
         "Missing FSM telemetry tag micro_fix_pytest_scoped"
     )
+
+
+def test_fail_to_pass_is_the_authority_when_present() -> None:
+    """The envelope states exactly which tests must flip; nothing else
+    outranks it."""
+    from backend.core.ouroboros.governance.phase_runners.validate_runner import (
+        _micro_fix_scope,
+    )
+    assert _micro_fix_scope(
+        fail_to_pass=["tests/a.py::test_one"],
+        repair_files=[("lib/thing.py", "x = 1\n")],
+    ) == ["tests/a.py::test_one"]
+
+
+def test_run_is_never_unscoped_without_fail_to_pass() -> None:
+    """This is the case the original pin could not express, and it is the
+    case that was actually broken: an ordinary O+V goal carries no
+    fail_to_pass, so pytest collected the whole repository and ``-x``
+    stopped on the first ambient failure -- a file the candidate never
+    touched. The candidate's own files are the surface it answers for.
+    """
+    from backend.core.ouroboros.governance.phase_runners.validate_runner import (
+        _micro_fix_scope,
+    )
+    assert _micro_fix_scope(
+        fail_to_pass=[],
+        repair_files=[("tests/test_new.py", "x = 1\n"), ("pkg/mod.py", "y\n")],
+    ) == ["tests/test_new.py", "pkg/mod.py"]
+
+
+def test_scope_is_empty_only_when_nothing_is_proposed() -> None:
+    from backend.core.ouroboros.governance.phase_runners.validate_runner import (
+        _micro_fix_scope,
+    )
+    assert _micro_fix_scope(fail_to_pass=[], repair_files=[]) == []
+
+
+def test_scope_never_raises_on_junk() -> None:
+    from backend.core.ouroboros.governance.phase_runners.validate_runner import (
+        _micro_fix_scope,
+    )
+    assert _micro_fix_scope(fail_to_pass=None, repair_files=None) == []
 
 
 # ──────────────────────────────────────────────────────────────────────

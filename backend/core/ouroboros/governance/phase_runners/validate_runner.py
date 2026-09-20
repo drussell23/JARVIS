@@ -75,7 +75,9 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import (
+    TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple,
+)
 
 from backend.core.ouroboros.governance.ledger import OperationState
 from backend.core.ouroboros.governance.op_context import (
@@ -358,6 +360,35 @@ def _retry_regen_remaining_s(ctx: Any, orch: Any) -> float:
         return float(orch._config.validation_timeout_s)
     except Exception:  # noqa: BLE001
         return 0.0
+
+
+def _micro_fix_scope(
+    *,
+    fail_to_pass: Sequence[str],
+    repair_files: Sequence[Tuple[str, str]],
+) -> list:
+    """The pytest targets for one micro-fix run.
+
+    An unscoped ``pytest -x`` collects the WHOLE repository and stops at the
+    first failure it meets, which on this repo is a collection error in
+    ``tests/diagnostic/test_gcp_extraction.py`` -- a file the candidate has
+    nothing to do with. The repair loop then reasons about someone else's
+    failure, and every frame it resolves belongs to code the op was never
+    sanctioned to touch.
+
+    The envelope's ``fail_to_pass`` set is the authority when the op carries
+    one (SWE-Bench-Pro states exactly which tests must flip). Otherwise the
+    candidate's own files are precisely the surface it is answerable for.
+    Empty only when the candidate proposes nothing, which is already a
+    nothing-to-repair. NEVER raises.
+    """
+    try:
+        explicit = [str(t) for t in (fail_to_pass or ()) if str(t)]
+        if explicit:
+            return explicit
+        return [str(p) for p, _c in (repair_files or ()) if str(p)]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _micro_fix_budget_s(ctx: Any, orch: Any) -> float:
@@ -1477,13 +1508,39 @@ class VALIDATERunner(PhaseRunner):
                         # the hard guard broke the loop. ``sys.executable`` is
                         # by construction an interpreter that can run this
                         # repo's tests: it is the one running them now.
-                        _test_argv = [sys.executable, "-m", "pytest", "-x", "-q"]
-                        if _fail_to_pass:
-                            _test_argv.extend(_fail_to_pass)
+                        # ``--color=no`` because this repo's pytest.ini sets
+                        # ``--color=yes``, which forces ANSI escapes even into
+                        # a pipe. Every pattern that reads this output is
+                        # line-anchored, and an escape sequence sits in front
+                        # of the anchor -- that is the whole of the
+                        # ``UnknownError line=0`` the micro-fix died on. The
+                        # engine strips escapes defensively too; a conftest
+                        # can re-enable colour and neither layer alone is
+                        # enough.
+                        _test_argv = [
+                            sys.executable, "-m", "pytest", "-x", "-q",
+                            "--color=no",
+                        ]
+                        # Scope the run. Unscoped, pytest collects the WHOLE
+                        # repository and ``-x`` stops at the first ambient
+                        # failure -- observed live as a collection error in
+                        # tests/diagnostic/test_gcp_extraction.py, a file the
+                        # candidate has nothing to do with. The repair then
+                        # reasons about someone else's failure. The
+                        # envelope's fail_to_pass set is the authority when
+                        # the op carries one; otherwise the candidate's own
+                        # files are exactly the surface it is responsible for.
+                        _scope = _micro_fix_scope(
+                            fail_to_pass=_fail_to_pass,
+                            repair_files=_repair_files,
+                        )
+                        if _scope:
+                            _test_argv.extend(_scope)
                             _fsm_log(
                                 "micro_fix_pytest_scoped",
-                                f"n_tests={len(_fail_to_pass)} "
-                                f"first={_fail_to_pass[0]!r}",
+                                f"n_targets={len(_scope)} "
+                                f"source={'fail_to_pass' if _fail_to_pass else 'candidate_files'} "
+                                f"first={_scope[0]!r}",
                             )
                         # Host the repair in a throwaway tree. The loop
                         # materializes what it repairs and writes each fix, and

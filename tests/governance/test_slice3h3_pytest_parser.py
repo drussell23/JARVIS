@@ -196,7 +196,17 @@ FAILED tests/test_doc.py::test_role_mixin - AssertionError: mismatch
     # Either matched as assertion summary or generic PytestFailure
     assert err.error_type in ("AssertionError", "PytestFailure")
     assert err.file_path == "tests/test_doc.py"
-    assert err.line_number > 0  # Must be > 0 to defeat the hard-guard
+    # This asserted ``> 0`` on output that states NO line, with the stated
+    # goal of defeating the hard guard. The cascade satisfied it by
+    # returning 1 -- a placeholder shaped like a location -- and the guard,
+    # which only rejects ``<= 0``, let it through. The loop then patched the
+    # top of a file it had no reading of, which is the corruption the guard
+    # exists to prevent. Attribution without a line is attribution to
+    # nothing: the summary names the FILE, and that is all it names.
+    assert err.line_number == 0, (
+        "a short summary carries no line number; reporting one fabricates a "
+        "patch target and defeats the hard guard by lying to it."
+    )
 
 
 def test_spine_unknown_output_still_yields_unknown_error() -> None:
