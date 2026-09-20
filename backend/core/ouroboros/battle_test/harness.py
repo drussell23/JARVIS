@@ -10079,6 +10079,20 @@ class BattleTestHarness:
 
         return probe_process_tree_rss_mb()
 
+    @staticmethod
+    async def _probe_process_tree_rss_mb_async() -> Optional[float]:
+        """Off-loop sibling of :meth:`_probe_process_tree_rss_mb`.
+
+        The sync staticmethod is preserved byte-stable because two internal
+        callers and the watchdog test monkeypatch surface depend on it; this
+        is additive, and only the async watchdogs use it.
+        """
+        from backend.core.ouroboros.governance.process_tree_probe import (
+            probe_process_tree_rss_mb_async,
+        )
+
+        return await probe_process_tree_rss_mb_async()
+
     async def _checkpoint_oracle_best_effort(self) -> None:
         """Persist the Oracle graph now (composes Arc A symmetry +
         Arc B in-build checkpoint). Never raises — durability is an
@@ -10180,7 +10194,7 @@ class BattleTestHarness:
                 )
                 return
             _tick += 1
-            rss_mb = self._probe_process_tree_rss_mb()
+            rss_mb = await self._probe_process_tree_rss_mb_async()
             if rss_mb is None:
                 continue  # transient probe failure — retry next tick
             if _tick % 12 == 0:
@@ -10238,6 +10252,10 @@ class BattleTestHarness:
 
         def _run() -> None:
             while not stop_event.wait(thread_interval):
+                # Sync on purpose: this body IS an OS thread
+                # (_start_process_memory_hard_deadline_thread), so it is
+                # already off the event loop. Offloading from a thread would
+                # buy nothing and add a hop.
                 rss_mb = self._probe_process_tree_rss_mb()
                 if rss_mb is None or rss_mb < cap_mb:
                     continue

@@ -185,4 +185,43 @@ def probe_process_tree_memory_mb() -> Optional[float]:
 # MemoryPressureGate) and their test monkeypatch seams import this
 # name. It now measures footprint on darwin — strictly MORE signal,
 # same contract (MB or None).
+async def probe_process_tree_memory_mb_async() -> Optional[float]:
+    """The same probe, off the event loop.
+
+    Attributed live by ``StallAttributor`` on 2026-09-19: seven of twelve
+    samples caught the main thread inside ``psutil._pslinux.ppid_map`` ->
+    ``_common.open_binary``, reached from the async
+    ``_monitor_process_memory`` watchdog. ``children(recursive=True)`` reads
+    EVERY process's ``/proc/<pid>/stat`` to build a parent map, then this
+    probe reads ``/proc/<pid>/statm`` per child. One stall measured 2,572ms.
+
+    A memory monitor was the largest single contributor to control-plane
+    starvation -- the instrument, not the work.
+
+    Routed with ``cpu_bound=False``: this is syscall-heavy ``/proc`` I/O and
+    psutil releases the GIL across those reads, so a thread is the correct
+    executor. A process pool would pay fork + IPC to do the same syscalls,
+    and would read a DIFFERENT process tree than the one being measured.
+
+    Returns ``None`` on any failure -- the same contract the sync probe
+    already has for a transient miss, so the watchdog's ``continue`` branch
+    needs no new case. NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            is_offload_error,
+            offload,
+        )
+    except Exception:  # noqa: BLE001 — substrate absent: degrade, never fail
+        return probe_process_tree_memory_mb()
+    try:
+        result = await offload(probe_process_tree_memory_mb, cpu_bound=False)
+    except Exception:  # noqa: BLE001
+        return None
+    if is_offload_error(result):
+        return None
+    return result
+
+
 probe_process_tree_rss_mb = probe_process_tree_memory_mb
+probe_process_tree_rss_mb_async = probe_process_tree_memory_mb_async

@@ -914,7 +914,39 @@ class ModuleContextRouter:
         )
 
         # 5. Semantic ranking via embedder + persisted cache (only on candidates)
-        sem_scores_list: List[float] = self._semantic_scores(query, embed_topics)
+        # Embedding inference off the loop. Attributed live by
+        # StallAttributor 2026-09-19: eight of twelve samples caught the main
+        # thread inside onnxruntime_inference_collection.run, reached from
+        # this exact chain -- async _route_impl -> sync _semantic_scores ->
+        # _embed_texts_cached -> _embed_texts -> ONNX. The whole subtree is
+        # synchronous inside an async method, so CONTEXT_EXPANSION blocked
+        # the control plane for the duration of every embed.
+        #
+        # One offload boundary around the whole sync subtree rather than four
+        # newly-async functions: the cache lookup, the inference and the
+        # cosine scoring are one unit of work, and splitting them would add
+        # three await points that each hand the loop a partially-scored
+        # result it cannot use.
+        #
+        # cpu_bound=False despite the substrate docstring naming "embedding
+        # inference" as a process-pool case: onnxruntime releases the GIL
+        # inside session.run, so a thread already gets the parallelism, while
+        # a process pool would re-load the model in every worker -- paying a
+        # multi-hundred-MB import per call to avoid a lock that is not held.
+        try:
+            from backend.core.ouroboros.governance.cooperative_fs_io import (
+                is_offload_error,
+                offload,
+            )
+            _sem = await offload(
+                self._semantic_scores, query, embed_topics, cpu_bound=False,
+            )
+            sem_scores_list: List[float] = (
+                [] if is_offload_error(_sem) else _sem
+            )
+        except Exception:  # noqa: BLE001 — degrade to the on-loop path rather
+            # than lose routing quality; correctness outranks latency here.
+            sem_scores_list = self._semantic_scores(query, embed_topics)
         sem_map: dict[str, float] = {
             embed_topics[i].source_id: sem_scores_list[i]
             for i in range(len(embed_topics))
