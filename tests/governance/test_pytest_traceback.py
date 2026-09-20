@@ -240,6 +240,68 @@ async def test_unparseable_file_still_yields_its_line(tmp_path):
     assert parsed.error_type == "SyntaxError"
 
 
+# ---------------------------------------------------------------------------
+# AST drift — the line map must never outlive the file
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_line_map_is_re_read_after_the_file_changes(tmp_path):
+    """A micro-fix rewrites the file between iterations and can change its
+    length, so any memoised parse would answer the next traceback from the
+    previous file.
+
+    There is deliberately no cache to flush: verification reads and parses
+    from disk on every call, and the repair loop materialises its text
+    before every test run, so the map is re-derived after each applied fix
+    by construction. This pins that -- the same location must change verdict
+    when the file underneath it changes.
+    """
+    (tmp_path / "tests").mkdir()
+    target = tmp_path / "tests" / "x.py"
+    out = "tests/x.py:3: in test_x\nE   AssertionError: boom\n"
+
+    target.write_text("def test_x():\n    a = 1\n    assert a == 2\n")
+    first = await parse_failure(out, repo_root=tmp_path)
+    assert first is not None and first.line_number == 3
+
+    # A fix shortens the file: line 3 no longer exists.
+    target.write_text("def test_x():\n    pass\n")
+    second = await parse_failure(out, repo_root=tmp_path)
+    assert second is None, (
+        "line 3 resolved against a file that no longer has one — the line "
+        "map outlived the file it described."
+    )
+
+    # And back again: a cache would keep answering None.
+    target.write_text("def test_x():\n    a = 1\n    assert a == 2\n")
+    third = await parse_failure(out, repo_root=tmp_path)
+    assert third is not None and third.line_number == 3
+
+
+@pytest.mark.asyncio
+async def test_engine_holds_no_module_level_state(tmp_path):
+    """Two roots must not contaminate each other.
+
+    Concurrent ops each run in their own sandbox, so any module-level map
+    keyed by path alone would answer one op's question with another's file.
+    """
+    for name in ("a", "b"):
+        root = tmp_path / name
+        (root / "tests").mkdir(parents=True)
+        (root / "tests" / "x.py").write_text(
+            "def test_x():\n    assert 1 == 2\n",
+        )
+    out = "tests/x.py:2: in test_x\nE   AssertionError: boom\n"
+
+    # Shorten only one of them.
+    (tmp_path / "a" / "tests" / "x.py").write_text("pass\n")
+
+    assert await parse_failure(out, repo_root=tmp_path / "a") is None
+    b_result = await parse_failure(out, repo_root=tmp_path / "b")
+    assert b_result is not None and b_result.line_number == 2
+
+
 @pytest.mark.asyncio
 async def test_missing_file_is_dropped(tmp_path):
     out = "tests/gone.py:1: in test_x\nE   AssertionError: x\n"

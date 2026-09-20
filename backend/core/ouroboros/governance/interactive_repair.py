@@ -131,6 +131,7 @@ class InteractiveRepairLoop:
 
     def __init__(
         self, provider: Any, project_root: Path, *, isolated: bool = False,
+        governor: Any = None,
     ) -> None:
         """``isolated`` asserts that *project_root* is a throwaway tree.
 
@@ -143,6 +144,7 @@ class InteractiveRepairLoop:
         self._provider = provider
         self._project_root = project_root
         self._isolated = bool(isolated)
+        self._governor = governor
 
     async def repair(
         self, file_path: str, file_content: str,
@@ -168,6 +170,40 @@ class InteractiveRepairLoop:
                 errors_encountered=[], fixes_applied=[],
                 total_duration_s=0.0,
                 final_output="InteractiveRepair not permitted (unsandboxed and not explicitly enabled)",
+                repaired_content=file_content,
+            )
+
+        # One claim per invocation, against a ceiling that spans them.
+        # ``repair()`` is called once per VALIDATE_RETRY iteration and each
+        # call restarts its own loop counter, so a file could receive a full
+        # iteration budget per ladder rung -- bounded at every level and
+        # unbounded across them.
+        from backend.core.ouroboros.governance.micro_fix_governor import (  # noqa: PLC0415
+            MicroFixExhaustionFault, default_governor,
+        )
+        governor = self._governor or default_governor()
+        admission = await governor.admit(op_id=op_id, file_path=file_path)
+        if not admission.permitted:
+            fault = MicroFixExhaustionFault(
+                "micro-fix quota spent without convergence",
+                op_id=op_id, file_path=file_path,
+                attempts=admission.attempts, limit=admission.limit,
+                reason=admission.reason,
+            )
+            # Logged, not raised: ``fixed=False`` is already the ladder's
+            # "fall through to VALIDATE_RETRY/L2", which is the graceful
+            # hand-back. Raising would make every caller handle a control
+            # flow that the return value already expresses.
+            logger.warning(
+                "[InteractiveRepair] %s (op=%s file=%s %s) — handing back to "
+                "the ladder to cool down",
+                fault, op_id, file_path, admission.render(),
+            )
+            return InteractiveRepairResult(
+                fixed=False, iterations_used=0,
+                errors_encountered=[], fixes_applied=[],
+                total_duration_s=time.monotonic() - t0,
+                final_output=f"MicroFixExhaustionFault: {admission.render()}",
                 repaired_content=file_content,
             )
 
@@ -210,10 +246,43 @@ class InteractiveRepairLoop:
                 break
 
             fixes.append(fix)
+            previous = current
             current = self._apply_fix(current, fix)
             # No write here: _run_and_capture materializes `current` at the
             # top of the next iteration. One write site, so the bytes under
             # test are always the bytes this loop believes it is repairing.
+
+            # Did the fix break a file that parsed? If so every later
+            # traceback describes damage this loop authored, and the rest of
+            # the budget goes on chasing it. Revert to the last text that
+            # parsed so the candidate is handed back no worse than it came.
+            regression = await governor.observe_regression(
+                op_id=op_id, file_path=file_path,
+                before=previous, after=current,
+            )
+            if not regression.permitted:
+                logger.warning(
+                    "[InteractiveRepair] Iter %d introduced a syntax error in "
+                    "%s (op=%s) — reverting to the last text that parsed and "
+                    "handing back (%s)",
+                    iteration, file_path, op_id, regression.render(),
+                )
+                current = previous
+                break
+
+            # Identical text twice is not convergence. Cycle detection is
+            # ForwardProgressDetector's job; the governor keys it per file.
+            progress = await governor.observe(
+                op_id=op_id, file_path=file_path, content=current,
+            )
+            if not progress.permitted:
+                logger.warning(
+                    "[InteractiveRepair] Iter %d re-emitted identical content "
+                    "for %s (op=%s) — not converging, handing back (%s)",
+                    iteration, file_path, op_id, progress.render(),
+                )
+                break
+
             logger.info(
                 "[InteractiveRepair] Iter %d: fixed %s at L%d-%d (op=%s)",
                 iteration, err.error_type, fix.line_range[0], fix.line_range[1], op_id,
