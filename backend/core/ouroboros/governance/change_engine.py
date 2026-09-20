@@ -19,12 +19,10 @@ Key guarantees:
 
 from __future__ import annotations
 
-import ast
 import enum
 import hashlib
 import logging
 import os
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, List, Optional
@@ -972,16 +970,19 @@ class ChangeEngine:
             await self._comm.emit_heartbeat(
                 op_id=op_id, phase="validate", progress_pct=40.0
             )
-            _RUNNABLE_EXTS = {".py", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp"}
-            if Path(request.target_file).suffix in _RUNNABLE_EXTS:
-                valid = await self._validate_in_sandbox(request.proposed_content)
-            else:
-                valid = True  # non-code files skip AST syntax validation
+            # The strategy is chosen by extension downstream, so there is no
+            # allow-list here: a type with no grammar to corrupt (.md/.txt)
+            # routes to the always-valid fallback and passes. The list this
+            # replaced named .c/.cpp/.h and sent them to a Python parser.
+            fracture = await self._precompile_fracture(
+                request.proposed_content, request.target_file
+            )
+            valid = fracture is None
             await self._ledger.append(
                 LedgerEntry(
                     op_id=op_id,
                     state=OperationState.VALIDATING,
-                    data={"syntax_valid": valid},
+                    data={"syntax_valid": valid, "fracture": fracture},
                 )
             )
 
@@ -1267,11 +1268,11 @@ class ChangeEngine:
             verify_passed = True
             if request.verify_fn is not None:
                 verify_passed = await request.verify_fn()
-            elif Path(request.target_file).suffix in {".py", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp"}:
-                # Default: AST parse check on the applied file (code files only)
-                verify_passed = await self._validate_in_sandbox(
-                    target.read_text(encoding="utf-8")
-                )
+            else:
+                # Default: polymorphic structural re-check of the APPLIED file.
+                verify_passed = await self._precompile_fracture(
+                    target.read_text(encoding="utf-8"), request.target_file
+                ) is None
 
             if not verify_passed:
                 # Automatic rollback — with failure handler for rollback itself
@@ -1479,16 +1480,25 @@ class ChangeEngine:
                 error=str(exc),
             )
 
-    async def _validate_in_sandbox(self, code: str) -> bool:
-        """Validate code by AST-parsing in a temporary directory."""
-        try:
-            with tempfile.TemporaryDirectory(
-                prefix="ouroboros_validate_"
-            ) as sandbox_dir:
-                sandbox_path = Path(sandbox_dir) / "validate.py"
-                sandbox_path.write_text(code, encoding="utf-8")
-                source = sandbox_path.read_text(encoding="utf-8")
-                ast.parse(source, filename=str(sandbox_path))
-            return True
-        except SyntaxError:
-            return False
+    async def _precompile_fracture(
+        self, code: str, file_path: str
+    ) -> Optional[str]:
+        """In-memory polymorphic structural gate → ``None`` when *code* is
+        sound for its OWN file type, else the fracture detail.
+
+        This was a tempfile round-trip: mkdtemp → write → read back →
+        ``ast.parse``, three synchronous filesystem operations, inside an
+        ``async def``, to parse a string that was already in memory. It also
+        parsed every candidate as Python while its caller routed ``.c`` /
+        ``.cpp`` / ``.h`` here, so C-family changes could never pass.
+
+        DRY: ``precompile_detail`` dispatches on the extension via
+        ``ChunkerFactory`` and never raises — a parser fault surfaces as a
+        detail, not an exception. Pure CPU on a string already resident, so it
+        stays on the loop: the code it replaces did strictly more work there,
+        plus disk.
+        """
+        from backend.core.ouroboros.governance.stitch_precompiler import (  # noqa: PLC0415
+            precompile_detail,
+        )
+        return precompile_detail(code, file_path)

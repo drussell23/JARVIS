@@ -18,9 +18,7 @@ Key guarantees:
 
 from __future__ import annotations
 
-import ast
 import logging
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -158,7 +156,7 @@ class MultiFileChangeEngine:
                 op_id=op_id, phase="validate", progress_pct=30.0
             )
             for fpath, content in request.files.items():
-                if not self._validate_syntax(content):
+                if not self._precompile_ok(content, str(fpath)):
                     await self._ledger.append(
                         LedgerEntry(
                             op_id=op_id,
@@ -310,10 +308,10 @@ class MultiFileChangeEngine:
             if request.verify_fn is not None:
                 verify_passed = await request.verify_fn()
             else:
-                # Default: AST parse all applied files
+                # Default: polymorphic structural re-check of applied files
                 for fpath in file_paths:
-                    if not self._validate_syntax(
-                        fpath.read_text(encoding="utf-8")
+                    if not self._precompile_ok(
+                        fpath.read_text(encoding="utf-8"), str(fpath)
                     ):
                         verify_passed = False
                         break
@@ -384,15 +382,20 @@ class MultiFileChangeEngine:
                 error=str(exc),
             )
 
-    def _validate_syntax(self, code: str) -> bool:
-        """Validate Python syntax by AST-parsing in a temp directory."""
-        try:
-            with tempfile.TemporaryDirectory(
-                prefix="ouroboros_mf_validate_"
-            ) as sandbox:
-                p = Path(sandbox) / "validate.py"
-                p.write_text(code, encoding="utf-8")
-                ast.parse(p.read_text(encoding="utf-8"), filename=str(p))
-            return True
-        except SyntaxError:
-            return False
+    def _precompile_ok(self, code: str, file_path: str) -> bool:
+        """In-memory polymorphic structural gate — ``True`` when *code* is
+        sound for its OWN file type.
+
+        This was a tempfile round-trip (mkdtemp → write → read back →
+        ``ast.parse``) that parsed EVERY member of a multi-file change as
+        Python with no extension guard whatsoever, so a ``.json`` / ``.yaml``
+        / ``.tsx`` file was failed on a grammar it does not have — and one
+        such member failed the whole atomic set.
+
+        DRY: ``precompile_detail`` dispatches on the extension via
+        ``ChunkerFactory`` and never raises.
+        """
+        from backend.core.ouroboros.governance.stitch_precompiler import (  # noqa: PLC0415
+            precompile_detail,
+        )
+        return precompile_detail(code, file_path) is None

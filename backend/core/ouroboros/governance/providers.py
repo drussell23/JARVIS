@@ -4464,7 +4464,9 @@ def _build_codegen_prompt(
                     1, get_default_ledger().estimate_tokens("x" * max(1, char_budget)),
                 )
                 budget_tokens = max(_legacy, dependency_budget_tokens())
-                pruned, used = fit_dependencies(pairs, budget_tokens=budget_tokens)
+                pruned, used = fit_dependencies(
+                    pairs, budget_tokens=budget_tokens, label=label,
+                )
                 for module in pruned:
                     context_parts.append(
                         f"### {label}: {module.path} [{module.detail.value}]\n"

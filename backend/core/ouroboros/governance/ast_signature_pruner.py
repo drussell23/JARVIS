@@ -67,6 +67,12 @@ class Detail(str, Enum):
     NAMES = "names"
 
 
+# Worst-last. The whole set walks DOWN this ladder together; the Fidelity
+# Watchdog grades a rung by its position here, so inserting a rung changes the
+# grading automatically instead of silently bypassing it.
+LADDER: Tuple[Detail, ...] = (Detail.FULL, Detail.SIGNATURES, Detail.NAMES)
+
+
 @dataclass(frozen=True)
 class PrunedModule:
     """One module reduced to the surface a caller can rely on."""
@@ -289,6 +295,7 @@ def fit_dependencies(
     *,
     budget_tokens: Optional[int] = None,
     model_id: str = "",
+    label: str = "dependencies",
 ) -> Tuple[List[PrunedModule], int]:
     """Reduce ``(path, source)`` pairs until they fit the budget.
 
@@ -307,7 +314,7 @@ def fit_dependencies(
     if not pairs:
         return [], 0
 
-    for detail in (Detail.FULL, Detail.SIGNATURES, Detail.NAMES):
+    for detail in LADDER:
         rendered: List[PrunedModule] = []
         for path, source in pairs:
             if detail is Detail.FULL:
@@ -326,6 +333,7 @@ def fit_dependencies(
                 "[SignaturePruner] %d module(s) at %s — %d/%d tokens",
                 len(rendered), detail.value, total, budget,
             )
+            _observe_fidelity(label, detail, len(rendered), total, budget)
             return rendered, total
 
     logger.warning(
@@ -334,10 +342,29 @@ def fit_dependencies(
         "invent it",
         len(pairs), budget,
     )
+    _observe_fidelity(label, LADDER[-1], len(rendered), total, budget)
     return rendered, total
 
 
+def _observe_fidelity(
+    label: str, detail: Detail, modules: int, used: int, budget: int,
+) -> None:
+    """Hand the settled rung to the Fidelity Watchdog. Imported lazily and
+    guarded: an observability fault must never cost a generation."""
+    try:
+        from backend.core.ouroboros.governance.context_fidelity import (  # noqa: PLC0415
+            observe,
+        )
+        observe(
+            label, detail.value, tuple(d.value for d in LADDER),
+            modules, used, budget,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[SignaturePruner] fidelity observation failed", exc_info=True)
+
+
 __all__ = [
+    "LADDER",
     "Detail",
     "PrunedModule",
     "dependency_budget_tokens",

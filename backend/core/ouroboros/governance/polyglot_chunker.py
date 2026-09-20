@@ -20,6 +20,11 @@ Strategy Pattern:
   * ``YAMLTreeChunker`` — an indentation-structured key-path line locator;
     validates with ``yaml.safe_load`` (or a brace/indent sanity check if PyYAML
     is absent).
+  * ``CFamilyChunker`` — ``.c`` / ``.cpp`` / ``.h``: line-anchored extraction plus
+    a delimiter-balance gate that skips string and comment spans. There is no C
+    front-end in-process, so balance is the most that can be honestly asserted;
+    what stood in its place before was ``ast.parse``, which rejects every valid
+    C file that exists.
   * ``RegexIndentationChunker`` — the universal fallback for ``.txt`` / ``.md`` /
     unknown: a strict line-based block; validates as always-well-formed (text has
     no grammar to corrupt).
@@ -543,19 +548,16 @@ class TSXChunker(BaseChunker):
         )
 
     def validate(self, text: str) -> bool:
-        # No in-process TS parser — validate balanced braces/parens/brackets
-        # (the structural corruption class the stitch could introduce). Strings/
-        # comments are not fully tokenized; this is a structural sanity gate.
-        depth = {"{": 0, "(": 0, "[": 0}
-        pairs = {"}": "{", ")": "(", "]": "["}
-        for c in text:
-            if c in depth:
-                depth[c] += 1
-            elif c in pairs:
-                depth[pairs[c]] -= 1
-                if depth[pairs[c]] < 0:
-                    return False
-        return all(v == 0 for v in depth.values())
+        return self.validate_detail(text) is None
+
+    def validate_detail(self, text: str) -> Optional[str]:
+        # No in-process TS parser — the honest gate is delimiter balance, the
+        # structural corruption class a graft actually introduces. Shared with
+        # the C family via ``delimiter_fracture_detail``, which skips string
+        # and comment spans: a brace inside a JSX string or a ``//`` comment no
+        # longer reads as a fracture, and the caller gets the offending LINE
+        # instead of a bare False.
+        return delimiter_fracture_detail(text, quotes=_QUOTES_TS)
 
 
 def build_context_bundled_target(chunk: Chunk, *, instruction: str = ""):
@@ -612,6 +614,118 @@ class RegexIndentationChunker(BaseChunker):
 
 
 # ---------------------------------------------------------------------------
+# C family — one shared delimiter scanner (no in-process C front-end)
+# ---------------------------------------------------------------------------
+
+
+_DELIM_CLOSERS = {"}": "{", ")": "(", "]": "["}
+_DELIM_OPENERS = frozenset(_DELIM_CLOSERS.values())
+
+# A stray backtick in C is not a template literal, so the C family does not
+# treat it as a string opener; TS/JSX does.
+_QUOTES_C = "\"'"
+_QUOTES_TS = "\"'`"
+
+
+def delimiter_fracture_detail(
+    text: str,
+    *,
+    line_comment: str = "//",
+    block_comment: Tuple[str, str] = ("/*", "*/"),
+    quotes: str = _QUOTES_C,
+) -> Optional[str]:
+    """Delimiter balance for a C-family grammar → ``None`` if sound, else the
+    fracture detail naming the offending LINE.
+
+    A STRUCTURAL gate, not a parser: it asserts only that braces, parens and
+    brackets pair up outside of string and comment spans. That is precisely the
+    corruption class a bad graft introduces, and it is the most that can be
+    honestly claimed about C/C++ without a C front-end in-process. Deliberately
+    weaker than ``ast.parse`` — and unboundedly stronger than running C through
+    ``ast.parse``, which rejects every valid C file ever written.
+
+    Never raises: a scan fault is the caller's *detail*, not an exception.
+    """
+    stack: List[Tuple[str, int]] = []
+    i, line, n = 0, 1, len(text)
+    bopen, bclose = block_comment
+    while i < n:
+        c = text[i]
+        if c == "\n":
+            line += 1
+            i += 1
+        elif line_comment and text.startswith(line_comment, i):
+            nl = text.find("\n", i)
+            i = n if nl < 0 else nl
+        elif bopen and text.startswith(bopen, i):
+            end = text.find(bclose, i + len(bopen))
+            if end < 0:
+                return f"unterminated block comment opened at line {line}"
+            line += text.count("\n", i, end)
+            i = end + len(bclose)
+        elif c in quotes:
+            opened_at, i = line, i + 1
+            while i < n:
+                d = text[i]
+                if d == "\\":
+                    i += 2
+                    continue
+                if d == c:
+                    break
+                if d == "\n":
+                    line += 1
+                    # Only a template literal may legally span lines.
+                    if c != "`":
+                        return (
+                            "unterminated string literal opened at line "
+                            f"{opened_at}"
+                        )
+                i += 1
+            else:
+                return f"unterminated string literal opened at line {opened_at}"
+            i += 1
+        elif c in _DELIM_OPENERS:
+            stack.append((c, line))
+            i += 1
+        elif c in _DELIM_CLOSERS:
+            if not stack or stack[-1][0] != _DELIM_CLOSERS[c]:
+                return f"unbalanced '{c}' at line {line}"
+            stack.pop()
+            i += 1
+        else:
+            i += 1
+    if stack:
+        ch, ln = stack[-1]
+        return f"unclosed '{ch}' opened at line {ln}"
+    return None
+
+
+class CFamilyChunker(RegexIndentationChunker):
+    """C/C++ — line-anchored extraction (INHERITED from the text strategy; the
+    stitcher is already language-agnostic) plus delimiter-balance validation.
+
+    Before this existed, ``.c`` / ``.cpp`` / ``.h`` fell through to the Python
+    AST gate, so no C-family change could pass VALIDATE, and any that reached
+    disk was rolled back by post-apply VERIFY.
+    """
+
+    extensions = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx")
+    language = "c"
+
+    def extract(self, source: str, file_path: str, target: str) -> Optional[Chunk]:
+        chunk = super().extract(source, file_path, target)
+        if chunk is not None:
+            chunk.language = self.language
+        return chunk
+
+    def validate(self, text: str) -> bool:
+        return self.validate_detail(text) is None
+
+    def validate_detail(self, text: str) -> Optional[str]:
+        return delimiter_fracture_detail(text, quotes=_QUOTES_C)
+
+
+# ---------------------------------------------------------------------------
 # Factory — dynamic dispatch by extension
 # ---------------------------------------------------------------------------
 
@@ -619,6 +733,7 @@ class RegexIndentationChunker(BaseChunker):
 class ChunkerFactory:
     _STRATEGIES: Tuple[BaseChunker, ...] = (
         PythonASTChunker(), JSONTreeChunker(), YAMLTreeChunker(), TSXChunker(),
+        CFamilyChunker(),
     )
     _FALLBACK = RegexIndentationChunker()
 
