@@ -561,6 +561,10 @@ class TargetImportVerdict:
     #: Subjects whose import EXECUTES A PROGRAM (``path: why``). No install and
     #: no host reverses this either -- only refactoring the subject does.
     executes: Tuple[str, ...] = ()
+    #: First-party modules a subject imports UNCONDITIONALLY that do not exist
+    #: (``subject -> module``). The subject cannot be imported by anyone until
+    #: it is repaired, so no test of it can pass.
+    broken: Tuple[str, ...] = ()
 
     @property
     def impossible(self) -> bool:
@@ -574,12 +578,14 @@ class TargetImportVerdict:
         driven from a Mac. Deleting it would delete Mac functionality; leaving
         it dispatchable burns an op per pass forever.
         """
-        return bool(self.structural or self.executes)
+        return bool(self.structural or self.executes or self.broken)
 
     @property
     def reason(self) -> str:
         if self.importable:
             return ""
+        if self.broken:
+            return f"{FIRST_PARTY_IMPORT_MISSING}: {'; '.join(self.broken)}"
         if self.executes:
             return f"{IMPORT_EXECUTES_PROGRAM}: {'; '.join(self.executes)}"
         if self.structural:
@@ -639,6 +645,143 @@ def _import_scope(body: Sequence[ast.stmt]) -> Iterator[ast.stmt]:
                 yield from _import_scope(handler.body)
             yield from _import_scope(node.orelse)
             yield from _import_scope(node.finalbody)
+
+
+# ---------------------------------------------------------------------------
+# The subject imports a first-party module that does not exist
+# ---------------------------------------------------------------------------
+
+#: The subject's own import statement names a module of THIS repository that
+#: is not there. Not unprovisioned (nothing to install) and not platform-bound:
+#: the subject is simply broken, and stays unimportable until it is repaired.
+FIRST_PARTY_IMPORT_MISSING = "first_party_import_missing"
+
+#: A package whose ``__init__`` shapes its own namespace cannot be judged from
+#: the filesystem, so nothing beneath it is ever accused.
+_DYNAMIC_PACKAGE_MARKERS = ("__path__", "sys.modules", "def __getattr__")
+
+#: ``(path, mtime_ns, size) -> ((module, level), ...)`` -- the PARSE only. See
+#: ``missing_first_party_imports`` for why the answer itself is never cached.
+_mandatory_import_cache: Dict[Tuple[str, int, int], Tuple[Tuple[str, int], ...]] = {}
+
+
+def _mandatory_imports(body: Sequence[ast.stmt]) -> Iterator[ast.stmt]:
+    """Import statements that MUST succeed for the module to import at all.
+
+    Excluded, because their failure is survivable or never happens at import:
+    anything inside a ``try`` (the optional-dependency idiom), under any ``if``
+    (``TYPE_CHECKING``, ``__main__``, feature probes), or inside a def/class.
+    """
+    for node in body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            yield node
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            yield from _mandatory_imports(node.body)
+
+
+def _dotted_module_exists(base: Path, parts: Sequence[str]) -> bool:
+    """Whether dotted *parts* names a module or package under *base*.
+
+    Errs toward True everywhere it cannot be sure: a dynamic package, an
+    unreadable ``__init__``, a namespace directory, a compiled extension, or a
+    path that continues past a plain ``.py`` file (attribute access, which the
+    filesystem cannot speak to).
+    """
+    cur = Path(base)
+    for index, part in enumerate(parts):
+        last = index == len(parts) - 1
+        pkg = cur / part
+        if pkg.is_dir():
+            init = pkg / "__init__.py"
+            if init.is_file():
+                try:
+                    head = init.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    return True
+                if any(marker in head for marker in _DYNAMIC_PACKAGE_MARKERS):
+                    return True
+            cur = pkg
+            continue
+        if (cur / f"{part}.py").is_file():
+            return True
+        if last and (any(cur.glob(f"{part}.*.so")) or any(cur.glob(f"{part}.pyd"))):
+            return True
+        return False
+    return True
+
+
+def missing_first_party_imports(path: Path, repo_root: Path) -> Tuple[str, ...]:
+    """First-party modules *path* imports unconditionally that do not exist.
+
+    ## The leak this closes
+
+    ``_third_party_tops`` stops at the TOP of a dotted import: once ``vision``
+    is found under a pythonpath root the import is filed as first-party and
+    never looked at again. ``backend/jarvis_integrated_assistant.py`` opens
+    with ``from vision.proactive_vision_assistant import ...`` -- ``vision`` is
+    a real package, ``proactive_vision_assistant`` is not in it. The Sentinel
+    chose that subject, the 30B wrote three different test files for it over
+    three rounds, and all nine attempts failed identically:
+
+        ModuleNotFoundError: No module named 'vision.proactive_vision_assistant'
+
+    Sixteen minutes of a soak hour on a goal no candidate could pass. Measured
+    on this repository: 27 of 3,767 modules (0.7%); on the absolute ones,
+    ``importlib.util.find_spec`` agreed 9 of 9 with no dissent.
+
+    ## What is cached, and what must not be
+
+    The PARSE is cached -- which modules the subject imports is a function of
+    the subject's bytes. The ANSWER is not: whether those modules exist is a
+    function of the rest of the tree. The first draft cached the answer on the
+    importer's mtime, and its own test caught it: repair the import by CREATING
+    ``vision/soon.py`` and the subject is never touched, so a long-lived daemon
+    would have held the quarantine forever -- a gate that cannot notice it has
+    been satisfied. Existence is a handful of ``stat`` calls; it is re-asked
+    every time. (Size rides in the key because Linux stamps mtime from a coarse
+    clock, and two writes a few milliseconds apart can share one.)
+
+    NEVER raises; a file that cannot be read or parsed accuses nobody.
+    """
+    try:
+        path = Path(path)
+        stat = path.stat()
+        key = (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+        imports = _mandatory_import_cache.get(key)
+        if imports is None:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+            collected: List[Tuple[str, int]] = []
+            for node in _mandatory_imports(tree.body):
+                if isinstance(node, ast.Import):
+                    collected.extend((alias.name, 0) for alias in node.names)
+                else:
+                    collected.append((node.module or "", int(node.level or 0)))
+            imports = tuple(collected)
+            if len(_mandatory_import_cache) > 4096:
+                _mandatory_import_cache.clear()
+            _mandatory_import_cache[key] = imports
+        roots = _pythonpath_roots(Path(repo_root))
+        found: List[str] = []
+        for module, level in imports:
+            parts = [p for p in module.split(".") if p]
+            if level:
+                base = path.parent
+                for _ in range(level - 1):
+                    base = base.parent
+                if parts and not _dotted_module_exists(base, parts):
+                    found.append("." * level + module)
+                continue
+            if len(parts) < 2:
+                continue  # a bare top-level name belongs to the check above
+            homes = [
+                r for r in roots
+                if (r / parts[0]).is_dir() or (r / f"{parts[0]}.py").is_file()
+            ]
+            if homes and not any(_dotted_module_exists(r, parts) for r in homes):
+                found.append(module)
+        return tuple(dict.fromkeys(found))
+    except Exception:  # noqa: BLE001 -- includes SyntaxError / RecursionError
+        return ()
 
 
 def import_execution_hazard(path: Path, repo_root: Path) -> str:
@@ -748,6 +891,7 @@ def target_import_verdict(
         bad: List[str] = []
         inspected: List[str] = []
         executes: List[str] = []
+        broken: List[str] = []
         for _label, src in sources:
             try:
                 shown = str(Path(src).relative_to(root))
@@ -760,12 +904,14 @@ def target_import_verdict(
             hazard = import_execution_hazard(Path(src), root)
             if hazard:
                 executes.append(f"{shown} {hazard}")
-        if not bad and not executes:
+            for module in missing_first_party_imports(Path(src), root):
+                broken.append(f"{shown} -> {module}")
+        if not bad and not executes and not broken:
             return _IMPORTABLE_OK
         return TargetImportVerdict(
             False, tuple(bad), tuple(inspected),
             structurally_unavailable(bad, root) if bad else (),
-            tuple(executes),
+            tuple(executes), tuple(broken),
         )
     except Exception:  # noqa: BLE001
         logger.debug("[EnvIntegrity] target verdict degraded", exc_info=True)
