@@ -500,7 +500,93 @@ def _subject_of_op(target_files: Sequence[str], description: str, repo_root: Pat
 async def exemplar_instruction(
     target_files: Sequence[str], description: str, repo_root: Path, *, op_id: str = "",
 ) -> str:
-    """The instruction block to append before GENERATE, or ``""``. NEVER raises.
+    """Everything this module adds before GENERATE, or ``""``. NEVER raises.
+
+    Two parts, each independently optional: a verified-passing reference test
+    (:func:`_exemplar_block`), and — for every third-party package the subject
+    uses that the reference does NOT cover — that package's contract as read
+    from the installed source (:func:`_contract_block`). The second part
+    retires itself per package: the day a passing FastAPI test lands here and
+    becomes the exemplar, ``fastapi`` is covered and its contract is no longer
+    injected.
+    """
+    try:
+        if not injection_enabled():
+            return ""
+        covered: set = set()
+        exemplar = await _exemplar_block(
+            target_files, description, repo_root, op_id=op_id, covered=covered,
+        )
+        contract = await _contract_block(
+            target_files, description, repo_root, frozenset(covered), op_id=op_id,
+        )
+        return exemplar + contract
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        logger.debug("[TestExemplar] instruction degraded", exc_info=True)
+        return ""
+
+
+async def _contract_block(
+    target_files: Sequence[str], description: str, repo_root: Path,
+    covered: FrozenSet[str], *, op_id: str = "",
+) -> str:
+    """Installed-library contracts for the subject's UNCOVERED third-party
+    imports, rarest first. ``""`` when there are none. NEVER raises."""
+    try:
+        root = Path(repo_root)
+        subject = _subject_of_op(target_files, description, root)
+        if subject is None:
+            return ""
+        from backend.core.ouroboros.governance import library_contract as lc  # noqa: PLC0415
+        from backend.core.ouroboros.governance.ast_signature_pruner import (  # noqa: PLC0415
+            dependency_budget_tokens,
+        )
+        wanted = [t for t in traits_of(subject) if not t.startswith("flag:") and t not in covered]
+        if not wanted:
+            return ""
+        catalog = await asyncio.to_thread(catalog_for, root)
+        tops = await asyncio.to_thread(
+            lambda: sorted(
+                (t for t in wanted if lc.third_party_root(t) is not None),
+                key=lambda t: (-catalog.weight(t), t),
+            )
+        )
+        if not tops:
+            return ""
+        source = subject.read_text(encoding="utf-8", errors="replace")
+        # Its own budget, like each dependency section the prompt assembler
+        # builds: a different KIND of context, not a share of the exemplar's.
+        body = await asyncio.to_thread(lc.contract_for, source, tops, dependency_budget_tokens())
+        if not body:
+            return ""
+        logger.info(
+            "[TestExemplar] op=%s injected LIBRARY CONTRACT for %s (no verified exemplar covers %s) — %d chars",
+            op_id, subject.name, ", ".join(tops), len(body),
+        )
+        return (
+            "\n\n## Library contract — read from the INSTALLED packages, not from memory\n"
+            f"Extracted from site-packages for the versions installed here ({', '.join(tops)}). "
+            "No passing test in this repository exercises these yet, so this is the "
+            "authoritative API surface: construct and inspect these objects ONLY through "
+            "what is listed. Note the `instance attributes` lines — they name what an "
+            "object exposes that no signature shows (a response's payload is its `body`, "
+            "as bytes; it is not iterable and is not a dict).\n"
+            f"```python\n{body}\n```\n"
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        logger.debug("[TestExemplar] contract degraded", exc_info=True)
+        return ""
+
+
+async def _exemplar_block(
+    target_files: Sequence[str], description: str, repo_root: Path, *,
+    op_id: str = "", covered: Optional[set] = None,
+) -> str:
+    """The verified reference-test block, or ``""``. NEVER raises.
 
     ``""`` is the answer whenever this cannot help: the op is not writing a new
     test, nothing relevant exists, nothing relevant PASSES, or the excerpt does
@@ -544,6 +630,10 @@ async def exemplar_instruction(
         )
         if not body:
             return ""
+        # Only NOW: an exemplar that was found but did not fit covers nothing,
+        # and must not suppress the library contract that would stand in for it.
+        if covered is not None:
+            covered.update(cand.subject_traits)
         shared = sorted(
             (t for t in wanted & cand.subject_traits),
             key=lambda t: -catalog.weight(t),
