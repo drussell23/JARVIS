@@ -6064,7 +6064,7 @@ class GovernedOrchestrator:
             _episodic_memory = None
             try:
                 from backend.core.ouroboros.governance.episodic_memory import EpisodicFailureMemory
-                _episodic_memory = EpisodicFailureMemory(ctx.op_id)
+                _episodic_memory = EpisodicFailureMemory.for_op(ctx, self._config.project_root)
             except ImportError:
                 pass
 

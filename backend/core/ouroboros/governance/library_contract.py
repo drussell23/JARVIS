@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import re
 import logging
 import sysconfig
 from pathlib import Path
@@ -298,6 +299,146 @@ def render_class(node: ast.ClassDef, tree: ast.Module, dotted: str) -> str:
     return "\n".join(lines)
 
 
+def render_index(node: ast.ClassDef, dotted: str, tree: Optional[ast.Module] = None) -> str:
+    """A class the subject never touches directly — a testing entry point,
+    say — as an INDEX: what it is, how it is built, what it exposes. Its
+    method SIGNATURES are not shown; the model needs to know `client.get(url)`
+    exists, not the eleven httpx parameter types behind it. On the live probe
+    the full TestClient rendering alone was 1,400 tokens of parameter types."""
+    bases = ", ".join(_annotation(b) for b in node.bases)
+    head = f"class {node.name}({bases}):   # {dotted}" if bases else f"class {node.name}:   # {dotted}"
+    lines = [head]
+    doc = _first_paragraph(node)
+    if doc:
+        lines.append(f'    """{doc}"""')
+    # Construction may be inherited (JSONResponse has no __init__ of its
+    # own); climb one same-module base for it, as the full render does.
+    chain: List[ast.ClassDef] = [node]
+    if tree is not None:
+        local = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+        for base in node.bases:
+            name = getattr(base, "id", None)
+            if name in local and local[name] is not node:
+                chain.append(local[name])
+    methods: List[str] = []
+    attrs: List[str] = []
+    init_line = ""
+    for cls in chain:
+        for item in cls.body:
+            if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if item.name == "__init__":
+                # The SIGNATURE is the nearest __init__; the ATTRIBUTES are
+                # gathered up the chain -- starlette's JSONResponse.__init__
+                # sets nothing itself and delegates to Response.__init__,
+                # which is where `body` lives.
+                if not init_line:
+                    origin = "" if cls is node else f"   # inherited from {cls.name}"
+                    init_line = f"    {signature(item)}: ...{origin}"
+                for attr in _instance_attributes(item):
+                    if attr not in attrs:
+                        attrs.append(attr)
+            elif not item.name.startswith("_") and item.name + "()" not in methods:
+                methods.append(item.name + "()")
+    if init_line:
+        lines.append(init_line)
+    if attrs:
+        lines.append(f"    # instance attributes set by __init__: {', '.join(attrs)}")
+    if methods:
+        lines.append(f"    # methods: {', '.join(methods)}")
+    return "\n".join(lines)
+
+
+def produced_types(subject_source: str) -> List[str]:
+    """Names the subject RETURNS or RAISES as constructed objects — what a
+    test of it will receive and must inspect. `return JSONResponse(...)`,
+    `raise HTTPException(...)`, `return await X(...)`. These come first: they
+    are the objects the failing assertions were written against."""
+    out: List[str] = []
+    try:
+        tree = ast.parse(subject_source)
+    except Exception:  # noqa: BLE001
+        return out
+    for node in ast.walk(tree):
+        value = None
+        if isinstance(node, (ast.Return, ast.Raise)):
+            value = getattr(node, "value", None) or getattr(node, "exc", None)
+        if isinstance(value, ast.Await):
+            value = value.value
+        if isinstance(value, ast.Call):
+            fn = value.func
+            name = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else ""
+            if name and name not in out:
+                out.append(name)
+    return out
+
+
+_TYPE_IN_MESSAGE = re.compile(r"'([A-Za-z_][A-Za-z0-9_]*)'|\b([A-Z][A-Za-z0-9_]*)\(\)")
+
+
+def type_names_in_error(text: str) -> List[str]:
+    """Candidate type names an exception message quotes. No error taxonomy:
+    every quoted identifier is a candidate, and the caller keeps only those
+    that resolve to an installed library type — which is what makes the
+    extraction safe without a list of error shapes."""
+    found: List[str] = []
+    for a, b in _TYPE_IN_MESSAGE.findall(text or ""):
+        name = a or b
+        if name and name not in found and not name.islower():
+            found.append(name)
+    return found
+
+
+def _import_origins(sources: Sequence[str]) -> Dict[str, str]:
+    """``name -> dotted module`` for every third-party ``from M import name``
+    across *sources*, plus ``M`` for every ``import M``."""
+    origins: Dict[str, str] = {}
+    for source in sources:
+        try:
+            tree = ast.parse(source)
+        except Exception:  # noqa: BLE001
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                if third_party_root(node.module.split(".")[0]) is None:
+                    continue
+                for alias in node.names:
+                    if alias.name != "*":
+                        origins.setdefault(alias.asname or alias.name, node.module + "\0" + alias.name)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if third_party_root(alias.name.split(".")[0]) is not None:
+                        origins.setdefault(alias.asname or alias.name, alias.name)
+    return origins
+
+
+def contract_for_type(name: str, sources: Sequence[str]) -> str:
+    """The full contract of ONE library type, located through what *sources*
+    import. ``""`` when *name* is not a library type those sources know."""
+    try:
+        origins = _import_origins(sources)
+        target = origins.get(name)
+        found = None
+        if target and "\0" in target:
+            module, imported = target.split("\0", 1)
+            found = resolve_name(module, imported)
+        else:
+            # Attribute form: `fastapi.responses.JSONResponse` with `import fastapi`.
+            for alias, module in origins.items():
+                if "\0" in module:
+                    continue
+                found = resolve_name(module, name)
+                if found is not None:
+                    break
+        if found is None:
+            return ""
+        origin, node, tree = found
+        return render(node, tree, origin)
+    except Exception:  # noqa: BLE001
+        logger.debug("[LibraryContract] type contract degraded", exc_info=True)
+        return ""
+
+
 def render(node: ast.AST, tree: ast.Module, dotted: str) -> str:
     if isinstance(node, ast.ClassDef):
         return render_class(node, tree, dotted)
@@ -376,20 +517,28 @@ def contract_for(
             from backend.core.ouroboros.governance.ast_signature_pruner import (  # noqa: PLC0415
                 _estimate as estimate,
             )
-        wanted: List[Tuple[str, str]] = []
+        produced = set(produced_types(subject_source))
+        imported: List[Tuple[str, str]] = []
         for top in tops:
             if third_party_root(top) is None:
                 continue
-            wanted.extend(imported_names(subject_source, top))          # priority 1
+            imported.extend(imported_names(subject_source, top))
+        # 1. what the subject RETURNS or RAISES -- the objects a test receives;
+        # 2. everything else it imports from the package;
+        # 3. the package's testing entry points, as an index.
+        wanted: List[Tuple[str, str, bool]] = (
+            [(m, n, True) for m, n in imported if n in produced]
+            + [(m, n, False) for m, n in imported if n not in produced]
+        )
         for top in tops:
             if third_party_root(top) is None:
                 continue
-            for module in testing_modules(top):                         # priority 2
-                wanted.extend((module, name) for name in _public_names(module))
+            for module in testing_modules(top):
+                wanted.extend((module, name, False) for name in _public_names(module))
         blocks: List[str] = []
         shown: Set[Tuple[str, str]] = set()
         used = 0
-        for module, name in wanted:
+        for module, name, referenced in wanted:
             found = resolve_name(module, name)
             if found is None:
                 continue
@@ -397,7 +546,13 @@ def contract_for(
             if (origin, name) in shown:
                 continue
             via = "" if origin == module else f"   (imported as {module}.{name})"
-            block = render(node, tree, origin) + via
+            # FULL contract only for what the subject PRODUCES -- the objects a
+            # test receives and inspects. A class the subject merely uses
+            # (a router it registers handlers on, a base model it subclasses)
+            # gets the index: enough to construct it, not the forty-parameter
+            # constructor a test will never call. Functions are short; full.
+            full = (name in produced) or not isinstance(node, ast.ClassDef)
+            block = (render(node, tree, origin) if full else render_index(node, origin, tree)) + via
             cost = estimate(block)
             if used + cost > budget_tokens:
                 continue
@@ -412,6 +567,10 @@ def contract_for(
 
 __all__ = [
     "contract_for",
+    "contract_for_type",
+    "produced_types",
+    "render_index",
+    "type_names_in_error",
     "imported_names",
     "module_file",
     "render",

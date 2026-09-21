@@ -1045,6 +1045,7 @@ class VALIDATERunner(PhaseRunner):
                                 error_summary=critique_report.summary,
                                 specific_errors=[c.what_failed for c in critique_report.critiques],
                                 line_numbers=[c.line_number for c in critique_report.critiques if c.line_number],
+                                candidate_source=str(candidate.get("full_content") or ""),
                             )
                             logger.info(
                                 "[Orchestrator] Episodic memory recorded: %s — %s [%s]",

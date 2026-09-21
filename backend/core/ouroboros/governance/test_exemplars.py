@@ -517,8 +517,17 @@ async def exemplar_instruction(
         exemplar = await _exemplar_block(
             target_files, description, repo_root, op_id=op_id, covered=covered,
         )
+        # ONE budget for both. The first version gave the contract the whole
+        # dependency budget of its own and, on a first op whose window is not
+        # yet negotiated, that produced 21 KB of signatures around the one
+        # line that mattered. The contract gets what the exemplar left.
+        from backend.core.ouroboros.governance.ast_signature_pruner import (  # noqa: PLC0415
+            _estimate, dependency_budget_tokens,
+        )
+        remaining = max(0, dependency_budget_tokens() - _estimate(exemplar))
         contract = await _contract_block(
-            target_files, description, repo_root, frozenset(covered), op_id=op_id,
+            target_files, description, repo_root, frozenset(covered),
+            op_id=op_id, budget_tokens=remaining,
         )
         return exemplar + contract
     except asyncio.CancelledError:
@@ -530,7 +539,7 @@ async def exemplar_instruction(
 
 async def _contract_block(
     target_files: Sequence[str], description: str, repo_root: Path,
-    covered: FrozenSet[str], *, op_id: str = "",
+    covered: FrozenSet[str], *, op_id: str = "", budget_tokens: Optional[int] = None,
 ) -> str:
     """Installed-library contracts for the subject's UNCOVERED third-party
     imports, rarest first. ``""`` when there are none. NEVER raises."""
@@ -543,6 +552,9 @@ async def _contract_block(
         from backend.core.ouroboros.governance.ast_signature_pruner import (  # noqa: PLC0415
             dependency_budget_tokens,
         )
+        budget = dependency_budget_tokens() if budget_tokens is None else int(budget_tokens)
+        if budget <= 0:
+            return ""
         wanted = [t for t in traits_of(subject) if not t.startswith("flag:") and t not in covered]
         if not wanted:
             return ""
@@ -558,7 +570,7 @@ async def _contract_block(
         source = subject.read_text(encoding="utf-8", errors="replace")
         # Its own budget, like each dependency section the prompt assembler
         # builds: a different KIND of context, not a share of the exemplar's.
-        body = await asyncio.to_thread(lc.contract_for, source, tops, dependency_budget_tokens())
+        body = await asyncio.to_thread(lc.contract_for, source, tops, budget)
         if not body:
             return ""
         logger.info(
