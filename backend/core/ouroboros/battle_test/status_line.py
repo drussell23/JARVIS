@@ -143,6 +143,13 @@ class StatusSnapshot:
     liquidity_exhausted: bool = False
     liquidity_provider: str = ""       # first exhausted provider name
     liquidity_reset_s: Optional[float] = None
+    # Landed work — the pipeline's final tier. ALWAYS rendered, idle or busy:
+    # every other field here can look healthy while this one stays at zero,
+    # which is exactly the condition it exists to make impossible to miss.
+    landed_total: int = 0
+    landed_per_hour: float = 0.0
+    landed_settled: bool = False
+    landed_uptime_s: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +362,7 @@ class StatusLineBuilder:
         route, provider, model = self._sample_route_and_provider(primary_op)
         liq_exhausted, liq_provider, liq_reset = self._sample_liquidity()
         funding_mode, funding_label = self._sample_funding()
+        landed_total, landed_rate, landed_settled, landed_uptime = self._sample_landed()
 
         # §37 Slice 5 — feed cost-band-crossing observer.
         # Chatter-suppression is structural in the observer; this call
@@ -389,6 +397,10 @@ class StatusLineBuilder:
             liquidity_reset_s=liq_reset,
             funding_mode=funding_mode,
             funding_label=funding_label,
+            landed_total=landed_total,
+            landed_per_hour=landed_rate,
+            landed_settled=landed_settled,
+            landed_uptime_s=landed_uptime,
         )
 
     def render_plain(self) -> str:
@@ -436,6 +448,19 @@ class StatusLineBuilder:
     # ------------------------------------------------------------------
     # Samplers — each guards against missing refs / missing attrs
     # ------------------------------------------------------------------
+
+    def _sample_landed(self) -> tuple:
+        """``(total, per_hour, settled, uptime_s)``. A few field reads under a
+        lock — no disk, no await — so a ~500 ms render tick costs nothing and a
+        fault degrades to zeros like every other sampler here."""
+        try:
+            from backend.core.ouroboros.governance.landed_metrics import (
+                get_landed_metrics,
+            )
+            snap = get_landed_metrics().snapshot()
+            return snap.total, snap.per_hour, snap.settled, snap.uptime_s
+        except Exception:  # noqa: BLE001
+            return 0, 0.0, False, 0.0
 
     def _sample_cost(self) -> tuple:
         if self._cost is None:
@@ -997,6 +1022,9 @@ def _format_plain(snap: StatusSnapshot, *, compact: bool) -> str:
                 ):
                     tok += f" ~{max(1, int(snap.liquidity_reset_s / 60))}m"
                 crumb = f"{crumb} · {tok}" if crumb else tok
+            landed_tok = _format_landed_token(snap)
+            if landed_tok:
+                crumb = f"{crumb} · {landed_tok}" if crumb else landed_tok
             return crumb
     except Exception:  # noqa: BLE001 — defensive
         pass
@@ -1042,6 +1070,9 @@ def _format_plain(snap: StatusSnapshot, *, compact: bool) -> str:
     if cost_fr >= (warn_threshold_pct() / 100.0):
         cost_txt += " ⚠"
     parts.append(cost_txt)
+    landed_tok = _format_landed_token(snap)
+    if landed_tok:
+        parts.append(landed_tok)
 
     idle_txt = (
         f"Idle: {int(snap.idle_elapsed_s)}s / {int(snap.idle_timeout_s)}s"
@@ -1106,6 +1137,22 @@ def _format_plain(snap: StatusSnapshot, *, compact: bool) -> str:
             pass
 
     return " · ".join(parts)
+
+
+def _format_landed_token(snap: StatusSnapshot) -> str:
+    """``landed 3 · 2.7/h``. Delegates to the one formatter in
+    ``landed_metrics`` so the cockpit and the log cannot disagree. Tolerates a
+    hand-built snapshot that predates these fields. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.landed_metrics import (
+            render_landed,
+        )
+        return render_landed(
+            getattr(snap, "landed_total", 0), getattr(snap, "landed_per_hour", 0.0),
+            getattr(snap, "landed_settled", False), getattr(snap, "landed_uptime_s", 0.0),
+        )
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _format_mode_token() -> str:

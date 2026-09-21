@@ -5412,6 +5412,9 @@ class BattleTestHarness:
                         "route": snap.route,
                         "provider": snap.provider,
                         "liquidity_exhausted": snap.liquidity_exhausted,
+                        "landed_total": snap.landed_total,
+                        "landed_per_hour": snap.landed_per_hour,
+                        "landed_settled": snap.landed_settled,
                     }
                 except Exception:  # noqa: BLE001
                     return {}

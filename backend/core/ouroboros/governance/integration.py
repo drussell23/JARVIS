@@ -351,6 +351,19 @@ def _build_comm_protocol(
         transports.append(OpsLogger())
         logger.info("[Integration] OpsLogger added to CommProtocol")
 
+    # LandedMetricsTransport — always add. Counts DECISION outcome=applied, the
+    # one announcement every apply engine already makes, so the scoreboard
+    # needs nothing from any of them.
+    try:
+        from backend.core.ouroboros.governance.landed_metrics import (
+            LandedMetricsTransport,
+        )
+    except ImportError:
+        logger.warning("[Integration] LandedMetricsTransport skipped: module not available")
+    else:
+        transports.append(LandedMetricsTransport())
+        logger.info("[Integration] LandedMetricsTransport added to CommProtocol")
+
     # LangfuseTransport — optional, enabled via LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY
     if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
         try:
