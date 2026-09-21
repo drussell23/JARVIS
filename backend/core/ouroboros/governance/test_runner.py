@@ -24,7 +24,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, List, Literal, Optional, Tuple
 
-from backend.core.ouroboros.governance.process_session import reap_session, was_shed
+from backend.core.ouroboros.governance.process_session import (
+    over_budget, reap_session, was_shed,
+)
 from backend.core.ouroboros.governance.test_timeout_derivation import (
     derive_test_timeouts,
     observe_per_file_rate,
@@ -1995,6 +1997,23 @@ class TestRunner:
                 returncode, elapsed, stdout_text,
             )
 
+        if result.get("over_budget"):
+            used_mb, budget_mb = result["over_budget"]
+            # The candidate spawned more than its share of the machine — a
+            # real JARVIS backend per test, in the case that found this. That
+            # is the TEST's fault, so it stays fc=test and the reason goes in
+            # the output the repair loop reads: the model must not be told
+            # "infra" for the one mistake it most needs to stop making.
+            streaming_result = dataclasses.replace(
+                streaming_result, passed=False, timed_out=False,
+                stdout=(streaming_result.stdout or "") + (
+                    f"\nMemoryBudgetExceeded: the test session used {used_mb:.0f} MB "
+                    f"against a {budget_mb:.0f} MB budget and was terminated. The test "
+                    "started real processes (an application server, a subprocess) instead "
+                    "of mocking them. Mock subprocess/process launches and network servers; "
+                    "never start the application under test.\n"
+                ),
+            )
         if result.get("shed"):
             # A run WE killed to relieve memory pressure. With no report and
             # exit -9 it parses as an ordinary failure — the model gets blamed
@@ -2264,6 +2283,8 @@ class TestRunner:
             "early_exit_node": early_exit_node,
             # Ended by memory-pressure shedding, not by its own failure.
             "shed": bool(monitored_pid is not None and was_shed(monitored_pid)),
+            # Ended for exceeding ITS OWN memory budget: the candidate's doing.
+            "over_budget": over_budget(monitored_pid) if monitored_pid is not None else None,
         }
 
     async def _compare_paths_loudly(

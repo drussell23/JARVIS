@@ -2160,6 +2160,13 @@ class BattleTestHarness:
                 # WallClockWatchdog applies. The daemon thread re-probes
                 # RSS independently and fires the same event even if the
                 # loop is fully wedged by a leaking in-process op.
+                try:
+                    from backend.core.ouroboros.governance.process_session import (
+                        configure_tree_budget,
+                    )
+                    configure_tree_budget(_pm_cap_mb, _pm_interval_s)
+                except Exception:  # noqa: BLE001 — a gauge never blocks ignition
+                    logger.debug("[Harness] session budget arming degraded", exc_info=True)
                 self._start_process_memory_hard_deadline_thread(
                     _pm_warn_mb, _pm_cap_mb, _pm_interval_s,
                 )

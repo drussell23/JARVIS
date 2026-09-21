@@ -49,7 +49,7 @@ import os
 import signal
 import threading
 from pathlib import Path
-from typing import Dict, Optional, Set, Tuple
+from typing import Dict, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +225,193 @@ def was_shed(leader_pid: int) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Session memory budgets — a test that boots the application dies alone
+# ---------------------------------------------------------------------------
+#
+# bt-2026-09-21-225249: the daemon's tree sat at 2.8 GB for 35 minutes, then
+# three candidate tests of `jarvis_reload_manager.py` — a module whose job is
+# to launch JARVIS — each started a REAL backend inside its sandbox, and 45 s
+# later the tree was at 36.9 GB. The daemon's own watchdog caps the WHOLE tree
+# and did the only thing it can: stop the daemon. Gracefully, before the host
+# felt it — but the soak was over, on the strength of one bad test.
+#
+# The unit that should die is the SESSION. Each pytest run already owns one
+# (start_new_session=True), so its members are enumerable and its memory is
+# a sum over them. The budget is not a number written here: it is the daemon
+# cap the harness already derives, shared out across the sessions alive at
+# that moment. One session gets the whole headroom; three share it. A session
+# that exceeds its share is ended and the fact is remembered, so TestRunner
+# files the run as what it was — the candidate's failure, with the reason in
+# its output — rather than as a timeout nobody can learn from.
+
+_ENV_BUDGET_FLOOR_MB = "JARVIS_SESSION_BUDGET_FLOOR_MB"
+_ENV_BUDGET_POLL_FLOOR_S = "JARVIS_SESSION_BUDGET_POLL_FLOOR_S"
+
+_budget_lock = threading.Lock()
+_tree_cap_mb: float = 0.0
+_tree_poll_base_s: float = 0.0
+_over_budget: Dict[int, Tuple[float, float]] = {}
+_budget_thread: Optional[threading.Thread] = None
+_budget_stop = threading.Event()
+
+
+def _env_float(name: str, default: float, minimum: float) -> float:
+    try:
+        value = float(os.environ.get(name, "") or default)
+        return value if value >= minimum else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _rss_kb(pid: int) -> int:
+    try:
+        for line in (Path("/proc") / str(pid) / "status").read_text(errors="replace").splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def _tree_and_sessions_rss_kb(leaders: Sequence[int]) -> Tuple[int, Dict[int, int]]:
+    """One /proc walk: total RSS of this process's tree, and per-session RSS.
+    'Tree' here is every process whose session id belongs to one of ours or
+    to this process itself — the same population the daemon cap measures."""
+    mine = os.getsid(0)
+    wanted = {int(pid): 0 for pid in leaders}
+    total = 0
+    try:
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            ids = _stat_ids(entry)
+            if ids is None:
+                continue
+            _pgrp, session, state = ids
+            if state == "Z":
+                continue
+            if session in wanted:
+                rss = _rss_kb(pid)
+                wanted[session] += rss
+                total += rss
+            elif session == mine:
+                total += _rss_kb(pid)
+    except OSError:
+        pass
+    return total, wanted
+
+
+def session_budget_mb(tree_rss_mb: float, live_sessions: int) -> float:
+    """What ONE session may use right now: the headroom under the daemon
+    cap, shared equally among the sessions alive. Adaptive by construction —
+    it moves with the daemon's own footprint and with concurrency. A floor
+    (env) keeps a crowded moment from starving every session to nothing."""
+    with _budget_lock:
+        cap = _tree_cap_mb
+    if cap <= 0:
+        return float("inf")
+    headroom = max(0.0, cap - tree_rss_mb)
+    share = headroom / max(1, int(live_sessions))
+    return max(share, _env_float(_ENV_BUDGET_FLOOR_MB, 512.0, 1.0))
+
+
+def _budget_tick() -> None:
+    with _live_lock:
+        leaders = list(_live)
+    if not leaders:
+        return
+    total_kb, per_session = _tree_and_sessions_rss_kb(leaders)
+    sessions_kb = sum(per_session.values())
+    # Headroom is judged against the tree WITHOUT the sessions, so a session's
+    # own growth does not shrink the budget it is measured against.
+    base_mb = (total_kb - sessions_kb) / 1024.0
+    budget = session_budget_mb(base_mb, len(leaders))
+    for leader, kb in per_session.items():
+        used = kb / 1024.0
+        if used <= budget:
+            continue
+        with _live_lock:
+            owner = _live.get(leader, "")
+            _shed.discard(leader)  # this is NOT a pressure shed
+        with _budget_lock:
+            _over_budget[leader] = (used, budget)
+        logger.warning(
+            "[ProcessSession] session %s (%s) used %.0f MB against a %.0f MB "
+            "budget (daemon cap %.0f MB, %d live session(s)) — ended. The "
+            "candidate under test spawned more than its share of the machine.",
+            leader, owner or "?", used, budget, _tree_cap_mb, len(leaders),
+        )
+        reap_session(leader, owner=owner or "session-budget")
+
+
+def _budget_interval_s(tree_rss_mb: float) -> float:
+    """Poll faster as the tree approaches the cap. The daemon watchdog's own
+    15 s interval slept through a 34 GB jump; the floor is seconds."""
+    with _budget_lock:
+        cap, base = _tree_cap_mb, _tree_poll_base_s
+    floor = _env_float(_ENV_BUDGET_POLL_FLOOR_S, 1.0, 0.1)
+    if cap <= 0 or base <= floor:
+        return max(floor, base)
+    headroom = max(0.0, min(1.0, (cap - tree_rss_mb) / cap))
+    return floor + (base - floor) * headroom
+
+
+def _budget_loop() -> None:
+    while not _budget_stop.is_set():
+        try:
+            _budget_tick()
+            with _live_lock:
+                leaders = list(_live)
+            total_kb, _ = _tree_and_sessions_rss_kb(leaders) if leaders else (0, {})
+            wait = _budget_interval_s(total_kb / 1024.0)
+        except Exception:  # noqa: BLE001 — a gauge never dies
+            logger.debug("[ProcessSession] budget tick degraded", exc_info=True)
+            wait = 5.0
+        _budget_stop.wait(wait)
+
+
+def configure_tree_budget(cap_mb: float, poll_base_s: float) -> bool:
+    """Arm session budgets against the daemon's tree cap. Called by whoever
+    arms the daemon watchdog, with the SAME cap, so there is one number.
+    Idempotent. ``cap_mb <= 0`` disarms."""
+    global _budget_thread, _tree_cap_mb, _tree_poll_base_s
+    with _budget_lock:
+        _tree_cap_mb = float(cap_mb or 0.0)
+        _tree_poll_base_s = float(poll_base_s or 0.0)
+        armed = _tree_cap_mb > 0
+    if not armed or not Path("/proc").is_dir():
+        return False
+    if _budget_thread is None or not _budget_thread.is_alive():
+        _budget_stop.clear()
+        _budget_thread = threading.Thread(
+            target=_budget_loop, name="session-budget", daemon=True,
+        )
+        _budget_thread.start()
+    logger.warning(
+        "[ProcessSession] session memory budgets ARMED — each test session may "
+        "use its share of the %.0f MB headroom; one that exceeds it is ended alone",
+        _tree_cap_mb,
+    )
+    return True
+
+
+def over_budget(leader_pid: int) -> Optional[Tuple[float, float]]:
+    """``(used_mb, budget_mb)`` if *leader_pid* was ended for exceeding its
+    budget, else ``None``. Consumes the mark."""
+    with _budget_lock:
+        return _over_budget.pop(int(leader_pid), None)
+
+
+def reset_budget_for_tests() -> None:
+    global _budget_thread
+    _budget_stop.set()
+    with _budget_lock:
+        _over_budget.clear()
+    _budget_thread = None
+
+
 async def leader_exited(proc: "asyncio.subprocess.Process") -> None:
     """Return when *proc* — the LEADER — has exited. Not when its pipes close.
 
@@ -281,4 +468,5 @@ async def leader_exited(proc: "asyncio.subprocess.Process") -> None:
 __all__ = [
     "leader_exited", "reap_session", "register_session", "session_survivors",
     "shed_live_sessions", "unregister_session", "was_shed",
+    "configure_tree_budget", "over_budget", "session_budget_mb",
 ]
