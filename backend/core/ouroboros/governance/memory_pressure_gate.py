@@ -247,6 +247,42 @@ _RUST_POOL_LEVELS: Dict[str, PressureLevel] = {
 }
 
 
+def host_commit_dim_enabled() -> bool:
+    """The Windows-host commit dimension. Default ON: off WSL there is no
+    sampler, the dimension answers OK, and the composition is a no-op."""
+    return _env_bool("JARVIS_MEMORY_PRESSURE_HOST_COMMIT_DIM_ENABLED", True)
+
+
+def start_host_commit_sampler() -> bool:
+    """Start the host-commit sampler thread. Called ONCE, by the daemon at
+    boot — never as a side effect of reading the gate, so a unit test or a CLI
+    that touches ``pressure()`` does not begin spawning PowerShell.
+
+    The sampler is handed THIS module's threshold functions, so its adaptive
+    cadence and the gate's levels share one definition of "getting close".
+    """
+    try:
+        if not host_commit_dim_enabled():
+            return False
+        from backend.core.ouroboros.governance import host_commit_probe  # noqa: PLC0415
+        sampler = host_commit_probe.start_sampler(
+            warn_pct=warn_threshold_pct, critical_pct=critical_threshold_pct,
+        )
+        if sampler is None:
+            logger.info("[MemoryPressureGate] host-commit dimension: host not readable here — inert")
+            return False
+        logger.warning(
+            "[MemoryPressureGate] host-commit dimension ARMED — the gate now "
+            "sees Windows commit, not just guest RAM (levels: warn<%.0f%% "
+            "high<%.0f%% critical<%.0f%% free)",
+            warn_threshold_pct(), high_threshold_pct(), critical_threshold_pct(),
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug("[MemoryPressureGate] host sampler start degraded", exc_info=True)
+        return False
+
+
 def rust_pool_dim_enabled() -> bool:
     """Master switch for the native-arena dimension. Default TRUE.
 
@@ -564,10 +600,38 @@ class MemoryPressureGate:
         # The native arena's own view, composed the same strictest-wins way.
         # It can only ever make the gate MORE conservative, never less.
         pool_level, _pool_src = self._rust_pool_dim()
+        # The HOST's view. Every dimension above reads the guest, and the
+        # guest read 97% free at the moment the host — at 39% — had its
+        # pressure relieved by killing the soak.
+        host_level, _host_free = self._host_commit_dim()
         return _strictest(
-            _strictest(_strictest(free_level, proc_level), resv_level),
-            pool_level,
+            _strictest(
+                _strictest(_strictest(free_level, proc_level), resv_level),
+                pool_level,
+            ),
+            host_level,
         )
+
+    # -- host commit dimension ----------------------------------------------
+
+    def _host_commit_dim(self) -> Tuple[PressureLevel, Optional[float]]:
+        """Windows commit headroom, graded on the SAME free-% ladder as guest
+        RAM. Reads only the sampler's last FRESH sample — never the host
+        itself, which costs a ~400 ms process spawn. No sampler, a stale
+        sample, or any fault → ``(OK, None)``: this dimension can only make
+        the gate more conservative, and ``ProcessMemoryWatchdog`` remains the
+        hard stop.
+        """
+        if not host_commit_dim_enabled():
+            return PressureLevel.OK, None
+        try:
+            from backend.core.ouroboros.governance import host_commit_probe  # noqa: PLC0415
+            sample = host_commit_probe.latest_sample()
+            if sample is None:
+                return PressureLevel.OK, None
+            return self.level_for_free_pct(sample.free_pct), sample.free_pct
+        except Exception:  # noqa: BLE001
+            return PressureLevel.OK, None
 
     # -- rust pool dimension ------------------------------------------------
 
@@ -754,7 +818,10 @@ class MemoryPressureGate:
         # Slice 26 — in-flight reservation dim (same additive contract:
         # disabled/quiet → OK → composition is a no-op).
         resv_level, _resv_mb = self._reservation_dim(probe)
-        level = _strictest(_strictest(free_level, proc_level), resv_level)
+        host_level, _host_free_pct = self._host_commit_dim()
+        level = _strictest(
+            _strictest(_strictest(free_level, proc_level), resv_level), host_level,
+        )
         proc_dominant = _LEVEL_RANK[proc_level] > _LEVEL_RANK[free_level]
         resv_dominant = (
             _LEVEL_RANK[resv_level] > _LEVEL_RANK[free_level]

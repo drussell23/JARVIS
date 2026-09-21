@@ -19,11 +19,12 @@ import os
 import re
 import tempfile
 import time
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, List, Literal, Optional, Tuple
 
-from backend.core.ouroboros.governance.process_session import reap_session
+from backend.core.ouroboros.governance.process_session import reap_session, was_shed
 from backend.core.ouroboros.governance.test_timeout_derivation import (
     derive_test_timeouts,
     observe_per_file_rate,
@@ -1994,6 +1995,18 @@ class TestRunner:
                 returncode, elapsed, stdout_text,
             )
 
+        if result.get("shed"):
+            # A run WE killed to relieve memory pressure. With no report and
+            # exit -9 it parses as an ordinary failure — the model gets blamed
+            # and a lesson gets recorded for something that never ran to a
+            # verdict. ``timed_out`` is the existing flag every consumer maps
+            # to ``failure_class=infra``, never learned from, never retried.
+            streaming_result = dataclasses.replace(
+                streaming_result, passed=False, timed_out=True,
+                stdout=(streaming_result.stdout or "")
+                + "\n[TestRunner] run terminated by memory-pressure shedding (infra)",
+            )
+
         # Ticket #4 Slice 3 runtime parity check. Operators opt in via
         # JARVIS_TEST_RUNNER_PARITY_MODE=true + streaming on. Runs the
         # legacy path against the same test_paths + compares structural
@@ -2153,6 +2166,7 @@ class TestRunner:
                     )
 
         returncode: Optional[int] = None
+        monitored_pid: Optional[int] = None
 
         try:
             async with BackgroundMonitor(
@@ -2202,6 +2216,7 @@ class TestRunner:
                                     )
                                     return  # break out → __aexit__ kills subprocess
 
+                monitored_pid = mon.pid
                 await asyncio.wait_for(_drive(), timeout=self._timeout)
                 returncode = mon.exit_code
         except asyncio.TimeoutError:
@@ -2247,6 +2262,8 @@ class TestRunner:
             # _run_pytest's structural parsing.
             "early_exit_triggered": early_exit_triggered,
             "early_exit_node": early_exit_node,
+            # Ended by memory-pressure shedding, not by its own failure.
+            "shed": bool(monitored_pid is not None and was_shed(monitored_pid)),
         }
 
     async def _compare_paths_loudly(

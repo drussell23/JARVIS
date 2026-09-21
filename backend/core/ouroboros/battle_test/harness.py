@@ -3088,6 +3088,13 @@ class BattleTestHarness:
         # loop dispatches THROUGH intake: starting it earlier would have it
         # discover work it cannot yet submit, fail the dispatch, and cool down
         # a target for a reason that was never the target's fault.
+        try:
+            from backend.core.ouroboros.governance.memory_pressure_gate import (
+                start_host_commit_sampler,
+            )
+            start_host_commit_sampler()
+        except Exception:  # noqa: BLE001 — a gauge never blocks ignition
+            logger.debug("[Harness] host-commit sampler start degraded", exc_info=True)
         await self._start_sentinel_loop()
 
         _boot_mark("harness_boot_sequence_done")

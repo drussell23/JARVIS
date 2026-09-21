@@ -268,6 +268,18 @@ class SentinelLoop:
                 except Exception as exc:  # noqa: BLE001 — a pass must never kill the loop
                     logger.warning("[Sentinel] pass failed: %r", exc, exc_info=True)
                     outcome = PassOutcome("failed", detail=f"{type(exc).__name__}: {exc}")
+                if outcome.state == "shedding":
+                    # Not a pass: nothing was discovered or dispatched, and it
+                    # must not consume a pass ceiling. Re-ask on the PROBE's
+                    # cadence (seconds, tighter as commit falls) rather than
+                    # the pass interval (20 minutes).
+                    try:
+                        await asyncio.wait_for(
+                            self._stopping.wait(), timeout=self._shed_recheck_s(),
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
                 self.passes += 1
                 self._emit(outcome)
                 # Idle only when there was nothing to do; otherwise go straight
@@ -282,11 +294,80 @@ class SentinelLoop:
         except asyncio.CancelledError:
             raise
 
+    # -- memory-pressure shedding -----------------------------------------
+
+    def _shed_recheck_s(self) -> float:
+        try:
+            from backend.core.ouroboros.governance import host_commit_probe  # noqa: PLC0415
+            return max(1.0, host_commit_probe.current_interval_s())
+        except Exception:  # noqa: BLE001
+            return 5.0
+
+    async def _memory_shedding(self) -> str:
+        """Why no work may be dispatched right now, or ``""``. NEVER raises.
+
+        The Sentinel is the component that STARTS work, and until now it never
+        asked the memory gate anything — while the gate, for its part, could
+        not see the host. bt-2026-09-20-183259 ended with the guest 97% free
+        and the host short enough that the run was killed from outside.
+
+        Hysteresis comes from the gate's own ladder, not from new numbers:
+        shedding BEGINS at HIGH or CRITICAL and ENDS only at OK. Starting and
+        stopping on the same boundary would flap — dispatch an op, tip back
+        over, kill it, recover, dispatch again.
+
+        At CRITICAL the live test sessions are ended too. They are the largest
+        thing this process can release immediately, and they are marked so the
+        runner files them as infrastructure rather than as failures.
+        """
+        try:
+            from backend.core.ouroboros.governance.memory_pressure_gate import (  # noqa: PLC0415
+                PressureLevel, get_default_gate,
+            )
+            gate = get_default_gate()
+            level = await asyncio.to_thread(gate.pressure)
+            was = getattr(self, "_shedding", False)
+            if level in (PressureLevel.HIGH, PressureLevel.CRITICAL):
+                detail = ""
+                try:
+                    from backend.core.ouroboros.governance import host_commit_probe  # noqa: PLC0415
+                    sample = host_commit_probe.latest_sample()
+                    detail = sample.render() if sample is not None else ""
+                except Exception:  # noqa: BLE001
+                    pass
+                if not was:
+                    self._shedding = True
+                    logger.warning(
+                        "[MemoryPressureShedding] BEGIN level=%s %s — dispatch "
+                        "paused until pressure returns to OK", level.value, detail,
+                    )
+                    self._emit(PassOutcome("shedding", detail=f"{level.value} {detail}".strip()))
+                if level is PressureLevel.CRITICAL:
+                    from backend.core.ouroboros.governance.process_session import (  # noqa: PLC0415
+                        shed_live_sessions,
+                    )
+                    await asyncio.to_thread(shed_live_sessions, f"{level.value} {detail}".strip())
+                return f"{level.value} {detail}".strip()
+            if was and level is not PressureLevel.OK:
+                return f"{level.value} (recovering — resumes at OK)"
+            if was:
+                self._shedding = False
+                logger.warning("[MemoryPressureShedding] END — pressure OK, dispatch resumes")
+            return ""
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — a broken gauge never stops the loop
+            logger.debug("[Sentinel] memory shedding check degraded", exc_info=True)
+            return ""
+
     # -- one pass ---------------------------------------------------------
 
     async def run_once(self) -> PassOutcome:
         """Discover → sanction → dispatch → outcome. NEVER raises."""
         started = time.monotonic()
+        shedding = await self._memory_shedding()
+        if shedding:
+            return PassOutcome("shedding", detail=shedding)
         from backend.core.ouroboros.governance.autonomy import goal_discovery as gd
 
         # Breadcrumbs at WARNING, deliberately. A headless soak's log carries

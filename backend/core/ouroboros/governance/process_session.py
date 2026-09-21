@@ -47,8 +47,9 @@ import asyncio
 import logging
 import os
 import signal
+import threading
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,74 @@ def reap_session(leader_pid: int, *, owner: str = "") -> Tuple[int, ...]:
         return ()
 
 
+# ---------------------------------------------------------------------------
+# Live sessions — so pressure can end them, and the ending is not misread
+# ---------------------------------------------------------------------------
+
+_live_lock = threading.Lock()
+_live: Dict[int, str] = {}
+_shed: Set[int] = set()
+
+
+def register_session(leader_pid: int, owner: str = "") -> None:
+    """Note a session this process created, for as long as it runs."""
+    try:
+        with _live_lock:
+            _live[int(leader_pid)] = str(owner or "")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def unregister_session(leader_pid: int) -> None:
+    try:
+        with _live_lock:
+            _live.pop(int(leader_pid), None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def shed_live_sessions(reason: str = "") -> Tuple[int, ...]:
+    """End every live session NOW and remember that WE ended it.
+
+    The remembering is the point. A run that dies under ``SIGKILL`` leaves no
+    report and an exit code of -9, which downstream reads as an ordinary test
+    failure: the model is told its code was wrong and the lesson is recorded.
+    ``was_shed`` lets the runner file it where it belongs — infrastructure.
+    """
+    with _live_lock:
+        victims = dict(_live)
+    ended = []
+    for pid, owner in victims.items():
+        with _live_lock:
+            _shed.add(pid)
+        try:
+            os.killpg(pid, signal.SIGKILL)
+            ended.append(pid)
+        except (ProcessLookupError, PermissionError):
+            pass
+        except Exception:  # noqa: BLE001
+            logger.debug("[ProcessSession] shed degraded pid=%s", pid, exc_info=True)
+    if ended:
+        logger.warning(
+            "[ProcessSession] SHED %d live session(s) (%s): %s",
+            len(ended), reason or "memory pressure", ended[:12],
+        )
+    return tuple(ended)
+
+
+def was_shed(leader_pid: int) -> bool:
+    """Whether *leader_pid* was ended by :func:`shed_live_sessions`. Consumes
+    the mark — it is asked once, by whoever is classifying that run."""
+    try:
+        with _live_lock:
+            if int(leader_pid) in _shed:
+                _shed.discard(int(leader_pid))
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
 async def leader_exited(proc: "asyncio.subprocess.Process") -> None:
     """Return when *proc* — the LEADER — has exited. Not when its pipes close.
 
@@ -209,4 +278,7 @@ async def leader_exited(proc: "asyncio.subprocess.Process") -> None:
         logger.debug("[ProcessSession] leader-exit wait degraded", exc_info=True)
 
 
-__all__ = ["leader_exited", "reap_session", "session_survivors"]
+__all__ = [
+    "leader_exited", "reap_session", "register_session", "session_survivors",
+    "shed_live_sessions", "unregister_session", "was_shed",
+]

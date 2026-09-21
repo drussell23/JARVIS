@@ -192,6 +192,14 @@ class BackgroundMonitor:
             self._exited = True
             raise
 
+        try:
+            from backend.core.ouroboros.governance.process_session import (  # noqa: PLC0415
+                register_session,
+            )
+            register_session(self._proc.pid, f"monitor:{self._op_id}")
+        except Exception:  # noqa: BLE001
+            pass
+
         self._readers = [
             asyncio.create_task(
                 self._read_stream(self._proc.stdout, KIND_STDOUT),
@@ -207,6 +215,11 @@ class BackgroundMonitor:
             name=f"bgmon-{self._op_id}-exit",
         ))
         return self
+
+    @property
+    def pid(self) -> Optional[int]:
+        """Leader pid (= its session id), or ``None`` before spawn."""
+        return None if self._proc is None else self._proc.pid
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         if self._exited:
@@ -241,9 +254,10 @@ class BackgroundMonitor:
         if self._proc is not None:
             try:
                 from backend.core.ouroboros.governance.process_session import (  # noqa: PLC0415
-                    reap_session,
+                    reap_session, unregister_session,
                 )
                 reap_session(self._proc.pid, owner=f"monitor:{self._op_id}")
+                unregister_session(self._proc.pid)
             except Exception:  # noqa: BLE001
                 logger.debug("[BackgroundMonitor] session reap degraded", exc_info=True)
 
