@@ -46,10 +46,12 @@ re-derives its authority from the document rather than trusting this module.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
 import sys
+import threading
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -844,6 +846,145 @@ def _import_verdicts(
     return out
 
 
+async def _tree_state(repo_root: Path) -> Tuple[str, str]:
+    """``(worktree fingerprint, environment fingerprint)`` for this pass.
+
+    An empty worktree fingerprint means UNKNOWN, and unknown disables caching
+    for the pass rather than matching the last unknown. NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.governance import repo_state  # noqa: PLC0415
+        fingerprint = await repo_state.worktree_fingerprint(Path(repo_root))
+        return fingerprint, repo_state.environment_fingerprint()
+    except Exception:  # noqa: BLE001
+        logger.debug("[GoalDiscovery] tree state degraded", exc_info=True)
+        return "", ""
+
+
+class _TreePureCache:
+    """Discovery results that are a PURE FUNCTION of (tree, environment).
+
+    ## What it removed
+
+    bt-2026-09-20-183259 spent 750 s in discovery over 12 passes -- more than
+    all 122 generations -- re-deriving identical answers from a tree that had
+    not moved. The fingerprint that detects "has not moved" costs ~55 ms,
+    because git already keeps the Merkle tree (`repo_state`).
+
+    ## What is in it, and what is pointedly not
+
+    IN: covering-test stems and per-goal import verdicts. Both read only the
+    tree and the installed distributions, and the key carries both -- a verdict
+    cached across a `pip install` would keep a goal demoted after the package
+    that unblocks it had landed, which is the staleness `environment_integrity`
+    refuses by never caching the environment answer at all.
+
+    NOT IN: the candidates. Selection also reads the cooldown ledger, the
+    settled set, the DAG and the clock. A cached candidate list would hand the
+    Sentinel the goal that failed two minutes ago, from an unchanged tree,
+    forever -- the exact loop the cooldown exists to break. Those filters cost
+    microseconds and run every pass.
+
+    Holds ONE state. When the tree or the environment moves, everything goes;
+    there is no partial invalidation to get wrong. Thread-safe: passes run in
+    `asyncio.to_thread`.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state: Tuple[str, str] = ("", "")
+        self._covering: Optional[FrozenSet[str]] = None
+        self._verdicts: Dict[str, Any] = {}
+        self.hits = 0
+        self.misses = 0
+        self.rebinds = 0
+
+    def _bind(self, state: Tuple[str, str]) -> bool:
+        """Adopt *state*; returns whether results may be kept under it."""
+        if not state or not state[0]:
+            return False
+        if state != self._state:
+            self._state = state
+            self._covering = None
+            self._verdicts = {}
+            self.rebinds += 1
+        return True
+
+    def covering(self, repo_root: Path, state: Tuple[str, str]) -> FrozenSet[str]:
+        with self._lock:
+            keep = self._bind(state)
+            if keep and self._covering is not None:
+                self.hits += 1
+                return self._covering
+        stems = _covering_test_stems(Path(repo_root))
+        with self._lock:
+            self.misses += 1
+            if keep and self._state == state:
+                self._covering = stems
+        return stems
+
+    @staticmethod
+    def _key(work: "DiscoveredWork") -> str:
+        detail = getattr(work, "detail", None) or {}
+        parts = (
+            str(work.goal_id), str(work.target_file or ""),
+            str(getattr(work, "subject_file", "") or ""),
+            str(detail.get("description") or work.evidence or ""),
+        )
+        return hashlib.sha256("\0".join(parts).encode("utf-8", "replace")).hexdigest()
+
+    def verdicts(
+        self, works: Sequence["DiscoveredWork"], repo_root: Path,
+        state: Tuple[str, str],
+    ) -> Dict[str, Any]:
+        from backend.core.ouroboros.governance import repo_state  # noqa: PLC0415
+
+        with self._lock:
+            keep = self._bind(state)
+            known = dict(self._verdicts) if keep else {}
+        out: Dict[str, Any] = {}
+        fresh: Dict[str, Any] = {}
+        # Pinned so the module index inside each verdict is built against the
+        # SAME reading this pass took, once, instead of re-fingerprinting per
+        # goal.
+        with repo_state.pinned(Path(repo_root), state[0] if state else ""):
+            for work in works:
+                try:
+                    key = self._key(work)
+                    if key in known:
+                        out[work.goal_id] = known[key]
+                        continue
+                    verdict = _import_verdict(work, repo_root)
+                    out[work.goal_id] = verdict
+                    fresh[key] = verdict
+                except Exception:  # noqa: BLE001
+                    continue
+        with self._lock:
+            self.hits += len(out) - len(fresh)
+            self.misses += len(fresh)
+            if keep and self._state == state:
+                self._verdicts.update(fresh)
+        return out
+
+    def render(self) -> str:
+        with self._lock:
+            state = self._state[0][:10] or "unknown"
+            return (
+                f"tree-pure cache: tree={state} hits={self.hits} "
+                f"misses={self.misses} rebinds={self.rebinds}"
+            )
+
+    def reset(self) -> None:
+        with self._lock:
+            self._state = ("", "")
+            self._covering = None
+            self._verdicts = {}
+            self.hits = self.misses = self.rebinds = 0
+
+
+_TREE_PURE = _TreePureCache()
+
+
 def is_dispatchable(work: "DiscoveredWork", repo_root: Path) -> bool:
     """Whether spending an op on *work* could produce a write at all.
 
@@ -1096,9 +1237,15 @@ async def discover(
     # head of the queue and newly authored landable work sat past the cap.
     # Weight still breaks ties, so within a liveness tier the ranking is
     # unchanged. The walk is one pass, off the event loop, reused by every key.
-    covering = await asyncio.to_thread(_covering_test_stems, Path(repo_root))
     root = Path(repo_root)
     pool = signed + reds
+    # ONE reading of the tree for the whole pass. Everything below that is a
+    # pure function of (tree, environment) is answered from `_TREE_PURE` while
+    # that reading stands; everything that depends on cooldowns, on what has
+    # landed or on the clock is still decided fresh, further down. See
+    # `_TreePureCache` for why the candidate list itself is never cached.
+    tree_state = await _tree_state(root)
+    covering = await asyncio.to_thread(_TREE_PURE.covering, root, tree_state)
     # IMPORTABILITY SITS BETWEEN LIVENESS AND EVIDENCE. It is a second, finer
     # question about the same thing liveness measures — how far this work can
     # actually get — so it belongs in the same key rather than folded into the
@@ -1112,7 +1259,10 @@ async def discover(
     # complaint — with 30 importable goals and a cap of 8, the blocked ones are
     # simply never reached — and unlike quarantine it starves nothing: a goal
     # whose dependency gets installed rises again on its own, next pass.
-    verdicts = await asyncio.to_thread(_import_verdicts, pool, root)
+    verdicts = await asyncio.to_thread(
+        _TREE_PURE.verdicts, pool, root, tree_state,
+    )
+    logger.info("[GoalDiscovery] %s", _TREE_PURE.render())
     # Ranked ONCE and carried, not recomputed for the sort and again for the
     # census: each rank costs a `stat`, and a queue-wide double stat every pass
     # is the kind of cost that arrives unnoticed on the critical path.

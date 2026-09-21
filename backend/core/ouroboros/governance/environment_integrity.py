@@ -1037,7 +1037,35 @@ def _operator_platform_bound() -> Dict[str, Tuple[FrozenSet[str], bool]]:
     return out
 
 
+_marker_memo: Dict[Tuple[str, str], FrozenSet[str]] = {}
+
+
 def _marker_excluded(repo_root: Path) -> FrozenSet[str]:
+    """:func:`_scan_marker_excluded`, answered once per tree state.
+
+    It walks the repository for every ``requirements*.txt``, and it was called
+    once per unresolvable import per goal -- 50 walks, ~1 s, on every discovery
+    pass. The answer is a pure function of the tree (the manifests are in
+    ``repo_state``'s relevance set) and of the host, which does not change
+    under a running process. With an UNKNOWN tree state nothing is kept.
+    """
+    try:
+        from backend.core.ouroboros.governance import repo_state  # noqa: PLC0415
+        state = repo_state.current_fingerprint(Path(repo_root))
+    except Exception:  # noqa: BLE001
+        state = ""
+    if not state:
+        return _scan_marker_excluded(repo_root)
+    key = (str(repo_root), state)
+    hit = _marker_memo.get(key)
+    if hit is None:
+        hit = _scan_marker_excluded(repo_root)
+        _marker_memo.clear()  # one tree state at a time; no partial staleness
+        _marker_memo[key] = hit
+    return hit
+
+
+def _scan_marker_excluded(repo_root: Path) -> FrozenSet[str]:
     """Canonical distribution names a manifest marker excludes on THIS host.
 
     Reads the repository's own declarations, so ``coremltools>=7.0.0;

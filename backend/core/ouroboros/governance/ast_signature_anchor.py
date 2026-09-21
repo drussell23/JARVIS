@@ -899,7 +899,17 @@ def collect_anchor_sources(
                 continue
             found: List[Path] = []
             try:
-                for p in root.rglob(stem + ".py"):
+                # An index lookup, not ``root.rglob(stem + ".py")``. That was a
+                # FULL repository walk per test target, per goal, per Sentinel
+                # pass -- 205 walks / 1,046,115 selector calls for 49 goals,
+                # descending into ``.worktrees`` (whole repo copies) and
+                # discarding the hits afterwards. ``repo_state.module_index``
+                # walks once per tree state, pruning as it goes. The filters
+                # and the ordering below are unchanged.
+                from backend.core.ouroboros.governance.repo_state import (  # noqa: PLC0415
+                    module_index,
+                )
+                for p in module_index(root).find(stem + ".py"):
                     sp = _norm(str(p))
                     nm = p.name
                     # Exclude the worktree tree, any tests/ or test/ DIRECTORY
