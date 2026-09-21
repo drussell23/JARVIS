@@ -5767,6 +5767,16 @@ class GovernedOrchestrator:
             except Exception:
                 logger.debug("[Orchestrator] TestCoverageEnforcer failed", exc_info=True)
 
+            # ── Verified reference test for test-synthesis ops ──
+            # Twin of the plan_runner seam; both call the one helper.
+            try:
+                from backend.core.ouroboros.governance.test_exemplars import (
+                    with_exemplar,
+                )
+                ctx = await with_exemplar(ctx, self._config.project_root)
+            except ImportError:
+                pass
+
             # ── JARVIS Tier 5: Cross-Domain Intelligence ──────────────────────
             try:
                 from backend.core.ouroboros.governance.jarvis_intelligence import (

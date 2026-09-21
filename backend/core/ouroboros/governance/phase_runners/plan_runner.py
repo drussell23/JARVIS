@@ -842,6 +842,18 @@ class PLANRunner(PhaseRunner):
         except Exception:
             logger.debug("[Orchestrator] TestCoverageEnforcer failed", exc_info=True)
 
+        # ── Verified reference test for test-synthesis ops ──
+        # When this op is writing a NEW test file, show the model a test that
+        # is known to PASS for a module resembling its subject. See
+        # `test_exemplars` for why nothing unverified is ever shown.
+        try:
+            from backend.core.ouroboros.governance.test_exemplars import (
+                with_exemplar,
+            )
+            ctx = await with_exemplar(ctx, orch._config.project_root)
+        except ImportError:
+            pass
+
         # ── JARVIS Tier 5: Cross-Domain Intelligence ──
         try:
             from backend.core.ouroboros.governance.jarvis_intelligence import (
