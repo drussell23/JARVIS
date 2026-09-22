@@ -125,11 +125,28 @@ def test_fs_pool_registers_hard_reap():
     src = inspect.getsource(C._get_fs_process_pool)
     assert "register_cleanup" in src
     assert "reap_fs_process_pool_hard" in src
-    # the hard-reap snapshots worker PIDs + SIGKILLs survivors
-    reap_src = inspect.getsource(C.reap_fs_process_pool_hard)
-    assert "_processes" in reap_src
-    assert "SIGKILL" in reap_src
-    assert "shutdown_fs_process_pool" in reap_src
+    # The hard-reap leaves NO pool and NO live worker. Asserted on real
+    # workers rather than read out of its source: the snapshot/SIGKILL moved
+    # into the shared `_retire_pool` (also used when a pool breaks) unchanged,
+    # and a text pin cannot tell that refactor from a regression.
+    import asyncio
+    import os
+
+    C.shutdown_fs_process_pool()
+    assert isinstance(asyncio.run(C.offload(os.getpid, cpu_bound=True)), int)
+    pids = C._pool_pids(C._FS_PROCESS_POOL)
+    assert pids
+    C.reap_fs_process_pool_hard()
+    assert C._FS_PROCESS_POOL is None
+    import time
+    time.sleep(0.3)
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+            alive = True
+        except OSError:
+            alive = False
+        assert not alive, f"worker {pid} survived the hard reap"
 
 
 def test_fs_pool_hard_reap_never_raises_when_no_pool():

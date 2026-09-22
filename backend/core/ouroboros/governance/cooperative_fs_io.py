@@ -649,17 +649,43 @@ def reap_fs_process_pool_hard() -> None:
     time, not registration time) and SIGKILLs any that outlive the shutdown.
     NEVER raises — it runs from the signal-safe cascade path.
     """
-    pool = _FS_PROCESS_POOL
-    pids: list = []
+    _retire_pool(_FS_PROCESS_POOL)
+
+
+def _pool_pids(pool: Any) -> list:
     try:
-        if pool is not None:
-            pids = [
-                p.pid for p in getattr(pool, "_processes", {}).values()
-                if p is not None and getattr(p, "pid", None)
-            ]
+        return [
+            p.pid for p in (getattr(pool, "_processes", None) or {}).values()
+            if p is not None and getattr(p, "pid", None)
+        ]
     except Exception:  # noqa: BLE001
-        pids = []
-    shutdown_fs_process_pool()
+        return []
+
+
+def _retire_pool(pool: Any) -> None:
+    """Take *pool* out of service: shut it down and SIGKILL any surviving
+    worker. NEVER raises.
+
+    Identity-guarded: the global is cleared only if it is STILL *pool*. Two
+    offloads that both saw the same pool break would otherwise race, and the
+    second would retire the fresh pool the first had just built for its retry.
+    """
+    global _FS_PROCESS_POOL
+    if pool is None:
+        return
+    pids = _pool_pids(pool)
+    with _FS_PROCESS_POOL_LOCK:
+        if _FS_PROCESS_POOL is pool:
+            _FS_PROCESS_POOL = None
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except TypeError:
+        try:
+            pool.shutdown(wait=False)
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception:  # noqa: BLE001
+        pass
     import signal as _signal
     for pid in pids:
         try:
@@ -667,6 +693,40 @@ def reap_fs_process_pool_hard() -> None:
             os.kill(pid, _signal.SIGKILL)
         except OSError:
             pass                     # already gone / not ours
+
+
+def _pool_worker_report(pool: Any) -> str:
+    """Best-effort ``pid=… alive=… exit=…`` per worker of a broken pool.
+
+    The executor's manager thread owns reaping, so a dead worker's exit code
+    is often not yet known here (measured: ``None`` right after a SIGKILL).
+    A lifeline self-exit is identifiable anyway: it always prints its reason
+    (``… -> os._exit(86|87)``) to the daemon's inherited stderr first."""
+    try:
+        parts = []
+        for p in (getattr(pool, "_processes", None) or {}).values():
+            pid = getattr(p, "pid", None)
+            try:
+                code = p.exitcode
+            except Exception:  # noqa: BLE001
+                code = None
+            parts.append(
+                f"pid={pid} alive={code is None and _pid_alive(pid)} "
+                f"exit={'?' if code is None else code}"
+            )
+        return ", ".join(parts) or "no worker records"
+    except Exception:  # noqa: BLE001
+        return "unavailable"
+
+
+def _pid_alive(pid: Optional[int]) -> bool:
+    try:
+        if not pid:
+            return False
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def shutdown_fs_process_pool() -> None:
@@ -830,58 +890,36 @@ async def offload(
 
     if cpu_bound:
         _validate_picklable_for_process_pool(fn, args, kwargs)
-        try:
-            executor = _get_fs_process_pool()
-        except Exception as exc:  # noqa: BLE001 — pool creation fault
-            logger.debug(
-                "[CooperativeFSIO] offload(cpu_bound=True) failed to "
-                "acquire process pool", exc_info=True,
-            )
-            return OffloadError(
-                fn_name=getattr(fn, "__name__", repr(fn)),
-                exc_type=type(exc).__name__,
-                message=str(exc),
-                cpu_bound=True,
-            )
-        # BOUNDED. A process-pool future that never resolves is a hang the
-        # caller cannot see: no exception, no sentinel, just an `await`
-        # that outlives the op. Soak bt-2026-09-03-012434 lost its run to
-        # exactly this -- 91 of 92 rust-map crawls returned, one worker
-        # wedged silently on a DrvFS walk, the only in-flight op sat in
-        # CLASSIFY for 2,103 s, and the stale detector ended the session at
-        # 141 of 150 minutes. The harness's child-reaper found the ghost
-        # worker at shutdown. The deadline derives from the walk's own
-        # budget (`bounded_walker.blast_radius_timeout_s`) times a
-        # multiplier for spawn/IPC/parse overhead -- not a new constant.
-        # On expiry the wedged worker is SIGKILLed and the pool rebuilt on
-        # the next call, so one hung child cannot poison every later
-        # offload, and the caller gets the same sentinel every other
-        # failure produces.
-        deadline_s = fs_process_pool_deadline_s()
-        fut = loop.run_in_executor(
-            executor, _offload_worker, fn, args, kwargs, True,
-        )
-        if deadline_s <= 0.0:
-            return await fut
-        try:
-            return await asyncio.wait_for(fut, timeout=deadline_s)
-        except asyncio.TimeoutError:
+        # HEALS. One worker that dies abruptly marks a ProcessPoolExecutor
+        # BROKEN forever -- every later submit raises BrokenProcessPool at
+        # once -- and nothing replaced it: bt-2026-09-22-201845 lost its
+        # pool 16 minutes in, and for the rest of the soak every cpu-bound
+        # offload failed (strategic-direction prompt sections, the coverage
+        # index), silently, because callers treat a raise as "degraded".
+        # worker_lifeline kills workers ON PURPOSE on the stated premise that
+        # the pool "rebuilds on worker death"; this is that rebuild. The
+        # broken pool is retired (identity-guarded), a fresh one is built by
+        # the ordinary lazy getter, and the call is retried ONCE -- offloaded
+        # work is pure by contract, so a retry is safe, and a fn that kills
+        # its own worker every time gets exactly two attempts, never a loop.
+        for attempt in (1, 2):
+            outcome = await _offload_to_process_pool(loop, fn, args, kwargs)
+            if not isinstance(outcome, _PoolBroken):
+                return outcome
             logger.warning(
-                "[CooperativeFSIO] offload(cpu_bound=True) of %s exceeded "
-                "%.1fs -- reaping the process pool (a wedged worker is "
-                "SIGKILLed; the pool is rebuilt on the next call)",
-                getattr(fn, "__name__", repr(fn)), deadline_s,
+                "[CooperativeFSIO] process pool BROKEN during %s (%s) — "
+                "workers: %s; retired, %s",
+                getattr(fn, "__name__", repr(fn)), outcome.reason,
+                outcome.workers,
+                "rebuilding and retrying once" if attempt == 1
+                else "second break in one call: returning an OffloadError",
             )
-            try:
-                reap_fs_process_pool_hard()
-            except Exception:  # noqa: BLE001 — the reaper never raises, belt and braces
-                pass
-            return OffloadError(
-                fn_name=getattr(fn, "__name__", repr(fn)),
-                exc_type="TimeoutError",
-                message=f"process-pool offload exceeded {deadline_s:.1f}s",
-                cpu_bound=True,
-            )
+        return OffloadError(
+            fn_name=getattr(fn, "__name__", repr(fn)),
+            exc_type="BrokenProcessPool",
+            message=outcome.reason,
+            cpu_bound=True,
+        )
 
     # Thread path — reuse the EXISTING advisor-blast pool (do not
     # create a second thread pool).
@@ -892,6 +930,86 @@ async def offload(
     return await loop.run_in_executor(
         executor, _offload_worker, fn, args, kwargs, False,
     )
+
+
+@dataclass(frozen=True)
+class _PoolBroken:
+    """The pool broke under this call; it has already been retired."""
+
+    reason: str
+    workers: str
+
+
+async def _offload_to_process_pool(
+    loop: asyncio.AbstractEventLoop,
+    fn: Callable[..., Any],
+    args: tuple,
+    kwargs: dict,
+) -> Any:
+    """ONE bounded attempt on the current process pool.
+
+    Returns ``fn``'s result or an :class:`OffloadError` exactly as
+    :func:`offload` documents, or :class:`_PoolBroken` when the pool itself
+    broke (at submit or mid-task) -- already retired, for the caller to retry.
+    """
+    from concurrent.futures.process import BrokenProcessPool  # noqa: PLC0415
+
+    try:
+        executor = _get_fs_process_pool()
+    except Exception as exc:  # noqa: BLE001 — pool creation fault
+        logger.debug(
+            "[CooperativeFSIO] offload(cpu_bound=True) failed to "
+            "acquire process pool", exc_info=True,
+        )
+        return OffloadError(
+            fn_name=getattr(fn, "__name__", repr(fn)),
+            exc_type=type(exc).__name__,
+            message=str(exc),
+            cpu_bound=True,
+        )
+    # BOUNDED. A process-pool future that never resolves is a hang the
+    # caller cannot see: no exception, no sentinel, just an `await`
+    # that outlives the op. Soak bt-2026-09-03-012434 lost its run to
+    # exactly this -- 91 of 92 rust-map crawls returned, one worker
+    # wedged silently on a DrvFS walk, the only in-flight op sat in
+    # CLASSIFY for 2,103 s, and the stale detector ended the session at
+    # 141 of 150 minutes. The harness's child-reaper found the ghost
+    # worker at shutdown. The deadline derives from the walk's own
+    # budget (`bounded_walker.blast_radius_timeout_s`) times a
+    # multiplier for spawn/IPC/parse overhead -- not a new constant.
+    # On expiry the wedged worker is SIGKILLed and the pool rebuilt on
+    # the next call, so one hung child cannot poison every later
+    # offload, and the caller gets the same sentinel every other
+    # failure produces.
+    deadline_s = fs_process_pool_deadline_s()
+    try:
+        # Submit INSIDE the try: a pool already broken raises here, at
+        # submit, not from the future.
+        fut = loop.run_in_executor(
+            executor, _offload_worker, fn, args, kwargs, True,
+        )
+        if deadline_s <= 0.0:
+            return await fut
+        return await asyncio.wait_for(fut, timeout=deadline_s)
+    except BrokenProcessPool as exc:
+        workers = _pool_worker_report(executor)
+        _retire_pool(executor)
+        return _PoolBroken(reason=str(exc) or "BrokenProcessPool", workers=workers)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[CooperativeFSIO] offload(cpu_bound=True) of %s exceeded "
+            "%.1fs -- reaping the process pool (a wedged worker is "
+            "SIGKILLed; the pool is rebuilt on the next call)",
+            getattr(fn, "__name__", repr(fn)), deadline_s,
+        )
+        # The pool THIS call used -- not whatever the global holds by now.
+        _retire_pool(executor)
+        return OffloadError(
+            fn_name=getattr(fn, "__name__", repr(fn)),
+            exc_type="TimeoutError",
+            message=f"process-pool offload exceeded {deadline_s:.1f}s",
+            cpu_bound=True,
+        )
 
 
 # ============================================================================
