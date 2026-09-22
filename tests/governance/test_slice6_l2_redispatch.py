@@ -100,24 +100,28 @@ def test_ast_pin_l2_hook_classifies_soft_vs_hard_stops() -> None:
     """``_l2_hook`` must classify L2_STOPPED stop_reasons into HARD
     (preserved cancel) vs SOFT (new l2_retry directive). Without
     classification the bounded-retry loop has nothing to consume."""
+    from backend.core.ouroboros.governance.orchestrator import l2_stop_is_hard
+
     src = ORCHESTRATOR_FILE.read_text()
-    # The classification structure must be present
-    assert "_l2_hard_stop_prefixes" in src, (
-        "Missing _l2_hard_stop_prefixes in _l2_hook — Slice 6 "
+    # The classification structure must be present, and asked by the hook.
+    assert "l2_stop_is_hard(" in src, (
+        "_l2_hook no longer classifies stop reasons — Slice 6 "
         "classification was reverted."
     )
-    # All four HARD prefixes must be enumerated (matches repair_engine
-    # _stopped() invocations for genuinely-exhausted conditions).
-    for prefix in (
-        '"timebox_exhausted"',
-        '"max_iterations_exhausted"',
-        '"max_validation_runs_exhausted"',
-        '"deadline_budget_exhausted"',
+    # All four HARD reasons classify hard (matches repair_engine _stopped()
+    # invocations for genuinely-exhausted conditions); transient ones do not.
+    for reason in (
+        "timebox_exhausted",
+        "max_iterations_exhausted",
+        "max_validation_runs_exhausted",
+        "deadline_budget_exhausted",
     ):
-        assert prefix in src, (
-            f"Slice 6 HARD prefix {prefix} missing — soft/hard "
+        assert l2_stop_is_hard(reason), (
+            f"Slice 6 HARD reason {reason} classified soft — soft/hard "
             "boundary will leak"
         )
+    assert not l2_stop_is_hard("generate_error:TypeError")
+    assert not l2_stop_is_hard("empty_candidates")
     # The SOFT path must emit the new directive shape
     assert '"l2_retry"' in src, (
         "_l2_hook does not emit l2_retry directive — VALIDATE_RETRY "

@@ -157,6 +157,29 @@ def reap_session(leader_pid: int, *, owner: str = "") -> Tuple[int, ...]:
         return ()
 
 
+def dump_stacks(leader_pid: int) -> bool:
+    """Ask a run we are about to kill where it is stuck. NEVER raises.
+
+    ``SIGABRT`` to the leader: pytest enables ``faulthandler`` at configure
+    time, so the process writes every thread's stack to its (captured) stderr
+    and then dies. That is the only stack a hang killed at the WALL cap can
+    leave -- per-test ``pytest-timeout`` never arms during collection, and
+    ``reap_session``'s SIGKILL prints nothing. A process without faulthandler
+    simply dies, which is what the caller was about to do anyway.
+
+    Sent only while the leader provably holds the id (alive, not our own
+    group) -- the same guard ``reap_session`` uses. Returns whether it was sent.
+    """
+    try:
+        pid = int(leader_pid)
+        if pid <= 1 or pid == os.getpgrp() or not _leader_alive(pid):
+            return False
+        os.kill(pid, signal.SIGABRT)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Live sessions — so pressure can end them, and the ending is not misread
 # ---------------------------------------------------------------------------

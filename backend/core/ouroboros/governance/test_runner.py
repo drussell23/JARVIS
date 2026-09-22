@@ -25,7 +25,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, List, Literal, Optional, Tuple
 
 from backend.core.ouroboros.governance.process_session import (
-    over_budget, reap_session, was_shed,
+    dump_stacks, over_budget, reap_session, was_shed,
+)
+from backend.core.ouroboros.governance.pytest_traceback import (
+    TIMEOUT_BANNER_RE, hang_site,
 )
 from backend.core.ouroboros.governance.test_timeout_derivation import (
     derive_test_timeouts,
@@ -248,6 +251,12 @@ class TestResult:
     #: removed from the reward grader. Defaulted so every existing
     #: construction site stays valid.
     timed_out: bool = False
+    #: A cut-off run whose stack ran through code this repository owns: the
+    #: rendered ``pytest_traceback.HangSite`` (also appended to ``stdout``).
+    #: Non-empty makes the cut-off a verdict on the candidate (``fc=test``)
+    #: while ``timed_out`` keeps meaning "never finished" for everything that
+    #: must not learn a duration from it.
+    hang: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -588,9 +597,16 @@ class PythonAdapter:
             # graduation_ledger.INFRA "waived (OOM / TLS / network flake)"
             # and risk_tier_extender's "not policy-relevant"), so no new
             # class is introduced and no downstream consumer changes.
+            # ...UNLESS the stack says the candidate is what hung: a test
+            # blocked on an unmocked process or socket is the test's defect,
+            # and filing it infra ended the op with no repair and re-dispatched
+            # the same goal every soak (``hang`` -- see TestResult).
             failure_class=(
                 "none" if test_result.passed
-                else ("infra" if test_result.timed_out else "test")
+                else (
+                    "infra" if test_result.timed_out and not test_result.hang
+                    else "test"
+                )
             ),
             test_result=test_result,
             duration_s=elapsed,
@@ -1064,7 +1080,32 @@ def failure_digest(multi: Any, *, limit: int = 600) -> str:
 #: ``pytest-timeout``'s own banner ("+++ Timeout +++") and its per-test
 #: header ("Timeout: 10.0s ..."). Matching the PLUGIN's output rather than
 #: an exit code, because the kill leaves no report and no exit convention.
-_PYTEST_TIMEOUT_RE = re.compile(r"\+{3,}\s*Timeout\s*\+{3,}|^Timeout:\s", re.M)
+#: Owned by ``pytest_traceback`` (the repair sandbox reads the same banner).
+_PYTEST_TIMEOUT_RE = TIMEOUT_BANNER_RE
+
+
+def _stack_dump_grace_s() -> float:
+    """How long a run asked to dump its stacks (``dump_stacks``) gets to write
+    them before its session is reaped. Default: the stream monitor's own
+    terminate grace -- the same allowance any run gets to leave cleanly."""
+    from backend.core.ouroboros.governance.background_monitor import (  # noqa: PLC0415
+        _DEFAULT_TERMINATE_GRACE_S,
+    )
+    try:
+        raw = float(os.environ.get("JARVIS_TEST_STACK_DUMP_GRACE_S", "") or 0)
+        return raw if raw > 0 else _DEFAULT_TERMINATE_GRACE_S
+    except (TypeError, ValueError):
+        return _DEFAULT_TERMINATE_GRACE_S
+
+
+class _WallTimeout(asyncio.TimeoutError):
+    """The invocation hit its wall cap. Carries what the run printed before
+    it was cut off, including the stack ``dump_stacks`` asked it for -- the
+    bare ``TimeoutError`` this replaces dropped all of it."""
+
+    def __init__(self, output: str) -> None:
+        super().__init__("pytest invocation hit its wall-clock cap")
+        self.output = output
 
 
 def _effective_sandbox_prefixes() -> Tuple[str, ...]:
@@ -1904,6 +1945,7 @@ class TestRunner:
             # allowance on the strength of a hang) and the model was told its
             # code was wrong.
             timed_out=retry.timed_out,
+            hang=retry.hang,
         )
 
     # -- private ------------------------------------------------------------
@@ -1965,18 +2007,23 @@ class TestRunner:
                 result = await self._exec_with_timeout(
                     cmd, effective_cwd, report_path,
                 )
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             elapsed = time.monotonic() - start
-            return TestResult(
+            # What the run printed before the cap -- including the stack it
+            # was asked to dump -- followed by the verdict line every consumer
+            # already keys on.
+            partial = getattr(exc, "output", "") or ""
+            return self._attribute_hang(TestResult(
                 passed=False,
                 total=0,
                 failed=0,
                 failed_tests=(),
                 duration_seconds=elapsed,
-                stdout="pytest timed out after {:.1f}s".format(self._timeout),
+                stdout=(partial + "\n" if partial else "")
+                + "pytest timed out after {:.1f}s".format(self._timeout),
                 flake_suspected=False,
                 timed_out=True,
-            )
+            ), effective_cwd, test_paths)
         finally:
             self._cleanup_report(report_path)
 
@@ -2039,7 +2086,44 @@ class TestRunner:
                 cmd, effective_cwd, streaming_result,
             )
 
-        return streaming_result
+        return self._attribute_hang(streaming_result, effective_cwd, test_paths)
+
+    @staticmethod
+    def _attribute_hang(
+        result: TestResult, cwd: str, test_paths: List[str],
+    ) -> TestResult:
+        """Decide whose fault a cut-off run is, from the stack it left. NEVER raises.
+
+        A run killed at a time cap was filed ``infra`` unconditionally -- which
+        is right when the harness wedged and wrong when the candidate's test
+        blocked on an unmocked process or socket: that op then ended with no
+        repair, and the Sentinel re-dispatched the same goal every soak
+        (``jarvis_reload_manager``, ``migrate_acoustic_features``: 13 failures
+        and counting). The stack decides, through the traceback engine's
+        owned-frame rule: repo-owned code on it -> ``hang`` is set, the
+        verdict is appended to ``stdout`` and the adapter files ``test``;
+        nothing owned -> unchanged, still infra.
+        """
+        if not result.timed_out or result.hang:
+            return result
+        site = hang_site(
+            result.stdout or "", repo_root=Path(cwd), preferred_paths=test_paths,
+        )
+        if site is None:
+            logger.info(
+                "[TestRunner] cut-off run left no repo-owned frame — infra",
+            )
+            return result
+        verdict = site.render()
+        logger.warning(
+            "[TestRunner] hang attributed to the candidate: %s blocked in %s() "
+            "via %s:%d — filed as a test failure, not infra",
+            site.node_id, site.blocking.function or "?",
+            site.call_site.file_path, site.call_site.line_number,
+        )
+        return dataclasses.replace(
+            result, hang=verdict, stdout=f"{result.stdout or ''}\n{verdict}\n",
+        )
 
     async def _exec_with_timeout(
         self,
@@ -2074,23 +2158,35 @@ class TestRunner:
             start_new_session=True,
         )
 
+        # ONE communicate(), awaited rather than cancelled: a cancelled one
+        # discards everything the run printed before the cap, which is exactly
+        # the output that says where it was stuck.
+        comm = asyncio.ensure_future(proc.communicate())
         try:
-            raw_stdout, _ = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=self._timeout,
-            )
-        except asyncio.TimeoutError:
-            # Kill the whole session on timeout, not just the leader.
+            done, _ = await asyncio.wait({comm}, timeout=self._timeout)
+            if not done:
+                # Cut off. The stack first (the reap prints nothing), then the
+                # whole session -- not just the leader -- then a bounded drain
+                # as the pipe's last writers die.
+                grace = _stack_dump_grace_s()
+                dump_stacks(proc.pid)
+                done, _ = await asyncio.wait({comm}, timeout=grace)
+                reap_session(proc.pid, owner="test_runner")
+                if not done:
+                    done, _ = await asyncio.wait({comm}, timeout=grace)
+                partial = b""
+                if done and comm.exception() is None:
+                    partial = comm.result()[0] or b""
+                else:
+                    comm.cancel()
+                raise _WallTimeout(partial.decode("utf-8", errors="replace"))
+        except asyncio.CancelledError:
+            # The caller gave up (shutdown, op cancel). The run must not outlive it.
+            comm.cancel()
             reap_session(proc.pid, owner="test_runner")
-            # Wait for process to actually terminate — use
-            # ``communicate()`` (not a blind ``.wait()``) so the
-            # pipe drains as the child exits. Bounded by 5s.
-            try:
-                await asyncio.wait_for(proc.communicate(), timeout=5.0)
-            except (asyncio.TimeoutError, ProcessLookupError):
-                pass
             raise
 
+        raw_stdout, _ = comm.result()
         reap_session(proc.pid, owner="test_runner")
         stdout_text = (
             raw_stdout.decode("utf-8", errors="replace") if raw_stdout else ""
@@ -2236,7 +2332,22 @@ class TestRunner:
                                     return  # break out → __aexit__ kills subprocess
 
                 monitored_pid = mon.pid
-                await asyncio.wait_for(_drive(), timeout=self._timeout)
+                # ONE consumer, awaited rather than cancelled at the cap, so it
+                # keeps collecting while the run writes the stack it is asked
+                # for. Leaving the context (raise below) reaps the session.
+                drive = asyncio.ensure_future(_drive())
+                try:
+                    done, _ = await asyncio.wait({drive}, timeout=self._timeout)
+                    if not done:
+                        dump_stacks(mon.pid)
+                        await asyncio.wait({drive}, timeout=_stack_dump_grace_s())
+                        drive.cancel()
+                        await asyncio.gather(drive, return_exceptions=True)
+                        raise _WallTimeout("\n".join(collected_lines))
+                    drive.result()
+                except asyncio.CancelledError:
+                    drive.cancel()
+                    raise
                 returncode = mon.exit_code
         except asyncio.TimeoutError:
             # Mirror legacy path's behavior — surface TimeoutError so

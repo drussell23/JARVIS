@@ -83,9 +83,12 @@ _PYTEST_FRAME = re.compile(
 # refused it as unattributable and the candidate never got fixed. ``File
 # "..."`` is unambiguous enough to read through the marker, which is why the
 # pytest frame pattern below still refuses ``E`` lines and this one does not.
+# The comma before ``in`` is optional because ``faulthandler`` -- the only
+# stack a hang killed at the WALL cap can produce -- prints
+# ``File "x.py", line 7 in fn``, where ``traceback`` prints ``line 7, in fn``.
 _STDLIB_FRAME = re.compile(
     r'^(?:E\s+)?\s*File "(?P<path>[^"]+)", line (?P<line>\d+)'
-    r'(?:, in (?P<func>\S+))?',
+    r'(?:,? in (?P<func>\S+))?',
     re.MULTILINE,
 )
 
@@ -262,6 +265,12 @@ def is_vendored(path: str) -> bool:
 def _owned(path: str, repo_root: Path) -> bool:
     """Whether *path* is a source file this repository controls."""
     if not path or is_vendored(path):
+        return False
+    # ``<frozen runpy>``, ``<string>``, ``<stdin>``: code with no file. Joined
+    # onto the root as if repo-relative, these "resolved inside the repo" and
+    # were owned -- a hang entirely inside the interpreter's import machinery
+    # would have been blamed on the candidate.
+    if path.startswith("<"):
         return False
     try:
         candidate = Path(path)
@@ -468,8 +477,188 @@ async def parse_failure(
     )
 
 
+# ---------------------------------------------------------------------------
+# Hangs -- a run cut off at a time cap, attributed to the code that blocked
+# ---------------------------------------------------------------------------
+
+#: pytest-timeout's banner. The authority for "this run was killed by the
+#: per-test cap" (``test_runner`` reads it from here).
+TIMEOUT_BANNER_RE = re.compile(r"\+{3,}\s*Timeout\s*\+{3,}|^Timeout:\s", re.M)
+
+# One thread's stack, in either dialect a hang is reported in:
+#   pytest-timeout (per-test cap):   ~~~~ Stack of MainThread (1403...) ~~~~
+#   faulthandler   (wall cap):       Current thread 0x7f.. (most recent call first):
+_STACK_HEADER = re.compile(
+    r"^(?:~+ Stack of .+? ~+"
+    r"|(?:Current thread|Thread) 0x[0-9a-fA-F]+ \(most recent call first\):)\s*$",
+    re.M,
+)
+_INNERMOST_FIRST = "most recent call first"
+
+
+def _is_test_file(path: str) -> bool:
+    name = Path(path).name
+    return name.startswith("test_") or name.endswith("_test.py")
+
+
+def _rel(path: str, repo_root: Path) -> str:
+    """Root-relative when inside the root. Sandboxes are fresh directories per
+    run, so only the relative form is stable enough to compare across runs."""
+    try:
+        return Path(path).resolve().relative_to(repo_root.resolve()).as_posix()
+    except Exception:  # noqa: BLE001
+        return path
+
+
+def _source_at(path: str, line_number: int, repo_root: Path) -> str:
+    try:
+        target = Path(path)
+        if not target.is_absolute():
+            target = repo_root / target
+        lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+        return lines[line_number - 1].strip() if 0 < line_number <= len(lines) else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+@dataclass(frozen=True)
+class HangSite:
+    """Where a run that never finished was stuck, in repo terms.
+
+    ``call_site`` is the innermost frame the repository owns -- the call a
+    test must mock; ``blocking`` is the innermost frame of all -- what it was
+    waiting IN (``select``, ``wait``, ``recv``). Paths are root-relative.
+    """
+
+    node_id: str
+    collection: bool
+    call_site: Frame
+    blocking: Frame
+    source_line: str
+
+    @property
+    def key(self) -> str:
+        """Identity of the unmocked call, stable across sandboxes and reruns."""
+        return (
+            f"{self.call_site.file_path}:{self.call_site.line_number}"
+            f"->{self.blocking.function or '?'}"
+        )
+
+    def render(self) -> str:
+        """A pytest summary block, so every consumer that already reads
+        ``FAILED id - message`` (classifier ids, failure evidence, the repair
+        prompt) reads the hang without learning a new format."""
+        where = (
+            f"{self.call_site.file_path}:{self.call_site.line_number}"
+            f" in {self.call_site.function or '?'}"
+        )
+        code = f": `{self.source_line}`" if self.source_line else ""
+        outcome = "ERROR" if self.collection else "FAILED"
+        return (
+            "=========================== short test summary info "
+            "============================\n"
+            f"{outcome} {self.node_id} - TestHangError: blocked in "
+            f"{self.blocking.function or '?'}() "
+            f"({Path(self.blocking.file_path).name}:{self.blocking.line_number}) "
+            f"via {where}{code} -- the test waited on real I/O (a process, "
+            "socket, event or lock) that never completed. Mock that call where "
+            f"{self.call_site.file_path} looks it up; a unit test must never "
+            "wait on a real process, socket or server."
+        )
+
+
+def _stacks(output: str) -> Tuple[Tuple[str, Tuple[Frame, ...]], ...]:
+    """Each thread's stack as ``(header, frames outermost-first)``. A report
+    with no thread headers is one stack in printed (outermost-first) order."""
+    clean = strip_ansi(output)
+    headers = list(_STACK_HEADER.finditer(clean))
+    if not headers:
+        return (("", parse_frames(clean)),)
+    out = []
+    for i, header in enumerate(headers):
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(clean)
+        frames = list(parse_frames(clean[header.end():end]))
+        if _INNERMOST_FIRST in header.group(0):
+            frames.reverse()
+        out.append((header.group(0), tuple(frames)))
+    return tuple(out)
+
+
+def hang_site(
+    output: str,
+    *,
+    repo_root: Path,
+    preferred_paths: Iterable[str] = (),
+) -> Optional[HangSite]:
+    """Attribute a hang to the repository code it was stuck in. NEVER raises.
+
+    ``None`` means the stack is purely external -- the interpreter, pytest,
+    third-party code -- or absent: the cut-off says nothing about the
+    candidate, and the run stays infrastructure. Otherwise the stack that
+    passes through *preferred_paths* (the files under test) is chosen, else the
+    first that passes through any repo-owned code; the pseudo-frames of
+    ``<frozen ...>`` machinery are never owned.
+    """
+    try:
+        root = Path(repo_root)
+        preferred = {str(p) for p in preferred_paths if p}
+        # Only a HANG REPORT is read: a timeout banner or a thread-stack dump.
+        # A run cut off for another reason (memory-pressure shedding) can
+        # still hold an ordinary failure traceback printed earlier, and that
+        # is not where it was stuck.
+        clean = strip_ansi(output)
+        if not (_STACK_HEADER.search(clean) or TIMEOUT_BANNER_RE.search(clean)):
+            return None
+
+        def _is_preferred(frame: Frame) -> bool:
+            name = frame.file_path
+            return any(name.endswith(p) or p.endswith(name) for p in preferred)
+
+        chosen: Optional[Tuple[Frame, ...]] = None
+        fallback: Optional[Tuple[Frame, ...]] = None
+        for _header, frames in _stacks(output):
+            if not frames or not any(_owned(f.file_path, root) for f in frames):
+                continue
+            if preferred and any(_is_preferred(f) for f in frames):
+                chosen = frames
+                break
+            if fallback is None:
+                fallback = frames
+        frames = chosen or fallback
+        if not frames:
+            return None
+
+        owned = [f for f in frames if _owned(f.file_path, root)]
+        call = owned[-1]
+        blocking = frames[-1]
+        entry = next(
+            (f for f in owned if _is_preferred(f) or _is_test_file(f.file_path)),
+            None,
+        )
+        collection = bool(entry and entry.function == "<module>")
+        if entry is None:
+            node_id = _rel(call.file_path, root)
+        elif collection or not entry.function.startswith("test"):
+            node_id = _rel(entry.file_path, root)
+        else:
+            node_id = f"{_rel(entry.file_path, root)}::{entry.function}"
+        return HangSite(
+            node_id=node_id,
+            collection=collection,
+            call_site=Frame(_rel(call.file_path, root), call.line_number, call.function),
+            blocking=Frame(_rel(blocking.file_path, root), blocking.line_number, blocking.function),
+            source_line=_source_at(call.file_path, call.line_number, root),
+        )
+    except Exception:  # noqa: BLE001 — attribution is best-effort; None = infra
+        logger.debug("[PytestTraceback] hang attribution degraded", exc_info=True)
+        return None
+
+
 __all__ = [
     "Frame",
+    "HangSite",
+    "TIMEOUT_BANNER_RE",
+    "hang_site",
     "ParsedFailure",
     "is_vendored",
     "parse_error",

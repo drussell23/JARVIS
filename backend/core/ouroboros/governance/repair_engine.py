@@ -972,6 +972,15 @@ class RepairEngine:
         progress_tracker = RepairProgressTracker()
         escalation_count = 0
         pending_escalation: Any = None
+        # Hang progress: the SITE a cut-off run was stuck at, not the candidate
+        # text. A model that rewrites its mock each attempt but keeps blocking
+        # at the same unmocked call changes the content hash every time, so
+        # content identity cannot see this loop; the site can.
+        from backend.core.ouroboros.governance.forward_progress import (
+            ForwardProgressDetector,
+        )
+        hang_progress = ForwardProgressDetector()
+        hang_directive: Optional[str] = None
         t_start = time.monotonic()
         records: list = []
         model_id: str = getattr(ctx.generation, "model_id", "")
@@ -1444,6 +1453,39 @@ class RepairEngine:
             patch_sig = _patch_sig(diff if _has_real_diff else full_content)
 
             # ----------------------------------------------------------------
+            # HANG PROGRESS — the same unmocked call, again?
+            # ----------------------------------------------------------------
+            # Every failing iteration is observed (a non-hang under its own
+            # identity), so "consecutive" means consecutive. The detector's own
+            # threshold (JARVIS_FORWARD_PROGRESS_MAX_REPEATS) decides stuck:
+            # tripped -> the model could not find the mock with the verdict in
+            # front of it, and each further attempt costs a full time cap, so
+            # the run stops as futile; repeated below the threshold -> the next
+            # prompt says the mock it added did not intercept the call.
+            _hang_key = getattr(svr, "hang_site_key", "") or ""
+            hang_directive = None
+            if hang_progress.observe(ctx.op_id, _hang_key or f"no-hang:{fail_sig}"):
+                if _hang_key:
+                    _logger.warning(
+                        "[L2 Repair] op=%s blocked at the same unmocked call on "
+                        "consecutive attempts (%s) — stopping as futile",
+                        ctx.op_id, _hang_key,
+                    )
+                    return _stopped(f"hang_repeated:{_hang_key}")
+            elif _hang_key and int(
+                (hang_progress.summary(ctx.op_id) or {}).get("repeat_count", 0)
+            ) > 1:
+                _caller = _hang_key.split(":", 1)[0]
+                hang_directive = (
+                    "## REPEATED HANG — YOUR MOCK DID NOT INTERCEPT THE CALL\n"
+                    f"This attempt blocked at the SAME call as the previous one "
+                    f"({_hang_key}). Whatever you patched is not the name "
+                    f"{_caller} actually calls. Patch it as an attribute of the "
+                    f"module that CALLS it ({_caller}), not of the module that "
+                    "defines it, and make the patched call return immediately."
+                )
+
+            # ----------------------------------------------------------------
             # EVALUATE PROGRESS (Phase 3 — granular v1.1 when enabled)
             # ----------------------------------------------------------------
             # Base conditions (always): fewer failing tests, or severity improved.
@@ -1705,8 +1747,15 @@ class RepairEngine:
                 current_candidate_content=sandbox_content,
                 current_candidate_file_path=file_path,
                 dependency_cone=_dependency_cone,
+                # Both are "change approach NOW" directives; the renderer
+                # places this field first, ahead of everything else.
                 escalation_directive=(
-                    pending_escalation.paradigm if pending_escalation else None
+                    "\n\n".join(
+                        d for d in (
+                            pending_escalation.paradigm if pending_escalation else None,
+                            hang_directive,
+                        ) if d
+                    ) or None
                 ),
                 prior_iteration_diff=_epistemic_diff,
                 # Unconditional: what failed is not an epistemic refinement, it

@@ -291,6 +291,42 @@ class SandboxValidationResult:
     stderr: str
     returncode: int
     duration_s: float
+    #: ``pytest_traceback.HangSite.key`` when the run was cut off inside code
+    #: the repository owns: the unmocked call, stable across sandboxes. The
+    #: repair loop tracks it so a model that keeps missing the same mock is
+    #: stopped, and told so. ``""`` = no attributable hang.
+    hang_site_key: str = ""
+
+
+def _attribute_hang(
+    stdout: str, stderr: str, sandbox: Path, test_targets: Sequence[str],
+) -> Tuple[str, str]:
+    """``(stdout, hang_site_key)`` for a failed run. NEVER raises.
+
+    The same owned-frame attribution ``TestRunner`` applies: a run cut off
+    inside repo-owned code gets the ``HangSite`` verdict appended as a pytest
+    summary line (which the classifier, the failure evidence and the repair
+    prompt all already read) and its key returned; anything else is returned
+    unchanged with ``""``. pytest-timeout writes its dump to stderr and
+    faulthandler to stderr as well, so both streams are read.
+    """
+    try:
+        from backend.core.ouroboros.governance.pytest_traceback import (  # noqa: PLC0415
+            hang_site,
+        )
+        site = hang_site(
+            f"{stdout}\n{stderr}", repo_root=sandbox, preferred_paths=test_targets,
+        )
+        if site is None:
+            return stdout, ""
+        _logger.warning(
+            "repair_sandbox: hang attributed — %s blocked in %s() via %s:%d",
+            site.node_id, site.blocking.function or "?",
+            site.call_site.file_path, site.call_site.line_number,
+        )
+        return f"{stdout}\n{site.render()}\n", site.key
+    except Exception:  # noqa: BLE001
+        return stdout, ""
 
 
 # ---------------------------------------------------------------------------
@@ -933,47 +969,71 @@ class RepairSandbox:
             cmd.extend(["-c", str(_ini)])
         cmd.extend(test_targets)
 
+        from backend.core.ouroboros.governance.process_session import (  # noqa: PLC0415
+            dump_stacks, reap_session, register_session, unregister_session,
+        )
+        from backend.core.ouroboros.governance.test_runner import (  # noqa: PLC0415
+            _stack_dump_grace_s,
+        )
+
         start = time.monotonic()
+        proc = None
+        comm = None
         try:
+            # Its OWN session, registered, reaped on every ending -- the rule
+            # every other test runner here follows. Without it a child the
+            # test spawned (a server, ``sleep 300``) survived pytest-timeout's
+            # ``os._exit`` and every kill below, once per repair iteration,
+            # and the memory-pressure shedder and per-session budget could not
+            # see the run at all.
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=str(sandbox),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.DEVNULL,
                 env=env,
+                start_new_session=True,
             )
             self._active_proc = proc
+            register_session(proc.pid, "repair_sandbox")
 
-            try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=timeout_s + 2.0,
-                )
-            except asyncio.TimeoutError:
-                try:
-                    proc.kill()
-                    await proc.wait()
-                except Exception:
-                    pass
-                finally:
-                    self._active_proc = None
-
-                duration = time.monotonic() - start
-                return SandboxValidationResult(
-                    passed=False,
-                    stdout="",
-                    stderr="timeout",
-                    returncode=-1,
-                    duration_s=duration,
-                )
-
+            # ONE communicate(), awaited rather than cancelled, so output
+            # printed before a cap survives it (a cancelled one discards it).
+            comm = asyncio.ensure_future(proc.communicate())
+            done, _ = await asyncio.wait({comm}, timeout=timeout_s + 2.0)
+            cut_off = not done
+            if cut_off:
+                # The stack first (the reap prints nothing), then the session.
+                grace = _stack_dump_grace_s()
+                dump_stacks(proc.pid)
+                done, _ = await asyncio.wait({comm}, timeout=grace)
+                reap_session(proc.pid, owner="repair_sandbox")
+                if not done:
+                    done, _ = await asyncio.wait({comm}, timeout=grace)
+            stdout_b, stderr_b = b"", b""
+            if done and comm.exception() is None:
+                stdout_b, stderr_b = comm.result()
+            else:
+                comm.cancel()
+            reap_session(proc.pid, owner="repair_sandbox")
             self._active_proc = None
             duration = time.monotonic() - start
 
             stdout = stdout_b.decode(errors="replace")
             stderr = stderr_b.decode(errors="replace")
-            returncode = proc.returncode if proc.returncode is not None else -1
+            if cut_off:
+                # Kept for every consumer that reads "timeout" from stderr.
+                stderr = f"{stderr}\ntimeout" if stderr else "timeout"
+            returncode = (
+                -1 if cut_off or proc.returncode is None else proc.returncode
+            )
             passed = returncode == 0
+            hang_key = ""
+            if not passed:
+                stdout, hang_key = _attribute_hang(
+                    stdout, stderr, sandbox, test_targets,
+                )
 
             return SandboxValidationResult(
                 passed=passed,
@@ -981,12 +1041,22 @@ class RepairSandbox:
                 stderr=stderr,
                 returncode=returncode,
                 duration_s=duration,
+                hang_site_key=hang_key,
             )
 
         except asyncio.CancelledError:
+            # The repair loop gave up; the run must not outlive it.
+            if comm is not None:
+                comm.cancel()
+            if proc is not None:
+                reap_session(proc.pid, owner="repair_sandbox")
             raise
         except Exception as exc:
             self._active_proc = None
+            if comm is not None:
+                comm.cancel()
+            if proc is not None:
+                reap_session(proc.pid, owner="repair_sandbox")
             duration = time.monotonic() - start
             _logger.warning("repair_sandbox: run_tests error: %s", exc)
             return SandboxValidationResult(
@@ -996,6 +1066,9 @@ class RepairSandbox:
                 returncode=-1,
                 duration_s=duration,
             )
+        finally:
+            if proc is not None:
+                unregister_session(proc.pid)
 
     # ------------------------------------------------------------------
     # Teardown

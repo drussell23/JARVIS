@@ -395,7 +395,16 @@ def test_pin_10_run_inner_legacy_bytes_pinned():
     # after the trace. One await + one keyword; the FSM skeleton is unchanged.
     # Verified by tests/governance/test_l2_subject_source.py (the loop test
     # fails with the wiring reverted). Soak validation: same first soak.
-    EXPECTED_DIGEST = "c04a05a14ab0805f"
+    #
+    # Phase tag: hang attribution (2026-09-22, same branch). A failing
+    # iteration's ``svr.hang_site_key`` (the unmocked call a cut-off run was
+    # stuck at) feeds a ForwardProgressDetector: tripped -> stop
+    # ``hang_repeated:<site>`` (a hard stop in orchestrator.l2_stop_is_hard);
+    # repeated under a raised threshold -> a directive merged into
+    # ``escalation_directive``. No other FSM transition changed. Verified by
+    # tests/governance/test_hang_attribution.py (fails with the wiring
+    # reverted). Soak validation: same first soak.
+    EXPECTED_DIGEST = "48626d205204c71f"
     assert digest == EXPECTED_DIGEST, (
         f"_run_inner bytes drift detected: expected "
         f"{EXPECTED_DIGEST}, got {digest}. Legacy LINEAR semantics "

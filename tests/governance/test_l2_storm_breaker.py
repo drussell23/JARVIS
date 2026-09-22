@@ -131,15 +131,16 @@ def test_spine_class_retries_exhausted_is_hard_stop():
     It must sit in _l2_hook's HARD prefixes so the engine's own verdict
     ('this failure class is out of retries') is honored instead of
     re-dispatched."""
-    src = _ORCH.read_text(encoding="utf-8")
-    # The prefix must appear inside the hard-stop tuple.
-    tuple_start = src.find("_l2_hard_stop_prefixes = (")
-    assert tuple_start != -1, "hard-stop prefixes tuple missing from _l2_hook"
-    tuple_src = src[tuple_start : src.find(")", tuple_start)]
-    assert '"class_retries_exhausted"' in tuple_src, (
-        "class_retries_exhausted missing from _l2_hard_stop_prefixes — "
-        "a monotonic exhaustion is classified as transient and will be "
+    # Asked of the classifier _l2_hook calls, not read out of its source: a
+    # text pin broke when the tuple moved to module level unchanged.
+    from backend.core.ouroboros.governance.orchestrator import l2_stop_is_hard
+
+    assert l2_stop_is_hard("class_retries_exhausted:env"), (
+        "class_retries_exhausted is classified transient and will be "
         "futilely re-dispatched (the a1-brain-20260705-233225 storm)"
+    )
+    assert "l2_stop_is_hard(" in _ORCH.read_text(encoding="utf-8"), (
+        "_l2_hook no longer asks the shared classifier"
     )
     # And the engine really emits it (taxonomy lockstep, same as the
     # existing Slice 6 spine test for the other four).

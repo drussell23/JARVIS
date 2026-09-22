@@ -146,6 +146,37 @@ from backend.core.ouroboros.governance.epistemic_shedder import shed_to_fit
 logger = logging.getLogger("Ouroboros.Orchestrator")
 
 
+#: L2 stop reasons that mean GENUINELY EXHAUSTED: a fresh L2 dispatch would
+#: re-derive the same outcome, so the op ends instead of re-dispatching. Every
+#: other stop is SOFT (a transient provider fault) and may be retried.
+L2_HARD_STOP_PREFIXES: Tuple[str, ...] = (
+    "timebox_exhausted",
+    "max_iterations_exhausted",
+    "max_validation_runs_exhausted",
+    "deadline_budget_exhausted",
+    # a1-brain-20260705-233225 storm root cause: a per-class retry exhaustion
+    # IS "genuinely exhausted" by this taxonomy's own definition, but was
+    # absent here → classified SOFT → futilely re-dispatched — 120/120
+    # identical class_retries_exhausted:env re-dispatches, each burning a
+    # fresh 120s timebox. The engine's per-run counter re-derives the same
+    # deterministic failure every dispatch.
+    "class_retries_exhausted",
+    # The model blocked at the SAME unmocked call on consecutive attempts with
+    # the hang verdict in front of it. A fresh dispatch starts from the same
+    # candidate and re-buys a full time cap per iteration.
+    "hang_repeated",
+)
+
+
+def l2_stop_is_hard(stop_reason: str) -> bool:
+    """Whether an ``L2_STOPPED`` reason is exhaustion (end the op) rather than
+    a transient fault (re-dispatch). ``reason`` or ``reason:detail``."""
+    reason = stop_reason or ""
+    return any(
+        reason == p or reason.startswith(p + ":") for p in L2_HARD_STOP_PREFIXES
+    )
+
+
 def _goal_binding_kwargs(evidence_json: str) -> Dict[str, str]:
     """``roadmap_goal_id`` / ``roadmap_goal_digest`` kwargs for the
     auto-committer from an op's intake evidence; empty for non-roadmap ops
@@ -13769,26 +13800,8 @@ class GovernedOrchestrator:
             # a fresh 120s window each pass). On HARD stop, preserve the
             # pre-Slice-6 cancel behavior verbatim.
             # ──────────────────────────────────────────────────────────
-            _l2_hard_stop_prefixes = (
-                "timebox_exhausted",
-                "max_iterations_exhausted",
-                "max_validation_runs_exhausted",
-                "deadline_budget_exhausted",
-                # a1-brain-20260705-233225 storm root cause: a per-class
-                # retry exhaustion IS "genuinely exhausted" by this
-                # taxonomy's own definition, but was absent here →
-                # classified SOFT → futilely re-dispatched — 120/120
-                # identical class_retries_exhausted:env re-dispatches,
-                # each burning a fresh 120s timebox. The engine's
-                # per-run counter re-derives the same deterministic
-                # failure every dispatch.
-                "class_retries_exhausted",
-            )
             _stop_reason_str = l2_result.stop_reason or ""
-            _is_hard_stop = any(
-                _stop_reason_str == p or _stop_reason_str.startswith(p + ":")
-                for p in _l2_hard_stop_prefixes
-            )
+            _is_hard_stop = l2_stop_is_hard(_stop_reason_str)
             if not _is_hard_stop:
                 # Soft stop — leave ctx unadvanced; caller may re-dispatch.
                 logger.info(
