@@ -60,6 +60,16 @@ def _env_bool(key: str, default: bool) -> bool:
 # Public API
 # ---------------------------------------------------------------------------
 
+def trace_max_chars() -> int:
+    """The one budget for failure-trace text handed to a repair prompt.
+
+    ``JARVIS_EPISTEMIC_TRACE_MAX_CHARS`` (default 2500). Every reader of that
+    knob goes through here, so the trace a prompt carries and the tail a pivot
+    carries cannot be sized by two different rules.
+    """
+    return _env_int("JARVIS_EPISTEMIC_TRACE_MAX_CHARS", 2500)
+
+
 def build_failure_context(
     *,
     prior_src: object,
@@ -145,10 +155,14 @@ def build_failure_context(
         # 3. Stderr trace tail + failing test ids
         # ------------------------------------------------------------------
         try:
-            trace_max = _env_int("JARVIS_EPISTEMIC_TRACE_MAX_CHARS", 2500)
-            stderr_tail = stderr_str[-trace_max:] if len(stderr_str) > trace_max else stderr_str
-            parts.append("--- FAILING TEST STDERR (tail) ---")
-            parts.append(stderr_tail)
+            # Omitted when there is nothing to show: a caller that renders the
+            # trace in its own section passes none here, and an empty labelled
+            # block tells the model a trace exists and says nothing.
+            if stderr_str.strip():
+                trace_max = trace_max_chars()
+                stderr_tail = stderr_str[-trace_max:] if len(stderr_str) > trace_max else stderr_str
+                parts.append("--- FAILING TEST STDERR (tail) ---")
+                parts.append(stderr_tail)
         except Exception:
             pass
 
@@ -258,6 +272,11 @@ def epistemic_feedback_enabled() -> bool:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def truncate_middle(text: str, max_chars: int) -> str:
+    """Public name for :func:`_truncate_middle` -- head and tail both survive."""
+    return _truncate_middle(text, max_chars)
+
 
 def _truncate_middle(text: str, max_chars: int) -> str:
     """Truncate the MIDDLE of text so both ends survive.

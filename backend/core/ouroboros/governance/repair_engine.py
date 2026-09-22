@@ -556,17 +556,13 @@ def _epistemic_base_temp() -> float:
 
 
 def _env_trace_tail_chars() -> int:
-    """Max chars of stderr tail to carry on an L2_PIVOT (failure-locus hint).
+    """Max chars of failure-trace tail to carry on an L2_PIVOT (failure-locus hint).
 
-    Reuses ``JARVIS_EPISTEMIC_TRACE_MAX_CHARS`` (default ``2500``) — the same
-    knob ``epistemic_feedback.build_failure_context`` uses for its trace tail.
-    Fail-soft: any parse error returns ``2500``.
+    The one trace budget, read through ``epistemic_feedback.trace_max_chars``
+    so the pivot tail and the prompt's trace cannot be sized by two rules.
     """
-    import os
-    try:
-        return int(os.environ.get("JARVIS_EPISTEMIC_TRACE_MAX_CHARS", "2500"))
-    except (ValueError, TypeError):
-        return 2500
+    from backend.core.ouroboros.governance.epistemic_feedback import trace_max_chars
+    return trace_max_chars()
 
 
 def _epistemic_temp_floor() -> float:
@@ -1354,11 +1350,19 @@ class RepairEngine:
                 "\u2705 PASSED" if svr.passed else "\u274c FAILED",
                 svr.returncode,
             )
+            # What the run said about the failure, derived ONCE from both
+            # streams and used by every consumer below (log, prompt, epistemic
+            # context, pivot). Reading raw ``svr.stderr`` / a 300-char slice of
+            # stdout is what left 40 iterations of bt-2026-09-21-235603 with no
+            # assertion to repair: pytest reports on stdout, colourised.
+            from backend.core.ouroboros.governance.pytest_traceback import (
+                failure_evidence,
+            )
+            evidence = failure_evidence(svr.stdout, svr.stderr)
             if not svr.passed:
-                _tail = (svr.stdout or svr.stderr or "")[-200:]
                 _logger.info(
-                    "\U0001f527 [L2 Repair] Iteration %d failure tail: %s",
-                    iteration, _tail,
+                    "\U0001f527 [L2 Repair] Iteration %d failure: %s",
+                    iteration, evidence.summary or "(the run reported nothing)",
                 )
             # For telemetry, record *content* line count on the full_content
             # path so dashboards don't read diff_lines=0 as "nothing changed".
@@ -1575,7 +1579,10 @@ class RepairEngine:
                             if _do_pivot:
                                 _stderr_tail = ""
                                 try:
-                                    _raw = getattr(svr, "stderr", "") or ""
+                                    # The failure locus the pivot decomposes
+                                    # at: the reported trace, not raw stderr
+                                    # (empty for a pytest assertion failure).
+                                    _raw = evidence.trace
                                     _tt = _env_trace_tail_chars()
                                     _stderr_tail = (
                                         _raw[-_tt:] if len(_raw) > _tt else _raw
@@ -1655,21 +1662,17 @@ class RepairEngine:
                 )
                 _repeated_count = signature_seen_counts[fail_sig] - 1  # 0 on first sight
                 if epistemic_feedback_enabled():
-                    # Rich context: prior STABLE candidate vs current FAILING candidate,
-                    # plus the FULL sandbox stderr (NOT the 300-char failure_summary).
+                    # Rich context: prior STABLE candidate vs current FAILING
+                    # candidate. The trace is NOT passed here: it reaches the
+                    # prompt once, as ``failure_trace`` below, rather than twice.
                     _full_block = build_failure_context(
                         prior_src=prior_sandbox_content,
                         failed_src=sandbox_content,
-                        stderr=svr.stderr,
+                        stderr="",
                         failing_tests=classification.failing_test_ids,
                         sub_goal_label=getattr(ctx, "op_id", "") or "",
                     )
-                    # The assembled block carries diff + trace; place it in the diff
-                    # field (rendered under EPISTEMIC DIFF) and keep the raw stderr
-                    # tail in the trace field so the prompt receives BOTH the hybrid
-                    # diff AND the full trace with clear labels.
                     _epistemic_diff = _full_block or ""
-                    _epistemic_trace = svr.stderr or ""
                     # Parametric degeneration: lower the temperature for the NEXT
                     # GENERATE when this signature has recurred. _repeated_count=0 →
                     # base temp unchanged (temperature_for_attempt returns base).
@@ -1681,7 +1684,6 @@ class RepairEngine:
                     epistemic_temperature = None
             except Exception:  # noqa: BLE001 — epistemic is advisory, never fatal
                 _epistemic_diff = ""
-                _epistemic_trace = ""
                 epistemic_temperature = None
 
             repair_context = RepairContext(
@@ -1690,7 +1692,7 @@ class RepairEngine:
                 failure_class=fail_class,
                 failure_signature_hash=fail_sig,
                 failing_tests=classification.failing_test_ids,
-                failure_summary=(svr.stdout + svr.stderr)[:300],
+                failure_summary=evidence.summary,
                 current_candidate_content=sandbox_content,
                 current_candidate_file_path=file_path,
                 dependency_cone=_dependency_cone,
@@ -1698,7 +1700,10 @@ class RepairEngine:
                     pending_escalation.paradigm if pending_escalation else None
                 ),
                 prior_iteration_diff=_epistemic_diff,
-                failure_trace=_epistemic_trace,
+                # Unconditional: what failed is not an epistemic refinement, it
+                # is the minimum a repair needs. The flag governs the diff and
+                # the temperature, never whether the model sees the error.
+                failure_trace=evidence.trace,
             )
 
             # T2: the current failing candidate becomes the PRIOR-stable source for the

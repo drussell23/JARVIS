@@ -371,7 +371,23 @@ def test_pin_10_run_inner_legacy_bytes_pinned():
     # tests/governance/test_repair_lane_test_targets.py 12/12 +
     # test_validate_candidate_tree.py e2e). Soak validation: Run #20
     # (first ignition after the Slice 9 merge). Pin updated atomically.
-    EXPECTED_DIGEST = "411775083e93b81b"
+    #
+    # Phase tag: L2 failure evidence (2026-09-22, branch
+    # ouroboros/l2-failure-evidence). _run_inner told the model what failed
+    # with ``(stdout + stderr)[:300]`` and ``stderr`` -- for pytest, the
+    # session header and an empty string, since failures print on stdout
+    # (colourised by pytest.ini). It now derives ONE
+    # ``pytest_traceback.failure_evidence(stdout, stderr)`` per failing
+    # iteration and feeds it to the log line, ``failure_summary``,
+    # ``failure_trace`` (now unconditional -- the flag governs the diff and
+    # temperature, not whether the error is shown) and the pivot tail; the
+    # trace is no longer passed into build_failure_context too, so it reaches
+    # the prompt once. The FSM skeleton (kill conditions, apply, run, classify,
+    # divergence, class caps) is unchanged. Verified by
+    # tests/governance/test_l2_failure_evidence.py (fails at the prior pin,
+    # passes here) + the epistemic/pivot/slice-4a/5a/7 suites unchanged.
+    # Soak validation: the first soak on this branch. Pin updated atomically.
+    EXPECTED_DIGEST = "180e73e14d4b82bf"
     assert digest == EXPECTED_DIGEST, (
         f"_run_inner bytes drift detected: expected "
         f"{EXPECTED_DIGEST}, got {digest}. Legacy LINEAR semantics "

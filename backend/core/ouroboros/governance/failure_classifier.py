@@ -55,8 +55,11 @@ NON_RETRYABLE_ENV_SUBTYPES: frozenset[str] = frozenset(
 # Hash helpers
 # ---------------------------------------------------------------------------
 
+# ``ERROR`` as well as ``FAILED``: a fixture or setup error is a failing test
+# whose id pytest prints under the other word. Leaving it out collapsed every
+# such run onto the id-less signature, so no two iterations could differ.
 _FAILED_RE = re.compile(
-    r"^FAILED\s+([\w/.\-:\[\]]+(?:::[^\s]+)?)",
+    r"^(?:FAILED|ERROR)\s+([\w/.\-:\[\]]+(?:::[^\s]+)?)",
     re.MULTILINE,
 )
 
@@ -196,8 +199,18 @@ class FailureClassifier:
         ClassificationResult
             Immutable classification with populated hash and metadata.
         """
-        stdout: str = getattr(svr, "stdout", "") or ""
-        stderr: str = getattr(svr, "stderr", "") or ""
+        # Normalised BEFORE any pattern runs. ``pytest.ini`` forces
+        # ``--color=yes`` into the pipe, so every ``FAILED`` line began with an
+        # escape sequence and the line-anchored id pattern never matched: each
+        # iteration of a failing L2 repair got the SAME id-less signature, which
+        # blinded progress detection and drove the signature-repeat temperature
+        # decay to its floor on failures that were not repeating at all.
+        from backend.core.ouroboros.governance.pytest_traceback import (  # noqa: PLC0415
+            strip_ansi,
+        )
+
+        stdout: str = strip_ansi(getattr(svr, "stdout", "") or "")
+        stderr: str = strip_ansi(getattr(svr, "stderr", "") or "")
         combined = stdout + "\n" + stderr
 
         # ------------------------------------------------------------------

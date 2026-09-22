@@ -47,7 +47,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 logger = logging.getLogger("Ouroboros.PytestTraceback")
 
@@ -110,6 +110,17 @@ _BARE_ERROR = re.compile(
 # failed without being told what it asserted.
 _ASSERT_LINE = re.compile(r"^E\s+(?P<msg>assert\s.*)$", re.MULTILINE)
 
+# pytest's section rule:  ======= FAILURES =======   /   ==== 2 failed in 0.1s ====
+# The report is a sequence of these rules, each followed by its body. The
+# title is kept verbatim (case-folded as a key) rather than matched against a
+# list, so a section this module has never heard of is still a section.
+_SECTION_RULE = re.compile(r"^=+ (?P<title>.+?) =+$", re.MULTILINE)
+
+#: The sections that say WHAT failed, in the order pytest prints them.
+FAILURE_SECTIONS: Tuple[str, ...] = ("errors", "failures")
+#: The section pytest writes one ``FAILED id - message`` line per failure into.
+SUMMARY_SECTION = "short test summary info"
+
 
 @dataclass(frozen=True)
 class Frame:
@@ -141,6 +152,94 @@ def strip_ansi(text: str) -> str:
         return _ANSI_RE.sub("", text or "")
     except Exception:  # noqa: BLE001
         return text or ""
+
+
+def report_sections(output: str) -> Dict[str, str]:
+    """pytest's report split on its own ``=== title ===`` rules. NEVER raises.
+
+    Keyed by the case-folded title; the value is the text between that rule
+    and the next, ANSI already stripped. A title repeated by pytest (it does
+    not, today) keeps both bodies, joined in printed order.
+    """
+    out: Dict[str, str] = {}
+    try:
+        clean = strip_ansi(output)
+        rules = list(_SECTION_RULE.finditer(clean))
+        for i, rule in enumerate(rules):
+            end = rules[i + 1].start() if i + 1 < len(rules) else len(clean)
+            key = rule.group("title").strip().casefold()
+            body = clean[rule.end():end].strip("\n")
+            out[key] = f"{out[key]}\n{body}" if key in out else body
+    except Exception:  # noqa: BLE001
+        logger.debug("[PytestTraceback] section parse degraded", exc_info=True)
+    return out
+
+
+@dataclass(frozen=True)
+class FailureEvidence:
+    """What a test run said about its failure, in the words a repair needs.
+
+    ``summary`` is one line per failure (pytest's own ``FAILED id - message``
+    lines); ``trace`` is the tracebacks behind them. Both ANSI-free and bounded
+    by :func:`epistemic_feedback.trace_max_chars`.
+    """
+
+    summary: str
+    trace: str
+
+
+def failure_evidence(stdout: str, stderr: str = "") -> FailureEvidence:
+    """The failure a test run reported, read from BOTH of its streams. NEVER raises.
+
+    ## Why this exists
+
+    The L2 repair loop told the model what failed with
+    ``(stdout + stderr)[:300]`` and ``stderr``. pytest writes its failures to
+    STDOUT, after a session header and a progress bar, and ``pytest.ini``
+    forces ``--color=yes`` into the pipe: measured through the real
+    ``RepairSandbox``, those 300 characters were the header and a red ``FF``,
+    and stderr was empty. Every repair iteration in bt-2026-09-21-235603 was
+    asked to fix a test without being told what it asserted -- 40 iterations,
+    zero converged, seven ops ended ``class_retries_exhausted:test``.
+
+    ## What counts as evidence
+
+    pytest's ``errors``/``failures`` sections when it printed any; otherwise
+    (a timeout, an interpreter crash, a collection abort, a non-pytest runner)
+    the whole cleaned output, because then the output IS the evidence and
+    nothing here can know which part matters. stderr is appended when it says
+    anything, never dropped. The summary falls back to the last error the
+    output names, then to the trace's last line, so it is never empty while
+    the run said something.
+    """
+    from backend.core.ouroboros.governance import epistemic_feedback as _ef  # noqa: PLC0415
+
+    try:
+        out = strip_ansi(stdout or "").strip("\n")
+        err = strip_ansi(stderr or "").strip("\n")
+        sections = report_sections(out)
+        failed = [sections[name] for name in FAILURE_SECTIONS if sections.get(name)]
+        if failed:
+            trace = "\n\n".join(failed)
+            if err.strip():
+                trace = f"{trace}\n\n--- stderr ---\n{err}"
+        else:
+            trace = "\n".join(part for part in (out, err) if part.strip())
+        summary = sections.get(SUMMARY_SECTION, "").strip()
+        if not summary:
+            etype, message = parse_error(f"{out}\n{err}")
+            summary = ": ".join(part for part in (etype, message) if part)
+        if not summary and trace.strip():
+            summary = trace.strip().splitlines()[-1]
+        budget = _ef.trace_max_chars()
+        return FailureEvidence(
+            summary=_ef.truncate_middle(summary, budget),
+            trace=_ef.truncate_middle(trace, budget),
+        )
+    except Exception:  # noqa: BLE001 — evidence is best-effort, never fatal
+        logger.debug("[PytestTraceback] failure evidence degraded", exc_info=True)
+        raw = "\n".join(part for part in (stdout or "", stderr or "") if part)
+        return FailureEvidence(summary="", trace=strip_ansi(raw))
 
 
 def is_vendored(path: str) -> bool:
