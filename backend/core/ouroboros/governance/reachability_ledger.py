@@ -52,8 +52,13 @@ Concurrency
 VALIDATE fans candidates out under ``asyncio.gather`` and the sentinel runs
 goals concurrently, so every counter here is read-modify-write under
 contention -- the same shape as the admission race found in the micro-fix
-governor. All mutation happens under a single ``asyncio.Lock``; the
-in-process counters cannot interleave.
+governor. All mutation happens under a single lock; the in-process counters
+cannot interleave. A ``threading.Lock``, not an ``asyncio.Lock``: nothing
+held under it awaits (dict updates and one small append), and since
+``cooperative_fs_io.offload`` settles every call here the ledger is reached
+from many event loops and worker threads -- an ``asyncio.Lock`` binds to the
+first loop that waits on it and raises on any other, which would let the
+accounting break the very call it accounts.
 
 The durable line is appended with ``O_APPEND`` in one ``write()`` per
 record, which Linux does not interleave for writes of this size. That is a
@@ -65,10 +70,10 @@ Nothing outside this process writes this file.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -110,12 +115,37 @@ def keep_rotations() -> int:
     return _env_int("JARVIS_REACHABILITY_KEEP_ROTATIONS", _DEFAULT_KEEP_ROTATIONS)
 
 
+_DEFAULT_FAILING_STREAK = 3
+_DEFAULT_FAILURE_DETAIL_CHARS = 240
+
+
+def failing_streak() -> int:
+    """Consecutive failed invocations at which a capability is declared FAILING.
+
+    Consecutive, not a rate: a path that fails now and then is a flaky path; a
+    path that fails every time it is asked is DOWN -- the state that hid
+    cooperative_fs_io's broken process pool for 2.5 hours of a soak, because
+    each of the calls it failed was absorbed as a DEBUG "degraded" line.
+    """
+    return _env_int("JARVIS_REACHABILITY_FAILING_STREAK", _DEFAULT_FAILING_STREAK)
+
+
+def failure_detail_chars() -> int:
+    return _env_int("JARVIS_REACHABILITY_FAILURE_DETAIL_CHARS", _DEFAULT_FAILURE_DETAIL_CHARS)
+
+
 class Tier(str, Enum):
-    """Strength of evidence that a capability is alive."""
+    """Strength of evidence that a capability is alive -- and, below the line,
+    evidence that it is not."""
 
     REGISTERED = "registered"
     INVOKED = "invoked"
     EFFECTIVE = "effective"
+    #: An invocation that failed. Durable on the first of a streak and on the
+    #: alarm (``health`` says which); counted in memory for every one.
+    FAILED = "failed"
+    #: A FAILING capability succeeded again.
+    RECOVERED = "recovered"
 
 
 @dataclass
@@ -130,6 +160,14 @@ class CapabilityState:
     last_invoked_at: float = 0.0
     last_effective_at: float = 0.0
     last_detail: str = ""
+    failed: int = 0
+    consecutive_failures: int = 0
+    #: When the current FAILING episode began; 0.0 = not failing.
+    failing_since: float = 0.0
+    last_failure_at: float = 0.0
+    last_failure: str = ""
+    alarms: int = 0
+    recoveries: int = 0
 
     @property
     def inert(self) -> bool:
@@ -141,10 +179,17 @@ class CapabilityState:
         """Loaded, and never reached."""
         return self.registered > 0 and self.invoked == 0
 
+    @property
+    def failing(self) -> bool:
+        """Failing on every recent invocation -- down, not flaky."""
+        return self.failing_since > 0.0
+
     def render(self) -> str:
         return (
             f"{self.capability}: registered={self.registered} "
             f"invoked={self.invoked} effective={self.effective}"
+            + (f" failed={self.failed}" if self.failed else "")
+            + (f" FAILING(x{self.consecutive_failures})" if self.failing else "")
             + (" INERT" if self.inert else "")
             + (" DORMANT" if self.dormant else "")
         )
@@ -159,6 +204,14 @@ class CapabilityState:
             "dormant": self.dormant,
             "last_effective_at": self.last_effective_at,
             "last_detail": self.last_detail,
+            "failed": self.failed,
+            "failing": self.failing,
+            "consecutive_failures": self.consecutive_failures,
+            "failing_since": self.failing_since,
+            "last_failure_at": self.last_failure_at,
+            "last_failure": self.last_failure,
+            "alarms": self.alarms,
+            "recoveries": self.recoveries,
         }
 
 
@@ -172,11 +225,12 @@ class Effect:
     repairing nothing.
     """
 
-    __slots__ = ("_effective", "_detail")
+    __slots__ = ("_effective", "_detail", "_failure")
 
     def __init__(self) -> None:
         self._effective = False
         self._detail = ""
+        self._failure = ""
 
     @property
     def effective(self) -> bool:
@@ -186,10 +240,25 @@ class Effect:
     def detail(self) -> str:
         return self._detail
 
+    @property
+    def failed(self) -> bool:
+        return bool(self._failure)
+
+    @property
+    def failure(self) -> str:
+        return self._failure
+
     def mark(self, detail: str = "") -> None:
         """Assert effectiveness directly, for outcomes with no AST."""
         self._effective = True
         self._detail = detail
+
+    def fail(self, detail: str) -> None:
+        """This invocation FAILED without raising -- the fail-soft shape: the
+        capability returned a sentinel / ``None`` / an error object and the
+        caller carried on. Exactly the failures a ledger that only counted
+        exceptions (or nothing) could never see."""
+        self._failure = detail or "failed"
 
     def ast_mutation(self, before: str, after: str, *, detail: str = "") -> bool:
         """Effective iff *after* is a structurally different program.
@@ -232,7 +301,7 @@ class ReachabilityLedger:
         self._states: Dict[str, CapabilityState] = {}
         self._written = 0
         self._rotations = 0
-        self._lock = asyncio.Lock()
+        self._lock = threading.Lock()
 
     # -- recording -----------------------------------------------------
 
@@ -243,14 +312,22 @@ class ReachabilityLedger:
         *,
         op_id: str = "",
         detail: str = "",
+        durable: bool = True,
     ) -> CapabilityState:
-        """Append one observation. NEVER raises."""
+        """Append one observation. NEVER raises.
+
+        ``durable=False`` counts it in memory only: for hot seams (every
+        ``offload``) a line per call would make the ledger the I/O offender.
+        Failures and health transitions are recorded by :meth:`settle`."""
+        # The outcome tiers go through the streak logic, never around it (and
+        # before the lock: settle takes the same one).
+        if tier is Tier.FAILED:
+            return await self.settle(capability, ok=False, op_id=op_id, detail=detail)
+        if tier is Tier.RECOVERED:
+            return await self.settle(capability, ok=True, op_id=op_id, detail=detail)
         now = time.time()
-        async with self._lock:
-            state = self._states.get(capability)
-            if state is None:
-                state = CapabilityState(capability=capability, first_seen=now)
-                self._states[capability] = state
+        with self._lock:
+            state = self._state_for(capability, now)
             if tier is Tier.REGISTERED:
                 state.registered += 1
             elif tier is Tier.INVOKED:
@@ -261,7 +338,70 @@ class ReachabilityLedger:
                 state.last_effective_at = now
             if detail:
                 state.last_detail = detail
-            self._append(capability, tier, op_id, detail, now)
+            if durable:
+                self._append(capability, tier, op_id, detail, now)
+            return state
+
+    def _state_for(self, capability: str, now: float) -> CapabilityState:
+        state = self._states.get(capability)
+        if state is None:
+            state = CapabilityState(capability=capability, first_seen=now)
+            self._states[capability] = state
+        return state
+
+    async def settle(
+        self,
+        capability: str,
+        *,
+        ok: bool,
+        op_id: str = "",
+        detail: str = "",
+    ) -> CapabilityState:
+        """How one invocation ENDED. NEVER raises.
+
+        A success resets the streak (and ends a FAILING episode, loudly). A
+        failure extends it: the first of a streak is recorded at INFO and
+        durably; the one that reaches :func:`failing_streak` raises the HEALTH
+        ALARM at WARNING -- the level a soak log keeps -- and durably; the rest
+        of the episode is counted, not re-logged, so a path down for hours
+        costs one alarm line, not one per call.
+        """
+        now = time.time()
+        with self._lock:
+            state = self._state_for(capability, now)
+            if ok:
+                if state.failing:
+                    down_s = now - state.failing_since
+                    streak = state.consecutive_failures
+                    state.failing_since = 0.0
+                    state.recoveries += 1
+                    summary = f"recovered after {streak} consecutive failures ({down_s:.0f}s failing)"
+                    self._append(capability, Tier.RECOVERED, op_id, summary, now)
+                    logger.warning("[Reachability] RECOVERED %s — %s", capability, summary)
+                state.consecutive_failures = 0
+                return state
+
+            reason = (detail or "failed")[: failure_detail_chars()]
+            state.failed += 1
+            state.consecutive_failures += 1
+            state.last_failure_at = now
+            state.last_failure = reason
+            threshold = failing_streak()
+            if not state.failing and state.consecutive_failures >= threshold:
+                state.failing_since = now
+                state.alarms += 1
+                self._append(capability, Tier.FAILED, op_id, reason, now, health="alarm")
+                logger.warning(
+                    "[Reachability] HEALTH ALARM %s — %d consecutive failed "
+                    "invocations, the fail-soft path is DOWN: %s",
+                    capability, state.consecutive_failures, reason,
+                )
+            elif state.consecutive_failures == 1:
+                self._append(capability, Tier.FAILED, op_id, reason, now, health="first")
+                logger.info(
+                    "[Reachability] %s failed (%s) — alarm at %d consecutive",
+                    capability, reason, threshold,
+                )
             return state
 
     async def registered(self, capability: str, *, detail: str = "") -> None:
@@ -279,14 +419,18 @@ class ReachabilityLedger:
 
     def _append(
         self, capability: str, tier: Tier, op_id: str, detail: str, at: float,
+        *, health: str = "",
     ) -> None:
         """One O_APPEND write per record. Called under the lock; never raises."""
         if self._path is None or self._written >= self._max_records:
             return
-        line = json.dumps({
+        record = {
             "at": round(at, 3), "capability": capability,
             "tier": tier.value, "op_id": op_id, "detail": detail,
-        }, sort_keys=True) + "\n"
+        }
+        if health:
+            record["health"] = health
+        line = json.dumps(record, sort_keys=True) + "\n"
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             self._maybe_rotate()
@@ -343,19 +487,19 @@ class ReachabilityLedger:
     # -- reading -------------------------------------------------------
 
     async def state(self, capability: str) -> CapabilityState:
-        async with self._lock:
+        with self._lock:
             return self._states.get(capability) or CapabilityState(
                 capability=capability,
             )
 
     async def snapshot(self) -> Dict[str, CapabilityState]:
-        async with self._lock:
+        with self._lock:
             return {k: v for k, v in self._states.items()}
 
     async def inert(self, *, min_invocations: int = 1) -> List[CapabilityState]:
         """Capabilities reached at least *min_invocations* times that have
         never changed an outcome. This is the alarm, not a log line."""
-        async with self._lock:
+        with self._lock:
             return sorted(
                 (
                     s for s in self._states.values()
@@ -366,11 +510,42 @@ class ReachabilityLedger:
 
     async def dormant(self) -> List[CapabilityState]:
         """Registered and never reached."""
-        async with self._lock:
+        with self._lock:
             return sorted(
                 (s for s in self._states.values() if s.dormant),
                 key=lambda s: s.capability,
             )
+
+    async def failing(self) -> List[CapabilityState]:
+        """Capabilities DOWN right now, longest-failing first."""
+        with self._lock:
+            return sorted(
+                (s for s in self._states.values() if s.failing),
+                key=lambda s: s.failing_since,
+            )
+
+    def health_report(self) -> Dict[str, Any]:
+        """The session's capability health, for ``summary.json``. Synchronous
+        (the summary is written from sync shutdown paths) and lock-free: a
+        dict copy is atomic under the GIL, and a report one observation stale
+        is still the report. NEVER raises.
+
+        ``failing`` -- down at the end of the session; ``degraded`` -- failed
+        at least once but not down now (flaky, or recovered: ``recoveries``
+        says which).
+        """
+        try:
+            states = list(dict(self._states).values())
+            failing = [s.as_dict() for s in states if s.failing]
+            degraded = [s.as_dict() for s in states if s.failed and not s.failing]
+            return {
+                "failing_streak": failing_streak(),
+                "failing": sorted(failing, key=lambda d: d["failing_since"]),
+                "degraded": sorted(degraded, key=lambda d: -d["failed"]),
+                "capabilities_observed": len(states),
+            }
+        except Exception:  # noqa: BLE001
+            return {"error": "health report unavailable"}
 
 
 _default: Optional[ReachabilityLedger] = None
@@ -391,22 +566,46 @@ async def track_reachability(
     *,
     op_id: str = "",
     ledger: Optional[ReachabilityLedger] = None,
+    durable: bool = True,
 ) -> AsyncIterator[Effect]:
-    """Record an invocation, and whatever the body proves about its effect.
+    """Record an invocation, whatever the body proves about its effect, and
+    how it ENDED.
 
     The invocation is recorded on entry rather than exit: a capability that
     raised still ran, and a ledger that only counts clean exits under-reports
     exactly the paths most worth seeing. Effectiveness is recorded on exit,
     and only if the body established it.
+
+    The ending is settled too: an exception, or ``effect.fail(...)`` for the
+    fail-soft shape, is a FAILED invocation; a normal exit is a success.
+    Cancellation (and any other ``BaseException``) is neither -- an op torn
+    down mid-call says nothing about the capability, and must not extend a
+    streak or end one. ``durable=False`` keeps per-call records in memory for
+    hot seams; failures and health transitions are durable regardless.
     """
     book = ledger or default_ledger()
-    await book.invoked(capability, op_id=op_id)
+    await book.record(capability, Tier.INVOKED, op_id=op_id, durable=durable)
     effect = Effect()
+    raised = ""
+    completed = False
     try:
         yield effect
+        completed = True
+    except Exception as exc:
+        raised = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
         if effect.effective:
-            await book.effective(capability, op_id=op_id, detail=effect.detail)
+            await book.record(
+                capability, Tier.EFFECTIVE, op_id=op_id,
+                detail=effect.detail, durable=durable,
+            )
+        if raised or effect.failed:
+            await book.settle(
+                capability, ok=False, op_id=op_id, detail=raised or effect.failure,
+            )
+        elif completed:
+            await book.settle(capability, ok=True, op_id=op_id)
 
 
 def tracks_reachability(

@@ -820,7 +820,57 @@ def _offload_worker(
         )
 
 
+def _offload_capability(fn: Callable[..., Any], cpu_bound: bool) -> str:
+    """The reachability capability an offloaded callable is accounted under:
+    one per CALL SITE's target (``functools.partial`` is unwrapped to what it
+    calls), so an alarm names the work that is failing, and the cardinality is
+    bounded by the code, never by the arguments."""
+    target = getattr(fn, "func", fn)
+    module = getattr(target, "__module__", "") or "?"
+    name = getattr(target, "__qualname__", "") or type(target).__name__
+    return f"offload.{'process' if cpu_bound else 'thread'}:{module}.{name}"
+
+
 async def offload(
+    fn: Callable[..., Any],
+    /,
+    *args: Any,
+    cpu_bound: bool = False,
+    **kwargs: Any,
+) -> Any:
+    """Off-loop delegation, with every ENDING accounted. Contract: see
+    :func:`_offload_dispatch` -- unchanged, including what it raises.
+
+    Every caller of this seam is fail-soft: an :class:`OffloadError` comes
+    back, the caller logs "degraded" at DEBUG and carries on. That is right
+    for one call and blind for a thousand: bt-2026-09-22-201845 lost its
+    process pool 16 minutes in and every cpu-bound offload failed for the next
+    2.5 hours without one line a soak log keeps. Each call is therefore settled
+    in the reachability ledger (per-call counters in memory, ``durable=False``
+    -- this is a hot seam): an OffloadError or a raise is a failed invocation,
+    a result a successful one, and a capability that fails on every call
+    raises a HEALTH ALARM at WARNING and lands in the session summary. The
+    accounting can never cost the offload: if the ledger is unavailable the
+    call is dispatched directly.
+    """
+    try:
+        from backend.core.ouroboros.governance.reachability_ledger import (  # noqa: PLC0415
+            track_reachability,
+        )
+    except Exception:  # noqa: BLE001 — accounting is never a precondition
+        return await _offload_dispatch(fn, *args, cpu_bound=cpu_bound, **kwargs)
+    async with track_reachability(
+        _offload_capability(fn, cpu_bound), durable=False,
+    ) as effect:
+        result = await _offload_dispatch(fn, *args, cpu_bound=cpu_bound, **kwargs)
+        if is_offload_error(result):
+            effect.fail(f"{result.exc_type}: {result.message}")
+        else:
+            effect.mark("returned")
+        return result
+
+
+async def _offload_dispatch(
     fn: Callable[..., Any],
     /,
     *args: Any,

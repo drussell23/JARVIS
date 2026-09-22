@@ -594,6 +594,21 @@ class SessionRecorder:
         except Exception:  # noqa: BLE001 — telemetry never breaks the summary
             pass
 
+        # Capability health — which fail-soft paths FAILED this session, and
+        # which were DOWN at the end. The summary is what a soak is judged
+        # from; a capability that failed on every call for hours (the process
+        # pool, bt-2026-09-22-201845) must be in it, not only in a DEBUG line
+        # nobody keeps. Emitted only when something failed. Fail-soft.
+        try:
+            from backend.core.ouroboros.governance.reachability_ledger import (
+                default_ledger,
+            )
+            _health = default_ledger().health_report()
+            if _health.get("failing") or _health.get("degraded"):
+                summary["capability_health"] = _health
+        except Exception:  # noqa: BLE001 — telemetry never breaks the summary
+            pass
+
         # Per-Phase Cost Drill-Down arc (Slice 3) — emit ``cost_by_phase``
         # (session rollup) + ``cost_by_op_phase`` (per-op per-phase) only
         # when the finalize observer received at least one op. Additive

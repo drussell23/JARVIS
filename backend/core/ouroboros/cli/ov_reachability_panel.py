@@ -87,6 +87,11 @@ class CapabilityRow:
     invoked: int = 0
     effective: int = 0
     last_detail: str = ""
+    #: Failure records (durable ones only: first-of-streak and alarms -- the
+    #: ledger counts the rest in memory; ``summary.json`` has the totals).
+    failed: int = 0
+    #: Down as of the last alarm / recovery record in the tail.
+    failing: bool = False
 
     @property
     def inert(self) -> bool:
@@ -106,6 +111,9 @@ class CapabilityRow:
 
     @property
     def verdict(self) -> str:
+        # Down outranks inert: failing is running and breaking, now.
+        if self.failing:
+            return "FAILING"
         if self.inert:
             return "INERT"
         if self.dormant:
@@ -123,20 +131,28 @@ class ReachabilityModel:
     error: str = ""
 
     @property
+    def failing(self) -> List[CapabilityRow]:
+        """Down now, most-failed first."""
+        return sorted((r for r in self.rows if r.failing), key=lambda r: -r.failed)
+
+    @property
     def inert(self) -> List[CapabilityRow]:
         """Inert capabilities, worst first -- most-invoked wastes most."""
         return sorted(
-            (r for r in self.rows if r.inert), key=lambda r: -r.invoked,
+            (r for r in self.rows if r.inert and not r.failing), key=lambda r: -r.invoked,
         )
 
     @property
     def dormant(self) -> List[CapabilityRow]:
-        return sorted((r for r in self.rows if r.dormant), key=lambda r: r.capability)
+        return sorted(
+            (r for r in self.rows if r.dormant and not r.failing),
+            key=lambda r: r.capability,
+        )
 
     @property
     def live(self) -> List[CapabilityRow]:
         return sorted(
-            (r for r in self.rows if not r.inert and not r.dormant),
+            (r for r in self.rows if not r.inert and not r.dormant and not r.failing),
             key=lambda r: -r.effective,
         )
 
@@ -167,6 +183,12 @@ def aggregate(lines: List[str]) -> ReachabilityModel:
             row.invoked += 1
         elif tier == "effective":
             row.effective += 1
+        elif tier == "failed":
+            row.failed += 1
+            if record.get("health") == "alarm":
+                row.failing = True
+        elif tier == "recovered":
+            row.failing = False
         detail = str(record.get("detail", "") or "")
         if detail:
             row.last_detail = detail[:80]
@@ -239,8 +261,12 @@ def render_rows(model: ReachabilityModel) -> List[str]:
             f"  {row.verdict:<8} {row.capability:<28} "
             f"reg={row.registered:<5} inv={row.invoked:<5} "
             f"eff={row.effective:<5} yield={row.yield_pct:5.1f}%"
+            + (f" fail={row.failed}" if row.failed else "")
         )
 
+    if model.failing:
+        out.append("FAILING — a fail-soft path failing on every call:")
+        out.extend(f"{_fmt(r)}  last: {r.last_detail}" for r in model.failing)
     if model.inert:
         out.append("INERT — invoked, never changed an outcome:")
         out.extend(_fmt(r) for r in model.inert)
@@ -283,8 +309,14 @@ def render_panel(model: ReachabilityModel) -> object:
         table.add_row(Text("NO DATA", style="yellow"), model.error, "", "", "", "", "")
         return table
 
-    style_for = {"INERT": "bold red", "DORMANT": "yellow", "LIVE": "green"}
-    for row in list(model.inert) + list(model.dormant) + list(model.live):
+    style_for = {
+        "FAILING": "bold white on red", "INERT": "bold red",
+        "DORMANT": "yellow", "LIVE": "green",
+    }
+    for row in (
+        list(model.failing) + list(model.inert)
+        + list(model.dormant) + list(model.live)
+    ):
         table.add_row(
             Text(row.verdict, style=style_for.get(row.verdict, "")),
             row.capability,
