@@ -1027,3 +1027,155 @@ def build_signature_anchor(
         )
     except Exception:  # noqa: BLE001 — the anchor is additive, never fatal
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Exercised source — the BODIES a failing test runs, for the repair prompt
+# ---------------------------------------------------------------------------
+
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
+_ENV_SUBJECT_ENABLED = "JARVIS_REPAIR_SUBJECT_SOURCE_ENABLED"
+_ENV_SUBJECT_MAX_CHARS = "JARVIS_REPAIR_SUBJECT_MAX_CHARS"
+
+
+def subject_source_enabled() -> bool:
+    raw = os.environ.get(_ENV_SUBJECT_ENABLED, "true").strip().lower()
+    return raw not in ("false", "0", "no", "off")
+
+
+def _failing_test_bodies(test_source: str, failing_tests: Sequence[str]) -> str:
+    """Source of the test functions named by *failing_tests*; the whole file
+    when none can be located (unparseable candidate, ids from another file)."""
+    names = {
+        str(t).rsplit("::", 1)[-1].split("[", 1)[0]
+        for t in failing_tests or () if t
+    }
+    try:
+        tree = ast.parse(test_source or "")
+    except SyntaxError:
+        return test_source or ""
+    bodies = [
+        ast.get_source_segment(test_source, node) or ""
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names
+    ]
+    return "\n\n".join(b for b in bodies if b) or (test_source or "")
+
+
+def exercised_source_block(
+    target_files: Sequence[str],
+    description: str,
+    repo_root: os.PathLike,
+    *,
+    evidence_text: str,
+    test_source: str,
+    failing_tests: Sequence[str] = (),
+    exclude: Sequence[str] = (),
+) -> str:
+    """The current BODIES of the code a failing test exercises. NEVER raises.
+
+    ## Why this exists
+
+    The signature anchor tells the model what the subject's API IS; a failing
+    assertion tells it what the test EXPECTED. Neither says what the code
+    actually DOES, which is the one fact a repair of ``assert False is True``
+    on ``should_use_lite_mode()`` needs -- and the repair prompt carried no
+    body at all. Test-synthesis repairs therefore guessed at behaviour they
+    could have read (bt-2026-09-21-235603: 7/7 L2 runs exhausted).
+
+    ## What is shown
+
+    Sources come from :func:`collect_anchor_sources` -- the subject and one
+    hop of its first-party imports, the same resolution the anchor uses -- minus
+    *exclude* (the files the op is editing: their current text is already in
+    the prompt, and they are not read-only). Within them, the symbols named by
+    the failure evidence or by the failing tests' own bodies are sliced by
+    ``ast_symbol_scoper.isolate_symbols``. Symbols the EVIDENCE names come
+    first, then smaller before larger; a slice overlapping one already chosen
+    is dropped, so a class never repeats the method shown above it. Whole
+    slices only -- a body cut mid-function states behaviour it does not have --
+    within ``JARVIS_REPAIR_SUBJECT_MAX_CHARS`` (default: the signature
+    anchor's own budget). Nothing matched -> ``""``.
+    """
+    try:
+        if not subject_source_enabled():
+            return ""
+        from backend.core.ouroboros.governance.ast_symbol_scoper import (  # noqa: PLC0415
+            isolate_symbols,
+        )
+
+        root = Path(repo_root)
+        excluded = set()
+        for rel in exclude or ():
+            try:
+                excluded.add(str((root / str(rel)).resolve()))
+            except Exception:  # noqa: BLE001
+                continue
+        corpus = f"{evidence_text or ''}\n{_failing_test_bodies(test_source, failing_tests)}"
+        named_by_evidence = evidence_text or ""
+        # Code names code QUALIFIED -- ``manager.should_use_lite_mode()``,
+        # ``SmartStartupManager.should_use_lite_mode`` -- and isolate_symbols'
+        # matcher deliberately refuses a dotted occurrence (it was written for
+        # prose descriptions). Handed as bare identifier hints instead, so a
+        # call through an instance still selects the function it calls.
+        # Measured on the real smart_startup_manager op: raw corpus -> 0 slices.
+        hints = tuple(dict.fromkeys(_IDENTIFIER_RE.findall(corpus)))
+
+        slices: List[Tuple[bool, int, str, str, int, int, str]] = []
+        for label, path in collect_anchor_sources(target_files, description, root):
+            if str(path) in excluded:
+                continue
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for tgt in isolate_symbols(str(path), "", hints=hints):
+                if not tgt.symbol:  # whole-file degrade: not a slice
+                    continue
+                body = "\n".join(lines[tgt.lineno - 1:tgt.end_lineno])
+                # A dot BEFORE the leaf is allowed: ``Manager.start`` in a
+                # traceback names the method, and is the most specific
+                # evidence there is.
+                leaf = tgt.symbol.rsplit(".", 1)[-1]
+                in_evidence = bool(re.search(
+                    r"(?<!\w)" + re.escape(leaf) + r"(?!\w)", named_by_evidence,
+                ))
+                slices.append((
+                    not in_evidence, len(body), label, tgt.symbol,
+                    tgt.lineno, tgt.end_lineno, body,
+                ))
+        if not slices:
+            return ""
+        slices.sort(key=lambda s: (s[0], s[1]))
+
+        budget = _int_env(
+            _ENV_SUBJECT_MAX_CHARS, _int_env(_ENV_MAX_CHARS, _DEFAULT_MAX_CHARS),
+        )
+        chosen: List[str] = []
+        taken: dict = {}
+        used = 0
+        for _later, size, label, symbol, start, end, body in slices:
+            spans = taken.setdefault(label, [])
+            if any(start <= e and s <= end for s, e in spans):
+                continue
+            block = f"### {label} :: {symbol} (lines {start}-{end})\n```python\n{body}\n```"
+            if used + len(block) > budget:
+                continue
+            spans.append((start, end))
+            chosen.append(block)
+            used += len(block)
+        if not chosen:
+            return ""
+        logger.info(
+            "[SigAnchor] exercised source: %d slice(s), %d chars", len(chosen), used,
+        )
+        return (
+            "## SOURCE UNDER TEST (read-only - how this code behaves today)\n\n"
+            "Current bodies of the functions the failure and the failing tests "
+            "name. They are outside this op's scope and will not change: make "
+            "the file you are repairing agree with what they actually do.\n\n"
+            + "\n\n".join(chosen)
+        )
+    except Exception:  # noqa: BLE001 — additive, never fatal
+        logger.debug("[SigAnchor] exercised source degraded", exc_info=True)
+        return ""

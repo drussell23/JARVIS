@@ -387,7 +387,15 @@ def test_pin_10_run_inner_legacy_bytes_pinned():
     # tests/governance/test_l2_failure_evidence.py (fails at the prior pin,
     # passes here) + the epistemic/pivot/slice-4a/5a/7 suites unchanged.
     # Soak validation: the first soak on this branch. Pin updated atomically.
-    EXPECTED_DIGEST = "180e73e14d4b82bf"
+    #
+    # Phase tag: L2 subject source (2026-09-22, same branch). The trace says
+    # what a failing test expected; nothing said what the code under test
+    # does. _run_inner now awaits RepairEngine._exercised_source (off-loop,
+    # fail-soft "") and threads it into RepairContext.subject_source, rendered
+    # after the trace. One await + one keyword; the FSM skeleton is unchanged.
+    # Verified by tests/governance/test_l2_subject_source.py (the loop test
+    # fails with the wiring reverted). Soak validation: same first soak.
+    EXPECTED_DIGEST = "c04a05a14ab0805f"
     assert digest == EXPECTED_DIGEST, (
         f"_run_inner bytes drift detected: expected "
         f"{EXPECTED_DIGEST}, got {digest}. Legacy LINEAR semantics "

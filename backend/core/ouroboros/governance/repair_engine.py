@@ -1686,6 +1686,15 @@ class RepairEngine:
                 _epistemic_diff = ""
                 epistemic_temperature = None
 
+            # What the code the failing tests call actually DOES — the evidence
+            # says what they expected. Off the loop: file reads + AST parses.
+            _subject_source = await self._exercised_source(
+                ctx, evidence.trace,
+                test_source=sandbox_content or full_content,
+                failing_tests=classification.failing_test_ids,
+                editing=(file_path, *(p for p, _ in (_multi_files or ()))),
+            )
+
             repair_context = RepairContext(
                 iteration=iteration,
                 max_iterations=budget.max_iterations,
@@ -1704,6 +1713,7 @@ class RepairEngine:
                 # is the minimum a repair needs. The flag governs the diff and
                 # the temperature, never whether the model sees the error.
                 failure_trace=evidence.trace,
+                subject_source=_subject_source,
             )
 
             # T2: the current failing candidate becomes the PRIOR-stable source for the
@@ -1785,6 +1795,43 @@ class RepairEngine:
         except Exception as exc:  # noqa: BLE001 — cone is advisory; never break L2
             _logger.debug("[RepairBridge] dependency cone unavailable (non-fatal): %s", exc)
             return None
+
+    async def _exercised_source(
+        self,
+        ctx: Any,
+        evidence_text: str,
+        *,
+        test_source: str,
+        failing_tests: Tuple[str, ...],
+        editing: Tuple[str, ...],
+    ) -> str:
+        """Bodies of the out-of-scope code the failing tests run, for the repair prompt.
+
+        Delegates to ``ast_signature_anchor.exercised_source_block`` in a worker
+        thread (file reads + AST parses). Everything the op is editing is
+        excluded — its declared targets and this iteration's candidate files —
+        since their text is already in the prompt and they are not read-only.
+        Fail-soft: any error → ``""`` (section not rendered)."""
+        try:
+            from backend.core.ouroboros.governance.ast_signature_anchor import (
+                exercised_source_block,
+            )
+            target_files = tuple(getattr(ctx, "target_files", ()) or ())
+            return await asyncio.to_thread(
+                exercised_source_block,
+                target_files,
+                getattr(ctx, "description", "") or "",
+                self._repo_root,
+                evidence_text=evidence_text,
+                test_source=test_source,
+                failing_tests=failing_tests,
+                exclude=tuple(p for p in (*target_files, *editing) if p),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — additive context; never break L2
+            _logger.debug("[L2 Repair] exercised source unavailable (non-fatal): %s", exc)
+            return ""
 
     async def _resolve_multifile_batch(self, candidate: Any) -> Optional[list]:
         """L2 completion (Phase 1) — extract + topologically order a candidate's files.

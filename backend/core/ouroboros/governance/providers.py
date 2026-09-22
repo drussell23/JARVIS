@@ -4955,6 +4955,11 @@ Rules:
                 f"{_repair_block}\n\n## FULL FAILURE TRACE\n"
                 f"{_epistemic_trace}"
             )
+        # Placed right after the trace it explains: what the test expected,
+        # then what the code under test actually does. Self-titled block.
+        _subject_source = getattr(_rc, "subject_source", "") or ""
+        if _subject_source:
+            _repair_block = f"{_repair_block}\n\n{_subject_source}"
         parts.append(_repair_block)
 
     parts.append(schema_instruction)

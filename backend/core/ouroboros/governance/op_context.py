@@ -2178,3 +2178,7 @@ class RepairContext:
     # context could not be assembled (fail-soft). Rendered into the REPAIR MODE prompt block.
     prior_iteration_diff: str = ""
     failure_trace: str = ""
+    # Current BODIES of the out-of-scope code the failing tests exercise
+    # (``ast_signature_anchor.exercised_source_block``). The trace says what the
+    # test expected; this says what the code does. ``""`` -> not rendered.
+    subject_source: str = ""
