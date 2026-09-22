@@ -8818,8 +8818,14 @@ class GovernedOrchestrator:
                 _validation_tasks = [_validate_one(c) for c in generation.candidates]
                 _validation_results = await asyncio.gather(*_validation_tasks, return_exceptions=True)
 
-                # Process results in candidate order — preserves priority
-                _early_return_ctx: Optional[OperationContext] = None
+                # Process results in candidate order — preserves priority.
+                # A candidate's early-return verdict is HELD, not applied, until
+                # it is known no sibling passed — see validate_runner's
+                # ``_PendingTerminal`` (the extracted twin of this loop).
+                from backend.core.ouroboros.governance.phase_runners.validate_runner import (  # noqa: E501,PLC0415
+                    _PendingTerminal,
+                )
+                _pending_terminal: Optional[_PendingTerminal] = None
                 for _vr in _validation_results:
                     if isinstance(_vr, BaseException):
                         logger.debug("[Orchestrator] Candidate validation raised: %s", _vr)
@@ -8891,16 +8897,12 @@ class GovernedOrchestrator:
                         continue  # still record ledger for remaining, but winner is chosen
 
                     # Infra failure: non-retryable — escalate immediately
-                    if validation.failure_class == "infra" and _early_return_ctx is None:
-                        ctx = ctx.advance(
-                            OperationPhase.POSTMORTEM,
+                    if validation.failure_class == "infra" and _pending_terminal is None:
+                        _pending_terminal = _PendingTerminal(
+                            phase=OperationPhase.POSTMORTEM,
+                            reason_code="validation_infra_failure",
                             validation=validation,
-                            terminal_reason_code="validation_infra_failure",
-                        )
-                        await self._record_ledger(
-                            ctx,
-                            OperationState.FAILED,
-                            {
+                            ledger={
                                 "reason": "validation_infra_failure",
                                 "failure_class": "infra",
                                 "adapter_names_run": list(validation.adapter_names_run),
@@ -8908,22 +8910,16 @@ class GovernedOrchestrator:
                                 "short_summary": validation.short_summary,
                             },
                         )
-                        _early_return_ctx = ctx
                         _fsm_log("infra_early_return_set")
 
                     # Budget failure: non-retryable
-                    if validation.failure_class == "budget" and _early_return_ctx is None:
-                        ctx = ctx.advance(
-                            OperationPhase.CANCELLED,
+                    if validation.failure_class == "budget" and _pending_terminal is None:
+                        _pending_terminal = _PendingTerminal(
+                            phase=OperationPhase.CANCELLED,
+                            reason_code="validation_budget_exhausted",
                             validation=validation,
-                            terminal_reason_code="validation_budget_exhausted",
+                            ledger={"reason": "validation_budget_exhausted"},
                         )
-                        await self._record_ledger(
-                            ctx,
-                            OperationState.FAILED,
-                            {"reason": "validation_budget_exhausted"},
-                        )
-                        _early_return_ctx = ctx
                         _fsm_log("budget_early_return_set")
 
                     if not validation.passed:
@@ -8958,11 +8954,21 @@ class GovernedOrchestrator:
                                 logger.debug("[Orchestrator] Episodic/critique recording failed", exc_info=True)
 
                 # If a non-retryable failure was found and no candidate passed, return immediately
-                if _early_return_ctx is not None and best_candidate is None:
+                if _pending_terminal is not None and best_candidate is None:
+                    ctx = ctx.advance(
+                        _pending_terminal.phase,
+                        validation=_pending_terminal.validation,
+                        terminal_reason_code=_pending_terminal.reason_code,
+                    )
+                    await self._record_ledger(
+                        ctx, OperationState.FAILED, dict(_pending_terminal.ledger),
+                    )
                     _fsm_log("early_return")
-                    return _early_return_ctx
+                    return ctx
 
                 if best_candidate is not None:
+                    if _pending_terminal is not None:
+                        _fsm_log("early_return_superseded", _pending_terminal.reason_code)
                     _fsm_log("candidate_passed_break")
                     break  # at least one candidate passed
 

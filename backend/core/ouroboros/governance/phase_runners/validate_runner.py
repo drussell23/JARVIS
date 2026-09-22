@@ -73,6 +73,7 @@ import logging
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import (
@@ -98,6 +99,30 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 logger = logging.getLogger("Ouroboros.Orchestrator")
+
+
+@dataclass(frozen=True)
+class _PendingTerminal:
+    """An early-return verdict ONE candidate earned, not yet applied to the op.
+
+    Candidates are validated together and judged one by one. The infra /
+    coverage-deficit / budget branches used to ``ctx.advance(...)`` the op's
+    WORKING context to POSTMORTEM the moment one candidate hit them, write the
+    FAILED ledger record, and -- for a coverage deficit -- file the
+    substitution goals. When a sibling candidate then PASSED, the loop broke
+    to GATE carrying a POSTMORTEM context: ``Illegal phase transition:
+    POSTMORTEM -> GATE`` (bt-2026-09-22-201845, op-01a0cb4f -- a passing
+    candidate lost to its sibling's missing Google credentials). The verdict
+    is now held here and committed only when the early return is actually
+    taken: no candidate passed.
+    """
+
+    phase: OperationPhase
+    reason_code: str
+    validation: Any
+    ledger: Dict[str, Any] = field(default_factory=dict)
+    #: Coverage deficit only: file the A/B substitution DAG on commit.
+    substitute: bool = False
 
 
 def _plan_ladder_iteration(
@@ -797,7 +822,7 @@ class VALIDATERunner(PhaseRunner):
             _validation_tasks = [_validate_one(c) for c in _iter_candidates]
             _validation_results = await asyncio.gather(*_validation_tasks, return_exceptions=True)
 
-            _early_return_ctx: Optional[OperationContext] = None
+            _pending_terminal: Optional[_PendingTerminal] = None
             for _vr in _validation_results:
                 if isinstance(_vr, BaseException):
                     logger.debug("[Orchestrator] Candidate validation raised: %s", _vr)
@@ -860,16 +885,12 @@ class VALIDATERunner(PhaseRunner):
                     continue
 
                 # Infra failure: non-retryable
-                if validation.failure_class == "infra" and _early_return_ctx is None:
-                    ctx = ctx.advance(
-                        OperationPhase.POSTMORTEM,
+                if validation.failure_class == "infra" and _pending_terminal is None:
+                    _pending_terminal = _PendingTerminal(
+                        phase=OperationPhase.POSTMORTEM,
+                        reason_code="validation_infra_failure",
                         validation=validation,
-                        terminal_reason_code="validation_infra_failure",
-                    )
-                    await orch._record_ledger(
-                        ctx,
-                        OperationState.FAILED,
-                        {
+                        ledger={
                             "reason": "validation_infra_failure",
                             "failure_class": "infra",
                             "adapter_names_run": list(validation.adapter_names_run),
@@ -877,7 +898,6 @@ class VALIDATERunner(PhaseRunner):
                             "short_summary": validation.short_summary,
                         },
                     )
-                    _early_return_ctx = ctx
                     _fsm_log("infra_early_return_set")
 
                 # TestCoverageDeficit — non-retryable, and SUBSTITUTED.
@@ -893,39 +913,30 @@ class VALIDATERunner(PhaseRunner):
                 # `depends_on=(A,)`. The running goal is never mutated.
                 if (
                     validation.failure_class == "no_covering_test"
-                    and _early_return_ctx is None
+                    and _pending_terminal is None
                 ):
-                    _sub = await _substitute_for_coverage_deficit(ctx)
-                    ctx = ctx.advance(
-                        OperationPhase.POSTMORTEM,
+                    # Substitution files NEW goals: deferred with the rest, or
+                    # a sibling that passes would land AND leave a DAG behind.
+                    _pending_terminal = _PendingTerminal(
+                        phase=OperationPhase.POSTMORTEM,
+                        reason_code="test_coverage_deficit",
                         validation=validation,
-                        terminal_reason_code="test_coverage_deficit",
-                    )
-                    await orch._record_ledger(
-                        ctx,
-                        OperationState.FAILED,
-                        {
+                        ledger={
                             "reason": "test_coverage_deficit",
                             "failure_class": "no_covering_test",
-                            "substitution": _sub or "not_filed",
                             "short_summary": validation.short_summary,
                         },
+                        substitute=True,
                     )
-                    _early_return_ctx = ctx
-                    _fsm_log("coverage_deficit_early_return_set", _sub or "not_filed")
+                    _fsm_log("coverage_deficit_early_return_set")
 
-                if validation.failure_class == "budget" and _early_return_ctx is None:
-                    ctx = ctx.advance(
-                        OperationPhase.CANCELLED,
+                if validation.failure_class == "budget" and _pending_terminal is None:
+                    _pending_terminal = _PendingTerminal(
+                        phase=OperationPhase.CANCELLED,
+                        reason_code="validation_budget_exhausted",
                         validation=validation,
-                        terminal_reason_code="validation_budget_exhausted",
+                        ledger={"reason": "validation_budget_exhausted"},
                     )
-                    await orch._record_ledger(
-                        ctx,
-                        OperationState.FAILED,
-                        {"reason": "validation_budget_exhausted"},
-                    )
-                    _early_return_ctx = ctx
                     _fsm_log("budget_early_return_set")
 
                 if not validation.passed:
@@ -1056,16 +1067,30 @@ class VALIDATERunner(PhaseRunner):
                         except Exception:
                             logger.debug("[Orchestrator] Episodic/critique recording failed", exc_info=True)
 
-            if _early_return_ctx is not None and best_candidate is None:
-                _fsm_log("early_return")
-                _reason = _early_return_ctx.terminal_reason_code or "validation_failed"
+            if _pending_terminal is not None and best_candidate is None:
+                # Committed NOW, when it is known no candidate passed: the
+                # advance, the substitution (coverage deficit), the ledger.
+                _ledger = dict(_pending_terminal.ledger)
+                if _pending_terminal.substitute:
+                    _sub = await _substitute_for_coverage_deficit(ctx)
+                    _ledger["substitution"] = _sub or "not_filed"
+                ctx = ctx.advance(
+                    _pending_terminal.phase,
+                    validation=_pending_terminal.validation,
+                    terminal_reason_code=_pending_terminal.reason_code,
+                )
+                await orch._record_ledger(ctx, OperationState.FAILED, _ledger)
+                _fsm_log("early_return", _ledger.get("substitution", ""))
                 return PhaseResult(
-                    next_ctx=_early_return_ctx, next_phase=None, status="fail",
-                    reason=_reason,
+                    next_ctx=ctx, next_phase=None, status="fail",
+                    reason=_pending_terminal.reason_code,
                     artifacts={"best_candidate": None, "best_validation": best_validation},
                 )
 
             if best_candidate is not None:
+                if _pending_terminal is not None:
+                    # A sibling passed: its verdict wins, the op continues.
+                    _fsm_log("early_return_superseded", _pending_terminal.reason_code)
                 _fsm_log("candidate_passed_break")
                 break
 
