@@ -303,6 +303,9 @@ def test_discovery_enforces_the_edge_at_SELECTION(monkeypatch, tmp_path):
         weight=1.0, declared_goal_id="ov-b",
         detail={"depends_on": ["ov-a"]},
     )
+    # B's target must exist: an absent one is dead work, held out of the cap.
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "backend/b.py").touch()
     monkeypatch.setattr(GD, "_from_roadmap_goals", lambda *_a, **_k: [a, b])
     monkeypatch.setattr(GD, "_from_ambient_reds", lambda *_a, **_k: [])
     monkeypatch.setattr(GD, "_iter_uncovered_modules", lambda *_a, **_k: [])

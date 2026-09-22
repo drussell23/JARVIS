@@ -56,7 +56,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import (
-    Any, Dict, FrozenSet, Iterator, List, Optional, Sequence, Tuple,
+    Any, Callable, Dict, FrozenSet, Iterator, List, Optional, Sequence, Tuple,
 )
 
 logger = logging.getLogger("Ouroboros.GoalDiscovery")
@@ -1015,25 +1015,43 @@ def is_dispatchable(work: "DiscoveredWork", repo_root: Path) -> bool:
     if _liveness_rank(work, repo_root) <= LIVENESS_DEAD:
         return False
     try:
-        from backend.core.ouroboros.governance import (  # noqa: PLC0415
-            environment_integrity as _ei,
-        )
         verdict = _import_verdict(work, repo_root)
-        if _is_importable(verdict):
-            return True
-        structural = bool(getattr(verdict, "impossible", False))
-        if not (structural or _ei.quarantine_enabled()):
+        refusal = _dispatch_refusal(LIVENESS_CREATES_TEST, verdict)
+        if not refusal:
             return True
         logger.warning(
             "[GoalDiscovery] %s %s — %s",
-            work.goal_id,
-            "quarantined (impossible on this host)" if structural
-            else "quarantined (operator-armed)",
+            work.goal_id, refusal,
             getattr(verdict, "reason", "") or "unimportable target",
         )
         return False
     except Exception:  # noqa: BLE001 — a degraded check never sheds work
         return True
+
+
+def _dispatch_refusal(liveness: int, verdict: Any) -> str:
+    """Why an op spent on this work could not write anything; ``""`` if it could.
+
+    The ONE statement of the dispatch rule, answered from values the caller
+    already holds, so ``discover`` can apply it BEFORE its cap and the Sentinel
+    can apply it after without the two ever disagreeing. Pure: no filesystem,
+    no logging. A degraded check answers ``""`` — it never sheds work.
+    """
+    try:
+        if liveness <= LIVENESS_DEAD:
+            return "dead target"
+        if _is_importable(verdict):
+            return ""
+        if getattr(verdict, "impossible", False):
+            return "quarantined (impossible on this host)"
+        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+            environment_integrity as _ei,
+        )
+        if _ei.quarantine_enabled():
+            return "quarantined (operator-armed)"
+        return ""
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 class _EligibilityGate:
@@ -1141,6 +1159,7 @@ class _EligibilityGate:
 
 def _take_cheap(
     walk: Iterator["DiscoveredWork"], gate: "_EligibilityGate", limit: int,
+    refused: Optional[Callable[["DiscoveredWork"], bool]] = None,
 ) -> List["DiscoveredWork"]:
     """Pull up to *limit* items off *walk* that clear the gate's cheap half.
 
@@ -1162,6 +1181,10 @@ def _take_cheap(
         if item.target_file in pending:
             continue
         if not gate.cheap_ok(item):
+            continue
+        # After the cheap half, so a verdict is only resolved for work that
+        # would otherwise take a slot.
+        if refused is not None and refused(item):
             continue
         pending.add(item.target_file)
         out.append(item)
@@ -1271,7 +1294,24 @@ async def discover(
         for w in pool
     ]
     scored.sort(key=lambda rw: (-rw[0], not rw[1], -rw[2].weight))
-    documented = [w for _, _, w in scored]
+    # THE BUDGET DEFECT, third instance. The Sentinel refuses undispatchable
+    # work (dead target, quarantined subject) AFTER this function has capped
+    # the list — so eight quarantined signed goals filled all eight slots, the
+    # coverage walk below never ran because the cap was already met, and the
+    # loop sat on `ExecutionQueueStarved` for five hours of a 6.5 h soak while
+    # uncovered modules waited unread (bt-2026-09-21-235603). The census above
+    # still counts every goal; only the ranking skips what cannot be spent.
+    documented = [
+        w for rank, _, w in scored
+        if not _dispatch_refusal(rank, verdicts.get(w.goal_id))
+    ]
+    held = len(scored) - len(documented)
+    if held:
+        logger.info(
+            "[GoalDiscovery] %d of %d documented goal(s) undispatchable on "
+            "this host — held out of the cap, kept on the roadmap",
+            held, len(scored),
+        )
     if scored:
         # WARNING, like the Sentinel's own pass breadcrumbs and for the same
         # reason: a headless soak's log carries WARNING and above, so an INFO
@@ -1287,7 +1327,7 @@ async def discover(
                     Counter(r for r, _, _ in scored).items(), reverse=True,
                 )
             ),
-            len(blocked), len(scored), documented[0].target_file,
+            len(blocked), len(scored), scored[0][2].target_file,
         )
         if blocked:
             # Named, not just counted, and SPLIT — because the two halves ask
@@ -1369,10 +1409,17 @@ async def discover(
         # otherwise hand back the same candidates every round, and a batch the
         # ledger prunes without marking anything seen would never terminate.
         walk = iter(_iter_uncovered_modules(Path(repo_root)))
+
+        def _walk_refused(item: DiscoveredWork) -> bool:
+            # Same rule as the documented sources: a quarantined subject found
+            # by the walk would take a slot the Sentinel then refuses to spend.
+            verdict = _TREE_PURE.verdicts((item,), root, tree_state).get(item.goal_id)
+            return bool(_dispatch_refusal(LIVENESS_CREATES_TEST, verdict))
+
         while len(ranked) < cap:
             try:
                 batch = await asyncio.to_thread(
-                    _take_cheap, walk, gate, cap - len(ranked),
+                    _take_cheap, walk, gate, cap - len(ranked), _walk_refused,
                 )
             except Exception:  # noqa: BLE001 — a source may never break a pass
                 break

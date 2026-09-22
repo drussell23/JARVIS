@@ -22,6 +22,12 @@ from backend.core.ouroboros.governance.autonomy import goal_discovery as GD
 from backend.core.ouroboros.governance.autonomy.goal_discovery import DiscoveredWork
 
 
+def _touch(root, rel):
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
+
+
 class _Goal:
     """The shape ``roadmap_reader.RoadmapGoal`` presents."""
 
@@ -36,8 +42,16 @@ class _Doc:
         self.goals = tuple(goals)
 
 
-def _patch_roadmap(monkeypatch, goals, verdict="valid", doc=True):
+def _patch_roadmap(monkeypatch, goals, verdict="valid", doc=True, root=None):
+    """``root`` materialises every target: a goal whose target is absent (and
+    not a test to create) is dead work, which ``discover`` holds out of the
+    cap -- so a test about ranking or capping needs live targets."""
     import backend.core.ouroboros.governance.roadmap_reader as rr
+
+    if root is not None:
+        for g in goals:
+            for f in g.target_files:
+                _touch(root, f)
 
     monkeypatch.setattr(
         rr, "read_roadmap",
@@ -66,7 +80,7 @@ def test_discovery_has_a_third_source(monkeypatch, tmp_path):
     stay lazy, while the property it was guarding never moved.
     """
     assert "_from_roadmap_goals" in inspect.getsource(GD.discover)
-    _patch_roadmap(monkeypatch, [_Goal("ov-dag-repair-x", ["backend/api/x.py"])])
+    _patch_roadmap(monkeypatch, [_Goal("ov-dag-repair-x", ["backend/api/x.py"])], root=tmp_path)
     monkeypatch.setattr(GD, "_from_ambient_reds", lambda *a, **k: [])
     monkeypatch.setattr(GD, "_iter_uncovered_modules", lambda *a, **k: [])
 
@@ -92,8 +106,9 @@ def test_the_signed_source_is_ranked_with_the_others(monkeypatch, tmp_path):
     assert GD._priority_weight(_lowest) < GD._KIND_WEIGHT["ambient_red"]
     _patch_roadmap(monkeypatch, [
         _Goal("ov-low", ["backend/api/low.py"], priority=_lowest),
-    ])
+    ], root=tmp_path)
     monkeypatch.setattr(GD, "_iter_uncovered_modules", lambda *a, **k: [])
+    _touch(tmp_path, "backend/api/red.py")
     monkeypatch.setattr(GD, "_from_ambient_reds", lambda *a, **k: [
         DiscoveredWork(
             target_file="backend/api/red.py", kind="ambient_red",
@@ -200,7 +215,7 @@ def test_the_dependent_is_released_once_the_prerequisite_lands(monkeypatch, tmp_
     _patch_roadmap(monkeypatch, [
         _Goal("a", ["tests/test_x.py"]),
         _Goal("b", ["backend/x.py"], deps=("a",)),
-    ])
+    ], root=tmp_path)
     monkeypatch.setattr(GD, "_from_ambient_reds", lambda *a, **k: [])
     monkeypatch.setattr(GD, "_iter_uncovered_modules", lambda *a, **k: [])
 
@@ -306,7 +321,7 @@ def test_the_cap_is_applied_after_ranking_not_during_collection(monkeypatch, tmp
     a small cap."""
     _patch_roadmap(monkeypatch, [
         _Goal(f"old{i}", [f"backend/old{i}.py"]) for i in range(30)
-    ] + [_Goal("brand-new", ["backend/new.py"])])
+    ] + [_Goal("brand-new", ["backend/new.py"])], root=tmp_path)
     monkeypatch.setattr(GD, "_from_ambient_reds", lambda *a, **k: [])
     monkeypatch.setattr(GD, "_iter_uncovered_modules", lambda *a, **k: [])
 
@@ -322,7 +337,7 @@ def test_the_cap_is_applied_after_ranking_not_during_collection(monkeypatch, tmp
 def test_the_pass_cap_is_still_enforced(monkeypatch, tmp_path):
     _patch_roadmap(monkeypatch, [
         _Goal(f"g{i}", [f"backend/x{i}.py"]) for i in range(50)
-    ])
+    ], root=tmp_path)
     monkeypatch.setattr(GD, "_from_ambient_reds", lambda *a, **k: [])
     monkeypatch.setattr(GD, "_iter_uncovered_modules", lambda *a, **k: [])
 

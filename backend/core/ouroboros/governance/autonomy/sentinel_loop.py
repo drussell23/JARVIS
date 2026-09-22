@@ -407,7 +407,7 @@ class SentinelLoop:
         if not live:
             logger.warning(
                 "[Sentinel] ExecutionQueueStarved: all %d eligible candidate(s) "
-                "target files that do not exist and are not tests to create "
+                "are undispatchable here (dead target or quarantined subject) "
                 "(head: %s). Nothing is dispatchable this pass; the queue is "
                 "held, not drained — these rise on their own once the work "
                 "that creates their targets lands.",

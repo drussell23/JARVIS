@@ -56,6 +56,9 @@ def test_reds_that_all_collapse_to_one_subject_do_not_eat_the_budget(
 ):
     """Eight failing tests, one subject file. The pass must still fill up."""
     cap = 8
+    # A live subject: an absent one is dead work, held out of the cap anyway.
+    (tmp_path / "backend/api").mkdir(parents=True)
+    (tmp_path / "backend/api/same.py").touch()
     monkeypatch.setattr(
         GD, "_from_ambient_reds",
         lambda *a, **k: [_red("backend/api/same.py") for _ in range(cap)],
