@@ -102,7 +102,12 @@ def digest_from_text(
     ``error_class_hint`` seeds the class for a shape the regexes miss (e.g. an
     AST pre-flight that already produced ``"SyntaxError: …"``)."""
     try:
-        text = str(stdout or "")
+        # pytest.ini forces --color=yes; every pattern below is line-anchored.
+        from backend.core.ouroboros.governance.pytest_traceback import (  # noqa: PLC0415
+            strip_ansi,
+        )
+
+        text = strip_ansi(str(stdout or ""))
         max_assert = _int_env(_ENV_MAX_ASSERTIONS, 6)
         max_nodes = _int_env(_ENV_MAX_NODES, 6)
         assert_chars = _int_env(_ENV_ASSERTION_CHARS, 200)
@@ -110,7 +115,22 @@ def digest_from_text(
         assertions: List[str] = []
         nodes: List[str] = list(dict.fromkeys(str(t).strip() for t in failed_tests if str(t).strip()))
         locations: List[str] = []
-        error_class = str(error_class_hint or "").strip()
+        # The class is chosen by EVIDENCE STRENGTH, not by which line came
+        # first. It was first-come: the ``E   RuntimeError: ...`` line set
+        # nothing, the first bare ``...Warning:`` line did -- which in a pytest
+        # report is the warnings summary -- and the per-test ``FAILED ... -
+        # RuntimeError`` verdict could not override it. 23 validation
+        # failures in bt-2026-09-22-201845 were headlined "RuntimeWarning"
+        # while dying of RuntimeError / TypeError / AttributeError, and that
+        # headline is what the re-planner and the GRPO corpus read.
+        # Rank 0 = the caller's hint (an AST pre-flight already knows).
+        ranked: Dict[int, str] = {}
+        if str(error_class_hint or "").strip():
+            ranked[0] = str(error_class_hint).strip()
+
+        def _offer(rank: int, cls: str) -> None:
+            if cls and rank not in ranked:
+                ranked[rank] = cls
 
         for raw in text.splitlines():
             m = _E_LINE.match(raw)
@@ -118,6 +138,9 @@ def digest_from_text(
                 msg = m.group("msg").strip()
                 if msg and msg not in assertions:
                     assertions.append(msg[:assert_chars])
+                ec = _ERRCLASS_LINE.match(msg)
+                if ec:
+                    _offer(2, ec.group("cls"))
                 continue
             m = _FAILED_LINE.match(raw.strip())
             if m:
@@ -127,8 +150,8 @@ def digest_from_text(
                 rest = (m.group("rest") or "").strip()
                 if rest:
                     ec = _ERRCLASS_LINE.match(rest)
-                    if ec and not error_class:
-                        error_class = ec.group("cls")
+                    if ec:
+                        _offer(1, ec.group("cls"))
                     if rest not in assertions:
                         assertions.append(rest[:assert_chars])
                 continue
@@ -137,16 +160,18 @@ def digest_from_text(
                 loc = f"{m.group('path')}:{m.group('line')}"
                 if loc not in locations:
                     locations.append(loc)
-                if m.group("cls") and not error_class:
-                    error_class = m.group("cls")
+                _offer(3, m.group("cls") or "")
                 continue
-            if not error_class:
-                ec = _ERRCLASS_LINE.search(raw)
-                if ec:
-                    error_class = ec.group("cls")
-                    cand = f"{ec.group('cls')}: {ec.group('msg').strip()}"
-                    if cand not in assertions:
-                        assertions.append(cand[:assert_chars])
+            ec = _ERRCLASS_LINE.search(raw)
+            # A bare warning line is the warnings summary, not a failure: a
+            # warning that DID fail a test (-W error) is reported on an E or
+            # FAILED line above.
+            if ec and not ec.group("cls").endswith("Warning") and 4 not in ranked:
+                ranked[4] = ec.group("cls")
+                cand = f"{ec.group('cls')}: {ec.group('msg').strip()}"
+                if cand not in assertions:
+                    assertions.append(cand[:assert_chars])
+        error_class = ranked[min(ranked)] if ranked else ""
 
         assertions = assertions[:max_assert]
         nodes = nodes[:max_nodes]

@@ -554,6 +554,156 @@ def _input_shape_lines(node, indent: str) -> List[str]:
         return []
 
 
+# What an asyncio call demands of the thread CALLING the function that makes
+# it. Facts about the asyncio API, not tunables: ``asyncio.run`` /
+# ``run_until_complete`` START a loop and raise inside a running one;
+# ``create_task`` / ``ensure_future`` / ``get_running_loop`` REQUIRE one and
+# raise ``no running event loop`` outside it.
+_STARTS_LOOP = frozenset({"run", "run_until_complete"})
+_NEEDS_LOOP = frozenset({"create_task", "ensure_future", "get_running_loop"})
+
+
+def _loop_calls(nodes) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
+    """``(starts, needs)`` -- ``(api, line)`` for each asyncio call in *nodes*.
+
+    ``asyncio.<api>`` only, so ``subprocess.run`` is not mistaken for
+    ``asyncio.run``; ``run_until_complete`` on any receiver, since it only
+    exists on event loops."""
+    starts: List[Tuple[str, int]] = []
+    needs: List[Tuple[str, int]] = []
+    for n in nodes:
+        if not isinstance(n, ast.Call) or not isinstance(n.func, ast.Attribute):
+            continue
+        api = n.func.attr
+        on_asyncio = isinstance(n.func.value, ast.Name) and n.func.value.id == "asyncio"
+        if api == "run_until_complete" or (on_asyncio and api in _STARTS_LOOP):
+            starts.append((api, n.lineno))
+        elif on_asyncio and api in _NEEDS_LOOP:
+            needs.append((api, n.lineno))
+    return starts, needs
+
+
+def _loop_contract_lines(node, indent: str) -> List[str]:
+    """``# event loop:`` -- which kind of TEST may call a SYNC function.
+
+    Measured, bt-2026-09-22-201845: tests called ``ml_memory_manager``'s sync
+    method that does ``asyncio.create_task`` from a plain test (``no running
+    event loop``), and exercised ``fresh_backend`` (``asyncio.run`` at import)
+    from inside async tests (``cannot be called from a running event loop``).
+    The signature says ``def`` in both cases; only the body says which test
+    shape can run it. ``async def`` needs no line -- its signature says it."""
+    if not isinstance(node, ast.FunctionDef):
+        return []
+    starts, needs = _loop_calls(_own_body_nodes(node))
+    out: List[str] = []
+    if starts:
+        api, line = starts[0]
+        out.append(
+            f"{indent}    # event loop: STARTS its own (asyncio {api}, line {line}) "
+            "-- call it from a plain `def` test; inside an `async def` test it "
+            "raises RuntimeError"
+        )
+    if needs:
+        api, line = needs[0]
+        out.append(
+            f"{indent}    # event loop: needs a RUNNING one (asyncio.{api}, line "
+            f"{line}) -- call it from an `async def` test; from a plain `def` "
+            "test it raises RuntimeError: no running event loop"
+        )
+    return out
+
+
+def _module_loop_lines(tree) -> List[str]:
+    """A module that starts an event loop AT IMPORT (top-level ``asyncio.run``)
+    cannot be imported from inside a running loop -- i.e. inside an async test."""
+    def _main_guard(stmt) -> bool:
+        # ``if __name__ == "__main__":`` never runs on import -- counted, it
+        # told the model smart_startup_manager started a loop at import when
+        # only running it as a script does (found on the real module).
+        try:
+            test = stmt.test
+            if not (isinstance(stmt, ast.If) and isinstance(test, ast.Compare)):
+                return False
+            # Either side: ``__name__ == "__main__"`` or ``"__main__" == __name__``.
+            sides = {
+                getattr(x, "id", None) or getattr(x, "value", None)
+                for x in (test.left, *test.comparators)
+            }
+            return sides == {"__name__", "__main__"}
+        except Exception:  # noqa: BLE001
+            return False
+
+    top = [
+        n for stmt in tree.body
+        if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and not _main_guard(stmt)
+        for n in ast.walk(stmt)
+    ]
+    starts, _needs = _loop_calls(top)
+    if not starts:
+        return []
+    api, line = starts[0]
+    return [
+        f"# importing this module runs asyncio {api} (line {line}) -- import it "
+        "at the top of the test file, never inside an `async def` test"
+    ]
+
+
+def pytest_asyncio_mode_line(repo_root: os.PathLike) -> str:
+    """The repo's ``asyncio_mode``, read from its OWN pytest config, as one
+    prompt line. ``""`` when none is configured. NEVER raises.
+
+    Read in pytest's own order -- pytest.ini, pyproject.toml, tox.ini,
+    setup.cfg -- stopping at the first file that configures pytest at all, as
+    pytest does. Under ``auto`` every ``async def test_*`` already runs inside
+    a loop; under ``strict`` it needs ``@pytest.mark.asyncio``."""
+    try:
+        import configparser  # noqa: PLC0415
+
+        root = Path(repo_root)
+        mode, source = "", ""
+        for name, section in (("pytest.ini", "pytest"), ("pyproject.toml", None),
+                              ("tox.ini", "pytest"), ("setup.cfg", "tool:pytest")):
+            path = root / name
+            if not path.is_file():
+                continue
+            if section is None:
+                try:
+                    import tomllib  # noqa: PLC0415
+                except ImportError:  # pragma: no cover — 3.10 and older
+                    continue
+                opts = (
+                    tomllib.loads(path.read_text(encoding="utf-8"))
+                    .get("tool", {}).get("pytest", {}).get("ini_options")
+                )
+                if opts is None:
+                    continue
+                mode, source = str(opts.get("asyncio_mode", "") or ""), name
+                break
+            parser = configparser.ConfigParser(interpolation=None)
+            parser.read(path, encoding="utf-8")
+            if not parser.has_section(section):
+                continue
+            mode, source = parser.get(section, "asyncio_mode", fallback="").strip(), name
+            break
+        mode = mode.strip().lower()
+        if mode == "auto":
+            return (
+                f"# test runner: asyncio_mode=auto ({source}) -- an `async def "
+                "test_*` already runs INSIDE an event loop, no marker needed; "
+                "never call asyncio.run() inside one"
+            )
+        if mode == "strict":
+            return (
+                f"# test runner: asyncio_mode=strict ({source}) -- an `async def "
+                "test_*` needs @pytest.mark.asyncio; never call asyncio.run() "
+                "inside one"
+            )
+        return ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _def_lines(node, indent: str, doc_chars: int) -> List[str]:
     """Signature line for a def, expanded with its contract when one exists:
     ``def f(...) -> T:`` / docstring excerpt / ``# reads:`` access pattern /
@@ -565,7 +715,7 @@ def _def_lines(node, indent: str, doc_chars: int) -> List[str]:
     doc = _doc_excerpt(node, doc_chars) if doc_chars > 0 else ""
     extra = (
         _access_lines(node, indent) + _input_shape_lines(node, indent)
-        + _contract_lines(node, indent)
+        + _contract_lines(node, indent) + _loop_contract_lines(node, indent)
     )
     if (not doc and not extra) or not sig.endswith(" ..."):
         return [indent + sig]
@@ -751,6 +901,7 @@ def extract_public_api(
     if mod_doc:
         head.append('"""' + mod_doc + '"""')
     head.extend(_module_constant_lines(tree))
+    head.extend(_module_loop_lines(tree))
     return "\n".join(head + lines)
 
 
@@ -994,6 +1145,12 @@ def build_signature_anchor(
         if not blocks:
             return ""
         body = "\n\n".join(blocks)
+        # A test being WRITTEN must know which test shape the runner gives it;
+        # the `# event loop:` lines above are only actionable against that.
+        if any(is_test_path(t) for t in target_files or ()):
+            runner_line = pytest_asyncio_mode_line(repo_root)
+            if runner_line:
+                body = f"{runner_line}\n\n{body}"
         try:
             logger.info(
                 "[SigAnchor] injected %d chars for %d module(s): %s",
