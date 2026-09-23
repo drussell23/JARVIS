@@ -9268,10 +9268,42 @@ class GovernedOrchestrator:
                                     "[Orchestrator] Micro-fix succeeded in %d iterations for op=%s",
                                     _repair_result.iterations_used, ctx.op_id,
                                 )
-                                # Skip full regeneration — advance to GATE
-                                ctx = ctx.advance(OperationPhase.GATE, validation=best_validation)
-                                _fsm_log("micro_fix_succeeded_break")
-                                break
+                                # Same success exit as the extracted runner,
+                                # through its helper: rebuild the candidate
+                                # around the repaired text and put it back
+                                # through the ordinary validator (a sandbox
+                                # convergence is evidence, not a verdict), then
+                                # record the winner and leave. The post-loop
+                                # path owns the GATE transition; advancing here
+                                # as well was "GATE -> GATE", and advancing with
+                                # no winner recorded left best_candidate None.
+                                from backend.core.ouroboros.governance.phase_runners.validate_runner import (  # noqa: E501,PLC0415
+                                    _repaired_candidate,
+                                )
+                                _repaired_cand = _repaired_candidate(
+                                    candidates=(
+                                        [best_candidate]
+                                        if best_candidate is not None else []
+                                    ) + list(generation.candidates or ()),
+                                    file_path=_repair_target,
+                                    content=_repair_result.repaired_content,
+                                )
+                                if _repaired_cand is None:
+                                    _fsm_log("micro_fix_no_repaired_candidate")
+                                else:
+                                    _micro_validation = await self._run_validation(
+                                        ctx, _repaired_cand, remaining_s,
+                                    )
+                                    _fsm_log(
+                                        "micro_fix_revalidated",
+                                        f"passed={_micro_validation.passed} "
+                                        f"fc={_micro_validation.failure_class!r}",
+                                    )
+                                    if _micro_validation.passed:
+                                        best_candidate = _repaired_cand
+                                        best_validation = _micro_validation
+                                        _fsm_log("micro_fix_succeeded_break")
+                                        break
                         else:
                             _fsm_log(
                                 "micro_fix_skipped_new_file",

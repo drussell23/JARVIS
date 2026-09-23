@@ -1668,12 +1668,18 @@ class VALIDATERunner(PhaseRunner):
                                     f"fc={_micro_validation.failure_class!r}",
                                 )
                                 if _micro_validation.passed:
+                                    # A success EXIT, like candidate_passed_break:
+                                    # record the winner and leave. The GATE
+                                    # transition has ONE owner -- the post-loop
+                                    # path, which runs source drift, shadow,
+                                    # entropy and the read-only short-circuit
+                                    # first. Advancing here too made every
+                                    # repaired op die "Illegal phase transition:
+                                    # GATE -> GATE" (bt-2026-09-22-201845: the
+                                    # first two live micro-fix repairs, both
+                                    # re-validated passing, both lost).
                                     best_candidate = _repaired_cand
                                     best_validation = _micro_validation
-                                    ctx = ctx.advance(
-                                        OperationPhase.GATE,
-                                        validation=best_validation,
-                                    )
                                     _fsm_log("micro_fix_succeeded_break")
                                     break
                     else:
