@@ -36,7 +36,6 @@ Both ``alpha`` and ``max_lines`` are env-tunable (no hardcoding):
 
 from __future__ import annotations
 
-import ast as _ast
 import bisect
 import functools
 import logging
@@ -54,6 +53,13 @@ from typing import (
     Set,
     Tuple,
     Union,
+)
+
+from backend.core.ouroboros.governance.test_import_index import (
+    BoundedLRU,
+    build_import_map,
+    iter_test_files,
+    tree_cache_max,
 )
 
 logger = logging.getLogger(__name__)
@@ -105,10 +111,10 @@ def _strat_ast_import_enabled() -> bool:
     ).strip().lower() not in ("0", "false", "no")
 
 
-# Lazy AST import map per repo_root — built once, cached per process.
+# AST import map per repo_root, warmed by the coverage-index build.
 # Keyed by resolved repo_root (Path); value is {dotted_module: [test_files]}.
-# Thread-safe for reads; idempotent racy writes are benign.
-_strat_ast_cache: Dict[Path, Dict[str, List[Path]]] = {}
+# Bounded like test_runner's cache (``JARVIS_TEST_IMPORT_MAP_CACHE_MAX``).
+_strat_ast_cache: "BoundedLRU[Path, Dict[str, List[Path]]]" = BoundedLRU(tree_cache_max)
 
 
 # ---------------------------------------------------------------------------
@@ -436,17 +442,11 @@ def _iter_test_files(
 ) -> "Iterable[Path]":
     """Yield every ``test_*.py`` regular file under the configured test roots.
 
-    Single source of truth for the test-tree traversal so the AST-map
+    Delegates to the shared walker in ``test_import_index`` so the AST-map
     builder and the coverage-index builder can never drift (and so the
     expensive walk happens exactly ONCE when both are built together).
     """
-    for tdn in sorted(dir_names):
-        top = repo_root / tdn
-        if not top.is_dir():
-            continue
-        for test_file in sorted(top.rglob("test_*.py")):
-            if test_file.is_file():
-                yield test_file
+    return iter_test_files(repo_root, dir_names)
 
 
 def _strat_build_ast_map(
@@ -455,38 +455,14 @@ def _strat_build_ast_map(
     *,
     files: "Optional[List[Path]]" = None,
 ) -> Dict[str, List[Path]]:
-    """Synchronous AST import-map builder (mirrors test_runner._build_test_import_map).
+    """Synchronous AST import-map builder -- the ONE content-addressed
+    builder shared with ``test_runner`` (``test_import_index``).
 
-    Scans every ``test_*.py`` under the configured test roots and maps
-    ``dotted_module_path → [test_files that import it]``. ``files`` lets a
-    caller that already walked the tree (the coverage-index builder) reuse
+    Maps ``dotted_module_path → [test_files that import it]``. ``files`` lets
+    a caller that already walked the tree (the coverage-index builder) reuse
     its file list instead of paying a second full traversal.
     """
-    import_map: Dict[str, List[Path]] = {}
-    for test_file in (files if files is not None else _iter_test_files(repo_root, dir_names)):
-        try:
-            source = test_file.read_text(encoding="utf-8", errors="replace")
-            tree = _ast.parse(source, filename=str(test_file))
-        except (SyntaxError, OSError, UnicodeDecodeError):
-            continue
-        for node in _ast.walk(tree):
-            if isinstance(node, _ast.Import):
-                for alias in node.names:
-                    lst = import_map.setdefault(alias.name, [])
-                    if test_file not in lst:
-                        lst.append(test_file)
-            elif isinstance(node, _ast.ImportFrom):
-                module = node.module or ""
-                if module:
-                    lst = import_map.setdefault(module, [])
-                    if test_file not in lst:
-                        lst.append(test_file)
-                for alias in node.names:
-                    full = f"{module}.{alias.name}" if module else alias.name
-                    lst = import_map.setdefault(full, [])
-                    if test_file not in lst:
-                        lst.append(test_file)
-    return import_map
+    return build_import_map(repo_root, dir_names, files=files)
 
 
 def _strat_path_to_module(source_file: Path, repo_root: Path) -> str | None:

@@ -11,7 +11,6 @@ Provides deterministic test scoping and async pytest execution with:
 """
 from __future__ import annotations
 
-import ast as _ast
 import asyncio
 import json
 import logging
@@ -29,6 +28,9 @@ from backend.core.ouroboros.governance.process_session import (
 )
 from backend.core.ouroboros.governance.pytest_traceback import (
     TIMEOUT_BANNER_RE, hang_site,
+)
+from backend.core.ouroboros.governance.test_import_index import (
+    BoundedLRU, build_import_map, tree_cache_max,
 )
 from backend.core.ouroboros.governance.test_timeout_derivation import (
     derive_test_timeouts,
@@ -1301,19 +1303,6 @@ def _path_to_module(source_file: Path, repo_root: Path) -> Optional[str]:
     return ".".join(parts) if parts else None
 
 
-def _register_import(
-    import_map: Dict[str, List[Path]],
-    key: str,
-    test_file: Path,
-) -> None:
-    """Append *test_file* to *import_map[key]* (deduplicated)."""
-    if not key:
-        return
-    lst = import_map.setdefault(key, [])
-    if test_file not in lst:
-        lst.append(test_file)
-
-
 def _is_test_tree_path(
     path: Path, dir_names: FrozenSet[str] = _TEST_DIR_NAMES,
 ) -> bool:
@@ -1341,35 +1330,10 @@ def _build_test_import_map(
 
     This map lets :meth:`TestRunner.resolve_affected_tests` Strategy 3 answer
     "which tests directly import the changed module?" in O(1) after the
-    one-time build (cached per ``repo_root`` at module level).
+    build. Each file is parsed once per distinct CONTENT process-wide (see
+    ``test_import_index``), so a sandbox copy only re-reads and re-hashes.
     """
-    import_map: Dict[str, List[Path]] = {}
-
-    for tdn in sorted(dir_names):
-        top_tests = repo_root / tdn
-        if not top_tests.is_dir():
-            continue
-        for test_file in sorted(top_tests.rglob("test_*.py")):
-            if not test_file.is_file():
-                continue
-            try:
-                source = test_file.read_text(encoding="utf-8", errors="replace")
-                tree = _ast.parse(source, filename=str(test_file))
-            except (SyntaxError, OSError, UnicodeDecodeError):
-                continue
-            for node in _ast.walk(tree):
-                if isinstance(node, _ast.Import):
-                    for alias in node.names:
-                        _register_import(import_map, alias.name, test_file)
-                elif isinstance(node, _ast.ImportFrom):
-                    module = node.module or ""
-                    if module:
-                        _register_import(import_map, module, test_file)
-                    for alias in node.names:
-                        full = f"{module}.{alias.name}" if module else alias.name
-                        _register_import(import_map, full, test_file)
-
-    return import_map
+    return build_import_map(repo_root, dir_names)
 
 
 def _find_tests_by_ast_import(
@@ -1390,15 +1354,20 @@ def _find_tests_by_ast_import(
     return sorted(result)
 
 
-# AST import map cache: repo_root → {module_path: [test_files]}
-# Populated lazily on the first resolve_affected_tests call; valid for the
-# process lifetime.  Thread-safe for reads; built exactly once per repo_root
-# (the executor call is idempotent and cheap races are benign).
-_ast_import_cache: Dict[Path, Dict[str, List[Path]]] = {}
+# AST import map cache: tree root → {module_path: [test_files]}.
+#
+# BOUNDED. This was a plain dict for the process lifetime, and a tree root is
+# a fresh /tmp path per L2 sandbox and per test-writing candidate, so each
+# one pinned a ~6 MB, 14k-key map forever: the top growth site in soak
+# bt-2026-09-23-005910 (~450 MB/h). A miss now re-assembles from the
+# content-addressed per-file tier rather than re-parsing, so evicting the
+# base tree's map is cheap. ``JARVIS_TEST_IMPORT_MAP_CACHE_MAX`` (default 4).
+_ast_import_cache: "BoundedLRU[Path, Dict[str, List[Path]]]" = BoundedLRU(tree_cache_max)
 
 #: The build currently producing a map, per repo root. Module-level for the
 #: same reason the cache is: the point is to be shared across every caller
-#: in the process.
+#: in the process. An entry removes itself when its build finishes -- a done
+#: future holds its result, so a leftover entry would pin a whole map.
 _ast_import_inflight: Dict[Path, "asyncio.Future"] = {}
 
 
@@ -1419,6 +1388,16 @@ def _ast_map_inflight_for_this_loop(root: Path) -> Optional["asyncio.Future"]:
         return fut if fut.get_loop() is asyncio.get_running_loop() else None
     except Exception:  # noqa: BLE001
         return None
+
+
+def _settle_ast_map_build(key: Path, fut: "asyncio.Future") -> None:
+    """Done-callback of an import-map build: cache a success, then retire
+    the in-flight entry. Runs whether or not any awaiter survived."""
+    if _ast_import_inflight.get(key) is fut:
+        _ast_import_inflight.pop(key, None)
+    if fut.cancelled() or fut.exception() is not None:
+        return
+    _ast_import_cache[key] = fut.result()
 
 
 # ---------------------------------------------------------------------------
@@ -1634,18 +1613,11 @@ class TestRunner:
             _TEST_DIR_NAMES,
         )
         _ast_import_inflight[key] = task
-        try:
-            import_map = await asyncio.shield(task)
-        except asyncio.CancelledError:
-            # The build keeps running and still fills the cache below --
-            # the work is already paid for, and discarding it would make a
-            # cancelled op cost the next one a fresh cold scan.
-            raise
-        finally:
-            if _ast_import_inflight.get(key) is task and task.done():
-                _ast_import_inflight.pop(key, None)
-
-        _ast_import_cache[key] = import_map
+        task.add_done_callback(lambda fut, k=key: _settle_ast_map_build(k, fut))
+        # A cancelled caller re-raises here, but the build keeps running and
+        # the done-callback still caches it -- the work is already paid for,
+        # and discarding it would make the next op pay a fresh scan.
+        import_map = await asyncio.shield(task)
         logger.debug(
             "[TestRunner] AST import map built: %d module keys indexed",
             len(import_map),
