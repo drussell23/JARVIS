@@ -8666,6 +8666,7 @@ class GovernedOrchestrator:
             )
             if _vg_terminal is not None:
                 return _vg_terminal
+            generation = await self._prune_cosmetic_siblings(ctx, generation)
 
         # Wave 2 (5) Slice 4a.1 - VALIDATERunner delegation gate.
         # Flag JARVIS_PHASE_RUNNER_VALIDATE_EXTRACTED (default false) routes
@@ -13071,6 +13072,62 @@ class GovernedOrchestrator:
             )
         return "Unknown failure. Read target files and check dependents before retrying."
 
+    def _candidate_value_verdicts(self, generation: Any) -> Tuple[list, list]:
+        """Per-CANDIDATE value verdicts (one per candidate, in pool order) and
+        the per-file detail. The one classifier behind both the all-cosmetic
+        terminal and the sibling prune."""
+        from backend.core.ouroboros.governance.candidate_value_gate import (  # noqa: E501
+            evaluate_candidate_value,
+        )
+        root = Path(self._config.execution_root)
+        verdicts: list = []
+        detail: list = []
+        for cand in getattr(generation, "candidates", None) or []:
+            verdict, d = evaluate_candidate_value(root, self._iter_candidate_files(cand))
+            verdicts.append(verdict)
+            detail.extend(d)
+        return verdicts, detail
+
+    async def _prune_cosmetic_siblings(
+        self, ctx: "OperationContext", generation: Any,
+    ) -> Any:
+        """Drop the candidates proven cosmetic from a pool that also holds a
+        substantive one, so VALIDATE can only pick a candidate that changes
+        something.
+
+        The all-cosmetic terminal judges the POOL. A pool of mixed siblings
+        therefore reached VALIDATE whole, and the first to pass won even when
+        it was the cosmetic one. Measured bt-2026-09-23-180828: op-01a0cf75-0df6
+        drew one substantive and two cosmetic siblings, a cosmetic one passed
+        first, and 474341904e landed a quote-style/docstring-dedent change that
+        is AST-identical to its base -- counted as a landing.
+
+        Returns *generation* unchanged when nothing is cosmetic, when nothing
+        substantive would remain (the terminal owns that case), when the gate
+        is off, or on any error. Indeterminate candidates are kept.
+        """
+        if os.environ.get(
+            "JARVIS_CANDIDATE_VALUE_GATE_ENABLED", "true",
+        ).strip().lower() not in ("1", "true", "yes", "on"):
+            return generation
+        try:
+            from backend.core.ouroboros.governance.candidate_value_gate import (  # noqa: E501
+                COSMETIC as _VG_COSMETIC,
+            )
+            cands = tuple(getattr(generation, "candidates", None) or ())
+            verdicts, _detail = self._candidate_value_verdicts(generation)
+            keep = tuple(c for c, v in zip(cands, verdicts) if v != _VG_COSMETIC)
+            if not keep or len(keep) == len(cands):
+                return generation
+            logger.info(
+                "[ValueGate] op=%s dropped %d cosmetic sibling(s); %d candidate(s) "
+                "go to VALIDATE", ctx.op_id, len(cands) - len(keep), len(keep),
+            )
+            return dataclasses.replace(generation, candidates=keep)
+        except Exception:  # noqa: BLE001 — pruning must never block a real candidate
+            logger.debug("[ValueGate] sibling prune skipped", exc_info=True)
+            return generation
+
     async def _maybe_complete_cosmetic_candidate(
         self, ctx: "OperationContext", generation: Any,
     ) -> Optional["OperationContext"]:
@@ -13163,19 +13220,11 @@ class GovernedOrchestrator:
         try:
             from backend.core.ouroboros.governance.candidate_value_gate import (  # noqa: E501
                 COSMETIC as _VG_COSMETIC,
-                evaluate_candidate_value,
             )
-            _vg_root = Path(self._config.execution_root)
-            _vg_cands = getattr(generation, "candidates", None) or []
-            _vg_all_cosmetic = bool(_vg_cands)
-            _vg_detail: list = []
-            for _vg_cand in _vg_cands:
-                _vg_files = self._iter_candidate_files(_vg_cand)
-                _verdict, _d = evaluate_candidate_value(_vg_root, _vg_files)
-                _vg_detail.extend(_d)
-                if _verdict != _VG_COSMETIC:
-                    _vg_all_cosmetic = False
-                    break
+            _vg_verdicts, _vg_detail = self._candidate_value_verdicts(generation)
+            _vg_all_cosmetic = bool(_vg_verdicts) and all(
+                v == _VG_COSMETIC for v in _vg_verdicts
+            )
             logger.debug(
                 "[ValueGate] verdict op=%s all_cosmetic=%s files=%s",
                 ctx.op_id, _vg_all_cosmetic,

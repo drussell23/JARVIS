@@ -1241,6 +1241,17 @@ async def dispatch_pipeline(
                     _vg_terminal.op_id,
                 )
                 return _vg_terminal
+            # A mixed pool reaches VALIDATE without its cosmetic siblings, or
+            # the first to pass wins even when it changes nothing.
+            try:
+                pctx.generation = await orchestrator._prune_cosmetic_siblings(
+                    ctx, pctx.generation,
+                )
+            except Exception:  # noqa: BLE001 — fail-safe forward
+                logger.debug(
+                    "[PhaseDispatcher] cosmetic-sibling prune failed "
+                    "(pass-forward)", exc_info=True,
+                )
 
     raise PhaseDispatchError(
         f"dispatcher exceeded max_iterations={max_iterations}; "

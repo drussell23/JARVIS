@@ -222,7 +222,11 @@ class TestOrchestratorSeamWiring:
         helper = inspect.getsource(
             Orchestrator._maybe_complete_cosmetic_candidate,
         )
-        assert "evaluate_candidate_value" in helper
+        # The per-candidate classifier is shared with the sibling prune.
+        assert "_candidate_value_verdicts" in helper
+        assert "evaluate_candidate_value" in inspect.getsource(
+            Orchestrator._candidate_value_verdicts,
+        )
         assert "no_op_cosmetic" in helper
 
     def test_no_audit_reject_markers_in_gate_emits(self):

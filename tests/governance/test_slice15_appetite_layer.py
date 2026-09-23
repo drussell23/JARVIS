@@ -356,6 +356,8 @@ class _StubOrch:
     _maybe_complete_cosmetic_candidate = (
         Orchestrator._maybe_complete_cosmetic_candidate
     )
+    _candidate_value_verdicts = Orchestrator._candidate_value_verdicts
+    _prune_cosmetic_siblings = Orchestrator._prune_cosmetic_siblings
 
     def __init__(self, tmp_path):
         self._config = OrchestratorConfig(project_root=tmp_path)
