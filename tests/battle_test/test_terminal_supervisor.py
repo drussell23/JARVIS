@@ -34,7 +34,10 @@ _FAKE_DAEMON = textwrap.dedent("""
         base = {"session_id": d.name, "session_outcome": "in_flight",
                 "stop_reason": "unknown", "started_at": time.time()}
         base.update(kw)
+        if base["session_outcome"] != "in_flight":
+            base.pop("started_at")   # like the harness: the FINAL schema has none
         (d / "summary.json").write_text(json.dumps(base))
+    (d / "wall_deadline.json").write_text(json.dumps({"deadline_wall": time.time() + 600}))
     summary()
     (d / "heartbeat.tick").write_text(str(time.time()))
     if mode == "sigkill":
