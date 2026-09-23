@@ -780,6 +780,131 @@ def _module_constant_lines(tree) -> List[str]:
     return out
 
 
+_ENV_PATCH_TARGETS = "JARVIS_AST_SIGNATURE_ANCHOR_PATCH_TARGETS_ENABLED"
+_PATCH_NAMES_MAX = 24
+
+
+def _dotted_module(label: str) -> str:
+    """``backend/foo/bar.py`` -> ``backend.foo.bar`` (labels are repo paths)."""
+    s = _norm(label)
+    if s.endswith(".py"):
+        s = s[:-3]
+    parts = [p for p in s.split("/") if p]
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def _import_source(node, module: str) -> str:
+    """The absolute module an ``ImportFrom`` reads from (relative resolved)."""
+    if not node.level:
+        return node.module or ""
+    pkg = module.split(".")[: -node.level] if module else []
+    return ".".join(pkg + ([node.module] if node.module else []))
+
+
+def _bindings(node, module: str) -> List[Tuple[str, str, str]]:
+    """``(bound name, patch target, source module)`` for one import statement."""
+    out: List[Tuple[str, str, str]] = []
+    if isinstance(node, ast.Import):
+        for a in node.names:
+            if a.asname:
+                out.append((a.asname, a.name, a.name))
+            else:
+                top = a.name.split(".")[0]
+                out.append((top, top, a.name))
+    elif isinstance(node, ast.ImportFrom):
+        src = _import_source(node, module)
+        for a in node.names:
+            if a.name == "*":
+                continue
+            out.append((a.asname or a.name, f"{src}.{a.name}" if src else a.name, src))
+    return out
+
+
+def _absent_first_party(source_module: str, importer: Optional[Path], root: Optional[Path]) -> bool:
+    """True when *source_module* belongs to an in-repo package but its file is
+    gone -- e.g. ``vision.integrate_robust_learning``, deleted in a cleanup
+    while ``backend/apply_robust_learning.py`` still imports it at call time.
+    ``mock.patch`` imports the source to patch it, so no patch string works;
+    only a ``sys.modules`` stub does."""
+    if importer is None or root is None or not source_module:
+        return False
+    top = source_module.split(".")[0]
+    if _resolve_first_party(top, importer, root) is None:
+        return False                       # stdlib / third-party
+    return _resolve_first_party(source_module, importer, root) is None
+
+
+def _patch_target_lines(
+    tree, module_label: str,
+    importer: Optional[Path] = None, root: Optional[Path] = None,
+) -> List[str]:
+    """Which names ``mock.patch`` can reach THROUGH this module, and which it
+    cannot.
+
+    A function-local import binds nothing on the module: it runs at call time
+    and resolves from its SOURCE module. Measured 2026-09-23
+    (bt-2026-09-23-172111): the anchor showed the exact API of
+    ``backend/apply_robust_learning.py`` 34 times, and the model still wrote
+    ``patch("backend.apply_robust_learning.apply_robust_learning_patch")`` --
+    a name imported INSIDE ``apply_robust_learning_patches()`` from
+    ``vision.integrate_robust_learning`` -- and every attempt died on
+    ``AttributeError: ... does not have the attribute``. Signatures say what a
+    module defines; this says what a test may patch. NEVER raises.
+    """
+    if os.environ.get(_ENV_PATCH_TARGETS, "true").strip().lower() in ("0", "false", "no", "off"):
+        return []
+    module = _dotted_module(module_label)
+    out: List[str] = []
+    try:
+        top: List[str] = []
+        for node in tree.body:
+            stmts = [node]
+            if isinstance(node, (ast.Try, ast.If)):
+                stmts = list(ast.walk(node))
+            for st in stmts:
+                for name, _target, _src in _bindings(st, module):
+                    if name not in top:
+                        top.append(name)
+        local: List[Tuple[str, str, str, str]] = []
+        defs = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                defs.append((f"{node.name}()", node))
+            elif isinstance(node, ast.ClassDef):
+                defs.extend((f"{node.name}.{m.name}()", m) for m in node.body
+                            if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)))
+        for owner, fn in defs:
+            for st in ast.walk(fn):
+                for name, target, src in _bindings(st, module):
+                    if name not in top and all(name != n for _o, n, _t, _s in local):
+                        local.append((owner, name, target, src))
+        if not top and not local:
+            return []
+        prefix = module or "this_module"
+        out.append("# mock.patch targets:")
+        if top:
+            shown = ", ".join(top[:_PATCH_NAMES_MAX]) + (", ..." if len(top) > _PATCH_NAMES_MAX else "")
+            out.append(f"#   module-level imports, patchable as \"{prefix}.<name>\": {shown}")
+        if local:
+            out.append("#   imported INSIDE a function at call time -- NOT attributes of "
+                       f"{prefix}; patching \"{prefix}.<name>\" raises AttributeError. "
+                       "Patch the source instead:")
+            for owner, name, target, src in local[:_PATCH_NAMES_MAX]:
+                if _absent_first_party(src, importer, root):
+                    out.append(
+                        f"#     {owner}: {name} -> source module \"{src}\" DOES NOT EXIST "
+                        f"on disk, so patch() cannot import it; stub it: "
+                        f"mock.patch.dict(sys.modules, {{\"{src}\": fake}}) "
+                        f"with fake.{target.rsplit('.', 1)[-1]} set")
+                else:
+                    out.append(f"#     {owner}: {name} -> patch(\"{target}\")")
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
 def _public_doc_nodes(tree) -> List[object]:
     """Module, public top-level defs, public classes and their public /
     __init__ methods — every node whose docstring the anchor may carry."""
@@ -844,6 +969,8 @@ def extract_public_api(
     doc_chars: Optional[int] = None,
     budget: Optional[int] = None,
     include_private: bool = False,
+    source_path: Optional[os.PathLike] = None,
+    repo_root: Optional[os.PathLike] = None,
 ) -> str:
     """Compact authoritative block for the PUBLIC top-level API of *source* —
     public functions and public classes (annotated fields, public methods +
@@ -902,6 +1029,11 @@ def extract_public_api(
         head.append('"""' + mod_doc + '"""')
     head.extend(_module_constant_lines(tree))
     head.extend(_module_loop_lines(tree))
+    head.extend(_patch_target_lines(
+        tree, module_import_path,
+        Path(source_path) if source_path else None,
+        Path(repo_root) if repo_root else None,
+    ))
     return "\n".join(head + lines)
 
 
@@ -1133,6 +1265,7 @@ def build_signature_anchor(
             block = extract_public_api(
                 src, label, budget=max_chars - used,
                 include_private=is_test_path(path),
+                source_path=path, repo_root=repo_root,
             )
             if not block:
                 continue
@@ -1179,7 +1312,10 @@ def build_signature_anchor(
             "guard that precedes them. Derive every expected value from those "
             "formulas INSIDE the test from your own inputs (e.g. "
             "`expected = blocks * heads * (k + v) * 2`) — never hand-compute a "
-            "numeric literal.\n\n"
+            "numeric literal. `# mock.patch targets:` is the ONLY set of "
+            "names a test may patch through a module: a name imported inside "
+            "a function is not an attribute of that module -- patch it with "
+            "the exact `patch(\"...\")` string shown.\n\n"
             "```python\n" + body + "\n```"
         )
     except Exception:  # noqa: BLE001 — the anchor is additive, never fatal
