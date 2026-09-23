@@ -605,8 +605,16 @@ class _SubprocessRunner:
         success = False
 
         try:
+            from backend.core.ouroboros.governance.process_session import (  # noqa: PLC0415
+                contain_argv_async,
+            )
+            # The worker applies patches and runs pytest over them: candidate
+            # code. Containing the worker contains everything it starts, and
+            # the timeout's leader kill below now ends all of it.
             proc = await asyncio.create_subprocess_exec(
-                _PYTHON_BIN, "-m", _WORKER_MODULE,
+                *await contain_argv_async(
+                    [_PYTHON_BIN, "-m", _WORKER_MODULE], owner="teammate_worker",
+                ),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

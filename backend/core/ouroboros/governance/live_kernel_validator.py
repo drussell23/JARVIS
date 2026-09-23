@@ -174,9 +174,17 @@ class LiveKernelValidator:
         """Spawn an ephemeral, TTL-bounded subprocess. Returns (rc, stdout, stderr)."""
         import asyncio
         import sys as _sys
+        from backend.core.ouroboros.governance.process_session import (  # noqa: PLC0415
+            contain_argv_async,
+        )
+        # The probe imports and calls the patched kernel's symbols. Contained,
+        # the timeout's leader kill below ends everything they started.
         proc = await asyncio.create_subprocess_exec(
-            _sys.executable, "-c", script,
+            *await contain_argv_async(
+                [_sys.executable, "-c", script], owner="live_kernel_validator",
+            ),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
         )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)

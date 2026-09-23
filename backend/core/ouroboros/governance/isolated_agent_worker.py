@@ -296,6 +296,10 @@ def run_pytest(
     cmd.extend(test_paths)
 
     try:
+        # Already contained: this worker is started inside a private PID
+        # namespace by its parent (hybrid_teammate_executor), and everything
+        # it spawns inherits it -- without breaking this module's stdlib-only
+        # import contract.
         result = subprocess.run(
             cmd,
             capture_output=True,

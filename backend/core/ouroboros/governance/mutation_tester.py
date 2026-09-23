@@ -443,8 +443,13 @@ def _run_pytest(
         *[str(t) for t in test_files],
     ]
     try:
+        from backend.core.ouroboros.governance.process_session import (  # noqa: PLC0415
+            contain_argv,
+        )
+        # A mutant is candidate code by construction. Contained, the
+        # timeout's leader kill also ends everything the mutant started.
         proc = subprocess.run(
-            cmd,
+            contain_argv(cmd, owner="mutation_tester"),
             cwd=str(cwd) if cwd else None,
             capture_output=True,
             timeout=timeout_s,

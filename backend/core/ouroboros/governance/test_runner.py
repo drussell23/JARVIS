@@ -789,11 +789,14 @@ class CppAdapter:
         cwd = str(sandbox_dir or self._repo_root)
         half = budget_s * 0.5
 
-        # Configure
+        # Configure. Contained like every candidate run: configure and build
+        # execute the candidate's own CMake code (custom commands, execute_process).
         try:
             proc = await asyncio.create_subprocess_exec(
-                "cmake", str(self._repo_root), "-B", str(build_dir),
-                f"-G{self._CMAKE_GENERATOR}",
+                *await contain_argv_async(
+                    ["cmake", str(self._repo_root), "-B", str(build_dir),
+                     f"-G{self._CMAKE_GENERATOR}"], owner="cmake_configure",
+                ),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 stdin=asyncio.subprocess.DEVNULL,
@@ -816,7 +819,10 @@ class CppAdapter:
         # Build
         try:
             proc2 = await asyncio.create_subprocess_exec(
-                "cmake", "--build", str(build_dir), "--parallel",
+                *await contain_argv_async(
+                    ["cmake", "--build", str(build_dir), "--parallel"],
+                    owner="cmake_build",
+                ),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 stdin=asyncio.subprocess.DEVNULL,
@@ -844,16 +850,25 @@ class CppAdapter:
         """Probe ABI by cmake-installing and attempting to load .so files."""
         import sys as _sys
         install_tmp = build_dir / "_abi_probe_install"
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
-                "cmake", "--install", str(build_dir), "--prefix", str(install_tmp),
+                *await contain_argv_async(
+                    ["cmake", "--install", str(build_dir), "--prefix", str(install_tmp)],
+                    owner="cmake_install",
+                ),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 stdin=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
             )
             await asyncio.wait_for(proc.communicate(), timeout=30.0)
         except Exception:
             return True, ""  # no install → no .so → skip probe
+        finally:
+            # A timed-out install used to be abandoned still running.
+            if proc is not None:
+                reap_session(proc.pid, owner="cmake_install")
 
         # fs-hot-tier Batch 3 (row 24): the rglob is dispatched off the
         # asyncio loop via cooperative_fs_io.offload(cpu_bound=False)
@@ -876,20 +891,28 @@ class CppAdapter:
             return True, ""  # no extension → skip probe
 
         for so in so_files:
+            probe = None
             try:
+                # Loading a .so runs its constructors: candidate code.
                 probe = await asyncio.create_subprocess_exec(
-                    _sys.executable, "-c",
-                    "import ctypes, sys; ctypes.CDLL(sys.argv[1])",
-                    str(so),
+                    *await contain_argv_async(
+                        [_sys.executable, "-c",
+                         "import ctypes, sys; ctypes.CDLL(sys.argv[1])", str(so)],
+                        owner="abi_probe",
+                    ),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     stdin=asyncio.subprocess.DEVNULL,
+                    start_new_session=True,
                 )
                 await asyncio.wait_for(probe.communicate(), timeout=10.0)
                 if probe.returncode != 0:
                     return False, f"ABI probe: {so.name} failed to load"
             except Exception as exc:
                 return False, f"ABI probe error: {exc}"
+            finally:
+                if probe is not None:
+                    reap_session(probe.pid, owner="abi_probe")
         return True, ""
 
     async def _default_ctest(
@@ -901,7 +924,10 @@ class CppAdapter:
         t0 = time.monotonic()
         try:
             proc = await asyncio.create_subprocess_exec(
-                "ctest", "--output-on-failure", "--test-dir", str(build_dir),
+                *await contain_argv_async(
+                    ["ctest", "--output-on-failure", "--test-dir", str(build_dir)],
+                    owner="ctest",
+                ),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 stdin=asyncio.subprocess.DEVNULL,

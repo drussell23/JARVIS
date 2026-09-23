@@ -503,17 +503,31 @@ async def _check_coverage(
             "coverage", False,
             f"no tests/**/test_<stem>.py for {', '.join(files[:3]) or 'the touched files'}",
         )
+    from backend.core.ouroboros.governance.process_session import (  # noqa: PLC0415
+        contain_argv_async, reap_session,
+    )
+    proc = None
     try:
+        # The commit under promotion is candidate code until it is promoted.
         proc = await asyncio.create_subprocess_exec(
-            python_bin, "-m", "pytest", *tests, "-q", "-p", "no:cacheprovider",
+            *await contain_argv_async(
+                [python_bin, "-m", "pytest", *tests, "-q", "-p", "no:cacheprovider"],
+                owner="promotion_gate",
+            ),
             cwd=str(repo_root),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            stdin=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
         )
         raw, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
     except asyncio.TimeoutError:
         return Finding("coverage", False, f"tests exceeded {timeout_s:.0f}s")
     except Exception as exc:  # noqa: BLE001
         return Finding("coverage", False, f"could not run tests: {exc!r}"[:200])
+    finally:
+        # A timeout used to return with the run still going.
+        if proc is not None:
+            reap_session(proc.pid, owner="promotion_gate")
     text = re.sub(r"\x1b\[[0-9;]*m", "", (raw or b"").decode("utf-8", "replace"))
     failed = [
         ln for ln in text.splitlines()

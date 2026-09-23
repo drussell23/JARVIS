@@ -114,7 +114,14 @@ class ForensicInoculationEngine:
         checks = "; ".join(f"assert hasattr(m,{s!r}), 'missing {s}'" for s in symbols)
         code = f"import importlib,sys; m=importlib.import_module({module!r}); {checks}"
         try:
-            p = subprocess.run([os.environ.get("PYTHON", "python3"), "-c", code],
+            from backend.core.ouroboros.governance.process_session import (  # noqa: PLC0415
+                contain_argv,
+            )
+            # Importing the fragile module runs its top level (candidate code).
+            # Runs on a worker thread (inoculate -> to_thread), so the one-time
+            # host probe inside contain_argv never blocks the loop.
+            p = subprocess.run(contain_argv([os.environ.get("PYTHON", "python3"), "-c", code],
+                                            owner="forensic_inoculation"),
                                cwd=str(self._repo), capture_output=True, text=True, timeout=30,
                                env={**os.environ, "PYTHONPATH": str(self._repo)})
             return (p.returncode == 0), (p.stderr or p.stdout)[-1200:]

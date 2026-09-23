@@ -26,6 +26,7 @@ import asyncio
 import logging
 import os
 import shlex
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, Optional
@@ -289,8 +290,18 @@ class SandboxedBashTool:
         cwd = str(self._config.cwd) if self._config.cwd else None
 
         try:
-            process = await asyncio.create_subprocess_shell(
-                command,
+            # A model-authored command is candidate code. The shell is spelled
+            # out (what create_subprocess_shell runs) so the argv can be
+            # contained; the timeout's kill below then ends the whole tree,
+            # where it used to end only the shell.
+            from backend.core.ouroboros.governance.process_session import (  # noqa: PLC0415
+                contain_argv_async,
+            )
+            process = await asyncio.create_subprocess_exec(
+                *await contain_argv_async(
+                    [shutil.which("sh") or "/bin/sh", "-c", command],
+                    owner="bash_tool",
+                ),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 stdin=asyncio.subprocess.DEVNULL,

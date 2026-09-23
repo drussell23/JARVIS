@@ -18,6 +18,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+from backend.core.ouroboros.governance.process_session import contain_argv
 from backend.core.ouroboros.governance.saga.saga_types import RepoPatch
 
 logger = logging.getLogger("Ouroboros.CrossRepoVerifier")
@@ -171,7 +172,10 @@ class CrossRepoVerifier:
         try:
             proc = await asyncio.to_thread(
                 subprocess.run,
-                ["python3", "-m", "pytest", "--tb=short", "-q", "--no-header"] + changed_files,
+                contain_argv(
+                    ["python3", "-m", "pytest", "--tb=short", "-q", "--no-header"] + changed_files,
+                    owner="cross_repo_tier1",
+                ),
                 cwd=str(repo_root),
                 capture_output=True,
                 text=True,
@@ -235,7 +239,9 @@ class CrossRepoVerifier:
                 try:
                     proc = await asyncio.to_thread(
                         subprocess.run,
-                        ["python3", "-c", f"import {module}"],
+                        # Importing runs the module's top level: candidate code.
+                        contain_argv(["python3", "-c", f"import {module}"],
+                                     owner="cross_repo_tier2"),
                         cwd=str(src_root),
                         capture_output=True,
                         text=True,
@@ -273,7 +279,8 @@ class CrossRepoVerifier:
                 try:
                     proc = await asyncio.to_thread(
                         subprocess.run,
-                        ["python3", "-m", "pytest", "-m", "cross_repo", "-q"],
+                        contain_argv(["python3", "-m", "pytest", "-m", "cross_repo", "-q"],
+                                     owner="cross_repo_tier3"),
                         cwd=str(repo_root),
                         capture_output=True,
                         text=True,
