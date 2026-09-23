@@ -4985,13 +4985,34 @@ class GovernedOrchestrator:
                     # op ran without expansion and nothing surfaced it.
                     # A swallowed exception that changes behaviour must at
                     # minimum say where it came from.
-                    logger.warning(
+                    from backend.core.ouroboros.governance.phase_runners.context_expansion_runner import (  # noqa: E501
+                        expansion_failure_is_defect as _ce_defect,
+                        settle_expansion as _ce_settle,
+                    )
+                    _ce_fatal = _ce_defect(exc)
+                    logger.error(
                         "[Orchestrator] Context expansion failed for op=%s: "
-                        "%s: %s; continuing to GENERATE with UNEXPANDED "
-                        "context",
+                        "%s: %s; %s",
                         ctx.op_id, type(exc).__name__, exc,
+                        "a code defect -- ending the op (context_expansion_defect)"
+                        if _ce_fatal else
+                        "transient -- continuing to GENERATE with UNEXPANDED context",
                         exc_info=True,
                     )
+                    await _ce_settle(ctx.op_id, exc)
+                    if _ce_fatal:
+                        ctx = ctx.advance(
+                            OperationPhase.CANCELLED,
+                            terminal_reason_code="context_expansion_defect",
+                        )
+                        await self._record_ledger(
+                            ctx, OperationState.FAILED,
+                            {
+                                "reason": "context_expansion_defect",
+                                "detail": f"{type(exc).__name__}: {exc}"[:500],
+                            },
+                        )
+                        return ctx
 
                 # ---- ModuleContextRouter: architecture memory injection (MEM-2, inline path) ----
                 # Parity with ContextExpansionRunner. Gated default-OFF; fail-soft.

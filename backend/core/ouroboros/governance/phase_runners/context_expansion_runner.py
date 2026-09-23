@@ -63,6 +63,47 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger("Ouroboros.Orchestrator")
 
+#: Exception types that mean the expansion CODE is wrong, not that a
+#: dependency hiccupped: they recur on every op until someone fixes a line.
+#: bt-2026-09-21..23 ran 113 of 113 ops unexpanded on one such AttributeError
+#: (``index_age_s`` on the isolated Oracle), logged as a WARNING each time.
+_DEFECT_TYPES = (AttributeError, TypeError, NameError, ImportError)
+
+CAPABILITY = "context_expansion"
+
+
+def expansion_failure_is_defect(exc: BaseException) -> bool:
+    """Should this expansion failure end the op instead of degrading it?
+
+    A deterministic code defect ends it (``context_expansion_defect``):
+    generating blind on every op hides the defect and spends the model on
+    work that lacks its context. A transient fault (timeout, IPC/OS error)
+    degrades: failing the op there would turn one hiccup into lost work.
+    ``JARVIS_CONTEXT_EXPANSION_DEFECTS_FATAL`` (default true) switches the
+    defect rule off; both kinds log at ERROR and settle the reachability
+    ledger either way, so a streak raises a HEALTH ALARM.
+    """
+    import os  # noqa: PLC0415
+    if os.environ.get("JARVIS_CONTEXT_EXPANSION_DEFECTS_FATAL", "true").strip().lower() in (
+        "0", "false", "no", "off",
+    ):
+        return False
+    return isinstance(exc, _DEFECT_TYPES)
+
+
+async def settle_expansion(op_id: str, exc: Optional[BaseException]) -> None:
+    """One reachability settle per expansion. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.reachability_ledger import (  # noqa: PLC0415
+            default_ledger,
+        )
+        await default_ledger().settle(
+            CAPABILITY, ok=exc is None, op_id=op_id,
+            detail="" if exc is None else f"{type(exc).__name__}: {exc}"[:300],
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("[Orchestrator] context_expansion settle failed", exc_info=True)
+
 
 class ContextExpansionRunner(PhaseRunner):
     """Verbatim transcription of orchestrator.py CONTEXT_EXPANSION block (~2143-2254)."""
@@ -82,6 +123,7 @@ class ContextExpansionRunner(PhaseRunner):
 
         # ---- VERBATIM transcription of orchestrator.py 2143-2254 ----
         # ---- Phase 2b: CONTEXT_EXPANSION ----
+        _expansion_exc: Optional[BaseException] = None
         try:
             expansion_deadline = datetime.now(tz=timezone.utc) + timedelta(
                 seconds=orch._config.context_expansion_timeout_s
@@ -214,12 +256,38 @@ class ContextExpansionRunner(PhaseRunner):
             # Identical treatment on both paths now, so the next occurrence
             # names its own line and the underlying defect becomes findable
             # instead of inferable.
-            logger.warning(
-                "[Orchestrator] Context expansion failed for op=%s: %s: %s; "
-                "continuing to GENERATE with UNEXPANDED context",
+            _expansion_exc = exc
+            _fatal = expansion_failure_is_defect(exc)
+            logger.error(
+                "[Orchestrator] Context expansion failed for op=%s: %s: %s; %s",
                 ctx.op_id, type(exc).__name__, exc,
+                "a code defect -- ending the op (context_expansion_defect)"
+                if _fatal else
+                "transient -- continuing to GENERATE with UNEXPANDED context",
                 exc_info=True,
             )
+            await settle_expansion(ctx.op_id, exc)
+            if _fatal:
+                from backend.core.ouroboros.governance.ledger import (  # noqa: PLC0415
+                    OperationState,
+                )
+                ctx = ctx.advance(
+                    OperationPhase.CANCELLED,
+                    terminal_reason_code="context_expansion_defect",
+                )
+                await orch._record_ledger(
+                    ctx, OperationState.FAILED,
+                    {
+                        "reason": "context_expansion_defect",
+                        "detail": f"{type(exc).__name__}: {exc}"[:500],
+                    },
+                )
+                return PhaseResult(
+                    next_ctx=ctx, next_phase=None, status="fail",
+                    reason="context_expansion_defect",
+                )
+        if _expansion_exc is None:
+            await settle_expansion(ctx.op_id, None)
 
         # ---- ModuleContextRouter: architecture memory injection (MEM-2) ----
         # Authority-free / advisory. Appends relevant architecture-memory topics

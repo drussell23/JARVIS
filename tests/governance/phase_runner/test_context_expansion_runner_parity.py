@@ -7,7 +7,8 @@ Parity contract:
 
 1. ``ContextExpander.expand(ctx, deadline)`` is awaited via wait_for
 2. Optional ExplorationFleet + Oracle dependency summary injections
-3. Broad try/except wraps — expansion failure is a WARNING, not fatal
+3. Broad try/except wraps — a transient expansion failure degrades (logged
+   at ERROR); a code defect ends the op (test_context_expansion_defect_escalation)
 4. Unconditional advance to PLAN at the end (``next_phase=PLAN``)
 5. Resolves ``ContextExpander`` through orchestrator module for test patching
 """
