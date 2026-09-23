@@ -631,9 +631,23 @@ async def is_structurally_redundant_async(
         )
         if not is_offload_error(result):
             return result
-        logger.debug("[SiblingEntropy] offload declined — scanning in-process")
+        # Declined by the process path (a worker died running it, or it
+        # timed out): the verdict is still required, but NOT on the event
+        # loop -- that in-process fallback was bt-2026-09-22-201845's 152
+        # difflib stalls. The thread path keeps the loop scheduling.
+        logger.debug("[SiblingEntropy] process offload declined — scanning on a thread")
+        result = await offload(
+            redundancy_scan, list(new_fingerprints), seen, thr,
+            cpu_bound=False,
+        )
+        if not is_offload_error(result):
+            return result
+        logger.debug("[SiblingEntropy] thread offload failed too: %s", result.message)
     except Exception:  # noqa: BLE001
         logger.debug("[SiblingEntropy] offload unavailable", exc_info=True)
+    # Last resort, reached only if the scan itself raises on a thread: the
+    # in-process call re-raises the same fault, which is this function's
+    # documented contract ("NEVER raises beyond what the sync path raises").
     return redundancy_scan(list(new_fingerprints), seen, thr)
 
 

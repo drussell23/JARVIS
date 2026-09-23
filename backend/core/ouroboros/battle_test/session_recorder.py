@@ -609,6 +609,19 @@ class SessionRecorder:
         except Exception:  # noqa: BLE001 — telemetry never breaks the summary
             pass
 
+        # Memory growth — present only when the daemon's own RSS showed
+        # sustained linear growth: the fit that triggered tracing and the top
+        # growing allocation sites tracemalloc attributed it to.
+        try:
+            from backend.core.ouroboros.governance.memory_growth_tracer import (
+                default_tracer,
+            )
+            _growth = default_tracer().report()
+            if _growth:
+                summary["memory_growth"] = _growth
+        except Exception:  # noqa: BLE001 — telemetry never breaks the summary
+            pass
+
         # Per-Phase Cost Drill-Down arc (Slice 3) — emit ``cost_by_phase``
         # (session rollup) + ``cost_by_op_phase`` (per-op per-phase) only
         # when the finalize observer received at least one op. Additive

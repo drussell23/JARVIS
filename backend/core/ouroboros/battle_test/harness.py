@@ -10211,6 +10211,17 @@ class BattleTestHarness:
                 )
                 return
             _tick += 1
+            # Growth attribution rides the same tick: free (one own-RSS read,
+            # off the loop) until the daemon's own memory shows sustained
+            # linear growth, then tracemalloc names the allocation sites. See
+            # memory_growth_tracer. Never raises.
+            try:
+                from backend.core.ouroboros.governance.memory_growth_tracer import (  # noqa: PLC0415
+                    default_tracer,
+                )
+                await default_tracer().tick(warn_mb=warn_mb)
+            except Exception:  # noqa: BLE001 — a diagnostic never stops the watchdog
+                logger.debug("[ProcessMemoryWatchdog] growth tracer degraded", exc_info=True)
             rss_mb = await self._probe_process_tree_rss_mb_async()
             if rss_mb is None:
                 continue  # transient probe failure — retry next tick

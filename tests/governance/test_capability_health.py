@@ -223,9 +223,12 @@ async def test_a_dead_process_pool_alarms_by_name_and_reaches_the_summary(tmp_pa
         convergence_state="INSUFFICIENT_DATA", convergence_slope=0.0,
         convergence_r2=0.0,
     ).read_text())
-    failing = summary["capability_health"]["failing"]
-    assert [f["capability"] for f in failing] == [cap]
-    assert failing[0]["consecutive_failures"] == 3
+    # Two names alarm: the fn that could not run, and the pool it needed --
+    # the pool's own capability is what stays red when the thread fallback
+    # masks the outage for every other fn.
+    failing = {f["capability"]: f for f in summary["capability_health"]["failing"]}
+    assert set(failing) == {cap, "offload.process_pool"}
+    assert failing[cap]["consecutive_failures"] == 3
 
 
 def test_a_healthy_session_adds_no_health_key(tmp_path):

@@ -952,18 +952,41 @@ async def _offload_dispatch(
         # the ordinary lazy getter, and the call is retried ONCE -- offloaded
         # work is pure by contract, so a retry is safe, and a fn that kills
         # its own worker every time gets exactly two attempts, never a loop.
+        died_in_flight = False
         for attempt in (1, 2):
             outcome = await _offload_to_process_pool(loop, fn, args, kwargs)
             if not isinstance(outcome, _PoolBroken):
                 return outcome
+            died_in_flight = died_in_flight or outcome.in_flight
             logger.warning(
-                "[CooperativeFSIO] process pool BROKEN during %s (%s) — "
-                "workers: %s; retired, %s",
+                "[CooperativeFSIO] process pool BROKEN %s %s (%s) — "
+                "workers: %s; retired%s",
+                "mid-task in" if outcome.in_flight else "before",
                 getattr(fn, "__name__", repr(fn)), outcome.reason,
                 outcome.workers,
-                "rebuilding and retrying once" if attempt == 1
-                else "second break in one call: returning an OffloadError",
+                ", rebuilding and retrying once" if attempt == 1 else "",
             )
+        await _settle_process_pool(ok=False, detail=outcome.reason)
+        # GRACEFUL DEGRADATION: the work still leaves the event loop. When
+        # the pool is merely unavailable (could not be built, or broke before
+        # this call's work reached a worker), nothing implicates ``fn``, so it
+        # runs on the thread pool: slower under the GIL, but the loop keeps
+        # scheduling. Callers used to get an OffloadError here and run the
+        # work IN-PROCESS -- bt-2026-09-22-201845's 152 sibling_entropy
+        # difflib stalls (up to 10 s each) were exactly that, for 2.5 hours.
+        #
+        # NOT when a worker died WHILE RUNNING this fn, on either attempt:
+        # then ``fn`` is the prime suspect (a C-extension segfault, an
+        # os._exit), and running it in the daemon's own process would turn a
+        # dead worker into a dead daemon. That stays an OffloadError.
+        if not died_in_flight and thread_fallback_enabled():
+            logger.warning(
+                "[CooperativeFSIO] %s runs on the thread pool while the "
+                "process pool is unavailable — the event loop stays free; "
+                "the work shares the GIL",
+                getattr(fn, "__name__", repr(fn)),
+            )
+            return await _offload_to_threads(loop, fn, args, kwargs)
         return OffloadError(
             fn_name=getattr(fn, "__name__", repr(fn)),
             exc_type="BrokenProcessPool",
@@ -971,8 +994,28 @@ async def _offload_dispatch(
             cpu_bound=True,
         )
 
-    # Thread path — reuse the EXISTING advisor-blast pool (do not
-    # create a second thread pool).
+    return await _offload_to_threads(loop, fn, args, kwargs)
+
+
+def thread_fallback_enabled() -> bool:
+    """``JARVIS_OFFLOAD_THREAD_FALLBACK_ENABLED`` (default true): cpu-bound
+    work the process pool cannot take runs on the thread pool instead of
+    failing back to the caller."""
+    return (
+        os.environ.get("JARVIS_OFFLOAD_THREAD_FALLBACK_ENABLED", "true")
+        .strip().lower() not in ("0", "false", "no", "off")
+    )
+
+
+async def _offload_to_threads(
+    loop: asyncio.AbstractEventLoop,
+    fn: Callable[..., Any],
+    args: tuple,
+    kwargs: dict,
+) -> Any:
+    """The thread path: the EXISTING advisor-blast pool (never a second
+    thread pool, never the contested default executor). Shared by
+    ``cpu_bound=False`` and the process pool's degradation fallback."""
     from backend.core.ouroboros.governance.operation_advisor import (  # noqa: E501
         _get_advisor_blast_executor,
     )
@@ -982,12 +1025,28 @@ async def _offload_dispatch(
     )
 
 
+async def _settle_process_pool(*, ok: bool, detail: str = "") -> None:
+    """The pool's OWN health, separate from each fn's. A thread fallback
+    succeeds, so per-fn accounting would read healthy while the pool is
+    down; this capability keeps the outage visible (HEALTH ALARM, summary)."""
+    try:
+        from backend.core.ouroboros.governance.reachability_ledger import (  # noqa: PLC0415
+            default_ledger,
+        )
+        await default_ledger().settle("offload.process_pool", ok=ok, detail=detail)
+    except Exception:  # noqa: BLE001 — accounting never costs the offload
+        pass
+
+
 @dataclass(frozen=True)
 class _PoolBroken:
-    """The pool broke under this call; it has already been retired."""
+    """The pool could not run this call; it has already been retired."""
 
     reason: str
     workers: str
+    #: True only when a worker died WHILE RUNNING this call's fn -- the one
+    #: case that implicates the fn and forbids running it in-process.
+    in_flight: bool = False
 
 
 async def _offload_to_process_pool(
@@ -999,8 +1058,16 @@ async def _offload_to_process_pool(
     """ONE bounded attempt on the current process pool.
 
     Returns ``fn``'s result or an :class:`OffloadError` exactly as
-    :func:`offload` documents, or :class:`_PoolBroken` when the pool itself
-    broke (at submit or mid-task) -- already retired, for the caller to retry.
+    :func:`offload` documents, or :class:`_PoolBroken` when the pool could
+    not run it -- already retired, for the caller to retry or degrade. Three
+    distinct failures, because only one of them implicates ``fn``:
+
+    * the pool could not be BUILT (spawn failure, resource limits);
+    * it failed at SUBMIT: already broken by an earlier death, or shut down
+      by a concurrent retire between the lazy get and the submit
+      (``RuntimeError: cannot schedule new futures after shutdown`` -- which
+      used to escape ``offload`` entirely);
+    * a worker died WHILE RUNNING ``fn`` (``in_flight``).
     """
     from concurrent.futures.process import BrokenProcessPool  # noqa: PLC0415
 
@@ -1011,11 +1078,9 @@ async def _offload_to_process_pool(
             "[CooperativeFSIO] offload(cpu_bound=True) failed to "
             "acquire process pool", exc_info=True,
         )
-        return OffloadError(
-            fn_name=getattr(fn, "__name__", repr(fn)),
-            exc_type=type(exc).__name__,
-            message=str(exc),
-            cpu_bound=True,
+        return _PoolBroken(
+            reason=f"pool could not be built: {type(exc).__name__}: {exc}",
+            workers="none",
         )
     # BOUNDED. A process-pool future that never resolves is a hang the
     # caller cannot see: no exception, no sentinel, just an `await`
@@ -1030,21 +1095,27 @@ async def _offload_to_process_pool(
     # On expiry the wedged worker is SIGKILLed and the pool rebuilt on
     # the next call, so one hung child cannot poison every later
     # offload, and the caller gets the same sentinel every other
-    # failure produces.
+    # failure produces. A wedged fn is NOT offered to the thread pool:
+    # it would wedge a thread the same way.
     deadline_s = fs_process_pool_deadline_s()
     try:
-        # Submit INSIDE the try: a pool already broken raises here, at
-        # submit, not from the future.
         fut = loop.run_in_executor(
             executor, _offload_worker, fn, args, kwargs, True,
         )
-        if deadline_s <= 0.0:
-            return await fut
-        return await asyncio.wait_for(fut, timeout=deadline_s)
+    except (BrokenProcessPool, RuntimeError) as exc:
+        workers = _pool_worker_report(executor)
+        _retire_pool(executor)
+        return _PoolBroken(
+            reason=f"{type(exc).__name__} at submit: {exc}", workers=workers,
+        )
+    try:
+        result = await (fut if deadline_s <= 0.0 else asyncio.wait_for(fut, timeout=deadline_s))
     except BrokenProcessPool as exc:
         workers = _pool_worker_report(executor)
         _retire_pool(executor)
-        return _PoolBroken(reason=str(exc) or "BrokenProcessPool", workers=workers)
+        return _PoolBroken(
+            reason=str(exc) or "BrokenProcessPool", workers=workers, in_flight=True,
+        )
     except asyncio.TimeoutError:
         logger.warning(
             "[CooperativeFSIO] offload(cpu_bound=True) of %s exceeded "
@@ -1060,6 +1131,9 @@ async def _offload_to_process_pool(
             message=f"process-pool offload exceeded {deadline_s:.1f}s",
             cpu_bound=True,
         )
+    # The pool ran the work: that is its health, whatever fn itself returned.
+    await _settle_process_pool(ok=True)
+    return result
 
 
 # ============================================================================
