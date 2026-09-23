@@ -55,7 +55,6 @@ landing ref".
 from __future__ import annotations
 
 import ast
-import asyncio
 import logging
 import os
 import re
@@ -503,37 +502,25 @@ async def _check_coverage(
             "coverage", False,
             f"no tests/**/test_<stem>.py for {', '.join(files[:3]) or 'the touched files'}",
         )
-    from backend.core.ouroboros.governance.process_session import (  # noqa: PLC0415
-        contain_argv_async, reap_session,
+    from backend.core.ouroboros.governance.test_subprocess_helper import (  # noqa: PLC0415
+        run_pytest_subprocess,
     )
-    proc = None
-    try:
-        # The commit under promotion is candidate code until it is promoted.
-        proc = await asyncio.create_subprocess_exec(
-            *await contain_argv_async(
-                [python_bin, "-m", "pytest", *tests, "-q", "-p", "no:cacheprovider"],
-                owner="promotion_gate",
-            ),
-            cwd=str(repo_root),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-            stdin=asyncio.subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        raw, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-    except asyncio.TimeoutError:
+    # The commit under promotion is candidate code until it is promoted, so it
+    # runs through the one pytest seam: contained, and reaped on every ending.
+    got = await run_pytest_subprocess(
+        [python_bin, "-m", "pytest", *tests, "-q", "-p", "no:cacheprovider"],
+        cwd=str(repo_root), timeout_s=timeout_s, caller="promotion_gate",
+    )
+    if got.timed_out:
         return Finding("coverage", False, f"tests exceeded {timeout_s:.0f}s")
-    except Exception as exc:  # noqa: BLE001
-        return Finding("coverage", False, f"could not run tests: {exc!r}"[:200])
-    finally:
-        # A timeout used to return with the run still going.
-        if proc is not None:
-            reap_session(proc.pid, owner="promotion_gate")
-    text = re.sub(r"\x1b\[[0-9;]*m", "", (raw or b"").decode("utf-8", "replace"))
+    if got.spawn_error_class:
+        return Finding("coverage", False, f"could not run tests: {got.spawn_error_class}")
+    text = re.sub(r"\x1b\[[0-9;]*m", "", got.stdout or "")
     failed = [
         ln for ln in text.splitlines()
         if ln.startswith("FAILED") or ln.startswith("ERROR")
     ]
-    if proc.returncode != 0 or failed:
+    if got.returncode != 0 or failed:
         return Finding(
             "coverage", False,
             f"{len(failed)} failing in {', '.join(tests[:3])}: "

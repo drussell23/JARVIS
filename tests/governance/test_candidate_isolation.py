@@ -107,6 +107,37 @@ async def test_uncontained_the_same_candidate_does_kill_it(tmp_path, monkeypatch
             victim.wait()
 
 
+@pytest.mark.parametrize("attack", ["pkill", "proc_walk"])
+def test_a_new_session_alone_does_not_protect_the_daemon(attack):
+    """Why the seam is a PID namespace and not setsid/killpg.
+
+    A session or process group decides who RECEIVES a group signal; it hides
+    nothing from a process that picks its targets by name. pkill scans every
+    pid in the namespace, and so does a candidate that walks /proc itself.
+    """
+    victim, word = _victim()
+    code = {
+        "pkill": f"import subprocess; subprocess.run(['pkill', '-f', '{word}'])",
+        "proc_walk": (
+            "import os, signal\n"
+            "for p in filter(str.isdigit, os.listdir('/proc')):\n"
+            "    try:\n"
+            f"        if b'{word}' in open(f'/proc/{{p}}/cmdline', 'rb').read() "
+            "and int(p) != os.getpid():\n"
+            "            os.kill(int(p), signal.SIGKILL)\n"
+            "    except OSError:\n"
+            "        pass\n"
+        ),
+    }[attack]
+    try:
+        subprocess.run([sys.executable, "-c", code], preexec_fn=os.setsid, timeout=30)
+        assert victim.wait(timeout=5) is not None
+    finally:
+        if victim.poll() is None:
+            victim.kill()
+            victim.wait()
+
+
 def test_the_sync_helper_is_contained_too(tmp_path, contained):
     victim, word = _victim()
     try:
@@ -277,7 +308,8 @@ _SEAMS = [
     (_G + "interactive_repair.py", "_run_and_capture"),
     (_G + "mutation_tester.py", "_run_pytest"),
     (_G + "hybrid_teammate_executor.py", "run"),
-    (_G + "accumulation_promotion_gate.py", "_check_coverage"),
+    # accumulation_promotion_gate._check_coverage delegates to
+    # run_pytest_subprocess (above); the Slice 9 cage keeps it that way.
     (_G + "saga/cross_repo_verifier.py", "_verify_single_repo"),
     (_G + "saga/cross_repo_verifier.py", "_tier2_cross_repo_contracts"),
     (_G + "saga/cross_repo_verifier.py", "_tier3_integration_tests"),
