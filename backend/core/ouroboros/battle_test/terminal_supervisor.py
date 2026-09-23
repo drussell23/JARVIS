@@ -37,9 +37,11 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -340,11 +342,167 @@ def _session_started_by(sessions_root: Path, launched_at: float) -> Optional[Pat
     return best[1]
 
 
-def supervise(argv: Sequence[str], *, sessions_root: Path, cwd: Optional[str] = None) -> int:
+def _env_gb(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.environ.get(name, "").strip() or default))
+    except ValueError:
+        return default
+
+
+def _dir_bytes(path: Path) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for fn in files:
+            try:
+                total += os.lstat(os.path.join(root, fn)).st_size
+            except OSError:
+                pass
+    return total
+
+
+class DiskGuard:
+    """Keeps a detached soak from running a disk out of space.
+
+    Watches FREE BYTES, not percent used, on every volume the soak writes
+    through: the guest root, and the host drive that backs WSL's ext4.vhdx.
+    The guest's own ``df`` reports the virtual disk's capacity (1007 GB,
+    788 GB free on 2026-09-23) while the Windows drive holding it had 483 GB
+    free -- the host is the real limit, the same shape as the host-commit
+    memory lesson.
+
+    * free below the SOFT floor, or the log dir over its quota -> a forced
+      ``ArtifactJanitor`` sweep (gzip aging logs, prune ancient ones) over the
+      log dir and the session dirs, never touching the live session;
+    * free below the HARD floor -> ``on_trip(reason)`` once: the supervisor
+      SIGTERMs the daemon, whose own handler writes a graceful summary.
+
+    Knobs (GB): ``JARVIS_DISK_GUARD_SOFT_FREE_GB`` (20),
+    ``JARVIS_DISK_GUARD_HARD_FREE_GB`` (5), ``JARVIS_SOAK_LOG_QUOTA_GB`` (2);
+    ``JARVIS_DISK_GUARD_INTERVAL_S`` (60); extra volumes via
+    ``JARVIS_DISK_GUARD_VOLUMES`` (comma-separated, default ``/mnt/c``).
+    """
+
+    def __init__(
+        self, *,
+        volumes: Sequence[Path],
+        sweep_dirs: Sequence[Path],
+        log_dir: Optional[Path],
+        on_trip,
+        protect=lambda: (),
+        free_probe=None,
+        janitor_factory=None,
+    ) -> None:
+        self._volumes = [Path(v) for v in volumes if Path(v).exists()]
+        self._sweep_dirs = [Path(d) for d in sweep_dirs]
+        self._log_dir = log_dir
+        self._on_trip = on_trip
+        self._protect = protect
+        self._free = free_probe or (lambda p: shutil.disk_usage(p).free)
+        self._janitor_factory = janitor_factory
+        self._tripped: Optional[str] = None
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        gb = 1024 ** 3
+        self.soft = _env_gb("JARVIS_DISK_GUARD_SOFT_FREE_GB", 20.0) * gb
+        self.hard = _env_gb("JARVIS_DISK_GUARD_HARD_FREE_GB", 5.0) * gb
+        self.quota = _env_gb("JARVIS_SOAK_LOG_QUOTA_GB", 2.0) * gb
+        self.interval = _env_gb("JARVIS_DISK_GUARD_INTERVAL_S", 60.0) or 60.0
+        self.sweeps: List[Dict[str, Any]] = []
+
+    @property
+    def tripped(self) -> Optional[str]:
+        return self._tripped
+
+    def _sweep(self, why: str) -> None:
+        factory = self._janitor_factory
+        if factory is None:
+            try:  # stdlib-only module, imported lazily so the supervisor stays importable
+                from backend.core.ouroboros.governance.artifact_janitor import ArtifactJanitor
+            except Exception:  # noqa: BLE001
+                logger.warning("[DiskGuard] janitor unavailable; cannot rotate (%s)", why)
+                return
+            factory = ArtifactJanitor
+        janitor = factory(
+            scan_dirs=[str(d) for d in self._sweep_dirs],
+            compress_age_days=_env_gb("JARVIS_DISK_GUARD_COMPRESS_AGE_DAYS", 1.0),
+            protect_paths=[str(p) for p in self._protect()],
+        )
+        report = janitor.sweep(force=True)
+        report["why"] = why
+        self.sweeps.append(report)
+        logger.warning("[DiskGuard] swept (%s): compressed=%s deleted=%s freed=%.1f MB",
+                       why, report.get("compressed"), report.get("deleted"),
+                       report.get("freed_bytes", 0) / 1e6)
+
+    def check_once(self) -> Optional[str]:
+        """One evaluation; returns the action taken (None, 'sweep', 'trip')."""
+        if self._tripped:
+            return None
+        try:
+            frees = {str(v): self._free(v) for v in self._volumes}
+        except OSError:
+            return None
+        low = min(frees.items(), key=lambda kv: kv[1], default=None)
+        if low is not None and low[1] < self.hard:
+            self._tripped = f"disk_guard:{low[0]}:{low[1] / 1024 ** 3:.1f}GB_free"
+            logger.error("[DiskGuard] HARD floor breached (%s); stopping the soak", self._tripped)
+            self._on_trip(self._tripped)
+            return "trip"
+        why = None
+        if low is not None and low[1] < self.soft:
+            why = f"soft_floor:{low[0]}"
+        elif self._log_dir is not None and self._log_dir.is_dir() and _dir_bytes(self._log_dir) > self.quota:
+            why = f"log_quota:{self._log_dir}"
+        if why:
+            self._sweep(why)
+            return "sweep"
+        return None
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                self.check_once()
+            except Exception:  # noqa: BLE001 — a guard must never take the supervisor down
+                logger.warning("[DiskGuard] check failed", exc_info=True)
+
+    def start(self) -> "DiskGuard":
+        self._thread = threading.Thread(target=self._run, name="disk-guard", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+def _guard_volumes(sessions_root: Path) -> List[Path]:
+    raw = os.environ.get("JARVIS_DISK_GUARD_VOLUMES", "/mnt/c")
+    return [Path(sessions_root)] + [Path(v) for v in raw.split(",") if v.strip()]
+
+
+def supervise(
+    argv: Sequence[str], *, sessions_root: Path, cwd: Optional[str] = None,
+    log_dir: Optional[Path] = None,
+) -> int:
     """Run *argv* as a supervised child; returns its exit code (128+N for a signal)."""
     reconcile_orphans(sessions_root)
     launched_at = time.time()
     child = subprocess.Popen(list(argv), cwd=cwd)
+
+    def _trip(_reason: str) -> None:
+        try:
+            child.send_signal(signal.SIGTERM)
+        except OSError:
+            pass
+
+    def _live_paths():
+        live = _session_started_by(sessions_root, launched_at)
+        return [live] if live is not None else []
+
+    guard = DiskGuard(
+        volumes=_guard_volumes(sessions_root),
+        sweep_dirs=[d for d in (log_dir, sessions_root) if d is not None],
+        log_dir=log_dir, on_trip=_trip, protect=_live_paths,
+    ).start()
 
     def _forward(signum, _frame):
         try:
@@ -356,6 +514,7 @@ def supervise(argv: Sequence[str], *, sessions_root: Path, cwd: Optional[str] = 
     try:
         rc = child.wait()  # PEP 475: resumes after a forwarded signal
     finally:
+        guard.stop()
         for s, h in previous.items():
             signal.signal(s, h)
 
@@ -363,6 +522,8 @@ def supervise(argv: Sequence[str], *, sessions_root: Path, cwd: Optional[str] = 
     oom = oom_evidence(child.pid) if signame == "SIGKILL" else None
     if oom:
         stop_reason = "killed:oom"
+    if guard.tripped:
+        stop_reason = guard.tripped
     record: Dict[str, Any] = {
         "pid": child.pid,
         "argv": list(argv),
@@ -372,6 +533,7 @@ def supervise(argv: Sequence[str], *, sessions_root: Path, cwd: Optional[str] = 
         "signal": signame,
         "stop_reason": stop_reason,
         "oom_evidence": oom,
+        "disk_guard": {"tripped": guard.tripped, "sweeps": guard.sweeps},
     }
     session_dir = _session_started_by(sessions_root, launched_at)
     if session_dir is not None:
@@ -400,6 +562,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--sessions-root", type=Path, default=None)
     ap.add_argument("--reconcile-only", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--log-dir", type=Path, default=None)
     ap.add_argument("command", nargs=argparse.REMAINDER)
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -411,7 +574,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         ap.error("no command to supervise")
-    return supervise(command, sessions_root=root)
+    return supervise(command, sessions_root=root, log_dir=args.log_dir)
 
 
 if __name__ == "__main__":

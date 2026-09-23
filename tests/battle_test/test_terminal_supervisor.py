@@ -178,3 +178,73 @@ def test_stale_window_derives_from_the_harness_watchdog(monkeypatch):
     assert TS.stale_after_s() == 300.0
     monkeypatch.setenv("JARVIS_TERMINAL_SUPERVISOR_STALE_S", "45")
     assert TS.stale_after_s() == 45.0
+
+
+# ---------------------------------------------------------------------------
+# DiskGuard: a detached soak cannot run a disk out of space
+# ---------------------------------------------------------------------------
+
+GB = 1024 ** 3
+
+
+def _guard(tmp_path, free, *, trips, log_dir=None, protect=()):
+    return TS.DiskGuard(
+        volumes=[tmp_path], sweep_dirs=[tmp_path / "logs", tmp_path / "sessions"],
+        log_dir=log_dir, on_trip=trips.append, protect=lambda: list(protect),
+        free_probe=lambda _p: free,
+    )
+
+
+def _aged(path: Path, text: str, days: float) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    t = time.time() - days * 86400
+    os.utime(path, (t, t))
+    return path
+
+
+def test_plenty_of_space_does_nothing(tmp_path):
+    trips = []
+    assert _guard(tmp_path, 400 * GB, trips=trips).check_once() is None
+    assert trips == []
+
+
+def test_the_soft_floor_rotates_old_logs_and_spares_the_live_session(tmp_path):
+    old = _aged(tmp_path / "logs" / "soak-old.log", "x" * 50_000, days=3)
+    live = _aged(tmp_path / "sessions" / "bt-live" / "debug.log", "y" * 50_000, days=3)
+    trips = []
+    g = _guard(tmp_path, 10 * GB, trips=trips, protect=[tmp_path / "sessions" / "bt-live"])
+    assert g.check_once() == "sweep"
+    assert not old.exists() and (tmp_path / "logs" / "soak-old.log.gz").exists()
+    assert live.exists(), "the live session's log must never be rotated"
+    assert trips == [] and g.sweeps[0]["compressed"] == 1
+
+
+def test_the_log_quota_rotates_even_with_free_disk(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_SOAK_LOG_QUOTA_GB", str(10_000 / GB))
+    _aged(tmp_path / "logs" / "soak-old.log", "z" * 50_000, days=3)
+    trips = []
+    g = _guard(tmp_path, 400 * GB, trips=trips, log_dir=tmp_path / "logs")
+    assert g.check_once() == "sweep"
+    assert g.sweeps[0]["why"].startswith("log_quota")
+
+
+def test_the_hard_floor_trips_once(tmp_path):
+    trips = []
+    g = _guard(tmp_path, 2 * GB, trips=trips)
+    assert g.check_once() == "trip"
+    assert g.check_once() is None
+    assert len(trips) == 1 and trips[0].startswith("disk_guard:")
+
+
+def test_a_hard_trip_gracefully_stops_the_daemon_and_is_recorded(tmp_path, monkeypatch):
+    (tmp_path / "sessions").mkdir()
+    monkeypatch.setenv("JARVIS_DISK_GUARD_HARD_FREE_GB", str(10 ** 9))  # every disk is "full"
+    monkeypatch.setenv("JARVIS_DISK_GUARD_INTERVAL_S", "0.2")
+    monkeypatch.setenv("JARVIS_DISK_GUARD_VOLUMES", str(tmp_path))
+    rc = TS.supervise(_daemon(tmp_path, "graceful"), sessions_root=tmp_path / "sessions")
+    assert rc == 0
+    s = _summary(tmp_path)
+    assert (s["session_outcome"], s["stop_reason"]) == ("incomplete_kill", "sigterm")
+    t = _terminal(tmp_path)
+    assert t["stop_reason"].startswith("disk_guard:") and t["disk_guard"]["tripped"]

@@ -41,6 +41,6 @@ export JARVIS_REPAIR_TRAJECTORY_EMIT_ENABLED=true
 export PYTHONUNBUFFERED=1
 
 exec "$PY" -m backend.core.ouroboros.battle_test.terminal_supervisor \
-  --sessions-root "$REPO/.ouroboros/sessions" -- \
+  --sessions-root "$REPO/.ouroboros/sessions" --log-dir "$LOGS" -- \
   "$PY" scripts/ouroboros_battle_test.py --production-soak --headless \
   --max-wall-seconds "$MAX_WALL"
