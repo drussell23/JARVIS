@@ -324,9 +324,15 @@ def oom_evidence(pid: int, timeout_s: float = 5.0) -> Optional[str]:
 
 
 def _session_started_by(sessions_root: Path, launched_at: float) -> Optional[Path]:
-    """The session the child started: the latest ``started_at`` it recorded
-    at or after launch. Directory times are no guide -- a reconcile rewrite
-    bumps an old session's mtime too."""
+    """The session the child started: the latest start it recorded at or
+    after launch. Directory times are no guide -- a reconcile rewrite bumps an
+    old session's mtime too.
+
+    The start comes from the in-flight summary's ``started_at`` or, failing
+    that, from ``wall_deadline.json``'s mtime (written once at session start,
+    never rewritten). The FINAL summary schema carries no ``started_at``:
+    measured on bt-2026-09-23-172111, a lookup made after a clean exit found
+    nothing and no terminal.json was written."""
     best: Tuple[float, Optional[Path]] = (0.0, None)
     try:
         dirs = [p for p in Path(sessions_root).iterdir() if p.is_dir()]
@@ -336,7 +342,12 @@ def _session_started_by(sessions_root: Path, launched_at: float) -> Optional[Pat
         try:
             started = float((_read_json(d / "summary.json") or {}).get("started_at") or 0)
         except (TypeError, ValueError):
-            continue
+            started = 0.0
+        if started <= 0:
+            try:
+                started = (d / "wall_deadline.json").stat().st_mtime
+            except OSError:
+                continue
         if started >= launched_at - 1 and started > best[0]:
             best = (started, d)
     return best[1]
@@ -494,8 +505,18 @@ def supervise(
         except OSError:
             pass
 
+    seen: Dict[str, Path] = {}
+
+    def _live_session() -> Optional[Path]:
+        # Remembered once found: the end-of-run summary is a different schema.
+        if "dir" not in seen:
+            found = _session_started_by(sessions_root, launched_at)
+            if found is not None:
+                seen["dir"] = found
+        return seen.get("dir")
+
     def _live_paths():
-        live = _session_started_by(sessions_root, launched_at)
+        live = _live_session()
         return [live] if live is not None else []
 
     guard = DiskGuard(
@@ -535,7 +556,7 @@ def supervise(
         "oom_evidence": oom,
         "disk_guard": {"tripped": guard.tripped, "sweeps": guard.sweeps},
     }
-    session_dir = _session_started_by(sessions_root, launched_at)
+    session_dir = _live_session()
     if session_dir is not None:
         record["session_id"] = session_dir.name
         record["summary_stamped"] = stamp_summary(session_dir, {
