@@ -107,3 +107,46 @@ def test_a_deleted_first_party_source_gets_the_sys_modules_stub_not_a_patch_stri
             and 'mock.patch.dict(sys.modules, {"vision.gone": fake})' in block)
     assert 'run(): here -> patch("vision.present.here")' in block
     assert 'run(): json -> patch("json")' in block   # stdlib is never "absent"
+
+
+MAIN_GUARDED = textwrap.dedent('''
+    import os
+
+    def create_env_file():
+        from dotenv import load_dotenv
+        return load_dotenv
+
+    try:
+        import yaml
+    except ImportError:
+        yaml = None
+
+    if __name__ == "__main__":
+        from dotenv import load_dotenv
+        create_env_file()
+''')
+
+
+def test_a_main_guard_import_is_not_a_module_attribute():
+    """bt-2026-09-23-184914: load_dotenv bound only under __main__ was listed
+    as patchable on the module, and the model's patch hit that AttributeError."""
+    block = A.extract_public_api(MAIN_GUARDED, "backend/setup_x.py")
+    top = next(ln for ln in block.splitlines() if "module-level imports" in ln)
+    assert "load_dotenv" not in top
+    assert "os" in top and "yaml" in top          # a top-level try DOES bind
+    assert 'create_env_file(): load_dotenv -> patch("dotenv.load_dotenv")' in block
+
+
+def test_the_exact_import_statement_is_stated():
+    block = A.extract_public_api(MAIN_GUARDED, "backend/setup_x.py")
+    assert "# import: from backend.setup_x import create_env_file" in block
+    assert "# import:" not in A.extract_public_api("def test_a():\n    pass\n", "tests/test_x.py")
+
+
+def test_a_missing_mocker_is_announced(monkeypatch):
+    import importlib.util as u
+    real = u.find_spec
+    monkeypatch.setattr(u, "find_spec", lambda n, *a: None if n == "pytest_mock" else real(n, *a))
+    assert "no `mocker` fixture" in A.pytest_plugin_line()
+    monkeypatch.setattr(u, "find_spec", lambda n, *a: object())
+    assert A.pytest_plugin_line() == ""

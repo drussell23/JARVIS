@@ -836,6 +836,70 @@ def _absent_first_party(source_module: str, importer: Optional[Path], root: Opti
     return _resolve_first_party(source_module, importer, root) is None
 
 
+def _is_main_guard(node) -> bool:
+    try:
+        return isinstance(node, ast.If) and "__main__" in ast.unparse(node.test) \
+            and "__name__" in ast.unparse(node.test)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _import_time_statements(tree) -> List[object]:
+    """Statements that RUN when the module is imported: the top level plus
+    the bodies of top-level ``if``/``try`` blocks -- but never the
+    ``if __name__ == "__main__":`` guard, and never inside a def or class.
+
+    Measured bt-2026-09-23-184914: ``backend/setup_claude_api.py`` imports
+    ``load_dotenv`` only under its __main__ guard; walking that block listed it
+    as patchable on the module, and the model's patch died on exactly that
+    AttributeError."""
+    out: List[object] = []
+    todo = list(tree.body)
+    while todo:
+        node = todo.pop(0)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if _is_main_guard(node):
+            continue
+        out.append(node)
+        for field_name in ("body", "orelse", "finalbody"):
+            todo.extend(getattr(node, field_name, None) or [])
+        for handler in getattr(node, "handlers", None) or []:
+            todo.extend(handler.body)
+    return out
+
+
+def _import_line(tree, module_label: str) -> List[str]:
+    """``# import: from <module> import a, b`` -- the exact statement a test
+    needs. bt-2026-09-23-184914: shown the signatures under a file-path label,
+    the model called ``check_current_api_key`` without importing it
+    (NameError)."""
+    module = _dotted_module(module_label)
+    if not module or not _norm(module_label).endswith(".py") or is_test_path(module_label):
+        return []
+    names = [n.name for n in tree.body
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+             and _is_public(n.name)]
+    if not names:
+        return []
+    shown = ", ".join(names[:_PATCH_NAMES_MAX]) + (", ..." if len(names) > _PATCH_NAMES_MAX else "")
+    return [f"# import: from {module} import {shown}"]
+
+
+def pytest_plugin_line() -> str:
+    """What the test runner lacks that a model reaches for by habit.
+    bt-2026-09-23-184914: tests asked for the ``mocker`` fixture, and
+    pytest-mock is not installed here ("fixture 'mocker' not found")."""
+    try:
+        import importlib.util as _u  # noqa: PLC0415
+        if _u.find_spec("pytest_mock") is None:
+            return ("# pytest-mock is NOT installed: there is no `mocker` fixture -- "
+                    "use unittest.mock (patch / patch.object / MagicMock)")
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 def _patch_target_lines(
     tree, module_label: str,
     importer: Optional[Path] = None, root: Optional[Path] = None,
@@ -859,11 +923,7 @@ def _patch_target_lines(
     out: List[str] = []
     try:
         top: List[str] = []
-        for node in tree.body:
-            stmts = [node]
-            if isinstance(node, (ast.Try, ast.If)):
-                stmts = list(ast.walk(node))
-            for st in stmts:
+        for st in _import_time_statements(tree):
                 for name, _target, _src in _bindings(st, module):
                     if name not in top:
                         top.append(name)
@@ -1029,6 +1089,7 @@ def extract_public_api(
         head.append('"""' + mod_doc + '"""')
     head.extend(_module_constant_lines(tree))
     head.extend(_module_loop_lines(tree))
+    head.extend(_import_line(tree, module_import_path))
     head.extend(_patch_target_lines(
         tree, module_import_path,
         Path(source_path) if source_path else None,
@@ -1255,8 +1316,17 @@ def build_signature_anchor(
             return ""
         max_modules = _int_env(_ENV_MAX_MODULES, _DEFAULT_MAX_MODULES)
         max_chars = _int_env(_ENV_MAX_CHARS, _DEFAULT_MAX_CHARS)
+        # A test being WRITTEN must know which test shape the runner gives it
+        # (the `# event loop:` lines are only actionable against that) and
+        # which plugins it lacks. These lead the block and are charged to the
+        # same budget, so the anchor never exceeds MAX_CHARS.
+        prefix = ""
+        if any(is_test_path(t) for t in target_files or ()):
+            for line in (pytest_asyncio_mode_line(repo_root), pytest_plugin_line()):
+                if line:
+                    prefix += line + "\n\n"
         blocks: List[str] = []
-        used = 0
+        used = len(prefix)
         for label, path in sources[:max_modules]:
             try:
                 src = path.read_text(encoding="utf-8", errors="replace")
@@ -1277,13 +1347,7 @@ def build_signature_anchor(
                 break
         if not blocks:
             return ""
-        body = "\n\n".join(blocks)
-        # A test being WRITTEN must know which test shape the runner gives it;
-        # the `# event loop:` lines above are only actionable against that.
-        if any(is_test_path(t) for t in target_files or ()):
-            runner_line = pytest_asyncio_mode_line(repo_root)
-            if runner_line:
-                body = f"{runner_line}\n\n{body}"
+        body = prefix + "\n\n".join(blocks)
         try:
             logger.info(
                 "[SigAnchor] injected %d chars for %d module(s): %s",
