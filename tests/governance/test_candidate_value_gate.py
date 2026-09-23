@@ -209,7 +209,9 @@ class TestOrchestratorSeamWiring:
         tests/governance/test_slice15_appetite_layer.py."""
         src = self.ORCH.read_text()
         i = src.index('if generation.is_noop:')
-        j = src.index("VALIDATERunner delegation gate", i)
+        # Up to the VALIDATE delegation (anchored on the construction, not on
+        # a comment -- the old comment anchor went with the inline twin).
+        j = src.index("VALIDATERunner(", i)
         seam = src[i:j]
         assert "_maybe_complete_cosmetic_candidate" in seam, (
             "the legacy pre-VALIDATE seam must delegate to the shared "

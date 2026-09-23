@@ -134,46 +134,6 @@ def test_ast_pin_l2_hook_classifies_soft_vs_hard_stops() -> None:
     )
 
 
-def test_ast_pin_validate_retry_loop_handles_l2_retry() -> None:
-    """The VALIDATE_RETRY loop's L2 dispatch block must be wrapped
-    in a bounded retry loop that consumes the l2_retry directive
-    and re-dispatches with a fresh budget."""
-    src = ORCHESTRATOR_FILE.read_text()
-    # Bounded retry loop primitives
-    assert "JARVIS_L2_DISPATCH_RETRIES" in src, (
-        "Missing JARVIS_L2_DISPATCH_RETRIES env knob — operators "
-        "cannot tune the re-dispatch cap"
-    )
-    assert "_l2_max_dispatches" in src, (
-        "Missing _l2_max_dispatches counter — retry is unbounded "
-        "or absent"
-    )
-    assert "_l2_dispatch_idx" in src, (
-        "Missing _l2_dispatch_idx — no per-attempt tracking"
-    )
-    assert "_l2_soft_stop_history" in src, (
-        "Missing _l2_soft_stop_history — operators lose audit trail "
-        "of which stop_reasons fired across the retry cascade"
-    )
-    # The handler branch for l2_retry must exist
-    assert 'directive[0] == "l2_retry"' in src, (
-        "Loop does not match 'l2_retry' directive — Slice 6 "
-        "wiring is dead code"
-    )
-    # Exhaustion path must terminal-fail with explicit reason
-    assert "l2_soft_stop_retries_exhausted" in src, (
-        "Missing l2_soft_stop_retries_exhausted terminal_reason — "
-        "exhausted retries silently fall through"
-    )
-    # FSM event tags for observability (Manifesto §8)
-    assert '"l2_redispatch"' in src, (
-        "Missing l2_redispatch FSM tag — re-dispatch not observable"
-    )
-    assert '"l2_soft_retries_exhausted"' in src, (
-        "Missing l2_soft_retries_exhausted FSM tag"
-    )
-
-
 # ──────────────────────────────────────────────────────────────────────
 # Spine — 5
 # ──────────────────────────────────────────────────────────────────────
@@ -204,92 +164,6 @@ def test_spine_hard_stop_taxonomy_matches_repair_engine() -> None:
         )
 
 
-def test_spine_default_retry_count_is_one() -> None:
-    """Default JARVIS_L2_DISPATCH_RETRIES=1 means up to 2 total
-    dispatches per op (initial + 1 retry). Sane production default
-    that doubles L2 chances without inflating cost catastrophically."""
-    src = ORCHESTRATOR_FILE.read_text()
-    # Default reads "1" from the env (operator can raise/lower)
-    assert 'os.environ.get("JARVIS_L2_DISPATCH_RETRIES", "1")' in src, (
-        "Default JARVIS_L2_DISPATCH_RETRIES is not '1' — production "
-        "default drifted from Slice 6 design"
-    )
-    # +1 conversion (retries → total dispatches) — AST-walk to find
-    # the BinOp where left side is the env.get call and right is 1.
-    tree = ast.parse(src, filename=str(ORCHESTRATOR_FILE))
-    found_conversion = False
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.BinOp)
-            and isinstance(node.op, ast.Add)
-            and isinstance(node.right, ast.Constant)
-            and node.right.value == 1
-            and isinstance(node.left, ast.Call)
-        ):
-            # Look inside the int(...) call for the env lookup
-            inner_src = ast.unparse(node.left)
-            if "JARVIS_L2_DISPATCH_RETRIES" in inner_src:
-                found_conversion = True
-                break
-    assert found_conversion, (
-        "Missing `int(os.environ.get('JARVIS_L2_DISPATCH_RETRIES', '1')) + 1` "
-        "BinOp — off-by-one risk on the retry cap (retries vs total dispatches)"
-    )
-
-
-def test_spine_break_directive_routes_to_outer_break() -> None:
-    """When _l2_hook returns ('break', ...) inside the retry loop,
-    we must capture it AND break the inner loop AND break the OUTER
-    VALIDATE_RETRY while loop so the candidate proceeds to GATE.
-
-    Pre-Slice 6 used `break` directly which broke a single layer; the
-    new structure must preserve the outer-break semantic via the
-    captured-directive pattern."""
-    src = ORCHESTRATOR_FILE.read_text()
-    # Capture pattern
-    assert "_l2_break_directive = directive" in src, (
-        "_l2_break_directive not captured — break path leaks out "
-        "of the retry loop without unwinding correctly"
-    )
-    # Outer-loop unwind
-    assert "if _l2_break_directive is not None:" in src, (
-        "Missing post-inner-loop break-directive handler — converged "
-        "L2 candidate never reaches GATE"
-    )
-
-
-def test_spine_retries_exhausted_terminal_advances_ctx() -> None:
-    """When ALL re-dispatches consume their budget on soft stops,
-    the orchestrator must advance ctx to CANCELLED terminal phase
-    AND record a FAILED ledger entry — leaving ctx unadvanced would
-    break the orchestrator's terminal-state invariant."""
-    src = ORCHESTRATOR_FILE.read_text()
-    # ctx must be advanced explicitly
-    assert (
-        "ctx.advance(\n                                    OperationPhase.CANCELLED,"
-        in src
-        or "OperationPhase.CANCELLED,\n                                    terminal_reason_code=(" in src
-    ), (
-        "Retries-exhausted path does NOT advance ctx to CANCELLED — "
-        "terminal-state invariant broken"
-    )
-    # Ledger record with soft_stop_history
-    assert "soft_stop_history" in src, (
-        "Missing soft_stop_history in ledger record — operators "
-        "lose audit trail of which provider failure shapes ate the budget"
-    )
-
-
-def test_spine_legacy_l2_skipped_path_preserved() -> None:
-    """When repair_engine is None or best_validation is None, the
-    pre-Slice-6 ``l2_skipped`` FSM event must still fire. Slice 6's
-    restructure (inner while loop) must not break the no-L2 path."""
-    src = ORCHESTRATOR_FILE.read_text()
-    assert '"l2_skipped"' in src, (
-        "l2_skipped FSM event lost — no-L2 path broken by Slice 6 restructure"
-    )
-
-
 # ──────────────────────────────────────────────────────────────────────
 # Slice 6 production-path coverage — validate_runner.py
 #
@@ -299,8 +173,10 @@ def test_spine_legacy_l2_skipped_path_preserved() -> None:
 # by _l2_hook but validate_runner.py's caller didn't handle it — the
 # op terminal-cancelled despite Slice 6 being live in orchestrator.py.
 #
-# These pins enforce Slice 6 wiring is present in BOTH files so the
-# regression "I patched the wrong module" never repeats.
+# These pinned the Slice 6 wiring in BOTH files so the regression "I
+# patched the wrong module" could not repeat. Since 2026-09-22 there is
+# one file: the orchestrator's inline VALIDATE twin was deleted, so its
+# pins went with it and the properties they guarded are pinned here.
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -395,3 +271,23 @@ def test_spine_validate_runner_returns_phase_result_on_exhaustion() -> None:
         "validate_runner doesn't build PhaseResult from exhausted-ctx "
         "— contract violation (raw ctx returned)"
     )
+
+
+def test_spine_validate_runner_retries_exhausted_advances_to_cancelled() -> None:
+    """Exhausted soft-stop re-dispatches end the op: ctx advanced to
+    CANCELLED and the FAILED ledger record carries the soft-stop history
+    (operators need to see which failure shapes ate the budget)."""
+    import re
+    src = VALIDATE_RUNNER_FILE.read_text()
+    assert re.search(
+        r"ctx\.advance\(\s*OperationPhase\.CANCELLED,\s*terminal_reason_code=\(\s*"
+        r"f\"l2_soft_stop_retries_exhausted", src,
+    ), "retries-exhausted path does not advance ctx to CANCELLED"
+    assert "soft_stop_history" in src, "the soft-stop history left the ledger record"
+
+
+def test_spine_validate_runner_l2_skipped_path_preserved() -> None:
+    """With no repair engine (or nothing to repair) the l2_skipped FSM event
+    still fires: Slice 6's inner loop must not swallow the no-L2 path."""
+    import re
+    assert re.search(r'_fsm_log\(\s*"l2_skipped"', VALIDATE_RUNNER_FILE.read_text())

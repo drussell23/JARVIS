@@ -20,9 +20,9 @@ deletion) fails CI before reaching production.
 
 Verifies:
 
-  * All 9 phase-runner flags default-TRUE (CLASSIFY / ROUTE /
-    CONTEXT_EXPANSION / PLAN / GENERATE / VALIDATE / GATE /
-    SLICE4B / COMPLETE)
+  * All 8 phase-runner flags default-TRUE (CLASSIFY / ROUTE /
+    CONTEXT_EXPANSION / PLAN / GENERATE / GATE / SLICE4B / COMPLETE);
+    VALIDATE has no flag -- one implementation, pinned below
   * All 9 phase-runner module files exist on disk
   * `phase_runners/__init__.py` exports the canonical runner
     class names
@@ -51,7 +51,9 @@ _PHASE_RUNNER_FLAGS = (
     "JARVIS_PHASE_RUNNER_CONTEXT_EXPANSION_EXTRACTED",
     "JARVIS_PHASE_RUNNER_PLAN_EXTRACTED",
     "JARVIS_PHASE_RUNNER_GENERATE_EXTRACTED",
-    "JARVIS_PHASE_RUNNER_VALIDATE_EXTRACTED",
+    # VALIDATE has no switch: its inline twin was deleted (2026-09-22) and
+    # the runner is unconditional -- pinned by the single-implementation
+    # tests at the bottom of this file, which are stricter than a default.
     "JARVIS_PHASE_RUNNER_GATE_EXTRACTED",
     "JARVIS_PHASE_RUNNER_SLICE4B_EXTRACTED",
     "JARVIS_PHASE_RUNNER_COMPLETE_EXTRACTED",
@@ -267,3 +269,66 @@ def test_brutal_review_entry_is_stale_proof():
     assert (
         '"JARVIS_PHASE_RUNNER_SLICE4B_EXTRACTED", "true"' in text
     )
+
+
+# ---------------------------------------------------------------------------
+# VALIDATE: one implementation, no kill switch back to a second
+# ---------------------------------------------------------------------------
+#
+# The inline VALIDATE loop in orchestrator.py was a near-verbatim twin of
+# VALIDATERunner behind JARVIS_PHASE_RUNNER_VALIDATE_EXTRACTED=false. Twins
+# drift: it lost the trajectory-recorder call once, and on 2026-09-22 two
+# fixes (sibling early-return verdicts; the micro-fix success that advanced
+# GATE twice) had to be made in both copies -- the twin's micro-fix had
+# never been re-homed at all. It was deleted. These pin that it stays gone:
+# asked of the syntax tree, not of text a comment could satisfy.
+
+import ast  # noqa: E402
+
+
+def _fsm_states(path: Path) -> set:
+    """The ValidateRetryFSM states a module logs: first args of _fsm_log()."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return {
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name) and node.func.id == "_fsm_log"
+        and node.args and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    }
+
+
+def _gov(rel: str) -> Path:
+    return _repo_root() / "backend/core/ouroboros/governance" / rel
+
+
+def test_the_validate_state_machine_exists_once():
+    runner = _fsm_states(_gov("phase_runners/validate_runner.py"))
+    assert {"candidate_passed_break", "micro_fix_succeeded_break", "loop_exit_normal"} <= runner, (
+        "the VALIDATE FSM was not found in validate_runner.py -- this pin is blind"
+    )
+    duplicated = _fsm_states(_gov("orchestrator.py")) & runner
+    assert not duplicated, (
+        f"orchestrator.py runs VALIDATE FSM states again: {sorted(duplicated)} -- "
+        "a second copy of the loop is back, and it will drift"
+    )
+
+
+def test_validate_delegation_is_unconditional():
+    """No switch can route VALIDATE anywhere but the runner."""
+    tree = ast.parse(_gov("orchestrator.py").read_text(encoding="utf-8"))
+    names = {
+        n.name for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert "_phase_runner_validate_extracted" not in names
+    reads = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Constant) and n.value == "JARVIS_PHASE_RUNNER_VALIDATE_EXTRACTED"
+    ]
+    assert not reads, "orchestrator.py reads the deleted VALIDATE kill switch again"
+    assert any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "VALIDATERunner"
+        for n in ast.walk(tree)
+    ), "the legacy pipeline no longer constructs VALIDATERunner"
