@@ -52,4 +52,21 @@ $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Settings $settings `
     -Principal $principal -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
-Write-Output "Started '$TaskName' (max wall ${MaxWallSeconds}s). Log: ~/soak_logs in WSL."
+
+# A task whose pre-flight fails just ends; say so instead of leaving a
+# registered task that silently ran nothing.
+$deadline = (Get-Date).AddSeconds(90)
+while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Seconds 5
+    $info = Get-ScheduledTaskInfo -TaskName $TaskName
+    if ((Get-ScheduledTask -TaskName $TaskName).State -ne "Running") {
+        $log = & $wsl -d $Distro -u $User -- bash -c 'tail -20 "$(ls -t ~/soak_logs/soak-*.log | head -1)"'
+        throw "Task '$TaskName' ended during boot (LastTaskResult=$($info.LastTaskResult)).`n$log"
+    }
+    $pid_ = & $wsl -d $Distro -u $User -- pgrep -f "scripts/ouroboros_battle_test.py --production-soak"
+    if ($pid_) {
+        Write-Output "Started '$TaskName': daemon pid $($pid_ -join ',') (max wall ${MaxWallSeconds}s). Log: ~/soak_logs in WSL."
+        return
+    }
+}
+throw "Task '$TaskName' is running but no daemon appeared within 90s; check ~/soak_logs."
