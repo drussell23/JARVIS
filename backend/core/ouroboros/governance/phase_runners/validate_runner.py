@@ -1,9 +1,11 @@
 """VALIDATERunner — Slice 4a.1 of Wave 2 item (5).
 
-Extracts orchestrator.py lines ~4693-5440 (the VALIDATE phase body
-through its advance-to-GATE transition) into a :class:`PhaseRunner`
-behind ``JARVIS_PHASE_RUNNER_VALIDATE_EXTRACTED`` (default ``true`` — graduated
-2026-04-22/23; the inline twin remains as the kill-switch path).
+Extracted the orchestrator's VALIDATE phase body (through its
+advance-to-GATE transition) into a :class:`PhaseRunner`. Graduated
+2026-04-22/23; since 2026-09-22 the ONLY implementation -- the inline twin
+and its ``JARVIS_PHASE_RUNNER_VALIDATE_EXTRACTED`` kill switch were deleted
+after the copy drifted from this one twice in a single soak day. Both the
+dispatcher and the orchestrator's legacy pipeline construct this runner.
 
 **Zero behavior change per slice.** Verbatim transcription with
 ``self.`` → ``orch.`` substitutions.
@@ -831,11 +833,9 @@ class VALIDATERunner(PhaseRunner):
 
                 # One publisher for BOTH consumers -- see
                 # Orchestrator._publish_candidate_verdict. This block was
-                # a copy that wrote the ledger and silently skipped the
-                # trajectory recorder, so flipping
-                # JARVIS_PHASE_RUNNER_VALIDATE_EXTRACTED would have
-                # stopped per-candidate verdicts reaching the corpus with
-                # nothing failing to say so.
+                # once a copy that wrote the ledger and silently skipped the
+                # trajectory recorder -- the first drift between two copies
+                # of this loop; the second copy is gone now.
                 await orch._publish_candidate_verdict(
                     ctx,
                     candidate=candidate,

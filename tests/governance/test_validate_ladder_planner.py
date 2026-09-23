@@ -227,15 +227,22 @@ def test_the_runner_helpers_are_fail_soft():
     assert validate_runner._admitted_candidates(CANDS, None) == CANDS
 
 
-def test_the_live_ladder_is_the_dispatcher_path_not_the_orchestrator_copy():
-    """Two copies of this loop exist. The dispatcher short-circuits
-    `_run_pipeline` before the orchestrator's inline copy, so validate_runner
-    is the reachable one — pinned here because a silent flip would make this
-    fix unreachable, which is this repo's most expensive recurring failure."""
+def test_the_live_ladder_is_the_only_ladder():
+    """Two copies of this loop existed, and this pinned that the dispatcher
+    reached validate_runner's before the orchestrator's inline one -- because
+    a fix landed in the unreachable copy is this repo's most expensive
+    recurring failure. The inline copy is deleted (2026-09-22): the legacy
+    pipeline delegates to the same runner, so there is no wrong copy to land
+    a fix in."""
     from backend.core.ouroboros.governance import orchestrator
 
     src = inspect.getsource(orchestrator.GovernedOrchestrator._run_pipeline)
-    gate = src.index("if _dispatcher_enabled():")
-    ret = src.index("return await _dispatch_pipeline", gate)
-    inline = src.index("for _iter_idx in range(1 + self._config.max_validate_retries)")
-    assert ret < inline, "the orchestrator's inline ladder now runs first"
+    assert "for _iter_idx in range(1 + self._config.max_validate_retries)" not in src, (
+        "the orchestrator carries an inline VALIDATE ladder again"
+    )
+    assert "VALIDATERunner(" in src, "the legacy pipeline no longer delegates VALIDATE"
+    from backend.core.ouroboros.governance.phase_runners import validate_runner
+
+    assert "for _iter_idx in range(" in inspect.getsource(
+        validate_runner.VALIDATERunner.run,
+    ), "validate_runner lost the ladder"

@@ -136,15 +136,19 @@ def test_all_three_consumers_dispatch_l2_pivot() -> None:
     """
     orch = ORCHESTRATOR_FILE.read_text()
     vr = VALIDATE_RUNNER_FILE.read_text()
-    assert orch.count('elif directive[0] == "l2_pivot":') == 2, (
-        "both directive-named orchestrator consumers must dispatch l2_pivot"
+    # One directive-named consumer left in the orchestrator (VERIFY): its
+    # VALIDATE_RETRY consumer went with the deleted inline VALIDATE twin
+    # (2026-09-22) -- validate_runner is that consumer now, asserted below.
+    assert orch.count('elif directive[0] == "l2_pivot":') == 1, (
+        "the orchestrator's VERIFY consumer must dispatch l2_pivot"
     )
     # The 4th (visual-verify) consumer uses the _vv_directive variable name.
     assert orch.count('elif _vv_directive[0] == "l2_pivot":') == 1, (
         "the visual-verify consumer must dispatch l2_pivot (finding #2)"
     )
-    # def + 3 orchestrator callsites (VALIDATE_RETRY, VERIFY, visual-VERIFY).
-    assert orch.count("_handle_l2_pivot(") >= 4
+    # def + 2 orchestrator callsites (VERIFY, visual-VERIFY); VALIDATE_RETRY's
+    # is validate_runner's orch._handle_l2_pivot, asserted next.
+    assert orch.count("_handle_l2_pivot(") >= 3
     assert 'elif directive[0] == "l2_pivot":' in vr
     assert "orch._handle_l2_pivot(" in vr
 

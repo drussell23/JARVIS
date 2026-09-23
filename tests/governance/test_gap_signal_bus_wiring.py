@@ -112,18 +112,19 @@ def test_entropy_helper_fail_soft_on_garbage_composite():
 
 # ── The producers are actually wired (no silent inert regression) ─────────
 
-def test_both_producers_call_the_seam():
-    """Guard against re-severing: both call sites must invoke the seam and must
-    NOT contain the phantom accessor."""
+def test_the_producer_calls_the_seam():
+    """Guard against re-severing: the VALIDATE entropy producer must invoke
+    the seam, and neither module may carry the phantom accessor. There were
+    two producers until 2026-09-22; the orchestrator's was inside the inline
+    VALIDATE twin, which was deleted -- validate_runner is the one producer."""
     import inspect
     from backend.core.ouroboros.governance import orchestrator
     from backend.core.ouroboros.governance.phase_runners import validate_runner
 
+    assert "emit_entropy_capability_gap(" in inspect.getsource(validate_runner), (
+        "validate_runner no longer calls the capability-gap seam — re-severed"
+    )
     for mod in (orchestrator, validate_runner):
-        src = inspect.getsource(mod)
-        assert "emit_entropy_capability_gap(" in src, (
-            f"{mod.__name__} no longer calls the capability-gap seam — re-severed"
-        )
-        assert "GapSignalBus.get_instance()" not in src, (
+        assert "GapSignalBus.get_instance()" not in inspect.getsource(mod), (
             f"{mod.__name__} still calls the phantom GapSignalBus.get_instance()"
         )
