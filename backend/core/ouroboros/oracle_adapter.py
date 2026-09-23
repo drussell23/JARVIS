@@ -122,6 +122,32 @@ def oracle_is_ready(oracle: Any) -> bool:
         return True
 
 
+def oracle_index_age_s(oracle: Any) -> Optional[float]:
+    """Seconds since *oracle*'s index was built, or ``None`` when unknown.
+    Total across BOTH oracle surfaces. NEVER raises.
+
+    ``index_age_s`` exists on :class:`TheOracle` (reached through the
+    in-process adapter's delegation) but not on the process-isolated adapter,
+    whose ``__getattr__`` raises for any non-IPC name. ``context_expander``
+    called it directly on the line after ``oracle_is_ready`` -- the first
+    split's fix -- so under isolation CONTEXT_EXPANSION raised on EVERY op:
+    113 of 113 dispatches across soaks bt-2026-09-21-235603 ..
+    bt-2026-09-23-180828, logged as a WARNING and continued unexpanded.
+    Unknown is ``None``, never ``0.0``: a freshness check must not read an
+    unanswerable question as "fresh".
+    """
+    try:
+        probe = getattr(oracle, "index_age_s", None)
+    except Exception:  # noqa: BLE001 — a hostile __getattr__
+        return None
+    if not callable(probe):
+        return None
+    try:
+        return float(probe())
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class InProcessOracleAdapter:
     """Wraps the in-process ``TheOracle`` behind the unified async interface.
     Preserves the existing deferred-init behavior (non-blocking boot; readiness

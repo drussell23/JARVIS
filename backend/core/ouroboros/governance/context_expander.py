@@ -95,6 +95,7 @@ class ContextExpander:
         # Inject past reasoning dialogues for the same domain so the model
         # has context from previous operations on similar tasks.
         from backend.core.ouroboros.oracle_adapter import (  # noqa: PLC0415
+            oracle_index_age_s as _oracle_index_age_s,
             oracle_is_ready as _oracle_is_ready,
         )
 
@@ -128,9 +129,10 @@ class ContextExpander:
             logger.info("[ContextExpander] Oracle not ready \u2014 using blind baseline")
             return self._inject_skill_instructions(ctx)
 
-        # Freshness check: warn if index is stale (> 5 minutes old)
-        age_s = self._oracle.index_age_s()
-        if age_s > 300:
+        # Freshness check: warn if index is stale (> 5 minutes old). Advisory
+        # only; unknown (the process-isolated Oracle has no index_age_s) skips it.
+        age_s = _oracle_index_age_s(self._oracle)
+        if age_s is not None and age_s > 300:
             logger.warning(
                 "[ContextExpander] Oracle index is stale (%.0fs old) — "
                 "context expansion may use outdated graph data",
