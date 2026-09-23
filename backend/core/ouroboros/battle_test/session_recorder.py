@@ -622,6 +622,20 @@ class SessionRecorder:
         except Exception:  # noqa: BLE001 — telemetry never breaks the summary
             pass
 
+        # Candidate containment — how this session's candidate code ran, once
+        # any ran. An uncontained session could be killed by what it tested.
+        try:
+            from backend.core.ouroboros.governance.process_session import (
+                probed_isolation,
+            )
+            _iso = probed_isolation()
+            if _iso is not None:
+                summary["candidate_isolation"] = {
+                    "contained": _iso.available, "reason": _iso.reason,
+                }
+        except Exception:  # noqa: BLE001
+            pass
+
         # Per-Phase Cost Drill-Down arc (Slice 3) — emit ``cost_by_phase``
         # (session rollup) + ``cost_by_op_phase`` (per-op per-phase) only
         # when the finalize observer received at least one op. Additive

@@ -46,8 +46,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import signal
+import subprocess
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Set, Tuple
 
@@ -174,7 +177,9 @@ def dump_stacks(leader_pid: int) -> bool:
         pid = int(leader_pid)
         if pid <= 1 or pid == os.getpgrp() or not _leader_alive(pid):
             return False
-        os.kill(pid, signal.SIGABRT)
+        # A contained run's leader is the namespace wrapper, which has no
+        # faulthandler and whose death takes the payload with it unprinted.
+        os.kill(_payload_pid(pid), signal.SIGABRT)
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -488,8 +493,229 @@ async def leader_exited(proc: "asyncio.subprocess.Process") -> None:
         logger.debug("[ProcessSession] leader-exit wait degraded", exc_info=True)
 
 
+# ---------------------------------------------------------------------------
+# Containment — candidate code cannot see, or signal, the daemon that runs it
+# ---------------------------------------------------------------------------
+#
+# bt-2026-09-22-201845 was killed by its own candidate. The model wrote a test
+# for ``backend/apply_performance_fixes.py``, which runs ``pkill -f jarvis`` --
+# and every process on the host whose command line contains that word,
+# including the daemon at ``/home/jarvis_svc/jarvis/...``, received SIGTERM in
+# the second VALIDATE started. A session contains signals the run sends to
+# ITSELF; it does nothing about signals the run sends to everyone else it can
+# see, and a candidate runs as the daemon's own user.
+#
+# The candidate is therefore started in its own PID namespace: it sees only its
+# own processes, so a pattern kill finds nothing of ours, and a pid it guesses
+# names nothing outside. As a side effect the namespace closes the one gap the
+# session docstring above concedes -- a descendant that calls ``setsid`` leaves
+# the session, but it cannot leave the namespace, and the kernel kills every
+# member when the namespace's init dies.
+#
+# The first process of a PID namespace is its init, and init is exempt from
+# every signal it has no handler for -- measured: a group SIGTERM hung on a
+# payload running as init, and a payload's own SIGKILL at itself was a no-op.
+# So the payload never runs as init: a POSIX-sh init starts it as pid 2,
+# forwards the terminating signals to it, and exits with its status (128+N for
+# a signal death, the shell convention -- every seam here passes on rc == 0
+# and classifies the rest from output and timeouts, never from the sign).
+#
+# Unprivileged: a user namespace maps the daemon's own uid/gid, so no root and
+# no setuid helper. Where the kernel refuses (no user namespaces, a
+# restrictive LSM, not Linux), the probe says so ONCE, loudly, and candidates
+# run uncontained -- unless JARVIS_CANDIDATE_ISOLATION_REQUIRED is set, in
+# which case the spawn is refused (PermissionError: every seam already treats
+# a spawn it may not make as an infra failure, never as a verdict on the code).
+
+_ISOLATION_MARKER = "ov-candidate-init"
+
+# pid 1 of the namespace. ``$@`` is the payload argv. ABRT is forwarded too:
+# ``dump_stacks`` targets the payload directly, but a signal to the init must
+# never become the payload's silent death. POSIX sh points a background job's
+# stdin at /dev/null, and dash still does so for ``0<&0`` (measured) -- so
+# stdin is handed over through a spare descriptor, closed in the payload.
+_INIT_SCRIPT = (
+    'exec 3<&0; "$@" <&3 3<&- & c=$!; exec 3<&-; '
+    'for s in TERM INT HUP QUIT ABRT USR1 USR2; do '
+    'trap "kill -$s $c 2>/dev/null" $s; done; '
+    'while :; do wait $c; r=$?; kill -0 $c 2>/dev/null || exit $r; done'
+)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
+
+
+def isolation_enabled() -> bool:
+    """``JARVIS_CANDIDATE_ISOLATION_ENABLED`` (default true)."""
+    return _env_bool("JARVIS_CANDIDATE_ISOLATION_ENABLED", True)
+
+
+def isolation_required() -> bool:
+    """``JARVIS_CANDIDATE_ISOLATION_REQUIRED`` (default false): refuse to run a
+    candidate uncontained rather than degrade."""
+    return _env_bool("JARVIS_CANDIDATE_ISOLATION_REQUIRED", False)
+
+
+class IsolationUnavailable(PermissionError):
+    """Containment was required and this host cannot provide it."""
+
+
+@dataclass(frozen=True)
+class IsolationProbe:
+    available: bool
+    reason: str
+    prefix: Tuple[str, ...] = ()
+
+
+_probe_lock = threading.Lock()
+_probe: Optional[IsolationProbe] = None
+
+
+def _wrapper_prefix() -> Optional[Tuple[str, ...]]:
+    unshare, sh = shutil.which("unshare"), shutil.which("sh")
+    if not unshare or not sh:
+        return None
+    return (
+        unshare, "--user", "--map-current-user", "--pid", "--fork",
+        "--mount-proc", "--kill-child", "--",
+        sh, "-c", _INIT_SCRIPT, _ISOLATION_MARKER,
+    )
+
+
+def _run_probe() -> IsolationProbe:
+    prefix = _wrapper_prefix()
+    if prefix is None:
+        return IsolationProbe(False, "unshare or sh not on PATH")
+    probe_s = _env_float("JARVIS_CANDIDATE_ISOLATION_PROBE_TIMEOUT_S", 5.0, 0.1)
+    try:
+        # The probe proves the property, not just the syntax: inside, the
+        # namespace must show exactly the init and the payload.
+        done = subprocess.run(
+            [*prefix, "sh", "-c", "ls -d /proc/[0-9]* | wc -l"],
+            capture_output=True, text=True, timeout=probe_s,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return IsolationProbe(False, f"{type(exc).__name__}: {exc}")
+    visible = (done.stdout or "").strip()
+    if done.returncode != 0:
+        detail = (done.stderr or done.stdout or "").strip().splitlines()
+        return IsolationProbe(
+            False, f"unshare exited {done.returncode}: "
+            f"{detail[-1] if detail else 'no diagnostic'}",
+        )
+    if not visible.isdigit() or int(visible) > 4:
+        return IsolationProbe(False, f"namespace not private ({visible!r} pids visible)")
+    return IsolationProbe(True, "pid+user namespace", prefix)
+
+
+def isolation_status() -> IsolationProbe:
+    """The host's answer, probed once per process. NEVER raises. Blocks for
+    one short spawn the first time -- async callers use
+    :func:`contain_argv_async`, which takes that first probe off the loop."""
+    global _probe
+    with _probe_lock:
+        if _probe is None:
+            try:
+                _probe = _run_probe()
+            except Exception as exc:  # noqa: BLE001
+                _probe = IsolationProbe(False, f"probe faulted: {exc!r}")
+            if _probe.available:
+                logger.info(
+                    "[ProcessSession] candidate code runs contained: %s",
+                    _probe.reason,
+                )
+            else:
+                logger.warning(
+                    "[ProcessSession] CANDIDATE CODE RUNS UNCONTAINED — this "
+                    "host cannot create a private PID namespace (%s). A "
+                    "candidate can signal the daemon (bt-2026-09-22-201845 "
+                    "was killed by a candidate's `pkill -f jarvis`). Set "
+                    "JARVIS_CANDIDATE_ISOLATION_REQUIRED=true to refuse "
+                    "instead.", _probe.reason,
+                )
+        return _probe
+
+
+def probed_isolation() -> Optional[IsolationProbe]:
+    """The probe's answer if a candidate has been started, else ``None``.
+    Never probes -- a reader must not spawn."""
+    return _probe
+
+
+def reset_isolation_for_tests() -> None:
+    global _probe
+    with _probe_lock:
+        _probe = None
+
+
+def contain_argv(argv: Sequence[str], *, owner: str = "") -> list:
+    """*argv*, wrapped so the process it starts -- and everything that
+    process starts -- lives in a private PID namespace.
+
+    The single entry point for every spawn that executes candidate code.
+    Returns *argv* unchanged when isolation is switched off or the host
+    cannot provide it (unless required: then :class:`IsolationUnavailable`).
+    """
+    argv = list(argv)
+    if not argv or not isolation_enabled():
+        return argv
+    if shutil.which(str(argv[0])) is None:
+        # Nothing to contain: the spawn fails as it always did, with the
+        # caller's own FileNotFoundError -- not as exit 127 from inside a
+        # namespace, which every seam would read as the CANDIDATE failing.
+        return argv
+    status = isolation_status()
+    if status.available:
+        return [*status.prefix, *argv]
+    if isolation_required():
+        raise IsolationUnavailable(
+            f"{owner or 'candidate run'} refused: containment is required and "
+            f"unavailable ({status.reason})"
+        )
+    return argv
+
+
+async def contain_argv_async(argv: Sequence[str], *, owner: str = "") -> list:
+    """:func:`contain_argv` for a coroutine: the one-time host probe (a short
+    spawn) runs on a worker thread, never on the event loop."""
+    if _probe is None and isolation_enabled():
+        await asyncio.get_running_loop().run_in_executor(None, isolation_status)
+    return contain_argv(argv, owner=owner)
+
+
+def _children(pid: int) -> Tuple[int, ...]:
+    try:
+        raw = (_PROC / str(pid) / "task" / str(pid) / "children").read_text()
+        return tuple(int(x) for x in raw.split())
+    except (OSError, ValueError):
+        return ()
+
+
+def _payload_pid(leader_pid: int) -> int:
+    """The process that actually runs the candidate. For a contained run the
+    leader is the ``unshare`` wrapper and its child the namespace init; the
+    payload is the init's child. Otherwise the leader itself."""
+    try:
+        cmdline = (_PROC / str(leader_pid) / "cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return leader_pid
+    if _ISOLATION_MARKER.encode() not in cmdline:
+        return leader_pid
+    for init in _children(leader_pid):
+        for payload in _children(init):
+            return payload
+    return leader_pid
+
+
 __all__ = [
     "leader_exited", "reap_session", "register_session", "session_survivors",
     "shed_live_sessions", "unregister_session", "was_shed",
     "configure_tree_budget", "over_budget", "session_budget_mb",
+    "contain_argv", "contain_argv_async", "isolation_status",
+    "IsolationUnavailable", "IsolationProbe",
 ]

@@ -970,7 +970,8 @@ class RepairSandbox:
         cmd.extend(test_targets)
 
         from backend.core.ouroboros.governance.process_session import (  # noqa: PLC0415
-            dump_stacks, reap_session, register_session, unregister_session,
+            contain_argv_async, dump_stacks, reap_session, register_session,
+            unregister_session,
         )
         from backend.core.ouroboros.governance.test_runner import (  # noqa: PLC0415
             _stack_dump_grace_s,
@@ -987,7 +988,7 @@ class RepairSandbox:
             # and the memory-pressure shedder and per-session budget could not
             # see the run at all.
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
+                *await contain_argv_async(cmd, owner="repair_sandbox"),
                 cwd=str(sandbox),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

@@ -423,13 +423,22 @@ class InteractiveRepairLoop:
             **os.environ,
             "PYTHONPATH": os.pathsep.join(_pythonpath_parts),
         }
+        from backend.core.ouroboros.governance.process_session import (  # noqa: PLC0415
+            contain_argv_async, reap_session,
+        )
+        proc = None
         try:
+            # Contained and session-owned, like every other candidate run: the
+            # micro-fix executes the candidate as surely as VALIDATE does, and
+            # a timeout used to abandon the run still going.
             proc = await asyncio.create_subprocess_exec(
-                *test_argv,
+                *await contain_argv_async(test_argv, owner="micro_fix"),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.DEVNULL,
                 cwd=str(self._project_root),
                 env=_subprocess_env,
+                start_new_session=True,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_micro_timeout_s())
             if proc.returncode == 0:
@@ -488,6 +497,9 @@ class InteractiveRepairLoop:
                 error_type="TimeoutError", message=f"Timed out after {_micro_timeout_s()}s",
                 file_path=file_path, line_number=0, traceback_excerpt="", full_output="TIMEOUT",
             )
+        finally:
+            if proc is not None:
+                reap_session(proc.pid, owner="micro_fix")
 
     @staticmethod
     def _extract_error(output: str, default_file: str) -> ExtractedError:

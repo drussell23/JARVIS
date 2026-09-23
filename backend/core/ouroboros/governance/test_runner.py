@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, List, Literal, Optional, Tuple
 
 from backend.core.ouroboros.governance.process_session import (
-    dump_stacks, over_budget, reap_session, was_shed,
+    contain_argv_async, dump_stacks, over_budget, reap_session, was_shed,
 )
 from backend.core.ouroboros.governance.pytest_traceback import (
     TIMEOUT_BANNER_RE, hang_site,
@@ -2150,7 +2150,7 @@ class TestRunner:
         prevents OS-pipe-buffer (~64KB) backpressure stalls.
         """
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
+            *await contain_argv_async(cmd, owner="test_runner"),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             stdin=asyncio.subprocess.DEVNULL,
@@ -2285,7 +2285,7 @@ class TestRunner:
 
         try:
             async with BackgroundMonitor(
-                cmd=tuple(cmd),
+                cmd=tuple(await contain_argv_async(cmd, owner="test_runner")),
                 op_id=f"testrunner-{int(time.monotonic() * 1000)}",
                 cwd=cwd,
                 ring_capacity=4096,

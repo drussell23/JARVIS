@@ -320,8 +320,11 @@ async def run_pytest_subprocess(
 
     proc: Optional[asyncio.subprocess.Process] = None
     try:
+        from backend.core.ouroboros.governance.process_session import (  # noqa: PLC0415
+            contain_argv_async,
+        )
         proc = await asyncio.create_subprocess_exec(
-            *argv_list,
+            *await contain_argv_async(argv_list, owner=caller),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             stdin=asyncio.subprocess.DEVNULL,
@@ -543,8 +546,13 @@ def run_pytest_subprocess_sync(
     spawn_err_class: Optional[str] = None
 
     try:
+        from backend.core.ouroboros.governance.process_session import (  # noqa: PLC0415
+            contain_argv,
+        )
+        # Contained, the timeout's leader kill also takes every descendant:
+        # the namespace dies with its init (the killpg gap noted below).
         proc = _subprocess.run(
-            argv_list,
+            contain_argv(argv_list, owner=caller),
             capture_output=True,
             text=True,
             timeout=float(timeout_s),
