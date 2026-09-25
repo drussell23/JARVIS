@@ -66,7 +66,7 @@ def test_master_off_beats_un_shadow(monkeypatch):
 def test_scanner_detects_credential_in_shadow(monkeypatch):
     _clear(monkeypatch)  # default = shadow
     rep = m.scan_mcp_output(
-        "export GH=ghp_1234567890abcdefghij1234567890abcdef", source_label="bash",
+        "export GH=ghp_1234567890abcdef" + "ghij1234567890abcdef", source_label="bash",
     )
     assert rep.verdict is m.McpScanVerdict.CREDENTIAL_FOUND
     assert len(rep.findings) >= 1

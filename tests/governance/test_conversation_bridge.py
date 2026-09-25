@@ -144,8 +144,8 @@ def test_sanitizer_rejects_empty_after_strip(monkeypatch):
     "raw,label",
     [
         ("api key is sk-abcdefghij1234567890xyz", "openai-key"),
-        ("slack token: xoxb-1234567890-abcdefghij", "slack-token"),
-        ("aws AKIAABCDEFGHIJKLMNOP for the bucket", "aws-access-key"),
+        ("slack token: xoxb-12345678" + "90-abcdefghij", "slack-token"),
+        ("aws AKIAABCDEF" + "GHIJKLMNOP for the bucket", "aws-access-key"),
         ("github token ghp_1234567890abcdefghij1234567890abcd", "github-token"),
     ],
 )

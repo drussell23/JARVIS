@@ -14,6 +14,7 @@ import traceback
 import pytest
 
 from backend.core.ouroboros.battle_test import panic_arbiter as pa
+from tests.support import fake_credentials as fake
 
 
 @pytest.fixture(autouse=True)
@@ -411,7 +412,7 @@ class TestTheStackFrameNecromancer:
         connection string. Broadcasting them unredacted to every attached
         cockpit would make the crash reporter the worst leak in the
         system."""
-        secret = "sk-abcdefghijklmnopqrstuvwx12"
+        secret = fake.assemble("sk", "-abcdefghijklmnop", "qrstuvwx12")
 
         def _victim_frame():
             token = secret                        # noqa: F841

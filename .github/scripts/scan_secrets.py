@@ -50,9 +50,11 @@ import json
 import math
 import os
 import re
+import shlex
+import subprocess
 import sys
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 # --------------------------------------------------------------------------
 # Tunables (env-overridable — no hardcoded policy)
@@ -173,6 +175,26 @@ class _Visitor(ast.NodeVisitor):
 
     def __init__(self) -> None:
         self.pairs: List[Tuple[str, str, int]] = []
+        #: EVERY string literal outside a docstring, as ``(value, first, last)``
+        #: line span. Checked against the structural SHAPES only: an
+        #: ``AKIA…`` key in a parametrize list or a positional argument is
+        #: as exposed as one in an assignment -- text-level scanners
+        #: (GitGuardian, push protection) read the file, not the AST.
+        self.literals: List[Tuple[str, int, int]] = []
+
+    def visit_Expr(self, node: ast.Expr) -> None:
+        # A bare string statement is a docstring or inert prose: skipped by
+        # construction, as before. Any other expression is walked normally.
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            return
+        self.generic_visit(node)
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if isinstance(node.value, str):
+            first = getattr(node, "lineno", 0)
+            self.literals.append(
+                (node.value, first, getattr(node, "end_lineno", None) or first),
+            )
 
     def _record(self, name: str, node: ast.AST) -> None:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -271,6 +293,26 @@ def scan_source(
                 path, lineno, name, "High-entropy literal", ent,
                 value[:8] + "…",
             ))
+
+    # Shapes in every other literal. Only the decisive structural signatures:
+    # the entropy/name heuristics need an identifier to rank against, and a
+    # positional literal has none.
+    # Keyed on the VALUE: the pass above already reported or deliberately
+    # allowlisted it, and an f-string part's line number is the enclosing
+    # expression's on 3.11, so a (value, line) key would double-report.
+    judged = {value for _name, value, _lineno in visitor.pairs}
+    for value, first, last in visitor.literals:
+        if value in judged:
+            continue
+        span = lines[max(first - 1, 0):last]
+        if any(ALLOWLIST_PRAGMA in line for line in span):
+            continue
+        shape = matched_shape(value)
+        if shape is not None:
+            findings.append(_Finding(
+                path, first, "<literal>", shape, shannon_entropy(value),
+                value[:12] + "…",
+            ))
     return findings
 
 
@@ -298,9 +340,87 @@ def scan_tree(
     return out
 
 
+def _git(repo: Path, *args: str, stdin: Optional[bytes] = None) -> bytes:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], input=stdin,
+        capture_output=True, check=True,
+    ).stdout
+
+
+def _read_blobs(repo: Path, blobs: Sequence[str]) -> Dict[str, bytes]:
+    """Contents of *blobs*, in ONE ``git cat-file --batch`` process."""
+    if not blobs:
+        return {}
+    out = _git(repo, "cat-file", "--batch", stdin="".join(b + "\n" for b in blobs).encode())
+    contents: Dict[str, bytes] = {}
+    pos = 0
+    while pos < len(out):
+        header_end = out.index(b"\n", pos)
+        fields = out[pos:header_end].split()
+        pos = header_end + 1
+        if len(fields) < 3 or fields[1] == b"missing":
+            continue
+        size = int(fields[2])
+        contents[fields[0].decode()] = out[pos:pos + size]
+        pos += size + 1  # trailing newline after every object
+    return contents
+
+
+def scan_revisions(
+    repo: Path, revs: Sequence[str], *, entropy_threshold: float = DEFAULT_ENTROPY,
+    min_length: int = DEFAULT_MIN_LEN,
+) -> List[_Finding]:
+    """Findings in every Python file version introduced by the commits *revs*
+    selects (``git rev-list`` syntax: ``A..B``, ``^X``, ``--not --remotes``).
+
+    Per COMMIT, not per tip: a text scanner on the receiving end (GitGuardian,
+    push protection) reads every pushed commit, so a credential added in one
+    commit and deleted in the next has still been published. Each distinct
+    blob is scanned once -- content-addressed, so a file carried unchanged
+    through a long range costs one scan.
+    """
+    commits = _git(repo, "rev-list", *revs).decode().split()
+    introduced: Dict[str, Tuple[str, str]] = {}  # blob -> (path, commit)
+    for commit in commits:
+        # `-m`: a merge's conflict resolution can introduce content no parent
+        # had, and diff-tree shows merges as empty without it.
+        tokens = iter(_git(
+            repo, "diff-tree", "--no-commit-id", "-r", "--root", "-m", "-z",
+            "--diff-filter=ACMR", commit,
+        ).decode("utf-8", "replace").split("\0"))
+        for header in tokens:
+            if not header.startswith(":"):
+                continue
+            fields = header.split()        # :<mode> <mode> <sha> <sha> <status>
+            path = next(tokens, "")
+            if fields[-1][:1] in ("R", "C"):
+                path = next(tokens, "")    # renames/copies carry src THEN dst
+            if len(fields) < 5 or not path.endswith(".py"):
+                continue
+            if any(part in _SKIP_DIR_PARTS for part in Path(path).parts):
+                continue
+            introduced.setdefault(fields[3], (path, commit))
+    contents = _read_blobs(repo, list(introduced))
+    out: List[_Finding] = []
+    for blob, (path, commit) in introduced.items():
+        src = contents.get(blob)
+        if src is None:
+            continue
+        out.extend(scan_source(
+            src.decode("utf-8", "replace"), f"{path}@{commit[:10]}",
+            entropy_threshold=entropy_threshold, min_length=min_length,
+        ))
+    return out
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", default=".")
+    ap.add_argument(
+        "--revs", default=None,
+        help="scan the file versions introduced by these commits instead of "
+             "the working tree (git rev-list syntax, e.g. 'origin/main..HEAD')",
+    )
     ap.add_argument("--json", action="store_true")
     ap.add_argument(
         "--entropy",
@@ -314,10 +434,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = ap.parse_args(argv)
 
-    findings = scan_tree(
-        Path(args.root), entropy_threshold=args.entropy,
-        min_length=args.min_length,
-    )
+    if args.revs:
+        findings = scan_revisions(
+            Path(args.root), shlex.split(args.revs),
+            entropy_threshold=args.entropy, min_length=args.min_length,
+        )
+    else:
+        findings = scan_tree(
+            Path(args.root), entropy_threshold=args.entropy,
+            min_length=args.min_length,
+        )
 
     if args.json:
         print(json.dumps([f.to_dict() for f in findings], indent=2))

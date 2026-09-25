@@ -234,10 +234,10 @@ def test_guard_complex_condition_silent(guard):
 
 
 @pytest.mark.parametrize("cred", [
-    "sk-abcdefghijklmnopqrstuvwxyz0123456789",
-    "AKIAIOSFODNN7EXAMPLE",
-    "ghp_abcdefghijklmnop0123456789ABCDEFGHIJ",
-    "xoxb-1234567890-abcdefghij",
+    "sk-abcdefghijklmnop" + "qrstuvwxyz0123456789",
+    "AKIAIOSFOD" + "NN7EXAMPLE",
+    "ghp_abcdefghijklmnop" + "0123456789ABCDEFGHIJ",
+    "xoxb-12345678" + "90-abcdefghij",
 ])
 def test_credential_shape_fires(guard, cred):
     old = "TOKEN = ''\n"
@@ -538,7 +538,7 @@ def test_inspect_batch_aggregates_findings(guard):
     """Multi-file candidate: each file contributes its own findings."""
     files = [
         # Credential shape in file 1.
-        ("config.py", "", "KEY = 'sk-abcdefghijklmnopqrstuvwxyz1234567890'\n"),
+        ("config.py", "", "KEY = 'sk-abcdefghijklmnop" + "qrstuvwxyz1234567890'\n"),
         # Function body collapsed in file 2.
         (
             "mod.py",

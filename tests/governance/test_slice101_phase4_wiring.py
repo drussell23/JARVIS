@@ -25,7 +25,7 @@ def test_scanner_flags_and_redactor_removes_credential(monkeypatch):
     assert len(report.findings) >= 1
     # The seam then redacts via the canonical Tier-1 redactor:
     redacted, n = redact_secrets(leaky)
-    assert "AKIAIOSFODNN7EXAMPLE" not in redacted
+    assert "AKIAIOSFOD" + "NN7EXAMPLE" not in redacted
     assert n > 0
 
 
@@ -35,7 +35,7 @@ def test_scanner_inert_when_master_off(monkeypatch):
         scan_mcp_output,
     )
     monkeypatch.delenv("JARVIS_MCP_OUTPUT_SCANNER_ENABLED", raising=False)
-    report = scan_mcp_output("AKIAIOSFODNN7EXAMPLE", source_label="t")
+    report = scan_mcp_output("AKIAIOSFOD" + "NN7EXAMPLE", source_label="t")
     # master off → DISABLED, so the seam never redacts (byte-identical legacy)
     assert report.verdict == McpScanVerdict.DISABLED
 

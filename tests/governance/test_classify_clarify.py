@@ -122,7 +122,7 @@ def test_sanitize_redacts_openai_key():
 def test_sanitize_redacts_aws_key():
     raw = "AWS key: AKIAIOSFODNN7EXAMPLE and stuff"  # pragma: allowlist secret
     out = sanitize_answer(raw)
-    assert "AKIAIOSFODNN7EXAMPLE" not in out
+    assert "AKIAIOSFOD" + "NN7EXAMPLE" not in out
     assert "[REDACTED_SECRET]" in out
 
 

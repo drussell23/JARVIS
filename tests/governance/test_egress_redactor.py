@@ -23,6 +23,7 @@ from backend.core.ouroboros.governance.egress_redactor import (
     redact_payload,
     redact_text,
 )
+from tests.support import fake_credentials as fake
 
 
 def _scrub(text: str) -> str:
@@ -74,14 +75,9 @@ def test_ordinary_values_survive():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("secret", [
-    "sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "sk-ant-aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    "xoxb-1111111111-abcdefghij",
-    "AKIAIOSFODNN7EXAMPLE",
-    "AIzaSyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-])
+@pytest.mark.parametrize(
+    "secret", list(fake.TOKEN_SHAPES.values()), ids=list(fake.TOKEN_SHAPES),
+)
 def test_known_token_shapes_are_redacted_anywhere(secret):
     out = _scrub(f"# a comment mentioning {secret} in passing\n")
     assert secret not in out
@@ -89,23 +85,17 @@ def test_known_token_shapes_are_redacted_anywhere(secret):
 
 
 def test_pem_block_is_redacted():
-    pem = (
-        "-----BEGIN RSA PRIVATE KEY-----\n"
-        "MIIEowIBAAKCAQEA1234567890\n"
-        "-----END RSA PRIVATE KEY-----"
-    )
-    out = _scrub(f"KEY = '''{pem}'''")
-    assert "MIIEowIBAAKCAQEA" not in out
+    out = _scrub(f"KEY = '''{fake.PEM_PRIVATE_KEY}'''")
+    assert fake.PEM_BODY[:16] not in out
 
 
 def test_jwt_is_redacted():
-    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghijklmnop"
-    assert jwt not in _scrub(f"token = {jwt}")
+    assert fake.JWT not in _scrub(f"token = {fake.JWT}")
 
 
 def test_url_credentials_are_redacted_but_the_host_survives():
     """The host is useful context; the credentials are not."""
-    out = _scrub('DB = "postgres://admin:s3cret@db.internal:5432/app"')
+    out = _scrub(f'DB = "{fake.url_with_credentials()}"')
     assert "s3cret" not in out and "admin" not in out
     assert "db.internal" in out
 

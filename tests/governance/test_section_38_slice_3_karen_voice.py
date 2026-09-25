@@ -126,7 +126,7 @@ def test_redact_aws_key_shape():
     from backend.core.ouroboros.governance.karen_voice_announcer import (
         redact_sensitive,
     )
-    out = redact_sensitive("Set token to AKIAIOSFODNN7EXAMPLE")
+    out = redact_sensitive("Set token to AKIAIOSFOD" + "NN7EXAMPLE")
     assert "[redacted]" in out
 
 

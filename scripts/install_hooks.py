@@ -16,6 +16,7 @@ Usage:
     python scripts/install_hooks.py install  # Install hooks
     python scripts/install_hooks.py remove   # Remove hooks
     python scripts/install_hooks.py status   # Check status
+    python scripts/install_hooks.py install pre-push   # Only the named hook(s)
 
 Author: JARVIS System
 """
@@ -112,9 +113,11 @@ def get_source_hooks_dir() -> Path:
 # branch. pre-rebase covers rebase, which can rewrite history before any ref
 # transaction opens.
 #
-# "pre-push" is deliberately NOT managed here: an unmanaged local hook already
-# enforces main-branch protection there, and installing over it would silently
-# drop that guard. Pushes move no local ref, so the mutex has little to add.
+# "pre-push" is the secret gate: the last point at which a credential-shaped
+# value can be stopped before a remote scanner (GitGuardian, push protection)
+# reads it. It is CHAINED, not overwritten: an unmanaged local pre-push already
+# enforces main-branch protection on some machines, so an existing non-JARVIS
+# hook is moved to "pre-push.local" and the gate runs it after passing.
 HOOKS_TO_INSTALL = [
     "pre-commit",
     "pre-commit.project",
@@ -123,7 +126,19 @@ HOOKS_TO_INSTALL = [
     "_git_mutex_bridge.sh",
     "reference-transaction",
     "pre-rebase",
+    "pre-push",
 ]
+
+#: Managed hooks that chain to a pre-existing foreign hook instead of
+#: replacing it: hook name -> where the foreign hook is preserved.
+CHAINED_HOOKS = {"pre-push": "pre-push.local"}
+
+
+def _is_jarvis_hook(path: Path) -> bool:
+    try:
+        return "JARVIS" in path.read_text(errors="replace")
+    except OSError:
+        return False
 
 
 def backup_hook(hooks_dir: Path, hook_name: str) -> bool:
@@ -154,6 +169,14 @@ def install_hook(hooks_dir: Path, source_dir: Path, hook_name: str) -> Tuple[boo
         return False, f"Source hook {hook_name} not found at {source_path}"
     
     try:
+        chained = CHAINED_HOOKS.get(hook_name)
+        if chained and dest_path.exists() and not _is_jarvis_hook(dest_path):
+            # Preserve the foreign hook where the managed one will call it.
+            keep = hooks_dir / chained
+            if keep.exists():
+                backup_hook(hooks_dir, chained)
+            shutil.move(str(dest_path), str(keep))
+            print(f"  🔗 Kept existing {hook_name} as {chained} (chained)")
         # Backup existing hook
         if dest_path.exists():
             backup_hook(hooks_dir, hook_name)
@@ -189,7 +212,13 @@ def remove_hook(hooks_dir: Path, hook_name: str) -> Tuple[bool, str]:
         
         # Remove
         hook_path.unlink()
-        
+
+        # Put a chained foreign hook back where git will run it.
+        chained = CHAINED_HOOKS.get(hook_name)
+        if chained and (hooks_dir / chained).exists():
+            shutil.move(str(hooks_dir / chained), str(hook_path))
+            return True, f"Removed {hook_name}; restored {chained} as {hook_name}"
+
         return True, f"Removed {hook_name}"
         
     except Exception as e:
@@ -217,8 +246,19 @@ def get_hook_status(hooks_dir: Path, hook_name: str) -> str:
         return color("error reading", Colors.RED)
 
 
-def cmd_install() -> int:
-    """Install all hooks."""
+def _selected(names) -> list:
+    """The managed hooks *names* selects; all of them when empty. Unknown
+    names raise rather than being silently ignored."""
+    if not names:
+        return list(HOOKS_TO_INSTALL)
+    unknown = [n for n in names if n not in HOOKS_TO_INSTALL]
+    if unknown:
+        raise SystemExit(f"Unknown hook(s): {unknown}; managed: {HOOKS_TO_INSTALL}")
+    return list(names)
+
+
+def cmd_install(names=None) -> int:
+    """Install all hooks, or only *names*."""
     print(color("\n🔧 Installing JARVIS Git Hooks", Colors.CYAN, Colors.BOLD))
     print(color("=" * 50, Colors.CYAN))
     
@@ -240,7 +280,7 @@ def cmd_install() -> int:
     success_count = 0
     fail_count = 0
     
-    for hook_name in HOOKS_TO_INSTALL:
+    for hook_name in _selected(names):
         success, message = install_hook(hooks_dir, source_dir, hook_name)
         
         if success:
@@ -268,8 +308,8 @@ def cmd_install() -> int:
         return 1
 
 
-def cmd_remove() -> int:
-    """Remove all hooks."""
+def cmd_remove(names=None) -> int:
+    """Remove all hooks, or only *names*."""
     print(color("\n🗑️ Removing JARVIS Git Hooks", Colors.CYAN, Colors.BOLD))
     print(color("=" * 50, Colors.CYAN))
     
@@ -282,7 +322,7 @@ def cmd_remove() -> int:
     success_count = 0
     fail_count = 0
     
-    for hook_name in HOOKS_TO_INSTALL:
+    for hook_name in _selected(names):
         success, message = remove_hook(hooks_dir, hook_name)
         
         if success:
@@ -331,9 +371,9 @@ def main() -> int:
         cmd = sys.argv[1].lower()
     
     if cmd in ("install", "i"):
-        return cmd_install()
+        return cmd_install(sys.argv[2:])
     elif cmd in ("remove", "r", "uninstall"):
-        return cmd_remove()
+        return cmd_remove(sys.argv[2:])
     elif cmd in ("status", "s"):
         return cmd_status()
     else:

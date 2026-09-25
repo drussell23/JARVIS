@@ -142,7 +142,7 @@ def test_firewall_rejects_fake_critical_directive() -> None:
 
 @pytest.mark.parametrize("secret", [
     "sk-ant-api03-" + "A" * 40,
-    "AKIAIOSFODNN7EXAMPLE",
+    "AKIAIOSFOD" + "NN7EXAMPLE",
     "ghp_" + "X" * 36,
 ])
 def test_firewall_rejects_credential_shapes(secret: str) -> None:
@@ -157,7 +157,7 @@ def test_firewall_rejects_credential_shapes(secret: str) -> None:
 
 def test_firewall_rejects_pem_private_key() -> None:
     r = sanitize_for_firewall(
-        "Goal description\n-----BEGIN RSA PRIVATE KEY-----\nblah\n",
+        "Goal description\n-----BEGIN RSA " + "PRIVATE KEY-----\nblah\n",
         field_name="goal",
     )
     assert r.rejected is True

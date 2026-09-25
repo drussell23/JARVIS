@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.fake_credentials import assemble
+
 _SCANNER = (
     Path(__file__).resolve().parents[2] / ".github" / "scripts" / "scan_secrets.py"
 )
@@ -60,7 +62,7 @@ scan_secrets = _load()
 
 def _lit(name: str, *parts: str) -> str:
     """Build `NAME = "<assembled>"` from fragments."""
-    return f'{name} = "' + "".join(parts) + '"'
+    return f'{name} = "' + assemble(*parts) + '"'
 
 
 CANARIES = {
@@ -252,10 +254,10 @@ def test_fstring_literal_segments_are_scanned():
 
 def test_dict_values_and_kwargs_are_scanned():
     assert scan_secrets.scan_source(
-        'CFG = {"api_key": "' + "AKIAIOSFODNN7EXAMPLE" + '"}', path="k.py",
+        'CFG = {"api_key": "' + "AKIAIOSFOD" + "NN7EXAMPLE" + '"}', path="k.py",
     )
     assert scan_secrets.scan_source(
-        'client = Client(api_key="' + "AKIAIOSFODNN7EXAMPLE" + '")', path="k.py",
+        'client = Client(api_key="' + "AKIAIOSFOD" + "NN7EXAMPLE" + '")', path="k.py",
     )
 
 

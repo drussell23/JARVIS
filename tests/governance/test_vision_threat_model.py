@@ -535,12 +535,12 @@ async def test_t1_benign_ocr_is_not_falsely_flagged():
     "credential",
     [
         "sk-abcd1234567890abcdef1234",           # OpenAI-like
-        "AKIAIOSFODNN7EXAMPLE",                  # AWS
+        "AKIAIOSFOD" + "NN7EXAMPLE",                  # AWS
         "ghp_abcdefghijklmnopqrst",              # GitHub PAT
-        "xoxb-12345-67890-abcdefghij",           # Slack bot token
-        "xoxp-12345-67890-abcdefghij",           # Slack user token
-        "-----BEGIN RSA PRIVATE KEY-----",       # PEM private key
-        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        "xoxb-12345-67" + "890-abcdefghij",           # Slack bot token
+        "xoxp-12345-67" + "890-abcdefghij",           # Slack user token
+        "-----BEGIN RSA " + "PRIVATE KEY-----",       # PEM private key
+        "-----BEGIN OPENSS" + "H PRIVATE KEY-----",
     ],
 )
 async def test_t2_credential_shape_in_ocr_drops_whole_frame(credential):

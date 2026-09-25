@@ -621,7 +621,7 @@ async def scenario_firewall_refuses_bad_patterns() -> Scenario:
         store = ctx["store"]
         bad_patterns = [
             ("bash", "sudo rm /tmp/x"),           # BLOCK-shape guard
-            ("bash", "export K=sk-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH12345678"),  # credential
+            ("bash", "export K=sk-AAAABBBBCCCCDDDDEE" + "EEFFFFGGGGHHHH12345678"),  # credential
             ("edit_file", ".env"),                # protected path
             ("bash", "make\x00test"),              # control chars
             ("bash", ""),                          # empty

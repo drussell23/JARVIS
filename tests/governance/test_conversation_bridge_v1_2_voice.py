@@ -172,7 +172,7 @@ class TestSanitizerPipeline:
         Operator-binding load-bearing: voice MUST NOT bypass
         the credential-shape regex set."""
         ok = record_voice_transcript(
-            "my api key is sk-abcdefghijklmnopqrstuv1234567890",
+            "my api key is sk-abcdefghijklmn" + "opqrstuv1234567890",
         )
         assert ok is True
         turns = get_default_bridge().snapshot()

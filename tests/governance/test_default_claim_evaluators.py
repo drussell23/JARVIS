@@ -245,11 +245,11 @@ def test_no_new_credentials_clean_diff() -> None:
     "secret_text, label",
     [
         # 5 canonical patterns; each must be detected
-        ("API_KEY = 'sk-AbCdEfGhIjKlMnOpQrStUvWxYz123456'", "openai"),
-        ("AWS_KEY = 'AKIAIOSFODNN7EXAMPLE'", "aws"),
+        ("API_KEY = 'sk-AbCdEfGhIjKlMn" + "OpQrStUvWxYz123456'", "openai"),
+        ("AWS_KEY = 'AKIAIOSFOD" + "NN7EXAMPLE'", "aws"),
         ("GH_TOKEN = 'ghp_AbCdEfGhIjKlMnOpQrStUvWxYz12345'", "github"),
-        ("SLACK = 'xoxb-1234567890-foo-bar-baz-1234567890'", "slack"),
-        ("-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCA...", "pem"),
+        ("SLACK = 'xo" + "xb-1234567890-foo-bar-baz-1234567890'", "slack"),
+        ("-----BEGIN RSA " + "PRIVATE KEY-----\nMIIEpAIBAAKCA...", "pem"),
     ],
 )
 def test_no_new_credentials_detects_all_5_patterns(secret_text, label) -> None:

@@ -307,7 +307,7 @@ class TestToolOutputInjectionScan:
         assert result.injection_count == 0
         # Credential shapes should pass through untouched
         assert "sk-abc123" in result.redacted
-        assert "AKIA1234567890123456" in result.redacted
+        assert "AKIA123456" + "7890123456" in result.redacted
 
     def test_disabled_passthrough(
         self, monkeypatch: pytest.MonkeyPatch,
