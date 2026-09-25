@@ -24,6 +24,10 @@ from backend.core.ouroboros.governance.intake.intent_envelope import make_envelo
 
 logger = logging.getLogger(__name__)
 
+#: Poll-loop backoff after a failure: doubles from the base, capped.
+_BACKOFF_BASE_S = 0.1
+_BACKOFF_CAP_S = 30.0
+
 
 class CapabilityGapSensor:
     """Intake sensor that converts CapabilityGapEvents into Ouroboros envelopes.
@@ -83,15 +87,35 @@ class CapabilityGapSensor:
             pass
 
     async def _poll_loop(self) -> None:
-        """Continuously consume events from the bus and forward them as envelopes."""
+        """Continuously consume events from the bus and forward them as envelopes.
+
+        A failure BACKS OFF before retrying. A ``get()`` that raises without
+        suspending used to be retried at once, so the loop never yielded: 5.5 M
+        logged exceptions in 4 s, every other task on the event loop starved,
+        and the A/B test run was killed by a timeout. The sleep is what hands
+        control back to the loop; the bound keeps a persistent fault from
+        silencing the sensor for longer than one cap.
+        """
+        failures = 0
         while True:
             try:
                 event = await self._gap_bus.get()
                 await self._handle(event)
+                failures = 0
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("CapabilityGapSensor: error in poll loop")
+                failures += 1
+                # Traceback on the first failure and then at powers of two:
+                # a persistent fault stays visible without flooding the log.
+                if failures & (failures - 1) == 0:
+                    logger.exception(
+                        "CapabilityGapSensor: error in poll loop "
+                        "(consecutive=%d)", failures,
+                    )
+                await asyncio.sleep(
+                    min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * 2 ** min(failures - 1, 16)),
+                )
 
     async def _poll_once(self) -> None:
         """Consume a single event — used in unit tests."""
