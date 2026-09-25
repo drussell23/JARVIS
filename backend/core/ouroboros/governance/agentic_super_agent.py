@@ -245,6 +245,11 @@ async def run_agentic_repair(
                         target.symbol, turn, max(0, turns - turn),
                     )
                     _release_refinement(target.symbol)
+                    # Severed early is still unconverged, and must leave the
+                    # same terminal lesson the exhausted-budget path does.
+                    _note_stitch_lesson(
+                        target, "stitch_node_unconverged", last_error, turn=turn,
+                    )
                     return AgentOutcome(
                         symbol=target.symbol,
                         status=STATUS_UNCONVERGED,
