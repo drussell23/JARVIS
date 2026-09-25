@@ -35,6 +35,7 @@ import sys
 import tempfile
 import time
 import dataclasses
+import inspect
 from dataclasses import asdict as _dc_asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -4906,35 +4907,14 @@ class GovernedOrchestrator:
                         timeout=self._config.context_expansion_timeout_s,
                     )
 
-                    # ExplorationFleet: parallel codebase exploration across Trinity repos
-                    if self._exploration_fleet is not None:
-                        try:
-                            _fleet_report = await asyncio.wait_for(
-                                self._exploration_fleet.deploy(
-                                    goal=ctx.description,
-                                    max_agents=8,
-                                ),
-                                timeout=min(30.0, self._config.context_expansion_timeout_s / 2),
-                            )
-                            if _fleet_report.total_findings > 0:
-                                _fleet_text = self._exploration_fleet.format_for_prompt(_fleet_report)
-                                ctx = ctx.with_expanded_files(
-                                    ctx.expanded_files + (f"[Fleet:{_fleet_report.total_findings}]",)
-                                )
-                                logger.info(
-                                    "[Orchestrator] ExplorationFleet: %d agents, %d findings in %.1fs",
-                                    _fleet_report.agents_completed,
-                                    _fleet_report.total_findings,
-                                    _fleet_report.duration_s,
-                                )
-                        except Exception as _fleet_exc:
-                            logger.debug("[Orchestrator] ExplorationFleet skipped: %s", _fleet_exc)
+                    # No ExplorationFleet deploy here -- see ContextExpansionRunner
+                    # for why it was removed from CONTEXT_EXPANSION.
 
                     # P2.1: Dependency-aware generation — inject Oracle graph summary
                     _oracle_ref = getattr(self._stack, "oracle", None)
                     if _oracle_ref is not None and ctx.target_files:
                         try:
-                            _dep_summary = self._build_dependency_summary(
+                            _dep_summary = await self._build_dependency_summary(
                                 _oracle_ref, ctx.target_files,
                             )
                             if _dep_summary:
@@ -4944,7 +4924,7 @@ class GovernedOrchestrator:
                                     len(_dep_summary), len(ctx.target_files),
                                 )
                         except Exception as _dep_exc:
-                            logger.debug("[Orchestrator] Dependency summary skipped: %s", _dep_exc)
+                            logger.warning("[Orchestrator] Dependency summary skipped: %s: %s", type(_dep_exc).__name__, _dep_exc)
 
                     # Sovereign Epistemic Context Matrix (spec 5.1): on a heavy GOAL, build a
                     # bounded, hash-validated candidate DAG from the oracle to seed Venom +
@@ -12930,7 +12910,7 @@ class GovernedOrchestrator:
             pass  # Session lessons are best-effort
 
     @staticmethod
-    def _build_dependency_summary(
+    async def _build_dependency_summary(
         oracle: Any,
         target_files: Sequence[str],
     ) -> str:
@@ -12951,17 +12931,22 @@ class GovernedOrchestrator:
 
         for raw_path in target_files[:3]:  # Cap at 3 files to stay within budget
             try:
-                # Slice 113: this builder is SYNC, so reach the underlying
-                # in-process Oracle directly via the adapter's ``.raw`` (avoids
-                # an async cascade through every caller). In-process → identical
-                # behavior; under process isolation the graph is in another
-                # process so this sync path simply degrades (caught below).
-                _raw_oracle = getattr(oracle, "raw", oracle)
-                ctx_info = _raw_oracle.get_context_for_improvement(raw_path, max_depth=2)
+                # Through the adapter's async interface, which BOTH adapters
+                # serve (the isolated one over IPC). Slice 113 made this builder
+                # sync and reached for ``.raw`` instead, on the belief that the
+                # isolated case "simply degrades (caught below)". It did not:
+                # ``.raw`` there is the async proxy, the call returned an
+                # un-awaited coroutine WITHOUT raising, and the ``.get`` below
+                # failed outside this try -- 'coroutine' object has no attribute
+                # 'get', DEBUG-logged, on every op under the isolated Oracle.
+                # A bare oracle with a sync method is still accepted.
+                ctx_info = oracle.get_context_for_improvement(raw_path, max_depth=2)
+                if inspect.isawaitable(ctx_info):
+                    ctx_info = await ctx_info
             except Exception:
                 continue
 
-            if not ctx_info.get("found"):
+            if not isinstance(ctx_info, dict) or not ctx_info.get("found"):
                 continue
 
             risk = ctx_info.get("risk_assessment", {})

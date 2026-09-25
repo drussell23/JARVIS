@@ -55,7 +55,7 @@ class _FakeOrchestrator:
     _dialogue_store: Any = None
     _exploration_fleet: Any = None
 
-    def _build_dependency_summary(self, oracle, target_files):
+    async def _build_dependency_summary(self, oracle, target_files):
         return ""
 
 
@@ -143,8 +143,8 @@ async def test_routing_appended_when_flag_on(ctx, orch, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_routing_skipped_when_flag_off(ctx, orch, monkeypatch):
-    """When JARVIS_MEMORY_ROUTING_ENABLED is absent/false, prompt is unchanged."""
-    monkeypatch.delenv("JARVIS_MEMORY_ROUTING_ENABLED", raising=False)
+    """When JARVIS_MEMORY_ROUTING_ENABLED=0, prompt is unchanged (default-ON since 2026-07-31)."""
+    monkeypatch.setenv("JARVIS_MEMORY_ROUTING_ENABLED", "0")
 
     prompt_before = ctx.strategic_memory_prompt  # "" (empty at CONTEXT_EXPANSION entry)
 

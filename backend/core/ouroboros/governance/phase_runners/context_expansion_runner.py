@@ -11,7 +11,7 @@ graduated 2026-04-22/23; the inline twin remains as the kill-switch path).
 * Construct optional helpers: SkillRegistry / DocFetcher / WebSearchCapability /
   VisualCodeComprehension / CodeExplorationTool
 * Run ContextExpander.expand(ctx, deadline) via asyncio.wait_for
-* Run ExplorationFleet (optional parallel codebase exploration)
+* Inject the Oracle dependency summary (no ExplorationFleet -- see below)
 * Inject Oracle dependency summary (P2.1)
 * Broad try/except wraps the whole body — expansion failure is a WARNING,
   not a terminal. Pipeline continues to GENERATE via PLAN.
@@ -28,7 +28,6 @@ graduated 2026-04-22/23; the inline twin remains as the kill-switch path).
     - ``_generator``
     - ``_stack.oracle`` (optional)
     - ``_dialogue_store`` (optional)
-    - ``_exploration_fleet`` (optional)
     - ``_build_dependency_summary``
 * ``serpent`` — not used in this runner (PreActionNarrator +
   serpent.update_phase already fired in ROUTERunner pre-advance)
@@ -194,35 +193,21 @@ class ContextExpansionRunner(PhaseRunner):
                 timeout=orch._config.context_expansion_timeout_s,
             )
 
-            # ExplorationFleet: parallel codebase exploration across Trinity repos
-            if orch._exploration_fleet is not None:
-                try:
-                    _fleet_report = await asyncio.wait_for(
-                        orch._exploration_fleet.deploy(
-                            goal=ctx.description,
-                            max_agents=8,
-                        ),
-                        timeout=min(30.0, orch._config.context_expansion_timeout_s / 2),
-                    )
-                    if _fleet_report.total_findings > 0:
-                        _fleet_text = orch._exploration_fleet.format_for_prompt(_fleet_report)
-                        ctx = ctx.with_expanded_files(
-                            ctx.expanded_files + (f"[Fleet:{_fleet_report.total_findings}]",)
-                        )
-                        logger.info(
-                            "[Orchestrator] ExplorationFleet: %d agents, %d findings in %.1fs",
-                            _fleet_report.agents_completed,
-                            _fleet_report.total_findings,
-                            _fleet_report.duration_s,
-                        )
-                except Exception as _fleet_exc:
-                    logger.debug("[Orchestrator] ExplorationFleet skipped: %s", _fleet_exc)
+            # No ExplorationFleet deploy here, deliberately. It used to run
+            # 8 agents per op (3-12 s, sometimes timing out) and its output
+            # never reached the prompt: it read ``ctx.expanded_files`` (no such
+            # field) and ``_fleet_text`` was never injected even on success.
+            # Wiring it in was not the fix -- the fleet scans FIXED repo scopes,
+            # not the op's targets, and in every soak 2026-09-08..09-23 it
+            # reported the same 77 files and ~360 findings whatever the goal.
+            # That is constant off-target text in a 32k window. The fleet stays
+            # available to the model through delegate_to_agent.
 
             # P2.1: Dependency-aware generation — inject Oracle graph summary
             _oracle_ref = getattr(orch._stack, "oracle", None)
             if _oracle_ref is not None and ctx.target_files:
                 try:
-                    _dep_summary = orch._build_dependency_summary(
+                    _dep_summary = await orch._build_dependency_summary(
                         _oracle_ref, ctx.target_files,
                     )
                     if _dep_summary:
@@ -232,7 +217,7 @@ class ContextExpansionRunner(PhaseRunner):
                             len(_dep_summary), len(ctx.target_files),
                         )
                 except Exception as _dep_exc:
-                    logger.debug("[Orchestrator] Dependency summary skipped: %s", _dep_exc)
+                    logger.warning("[Orchestrator] Dependency summary skipped: %s: %s", type(_dep_exc).__name__, _dep_exc)
         except Exception as exc:
             # RUNNER PARITY -- the reason this bug outlived its own fix.
             #

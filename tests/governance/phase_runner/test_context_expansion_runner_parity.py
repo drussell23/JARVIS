@@ -6,7 +6,7 @@ Verbatim transcription of orchestrator.py CONTEXT_EXPANSION block
 Parity contract:
 
 1. ``ContextExpander.expand(ctx, deadline)`` is awaited via wait_for
-2. Optional ExplorationFleet + Oracle dependency summary injections
+2. Oracle dependency summary injection (no ExplorationFleet deploy)
 3. Broad try/except wraps — a transient expansion failure degrades (logged
    at ERROR); a code defect ends the op (test_context_expansion_defect_escalation)
 4. Unconditional advance to PLAN at the end (``next_phase=PLAN``)
@@ -59,7 +59,7 @@ class _FakeOrchestrator:
     _dialogue_store: Any = None
     _exploration_fleet: Any = None
 
-    def _build_dependency_summary(self, oracle, target_files):
+    async def _build_dependency_summary(self, oracle, target_files):
         return ""
 
 
