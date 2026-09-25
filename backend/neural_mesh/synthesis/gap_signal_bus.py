@@ -127,6 +127,8 @@ class GapSignalBus:
 
     def __init__(self, maxsize: int = 256) -> None:
         self._queue: asyncio.Queue[CapabilityGapEvent] = asyncio.Queue(maxsize=maxsize)
+        #: The loop whose consumer the queue is bound to (see ``_consumer_queue``).
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     # ------------------------------------------------------------------
     # Producer side
@@ -197,7 +199,39 @@ class GapSignalBus:
 
     async def get(self) -> CapabilityGapEvent:
         """Await and return the next event from the queue."""
-        return await self._queue.get()
+        return await self._consumer_queue().get()
+
+    def _consumer_queue(self) -> "asyncio.Queue[CapabilityGapEvent]":
+        """The queue, bound to the loop that is consuming it NOW.
+
+        An ``asyncio.Queue`` binds to the first loop that waits on it, and from
+        then on ``get()`` from any other loop raises ``RuntimeError`` without
+        ever suspending. This bus is a process singleton, so a consumer started
+        under a second loop (every pytest-asyncio test; an intake layer
+        restarted under a new loop) failed instantly on every call — and the
+        sensor's poll loop, retrying at once, logged 5.5 M exceptions in 4 s
+        while starving every other task on its loop.
+
+        On a loop change the queue is replaced and pending events carried over,
+        so nothing emitted before the switch is lost. Only the CONSUMER rebinds:
+        ``emit`` is sync and may run under a different loop than the consumer,
+        and letting it rebind would move the queue away from the task waiting
+        on it.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return self._queue
+        if self._loop is None:
+            self._loop = loop
+        elif self._loop is not loop:
+            fresh: asyncio.Queue[CapabilityGapEvent] = asyncio.Queue(
+                maxsize=self._queue.maxsize,
+            )
+            while not self._queue.empty():
+                fresh.put_nowait(self._queue.get_nowait())
+            self._queue, self._loop = fresh, loop
+        return self._queue
 
     # ------------------------------------------------------------------
     # Introspection
