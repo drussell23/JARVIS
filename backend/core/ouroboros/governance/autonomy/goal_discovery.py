@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
 import logging
 import os
 import re
@@ -56,7 +57,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import (
-    Any, Callable, Dict, FrozenSet, Iterator, List, Optional, Sequence, Tuple,
+    Any, Callable, Dict, FrozenSet, Iterable, Iterator, List, Optional,
+    Sequence, Tuple,
 )
 
 logger = logging.getLogger("Ouroboros.GoalDiscovery")
@@ -312,8 +314,22 @@ def _from_ambient_reds(
     return out
 
 
-def _iter_uncovered_modules(repo_root: Path) -> Iterator[DiscoveredWork]:
+#: ``_iter_uncovered_modules`` tiers: modules inside a package, then the
+#: top-level scripts beside them (see ``_targets_top_level_script``).
+WALK_PACKAGES = "packages"
+WALK_TOP_LEVEL = "top_level"
+
+
+def _iter_uncovered_modules(
+    repo_root: Path, *, tier: Optional[str] = None,
+) -> Iterator[DiscoveredWork]:
     """Production modules with no test file of the conventional name.
+
+    *tier* restricts the walk to :data:`WALK_PACKAGES` or
+    :data:`WALK_TOP_LEVEL`; ``None`` yields every package module first and the
+    top-level scripts after them. The walk used to be plain ``rglob`` order,
+    which visits the root of ``backend/`` first — so dead debug scripts headed
+    every pass.
 
     A GENERATOR, and that is the whole point. Every source in this module is
     now UNCAPPED at collection, because a cap applied before the pass's filters
@@ -332,7 +348,19 @@ def _iter_uncovered_modules(repo_root: Path) -> Iterator[DiscoveredWork]:
     try:
         tests_root = repo_root / "tests"
         known = {p.name for p in tests_root.rglob("test_*.py")} if tests_root.exists() else set()
-        for src in (repo_root / "backend").rglob("*.py"):
+        source_root = repo_root / _SOURCE_ROOT
+        if tier == WALK_TOP_LEVEL:
+            sources: Iterable[Path] = sorted(source_root.glob("*.py"))
+        elif tier == WALK_PACKAGES:
+            sources = (
+                p for p in source_root.rglob("*.py") if p.parent != source_root
+            )
+        else:
+            sources = itertools.chain(
+                (p for p in source_root.rglob("*.py") if p.parent != source_root),
+                sorted(source_root.glob("*.py")),
+            )
+        for src in sources:
             rel = str(src.relative_to(repo_root)).replace("\\", "/")
             if _is_test_file(rel) or _is_governance(rel):
                 continue
@@ -550,6 +578,7 @@ def _from_roadmap_goals(repo_root: Path) -> List[DiscoveredWork]:
 
 async def _settled_goal_ids(
     pool: Sequence["DiscoveredWork"], *, repo_root: Path, settled: Any = None,
+    also: Sequence[str] = (),
 ) -> frozenset:
     """The goal ids in *pool* the repository has already SATISFIED.
 
@@ -565,13 +594,19 @@ async def _settled_goal_ids(
     *settled* is an injection seam mirroring ``cooldown``: any object exposing
     ``satisfied_goal_ids(ids)``. ``None`` resolves the real ledger.
 
+    *also* adds ids that are not in *pool* — the batch's DAG prerequisites.
+    The dependency gate reads its "has A landed" answer from this same set, so
+    a prerequisite asked about only when it shares a batch with its dependent
+    reads as unmet whenever the two are ranked in different batches.
+
     NEVER raises: an unreadable ledger yields an empty set, which is exactly
     the behaviour this function replaces.
     """
     try:
         goal_ids = []
-        for item in pool or ():
-            gid = str(getattr(item, "goal_id", "") or "").strip()
+        candidates = [getattr(item, "goal_id", "") for item in pool or ()]
+        for gid in [*candidates, *(also or ())]:
+            gid = str(gid or "").strip()
             if gid and gid not in goal_ids:
                 goal_ids.append(gid)
         if not goal_ids:
@@ -681,6 +716,67 @@ try:  # pragma: no cover — trivial, and a missing gate must not break discover
 except Exception:  # noqa: BLE001
     _UNRESOLVABLE_REASON = "unresolvable_target_dependency"
     _PLATFORM_REASON = "platform_unavailable"
+
+
+#: The regex the signature anchor uses to find the module-under-test in a goal's
+#: description. Imported, not restated, so "the subject this goal names" means
+#: the same thing to the ranker as it does to the prompt.
+try:  # pragma: no cover — trivial, and a missing anchor must not break discovery
+    from backend.core.ouroboros.governance.ast_signature_anchor import (
+        _PY_PATH_RE as _SUBJECT_PATH_RE,
+    )
+except Exception:  # noqa: BLE001
+    _SUBJECT_PATH_RE = re.compile(r"[A-Za-z0-9_./\\-]+\.py")
+
+#: The source tree the coverage walk enumerates. A module directly inside it,
+#: outside every package, is a top-level script.
+_SOURCE_ROOT = "backend"
+
+
+def _is_top_level_script(path: str) -> bool:
+    """``backend/<name>.py`` — a file directly in the source root, no package."""
+    parts = PurePosixPath(path.replace("\\", "/").lstrip("./")).parts
+    return len(parts) == 2 and parts[0] == _SOURCE_ROOT and parts[1].endswith(".py")
+
+
+def _targets_top_level_script(work: "DiscoveredWork") -> bool:
+    """Whether every source subject *work* names is a top-level script.
+
+    ## The starvation this fixes
+
+    Measured on bt-2026-09-25-004828: 13 of 13 identifiable VALIDATE failures
+    targeted a script at the root of ``backend/`` — ``trace_live_error.py``
+    calling a ``ResponseBuilder`` that was renamed, ``debug_app_classification``
+    calling a removed ``_classify_command`` from a hardcoded mac path. Those are
+    not model hallucinations; the SUBJECTS are dead debug scripts, so no test of
+    them can pass. The roadmap had 50 of its 71 signed goals on such scripts,
+    because the coverage walk visits the root of ``backend/`` first and every
+    uncovered module carries the same weight — the queue was walk order.
+
+    ## Demoted, never shed
+
+    Liveness and import verdicts both pass these scripts (they exist, and most
+    import fine), and some of them are real: ``runtime_patcher.py`` landed a
+    test in the same soak. So the path is a RANKING signal below importability,
+    not a filter — package modules are taken first, and a script is still
+    reached whenever the packages run out.
+
+    Pure string work on paths the goal already names — no filesystem, because
+    ``sorted`` calls it per element. A goal that names no source subject (a
+    free-form roadmap goal) is never demoted.
+    """
+    try:
+        named = [str(getattr(work, "subject_file", "") or ""), str(work.target_file or "")]
+        detail = getattr(work, "detail", None) or {}
+        named += _SUBJECT_PATH_RE.findall(str(detail.get("description") or ""))
+        subjects = [
+            p.replace("\\", "/").lstrip("./") for p in named
+            if p and not _is_test_file(p)
+        ]
+        subjects = [p for p in subjects if p.startswith(_SOURCE_ROOT + "/")]
+        return bool(subjects) and all(_is_top_level_script(p) for p in subjects)
+    except Exception:  # noqa: BLE001 — ranking never breaks a pass
+        return False
 
 
 def _covering_test_stems(repo_root: Path) -> FrozenSet[str]:
@@ -1293,7 +1389,12 @@ async def discover(
         (_liveness_rank(w, root, covering), _is_importable(verdicts.get(w.goal_id)), w)
         for w in pool
     ]
-    scored.sort(key=lambda rw: (-rw[0], not rw[1], -rw[2].weight))
+    # A TOP-LEVEL SCRIPT SITS BELOW IMPORTABILITY, above evidence: an
+    # import-blocked goal cannot pass at all, a script's goal merely rarely
+    # does. See `_targets_top_level_script` for the measurement.
+    scored.sort(key=lambda rw: (
+        -rw[0], not rw[1], _targets_top_level_script(rw[2]), -rw[2].weight,
+    ))
     # THE BUDGET DEFECT, third instance. The Sentinel refuses undispatchable
     # work (dead target, quarantined subject) AFTER this function has capped
     # the list — so eight quarantined signed goals filled all eight slots, the
@@ -1374,8 +1475,12 @@ async def discover(
         """
         if not batch or len(ranked) >= cap:
             return
+        prerequisites = [
+            dep for item in batch
+            for dep in ((dag_index.get(item.goal_id) or {}).get("depends_on") or ())
+        ]
         settled_ids = await _settled_goal_ids(
-            batch, repo_root=Path(repo_root), settled=settled,
+            batch, repo_root=Path(repo_root), settled=settled, also=prerequisites,
         )
         for item in batch:
             if len(ranked) >= cap:
@@ -1387,8 +1492,20 @@ async def discover(
     # ranking is exact without materialising the walk: everything that outranks
     # an uncovered module is considered first, the walk fills whatever the cap
     # still has room for, and the lower-weight tail follows.
+    #
+    # The same holds per path tier. Signed goals on top-level scripts are
+    # taken only after the walk's PACKAGE modules — otherwise the 50 such
+    # goals already on the roadmap would fill the cap before the walk ran,
+    # and demoting them in the sort above would change nothing.
     _uncovered_weight = _KIND_WEIGHT["uncovered_module"]
-    await _rank([w for w in documented if w.weight >= _uncovered_weight])
+    _strong = [w for w in documented if w.weight >= _uncovered_weight]
+    _scripts = [w for w in _strong if _targets_top_level_script(w)]
+    if _scripts:
+        logger.info(
+            "[GoalDiscovery] %d signed goal(s) on top-level scripts ranked "
+            "after package work", len(_scripts),
+        )
+    await _rank([w for w in _strong if not _targets_top_level_script(w)])
 
     # THE BUDGET DEFECT, second instance — same class as the roadmap cap, and
     # it survived that fix. The coverage scan used to be sized
@@ -1402,20 +1519,21 @@ async def discover(
     # The shortfall is now measured from candidates that SURVIVED the gate, and
     # the walk is pulled until that shortfall is filled or the tree is
     # exhausted. `_take_cheap` runs off the loop: it is filesystem I/O.
-    if len(ranked) < cap:
+    def _walk_refused(item: DiscoveredWork) -> bool:
+        # Same rule as the documented sources: a quarantined subject found
+        # by the walk would take a slot the Sentinel then refuses to spend.
+        verdict = _TREE_PURE.verdicts((item,), root, tree_state).get(item.goal_id)
+        return bool(_dispatch_refusal(LIVENESS_CREATES_TEST, verdict))
+
+    async def _fill_from_walk(tier: str) -> None:
+        if len(ranked) >= cap:
+            return
         # `iter()` is load-bearing, not decoration: the batches must resume
         # where the previous one stopped. A source that returns a re-iterable
         # (a list — which is exactly what a test double supplies) would
         # otherwise hand back the same candidates every round, and a batch the
         # ledger prunes without marking anything seen would never terminate.
-        walk = iter(_iter_uncovered_modules(Path(repo_root)))
-
-        def _walk_refused(item: DiscoveredWork) -> bool:
-            # Same rule as the documented sources: a quarantined subject found
-            # by the walk would take a slot the Sentinel then refuses to spend.
-            verdict = _TREE_PURE.verdicts((item,), root, tree_state).get(item.goal_id)
-            return bool(_dispatch_refusal(LIVENESS_CREATES_TEST, verdict))
-
+        walk = iter(_iter_uncovered_modules(Path(repo_root), tier=tier))
         while len(ranked) < cap:
             try:
                 batch = await asyncio.to_thread(
@@ -1427,6 +1545,9 @@ async def discover(
                 break
             await _rank(batch)
 
+    await _fill_from_walk(WALK_PACKAGES)
+    await _rank(_scripts)
+    await _fill_from_walk(WALK_TOP_LEVEL)
     await _rank([w for w in documented if w.weight < _uncovered_weight])
     logger.info(
         "[GoalDiscovery] %d candidate(s): %d signed, %d red, %d uncovered",
