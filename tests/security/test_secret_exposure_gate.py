@@ -61,9 +61,10 @@ def test_a_pem_marker_in_a_multiline_literal_is_flagged():
     assert _kinds(f'check(\n    "{body}"\n)\n') == ["PEM Private Key"]
 
 
-def test_a_docstring_is_still_exempt_by_construction():
+def test_a_key_in_a_docstring_is_no_longer_exempt():
+    """Docstrings are scanned as prose now (tests/security/test_prose_secret_scan.py)."""
     src = f'def f():\n    """Detects {fake.AWS_ACCESS_KEY} shapes."""\n'
-    assert _kinds(src) == []
+    assert _kinds(src) == ["AWS Access Key"]
 
 
 def test_the_pragma_covers_every_line_of_a_multiline_literal():

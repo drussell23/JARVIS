@@ -193,16 +193,18 @@ def test_benign_pattern_is_not_flagged(label, source):
     )
 
 
-def test_docstrings_are_structurally_unreachable():
-    """Not an exclusion list — a docstring is a bare Expr the visitor never
-    records, so this holds for any docstring content whatsoever."""
-    src = '"""api_key = \\"' + "AKIA" + "IOSFODNN7EXAMPLE" + '\\" here."""\nX = 1\n'  # pragma: allowlist secret
-    assert not scan_secrets.scan_source(src, path="d.py")
+def test_a_key_in_a_docstring_is_caught():
+    """Docstrings USED to be structurally unreachable, and that was a blind
+    spot: a model asked for an example pastes a real key into one, and it is
+    published like any other byte. Documentation that only NAMES a pattern is
+    still benign -- see BENIGN["scanner_docstring"]."""
+    src = '"""api_key = \\"' + assemble("AKIA", "IOSFODNN7EXAMPLE") + '\\" here."""\nX = 1\n'
+    assert scan_secrets.scan_source(src, path="d.py")
 
 
-def test_comments_never_enter_the_ast():
-    src = '# api_key = "' + "sk" + '-Abcdefghijklmnopqrstuvwxyz0123456789ABCD"\nX = 1\n'  # pragma: allowlist secret
-    assert not scan_secrets.scan_source(src, path="c.py")
+def test_a_key_in_a_comment_is_caught():
+    src = '# api_key = "' + assemble("sk", "-Abcdefghijklmnopqrstuvwxyz0123456789ABCD") + '"\nX = 1\n'
+    assert scan_secrets.scan_source(src, path="c.py")
 
 
 # ---------------------------------------------------------------------------

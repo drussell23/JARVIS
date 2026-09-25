@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import io
 import json
 import math
 import os
@@ -53,6 +54,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tokenize
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -97,6 +99,39 @@ _SHAPES: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
     ("Stripe Key", re.compile(r"\b[sr]k_live_[0-9A-Za-z]{20,}\b")),
 )
 
+#: In PROSE (docstrings, comments) a shape must be a complete credential, not
+#: its marker: documentation legitimately names ``-----BEGIN PRIVATE KEY-----``
+#: when describing what a detector looks for. A leaked key has a body.
+_PROSE_SHAPE_OVERRIDES = {
+    "PEM Private Key": re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----\s*[A-Za-z0-9+/=]{40,}",
+    ),
+}
+
+#: The regex each label is held to in prose.
+_SHAPES_BY_LABEL = {
+    label: _PROSE_SHAPE_OVERRIDES.get(label, rx) for label, rx in _SHAPES
+}
+
+# --------------------------------------------------------------------------
+# Prose (docstring + comment) randomness -- calibrated, see _prose_suspect
+# --------------------------------------------------------------------------
+
+DEFAULT_PROSE_COVERAGE = 0.5
+DEFAULT_PROSE_RANDOMNESS = 0.8
+#: A candidate run: the base64/base64url alphabet plus '=' padding and the
+#: separators that assignments and ids use.
+_PROSE_TOKEN = re.compile(r"[A-Za-z0-9+/=_\-.:]+")
+_PROSE_SEP = re.compile(r"[-_=.:]+")
+_HEX_RUN = re.compile(r"[0-9a-fA-F]+")
+#: Word-like runs: Capitalised or lowercase words, SCREAMING words, years/ids.
+#: In a uniform base62 string these are rare (runs of >=3 same-case letters);
+#: in an identifier, path or model name they are most of the text.
+_WORD_RUN = re.compile(r"[A-Z]?[a-z]{3,}|[A-Z]{3,}(?![a-z])|[0-9]{4,}")
+#: '-' and '_' are 2 of base64url's 64 symbols: the separator density a
+#: genuinely random url-safe token carries.
+_URL_SEPARATOR_DENSITY = 2 / 64
+
 #: Values that are self-evidently not secrets regardless of entropy.
 _PLACEHOLDER = re.compile(
     r"^(your[_\-]?|my[_\-]?|example|sample|dummy|fake|test|placeholder|"
@@ -137,6 +172,74 @@ def matched_shape(value: str) -> Optional[str]:
         if rx.search(value):
             return label
     return None
+
+
+def matched_prose_shape(value: str) -> Optional[str]:
+    """:func:`matched_shape` for prose: every shape, with markers that are
+    only documentation (a PEM header without a body) held to a complete key."""
+    for label, rx in _SHAPES:
+        if _PROSE_SHAPE_OVERRIDES.get(label, rx).search(value):
+            return label
+    return None
+
+
+def _word_coverage(token: str) -> float:
+    return sum(len(m.group(0)) for m in _WORD_RUN.finditer(token)) / max(len(token), 1)
+
+
+def _randomness(token: str) -> float:
+    """Entropy as a fraction of the most this token COULD carry: log2 of the
+    smaller of its length and its alphabet (16 for hex, 64 otherwise). A fixed
+    bits-per-char gate cannot work on prose -- a 20-char token can never exceed
+    log2(20) -- so the gate adapts to the token's own ceiling."""
+    alphabet = 16 if _HEX_RUN.fullmatch(token) else 64
+    return shannon_entropy(token) / math.log2(max(2, min(len(token), alphabet)))
+
+
+def _random_run(
+    token: str, *, min_length: int, coverage: float, randomness: float,
+) -> bool:
+    return (
+        len(token) >= min_length
+        and not _HEX_RUN.fullmatch(token)
+        and any(c.isdigit() for c in token)
+        and any(c.isalpha() for c in token)
+        and _word_coverage(token) < coverage
+        and _randomness(token) >= randomness
+    )
+
+
+def _prose_suspect(
+    token: str, *, min_length: int, coverage: float, randomness: float,
+) -> bool:
+    """Is this prose token a random credential rather than language?
+
+    Calibrated on this repository: 2,762 candidate tokens across every
+    docstring and comment, against uniform random keys. Character entropy
+    alone could not separate them -- ``M10AdaptiveThreshold`` scores as random
+    as a real key -- but WORD COVERAGE does: random base62 has a median of 0.25,
+    identifiers, paths and model names sit far above 0.5.
+
+    Two readings, either of which flags:
+
+    * the longest separator-free run: splits op ids and UUIDs
+      (``op-019fa4d2-2468-…``) into short hex pieces that never qualify;
+    * the whole token, only if MIXED-case (hex ids are single-case) and its
+      separator density is what a random base64url token would carry --
+      model names like ``Qwen3-VL-30B-A3B`` are cut into short pieces far more
+      densely, a url-safe key is not.
+
+    Pure hex is never flagged here: in prose it is overwhelmingly a digest or a
+    commit id, indistinguishable by content from a hex key. Shapes still apply.
+    """
+    knobs = dict(min_length=min_length, coverage=coverage, randomness=randomness)
+    if _random_run(max(_PROSE_SEP.split(token), key=len), **knobs):
+        return True
+    whole = token.strip("-_=.:")
+    if not (any(c.isupper() for c in whole) and any(c.islower() for c in whole)):
+        return False
+    density = len(_PROSE_SEP.findall(whole)) / max(len(whole), 1)
+    return density <= 3 * _URL_SEPARATOR_DENSITY and _random_run(whole, **knobs)
 
 
 def _is_pointer_name(name: str) -> bool:
@@ -181,11 +284,19 @@ class _Visitor(ast.NodeVisitor):
         #: as exposed as one in an assignment -- text-level scanners
         #: (GitGuardian, push protection) read the file, not the AST.
         self.literals: List[Tuple[str, int, int]] = []
+        #: Docstrings and bare string statements, as ``(text, first, last)``.
+        self.docstrings: List[Tuple[str, int, int]] = []
 
     def visit_Expr(self, node: ast.Expr) -> None:
-        # A bare string statement is a docstring or inert prose: skipped by
-        # construction, as before. Any other expression is walked normally.
+        # A bare string statement is a docstring or inert prose. It is not a
+        # VALUE, so the value heuristics never judge it -- but a key pasted
+        # into a docstring "as an example" is published all the same, so it is
+        # collected for the prose pass. Any other expression is walked normally.
         if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            first = getattr(node, "lineno", 0)
+            self.docstrings.append(
+                (node.value.value, first, getattr(node, "end_lineno", None) or first),
+            )
             return
         self.generic_visit(node)
 
@@ -231,13 +342,30 @@ class _Visitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
 def scan_source(
     source: str, path: str = "<memory>", *,
     entropy_threshold: float = DEFAULT_ENTROPY,
     min_length: int = DEFAULT_MIN_LEN,
+    prose_coverage: Optional[float] = None,
+    prose_randomness: Optional[float] = None,
 ) -> List[_Finding]:
     """Findings for one Python source string. Unparseable input yields [] —
-    a syntax error is the linter's problem, not the scanner's."""
+    a syntax error is the linter's problem, not the scanner's.
+
+    The prose thresholds default to ``SECRET_SCAN_PROSE_COVERAGE`` /
+    ``SECRET_SCAN_PROSE_RANDOMNESS``, so every entry point (tree, revisions,
+    the pre-push gate) honours the same tuning."""
+    if prose_coverage is None:
+        prose_coverage = _env_float("SECRET_SCAN_PROSE_COVERAGE", DEFAULT_PROSE_COVERAGE)
+    if prose_randomness is None:
+        prose_randomness = _env_float("SECRET_SCAN_PROSE_RANDOMNESS", DEFAULT_PROSE_RANDOMNESS)
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -313,7 +441,66 @@ def scan_source(
                 path, first, "<literal>", shape, shannon_entropy(value),
                 value[:12] + "…",
             ))
+
+    # Prose: docstrings and comments. Nothing here is a VALUE, but all of it
+    # is published -- and a model asked for an example will paste a key.
+    prose = [("<docstring>", text, first, last) for text, first, last in visitor.docstrings]
+    prose += [("<comment>", text, line, line) for text, line in _comments(source)]
+    for channel, text, first, _last in prose:
+        # The pragma covers the LINE it is on, not the whole block: one
+        # reviewed id in a long module docstring must not blind the scanner to
+        # the rest of it.
+        findings.extend(
+            f for f in _prose_findings(
+                path, channel, text, first, min_length=min_length,
+                coverage=prose_coverage, randomness=prose_randomness,
+            )
+            if not (0 < f.line <= len(lines) and ALLOWLIST_PRAGMA in lines[f.line - 1])
+        )
     return findings
+
+
+def _comments(source: str) -> List[Tuple[str, int]]:
+    """``(text, line)`` of every comment. A file the tokenizer rejects yields
+    what it produced before failing -- never raises."""
+    out: List[Tuple[str, int]] = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            if tok.type == tokenize.COMMENT:
+                out.append((tok.string, tok.start[0]))
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        pass
+    return out
+
+
+def _prose_findings(
+    path: str, channel: str, text: str, first: int, *, min_length: int,
+    coverage: float, randomness: float,
+) -> List[_Finding]:
+    """Findings in one docstring or comment: complete credential shapes, then
+    random runs no language produces (:func:`_prose_suspect`)."""
+    found: List[_Finding] = []
+    claimed: List[Tuple[int, int]] = []
+    for label, rx in _SHAPES_BY_LABEL.items():
+        for m in rx.finditer(text):
+            claimed.append(m.span())
+            found.append(_Finding(
+                path, first + text[: m.start()].count("\n"), channel, label,
+                shannon_entropy(m.group(0)), m.group(0)[:12] + "…",
+            ))
+    for m in _PROSE_TOKEN.finditer(text):
+        token = m.group(0)
+        if any(s < m.end() and m.start() < e for s, e in claimed):
+            continue  # already reported, by the decisive shape
+        if _prose_suspect(
+            token, min_length=min_length, coverage=coverage, randomness=randomness,
+        ):
+            found.append(_Finding(
+                path, first + text[: m.start()].count("\n"), channel,
+                "High-entropy token in prose", shannon_entropy(token),
+                token[:8] + "…",
+            ))
+    return found
 
 
 def iter_python_files(root: Path) -> Iterable[Path]:

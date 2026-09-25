@@ -4,7 +4,7 @@ Closes the case-collision bug surfaced by the capability soak
 bt-2026-05-25-000817:
 
   POST /v1/messages → 401 "invalid x-api-key"
-    request_id=req_011CbNKujYDTjX6Ggs4bT517
+    request_id=req_011CbNKujYDTjX6Ggs4bT517  (a server request id; pragma: allowlist secret)
 
 Direct curl with the same key returns HTTP 200. The Aegis-side proxy
 was leaking the bridge's PLACEHOLDER ``X-Api-Key`` header through to
