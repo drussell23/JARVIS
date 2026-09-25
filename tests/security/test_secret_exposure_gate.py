@@ -174,11 +174,12 @@ def test_a_secret_introduced_by_a_merge_resolution_is_caught(repo):
 
 
 def _push_hook(repo: Path, url: str, stdin: str, hooks_dir: Path = None):
-    env = dict(os.environ)
+    """Run the hook the way git does: through sh, launcher first."""
+    env = {**os.environ, "JARVIS_HOOK_PYTHON": sys.executable}
     if hooks_dir is not None:
         _git(repo, "config", "core.hooksPath", str(hooks_dir))
     return subprocess.run(
-        [sys.executable, str(_HOOK), "origin", url], input=stdin.encode(),
+        ["sh", str(_HOOK), "origin", url], input=stdin.encode(),
         cwd=repo, capture_output=True, env=env, check=False,
     )
 
@@ -299,3 +300,60 @@ def test_no_capable_scanner_anywhere_is_reported_not_refused(tmp_path):
     _git(r, "commit", "-qm", "no scanner in this repository")
     out = _push_hook(r, "https://example.invalid/x.git", _update_line(r))
     assert out.returncode == 0 and b"not applicable" in out.stderr
+
+
+# ---------------------------------------------------------------------------
+# The installed scanner snapshot: trusted, and run alongside the checkout's
+# ---------------------------------------------------------------------------
+
+
+def _installed_hooks(tmp_path: Path) -> Path:
+    """A hooks dir as the installer leaves it: launcher, gate, snapshot."""
+    installer = _load("install_hooks", _REPO / "scripts" / "install_hooks.py")
+    hooks = tmp_path / "installed-hooks"
+    hooks.mkdir()
+    for name in installer._selected(["pre-push"]):
+        ok, message = installer.install_hook(hooks, _HOOK.parent, name)
+        assert ok, message
+    return hooks
+
+
+def _push_installed(repo: Path, hooks: Path, stdin: str):
+    env = {**os.environ, "JARVIS_HOOK_PYTHON": sys.executable}
+    return subprocess.run(
+        ["sh", str(hooks / "pre-push"), "origin", "https://example.invalid/x.git"],
+        input=stdin.encode(), cwd=repo, capture_output=True, env=env, check=False,
+    )
+
+
+def test_the_installer_delivers_the_scanner_snapshot(tmp_path):
+    hooks = _installed_hooks(tmp_path)
+    assert sorted(p.name for p in hooks.iterdir()) == [
+        "pre-push", "pre_push_gate.py", "scan_secrets.py",
+    ]
+    assert (hooks / "scan_secrets.py").read_bytes() == _SCANNER.read_bytes()
+
+
+def test_a_weakened_checkout_scanner_cannot_hide_what_the_snapshot_sees(repo, tmp_path):
+    hooks = _installed_hooks(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    _commit(repo, "leak", **{"cfg.py": f'KEY = "{fake.OPENAI_KEY}"\n'})
+    (repo / ".github" / "scripts" / "scan_secrets.py").write_text(
+        "ALLOWLIST_PRAGMA = 'x'\n"
+        "def scan_revisions(repo, revs, **kw):\n    return []\n",   # sees nothing
+    )
+    r = _push_installed(repo, hooks, _update_line(repo, base))
+    assert r.returncode == 1 and b"OpenAI Key" in r.stderr
+
+
+def test_an_old_checkout_pushing_old_commits_is_still_judged(repo, tmp_path):
+    """The live Windows finding: the clone's branch AND the pushed commits
+    predated per-commit scanning, and the gate reported 'not applicable'."""
+    hooks = _installed_hooks(tmp_path)
+    old = "ALLOWLIST_PRAGMA = 'x'\n"   # predates scan_revisions
+    (repo / ".github" / "scripts" / "scan_secrets.py").write_text(old)
+    _git(repo, "commit", "-qam", "old scanner")
+    base = _git(repo, "rev-parse", "HEAD")
+    _commit(repo, "leak", **{"cfg.py": f'KEY = "{fake.OPENAI_KEY}"\n'})
+    r = _push_installed(repo, hooks, _update_line(repo, base))
+    assert r.returncode == 1 and b"OpenAI Key" in r.stderr

@@ -1,167 +1,113 @@
-#!/usr/bin/env python3
-"""
-JARVIS Pre-Push Secret Gate
-===========================
+#!/bin/sh
+# JARVIS pre-push -- host-agnostic launcher for the secret gate.
+#
+# git runs hooks through a POSIX sh on every platform it supports (Git for
+# Windows ships one), so this file is sh, not Python: a `#!/usr/bin/env
+# python3` hook dies with "not found" on a Windows host whose `python3` is
+# absent -- or, worse, is the Microsoft Store alias, which EXISTS on PATH and
+# only fails when run.
+#
+# So every candidate is PROVEN by running it, never trusted because it was
+# found. The first interpreter that actually executes Python 3.8+ wins:
+#
+#   1. $JARVIS_HOOK_PYTHON            operator override (a path or a command)
+#   2. git config jarvis.hookPython   per-repository override
+#   3. python3, python, py -3         whatever the host provides
+#   4. uv python find                 a uv-managed CPython, if uv is installed
+#   5. WSL bridge (Windows only)      the gate runs inside WSL, on /mnt/...
+#
+# Nothing works: the push is REFUSED with instructions (fail closed).
+# The gate itself is pre_push_gate.py, installed beside this file.
 
-Scans every commit about to leave this machine for credential-shaped values,
-with the same AST + shape scanner CI runs (``.github/scripts/scan_secrets.py``)
--- but BEFORE the push, which is the only point where it can still help.
+hooks_dir=$(cd "$(dirname "$0")" && pwd)
+gate="$hooks_dir/pre_push_gate.py"
+probe='import sys; sys.exit(0 if sys.version_info >= (3, 8) else 3)'
 
-Why it exists: that scanner ran only in CI, after the push. A PEM-shaped test
-fixture reached ``main`` and GitGuardian opened an incident on it; by the time
-CI could have said anything, the bytes were already public. A text scanner on
-the receiving end reads every pushed COMMIT, so this scans each commit's file
-versions, not just the tip.
+if [ ! -f "$gate" ]; then
+    echo "[pre-push] $gate is missing -- reinstall with:" >&2
+    echo "           python3 scripts/install_hooks.py install pre-push" >&2
+    exit 1
+fi
 
-Scope: only pushes to a NETWORK remote are an exposure. The post-commit mirror
-into the local Windows clone is a filesystem push and is not scanned -- doing
-so would put a scan on every commit for no protection.
+case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*|Windows_NT) host=windows ;;
+    *) host=posix ;;
+esac
 
-Chaining: an existing, non-JARVIS ``pre-push`` hook is preserved by the
-installer as ``pre-push.local`` and run after this gate passes, with the same
-arguments and stdin -- so a local main-branch guard is never silently dropped.
+# Probe with stdin detached, so a probe can never consume the ref list git is
+# feeding this hook -- the gate needs every line of it.
+works() {
+    "$@" -c "$probe" </dev/null >/dev/null 2>&1
+}
 
-Fails CLOSED: if the scanner itself cannot run, the push is refused. Bypass a
-reviewed false positive with ``# pragma: allowlist secret`` on the line, or the
-whole gate with ``git push --no-verify``.
+# Resolution only SETS variables; the single exec happens at top level, where
+# "$@" is still the hook's own arguments (inside a function it is not).
+#   py_path  -- an interpreter path, run quoted (it may contain spaces)
+#   py_cmd   -- a command line, run word-split ("py -3")
+py_path=
+py_cmd=
+resolve() {
+    for cand in "$JARVIS_HOOK_PYTHON" "$(git config --get jarvis.hookPython 2>/dev/null)"; do
+        [ -n "$cand" ] || continue
+        if works "$cand"; then py_path=$cand; return 0; fi
+        # shellcheck disable=SC2086 -- deliberate word splitting ("py -3")
+        if works $cand; then py_cmd=$cand; return 0; fi
+        echo "[pre-push] configured interpreter '$cand' does not run Python 3.8+ -- ignored" >&2
+    done
+    for cand in python3 python; do
+        command -v "$cand" >/dev/null 2>&1 || continue
+        if works "$cand"; then py_path=$cand; return 0; fi
+    done
+    if command -v py >/dev/null 2>&1 && works py -3; then
+        py_cmd="py -3"; return 0
+    fi
+    if command -v uv >/dev/null 2>&1; then
+        found=$(uv python find 2>/dev/null)
+        if [ -n "$found" ] && [ "$host" = windows ] && command -v cygpath >/dev/null 2>&1; then
+            found=$(cygpath -u "$found")
+        fi
+        if [ -n "$found" ] && works "$found"; then py_path=$found; return 0; fi
+    fi
+    return 1
+}
 
-Install:  python3 scripts/install_hooks.py install pre-push
-"""
-import os
-import re
-import subprocess
-import sys
-import types
-from pathlib import Path
+if resolve; then
+    if [ -n "$py_path" ]; then
+        exec "$py_path" "$gate" "$@"
+    fi
+    # shellcheck disable=SC2086
+    exec $py_cmd "$gate" "$@"
+fi
 
-_ZERO = re.compile(r"^0+$")
-#: user@host:path -- git's scp-like syntax for an SSH remote.
-_SCP_LIKE = re.compile(r"^[^/\s:@]+@[^/\s:]+:")
+# The WSL bridge: last, because it is the slowest to start and a native
+# interpreter is always preferable. wsl.exe starts in the translated current
+# directory (the repository root), so the gate's git calls see the same repo.
+if [ "$host" = windows ] && command -v wsl.exe >/dev/null 2>&1; then
+    distro=${JARVIS_HOOK_WSL_DISTRO:+-d $JARVIS_HOOK_WSL_DISTRO}
+    # MSYS rewrites POSIX-looking arguments passed to a native .exe
+    # (/mnt/c/... -> C:/Program Files/Git/mnt/c/...). Switch that off for
+    # every argument, the gate path and the remote URL alike.
+    export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
+    win_gate=$(cygpath -w "$gate" 2>/dev/null || echo "$gate")
+    # </dev/null is load-bearing: wsl.exe forwards and CONSUMES its parent's
+    # stdin, so an undetached helper call swallows git's ref list and the gate
+    # then sees nothing to scan and passes -- found live, silently exit 0.
+    # shellcheck disable=SC2086 -- $distro is empty or "-d NAME"
+    wsl_gate=$(wsl.exe $distro -e wslpath -u "$win_gate" </dev/null 2>/dev/null | tr -d '\r')
+    # shellcheck disable=SC2086
+    if [ -n "$wsl_gate" ] && wsl.exe $distro -e python3 -c "$probe" </dev/null >/dev/null 2>&1; then
+        # shellcheck disable=SC2086
+        exec wsl.exe $distro -e python3 "$wsl_gate" "$@"
+    fi
+fi
 
-
-def _git(*args: str) -> str:
-    return subprocess.run(
-        ["git", *args], capture_output=True, text=True, check=False,
-    ).stdout.strip()
-
-
-def _is_network_remote(url: str) -> bool:
-    """True unless *url* is a path on this machine."""
-    if "://" in url:
-        return not url.startswith("file://")
-    if _SCP_LIKE.match(url):
-        return True
-    return False  # an absolute/relative path, or a Windows drive path
-
-
-def _revs_for(local_sha: str, remote_sha: str, remote: str) -> list:
-    """rev-list arguments selecting exactly the commits this ref update sends."""
-    if not _ZERO.match(remote_sha) and _git("cat-file", "-t", remote_sha) == "commit":
-        return [local_sha, "^" + remote_sha]
-    # A new branch, or a remote tip we have not fetched: everything not
-    # already on the remote. A push to a bare URL has no remote-tracking refs
-    # of its own, so fall back to "not on ANY remote" rather than scanning the
-    # branch's whole history.
-    named = remote in _git("remote").split()
-    return [local_sha, "--not", f"--remotes={remote}" if named else "--remotes"]
-
-
-_SCANNER_PATH = ".github/scripts/scan_secrets.py"
-
-
-def _module_from_source(source: str, origin: str):
-    module = types.ModuleType("scan_secrets")
-    module.__file__ = origin
-    sys.modules["scan_secrets"] = module
-    exec(compile(source, origin, "exec"), module.__dict__)  # noqa: S102
-    return module
-
-
-def _load_scanner(root: Path, pushed: list):
-    """The scanner that can judge this push, or None if no version can.
-
-    The working tree comes first. A checkout on an older branch carries a
-    scanner that predates per-commit scanning, so the version inside each
-    commit being pushed is tried next -- the gate should not refuse every push
-    from an old branch, nor go blind on one. A scanner that fails to LOAD
-    raises: that is a broken gate, and the caller fails closed.
-    """
-    candidates = []
-    path = root / _SCANNER_PATH
-    if path.is_file():
-        candidates.append((path.read_text(encoding="utf-8"), str(path)))
-    for sha in pushed:
-        blob = subprocess.run(
-            ["git", "show", f"{sha}:{_SCANNER_PATH}"],
-            capture_output=True, text=True, check=False,
-        )
-        if blob.returncode == 0:
-            candidates.append((blob.stdout, f"{sha[:10]}:{_SCANNER_PATH}"))
-    for source, origin in candidates:
-        module = _module_from_source(source, origin)
-        if hasattr(module, "scan_revisions"):
-            return module
-    return None
-
-
-def _chain(argv: list, stdin: bytes) -> int:
-    local = Path(_git("rev-parse", "--git-path", "hooks")) / "pre-push.local"
-    if local.is_file() and os.access(local, os.X_OK):
-        return subprocess.run([str(local), *argv], input=stdin, check=False).returncode
-    return 0
-
-
-def main() -> int:
-    argv = sys.argv[1:]
-    remote = argv[0] if argv else ""
-    url = argv[1] if len(argv) > 1 else remote
-    stdin = sys.stdin.buffer.read()
-
-    if _is_network_remote(url):
-        root = Path(_git("rev-parse", "--show-toplevel") or ".")
-        updates = [
-            parts for parts in (
-                line.split() for line in stdin.decode("utf-8", "replace").splitlines()
-            )
-            # malformed lines and branch deletions carry nothing to scan
-            if len(parts) == 4 and not _ZERO.match(parts[1])
-        ]
-        try:
-            scanner = _load_scanner(root, [parts[1] for parts in updates])
-            if scanner is None:
-                sys.stderr.write(
-                    "[pre-push] no per-commit secret scanner in this checkout "
-                    "or the pushed commits -- secret gate not applicable\n",
-                )
-            else:
-                findings = []
-                for parts in updates:
-                    findings += scanner.scan_revisions(
-                        root, _revs_for(parts[1], parts[3], remote),
-                    )
-                if findings:
-                    sys.stderr.write(
-                        f"\n\033[1;31m[pre-push] {len(findings)} credential-shaped "
-                        f"value(s) in the commits being pushed to {remote}:\033[0m\n",
-                    )
-                    for f in findings:
-                        sys.stderr.write(f"   {f.kind} · {f.path}:{f.line} ({f.name})\n")
-                    sys.stderr.write(
-                        "\n   A test fixture must never contain a complete credential:\n"
-                        "   build it from fragments (tests/support/fake_credentials.py).\n"
-                        "   A value already pushed stays in history -- rewrite the\n"
-                        "   unpushed commits, not just the tip.\n"
-                        f"   Reviewed false positive: '# {scanner.ALLOWLIST_PRAGMA}'.\n\n",
-                    )
-                    return 1
-        except Exception as exc:  # noqa: BLE001 -- fail closed
-            sys.stderr.write(
-                f"\033[1;31m[pre-push] secret gate failed to run: "
-                f"{type(exc).__name__}: {exc} -- push refused (fail closed)\033[0m\n",
-            )
-            return 1
-    return _chain(argv, stdin)
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+cat >&2 <<'EOF'
+[pre-push] JARVIS secret gate: no working Python 3.8+ interpreter found.
+           Tried $JARVIS_HOOK_PYTHON, git config jarvis.hookPython, python3,
+           python, py -3, `uv python find`, and (on Windows) the WSL bridge.
+           A Microsoft Store "python" alias does not count -- it only opens
+           the Store. Point the gate at a real interpreter:
+               git config jarvis.hookPython "C:/path/to/python.exe"
+           Push refused (fail closed). To bypass once: git push --no-verify
+EOF
+exit 1

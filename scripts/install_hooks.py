@@ -17,6 +17,7 @@ Usage:
     python scripts/install_hooks.py remove   # Remove hooks
     python scripts/install_hooks.py status   # Check status
     python scripts/install_hooks.py install pre-push   # Only the named hook(s)
+    python scripts/install_hooks.py --repo C:/path/to/clone install pre-push
 
 Author: JARVIS System
 """
@@ -46,7 +47,9 @@ def color(text: str, *styles: str) -> str:
 
 
 def get_project_root() -> Path:
-    """Get the project root directory."""
+    """Get the project root directory (the ``--repo`` target when given)."""
+    if _TARGET_REPO is not None:
+        return _TARGET_REPO
     # Try to find the root by looking for .git
     current = Path(__file__).resolve().parent
     
@@ -133,10 +136,24 @@ HOOKS_TO_INSTALL = [
 #: replacing it: hook name -> where the foreign hook is preserved.
 CHAINED_HOOKS = {"pre-push": "pre-push.local"}
 
+#: Files a hook cannot run without. "pre-push" is a host-agnostic sh launcher;
+#: the gate it launches is Python, installed beside it -- selecting the hook
+#: selects its companions, so a partial install cannot exist.
+HOOK_COMPANIONS = {"pre-push": ("pre_push_gate.py", "scan_secrets.py")}
+
+#: Companions that do not live in scripts/hooks/, by path from the repository
+#: root. The gate runs this SNAPSHOT of the scanner alongside the checkout's
+#: copy, so neither an old branch nor a weakened working tree can blind it.
+COMPANION_SOURCES = {"scan_secrets.py": Path(".github") / "scripts" / "scan_secrets.py"}
+
+#: Set by ``--repo``: install into ANOTHER checkout's hooks (e.g. the Windows
+#: clone from the WSL one) using this checkout's hook sources.
+_TARGET_REPO: Optional[Path] = None
+
 
 def _is_jarvis_hook(path: Path) -> bool:
     try:
-        return "JARVIS" in path.read_text(errors="replace")
+        return "JARVIS" in path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
 
@@ -161,8 +178,11 @@ def backup_hook(hooks_dir: Path, hook_name: str) -> bool:
 
 
 def install_hook(hooks_dir: Path, source_dir: Path, hook_name: str) -> Tuple[bool, str]:
-    """Install a single hook."""
+    """Install a single hook (or a hook's companion file)."""
     source_path = source_dir / hook_name
+    if hook_name in COMPANION_SOURCES:
+        # scripts/hooks/ -> repository root -> the companion's real home
+        source_path = source_dir.resolve().parents[1] / COMPANION_SOURCES[hook_name]
     dest_path = hooks_dir / hook_name
     
     if not source_path.exists():
@@ -203,8 +223,9 @@ def remove_hook(hooks_dir: Path, hook_name: str) -> Tuple[bool, str]:
     
     try:
         # Check if it's our hook by looking for JARVIS signature
-        content = hook_path.read_text()
-        if "JARVIS" not in content:
+        content = hook_path.read_text(encoding="utf-8", errors="replace")
+        is_companion = any(hook_name in c for c in HOOK_COMPANIONS.values())
+        if "JARVIS" not in content and not is_companion:
             return False, f"{hook_name} exists but is not a JARVIS hook - not removing"
         
         # Backup before removing
@@ -233,7 +254,7 @@ def get_hook_status(hooks_dir: Path, hook_name: str) -> str:
         return color("not installed", Colors.YELLOW)
     
     try:
-        content = hook_path.read_text()
+        content = hook_path.read_text(encoding="utf-8", errors="replace")
         if "JARVIS" in content:
             # Check if executable
             if os.access(hook_path, os.X_OK):
@@ -250,11 +271,16 @@ def _selected(names) -> list:
     """The managed hooks *names* selects; all of them when empty. Unknown
     names raise rather than being silently ignored."""
     if not names:
-        return list(HOOKS_TO_INSTALL)
+        names = list(HOOKS_TO_INSTALL)
     unknown = [n for n in names if n not in HOOKS_TO_INSTALL]
     if unknown:
         raise SystemExit(f"Unknown hook(s): {unknown}; managed: {HOOKS_TO_INSTALL}")
-    return list(names)
+    out: list = []
+    for name in names:
+        for item in (*HOOK_COMPANIONS.get(name, ()), name):
+            if item not in out:
+                out.append(item)
+    return out
 
 
 def cmd_install(names=None) -> int:
@@ -365,6 +391,21 @@ def cmd_status() -> int:
 
 def main() -> int:
     """Main entry point."""
+    global _TARGET_REPO
+    # A Windows console codec (cp1252) cannot encode the status emoji; the
+    # installer must degrade its output, never crash before installing.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    if "--repo" in sys.argv:
+        i = sys.argv.index("--repo")
+        if i + 1 >= len(sys.argv):
+            print("--repo needs a path")
+            return 1
+        _TARGET_REPO = Path(sys.argv[i + 1]).resolve()
+        del sys.argv[i:i + 2]
     if len(sys.argv) < 2:
         cmd = "install"
     else:
