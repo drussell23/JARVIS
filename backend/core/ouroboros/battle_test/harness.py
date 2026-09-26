@@ -5399,8 +5399,14 @@ class BattleTestHarness:
             from backend.core.ouroboros.governance.paid_lanes import posture
             p = posture()
             model = resolve_display_model() or "local lane"
-            off = [f"{name}: {v['reason']}" for name, v in p["lanes"].items()
-                   if not v["allowed"]]
+            # Grouped by reason: one declaration switching every lane off
+            # reads once, and distinct causes still read per lane.
+            by_reason: dict = {}
+            for name, v in p["lanes"].items():
+                if not v["allowed"]:
+                    by_reason.setdefault(v["reason"], []).append(name)
+            off = [f"{', '.join(names)}: {reason}"
+                   for reason, names in by_reason.items()]
             if p["mode"] == "local-only":
                 self._repl_print(
                     f"[{_SEM['neural']}]⚙ Local-first[/{_SEM['neural']}] "

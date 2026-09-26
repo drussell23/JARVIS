@@ -259,3 +259,18 @@ def test_the_status_chip_reads_local_when_paid_lanes_are_declared_off(paid_off, 
     monkeypatch.setattr(capability_state.CapabilityEvaluator, "_read_remote",
                         staticmethod(lambda: ("serving", "localhost:11434", True)))
     assert StatusLineBuilder()._sample_funding() == ("local", "localhost:11434")
+
+
+def test_the_boot_banner_says_local_first_once(paid_off, monkeypatch):
+    """Found live (bt-2026-09-26-142157): one declaration was printed once
+    per lane. Lanes are grouped by the reason they are off."""
+    from backend.core.ouroboros.battle_test.harness import BattleTestHarness
+    from backend.core.ouroboros.governance import candidate_generator as cg
+    monkeypatch.setattr(cg, "resolve_display_model", lambda: "qwen3-coder-ov:30b")
+    printed = []
+    stub = SimpleNamespace(_repl_print=printed.append)
+    BattleTestHarness._announce_lane_posture(stub)
+    (line,) = printed
+    assert "Local-first" in line and "qwen3-coder-ov:30b" in line
+    assert "claude, doubleword: JARVIS_PAID_LANES_ENABLED=false" in line
+    assert line.count("JARVIS_PAID_LANES_ENABLED") == 1
