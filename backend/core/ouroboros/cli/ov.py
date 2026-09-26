@@ -455,6 +455,8 @@ _SENTINEL_FLAGS = (
 #: quarantine, no idle/wall leash). Read by the bootstrap's `--production-soak`
 #: default, so the detached daemon inherits it through the environment.
 _PRODUCTION_SOAK_ENV = "OUROBOROS_PRODUCTION_SOAK"
+#: accumulation_promotion_gate's master switch (the gate owns the name).
+_PROMOTION_ENV = "JARVIS_ACCUMULATION_PROMOTION_ENABLED"
 
 _NO_SENTINEL = "--no-sentinel"
 _NO_PRODUCTION_SOAK = "--no-production-soak"
@@ -501,6 +503,12 @@ def arm_production_soak(environ=None) -> bool:
     if current in _FALSY:
         return False
     env[_PRODUCTION_SOAK_ENV] = "1"
+    # Continuous LOCAL promotion rides the same profile: each verified
+    # landing fast-forwards the operator's branch (never pushed — GitHub
+    # stays the operator's call). Its own exported false still wins.
+    promo = str(env.get(_PROMOTION_ENV, "") or "").strip().lower()
+    if promo not in _FALSY:
+        env[_PROMOTION_ENV] = "true"
     return True
 
 

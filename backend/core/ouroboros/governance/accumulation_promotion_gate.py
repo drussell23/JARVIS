@@ -69,6 +69,7 @@ __all__ = [
     "Finding",
     "PromotionVerdict",
     "PromotionConflictFault",
+    "commit_session",
     "gate_enabled",
     "verify_commit",
     "promote_accumulation_commit",
@@ -155,6 +156,10 @@ class PromotionVerdict:
     landed_shas: Tuple[str, ...] = ()
     findings: Tuple[Finding, ...] = ()
     detail: str = ""
+    #: ff-only promotions: what became of the source branch —
+    #: ``deleted`` / ``checked_out`` (a live session still commits to it) /
+    #: ``unmerged`` / … (``WorktreeManager.delete_branch_if_merged``).
+    branch_disposition: str = ""
 
     @property
     def refusals(self) -> Tuple[Finding, ...]:
@@ -214,6 +219,13 @@ def _file_at(sha: str, path: str, repo_root: Path) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+def commit_session(message: str) -> str:
+    """The ``Session:`` trailer an autonomous commit carries, or ``""``.
+    Line-anchored: a trailer is a line, and ``Claude-Session:`` is not it."""
+    m = re.search(r"^Session:\s*(\S+)", message or "", re.MULTILINE)
+    return m.group(1) if m else ""
+
+
 def _classify_commit(
     sha: str, repo_root: Path, branch: str, owner: str,
 ) -> Tuple[str, str]:
@@ -244,8 +256,7 @@ def _classify_commit(
         if not re.search(rf"^{re.escape(t)}:", msg, re.MULTILINE)
     ]
     if not missing:
-        m = re.search(r"^Session:\s*(\S+)", msg, re.MULTILINE)
-        session = m.group(1) if m else ""
+        session = commit_session(msg)
         if not session:
             return "unknown", f"{sha[:12]}: Session trailer present but empty"
         if session not in branch:
@@ -652,6 +663,7 @@ async def promote_accumulation_commit(
     manager: Any = None, python_bin: str = "python3",
     test_timeout_s: float = 300.0, record_lesson: Any = None,
     base: str = "",
+    target_branch: str = "",
 ) -> PromotionVerdict:
     """Verify, then delegate the merge. NEVER raises — faults become verdicts.
 
@@ -659,11 +671,22 @@ async def promote_accumulation_commit(
     it is injected so this module has no git-writing surface of its own and so
     tests can drive the refusal paths without a repository. ``record_lesson``
     is the LessonMemory seam, injected for the same reason.
+
+    ``target_branch`` selects the STRICT mode: the verified range is moved
+    onto that branch by fast-forward only
+    (:meth:`WorktreeManager.fast_forward_branch`), wherever it is or is not
+    checked out. A target that has diverged is refused with an ERROR asking
+    for a rebase — never merged, never cherry-picked, never left in a
+    conflict state — and on success the source branch is pruned by the one
+    safe deletion rule. ``base`` defaults to the target's head, because the
+    range that moves is exactly what must be verified.
     """
     repo_root = Path(repo_root)
     target = Path(target_root) if target_root is not None else repo_root
     if not gate_enabled():
         return PromotionVerdict(False, "gate_disabled", (sha,), detail=_ENV_ENABLED)
+    if target_branch and not base:
+        base = "refs/heads/%s" % target_branch
 
     findings = await verify_commit(
         sha, repo_root=repo_root, branch=branch,
@@ -711,6 +734,12 @@ async def promote_accumulation_commit(
         rc, out = _git(["rev-list", "--reverse", f"{base}..{sha}"], repo_root)
         if rc == 0 and out.strip():
             shas = [s.strip() for s in out.splitlines() if s.strip()]
+    if target_branch:
+        return await _fast_forward(
+            manager, sha=sha, branch=branch, target_branch=target_branch,
+            shas=shas, findings=findings, repo_root=repo_root,
+            record_lesson=record_lesson,
+        )
     try:
         result = await manager.promote_commits(
             target_root=str(target), branch=branch, commit_shas=shas,
@@ -765,6 +794,59 @@ async def promote_accumulation_commit(
     return PromotionVerdict(
         True, "promoted", (sha,), landed_shas=landed, findings=findings,
         detail=str(getattr(result, "strategy", "")),
+    )
+
+
+async def _fast_forward(
+    manager: Any, *, sha: str, branch: str, target_branch: str,
+    shas: Sequence[str], findings: Tuple[Finding, ...], repo_root: Path,
+    record_lesson: Any,
+) -> PromotionVerdict:
+    """The strict half of :func:`promote_accumulation_commit`. NEVER raises.
+
+    No quarantine ref on failure: a fast-forward either happens or leaves
+    every ref exactly where it was, so there is no conflicting state to pin
+    — the untouched source branch IS the reviewable artifact.
+    """
+    try:
+        result = await manager.fast_forward_branch(target_branch, branch, list(shas))
+    except Exception as exc:  # noqa: BLE001
+        state = str(getattr(exc, "state", "") or type(exc).__name__)
+        detail = str(getattr(exc, "detail", "") or exc)[:300]
+        if state == "diverged":
+            logger.error(
+                "[PromotionGate] %s NOT promoted onto %s — %s. Rebase %s onto "
+                "%s; nothing was merged and no ref moved.",
+                sha[:12], target_branch, detail, branch, target_branch,
+            )
+        else:
+            logger.warning(
+                "[PromotionGate] %s NOT promoted onto %s — %s: %s",
+                sha[:12], target_branch, state, detail,
+            )
+        await _record(
+            record_lesson, sha=sha, files=_touched_files(sha, repo_root),
+            failure_class="promotion_%s" % state, detail=detail,
+        )
+        return PromotionVerdict(
+            False, state, (sha,), findings=findings, detail=detail,
+        )
+    landed = tuple(getattr(result, "landed_shas", ()) or ())
+    try:
+        disposition = await manager.delete_branch_if_merged(
+            branch, into=target_branch,
+        )
+    except Exception:  # noqa: BLE001 — pruning never undoes a promotion
+        disposition = "git_failure"
+    logger.info(
+        "[PromotionGate] %s fast-forwarded onto %s (%d commit(s)); source "
+        "branch %s: %s", sha[:12], target_branch, len(landed), branch,
+        disposition,
+    )
+    return PromotionVerdict(
+        True, "promoted", (sha,), landed_shas=landed, findings=findings,
+        detail=str(getattr(result, "mode", "")),
+        branch_disposition=disposition,
     )
 
 

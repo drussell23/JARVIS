@@ -38,6 +38,8 @@ export JARVIS_REMOTE_PUSH_AIRGAP=true
 export JARVIS_SENTINEL_MODE_ENABLED=true
 export JARVIS_GOAL_DISCOVERY_ENABLED=true
 export JARVIS_REPAIR_TRAJECTORY_EMIT_ENABLED=true
+# Continuous local promotion: verified landings fast-forward main (never pushed).
+export JARVIS_ACCUMULATION_PROMOTION_ENABLED=${JARVIS_ACCUMULATION_PROMOTION_ENABLED:-true}
 export PYTHONUNBUFFERED=1
 
 exec "$PY" -m backend.core.ouroboros.battle_test.terminal_supervisor \

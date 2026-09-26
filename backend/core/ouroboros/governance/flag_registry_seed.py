@@ -1593,12 +1593,16 @@ SEED_SPECS: list = [
         name="JARVIS_ACCUMULATION_PROMOTION_ENABLED",
         type=FlagType.BOOL, default=False,
         description=(
-            "Master gate for post-hoc promotion of an accumulation branch "
-            "onto main. FALSE (the production posture) means landings stay "
+            "Master gate for promotion of a session branch onto the "
+            "operator's branch. Code default FALSE: landings stay "
             "quarantined on ouroboros/auto/<session> for operator review. "
-            "TRUE lets accumulation_promotion_gate verify a range and "
-            "DELEGATE the merge to WorktreeManager.promote_commits — it owns "
-            "no git mutation of its own. Three checks, all fail-closed: "
+            "The `ov` production profile and the supervised soak launcher "
+            "arm it: main_promoter then fast-forwards the target (env "
+            "JARVIS_ACCUMULATION_PROMOTION_TARGET, else origin's default "
+            "branch) onto every verified landing — ff-only, never a merge "
+            "commit, never pushed — and prunes merged session branches. "
+            "The gate verifies the range and DELEGATES every git mutation to "
+            "WorktreeManager. Checks, all fail-closed: "
             "provenance (every commit in the range is the sanctioned lane's "
             "or the repo owner's, and at least one is autonomous), structure "
             "(no public symbol or __all__ export silently lost — the "

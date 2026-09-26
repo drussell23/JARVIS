@@ -233,13 +233,25 @@ def is_valid_git_work_area(path: Any) -> bool:
         return False
 
 
+#: Every session workspace branch lives under this namespace.
+WORKSPACE_BRANCH_ROOT = "ouroboros/auto/"
+
+
+def workspace_branch_prefix(session_id: str) -> str:
+    """The part of :func:`workspace_branch` that is knowable without the
+    per-boot nonce — so another process (or the same one after a restart)
+    can find a session's branch from git instead of re-deriving a nonce it
+    never saw."""
+    return "%s%s-" % (WORKSPACE_BRANCH_ROOT, session_id)
+
+
 def workspace_branch(session_id: str) -> str:
     """Quarantine branch name. Intentionally identical to the
     Ledger-Sovereignty commit-workspace branch so file + commit isolation
     converge on ONE worktree, swept by the existing ``ouroboros/auto/*``
     reaper. A per-boot cryptographic nonce (Task 3) makes the name collision-
     proof across runs without resetting a prior crashed run's branch."""
-    return "ouroboros/auto/%s-%s" % (session_id, _session_branch_nonce(session_id))
+    return workspace_branch_prefix(session_id) + _session_branch_nonce(session_id)
 
 
 async def resolve_loop_project_root(

@@ -364,6 +364,23 @@ def _build_comm_protocol(
         transports.append(LandedMetricsTransport())
         logger.info("[Integration] LandedMetricsTransport added to CommProtocol")
 
+    # MainPromotionTransport — always add; inert unless
+    # JARVIS_ACCUMULATION_PROMOTION_ENABLED. Observes the `phase="commit"`
+    # heartbeat both commit paths already emit, so every landing is promoted
+    # (fast-forward only) without either path knowing. Bound to the protocol
+    # below, once it exists, to announce each outcome.
+    _promoter = None
+    try:
+        from backend.core.ouroboros.governance.main_promoter import (
+            MainPromotionTransport,
+        )
+    except ImportError:
+        logger.warning("[Integration] MainPromotionTransport skipped: module not available")
+    else:
+        _promoter = MainPromotionTransport()
+        transports.append(_promoter)
+        logger.info("[Integration] MainPromotionTransport added to CommProtocol")
+
     # LangfuseTransport — optional, enabled via LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY
     if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
         try:
@@ -416,7 +433,10 @@ def _build_comm_protocol(
         "[Integration] CommProtocol transport stack: %s",
         [type(t).__name__ for t in transports],
     )
-    return CommProtocol(transports=transports)
+    protocol = CommProtocol(transports=transports)
+    if _promoter is not None:
+        _promoter.bind(protocol)
+    return protocol
 
 
 # ---------------------------------------------------------------------------

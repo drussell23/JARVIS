@@ -19,6 +19,7 @@ Design notes
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -28,7 +29,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import AsyncIterator, Dict, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,9 @@ class PromotionError(RuntimeError):
     """Typed fail-closed promotion failure (Slice 11 mandate 2).
 
     ``state`` is one of: ``target_dirty``, ``conflict_aborted``,
-    ``branch_missing``, ``commit_budget_exceeded``, ``git_failure``.
+    ``branch_missing``, ``commit_budget_exceeded``, ``git_failure``,
+    ``diverged`` (ff-only mode: the target is not an ancestor of the
+    promoted commits, so only a rebase can land them).
     On ANY failure the workspace branch is untouched — it remains the
     quarantined, reviewable artifact (Sovereign Execution Boundary).
     """
@@ -163,8 +166,13 @@ def _parse_worktree_porcelain(text: str) -> "list[dict[str, str]]":
 # the boot WorktreeManager was constructed with (the prod base differs from the
 # repo-root ``.worktrees`` where the debris actually lives). The ``__`` dir form
 # + ``soak-`` cover the unregistered-on-disk-dir path under this manager's base.
+#: Directory-name prefix of the short-lived checkouts promotion verifies in
+#: (:meth:`WorktreeManager.detached_checkout`). Listed below so a crash that
+#: skips its ``finally`` is swept at the next boot like any other debris.
+_VERIFY_CHECKOUT_PREFIX = "promote-verify-"
+
 _DEFAULT_REAP_EXTRA_PREFIXES = (
-    "ouroboros/auto/bt-", "ouroboros__auto__bt-", "soak-",
+    "ouroboros/auto/bt-", "ouroboros__auto__bt-", "soak-", _VERIFY_CHECKOUT_PREFIX,
 )
 
 
@@ -655,6 +663,36 @@ class WorktreeManager:
             return []
         return out
 
+    @contextlib.asynccontextmanager
+    async def detached_checkout(self, commit: str) -> "AsyncIterator[Path]":
+        """A throwaway checkout of exactly ``commit``, removed on every exit.
+
+        What promotion verification must run against. A fast-forward makes
+        the target's tree byte-identical to the landing's, so this IS the
+        post-promotion state — where the target's current checkout is the
+        pre-promotion state, which does not yet hold the tests the landing
+        adds and would refuse every test-synthesis landing.
+
+        Detached (no branch to leak) under this manager's worktree base, with
+        a name the boot reaper recognises should a crash skip the ``finally``.
+        """
+        self._worktree_base.mkdir(parents=True, exist_ok=True)
+        path = self._worktree_base / (
+            "%s%s-%s" % (_VERIFY_CHECKOUT_PREFIX, commit[:12], os.urandom(3).hex())
+        )
+        rc, _, err = await self._run_git_rc(
+            self._repo_root, ["worktree", "add", "--detach", "--quiet", str(path), commit],
+        )
+        if rc != 0:
+            raise PromotionError(
+                "git_failure", "detached checkout of %s: %s"
+                % (commit[:12], err.strip()[:200]),
+            )
+        try:
+            yield path
+        finally:
+            await self.cleanup(path)
+
     async def cleanup(self, worktree_path: Path) -> None:
         """Remove worktree_path from git's worktree list and delete it.
 
@@ -974,7 +1012,23 @@ class WorktreeManager:
                         "live session", name,
                     )
                     continue
-                await self._git_delete_branch(name)
+                if _p == branch_prefix:
+                    # The caller's own prefix (L3 ``unit-`` scratch): work
+                    # units never survive a process boundary, so a blind
+                    # sweep loses nothing — unchanged.
+                    await self._git_delete_branch(name)
+                    continue
+                # Campaign debris (``ouroboros/auto/bt-``, …) is a SESSION
+                # branch and can hold the only copy of a landing that was
+                # never promoted. A forced delete here discarded exactly that
+                # at every boot, contradicting reap_dangling_auto_branches'
+                # own rule; both now share the one rule.
+                disposition = await self.delete_branch_if_merged(name)
+                if disposition != "deleted":
+                    logger.info(
+                        "WorktreeManager.reap_orphans: KEEPING branch %s — %s",
+                        name, disposition,
+                    )
 
         await self._run_git_capture(["worktree", "prune"])
 
@@ -1153,20 +1207,17 @@ class WorktreeManager:
                 dangling_branches.append(name)
 
         for branch_short in dangling_branches:
-            try:
-                reachable = await self._branch_reachable_elsewhere(branch_short)
-            except Exception:  # noqa: BLE001 — conservative on error
-                reachable = False
-            if reachable:
-                await self._git_delete_branch(branch_short)
-            else:
+            # The one deletion rule (reachable elsewhere, not checked out,
+            # compare-and-swap on the verified tip) shared with reap_orphans
+            # and post-promotion pruning.
+            disposition = await self.delete_branch_if_merged(branch_short)
+            if disposition != "deleted":
                 logger.info(
                     "WorktreeManager.reap_dangling_auto_branches: "
-                    "preserving branch %s — tip not reachable from any "
-                    "other ref (possible unpushed autonomous commits; "
-                    "worktree already reaped, branch left as forensic "
-                    "evidence)",
-                    branch_short,
+                    "preserving branch %s — %s (an unmerged branch may hold "
+                    "unpushed autonomous commits; worktree already reaped, "
+                    "branch left as forensic evidence)",
+                    branch_short, disposition,
                 )
 
         try:
@@ -1181,23 +1232,6 @@ class WorktreeManager:
                 len(reaped),
             )
         return len(reaped)
-
-    async def _branch_reachable_elsewhere(self, branch: str) -> bool:
-        """True iff ``branch``'s tip commit is reachable from some ref
-        OTHER than ``branch`` itself — i.e. deleting the branch label
-        would not make the commit unreachable (safe to prune). Used to
-        decide whether a dangling ``ouroboros/auto/*`` branch's ref
-        can be deleted without risking unpushed/unmerged autonomous
-        work. NEVER raises — a git failure is treated as "not
-        reachable" (conservative — leaves the branch alone)."""
-        out = await self._run_git_capture(
-            ["for-each-ref", "--format=%(refname:short)", "--contains", branch],
-        )
-        others = [
-            line.strip() for line in out.splitlines()
-            if line.strip() and line.strip() != branch
-        ]
-        return bool(others)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1318,6 +1352,217 @@ class WorktreeManager:
                 all_exempt = False
         return all_exempt, dirty_paths
 
+    async def _preflight_promotion(
+        self, root: Path, branch: str, commit_shas: Sequence[str],
+    ) -> List[str]:
+        """Budget, branch and commit existence, full-id normalization.
+        Read-only. Returns ``[]`` for nothing to promote; raises the typed
+        :class:`PromotionError` otherwise."""
+        shas = [s for s in commit_shas if s]
+        if not shas:
+            return []
+        try:
+            _max = int(os.environ.get("JARVIS_PROMOTION_MAX_COMMITS", "8"))
+        except ValueError:
+            _max = 8
+        if len(shas) > _max:
+            raise PromotionError(
+                "commit_budget_exceeded", "%d > %d" % (len(shas), _max),
+            )
+
+        rc, _, _ = await self._run_git_rc(
+            root, ["rev-parse", "--verify", "--quiet",
+                   "refs/heads/%s" % branch],
+        )
+        if rc != 0:
+            raise PromotionError("branch_missing", branch)
+        # Review P1: NORMALIZE to full ids. AutoCommitter reports SHORT
+        # hashes (`rev-parse --short HEAD`); every downstream comparison
+        # (ff range equality, landed-sha readback) needs full 40-char forms.
+        full_shas: List[str] = []
+        for s in shas:
+            rc, out, _ = await self._run_git_rc(
+                root, ["rev-parse", "--verify", "--quiet", s + "^{commit}"],
+            )
+            if rc != 0:
+                raise PromotionError("git_failure", "unknown commit %s" % s[:12])
+            full_shas.append(out.strip())
+        return full_shas
+
+    async def _require_exact_fast_forward(
+        self, root: Path, base: str, full_shas: Sequence[str],
+    ) -> None:
+        """Raise ``diverged`` unless moving ``base`` to the last sha is a pure
+        fast-forward that lands EXACTLY ``full_shas`` — no more, no fewer.
+
+        Ancestry alone is not enough: ``merge --ff-only`` / a ref move lands
+        the whole ``base..tip`` range, so a range carrying a commit the
+        caller did not verify would ride along unchecked."""
+        last = full_shas[-1]
+        rc, _, _ = await self._run_git_rc(
+            root, ["merge-base", "--is-ancestor", base, last],
+        )
+        if rc != 0:
+            raise PromotionError(
+                "diverged",
+                "%s is not an ancestor of %s — the target moved; rebase "
+                "the branch onto it" % (base[:40], last[:12]),
+            )
+        rc, out, _ = await self._run_git_rc(
+            root, ["rev-list", "--reverse", "%s..%s" % (base, last)],
+        )
+        got = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        if rc != 0 or got != list(full_shas):
+            raise PromotionError(
+                "diverged",
+                "%s..%s holds %d commit(s), %d were verified"
+                % (base[:40], last[:12], len(got), len(full_shas)),
+            )
+
+    async def branch_checkouts(self) -> Dict[str, str]:
+        """``{branch: worktree path}`` for every branch checked out in any
+        worktree of this repository. Read-only. NEVER raises."""
+        out: Dict[str, str] = {}
+        try:
+            rc, text, _ = await self._run_git_rc(
+                self._repo_root, ["worktree", "list", "--porcelain"],
+            )
+            if rc != 0:
+                return out
+            path = ""
+            for line in text.splitlines():
+                if line.startswith("worktree "):
+                    path = line.split(" ", 1)[1].strip()
+                elif line.startswith("branch refs/heads/") and path:
+                    out[line[len("branch refs/heads/"):].strip()] = path
+        except Exception:  # noqa: BLE001
+            logger.debug("WorktreeManager.branch_checkouts degraded", exc_info=True)
+        return out
+
+    async def fast_forward_branch(
+        self,
+        target_branch: str,
+        source_branch: str,
+        commit_shas: Sequence[str],
+    ) -> PromotionResult:
+        """Move ``target_branch`` to the last of ``commit_shas`` by a strict
+        FAST-FORWARD, or refuse. Never a merge commit, never a cherry-pick,
+        never a conflict state.
+
+        Where the target is checked out, the move happens IN that worktree
+        (``promote_commits(ff_only=True)``), so its files follow the ref and
+        the operator-dirt check applies. Where it is not checked out anywhere,
+        there is no tree to update and the move is a compare-and-swap
+        ``update-ref``: it lands only if the ref still points where the
+        fast-forward proof was taken, so a concurrent writer turns into a
+        ``diverged`` refusal instead of a lost update.
+        """
+        checkout = (await self.branch_checkouts()).get(target_branch)
+        if checkout:
+            return await self.promote_commits(
+                Path(checkout), source_branch, commit_shas, ff_only=True,
+            )
+        root = self._repo_root
+        full_shas = await self._preflight_promotion(root, source_branch, commit_shas)
+        if not full_shas:
+            return PromotionResult((), "none", str(root))
+        ref = "refs/heads/%s" % target_branch
+        rc, old, _ = await self._run_git_rc(root, ["rev-parse", "--verify", "--quiet", ref])
+        if rc != 0:
+            raise PromotionError("branch_missing", target_branch)
+        old = old.strip()
+        await self._require_exact_fast_forward(root, old, full_shas)
+        rc, _, err = await self._run_git_rc(
+            root,
+            ["update-ref", "-m", "ouroboros: fast-forward promotion of %s"
+             % source_branch, ref, full_shas[-1], old],
+        )
+        if rc != 0:
+            raise PromotionError(
+                "diverged", "%s moved during promotion: %s"
+                % (target_branch, err.strip()[:200]),
+            )
+        logger.info(
+            "WorktreeManager.fast_forward_branch: %s %s -> %s (%d commit(s), "
+            "ref-only; not checked out)",
+            target_branch, old[:12], full_shas[-1][:12], len(full_shas),
+        )
+        return PromotionResult(
+            tuple(full_shas), "ff", str(root), landed_shas=tuple(full_shas),
+        )
+
+    async def delete_branch_if_merged(
+        self, branch: str, *, into: str = "",
+    ) -> str:
+        """Delete ``branch`` only when nothing can be lost. Returns why.
+
+        ``deleted``        its tip is reachable from ``into`` (or, with no
+                           ``into``, from some other ref) and it was removed
+                           by a compare-and-swap on that exact tip;
+        ``checked_out``    a worktree still has it checked out — a live
+                           session keeps committing to it;
+        ``unmerged``       it holds commits no other ref reaches;
+        ``missing`` / ``moved`` / ``git_failure``.
+
+        The one deletion rule for session branches. ``git branch -D`` deletes
+        whatever it is given, which is how a boot sweep could discard a
+        landing that was never promoted. NEVER raises.
+        """
+        try:
+            ref = "refs/heads/%s" % branch
+            rc, tip, _ = await self._run_git_rc(
+                self._repo_root, ["rev-parse", "--verify", "--quiet", ref],
+            )
+            if rc != 0:
+                return "missing"
+            tip = tip.strip()
+            if branch in await self.branch_checkouts():
+                return "checked_out"
+            if into:
+                rc, _, _ = await self._run_git_rc(
+                    self._repo_root,
+                    ["merge-base", "--is-ancestor", tip, "refs/heads/%s" % into],
+                )
+                if rc != 0:
+                    return "unmerged"
+            else:
+                rc, out, _ = await self._run_git_rc(
+                    self._repo_root,
+                    ["for-each-ref", "--format=%(refname)", "--contains", tip],
+                )
+                others = [r for r in out.split() if r.strip() and r.strip() != ref]
+                if rc != 0 or not others:
+                    return "unmerged"
+            rc, _, _ = await self._run_git_rc(
+                self._repo_root, ["update-ref", "-d", ref, tip],
+            )
+            return "deleted" if rc == 0 else "moved"
+        except Exception:  # noqa: BLE001
+            logger.debug("WorktreeManager.delete_branch_if_merged degraded",
+                         exc_info=True)
+            return "git_failure"
+
+    async def prune_merged_branches(
+        self, prefix: str, *, into: str = "",
+    ) -> Dict[str, str]:
+        """Apply :meth:`delete_branch_if_merged` to every branch under
+        ``prefix``. Returns ``{branch: disposition}``. NEVER raises."""
+        out: Dict[str, str] = {}
+        try:
+            rc, text, _ = await self._run_git_rc(
+                self._repo_root,
+                ["for-each-ref", "--format=%(refname:short)",
+                 "refs/heads/%s*" % prefix],
+            )
+            for name in (text.splitlines() if rc == 0 else ()):
+                name = name.strip()
+                if name.startswith(prefix):
+                    out[name] = await self.delete_branch_if_merged(name, into=into)
+        except Exception:  # noqa: BLE001
+            logger.debug("WorktreeManager.prune_merged_branches degraded",
+                         exc_info=True)
+        return out
+
     async def promote_commits(
         self,
         target_root: Path,
@@ -1325,6 +1570,7 @@ class WorktreeManager:
         commit_shas: Sequence[str],
         *,
         allow_ff: bool = True,
+        ff_only: bool = False,
         baseline_hashes: "Optional[Dict[str, str]]" = None,
     ) -> PromotionResult:
         """Promote verified workspace commits onto ``target_root`` (Slice 11).
@@ -1346,37 +1592,15 @@ class WorktreeManager:
         the paths the promoted commits touch, so unrelated operator dirt
         never blocks). Governance (LiveWork consult, GENERATE-hash drift)
         lives in WorkspacePromoter — this layer is pure git.
+
+        ``ff_only`` removes the cherry-pick fallback entirely: a target that
+        is not an ancestor of the promoted commits raises ``diverged`` and
+        the target is untouched (see :meth:`fast_forward_branch`).
         """
         target = Path(os.path.realpath(target_root))
-        shas = [s for s in commit_shas if s]
-        if not shas:
+        full_shas = await self._preflight_promotion(target, branch, commit_shas)
+        if not full_shas:
             return PromotionResult((), "none", str(target))
-        try:
-            _max = int(os.environ.get("JARVIS_PROMOTION_MAX_COMMITS", "8"))
-        except ValueError:
-            _max = 8
-        if len(shas) > _max:
-            raise PromotionError(
-                "commit_budget_exceeded", "%d > %d" % (len(shas), _max),
-            )
-
-        rc, _, _ = await self._run_git_rc(
-            target, ["rev-parse", "--verify", "--quiet",
-                     "refs/heads/%s" % branch],
-        )
-        if rc != 0:
-            raise PromotionError("branch_missing", branch)
-        # Review P1: NORMALIZE to full ids. AutoCommitter reports SHORT
-        # hashes (`rev-parse --short HEAD`); every downstream comparison
-        # (ff range equality, landed-sha readback) needs full 40-char forms.
-        full_shas: List[str] = []
-        for s in shas:
-            rc, out, _ = await self._run_git_rc(
-                target, ["rev-parse", "--verify", "--quiet", s + "^{commit}"],
-            )
-            if rc != 0:
-                raise PromotionError("git_failure", "unknown commit %s" % s[:12])
-            full_shas.append(out.strip())
 
         touched: Set[str] = set()
         for s in full_shas:
@@ -1476,7 +1700,19 @@ class WorktreeManager:
 
         _mode = "cherry-pick"
         _ff_taken = False
-        if allow_ff:
+        if ff_only:
+            # STRICT: land exactly the verified commits by fast-forward, or
+            # raise. Merges to the last SHA, not the branch tip, so a commit
+            # the session added after the one being promoted cannot ride in.
+            await self._require_exact_fast_forward(target, _pre_head, full_shas)
+            rc_ff, _, err_ff = await self._run_git_rc(
+                target, ["merge", "--ff-only", full_shas[-1]],
+            )
+            if rc_ff != 0:
+                raise PromotionError("diverged", err_ff.strip()[:300])
+            _mode = "ff"
+            _ff_taken = True
+        elif allow_ff:
             # Review P2: ff is only sound when the branch's commits-ahead
             # are EXACTLY the requested shas — `merge --ff-only` lands the
             # whole HEAD..tip range, so a session branch carrying earlier

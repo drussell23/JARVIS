@@ -150,6 +150,15 @@ class StatusSnapshot:
     landed_per_hour: float = 0.0
     landed_settled: bool = False
     landed_uptime_s: float = 0.0
+    # Local promotion — the last landing fast-forwarded onto the operator's
+    # branch (or why it was refused), and how far that branch is ahead of its
+    # remote. The push is the operator's decision; this is what they need to
+    # make it. Empty until the first promotion attempt (main_promoter).
+    promotion_state: str = ""
+    promotion_target: str = ""
+    promotion_sha: str = ""
+    promotion_unpushed: Optional[int] = None
+    promotion_total: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +410,24 @@ class StatusLineBuilder:
             landed_per_hour=landed_rate,
             landed_settled=landed_settled,
             landed_uptime_s=landed_uptime,
+            **self._sample_promotion(),
         )
+
+    def _sample_promotion(self) -> Dict[str, Any]:
+        """The promotion record's fields, keyed as StatusSnapshot names them.
+        A lock and a few field reads; never git. NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.main_promoter import (
+                get_promotion_record,
+            )
+            p = get_promotion_record().snapshot()
+            return {
+                "promotion_state": p.state, "promotion_target": p.target,
+                "promotion_sha": p.sha, "promotion_unpushed": p.unpushed,
+                "promotion_total": p.total,
+            }
+        except Exception:  # noqa: BLE001
+            return {}
 
     def render_plain(self) -> str:
         """Plain ANSI-free rendering for logs / unit tests."""
@@ -1051,9 +1077,9 @@ def _format_plain(snap: StatusSnapshot, *, compact: bool) -> str:
                 ):
                     tok += f" ~{max(1, int(snap.liquidity_reset_s / 60))}m"
                 crumb = f"{crumb} · {tok}" if crumb else tok
-            landed_tok = _format_landed_token(snap)
-            if landed_tok:
-                crumb = f"{crumb} · {landed_tok}" if crumb else landed_tok
+            for tok in (_format_landed_token(snap), _format_promotion_token(snap)):
+                if tok:
+                    crumb = f"{crumb} · {tok}" if crumb else tok
             return crumb
     except Exception:  # noqa: BLE001 — defensive
         pass
@@ -1099,9 +1125,9 @@ def _format_plain(snap: StatusSnapshot, *, compact: bool) -> str:
     if cost_fr >= (warn_threshold_pct() / 100.0):
         cost_txt += " ⚠"
     parts.append(cost_txt)
-    landed_tok = _format_landed_token(snap)
-    if landed_tok:
-        parts.append(landed_tok)
+    for tok in (_format_landed_token(snap), _format_promotion_token(snap)):
+        if tok:
+            parts.append(tok)
 
     idle_txt = (
         f"Idle: {int(snap.idle_elapsed_s)}s / {int(snap.idle_timeout_s)}s"
@@ -1180,6 +1206,27 @@ def _format_landed_token(snap: StatusSnapshot) -> str:
             getattr(snap, "landed_total", 0), getattr(snap, "landed_per_hour", 0.0),
             getattr(snap, "landed_settled", False), getattr(snap, "landed_uptime_s", 0.0),
         )
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _format_promotion_token(snap: StatusSnapshot) -> str:
+    """``main ← 06b35c990f · 3 unpushed``. Delegates to the one formatter in
+    ``main_promoter``, reading the snapshot's own fields so an attached
+    cockpit renders the DAEMON's promotion, not its own empty record.
+    NEVER raises."""
+    try:
+        from types import SimpleNamespace
+
+        from backend.core.ouroboros.governance.main_promoter import (
+            render_promotion,
+        )
+        return render_promotion(SimpleNamespace(
+            state=getattr(snap, "promotion_state", ""),
+            target=getattr(snap, "promotion_target", ""),
+            sha=getattr(snap, "promotion_sha", ""),
+            unpushed=getattr(snap, "promotion_unpushed", None),
+        ))
     except Exception:  # noqa: BLE001
         return ""
 
