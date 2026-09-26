@@ -8595,6 +8595,21 @@ class GovernedLoopService:
             except Exception as exc:
                 logger.warning("[GovernedLoop] reactor_event_loop error: %s", exc)
 
+    async def _release_unadopted_oracle(self, oracle: Any) -> None:
+        """Release an Oracle this loop built but never adopted. Shielded: a
+        second cancellation during teardown must not strand the connection it
+        exists to close. NEVER raises."""
+        if oracle is None or oracle is self._oracle:
+            return
+        release = getattr(oracle, "release_resources", None)
+        if not callable(release):
+            return
+        try:
+            await asyncio.shield(_maybe_await(release()))
+        except BaseException:  # noqa: BLE001 — teardown never raises
+            logger.debug("[GovernedLoop] unadopted Oracle release degraded",
+                         exc_info=True)
+
     async def _oracle_index_loop(self) -> None:
         """Index all repos into TheOracle graph on boot, then poll for incremental changes.
 
@@ -8608,6 +8623,11 @@ class GovernedLoopService:
         causes a SQLite lock contention segfault (SIGSEGV at 0x0) when two clients
         target the same persistence directory concurrently.
         """
+        # An Oracle this loop CREATED but has not yet adopted. If init is
+        # cancelled or fails, nothing else holds a reference to it, so this is
+        # the only place its connection thread and AST pool can be released —
+        # dropping it leaves a non-daemon thread that blocks interpreter exit.
+        oracle: Any = None
         try:
             # Reuse injected Oracle if already available (e.g. from battle test harness)
             if self._oracle is not None:
@@ -8648,12 +8668,14 @@ class GovernedLoopService:
                 (await _maybe_await(self._oracle.get_metrics())).get("total_nodes", "?"),
             )
         except asyncio.CancelledError:
+            await self._release_unadopted_oracle(oracle)
             return
         except Exception as exc:
             logger.warning(
                 "[GovernedLoop] Oracle initialization failed: %s; codebase graph unavailable",
                 exc,
             )
+            await self._release_unadopted_oracle(oracle)
             self._oracle = None
             return
 

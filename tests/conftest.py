@@ -204,6 +204,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     # leak report that only prints when a terminal was missing is a leak
     # report nobody reads.
     _report_live_state_writes(terminalreporter)
+    _report_isolation_events(terminalreporter)
 
     try:
         from tests.pty_gate import (
@@ -847,3 +848,73 @@ def _isolate_context_budget(monkeypatch):
     monkeypatch.setenv("JARVIS_DW_MAX_CONTEXT_TOKENS", "8000")
     yield
     cb.reset_cache()
+
+
+# ===========================================================================
+# Runner isolation — one test must not end the runner or poison the next
+# ===========================================================================
+#
+# The mechanics live in tests/support/isolation_guard.py (and are tested
+# there); this wires them in. Measured on unchanged main, 2026-09-26: a
+# watchdog a failed test left armed `os._exit(75)`-ed the whole run minutes
+# later; a process-group kill ended two runs at the same instant; a stale
+# `.git/index.lock` from a killed git child failed later tests; and children
+# spawned without their own session outlived the tests that made them.
+#
+# Mode follows the tripwire above: `report` (default) names every event in
+# the terminal summary; JARVIS_TEST_ISOLATION_MODE=strict fails the test in
+# whose window it happened. The FENCE itself is unconditional — a refused
+# `os._exit` never ends the run in either mode.
+
+from tests.support import isolation_guard as _iso
+
+_FENCE = _iso.RunnerFence()
+_ISOLATION_EVENTS: "list" = []          # (nodeid, kind, detail)
+_GIT_ADMIN_DIRS: "Optional[list]" = None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _runner_fence():
+    _FENCE.install()
+    yield _FENCE
+    _FENCE.uninstall()
+
+
+@pytest.fixture(autouse=True)
+def _test_isolation_guard(request, _runner_fence):
+    """Per test: sweep stale git locks BEFORE it runs; after it, report any
+    fenced call and reap the children it leaked."""
+    global _GIT_ADMIN_DIRS
+    if _GIT_ADMIN_DIRS is None:
+        _GIT_ADMIN_DIRS = _iso.git_admin_dirs(project_root)
+    nodeid = request.node.nodeid
+    sweep = _iso.sweep_git_locks(_GIT_ADMIN_DIRS)
+    for lock in sweep.removed:
+        _ISOLATION_EVENTS.append((nodeid, "stale git lock removed (before)", lock))
+    for lock in sweep.held:
+        _ISOLATION_EVENTS.append((nodeid, "git lock held by a live process", lock))
+    _runner_fence.drain()                # a prior test's late watchdog is not ours
+    before = _iso.child_pids()
+    yield
+    events = [(nodeid, v.what + " REFUSED", v.render()) for v in _runner_fence.drain()]
+    reap = _iso.reap_new_children(before, _runner_fence)
+    events += [(nodeid, "leaked child reaped", r) for r in reap.reaped]
+    _ISOLATION_EVENTS.extend(events)
+    if events and _iso.isolation_mode() == "strict":
+        pytest.fail("test isolation: " + "; ".join(f"{k}: {d}" for _, k, d in events))
+
+
+def _report_isolation_events(terminalreporter) -> None:
+    """Name every fenced call, reaped child and swept lock. NEVER raises."""
+    try:
+        if not _ISOLATION_EVENTS:
+            return
+        terminalreporter.write_sep("=", "TEST ISOLATION EVENTS")
+        for nodeid, kind, detail in _ISOLATION_EVENTS[:200]:
+            terminalreporter.write_line(f"  [{kind}] {nodeid}\n      {detail}")
+        terminalreporter.write_line(
+            f"  {len(_ISOLATION_EVENTS)} event(s). "
+            "Set JARVIS_TEST_ISOLATION_MODE=strict to make these failures."
+        )
+    except Exception:  # noqa: BLE001 — a report must never break the summary
+        pass

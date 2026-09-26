@@ -151,6 +151,13 @@ backend/swift_bridge/*.pyc
 # Ouroboros benchmark diagnostic outputs (contain API response bodies; copy to
 # docs/benchmarks/artifacts/ explicitly if you want to include in a report)
 .ouroboros/benchmarks/
+# The organism's own runtime ledgers: DPO corpus, reachability, semantic
+# quality, sentinel arc traces. Untracked, they made every execution clone
+# "dirty", and the harness refused to create its accumulation branch at every
+# boot ("Repository ... is dirty"). Runtime DATA, not source — the corpus is
+# training data and must survive, so it is ignored, never cleaned.
+/.ouroboros/*.jsonl
+/.ouroboros/sentinel_arc_trace_*.json
 
 # Git worktrees (development workspaces)
 .worktrees/

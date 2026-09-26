@@ -2798,6 +2798,22 @@ class TheOracle:
                     "or =0 to skip saves on shutdown entirely.",
                     deadline_s,
                 )
+        await self.release_resources()
+        logger.info("The Oracle shutdown complete")
+
+    async def release_resources(self) -> None:
+        """Release everything that keeps this process alive — WITHOUT saving.
+
+        The half of :meth:`shutdown` an Oracle needs even when it never
+        finished initializing. ``initialize`` opens the persistence connection
+        (an aiosqlite connection is a NON-daemon thread that loops until
+        closed) and may spin up the AST pool; an Oracle abandoned mid-init with
+        those open keeps the interpreter from exiting at all — every exit then
+        needs the harness's ``os._exit`` watchdog, and a test process simply
+        hangs after its last test. Saving a half-built graph would be wrong, so
+        the save stays in ``shutdown``. Idempotent. NEVER raises.
+        """
+        self._shutting_down = True
         # Tear down the AST-indexing ProcessPoolExecutor deterministically.
         # Closes the bt-2026-06-16 "Shutting down The Oracle..." wedge: an in-flight
         # index left pool workers running, which blocked clean exit so
@@ -2837,7 +2853,6 @@ class TheOracle:
         except Exception:  # noqa: BLE001
             logger.debug("[Oracle.shutdown] backend close best-effort failed", exc_info=True)
         self._running = False
-        logger.info("The Oracle shutdown complete")
 
     def _ensure_semantic_index(self) -> "OracleSemanticIndex":
         """Slice 154 — lazily construct the OracleSemanticIndex if it isn't up yet.
