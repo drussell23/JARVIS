@@ -264,6 +264,22 @@ def test_end_to_end_through_the_REAL_gate(tmp_path, monkeypatch):
     assert not _git(root, "branch", "--list", BRANCH)
 
 
+def test_a_tests_only_landing_is_its_own_cover(tmp_path):
+    """Found live (bt-2026-09-26-143412): every landing was a new test file
+    for an uncovered module, and the gate skipped touched test files when
+    collecting cover — so each resolved to zero tests and was refused as
+    "no tests/**/test_<stem>.py" for a test file."""
+    (tmp_path / "tests" / "unit").mkdir(parents=True)
+    (tmp_path / "tests" / "unit" / "test_queue.py").write_text("def test_x(): pass\n")
+    (tmp_path / "tests" / "conftest.py").write_text("")
+    got = gate._test_paths_for(
+        ["tests/unit/test_queue.py", "tests/conftest.py", "tests/unit/test_gone.py"],
+        tmp_path,
+    )
+    # The new test runs; a helper is not a test; a deleted file is not cover.
+    assert got == ("tests/unit/test_queue.py",)
+
+
 def test_no_target_is_a_refusal_not_a_guess(repo, monkeypatch):
     monkeypatch.delenv("JARVIS_ACCUMULATION_PROMOTION_TARGET", raising=False)
     out = _run(mp.promote_landing(repo.landing, manager=repo.mgr))

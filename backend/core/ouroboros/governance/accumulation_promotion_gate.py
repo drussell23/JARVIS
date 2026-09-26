@@ -479,6 +479,11 @@ def _test_paths_for(files: Sequence[str], repo_root: Path) -> Tuple[str, ...]:
     Same convention the coverage sensor uses to decide a module is uncovered
     (``tests/**/test_<stem>.py``), so "covered" means the same thing to the
     gate as it does to the sensor that files the goal.
+
+    A touched test file is its OWN cover and runs as-is. Skipping it (as this
+    once did) resolved a tests-only landing — the whole output of the coverage
+    sensor's goals — to zero tests, and refused every one as "uncovered"
+    (soak bt-2026-09-26-143412: 3 of 3 landings refused).
     """
     out: List[str] = []
     tests_root = repo_root / "tests"
@@ -486,7 +491,12 @@ def _test_paths_for(files: Sequence[str], repo_root: Path) -> Tuple[str, ...]:
         return ()
     for f in files:
         stem = Path(f).stem
-        if not f.endswith(".py") or f.startswith("tests/"):
+        if not f.endswith(".py"):
+            continue
+        if f.startswith("tests/"):
+            if stem.startswith("test_") and (repo_root / f).is_file() \
+                    and f not in out:
+                out.append(f)
             continue
         for cand in tests_root.rglob(f"test_{stem}.py"):
             rel = str(cand.relative_to(repo_root)).replace("\\", "/")
