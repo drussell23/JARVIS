@@ -878,15 +878,21 @@ def _live_phase(fsm_ctx: Any) -> tuple:
     NEVER raises.
     """
     try:
+        from datetime import datetime
+
+        # TYPED, not merely present: a duck-typed context (a MagicMock, a
+        # shim) answers any attribute name with a truthy stand-in, and taking
+        # that as the phase renders an object repr on the status line. The
+        # runtime entry's own fields are a str and a datetime or nothing.
         label = getattr(fsm_ctx, "pipeline_phase", None)
         entered = getattr(fsm_ctx, "pipeline_phase_entered_at", None)
-        if not label:
-            phase_obj = getattr(fsm_ctx, "phase", None)
-            label = _phase_label(phase_obj) if phase_obj is not None else ""
-            entered = getattr(fsm_ctx, "phase_entered_at", None)
-        if not label or entered is None:
+        if isinstance(label, str) and label and isinstance(entered, datetime):
+            return (label, entered)
+        phase_obj = getattr(fsm_ctx, "phase", None)
+        entered = getattr(fsm_ctx, "phase_entered_at", None)
+        if phase_obj is None or entered is None:
             return ("", None)
-        return (str(label), entered)
+        return (_phase_label(phase_obj), entered)
     except Exception:  # noqa: BLE001
         return ("", None)
 

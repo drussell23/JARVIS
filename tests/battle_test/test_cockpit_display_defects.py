@@ -350,6 +350,19 @@ def test_the_status_line_reads_the_phase_off_the_loops_runtime_entries():
     assert snap.primary_op_id == "op-gen"
 
 
+def test_a_duck_typed_context_is_not_mistaken_for_a_phase():
+    """A MagicMock answers `pipeline_phase` with a truthy stand-in; taking it
+    rendered a mock repr as the phase. The OperationContext names still win."""
+    from unittest.mock import MagicMock
+
+    from backend.core.ouroboros.battle_test.status_line import _live_phase
+    ctx = MagicMock()
+    ctx.phase = SimpleNamespace(name="VALIDATE")
+    ctx.phase_entered_at = datetime.now(timezone.utc)
+    label, entered = _live_phase(ctx)
+    assert label == "VALIDATE" and entered is ctx.phase_entered_at
+
+
 def test_an_op_with_no_observed_transition_still_falls_back_honestly():
     from backend.core.ouroboros.battle_test.status_line import StatusLineBuilder
     gls = SimpleNamespace(_fsm_contexts={"op-new": _runtime_ctx("op-new")},

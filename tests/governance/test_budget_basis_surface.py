@@ -84,8 +84,19 @@ class TestTheBasisTravelsWithTheNumber:
         assert "OUROBOROS_BATTLE_COST_CAP_BASIS" in src
 
     def test_the_hydration_payload_carries_it(self):
+        """Behaviour, not a source string: the harness's bridge provider now
+        delegates to the ONE derived serializer (its hand-typed copy drifted
+        from the heartbeat's), so the basis crosses because it is a
+        StatusSnapshot field — pinned here end to end."""
         from backend.core.ouroboros.battle_test import harness
-        assert "cost_budget_basis" in inspect.getsource(harness)
+        from backend.core.ouroboros.battle_test.status_line import (
+            StatusSnapshot, snapshot_to_payload,
+        )
+        payload = snapshot_to_payload(StatusSnapshot(
+            cost_budget_usd=0.71, cost_budget_basis="observed — p95 x3",
+        ))
+        assert payload["cost_budget_basis"] == "observed — p95 x3"
+        assert "snapshot_to_payload" in inspect.getsource(harness)
 
 
 class TestTheRenderIsNotSilentlyTruncated:
