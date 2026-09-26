@@ -21,6 +21,16 @@ def _clean_env(monkeypatch):
     _os.environ.pop("JARVIS_OV_PRESENTATION", None)
 
 
+@pytest.fixture(autouse=True)
+def _restore_arming_env(monkeypatch):
+    # Bare `ov` arms the Sentinel + production-soak profile by writing
+    # os.environ inside main(). setenv/delenv first registers each key with
+    # monkeypatch, so its teardown restores them and nothing leaks onward.
+    for name in (*ov_cli._SENTINEL_FLAGS, ov_cli._PRODUCTION_SOAK_ENV):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+
+
 def _capture_delegation(monkeypatch):
     seen = {}
 

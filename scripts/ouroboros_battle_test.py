@@ -1581,6 +1581,36 @@ def _replay_session(session_ref: str) -> None:
     print(f"{'═' * 64}\n")
 
 
+def apply_production_soak_limits(args, argv, environ, *, cockpit_boot=False):
+    """Scale the three session limits up to the production-soak profile,
+    leaving every limit the operator set.
+
+    An operator value is one on the command line OR in the environment
+    variable the parser reads for that limit. `ov` hands its detached daemon
+    a derived cost cap and idle timeout through the ENVIRONMENT; checking
+    argv alone discarded them and showed "$0.00 / $25.00" in the cockpit
+    (measured 2026-09-26).
+    """
+    passed = set(argv)
+
+    def _operator_set(flag, *env_names):
+        return flag in passed or any(
+            str(environ.get(n, "") or "").strip() for n in env_names
+        )
+
+    cap_envs = ("OUROBOROS_BATTLE_COST_CAP",) + (
+        ("JARVIS_COCKPIT_COST_CAP",) if cockpit_boot else ()
+    )
+    if not _operator_set("--cost-cap", *cap_envs):
+        args.cost_cap = 25.00
+    if not _operator_set("--idle-timeout", "OUROBOROS_BATTLE_IDLE_TIMEOUT"):
+        args.idle_timeout = 0.0
+    if not _operator_set(
+        "--max-wall-seconds", "OUROBOROS_BATTLE_MAX_WALL_SECONDS",
+    ):
+        args.max_wall_seconds = 0.0
+
+
 def main(argv: "list[str] | None" = None) -> None:
     # ``argv`` defaults to ``None`` (reads ``sys.argv`` -- unchanged legacy
     # behavior for direct ``python3 scripts/...`` invocation). The ``ov``
@@ -1881,13 +1911,9 @@ def main(argv: "list[str] | None" = None) -> None:
     if getattr(args, "production_soak", False):
         import sys as _sys
 
-        _passed = set(_sys.argv[1:])
-        if "--cost-cap" not in _passed:
-            args.cost_cap = 25.00
-        if "--idle-timeout" not in _passed:
-            args.idle_timeout = 0.0
-        if "--max-wall-seconds" not in _passed:
-            args.max_wall_seconds = 0.0
+        apply_production_soak_limits(
+            args, _sys.argv[1:], os.environ, cockpit_boot=_cockpit_boot,
+        )
         # Enable the existing (Slice 112/113) process-isolated Oracle + the
         # Slice 123 quarantine — only if the operator hasn't set them otherwise.
         os.environ.setdefault("JARVIS_ORACLE_PROCESS_ISOLATION_ENABLED", "1")

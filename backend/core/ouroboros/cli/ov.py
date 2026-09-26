@@ -386,7 +386,10 @@ _HELP_TEXT = """ov -- Ouroboros + Venom, autonomous engineering organism
 
   ov                  instant cockpit — attach to the organism
                       (cold-boots one in the background if needed;
-                      --legacy-boot forces the old in-process boot)
+                      --legacy-boot forces the old in-process boot).
+                      The organism drives: Sentinel + production-soak
+                      profile are on; --no-sentinel / --no-production-soak
+                      turn them off for that boot
   ov run [flags]      headless autonomous session (foreground)
   ov daemon [flags]   alias for a headless run
   ov daemon --install    install the resident organism (launchd agent)
@@ -414,23 +417,48 @@ class Invocation:
     ``action`` is one of ``cockpit`` / ``headless`` / ``status`` / ``attach``
     / ``help``. ``delegate_argv`` is the argv handed to the legacy bootstrap
     for the boot actions. ``message`` carries the notice for the attach stub.
+    ``sentinel`` / ``production_soak`` are the cockpit's arming DECISIONS;
+    :func:`apply_arming` acts on them, so resolving stays side-effect free.
     """
 
     action: str
     delegate_argv: List[str] = field(default_factory=list)
     message: str = ""
+    sentinel: bool = False
+    production_soak: bool = False
+
+
+def apply_arming(inv: "Invocation", environ=None) -> None:
+    """Carry out the arming a resolved cockpit invocation asked for."""
+    if inv.sentinel:
+        arm_sentinel(environ)
+    if inv.production_soak:
+        arm_production_soak(environ)
 
 
 #: The two flags `_start_sentinel_loop` requires. They are separable
 #: capabilities BY DESIGN — discovery without sentinel files goals a human
 #: still approves; sentinel without discovery auto-approves goals a human
 #: still writes — and unattended application of self-authored code is the
-#: composition of the two. That design is preserved here: `--sentinel` is the
-#: one place that sets BOTH, and nothing sets either by default.
+#: composition of the two. `arm_sentinel` is the one place that sets BOTH.
+#:
+#: Bare `ov` arms it by default (operator directive 2026-09-26). The soaks ran
+#: the organism with the Sentinel on and `ov` ran it dormant, so the progress
+#: measured in soaks never appeared in the cockpit: two organisms behind one
+#: name. `--no-sentinel` or an exported `false` keeps it dormant.
 _SENTINEL_FLAGS = (
     "JARVIS_SENTINEL_MODE_ENABLED",
     "JARVIS_GOAL_DISCOVERY_ENABLED",
 )
+
+#: The production-soak profile (Oracle process isolation, boot-recovery
+#: quarantine, no idle/wall leash). Read by the bootstrap's `--production-soak`
+#: default, so the detached daemon inherits it through the environment.
+_PRODUCTION_SOAK_ENV = "OUROBOROS_PRODUCTION_SOAK"
+
+_NO_SENTINEL = "--no-sentinel"
+_NO_PRODUCTION_SOAK = "--no-production-soak"
+_FALSY = ("0", "false", "no", "off")
 
 
 def arm_sentinel(environ=None) -> bool:
@@ -454,11 +482,26 @@ def arm_sentinel(environ=None) -> bool:
     armed = True
     for name in _SENTINEL_FLAGS:
         current = str(env.get(name, "") or "").strip().lower()
-        if current in ("0", "false", "no", "off"):
+        if current in _FALSY:
             armed = False          # explicitly refused by the operator
             continue
         env[name] = "true"
     return armed
+
+
+def arm_production_soak(environ=None) -> bool:
+    """Give the cockpit's organism the soak organism's profile. Returns
+    whether it is on.
+
+    An operator-set value WINS, as with the Sentinel: an exported `0` is a
+    refusal, not silence to be filled.
+    """
+    env = os.environ if environ is None else environ
+    current = str(env.get(_PRODUCTION_SOAK_ENV, "") or "").strip().lower()
+    if current in _FALSY:
+        return False
+    env[_PRODUCTION_SOAK_ENV] = "1"
+    return True
 
 
 def sentinel_is_armed(environ=None) -> bool:
@@ -514,13 +557,20 @@ def resolve(argv: Optional[Sequence[str]] = None) -> Invocation:
         return Invocation("restart", list(rest))
     # cockpit (explicit or defaulted)
     #
-    # `--sentinel` is consumed HERE rather than passed through: the legacy
-    # bootstrap has no such flag, and handing it one it does not know would
-    # surface as an argparse error at boot instead of as autonomy.
-    _rest = [a for a in rest if a != "--sentinel"]
-    if len(_rest) != len(rest):
-        arm_sentinel()
-    return Invocation("cockpit", _rest)
+    # The Sentinel and the production-soak profile are ON by default. Their
+    # flags are consumed HERE rather than passed through: the legacy
+    # bootstrap knows none of them, and handing it one would surface as an
+    # argparse error at boot instead of as autonomy. `--sentinel` is kept as
+    # an accepted no-op so existing muscle memory and scripts still work.
+    _consumed = ("--sentinel", _NO_SENTINEL, _NO_PRODUCTION_SOAK)
+    return Invocation(
+        "cockpit",
+        [a for a in rest if a not in _consumed],
+        sentinel=_NO_SENTINEL not in rest,
+        production_soak=(
+            _NO_PRODUCTION_SOAK not in rest and "--production-soak" not in rest
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5265,6 +5315,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         pass
 
     inv = resolve(sys.argv[1:] if argv is None else list(argv))
+    apply_arming(inv)
     console = build_console()
 
     if inv.action == "help":
@@ -5459,8 +5510,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
             else:
                 console.print(
-                    "[Sentinel] dormant — it runs only what you ask. "
-                    "Start with `ov --sentinel` to let it drive.",
+                    "[Sentinel] dormant — it runs only what you ask "
+                    "(refused by --no-sentinel or an exported false). "
+                    "Plain `ov` lets it drive.",
                     markup=False,
                 )
         except Exception:  # noqa: BLE001 — a banner never blocks a boot
