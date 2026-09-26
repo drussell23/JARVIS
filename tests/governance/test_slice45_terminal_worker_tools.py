@@ -224,6 +224,21 @@ def test_assembled_lean_prompt_no_tools_for_background_legacy(monkeypatch):
     assert "## Available Tools" not in prompt
 
 
+def _assert_stdlib_only(path):
+    """A module the leaf may import must itself import no repo module at
+    IMPORT TIME — the only time a cycle can form. Function-local imports
+    (its lazy Aegis probe) run after every module has finished loading."""
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = ([node.module or ""] if isinstance(node, ast.ImportFrom)
+                     else [a.name for a in node.names])
+            for name in names:
+                assert not name.startswith("backend"), (
+                    f"{path.name} is imported by a leaf and must stay "
+                    f"stdlib-only; found {name}"
+                )
+
+
 def test_policy_module_is_a_leaf_no_governance_imports():
     """The policy must stay a dependency-free leaf (env reads only) so both
     providers.py and doubleword_provider.py import it without circular risk."""
@@ -235,6 +250,9 @@ def test_policy_module_is_a_leaf_no_governance_imports():
                 if isinstance(node, ast.ImportFrom)
                 else node.names[0].name
             )
+            if str(mod).endswith("governance.paid_lanes"):
+                _assert_stdlib_only(_POLICY.parent / "paid_lanes.py")
+                continue
             assert mod is None or "ouroboros.governance" not in str(mod), (
                 f"leaf policy must not import governance modules; found {mod}"
             )

@@ -1060,9 +1060,10 @@ def _claude_unavailable_now() -> bool:
     force_batch while Claude is AVAILABLE can only be the Slice 170 reroute (the legacy
     batch path requires Claude unavailable). NEVER raises."""
     try:
-        _disabled = os.environ.get(
-            "JARVIS_PROVIDER_CLAUDE_DISABLED", "",
-        ).strip().lower() in ("1", "true", "yes", "on")
+        from backend.core.ouroboros.governance.paid_lanes import (  # noqa: PLC0415
+            paid_lane_switched_on as _paid_configured,
+        )
+        _disabled = not _paid_configured("claude")
         return _disabled or (_force_batch_on_breaker_enabled() and _claude_breaker_open())
     except Exception:  # noqa: BLE001
         return False
@@ -1595,9 +1596,10 @@ def _slice36_should_force_batch(
         # available + a HEALTHY stream, RT failures cascade to Claude fallback and the
         # empirical cost-benefit shifts (the Slice 170 block above is the exception — a
         # DEGRADED stream fails over to DW-batch first).
-        _claude_disabled = os.environ.get(
-            "JARVIS_PROVIDER_CLAUDE_DISABLED", "",
-        ).strip().lower() in ("1", "true", "yes", "on")
+        from backend.core.ouroboros.governance.paid_lanes import (  # noqa: PLC0415
+            paid_lane_switched_on as _paid_configured,
+        )
+        _claude_disabled = not _paid_configured("claude")
         # Slice 159 — Claude is ALSO unavailable-as-fallback when its circuit breaker
         # is OPEN (economic credit-death / transport). Then an RT failure cascades to a
         # blocked Claude → terminal_quota exhaustion, so DW must carry via batch. This
@@ -2893,6 +2895,13 @@ class DoublewordProvider:
         Predicate is read at call-time (not cached at __init__) so
         the gate stays accurate if Aegis is enabled mid-session.
         """
+        from backend.core.ouroboros.governance.paid_lanes import (  # noqa: PLC0415
+            paid_lane_allowed,
+        )
+        if not paid_lane_allowed("doubleword"):
+            # Declared off, or observed unfunded: every standalone DW user
+            # (intent prompter, semantic triage, dream engine, …) asks this.
+            return False
         from backend.core.ouroboros.aegis.client import is_enabled as _aegis_is_enabled
         return _aegis_is_enabled() or bool(self._api_key)
 

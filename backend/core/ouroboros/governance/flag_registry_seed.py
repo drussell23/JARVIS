@@ -1620,6 +1620,40 @@ SEED_SPECS: list = [
         since="v1.0",
     ),
     # ====================================================================
+    # Paid-lane authority — may this process spend money on an LLM API?
+    # ====================================================================
+    FlagSpec(
+        name="JARVIS_PAID_LANES_ENABLED",
+        type=FlagType.BOOL, default=True,
+        description=(
+            "The operator's declaration of whether paid LLM lanes (Anthropic, "
+            "DoubleWord) may be used at all. false = every paid lane is off: "
+            "never constructed at boot, never probed, never called; every "
+            "route generates on the local lane first, the gate and cockpit "
+            "Q&A answer locally, and the status chip reads 'local'. Keys may "
+            "stay in .env. Unset keeps the historical behaviour. Per-provider "
+            "overrides: JARVIS_PROVIDER_<NAME>_DISABLED. Read ONLY through "
+            "governance/paid_lanes.py."
+        ),
+        category=Category.ROUTING,
+        source_file="backend/core/ouroboros/governance/paid_lanes.py",
+        example="false",
+        since="v1.0",
+    ),
+    FlagSpec(
+        name="JARVIS_PAID_LANE_VERDICT_TTL_S",
+        type=FlagType.FLOAT, default=5.0,
+        description=(
+            "How long a dispatch-time paid-lane verdict (which folds in the "
+            "economic ledger's observed-unfunded state) is cached. Hot paths "
+            "ask on every call; the answer changes at operator/billing speed."
+        ),
+        category=Category.TUNING,
+        source_file="backend/core/ouroboros/governance/paid_lanes.py",
+        example="5",
+        since="v1.0",
+    ),
+    # ====================================================================
     # Control-plane backpressure — the load-shed latch (CD-2)
     # Registered 2026-09-17, for the same reason the diff schema above was:
     # it governed real behaviour and was invisible to /help and the typo

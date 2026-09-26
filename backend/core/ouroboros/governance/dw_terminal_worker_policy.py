@@ -79,7 +79,10 @@ def claude_is_disabled() -> bool:
     Mirrors the ``JARVIS_PROVIDER_CLAUDE_DISABLED`` posture already
     consumed by Slices 19a / 20A / 22 / 23. Pure env read; NEVER raises.
     """
-    return _truthy("JARVIS_PROVIDER_CLAUDE_DISABLED", "")
+    from backend.core.ouroboros.governance.paid_lanes import (  # noqa: PLC0415
+        paid_lane_switched_on,
+    )
+    return not paid_lane_switched_on("claude")
 
 
 def background_is_terminal_worker(route: str) -> bool:

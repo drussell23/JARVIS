@@ -810,6 +810,42 @@ def cost_today_usd() -> float:
 ProviderCallable = Callable[[str, str], Awaitable[Tuple[str, float]]]
 
 
+def _default_provider_callable() -> Any:
+    """Which backend answers an operator's question when the caller named
+    none. Claude while the paid-lane authority allows it; otherwise the RT
+    gate, which is local-first — the cockpit keeps answering on the free
+    model instead of reporting PROVIDER_FAILED because an account is empty.
+    Decided per question, so funding restored mid-session takes effect."""
+    try:
+        from backend.core.ouroboros.governance.paid_lanes import (  # noqa: PLC0415
+            paid_lane_allowed,
+        )
+        if paid_lane_allowed("claude"):
+            return _default_claude_callable
+    except Exception:  # noqa: BLE001 — an unreadable policy keeps legacy behaviour
+        return _default_claude_callable
+    return _default_gate_callable
+
+
+async def _default_gate_callable(
+    system: str, user_question: str,
+) -> Tuple[str, float]:
+    """Answer through ``rt_gate`` (local lane first). Same contract as
+    :func:`_default_claude_callable`: NEVER raises, ``("", 0.0)`` on
+    failure. The local lane's marginal cost is zero, so the cost is 0.0."""
+    try:
+        from backend.core.ouroboros.governance.rt_gate import (  # noqa: PLC0415
+            gate_completion,
+        )
+        text = await gate_completion(
+            user_question, caller_id="fast_path_qa", system_prompt=system,
+            max_tokens=max_tokens(),
+        )
+        return (str(text or ""), 0.0)
+    except Exception:  # noqa: BLE001
+        return ("", 0.0)
+
+
 async def _default_claude_callable(
     system: str, user_question: str,
 ) -> Tuple[str, float]:
@@ -1496,7 +1532,7 @@ async def ask_question(
     provider = (
         provider_callable
         if provider_callable is not None
-        else _default_claude_callable
+        else _default_provider_callable()
     )
     try:
         answer, cost = await asyncio.wait_for(

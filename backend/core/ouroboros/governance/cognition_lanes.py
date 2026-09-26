@@ -120,11 +120,36 @@ async def rt_prompt(
 ) -> str:
     """ONE RT-lane prompt call: semaphore → lease → SSE stream → clamp →
     bound → explicit eviction → Claude cascade. Raises only the fallback's
-    terminal error (RT faults always cascade). Fully injectable."""
+    terminal error (RT faults always cascade). Fully injectable.
+
+    With EVERY paid lane refused by the paid-lane authority (and no
+    injected transport to honour), the DW-then-Claude cascade has no tier it
+    may use; the call is answered by the rt_gate instead — same prompt→text
+    contract, local lane first — rather than failing twice on refused
+    lanes. An injected session/provider is the caller's explicit choice and
+    is left alone."""
     import aiohttp
 
     bound = timeout_s if timeout_s is not None else _env_float(
         "JARVIS_COGNITION_RT_TIMEOUT_S", 90.0)
+
+    if session is None and dw_provider is None and claude is None:
+        from backend.core.ouroboros.governance.paid_lanes import (  # noqa: PLC0415
+            paid_lane_allowed,
+        )
+        if not (paid_lane_allowed("doubleword") or paid_lane_allowed("claude")):
+            from backend.core.ouroboros.governance.rt_gate import (  # noqa: PLC0415
+                gate_completion,
+            )
+            for _s in (stats, call_stats):
+                if _s is not None:
+                    _s["local_gate_calls"] = _s.get("local_gate_calls", 0) + 1
+            return await gate_completion(
+                prompt, caller_id=caller_id, response_format=response_format,
+                timeout_s=bound,
+                # The caller's ceiling when it gave one; otherwise the gate's.
+                **({"max_tokens": int(max_tokens)} if max_tokens else {}),
+            )
     clamp = clamp_tokens if clamp_tokens is not None else _env_int(
         "JARVIS_COGNITION_RT_MAX_OUTPUT_TOKENS", 2000)
     if clamp > 0:

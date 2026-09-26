@@ -332,8 +332,13 @@ def _claude_tier_structurally_absent() -> bool:
     no async, sub-microsecond. Safe to call inside the router hot
     path.
     """
-    raw = os.environ.get(CLAUDE_DISABLED_ENV_VAR, "").strip().lower()
-    return raw in {"true", "1", "yes", "on"}
+    # The paid-lane authority reads CLAUDE_DISABLED_ENV_VAR too, plus the
+    # operator's JARVIS_PAID_LANES_ENABLED — the same answer boot used to
+    # decide whether ClaudeProvider exists. Still env-only: no registry, no I/O.
+    from backend.core.ouroboros.governance.paid_lanes import (  # noqa: PLC0415
+        paid_lane_switched_on,
+    )
+    return not paid_lane_switched_on("claude")
 
 
 def _apply_immediate_tier_decay(

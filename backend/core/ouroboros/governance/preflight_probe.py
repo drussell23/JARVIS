@@ -270,12 +270,13 @@ def is_preflight_enabled() -> bool:
         return False
     # Slice 25B Phase 4 — Slice 19a composition: DW-only posture requires
     # pre-flight health tracking
-    claude_raw = os.environ.get(
-        "JARVIS_PROVIDER_CLAUDE_DISABLED", "",
-    ).strip().lower()
-    if claude_raw in ("1", "true", "yes", "on"):
-        return True
-    return False
+    # — which is only a DW-only posture when DW itself is configured. With
+    # every paid lane refused there is nothing for a DW preflight to probe.
+    from backend.core.ouroboros.governance.paid_lanes import (  # noqa: PLC0415
+        paid_lane_switched_on,
+    )
+    return (not paid_lane_switched_on("claude")
+            and paid_lane_switched_on("doubleword"))
 
 
 def _classify_outcome(outcome: ProbeOutcome) -> Tuple[

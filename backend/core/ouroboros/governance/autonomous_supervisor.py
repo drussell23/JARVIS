@@ -232,6 +232,16 @@ class AutonomousSupervisor:
         try:
             if self.state == STATE_ARMED:
                 return False
+            # The Sentinel exists to recover the DW lane. A lane the paid-lane
+            # authority refuses is not "degraded", it is switched off: there
+            # is nothing to recover and every probe would be spent for nothing.
+            from backend.core.ouroboros.governance.paid_lanes import (  # noqa: PLC0415
+                switch_verdict,
+            )
+            _dw = switch_verdict("doubleword")
+            if not _dw.allowed:
+                logger.debug("[Supervisor] evaluate: no-arm (%s)", _dw.reason)
+                return False
             conn = self._open_db()
             try:
                 pending = self._pending(conn)

@@ -3102,6 +3102,9 @@ class BattleTestHarness:
             start_host_commit_sampler()
         except Exception:  # noqa: BLE001 — a gauge never blocks ignition
             logger.debug("[Harness] host-commit sampler start degraded", exc_info=True)
+        # A banner is its own boot concern, never a step of ignition: a
+        # fault in it must not decide whether the Sentinel arms.
+        self._announce_lane_posture()
         await self._start_sentinel_loop()
 
         _boot_mark("harness_boot_sequence_done")
@@ -5381,6 +5384,37 @@ class BattleTestHarness:
                 "[Sentinel] ignition failed — the organism runs, but only on "
                 "goals a human files", exc_info=True,
             )
+
+    def _announce_lane_posture(self) -> None:
+        """Say, in every attached cockpit, what the organism generates with.
+
+        The operator's question after "is it working?" is "is it spending
+        money?". The paid-lane authority knows; this puts its answer beside
+        the Sentinel line at boot, including WHY a lane is off (declared, no
+        credential, observed unfunded). NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.candidate_generator import (
+                resolve_display_model,
+            )
+            from backend.core.ouroboros.governance.paid_lanes import posture
+            p = posture()
+            model = resolve_display_model() or "local lane"
+            off = [f"{name}: {v['reason']}" for name, v in p["lanes"].items()
+                   if not v["allowed"]]
+            if p["mode"] == "local-only":
+                self._repl_print(
+                    f"[{_SEM['neural']}]⚙ Local-first[/{_SEM['neural']}] "
+                    f"[{_SEM['dim']}]— every op generates on {model}; paid "
+                    f"lanes off ({'; '.join(off)})[/{_SEM['dim']}]"
+                )
+            else:
+                self._repl_print(
+                    f"[{_SEM['dim']}]⚙ Lanes — local {model} + paid "
+                    f"{', '.join(n for n, v in p['lanes'].items() if v['allowed'])}"
+                    f"{'; off: ' + '; '.join(off) if off else ''}[/{_SEM['dim']}]"
+                )
+        except Exception:  # noqa: BLE001 — a banner never blocks a boot
+            logger.debug("[Lanes] posture announcement degraded", exc_info=True)
 
     async def _stop_sentinel_loop(self) -> None:
         """Retire the autonomous loop before teardown. NEVER raises."""

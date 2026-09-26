@@ -1041,9 +1041,8 @@ def _claude_config_disabled() -> bool:
     this predicate lets the autarky path treat it as such. Reuses the existing
     ``_CLAUDE_DISABLED_ENV`` constant (no new flag). NEVER raises."""
     try:
-        return os.environ.get(_CLAUDE_DISABLED_ENV, "").strip().lower() in (
-            "1", "true", "yes", "on",
-        )
+        from .paid_lanes import paid_lane_switched_on  # noqa: PLC0415
+        return not paid_lane_switched_on("claude")
     except Exception:  # noqa: BLE001 — fail-closed to legacy cascade
         return False
 
@@ -1066,8 +1065,12 @@ def _slice23_should_activate_sentinel(provider_route: str) -> Tuple[bool, str]:
     if env_raw in ("0", "false", "no", "off"):
         return False, "env_explicit_off"
 
-    claude_raw = os.environ.get(_CLAUDE_DISABLED_ENV, "").strip().lower()
-    if claude_raw in ("1", "true", "yes", "on"):
+    if _claude_config_disabled():
+        # The sentinel walks DW models; with DW refused too there is nothing
+        # to walk, and "activating" it would only add a dead hop.
+        from .paid_lanes import paid_lane_switched_on  # noqa: PLC0415
+        if not paid_lane_switched_on("doubleword"):
+            return False, "no_paid_lanes"
         return True, "claude_disabled"
 
     # Multi-model fleet probe — lazy import keeps candidate_generator
@@ -3602,9 +3605,12 @@ def _free_lane_active() -> bool:
         # Consult .env before answering, so a key added while the loop is
         # RUNNING revokes free-lane status without a restart. TTL-bounded.
         _refresh_paid_lane_credentials()
-        if os.environ.get("DOUBLEWORD_API_KEY") or os.environ.get("ANTHROPIC_API_KEY"):
-            return False
-        return True
+        # A key alone is not a paid lane: an operator who declared paid lanes
+        # off (JARVIS_PAID_LANES_ENABLED=false) has a free host even with keys
+        # in .env. Answered by the one authority that also decides whether
+        # those providers are built at all.
+        from .paid_lanes import any_paid_lane_configured  # noqa: PLC0415
+        return not any_paid_lane_configured()
     except Exception:  # noqa: BLE001
         return False
 
@@ -9421,7 +9427,16 @@ class CandidateGenerator:
                     exc,
                 )
 
-        # FALLBACK_ACTIVE, PRIMARY_DEGRADED, or primary plan() just failed
+        # FALLBACK_ACTIVE, PRIMARY_DEGRADED, or primary plan() just failed.
+        # No fallback is a legitimate topology (paid lanes refused by the
+        # paid-lane authority, Slice 20A's self-fallback elimination): say so
+        # with the typed exhaustion instead of an AttributeError on None.
+        if self._fallback is None:
+            self._raise_exhausted(
+                "plan_no_fallback_configured",
+                deadline=deadline,
+                phase="plan",
+            )
         _sem_t0 = time.monotonic()
         logger.debug(
             "[CandidateGenerator] Plan fallback sem acquire: slots_free=%d/%d",

@@ -205,12 +205,20 @@ def _provider_construction_gate(
     any other value (including empty, missing, mis-typed) preserves
     pre-Slice-19a behavior.
     """
-    # Slice 19a — Claude-specific isolation gate
-    if provider_name == "claude":
-        _disable_raw = os.environ.get(
-            "JARVIS_PROVIDER_CLAUDE_DISABLED", "",
-        ).strip().lower()
-        if _disable_raw in ("true", "1", "yes", "on"):
+    # The paid-lane authority owns every switch (the operator's
+    # JARVIS_PAID_LANES_ENABLED, the per-provider JARVIS_PROVIDER_<NAME>_
+    # DISABLED — Slice 19a's CLAUDE instance included — and the Aegis
+    # credential predicate). A named provider it refuses is never built.
+    if provider_name:
+        from backend.core.ouroboros.governance.paid_lanes import (
+            switch_verdict as _paid_verdict,
+        )
+        _verdict = _paid_verdict(provider_name)
+        if not _verdict.allowed:
+            logger.info(
+                "[GovernedLoop] %s provider NOT constructed — %s",
+                provider_name, _verdict.reason,
+            )
             return False
     from backend.core.ouroboros.aegis.client import is_enabled as _aegis_is_enabled
     return bool(local_api_key) or _aegis_is_enabled()
@@ -5557,30 +5565,11 @@ class GovernedLoopService:
         # None → "" so the provider's self._api_key is always a string
         # (downstream code in the bridge handles the empty case).
         #
-        # Slice 19a (2026-05-26) — provider_name="claude" lets the gate
-        # honor JARVIS_PROVIDER_CLAUDE_DISABLED for pure DW-only soaks.
-        # When that env is true, ClaudeProvider is NEVER constructed
-        # (self._fallback stays None); IMMEDIATE ops fail visibly per
-        # Manifesto §5 transparency; DW carries all non-IMMEDIATE routes.
-        if not _provider_construction_gate(
-            local_api_key=self._config.claude_api_key,
-            provider_name="claude",
-        ):
-            # Slice 19a — diagnose the skip cause so operators can
-            # distinguish "no API key + no Aegis" (existing case) from
-            # "explicitly disabled via JARVIS_PROVIDER_CLAUDE_DISABLED"
-            # (new Slice 19a case).
-            _claude_disable_env = os.environ.get(
-                "JARVIS_PROVIDER_CLAUDE_DISABLED", "",
-            ).strip().lower()
-            if _claude_disable_env in ("true", "1", "yes", "on"):
-                logger.info(
-                    "[GovernedLoop] Slice 19a: ClaudeProvider construction "
-                    "SKIPPED — JARVIS_PROVIDER_CLAUDE_DISABLED=true. "
-                    "self._fallback stays None; IMMEDIATE-routed ops will "
-                    "fail visibly (Manifesto §5 transparency). SWE-Bench "
-                    "ops unaffected (Slice 10A → STANDARD route → DW)."
-                )
+        # provider_name="claude" puts Claude under the paid-lane authority:
+        # when it refuses (operator declared paid lanes off, the per-provider
+        # switch, or no credential) ClaudeProvider is NEVER constructed and
+        # self._fallback stays None; the gate logs the reason. IMMEDIATE ops
+        # are then demoted to STANDARD by urgency_router (same authority).
         if _provider_construction_gate(
             local_api_key=self._config.claude_api_key,
             provider_name="claude",
@@ -5623,7 +5612,9 @@ class GovernedLoopService:
         # because is_available also composes the Aegis predicate.
         tier0 = None
         _dw_api_key = os.environ.get("DOUBLEWORD_API_KEY", "")
-        if _provider_construction_gate(local_api_key=_dw_api_key):
+        if _provider_construction_gate(
+            local_api_key=_dw_api_key, provider_name="doubleword",
+        ):
             try:
                 from backend.core.ouroboros.governance.doubleword_provider import (
                     DoublewordProvider,
@@ -5858,9 +5849,10 @@ class GovernedLoopService:
             # None` guard fires correctly. The FSM gracefully emits
             # `fallback_skipped:no_fallback_configured`; ExhaustionWatcher
             # filters it; hibernation is reserved for genuine distress.
-            _claude_disabled = os.environ.get(
-                "JARVIS_PROVIDER_CLAUDE_DISABLED", "",
-            ).strip().lower() in ("true", "1", "yes", "on")
+            from backend.core.ouroboros.governance.paid_lanes import (
+                paid_lane_switched_on as _paid_configured,
+            )
+            _claude_disabled = not _paid_configured("claude")
             effective_primary = primary or fallback
             if _claude_disabled and fallback is None:
                 effective_fallback = None

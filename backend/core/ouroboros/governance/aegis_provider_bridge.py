@@ -127,6 +127,13 @@ def make_async_anthropic_client(
         An ``anthropic.AsyncAnthropic`` instance, configured for
         the appropriate transport.
     """
+    # The ONE Anthropic factory is also the structural backstop of the
+    # paid-lane authority: a path nobody remembered to gate still cannot
+    # build a client the operator has switched off. Typed, so callers that
+    # already degrade on a failed build keep degrading — with the reason.
+    from backend.core.ouroboros.governance.paid_lanes import require_paid_lane
+    require_paid_lane("claude")
+
     # Lazy import — keeps cold-import cost off the hot path for
     # callers that don't construct clients.
     from anthropic import AsyncAnthropic
@@ -272,6 +279,10 @@ async def dw_session_auth_header() -> Dict[str, str]:
         async with session.post(..., headers=headers) as resp:
             ...
     """
+    # Paid-lane backstop (see make_async_anthropic_client): every credentialed
+    # DW call composes one of these two headers.
+    from backend.core.ouroboros.governance.paid_lanes import require_paid_lane
+    require_paid_lane("doubleword")
     if aegis_client_mod.is_enabled():
         try:
             client = await aegis_client_mod.AegisClient.get()
@@ -309,6 +320,8 @@ def dw_authorization_header() -> Dict[str, str]:
        :func:`dw_session_auth_header` (async) which returns the
        session bearer when Aegis is enabled.
     """
+    from backend.core.ouroboros.governance.paid_lanes import require_paid_lane
+    require_paid_lane("doubleword")
     if aegis_client_mod.is_enabled():
         return {}
     dw_key = os.environ.get("DOUBLEWORD_API_KEY", "").strip()

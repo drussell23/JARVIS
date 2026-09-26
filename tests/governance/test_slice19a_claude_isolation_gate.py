@@ -84,9 +84,13 @@ def test_ast_pin_gate_function_carries_provider_name_kwarg() -> None:
                 "— Slice 19a disable knob inert"
             )
             # ast.unparse normalizes to single quotes; accept either.
+            # The per-provider question may be asked inline (the original
+            # literal) or of the paid-lane authority, keyed by the provider's
+            # own name — either way a Claude disable cannot reach DW.
             assert (
                 'provider_name == "claude"' in body_src
                 or "provider_name == 'claude'" in body_src
+                or "_paid_verdict(provider_name)" in body_src
             ), (
                 "Gate body lacks Claude-only guard — disable could "
                 "leak to other providers"

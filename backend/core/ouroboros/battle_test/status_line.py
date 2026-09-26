@@ -837,12 +837,19 @@ class StatusLineBuilder:
             # the strength of a per-minute token cap would send an operator to
             # a billing page to fix a problem a clock fixes.
             econ = view.get("economic_dry") or []
-            if not view.get("readable") or not econ:
-                return ("", "")
-            if not view.get("all_economic_dry"):
-                # Fractional: name the lanes that are out of money, and leave
-                # the ceiling alone — it is still spendable through the rest.
-                return ("partial", ", ".join(econ))
+            # A DECLARED posture is as decisive as an observed refusal: with
+            # every paid lane refused by the paid-lane authority nothing is
+            # ever called, so nothing is ever refused, and the ledger alone
+            # would leave the ceiling reading as spendable money.
+            from backend.core.ouroboros.governance.paid_lanes import posture
+            declared_local = bool(posture().get("declared_local"))
+            if not declared_local:
+                if not view.get("readable") or not econ:
+                    return ("", "")
+                if not view.get("all_economic_dry"):
+                    # Fractional: name the lanes that are out of money, and
+                    # leave the ceiling alone — it is still spendable.
+                    return ("partial", ", ".join(econ))
             try:
                 from backend.core.ouroboros.governance.capability_state import (
                     CapabilityEvaluator,

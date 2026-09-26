@@ -371,7 +371,18 @@ async def gate_completion_detailed(
         _cloud = (_d, _c)
     elif _pref == "claude":
         _cloud = (_c, _d)
+    # A cloud tier the paid-lane authority refuses is not in the order at
+    # all — not tried-and-failed. With every paid lane off, the local tier
+    # carries the gate alone (narration, briefings, cockpit chat, critique).
+    from backend.core.ouroboros.governance.paid_lanes import paid_lane_allowed
+    _refused = tuple(n for n, _t in _cloud if not paid_lane_allowed(n))
+    _cloud = tuple(p for p in _cloud if p[0] not in _refused)
     tiers = ((_l,) if local_tier_enabled() else ()) + _cloud
+    if not tiers:
+        raise GateProviderExhaustedError(
+            f"gate_completion has no tier to try (caller={caller_id}; "
+            f"local lane off, paid lanes refused: {','.join(_refused)})"
+        )
     for name, tier in tiers:
         raw = await tier()
         if not raw:

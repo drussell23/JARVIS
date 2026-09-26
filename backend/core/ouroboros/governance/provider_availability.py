@@ -44,7 +44,11 @@ from backend.core.ouroboros.governance.dw_surface_health import (
     SurfaceVerdict,
 )
 
-# Mirror Slice 19a/22's structural-disable contract verbatim.
+# Structural disable is decided by the paid-lane authority (it reads Slice
+# 19a's JARVIS_PROVIDER_CLAUDE_DISABLED and the operator's master switch).
+from backend.core.ouroboros.governance.paid_lanes import (  # noqa: E402
+    paid_lane_switched_on as _paid_lane_switched_on,
+)
 _CLAUDE_DISABLED_ENV_VAR = "JARVIS_PROVIDER_CLAUDE_DISABLED"
 _TRUE_TOKENS = {"1", "true", "yes", "on"}
 
@@ -261,7 +265,7 @@ def collect_provider_availability(
         _disabled = (
             claude_disabled
             if claude_disabled is not None
-            else _env_true(_CLAUDE_DISABLED_ENV_VAR)
+            else not _paid_lane_switched_on("claude")
         )
         _benabled = (
             breaker_enabled

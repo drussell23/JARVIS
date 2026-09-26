@@ -58,10 +58,15 @@ async def claude_inference(
     Optional[str]
         The response text, or ``None`` if the call failed for any reason.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        logger.warning("[claude_fallback] ANTHROPIC_API_KEY not set — skipping")
+    from backend.core.ouroboros.governance.paid_lanes import allowed_verdict
+    _verdict = allowed_verdict("claude")
+    if not _verdict.allowed:
+        # Its callers treat None as "no answer" and move on — the documented
+        # contract — so a refused lane costs a log line, not a failed call.
+        logger.debug("[claude_fallback] %s: paid lane refused — %s",
+                     caller_id, _verdict.reason)
         return None
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
 
     try:
         # Slice 2B-ii — route through Aegis Provider Bridge (transport
