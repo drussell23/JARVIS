@@ -2032,12 +2032,19 @@ class AttachUI:
         except Exception:  # noqa: BLE001
             pass
 
-    def _thinking_line(self) -> str:
+    def _thinking_line(self) -> Any:
         """The compact, self-clearing generation indicator — O+V's analogue
         of Claude Code's ``· Clauding… (2m 14s · ↓ 8.2k tokens)``. Recomputed
-        each repaint so the clock ticks between token frames. NEVER raises."""
+        each repaint so the clock ticks between token frames. NEVER raises.
+
+        Returns a Rich ``Text``, not a markup string: the stream strip draws
+        ``str`` rows verbatim (`bipartite_layout.dynamic_row_lines`), so
+        ``[dim]…[/dim]`` reached the operator as literal tags. Returns ``""``
+        when there is nothing to show.
+        """
         try:
             import time as _time
+            from rich.text import Text
             from backend.core.ouroboros.battle_test.stream_renderer import (
                 render_thinking_indicator, thinking_word,
             )
@@ -2047,7 +2054,9 @@ class AttachUI:
                 word=thinking_word(self._stream_op),
                 elapsed_s=elapsed, tokens=int(self._stream_tokens or 0),
             )
-            return f"[dim]{line}[/dim]" if line else ""
+            if not line:
+                return ""
+            return Text(line, style=_SEM.get("dim") or "dim")
         except Exception:  # noqa: BLE001
             return ""
 

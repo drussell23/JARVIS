@@ -1038,18 +1038,15 @@ class SerpentFlow:
         self._route_costs: Dict[str, Dict[str, Any]] = {}
         self._op_starts: Dict[str, float] = {}
         self._streaming_active: bool = False
-        # Per-op streaming-start dedup (2026-05-03). Both the legacy
-        # SerpentREPL._dispatch_event path AND the RenderConductor
-        # SerpentFlowBackend (Slice 2) call show_streaming_start for
-        # the same op_id; without dedup the operator sees duplicate
-        # "🧬 synthesizing via Claude" lines (sometimes unprefixed
-        # when the op was momentarily not in _active_ops). Idempotency
-        # lives here on the receiving method, not at either caller —
-        # single source of truth so the dedup keeps working as new
-        # render paths are wired in. Cleared per-op in
-        # show_streaming_end so re-streams of the same op (tool-loop
-        # rounds with reset state) work correctly.
-        self._streaming_started_ops: set = set()
+        # Per-op streaming-start dedup (2026-05-03) lives in
+        # ``_stream_tallies`` (below): an op with an OPEN tally is already
+        # announced. Both the legacy SerpentREPL._dispatch_event path AND
+        # the RenderConductor SerpentFlowBackend call show_streaming_start
+        # for the same op_id; without dedup the operator sees duplicate
+        # "🧬 synthesizing" lines. Idempotency lives on the receiving
+        # method, not at either caller. The tally closes in
+        # show_streaming_end, so a re-stream of the same op (a tool-loop
+        # round, a fallback lane) is announced again.
 
         # Op block tracking — set of op_ids with visually open blocks
         self._active_ops: set = set()
@@ -1111,6 +1108,14 @@ class SerpentFlow:
         self._stream_language: str = "json"
         self._stream_token_count: int = 0
         self._stream_provider: str = ""
+        # Per-op, per-lane token tallies: op_id -> {"lane": current lane,
+        # "tokens": {lane: count}}. One process-wide slot attributed a
+        # generation to whichever stream opened FIRST for the op: a failed
+        # Claude attempt followed by the local lane printed "Generated 125
+        # tokens via Claude" with $0 of Claude credit (measured 2026-09-26),
+        # and concurrent pool ops overwrote each other's slot.
+        self._stream_tallies: Dict[str, Dict[str, Any]] = {}
+        self._stream_last_op: str = ""
 
         # Operator-visible token streaming (Priority 2 UX fix — tokens
         # on the glass in real-time during GENERATE). Owns its own
@@ -1440,7 +1445,9 @@ class SerpentFlow:
     async def stop(self) -> None:
         """Print the shutdown summary."""
         self._stop_status()
-        self.show_streaming_end()
+        # Close EVERY open stream, not just the most recent one.
+        for _open_op in list(self._stream_tallies):
+            self.show_streaming_end(_open_op)
         elapsed = time.time() - self._started_at
         mins = int(elapsed // 60)
         secs = int(elapsed % 60)
@@ -1860,12 +1867,12 @@ class SerpentFlow:
         if self._lens_mode == "manual" and self._focused_op_id == op_id:
             self._focused_op_id = None
             self._lens_mode = "auto"
-        # Per-op streaming-start dedup cleanup (2026-05-03). Removes
-        # this op_id from the dedup set so a future op with the same
-        # id (rare but possible across long-lived sessions) can stream
-        # again without being silently no-op'd. Defensive — discard
-        # is idempotent on missing keys.
-        self._streaming_started_ops.discard(op_id)
+        # Per-op stream cleanup. A stream whose end never arrived (a
+        # failure path) must not outlive its op: the tally would leak and a
+        # future op reusing the id would inherit its lane and count.
+        self._stream_tallies.pop(op_id, None)
+        if self._stream_last_op == op_id:
+            self._stream_last_op = ""
         if not was_focused:
             return
         if self._borderless():
@@ -2055,7 +2062,14 @@ class SerpentFlow:
         before — keyed on the console's own ``relays_prints`` marker, never on
         its class. NEVER raises."""
         self._mirror_markup(mirror_line)
-        text = mirror_line if print_line is None else print_line
+        self._print_local(mirror_line if print_line is None else print_line, **kw)
+
+    def _print_local(self, text: str, **kw: Any) -> None:
+        """Print to THIS process's console only — never to a cockpit.
+
+        A relaying console forwards everything printed to it, so a plain
+        ``console.print`` is not local. The console's own ``relays_prints``
+        marker says whether to ask it not to. NEVER raises."""
         kw.setdefault("highlight", False)
         try:
             if getattr(self.console, "relays_prints", False):
@@ -2470,15 +2484,25 @@ class SerpentFlow:
         SerpentREPL._dispatch_event path AND the RenderConductor
         SerpentFlowBackend (Slice 2) call this for the same op.
         Dedup lives here on the receiving method so all callers can
-        call freely; only the first call per op_id has visible
-        effect. Cleared in show_streaming_end. When op_id is empty
-        (legacy callers, defensive), behavior is unchanged — fires
-        every time, since there's no key to dedup on.
+        call freely; only the first call per open stream has visible
+        effect. A LATER start for an op whose stream is still open names
+        the lane that now produces its tokens (a failed provider handed
+        the op on), so the receipt credits the lane that did the work.
+        When op_id is empty (legacy callers, defensive), behavior is
+        unchanged — fires every time, since there's no key to dedup on.
         """
-        if op_id and op_id in self._streaming_started_ops:
+        key = str(op_id or "")
+        lane = str(provider or "")
+        if key and key in self._stream_tallies:
+            if lane:
+                self._stream_tallies[key]["lane"] = lane
+                self._stream_provider = lane
+                self._spinner_state.provider = _prov(lane)
+                self._spinner_state.message = f"Streaming via {_prov(lane)}"
+            self._stream_last_op = key
             return
-        if op_id:
-            self._streaming_started_ops.add(op_id)
+        self._stream_tallies[key] = {"lane": lane, "tokens": {}}
+        self._stream_last_op = key
         self._streaming_active = True
         self._stream_buffer = ""
         self._stream_token_count = 0
@@ -2540,7 +2564,25 @@ class SerpentFlow:
             f"{self._stream_token_count} tokens{prov_seg}"
         )
 
-    def show_streaming_token(self, token: str) -> None:
+    def _stream_tally(self, op_id: str = "") -> Dict[str, Any]:
+        """The open tally for ``op_id`` (else the op that last streamed),
+        created on demand so a token that beat its start is still counted.
+        NEVER raises."""
+        key = str(op_id or self._stream_last_op or "")
+        tally = self._stream_tallies.get(key)
+        if tally is None:
+            tally = {"lane": self._stream_provider, "tokens": {}}
+            self._stream_tallies[key] = tally
+        return tally
+
+    @staticmethod
+    def _tally_lanes(tally: Dict[str, Any]) -> Tuple[int, List[str]]:
+        """``(total tokens, lanes that produced any, in order)``."""
+        counts = tally.get("tokens") or {}
+        lanes = [lane for lane, n in counts.items() if n > 0 and lane]
+        return (sum(counts.values()), lanes)
+
+    def show_streaming_token(self, token: str, op_id: str = "") -> None:
         """Append a token to the running buffer + tick the spinner.
 
         UI Slice 7: tokens still aggregate into ``self._stream_buffer``
@@ -2559,38 +2601,84 @@ class SerpentFlow:
             return
         self._stream_buffer += token
         self._stream_token_count += 1
+        # Credited to the lane streaming for THIS op right now.
+        try:
+            tally = self._stream_tally(op_id)
+            lane = str(tally.get("lane") or "")
+            tally["tokens"][lane] = tally["tokens"].get(lane, 0) + 1
+        except Exception:  # noqa: BLE001 — a tally never drops a token
+            pass
         # Bottom_toolbar reads token_count on its next refresh tick.
         # Pure state mutation — no per-token render overhead.
         self._spinner_state.token_count = self._stream_token_count
 
-    def show_streaming_end(self) -> None:
+    def show_streaming_end(self, op_id: str = "") -> None:
         """Finalize the ephemeral stream — vanish the spinner and
         emit a single inline receipt line.
 
-        Format: ``[✓] Generated N tokens via Claude``.
+        Format: ``[✓] Generated N tokens via <the lane(s) that produced
+        them>``. ``op_id`` closes that op's stream; without it the most
+        recent one closes. An end for a stream that is not open is a no-op:
+        two render paths deliver the same PHASE_END, and the second must not
+        close some OTHER op's stream mid-generation. Teardown closes each
+        open stream by name (see ``stop``).
+
+        The receipt goes to attached cockpits only while this renderer
+        owns in-flight publishing. When the per-op transport is elected
+        (`stream_renderer.set_inflight_publisher`), cockpits already get
+        the thinking indicator and the op recap's token count, and a second
+        surface for the same generation is exactly the duplication that
+        election exists to prevent. The local console still gets it.
         """
-        token_count = self._stream_token_count
-        prov = _prov(self._stream_provider) if self._stream_provider else ""
+        key = str(op_id or self._stream_last_op or "")
+        keys = [key] if key in self._stream_tallies else []
         # Clear spinner state first so the bottom_toolbar disappears
         # before the receipt line prints below it.
         self._stop_status()
-        if token_count > 0:
-            via_seg = (
-                f" via [{_SEM['provider']}]{prov}[/{_SEM['provider']}]"
-                if prov else ""
+        for k in keys:
+            tally = self._stream_tallies.pop(k, None) or {}
+            token_count, lanes = self._tally_lanes(tally)
+            if token_count <= 0:
+                continue
+            via = " → ".join(
+                f"[{_SEM['provider']}]{_prov(lane)}[/{_SEM['provider']}]"
+                for lane in lanes
             )
             gen_receipt = (
                 f"  [{_SEM['life']}][✓][/{_SEM['life']}] "
-                f"Generated {token_count} tokens{via_seg}"
+                f"Generated {token_count} tokens"
+                + (f" via {via}" if via else "")
             )
-            # Attach mirror: the synthesis receipt (tokens + provider).
-            self._print_mirrored(gen_receipt)
+            if self._owns_generation_surface():
+                self._print_mirrored(gen_receipt)
+            else:
+                self._print_local(gen_receipt)
+        if self._stream_last_op in keys:
+            self._stream_last_op = ""
+        if self._stream_tallies:
+            return          # another op is still streaming
         # Reset state for the next synthesis cycle.
         self._stream_buffer = ""
         self._stream_token_count = 0
         self._stream_provider = ""
         self._stream_language = "json"
         self._streaming_active = False
+
+    @staticmethod
+    def _owns_generation_surface() -> bool:
+        """Whether this renderer carries generation to attached cockpits.
+        Asks the ONE election; an unanswerable question keeps the legacy
+        behaviour (it does). NEVER raises."""
+        try:
+            from backend.core.ouroboros.battle_test.stream_renderer import (
+                owns_inflight_publishing,
+            )
+            from backend.core.ouroboros.governance.render_backends import (
+                SerpentFlowBackend,
+            )
+            return owns_inflight_publishing(SerpentFlowBackend.name)
+        except Exception:  # noqa: BLE001
+            return True
 
     # ══════════════════════════════════════════════════════════
     # Operation lifecycle — Zone 1 events
@@ -2861,7 +2949,7 @@ class SerpentFlow:
     ) -> None:
         """Generation completed — stop spinner, show summary."""
         self._stop_status()
-        self.show_streaming_end()
+        self.show_streaming_end(op_id)
 
         self._op_providers[op_id] = provider
         prov = _prov(provider)
@@ -5573,9 +5661,9 @@ class SerpentTransport:
                         self._flow.op_provider(op_id, provider)
                         self._flow.show_streaming_start(provider=provider, op_id=op_id)
                 elif payload.get("streaming") == "token":
-                    self._flow.show_streaming_token(payload.get("token", ""))
+                    self._flow.show_streaming_token(payload.get("token", ""), op_id=op_id)
                 elif payload.get("streaming") == "end":
-                    self._flow.show_streaming_end()
+                    self._flow.show_streaming_end(op_id)
 
                 # IntentDiscovery sensor
                 elif payload.get("intent_discovery_cycle") is not None:

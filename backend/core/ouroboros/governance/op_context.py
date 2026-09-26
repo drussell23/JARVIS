@@ -87,6 +87,22 @@ def register_phase_transition_observer(cb: "Callable[[str, str], None]") -> None
         pass
 
 
+def unregister_phase_transition_observer(cb: "Callable[[str, str], None]") -> bool:
+    """Remove a callback registered above. Returns whether it was present.
+
+    Compared by EQUALITY, not identity: a bound method is a new object on
+    every attribute access, so an identity test could never remove one.
+    NEVER raises."""
+    try:
+        for i, existing in enumerate(_PHASE_TRANSITION_OBSERVERS):
+            if existing == cb:
+                del _PHASE_TRANSITION_OBSERVERS[i]
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
 def _reset_phase_transition_observers_for_tests() -> None:
     _PHASE_TRANSITION_OBSERVERS.clear()
 

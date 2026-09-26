@@ -548,9 +548,8 @@ class StatusLineBuilder:
         for op_id, fsm_ctx in fsm_contexts.items():
             ids.append(op_id)
             try:
-                pe = getattr(fsm_ctx, "phase_entered_at", None)
-                # ``phase_entered_at`` is a datetime on OperationContext.
-                # Comparison via .timestamp() — missing → skip.
+                _, pe = _live_phase(fsm_ctx)
+                # A datetime; compared via .timestamp() — missing → skip.
                 if pe is not None:
                     ts = float(pe.timestamp())
                     if ts > primary_ts:
@@ -675,14 +674,13 @@ class StatusLineBuilder:
         primary_entered_at = None
         for fsm_ctx in fsm_contexts.values():
             try:
-                pe = getattr(fsm_ctx, "phase_entered_at", None)
-                phase_obj = getattr(fsm_ctx, "phase", None)
-                if pe is None or phase_obj is None:
+                label, pe = _live_phase(fsm_ctx)
+                if not label:
                     continue
                 ts = float(pe.timestamp())
                 if ts > primary_ts:
                     primary_ts = ts
-                    primary_phase = _phase_label(phase_obj)
+                    primary_phase = label
                     primary_entered_at = pe
             except Exception:  # noqa: BLE001
                 continue
@@ -866,6 +864,31 @@ class StatusLineBuilder:
 # ---------------------------------------------------------------------------
 # Helpers — phase label, formatting, color thresholds
 # ---------------------------------------------------------------------------
+
+
+def _live_phase(fsm_ctx: Any) -> tuple:
+    """``(label, entered_at)`` for one in-flight op, or ``("", None)``.
+
+    The governed loop's runtime entries are ``LoopRuntimeContext``, which
+    carries the pipeline phase as ``pipeline_phase`` /
+    ``pipeline_phase_entered_at``. The ``phase`` / ``phase_entered_at`` names
+    are ``OperationContext``'s and are honoured second, for callers that hold
+    one. Reading only those names made every live op look phase-less, so the
+    cockpit said IDLE through whole generations (measured live 2026-09-26).
+    NEVER raises.
+    """
+    try:
+        label = getattr(fsm_ctx, "pipeline_phase", None)
+        entered = getattr(fsm_ctx, "pipeline_phase_entered_at", None)
+        if not label:
+            phase_obj = getattr(fsm_ctx, "phase", None)
+            label = _phase_label(phase_obj) if phase_obj is not None else ""
+            entered = getattr(fsm_ctx, "phase_entered_at", None)
+        if not label or entered is None:
+            return ("", None)
+        return (str(label), entered)
+    except Exception:  # noqa: BLE001
+        return ("", None)
 
 
 def _phase_label(phase_obj: Any) -> str:
@@ -1427,25 +1450,41 @@ def _segment_priority(segment: str) -> int:
         return 0
 
 
-def snapshot_to_payload(snap: "StatusSnapshot") -> dict:
-    """A snapshot as a transport-safe dict. NEVER raises."""
+def _wire_value(value: Any, default: Any) -> Any:
+    """One snapshot field as a JSON-safe value. NEVER raises.
+
+    A non-finite float would serialise as ``NaN`` (not JSON) and a foreign
+    type would fail the whole frame, so each degrades to the field's own
+    default rather than taking the other fields down with it.
+    """
     try:
-        return {
-            "schema_version": STATUS_LINE_SCHEMA_VERSION,
-            "phase": snap.phase,
-            "phase_detail": snap.phase_detail,
-            "cost_spent_usd": round(float(snap.cost_spent_usd), 4),
-            "cost_budget_usd": round(float(snap.cost_budget_usd), 4),
-            "idle_elapsed_s": round(float(snap.idle_elapsed_s), 1),
-            "idle_timeout_s": round(float(snap.idle_timeout_s), 1),
-            "primary_op_id": snap.primary_op_id,
-            "extra_op_count": int(snap.extra_op_count),
-            "route": snap.route,
-            "provider": snap.provider,
-            "liquidity_exhausted": bool(snap.liquidity_exhausted),
-            "liquidity_provider": snap.liquidity_provider,
-            "liquidity_reset_s": snap.liquidity_reset_s,
-        }
+        if value is None or isinstance(value, (bool, int, str)):
+            return value
+        if isinstance(value, float):
+            import math
+            return value if math.isfinite(value) else default
+        return str(value)
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def snapshot_to_payload(snap: "StatusSnapshot") -> dict:
+    """A snapshot as a transport-safe dict. NEVER raises.
+
+    DERIVED from the dataclass, the same way :func:`payload_to_snapshot`
+    reads it back. The hand-typed version listed 13 of 21 fields and never
+    learned the later ones. The attach cockpit therefore rendered
+    ``landed 0 · 0m in`` beneath a "sentinel landed" line while the daemon
+    had counted the landing (measured live 2026-09-26), and it lost the model
+    and funding chips the same way. A field added to ``StatusSnapshot`` now
+    crosses the bridge without anyone remembering to add it here.
+    """
+    try:
+        payload: Dict[str, Any] = {"schema_version": STATUS_LINE_SCHEMA_VERSION}
+        for f in dataclasses.fields(StatusSnapshot):
+            default = f.default if f.default is not dataclasses.MISSING else None
+            payload[f.name] = _wire_value(getattr(snap, f.name, default), default)
+        return payload
     except Exception:  # noqa: BLE001
         return {}
 

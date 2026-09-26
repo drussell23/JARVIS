@@ -52,7 +52,7 @@ and ``shipped_code_invariants._discover_module_provided_invariants``.
 from __future__ import annotations
 
 import logging
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -237,6 +237,35 @@ class SerpentFlowBackend:
         contract so tests can substitute a stub."""
         self._flow = flow
         self._file_ref_dedup = _RingDedup()
+        # method name -> whether the wrapped renderer takes ``op_id``.
+        # Resolved once per method: the token path runs once per token.
+        self._op_id_capable: Dict[str, bool] = {}
+
+    def _call_scoped(self, method: str, *args: Any, op_id: str = "") -> None:
+        """Call ``self._flow.<method>(*args)``, scoped to ``op_id`` when the
+        renderer can take it. SerpentFlow attributes tokens per op; a
+        renderer with the older, narrower signature still gets the call.
+        Decided by signature, never by catching TypeError, so a TypeError
+        raised INSIDE the renderer is not retried as a second call."""
+        fn = getattr(self._flow, method, None)
+        if not callable(fn):
+            return
+        capable = self._op_id_capable.get(method)
+        if capable is None:
+            try:
+                import inspect  # noqa: PLC0415
+                params = inspect.signature(fn).parameters
+                capable = "op_id" in params or any(
+                    p.kind is inspect.Parameter.VAR_KEYWORD
+                    for p in params.values()
+                )
+            except (TypeError, ValueError):
+                capable = False
+            self._op_id_capable[method] = capable
+        if capable and op_id:
+            fn(*args, op_id=op_id)
+        else:
+            fn(*args)
 
     def notify(self, event: Any) -> None:
         """Route a RenderEvent to the wrapped SerpentFlow. Total over
@@ -249,8 +278,11 @@ class SerpentFlowBackend:
         try:
             if kind == "REASONING_TOKEN":
                 content = getattr(event, "content", "") or ""
-                if content and hasattr(self._flow, "show_streaming_token"):
-                    self._flow.show_streaming_token(content)
+                if content:
+                    self._call_scoped(
+                        "show_streaming_token", content,
+                        op_id=getattr(event, "op_id", None) or "",
+                    )
                 return
             if kind == "PHASE_BEGIN":
                 op_id = getattr(event, "op_id", None) or ""
@@ -276,8 +308,10 @@ class SerpentFlowBackend:
                             )
                 return
             if kind == "PHASE_END":
-                if hasattr(self._flow, "show_streaming_end"):
-                    self._flow.show_streaming_end()
+                self._call_scoped(
+                    "show_streaming_end",
+                    op_id=getattr(event, "op_id", None) or "",
+                )
                 return
             if kind == "FILE_REF":
                 self._handle_file_ref(event)

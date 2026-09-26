@@ -5407,29 +5407,17 @@ class BattleTestHarness:
                 return
 
             def _status_provider() -> dict:
+                # The ONE serializer the heartbeat also uses. A second
+                # hand-typed copy here drifted from it (it had landed_total but
+                # not landed_uptime_s; the heartbeat had neither).
                 try:
                     from backend.core.ouroboros.battle_test.status_line import (
-                        get_status_line_builder,
+                        get_status_line_builder, snapshot_to_payload,
                     )
                     b = get_status_line_builder()
                     if b is None:
                         return {}
-                    snap = b.snapshot()
-                    return {
-                        "phase": snap.phase,
-                        "phase_detail": snap.phase_detail,
-                        "cost_spent_usd": snap.cost_spent_usd,
-                        "cost_budget_usd": snap.cost_budget_usd,
-                        "cost_budget_basis": snap.cost_budget_basis,
-                        "idle_elapsed_s": snap.idle_elapsed_s,
-                        "primary_op_id": snap.primary_op_id,
-                        "route": snap.route,
-                        "provider": snap.provider,
-                        "liquidity_exhausted": snap.liquidity_exhausted,
-                        "landed_total": snap.landed_total,
-                        "landed_per_hour": snap.landed_per_hour,
-                        "landed_settled": snap.landed_settled,
-                    }
+                    return snapshot_to_payload(b.snapshot())
                 except Exception:  # noqa: BLE001
                     return {}
 

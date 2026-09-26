@@ -1932,6 +1932,20 @@ class GovernedLoopService:
                     _exc,
                 )
 
+            # The live PIPELINE phase of every op, foreground and pool, from
+            # the one choke all transitions flow through. Unregistered in
+            # stop() so a stopped service stops observing.
+            try:
+                from backend.core.ouroboros.governance.op_context import (
+                    register_phase_transition_observer,
+                )
+                register_phase_transition_observer(self._on_pipeline_phase)
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning(
+                    "[GovernedLoop] Failed to register phase observer: %s",
+                    _exc,
+                )
+
             # Fetch and cache VM capability contract
             if self._prime_client is not None:
                 try:
@@ -2878,12 +2892,31 @@ class GovernedLoopService:
             await self._teardown_partial()
             raise
 
+    def _on_pipeline_phase(self, op_id: str, phase_name: str) -> None:
+        """Mirror a committed pipeline transition onto the op's runtime
+        context. An op with no runtime context (not yet admitted, or already
+        terminal) is not in flight, so there is nothing to mirror. NEVER
+        raises: it runs inside ``OperationContext.advance()``."""
+        try:
+            ctx = self._fsm_contexts.get(op_id)
+            if ctx is not None:
+                ctx.observe_pipeline_phase(phase_name)
+        except Exception:  # noqa: BLE001
+            logger.debug("[GovernedLoop] phase mirror skipped", exc_info=True)
+
     async def stop(self) -> None:
         """Graceful shutdown. Drains in-flight ops, cancels probes."""
         if self._state is ServiceState.INACTIVE:
             return
 
         self._state = ServiceState.STOPPING
+        try:
+            from backend.core.ouroboros.governance.op_context import (
+                unregister_phase_transition_observer,
+            )
+            unregister_phase_transition_observer(self._on_pipeline_phase)
+        except Exception:  # noqa: BLE001
+            logger.debug("[GovernedLoop] phase observer release skipped", exc_info=True)
 
         # Sovereign Epistemic Context Matrix LR2: reconcile this session's memory
         # quarantine vs live disk on teardown; refresh oracle for revalidated

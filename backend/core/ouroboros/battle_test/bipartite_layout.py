@@ -1096,6 +1096,37 @@ def _mount_region_layout(rows: "list") -> Any:
 _REFRESH_INTERVAL_S: float = 0.1
 
 
+def dynamic_row_lines(rows: Any) -> List[str]:
+    """A strip's rows as the ANSI lines prompt_toolkit will draw. NEVER raises.
+
+    The strip is drawn through ``ANSI``, so a ``str`` must already be plain
+    or pre-escaped text, and it passes through BYTE-IDENTICAL. That is load-
+    bearing: the same strip carries raw tool output (``[1/3]``, ``a[0]``),
+    and reading it as Rich markup would eat those brackets.
+
+    Styled content therefore travels as a Rich renderable (``Text``), never as
+    a markup string. A markup string is the plain case, and a
+    ``[dim]…[/dim]`` sent that way reached the operator verbatim on every
+    generation (measured live 2026-09-26). A renderable is resolved here, at
+    the boundary, by `ui.markup_ansi.markup_to_ansi`, the one translator the
+    toolbar and the attach bridge already use, and split on the line breaks
+    it produced so the strip's height follows what is actually drawn.
+    """
+    out: List[str] = []
+    for row in rows or ():
+        try:
+            if row is None:
+                continue
+            if isinstance(row, str):
+                out.append(row)
+                continue
+            from backend.core.ouroboros.ui.markup_ansi import markup_to_ansi
+            out.extend(markup_to_ansi(row).split("\n"))
+        except Exception:  # noqa: BLE001 — one bad row never blanks the strip
+            logger.debug("[Bipartite] dynamic row dropped", exc_info=True)
+    return out
+
+
 def build_dynamic_rows(rows: Callable[[], Any]) -> Any:
     """A strip that is EXACTLY as tall as whatever it currently holds.
 
@@ -1118,6 +1149,8 @@ def build_dynamic_rows(rows: Callable[[], Any]) -> Any:
     ``rows`` is a callable returning the CURRENT roster lines, so the source
     (a local singleton in-process, a heartbeat snapshot remotely) is the
     caller's concern and this container never learns which one it is drawing.
+    Each row is either a ``str`` (plain or pre-escaped ANSI, drawn as given)
+    or a Rich renderable such as ``Text`` (styled; see :func:`dynamic_row_lines`).
     NEVER raises — returns None, and the layout omits the row.
     """
     try:
@@ -1128,7 +1161,7 @@ def build_dynamic_rows(rows: Callable[[], Any]) -> Any:
 
         def _current() -> list:
             try:
-                return [str(x) for x in (rows() or ())]
+                return dynamic_row_lines(rows() or ())
             except Exception:  # noqa: BLE001
                 return []
 
@@ -1143,6 +1176,8 @@ def build_dynamic_rows(rows: Callable[[], Any]) -> Any:
                 return []
 
         def _height() -> Any:
+            # Counted AFTER rendering, so a renderable that carries its own
+            # line breaks claims every row it will actually draw.
             try:
                 return Dimension.exact(max(1, len(_current())))
             except Exception:  # noqa: BLE001

@@ -101,6 +101,30 @@ class LoopRuntimeContext:
     # stale. Phase transitions implicitly bump this too (any progress is
     # progress). Defaults to construction time so a brand-new ctx is fresh.
     last_activity_at_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # The PIPELINE phase (CLASSIFY … COMPLETE) the op is in, and when it
+    # entered it — distinct from ``state``, which is the loop's own lifecycle
+    # (RUNNING / SUSPENDED / …). Stamped from ``OperationContext.advance()``'s
+    # transition event, the one choke every phase change flows through, so it
+    # covers foreground and background-pool ops alike. ``None`` until the
+    # first transition is observed. Readers that want "what is this op doing"
+    # (the status line) read these; before they existed they asked this
+    # object for ``phase`` / ``phase_entered_at``, which only
+    # ``OperationContext`` has, and reported IDLE for every running op.
+    pipeline_phase: Optional[str] = None
+    pipeline_phase_entered_at: Optional[datetime] = None
+
+    def observe_pipeline_phase(
+        self, phase_name: str, at: Optional[datetime] = None,
+    ) -> None:
+        """Record a committed pipeline transition. A transition is progress,
+        so it also refreshes the activity signal. NEVER raises."""
+        try:
+            now = at or datetime.now(timezone.utc)
+            self.pipeline_phase = str(phase_name or "") or None
+            self.pipeline_phase_entered_at = now
+            self.last_activity_at_utc = now
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class Ledger(Protocol):

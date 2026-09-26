@@ -73,6 +73,12 @@ def markup_to_ansi(
             soft_wrap=True,
             legacy_windows=False,
         )
+        # A scratch Console has no theme, so a design-language TOKEN
+        # (`muted`, `accent`, …) resolved to nothing and the styling vanished
+        # silently. `spooled_console` hit the same trap; the theme's own
+        # idempotent helper is the fix there and here.
+        from backend.core.ouroboros.ui.theme import ensure_theme
+        ensure_theme(out)
         out.print(msg, end="")
         return buf.getvalue()
     except Exception:  # noqa: BLE001 — styling is never worth losing the line
