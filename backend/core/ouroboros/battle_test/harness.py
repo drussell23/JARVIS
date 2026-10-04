@@ -10064,48 +10064,14 @@ class BattleTestHarness:
         switch off, or total RAM unknowable with no explicit cap) — the
         caller then never arms the watchdog (inert, exactly the
         wall-clock discipline when ``max_wall_seconds`` is None).
+
+        The formula lives in ``governance.process_memory_budget`` so the
+        test execution lock reserves exactly the cap this watchdog enforces.
         """
-        if os.environ.get(
-            "JARVIS_PROCESS_MEMORY_WATCHDOG_ENABLED", "true",
-        ).strip().lower() == "false":
-            return (0.0, None, 0.0)
-
-        def _envf(name: str) -> Optional[float]:
-            raw = os.environ.get(name, "").strip()
-            if not raw:
-                return None
-            try:
-                v = float(raw)
-                return v if v > 0 else None
-            except (TypeError, ValueError):
-                return None
-
-        # Interval — floor 2s (no busy-probe), ceiling 120s (bound the
-        # detection lag on a fast leak).
-        interval_s = _envf("JARVIS_PROCESS_MEMORY_WATCHDOG_INTERVAL_S") or 15.0
-        interval_s = max(2.0, min(120.0, interval_s))
-
-        cap_mb = _envf("JARVIS_PROCESS_MEMORY_CAP_MB")
-        if cap_mb is None:
-            try:
-                frac_raw = _envf("JARVIS_PROCESS_MEMORY_CAP_FRACTION")
-                frac = frac_raw if frac_raw is not None else 0.75
-                frac = max(0.10, min(0.95, frac))
-                import psutil  # lazy — already a project dependency
-                total_mb = psutil.virtual_memory().total / (1024.0 * 1024.0)
-                cap_mb = total_mb * frac
-            except Exception:  # noqa: BLE001 — psutil missing / probe failed
-                # No host-relative cap derivable and no override → stay
-                # DISABLED rather than invent a number (no hardcoding).
-                return (0.0, None, interval_s)
-
-        warn_mb = _envf("JARVIS_PROCESS_MEMORY_WARN_MB")
-        if warn_mb is None:
-            warn_mb = cap_mb * 0.85
-        # Keep warn strictly below cap so the WARN checkpoint always
-        # precedes the CAP stop.
-        warn_mb = min(warn_mb, cap_mb * 0.98)
-        return (warn_mb, cap_mb, interval_s)
+        from backend.core.ouroboros.governance.process_memory_budget import (
+            resolve_process_memory_thresholds,
+        )
+        return resolve_process_memory_thresholds()
 
     @staticmethod
     def _probe_process_tree_rss_mb() -> Optional[float]:

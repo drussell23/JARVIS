@@ -102,6 +102,10 @@ def _resolve_root_ignores() -> list[str]:
 #: Consumed by pytest during root-directory collection.
 collect_ignore = _resolve_root_ignores()
 
+#: Every suite launched from this checkout is admitted and memory-contained
+#: by the resource-aware execution lock (see the plugin's docstring).
+pytest_plugins = ["tests.support.execution_lock_plugin"]
+
 logger.debug(
     "[root-conftest] collecting %d root test modules, ignoring %d script-only/unsafe",
     len(list(_HERE.glob("test_*.py"))) - len(collect_ignore),

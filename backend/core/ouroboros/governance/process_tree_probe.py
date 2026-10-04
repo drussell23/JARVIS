@@ -134,8 +134,13 @@ def _resolve_probe_metric() -> str:
 # ---------------------------------------------------------------------------
 
 
-def probe_process_tree_memory_mb() -> Optional[float]:
-    """Sum memory of THIS process + all descendants, in MB.
+def probe_process_tree_memory_mb(root_pid: Optional[int] = None) -> Optional[float]:
+    """Sum memory of THIS process (or *root_pid*) + all descendants, in MB.
+
+    *root_pid* lets a different process measure a tree it does not own --
+    the test execution lock sizing a live soak's current footprint. The
+    ``getrusage`` fallback below can only describe SELF, so it is skipped
+    for a foreign root (None is the honest answer there).
 
     Per-pid metric: phys_footprint on darwin (compression-aware — see
     module docstring), rss elsewhere or wherever the footprint
@@ -151,7 +156,7 @@ def probe_process_tree_memory_mb() -> Optional[float]:
     use_footprint = _resolve_probe_metric() == "footprint"
     try:
         import psutil
-        me = psutil.Process()
+        me = psutil.Process(root_pid)
         procs = [me]
         try:
             procs.extend(me.children(recursive=True))
@@ -171,6 +176,8 @@ def probe_process_tree_memory_mb() -> Optional[float]:
         return total
     except Exception:  # noqa: BLE001 — fall through to stdlib
         pass
+    if root_pid is not None and root_pid != os.getpid():
+        return None
     try:
         import resource
         ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
