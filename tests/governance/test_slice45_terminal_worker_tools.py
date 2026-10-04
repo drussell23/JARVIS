@@ -250,9 +250,178 @@ def test_policy_module_is_a_leaf_no_governance_imports():
                 if isinstance(node, ast.ImportFrom)
                 else node.names[0].name
             )
-            if str(mod).endswith("governance.paid_lanes"):
-                _assert_stdlib_only(_POLICY.parent / "paid_lanes.py")
+            # Leaves the policy may compose: each must itself be stdlib-only
+            # at import time, so no cycle can form through it.
+            _leaf = next(
+                (name for name in ("paid_lanes", "route_predicates")
+                 if str(mod).endswith(f"governance.{name}")),
+                None,
+            )
+            if _leaf is not None:
+                _assert_stdlib_only(_POLICY.parent / f"{_leaf}.py")
                 continue
             assert mod is None or "ouroboros.governance" not in str(mod), (
                 f"leaf policy must not import governance modules; found {mod}"
             )
+
+
+# ── 6. Exec layer agrees with the prompt layer (soak bt-2026-10-04-204411) ──
+#
+# Sections 2-5 pin the PROMPT layer. The exec layer is the other half of the
+# same contract: a seat that is shown the tools must run the loop that
+# consumes them. PrimeProvider gated its loop on ``should_skip_venom_for_route``
+# alone, so with Claude disabled the local 30B was advertised the tools on a
+# BACKGROUND op, answered with a 2b.2-tool call, and had it rejected as
+# ``tool_call_returned_under_venom_skip`` -- every VALIDATE_RETRY regeneration
+# (always served on the BACKGROUND free lane) died that way.
+
+from backend.core.ouroboros.governance.dw_terminal_worker_policy import (  # noqa: E402
+    route_skips_tool_loop,
+)
+from backend.core.ouroboros.governance.route_predicates import (  # noqa: E402
+    VENOM_SKIP_ROUTES,
+)
+
+_ALL_ROUTES = tuple(sorted(VENOM_SKIP_ROUTES)) + (
+    "standard", "immediate", "complex", "",
+)
+# (claude_disabled, master_flag) postures the policy distinguishes.
+_POSTURES = (
+    (False, None), (True, None), (True, "false"), (False, "false"),
+)
+
+
+def _apply_posture(monkeypatch, claude_disabled, master):
+    if claude_disabled:
+        monkeypatch.setenv("JARVIS_PROVIDER_CLAUDE_DISABLED", "true")
+    if master is not None:
+        monkeypatch.setenv(MASTER_FLAG, master)
+
+
+@pytest.mark.parametrize("claude_disabled,master", _POSTURES)
+@pytest.mark.parametrize("route", _ALL_ROUTES)
+def test_exec_skip_matches_prompt_advertisement(
+    monkeypatch, route, claude_disabled, master,
+):
+    """THE parity contract: the loop runs iff the tools were advertised."""
+    _apply_posture(monkeypatch, claude_disabled, master)
+    advertised = _build_tool_section(provider_route=route) != ""
+    assert route_skips_tool_loop(route) is (not advertised), (
+        route, claude_disabled, master,
+    )
+
+
+@pytest.mark.parametrize("claude_disabled,master", _POSTURES)
+@pytest.mark.parametrize("route", _ALL_ROUTES)
+def test_read_only_never_skips_the_loop(monkeypatch, route, claude_disabled, master):
+    _apply_posture(monkeypatch, claude_disabled, master)
+    assert route_skips_tool_loop(route, is_read_only=True) is False
+
+
+def test_terminal_worker_background_runs_the_loop(monkeypatch):
+    monkeypatch.setenv("JARVIS_PROVIDER_CLAUDE_DISABLED", "true")
+    assert route_skips_tool_loop("background") is False
+    # Scope did not widen: the other skip routes stay suppressed.
+    assert route_skips_tool_loop("speculative") is True
+    assert route_skips_tool_loop("wiring_validation") is True
+
+
+def test_legacy_background_still_skips_when_claude_enabled():
+    assert route_skips_tool_loop("background") is True
+
+
+def test_policy_probe_failure_keeps_layers_in_agreement(monkeypatch):
+    """A broken terminal-worker probe must resolve the SAME way in both
+    layers (suppress + skip), never advertise-without-loop."""
+    import backend.core.ouroboros.governance.dw_terminal_worker_policy as pol
+
+    def _boom():
+        raise RuntimeError("probe down")
+
+    monkeypatch.setattr(pol, "claude_is_disabled", _boom)
+    assert route_skips_tool_loop("background") is True
+    assert _build_tool_section(provider_route="background") == ""
+
+
+def test_both_provider_seats_gate_on_the_canonical_predicate():
+    """No seat may re-derive the skip from the route alone."""
+    src = _PROVIDERS.read_text(encoding="utf-8")
+    gates = [
+        ln.strip() for ln in src.splitlines()
+        if ln.strip().startswith("_skip_tools =") and "_route" in ln
+    ]
+    assert len(gates) >= 2, gates  # PrimeProvider + ClaudeProvider
+    for gate in gates:
+        assert "route_skips_tool_loop(" in gate, gate
+        assert "is_read_only=_is_read_only" in gate, gate
+
+
+class _StubToolLoop:
+    """ToolLoopCoordinator.run() stand-in (test_provider_tool_loop pattern)."""
+
+    def __init__(self, response: str) -> None:
+        self._response = response
+        self.run_called = False
+
+    async def run(self, prompt, generate_fn, parse_fn, repo, op_id, deadline, **_kw):
+        self.run_called = True
+        await generate_fn(prompt)
+        return self._response, []
+
+
+def _prime_client(text: str):
+    client = MagicMock()
+    resp = MagicMock()
+    resp.model = "qwen3-coder-ov:30b"
+    resp.latency_ms = 10.0
+    resp.tokens_used = 10
+    resp.metadata = {}
+    resp.content = text
+
+    async def _generate(**_kw):
+        return resp
+
+    client.generate = _generate
+    return client
+
+
+async def _drive_prime_background(tmp_path):
+    import json
+    from datetime import datetime, timezone
+
+    from backend.core.ouroboros.governance.op_context import OperationContext
+    from backend.core.ouroboros.governance.providers import PrimeProvider
+
+    patch = json.dumps({
+        "schema_version": "2b.1",
+        "candidates": [{
+            "candidate_id": "c1",
+            "file_path": "tests/test_utils.py",
+            "full_content": "def test_stub():\n    assert True\n",
+            "rationale": "terminal-worker loop",
+        }],
+    })
+    loop = _StubToolLoop(patch)
+    provider = PrimeProvider(_prime_client(patch), repo_root=tmp_path, tool_loop=loop)
+    ctx = OperationContext.create(
+        target_files=("tests/test_utils.py",),
+        description="background terminal-worker op",
+        op_id="op-tw-loop",
+        provider_route="background",
+    )
+    await provider.generate(ctx, datetime(2099, 1, 1, tzinfo=timezone.utc))
+    return loop
+
+
+async def test_prime_seat_runs_loop_for_terminal_worker_background(
+    monkeypatch, tmp_path,
+):
+    """The seat the local 30B is served through runs the loop it was shown."""
+    monkeypatch.setenv("JARVIS_PROVIDER_CLAUDE_DISABLED", "true")
+    loop = await _drive_prime_background(tmp_path)
+    assert loop.run_called
+
+
+async def test_prime_seat_skips_loop_for_background_when_claude_enabled(tmp_path):
+    loop = await _drive_prime_background(tmp_path)
+    assert not loop.run_called

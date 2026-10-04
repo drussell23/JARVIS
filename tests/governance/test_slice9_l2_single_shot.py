@@ -183,11 +183,20 @@ def test_spine_route_based_skip_preserved_verbatim() -> None:
         "skip broken by Slice 9 restructure"
     )
     # The pre-existing _skip_tools computation must still exist
-    # (BEFORE the Slice 9 guard adds to it)
-    assert "should_skip_venom_for_route(_route) and not _is_read_only" in src, (
+    # (BEFORE the Slice 9 guard adds to it). It is now the canonical
+    # ``route_skips_tool_loop``, which composes should_skip_venom_for_route.
+    assert (
+        "_skip_tools = route_skips_tool_loop(_route, is_read_only=_is_read_only)"
+        in src
+    ), (
         "Pre-existing route-based _skip_tools logic removed — "
         "regression"
     )
+    from backend.core.ouroboros.governance.dw_terminal_worker_policy import (
+        route_skips_tool_loop,
+    )
+    assert route_skips_tool_loop("speculative") is True
+    assert route_skips_tool_loop("wiring_validation") is True
 
 
 def test_spine_dw_dispatch_chain_threads_repair_context() -> None:

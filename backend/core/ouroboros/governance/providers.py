@@ -7506,14 +7506,26 @@ class PrimeProvider:
         # Slice 12AD: route-skip set is the canonical
         # ``route_predicates.VENOM_SKIP_ROUTES`` (background / speculative /
         # wiring_validation). Single named seam — no more inlined literals.
+        # The skip itself is ``route_skips_tool_loop``, which also honours the
+        # Slice 45 terminal-worker exception the prompt layer applies: the
+        # local 30B serving a BACKGROUND op with Claude disabled is SHOWN the
+        # tools, so this seat must run the loop that consumes its tool calls.
+        from backend.core.ouroboros.governance.dw_terminal_worker_policy import (
+            route_skips_tool_loop,
+        )
         from backend.core.ouroboros.governance.route_predicates import (
             should_skip_venom_for_route,
         )
         _route = getattr(context, "provider_route", "")
         _is_read_only = bool(getattr(context, "is_read_only", False))
-        _skip_tools = should_skip_venom_for_route(_route) and not _is_read_only
+        _skip_tools = route_skips_tool_loop(_route, is_read_only=_is_read_only)
         if _skip_tools:
             logger.info("[PrimeProvider] %s route — skipping Venom tool loop", _route)
+        elif should_skip_venom_for_route(_route) and not _is_read_only:
+            logger.info(
+                "[PrimeProvider] %s route + terminal worker — Venom tool loop "
+                "kept active (the prompt advertised the tools)", _route,
+            )
         elif should_skip_venom_for_route(_route) and _is_read_only:
             logger.info(
                 "[PrimeProvider] %s route + is_read_only=True — Venom tool "
@@ -11962,14 +11974,22 @@ class ClaudeProvider:
         # no cost-escalation risk, and the tool loop is the only way for
         # read-only cartography ops to produce useful output (dispatch_subagent,
         # read_file, search_code, etc.).
+        from backend.core.ouroboros.governance.dw_terminal_worker_policy import (
+            route_skips_tool_loop,
+        )
         from backend.core.ouroboros.governance.route_predicates import (
             should_skip_venom_for_route,
         )
         _route = getattr(context, "provider_route", "")
         _is_read_only = bool(getattr(context, "is_read_only", False))
-        _skip_tools = should_skip_venom_for_route(_route) and not _is_read_only
+        _skip_tools = route_skips_tool_loop(_route, is_read_only=_is_read_only)
         if _skip_tools:
             logger.info("[ClaudeProvider] %s route — skipping Venom tool loop", _route)
+        elif should_skip_venom_for_route(_route) and not _is_read_only:
+            logger.info(
+                "[ClaudeProvider] %s route + terminal worker — Venom tool loop "
+                "kept active (the prompt advertised the tools)", _route,
+            )
         elif should_skip_venom_for_route(_route) and _is_read_only:
             logger.info(
                 "[ClaudeProvider] %s route + is_read_only=True — Venom tool "

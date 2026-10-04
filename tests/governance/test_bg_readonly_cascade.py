@@ -115,11 +115,22 @@ def test_canonical_matches_providers_prime() -> None:
         f"(PrimeProvider + ClaudeProvider); found {len(route_gates)}: "
         f"{route_gates}"
     )
+    # Both spellings carry the contract: the inline conjunction, or the
+    # canonical ``route_skips_tool_loop`` fed the op's read-only flag (whose
+    # read-only behaviour is pinned in test_slice45_terminal_worker_tools).
     for gate in route_gates:
-        assert "not _is_read_only" in gate, (
+        assert (
+            "not _is_read_only" in gate
+            or "is_read_only=_is_read_only" in gate
+        ), (
             "a provider's route-derived skip-tools gate no longer honours "
             f"the read-only contract: {gate!r}"
         )
+    from backend.core.ouroboros.governance.dw_terminal_worker_policy import (
+        route_skips_tool_loop,
+    )
+    for route in ("background", "speculative", "wiring_validation"):
+        assert route_skips_tool_loop(route, is_read_only=True) is False, route
 
 
 # ---------------------------------------------------------------------------
