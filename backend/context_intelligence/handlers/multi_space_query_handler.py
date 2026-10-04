@@ -44,6 +44,26 @@ from context_intelligence.managers.space_state_manager import (
 logger = logging.getLogger(__name__)
 
 
+def normalize_space_ids(space_ids) -> List[int]:
+    """Coerce resolved space ids to unique ints, preserving order.
+
+    Every detector keys spaces by int; ids parsed out of a query or handed
+    in by a caller may arrive as "2". Normalizing once at the handler's
+    entry means no lookup downstream can miss on type. Unparseable ids are
+    dropped with a warning rather than analyzed as a space that cannot exist.
+    """
+    out: List[int] = []
+    for raw in space_ids or []:
+        try:
+            sid = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(f"[MULTI-SPACE] Dropping non-integer space id {raw!r}")
+            continue
+        if sid not in out:
+            out.append(sid)
+    return out
+
+
 # ============================================================================
 # QUERY TYPES
 # ============================================================================
@@ -148,12 +168,12 @@ class MultiSpaceQueryHandler:
         self.summary_patterns = [
             r'\bwhat\'?s\s+happening\s+across\b',
             r'\bwhat\s+is\s+happening\s+across\b',
-            r'\bshow\s+(?:me\s+)?all\s+(?:my\s+)?(?:desktop\s+)?spaces?\b',
-            r'\boverview\s+of\s+(?:all\s+)?(?:my\s+)?spaces?\b',
-            r'\bwhat\'?s\s+on\s+(?:all\s+)?(?:my\s+)?spaces?\b',
-            r'\bwhat\'?s\s+in\s+(?:all\s+)?(?:my\s+)?spaces?\b',
-            r'\bacross\s+(?:all\s+)?(?:my\s+)?(?:desktop\s+)?spaces?\b',
-            r'\ball\s+(?:my\s+)?(?:desktop\s+)?spaces?\b.*\bwhat\b',
+            r'\bshow\s+(?:me\s+)?all\s+(?:my\s+)?(?:(?:desktop\s+)?spaces?|desktops?)\b',
+            r'\boverview\s+of\s+(?:all\s+)?(?:my\s+)?(?:spaces?|desktops?)\b',
+            r'\bwhat\'?s\s+on\s+(?:all\s+)?(?:my\s+)?(?:spaces?|desktops?)\b',
+            r'\bwhat\'?s\s+in\s+(?:all\s+)?(?:my\s+)?(?:spaces?|desktops?)\b',
+            r'\bacross\s+(?:all\s+)?(?:my\s+)?(?:(?:desktop\s+)?spaces?|desktops?)\b',
+            r'\ball\s+(?:my\s+)?(?:(?:desktop\s+)?spaces?|desktops?)\b.*\bwhat\b',
         ]
 
         # Search patterns (looking for specific content)
@@ -164,11 +184,12 @@ class MultiSpaceQueryHandler:
             r'\bsearch\s+(?:for\s+)?(?:the\s+)?(\w+)\s+in\s+all\b',
         ]
 
-        # Space extraction patterns
+        # Space extraction patterns. "Desktop N" is the user-facing name on
+        # both macOS (Mission Control) and Windows, so it counts as a space.
         self.space_patterns = [
-            r'space\s+(\d+)',
-            r'spaces?\s+(\d+)\s+(?:and|&)\s+(\d+)',
-            r'spaces?\s+(\d+),\s*(\d+)(?:,\s*and\s+(\d+))?',
+            r'(?:space|desktop)\s+(\d+)',
+            r'(?:space|desktop)s?\s+(\d+)\s+(?:and|&)\s+(\d+)',
+            r'(?:space|desktop)s?\s+(\d+),\s*(\d+)(?:,\s*and\s+(\d+))?',
         ]
 
     async def handle_query(self, query: str, available_spaces: Optional[List[int]] = None) -> MultiSpaceQueryResult:
@@ -191,7 +212,9 @@ class MultiSpaceQueryHandler:
         logger.debug(f"[MULTI-SPACE] Query type: {query_type.value}")
 
         # Step 2: Resolve which spaces to analyze
-        spaces_to_analyze = await self._resolve_spaces(query, query_type, available_spaces)
+        spaces_to_analyze = normalize_space_ids(
+            await self._resolve_spaces(query, query_type, available_spaces)
+        )
         logger.info(f"[MULTI-SPACE] Spaces to analyze: {spaces_to_analyze}")
 
         if not spaces_to_analyze:
@@ -299,8 +322,14 @@ class MultiSpaceQueryHandler:
                 return MultiSpaceQueryType.SEARCH
 
         # Default to comparison if multiple spaces mentioned
-        if len(self._extract_space_numbers(query)) >= 2:
+        named = self._extract_space_numbers(query)
+        if len(named) >= 2:
             return MultiSpaceQueryType.COMPARE
+        # One named space and no search pattern ("what's on desktop 2"):
+        # describe it. As SEARCH it had no term to match and always
+        # answered "No matches found".
+        if len(named) == 1:
+            return MultiSpaceQueryType.SUMMARY
 
         return MultiSpaceQueryType.SEARCH  # Default
 
@@ -322,9 +351,11 @@ class MultiSpaceQueryHandler:
             if available_spaces:
                 logger.debug(f"[MULTI-SPACE] Using all available spaces for search: {available_spaces}")
                 return available_spaces
-            else:
-                # Auto-detect available spaces (1-10 by default)
-                return list(range(1, 11))
+            detected = await self._detect_space_ids()
+            if detected:
+                return detected
+            # No detector answer: probe a bounded default range
+            return list(range(1, 11))
 
         # For comparison, try contextual resolver
         if self.contextual_resolver:
@@ -336,8 +367,31 @@ class MultiSpaceQueryHandler:
             except Exception as e:
                 logger.debug(f"[MULTI-SPACE] Contextual resolution failed: {e}")
 
+        # A summary with no named space covers every space that exists
+        if query_type == MultiSpaceQueryType.SUMMARY:
+            detected = await self._detect_space_ids()
+            if detected:
+                return detected
+
         # Fallback: empty list (will trigger clarification)
         return []
+
+    async def _detect_space_ids(self) -> List[int]:
+        """Space ids that exist right now, per the injected space detector."""
+        detector = self.yabai_detector
+        if detector is None:
+            return []
+        try:
+            if hasattr(detector, "enumerate_all_spaces_async"):
+                spaces = await detector.enumerate_all_spaces_async()
+            else:
+                spaces = await asyncio.get_running_loop().run_in_executor(
+                    None, detector.enumerate_all_spaces
+                )
+        except Exception as e:
+            logger.debug(f"[MULTI-SPACE] Space detection failed: {e}")
+            return []
+        return normalize_space_ids(s.get("space_id") for s in spaces or [])
 
     def _extract_space_numbers(self, query: str) -> List[int]:
         """Extract explicit space numbers from query"""
@@ -427,17 +481,24 @@ class MultiSpaceQueryHandler:
                 logger.warning(f"[MULTI-SPACE] Yabai query failed for space {space_id}: {e}")
 
         # Source 3: Core Graphics (low-level window detection)
+        # Reads the typed ``windows`` list (EnhancedWindowInfo), the one shape
+        # both detector branches emit. ``spaces[id]`` is a per-space SUMMARY
+        # whose nested "windows" are yabai- or kCG-keyed depending on branch,
+        # and it was looked up with str(space_id) against int keys -- so this
+        # source never contributed a window on any platform.
         if self.cg_window_detector:
             try:
                 all_cg_windows = self.cg_window_detector.get_all_windows_across_spaces()
-                if all_cg_windows and "spaces" in all_cg_windows:
-                    space_key = str(space_id)
-                    if space_key in all_cg_windows["spaces"]:
-                        cg_windows = all_cg_windows["spaces"][space_key]
-                        aggregated_data["cg_windows"] = cg_windows
-                        aggregated_data["window_count"] = max(aggregated_data["window_count"], len(cg_windows))
-                        aggregated_data["sources_used"].append("core_graphics")
-                        logger.debug(f"[MULTI-SPACE] Space {space_id}: Got {len(cg_windows)} windows from Core Graphics")
+                cg_windows = [
+                    {"app_name": w.app_name, "window_title": w.window_title}
+                    for w in (all_cg_windows or {}).get("windows", [])
+                    if w.space_id is not None and int(w.space_id) == space_id
+                ]
+                if cg_windows:
+                    aggregated_data["cg_windows"] = cg_windows
+                    aggregated_data["window_count"] = max(aggregated_data["window_count"], len(cg_windows))
+                    aggregated_data["sources_used"].append("core_graphics")
+                    logger.debug(f"[MULTI-SPACE] Space {space_id}: Got {len(cg_windows)} windows from Core Graphics")
             except Exception as e:
                 logger.warning(f"[MULTI-SPACE] Core Graphics query failed for space {space_id}: {e}")
 

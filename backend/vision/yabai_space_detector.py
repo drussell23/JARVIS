@@ -14109,7 +14109,11 @@ def get_yabai_detector(auto_start: bool = True) -> YabaiSpaceDetector:
     """
     global _yabai_detector
     if _yabai_detector is None:
-        _yabai_detector = YabaiSpaceDetector(auto_start=auto_start)
+        # Host-selected backend: yabai on macOS, the Windows desktop agent on
+        # Windows / WSL (JARVIS_SPACE_BACKEND overrides). Same query surface.
+        from vision.windows_desktop import create_space_detector
+
+        _yabai_detector = create_space_detector(auto_start=auto_start)
     return _yabai_detector
 
 

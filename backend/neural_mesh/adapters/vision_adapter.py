@@ -696,10 +696,10 @@ async def create_yabai_adapter(
         Initialized adapter or None if creation fails
     """
     try:
-        from vision.yabai_space_detector import YabaiSpaceDetector
+        from vision.windows_desktop import create_space_detector
 
-        # Create minimal vision loop with Yabai only
-        detector = YabaiSpaceDetector(enable_vision=False)
+        # Create minimal vision loop with the host's space backend only
+        detector = create_space_detector(enable_vision=False)
 
         adapter = VisionCognitiveAdapter(
             vision_loop=None,  # Will use Yabai directly

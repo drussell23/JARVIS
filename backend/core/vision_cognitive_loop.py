@@ -347,8 +347,8 @@ class VisionCognitiveLoop:
         """Initialize multi-space components."""
         # Try to import Yabai detector
         try:
-            from vision.yabai_space_detector import YabaiSpaceDetector
-            self._yabai_detector = YabaiSpaceDetector(enable_vision=False)
+            from vision.windows_desktop import create_space_detector
+            self._yabai_detector = create_space_detector(enable_vision=False)
             logger.debug("[VisionLoop] YabaiSpaceDetector loaded")
         except ImportError:
             logger.debug("[VisionLoop] YabaiSpaceDetector not available")

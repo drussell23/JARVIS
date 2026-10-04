@@ -1,0 +1,5 @@
+# Windows-host only: dependencies of daemon.py (never installed in WSL).
+aiohttp==3.13.2
+pyvda
+pywin32
+pillow

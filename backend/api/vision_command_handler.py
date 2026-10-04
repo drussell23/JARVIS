@@ -264,7 +264,9 @@ class VisionCommandHandler:
         self.space_response_generator = None
         if yabai_system_available:
             try:
-                self.yabai_detector = YabaiSpaceDetector()
+                from vision.windows_desktop import create_space_detector
+
+                self.yabai_detector = create_space_detector()
                 self.workspace_analyzer = WorkspaceAnalyzer()
                 self.space_response_generator = SpaceResponseGenerator(
                     use_sir_prefix=True

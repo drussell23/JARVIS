@@ -1359,8 +1359,8 @@ async def load_query_complexity_manager():
 async def load_yabai_detector():
     """Load Yabai space detector"""
     try:
-        from vision.yabai_space_detector import YabaiSpaceDetector
-        return YabaiSpaceDetector()
+        from vision.windows_desktop import create_space_detector
+        return create_space_detector()
     except Exception:
         logger.debug("[WARMUP] Yabai detector not available")
         return None

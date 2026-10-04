@@ -40,6 +40,32 @@ import json
 logger = logging.getLogger(__name__)
 
 
+async def _yabai_query(kind: str) -> List[Dict[str, Any]]:
+    """``yabai -m query --<kind>`` JSON from the host's space backend.
+
+    On Windows / WSL the desktop agent answers in yabai's own schema
+    (``index``, ``has-focus``, ``space``, ``frame`` ...), so every reader
+    below stays unchanged. Elsewhere the yabai CLI runs exactly as before.
+    Raises on failure; each caller keeps its own fallback.
+    """
+    from vision.windows_desktop import space_backend
+
+    if space_backend() == "windows_agent":
+        from vision.yabai_space_detector import get_yabai_detector
+
+        return await get_yabai_detector().query_raw_async(kind)
+
+    proc = await asyncio.create_subprocess_shell(
+        f"yabai -m query --{kind}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"yabai query --{kind} failed: {stderr.decode().strip()}")
+    return json.loads(stdout.decode())
+
+
 # ============================================================================
 # SPACE STATE DEFINITIONS
 # ============================================================================
@@ -145,18 +171,7 @@ class SpaceValidator:
             Tuple of (exists, max_space_id)
         """
         try:
-            result = await asyncio.create_subprocess_shell(
-                "yabai -m query --spaces",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await result.communicate()
-
-            if result.returncode != 0:
-                logger.error(f"[SPACE-VALIDATOR] Yabai query failed: {stderr.decode()}")
-                return False, None
-
-            spaces_data = json.loads(stdout.decode())
+            spaces_data = await _yabai_query("spaces")
             space_ids = [s.get("index", 0) for s in spaces_data]
 
             exists = space_id in space_ids
@@ -179,19 +194,7 @@ class SpaceValidator:
             List of WindowInfo objects
         """
         try:
-            # Query all windows
-            result = await asyncio.create_subprocess_shell(
-                "yabai -m query --windows",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await result.communicate()
-
-            if result.returncode != 0:
-                logger.error(f"[SPACE-VALIDATOR] Window query failed: {stderr.decode()}")
-                return []
-
-            all_windows = json.loads(stdout.decode())
+            all_windows = await _yabai_query("windows")
 
             # Filter for this space and build WindowInfo objects
             windows = []
@@ -532,23 +535,14 @@ class SpaceStateManager:
             Dictionary of properties
         """
         try:
-            result = await asyncio.create_subprocess_shell(
-                "yabai -m query --spaces",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, _ = await result.communicate()
-
-            if result.returncode == 0:
-                spaces = json.loads(stdout.decode())
-                for space in spaces:
-                    if space.get("index") == space_id:
-                        return {
-                            "is_current": space.get("has-focus", False),
-                            "is_fullscreen": space.get("is-native-fullscreen", False),
-                            "display_id": space.get("display", 1),
-                            "is_visible": space.get("is-visible", False)
-                        }
+            for space in await _yabai_query("spaces"):
+                if space.get("index") == space_id:
+                    return {
+                        "is_current": space.get("has-focus", False),
+                        "is_fullscreen": space.get("is-native-fullscreen", False),
+                        "display_id": space.get("display", 1),
+                        "is_visible": space.get("is-visible", False)
+                    }
 
             return {}
 

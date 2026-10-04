@@ -1142,8 +1142,8 @@ class UnifiedCommandProcessor:
 
         def _sync_init_yabai_detector():
             """Synchronous init for YabaiSpaceDetector"""
-            from vision.yabai_space_detector import YabaiSpaceDetector
-            return YabaiSpaceDetector()
+            from vision.windows_desktop import create_space_detector
+            return create_space_detector()
 
         async def init_yabai_detector():
             """Initialize YabaiSpaceDetector"""
