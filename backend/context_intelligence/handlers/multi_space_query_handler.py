@@ -30,6 +30,7 @@ Features:
 
 import asyncio
 import logging
+import os
 from typing import Dict, List, Optional, Any, Set, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -42,6 +43,10 @@ from context_intelligence.managers.space_state_manager import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Most spaces one query may send to the vision model (one model call each)
+_VISION_MAX_SPACES = int(os.environ.get("JARVIS_LOCAL_VISION_MAX_SPACES", "3"))
 
 
 def normalize_space_ids(space_ids) -> List[int]:
@@ -228,8 +233,15 @@ class MultiSpaceQueryHandler:
                 total_time=0.0
             )
 
-        # Step 3: Capture and analyze spaces in parallel
-        results = await self._analyze_spaces_parallel(spaces_to_analyze, query)
+        # Step 3: Capture and analyze spaces in parallel. Looking at the
+        # pixels costs a model call per space, so only questions about a few
+        # specific spaces (or an overview of a few) get one.
+        look = (
+            query_type in (MultiSpaceQueryType.SUMMARY, MultiSpaceQueryType.COMPARE,
+                           MultiSpaceQueryType.DIFFERENCE)
+            and len(spaces_to_analyze) <= _VISION_MAX_SPACES
+        )
+        results = await self._analyze_spaces_parallel(spaces_to_analyze, query, look=look)
 
         # Step 4: Perform query-specific processing
         if query_type == MultiSpaceQueryType.COMPARE:
@@ -406,7 +418,8 @@ class MultiSpaceQueryHandler:
 
         return sorted(list(spaces))
 
-    async def _analyze_spaces_parallel(self, space_ids: List[int], query: str) -> List[SpaceAnalysisResult]:
+    async def _analyze_spaces_parallel(self, space_ids: List[int], query: str,
+                                       look: bool = False) -> List[SpaceAnalysisResult]:
         """
         Analyze multiple spaces in parallel using async/await.
 
@@ -416,7 +429,7 @@ class MultiSpaceQueryHandler:
 
         # Create async tasks for each space
         tasks = [
-            self._analyze_single_space(space_id, query)
+            self._analyze_single_space(space_id, query, look=look)
             for space_id in space_ids
         ]
 
@@ -528,7 +541,8 @@ class MultiSpaceQueryHandler:
 
         return aggregated_data
 
-    async def _analyze_single_space(self, space_id: int, query: str) -> SpaceAnalysisResult:
+    async def _analyze_single_space(self, space_id: int, query: str,
+                                    look: bool = False) -> SpaceAnalysisResult:
         """
         Analyze a single space using unified data aggregation.
 
@@ -642,6 +656,10 @@ class MultiSpaceQueryHandler:
             if errors:
                 content_summary += f" [⚠️ {len(errors)} error(s)]"
 
+            vision_analysis = await self._look_at_space(space_id, windows, query) if look else None
+            if vision_analysis and vision_analysis.get("description"):
+                content_summary += f" — {vision_analysis['description']}"
+
             # Add data source info for debugging
             if sources_used:
                 logger.debug(f"[MULTI-SPACE] Space {space_id} analysis used sources: {', '.join(sources_used)}")
@@ -657,7 +675,8 @@ class MultiSpaceQueryHandler:
                 content_summary=content_summary,
                 errors=errors,
                 significance="critical" if errors else "normal",
-                analysis_time=analysis_time
+                analysis_time=analysis_time,
+                vision_analysis=vision_analysis,
             )
 
         except Exception as e:
@@ -668,6 +687,46 @@ class MultiSpaceQueryHandler:
                 content_summary=f"Analysis error: {str(e)}",
                 analysis_time=(datetime.now() - start_time).total_seconds()
             )
+
+    async def _look_at_space(self, space_id: int, windows: List[Dict[str, Any]],
+                             query: str) -> Optional[Dict[str, Any]]:
+        """Capture the space and ask the local vision model what is on it.
+
+        Needs a detector that can capture without switching (the Windows
+        desktop agent) and a configured local vision model; otherwise returns
+        None and the answer stays the window-list summary. The known window
+        list goes into the prompt so the model reads content instead of
+        guessing which application it is looking at.
+        """
+        capture = getattr(self.yabai_detector, "capture_space_async", None)
+        if capture is None:
+            return None
+        from vision.local_vision_client import get_local_vision_client
+
+        client = get_local_vision_client()
+        if not client.enabled:
+            return None
+        shot = await capture(space_id, max_dim=client.max_dim)
+        if not shot.ok:
+            logger.info(f"[MULTI-SPACE] Space {space_id}: capture unavailable ({shot.error})")
+            return {"error": shot.error, "source": "capture"}
+        listing = "\n".join(
+            f"- {w.get('app', 'Unknown')}: {w.get('title', '')}" for w in windows[:12]
+        ) or "- (none reported)"
+        prompt = (
+            f"This is a screenshot of desktop {space_id}. The windows on it, topmost first, are:\n"
+            f"{listing}\n"
+            f'The user asked: "{query}"\n'
+            "In 2-4 sentences, say what is on this desktop and what the user appears to be doing "
+            "there, quoting short important visible text exactly. Use the application names above; "
+            "do not guess others."
+        )
+        answer = await client.describe(shot.png, prompt)
+        if not answer.ok:
+            logger.info(f"[MULTI-SPACE] Space {space_id}: vision model unavailable ({answer.error})")
+            return {"error": answer.error, "source": "vision_model", "model": answer.model}
+        return {"description": answer.text, "model": answer.model,
+                "latency_ms": round(answer.latency_ms), "capture": shot.meta}
 
     async def _compare_spaces(self, results: List[SpaceAnalysisResult], query: str) -> Dict[str, Any]:
         """
