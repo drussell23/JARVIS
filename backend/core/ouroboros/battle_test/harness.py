@@ -961,7 +961,14 @@ class BattleTestHarness:
 
         # Publish session dir for downstream non-streaming callers
         # (e.g. CompactionCallerStrategy writes compaction_shadow.jsonl here).
-        os.environ.setdefault("JARVIS_OUROBOROS_SESSION_DIR", str(self._session_dir))
+        # ABSOLUTE: children inherit this from another cwd. The relative
+        # ``.ouroboros/sessions/<id>`` it used to publish resolved to nothing
+        # inside a VALIDATE sandbox (cwd /tmp/jarvis_repair_sandbox_*), so the
+        # test execution lock could not see the child belonged to a live soak
+        # and refused it (bt-2026-10-05-005023: six validations lost).
+        os.environ.setdefault(
+            "JARVIS_OUROBOROS_SESSION_DIR", str(Path(self._session_dir).resolve()),
+        )
         # Slice 2 workspace-arming integrity (bt-2026-07-18-200502): publish the
         # session id at the EARLIEST point it is final — Stage-B file-isolation
         # stamps its ledger-sovereignty ownership marker at GLS-config

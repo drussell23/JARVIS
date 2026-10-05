@@ -1438,10 +1438,14 @@ async def discover(
                 if not getattr(verdicts.get(w.goal_id), "impossible", False)
                 for m in getattr(verdicts.get(w.goal_id), "unresolvable", ())
             )
+            from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                environment_integrity as _ei,
+            )
             logger.warning(
-                "[GoalDiscovery] %s — %d demoted to the tail, install to "
-                "unblock: %s",
+                "[GoalDiscovery] %s — %d %s, install to unblock: %s",
                 _UNRESOLVABLE_REASON, len(blocked) - len(impossible),
+                "quarantined (an install re-admits them)" if _ei.quarantine_enabled()
+                else "demoted to the tail",
                 " ".join(f"{m}x{n}" for m, n in unprovisioned.most_common(8)) or "-",
             )
             if impossible:

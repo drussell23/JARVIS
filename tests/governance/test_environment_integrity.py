@@ -570,9 +570,15 @@ def test_an_install_re_admits_the_goal_on_the_next_check(tmp_path, monkeypatch):
 def test_every_dispatch_path_states_the_rule_once():
     """Discovery, its walk, the Sentinel and resume share one statement."""
     root = Path(__file__).resolve().parents[2]
+    import ast as _ast
     gd = (root / "backend/core/ouroboros/governance/autonomy/goal_discovery.py").read_text(encoding="utf-8")
     router = (root / "backend/core/ouroboros/governance/intake/unified_intake_router.py").read_text(encoding="utf-8")
-    assert "dispatch_quarantine_reason(verdict)" in gd and "quarantine_enabled()" not in gd
+    rule = next(
+        _ast.unparse(n) for n in _ast.walk(_ast.parse(gd))
+        if isinstance(n, _ast.FunctionDef) and n.name == "_dispatch_refusal"
+    )
+    # The rule delegates; it does not re-decide quarantine itself.
+    assert "dispatch_quarantine_reason(verdict)" in rule and "quarantine_enabled" not in rule
     assert "dispatch_quarantine_reason(verdict)" in router
 
 
