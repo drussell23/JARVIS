@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Tuple
 
+from backend.core.ouroboros.governance.test_reality import FAILURE_CLASS as _HOLLOW_TEST
+
 
 class CritiqueType(str, Enum):
     """Classification of what kind of failure occurred."""
@@ -127,6 +129,8 @@ class CritiqueBuilder:
             critiques.append(cls._build_security_critique(file_path, error_text))
         elif failure_class == "infra":
             critiques.append(cls._build_infra_critique(file_path, error_text))
+        elif failure_class == _HOLLOW_TEST:
+            critiques.extend(cls._parse_hollow_test(file_path, error_text))
         else:
             critiques.append(cls._build_generic_critique(file_path, failure_class, error_text))
 
@@ -261,6 +265,28 @@ class CritiqueBuilder:
             direction="This may be a transient infrastructure issue — retry may help",
             severity=CritiqueSeverity.ERROR,
         )
+
+    @classmethod
+    def _parse_hollow_test(cls, file_path: str, error_text: str) -> List[StructuredCritique]:
+        """One critique per Test Reality Gate violation, each correction WHOLE.
+
+        The generic critique keeps ``error_text[:300]``; a hollow-test
+        correction names every violated test and its exact fix, and a cut one
+        repairs the first test while the rest stay hollow."""
+        items = [ln[2:].strip() for ln in (error_text or "").splitlines() if ln.startswith("- ")]
+        return [
+            StructuredCritique(
+                file_path=file_path,
+                failure_type=CritiqueType.LOGIC_ERROR,
+                what_failed=item,
+                where=file_path,
+                observed="passes pytest vacuously (structural check, before execution)",
+                expected="a test that runs, verifies, and exercises its subject",
+                direction=item,
+                severity=CritiqueSeverity.ERROR,
+            )
+            for item in items
+        ] or [cls._build_generic_critique(file_path, _HOLLOW_TEST, error_text)]
 
     @classmethod
     def _build_generic_critique(cls, file_path: str, failure_class: str, error_text: str) -> StructuredCritique:

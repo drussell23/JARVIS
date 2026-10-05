@@ -15,9 +15,12 @@ Frozen dataclass entries for immutability.
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -213,7 +216,17 @@ class EpisodicFailureMemory:
                 for block in resolver(text, [source] if source else []) or ():
                     if block and block not in blocks:
                         blocks.append(block)
-            return render_contract_section(blocks)
+            section = render_contract_section(blocks)
+            if section:
+                # The VALIDATE_RETRY copy of the contract. L2 and the micro-fix
+                # log theirs in library_contract; without this line a recurrence
+                # after a retry could not be told apart from a retry that never
+                # carried the contract (bt-2026-10-05-012717, `_analyzer_lock` x3).
+                logger.info(
+                    "[LibraryContract] retry contract rendered op=%s: %d chars, %d PROVEN fact(s)",
+                    self._op_id, len(section), section.count("# PROVEN:"),
+                )
+            return section
         except Exception:  # noqa: BLE001
             return ""
 

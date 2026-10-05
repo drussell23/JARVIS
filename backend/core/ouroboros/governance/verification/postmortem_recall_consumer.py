@@ -361,7 +361,7 @@ _CORE_FAILURE_CLASSES: frozenset = frozenset({
     # Sub-classes emitted by validators / change_engine / orchestrator
     "ascii", "cancelled", "content", "cost_contract_violation",
     "dep_file_rename", "diff_apply", "duplication", "env",
-    "exploration", "failed", "json_parse", "multi_file_coverage",
+    "exploration", "failed", "hollow_test", "json_parse", "multi_file_coverage",
     "rollback", "schema", "security", "worktree_isolation",
     # Legacy *_failure aliases (kept for FailureEpisode back-compat)
     "timeout_failure", "validation_failure", "generation_failure",

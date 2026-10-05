@@ -1187,6 +1187,50 @@ class RepairEngine:
             else:
                 file_path = current_candidate.get("file_path", "")
 
+            # Test Reality Gate — the SAME rule VALIDATE applies before pytest.
+            # A hollow test PASSES the sandbox, so without this L2 would mark it
+            # CONVERGED and (skip-canonical-after-converge) send it to APPLY. No
+            # fall-through cap: the iteration budget is the bound, and a run of
+            # hollow repairs ends as an L2 stop, never as a landing.
+            _hollow = await self._hollow_test(ctx, _multi_files or [(file_path, full_content)])
+            if _hollow is not None:
+                from backend.core.ouroboros.governance.op_context import RepairContext
+                from backend.core.ouroboros.governance.test_reality import FAILURE_CLASS as _HOLLOW_FC
+                _hp, _hv = _hollow
+                _hollow_feedback = f"{_hp}: {_hv.correction()}"
+                _logger.info(
+                    "[L2 Repair] Iteration %d: Test Reality Gate REJECT %s — %s",
+                    iteration, _hp, _hv.summary(),
+                )
+                repair_context = RepairContext(
+                    iteration=iteration,
+                    max_iterations=budget.max_iterations,
+                    failure_class=_HOLLOW_FC,
+                    failure_signature_hash=_patch_sig(_hv.summary()),
+                    failing_tests=last_failing_tests,
+                    failure_summary=_hollow_feedback[:600],
+                    current_candidate_content=full_content,
+                    current_candidate_file_path=file_path,
+                    failure_trace=_hollow_feedback,
+                )
+                rec = RepairIterationRecord(
+                    op_id=ctx.op_id,
+                    iteration=iteration,
+                    repair_state=L2State.L2_BUILD_REPAIR_PROMPT.value,
+                    failure_class=_HOLLOW_FC,
+                    failure_signature_hash=_patch_sig(_hv.summary()),
+                    patch_signature_hash=_patch_sig(diff or full_content),
+                    diff_lines=0,
+                    files_changed=len(_multi_files or ()) or 1,
+                    validation_duration_s=0.0,
+                    outcome="hollow_test_reject",
+                    model_id=model_id,
+                    provider_name=provider_name,
+                )
+                self._emit_record(ctx.op_id, rec)
+                records.append(rec)
+                continue  # regenerate with the structural correction
+
             # ----------------------------------------------------------------
             # Slice 3 — PRE-FLIGHT STRUCTURAL VALIDATION GATE (the enforce).
             # Runs BEFORE the sandbox so a structural regression (new cycle /
@@ -1847,6 +1891,27 @@ class RepairEngine:
             return clause or None
         except Exception as exc:  # noqa: BLE001 — cone is advisory; never break L2
             _logger.debug("[RepairBridge] dependency cone unavailable (non-fatal): %s", exc)
+            return None
+
+    async def _hollow_test(self, ctx: Any, files: Any) -> Any:
+        """``(path, verdict)`` when the candidate proposes a hollow test, else
+        ``None`` -- ``test_reality.hollow_test_in_candidate``, the entry point
+        VALIDATE uses too. Off the loop; any fault -> ``None`` (never blocks)."""
+        try:
+            from backend.core.ouroboros.governance.test_reality import (
+                hollow_test_in_candidate,
+            )
+            return await asyncio.to_thread(
+                hollow_test_in_candidate,
+                [(str(p), str(c or "")) for p, c in (files or ())],
+                target_files=tuple(getattr(ctx, "target_files", ()) or ()),
+                description=getattr(ctx, "description", "") or "",
+                repo_root=self._repo_root,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- additive gate; never break L2
+            _logger.debug("[L2 Repair] test reality gate unavailable (non-fatal): %s", exc)
             return None
 
     async def _api_contract(self, ctx: Any, evidence_text: str, *, test_source: str) -> str:

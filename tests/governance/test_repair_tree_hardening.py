@@ -414,7 +414,18 @@ def test_pin_10_run_inner_legacy_bytes_pinned():
     # entry above; no FSM transition changed. Verified by
     # tests/governance/test_error_contract.py. Soak validation: the first soak
     # on branch ouroboros/l2-error-contract-and-dep-quarantine.
-    EXPECTED_DIGEST = "737af52c4fac0cfe"
+    #
+    # Phase tag: Test Reality Gate (2026-10-04). c985ccaee4 landed a test that
+    # never executes; a hollow test PASSES the L2 sandbox, so L2 would have
+    # converged on it and (skip-canonical-after-converge) sent it to APPLY.
+    # _run_inner now awaits RepairEngine._hollow_test before the structural
+    # gate and, on a hollow verdict, regenerates with the structural correction
+    # (RepairContext.failure_class="hollow_test") -- no fall-through cap; the
+    # iteration budget bounds it. Same entry point as VALIDATE
+    # (test_reality.hollow_test_in_candidate). Verified by
+    # tests/governance/test_test_reality_gate.py. Soak validation: the first
+    # soak on branch ouroboros/test-reality-gate.
+    EXPECTED_DIGEST = "8590e0da5b8c99ab"
     assert digest == EXPECTED_DIGEST, (
         f"_run_inner bytes drift detected: expected "
         f"{EXPECTED_DIGEST}, got {digest}. Legacy LINEAR semantics "

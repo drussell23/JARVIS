@@ -8929,7 +8929,7 @@ class GovernedOrchestrator:
                         best_validation = validation
 
                         # ---- Record failure in episodic memory + build structured critique ----
-                        if _episodic_memory is not None and validation.failure_class in ("test", "build"):
+                        if _episodic_memory is not None and validation.failure_class in ("test", "build", "hollow_test"):
                             try:
                                 from backend.core.ouroboros.governance.structured_critique import CritiqueBuilder
                                 critique_report = CritiqueBuilder.from_validation_output(
@@ -14660,6 +14660,45 @@ class GovernedOrchestrator:
                         )
             except Exception as exc:
                 logger.debug("[Orchestrator] Duplication check skipped for %s: %s", _fp, exc)
+
+        # Step 1c: Test Reality Gate — a test file that cannot run, verifies
+        # nothing, or never imports its subject passes pytest VACUOUSLY
+        # (c985ccaee4: "1 passed", executing nothing) and then marks its subject
+        # as covered for good. Structural, before any runner; the correction
+        # rides in ``error`` / ``failure_detail`` to the retry and L2 feedback.
+        try:
+            from backend.core.ouroboros.governance.test_reality import (
+                FAILURE_CLASS as _HOLLOW_FC,
+                hollow_test_in_candidate,
+            )
+            _hollow = await asyncio.to_thread(
+                hollow_test_in_candidate, _all_files,
+                target_files=tuple(getattr(ctx, "target_files", ()) or ()),
+                description=str(getattr(ctx, "description", "") or ""),
+                repo_root=self._config.project_root,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — a gate fault never rejects work
+            logger.debug("[Orchestrator] Test Reality Gate skipped: %s", exc)
+            _hollow = None
+        if _hollow is not None:
+            _hp, _hv = _hollow
+            _correction = f"{_hp}: {_hv.correction()}"
+            logger.warning(
+                "[TestReality] op=%s REJECTED %s — %s",
+                getattr(ctx, "op_id", "?")[:16], _hp, _hv.summary(),
+            )
+            return ValidationResult(
+                passed=False,
+                best_candidate=None,
+                validation_duration_s=0.0,
+                error=_correction,
+                failure_class=_HOLLOW_FC,
+                short_summary=f"{_hp}: {_hv.summary()}"[:300],
+                adapter_names_run=(),
+                failure_detail=_correction,
+            )
 
         # Non-code files (docs, configs, etc.) need no test/syntax runner,
         # but structured config files get a format sanity check so that

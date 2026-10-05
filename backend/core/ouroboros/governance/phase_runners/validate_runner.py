@@ -1040,7 +1040,7 @@ class VALIDATERunner(PhaseRunner):
                             "degraded", exc_info=True,
                         )
 
-                    if _episodic_memory is not None and validation.failure_class in ("test", "build"):
+                    if _episodic_memory is not None and validation.failure_class in ("test", "build", "hollow_test"):
                         try:
                             from backend.core.ouroboros.governance.structured_critique import CritiqueBuilder
                             critique_report = CritiqueBuilder.from_validation_output(
