@@ -247,10 +247,13 @@ def test_validate_runs_the_gate_before_any_test_runner():
     assert core.index("_ast_preflight(") < core.index("hollow_test_in_candidate")
 
 
-def test_both_ladder_copies_feed_hollow_test_to_retry_memory():
-    for rel in ("phase_runners/validate_runner.py", "orchestrator.py"):
-        src = (_GOV / rel).read_text(encoding="utf-8")
-        assert f'in ("test", "build", "{FAILURE_CLASS}")' in src, rel
+def test_the_single_validate_owner_feeds_hollow_test_to_retry_memory():
+    """VALIDATE has one implementation (validate-single-owner deleted the
+    orchestrator's inline twin), so the retry-memory admission lives once."""
+    runner = (_GOV / "phase_runners/validate_runner.py").read_text(encoding="utf-8")
+    assert f'in ("test", "build", "{FAILURE_CLASS}")' in runner
+    orch = (_GOV / "orchestrator.py").read_text(encoding="utf-8")
+    assert 'validation.failure_class in ("test", "build"' not in orch  # no second ladder
 
 
 def test_l2_runs_the_gate_before_its_sandbox_with_no_fall_through():
