@@ -1511,9 +1511,9 @@ class UnifiedIntakeRouter:
                 _ei.target_import_verdict, targets, description,
                 Path(self._config.project_root),
             )
-            if getattr(verdict, "impossible", False):
-                return str(getattr(verdict, "reason", "") or "structurally undispatchable")
-            return ""
+            # The same rule discovery and the Sentinel apply: resume is a
+            # dispatch, and it must not admit what they refuse.
+            return _ei.dispatch_quarantine_reason(verdict)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001

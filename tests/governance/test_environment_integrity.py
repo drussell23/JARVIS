@@ -301,11 +301,12 @@ def test_the_ranker_demotes_an_unimportable_target(tmp_path):
     assert ranked[1].target_file == "bad.py"
 
 
-def test_demoted_work_is_still_dispatchable_by_default(tmp_path):
-    """Quarantining by default would silently delete 41% of the live queue over
-    a judgement the operator has not made."""
+def test_demoted_work_is_dispatchable_when_the_operator_opts_out(tmp_path, monkeypatch):
+    """The pre-2026-10-04 default, now the operator's explicit opt-out (the
+    default quarantines -- see test_an_unprovisioned_target_is_quarantined_by_default)."""
     from backend.core.ouroboros.governance.autonomy import goal_discovery as GD
 
+    monkeypatch.setenv("JARVIS_QUARANTINE_UNIMPORTABLE_TARGETS", "false")
     bad = tmp_path / "bad.py"
     bad.write_text("import totally_absent_package_xyz\n", encoding="utf-8")
     (tmp_path / "tests").mkdir()
@@ -519,20 +520,60 @@ def test_structural_quarantine_needs_no_operator_switch(tmp_path, monkeypatch):
     assert GD.is_dispatchable(work, tmp_path) is False
 
 
-def test_an_unprovisioned_target_stays_dispatchable_without_the_switch(tmp_path, monkeypatch):
-    """The other half of the split: absent is reversed by an install, so the
-    goal is demoted and rises again — never refused."""
+def _unprovisioned_work(tmp_path, package="totally_absent_xyz"):
     from backend.core.ouroboros.governance.autonomy import goal_discovery as GD
 
-    monkeypatch.delenv("JARVIS_QUARANTINE_UNIMPORTABLE_TARGETS", raising=False)
-    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests").mkdir(exist_ok=True)
     (tmp_path / "tests" / "test_bad.py").write_text("", encoding="utf-8")
-    (tmp_path / "bad.py").write_text("import totally_absent_xyz\n", encoding="utf-8")
-    work = GD.DiscoveredWork(
+    (tmp_path / "bad.py").write_text(f"import {package}\n", encoding="utf-8")
+    return GD, GD.DiscoveredWork(
         target_file="bad.py", kind="roadmap_goal", evidence="b",
         weight=1.0, subject_file="bad.py",
     )
+
+
+def test_an_unprovisioned_target_is_quarantined_by_default(tmp_path, monkeypatch):
+    """bt-2026-10-04-215048: demotion let the coverage walk dispatch an
+    `import sklearn` subject -- three generations on a ModuleNotFoundError no
+    candidate can repair. Absent now refuses dispatch by default."""
+    monkeypatch.delenv("JARVIS_QUARANTINE_UNIMPORTABLE_TARGETS", raising=False)
+    GD, work = _unprovisioned_work(tmp_path)
+    assert GD.is_dispatchable(work, tmp_path) is False
+    verdict = EI.target_import_verdict(["bad.py"], "", tmp_path)
+    assert EI.dispatch_quarantine_reason(verdict) == (
+        f"{EI.UNRESOLVABLE_TARGET_DEPENDENCY}: totally_absent_xyz "
+        "(quarantined: unprovisioned -- an install re-admits it)"
+    )
+
+
+def test_the_operator_can_restore_demotion(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_QUARANTINE_UNIMPORTABLE_TARGETS", "false")
+    GD, work = _unprovisioned_work(tmp_path)
     assert GD.is_dispatchable(work, tmp_path) is True
+
+
+def test_an_install_re_admits_the_goal_on_the_next_check(tmp_path, monkeypatch):
+    """Quarantine is a live verdict, never a deletion: the environment answer is
+    not cached, so the package landing is enough."""
+    monkeypatch.delenv("JARVIS_QUARANTINE_UNIMPORTABLE_TARGETS", raising=False)
+    GD, work = _unprovisioned_work(tmp_path, package="late_installed_pkg_q7")
+    assert GD.is_dispatchable(work, tmp_path) is False
+    site = tmp_path / "site"
+    (site / "late_installed_pkg_q7").mkdir(parents=True)
+    (site / "late_installed_pkg_q7" / "__init__.py").write_text("")
+    monkeypatch.syspath_prepend(str(site))
+    import importlib
+    importlib.invalidate_caches()
+    assert GD.is_dispatchable(work, tmp_path) is True
+
+
+def test_every_dispatch_path_states_the_rule_once():
+    """Discovery, its walk, the Sentinel and resume share one statement."""
+    root = Path(__file__).resolve().parents[2]
+    gd = (root / "backend/core/ouroboros/governance/autonomy/goal_discovery.py").read_text(encoding="utf-8")
+    router = (root / "backend/core/ouroboros/governance/intake/unified_intake_router.py").read_text(encoding="utf-8")
+    assert "dispatch_quarantine_reason(verdict)" in gd and "quarantine_enabled()" not in gd
+    assert "dispatch_quarantine_reason(verdict)" in router
 
 
 def test_colorama_is_now_declared():

@@ -64,8 +64,23 @@ async def test_a_healthy_op_resumes(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_an_unprovisioned_dependency_does_not_strand_the_op(tmp_path):
-    """An install reverses it, and the op's exploration is worth keeping."""
+async def test_an_unprovisioned_dependency_is_not_resumed(tmp_path, monkeypatch):
+    """Resume is a dispatch: it applies the rule discovery and the Sentinel do.
+    A resumed op could only spend its retries on the same ModuleNotFoundError;
+    the goal itself stays on the roadmap and is re-admitted after an install."""
+    monkeypatch.delenv("JARVIS_QUARANTINE_UNIMPORTABLE_TARGETS", raising=False)
+    _write(tmp_path, "backend/needs.py",
+           "import a_package_that_is_not_installed_anywhere\n\ndef f():\n    return 1\n")
+    why = await _router(tmp_path)._resume_refusal(
+        _checkpoint(["backend/needs.py"], "fix `backend/needs.py`"),
+    )
+    assert why.startswith(f"{ei.UNRESOLVABLE_TARGET_DEPENDENCY}: a_package_that_is_not_installed_anywhere")
+    assert why.endswith("(quarantined: unprovisioned -- an install re-admits it)")
+
+
+@pytest.mark.asyncio
+async def test_an_unprovisioned_op_resumes_when_the_operator_restores_demotion(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_QUARANTINE_UNIMPORTABLE_TARGETS", "false")
     _write(tmp_path, "backend/needs.py",
            "import a_package_that_is_not_installed_anywhere\n\ndef f():\n    return 1\n")
     why = await _router(tmp_path)._resume_refusal(

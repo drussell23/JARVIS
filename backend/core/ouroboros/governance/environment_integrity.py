@@ -66,7 +66,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, FrozenSet, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("Ouroboros.EnvironmentIntegrity")
 
@@ -142,17 +142,52 @@ def boot_gate_enabled() -> bool:
 
 
 def quarantine_enabled() -> bool:
-    """Whether an unimportable target becomes UNDISPATCHABLE rather than merely
-    sorted last.
+    """Whether an UNPROVISIONED target (a third-party import this interpreter
+    cannot find) becomes undispatchable rather than merely sorted last.
 
-    OFF by default, and that default is load-bearing. On the live roadmap 21 of
-    51 goals have an unresolvable import -- most of them macOS-only (``Quartz``,
-    ``pyautogui``) or the multi-gigabyte ML stack. Quarantining by default would
-    silently delete 41% of the queue on a judgement the operator has not made.
-    Demotion already achieves the operator's actual goal: with 30 importable
-    goals and a dispatch cap of 8, the blocked ones are never reached.
+    ON by default since 2026-10-04. The OFF default rested on one premise:
+    "with 30 importable goals and a dispatch cap of 8, the blocked ones are
+    never reached". Soak bt-2026-10-04-215048 falsified it -- the coverage walk
+    reached ``backend/autonomy/contextual_understanding.py`` (``import
+    sklearn``), and the op spent three generations and two micro-fixes on a
+    ``ModuleNotFoundError`` no candidate can repair. Demotion only orders the
+    queue; whenever the importable head is cooling or settled, the tail is
+    dispatched. The operator has now made the judgement the old docstring
+    waited for.
+
+    Quarantine is not deletion. The goal stays on the roadmap and the verdict
+    is recomputed every pass against the live interpreter (discovery's cache is
+    keyed on the environment fingerprint; this module never caches the
+    environment answer), so installing the package re-admits the goal on the
+    next pass. ``JARVIS_QUARANTINE_UNIMPORTABLE_TARGETS=false`` restores
+    demotion.
     """
-    return _flag(_ENV_QUARANTINE, False)
+    return _flag(_ENV_QUARANTINE, True)
+
+
+def dispatch_quarantine_reason(verdict: Any) -> str:
+    """Why work whose subject has this import *verdict* must not be dispatched
+    on THIS host, or ``""``.
+
+    The ONE statement of the import half of the dispatch rule, shared by
+    discovery's ranking, its coverage walk, the Sentinel and the resume path,
+    so none of them can admit what another refuses. The verdict's reason code
+    LEADS (``unresolvable_target_dependency: sklearn``, ``platform_unavailable:
+    Quartz``...) so the telemetry constants stay greppable wherever the refusal
+    is logged or stamped. ``None`` (unasked) and importable verdicts answer
+    ``""``. NEVER raises.
+    """
+    try:
+        if verdict is None or getattr(verdict, "importable", True):
+            return ""
+        reason = str(getattr(verdict, "reason", "") or UNRESOLVABLE_TARGET_DEPENDENCY)
+        if getattr(verdict, "impossible", False):
+            return f"{reason} (quarantined: impossible on this host)"
+        if quarantine_enabled():
+            return f"{reason} (quarantined: unprovisioned -- an install re-admits it)"
+        return ""
+    except Exception:  # noqa: BLE001 -- a degraded rule never sheds work
+        return ""
 
 
 # ---------------------------------------------------------------------------

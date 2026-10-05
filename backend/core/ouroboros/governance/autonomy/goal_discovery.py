@@ -1092,10 +1092,12 @@ def is_dispatchable(work: "DiscoveredWork", repo_root: Path) -> bool:
 
     ## Two different "cannot import", two different answers
 
-    A target needing ``torch`` is UNPROVISIONED: one install reverses it, so
-    the goal is demoted by the ranker and rises again the moment the package
-    lands. Refusing it here would delete real work over a judgement (install
-    the multi-gigabyte ML stack?) that is the operator's to make.
+    A target needing ``torch`` is UNPROVISIONED: one install reverses it. It
+    is quarantined by default (since 2026-10-04, when demotion let the walk
+    dispatch an ``import sklearn`` subject three times) and re-admitted on the
+    first pass after the package lands -- the verdict is recomputed against
+    the live interpreter every pass. ``JARVIS_QUARANTINE_UNIMPORTABLE_TARGETS
+    =false`` restores the older demote-only behaviour.
 
     A target needing ``Quartz`` is IMPOSSIBLE: it is an Objective-C framework
     and this is Linux. No install reverses that, so demotion just means the
@@ -1104,9 +1106,8 @@ def is_dispatchable(work: "DiscoveredWork", repo_root: Path) -> bool:
     and selectable again the day the same repository is driven from a Mac.
     Deleting it would delete Mac functionality from the queue.
 
-    ``JARVIS_QUARANTINE_UNIMPORTABLE_TARGETS`` remains the operator's blunt
-    switch for the first category; the second needs no switch, because the
-    verdict is a fact about the machine rather than a preference.
+    Both answers come from ``environment_integrity.dispatch_quarantine_reason``,
+    the one statement of the rule.
     """
     if _liveness_rank(work, repo_root) <= LIVENESS_DEAD:
         return False
@@ -1136,16 +1137,10 @@ def _dispatch_refusal(liveness: int, verdict: Any) -> str:
     try:
         if liveness <= LIVENESS_DEAD:
             return "dead target"
-        if _is_importable(verdict):
-            return ""
-        if getattr(verdict, "impossible", False):
-            return "quarantined (impossible on this host)"
         from backend.core.ouroboros.governance import (  # noqa: PLC0415
             environment_integrity as _ei,
         )
-        if _ei.quarantine_enabled():
-            return "quarantined (operator-armed)"
-        return ""
+        return _ei.dispatch_quarantine_reason(verdict)
     except Exception:  # noqa: BLE001
         return ""
 

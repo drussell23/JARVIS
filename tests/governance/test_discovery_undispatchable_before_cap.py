@@ -88,10 +88,13 @@ def test_everything_discover_returns_the_sentinel_will_dispatch(world, tmp_path)
     assert all(GD.is_dispatchable(w, tmp_path) for w in got)
 
 
-def test_refusal_is_a_pure_reading_of_liveness_and_verdict():
+def test_refusal_is_a_pure_reading_of_liveness_and_verdict(monkeypatch):
+    monkeypatch.delenv("JARVIS_QUARANTINE_UNIMPORTABLE_TARGETS", raising=False)
     assert GD._dispatch_refusal(GD.LIVENESS_DEAD, None) == "dead target"
     assert GD._dispatch_refusal(GD.LIVENESS_CREATES_TEST, None) == ""
     assert "impossible" in GD._dispatch_refusal(GD.LIVENESS_LANDABLE, _IMPOSSIBLE)
     unprovisioned = SimpleNamespace(importable=False, impossible=False)
-    # Demoted, not refused, unless the operator armed quarantine.
+    # Refused by default since 2026-10-04; demoted only on the operator's opt-out.
+    assert "quarantined: unprovisioned" in GD._dispatch_refusal(GD.LIVENESS_LANDABLE, unprovisioned)
+    monkeypatch.setenv("JARVIS_QUARANTINE_UNIMPORTABLE_TARGETS", "false")
     assert GD._dispatch_refusal(GD.LIVENESS_LANDABLE, unprovisioned) == ""
