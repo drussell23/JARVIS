@@ -1,6 +1,8 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
-**Version**: 3.39 (2026-10-04 — **§33 added — the 30B Capability Envelope.** Every GENERATE on this host runs on the local `qwen3-coder-ov:30b`; §33 states from measurement only what O+V carries on it and what it does not. **Proven this date:** a landing *cadence* (1.02/h over 2.95 h, `bt-2026-10-04-215048`) and landings on local `main` via `--ff-only` promotion — both listed as "not proven" in §32.6. **Measured limits:** analogical API invention with the signature anchor present (`ConversationTurn.from_dict` ×3), diff-apply divergence, and one vacuous test that passed VALIDATE (`c985ccaee4`). **Conclusion:** the 30B is a capable implementer on well-scoped tasks; intent, decomposition and design stay with the operator and the planner until §33.7's measurements move a row. Qualifies the §6 anti-goal "provider quality is fine" for the local lane. §33.8 — the operator's definition of done — is open.)
+**Version**: 3.40 (2026-10-04 — **§34 added — the 2026-10-04 arc, from crash to cadence.** The full evidence record behind §33: a timeline of the day, the host/guest memory envelope (commit limit 100.7 → 165.7 GB; 0 guest OOM after the 14:37 reset), all four soaks with per-soak metrics, a landing-by-landing audit (13 landings, 9 admitted, 3 with one assertion-free test, 1 hollow), the failure-class analysis across retries, every fix with its evidence, six measurements that misreported and how each was caught, and O+V's position on the operator's four-step self-development sequence and the §6 A-level targets. **Headline:** `bt-2026-10-05-012717` ran 4.3 h unattended with 10 verified landings — 2.33/h raw, 1.40/h substantive, against 1.01/h in the soak before — and 0 missing-dependency dispatches (from 12 identical recurrences). Step 1 of the sequence is met for test synthesis; steps 2–4 have not started.)
+>
+> 3.39 (2026-10-04 — **§33 added — the 30B Capability Envelope.** Every GENERATE on this host runs on the local `qwen3-coder-ov:30b`; §33 states from measurement only what O+V carries on it and what it does not. **Proven this date:** a landing *cadence* (1.02/h over 2.95 h, `bt-2026-10-04-215048`) and landings on local `main` via `--ff-only` promotion — both listed as "not proven" in §32.6. **Measured limits:** analogical API invention with the signature anchor present (`ConversationTurn.from_dict` ×3), diff-apply divergence, and one vacuous test that passed VALIDATE (`c985ccaee4`). **Conclusion:** the 30B is a capable implementer on well-scoped tasks; intent, decomposition and design stay with the operator and the planner until §33.7's measurements move a row. Qualifies the §6 anti-goal "provider quality is fine" for the local lane. §33.8 — the operator's definition of done — is open.)
 >
 > 3.38 (2026-09-08 — **THE FIRST AUTONOMOUS LANDING. The gate named in v3.37 as "Not yet proven: a landing" is closed.** Session `bt-2026-09-08-225144` produced two commits authored by O+V on the accumulation branch `ouroboros/auto/bt-2026-09-08-225144-48fd5c`: `bb575e9b28` created `tests/test_apply_emergency_cpu_fix.py` (80 lines) for a module the organism itself identified as uncovered, under the self-signed goal `ov-auto-uncovered-module-apply-emergency-cpu-fix`; and `919f8ea443` modified a PRODUCTION file, `backend/api/sse_contract.py` (+8/-7), making broad `except` blocks log with `exc_info` so a swallowed SSE fault leaves evidence. Both `SAFE_AUTO (Green)`, both `Co-Authored-By: Ouroboros+Venom`, both served by the LOCAL `qwen3-coder-ov:30b` at `cost_total = 0.0`. The GoalReconciliationLedger closes the loop with a real sha: `satisfied ov-auto-uncovered-module-apply-emergency-cpu-fix sha=bb575e9b28`. The post-commit hook mirrored both to the Windows clone. **What unblocked it** was not model quality but four measured harness defects, in order: (1) a literal `120.0` default in `PythonAdapter.__init__` that overrode the live budget the router had already computed — `min(budget, 120)` is 120 forever; (2) queue precedence — the Sentinel's own signed goal was submitted NINTH at the same `priority=3` as bulk batch work, ~3 hours down a one-worker lane inside a 40-minute session; (3) the capability interceptor aborting every SANCTIONED op for a RECOVERABLE schema degradation, which stayed invisible only while sanctioned ops never reached a worker; (4) `Strategy 4 (repo fallback)`, which answered "no test covers this file" by handing pytest the entire `tests/` DIRECTORY — **69,353 tests and 200.9s of collection alone**, versus 0.67s for one explicit file, run twice per candidate by the flake retry. That is the ~450s/candidate that consumed every op budget, and it was WRONG as well as slow: `audio_error_fallback.py` was failed on a test in `tests/adversarial/test_synthetic_adversary.py` with no relationship to the change. **Measured after**: validation of a covered file 450s → 1.31s; of an uncovered file 450s → 0.02s (`no_covering_test`, an honest refusal). **Composite unchanged** — one landing is not a cadence; see §32.6.)
 >
@@ -130,13 +132,20 @@
     - [31.7 Invariants this section adds](#317-invariants-this-section-adds)
     - [31.8 The local tier, configured — deployment profile and warm-swap protocol](#318-the-local-tier-configured--deployment-profile-and-warm-swap-protocol-2026-08-18)
 32. [The First Autonomous Landing — and the four numbers that were in the way](#32-the-first-autonomous-landing--and-the-four-numbers-that-were-in-the-way-new-2026-09-08)
-33. [The 30B Capability Envelope — what O+V can and cannot do on the local model](#33-the-30b-capability-envelope--what-ov-can-and-cannot-do-on-the-local-model-new-2026-10-04) *(latest section)*
+33. [The 30B Capability Envelope — what O+V can and cannot do on the local model](#33-the-30b-capability-envelope--what-ov-can-and-cannot-do-on-the-local-model-new-2026-10-04)
     - [33.2 What the 30B does reliably](#332-what-the-30b-does-reliably)
     - [33.3 What it does not do reliably](#333-what-it-does-not-do-reliably)
     - [33.5 The division of labour this implies](#335-the-division-of-labour-this-implies)
     - [33.6 Gaps this section exposes, ranked](#336-gaps-this-section-exposes-ranked)
     - [33.7 How the envelope grows — each path with its measurement](#337-how-the-envelope-grows--each-path-with-its-measurement)
     - [33.8 Definition of done — what "JARVIS up and running" means](#338-definition-of-done--what-jarvis-up-and-running-means)
+34. [The 2026-10-04 Arc — From Crash to Cadence: the soak record, the metrics, and where O+V stands](#34-the-2026-10-04-arc--from-crash-to-cadence-the-soak-record-the-metrics-and-where-ov-stands-new-2026-10-04) *(latest section)*
+    - [34.3 The soak record](#343-the-soak-record)
+    - [34.4 Landing audit — every landing of the day](#344-landing-audit--every-landing-of-the-day)
+    - [34.5 Failure analysis — what happens after VALIDATE fails](#345-failure-analysis--what-happens-after-validate-fails)
+    - [34.8 Measurements that were wrong — and why the numbers above can be trusted](#348-measurements-that-were-wrong--and-why-the-numbers-above-can-be-trusted)
+    - [34.9 Where O+V stands on the roadmap](#349-where-ov-stands-on-the-roadmap)
+    - [34.10 Next actions, ranked](#3410-next-actions-ranked)
 
 ## 1. Executive Summary
 
@@ -5567,7 +5576,244 @@ against the gap.
 | A *cadence* of landings | **proven** — 1.02/h over 2.95 h (`bt-2026-10-04-215048`); §32.6 listed it as not proven |
 | Landings on `main` | **proven** — `--ff-only` promotion to local `main`, verified from `PROMOTION_SUCCESS` events; not pushed (operator's call) |
 | Unattended multi-hour stability | **proven** for the soak process; VALIDATE memory containment still open (33.6 #4) |
-| Every landing is real work | **not proven** — 1 hollow and 1 low-value landing among the 8 audited on 2026-10-04 (as of 19:56) |
+| Every landing is real work | **not proven** — of the day's 13 landings, 1 hollow, 1 low-value and 3 carrying one assertion-free test (§34.4); the Test Reality Gate (`5c0130ec36`) targets this |
 | Analogical hallucination stops recurring once corrected | **under measurement** — contracts first injected live 2026-10-04 19:54 |
 | Self-planned feature work | **not demonstrated** |
 | Production-code (non-test) landings at cadence | **not demonstrated** |
+
+---
+
+## 34. The 2026-10-04 Arc — From Crash to Cadence: the soak record, the metrics, and where O+V stands *(NEW 2026-10-04)*
+
+> **What this section is.** The evidence behind §33, in full. On the morning of
+> 2026-10-04 O+V could not finish a soak: the Windows host ran out of commit and
+> the WSL guest went down with it. By 22:30 the same model on the same hardware
+> had run 4+ hours unattended and landed 10 verified commits to local `main`. This
+> section records how — every soak, every metric, every fix, every measurement
+> that turned out to be wrong — and places the result on the roadmap. Numbers for
+> the soak still running at the time of writing (`bt-2026-10-05-012717`) are
+> marked *provisional*; 34.11 is updated with its final figures before merge.
+
+### 34.1 Timeline (PDT)
+
+| Time | Event | Evidence |
+|---|---|---|
+| 13:38 | Host rebooted with the page file raised 40,000 → 106,496 MB; commit limit 100.7 → **165.7 GB**. `.wslconfig` memory 48 → 40 GB | `reactor/scripts/host/set_pagefile_commit_headroom.ps1` |
+| 13:44 | Soak `bt-2026-10-04-204411` on `3077dc648a` | — |
+| ~13:52 | Every VALIDATE_RETRY regeneration fails `background_dw_blocked_by_topology`. Root cause: the free lane DID reach the local 30B, but PrimeProvider skipped the tool loop by route while the prompt (Slice 45 terminal-worker) advertised the tools → `tool_call_returned_under_venom_skip` | fixed `de96877db8` |
+| 14:24 | A full `pytest tests/governance` run, started by the operator's agent beside the soak, grew one python to 14.3 GB anon RSS; the 40 GB guest OOM-killed inside `init.scope` (`OOMPolicy=stop`), stopping the soak at 0.68 h. The OOM record — held in the shared VM kernel log — was replayed on every later distro start, SIGKILLing each new session ~90 s in | cleared by `wsl --shutdown` 14:37; prevented by `4d43f3e5b4` |
+| 14:50 | Soak `bt-2026-10-04-215048` on `de96877db8` | — |
+| 15:16–15:20 | The soak's own VALIDATE runs (op `model_status_api`, three concurrent candidate suites) pushed the soak tree 2.6 → **27.4 GB** (watchdog warn 25.6, cap ~30.1) | `ProcessMemoryWatchdog WARN` ×2 |
+| 16:27 / 17:31 / 17:44 | First three landings of the day | `cf3c13f44c`, `2fc7368e5d`, `e7bfacb4b9` |
+| 17:48 | Soak stopped after its 3-hour review; error-contract, quarantine and test-lock branches rebased and fast-forwarded to `main` = `ffc85baad3` | — |
+| 17:50 | Soak `bt-2026-10-05-005023` on `ffc85baad3` | — |
+| ~18:20 | Found: the test lock refused 6 of that soak's own VALIDATE runs — the harness exported `JARVIS_OUROBOROS_SESSION_DIR` as a RELATIVE path, meaningless in the `/tmp/jarvis_repair_sandbox_*` cwd of a VALIDATE child | fixed `bf3cb87250`; soak stopped |
+| 18:27 | Soak `bt-2026-10-05-012717` on `bf3cb87250` | verified live: a VALIDATE child received the absolute path and was exempt |
+| 18:29–22:24 | 10 verified landings | 34.4 |
+| ~21:30 | Test Reality Gate built against this soak's landings | `5c0130ec36` (branch, pending merge) |
+
+### 34.2 Infrastructure — the host and guest memory envelope
+
+| Measure | Value | Source |
+|---|---|---|
+| Windows commit limit | 100.7 → **165.7 GB** | `Win32_OperatingSystem` after the 13:38 reboot |
+| Committed at idle (post-reboot) | 14.7 GB | perf counter |
+| Committed under soak load | **44.3 – 65.5 GB** over the day | perf counter, sampled through both long soaks |
+| `llama-server` (30B) commit | 23.5 – 29.7 GB at ~1 GB resident (WDDM charges commit for VRAM) | process counters |
+| `vmmemWSL` | 3.7 – 7.0 GB | process counters |
+| Guest (`.wslconfig`) | 40 GB; soak watchdog cap = 0.75 × MemTotal ≈ 29–30 GB | `process_memory_budget` |
+| Guest OOM kills after 14:37 | **0** | `journalctl -k` |
+| `LocalMemoryCritical` / `HEALTH ALARM` | **0 / 0** in both long soaks | session `debug.log` |
+
+**What the page file fixed and what it did not.** The host never came near its
+limit again (peak 65.5 / 165.7 GB). The one memory failure of the day was in the
+*guest*: 40 GB is a hard ceiling shared by the soak and anything else run in WSL.
+That class is now handled in two layers (34.6, `4d43f3e5b4`): every pytest
+launched from the checkout is admitted against the soak's unused licence and then
+kernel-capped in its own cgroup scope. 38 governed runs were recorded beside the
+live soaks — max peak 1.16 GiB against 6.4–6.7 GiB grants, 0 OOM kills. **Still
+open:** the soak's OWN VALIDATE runs are exempt from that lock (they are inside
+the soak's budget) and nothing caps them in the kernel; 15:16 shows one op can
+take the soak tree to within ~3 GB of its stop.
+
+### 34.3 The soak record
+
+| Session | Code | Span | Ops with generation | Failed VALIDATE ≥1 | Retry regens (ops / regenerations) | **Landings** (verified) | Substantive | **Rate** | Missing-dependency dispatches | End |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `bt-2026-10-04-204411` | `3077dc648a` | 0.68 h | 13 attempted | 10 | broken — 0 reached the model with tools | **0** | 0 | 0 | — | guest OOM caused by an operator-side test run |
+| `bt-2026-10-04-215048` | `de96877db8` | 2.98 h | 20 | 16 | 13 / 26 ok | **3** | 3 | **1.01/h** | **2** (`sklearn`) | stopped after 3-h review, exit 0 |
+| `bt-2026-10-05-005023` | `ffc85baad3` | ~0.6 h | 4 | 2 | 2 / 2 ok | 0 | 0 | — | 0 | stopped — contaminated (6 VALIDATE runs refused by the lock) |
+| `bt-2026-10-05-012717` *(provisional, 22:45)* | `bf3cb87250` | 4.30 h | 34 | 27 | 19 / 36 ok, 1 exception | **10** | **6** | **2.33/h** raw, **1.40/h** substantive | **0** | running (cap ~00:28) |
+
+Terminal outcome distributions (from `debug.log` terminal events):
+
+| | `bt-2026-10-04-215048` | `bt-2026-10-05-012717` *(prov.)* |
+|---|---|---|
+| `CANCELLED:l2_stopped` | 7 | 14 |
+| `POSTMORTEM:validation_infra_failure` | 5 | 4 |
+| `POSTMORTEM:test_coverage_deficit` | 1 | 1 |
+| `COMPLETE:noop` / `COMPLETE:complete` | 1 / 0 | 1 / 1 |
+| `CANCELLED:l2_soft_stop_retries_exhausted` / `background_accepted` | 0 / 0 | 1 / 1 |
+| in flight at read time | 6 | 11 |
+
+`summary.json` is not a landing source: for `bt-2026-10-04-215048` it reported
+`completed: 2` while the promoter recorded 3 promotions (34.8 #3).
+
+### 34.4 Landing audit — every landing of the day
+
+Each landing was re-run outside the soak and judged by the Test Reality Gate (34.6).
+
+| Landed | Commit | File | Tests | Gate verdict | Independent re-run |
+|---|---|---|---|---|---|
+| 16:27 | `cf3c13f44c` | `tests/test_reactor_core_watcher.py` | 16 | admitted | 16 passed |
+| 17:31 | `2fc7368e5d` | `tests/test_unified_data_flywheel.py` | 15 | admitted | 15 passed |
+| 17:44 | `e7bfacb4b9` | `tests/test_intervention_decision_engine.py` | 19 | 1 test verifies nothing | 20 passed |
+| 18:29 | `34e3168861` | `tests/test_macos_integration.py` | 8 | admitted | 8 passed |
+| 18:43 | `1126d4555e` | edit to `test_todo_scanner_trigger_tag.py` | 1 changed | admitted — **low value**: the TODO scanner took a `TODO` inside a test string fixture as work | 21 passed |
+| 19:24 | `60566e96e8` | `tests/test_creative_problem_solving.py` | 6 | admitted | 6 passed |
+| 19:40 | `611ffb6269` | `tests/test_agent_runtime_models.py` | 20 | 1 test verifies nothing ("just check it doesn't raise") | 20 passed |
+| 19:44 | `c985ccaee4` | `tests/test_hardware_control.py` | 1 | **HOLLOW** — `async def` in `unittest.TestCase` (never runs) + never imports its subject | "1 passed" — vacuous; **reverted at merge** |
+| 20:24 | `17c02d4e31` | `tests/test_error_recovery.py` | 16 | admitted | 17 passed |
+| 20:59 | `80801fc781` | `tests/test_monitoring_metrics.py` | 7 | 1 test verifies nothing (print-driven) | 8 passed |
+| 21:20 | `dde6a7aa52` | `tests/test_error_recovery_orchestrator.py` | 19 | admitted | 19 passed |
+| 21:58 | `7699923ae1` | `tests/test_reasoning_provider.py` | 4 | admitted | 4 passed |
+| 22:24 | `41d9e35e00` | `tests/test_outcome_collector.py` | 19 | admitted | 19 passed |
+
+**Quality summary, 13 landings:** 9 admitted outright (1 of them low-value), 3
+contain one assertion-free test among many (the gate would bounce each for one
+repair), 1 hollow. Every landing is a test file; **0 production-code landings**.
+
+### 34.5 Failure analysis — what happens after VALIDATE fails
+
+Per failing test, classified by meaning (not exception name), across retry
+attempts (`l2_yield.py`; "gone" = absent from later attempts, which for
+model-written tests may mean fixed OR rewritten):
+
+| Class | `bt-2026-10-04-215048` | `bt-2026-10-05-012717` *(as of 21:20)* |
+|---|---|---|
+| `api:async_shape` (un-awaited coroutine) | gone 2, still failing 1 | gone 1 |
+| `api:nonexistent_attribute` | **recurred identically 3**, changed 2, gone 1, still 3 | **recurred identically 2**, gone 1, still 2 |
+| `api:undefined_name` | recurred identically 2, still 2 | — |
+| `api:wrong_signature` | gone 1, still 2 | gone 1, still 2 |
+| `env:missing_dependency` | **recurred identically 12**, still 6 | **0** |
+| `mock_misuse` | recurred identically 2, still 2 | gone 1, still 2 |
+| `type_misuse` | recurred 5, gone 1, still 6 | changed 2, recurred 1, gone 1, still 2 |
+| assertion / other | still failing 22 | still failing 35 |
+
+**Readings.**
+
+1. **Environment waste is gone.** 12 identical `ModuleNotFoundError` recurrences
+   in the earlier soak, **0** after the quarantine — the deterministic gate did
+   exactly what it was built for.
+2. **Analogical invention persists.** `api:nonexistent_attribute` still recurs
+   identically — `IntelligentLearningGoalsDiscovery._analyzer_lock` three times
+   (the name exists only as a module-level lock in the unrelated
+   `voice_health_analyzer.py`). The retry path builds its memory with the
+   contract resolver, so the correction was most likely in those prompts — but
+   that path did not log its render, so the effect is **unattributable** for this
+   soak (fixed in `5c0130ec36`). One counter-example landed: the op that invented
+   `core.contracts.triage_features` at 22:23 dropped it on retry and landed at
+   22:24 (`41d9e35e00`).
+3. **Assertion failures dominate and rarely recover** (22 and 35 still failing).
+   The model writes tests whose expectations disagree with the subject's real
+   behaviour; retries do not converge on them. This is the largest remaining
+   failure mass and no current mechanism targets it.
+4. **L2 stops are the top terminal** (7 and 14 `l2_stopped`): the repair ladder
+   runs, but most ops exhaust it.
+5. **Retry regeneration works**: 13/13 and 19/19 retried ops regenerated with
+   tool use (6–16 file reads per retry window); before `de96877db8` 0 did.
+
+### 34.6 Fixes shipped in this arc
+
+| Commit | Change | Evidence it worked |
+|---|---|---|
+| host | Page file 40 → 104 GB (commit limit 165.7 GB); `.wslconfig` 48 → 40 GB | host peak 65.5 GB; 0 commit failures |
+| `de96877db8` | One exec-layer tool-loop predicate (`route_skips_tool_loop`) for both provider seats, matching the prompt's terminal-worker advertisement | retries regenerate with tool calls; 0 `venom_skip` since |
+| `4d43f3e5b4` | Test execution lock: admission against live soaks' unused licence + self-adoption into a `MemoryMax` cgroup scope | 38 governed runs, 0 guest OOM since |
+| `d98a70273e` | A sibling run's grant is reserved only while its owner pid lives | no stale-reserve refusals since |
+| `54cadae124` | Error-named API contract for first-party types, with runtime-PROVEN facts, in VALIDATE_RETRY / L2 / micro-fix | 8 L2/micro injections in `bt-2026-10-05-012717`; retry-path effect unattributable (34.5 #2) |
+| `ffc85baad3` | Unprovisioned targets quarantined by default; one dispatch rule for discovery, walk, Sentinel and resume | missing-dependency dispatches 2 → **0**; 40 of 83 documented goals held (26 newly) |
+| `bf3cb87250` | Harness exports an absolute session dir | live VALIDATE child exempt; 0 lock refusals since |
+| `5c0130ec36` *(pending merge)* | Test Reality Gate (`cannot_execute`, `verifies_nothing`, `subject_not_imported`) in VALIDATE before pytest, in L2 before its sandbox, in retry memory; retry-contract render logged | flags `c985ccaee4`; 1.12% of 63,580 existing tests flagged if judged as new; regression identical 73 failure ids |
+| `cb153679e2` *(pending merge)* | PRD §33 — the 30B capability envelope | — |
+
+### 34.7 Where the 2.33/h comes from — and what it does not prove
+
+The raw rate more than doubled (1.01 → 2.33/h); the substantive rate rose ~40%
+(1.01 → 1.40/h). The candidate causes are: the retry fix (retries now reach the
+model with tools), the quarantine (no op spent on an unfixable environment), the
+error contract, and the queue (the walk reached different modules). **One soak
+cannot separate them.** The controlled way to attribute is to toggle one lever
+per soak; until then, the claim is "the combination raised the rate", not any
+single fix.
+
+### 34.8 Measurements that were wrong — and why the numbers above can be trusted
+
+Six instruments misreported during the arc. Each was caught by checking a
+negative against a source that could have produced a positive.
+
+1. **Colour codes made a regression diff vacuous.** `pytest.ini` forces
+   `--color=yes`; `grep '^FAILED'` matched nothing, and two empty lists "proved"
+   no new failures. Every diff since runs `--color=no` and prints the captured id
+   count (73 = 73, 52 = 52 — real comparisons).
+2. **Landings were read off the wrong branch.** The soak's checked-out branch is
+   not where landings go; promotion fast-forwards local `main`. The funnel now
+   reads `PROMOTION_SUCCESS` events (target branch + full hashes) and verifies each
+   with `merge-base --is-ancestor`.
+3. **`summary.json` undercounts completions** (2 vs 3 promotions).
+4. **A relative path hid a soak's own runs from the lock** (34.1, 18:20).
+5. **The live monitor was silent** for its first 30 minutes: `cut` block-buffers
+   into a pipe. Replaced with unbuffered `sed`.
+6. **First-party imports were misfiled as missing dependencies.** `core.*`
+   resolves through the repo's `pythonpath = . backend`; the classifier read only
+   the repo's top-level directories and called an invented first-party module an
+   environment gap.
+
+### 34.9 Where O+V stands on the roadmap
+
+**The operator's sequence** (self-development, 2026-09-20):
+
+| Step | Status |
+|---|---|
+| 1. Prove the loop lands validated work at a cadence | **Met for test synthesis** — 4.3 h unattended, 10 verified landings, 6 substantive |
+| 2. Restore features silently degraded by missing packages | **Not started.** The quarantine census names the blockers: `torch` 159 modules, `chromadb` 76, `librosa` 70, `sentence_transformers` 69, `scipy` 63, `sklearn` 45 |
+| 3. Arm the Epistemic Planner + Conception Bridge on a soak | **Not started** — built, default-off |
+| 4. JARVIS → O+V handoff through the `/goal` seam | **Not started** — blocked on §33.8 (the operator's definition of done) |
+
+**Against the §6 A-level targets:**
+
+| Dimension | Target | 2026-10-04 |
+|---|---|---|
+| Throughput | ≥ 1 commit / 30 min (2/h) | **met raw** (2.33/h); **not met substantive** (1.40/h) |
+| Autonomous initiation | ≥ 3 self-formed goals / session | **met narrowly** — 34 ops in one soak, all self-discovered; but hygiene goals (uncovered modules), not product goals |
+| Reliability | ≥ 90 % clean session completion | **not met / not measurable yet** — of 4 sessions, 2 were ended by operator-side defects, 1 stopped for review, 1 running |
+| Cross-session learning | POSTMORTEM-driven prompt changes in ≥ 30 % of later ops | not measured |
+| Operator UX | < 30 s from "I want X" to "X is being worked on" | not measured |
+| Cognitive depth | self-model summary the operator can read | not measured |
+| RSI convergence | composite trend non-decreasing over 30 days | not measured — one day of data |
+
+The composite readiness figure is deliberately not re-scored: one strong day
+establishes a rate on one kind of work, not a trend.
+
+### 34.10 Next actions, ranked
+
+1. **Soak the Test Reality Gate and the retry-contract log** (merge `5c0130ec36`).
+   Measure: hollow landings → 0; `nonexistent_attribute` identical recurrence
+   *after a logged contract* → attributable, target 0.
+2. **Give soak-owned VALIDATE runs a kernel memory cap** sized to the soak's
+   unused licence (34.2).
+3. **§33.8 — the operator's definition of done**, written as runnable acceptance
+   checks. Every later step aims at it.
+4. **Assertion-failure convergence** — the largest remaining failure mass (34.5 #3).
+   First measure what the failing expectations disagree with (subject behaviour vs
+   test arithmetic vs mocks) before building anything.
+5. **Diff-apply fidelity** — `TerminalDiffCascade` ×6 in the running soak.
+6. **TODO scanner false signals** — skip `TODO` inside string literals and test
+   fixtures.
+7. **Restore package-degraded features** (34.9 step 2), largest blocker first.
+8. **Arm the Epistemic Planner** on a soak once 1–3 hold (34.9 step 3).
+
+### 34.11 Final figures for `bt-2026-10-05-012717`
+
+*Pending — completed when the soak reaches its wall cap (~00:28 2026-10-05) and
+before this section is merged.*
