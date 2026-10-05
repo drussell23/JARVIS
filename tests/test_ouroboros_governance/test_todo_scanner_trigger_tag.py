@@ -1,3 +1,6 @@
+# [Ouroboros] Modified by Ouroboros (op=op-01a109af-) at 2026-10-05 01:43 UTC
+# Reason: TODO at tests/test_ouroboros_governance/test_todo_scanner_trigger_tag.py:88: seeded by battle test")
+
 """Tests for the TodoScannerSensor trigger-tag bypass (Task #68).
 
 Battle test bt-2026-04-12-005521 needed a deterministic way to seed a TODO
@@ -87,11 +90,12 @@ class TestParseMarkerLine:
     def test_trigger_tag_elevates_todo_to_high(self):
         result = _parse_marker_line("# TODO(rsi-trigger): seeded by battle test")
         assert result is not None
-        marker, _text, urgency, priority, has_trigger = result
+        marker, text, urgency, priority, has_trigger = result
         assert marker == "TODO"
         assert urgency == "high"     # Elevated!
         assert priority == 1.0       # Pinned to max!
         assert has_trigger is True
+        assert "seeded by battle test" in text
 
     def test_trigger_tag_elevates_note_to_high(self):
         """Even the lowest-priority NOTE marker gets elevated when tagged."""
