@@ -1,6 +1,6 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
-**Version**: 3.40 (2026-10-04 — **§34 added — the 2026-10-04 arc, from crash to cadence.** The full evidence record behind §33: a timeline of the day, the host/guest memory envelope (commit limit 100.7 → 165.7 GB; 0 guest OOM after the 14:37 reset), all four soaks with per-soak metrics, a landing-by-landing audit (13 landings, 9 admitted, 3 with one assertion-free test, 1 hollow), the failure-class analysis across retries, every fix with its evidence, six measurements that misreported and how each was caught, and O+V's position on the operator's four-step self-development sequence and the §6 A-level targets. **Headline:** `bt-2026-10-05-012717` ran 4.3 h unattended with 10 verified landings — 2.33/h raw, 1.40/h substantive, against 1.01/h in the soak before — and 0 missing-dependency dispatches (from 12 identical recurrences). Step 1 of the sequence is met for test synthesis; steps 2–4 have not started.)
+**Version**: 3.40 (2026-10-04 — **§34 added — the 2026-10-04 arc, from crash to cadence.** The full evidence record behind §33: a timeline of the day, the host/guest memory envelope (commit limit 100.7 → 165.7 GB; 0 guest OOM after the 14:37 reset), all four soaks with per-soak metrics, a landing-by-landing audit (13 landings, 9 admitted, 3 with one assertion-free test, 1 hollow), the failure-class analysis across retries, every fix with its evidence, six measurements that misreported and how each was caught, and O+V's position on the operator's four-step self-development sequence and the §6 A-level targets. **Headline:** `bt-2026-10-05-012717` ran its full 6.03 h unattended (exit 0, no OOM) with 10 verified landings, 6 substantive. Over the same 2.98 h window as the soak before, the substantive rate doubled (0.67 → 1.34/h); over the full run it fell to 1.00/h because the supply of landable work ran out at 22:24 — the last 2.1 h landed nothing and event-loop starvation rose ~100× (§34.11). Missing-dependency dispatches 12 identical recurrences → 0. Step 1 of the sequence is met for test synthesis; steps 2–4 have not started.)
 >
 > 3.39 (2026-10-04 — **§33 added — the 30B Capability Envelope.** Every GENERATE on this host runs on the local `qwen3-coder-ov:30b`; §33 states from measurement only what O+V carries on it and what it does not. **Proven this date:** a landing *cadence* (1.02/h over 2.95 h, `bt-2026-10-04-215048`) and landings on local `main` via `--ff-only` promotion — both listed as "not proven" in §32.6. **Measured limits:** analogical API invention with the signature anchor present (`ConversationTurn.from_dict` ×3), diff-apply divergence, and one vacuous test that passed VALIDATE (`c985ccaee4`). **Conclusion:** the 30B is a capable implementer on well-scoped tasks; intent, decomposition and design stay with the operator and the planner until §33.7's measurements move a row. Qualifies the §6 anti-goal "provider quality is fine" for the local lane. §33.8 — the operator's definition of done — is open.)
 >
@@ -5587,12 +5587,12 @@ against the gap.
 
 > **What this section is.** The evidence behind §33, in full. On the morning of
 > 2026-10-04 O+V could not finish a soak: the Windows host ran out of commit and
-> the WSL guest went down with it. By 22:30 the same model on the same hardware
-> had run 4+ hours unattended and landed 10 verified commits to local `main`. This
-> section records how — every soak, every metric, every fix, every measurement
-> that turned out to be wrong — and places the result on the roadmap. Numbers for
-> the soak still running at the time of writing (`bt-2026-10-05-012717`) are
-> marked *provisional*; 34.11 is updated with its final figures before merge.
+> the WSL guest went down with it. By 00:29 the next day the same model on the same
+> hardware had run a full 6-hour soak unattended and landed 10 verified commits to
+> local `main`. This section records how — every soak, every metric, every fix,
+> every measurement that turned out to be wrong — and places the result on the
+> roadmap. All figures for `bt-2026-10-05-012717` are final as of its 6.03 h wall
+> cap (34.11).
 
 ### 34.1 Timeline (PDT)
 
@@ -5630,7 +5630,7 @@ limit again (peak 65.5 / 165.7 GB). The one memory failure of the day was in the
 *guest*: 40 GB is a hard ceiling shared by the soak and anything else run in WSL.
 That class is now handled in two layers (34.6, `4d43f3e5b4`): every pytest
 launched from the checkout is admitted against the soak's unused licence and then
-kernel-capped in its own cgroup scope. 38 governed runs were recorded beside the
+kernel-capped in its own cgroup scope. 41 governed runs were recorded beside the
 live soaks — max peak 1.16 GiB against 6.4–6.7 GiB grants, 0 OOM kills. **Still
 open:** the soak's OWN VALIDATE runs are exempt from that lock (they are inside
 the soak's budget) and nothing caps them in the kernel; 15:16 shows one op can
@@ -5638,26 +5638,30 @@ take the soak tree to within ~3 GB of its stop.
 
 ### 34.3 The soak record
 
-| Session | Code | Span | Ops with generation | Failed VALIDATE ≥1 | Retry regens (ops / regenerations) | **Landings** (verified) | Substantive | **Rate** | Missing-dependency dispatches | End |
-|---|---|---|---|---|---|---|---|---|---|---|
-| `bt-2026-10-04-204411` | `3077dc648a` | 0.68 h | 13 attempted | 10 | broken — 0 reached the model with tools | **0** | 0 | 0 | — | guest OOM caused by an operator-side test run |
-| `bt-2026-10-04-215048` | `de96877db8` | 2.98 h | 20 | 16 | 13 / 26 ok | **3** | 3 | **1.01/h** | **2** (`sklearn`) | stopped after 3-h review, exit 0 |
-| `bt-2026-10-05-005023` | `ffc85baad3` | ~0.6 h | 4 | 2 | 2 / 2 ok | 0 | 0 | — | 0 | stopped — contaminated (6 VALIDATE runs refused by the lock) |
-| `bt-2026-10-05-012717` *(provisional, 22:45)* | `bf3cb87250` | 4.30 h | 34 | 27 | 19 / 36 ok, 1 exception | **10** | **6** | **2.33/h** raw, **1.40/h** substantive | **0** | running (cap ~00:28) |
+*Substantive* = admitted by the Test Reality Gate (34.4) and not low-value. It is
+the only rate this section compares; "raw" counts every verified promotion.
+
+| Session | Code | Span | Ops with generation | Failed VALIDATE ≥1 | Retry regens (ops / regenerations) | **Landings** (verified) | Substantive | **Raw rate** | **Substantive rate** | Missing-dependency dispatches | End |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `bt-2026-10-04-204411` | `3077dc648a` | 0.68 h | 13 attempted | 10 | broken — 0 reached the model with tools | **0** | 0 | 0 | 0 | — | guest OOM caused by an operator-side test run |
+| `bt-2026-10-04-215048` | `de96877db8` | 2.98 h | 20 | 16 | 13 / 26 ok | **3** | 2 | 1.01/h | **0.67/h** | **2** (`sklearn`) | stopped after 3-h review, exit 0 |
+| `bt-2026-10-05-005023` | `ffc85baad3` | ~0.6 h | 4 | 2 | 2 / 2 ok | 0 | 0 | — | — | 0 | stopped — contaminated (6 VALIDATE runs refused by the lock) |
+| `bt-2026-10-05-012717` | `bf3cb87250` | **6.03 h** (wall cap) | 43 | 35 | 25 / 48 ok, 1 exception | **10** | **6** | 1.66/h (2.68/h in its first 2.98 h) | **1.00/h** (1.34/h in its first 2.98 h) | **0** | wall-clock cap, exit 0, no OOM evidence |
 
 Terminal outcome distributions (from `debug.log` terminal events):
 
-| | `bt-2026-10-04-215048` | `bt-2026-10-05-012717` *(prov.)* |
+| | `bt-2026-10-04-215048` | `bt-2026-10-05-012717` (final) |
 |---|---|---|
-| `CANCELLED:l2_stopped` | 7 | 14 |
-| `POSTMORTEM:validation_infra_failure` | 5 | 4 |
+| `CANCELLED:l2_stopped` | 7 | 21 |
+| `POSTMORTEM:validation_infra_failure` | 5 | 6 |
 | `POSTMORTEM:test_coverage_deficit` | 1 | 1 |
 | `COMPLETE:noop` / `COMPLETE:complete` | 1 / 0 | 1 / 1 |
 | `CANCELLED:l2_soft_stop_retries_exhausted` / `background_accepted` | 0 / 0 | 1 / 1 |
-| in flight at read time | 6 | 11 |
+| without a terminal event in the log | 6 | 11 |
 
 `summary.json` is not a landing source: for `bt-2026-10-04-215048` it reported
-`completed: 2` while the promoter recorded 3 promotions (34.8 #3).
+`completed: 2` while the promoter recorded 3 promotions, and for
+`bt-2026-10-05-012717` `completed: 1` against 10 (34.8 #3).
 
 ### 34.4 Landing audit — every landing of the day
 
@@ -5689,16 +5693,22 @@ Per failing test, classified by meaning (not exception name), across retry
 attempts (`l2_yield.py`; "gone" = absent from later attempts, which for
 model-written tests may mean fixed OR rewritten):
 
-| Class | `bt-2026-10-04-215048` | `bt-2026-10-05-012717` *(as of 21:20)* |
-|---|---|---|
-| `api:async_shape` (un-awaited coroutine) | gone 2, still failing 1 | gone 1 |
-| `api:nonexistent_attribute` | **recurred identically 3**, changed 2, gone 1, still 3 | **recurred identically 2**, gone 1, still 2 |
-| `api:undefined_name` | recurred identically 2, still 2 | — |
-| `api:wrong_signature` | gone 1, still 2 | gone 1, still 2 |
-| `env:missing_dependency` | **recurred identically 12**, still 6 | **0** |
-| `mock_misuse` | recurred identically 2, still 2 | gone 1, still 2 |
-| `type_misuse` | recurred 5, gone 1, still 6 | changed 2, recurred 1, gone 1, still 2 |
-| assertion / other | still failing 22 | still failing 35 |
+| Class | `bt-2026-10-04-215048` (2.98 h) | `bt-2026-10-05-012717` first 2.9 h | `bt-2026-10-05-012717` full 6.03 h |
+|---|---|---|---|
+| `api:async_shape` (un-awaited coroutine) | gone 2, still failing 1 | gone 1 | gone 4, recurred 3, still 4 |
+| `api:nonexistent_attribute` | **recurred identically 3**, changed 2, gone 1, still 3 | **recurred identically 2**, gone 1, still 2 | recurred 6, gone 2, still 5 |
+| `api:missing_repo_module` (invented first-party module) | — | — | still 1 (another landed after dropping it) |
+| `api:undefined_name` | recurred identically 2, still 2 | — | recurred 2, still 1 |
+| `api:wrong_signature` | gone 1, still 2 | gone 1, still 2 | recurred 4, gone 1, still 5 |
+| `env:missing_dependency` | **recurred identically 12**, still 6 | **0** | **0** |
+| `mock_misuse` | recurred identically 2, still 2 | gone 1, still 2 | gone 1, changed 1, still 2 |
+| `type_misuse` | recurred 5, gone 1, still 6 | changed 2, recurred 1, gone 1, still 2 | recurred 8, changed 3, gone 2, still 9 |
+| assertion / other | still failing 22 | still failing 35 | still failing 54 |
+
+The last three hours of the long soak are not comparable to the first (34.11):
+they were spent on dead top-level scripts whose `AttributeError`s and
+`TypeError`s are the SUBJECTS' own breakage (calls into APIs since renamed or
+removed), so the full-run recurrence counts overstate model invention.
 
 **Readings.**
 
@@ -5714,13 +5724,13 @@ model-written tests may mean fixed OR rewritten):
    soak (fixed in `5c0130ec36`). One counter-example landed: the op that invented
    `core.contracts.triage_features` at 22:23 dropped it on retry and landed at
    22:24 (`41d9e35e00`).
-3. **Assertion failures dominate and rarely recover** (22 and 35 still failing).
+3. **Assertion failures dominate and rarely recover** (22 and 54 still failing).
    The model writes tests whose expectations disagree with the subject's real
    behaviour; retries do not converge on them. This is the largest remaining
    failure mass and no current mechanism targets it.
-4. **L2 stops are the top terminal** (7 and 14 `l2_stopped`): the repair ladder
+4. **L2 stops are the top terminal** (7 and 21 `l2_stopped`): the repair ladder
    runs, but most ops exhaust it.
-5. **Retry regeneration works**: 13/13 and 19/19 retried ops regenerated with
+5. **Retry regeneration works**: 13/13 and 25/25 retried ops regenerated with
    tool use (6–16 file reads per retry window); before `de96877db8` 0 did.
 
 ### 34.6 Fixes shipped in this arc
@@ -5729,18 +5739,20 @@ model-written tests may mean fixed OR rewritten):
 |---|---|---|
 | host | Page file 40 → 104 GB (commit limit 165.7 GB); `.wslconfig` 48 → 40 GB | host peak 65.5 GB; 0 commit failures |
 | `de96877db8` | One exec-layer tool-loop predicate (`route_skips_tool_loop`) for both provider seats, matching the prompt's terminal-worker advertisement | retries regenerate with tool calls; 0 `venom_skip` since |
-| `4d43f3e5b4` | Test execution lock: admission against live soaks' unused licence + self-adoption into a `MemoryMax` cgroup scope | 38 governed runs, 0 guest OOM since |
+| `4d43f3e5b4` | Test execution lock: admission against live soaks' unused licence + self-adoption into a `MemoryMax` cgroup scope | 41 governed runs, 0 guest OOM since |
 | `d98a70273e` | A sibling run's grant is reserved only while its owner pid lives | no stale-reserve refusals since |
-| `54cadae124` | Error-named API contract for first-party types, with runtime-PROVEN facts, in VALIDATE_RETRY / L2 / micro-fix | 8 L2/micro injections in `bt-2026-10-05-012717`; retry-path effect unattributable (34.5 #2) |
+| `54cadae124` | Error-named API contract for first-party types, with runtime-PROVEN facts, in VALIDATE_RETRY / L2 / micro-fix | 9 L2/micro injections in `bt-2026-10-05-012717`; retry-path effect unattributable (34.5 #2) |
 | `ffc85baad3` | Unprovisioned targets quarantined by default; one dispatch rule for discovery, walk, Sentinel and resume | missing-dependency dispatches 2 → **0**; 40 of 83 documented goals held (26 newly) |
 | `bf3cb87250` | Harness exports an absolute session dir | live VALIDATE child exempt; 0 lock refusals since |
 | `5c0130ec36` *(pending merge)* | Test Reality Gate (`cannot_execute`, `verifies_nothing`, `subject_not_imported`) in VALIDATE before pytest, in L2 before its sandbox, in retry memory; retry-contract render logged | flags `c985ccaee4`; 1.12% of 63,580 existing tests flagged if judged as new; regression identical 73 failure ids |
 | `cb153679e2` *(pending merge)* | PRD §33 — the 30B capability envelope | — |
 
-### 34.7 Where the 2.33/h comes from — and what it does not prove
+### 34.7 What the rate change means — and what it does not prove
 
-The raw rate more than doubled (1.01 → 2.33/h); the substantive rate rose ~40%
-(1.01 → 1.40/h). The candidate causes are: the retry fix (retries now reach the
+Compared over the same window (each soak's first 2.98 h), the substantive rate
+doubled — **0.67 → 1.34/h** — and the raw rate rose 1.01 → 2.68/h. Over its full
+6.03 h the later soak's substantive rate fell to **1.00/h**, because its supply of
+landable work ran out (34.11). The candidate causes of the same-window gain are: the retry fix (retries now reach the
 model with tools), the quarantine (no op spent on an unfixable environment), the
 error contract, and the queue (the walk reached different modules). **One soak
 cannot separate them.** The controlled way to attribute is to toggle one lever
@@ -5775,7 +5787,7 @@ negative against a source that could have produced a positive.
 
 | Step | Status |
 |---|---|
-| 1. Prove the loop lands validated work at a cadence | **Met for test synthesis** — 4.3 h unattended, 10 verified landings, 6 substantive |
+| 1. Prove the loop lands validated work at a cadence | **Met for test synthesis** — 6.03 h unattended to the wall cap, 10 verified landings, 6 substantive; bounded at the end by the supply of landable work (34.11) |
 | 2. Restore features silently degraded by missing packages | **Not started.** The quarantine census names the blockers: `torch` 159 modules, `chromadb` 76, `librosa` 70, `sentence_transformers` 69, `scipy` 63, `sklearn` 45 |
 | 3. Arm the Epistemic Planner + Conception Bridge on a soak | **Not started** — built, default-off |
 | 4. JARVIS → O+V handoff through the `/goal` seam | **Not started** — blocked on §33.8 (the operator's definition of done) |
@@ -5784,7 +5796,7 @@ negative against a source that could have produced a positive.
 
 | Dimension | Target | 2026-10-04 |
 |---|---|---|
-| Throughput | ≥ 1 commit / 30 min (2/h) | **met raw** (2.33/h); **not met substantive** (1.40/h) |
+| Throughput | ≥ 1 commit / 30 min (2/h) | **met in-window, not sustained** — raw 2.68/h over the first 2.98 h, 1.66/h over 6.03 h; substantive 1.34/h → 1.00/h. Not met substantively in either window |
 | Autonomous initiation | ≥ 3 self-formed goals / session | **met narrowly** — 34 ops in one soak, all self-discovered; but hygiene goals (uncovered modules), not product goals |
 | Reliability | ≥ 90 % clean session completion | **not met / not measurable yet** — of 4 sessions, 2 were ended by operator-side defects, 1 stopped for review, 1 running |
 | Cross-session learning | POSTMORTEM-driven prompt changes in ≥ 30 % of later ops | not measured |
@@ -5807,13 +5819,43 @@ establishes a rate on one kind of work, not a trend.
 4. **Assertion-failure convergence** — the largest remaining failure mass (34.5 #3).
    First measure what the failing expectations disagree with (subject behaviour vs
    test arithmetic vs mocks) before building anything.
-5. **Diff-apply fidelity** — `TerminalDiffCascade` ×6 in the running soak.
+5. **Diff-apply fidelity** — `TerminalDiffCascade` ×6 in the 6-h soak.
 6. **TODO scanner false signals** — skip `TODO` inside string literals and test
    fixtures.
 7. **Restore package-degraded features** (34.9 step 2), largest blocker first.
 8. **Arm the Epistemic Planner** on a soak once 1–3 hold (34.9 step 3).
 
-### 34.11 Final figures for `bt-2026-10-05-012717`
+### 34.11 Final figures for `bt-2026-10-05-012717` — and the supply wall
 
-*Pending — completed when the soak reaches its wall cap (~00:28 2026-10-05) and
-before this section is merged.*
+The soak ran to its wall-clock cap: **6.03 h, exit 0, no OOM evidence** (supervisor
+`terminal.json`). Final: 43 ops with generation, 35 failed VALIDATE at least
+once, 25 retried (48 regenerations ok, 1 exception), **10 verified landings, 6
+substantive**, 0 missing-dependency dispatches, 0 lock refusals, 0 watchdog warnings, 0
+`LocalMemoryCritical`, 0 `HEALTH ALARM`, 0 guest OOM kills, 41 lock-governed test
+runs beside it. Error contracts logged on the L2/micro-fix paths: 9.
+
+**The supply wall.** All ten landings fell between 18:29 and 22:24. From 22:24 to
+the cap (2.1 h) nothing landed: the queue had exhausted its landable package
+modules (landed, or cooling after a recent attempt) and reached what discovery
+ranks last — top-level debug scripts (`backend/trace_live_error.py`,
+`jarvis_reload_manager.py`, `start_system_parallel.py`) that call APIs since
+renamed or removed, so no test of them can pass — plus re-attempts of earlier
+failures. Of the ops that finished in that window, none landed. The event loop
+showed it: `ControlPlaneStarvation` ran 3 / 9 / 2 per hour from 18:00 to 21:00,
+then **209 / 414 / 337** in the 22:00, 23:00 and 00:00 hours.
+
+| Window | Hours | Substantive | Substantive rate |
+|---|---|---|---|
+| 18:27 → 21:25 (same length as the prior soak) | 2.98 | 4 | 1.34/h |
+| 21:25 → 22:24 | 0.98 | 2 | 2.04/h |
+| 22:24 → 00:29 | 2.08 | 0 | 0 |
+| **whole soak** | **6.03** | **6** | **1.00/h** |
+
+**What it means for the roadmap.** For the last third of the run, output was
+bounded by the **supply of landable work, not by the model**. On the uncovered-
+module diet, a soak front-loads its yield and then idles. Throughput past
+~1/h therefore needs more supply rather than more model: restore the
+package-blocked modules (34.9 step 2 — ~500 modules re-opened), stop spending
+generations on dead top-level scripts, and give O+V product work instead of
+coverage hygiene (34.9 steps 3–4). It also means a soak's rate must be quoted
+with its window: the same run reads 1.34/h or 1.00/h depending on when it is cut.
