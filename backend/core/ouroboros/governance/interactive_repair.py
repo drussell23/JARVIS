@@ -272,7 +272,10 @@ class InteractiveRepairLoop:
                 iteration, err.error_type, err.file_path, err.line_number,
                 op_id, (err.message or "")[:120],
             )
-            prompt = self._build_micro_prompt(file_path, current, err)
+            prompt = self._build_micro_prompt(
+                file_path, current, err,
+                api_contract=await self._api_contract(file_path, current, err),
+            )
             try:
                 from datetime import datetime, timedelta, timezone
                 deadline = datetime.now(timezone.utc) + timedelta(seconds=_micro_timeout_s())
@@ -687,8 +690,31 @@ class InteractiveRepairLoop:
             traceback_excerpt=output[-500:], full_output=output[-2000:],
         )
 
+    async def _api_contract(self, file_path: str, content: str, error: ExtractedError) -> str:
+        """Contract of every type *error* names, plus what the run PROVED --
+        the section L2 and the VALIDATE_RETRY regeneration render too. The
+        file being repaired anchors the resolution (a test maps to its subject
+        through ``collect_anchor_sources``). Off the loop; ``""`` on any fault."""
+        try:
+            from backend.core.ouroboros.governance.library_contract import (  # noqa: PLC0415
+                error_contract_section,
+            )
+            return await asyncio.to_thread(
+                error_contract_section,
+                f"{error.error_type}: {error.message}\n{error.traceback_excerpt}",
+                (file_path,), "", Path(self._project_root),
+                extra_sources=(content,),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 -- additive context; never break the loop
+            logger.debug("[InteractiveRepair] api contract unavailable", exc_info=True)
+            return ""
+
     @staticmethod
-    def _build_micro_prompt(file_path: str, content: str, error: ExtractedError) -> str:
+    def _build_micro_prompt(
+        file_path: str, content: str, error: ExtractedError, *, api_contract: str = "",
+    ) -> str:
         """Build focused micro-prompt for one error."""
         lines = content.split("\n")
         start = max(0, error.line_number - 5)
@@ -703,7 +729,8 @@ class InteractiveRepairLoop:
             f"File: {file_path}\nError: {error.error_type}: {error.message}\n"
             f"Line: {error.line_number}\n\nCode context:\n```python\n{ctx}\n```\n\n"
             f"Traceback:\n```\n{error.traceback_excerpt}\n```\n\n"
-            f"Fix ONLY this specific error. Return JSON:\n"
+            + (f"{api_contract}\n\n" if api_contract else "")
+            + f"Fix ONLY this specific error. Return JSON:\n"
             f'{{"start_line": {start + 1}, "end_line": {end}, '
             f'"replacement": "fixed code for these lines", '
             f'"reasoning": "why this fixes the error"}}'

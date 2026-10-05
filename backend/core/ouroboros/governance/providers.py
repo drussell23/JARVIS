@@ -4955,6 +4955,12 @@ Rules:
                 f"{_repair_block}\n\n## FULL FAILURE TRACE\n"
                 f"{_epistemic_trace}"
             )
+        # The contract of the type(s) the trace names, with what the run
+        # PROVED -- beside the error it explains, ahead of the longer bodies.
+        # Self-titled block (``library_contract.render_contract_section``).
+        _api_contract = getattr(_rc, "api_contract", "") or ""
+        if _api_contract:
+            _repair_block = f"{_repair_block}\n\n{_api_contract}"
         # Placed right after the trace it explains: what the test expected,
         # then what the code under test actually does. Self-titled block.
         _subject_source = getattr(_rc, "subject_source", "") or ""

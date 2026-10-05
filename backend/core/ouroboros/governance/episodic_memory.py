@@ -70,14 +70,14 @@ class EpisodicFailureMemory:
             targets = list(getattr(ctx, "target_files", ()) or ())
             description = str(getattr(ctx, "description", "") or "")
 
-            def _resolver(type_name: str, extra_sources: List[str]) -> str:
-                sources: List[str] = list(extra_sources)
+            def _resolver(error_text: str, extra_sources: List[str]) -> List[str]:
                 try:
-                    for _label, src in collect_anchor_sources(targets, description, root):
-                        sources.append(_Path(src).read_text(encoding="utf-8", errors="replace"))
+                    anchor = collect_anchor_sources(targets, description, root)
                 except Exception:  # noqa: BLE001
-                    pass
-                return _lc.contract_for_type(type_name, sources)
+                    anchor = []
+                return _lc.error_contract_blocks(
+                    error_text, anchor_sources=anchor, extra_sources=extra_sources,
+                )
 
             memory._contract_resolver = _resolver
         except Exception:  # noqa: BLE001 -- a memory without a resolver is the old memory
@@ -184,19 +184,9 @@ class EpisodicFailureMemory:
                 lines.append(f"Affected lines: {', '.join(str(ln) for ln in ep.line_numbers)}")
             lines.append("")
 
-        contracts = self._contracts_for(episodes)
-        if contracts:
-            lines.append(
-                "## API contract for the type(s) these errors name — read from the "
-                "INSTALLED package, not from memory"
-            )
-            lines.append(
-                "Inspect these objects only through what is listed. A response's "
-                "payload is its `body` (bytes); it is not iterable and not a dict."
-            )
-            lines.append("```python")
-            lines.extend(contracts)
-            lines.append("```")
+        section = self._contract_section(episodes)
+        if section:
+            lines.append(section)
             lines.append("")
         lines.append(
             "IMPORTANT: Do not repeat these mistakes. "
@@ -204,31 +194,28 @@ class EpisodicFailureMemory:
         )
         return "\n".join(lines)
 
-    def _contracts_for(self, episodes: List[FailureEpisode]) -> List[str]:
-        """One contract per DISTINCT library type the episodes' errors name.
-        NEVER raises; no resolver, or nothing resolvable, is simply nothing."""
+    def _contract_section(self, episodes: List[FailureEpisode]) -> str:
+        """The contract of every DISTINCT type the episodes' errors name --
+        installed or first-party -- with what the runs PROVED, rendered by the
+        section every repair prompt shares. NEVER raises; no resolver, or
+        nothing resolvable, is simply nothing."""
         resolver = self._contract_resolver
         if resolver is None:
-            return []
+            return ""
         try:
             from backend.core.ouroboros.governance.library_contract import (
-                type_names_in_error,
+                render_contract_section,
             )
-            out: List[str] = []
-            seen: set = set()
+            blocks: List[str] = []
             for ep in episodes:
                 text = " ".join([ep.error_summary, *ep.specific_errors])
-                for name in type_names_in_error(text):
-                    if name in seen:
-                        continue
-                    seen.add(name)
-                    source = self._candidate_sources.get((ep.file_path, int(ep.attempt)), "")
-                    block = resolver(name, [source] if source else [])
-                    if block:
-                        out.append(block)
-            return out
+                source = self._candidate_sources.get((ep.file_path, int(ep.attempt)), "")
+                for block in resolver(text, [source] if source else []) or ():
+                    if block and block not in blocks:
+                        blocks.append(block)
+            return render_contract_section(blocks)
         except Exception:  # noqa: BLE001
-            return []
+            return ""
 
     def clear(self) -> None:
         """Clear all episodes. Called when operation completes."""

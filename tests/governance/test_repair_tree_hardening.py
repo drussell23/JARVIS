@@ -404,7 +404,17 @@ def test_pin_10_run_inner_legacy_bytes_pinned():
     # ``escalation_directive``. No other FSM transition changed. Verified by
     # tests/governance/test_hang_attribution.py (fails with the wiring
     # reverted). Soak validation: same first soak.
-    EXPECTED_DIGEST = "48626d205204c71f"
+    #
+    # Phase tag: error-named API contract (2026-10-04). The 30B repeated
+    # ``ConversationTurn.from_dict`` across three repairs with the signature
+    # anchor present (bt-2026-10-04-215048). _run_inner now awaits
+    # RepairEngine._api_contract (off-loop, fail-soft "") and threads it into
+    # RepairContext.api_contract, rendered between the trace and the subject
+    # source. One await + one keyword, the exact shape of the subject-source
+    # entry above; no FSM transition changed. Verified by
+    # tests/governance/test_error_contract.py. Soak validation: the first soak
+    # on branch ouroboros/l2-error-contract-and-dep-quarantine.
+    EXPECTED_DIGEST = "737af52c4fac0cfe"
     assert digest == EXPECTED_DIGEST, (
         f"_run_inner bytes drift detected: expected "
         f"{EXPECTED_DIGEST}, got {digest}. Legacy LINEAR semantics "

@@ -1736,6 +1736,9 @@ class RepairEngine:
                 failing_tests=classification.failing_test_ids,
                 editing=(file_path, *(p for p, _ in (_multi_files or ()))),
             )
+            _api_contract = await self._api_contract(
+                ctx, evidence.trace, test_source=sandbox_content or full_content,
+            )
 
             repair_context = RepairContext(
                 iteration=iteration,
@@ -1763,6 +1766,7 @@ class RepairEngine:
                 # the temperature, never whether the model sees the error.
                 failure_trace=evidence.trace,
                 subject_source=_subject_source,
+                api_contract=_api_contract,
             )
 
             # T2: the current failing candidate becomes the PRIOR-stable source for the
@@ -1844,6 +1848,30 @@ class RepairEngine:
         except Exception as exc:  # noqa: BLE001 — cone is advisory; never break L2
             _logger.debug("[RepairBridge] dependency cone unavailable (non-fatal): %s", exc)
             return None
+
+    async def _api_contract(self, ctx: Any, evidence_text: str, *, test_source: str) -> str:
+        """Contract of every type the failure names, plus what the run PROVED.
+
+        Delegates to ``library_contract.error_contract_section`` -- the same
+        section the VALIDATE_RETRY regeneration and the micro-fix render -- in a
+        worker thread (file reads + AST parses). Fail-soft: any error -> ``""``."""
+        try:
+            from backend.core.ouroboros.governance.library_contract import (
+                error_contract_section,
+            )
+            return await asyncio.to_thread(
+                error_contract_section,
+                evidence_text,
+                tuple(getattr(ctx, "target_files", ()) or ()),
+                getattr(ctx, "description", "") or "",
+                self._repo_root,
+                extra_sources=(test_source,) if test_source else (),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- additive context; never break L2
+            _logger.debug("[L2 Repair] api contract unavailable (non-fatal): %s", exc)
+            return ""
 
     async def _exercised_source(
         self,

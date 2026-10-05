@@ -265,6 +265,15 @@ def _instance_attributes(init: ast.AST) -> List[str]:
     return seen
 
 
+def _is_dataclass(node: ast.ClassDef) -> bool:
+    for deco in node.decorator_list:
+        target = deco.func if isinstance(deco, ast.Call) else deco
+        name = getattr(target, "id", None) or getattr(target, "attr", None)
+        if name in ("dataclass", "define", "attrs", "s"):
+            return True
+    return False
+
+
 def render_class(node: ast.ClassDef, tree: ast.Module, dotted: str) -> str:
     local = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
     chain: List[ast.ClassDef] = [node]
@@ -279,6 +288,28 @@ def render_class(node: ast.ClassDef, tree: ast.Module, dotted: str) -> str:
         lines.append(f'    """{doc}"""')
     attributes: List[str] = []
     methods: Dict[str, str] = {}
+    # Annotated class-body fields ARE the data contract of a dataclass/attrs
+    # class -- and, with no ``__init__`` in the body, its constructor. Without
+    # them a dataclass renders as its methods alone, and the one way to build
+    # it (bt-2026-10-04-215048: ``ConversationTurn``, whose only method is
+    # ``to_dict``) is invisible.
+    fields: List[str] = []
+    for cls in reversed(chain):
+        for item in cls.body:
+            if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                name = item.target.id
+                if name.startswith("_") or any(f.split(":", 1)[0] == name for f in fields):
+                    continue
+                default = f" = {_default(item.value)}" if item.value is not None else ""
+                fields.append(f"{name}: {_annotation(item.annotation)}{default}")
+    if fields:
+        lines.append("    # fields: " + "; ".join(fields))
+        if _is_dataclass(node) and not any(
+            isinstance(i, (ast.FunctionDef, ast.AsyncFunctionDef)) and i.name == "__init__"
+            for c in chain for i in c.body
+        ):
+            args = ", ".join(f.split(":", 1)[0] + "=..." for f in fields)
+            lines.append(f"    # construct: {node.name}({args})")
     for cls in chain:
         for item in cls.body:
             if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -565,7 +596,253 @@ def contract_for(
         return ""
 
 
+# ---------------------------------------------------------------------------
+# Error-named contracts: installed AND first-party, plus what the run disproved
+# ---------------------------------------------------------------------------
+#
+# bt-2026-10-04-215048: the 30B wrote ``ConversationTurn.from_dict`` on three
+# attempts running. The 9000-char signature anchor was in every one of those
+# prompts and lists ``ConversationTurn`` with ``to_dict`` alone -- beside
+# ``MemoryEntry``, which has both. A long reference list is pattern-matched
+# past; what the retry lacked is the contract of the ONE type the error names,
+# placed WITH the error, and the fact the run itself proved. This module
+# already does that for installed packages (``contract_for_type``) -- but
+# ``_import_origins`` keeps third-party names only, so a repo-defined type
+# named by an error got nothing at all.
+
+_MISSING_MEMBER = re.compile(
+    r"(?:type object |module )?'(?P<owner>[A-Za-z_][\w.]*)'(?: object)? "
+    r"has no attribute '(?P<attr>\w+)'"
+)
+_UNEXPECTED_KEYWORD = re.compile(
+    r"(?P<owner>[A-Za-z_]\w*)\.(?P<func>\w+)\(\) got an unexpected keyword argument '(?P<attr>\w+)'"
+)
+_CANNOT_IMPORT = re.compile(r"cannot import name '(?P<attr>\w+)' from '(?P<owner>[\w.]+)'")
+_UNDEFINED_NAME = re.compile(r"name '(?P<attr>\w+)' is not defined")
+
+CONTRACT_SECTION_HEADER = (
+    "## API contract for the type(s) these errors name — read from the source "
+    "on disk, not from memory"
+)
+CONTRACT_SECTION_RULE = (
+    "Call ONLY the members listed for these types. A member that is not listed "
+    "does not exist on that type, whatever a similar class offers -- a method "
+    "on one class never carries over to another. Lines marked PROVEN were "
+    "established by the failing run itself; code that repeats them fails "
+    "identically."
+)
+_ENV_SECTION_MAX_CHARS = "JARVIS_ERROR_CONTRACT_MAX_CHARS"
+
+
+def _dotted(label: str) -> str:
+    from backend.core.ouroboros.governance.ast_signature_anchor import (  # noqa: PLC0415
+        _dotted_module,
+    )
+    return _dotted_module(label)
+
+
+def _anchor_trees(anchor_sources: Sequence[Tuple[str, Path]]) -> List[Tuple[str, ast.Module]]:
+    trees: List[Tuple[str, ast.Module]] = []
+    for label, path in anchor_sources or ():
+        tree = _parse(Path(path))
+        if tree is not None:
+            trees.append((_dotted(str(label)), tree))
+    return trees
+
+
+def _top_level(trees: Sequence[Tuple[str, ast.Module]]) -> Dict[str, Tuple[ast.AST, ast.Module, str]]:
+    """``name -> (node, tree, module)`` for every top-level class/def; first wins."""
+    out: Dict[str, Tuple[ast.AST, ast.Module, str]] = {}
+    for dotted, tree in trees:
+        for node in tree.body:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                out.setdefault(node.name, (node, tree, dotted))
+    return out
+
+
+def _member(node: ast.ClassDef, attr: str) -> Optional[ast.AST]:
+    for item in node.body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == attr:
+            return item
+        if isinstance(item, ast.AnnAssign) and getattr(item.target, "id", None) == attr:
+            return item
+        if isinstance(item, ast.Assign) and any(getattr(t, "id", None) == attr for t in item.targets):
+            return item
+    return None
+
+
+def _tree_public_names(tree: ast.Module) -> List[str]:
+    return [
+        n.name for n in tree.body
+        if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        and not n.name.startswith("_")
+    ]
+
+
+def proven_facts(error_text: str, trees: Sequence[Tuple[str, ast.Module]]) -> List[str]:
+    """What the failing run PROVED about first-party names, resolved by AST.
+
+    Speaks only about names these modules define: a ``'str' object has no
+    attribute`` is the runtime's business, not this contract's. NEVER raises.
+    """
+    facts: List[str] = []
+
+    def add(fact: str) -> None:
+        if fact not in facts:
+            facts.append(fact)
+
+    try:
+        names = _top_level(trees)
+        modules = {dotted: tree for dotted, tree in trees}
+        classes = {n: v for n, v in names.items() if isinstance(v[0], ast.ClassDef)}
+        text = error_text or ""
+        for m in _MISSING_MEMBER.finditer(text):
+            owner, attr = m.group("owner"), m.group("attr")
+            short = owner.rsplit(".", 1)[-1]
+            if short in classes:
+                holders = [
+                    f"`{name}` ({mod})" for name, (node, _t, mod) in classes.items()
+                    if name != short and _member(node, attr) is not None
+                ]
+                fact = (f"`{short}.{attr}` does NOT exist (AttributeError). Use only "
+                        f"the members of `{short}` listed below.")
+                if holders:
+                    fact += (f" `{attr}` is defined on {', '.join(holders)} -- a DIFFERENT "
+                             f"class; it does not carry over to `{short}`.")
+                add(fact)
+            elif owner in modules:
+                add(f"module `{owner}` has no `{attr}`. Its public names are: "
+                    f"{', '.join(_tree_public_names(modules[owner])) or '(none)'}.")
+        for m in _UNEXPECTED_KEYWORD.finditer(text):
+            owner, func, attr = m.group("owner"), m.group("func"), m.group("attr")
+            if owner in classes:
+                method = _member(classes[owner][0], func)
+                real = signature(method) if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)) else "see `# construct:` below"
+                add(f"`{owner}.{func}()` accepts no `{attr}` argument. Its real signature: {real}")
+        for m in _CANNOT_IMPORT.finditer(text):
+            module, attr = m.group("owner"), m.group("attr")
+            if attr in names:
+                add(f"`{attr}` is not in `{module}`; it is defined in `{names[attr][2]}` -- "
+                    f"`from {names[attr][2]} import {attr}`.")
+            elif module in modules:
+                add(f"`{module}` defines no `{attr}`. Its public names are: "
+                    f"{', '.join(_tree_public_names(modules[module])) or '(none)'}.")
+        for m in _UNDEFINED_NAME.finditer(text):
+            attr = m.group("attr")
+            if attr in names:
+                add(f"`{attr}` is used without being imported: `from {names[attr][2]} import {attr}`.")
+    except Exception:  # noqa: BLE001
+        logger.debug("[LibraryContract] proven facts degraded", exc_info=True)
+    return facts
+
+
+def first_party_contract(name: str, trees: Sequence[Tuple[str, ast.Module]]) -> str:
+    """The contract of a repo-defined class/function, by the renderer installed
+    packages use. ``""`` when none of the anchored modules defines *name*."""
+    try:
+        found = _top_level(trees).get(name)
+        if found is None:
+            return ""
+        node, tree, dotted = found
+        return render(node, tree, dotted)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def error_contract_blocks(
+    error_text: str,
+    *,
+    anchor_sources: Sequence[Tuple[str, Path]],
+    extra_sources: Sequence[str] = (),
+) -> List[str]:
+    """Blocks for every type *error_text* names, PROVEN facts first.
+
+    A name resolves through the installed packages the sources import, then
+    through the anchored first-party modules -- the ladder
+    ``collect_anchor_sources`` builds for the signature anchor, so the two
+    never disagree about which module is meant. NEVER raises.
+    """
+    try:
+        trees = _anchor_trees(anchor_sources)
+        texts = list(extra_sources)
+        for _label, path in anchor_sources or ():
+            try:
+                texts.append(Path(path).read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+        blocks: List[str] = []
+        facts = proven_facts(error_text, trees)
+        if facts:
+            blocks.append("\n".join(f"# PROVEN: {fact}" for fact in facts))
+        for name in type_names_in_error(error_text):
+            block = contract_for_type(name, texts) or first_party_contract(name, trees)
+            if block and block not in blocks:
+                blocks.append(block)
+        return blocks
+    except Exception:  # noqa: BLE001
+        logger.debug("[LibraryContract] error contract degraded", exc_info=True)
+        return []
+
+
+def render_contract_section(blocks: Sequence[str]) -> str:
+    """The one rendering every repair prompt uses. Whole blocks only, within
+    ``JARVIS_ERROR_CONTRACT_MAX_CHARS`` (default: the signature anchor's
+    budget). ``""`` when there is nothing to say."""
+    try:
+        from backend.core.ouroboros.governance.ast_signature_anchor import (  # noqa: PLC0415
+            _DEFAULT_MAX_CHARS, _ENV_MAX_CHARS, _int_env,
+        )
+        budget = _int_env(_ENV_SECTION_MAX_CHARS, _int_env(_ENV_MAX_CHARS, _DEFAULT_MAX_CHARS))
+    except Exception:  # noqa: BLE001
+        budget = 0
+    kept: List[str] = []
+    used = 0
+    for block in blocks or ():
+        if budget and used + len(block) > budget:
+            continue
+        kept.append(block)
+        used += len(block)
+    if not kept:
+        return ""
+    return (
+        f"{CONTRACT_SECTION_HEADER}\n{CONTRACT_SECTION_RULE}\n```python\n"
+        + "\n\n".join(kept) + "\n```"
+    )
+
+
+def error_contract_section(
+    error_text: str,
+    target_files: Sequence[str],
+    description: str,
+    repo_root: Path,
+    *,
+    extra_sources: Sequence[str] = (),
+) -> str:
+    """Error text in, prompt section out -- for the L2 repair and micro-fix
+    prompts, which hold the op's targets but no episodic memory. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.ast_signature_anchor import (  # noqa: PLC0415
+            collect_anchor_sources,
+        )
+        sources = collect_anchor_sources(list(target_files or ()), description or "", Path(repo_root))
+        section = render_contract_section(error_contract_blocks(
+            error_text, anchor_sources=sources, extra_sources=extra_sources,
+        ))
+        if section:
+            logger.info("[LibraryContract] error contract injected: %d chars", len(section))
+        return section
+    except Exception:  # noqa: BLE001
+        logger.debug("[LibraryContract] error contract section degraded", exc_info=True)
+        return ""
+
+
 __all__ = [
+    "CONTRACT_SECTION_HEADER",
+    "error_contract_blocks",
+    "error_contract_section",
+    "first_party_contract",
+    "proven_facts",
+    "render_contract_section",
     "contract_for",
     "contract_for_type",
     "produced_types",

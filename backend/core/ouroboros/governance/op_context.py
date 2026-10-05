@@ -2198,3 +2198,8 @@ class RepairContext:
     # (``ast_signature_anchor.exercised_source_block``). The trace says what the
     # test expected; this says what the code does. ``""`` -> not rendered.
     subject_source: str = ""
+    # The contract of every type the failure names, with what the run PROVED
+    # (``library_contract.error_contract_section``) -- e.g. "`X.from_dict`
+    # does NOT exist; `from_dict` is on `Y`, a different class". Rendered next
+    # to the trace, ahead of the subject bodies. ``""`` -> not rendered.
+    api_contract: str = ""
