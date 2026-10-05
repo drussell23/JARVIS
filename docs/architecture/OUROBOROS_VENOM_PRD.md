@@ -1,6 +1,8 @@
 # Ouroboros + Venom (O+V) — Product Requirements Document & Roadmap
 
-**Version**: 3.38 (2026-09-08 — **THE FIRST AUTONOMOUS LANDING. The gate named in v3.37 as "Not yet proven: a landing" is closed.** Session `bt-2026-09-08-225144` produced two commits authored by O+V on the accumulation branch `ouroboros/auto/bt-2026-09-08-225144-48fd5c`: `bb575e9b28` created `tests/test_apply_emergency_cpu_fix.py` (80 lines) for a module the organism itself identified as uncovered, under the self-signed goal `ov-auto-uncovered-module-apply-emergency-cpu-fix`; and `919f8ea443` modified a PRODUCTION file, `backend/api/sse_contract.py` (+8/-7), making broad `except` blocks log with `exc_info` so a swallowed SSE fault leaves evidence. Both `SAFE_AUTO (Green)`, both `Co-Authored-By: Ouroboros+Venom`, both served by the LOCAL `qwen3-coder-ov:30b` at `cost_total = 0.0`. The GoalReconciliationLedger closes the loop with a real sha: `satisfied ov-auto-uncovered-module-apply-emergency-cpu-fix sha=bb575e9b28`. The post-commit hook mirrored both to the Windows clone. **What unblocked it** was not model quality but four measured harness defects, in order: (1) a literal `120.0` default in `PythonAdapter.__init__` that overrode the live budget the router had already computed — `min(budget, 120)` is 120 forever; (2) queue precedence — the Sentinel's own signed goal was submitted NINTH at the same `priority=3` as bulk batch work, ~3 hours down a one-worker lane inside a 40-minute session; (3) the capability interceptor aborting every SANCTIONED op for a RECOVERABLE schema degradation, which stayed invisible only while sanctioned ops never reached a worker; (4) `Strategy 4 (repo fallback)`, which answered "no test covers this file" by handing pytest the entire `tests/` DIRECTORY — **69,353 tests and 200.9s of collection alone**, versus 0.67s for one explicit file, run twice per candidate by the flake retry. That is the ~450s/candidate that consumed every op budget, and it was WRONG as well as slow: `audio_error_fallback.py` was failed on a test in `tests/adversarial/test_synthetic_adversary.py` with no relationship to the change. **Measured after**: validation of a covered file 450s → 1.31s; of an uncovered file 450s → 0.02s (`no_covering_test`, an honest refusal). **Composite unchanged** — one landing is not a cadence; see §32.6.)
+**Version**: 3.39 (2026-10-04 — **§33 added — the 30B Capability Envelope.** Every GENERATE on this host runs on the local `qwen3-coder-ov:30b`; §33 states from measurement only what O+V carries on it and what it does not. **Proven this date:** a landing *cadence* (1.02/h over 2.95 h, `bt-2026-10-04-215048`) and landings on local `main` via `--ff-only` promotion — both listed as "not proven" in §32.6. **Measured limits:** analogical API invention with the signature anchor present (`ConversationTurn.from_dict` ×3), diff-apply divergence, and one vacuous test that passed VALIDATE (`c985ccaee4`). **Conclusion:** the 30B is a capable implementer on well-scoped tasks; intent, decomposition and design stay with the operator and the planner until §33.7's measurements move a row. Qualifies the §6 anti-goal "provider quality is fine" for the local lane. §33.8 — the operator's definition of done — is open.)
+>
+> 3.38 (2026-09-08 — **THE FIRST AUTONOMOUS LANDING. The gate named in v3.37 as "Not yet proven: a landing" is closed.** Session `bt-2026-09-08-225144` produced two commits authored by O+V on the accumulation branch `ouroboros/auto/bt-2026-09-08-225144-48fd5c`: `bb575e9b28` created `tests/test_apply_emergency_cpu_fix.py` (80 lines) for a module the organism itself identified as uncovered, under the self-signed goal `ov-auto-uncovered-module-apply-emergency-cpu-fix`; and `919f8ea443` modified a PRODUCTION file, `backend/api/sse_contract.py` (+8/-7), making broad `except` blocks log with `exc_info` so a swallowed SSE fault leaves evidence. Both `SAFE_AUTO (Green)`, both `Co-Authored-By: Ouroboros+Venom`, both served by the LOCAL `qwen3-coder-ov:30b` at `cost_total = 0.0`. The GoalReconciliationLedger closes the loop with a real sha: `satisfied ov-auto-uncovered-module-apply-emergency-cpu-fix sha=bb575e9b28`. The post-commit hook mirrored both to the Windows clone. **What unblocked it** was not model quality but four measured harness defects, in order: (1) a literal `120.0` default in `PythonAdapter.__init__` that overrode the live budget the router had already computed — `min(budget, 120)` is 120 forever; (2) queue precedence — the Sentinel's own signed goal was submitted NINTH at the same `priority=3` as bulk batch work, ~3 hours down a one-worker lane inside a 40-minute session; (3) the capability interceptor aborting every SANCTIONED op for a RECOVERABLE schema degradation, which stayed invisible only while sanctioned ops never reached a worker; (4) `Strategy 4 (repo fallback)`, which answered "no test covers this file" by handing pytest the entire `tests/` DIRECTORY — **69,353 tests and 200.9s of collection alone**, versus 0.67s for one explicit file, run twice per candidate by the flake retry. That is the ~450s/candidate that consumed every op budget, and it was WRONG as well as slow: `audio_error_fallback.py` was failed on a test in `tests/adversarial/test_synthetic_adversary.py` with no relationship to the change. **Measured after**: validation of a covered file 450s → 1.31s; of an uncovered file 450s → 0.02s (`no_covering_test`, an honest refusal). **Composite unchanged** — one landing is not a cadence; see §32.6.)
 >
 > 3.37 (2026-09-08 — **Autonomous Sentinel Mode: the organism discovers, sanctions and dispatches its own work; and the `generation_failed` cluster turns out to be HARDWARE, not model quality.** Commits `8989636260`..`4799cc9cf3`. **Proven live**: discovery ranks work from evidence in ~0.3s (ambient reds + uncovered modules), synthesises a goal, SELF-SIGNS it into `.jarvis/roadmap.yaml` through the one operator signer, dispatches it, and the cage ACCEPTS it — `[DelegatedProvenance] VERIFIED signer=drussell23 → ceiling APPROVAL_REQUIRED`, `chain_ok=True`, claimed in the GoalReconciliationLedger, reaching PLAN. A goal the organism wrote itself passed the cryptographic cage. **Not yet proven**: a landing — there is still no autonomous Sentinel commit. **Safety model as built** (operator's own): green/yellow/orange auto-approve behind a configurable tier ceiling, RED always escalates, and an un-liftable floor reusing `layer4_roadmap_authority.is_safety_operation` — BLOCKED, Order-2 RSI, recursion breach, or any op touching `ouroboros/governance` ALWAYS goes to a human. Both switches (`JARVIS_SENTINEL_MODE_ENABLED` + `JARVIS_GOAL_DISCOVERY_ENABLED`) required; launcher flag `--sentinel`. **Seven defects, each found by a LIVE run and none visible from the tests**: the census on the critical path (and an `asyncio.wait_for` "fix" that was FAKE — it cancels only at an await boundary, and the test timed a sleep that yields); dispatch called on the event loop, which the intake submitter correctly refuses; filed-but-undispatched goals stranded forever by their own duplicate-id guard; a goal declaring the file it READS instead of the file it WRITES (the cage caught it: `self_modification_unsanctioned_source`); the census swarm killing a 2400s session at 79s; the outcome probe watching an op id the pipeline never uses (zero `*-goal*.jsonl` ledgers exist, so it timed out BY CONSTRUCTION at any deadline); and an unset urgency routing a `source=roadmap` envelope to a DoubleWord lane with no credit. **The headline correction**: `generation_failed` (13/30 ops) is NOT the local model writing bad code — it is VRAM starvation. Four ops entered GENERATE together, each negotiating 32k context against a 30B on ONE card; every stream returned `tokens=0 tps=0.0`. The model never ran. `docs/architecture/HARDWARE_CONSTRAINTS.md` now records the measured envelope (RTX 5090 31.8 GiB; 17.3 GiB weights; KV = 96 KiB/token so a 32k context costs 3.0 GiB; four of them = 92% of the card) and `local_lane_capacity.py` derives concurrency from it. The model demonstrably generates — 119.2 tok/s, 18596+3177 tokens — so its capability is not in question; its output QUALITY under a clean capacity budget remains unmeasured. **Composite unchanged** — this moved activated capability, not the 85%.)
 
@@ -118,7 +120,7 @@
     - [28.6 Remediation, ranked by leverage per line changed](#286-remediation-ranked-by-leverage-per-line-changed)
 29. [The Distributed Body/Engine Link](#29-the-distributed-bodyengine-link-new-2026-08-15)
 30. [Proactive Mode](#30-proactive-mode-new-2026-08-15)
-31. [The Local Sovereignty Tier — Physics as a Governance Input](#31-the-local-sovereignty-tier--physics-as-a-governance-input-new-2026-08-18) *(latest section)*
+31. [The Local Sovereignty Tier — Physics as a Governance Input](#31-the-local-sovereignty-tier--physics-as-a-governance-input-new-2026-08-18)
     - [31.1 What shipped](#311-what-shipped)
     - [31.2 The measured envelope](#312-the-measured-envelope)
     - [31.3 Can a 1T–2.4T model run on that box? — answered with arithmetic](#313-can-a-1t24t-model-run-on-that-box--answered-with-arithmetic)
@@ -127,6 +129,14 @@
     - [31.6 Priorities — what to do next, ranked](#316-priorities--what-to-do-next-ranked)
     - [31.7 Invariants this section adds](#317-invariants-this-section-adds)
     - [31.8 The local tier, configured — deployment profile and warm-swap protocol](#318-the-local-tier-configured--deployment-profile-and-warm-swap-protocol-2026-08-18)
+32. [The First Autonomous Landing — and the four numbers that were in the way](#32-the-first-autonomous-landing--and-the-four-numbers-that-were-in-the-way-new-2026-09-08)
+33. [The 30B Capability Envelope — what O+V can and cannot do on the local model](#33-the-30b-capability-envelope--what-ov-can-and-cannot-do-on-the-local-model-new-2026-10-04) *(latest section)*
+    - [33.2 What the 30B does reliably](#332-what-the-30b-does-reliably)
+    - [33.3 What it does not do reliably](#333-what-it-does-not-do-reliably)
+    - [33.5 The division of labour this implies](#335-the-division-of-labour-this-implies)
+    - [33.6 Gaps this section exposes, ranked](#336-gaps-this-section-exposes-ranked)
+    - [33.7 How the envelope grows — each path with its measurement](#337-how-the-envelope-grows--each-path-with-its-measurement)
+    - [33.8 Definition of done — what "JARVIS up and running" means](#338-definition-of-done--what-jarvis-up-and-running-means)
 
 ## 1. Executive Summary
 
@@ -1115,7 +1125,7 @@ None of these are met today. All of them are implementation-feasible.
 
 ### Anti-goals (what A-level is NOT)
 
-- **NOT** "model is smarter" — provider quality is fine
+- **NOT** "model is smarter" — provider quality is fine *(written for the frontier providers; on the local 30B lane model capability is a measured constraint — see §33)*
 - **NOT** "more sensors" — we have enough; they need to be smarter
 - **NOT** "more env knobs" — we have 481+; we need fewer with better defaults
 - **NOT** "bigger context windows" — we already use 1M; the question is what we put in them
@@ -5437,3 +5447,127 @@ not believing it.
 
 The composite readiness figure is deliberately NOT re-scored here. One landing
 closes a gate; it does not establish a rate. The next gate is cadence.
+
+---
+
+## 33. The 30B Capability Envelope — what O+V can and cannot do on the local model *(NEW 2026-10-04)*
+
+> **Why this section exists.** The operator's goal (stated 2026-09-20): *"I
+> can't build JARVIS forever. It has to develop itself using O+V."* Every
+> GENERATE on this host runs on one local model — `qwen3-coder-ov:30b`
+> (Qwen3-Coder 30B-A3B, Q4_K_M, all-VRAM on the RTX 5090; there is no paid
+> lane, see §31). The target state in §6 was written when frontier providers
+> were assumed. This section states, **from measurement only**, which parts of
+> that goal the 30B carries today, which it does not, and what carries the rest
+> — so roadmap decisions stop assuming capability the model has not shown, and
+> stop under-using capability it has.
+
+### 33.1 The rule for this section
+
+Every row cites a soak, a commit, or a measurement. A row with no evidence is
+written **not demonstrated**, never "cannot". Rows are **re-measured, never
+carried forward**: when a later soak contradicts a row, the row changes and the
+version entry says so. The envelope is a property of *model × scaffolding ×
+hardware*; improving any one of the three moves it.
+
+### 33.2 What the 30B does reliably
+
+| Capability | Evidence |
+|---|---|
+| **Write a new test module for an existing source module** (6–20 tests, real assertions) — its strongest, repeatable skill | 2026-10-04: 6 substantive new-module landings across `bt-2026-10-04-215048` (`cf3c13f44c`, `2fc7368e5d`, `e7bfacb4b9`) and `bt-2026-10-05-012717` (`34e3168861`, `60566e96e8`, `611ffb6269`), each re-run green outside the soak |
+| **Sustain that unattended for hours** | `bt-2026-10-04-215048`: 3 verified landings in 2.95 h = **1.02/h**, 0 guest OOM; promoted to local `main` by `--ff-only` with no human step |
+| **Ground itself with tools before writing** | every VALIDATE_RETRY regeneration read the correct subject (6–16 `read_file` / `search_code` / `list_symbols` calls per retry window), `bt-2026-10-04-215048` |
+| **Correct an API-shape error once shown the real code** | `api:async_shape` gone after retry 2/2, `api:wrong_signature` 1/1 (same soak) |
+| **Small edits to short existing files; small coordinated two-file changes** | first autonomous commit `704f98b1d5` (2026-09-06); first multi-file atomic commit `78eb95aa7c` (2 files, 12 insertions) |
+| **Decline correctly when there is nothing to do** | `bt-2026-09-06-212249`: 30 of 35 generations returned `2b.1-noop` ("already correct") instead of inventing a change |
+
+### 33.3 What it does not do reliably
+
+| Limitation | Evidence | What carries it today |
+|---|---|---|
+| **Re-emit a long file faithfully** | whole-file re-emission mangled docstrings and introduced SyntaxErrors (2026-09-06, Tier-1 arc) | diff-mode generation (single-file diff schema) |
+| **Produce diffs that apply** | `TerminalDiffCascade` — "context diverges after N matching lines" — recurs in every soak | retry budget; still a leading op-killer |
+| **Avoid analogical API invention** | `ConversationTurn.from_dict` on 3 consecutive attempts **with the 9000-char signature anchor in every prompt** (`bt-2026-10-04-215048`; `from_dict` exists only on `MemoryEntry`) | error-named contract with runtime-PROVEN facts (`54cadae124`) — effect under measurement |
+| **Judge whether its own test means anything** | `c985ccaee4` landed a test that never executes (`async def` inside `unittest.TestCase`) and patches a non-existent path | **nothing yet** — see 33.6 |
+| **Mocks and async test shape** | `mock_misuse` and `type_misuse` recurred identically after retry (same soak) | partially the contract |
+| **Know what the environment can run** | dispatched `import sklearn` subjects; 3 generations each on an unfixable `ModuleNotFoundError` | deterministic quarantine (`ffc85baad3`), not the model |
+| **Plan a multi-step feature or a cross-module refactor** | **not demonstrated** | the operator |
+| **Turn a vision document into an architecture or a plan** | **not demonstrated** — the Epistemic Planner has never run on the 30B | the operator |
+
+### 33.4 The hardware envelope (measured 2026-10-04)
+
+| | |
+|---|---|
+| Resident footprint | 21.8 GB VRAM; ~22–30 GB of Windows commit (WDDM charges commit for VRAM) |
+| Throughput | ~165 tok/s; ~18–20 s per tool-assisted generation |
+| Concurrency | one GPU, so generations are **serialized** — one op's GENERATE at a time |
+| Working context | negotiated 32k tokens — smaller than a large module plus its first-party neighbours |
+
+### 33.5 The division of labour this implies
+
+The 30B is a **capable implementer on well-scoped tasks**. It is not, on current
+evidence, the senior engineer. On this host the senior engineer's judgement is
+supplied by three things around the model:
+
+1. **Deterministic scaffolding** for validity and grounding — gates, the
+   signature anchor, error-named contracts, dependency quarantine. Every row of
+   33.3 that is carried today is carried by scaffolding, not by the model.
+2. **The planner** for decomposition — breaking an intent into steps the size of
+   33.2's rows. Built (`epistemic_planner.py`), not yet armed.
+3. **The operator** for intent and architecture — what JARVIS is for, and the
+   shape of the system that serves it.
+
+So "JARVIS develops itself" on the 30B means: **O+V carries the volume of
+well-defined implementation work; intent, decomposition and design stay with the
+operator and the planner** until the evidence of 33.7 moves a row.
+
+This qualifies the §6 anti-goal "NOT 'model is smarter' — provider quality is
+fine". That held for the frontier providers it was written against; on the local
+lane, model capability is a measured constraint, and this section is where it is
+tracked.
+
+### 33.6 Gaps this section exposes, ranked
+
+1. **Test reality gate.** VALIDATE checks that a test *passed*, not that it *ran*
+   or *exercised its subject*. `c985ccaee4` passed vacuously and now marks
+   `hardware_control.py` as covered, so discovery will never send it real work.
+   Required: a test-synthesis candidate is rejected unless its subject module was
+   imported during the run and its tests executed (no never-awaited coroutine
+   tests, no zero-assertion tests).
+2. **Diff-apply fidelity.** `TerminalDiffCascade` is the most frequent way a
+   correct-looking candidate dies.
+3. **False work signals.** The TODO scanner treats `TODO` inside test string
+   fixtures as work (`1126d4555e`).
+4. **VALIDATE runs are not memory-contained.** One op's candidate runs pushed the
+   soak tree 2.6 → 27.4 GB (cap ~30 GB) at 15:16 on 2026-10-04. The test
+   execution lock (`4d43f3e5b4`) exempts soak-owned runs, and nothing else caps
+   them in the kernel.
+
+### 33.7 How the envelope grows — each path with its measurement
+
+| Path | What it would change | How we will know |
+|---|---|---|
+| **Decomposition** — arm the Epistemic Planner on a soak | feature intent → test-sized steps the 30B already lands | landings per hour whose goal the *planner* filed |
+| **Training** — the Reactor-Core preference corpus fine-tunes the 30B on its own verdicts | fewer recurring failure classes | identical-recurrence rate per class, before vs after a LoRA |
+| **A stronger planner model** for PLAN only, the 30B implementing | design-level work | needs paid capacity (currently $0) — operator decision |
+| **More scaffolding** — a deterministic carrier for each 33.3 row | removes model judgement where it is not needed | that row's failure count reaches 0 in a soak |
+
+### 33.8 Definition of done — what "JARVIS up and running" means
+
+*Open — operator input required.* O+V can only aim at a target it can check. This
+subsection will hold the operator's concrete answer — the three or four things
+JARVIS must do on day one ("say X, it does Y") — written as runnable acceptance
+checks, so O+V can measure its distance to them and the planner can file work
+against the gap.
+
+### 33.9 What is proven, and what is not (updates §32.6)
+
+| | |
+|---|---|
+| A *cadence* of landings | **proven** — 1.02/h over 2.95 h (`bt-2026-10-04-215048`); §32.6 listed it as not proven |
+| Landings on `main` | **proven** — `--ff-only` promotion to local `main`, verified from `PROMOTION_SUCCESS` events; not pushed (operator's call) |
+| Unattended multi-hour stability | **proven** for the soak process; VALIDATE memory containment still open (33.6 #4) |
+| Every landing is real work | **not proven** — 1 hollow and 1 low-value landing among the 8 audited on 2026-10-04 (as of 19:56) |
+| Analogical hallucination stops recurring once corrected | **under measurement** — contracts first injected live 2026-10-04 19:54 |
+| Self-planned feature work | **not demonstrated** |
+| Production-code (non-test) landings at cadence | **not demonstrated** |
