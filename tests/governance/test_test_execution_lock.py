@@ -183,11 +183,26 @@ def test_headroom_is_the_tightest_finite_ancestor(tmp_path):
 
 def test_sibling_scopes_reserve_their_unused_grant(tmp_path):
     app = "user.slice/user-1000.slice/user@1000.service/app.slice"
-    _cg(tmp_path, f"{app}/{tel.SCOPE_PREFIX}1.scope", max_=str(4 * GIB), current=str(GIB))
-    _cg(tmp_path, f"{app}/{tel.SCOPE_PREFIX}2.scope", max_=str(2 * GIB), current=str(2 * GIB))
-    _cg(tmp_path, f"{app}/unrelated.scope", max_=str(9 * GIB), current="0")
-    assert tel.sibling_scope_reserve(tmp_path) == 3 * GIB
-    assert tel.sibling_scope_reserve(tmp_path, exclude=f"{tel.SCOPE_PREFIX}1.scope") == 0
+    cg, proc = tmp_path / "cg", tmp_path / "proc"
+    _cg(cg, f"{app}/{tel.SCOPE_PREFIX}1.scope", max_=str(4 * GIB), current=str(GIB))
+    _cg(cg, f"{app}/{tel.SCOPE_PREFIX}2.scope", max_=str(2 * GIB), current=str(2 * GIB))
+    _cg(cg, f"{app}/unrelated.scope", max_=str(9 * GIB), current="0")
+    for pid in (1, 2):
+        (proc / str(pid)).mkdir(parents=True)
+    assert tel.sibling_scope_reserve(cg, proc_root=proc) == 3 * GIB
+    assert tel.sibling_scope_reserve(cg, exclude=f"{tel.SCOPE_PREFIX}1.scope", proc_root=proc) == 0
+
+
+def test_a_scope_whose_owner_died_reserves_nothing(tmp_path):
+    """Leftovers of a killed run are already in MemAvailable; reserving the
+    dead owner's grant would refuse every later launch while they linger."""
+    app = "user.slice/user-1000.slice/user@1000.service/app.slice"
+    cg, proc = tmp_path / "cg", tmp_path / "proc"
+    _cg(cg, f"{app}/{tel.SCOPE_PREFIX}77.scope", max_=str(6 * GIB), current=str(GIB))
+    proc.mkdir()
+    assert tel.sibling_scope_reserve(cg, proc_root=proc) == 0
+    (proc / "77").mkdir()
+    assert tel.sibling_scope_reserve(cg, proc_root=proc) == 5 * GIB
 
 
 # ── exemptions ──────────────────────────────────────────────────────────

@@ -275,13 +275,30 @@ def _scope_dirs(cgroup_root: Path) -> List[Path]:
         return []
 
 
+def _scope_owner_alive(scope: Path, proc_root: Path) -> bool:
+    """Whether the pytest process a scope was granted to is still running.
+
+    The grant is a licence held by THAT process (the unit is named
+    ``ov-pytest-<pid>.scope``). Once it is gone, nothing can grow into the
+    unused part of the grant, and whatever leftovers still occupy the scope is
+    already in MemAvailable -- reserving the grant would refuse every later run
+    for as long as one orphaned child lingers (seen live: a killed run's scope,
+    still collecting, refused the next launch with sibling_reserve=6.4GiB).
+    """
+    raw = scope.name[len(SCOPE_PREFIX):-len(".scope")]
+    return raw.isdigit() and (proc_root / raw).exists()
+
+
 def sibling_scope_reserve(
     cgroup_root: Path = _CGROUP, *, exclude: Optional[str] = None,
+    proc_root: Path = _PROC,
 ) -> int:
-    """Unused grant of every OTHER live governed test run (max - current)."""
+    """Unused grant of every OTHER governed test run whose owner still lives."""
     reserve = 0
     for scope in _scope_dirs(cgroup_root):
         if exclude and scope.name == exclude:
+            continue
+        if not _scope_owner_alive(scope, proc_root):
             continue
         limit = _read_int(scope / "memory.max")
         if limit is None:
