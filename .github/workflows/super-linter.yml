@@ -23,7 +23,7 @@ jobs:
           fetch-depth: 0  # Full git history for accurate linting
 
       - name: Super-Linter
-        uses: super-linter/super-linter@v6
+        uses: super-linter/super-linter@v9
         env:
           # Core settings
           VALIDATE_ALL_CODEBASE: false  # Only validate changed files
