@@ -1,23 +1,18 @@
-> **An autonomous, solo-built systems-engineering framework — ~4.29M tracked lines and 8,300+ solo-authored commits.**
+# JARVIS
 
-# JARVIS -- Just A Rather Very Intelligent System
+**An autonomous multi-agent operating system that writes, validates, and lands changes to its own codebase — served by a local 30B model at zero marginal inference cost, and fine-tuned on its own verified commits.**
 
-**The Body of the Trinity AGI OS**
+JARVIS is the control plane of the **Trinity** platform: three repositories, solo-architected by [Derek J. Russell](https://github.com/drussell23), that together close a full self-improvement loop on a single workstation GPU.
 
-> 📜 **[The Trinity Manifesto](./TRINITY_MANIFESTO.md)** — the canonical architecture: the Body/Mind/Nerves boundaries, the RSI Flywheel, and the absolute safety laws (the Immutable Orange Protocol + the Air-Gapped Sandbox).
-
-**Author:** [Derek J. Russell](https://github.com/drussell23) -- RSI/AGI Researcher & Trinity Architect
-
-JARVIS is the control plane and execution layer of a three-repository AGI ecosystem. It owns macOS integration, screen vision, voice biometric authentication, focus-preserving UI automation, and the ~98K-line unified supervisor that boots and coordinates the entire stack with a single command. All model references are resolved at runtime from a shared YAML policy -- zero hardcoded model names remain anywhere in the interactive or governance pipelines.
+| Repository | Tier | What it owns |
+|---|---|---|
+| **JARVIS** (this repo) | Agent OS / control plane | Ouroboros + Venom (O+V) autonomous engineering pipeline, intake sensors, governance, promotion, provenance, training orchestration |
+| [**J-Prime**](https://github.com/drussell23/JARVIS-Prime) | Inference serving | llama.cpp supervisor: VRAM admission, OpenAI + Ollama protocols, training lease, versioned LoRA registry |
+| [**Reactor-Core**](https://github.com/drussell23/JARVIS-Reactor) | Training | GRPO LoRA fine-tuning of a 30B MoE on one 32 GB card: per-expert NF4, calibrated memory envelope |
 
 ---
 
-## 📊 By the Numbers
-
-A solo-built system spanning three repositories — **JARVIS** (Body), **J-Prime**
-(Mind) and **Reactor Core** (Soul). Every figure below is generated from `git`
-by `scripts/readme_stats.py`, not transcribed by hand, so it cannot drift from
-the repositories it describes.
+## At a glance
 
 <!-- readme-stats:begin -->
 
@@ -27,17 +22,17 @@ the repositories it describes.
 
 | Repository | Lines | Files | Python | Commits |
 |---|---:|---:|---:|---:|
-| **JARVIS (Body)** | 5,069,221 | 10,713 | 3,863,944 (7,947 files) | 10,782 |
-| **J-Prime (Mind)** | 147,815 | 230 | 139,419 (199 files) | 276 |
-| **Reactor Core (Soul)** | 130,855 | 242 | 115,087 (199 files) | 172 |
-| **Trinity total** | **5,347,891** (~5.35M) | | 4,118,450 | **11,230** |
+| **JARVIS (Body)** | 5,072,684 | 10,727 | 3,868,263 (7,959 files) | 10,796 |
+| **J-Prime (Mind)** | 148,565 | 243 | 142,431 (211 files) | 283 |
+| **Reactor Core (Soul)** | 129,993 | 247 | 116,230 (203 files) | 179 |
+| **Trinity total** | **5,351,242** (~5.35M) | | 4,126,924 | **11,258** |
 
 Within JARVIS, by path — each row is reproducible from its own prefix:
 
 | Subset | Path | Lines | Files |
 |---|---|---:|---:|
-| **O+V engine** | `backend/core/ouroboros/` | 1,025,479 | 1,634 |
-| **Test spine** | `tests/` | 1,178,309 | 3,778 |
+| **O+V engine** | `backend/core/ouroboros/` | 1,027,813 | 1,639 |
+| **Test spine** | `tests/` | 1,179,765 | 3,784 |
 
 _3 of 3 repositories measured._
 
@@ -56,107 +51,115 @@ git ls-files -z | xargs -0 wc -l \
 
 <!-- readme-stats:end -->
 
-Not derived, and therefore stated as judgement rather than measurement:
+- **66,900+ `def test_` functions** across the three repositories (static count; parametrization expands the collected total — a full JARVIS repo-fallback collection measured **69,353** tests).
+- **17-phase** governed operation lifecycle, **24** intake sensors, fail-closed fast-forward promotion, HMAC-signed operator goals.
+- **6.03 h** unattended production soak: **10 verified autonomous landings**, exit 0, no OOM (`bt-2026-10-05-012717`, PRD v3.40).
+- **$0.00** marginal inference cost per operation on the local lane; paid providers are optional and can be switched off entirely.
 
-| Metric | Value |
+---
+
+## System topology
+
+```mermaid
+flowchart LR
+  subgraph J["JARVIS · agent OS (WSL2)"]
+    SEN["24 intake sensors"] --> UIR["UnifiedIntakeRouter (WAL)"]
+    UIR --> ORC["Orchestrator<br/>CLASSIFY → … → VERIFY"]
+    ORC --> LID["LocalInferenceDirector"]
+    ORC --> PRO["ff-only promotion → main"]
+    ORC --> REC["trajectory recorder"]
+    PRO --> LPV["landing provenance<br/>(hash-chained, HMAC)"]
+    HND["training handoff<br/>state machine"]
+  end
+  subgraph P["J-Prime · inference (Windows host, RTX 5090)"]
+    ENG["engine supervisor<br/>admission · LRU · keep_alive"] --> LS["llama-server<br/>CUDA"]
+    LEA["training lease"]
+    REG["adapter registry"]
+  end
+  subgraph R["Reactor-Core · training"]
+    GRPO["GRPO runner"] --> MG["memory_guard"]
+    GRPO --> MQ["per-expert NF4"]
+  end
+  LID -- "HTTP · json_schema · streamed" --> ENG
+  REC -- "trajectories (JSONL)" --> GRPO
+  LPV -- "landed + surviving labels" --> GRPO
+  HND -- "acquire / release" --> LEA
+  HND -- "train" --> GRPO
+  GRPO -- "LoRA GGUF" --> REG
+  REG -- "verified hot-swap" --> ENG
+```
+
+**The loop, end to end:** a sensor files work → O+V plans and generates a candidate against the locally served 30B model → VALIDATE runs only the covering tests → the commit lands on an accumulation branch and is fast-forwarded to local `main` only if provenance, structure, and coverage gates pass → `landing_provenance` proves which recorded candidates actually landed and survived → once enough unlearned landings accrue, the training handoff takes an exclusive GPU lease from J-Prime, Reactor-Core trains a GRPO LoRA on those trajectories, and J-Prime publishes the adapter only if it beats the incumbent on a greedy, cache-off comparison — otherwise it rejects it and restores the last good version.
+
+---
+
+## The O+V pipeline
+
+`OperationPhase` (`backend/core/ouroboros/governance/op_context.py`):
+
+```
+CLASSIFY → ROUTE → CONTEXT_EXPANSION → PLAN → GENERATE ⇄ GENERATE_RETRY
+        → VALIDATE ⇄ VALIDATE_RETRY → GATE → APPROVE → APPLY → VERIFY → VISUAL_VERIFY
+        → COMPLETE | CANCELLED | EXPIRED | POSTMORTEM
+```
+
+| Mechanism | Implementation | Guarantee |
+|---|---|---|
+| Intake | `intake/unified_intake_router.py`, 24 `*Sensor` classes | WAL-backed, deduplicated, liveness-tombstoned signals |
+| VALIDATE | `phase_runners/validate_runner.py` | Single owner; scoped to covering tests (450 s → 1.31 s per candidate) |
+| Promotion | `main_promoter.py` → `accumulation_promotion_gate.py` → `git merge --ff-only` | Fail-closed on provenance, structural shrink, and coverage; never pushes |
+| Operator sanction | `operator_goal_sanction.py`, `roadmap_reader.compute_signature` | Governance edits must trace to an HMAC-SHA256-signed roadmap goal |
+| Autonomy | `autonomy/sentinel.py`, `sentinel_loop.py` | Auto-approval capped at a tier ceiling; safety-class ops always escalate to a human |
+| Review lane | `orange_pr_reviewer.py` | PR-based human review; remote pushes air-gapped by default |
+| Provenance | `observability/landing_provenance.py` | sha256 of the landed blob (signature stripped) == recorded `candidate_hash` |
+| Training handoff | `observability/training_handoff.py` | `LABELING → PREFLIGHT → BASELINE → LEASING → TRAINING → CONVERTING → PUBLISHING → RESTORING → VERIFYING → COMMITTED \| ROLLED_BACK`, single-flight via `flock` |
+
+---
+
+## The local inference lane
+
+`backend/core/ouroboros/governance/local_inference_director.py` — 2,619 lines — is the client side of local inference: the component that makes a self-hosted model reliable enough to drive an autonomous pipeline.
+
+| Capability | How it works |
 |---|---|
-| Languages | Python · Swift · TypeScript · Rust · Shell |
-| Authorship | ~99.8% solo-authored |
-| Cadence | ~28 commits/day since Aug 2025 |
-
-> O+V is roughly **half engine, half proof** — the test spine exists to keep a
-> self-modifying system honest.
-
----
-
-## 🎯 O+V Execution Report Card — snapshot, 2026-07-22: C+ → B−/B
-
-> **A dated snapshot, deliberately not maintained.** It records what four instrumented soaks showed on that date and is left unedited so the trajectory stays legible. For current state read the git log; for current figures run `scripts/readme_stats.py`.
-
-Four instrumented soaks in 48 hours drove the autonomous-execution failure frontier from
-*"the pipeline blocks itself at CLASSIFY on fabricated evidence"* to **the organism's first
-verified autonomous code fix on the current stack** — it read a planted failing test
-(`assert -1 == 5`), generated the correct repair, applied it through the full governance
-cage, passed 2PC verification, and had its diff captured, telemetry-flushed, and parked for
-human review, entirely on the DoubleWord 397B realtime lane (TTFT p50 ~6.5s, **$0.018/soak,
-zero Claude spend**).
-
-**What failed → what killed it** (each soak exposed exactly one structural defect):
-
-| Soak | Died at | Root cause | Fix (merged) |
-|---|---|---|---|
-| 1 | CLASSIFY | Advisor **fabricated** `blast=50` on cold caches (cache-poisoning + a hard-BLOCK bypass) | Targeted Locality Bounding + Epistemic Humility (#70003) |
-| 2 | APPLY | Write-root **path doubling** → ENOENT on a garbage path | Path Canonicalization Sandbox + `PathTraversalError` (#70004) |
-| 3 | APPLY | Target gate **wired-but-inert** (inline twin only, never the shipping runner) + WAL **ghost signals** chasing shield-stashed files | Shipping-path Gate 3.5 + WAL Liveness Tombstoning + Sandboxed Ephemeral Instantiation (#70005) |
-| 4 | post-APPLY | Per-file freeze budget **rolled back its own success** (denied file 2 of an atomic 2-file op) | Transactional Op-Scoped Freeze (latch tracks the base op; siblings complete 2PC; fan-out ceiling 5) |
-
-**What worked without qualification**: the advisor plane after repair (0 false blocks across
-three soaks, honest localized measurement under the exact cold-cache conditions that used to
-wedge it) · DW `service_tier=priority` realtime economics · the Atomic Flush & Freeze
-containment envelope (diff captured + HiveEmitter flush demonstrated + cascade structurally
-parked, on its first live encounter) · four-soak root-cause discipline (every failure
-converted into a named, tested, merged fix — nothing patched around).
-
-**Path to A−/A+** (every remaining gap is enumerated — no unknowns left on the list):
-net-landed multi-file mutations under the op-scoped latch → AutoCommit + workspace promotion
-exercised live (`JARVIS_WORKSPACE_PROMOTION_ENABLED`) → multi-op sessions without the
-~20-minute op-flow dry-up → sustained multi-session cadence with human-reviewed parked
-diffs. Full campaign detail: `docs/architecture/OUROBOROS_VENOM_PRD.md` (v3.34 header).
+| **JSON-Schema constrained decoding** | The generation envelope schema (`providers.build_response_json_schema`) is attached as `response_format: json_schema` (OpenAI transport) or `format` (native transport), so a missing required field is unrepresentable at the sampler. A degradation ladder `json_schema → json_object → none` is learned per `(base_url, model)` from the engine's own 4xx — never from a version table — and a 5xx never weakens the constraint. |
+| **Zero-cost local routing** | `paid_lanes.py` is the single authority on paid lanes. With `JARVIS_PAID_LANES_ENABLED=false` (or no paid credential), `candidate_generator._try_local_primary` serves every route locally before route-based dispatch. |
+| **Per-draw sampling control** | `sibling_entropy.sampling_for` assigns each sibling draw its own point on a `(temperature, top_p, top_k, repeat_penalty)` ladder and a deterministic seed `sha256(op \| draw \| escalation)`. `_config_for_draw` applies it via `dataclasses.replace`, so a sibling's sampling never leaks into later ops on a shared client. |
+| **Streaming inter-token timeout** | `LatencyProfiler.inter_token_budget_s` derives separate first-token and steady-state deadlines from EWMA latency, prompt size, and sampling entropy, credited for measured event-loop lag. Each `readline` races the shutdown event; a wedge raises `InterTokenStall`, a cooperative shutdown raises `GracefulStreamInterruption` carrying the partial output. |
+| **Memory admission** | `local_model_admission.py` returns `ADMIT / PRUNE / DEFER` against host and accelerator pressure — deferral is a result, not an exception. |
+| **Thinking budget** | `reasoning_effort` defaults to `none`: same schema-valid output, **6.8 s → 1.5 s** measured on the constrained path. |
 
 ---
 
-## 🧪 The Preference-Corpus Arc — snapshot, 2026-09-04: soaks 19–26
+## Benchmarks
 
-> **A dated snapshot, deliberately not maintained.** It records what eight instrumented soaks showed on that date and is left unedited so the trajectory stays legible. For current state read the git log.
+All figures are measured on the reference host — RTX 5090 (32,607 MiB), Windows 11 + WSL2 (24 cores, 47 GiB) — serving `qwen3-coder-ov:30b` (30.5B MoE, 8 of 128 experts active, Q4_K_M, 17.3 GiB weights) plus a 27 MB GRPO LoRA through J-Prime on llama.cpp b11462 / CUDA 13.4. Methodology and raw sources: [J-Prime `BENCHMARKS.md`](https://github.com/drussell23/JARVIS-Prime/blob/main/BENCHMARKS.md), [`docs/architecture/HARDWARE_CONSTRAINTS.md`](docs/architecture/HARDWARE_CONSTRAINTS.md).
 
-The July campaign proved O+V could *land a fix*. This one asks a different question: can the
-organism produce a corpus good enough to **train the model it runs on**? GRPO learns from
-within-group **contrast** — a good answer beside a bad one on the same prompt — and every
-layer between the model and the trainer was silently discarding the losing half. Trainable
-groups went **4 → 20**; row survival **21% → 79%**.
+| Metric | Result | Source |
+|---|---|---|
+| Decode throughput | **p50 172 tok/s** (p10 152, p90 184; n = 337 generations) | J-Prime llama-server timings, 2026-10-07 |
+| First-token (prefill) latency, 4k–8k uncached tokens | **p50 885 ms** (~6.5k tok/s; n = 88) | same |
+| First-token (prefill) latency, 8k–16k uncached tokens | **p50 1.41 s** (n = 43) | same |
+| Marginal inference cost per operation | **$0.00** local vs ~$0.002 (DoubleWord) to ~$0.005–0.03 (frontier API) | `OUROBOROS_VENOM_NORTH_STAR.md` §47 |
+| VALIDATE per candidate | **450 s → 1.31 s** (covering tests vs 69,353-test repo fallback) | PRD v3.38 |
+| Unattended production soak | **6.03 h, 10 verified landings** (6 substantive), 0 OOM | PRD v3.40 |
+| Training-lease handoff | **21,236 MiB** freed and verified; full cycle `COMMITTED` in 26.6 min (1-step proof) | `eecadb334f` |
+| KV cache cost | **96 KiB/token** → 3.0 GiB per 32k-context stream | `HARDWARE_CONSTRAINTS.md` §3 |
 
-**What failed → what killed it** (each soak exposed exactly one structural defect):
+---
 
-| Soak | Died at | Root cause | Fix (merged) |
-|---|---|---|---|
-| 20 | work supply | The work-order seen-ledger is **cross-session**, so re-running a stable roadmap emitted **0** orders. 2.5h, 22 rows, none trainable. | `JARVIS_ALLOW_ROADMAP_REVISIT` *shadows* the ledger in memory — never deletes the operator's record (`5dc973d6c7`) |
-| 19/21 | sibling loop | A `2b.1-noop` sibling read as **EMPTY** and set `_stop`, forfeiting every remaining slot — 8 of 15 singleton ops | A refusal is an **answer**, not a dead lane: re-draw in-slot, drop the *slot* not the loop, + a per-slot `sibling_fulfillment` ledger (`95c1031e51`) |
-| 22 | the corpus | The recorder returned `False` for a refusal (`not traj.candidates`) — the cleanest negative answer never became a row | Synthesise it; body = the decline **envelope**, because prose falls through to `_grade_source` and grades as *broken Python*, inverting the ladder (`4c8f4d3af9`) |
-| 23 | the corpus | Unparseable draws **raised before** the recorder hook — `all_candidates_syntax_error` left nothing behind | Capture at the raise, body = the **raw** response so the grader scores by how far the parse got (`06c0d51705`) |
-| 24 | the filters | Reactor's `genuine_only` discarded **156 of 330** rows — every `retry` draw — on a rationale written for `repair` | `is_genuine_row` admits a retry whose answer is *categorical*; a refusal re-answers the **same** prompt (reactor `8f36af0`) |
-| 24 | the filters | `_UNKNOWN` discarded refusals whose op never reported — and a declining op is the *least* likely to reach a verdict | A refusal is **self-evidencing**; matched on the **policy tuple**, never the outcome string (`fbf227d4ca`) |
-| 24 | the filters | The same rule was missing on the **expiry** write path — where a declining op's rows actually land. Survival slid 100% → 25%. | One `_noop_override`, consulted by *both* writers (`525ba81739`) |
-| 25 | the pairs | Three ops held a patch **and** a parse_error sibling — the exact {good, bad} pair — every one reading as unmixed downstream | `_self_evidencing_policy`: `_NOOP` for a refusal, `_FAILURE` for an unparseable draw — **the parser is the verdict** (`93cce42284`) |
+## Components
 
-**The reward ladder, measured end-to-end against an unmodified Reactor**:
-
-```
-parse_error 0.300  <  noop 0.450  <  patch 0.812     spread 0.5121 vs a 0.01 gate
-breaking           <  declining   <  delivering
-```
-
-**Two structural facts that bound the approach** (both measured, both cost a soak to learn):
-GRPO groups on the exact prompt and **every prompt embeds its own Op-ID** — 85/85 rows, zero
-prompts shared across ops — so a new soak always mints *new* groups and can never deepen an
-existing one; re-running buys **breadth, never depth**. And a **noop-primary op can never draw
-a sibling** (the loop returns at its first guard), so it is all-refusal by construction — only
-patch-primary ops can ever be mixed.
-
-**What worked without qualification**: every fix was a *root cause*, never a workaround —
-the ledger is shadowed rather than deleted, the filter distinguishes categorical answers
-rather than blanket-admitting retries, the override matches a policy tuple rather than a
-string that three policies share. Two mandated designs were **measured and rejected** on
-evidence: a static `0.0` floor for parse errors (it collapses a real 0.1429 spread and ranks
-a parse error *below* envelope garbage) and hot-reloading the recorder mid-run (Python loads
-a module once per process; the launch-time sha guard is the actual fix).
-
-**Not proven**: no training run has executed. The corpus stands at **20 trainable groups**
-against a 25 target, and no mixed-shape op has yet survived a soak that had every fix at
-launch. `scripts/soaks/devtest_{prepare,baseline,report}.sh` exists to answer the prior
-question first — **can O+V land a sanctioned change untrained?** O+V has 0 autonomous commits
-and its wall has been *governance*, not candidate quality; if the chain does not close
-untrained, a fine-tuned model will not close it either. Full detail:
-`docs/architecture/OUROBOROS_VENOM_PRD.md` (v3.35 header).
+| Path | Role |
+|---|---|
+| `backend/core/ouroboros/governance/` | O+V: orchestrator, phase runners, providers, candidate generation, promotion, sanction, provenance |
+| `backend/core/ouroboros/battle_test/` | Harness, `serpent_flow.py` cockpit transcript, soak runner |
+| `backend/core/ouroboros/cli/ov.py` | The `ov` entry point (cockpit, daemon, status, attach, doctor, …) |
+| `unified_supervisor.py` | ~98K-line boot kernel for the full interactive stack |
+| `backend/vision/`, `backend/voice/`, `backend/ghost_hands/` | Screen capture and computer use, voice I/O, focus-preserving UI automation |
+| `backend/core_contexts/` | Five execution contexts (Executor, Architect, Developer, Communicator, Observer) |
+| `ci/lint_gate.py` | Undefined-name ratchet: whole-package zero for O+V packages, differential elsewhere |
+| `scripts/readme_stats.py` | Regenerates the figures above from git (`--check` fails on drift) |
 
 ---
 
@@ -164,1006 +167,91 @@ untrained, a fine-tuned model will not close it either. Full detail:
 
 This initiative is **not a software refactor**. It is the genesis of an autonomous, self-evolving **Artificial Intelligence Operating System**. The project explicitly rejects the rigid paradigms of traditional software engineering in favor of a symbiotic design: **the models and agents carry intelligence; the codebase is the nervous system** that connects senses, cognition, and safe execution.
 
-### What we abandon
-
-- Hardcoded business logic expressed as long `if` / `elif` routing trees
-- Static heuristics that break the first time a user goal does not match a pre-enumerated case
-- “Agent sprawl” — dozens or hundreds of narrow specialist classes that duplicate similar behaviors with slightly different code paths
-- Shortcuts: retry spam, brute-force patches, and symptom-level fixes that leave structural disease in place
-
-### What we build instead
-
-- **Deep asynchrony** — true parallelism across senses, cognition, and UI; no accidental blocking of the organism
-- **Mathematical and semantic governance** — thresholds, entropy-aware signals, and model-driven planning instead of string-matching routers
-- **Cross-repo contract integrity** — JARVIS (Body), J-Prime (Mind), and Reactor Core (Immune System) behave as one organism, not three glued scripts
-
-### The tri-partite organism
-
-| Layer | Repository | Role | Analogy |
-|---|---|---|---|
-| **Senses / Body** | **JARVIS** (this repo) | Screen, audio, input automation, APIs, supervisor | Peripheral and motor nervous system |
-| **Mind / Cognition** | **J-Prime** | Model serving, reasoning, brain policy, LangGraph | Executive and associative cortex |
-| **Immune system / Sandbox** | **Reactor Core** | Isolated validation of generated code, training lineage, probation | Adaptive immunity — test before merge |
-
-The Mind is not “imported” into the Body as a Python library. The Body talks to the Mind over **HTTP and WebSocket** with explicit contracts (`MindClient`, `PrimeRouter`), so each subsystem can evolve, scale, and fail independently without corrupting the whole.
+> `StrategicDirectionService` reads this section at boot and injects the seven principles into every O+V generation prompt. The full text, including the zero-shortcut mandate, lives in [`TRINITY_MANIFESTO.md`](TRINITY_MANIFESTO.md).
 
 ### The seven principles
 
 **1. The unified organism (tri-partite microkernel)**  
-The ecosystem awakens through a **single authoritative entry point**: `python3 unified_supervisor.py`. The supervisor is not a dumb process launcher; it is the **kernel** that coordinates local edge (senses), cloud cognition (J-Prime), and sandboxed execution (Reactor / Docker) with consistent lifecycle and health semantics.
+One authoritative entry point coordinates senses, cognition, and sandboxed execution with consistent lifecycle and health semantics.
 
 **2. Progressive awakening (adaptive lifecycle)**  
-Boot is **not** a single long blocking chain. Local senses (UI, voice, capture) should reach **ACTIVE_LOCAL** quickly so the host can interact while heavy resources (e.g. GCP J-Prime) spin up **asynchronously**. UI readiness must track **real async resolution** — never a cosmetic “ready” that lies about backend state.
+Local senses reach readiness quickly while heavy resources spin up asynchronously; readiness always tracks real backend state.
 
 **3. Asynchronous tendrils (disciplined concurrency)**  
-Foreground work, background exploration, and telemetry must use **structured concurrency** (`asyncio` task groups, gathering, cancellation discipline). Background **tendrils** must not starve the event loop, leak context, or corrupt shared memory assumptions.
+Structured concurrency throughout; background work must never starve the event loop, leak context, or corrupt shared state.
 
 **4. The synthetic soul (Trinity consciousness)**  
-The system maintains **episodic awareness** of what worked and what failed. Components such as the **ConsciousnessBridge** (and related memory / telemetry paths) observe outcomes so the organism can detect **gaps in its own competence**. When statistical signals (e.g. entropy / uncertainty) show persistent ignorance, that drives **exploration and evolution** — not silent failure.
+The system keeps episodic awareness of what worked and what failed, and treats persistent uncertainty as a signal to explore, not to fail silently.
 
 **5. Intelligence-driven routing (the cognitive forge)**  
-Routing, planning, and decomposition are **agentic and semantic**, not regex catalogs. **Intent classification** and **brain selection** evaluate requests against policy and capability, then route to the right **model tier** and tools. Complex work is expressed as **DAG-shaped plans** (directed acyclic graphs) rather than linear scripts.
+Routing, planning, and decomposition are semantic and policy-driven, not regex catalogs; complex work is expressed as DAG-shaped plans.
 
 **6. Threshold-triggered neuroplasticity (Ouroboros)**  
-When the organism hits a **capability gap**, it must synthesize a **just-in-time** response:
-
-- **Ephemeral tools** — one-off generated code or scripts run in the **sandbox** (Reactor Core), then discarded.
-- **Persistent assimilation** — if the same ephemeral capability is exercised successfully and **repeated** (e.g. graduation threshold such as **count ≥ 3**), **GraduationOrchestrator** proposes **permanent** integration: tests, validation, and a **secure Git PR** into the OS DNA.
-- **Unified Event Spine** — a `FileWatchGuard` (watchdog) watches the repo root and publishes file change events to `TrinityEventBus`. Intake sensors react to code changes, test results, and git commits in **sub-second time** instead of polling. The event spine bridges `GapSignalBus`, `EventEmitter`, and `EventChannelServer` into a single topic-based pub-sub system (MQTT-style wildcards, priority queues, WAL persistence, cross-repo transport).
-- **Adaptive provider routing + 6-layer cost optimization** — DoubleWord 397B now supports both batch and **real-time** (`/v1/chat/completions`) with full Venom tool loop at $0.10/$0.40/M — 30-37x cheaper than Claude. Claude fallback uses **prompt caching** (90% input savings). Smart `max_tokens` during tool rounds (1024 vs 8192). Prompt compression (20KB max per file vs 65KB). Complexity routing skips Venom for trivial tasks. **50-150+ operations per $0.50 budget** (vs 5-15 before optimization). Hard timeout enforcement at every layer: `asyncio.wait_for` on generation (180s + 5s grace), fallback provider cap (60s max), Tier 1 reserve rebalanced (25s minimum), DW poll interval tuned (5s). Python 3.9+ compatible — no `asyncio.timeout` (3.11+) anywhere.
-- **Venom: Agentic Execution** — The `ToolLoopCoordinator` transforms Ouroboros from a one-shot patch generator into a multi-turn agentic loop. During generation, the provider can call `read_file`, `search_code`, `run_tests`, and `get_callers` — reading the codebase, running tests, and revising its output across multiple turns. When validation fails, the **L2 Repair Engine** takes over with an iterative `generate → test → classify failure → revise` loop (up to 5 iterations, 120s timebox). Policy enforcement via `GoverningToolPolicy` ensures all tool calls stay within repo boundaries.
-- **SemanticTriage: Pre-Generation Intelligence** — The `SemanticTriageEngine` runs a lightweight 35B model analysis **before** expensive generation to classify whether the target change is already implemented (`NO_OP`), targets the wrong file (`REDIRECT`), needs additional context (`ENRICH`), or can proceed (`GENERATE`). This eliminates wasted generation cycles on no-op changes and redirects misrouted signals, reducing pipeline cost by filtering before the most expensive phase.
-- **5-Phase Communication Protocol** — The `CommProtocol` enforces structured observability across every operation: **INTENT** (what we're about to do) → **PLAN** (how we'll do it) → **HEARTBEAT** (progress with phase, percentage, and subsystem metadata) → **DECISION** (outcome with rationale) → **POSTMORTEM** (full diagnostic on failure). Fault-isolated transports, idempotency keys, global sequence numbers, and correlation IDs provide runbook-grade cross-operation tracing. Transports are pluggable; the battle-test harness routes messages to the SerpentFlow CLI surface.
-- **Trinity Consciousness: Metacognition** — The self-awareness layer (Zone 6.11) with 4 core engines (HealthCortex, MemoryEngine, DreamEngine, ProphecyEngine) and 3 fusion engines (CAI, SAI, UAE). **MemoryEngine** records operation outcomes and builds per-file reputation (success rate, fragility score). **ProphecyEngine** predicts regression risk. **DreamEngine** waits for 5 readiness gates (J-Prime health, user idle, VM warmth, resource governor, daily budget) before speculatively generating improvement blueprints during idle GPU time — with preemption, flap damping, and persistent state. **ConsciousnessBridge** injects this intelligence into the pipeline: regression assessment at CLASSIFY, fragile file context at GENERATE RETRY, outcome recording at POST-APPLY. The organism **learns from its own history**.
-- **Strategic Direction Awareness** — The `StrategicDirectionService` reads the Manifesto (README.md) and architecture docs on boot, extracts the 7 core principles, and injects them into every operation's generation prompt. The organism understands the developer's architectural vision and generates Manifesto-compliant code — async patterns, cross-repo integrity, observability, structural repair over shortcuts.
-- **IntentDiscoverySensor: Purpose-Driven Exploration** — The 16th sensor combines StrategicDirection principles, DreamEngine blueprints, and Oracle semantic search to synthesize concrete code improvement intents aligned with the developer's architectural vision. Unlike reactive sensors that wait for failures, IntentDiscoverySensor **proactively discovers** what the organism should improve next. Human acknowledgment is required (AC2 safety gate) before any discovered intent enters the pipeline.
-- **23 Autonomous Sensors** — The intake layer now deploys 23 specialized sensors: `TestFailureSensor`, `VoiceCommandSensor`, `OpportunityMinerSensor`, `CapabilityGapSensor`, `ScheduledTriggerSensor`, `BacklogSensor`, `RuntimeHealthSensor`, `WebIntelligenceSensor`, `PerformanceRegressionSensor`, `DocStalenessSensor`, `GitHubIssueSensor` (polls Trinity repos for bugs/features), `CrossRepoDriftSensor` (detects API/contract drift between JARVIS/J-Prime/Reactor), `ProactiveExplorationSensor` (curiosity-driven entropy-based exploration), `TodoScannerSensor`, `CUExecutionSensor`, and `IntentDiscoverySensor`. All signals flow through the `UnifiedIntakeRouter` with priority queuing, deduplication, and WAL persistence.
-- **Streaming output** — Both DW and Claude stream tokens character-by-character to the Rich TUI as code is being generated — like Claude Code shows its output appearing in real-time. SSE parsing for DW, `client.messages.stream()` for Claude.
-- **Terminal surface: SerpentFlow + a composable TUI layer** — the operator-facing renderer is `battle_test/serpent_flow.py`, a flowing Claude-Code-style transcript rather than a pinned table. Around it sit single-purpose modules: `stream_renderer.py` (GENERATE token streaming via Rich `Live`, 16ms batched), `diff_preview.py` (Yellow-tier `NOTIFY_APPLY` overlay), `status_line.py` + `live_status_line.py` (phase/cost/idle aggregation into a persistent bottom toolbar), `layout_controller.py` + `split_layout.py` (flow / split / focus modes), `ouroboros_tui.py` (Panel-based op lifecycle), and `op_block_buffer.py` (collapsible op blocks with `o-N` refs). Three-channel terminal muting runs throughout, preventing Rich cursor corruption from third-party output.
-
-  > An earlier `live_dashboard.py` provided a pinned Rich `Live` table. It was **deleted** in `481b430745` (UI Slice 2) in favour of the flowing surface above; this README described it for three months afterwards, which is the kind of drift `scripts/readme_stats.py` and the verification pass below exist to catch.
-- **Battle Test Runner** — `scripts/ouroboros_battle_test.py` boots the full 6-layer stack (GovernedLoopService, IntakeLayer, Consciousness, StrategicDirection, CommProtocol, SerpentFlow). SerpentFlow renders a flowing transcript with provider badges, tool-call counts, colored diffs, streaming code output, and real-time phase progression. Every commit signed `Generated-By: Ouroboros + Venom + Consciousness`. Hard timeout enforcement at every pipeline layer prevents generation hangs. The battle test is the empirical validator for every capability on this page — no claim is considered true until the harness reproduces it end-to-end.
-
-- **Battle Test Breakthrough — 2026-04-11: First Sustained Full-Pipeline Completion** — Session `bt-2026-04-11-154947` marked the first autonomous op to traverse the governance pipeline end to end (CLASSIFY → ROUTE → GENERATE → VALIDATE → GATE → APPLY → VERIFY, then L2 repair and POSTMORTEM on the failure path) since the Iron Gate regime was tightened in the Apr 9-10 push. Op `op-019d7d3e` (Python dependency upgrade in `requirements.txt`, SAFE_AUTO, critical urgency, runtime_health sensor) was autonomously generated, rejected on attempt 1 by the `dependency_file_integrity` Iron Gate catching a hallucinated `anthropic → anthropichttp` rename, regenerated with episodic-failure feedback injected, applied to disk (DECISION `applied/safe_auto_passed`), then post-APPLY-verified by the InfrastructureApplicator triggering a real `pip install` (SUCCESS in 4.7s). Verification correctly rerouted a 0/0-test result to L2 repair, which escaped to POSTMORTEM rather than brute-forcing a false pass. Three workers completed their assigned operations in the same session (402s, 365s, 11s); zero `client has been closed` errors across 119KB of debug log — the captured-client race that had blocked every prior session was empirically resolved. Root cause was closure-capture of `self._client` in `_do_stream`/`_create_with_prefill_fallback`/`_legacy_create`/`_plan_create`: when a hard-pool signal (`RemoteProtocolError`, `ReadError` unwrapped from `APIConnectionError`) triggered `_recycle_client()` mid-backoff, the `_call_with_backoff` retry re-ran the inner function but reused the closed client. Fix: re-acquire `self._client` at the top of each attempt so every retry sees the current generation. Iron Gate's `dependency_file_integrity` check (added to guard against hallucinated package renames) fired on its first production exposure, vindicating the Manifesto §6 Iron Discipline principle — the exploration-first + ASCII-strictness + dependency-integrity stack is working as a layered defence against model failure modes. Full postmortem in `docs/architecture/OUROBOROS.md#battle-test-breakthrough-log`.
+A capability gap triggers a just-in-time response — an ephemeral tool in the sandbox, graduated to permanent, tested integration once it proves itself repeatedly.
 
 **7. Absolute observability (systemic transparency)**  
-Autonomous decisions must be **visible**. A **TelemetryBus** (and related emitters) broadcasts decisions, state transitions, and errors into **live dashboards** and, where appropriate, **voice narration** — the circulatory and reporting layer of the symbiote.
-
-### The zero-shortcut mandate
-
-**No shortcuts whatsoever.** No brute-force retries without diagnosis. No hardcoded routing tables that encode product policy. No sequential bottlenecks that exist only because “it was easier.” If a subsystem fails or hangs, the response is **structural repair** — dismantle the flawed assumption and rebuild — not a bypass that hides the bug. We do not attempt to code every future task explicitly; we code **the entity that can survive novelty**.
-
-### Five core execution contexts + Symbiotic Router
-
-Large reasoning models collapse many narrow “specialist agents” into **one mind** that adapts to the task. The codebase exposes **five execution contexts** (Brain) differentiated by tools and sandbox boundaries, backed by the legacy **Neural Mesh** (Peripheral Nervous System) as a Strangler Fig fallback — 24 classes extend its base, of which 16 are named `*Agent` and the remainder are adapters and services. (The long-standing "22 agents" figure matched neither count and has been replaced with the definition that produces one.)
-
-| Context | Responsibility | Typical model tier (policy-driven) |
-|---|---|---|
-| **Executor** | Sees the screen, clicks, types, navigates apps — **motor loop** | Vision-capable / multimodal tier |
-| **Architect** | Decomposes goals into **DAGs**, assigns steps, reconciles failures | Highest reasoning tier |
-| **Developer** | Reads and writes code across repos, tests, PR flow | Same reasoning / coding tier as policy allows |
-| **Communicator** | Email, calendar, messaging — protocol-heavy I/O | Fast tier by default; heavy tier when ambiguity is high |
-| **Observer** | Monitors screen / logs, anomaly detection, briefings | Vision or fast tier depending on sensitivity |
-
-**Symbiotic Router (`backend/core_contexts/facade.py`) — 3-tier dispatch:**
-
-```
-Tier 1: Core Contexts (Brain)
-  │ Feature-flagged per vertical (JARVIS_CTX_EXECUTOR=true, etc.)
-  │ 397B Architect routes goals to the appropriate context
-  │ SUCCESS → return result
-  │ FAIL/DISABLED → fall through ↓
-  │
-Tier 2: Legacy Agents (Peripheral Nervous System)
-  │ 22 Neural Mesh agents (30K+ lines of production code)
-  │ GoogleWorkspaceAgent (6.7K lines), VisualMonitorAgent (11K lines), etc.
-  │ Keyword-based agent selection + lazy instantiation
-  │ SUCCESS → return result
-  │ FAIL → fall through ↓
-  │
-Tier 3: Ouroboros Neuroplasticity (Pillar 6)
-    CapabilityGapEvent emitted to GapSignalBus
-    GraduationOrchestrator JIT-synthesizes the missing capability
-    “I'm learning how to do this.”
-```
-
-The **Strangler Fig pattern** enables incremental migration: flip one vertical at a time, verify it works, then flip the next. Legacy agents stay alive as Tier 2 fallback until the Core Context fully absorbs their logic. No big bang. No deletion of working code.
-
-### Example: one goal, multiple contexts (Ouroboros-aligned)
-
-**User:** “Refactor authentication to OAuth2.”
-
-1. **Architect** (reasoning tier) emits a DAG: analyze current auth → research constraints → implement → test in sandbox → open PR.  
-2. **Developer** executes code-reading and editing steps with repo tools.  
-3. **Reactor Core** runs tests in **isolation** and returns pass/fail.  
-4. **Architect** replans with failure context if needed; otherwise approves merge / PR narrative.  
-
-The **same** model stack can serve Architect and Developer roles; the **separation is operational** (what tools and gates are attached), not a requirement for dozens of named agent files.
-
-### Mapping manifesto → this repository
-
-| Principle | Primary anchors in JARVIS |
-|---|---|
-| Unified kernel | `unified_supervisor.py` |
-| Body–Mind bridge | `backend/core/mind_client.py`, `backend/core/prime_router.py` |
-| Semantic routing | `backend/core/interactive_brain_router.py`, `backend/core/ouroboros/governance/brain_selection_policy.yaml` |
-| Motor / vision loop | `backend/vision/lean_loop.py`, `backend/ghost_hands/` |
-| Neuroplasticity | `backend/core/ouroboros/` (`governed_loop_service.py`, `orchestrator.py`, `saga/`, `intake/`) |
-| Observability | `backend/core/telemetry_emitter.py`, governance narration, env-driven telemetry flags |
-
-Contributors should align new work with these principles: **extend tools and policy**, do not add brittle routing ladders or duplicate “mini-agents” that differ only by prompt wording.
+Every autonomous decision, state transition, and error is visible — in telemetry, the cockpit, and, where appropriate, voice.
 
 ---
 
-## Trinity Architecture
+## Local setup
 
-The system is split across three repositories that map to **Body**, **Mind**, and **Soul**.
-
-| Repository | Role | Responsibilities |
-|---|---|---|
-| **JARVIS** (this repo) | Body / Senses | macOS integration, screen capture, keyboard/mouse automation, voice I/O, vision loop, unified supervisor, Ouroboros governance engine, WebSocket + REST API, React frontend |
-| **J-Prime** (jarvis-prime) | Mind / Cognition | Model serving (GGUF on NVIDIA L4), brain selection policy, reasoning graphs, `/v1/reason/*` endpoints, LangGraph orchestration |
-| **Reactor Core** (reactor-core) | Soul / Immune System | Sandbox execution of generated patches, DPO training pipeline, model lineage tracking, post-deployment probation, self-improvement feedback loop |
-
-The supervisor in this repo starts all three. J-Prime runs on a GCP `g2-standard-4` VM with an NVIDIA L4 GPU; Reactor Core runs its sandbox locally or in Docker. Communication is HTTP + WebSocket, with the `MindClient` maintaining a hysteresis-based operational level state machine (PRIMARY / DEGRADED / REFLEX) so the Body degrades gracefully when the Mind is unreachable.
-
----
-
-## Key Systems
-
-### Vision-Language-Action (VLA) Pipeline
-
-**`backend/vision/lean_loop.py` + `backend/vision/vision_reflex.py` + `backend/vision/apple_ocr.py`**
-
-**The Biological Analogy: Screenshots = Blinking. Video Streaming = Eyes Open.**
-
-Traditional AI assistants (Claude Desktop, Cursor) take periodic screenshots to "see" the screen. This is like a human who blinks every 2 seconds and is blind between blinks -- they miss everything that moves. JARVIS keeps its eyes open. A continuous video stream (macOS ScreenCaptureKit, indicated by the purple recording icon) feeds raw numpy frames at 10-15fps. The BallTracker processes every frame in ~9ms -- JARVIS sees motion, predicts trajectories, and tracks objects between cloud API calls. The cloud models (235B + Claude) provide deep reasoning, like the visual cortex processing a scene. But the eyes never close.
-
-Ouroboros is the neuroplasticity -- the brain learning to see better over time. A newborn has open eyes but cannot track a moving object. Over weeks, the visual cortex rewires itself: neurons that fire together wire together. Ouroboros does the same: the 397B reasoning model observes what the cloud models extract, then writes local numpy code that replicates that extraction in 2ms. Each graduation makes the brain faster. The eyes stay the same; the brain improves. The longer JARVIS runs, the more scenes it encounters, the more reflexes Ouroboros compiles, and the less it needs the cloud.
-
-JARVIS sees through a three-layer parallel perception pipeline. Deterministic code handles the fast path; agentic intelligence handles novel scene understanding.
-
-**Layer 1 -- Local OCR (deterministic skeleton, every cycle, ~2s)**
-Apple Vision Framework via a compiled Swift binary extracts text from the screen. The `apple_ocr.py` bridge runs macOS-native `VNRecognizeTextRequest` at 1.00 confidence on clean text, handling glow/shadow/stylized fonts that Tesseract cannot. Visual Telemetry saves every perception frame to `/tmp/claude/vision_telemetry/` as a timestamped artifact so the operator can verify what the agent saw without altering the host environment.
-
-**Layer 2 -- Doubleword 235B VL (structural analysis, parallel, ~8s)**
-`Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` performs fast structural reads: text extraction, UI element detection, object position, quadrant classification. Fires in parallel with Layer 3 on the same frame via `asyncio.create_task()`.
-
-**Layer 3 -- Claude Vision (semantic reasoning, parallel, ~8s)**
-Claude Sonnet provides deep contextual understanding: spatial relationships, motion direction, scene description, anomaly detection. Both cloud models run concurrently -- the VLA loop never blocks on either.
-
-**Cross-Validation Layer:**
-When both cloud models return results from the same frame, their outputs are compared:
-- **Numbers**: Does the 235B text read match OCR? (Consistently zero drift in testing.)
-- **Position**: Do both agree on the object quadrant? (Disagreements indicate temporal lag.)
-- **Motion**: Do both agree on trail direction? (High consensus on diagonal/upward/downward.)
-
-Cross-validation data is fed to the Ouroboros feedback loop as a learning signal. Position disagreements caused by temporal lag (object moves between API calls) are the primary signal that triggers Ouroboros to compile a local reflex.
-
-**Targeted Window Capture:**
-The frame server uses `CGDisplayBounds(CGMainDisplayID())` to capture only the primary display, not virtual ghost displays. For the VLA test, `CGWindowListCreateImage` with `kCGWindowListOptionIncludingWindow` captures a specific Chrome window by ID -- JARVIS sees the target application even when the terminal has focus.
-
-### Ouroboros Neuro-Compilation (Vision Reflex System)
-
-**`backend/vision/vision_reflex.py`**
-
-When the VLA cross-validation detects repeated patterns (e.g., the same OCR query firing 3+ times), Ouroboros triggers Neuro-Compilation -- using a reasoning model to write local code that replaces expensive cloud API calls with deterministic pixel-level extraction.
-
-**The Neuro-Compilation cycle:**
-
-1. **CognitiveInefficiencyEvent** fires after 3 repeated VLA calls (`OUROBOROS_GRADUATION_THRESHOLD`).
-2. The 235B VLM analyzes the current frame (the "conscious read").
-3. The 35B reasoning model (`Qwen/Qwen3.5-35B-A3B-FP8`) receives the 235B analysis + cross-validation consensus and generates a Python function that replicates the extraction locally.
-4. The generated code is compiled in a sandboxed namespace with pre-populated imports (numpy, PIL, subprocess, etc.).
-5. The reflex is validated against the last known-good result.
-6. On validation pass, the reflex is hot-swapped into the live loop. All subsequent reads bypass the cloud API.
-
-The reasoning model runs in the background (`asyncio.create_task`) -- the VLA loop continues uninterrupted during the ~60s synthesis. When the reflex is ready, it is hot-swapped on the next cycle.
-
-**Tier cascade (highest performance first):**
-
-| Tier | Method | Latency | Description |
-|------|--------|---------|-------------|
-| 4 | 35B-generated reflex | ~5ms | Numpy pixel analysis, centroid tracking, compiled OCR |
-| 3 | Persistent OCR server | ~150ms | Pre-compiled Swift binary, Vision Framework kept warm |
-| 1 | Compiled Swift binary | ~900ms | One-shot swiftc compilation, reused across calls |
-| 0 | Interpreted Swift | ~2000ms | Baseline -- swift recompiles the script each invocation |
-
-**Telemetry events:**
-- `vision.perception@1.0.0` -- every captured frame with artifact path
-- `ouroboros.cognitive_inefficiency@1.0.0` -- graduation threshold breached
-- `ouroboros.reflex_graduation@1.0.0` -- successful reflex assimilation
-
-**Current baseline: 13.7fps (27x over screenshots). Target: 60fps.**
-
-The zero-copy shared memory ring buffer (`shm_frame_bridge.h`) eliminates the pybind11 GIL bottleneck. The C++ SCK daemon writes BGRA frames into a 5-slot POSIX shm ring buffer at up to 21fps. Python reads the latest slot via `numpy.frombuffer()` -- zero copy, zero GIL. Two C++ bugs block the path to 60fps (documented as Ouroboros CapabilityGapEvents for 397B resolution):
-
-1. **Retina Stride Bug**: `bytesPerRow != width * 4` on retina displays causes the C++ downsampler to produce mixed-resolution frames. The SHM writer receives alternating logical/retina coordinates, breaking velocity tracking.
-2. **Window Crop Bug**: Chrome window detection via `CGWindowListCopyWindowInfo` fails intermittently when the terminal steals focus, forcing full-screen processing and green-pixel noise from non-ball UI elements.
-
-### Lean Vision Loop (UI Automation)
-
-**`backend/vision/lean_loop.py`**
-
-The underlying capture-think-act loop for UI automation tasks. Supports Claude Computer Use native API and an agentic fallback with provider cascade (Doubleword 235B VL, Claude Vision, J-Prime LLaVA). Each turn captures a screenshot at CU display resolution (1280x800), sends it with visual memory to the model, parses the action response, executes via pyautogui with Retina coordinate scaling, and verifies via pixel-diff. All tunables are environment-variable driven.
-
-### Ghost Hands
-
-**`backend/ghost_hands/background_actuator.py`**
-
-Focus-preserving UI automation. Ghost Hands executes actions on background windows without stealing keyboard focus from the user's active window. Three backends are available: Playwright for browser DOM manipulation, AppleScript/JXA for native macOS apps, and Quartz CGEvent injection for low-level input. A `FocusGuard` singleton saves and restores the frontmost application around every action.
-
-### Ouroboros Governance Engine
-
-**`backend/core/ouroboros/`**
-
-The self-developing code pipeline — the organism's immune system and neuroplasticity layer. Ouroboros runs an 11-phase governance pipeline (CLASSIFY → ROUTE → CONTEXT_EXPANSION → PLAN → GENERATE → VALIDATE → GATE → APPROVE → APPLY → VERIFY → COMPLETE) that detects improvement opportunities, generates multi-repo patches, validates them in sandboxed worktrees, applies them through branch-isolated sagas, and narrates every decision via voice and TUI.
-
-**Status (2026-04-15):** The governed complex-route arc has closed end-to-end. Session `bt-2026-04-15-175547` (Session O of the April 14-15 Sessions A–O battle-test arc) produced the first autonomously-generated Python file to land on disk through the full enforcement pipeline: `tests/governance/intake/sensors/test_test_failure_sensor_dedup.py` (4,986 bytes), written by the ChangeEngine after the `ExplorationLedger` scored the retry at `would_pass=True (score=11.00, 4 categories)`, `GATE can_write=True`, approval auto-approved via headless bypass, `ChangeEngine.RollbackArtifact.capture()` handled the new-file creation path, VERIFY found test critiques, L2 Repair converged on iteration 1/5, and `DECISION outcome=applied reason_code=safe_auto_passed` with a clean `POSTMORTEM root_cause=none`. Full 15-session arc postmortem with quoted terminal logs is in [`docs/architecture/OUROBOROS.md`](docs/architecture/OUROBOROS.md#battle-test-breakthrough-log). The eight distinct failure modes surfaced during the arc (TTY-less approval crash, risk-engine `too_many_files` escalation, L3 `READ_ONLY_PLANNING` mode switch from ambient probe failures, new-file `RollbackArtifact.capture()` ENOENT, 900s pool ceiling, 180s fallback cap on 5-tool-round retries, intake WAL cross-session coalescing, and the one-file-of-four multi-file fan-out gap) are each documented in the breakthrough log with their fix commits and env overrides. The end-to-end enforcement loop is now empirically validated; multi-file coordinated APPLY fan-out is the next product item.
-
-**11-Phase Pipeline:**
-
-| Phase | Component | Function |
-|---|---|---|
-| CLASSIFY | RiskEngine + ComplexityClassifier | Deterministic risk tier assignment |
-| ROUTE | BrainSelector + RouteDecisionService | Policy-driven provider selection |
-| CONTEXT_EXPANSION | ContextExpander + TheOracle + DocFetcher + WebSearch | Semantic file neighborhood + external docs + web search with epistemic allowlist |
-| GENERATE | DoublewordProvider → PrimeProvider → ClaudeProvider | 3-tier failback code generation (397B → 7B → Claude) |
-| VALIDATE | TestRunner (Python + C++ adapters) | Flake detection, structured critique, episodic memory |
-| GATE | PolicyEngine + ContractGate | Declarative YAML rules, FSM contract validation |
-| APPROVE | ApprovalProvider | Human-in-the-loop gate (idempotent, timeout → EXPIRED) |
-| APPLY | ChangeEngine + SagaApplyStrategy + InfrastructureApplicator | Transactional file writes + deterministic post-apply hooks (pip install, env reload) |
-| VERIFY | ShadowHarness + PatchBenchmarker + Shannon Entropy | Structural integrity + performance + composite ignorance measurement |
-| COMPLETE | Ledger + LearningBridge | Immutable audit trail + outcome feedback for future operations |
-
-**23 Autonomous Sensors (Intake Layer):**
-
-| Sensor | Detects | Poll Interval |
-|---|---|---|
-| TestFailureSensor | Real-time pytest failures (streak-based stability via TestWatcher) | Event-driven |
-| VoiceCommandSensor | Voice intents with STT confidence gating | Event-driven |
-| OpportunityMinerSensor | Cyclomatic complexity violations via AST | Hourly |
-| CapabilityGapSensor | Neural mesh capability boundaries | Event-driven |
-| ScheduledTriggerSensor | Cron-based governance operations (YAML config) | Configurable |
-| BacklogSensor | `.jarvis/backlog.json` task queue | 30s |
-| RuntimeHealthSensor | Python EOL, package staleness, import errors, security audit, legacy shim detection | Daily |
-| WebIntelligenceSensor | PyPI CVE/advisory vulnerabilities against installed packages | Daily |
-| PerformanceRegressionSensor | P50 latency drift, success rate drops, code quality degradation | Hourly |
-| DocStalenessSensor | Undocumented Python modules via AST analysis | Daily |
-| GitHubIssueSensor | Open issues across JARVIS/J-Prime/Reactor — auto-resolve bugs, test failures, dependency issues | Hourly |
-| ProactiveExplorationSensor | High-entropy domains identified for curiosity-driven learning | 2 hours |
-| CrossRepoDriftSensor | Contract/schema hash drift across Trinity repos | Hourly |
-| TodoScannerSensor | `TODO`, `FIXME`, `HACK` annotations in codebase — prioritizes by age and severity | Daily |
-| CUExecutionSensor | Compute unit execution tracking and resource utilization monitoring | Event-driven |
-| IntentDiscoverySensor | Manifesto-driven proactive improvement — synthesizes intents from StrategicDirection + DreamEngine + Oracle (AC2 human acknowledgment gate) | 2 hours |
-
-**Shannon Entropy Calculator (Pillar 4 — Synthetic Soul):**
-
-Computes a CompositeEntropySignal from two deterministic sources:
-- **Acute Ignorance** (per-generation): validation pass/fail, critique severity distribution, shadow harness confidence, retry exhaustion
-- **Chronic Ignorance** (historical domain): failure rate and outcome entropy from LearningBridge history
-
-Fused into a SystemicEntropyScore via `H(X) = -Σ p·log₂(p)` with a 4-quadrant decision matrix:
-
-| Acute | Chronic | Quadrant | Action |
-|---|---|---|---|
-| High | High | IMMEDIATE_TRIGGER | Emit CapabilityGapEvent → Ouroboros neuroplasticity |
-| High | Low | WARNING_RETRY | Bad prompt, not bad domain — retry with adjusted context |
-| Low | High | FALSE_CONFIDENCE | Force sandbox validation despite passing tests |
-| Low | Low | HEALTHY | No action needed |
-
-**Infrastructure Applicator (Boundary Principle):**
-
-Deterministic post-APPLY hook. When the agentic layer modifies `requirements.txt`, the deterministic skeleton automatically runs `pip install`. When `.env` is modified, it reloads environment variables in-process. The agentic layer decides WHAT to change; the skeleton executes the KNOWN consequence.
-
-| File Modified | Deterministic Action |
-|---|---|
-| `requirements.txt` | `venv/bin/pip install -r requirements.txt` |
-| `package.json` | `npm install` |
-| `.env`, `backend/.env` | In-process env var reload (additive merge) |
-
-### Ouroboros + Venom: The Proactive Autonomous Developer (O+V)
-
-<p align="center">
-  <img src="docs/images/ov-logo.jpeg" alt="Ouroboros + Venom (O+V) — the autonomous self-development engine" width="480">
-</p>
-
-<p align="center"><em>O+V — the Ouroboros serpent (the self-improvement loop) encircling the Venom &ldquo;V&rdquo; (the agentic tool engine).</em></p>
-
-**The Paradigm Shift: Proactive, Not Reactive**
-
-Traditional AI coding assistants (Claude Code, Cursor, Copilot) are *reactive* -- they wait for a human to type a prompt, then respond. Ouroboros + Venom (O+V) inverts this relationship. O+V is a **proactive autonomous developer** that continuously explores the codebase, detects improvement opportunities through 23 sensors, synthesizes patches, validates them, and applies them -- all without human intervention unless the severity of the change demands it.
-
-Think of it this way: **Claude Code proved the UX language for AI-assisted development. O+V uses that same language for autonomous work.** The difference is that O+V initiates its own work, understands the developer's architectural direction from the Manifesto, and decides what to build next based on strategic intent rather than waiting for instructions.
-
-```
-Claude Code (Reactive)           Ouroboros + Venom (Proactive)
-========================         ==============================
-Human types prompt        -->    23 sensors detect opportunities
-Human reviews suggestion  -->    Risk engine classifies autonomy tier
-Human approves change     -->    Iron Gate auto-approves / escalates by severity
-Human runs tests          -->    Post-apply verification loop + L2 self-repair
-Human moves to next task  -->    Session intelligence carries lessons forward
-```
-
-**When does O+V escalate to a human?**
-
-O+V uses a **graduated severity protocol** with four tiers:
-
-| Tier | Color | Behavior | Trigger |
-|------|-------|----------|---------|
-| `SAFE_AUTO` | Green | Auto-apply, silent in logs | Single-file, non-core, low-risk |
-| `NOTIFY_APPLY` | Yellow | Auto-apply, prominent CLI notice | New files, multi-file changes, core path modifications |
-| `APPROVAL_REQUIRED` | Orange | Block until human approves | Security-sensitive paths, breaking API changes |
-| `BLOCKED` | Red | Reject outright | Supervisor, credentials, governance engine itself |
-
-The organism handles Green and Yellow autonomously. Orange pauses and asks. Red never proceeds.
-
-**SerpentFlow CLI: Claude Code UX for Autonomous Work**
-
-The `SerpentFlow` CLI (`battle_test/serpent_flow.py`, 1,900+ lines) renders O+V's autonomous operations using the visual language pioneered by Claude Code -- `Update(path)` blocks, `Added N, removed M` summaries, numbered context diffs with `+`/`-` coloring -- but within an organism-themed flowing terminal that reflects O+V's proactive nature:
-
-```
-  ┌ op-2026-0408-1723 ────────────────────────────────
-  │ TestFailure  Fix assertion error in test_provider.py
-  │ triage       GENERATE (0.92)
-  │ 🧬 synthesized  1 candidate via DW-397B + 🔧 3  1,247 tok  (4.2s)
-  │ ⏺ Read(backend/core/ouroboros/governance/providers.py)
-  │ ⏺ Read(tests/test_provider.py)
-  │ ⏺ Update(tests/test_provider.py)
-  │   ⎿  Added 3 lines, removed 1 line
-  │   ⎿  reasoning: fix off-by-one in assertion — expected 3, was comparing to 2
-  │      42   def test_parse_tool_calls(self):
-  │      43 -     assert len(result) == 2
-  │      43 +     assert len(result) == 3
-  │      44 +     assert result[2].name == "search_code"
-  │ 🛡️ immune      ✅ 7/7 passing
-  │ ⏺ Verify(test_provider.py)
-  │   ⎿  ✅ 7/7 passing
-  │ ⚠ NOTIFY     multi_file_change  providers.py, test_provider.py
-  │   ⎿  auto-applying (Yellow severity — review in git log)
-  └ ✅ complete    DW-397B  $0.003  (8.1s)
-```
-
-Key differences from a pinned Rich `Live` table:
-- **Flowing output** -- events scroll like a terminal log, not a fixed dashboard
-- **CC-style artifact blocks** -- `Read`, `Update`, `Write`, `Verify` with context diffs
-- **Per-operation reasoning** -- model rationale displayed under each `Update` block
-- **Organism personality** -- op-scoped `┌│└` borders, sensor vocabulary, serpent boot banner
-- **Interactive REPL** -- `prompt_toolkit`-based command input while operations flow above
-
-**7 Autonomous Developer Intelligence Capabilities**
-
-These capabilities make O+V behave like a senior developer, not a code completion engine:
-
-**1. Operation Intent Visibility** -- Every operation displays the model's reasoning for why it made a specific change. The rationale is captured from the generation output and displayed as a `reasoning:` line under each `Update` block. No black-box patches.
-
-**2. Severity-Based Human Escalation** -- The 4-tier graduated protocol (Green/Yellow/Orange/Red) described above. `NOTIFY_APPLY` is the key innovation: changes that are safe enough to auto-apply but important enough to surface prominently -- new file creation, multi-file modifications, core orchestration paths.
-
-**3. Operation Dependency Chains (DAG-Based Signal Merging)** -- When multiple sensors detect opportunities that target the same files, O+V prevents conflicting concurrent patches. The `UnifiedIntakeRouter` tracks active file operations and queues overlapping signals behind the in-flight operation. When the blocking op completes, queued signals are automatically re-ingested. No merge conflicts from the organism fighting itself.
-
-**4. Exploration-First Enforcement** -- The generation prompt requires the model to call at least 2 exploration tools (`read_file`, `search_code`, `get_callers`) before proposing any code change. This prevents patches generated from stale parametric memory. "A senior engineer reads first, then writes."
-
-**5. Post-Apply Verification Loop** -- After APPLY succeeds, O+V runs a **scoped test suite** targeting only the files that were just modified. On failure, the operation routes into L2 self-repair (up to 5 iterations, 120s timebox) instead of immediately rolling back. The CLI renders a `Verify(files)` block showing pass/fail counts. Only if L2 repair also fails does rollback occur.
-
-**6. Cumulative Session Intelligence** -- An ephemeral lessons buffer on the orchestrator accumulates compact insights from every operation in the session: `[OK] description (files)` for successes, `[FAIL:pattern] description (files)` for failures. These lessons are injected as a `## Session Lessons` section into subsequent generation prompts. The model learns within a session without persistent fine-tuning. Capped at 20 lessons (configurable via `JARVIS_SESSION_LESSONS_MAX`).
-
-**7. Cost-Aware Operation Prioritization** -- The intake router's priority queue factors urgency, file count, and confidence into a composite score. Critical/high-urgency signals are promoted. Multi-file operations (which consume more generation tokens for less focused impact) are mildly deprioritized. High-confidence signals (>=0.9) get a slight boost. Within the same source tier, focused single-file ops are processed before sprawling multi-file ones.
-
-**O+V vs Claude Code: Comparative Architecture**
-
-| Dimension | Claude Code | O+V |
-|---|---|---|
-| **Initiation** | Human types prompt | 23 sensors detect opportunities autonomously |
-| **Scope** | Single conversation | Continuous session across hundreds of operations |
-| **Cost** | $3-15/M tokens (Claude) | $0.10-0.40/M tokens (DW 397B primary) |
-| **Codebase understanding** | Per-conversation exploration | Oracle semantic index + per-file reputation memory |
-| **Self-repair** | User retries manually | L2 repair engine (5 iterations, 120s timebox, failure classification) |
-| **Risk governance** | User judgment | 4-tier deterministic risk classification + Iron Gate |
-| **Strategic direction** | User provides context | Manifesto auto-injected into every prompt |
-| **Cross-session learning** | None | MemoryEngine (file reputation), LearningConsolidator (domain rules) |
-| **Regression prediction** | None | ProphecyEngine predicts risk before generation |
-| **Multi-repo** | Single repo | Saga-based cross-repo patches (JARVIS + J-Prime + Reactor) |
-| **Session intelligence** | Conversation context | Cumulative lessons buffer injected into prompts |
-| **UX language** | `Update(path)` + diffs | Same CC UX language, adapted for autonomous flowing output |
-
-**How O+V Understands Your Direction**
-
-O+V doesn't just fix bugs -- it understands *where the project is going*:
-
-1. **StrategicDirectionService** reads the Manifesto (README.md) and architecture docs at boot, extracts the 7 core principles, and injects them into every generation prompt
-2. **IntentDiscoverySensor** combines Manifesto principles + DreamEngine blueprints + Oracle semantic search to proactively discover what should be improved next
-3. **Session intelligence** carries forward what worked and what failed within the current session
-4. **MemoryEngine** builds per-file reputation across sessions -- fragile files get extra scrutiny, stable files get lighter validation
-5. **SuccessPatternStore** records (domain, approach, outcome) triples so the organism can replicate what works
-
-The organism reads the Manifesto, understands "async-first, zero shortcuts, structural repair", and generates code that aligns with those principles.
-
-**Graduation Orchestrator (Pillar 6):**
-
-Converts ephemeral tools into permanent agents: TRACKING → EVALUATING → WORKTREE_CREATING → GENERATING → VALIDATING → COMMITTING → AWAITING_APPROVAL → PUSHING → AWAITING_MERGE → REGISTERING → GRADUATED. After `JARVIS_GRADUATION_THRESHOLD` (default 3) successful uses, synthesizes production-ready agent code, runs contract tests, creates a Git PR, and hot-loads the new agent on merge.
-
-**Web Search Capability (Epistemic Allowlist):**
-
-Structured web search for CONTEXT_EXPANSION. When the 397B Architect encounters a capability gap, it can search for solutions across developer-verified domains. Three backends: DuckDuckGo (free, default, no API key), Brave Search API, Google Custom Search.
-
-Safety: Results are domain-restricted to an epistemic allowlist of 28 high-signal developer domains (stackoverflow.com, github.com, docs.python.org, readthedocs.io, pytorch.org, etc.). Results from unverified blogs, social media, and random websites are silently dropped to prevent prompt injection. Bounded: 3 results max, 10s timeout, 6K chars per page.
-
-**Adaptive Learning System:**
-
-Three interconnected learning components that make the organism smarter over time:
-
-- **LearningConsolidator**: Periodically synthesizes domain-level rules from outcome history. "Domain X fails 67% of the time due to import_error" becomes actionable context injected into future generation prompts. Persisted to `~/.jarvis/ouroboros/learning/`.
-- **SuccessPatternStore**: Records successful (domain, context, approach) triples. On future similar tasks, injects "a similar task succeeded with this approach." The positive counterpart to EpisodicMemory's failure tracking — the organism learns from what WORKS, not just what breaks.
-- **ThresholdTuner**: Analyzes false positive and miss rates for each threshold parameter. If the system triggers too often without value (FP > 40%), raises threshold. If regressions slip through (miss > 30%), lowers threshold. Self-calibrating organism.
-
-**Intelligence Hooks (Pre-GENERATE):**
-
-- **TestCoverageEnforcer**: Checks if target files have existing test coverage. If zero tests exist, injects "also generate tests" into the generation prompt. No code ships untested.
-- **TestGenerationHook**: Detects when candidates create new modules without companion test files. Flags for the retry/repair loop.
-- **SemanticReviewGate**: Path-based pre-filter for the existing SecurityReviewer. Identifies security-sensitive files (auth, crypto, unlock, supervisor) for focused LLM-as-a-Judge review before APPROVE.
-
-**GitHub Issue Auto-Resolution:**
-
-The organism fixes its own bugs. GitHubIssueSensor polls open issues across all three Trinity repos (JARVIS, J-Prime, Reactor) via the `gh` CLI. Issues are classified by labels and content to determine urgency and whether Ouroboros can auto-resolve them (test failures, dependency issues, tracebacks → yes; design decisions, architecture changes → requires human). Recurring issues (e.g., daily "Unlock Test Suite Failed") are deduplicated and emitted as a single high-priority envelope with `recurring_count`.
-
-### Voice Biometric Authentication
-
-**`backend/voice_unlock/`**
-
-Speaker verification using ECAPA-TDNN embeddings (192-dimensional vectors). Voiceprints are stored in Cloud SQL. The system captures audio continuously, extracts embeddings, and compares them against enrolled profiles with an 85% cosine similarity threshold. Supports contextual awareness (time-of-day, location, microphone type), continuous learning from successful unlocks, and anti-spoofing detection. The unlock flow is wired through `backend/api/voice_unlock_api.py`.
-
-### Voice-First Interactive Conversation
-
-**`backend/voice/conversation_manager.py` + `barge_in_detector.py` + `jarvis_voice_bridge.py`**
-
-The primary interface is voice. Derek talks to JARVIS and JARVIS talks back — no keyboard required.
-
-**ConversationManager** classifies 11 utterance types (greeting, status, code task, code question, confirmation, denial, emergency, positive/negative feedback, farewell, ambient) via deterministic keyword matching and routes each to the appropriate handler. Multi-turn context tracks the last 10 turns with topic continuity, pending questions, and active operation status.
-
-**BargeInDetector** monitors audio capture energy (RMS) every 50ms during TTS playback. If Derek speaks while JARVIS is talking, the afplay process is killed immediately (SIGTERM → SIGKILL) and audio capture resumes. Like Alexa/Siri — interrupt anytime.
-
-**JarvisVoiceBridge** is the integration glue: registered as a transcript hook on `RealTimeVoiceCommunicator`, all transcribed speech flows through the ConversationManager. Code tasks route to `VoiceCommandSensor` → Ouroboros pipeline. Proactive speech (predictions, emergencies, milestones) can be injected via `inject_proactive()`.
-
-**ProactiveSpeechEngine** allows JARVIS to speak first — predictions, emergency alerts, operation completions, milestones — with configurable debounce (30s default).
-
-### 🎙️ Voice I/O — the `ov` Conversational Loop (status 2026-07-26; see note)
-
-> **Superseded in part.** A voice-authentication arc landed 2026-08-03→08 and is not reflected below: the enrolled "formants" were peak-picked rumble (`3461c04e5b`), the Bayesian fusion was computed and overwritten on the next line (`626df1e377`), SNR was promoted unmeasured (`ee66c8337a`), and the installer authored an authorization rule instead of amending it (`76c5e87983`). Read those commits before trusting this section's biometric claims.
-
-The operator speaks to Karen in the `ov` cockpit and gets a spoken answer. This is the Body's primary afferent nerve — and the one major subsystem in this repository that has **never completed a full cycle in production**. Full analysis, root-cause ranking and phased roadmap: **`docs/architecture/OUROBOROS_VENOM_PRD.md` §24**.
-
-**The path** (every stage exists; none is stubbed):
-
-```
-speech → CoreAudio → AudioBus (AEC · 48→16k · range-fit) → StreamingSTT (VAD endpoint ·
-pre/post-roll · faster-whisper) → ConversationPipeline → AdaptiveVoiceRouter → DoubleWord
-→ UnifiedTTSEngine → AudioBus → speaker
-```
-
-**Proven, individually and on hardware:**
-
-| Claim | Evidence |
-|---|---|
-| Control plane arms the mic | `ov` frame → `LISTENING` at +50 ms → `[Bootstrap] audio lease ARMED` |
-| The STT pipeline transcribes speech | Golden Master through the **live** engine — **100 %**, twice |
-| Bus → model handoff is lossless | cross-correlation **1.000**, gain **0.00 dB**, live in production |
-| DoubleWord is primary | `route_for() == "remote"` with no env set; local is emergency-only |
-| Karen can speak | `[Acoustic] speaking:` + `[SPEECH START]` — heard by the operator |
-| **Operator speech transcribes** | ❌ **never** |
-
-**The blocker is acoustic, not software.** Measured at the operator's desk vs known-good speech:
-
-| | operator, seated | known-good |
-|---|---|---|
-| crest factor | 18.5 – 37.2 dB | **15.8 dB** |
-| syllabic modulation | 0.14 – 0.24 | **0.472** |
-| Whisper | `""` / `"I'm sorry."` | 100 % |
-
-`"I'm sorry."` is faster-whisper's **non-speech prior** — what it emits when handed something that is not language. High crest with low modulation is the *distance signature*: sustained vowels decay into the room floor while consonant transients survive.
-
-**Crest factor cannot be fixed in software.** It is `peak/rms`, a ratio — a scalar gain scales both terms identically. Proven: raising macOS input volume 40 → 85 lifted rms **6.4× (+16 dB)** and moved crest **not at all**. Every amplitude-based fix in this arc failed for that reason.
-
-**Shipped in this arc** — #70106 window-scoped forensics verdict + per-incident handoff integrity · #70107 partial cadence anchored to speech onset · #70108 Golden Master injector + the fix that finally gave Karen a working voice · #70109 `AdaptiveInputManager` proximity re-binder · #70110 device identity by name, not CoreAudio index. Spines: 43 new tests; `tests/audio` + `tests/voice` **548 passed, 5 skipped**.
-
-**Next** — V1: get one capture under 20 dB crest with modulation > 0.4 (Continuity mic awake and beside the operator, or a headset; the re-binder detects and binds either automatically). V2: prove one complete turn. V3: p50 < 1.5 s to first syllable. V4: robustness. V5: voice as an intake channel into the 11-phase pipeline.
+**Requirements:** Windows 11 + WSL2 (Ubuntu) or Linux — the engine is POSIX-only (`fcntl`, Unix sockets, `SIGHUP`) · Python **3.11.10** · NVIDIA GPU with ≥ 32 GB VRAM for the local 30B lane · a running [J-Prime](https://github.com/drussell23/JARVIS-Prime) engine. Full guide: [`docs/BRINGUP_WINDOWS_WSL2.md`](docs/BRINGUP_WINDOWS_WSL2.md).
 
 ```bash
-# Is the PIPELINE working? (synthetic speech, known transcript, real engine)
-python3 scripts/stt_golden_master.py --golden "Karen can you hear me clearly"
-
-# Run the plane with the proximity re-binder armed
-JARVIS_ADAPTIVE_INPUT=1 python3 backend/audio/audio_plane_host.py
+# Clone onto ext4 inside WSL2 — never /mnt/c (9p is too slow for a repo this size)
+git clone https://github.com/drussell23/JARVIS.git ~/jarvis && cd ~/jarvis
+pyenv install 3.11.10 && pyenv local 3.11.10
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt && pip install -e .      # installs the `ov` CLI
+cp .env.example .env
 ```
 
-> **Methodology note.** Four defects in this arc were *instruments lying*, not components breaking — a lifetime counter presented as a per-incident measurement, a false `PASS` on the model's non-speech prior, a composite score logged without its components, a truncated correlation search reported as divergence. An unreliable instrument costs more than a broken component, because it sends the next several sessions in a confidently wrong direction. Every diagnostic here now carries an epistemic floor that reports `unverifiable` rather than guessing.
-
-### JARVIS-Level Intelligence (7 Tiers)
-
-**`backend/core/ouroboros/governance/` — 7 tiers of autonomous intelligence**
-
-| Tier | Module | What It Does |
-|---|---|---|
-| **1. Proactive Judgment** | `operation_advisor.py` | Evaluates blast radius, test coverage, chronic entropy, time, staleness. BLOCK / ADVISE_AGAINST / CAUTION / RECOMMEND. "I wouldn't recommend that, sir." |
-| **2. Emergency Protocols** | `emergency_protocols.py` | 5-level escalation: GREEN → YELLOW → ORANGE → RED → HOUSE PARTY. Alert accumulation with exponential decay. Named protocols: HOUSE_PARTY, CLEAN_SLATE, IRON_LEGION, VERONICA. |
-| **3. Predictive Intelligence** | `predictive_engine.py` | Anticipates regressions: code velocity (22 changes/7d → 100% risk), dependency fragility, test decay, resource trajectory. Background task every 4h. |
-| **4. Self-Preservation** | `distributed_resilience.py` | Heartbeat to GCP (60s), state sync (5m), automatic failover if primary offline for 5 min. Survives crashes. |
-| **5. Cross-Domain Reasoning** | `jarvis_intelligence.py` | Fuses code + infrastructure + user behavior + security + business into unified insights. |
-| **6. Personality** | `jarvis_intelligence.py` | 5 states: CONFIDENT / CAUTIOUS / CONCERNED / PROUD / URGENT. Deterministic from metrics. Voice templates per state. |
-| **7. Autonomous Judgment** | `jarvis_intelligence.py` | Daily self-review, strategic planning, value alignment (7 explicit principles). The organism governs its own evolution. |
-
-### Self-Evolution Engine
-
-**`backend/core/ouroboros/governance/self_evolution.py`**
-
-9 research-grade self-programming techniques from 5 academic papers:
-
-1. **Runtime Prompt Adaptation** (Live-SWE-Agent) — prompts evolve based on execution outcomes
-2. **Module-Level Mutation** (CSE) — surgical function-level code evolution via AST
-3. **Negative Constraints** (CSE) — explicit "never do X" rules from failed attempts
-4. **Code Metrics Feedback** (SPA) — complexity, docstring coverage, line count drive generation
-5. **Dynamic Re-Planning** (Devin v3.0) — pattern-matched failure → alternative strategy
-6. **Multi-Version Evolution** (SWE-EVO) — epoch-based tracking: improving / stable / degrading
-7. Generate-Verify-Refine cycle (strengthened)
-8. Hierarchical Memory with positive/negative distinction (strengthened)
-9. Repository auto-documentation via CodeMetricsAnalyzer
-
-### Advanced Repair Techniques
-
-**`backend/core/ouroboros/governance/advanced_repair.py`**
-
-3 state-of-the-art APR techniques from 2026 research:
-
-1. **Hierarchical Fault Localization** (Agentless + RepoRepair) — 3-stage narrowing: file → function → line. Reduces prompt size ~10x.
-2. **Slow/Fast Thinking Router** (SIADAFIX) — simple fixes get 0.5x tokens, complex get 2x + force Tier 0.
-3. **Documentation-Augmented Repair** (RepoRepair) — auto-generate docs via AST FIRST, use as repair context.
-
-### Battle Test Interfaces (SerpentFlow + 6 Graduated Subsystems)
-
-**`backend/core/ouroboros/battle_test/`** — 52 files, the TUI/CLI rendering surface.
-
-| Subsystem | Key Files | Lines | Graduated | Master Switch |
-|-----------|-----------|-------|-----------|---------------|
-| **SerpentFlow** | `serpent_flow.py` (355KB) | CC-style flowing CLI REPL with `Update(path)` blocks, numbered diffs, prompt_toolkit | Shipped | — |
-| **Presentation Restraint** | `presentation_restraint.py`, `repl_completion.py`, `repl_input_polish.py` | CC-style aesthetic, auto-discovered slash palette (27 verbs), FileHistory, @filepath mentions, Esc-to-cancel | 2026-05-04 | `JARVIS_PRESENTATION_RESTRAINT_ENABLED` |
-| **NarrativeChannel** | `narrative_channel.py`, `narrative_renderer.py` | 6-kind `NarrativeKind` taxonomy, `n-N` refs, intent 💭 + preamble 🗣 surfaces | 2026-05-04 | `JARVIS_NARRATIVE_INTENT_ENABLED` |
-| **ToolRenderRegistry** | `tool_render_registry.py`, `tool_render_policy.py`, `tool_render_view.py`, `tool_render_store.py` | Descriptor-driven adaptive rendering, `BoundedBodyStore` ring with `t-N` refs | 2026-05-04 | `JARVIS_TOOL_RENDER_REGISTRY_ENABLED` |
-| **Live Status + Op Collapse** | `live_status_line.py`, `op_block_buffer.py` | Persistent `PromptSession(bottom_toolbar=...)` status, `OpBlockBuffer` FIFO ring with `o-N` refs | 2026-05-04 | `JARVIS_LIVE_STATUS_LINE_ENABLED` |
-| **IDE ReviewBranch** | `diff_archive.py` + `governance/review_branch_manager.py`, `review_coordinator.py` | Non-destructive git preview branches (`hash-object`+`commit-tree`+`branch`), `d-N` refs, 300s auto-REJECT | 2026-05-04 | `JARVIS_REVIEW_BRANCH_ENABLED` |
-| **Stream Renderer** | `stream_renderer.py`, `ouroboros_tui.py`, `split_layout.py`, `layout_controller.py` | Rich `Live + Markdown` 16ms batched updates, 3-region Layout, flow/split/focus FSM | Shipped | — |
-
-Terminal muting architecture: 3-channel muting throughout (`sys.stdout`, `sys.stderr`, Rich console) to prevent interleaving between the organism's output and the TUI's live updates.
-
-### The Transcript — one ordered history, five vocabularies
-
-The cockpit addressed its history through independent rings — `o-N` op blocks,
-`d-N` diffs, `t-N` tool bodies, `n-N` narrative — each with its own capacity and
-eviction. Two consequences followed from that shape, neither a bug in any single
-store: a surviving `o-12` could reference a `t-7` that had already aged out, and
-nothing knew whether `t-7` happened before or after `n-4`, because "next" spans
-namespaces and no structure spanned namespaces.
-
-| Module | Role |
-|---|---|
-| `transcript_spine.py` | Append-only sequence the four rings became views of. Capacity is the **sum of what those rings already held**, read from their own modules — so unifying retention evicts nothing that survived before. Uniform oldest-first eviction makes a dangling reference structurally impossible rather than handled. |
-| `transcript_milestones.py` | APPLY / VERIFY / commit as a fifth vocabulary (`m-N`), arriving through the existing `add_ops_digest_listener` fan-out so `SessionRecorder` keeps its slot. |
-| `transcript_log.py` | Frame codec + crash-recovery reader. `<crc32>\t<json>\n`; the checksum (not write atomicity) detects a tear, because POSIX does not promise a >1-sector write lands atomically under power loss. Recovery returns the longest **valid prefix** and stops at the first bad frame — skipping would silently reorder the transcript. |
-| `transcript_writer.py` | Group-committed durable append. **Seal, don't limp**: a write failure truncates back to the last verified offset and refuses every later append, because appending past a tear orphans everything after it. Health is reported as `DURABLE` / `DEGRADED` / `SEALED` — degraded means still writing while no longer *claiming* durability. |
-| `transcript_timeline.py` | Causal join (apply→verify→commit per op) as a **projection**, holding no state and no second store. |
-| `governance/durable_io.py` | The platform primitives. On macOS `fsync()` does not flush the drive's write cache — `fcntl(fd, F_FULLFSYNC)` does; and a rename is durable only after the **directory** is fsynced. Both were missing from every atomic-write helper in the repo. |
-
-Crash-consistency is proved by three oracles in `transcript_kill_harness.py`, each
-honest about its reach: exhaustive truncation at every byte offset (the reader), a
-real `SIGKILL` of a real child process at IPC-signalled seams (the writer), and a
-simulated power-cut replay (the durability boundary — which a `SIGKILL` structurally
-cannot test, since the page cache survives a dead process).
-
-> Durability is **off by default** (`JARVIS_TRANSCRIPT_DURABLE_ENABLED`). It is armed
-> and unit-proven but not yet live-proven end-to-end.
-
-### Attention-gated review clock
-
-`JARVIS_REVIEW_TIMEOUT_S` was wall-clock, so a Yellow-tier review raised while the
-cockpit was detached burned its whole window against an empty socket and auto-expired —
-discarding verified work in a way indistinguishable from an operator who looked and said
-no. `governance/attention_ledger.py` makes *attended* time a first-class quantity;
-`ReviewCoordinator` takes a mark on it rather than keeping a private clock. The gate is
-**self-arming** — inert until some operator has attached at least once — so headless
-soaks keep exact legacy behaviour, and a paused review stays bounded by an absolute
-ceiling reported as `unattended_ceiling`, never confused with a considered rejection.
-
-### Rehearsal tier — an honest terminal when every lane is dry
-
-When a provider returns 402 the breaker classifies it and fails over correctly; the
-defect was that every subsequent op re-walked the full cascade to rediscover an outage
-the ledger already held. `governance/rehearsal_tier.py` closes that loop and **produces
-no code**: `RehearsalOutcome` has no content/diff/patch field to put fabricated work in,
-`provenance` is a read-only constant, and AST pins prove the module never imports a
-mutation surface. Off by default (`JARVIS_REHEARSAL_TIER_ENABLED`).
-
-### Trinity Consciousness (Zone 6.11 — Self-Awareness Layer)
-
-**`backend/core/ouroboros/consciousness/`** (11 modules)
-
-The metacognition layer that gives Ouroboros self-awareness. Composed by `TrinityConsciousness` with phased startup/shutdown and cross-engine integrations.
-
-| Engine | Lines | Function |
-|---|---|---|
-| **HealthCortex** | 668 | Monitors system health metrics and Trinity component states (JARVIS, J-Prime, Reactor) |
-| **MemoryEngine** | 680 | Records operation outcomes, builds per-file reputation (success rate, fragility score), provides fragile-file context at GENERATE RETRY |
-| **DreamEngine** | 828 | Idle GPU speculative analyzer — 5 readiness gates (J-Prime health, user idle, VM warmth, resource governor, daily budget) → generates improvement blueprints during idle time with preemption and flap damping |
-| **ProphecyEngine** | 402 | Predicts regression risk from code changes and historical data — injected at CLASSIFY |
-| **ContextualAwareness (CAI)** | 879 | Deep code structure understanding via AST and dependency analysis |
-| **SituationalAwareness (SAI)** | 1,333 | System state and goal comprehension — tracks what the organism is doing and why |
-| **UnifiedAwareness (UAE)** | 1,232 | Fuses CAI + SAI into a unified organism perspective for decision-making |
-
-**ConsciousnessBridge** (`consciousness_bridge.py`) decouples consciousness from the governance pipeline:
-- **CLASSIFY**: Injects regression risk assessment from ProphecyEngine
-- **GENERATE RETRY**: Injects fragile-file memory from MemoryEngine
-- **POST-APPLY**: Records operation outcomes for future learning
-- **ProactiveDrive**: Health-gated background operation suggestions
-
-### Unified Supervisor
-
-**`unified_supervisor.py`** (~98K lines)
-
-The monolithic kernel and single entry point for the entire ecosystem. Organized into seven zones:
-
-| Zone | Name | Purpose |
-|---|---|---|
-| 0 | Early Protection | Signal handling, virtualenv detection, fast-fail checks |
-| 1 | Foundation | Imports, configuration, constants |
-| 2 | Core Utilities | Logging, distributed locks, retry logic |
-| 3 | Resource Managers | Docker, GCP VM lifecycle, port management, storage |
-| 4 | Intelligence Layer | ML model routing, goal inference, SAI |
-| 5 | Process Orchestration | Signal handling, cleanup, hot reload, Trinity coordination |
-| 6 | The Kernel | `JarvisSystemKernel` class, Ouroboros governance (Zones 6.0--6.9) |
-| 7 | Entry Point | CLI argument parsing, `main()` |
-
-Design principles: async-first parallel initialization, graceful degradation (components fail independently), self-healing (auto-restart crashed processes), lazy ML model loading, and adaptive thresholds that learn from outcomes.
-
----
-
-## Model Routing (3-Tier Cascade)
-
-All inference requests flow through `PrimeRouter` (`backend/core/prime_router.py`) and `MindClient` (`backend/core/mind_client.py`), which implement a tiered fallback cascade.
-
-| Tier | Name | Backend | Models | When Used |
-|---|---|---|---|---|
-| 0 | PRIMARY | Doubleword Batch API | Qwen3.5-397B-A17B (reasoning), Qwen3.5-35B-A3B (fast), vision and Nemotron variants | Latency-insensitive tasks above complexity 0.85; 29x cheaper than J-Prime VM time for batch workloads |
-| 1 | SECONDARY | Anthropic Claude API | claude-sonnet-4, claude-haiku-4-5 | Real-time interactive commands, vision verification, fallback when J-Prime is unavailable |
-| 2 | TERTIARY | GCP J-Prime (self-hosted) | Qwen2.5-Coder-7B/14B/32B, LLaVA v1.5, Phi-3 Mini | On-demand when the GCP VM is running; free per-request (VM spot cost only) |
-
-Brain selection for interactive commands is handled by `InteractiveBrainRouter` (`backend/core/interactive_brain_router.py`), which reads `brain_selection_policy.yaml` and maps task types to complexity tiers at runtime. Both the interactive router and the Ouroboros `BrainSelector` share the same YAML policy file as their single source of truth.
-
-#### Urgency-Aware Provider Routing
-
-Deterministic routing based on signal urgency + source + task complexity. Stamped at ROUTE phase by `UrgencyRouter` (`urgency_router.py`). No LLM calls — pure code, <1ms.
-
-| Route | Strategy | Cost | When |
-|-------|----------|------|------|
-| IMMEDIATE | Codex direct, skip DW | ~$0.03/op | Critical urgency, voice commands, test failures, runtime health |
-| STANDARD | DW primary → Codex fallback | ~$0.005/op | Normal-priority moderate ops (default cascade) |
-| COMPLEX | Codex plans → DW executes | ~$0.015/op | heavy_code, multi-file architectural changes |
-| BACKGROUND | DW only, no Codex fallback | ~$0.002/op | OpportunityMiner, DocStaleness, TODOs, backlog |
-| SPECULATIVE | DW batch fire-and-forget | ~$0.001/op | IntentDiscovery, DreamEngine pre-computation |
-
-**Timeout enforcement (route-aware):** IMMEDIATE: 60s + 5s grace. STANDARD: 120s. COMPLEX/BACKGROUND: 180s. Fallback provider hard cap: 60s. DW poll interval: 5s.
-
----
-
-## Quick Start
+Point the local lane at J-Prime in `.env`:
 
 ```bash
-# Clone
-git clone https://github.com/drussell23/JARVIS-AI-Agent.git
-cd JARVIS-AI-Agent
-
-# Install dependencies (Python 3.9+ — tested on 3.9 through 3.12)
-pip install -r requirements.txt
-
-# Configure environment
-cp backend/.env.example backend/.env
-# Edit backend/.env -- add at minimum: ANTHROPIC_API_KEY
-
-# Launch the full stack
-python3 unified_supervisor.py
-
-# Or launch with options
-python3 unified_supervisor.py --skip-docker --skip-gcp   # local-only, no cloud
-python3 unified_supervisor.py --mode production           # no hot reload
-python3 unified_supervisor.py --status                    # check running kernel
-python3 unified_supervisor.py --shutdown                  # graceful stop
+JARVIS_LOCAL_PRIME_ENABLED=true
+JARVIS_LOCAL_MODEL_BASE_URL=http://127.0.0.1:8000
+JARVIS_LOCAL_MODEL_NAME=qwen3-coder-ov:30b
+JARVIS_PAID_LANES_ENABLED=false          # zero-cost: local lane only
 ```
 
-### Ouroboros Battle Test
-
-Run the autonomous self-development pipeline with the SerpentFlow CLI:
+Verify, then run:
 
 ```bash
-# Full 6-layer stack with $0.50 budget and 10-minute idle timeout
-python3 scripts/ouroboros_battle_test.py --cost-cap 0.50 --idle-timeout 600 -v
-
-# Minimal budget for quick smoke test
-python3 scripts/ouroboros_battle_test.py --cost-cap 0.10 --idle-timeout 120 -v
+JARVIS_COMPUTE_TOPOLOGY_ENABLED=1 ov doctor   # hardware + sibling health, works with the daemon down
+ov                                            # interactive cockpit (arms the Sentinel; --no-sentinel to opt out)
+ov run --max-wall-seconds 2400                # headless soak
 ```
-
-The battle test boots GovernedLoopService, IntakeLayer (23 sensors), TrinityConsciousness, StrategicDirection, CommProtocol, and SerpentFlow. The CLI displays real-time operation progress, streaming code generation, colored diffs, tool call tracking, and L2 repair iterations. Operations are autonomously detected by sensors, triaged by SemanticTriage, generated by DW 397B (Tier 0) or Claude (Tier 1 fallback), validated in sandbox, and applied to the codebase.
-
-The supervisor auto-detects available components and starts what it can. GCP VM, Docker, and J-Prime are optional -- the system degrades gracefully to Claude API when they are unavailable.
 
 ---
 
-## Environment Variables
+## Testing and CI
 
-Core configuration. All values have sensible defaults; only `ANTHROPIC_API_KEY` is required for basic operation.
-
-> **Architecture note:** JARVIS uses a 3-layer environment injection topology:
-> 1. **FlagRegistry** (`flag_registry.py` + `flag_registry_seed.py`) — 282 typed `JARVIS_*` flags with category, source_file, and posture-relevance metadata. Typo detection via bounded Levenshtein distance.
-> 2. **IsomorphicEnv** (`isomorphic_env.py`) — Context manager that dynamically overlays operator-authoritative keys (e.g., `JARVIS_IAC_REMOTE_ROOT`, sandbox prefixes, Trinity capability flags) to ensure local/GCP fidelity parity across 4 conditions: live absolute root, cwd≠repo_root, sandbox-prefix policy, and node env vars.
-> 3. **Operator `.env`** — The operator-authoritative source for credentials and cost knobs. All other flags have sensible defaults and are discoverable via `/help flags` in the REPL.
->
-> The table below lists the **operator-facing subset**. For the full registry, run `/help flags` or query `GET /observability/flags`.
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | *(required)* | Claude API access for vision, reasoning, and fallback inference |
-| `DOUBLEWORD_API_KEY` | *(empty)* | Doubleword batch API access (Tier 0 routing + VLA vision) |
-| `DOUBLEWORD_MODEL` | `Qwen/Qwen3.5-35B-A3B-FP8` | Default Doubleword model for batch inference |
-| `DOUBLEWORD_VISION_MODEL` | `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` | Doubleword VLM for Layer 2 structural vision |
-| `DOUBLEWORD_ARCHITECT_MODEL` | `Qwen/Qwen3.5-35B-A3B-FP8` | Reasoning model for Ouroboros Neuro-Compilation |
-| `JARVIS_CLAUDE_VISION_MODEL` | `claude-sonnet-4-20250514` | Claude model for Layer 3 semantic vision |
-| `VISION_LEAN_ENABLED` | `true` | Enable the Lean Vision Loop (set `false` for legacy pipeline) |
-| `VISION_LEAN_MAX_TURNS` | `10` | Maximum see-think-act iterations per vision task |
-| `OUROBOROS_GRADUATION_THRESHOLD` | `3` | Repeated VLA calls before Ouroboros triggers Neuro-Compilation |
-| `VISION_TELEMETRY_DIR` | `/tmp/claude/vision_telemetry` | Directory for Visual Telemetry perception artifacts |
-| `VISION_TELEMETRY_MAX_ARTIFACTS` | `50` | Rolling window of saved perception frames |
-| `JARVIS_TELEMETRY_ENABLED` | `true` | Emit telemetry events (disk + optional remote) |
-| `JARVIS_PROACTIVE_MONITORING` | `false` | Enable proactive screen analysis and suggestions |
-| `JARVIS_GOVERNANCE_MODE` | `sandbox` | Ouroboros governance mode: `sandbox`, `observe`, or `governed` |
-| `JARVIS_SAGA_BRANCH_ISOLATION` | `false` | Enable branch-isolated sagas for Ouroboros patches |
-| `JARVIS_INFRA_APPLICATOR_ENABLED` | `true` | Enable deterministic post-APPLY hooks (pip install, env reload) |
-| `JARVIS_ENTROPY_SYSTEMIC_THRESHOLD` | `0.7` | Shannon entropy threshold for CapabilityGapEvent emission |
-| `JARVIS_ENTROPY_ACUTE_WEIGHT` | `0.6` | Weight of per-generation signal in composite entropy |
-| `JARVIS_ENTROPY_CHRONIC_WEIGHT` | `0.4` | Weight of historical domain signal in composite entropy |
-| `JARVIS_WEB_INTEL_INTERVAL_S` | `86400` | WebIntelligenceSensor poll interval (seconds) |
-| `JARVIS_RUNTIME_HEALTH_INTERVAL_S` | `86400` | RuntimeHealthSensor poll interval (seconds) |
-| `JARVIS_PERF_REGRESSION_INTERVAL_S` | `3600` | PerformanceRegressionSensor poll interval (seconds) |
-| `JARVIS_CTX_EXECUTOR` | `false` | Enable Executor Core Context (Strangler Fig migration) |
-| `JARVIS_CTX_COMMUNICATOR` | `false` | Enable Communicator Core Context |
-| `JARVIS_CTX_DEVELOPER` | `false` | Enable Developer Core Context |
-| `JARVIS_CTX_OBSERVER` | `false` | Enable Observer Core Context |
-| `BRAVE_SEARCH_API_KEY` | *(empty)* | Brave Search API (optional — DuckDuckGo is free default) |
-| `JARVIS_GITHUB_ISSUE_INTERVAL_S` | `3600` | GitHubIssueSensor poll interval (seconds) |
-| `JARVIS_EXPLORATION_INTERVAL_S` | `7200` | ProactiveExplorationSensor poll interval (seconds) |
-| `JARVIS_DRIFT_DETECTION_INTERVAL_S` | `3600` | CrossRepoDriftSensor poll interval (seconds) |
-| `JARVIS_INTENT_DISCOVERY_INTERVAL_S` | `900` | IntentDiscoverySensor poll interval (seconds) |
-| `JARVIS_INTENT_TEST_INTERVAL_S` | `300` | TestWatcher pytest poll interval (seconds) |
-| `JARVIS_REPO_PATH` | `.` | Repository root for TestWatcher subprocess invocation |
-| `JARVIS_SEMANTIC_REVIEW_ENABLED` | `true` | Enable semantic code review gate for sensitive files |
-| `JARVIS_VOICE_ENABLED` | `true` | Enable voice input/output |
-| `JARVIS_AUDIO_BUS_ENABLED` | `false` | Enable real-time full-duplex audio bus |
-| `JARVIS_SESSION_LESSONS_MAX` | `20` | Maximum session intelligence lessons carried forward between operations |
-| `JARVIS_VERIFY_TIMEOUT_S` | `60` | Post-apply scoped verification test timeout (seconds) |
-| `JARVIS_L2_ENABLED` | `true` | Enable L2 iterative self-repair engine (set `false` to disable) |
-| `JARVIS_EXPLORATION_GATE` | `true` | Hard-fail generation with <2 exploration tool calls |
-| `JARVIS_MIN_EXPLORATION_CALLS` | `2` | Minimum exploration tool calls required before patch |
-| `JARVIS_ASCII_GATE` | `true` | Hard-fail generation containing non-ASCII codepoints |
-| `JARVIS_L2_MAX_ITERS` | `5` | Maximum L2 repair iterations before hard stop |
-| `JARVIS_L2_TIMEBOX_S` | `120` | Total wall-clock time budget for entire repair loop |
-| `JARVIS_DEBUG` | `false` | Verbose debug logging |
-| `BACKEND_PORT` | `8000` | HTTP/WebSocket server port |
-
-See `backend/.env.example` for the complete list with descriptions.
-
----
-
-## Project Structure
-
+```bash
+python3 -m pytest tests/governance -q                 # O+V governance spine
+python3 -m pytest $(cat ci/ov-surface-suites.txt)     # the O+V surface suite CI runs
+python3 ci/lint_gate.py --root . --require-base       # undefined-name ratchet
+python3 scripts/readme_stats.py --check               # README figures match git
 ```
-JARVIS-AI-Agent/
-|-- unified_supervisor.py          # ~98K-line monolithic kernel (Zones 0-7)
-|-- backend/
-|   |-- api/                       # WebSocket + REST endpoints (FastAPI)
-|   |-- core/
-|   |   |-- mind_client.py         # Body-to-Mind HTTP bridge (hysteresis state machine)
-|   |   |-- prime_router.py        # Central inference router with fallback cascade
-|   |   |-- interactive_brain_router.py  # Task-type brain selection from YAML policy
-|   |   |-- runtime_task_orchestrator.py # Routes voice commands to vision/app/browser
-|   |   |-- gcp_vm_manager.py      # GCP VM lifecycle (create, start, stop, health)
-|   |   |-- distributed_lock_manager.py  # DLM v3.2 (Redis + file fallback)
-|   |   |-- telemetry_emitter.py   # Observability event pipeline
-|   |   `-- ouroboros/              # Self-developing governance engine
-|   |       |-- governance/                 # O+V pipeline engine (808 files, 22 subdirs, 775K lines)
-|   |       |   |-- orchestrator.py          # 11-phase pipeline
-|   |       |   |-- tool_executor.py          # Venom: 16+ tools, multi-turn agentic loop
-|   |       |   |-- candidate_generator.py    # 3-tier provider chain code generation
-|   |       |   |-- providers.py              # DoubleWord + Codex + J-Prime providers
-|   |       |   |-- repair_engine.py          # L2 iterative self-repair FSM
-|   |       |   |-- plan_generator.py         # Model-reasoned planning (schema plan.1)
-|   |       |   |-- semantic_triage.py        # Pre-generation filter
-|   |       |   |-- semantic_guardian.py      # 10-pattern AST/regex pre-APPLY detector
-|   |       |   |-- semantic_firewall.py      # 11 injection detectors + credential shapes
-|   |       |   |-- urgency_router.py         # 5-route deterministic routing
-|   |       |   |-- auto_committer.py         # Structured git commits with O+V signature
-|   |       |   |-- risk_tier_floor.py        # 3 composing env knobs, DST-correct TZ math
-|   |       |   |-- direction_inferrer.py     # 4-value posture (EXPLORE/CONSOLIDATE/HARDEN/MAINTAIN)
-|   |       |   |-- sensor_governor.py        # Global op-emission cap, posture weighting
-|   |       |   |-- flag_registry.py          # 282+ typed JARVIS_* flags, Levenshtein typo detect
-|   |       |   |-- worktree_manager.py       # L3 git worktree isolation
-|   |       |   |-- ide_observability.py      # REST routes for health/tasks
-|   |       |   |-- ide_observability_stream.py # SSE streaming, 10 event types
-|   |       |   |-- user_preference_memory.py  # 6-kind typed persistent memory
-|   |       |   |-- strategic_direction.py    # Manifesto + git momentum injection
-|   |       |   |-- brain_selector.py         # Model selection + boot handshake
-|   |       |   |-- brain_selection_policy.yaml  # Single source of truth for all model routing
-|   |       |   |-- governed_loop_service.py  # Main autonomous loop (Zone 6.8)
-|   |       |   |-- comm_protocol.py          # 5-phase observability (INTENT→PLAN→HEARTBEAT→DECISION→POSTMORTEM)
-|   |       |   |-- consciousness_bridge.py   # TrinityConsciousness ↔ governance pipeline bridge
-|   |       |   |-- entropy_calculator.py     # Shannon entropy composite ignorance measurement
-|   |       |   |-- infrastructure_applicator.py  # Deterministic post-APPLY hooks (pip, npm, env)
-|   |       |   |-- doc_fetcher.py            # Bounded external doc retrieval (asyncio.wait_for timeouts)
-|   |       |   |-- change_engine.py          # Transactional file writes with rollback
-|   |       |   |-- test_runner.py            # Multi-adapter test validation (Python + C++)
-|   |       |   |-- doubleword_provider.py    # Tier 0: DW 397B batch + real-time (16384 max_tokens, 5s poll)
-|   |       |   |-- serpent_animation.py      # ASCII Ouroboros animation (muted while a TUI surface is live)
-|   |       |   |-- graduation_orchestrator.py  # Ephemeral -> permanent agent via Git PR
-|   |       |   |-- causal/                   # Domain 1: cross-repo causal graph + WAL
-|   |       |   |-- saga/                     # Branch-isolated multi-repo patch application
-|   |       |   |-- autonomy/                 # L3 subagent scheduler + safety net (42 files)
-|   |       |   |   |-- subagent_scheduler.py # Parallel work unit dispatch (DAG)
-|   |       |   |   |-- iteration_planner.py  # Goal -> ExecutionGraph decomposition
-|   |       |   |   `-- iteration_service.py  # 10-state autonomy FSM
-|   |       |   |-- intent/                   # Intent signal processing
-|   |       |   |   |-- signals.py            # IntentSignal dataclass
-|   |       |   |   `-- test_watcher.py       # Pytest polling + stable failure detection (30s timeout)
-|   |       |   |-- intake/                   # UnifiedIntakeRouter + sensor bus
-|   |       |   |   |-- intake_layer_service.py  # Sensor lifecycle (Zone 6.9)
-|   |       |   |   |-- unified_intake_router.py # Priority queue + dedup + WAL
-|   |       |   |   |-- fs_event_bridge.py    # FileWatchGuard → TrinityEventBus bridge
-|   |       |   |   `-- sensors/              # 23 sensors
-|   |       |   |       |-- test_failure_sensor.py
-|   |       |   |       |-- voice_command_sensor.py
-|   |       |   |       |-- opportunity_miner_sensor.py
-|   |       |   |       |-- capability_gap_sensor.py
-|   |       |   |       |-- scheduled_sensor.py
-|   |       |   |       |-- backlog_sensor.py
-|   |       |   |       |-- runtime_health_sensor.py
-|   |       |   |       |-- web_intelligence_sensor.py
-|   |       |   |       |-- performance_regression_sensor.py
-|   |       |   |       |-- doc_staleness_sensor.py
-|   |       |   |       |-- github_issue_sensor.py       # Polls Trinity repos for bugs/features
-|   |       |   |       |-- cross_repo_drift_sensor.py   # API/contract drift detection
-|   |       |   |       |-- proactive_exploration_sensor.py  # Entropy-driven curiosity exploration
-|   |       |   |       |-- todo_scanner_sensor.py        # Codebase TODO/FIXME/HACK scanner
-|   |       |   |       |-- cu_execution_sensor.py        # Compute unit execution tracking
-|   |       |   |       `-- intent_discovery_sensor.py    # Manifesto-driven proactive improvement
-|   |       |   `-- ...                      # 22 subdirectories total
-|   |       |-- consciousness/                # Zone 6.11: Trinity self-awareness layer
-|   |       |   |-- consciousness_service.py  # TrinityConsciousness orchestrator
-|   |       |   |-- health_cortex.py          # System health monitoring
-|   |       |   |-- memory_engine.py          # Per-file reputation + fragility tracking
-|   |       |   |-- dream_engine.py           # Idle GPU speculative analysis
-|   |       |   |-- prophecy_engine.py        # Regression risk prediction
-|   |       |   |-- contextual_awareness.py   # Deep code structure understanding
-|   |       |   |-- situational_awareness.py  # System state + goal comprehension
-|   |       |   |-- unified_awareness.py      # CAI + SAI fusion
-|   |       |   |-- dream_metrics.py          # Speculative analysis budgets
-|   |       |   `-- types.py                  # Shared dataclasses
-|   |       |-- battle_test/                  # TUI/CLI rendering surface (52 files)
-|   |       |   |-- serpent_flow.py           # CC-style flowing CLI (355KB)
-|   |       |   |-- harness.py                # Full test harness (372KB)
-|   |       |   |-- presentation_restraint.py # CC-style aesthetic restraint
-|   |       |   |-- narrative_channel.py      # 6-kind NarrativeKind taxonomy
-|   |       |   |-- tool_render_registry.py   # Adaptive tool-result rendering
-|   |       |   |-- stream_renderer.py        # Rich Live + Markdown 16ms batch
-|   |       |   `-- ...                       # 52 files total, 6 graduated subsystems
-|   |       `-- oracle.py                     # Codebase semantic index
-|   |-- core_contexts/                # 5 Core Execution Contexts (Brain)
-|   |   |-- facade.py                 # Symbiotic Router: 3-tier dispatch
-|   |   |-- executor.py              # Screen vision, clicks, typing, app navigation
-|   |   |-- architect.py             # DAG planning, goal decomposition, context selection
-|   |   |-- developer.py             # Code generation, review, testing, Ouroboros
-|   |   |-- communicator.py          # Email, calendar, messaging, web search
-|   |   |-- observer.py              # Monitoring, anomaly detection, pattern recognition
-|   |   `-- tools/                   # 11 atomic tool modules (screen, input, apps, etc.)
-|   |-- neural_mesh/                  # 22 Legacy Agents (Peripheral Nervous System)
-|   |   |-- agents/                   # Production agents (30K+ lines total)
-|   |   |   |-- google_workspace_agent.py   # 6.7K lines: Gmail, Calendar, Drive, Contacts
-|   |   |   |-- visual_monitor_agent.py     # 11K lines: background visual surveillance
-|   |   |   |-- native_app_control_agent.py # 1.3K lines: macOS app automation
-|   |   |   `-- ...                         # 19 more specialized agents
-|   |   `-- synthesis/                # Capability gap detection + JIT agent synthesis
-|   |       |-- gap_signal_bus.py     # Fire-and-forget CapabilityGapEvent bus
-|   |       `-- agent_synthesis_loader.py  # J-Prime-driven agent synthesis
-|   |-- vision/
-|   |   |-- lean_loop.py           # VLA capture-think-act loop + Visual Telemetry
-|   |   |-- vision_reflex.py       # Ouroboros Neuro-Compilation (reflex compiler)
-|   |   |-- apple_ocr.py           # Apple Vision Framework OCR bridge (Swift)
-|   |   |-- frame_server.py        # Persistent Quartz screen capture (main display only)
-|   |   |-- realtime/              # Real-time frame pipeline
-|   |   `-- handlers/              # Vision event handlers
-|   |-- ghost_hands/
-|   |   |-- background_actuator.py # Focus-preserving UI automation
-|   |   |-- cgevent_worker.py      # Quartz low-level event injection
-|   |   `-- orchestrator.py        # Ghost Hands task coordination
-|   |-- voice_unlock/
-|   |   |-- core/                  # ECAPA-TDNN embedding, verification logic
-|   |   |-- services/              # Unlock service orchestration
-|   |   |-- ml/                    # ML feature extraction
-|   |   `-- security/              # Anti-spoofing, secure password typing
-|   |-- intelligence/
-|   |   `-- unified_model_serving.py  # 3-tier inference (PRIME_API / PRIME_LOCAL / CLAUDE)
-|   `-- voice/                     # Voice I/O, wake word, TTS
-|-- frontend/
-|   |-- src/                       # React UI
-|   `-- public/                    # Static assets
-|-- docs/                          # Architecture and integration documentation
-|-- benchmarks/                    # Performance and cost benchmarks
-|-- tests/                         # Test suites
-|-- config/                        # Runtime configuration files
-|-- scripts/                       # Utility and deployment scripts
-|-- extensions/
-|   |-- vscode-jarvis/              # VS Code / Cursor extension (TypeScript)
-|   |-- jetbrains-jarvis/           # JetBrains extension (Kotlin)
-|   |-- sublime-jarvis/             # Sublime Text extension (Python)
-|   `-- command-node/              # Command node integration
-`-- requirements.txt               # Python dependencies
-```
+
+`pytest.ini` enforces `--strict-markers`, `asyncio_mode=auto`, and a 120 s per-test timeout. Eight test files import macOS frameworks and fail to *collect* on Linux, which shrinks the denominator instead of failing loudly. Compare **collected** counts, not pass counts, when moving hosts.
 
 ---
 
 ## Documentation
 
-The **Symbiotic AI-Native Manifesto** (Trinity unification, seven principles, five execution contexts, zero-shortcut mandate) is the authoritative philosophical and architectural preamble in **this file**, under [Symbiotic AI-Native Manifesto: Trinity Ecosystem Unification](#symbiotic-ai-native-manifesto-trinity-ecosystem-unification).
-
-Detailed documentation also lives in the `docs/` directory.
-
-| Document | Path | Covers |
-|---|---|---|
-| Symbiotic manifesto (Trinity OS) | `README.md` | Genesis thesis, progressive awakening, Ouroboros neuroplasticity, observability, five contexts vs agent sprawl |
-| **Trinity Ecosystem Technical Document** | `docs/architecture/TRINITY_ECOSYSTEM_TECHNICAL_DOCUMENT.md` | Full architecture, 20+ academic references (SOAR, VSM, Shannon, Brooks, Kahneman), subsystem deep dives, comparative analysis vs Claude Desktop/Code |
-| Ouroboros architecture | `docs/architecture/OUROBOROS.md` | Governance pipeline phases, graduation, sandbox vs assimilation, key components, SemanticTriage, CommProtocol, Consciousness |
-| **Claude Mythos → O+V Integration Guide** | `docs/architecture/CLAUDE_MYTHOS_OV_INTEGRATION.md` | Line-by-line translation of the Claude Mythos Preview System Card (Anthropic, April 2026) into actionable O+V additions: 10 highest-leverage findings, §-by-§ deep dive of autonomy/alignment/impressions/agentic-safety sections, O+V-vs-Claude-Code capability matrix, new safety gates, letter grade with dimension breakdown, Sprint 1/2 roadmap, implementation checklist, glossary. Source PDF: `~/Documents/PDF Books/Trinity Ecosystem/Claude Mythos Preview System Card (3).pdf` |
-| Brain routing | `docs/architecture/BRAIN_ROUTING.md` | 3-tier cascade, Doubleword Tier 0, brain selection policy |
-| Doubleword Integration | `docs/integrations/DOUBLEWORD_INTEGRATION.md` | Tier 0 batch + real-time inference, 397B MoE reasoning, cost benchmarks, async batch protocol, 16384 max_tokens, 5s poll interval |
-| **JARVIS-Level Ouroboros** | `docs/architecture/JARVIS_LEVEL_OUROBOROS.md` | 7 tiers of transcendence: proactive judgment, emergency protocols, predictive intelligence, self-preservation, cross-domain reasoning, personality, autonomous judgment |
-| **Voice-First Conversation** | `docs/architecture/VOICE_FIRST_CONVERSATION.md` | ConversationManager, barge-in detection, proactive speech, multi-turn context, utterance classification, personality-aware responses |
-| Async Architecture | `docs/architecture/async-architecture.md` | Event loop design, cooperative cancellation, async-first patterns |
-| WebSocket Architecture | `docs/architecture/websocket-architecture.md` | Real-time communication protocol between frontend and backend |
-| Voice Sidecar Control Plane | `docs/architecture/VOICE_SIDECAR_CONTROL_PLANE.md` | Voice pipeline orchestration and audio bus design |
-| Ouroboros Production Readiness | `docs/ouroboros_production_readiness.md` | Governance pipeline deployment checklist |
-| Vision System | `docs/vision/` | Vision pipeline architecture and configuration |
-| Voice Unlock | `docs/voice_unlock/` | Voice biometric authentication flow diagrams |
-
-Additional inline documentation is embedded in module docstrings throughout the codebase. The unified supervisor's zone headers serve as navigational landmarks for the ~98K-line kernel.
-
----
-
-## Platform Requirements
-
-| Requirement | Details |
+| Document | Covers |
 |---|---|
-| Operating System | macOS (Apple Silicon recommended; uses CoreAudio, Quartz, AppleScript) |
-| Python | 3.9+ (tested through 3.12; no `asyncio.timeout` — uses `wait_for` for 3.9 compat) |
-| Node.js | 18+ (for React frontend) |
-| API Keys | Anthropic (required), Doubleword (optional, for Tier 0) |
-| GCP (optional) | `g2-standard-4` + NVIDIA L4 in `us-central1-b` for J-Prime self-hosted inference |
-| System Permissions | Screen Recording, Accessibility, Microphone (macOS will prompt on first use) |
-
----
-
-## Contributing
-
-1. Fork the repository and create a feature branch.
-2. Follow existing code conventions: async-first, environment-variable-driven configuration, no hardcoded model names or magic strings.
-3. Ensure the Ouroboros governance pipeline passes (`JARVIS_GOVERNANCE_MODE=sandbox`).
-4. Submit a pull request with a clear description of the change and its motivation.
-
-For changes that affect model routing, update `brain_selection_policy.yaml` -- do not add model names to Python source files.
+| [`docs/architecture/OUROBOROS.md`](docs/architecture/OUROBOROS.md) | Governance pipeline, phases, graduation, components |
+| [`docs/architecture/OUROBOROS_VENOM_PRD.md`](docs/architecture/OUROBOROS_VENOM_PRD.md) | Requirements, measured soak record, roadmap |
+| [`docs/architecture/HARDWARE_CONSTRAINTS.md`](docs/architecture/HARDWARE_CONSTRAINTS.md) | Measured VRAM/KV envelope and the arithmetic behind concurrency limits |
+| [`docs/architecture/BRAIN_ROUTING.md`](docs/architecture/BRAIN_ROUTING.md) | Provider and model routing |
+| [`docs/architecture/TRINITY_OVERVIEW.md`](docs/architecture/TRINITY_OVERVIEW.md) | Cross-repository architecture |
+| [`TRINITY_MANIFESTO.md`](TRINITY_MANIFESTO.md) | Design principles and safety laws |
 
 ---
 
 ## License
 
-This project is proprietary software. All rights reserved.
+Proprietary. All rights reserved.
