@@ -20,9 +20,11 @@ exec >>"$LOG" 2>&1 </dev/null
 cd "$REPO" || { echo "no repo at $REPO"; exit 1; }
 echo "launch $(date '+%F %T') HEAD $(git rev-parse --abbrev-ref HEAD) $(git log --oneline -1)"
 
-curl -s --max-time 5 http://localhost:11434/api/tags \
-  | "$PY" -c 'import json,sys; m=json.load(sys.stdin).get("models",[]); print(len(m),"model(s):",[x["name"] for x in m]); sys.exit(0 if m else 1)' \
-  || { echo "no inference lane"; exit 1; }
+# No inference-lane check here. This used to curl Ollama's port literally,
+# which tests the wrong engine once J-Prime serves the model and fails BEFORE
+# the organism can start J-Prime itself. The boot owns that verdict: it brings
+# up the Trinity siblings (governance/trinity_siblings.py) and then its fatal
+# lane gate judges the lane at the URL .env declares.
 
 "$PY" - <<'PY' || exit 1
 import os
