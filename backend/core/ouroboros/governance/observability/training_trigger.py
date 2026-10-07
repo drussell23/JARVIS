@@ -26,11 +26,13 @@ below exist so that outcome is impossible rather than unlikely.
    repo, which answers with the TRAINER'S OWN grouping and flatness
    predicate. Exit 2 means "I looked and there is nothing to learn from",
    which is a healthy refusal and is logged as such, not as a fault.
-4. **Device** -- the card must actually be free. ollama holds ~21.8 GiB
-   for ``JARVIS_LOCAL_MODEL_KEEP_ALIVE_SECONDS`` (1800) after the last op,
-   so a trainer launched the instant a soak ends measures, and fails on,
-   whatever is left. We evict, then VERIFY, and refuse if the eviction did
-   not take -- never trusting the call.
+4. **Device** -- handed over by J-Prime's training lease (drain, stop the
+   engines, VERIFY the VRAM is free), never by "evict and hope": eviction
+   let O+V reload the 30B on top of a trainer on 2026-10-07.
+
+Gates 3 and 4 and the training itself run in the Training Lifecycle Handoff
+(``observability.training_handoff``), a detached process; this module keeps
+the cheap gates and the helpers both share.
 
 ## Why a subprocess and not an import
 
@@ -54,12 +56,10 @@ the reason a session cannot shut down.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import shutil
 import signal
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -75,9 +75,6 @@ _ENV_GRACEFUL = "JARVIS_GRPO_AUTOTRAIN_GRACEFUL_STOPS"
 _ENV_PREFLIGHT_TIMEOUT = "JARVIS_GRPO_AUTOTRAIN_PREFLIGHT_TIMEOUT_S"
 _ENV_TRAIN_TIMEOUT = "JARVIS_GRPO_AUTOTRAIN_TIMEOUT_S"
 _ENV_FREE_MIB = "JARVIS_GRPO_AUTOTRAIN_MIN_FREE_MIB"
-_ENV_EVICT_WAIT = "JARVIS_GRPO_AUTOTRAIN_EVICT_WAIT_S"
-_ENV_OLLAMA_URL = "JARVIS_LOCAL_MODEL_BASE_URL"
-_ENV_OLLAMA_MODEL = "JARVIS_LOCAL_MODEL_NAME"
 _ENV_KILL_GRACE = "JARVIS_GRPO_AUTOTRAIN_KILL_GRACE_S"
 
 #: Stop reasons that mean "the session ended on purpose". Substring match,
@@ -161,23 +158,6 @@ def _preflight_cmd() -> Optional[List[str]]:
     return [py, str(script)] if script.exists() else None
 
 
-def _train_cmd() -> Optional[List[str]]:
-    """The training entry point.
-
-    Deliberately env-first with NO built-in default beyond the repo's own
-    pipeline runner: what "train" means changes with the experiment, and a
-    hardcoded argv here would silently pin one.
-    """
-    raw = (os.getenv(_ENV_TRAIN_CMD) or "").strip()
-    if raw:
-        return raw.split()
-    root, py = _reactor_root(), _reactor_python()
-    if not root or not py:
-        return None
-    script = root / "scripts" / "run_pipeline.py"
-    return [py, str(script)] if script.exists() else None
-
-
 # ---------------------------------------------------------------------------
 # Device
 # ---------------------------------------------------------------------------
@@ -198,53 +178,6 @@ async def _gpu_free_mib() -> Optional[int]:
     except Exception:  # noqa: BLE001 — a probe fault is "unknown", not an error
         logger.debug("[AutoTrain] nvidia-smi probe failed", exc_info=True)
         return None
-
-
-async def _evict_local_model() -> None:
-    """Ask ollama to drop its resident model. Best-effort by design.
-
-    ``keep_alive: 0`` is the documented way to release immediately. We do
-    not check the response: the only answer that matters is what the card
-    reports afterwards, which the caller polls.
-    """
-    base = (os.getenv(_ENV_OLLAMA_URL) or "").strip()
-    model = (os.getenv(_ENV_OLLAMA_MODEL) or "").strip()
-    if not base or not model:
-        return
-    payload = json.dumps({"model": model, "keep_alive": 0})
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "curl", "-s", "-m", "10", f"{base.rstrip('/')}/api/generate",
-            "-d", payload,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.wait_for(proc.wait(), timeout=15.0)
-    except Exception:  # noqa: BLE001
-        logger.debug("[AutoTrain] eviction request degraded", exc_info=True)
-
-
-async def _await_free_card(need_mib: int, wait_s: float) -> Tuple[bool, Optional[int]]:
-    """Evict, then poll until the card is actually free enough.
-
-    Returns ``(ok, free_mib)``. ``free_mib is None`` means there is no GPU
-    to measure, which is treated as "not our call to make" -- the trainer
-    may legitimately be CPU-bound or remote.
-    """
-    free = await _gpu_free_mib()
-    if free is None:
-        return True, None
-    if free >= need_mib:
-        return True, free
-    await _evict_local_model()
-    deadline = time.monotonic() + max(0.0, wait_s)
-    while time.monotonic() < deadline:
-        await asyncio.sleep(min(5.0, max(0.5, wait_s / 12.0)))
-        free = await _gpu_free_mib()
-        if free is None:
-            return True, None
-        if free >= need_mib:
-            return True, free
-    return False, free
 
 
 # ---------------------------------------------------------------------------
@@ -313,91 +246,39 @@ async def maybe_train_after_soak(
     stop_reason: str,
     session_id: str = "",
 ) -> Dict[str, Any]:
-    """Run one GRPO cycle if -- and only if -- every gate agrees.
+    """REQUEST a training cycle if this ending qualifies. Returns at once.
 
-    Returns a structured verdict for the caller to log. NEVER raises; the
-    only exception that escapes is CancelledError, and only after the child
-    has been reaped.
+    The cycle itself -- labeling, corpus gate, the J-Prime lease, GRPO,
+    conversion, publish, verification -- is the Training Lifecycle Handoff
+    (``observability.training_handoff``), run as its own detached process.
+    It used to run HERE, inside the organism's teardown: a 30B cycle is
+    hours, so the shutdown deadline was stretched to cover it while the
+    independent out-of-process watchdog was not, and on 2026-10-07 that
+    watchdog SIGKILLed the organism mid-teardown. Teardown now only asks.
+    NEVER raises.
     """
     verdict: Dict[str, Any] = {
         "fired": False, "reason": "", "session_id": session_id,
         "stop_reason": stop_reason,
     }
-
     if not autotrain_enabled():
         verdict["reason"] = "disabled"
         return verdict
-
     graceful = _csv(_ENV_GRACEFUL, _DEFAULT_GRACEFUL)
     if not any(g in (stop_reason or "") for g in graceful):
         # A crashed or killed session has a corpus of unknown completeness.
         verdict["reason"] = f"stop_reason_not_graceful:{stop_reason}"
         return verdict
-
-    pre = _preflight_cmd()
-    if not pre:
-        verdict["reason"] = "preflight_command_unresolved"
-        return verdict
-
     try:
-        rc, out = await _run(
-            pre, timeout_s=_num(_ENV_PREFLIGHT_TIMEOUT, 300.0, 10.0, 3600.0),
+        from backend.core.ouroboros.governance.observability.training_handoff import (  # noqa: PLC0415
+            request_cycle,
         )
-    except asyncio.CancelledError:
-        raise
+        out = await asyncio.to_thread(request_cycle, trigger=f"session_end:{session_id}")
     except Exception as exc:  # noqa: BLE001
-        verdict["reason"] = f"preflight_failed:{type(exc).__name__}"
+        verdict["reason"] = f"request_failed:{type(exc).__name__}"
         return verdict
-
-    try:
-        verdict["preflight"] = json.loads(out[out.index("{"):out.rindex("}") + 1])
-    except Exception:  # noqa: BLE001 — report is a bonus, rc is the answer
-        verdict["preflight"] = {"raw": out[-400:]}
-
-    if rc == 2:
-        # A healthy refusal, not a fault. This is the expected outcome
-        # whenever the corpus has no differentiated group.
-        verdict["reason"] = "corpus_not_trainable"
-        return verdict
-    if rc != 0:
-        verdict["reason"] = f"preflight_error:rc={rc}"
-        return verdict
-
-    need = int(_num(_ENV_FREE_MIB, 24000.0, 0.0, 1_000_000.0))
-    ok, free = await _await_free_card(need, _num(_ENV_EVICT_WAIT, 120.0, 0.0, 3600.0))
-    verdict["gpu_free_mib"] = free
-    if not ok:
-        verdict["reason"] = f"gpu_busy:{free}MiB_free_need_{need}"
-        return verdict
-
-    cmd = _train_cmd()
-    if not cmd:
-        verdict["reason"] = "train_command_unresolved"
-        return verdict
-
-    started = time.monotonic()
-    try:
-        rc, out = await _run(
-            cmd,
-            timeout_s=_num(_ENV_TRAIN_TIMEOUT, 7200.0, 60.0, 86400.0),
-            cwd=_reactor_root(),
-        )
-    except asyncio.CancelledError:
-        verdict["reason"] = "cancelled_during_training"
-        raise
-    except Exception as exc:  # noqa: BLE001
-        verdict["reason"] = f"train_launch_failed:{type(exc).__name__}"
-        return verdict
-
-    verdict.update({
-        "fired": True,
-        "reason": "completed" if rc == 0 else f"train_rc={rc}",
-        "returncode": rc,
-        "duration_s": round(time.monotonic() - started, 1),
-        "tail": out[-1200:],
-    })
-    # Whatever happened, the card must not be left held by our child.
-    verdict["gpu_free_mib_after"] = await _gpu_free_mib()
+    verdict.update({"fired": bool(out.get("requested")), "reason": "requested" if out.get("requested")
+                    else str(out.get("reason") or out), "request": out})
     return verdict
 
 

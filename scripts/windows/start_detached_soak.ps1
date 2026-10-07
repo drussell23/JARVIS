@@ -36,37 +36,10 @@ if ($Stop) {
     return
 }
 
-$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($existing -and $existing.State -eq "Running") {
-    throw "Task '$TaskName' is already running a soak. Use -Stop first."
-}
-
-# conhost --headless: no console window to close by accident.
-$action = New-ScheduledTaskAction -Execute (Join-Path $env:WINDIR "System32\conhost.exe") `
-    -Argument "--headless `"$wsl`" -d $Distro -u $User -- bash $Script $MaxWallSeconds"
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-    -ExecutionTimeLimit (New-TimeSpan -Seconds ($MaxWallSeconds + 3600)) `
-    -MultipleInstances IgnoreNew
-$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
-    -LogonType Interactive -RunLevel Limited
-Register-ScheduledTask -TaskName $TaskName -Action $action -Settings $settings `
-    -Principal $principal -Force | Out-Null
-Start-ScheduledTask -TaskName $TaskName
-
-# A task whose pre-flight fails just ends; say so instead of leaving a
-# registered task that silently ran nothing.
-$deadline = (Get-Date).AddSeconds(90)
-while ((Get-Date) -lt $deadline) {
-    Start-Sleep -Seconds 5
-    $info = Get-ScheduledTaskInfo -TaskName $TaskName
-    if ((Get-ScheduledTask -TaskName $TaskName).State -ne "Running") {
-        $log = & $wsl -d $Distro -u $User -- bash -c 'tail -20 "$(ls -t ~/soak_logs/soak-*.log | head -1)"'
-        throw "Task '$TaskName' ended during boot (LastTaskResult=$($info.LastTaskResult)).`n$log"
-    }
-    $pid_ = & $wsl -d $Distro -u $User -- pgrep -f "scripts/ouroboros_battle_test.py --production-soak"
-    if ($pid_) {
-        Write-Output "Started '$TaskName': daemon pid $($pid_ -join ',') (max wall ${MaxWallSeconds}s). Log: ~/soak_logs in WSL."
-        return
-    }
-}
-throw "Task '$TaskName' is running but no daemon appeared within 90s; check ~/soak_logs."
+# The detached-task mechanism lives in start_detached_wsl.ps1 (shared with
+# the training handoff); this script only supplies the soak's specifics.
+& (Join-Path $PSScriptRoot "start_detached_wsl.ps1") -TaskName $TaskName -Script $Script `
+    -Arguments "$MaxWallSeconds" -TimeLimitSeconds ($MaxWallSeconds + 3600) `
+    -ReadyPattern "scripts/ouroboros_battle_test.py --production-soak" `
+    -FailureLogCommand 'tail -20 "$(ls -t ~/soak_logs/soak-*.log | head -1)"' `
+    -Distro $Distro -User $User

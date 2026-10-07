@@ -8691,10 +8691,13 @@ class BattleTestHarness:
           * the flush's own ``JARVIS_TRAJECTORY_FLUSH_TIMEOUT_S`` (the
             call site below reads this identical value — one source of
             truth, so the guard cannot drift from the work);
-          * the auto-train hook's ``JARVIS_GRPO_AUTOTRAIN_TIMEOUT_S`` +
-            eviction wait, but ONLY when that hook is actually enabled —
-            a 3600 s allowance on a session that will never train is a
-            watchdog switched off by accident.
+          * the auto-train hook's REQUEST budget
+            (``training_handoff.request_timeout_s``), ONLY when that hook is
+            enabled. The hook no longer trains inside teardown -- it starts
+            the detached Training Lifecycle Handoff and returns -- so the
+            allowance is the launch, not the training. (It used to be the
+            training timeout; the out-of-process watchdog was never told,
+            and SIGKILLed the organism mid-teardown on 2026-10-07.)
 
         This does NOT breach the Slice-47 watchdog-isolation invariant.
         That invariant forbids the WALL-CLOCK cap and its hard-kill
@@ -8718,12 +8721,11 @@ class BattleTestHarness:
             from backend.core.ouroboros.governance.observability.training_trigger import (  # noqa: E501,PLC0415
                 autotrain_enabled as _autotrain_on,
             )
+            from backend.core.ouroboros.governance.observability.training_handoff import (  # noqa: E501,PLC0415
+                request_timeout_s as _handoff_request_s,
+            )
             if _autotrain_on():
-                total += _env_float_or(
-                    "JARVIS_GRPO_AUTOTRAIN_TIMEOUT_S", 3600.0,
-                ) + _env_float_or(
-                    "JARVIS_GRPO_AUTOTRAIN_EVICT_WAIT_S", 120.0,
-                )
+                total += _handoff_request_s()
         except Exception:  # noqa: BLE001 — hook optional
             pass
         return total

@@ -36,6 +36,7 @@ _CLOSE = "JARVIS_TRAJECTORY_CLOSE_TIMEOUT_S"
 _AT_ON = "JARVIS_GRPO_AUTOTRAIN_ENABLED"
 _AT_TIMEOUT = "JARVIS_GRPO_AUTOTRAIN_TIMEOUT_S"
 _AT_EVICT = "JARVIS_GRPO_AUTOTRAIN_EVICT_WAIT_S"
+_AT_REQUEST = "JARVIS_TRAINING_HANDOFF_REQUEST_TIMEOUT_S"
 
 
 def _budget() -> float:
@@ -46,7 +47,7 @@ def _budget() -> float:
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch):
-    for var in (_FLUSH, _CLOSE, _AT_ON, _AT_TIMEOUT, _AT_EVICT):
+    for var in (_FLUSH, _CLOSE, _AT_ON, _AT_TIMEOUT, _AT_EVICT, _AT_REQUEST):
         monkeypatch.delenv(var, raising=False)
     yield
 
@@ -84,18 +85,20 @@ def test_raising_the_flush_budget_raises_the_guard_with_it(
 def test_autotrain_budget_is_included_only_when_it_will_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A 3600 s allowance on a session that will never train is a watchdog
-    switched off by accident, so the hook's budget is conditional on the
-    hook actually being enabled."""
-    monkeypatch.setenv(_AT_TIMEOUT, "3600")
-    monkeypatch.setenv(_AT_EVICT, "120")
+    """Teardown only REQUESTS a training cycle (the Training Lifecycle
+    Handoff runs detached), so the allowance is the request's own budget --
+    never the training timeout. Stretching teardown by the training timeout
+    while the out-of-process watchdog was not told got the organism
+    SIGKILLed mid-teardown on 2026-10-07."""
+    monkeypatch.setenv(_AT_TIMEOUT, "43200")       # a real 30B cycle; must NOT appear
+    monkeypatch.setenv(_AT_REQUEST, "180")
 
     monkeypatch.setenv(_AT_ON, "false")
     off = _budget()
     monkeypatch.setenv(_AT_ON, "true")
     on = _budget()
 
-    assert on == pytest.approx(off + 3600.0 + 120.0)
+    assert on == pytest.approx(off + 180.0)
     assert off < 200.0, "a non-training session keeps a tight guard"
 
 

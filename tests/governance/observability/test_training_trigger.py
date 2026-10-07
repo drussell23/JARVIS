@@ -28,7 +28,7 @@ from backend.core.ouroboros.governance.observability import training_trigger as 
 
 def _clear(monkeypatch) -> None:
     for k in list(os.environ):
-        if k.startswith(("JARVIS_GRPO_AUTOTRAIN", "TRINITY_GRPO")):
+        if k.startswith(("JARVIS_GRPO_AUTOTRAIN", "TRINITY_GRPO", "JARVIS_TRAINING_HANDOFF")):
             monkeypatch.delenv(k, raising=False)
 
 
@@ -90,128 +90,57 @@ def test_composed_stop_reason_is_recognised(monkeypatch) -> None:
     """
     _clear(monkeypatch)
     monkeypatch.setenv(tt._ENV_MASTER, "true")
-    monkeypatch.setattr(tt, "_preflight_cmd", lambda: None)
     v = _fire(stop_reason="wall_clock_cap+atexit_fallback")
-    assert v["reason"] == "preflight_command_unresolved"  # got PAST gate 2
+    assert "JARVIS_TRAINING_HANDOFF_LAUNCH_CMD" in v["reason"]  # got PAST gate 2, to the request
 
 
 def test_graceful_set_is_configurable(monkeypatch) -> None:
     _clear(monkeypatch)
     monkeypatch.setenv(tt._ENV_MASTER, "true")
     monkeypatch.setenv(tt._ENV_GRACEFUL, "my_custom_stop")
-    monkeypatch.setattr(tt, "_preflight_cmd", lambda: None)
-    assert _fire(stop_reason="my_custom_stop")["reason"] == "preflight_command_unresolved"
+    assert "JARVIS_TRAINING_HANDOFF_LAUNCH_CMD" in _fire(stop_reason="my_custom_stop")["reason"]
     assert _fire(stop_reason="wall_clock_cap")["reason"].startswith(
         "stop_reason_not_graceful")
 
 
 # --------------------------------------------------------------------------
-# Gate 3 — the corpus
+# The request -- teardown ASKS for a cycle; it never runs one
 # --------------------------------------------------------------------------
 
-def _fake_run(rc: int, out: str):
-    async def _r(cmd, *, timeout_s, cwd=None, env=None):
-        return rc, out
-    return _r
-
-
-def test_refusal_is_not_an_error(monkeypatch) -> None:
-    """Exit 2 means 'I looked and there is nothing to learn from'.
-
-    It must be distinguishable from a fault, or an operator cannot tell a
-    healthy corpus-gate refusal from a broken preflight -- and would go
-    hunting a bug that is not there.
-    """
+def test_qualifying_stop_requests_a_detached_cycle(monkeypatch) -> None:
+    """The cycle is hours long; it must never run inside the organism's
+    teardown (2026-10-07: the stretched shutdown was SIGKILLed by the
+    independent out-of-process watchdog)."""
     _clear(monkeypatch)
     monkeypatch.setenv(tt._ENV_MASTER, "true")
-    monkeypatch.setattr(tt, "_preflight_cmd", lambda: ["echo"])
-    monkeypatch.setattr(tt, "_run", _fake_run(
-        2, json.dumps({"trainable_groups": 0, "flat_groups": 19})))
+    from backend.core.ouroboros.governance.observability import training_handoff as th
+    calls = []
+    monkeypatch.setattr(th, "request_cycle", lambda **kw: calls.append(kw) or {"requested": True})
+    v = _fire(stop_reason="wall_clock_cap", session_id="bt-1")
+    assert v["fired"] is True and v["reason"] == "requested"
+    assert calls == [{"trigger": "session_end:bt-1"}]
+
+
+def test_refused_request_is_reported_not_raised(monkeypatch) -> None:
+    _clear(monkeypatch)
+    monkeypatch.setenv(tt._ENV_MASTER, "true")
+    from backend.core.ouroboros.governance.observability import training_handoff as th
+    monkeypatch.setattr(th, "request_cycle",
+                        lambda **kw: {"requested": False, "reason": "a cycle is in progress (TRAINING)"})
     v = _fire(stop_reason="wall_clock_cap")
-    assert v["fired"] is False
-    assert v["reason"] == "corpus_not_trainable"
-    assert v["preflight"]["flat_groups"] == 19   # the report survives
+    assert v["fired"] is False and "in progress" in v["reason"]
 
 
-def test_preflight_error_is_distinct_from_refusal(monkeypatch) -> None:
+def test_request_crash_is_contained(monkeypatch) -> None:
     _clear(monkeypatch)
     monkeypatch.setenv(tt._ENV_MASTER, "true")
-    monkeypatch.setattr(tt, "_preflight_cmd", lambda: ["echo"])
-    monkeypatch.setattr(tt, "_run", _fake_run(1, "boom"))
+    from backend.core.ouroboros.governance.observability import training_handoff as th
+
+    def boom(**kw):
+        raise OSError("powershell.exe vanished")
+    monkeypatch.setattr(th, "request_cycle", boom)
     v = _fire(stop_reason="wall_clock_cap")
-    assert v["reason"] == "preflight_error:rc=1"
-
-
-def test_unparseable_preflight_output_still_refuses_cleanly(monkeypatch) -> None:
-    """rc is the answer; the JSON is a bonus. Garbage must not raise."""
-    _clear(monkeypatch)
-    monkeypatch.setenv(tt._ENV_MASTER, "true")
-    monkeypatch.setattr(tt, "_preflight_cmd", lambda: ["echo"])
-    monkeypatch.setattr(tt, "_run", _fake_run(2, "not json at all"))
-    v = _fire(stop_reason="wall_clock_cap")
-    assert v["reason"] == "corpus_not_trainable"
-    assert "raw" in v["preflight"]
-
-
-# --------------------------------------------------------------------------
-# Gate 4 — the device
-# --------------------------------------------------------------------------
-
-def test_busy_card_refuses_rather_than_ooms(monkeypatch) -> None:
-    """ollama holds ~21.8 GiB for 1800s after a soak.
-
-    Launching into that measures, and fails on, whatever is left -- and the
-    failure reads as 'the model does not fit' rather than 'something else
-    was resident'.
-    """
-    _clear(monkeypatch)
-    monkeypatch.setenv(tt._ENV_MASTER, "true")
-    monkeypatch.setenv(tt._ENV_EVICT_WAIT, "0")
-    monkeypatch.setattr(tt, "_preflight_cmd", lambda: ["echo"])
-    monkeypatch.setattr(tt, "_run", _fake_run(0, "{}"))
-
-    async def _busy():
-        return 1200
-    monkeypatch.setattr(tt, "_gpu_free_mib", _busy)
-    monkeypatch.setattr(tt, "_evict_local_model", lambda: asyncio.sleep(0))
-
-    v = _fire(stop_reason="wall_clock_cap")
-    assert v["fired"] is False
-    assert v["reason"].startswith("gpu_busy:")
-    assert v["gpu_free_mib"] == 1200
-
-
-def test_no_gpu_is_not_a_refusal(monkeypatch) -> None:
-    """A CPU-bound or remote trainer is legitimate.
-
-    'I cannot measure the card' must not be read as 'the card is busy', or
-    the trigger can never fire on a host without nvidia-smi.
-    """
-    _clear(monkeypatch)
-    monkeypatch.setenv(tt._ENV_MASTER, "true")
-    monkeypatch.setattr(tt, "_preflight_cmd", lambda: ["echo"])
-    monkeypatch.setattr(tt, "_train_cmd", lambda: ["echo", "trained"])
-    monkeypatch.setattr(tt, "_run", _fake_run(0, "{}"))
-
-    async def _none():
-        return None
-    monkeypatch.setattr(tt, "_gpu_free_mib", _none)
-    v = _fire(stop_reason="wall_clock_cap")
-    assert v["fired"] is True
-
-
-def test_free_threshold_is_configurable(monkeypatch) -> None:
-    _clear(monkeypatch)
-    monkeypatch.setenv(tt._ENV_MASTER, "true")
-    monkeypatch.setenv(tt._ENV_FREE_MIB, "1000")
-    monkeypatch.setattr(tt, "_preflight_cmd", lambda: ["echo"])
-    monkeypatch.setattr(tt, "_train_cmd", lambda: ["echo", "ok"])
-    monkeypatch.setattr(tt, "_run", _fake_run(0, "{}"))
-
-    async def _some():
-        return 1200
-    monkeypatch.setattr(tt, "_gpu_free_mib", _some)
-    assert _fire(stop_reason="wall_clock_cap")["fired"] is True
+    assert v["fired"] is False and v["reason"] == "request_failed:OSError"
 
 
 # --------------------------------------------------------------------------
@@ -251,56 +180,6 @@ def test_run_returns_output_and_code_on_normal_exit() -> None:
         [sys.executable, "-c", "print('hello'); raise SystemExit(3)"],
         timeout_s=30.0))
     assert rc == 3 and "hello" in out
-
-
-# --------------------------------------------------------------------------
-# Resilience — the hook must never be why a session cannot shut down
-# --------------------------------------------------------------------------
-
-def test_train_launch_failure_is_contained(monkeypatch) -> None:
-    _clear(monkeypatch)
-    monkeypatch.setenv(tt._ENV_MASTER, "true")
-    monkeypatch.setattr(tt, "_preflight_cmd", lambda: ["echo"])
-    monkeypatch.setattr(tt, "_train_cmd", lambda: ["definitely-not-a-binary"])
-
-    async def _ok(cmd, *, timeout_s, cwd=None, env=None):
-        if cmd[0] == "echo":
-            return 0, "{}"
-        raise FileNotFoundError("no such binary")
-    monkeypatch.setattr(tt, "_run", _ok)
-
-    async def _free():
-        return 99000
-    monkeypatch.setattr(tt, "_gpu_free_mib", _free)
-
-    v = _fire(stop_reason="wall_clock_cap")
-    assert v["fired"] is False
-    assert v["reason"].startswith("train_launch_failed:FileNotFoundError")
-
-
-def test_nonzero_training_exit_is_reported_not_raised(monkeypatch) -> None:
-    """A failed training run is telemetry, not an exception.
-
-    It must not propagate into the harness teardown it is called from.
-    """
-    _clear(monkeypatch)
-    monkeypatch.setenv(tt._ENV_MASTER, "true")
-    monkeypatch.setattr(tt, "_preflight_cmd", lambda: ["preflight"])
-    monkeypatch.setattr(tt, "_train_cmd", lambda: ["train"])
-
-    # The preflight must PASS and only the training must fail; a single
-    # fake returning rc=1 for both never reaches the training call at all.
-    async def _by_stage(cmd, *, timeout_s, cwd=None, env=None):
-        return (0, "{}") if cmd[0] == "preflight" else (1, "CUDA out of memory")
-    monkeypatch.setattr(tt, "_run", _by_stage)
-
-    async def _free():
-        return 99000
-    monkeypatch.setattr(tt, "_gpu_free_mib", _free)
-
-    v = _fire(stop_reason="wall_clock_cap")
-    assert v["fired"] is True and v["reason"] == "train_rc=1"
-    assert "CUDA out of memory" in v["tail"]
 
 
 def test_discovery_returns_none_rather_than_guessing(monkeypatch) -> None:
