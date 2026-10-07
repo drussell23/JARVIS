@@ -118,6 +118,7 @@ class LandedCommit:
     op_id: str
     files: Tuple[LandedFile, ...]
     ambiguous: Tuple[str, ...] = ()
+    committed_at: float = 0.0     # git's commit time (%ct): when it landed on the record
 
 
 async def _git(args: Sequence[str], cwd: Path) -> Tuple[int, str]:
@@ -172,7 +173,7 @@ async def landed_commits(root: Path, ref: str, *, depth: Optional[int] = None,
     from backend.core.ouroboros.governance.change_engine import strip_ouroboros_signature
 
     rc, log = await _git(["log", ref, "-n", str(depth or scan_depth()),
-                          "--format=%H%x00%B%x01"], root)
+                          "--format=%H%x00%ct%x00%B%x01"], root)
     if rc != 0:
         return []
     wanted = {s.strip() for s in (only or ()) if s and s.strip()}
@@ -180,7 +181,7 @@ async def landed_commits(root: Path, ref: str, *, depth: Optional[int] = None,
     for block in log.split("\x01"):
         if "\x00" not in block:
             continue
-        sha, body = block.strip().split("\x00", 1)
+        sha, ct, body = block.strip().split("\x00", 2)
         if wanted and not any(sha.startswith(w) or w.startswith(sha) for w in wanted):
             continue
         op_id = _op_of(body)
@@ -205,7 +206,8 @@ async def landed_commits(root: Path, ref: str, *, depth: Optional[int] = None,
                 blob_sha256=hashlib.sha256(stripped.encode()).hexdigest(),
                 surviving=await _surviving(root, ref, sha, path),
             ))
-        out.append(LandedCommit(sha=sha, op_id=op_id, files=tuple(files), ambiguous=tuple(ambiguous)))
+        out.append(LandedCommit(sha=sha, op_id=op_id, files=tuple(files), ambiguous=tuple(ambiguous),
+                                committed_at=float(ct or 0)))
     return out
 
 
@@ -365,7 +367,7 @@ async def label_landings(*, only: Optional[Iterable[str]] = None,
                     "label_id": str(uuid.uuid4()), "subject_event_id": eid,
                     "op_id": c.op_id, "candidate_hash": f.blob_sha256,
                     "commit_sha": c.sha, "file_path": f.path, "landing_ref": ref,
-                    "landed": True, "surviving": f.surviving,
+                    "landed": True, "surviving": f.surviving, "committed_at": c.committed_at,
                     "labeled_at": time.time(),
                 }
                 if dry_run:

@@ -90,6 +90,7 @@ def test_composed_stop_reason_is_recognised(monkeypatch) -> None:
     """
     _clear(monkeypatch)
     monkeypatch.setenv(tt._ENV_MASTER, "true")
+    _yield(monkeypatch, met=True)
     v = _fire(stop_reason="wall_clock_cap+atexit_fallback")
     assert "JARVIS_TRAINING_HANDOFF_LAUNCH_CMD" in v["reason"]  # got PAST gate 2, to the request
 
@@ -98,6 +99,7 @@ def test_graceful_set_is_configurable(monkeypatch) -> None:
     _clear(monkeypatch)
     monkeypatch.setenv(tt._ENV_MASTER, "true")
     monkeypatch.setenv(tt._ENV_GRACEFUL, "my_custom_stop")
+    _yield(monkeypatch, met=True)
     assert "JARVIS_TRAINING_HANDOFF_LAUNCH_CMD" in _fire(stop_reason="my_custom_stop")["reason"]
     assert _fire(stop_reason="wall_clock_cap")["reason"].startswith(
         "stop_reason_not_graceful")
@@ -106,6 +108,40 @@ def test_graceful_set_is_configurable(monkeypatch) -> None:
 # --------------------------------------------------------------------------
 # The request -- teardown ASKS for a cycle; it never runs one
 # --------------------------------------------------------------------------
+
+def _yield(monkeypatch, *, met, unlearned=0, threshold=15, error=None):
+    from backend.core.ouroboros.governance.observability import training_handoff as th
+
+    async def y(model=None):
+        d = {"met": met, "unlearned": unlearned, "threshold": threshold}
+        if error:
+            d["error"] = error
+        return d
+    monkeypatch.setattr(th, "training_yield", y)
+
+
+def test_below_the_batch_threshold_never_requests_a_cycle(monkeypatch) -> None:
+    """Hours of inference uptime are not spent on a micro-batch: a clean end
+    with too little NEW landed evidence returns at once."""
+    _clear(monkeypatch)
+    monkeypatch.setenv(tt._ENV_MASTER, "true")
+    from backend.core.ouroboros.governance.observability import training_handoff as th
+    calls = []
+    monkeypatch.setattr(th, "request_cycle", lambda **kw: calls.append(kw) or {"requested": True})
+    _yield(monkeypatch, met=False, unlearned=4)
+    v = _fire(stop_reason="wall_clock_cap")
+    assert v["fired"] is False and v["reason"] == "below_training_batch:4<15" and calls == []
+
+
+def test_an_unanswerable_yield_is_not_met(monkeypatch) -> None:
+    _clear(monkeypatch)
+    monkeypatch.setenv(tt._ENV_MASTER, "true")
+    from backend.core.ouroboros.governance.observability import training_handoff as th
+    monkeypatch.setattr(th, "request_cycle", lambda **kw: {"requested": True})
+    _yield(monkeypatch, met=False, error="J-Prime unreachable")
+    v = _fire(stop_reason="wall_clock_cap")
+    assert v["fired"] is False and "J-Prime unreachable" in v["reason"]
+
 
 def test_qualifying_stop_requests_a_detached_cycle(monkeypatch) -> None:
     """The cycle is hours long; it must never run inside the organism's
@@ -116,6 +152,7 @@ def test_qualifying_stop_requests_a_detached_cycle(monkeypatch) -> None:
     from backend.core.ouroboros.governance.observability import training_handoff as th
     calls = []
     monkeypatch.setattr(th, "request_cycle", lambda **kw: calls.append(kw) or {"requested": True})
+    _yield(monkeypatch, met=True, unlearned=18)
     v = _fire(stop_reason="wall_clock_cap", session_id="bt-1")
     assert v["fired"] is True and v["reason"] == "requested"
     assert calls == [{"trigger": "session_end:bt-1"}]
@@ -127,6 +164,7 @@ def test_refused_request_is_reported_not_raised(monkeypatch) -> None:
     from backend.core.ouroboros.governance.observability import training_handoff as th
     monkeypatch.setattr(th, "request_cycle",
                         lambda **kw: {"requested": False, "reason": "a cycle is in progress (TRAINING)"})
+    _yield(monkeypatch, met=True)
     v = _fire(stop_reason="wall_clock_cap")
     assert v["fired"] is False and "in progress" in v["reason"]
 
@@ -139,6 +177,7 @@ def test_request_crash_is_contained(monkeypatch) -> None:
     def boom(**kw):
         raise OSError("powershell.exe vanished")
     monkeypatch.setattr(th, "request_cycle", boom)
+    _yield(monkeypatch, met=True)
     v = _fire(stop_reason="wall_clock_cap")
     assert v["fired"] is False and v["reason"] == "request_failed:OSError"
 

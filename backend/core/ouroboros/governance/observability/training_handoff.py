@@ -75,7 +75,7 @@ _ENV_SMOKE_TIMEOUT = "JARVIS_TRAINING_SMOKE_TIMEOUT_S"
 _ENV_HTTP_TIMEOUT = "JARVIS_TRAINING_JPRIME_TIMEOUT_S"
 _ENV_LAUNCHER = "JARVIS_TRAINING_HANDOFF_LAUNCH_CMD"
 
-STATES = ("IDLE", "LABELING", "PREFLIGHT", "LEASING", "TRAINING", "CONVERTING", "PUBLISHING",
+STATES = ("IDLE", "LABELING", "PREFLIGHT", "BASELINE", "LEASING", "TRAINING", "CONVERTING", "PUBLISHING",
           "RESTORING", "VERIFYING", "COMMITTED", "ROLLED_BACK", "REFUSED", "FAILED")
 
 
@@ -252,44 +252,103 @@ async def _renew_forever(token: str, ttl: float) -> None:
             logger.error("[TrainingHandoff] lease renew failed: %s", exc)
 
 
-async def _smoke(model: str, prompts: List[str]) -> Tuple[bool, List[str]]:
-    """O+V's OWN client against the restored model: every answer must be a
-    schema-valid O+V envelope. Same client, same constraint ladder, same
-    transport the organism uses -- not a second opinion."""
+def _verify_response(text: str, row: Dict[str, Any]) -> str:
+    """Would O+V ACT on this answer? Decided by O+V's own parsers -- the same
+    two its generation loop dispatches through -- never by a looser check.
+
+    A schema-constrained decoder makes even a corrupted model emit JSON that
+    *looks* like an envelope; what a broken adapter cannot fake is a
+    candidate that survives O+V's validation (envelope rules, AST, no
+    placeholders) or a tool call naming a tool O+V has. Returns the accepted
+    shape; raises with the parser's own reason otherwise."""
+    from backend.core.ouroboros.governance import providers
+    calls = providers._parse_tool_call_response(text)
+    if calls:
+        from backend.core.ouroboros.governance.tool_executor import _L1_MANIFESTS
+        unknown = [c.name for c in calls if c.name not in _L1_MANIFESTS and not c.name.startswith("mcp_")]
+        if unknown:
+            raise ValueError(f"tool call names unknown tool(s) {unknown}")
+        return f"tool_calls:{','.join(c.name for c in calls)}"
+    from backend.core.ouroboros.governance.op_context import OperationContext
+    from backend.core.ouroboros.cli.thin_client import repo_root
+    target = str(row.get("file_path") or "")
+    ctx = OperationContext.create(target_files=(target,) if target else (),
+                                  description=f"post-training verification of {row.get('op_id', '')}")
+    src = repo_root() / target if target else None
+    try:
+        src_hash = hashlib.sha256(src.read_bytes()).hexdigest() if src and src.is_file() else ""
+    except OSError:
+        src_hash = ""
+    res = providers._parse_generation_response(text, "jprime-verify", 0.0, ctx, src_hash,
+                                               str(src or ""), repo_root=repo_root())
+    if getattr(res, "is_noop", False):
+        return "noop"
+    return f"candidates:{len(getattr(res, 'candidates', ()) or ())}"
+
+
+async def _smoke(model: str, rows: List[Dict[str, Any]]) -> Tuple[int, List[str]]:
+    """How many real tasks the SERVED model answers in a form O+V would act
+    on (judged by O+V's own parsers, :func:`_verify_response`), through O+V's
+    own client, constraint ladder and transport.
+
+    Greedy decoding (temperature 0): the score is a property of the weights,
+    not of a sample, so the incumbent and the candidate are compared on the
+    same footing and a restored adapter reproduces its baseline exactly.
+    Returns (accepted, per-task notes)."""
     from backend.core.ouroboros.governance.local_inference_director import LocalConfig, LocalPrimeClient
     client = LocalPrimeClient(LocalConfig.from_env())
     notes: List[str] = []
-    ok = True
+    accepted = 0
     timeout = tt._num(_ENV_SMOKE_TIMEOUT, 600.0, 10.0, 7200.0)
+    # Reproducible measurement: J-Prime serves this model with no prompt-cache
+    # reuse while the scope is open (greedy decoding drifts between cold and
+    # warm cache). Bounded by the most this measurement can take, so an
+    # abandoned scope closes itself.
+    await _http("POST", f"/v1/models/{model}/evaluation",
+                body={"on": True, "ttl_s": timeout * max(1, len(rows)) + 60}, timeout=30)
     try:
-        for i, prompt in enumerate(prompts):
+        for i, row in enumerate(rows):
+            prompt = row["prompt"]
             try:
                 res = await asyncio.wait_for(client.complete(
-                    system="", user=prompt, prompt_tokens=max(1, len(prompt) // 4)), timeout=timeout)
+                    system="", user=prompt, prompt_tokens=max(1, len(prompt) // 4), temperature=0.0),
+                    timeout=timeout)
                 text = getattr(res, "text", "") or getattr(res, "content", "")
-                env = json.loads(text)
-                if not isinstance(env, dict) or not env.get("schema_version"):
-                    raise ValueError("no schema_version in envelope")
-                notes.append(f"{i}:ok:{env.get('schema_version')}")
+                notes.append(f"{i}:ok:{_verify_response(text, row)}")
+                accepted += 1
             except Exception as exc:  # noqa: BLE001
-                ok = False
-                notes.append(f"{i}:FAIL:{type(exc).__name__}:{str(exc)[:120]}")
+                notes.append(f"{i}:FAIL:{type(exc).__name__}:{str(exc)[:160]}")
     finally:
         with contextlib.suppress(Exception):
             if hasattr(client, "aclose"):
                 await client.aclose()
-    return ok, notes
+        with contextlib.suppress(Exception):
+            await _http("POST", f"/v1/models/{model}/evaluation", body={"on": False}, timeout=30)
+    return accepted, notes
 
 
-def _smoke_prompts(n: int) -> List[str]:
-    """Real tasks, newest first: prompts whose candidate LANDED (git-proven),
-    else the newest genuine prompts. A fine-tune that cannot answer the work
-    O+V actually does is not shipped."""
+_ENV_VERIFY_TOLERANCE = "JARVIS_TRAINING_VERIFY_TOLERANCE"
+
+
+def _required(baseline: int) -> int:
+    """Tasks a candidate must pass: the incumbent's score less the operator's
+    tolerance (default 0 -- no regression), and never zero: a model that
+    answers nothing O+V can use is not shipped whatever the baseline."""
+    tol = int(tt._num(_ENV_VERIFY_TOLERANCE, 0.0, 0.0, 1000.0))
+    return max(1, baseline - tol)
+
+
+def _smoke_rows(n: int) -> List[Dict[str, Any]]:
+    """Real tasks, newest first: rows whose candidate LANDED (git-proven),
+    else the newest genuine rows. A fine-tune that cannot answer the work O+V
+    actually does is not shipped. Carries the target file so the candidate
+    parser can judge the answer against the real source."""
     from backend.core.ouroboros.governance.observability.landing_provenance import read_labels
     from backend.core.ouroboros.governance.observability.trajectory_recorder import events_dir
     landed = {eid for eid, lab in read_labels()[0].items() if lab.get("landed") and lab.get("surviving")}
-    picked: List[str] = []
-    fallback: List[str] = []
+    picked: List[Dict[str, Any]] = []
+    fallback: List[Dict[str, Any]] = []
+    seen: set = set()
     for f in sorted(events_dir().glob("experience_*.jsonl"), reverse=True):
         try:
             lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -301,28 +360,112 @@ def _smoke_prompts(n: int) -> List[str]:
             except ValueError:
                 continue
             prompt = str(row.get("user_input") or "")
-            if not prompt or prompt in picked or prompt in fallback:
+            if not prompt or prompt in seen:
                 continue
-            (picked if row.get("event_id") in landed else fallback).append(prompt)
+            seen.add(prompt)
+            meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            item = {"prompt": prompt, "file_path": meta.get("file_path", ""), "op_id": meta.get("op_id", "")}
+            (picked if row.get("event_id") in landed else fallback).append(item)
         if len(picked) >= n:
             break
     return (picked + fallback)[:n]
 
 
 # ---------------------------------------------------------------------------
+# Yield: is there enough NEW, unlearned evidence to be worth a cycle?
+# ---------------------------------------------------------------------------
+
+_ENV_MIN_BATCH = "JARVIS_MIN_TRAINING_BATCH"
+
+
+def min_training_batch() -> int:
+    return int(tt._num(_ENV_MIN_BATCH, 15.0, 1.0, 1_000_000.0))
+
+
+async def _trained_through(model: str) -> Tuple[float, str]:
+    """When the ACTIVE adapter's evidence ends, from J-Prime's own records.
+
+    A version this loop published carries ``source.trained_through`` (the
+    newest landing it learned from). One that predates the registry (origin,
+    e.g. the Ollama-built adapter) is bounded by its weight file's mtime:
+    nothing committed after the file was written can have trained it.
+    No adapter at all -> 0 (every landing is unlearned)."""
+    versions = await _http("GET", f"/v1/adapters/{model}", timeout=30)
+    active = versions.get("active")
+    entry = next((v for v in versions.get("versions") or [] if v.get("version") == active), None)
+    through = ((entry or {}).get("source") or {}).get("trained_through")
+    if through:
+        return float(through), f"registry:{active}"
+    show = await _http("POST", "/api/show", body={"model": model}, timeout=30)
+    adapters = show.get("adapters") or []
+    if not adapters:
+        return 0.0, "no_adapter"
+    mtimes = [a.get("mtime") for a in adapters if a.get("mtime")]
+    if len(mtimes) != len(adapters):
+        # An adapter IS served but where its evidence ends is unknowable:
+        # treating that as "learned nothing" would count every landing as new
+        # and start an hours-long cycle on evidence it may already hold.
+        raise RuntimeError(f"{model} serves {len(adapters)} adapter(s) with no readable training "
+                           "cutoff (J-Prime too old to report adapter mtime?)")
+    return float(max(mtimes)), "adapter_file_mtime"
+
+
+async def training_yield(model: Optional[str] = None) -> Dict[str, Any]:
+    """Count landed-and-surviving commits newer than what the active adapter
+    learned. Git is the clock (each label's commit time); J-Prime says where
+    the served adapter's evidence ends. NEVER raises -- an unanswerable yield
+    is reported with ``error`` and treated as "not met" by the callers."""
+    model = model or _model()
+    out: Dict[str, Any] = {"model": model, "threshold": min_training_batch()}
+    try:
+        from backend.core.ouroboros.governance.observability.landing_provenance import (
+            label_landings, read_labels)
+        await label_landings()                      # current with git before counting
+        labels, _, _ = read_labels()
+        commits: Dict[str, float] = {}
+        for lab in labels.values():
+            if lab.get("landed") and lab.get("surviving"):
+                commits[lab["commit_sha"]] = float(lab.get("committed_at") or 0.0)
+        missing = [s for s, t in commits.items() if not t]
+        if missing:                                 # labels written before committed_at existed
+            from backend.core.ouroboros.governance.observability.landing_provenance import (
+                _git, resolve_repo_and_ref)
+            root, _ = await resolve_repo_and_ref()
+            if root is not None:
+                rc, txt = await _git(["show", "-s", "--format=%H %ct", *missing], root)
+                for line in txt.splitlines() if rc == 0 else []:
+                    sha, _, ct = line.partition(" ")
+                    if sha in commits and ct.strip().isdigit():
+                        commits[sha] = float(ct)
+        through, source = await _trained_through(model)
+        newer = sorted(t for t in commits.values() if t > through)
+        out.update({"unlearned": len(newer), "landed_total": len(commits), "trained_through": through,
+                    "trained_through_source": source, "newest_unlearned": newer[-1] if newer else None})
+        out["met"] = len(newer) >= out["threshold"]
+    except Exception as exc:  # noqa: BLE001
+        out.update({"met": False, "error": f"{type(exc).__name__}: {exc}"[:300]})
+    return out
+
+
+# ---------------------------------------------------------------------------
 # The cycle
 # ---------------------------------------------------------------------------
 
-async def run_cycle(*, trigger: str = "manual") -> Dict[str, Any]:
-    """One exclusive cycle. Returns the cycle record. NEVER raises (except
-    CancelledError, after the lease has been released)."""
+async def run_cycle(*, trigger: str = "manual", force: bool = False,
+                    deploy_gguf: Optional[Path] = None) -> Dict[str, Any]:
+    """One exclusive cycle. ``deploy_gguf`` skips training and runs an
+    existing adapter through the SAME publish/verify/reject tail. ``force``
+    bypasses the yield threshold (never the other gates). Returns the cycle
+    record. NEVER raises (except CancelledError, after the lease is released)."""
     run_id = time.strftime("handoff-%Y%m%d-%H%M%S")
     cycle = Cycle(run_id=run_id, trigger=trigger, model=_model())
     with _single_flight() as mine:
         if not mine:
             return {"run_id": run_id, "state": "REFUSED", "outcome": "another cycle is running"}
         try:
-            return await _run(cycle)
+            if deploy_gguf is not None:
+                return await _deploy_only(cycle, Path(deploy_gguf))
+            return await _run(cycle, force=force)
         finally:
             if cycle.lease_token:
                 # Every exit path gives the card back and restores serving.
@@ -338,18 +481,49 @@ async def _finish(cycle: Cycle, state: str, outcome: str, **detail: Any) -> Dict
     return cycle.public()
 
 
-async def _run(cycle: Cycle) -> Dict[str, Any]:
+async def _baseline(cycle: Cycle) -> Tuple[List[Dict[str, Any]], int]:
+    """The incumbent's score on the verification tasks, measured BEFORE the
+    card is taken: the bar a candidate must meet and a rollback must
+    reproduce. Same tasks for all three measurements."""
+    rows = _smoke_rows(int(tt._num(_ENV_SMOKE_N, 6.0, 1.0, 50.0)))
+    accepted, notes = await _smoke(cycle.model, rows) if rows else (0, [])
+    _record(cycle, "BASELINE", tasks=len(rows), accepted=accepted, notes=notes)
+    return rows, accepted
+
+
+async def _lease(cycle: Cycle, purpose: str) -> Optional[Dict[str, Any]]:
+    """Take the card from J-Prime and verify it on this side too. Returns
+    None on success, else the finished (FAILED) cycle record."""
+    _record(cycle, "LEASING")
+    ttl = tt._num(_ENV_LEASE_TTL, 900.0, 60.0, 86400.0)
+    try:
+        got = await _http("POST", "/v1/lease/acquire", body={
+            "holder": f"training-handoff:{cycle.run_id}@{socket.gethostname()}",
+            "purpose": purpose, "ttl_s": ttl})
+    except Exception as exc:  # noqa: BLE001
+        return await _finish(cycle, "FAILED", f"lease refused: {exc}")
+    cycle.lease_token = got["token"]
+    need = int(tt._num(tt._ENV_FREE_MIB, 24000.0, 0.0, 1_000_000.0))
+    free = await tt._gpu_free_mib()
+    _record(cycle, "LEASING", freed_mib=got.get("freed_mib"), gpu_free_mib=free, need_mib=need)
+    if free is not None and free < need:
+        return await _finish(cycle, "FAILED", f"card not free after lease: {free} MiB < {need}")
+    return None
+
+
+async def _run(cycle: Cycle, *, force: bool) -> Dict[str, Any]:
     live = _organism_live()
     if live:
         return await _finish(cycle, "REFUSED", f"organism pid {live} is running; a cycle needs the card")
     if not cycle.model:
         return await _finish(cycle, "REFUSED", "JARVIS_LOCAL_MODEL_NAME is unset")
 
-    # 1. Labels from git truth, so the corpus the gate reads is current.
+    # 1. Labels from git truth, then the yield: is there enough NEW evidence?
     _record(cycle, "LABELING")
-    from backend.core.ouroboros.governance.observability.landing_provenance import label_landings
-    lab = await label_landings()
-    cycle.detail["labeling"] = {"summary": lab.summary()}
+    y = await training_yield(cycle.model)
+    cycle.detail["labeling"] = {"yield": y}
+    if not y.get("met") and not force:
+        return await _finish(cycle, "REFUSED", "below_training_batch", yield_=y)
 
     # 2. The trainer's own corpus gate.
     _record(cycle, "PREFLIGHT")
@@ -376,25 +550,19 @@ async def _run(cycle: Cycle) -> Dict[str, Any]:
     if not argv:
         return await _finish(cycle, "REFUSED", "train command unresolved")
 
-    # 3. Exclusive handoff of the card, verified on both sides.
-    _record(cycle, "LEASING")
-    ttl = tt._num(_ENV_LEASE_TTL, 900.0, 60.0, 86400.0)
-    try:
-        got = await _http("POST", "/v1/lease/acquire", body={
-            "holder": f"training-handoff:{cycle.run_id}@{socket.gethostname()}",
-            "purpose": f"GRPO fine-tune of {cycle.model}", "ttl_s": ttl})
-    except Exception as exc:  # noqa: BLE001
-        return await _finish(cycle, "FAILED", f"lease refused: {exc}")
-    cycle.lease_token = got["token"]
-    need = int(tt._num(tt._ENV_FREE_MIB, 24000.0, 0.0, 1_000_000.0))
-    free = await tt._gpu_free_mib()
-    _record(cycle, "LEASING", freed_mib=got.get("freed_mib"), gpu_free_mib=free, need_mib=need)
-    if free is not None and free < need:
-        return await _finish(cycle, "FAILED", f"card not free after lease: {free} MiB < {need}")
+    # 3. The bar, measured on the incumbent while it still serves.
+    rows, baseline = await _baseline(cycle)
+    if not rows:
+        return await _finish(cycle, "REFUSED", "no verification tasks available")
+
+    # 4. Exclusive handoff of the card, verified on both sides.
+    failed = await _lease(cycle, f"GRPO fine-tune of {cycle.model}")
+    if failed:
+        return failed
 
     # 4. Train, renewing the lease for as long as the trainer runs.
     _record(cycle, "TRAINING", argv=argv)
-    renew = asyncio.create_task(_renew_forever(cycle.lease_token, ttl))
+    renew = asyncio.create_task(_renew_forever(cycle.lease_token, tt._num(_ENV_LEASE_TTL, 900.0, 60.0, 86400.0)))
     try:
         rc, out = await tt._run(argv, timeout_s=tt._num(tt._ENV_TRAIN_TIMEOUT, 43200.0, 60.0, 172800.0),
                                 cwd=tt._reactor_root())
@@ -426,42 +594,81 @@ async def _run(cycle: Cycle) -> Dict[str, Any]:
     if rc != 0 or not gguf.is_file():
         return await _finish(cycle, "FAILED", f"conversion rc={rc}", tail=out[-600:])
 
-    # 6. Publish to J-Prime's registry (validated there from the file's header).
+    source = {"run_id": cycle.run_id, "base": cycle.base_model,
+              "steps": (report.get("result") or {}).get("global_step"),
+              # The newest landing this corpus held: the yield's next cutoff.
+              "trained_through": y.get("newest_unlearned") or y.get("trained_through")}
+    return await _publish_and_verify(cycle, gguf, source, rows, baseline, train=_train_summary(report))
+
+
+async def _deploy_only(cycle: Cycle, gguf: Path) -> Dict[str, Any]:
+    """An adapter produced elsewhere enters service through EXACTLY the gates a
+    trained one does: exclusive lease, registry validation, restore, O+V's
+    own verification, reject-and-restore on failure."""
+    live = _organism_live()
+    if live:
+        return await _finish(cycle, "REFUSED", f"organism pid {live} is running; a deploy needs the card")
+    if not cycle.model:
+        return await _finish(cycle, "REFUSED", "JARVIS_LOCAL_MODEL_NAME is unset")
+    if not gguf.is_file():
+        return await _finish(cycle, "FAILED", f"no adapter at {gguf}")
+    rows, baseline = await _baseline(cycle)
+    if not rows:
+        return await _finish(cycle, "REFUSED", "no verification tasks available")
+    failed = await _lease(cycle, f"adapter deploy to {cycle.model}")
+    if failed:
+        return failed
+    return await _publish_and_verify(cycle, gguf, {"run_id": cycle.run_id, "deployed_from": str(gguf)},
+                                     rows, baseline)
+
+
+async def _publish_and_verify(cycle: Cycle, gguf: Path, source: Dict[str, Any],
+                              rows: List[Dict[str, Any]], baseline: int, **detail: Any) -> Dict[str, Any]:
+    """The shared tail, entered holding the lease: publish -> restore ->
+    verify against the incumbent's baseline -> COMMITTED; or REJECT (weights
+    deleted, last good restored) and verify the restoration reproduces the
+    baseline -> ROLLED_BACK."""
     _record(cycle, "PUBLISHING", gguf_bytes=gguf.stat().st_size)
     data = gguf.read_bytes()
     try:
         pub = await _http("POST", f"/v1/adapters/{cycle.model}/publish", data=data, headers={
             "X-Adapter-SHA256": hashlib.sha256(data).hexdigest(),
-            "X-Adapter-Source": json.dumps({"run_id": cycle.run_id, "base": cycle.base_model,
-                                            "steps": (report.get("result") or {}).get("global_step")}),
+            "X-Adapter-Source": json.dumps(source, default=str),
             "Content-Type": "application/octet-stream"})
-    except Exception as exc:  # noqa: BLE001
-        return await _finish(cycle, "FAILED", f"publish refused: {exc}")
+    except Exception as exc:  # noqa: BLE001 -- refused at the registry: nothing went live
+        return await _finish(cycle, "FAILED", f"publish refused: {exc}", **detail)
     cycle.adapter_version, cycle.previous_version = pub.get("active", ""), pub.get("previous", "")
 
-    # 7. Give the card back; J-Prime reloads the model WITH the new adapter.
+    # Give the card back; J-Prime reloads the model WITH the new adapter.
     _record(cycle, "RESTORING", version=cycle.adapter_version)
     restored = await _http("POST", "/v1/lease/release",
                            body={"token": cycle.lease_token, "restore_models": [cycle.model]})
     cycle.lease_token = ""
 
-    # 8. Verify by serving -- or roll back and verify THAT.
-    _record(cycle, "VERIFYING", restore=restored)
-    prompts = _smoke_prompts(int(tt._num(_ENV_SMOKE_N, 3.0, 1.0, 50.0)))
-    ok = not restored.get("failed") and bool(prompts)
+    _record(cycle, "VERIFYING", restore=restored, baseline=baseline, tasks=len(rows))
+    need = _required(baseline)
     notes: List[str] = []
-    if ok:
-        ok, notes = await _smoke(cycle.model, prompts)
-    if ok:
-        return await _finish(cycle, "COMMITTED", f"{cycle.model} now serves {cycle.adapter_version}",
-                             smoke=notes, train=_train_summary(report))
-    rb = await _http("POST", f"/v1/adapters/{cycle.model}/rollback")
-    ok_back, notes_back = await _smoke(cycle.model, prompts) if prompts else (False, ["no prompts"])
+    if restored.get("failed"):
+        reason = f"failed to load: {restored['failed']}"
+    else:
+        accepted, notes = await _smoke(cycle.model, rows)
+        if accepted >= need:
+            return await _finish(cycle, "COMMITTED", f"{cycle.model} now serves {cycle.adapter_version} "
+                                 f"({accepted}/{len(rows)} vs incumbent {baseline}/{len(rows)})",
+                                 smoke=notes, **detail)
+        reason = (f"verification {accepted}/{len(rows)} below the incumbent's {baseline}/{len(rows)} "
+                  f"(need {need}): {'; '.join(n for n in notes if ':FAIL:' in n)[:240]}")
+
+    rej = await _http("POST", f"/v1/adapters/{cycle.model}/reject",
+                      body={"version": cycle.adapter_version, "reason": reason})
+    back, notes_back = await _smoke(cycle.model, rows)
+    verified = back >= baseline
     return await _finish(cycle, "ROLLED_BACK",
-                         f"new adapter failed verification; serving {rb.get('active')} again "
-                         f"({'verified' if ok_back else 'UNVERIFIED -- investigate'})",
-                         smoke_new=notes or [str(restored.get("failed"))], smoke_rollback=notes_back,
-                         train=_train_summary(report))
+                         f"{cycle.adapter_version} rejected ({reason[:160]}); serving {rej.get('active')} "
+                         f"again, {back}/{len(rows)} vs baseline {baseline}/{len(rows)} -- "
+                         f"{'verified' if verified else 'UNVERIFIED -- investigate'}",
+                         smoke_new=notes or [reason], smoke_rollback=notes_back, rejected=rej,
+                         rollback_verified=verified, **detail)
 
 
 def _train_summary(report: Dict[str, Any]) -> Dict[str, Any]:
@@ -513,6 +720,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="run one cycle in the foreground")
     r.add_argument("--trigger", default="manual")
+    r.add_argument("--force", action="store_true", help="bypass the yield threshold (never the other gates)")
+    d = sub.add_parser("deploy", help="put an existing adapter GGUF through publish/verify/reject")
+    d.add_argument("--gguf", required=True)
+    d.add_argument("--trigger", default="deploy")
+    sub.add_parser("yield", help="how much unlearned landed evidence has accumulated")
     q = sub.add_parser("request", help="start a detached cycle")
     q.add_argument("--trigger", default="manual")
     sub.add_parser("status")
@@ -529,7 +741,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         out = request_cycle(trigger=args.trigger)
         print(json.dumps(out))
         return 0 if out.get("requested") else 1
-    res = asyncio.run(run_cycle(trigger=args.trigger))
+    if args.cmd == "yield":
+        print(json.dumps(asyncio.run(training_yield()), indent=2, default=str))
+        return 0
+    if args.cmd == "deploy":
+        res = asyncio.run(run_cycle(trigger=args.trigger, deploy_gguf=Path(args.gguf)))
+    else:
+        res = asyncio.run(run_cycle(trigger=args.trigger, force=args.force))
     print(json.dumps(res, indent=2, default=str))
     return 0 if res.get("state") in ("COMMITTED", "REFUSED") else 1
 

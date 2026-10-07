@@ -271,8 +271,19 @@ async def maybe_train_after_soak(
         return verdict
     try:
         from backend.core.ouroboros.governance.observability.training_handoff import (  # noqa: PLC0415
-            request_cycle,
+            request_cycle, request_timeout_s, training_yield,
         )
+        # Gate 3 -- yield. A cycle costs hours of inference uptime, so it is
+        # only worth starting once enough NEW landed evidence (git-proven,
+        # newer than what the served adapter learned) has accumulated.
+        # Below JARVIS_MIN_TRAINING_BATCH this returns at once: teardown ends
+        # and the next boot goes straight back to Sentinel discovery.
+        y = await asyncio.wait_for(training_yield(), timeout=request_timeout_s())
+        verdict["yield"] = y
+        if not y.get("met"):
+            verdict["reason"] = (f"below_training_batch:{y.get('unlearned', '?')}<{y.get('threshold')}"
+                                 + (f" ({y['error']})" if y.get("error") else ""))
+            return verdict
         out = await asyncio.to_thread(request_cycle, trigger=f"session_end:{session_id}")
     except Exception as exc:  # noqa: BLE001
         verdict["reason"] = f"request_failed:{type(exc).__name__}"
