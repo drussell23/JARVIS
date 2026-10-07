@@ -31,7 +31,7 @@ class Clock:
         self.t += s
 
 
-def _run(up, spawned=None, comes_up_after=None):
+def _run(up, spawned=None, comes_up_after=None, lent=None):
     clock = Clock()
     spawned = spawned if spawned is not None else []
 
@@ -44,7 +44,9 @@ def _run(up, spawned=None, comes_up_after=None):
         spawned.append((cmd, values))
 
     lines = []
-    out = ts.ensure_siblings(say=lines.append, probe=probe, spawn=spawn, sleep=clock.sleep, clock=clock)
+    # The network is simulated: admission is too (never the live engine).
+    out = ts.ensure_siblings(say=lines.append, probe=probe, spawn=spawn, sleep=clock.sleep, clock=clock,
+                             lent=lambda sib, base: (lent or {}).get(sib.key, ""))
     return {s.key: s for s in out}, spawned, lines
 
 
@@ -110,3 +112,10 @@ def test_boot_calls_bring_up_before_the_lane_gate():
     from pathlib import Path
     src = (Path(__file__).resolve().parents[2] / "scripts" / "ouroboros_battle_test.py").read_text()
     assert src.index("ensure_siblings()") < src.index("    _check_api_keys_or_die()\n")
+
+
+def test_a_lent_mind_is_reported_lent_and_never_restarted():
+    st, spawned, lines = _run({"http://127.0.0.1:8000/api/version", "http://127.0.0.1:8090/health"},
+                              lent={"jprime": "training cycle handoff-1 in TRAINING"})
+    assert st["jprime"].state == "lent" and "handoff-1" in st["jprime"].detail
+    assert spawned == [] and any("lent" in ln for ln in lines)

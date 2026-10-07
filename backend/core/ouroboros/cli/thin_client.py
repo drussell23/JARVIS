@@ -141,6 +141,25 @@ def _boot_wait_s() -> float:
 #: a crash message over a configuration refusal.
 EXIT_MODEL_PIN_UNAVAILABLE = 78
 
+#: POSIX ``sysexits.h`` EX_UNAVAILABLE, as the daemon spends it: the local
+#: generation lane is lent to a training cycle (lane_admission). Declared
+#: here for the same reason as 78, and pinned equal by the same kind of test.
+EXIT_LANE_LENT = 69
+
+def _lane_lent_lines() -> "list[str]":
+    """The lane-lent alert as the gate would word it, else a pointer. NEVER raises."""
+    head = "⚠ the organism declined to start: the local model is lent to a training cycle"
+    try:
+        from backend.core.ouroboros.governance.lane_admission import describe, read_admission
+        from backend.core.ouroboros.governance.local_inference_director import LocalConfig
+        adm = read_admission(LocalConfig.from_env().base_url)
+        if adm.admitting is False:
+            return [head] + ["  " + line for line in describe(adm)[1:]]
+    except Exception:  # noqa: BLE001
+        pass
+    return [head + " -- the full alert is in " + str(daemon_log_path())]
+
+
 #: How many stall windows a boot may take in TOTAL. The stall window says
 #: how long silence is tolerated; this says how long the whole thing may
 #: run even while it keeps talking. 4x.
@@ -1113,6 +1132,15 @@ async def ensure_daemon(
                 "⚠ the organism declined to start: the pinned model is not "
                 "served. The full alert is in " + str(daemon_log_path())
             )
+            return False
+        if rc == EXIT_LANE_LENT:
+            # A REFUSAL THAT RESOLVES ON ITS OWN, in hours: the local model
+            # is lent to a training cycle. Retrying within the boot window
+            # is pointless (the daemon already waited when the lane was due
+            # back soon), so say who holds it and until when -- read fresh
+            # from the same reader the daemon's gate used.
+            for line in _lane_lent_lines():
+                _say(line)
             return False
         if rc == 75:                      # EX_TEMPFAIL — single-flight
             # A REFUSAL IS USUALLY TRANSIENT, so retrying is the cockpit's job

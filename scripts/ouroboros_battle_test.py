@@ -1067,13 +1067,28 @@ def _check_api_keys_or_die() -> None:
     which is precisely backwards.
 
     The fatality is unchanged. Mandate 1 is about no MODE suppressing the
-    check; it was never about requiring a cloud vendor specifically."""
-    if os.environ.get("DOUBLEWORD_API_KEY") or os.environ.get("ANTHROPIC_API_KEY"):
+    check; it was never about requiring a cloud vendor specifically.
+
+    A paid lane counts only when it may be SPENT: configured AND allowed
+    (``paid_lanes`` -- switch, credential, not observed unfunded). A key
+    sitting in the environment with ``JARVIS_PAID_LANES_ENABLED=false`` is
+    not a lane, and treating it as one skipped every check of the lane that
+    actually carries the work.
+
+    A reachable local engine is a lane only when it ADMITS this organism:
+    a Training Lifecycle Handoff lends the card for hours, and J-Prime keeps
+    listing its models while refusing every generation. A lane back within
+    the Mind's own ready budget is waited for; one lent for longer refuses
+    the boot with EX_UNAVAILABLE and says who holds it and until when."""
+    paid = _usable_paid_lanes()
+    if paid:
+        print(f"  Generation lane: PAID ({', '.join(paid)})")
         return
     local = _local_generation_lane()
     if local:
+        _require_local_admission_or_exit(local)
         print(f"  {_BOLD}Generation lane: LOCAL J-Prime at {local}{_RESET}")
-        print("  (no cloud keys exported — running at zero marginal cost)")
+        print("  (no paid lane in use — running at zero marginal cost)")
         return
     print(f"\n  {_RED}{_BOLD}ERROR: No usable generation lane.{_RESET}")
     print(f"  {_RED}Export DOUBLEWORD_API_KEY or ANTHROPIC_API_KEY,{_RESET}")
@@ -1081,6 +1096,40 @@ def _check_api_keys_or_die() -> None:
     print(f"  {_RED}with a reachable engine at JARVIS_LOCAL_MODEL_BASE_URL{_RESET}")
     print(f"  {_RED}(currently unreachable, or serving no models).{_RESET}\n")
     sys.exit(1)
+
+
+def _usable_paid_lanes() -> "list":
+    """Paid lanes this boot may spend on (configured AND allowed). NEVER
+    raises: an unreadable verdict is not a lane."""
+    try:
+        from backend.core.ouroboros.governance.paid_lanes import (
+            PAID_LANES, paid_lane_allowed, paid_lane_configured,
+        )
+        return [lane.name for lane in PAID_LANES
+                if paid_lane_configured(lane.name) and paid_lane_allowed(lane.name)]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _require_local_admission_or_exit(base: str) -> None:
+    """Exit EX_UNAVAILABLE when the local lane is lent beyond the Mind's
+    ready budget; wait when it is back sooner. See lane_admission."""
+    try:
+        from backend.core.ouroboros.governance.lane_admission import (
+            EXIT_LANE_LENT, await_admission, describe,
+        )
+        from backend.core.ouroboros.governance.trinity_siblings import jprime_ready_budget_s
+        adm = await_admission(base, jprime_ready_budget_s())
+    except Exception as exc:  # noqa: BLE001 -- an unreadable admission is not a refusal
+        print(f"  (lane admission unreadable: {type(exc).__name__}: {exc})")
+        return
+    if adm.admitting is not False:
+        return
+    print(f"\n  {_RED}{_BOLD}NOT STARTING: the local generation lane is lent out.{_RESET}")
+    for line in describe(adm):
+        print(f"  {_RED}{line}{_RESET}")
+    print()
+    sys.exit(EXIT_LANE_LENT)
 
 
 #: POSIX ``sysexits.h`` EX_CONFIG. The repo already speaks this dialect --

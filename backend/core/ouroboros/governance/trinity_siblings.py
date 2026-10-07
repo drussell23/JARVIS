@@ -46,7 +46,8 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger("Ouroboros.TrinitySiblings")
 
-__all__ = ["Sibling", "SiblingStatus", "siblings", "ensure_siblings", "autostart_enabled"]
+__all__ = ["Sibling", "SiblingStatus", "siblings", "ensure_siblings", "autostart_enabled",
+           "probe_timeout_s", "jprime_ready_budget_s"]
 
 _TRUTHY = ("1", "true", "yes", "on")
 
@@ -86,6 +87,16 @@ class SiblingStatus:
     detail: str = ""
 
 
+def probe_timeout_s() -> float:
+    """How long one readiness probe of a sibling may take."""
+    return _float_env("JARVIS_TRINITY_PROBE_TIMEOUT_S", 2.0)
+
+
+def jprime_ready_budget_s() -> float:
+    """How long a boot waits for the Mind to become able to serve."""
+    return _float_env("JARVIS_JPRIME_START_BUDGET_S", 120.0)
+
+
 def _jprime_url() -> str:
     # The same precedence as candidate_generator.local_lane_endpoint (the
     # failover-wired JARVIS_PRIME_URL first, else the local lane's base URL),
@@ -105,7 +116,7 @@ def siblings() -> List[Sibling]:
             # engine, and is cheap (no model load, no store scan).
             probe_path="/api/version", start_env="JARVIS_JPRIME_START_CMD",
             required=_local_lane_on,
-            ready_budget_s=lambda: _float_env("JARVIS_JPRIME_START_BUDGET_S", 120.0),
+            ready_budget_s=jprime_ready_budget_s,
         ),
         Sibling(
             key="reactor", title="Reactor-Core (Nerves)",
@@ -150,16 +161,29 @@ def _spawn(cmd: str, values: Dict[str, str]) -> subprocess.Popen:
         log.close()
 
 
+def _lent_detail(sib: Sibling, base: str) -> str:
+    """Why an answering J-Prime will not serve this organism, else ""."""
+    if sib.key != "jprime":
+        return ""
+    try:
+        from backend.core.ouroboros.governance.lane_admission import _who, read_admission
+        adm = read_admission(base)
+        return _who(adm) if adm.admitting is False else ""
+    except Exception:  # noqa: BLE001 -- a status line never takes the boot down
+        return ""
+
+
 def ensure_siblings(*, say: Callable[[str], None] = print,
                     probe: Callable[[str, float], bool] = _answers,
                     spawn: Callable[[str, Dict[str, str]], object] = _spawn,
                     sleep: Callable[[float], None] = time.sleep,
-                    clock: Callable[[], float] = time.monotonic) -> List[SiblingStatus]:
+                    clock: Callable[[], float] = time.monotonic,
+                    lent: Callable[[Sibling, str], str] = _lent_detail) -> List[SiblingStatus]:
     """Bring up every configured sibling that is not already serving. NEVER raises."""
     out: List[SiblingStatus] = []
     if not autostart_enabled():
         return out
-    probe_timeout = _float_env("JARVIS_TRINITY_PROBE_TIMEOUT_S", 2.0)
+    probe_timeout = probe_timeout_s()
     for sib in siblings():
         try:
             base = sib.base_url().rstrip("/")
@@ -168,6 +192,14 @@ def ensure_siblings(*, say: Callable[[str], None] = print,
                 out.append(SiblingStatus(sib.key, sib.title, base, "skipped", "local lane off"))
                 continue
             if probe(url, probe_timeout):
+                why = lent(sib, base)
+                if why:
+                    # Up, but lent out: not started over (it is not down),
+                    # not called "serving" (it will refuse us). The lane
+                    # gate owns what that means for this boot.
+                    say(f"  {sib.title}: up at {base}, lent -- {why}")
+                    out.append(SiblingStatus(sib.key, sib.title, base, "lent", why))
+                    continue
                 say(f"  {sib.title}: serving at {base}")
                 out.append(SiblingStatus(sib.key, sib.title, base, "serving"))
                 continue

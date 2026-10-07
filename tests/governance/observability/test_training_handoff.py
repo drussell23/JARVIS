@@ -54,6 +54,10 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("JARVIS_TRAINING_HANDOFF_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("JARVIS_TRAINING_HANDOFF_RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setenv("JARVIS_LOCAL_MODEL_NAME", "qwen3-coder-ov:30b")
+    # The budgets these tests assert on, pinned: importing the launcher
+    # script elsewhere in a run applies the production envelope to os.environ.
+    monkeypatch.setenv("JARVIS_GRPO_AUTOTRAIN_TIMEOUT_S", "43200")
+    monkeypatch.delenv("JARVIS_TRAINING_TIME_RESERVE_S", raising=False)
     monkeypatch.delenv("TRINITY_GRPO_BASE_MODEL", raising=False)
     monkeypatch.delenv("TRINITY_GRPO_TRAIN_CMD", raising=False)
     monkeypatch.setattr(th, "_organism_live", lambda: None)

@@ -198,6 +198,87 @@ def _single_flight():
         fh.close()
 
 
+def cycle_alive() -> bool:
+    """Is a cycle running right now? The kernel lock is the truth, never
+    state.json: a cycle that crashed leaves a stale state file, but its lock
+    dies with it."""
+    try:
+        with _single_flight() as free:
+            return not free
+    except Exception:  # noqa: BLE001 -- cannot probe: say "not proven alive"
+        return False
+
+
+# The phases, in order, from taking the card to the last use of the served
+# model. Each is bounded by its OWN knob (the one the phase spends), so the
+# latest moment a cycle can still hold the lane is derived, never guessed.
+_HOLDING = ("LEASING", "TRAINING", "CONVERTING", "PUBLISHING", "RESTORING", "VERIFYING")
+
+
+def _phase_budget_s(state: str, detail: Dict[str, Any]) -> float:
+    http = tt._num(_ENV_HTTP_TIMEOUT, 900.0, 5.0, 86400.0)
+    if state == "TRAINING":
+        return tt._num(tt._ENV_TRAIN_TIMEOUT, 43200.0, 60.0, 172800.0)
+    if state == "CONVERTING":
+        return tt._num(_ENV_CONVERT_TIMEOUT, 900.0, 30.0, 7200.0)
+    if state == "VERIFYING":
+        tasks = int(((detail or {}).get("verifying") or {}).get("tasks")
+                    or tt._num(_ENV_SMOKE_N, 6.0, 1.0, 50.0))
+        # The candidate's measurement, and -- on rejection -- the restored
+        # incumbent's, plus the reject call between them.
+        return 2 * tasks * tt._num(_ENV_SMOKE_TIMEOUT, 600.0, 10.0, 7200.0) + http
+    return http       # LEASING / PUBLISHING / RESTORING: one J-Prime call each
+
+
+def _state_entered_at(run_id: str, state: str) -> Optional[float]:
+    """When ``run_id`` entered ``state``, from the append-only history."""
+    try:
+        with (state_dir() / "history.jsonl").open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - (1 << 16)))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("run_id") == run_id and row.get("state") == state:
+            return float(row["ts"])
+    return None
+
+
+def occupancy() -> Optional[Dict[str, Any]]:
+    """What a live cycle is doing to the served model, for anyone about to
+    depend on it. None when no cycle runs. NEVER raises.
+
+    ``holds_lane`` is True from taking the card until the last verification
+    request: the lease covers LEASING..PUBLISHING, and RESTORING/VERIFYING
+    still use the served model exclusively (and may swap its adapter on a
+    rejection). ``release_by`` is the latest moment that can last, summed
+    from each remaining phase's own budget -- an upper bound, not a forecast.
+    """
+    try:
+        if not cycle_alive():
+            return None
+        st = status()
+        state = str(st.get("state") or "")
+        out: Dict[str, Any] = {"run_id": st.get("run_id"), "state": state,
+                               "trigger": st.get("trigger"), "model": st.get("model"),
+                               "holds_lane": state in _HOLDING, "since": None, "release_by": None}
+        if state in _HOLDING:
+            since = _state_entered_at(str(st.get("run_id")), state)
+            out["since"] = since
+            if since is not None:
+                rest = _HOLDING[_HOLDING.index(state):]
+                out["release_by"] = since + sum(_phase_budget_s(s, st.get("detail") or {}) for s in rest)
+        return out
+    except Exception:  # noqa: BLE001
+        logger.debug("[TrainingHandoff] occupancy unreadable", exc_info=True)
+        return None
+
+
 def _organism_live() -> Optional[int]:
     try:
         from backend.core.ouroboros.battle_test.singleton_lock import live_incumbent_pid
@@ -827,11 +908,8 @@ def request_cycle(*, trigger: str, requester_pid: Optional[int] = None,
     cmd = (os.environ.get(_ENV_LAUNCHER, "") or "").strip()
     if not cmd:
         return {"requested": False, "reason": f"{_ENV_LAUNCHER} is unset"}
-    # The kernel lock, not state.json, says whether a cycle is alive: a cycle
-    # that crashed leaves a stale state file but its lock dies with it.
-    with _single_flight() as free:
-        if not free:
-            return {"requested": False, "reason": f"a cycle is in progress ({status().get('state')})"}
+    if cycle_alive():
+        return {"requested": False, "reason": f"a cycle is in progress ({status().get('state')})"}
     import subprocess
     try:
         if requester_pid is not None:
