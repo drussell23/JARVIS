@@ -2072,6 +2072,13 @@ def main(argv: "list[str] | None" = None) -> None:
     # can suppress it.
     # ------------------------------------------------------------------
     _mode = resolve_presentation_mode()
+    # Bring up the Trinity siblings (J-Prime serves the model, Reactor-Core
+    # ingests the experience stream) BEFORE the lane gate judges the lane:
+    # the gate should see the Mind this boot was able to start, not the one
+    # an operator happened to start by hand. The gate stays the only owner
+    # of the fatal verdict.
+    from backend.core.ouroboros.governance.trinity_siblings import ensure_siblings
+    ensure_siblings()
     _check_api_keys_or_die()
     # AFTER the lane gate, never before: "the engine cannot serve" and "the
     # engine serves, but not what you asked for" are different faults, and
