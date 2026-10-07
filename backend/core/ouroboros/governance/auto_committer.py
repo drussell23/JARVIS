@@ -87,6 +87,11 @@ _PUSH_BRANCH = os.environ.get("JARVIS_AUTO_PUSH_BRANCH", "").strip()
 _PROTECTED_BRANCHES = frozenset({"main", "master", "production", "release"})
 
 # O+V Signature — the identity of the autonomous developer
+#: The trailer naming the operation that produced a commit. Spelled ONCE so
+#: the writer (below) and the readers that recover an op from git
+#: (observability.landing_provenance) cannot drift apart.
+OP_ID_TRAILER = "Op-ID"
+
 _OV_SIGNATURE = "Ouroboros+Venom [O+V] — Autonomous Self-Development Engine"
 _OV_COAUTHOR = "Co-Authored-By: Ouroboros+Venom <ouroboros@jarvis.trinity>"
 
@@ -846,7 +851,7 @@ class AutoCommitter:
         body_parts.append("")
 
         # --- Operational metadata ---
-        body_parts.append(f"Op-ID: {op_id}")
+        body_parts.append(f"{OP_ID_TRAILER}: {op_id}")
 
         risk_str = self._format_risk_tier(risk_tier)
         body_parts.append(f"Risk: {risk_str}")

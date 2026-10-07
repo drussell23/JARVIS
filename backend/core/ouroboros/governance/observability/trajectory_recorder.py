@@ -64,6 +64,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from backend.core.ouroboros.governance.op_context import OperationPhase
+
 logger = logging.getLogger(__name__)
 
 TRAJECTORY_RECORDER_SCHEMA_VERSION = "1.0"
@@ -378,6 +380,16 @@ _TERMINAL_REASON_POLICY: Dict[str, _OutcomePolicy] = {
     "wall_clock_cap": _INFRA,
 }
 
+#: Terminal phases that mean "the pipeline applied and verified the change".
+#: Spelled from the ENUM the orchestrator advances through, never retyped:
+#: the emit seam sends ``ctx.phase.name`` (``"COMPLETE"``) with reason code
+#: ``"complete"``, while this check used to compare against hand-typed
+#: ``"COMPLETED"``/``"APPLIED"`` and the reason map against ``"completed"``.
+#: Neither spelling ever matched, so every op that LANDED was written
+#: ``outcome=unknown, should_train=False`` -- measured 2026-10-07: 37 of 39
+#: landed ops had rows, and not one row was labelled success.
+_SUCCESS_PHASES: frozenset = frozenset({OperationPhase.COMPLETE.name})
+
 
 def classify_terminal_reason(
     terminal_reason: str, terminal_phase: str = "",
@@ -392,7 +404,7 @@ def classify_terminal_reason(
     if reason in _TERMINAL_REASON_POLICY:
         return _TERMINAL_REASON_POLICY[reason]
     phase = (terminal_phase or "").strip().upper()
-    if phase in ("COMPLETED", "APPLIED"):
+    if phase in _SUCCESS_PHASES:
         return _SUCCESS
     return _UNKNOWN
 

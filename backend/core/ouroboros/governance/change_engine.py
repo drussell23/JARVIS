@@ -23,6 +23,7 @@ import enum
 import hashlib
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, List, Optional
@@ -405,6 +406,43 @@ def _inject_ouroboros_signature(
         break
 
     lines.insert(insert_at, sig)
+    return "\n".join(lines)
+
+
+def strip_ouroboros_signature(content: str, op_id: str) -> Optional[str]:
+    """Exact inverse of :func:`_inject_ouroboros_signature` for ONE op.
+
+    The injector inserts ``sig`` (header + ``Reason:`` line, newline
+    terminated) as a single list element, so after the ``"\\n".join`` the
+    file carries three lines: the header naming ``op_id[:12]``, the reason,
+    and an empty line. Removing exactly those three restores the content the
+    injector received -- byte for byte -- which is what lets a committed
+    blob be matched against the candidate that produced it by hash.
+
+    Only THIS op's block is removed: older signatures belong to the content
+    the candidate was generated from and are part of it. Returns the content
+    unchanged when the op left no block (signatures disabled), and None when
+    the op left more than one -- ambiguity is reported, never guessed.
+    """
+    if not op_id:
+        return content
+    lines = content.split("\n")
+    header = re.compile(
+        r"^(?:#|//) \[Ouroboros\] Modified by Ouroboros \(op="
+        + re.escape(op_id[:12]) + r"\) at .+$"
+    )
+    hits = [
+        i for i, line in enumerate(lines)
+        if header.match(line)
+        and i + 2 < len(lines)
+        and re.match(r"^(?:#|//) Reason: ", lines[i + 1])
+        and lines[i + 2] == ""
+    ]
+    if not hits:
+        return content
+    if len(hits) > 1:
+        return None
+    del lines[hits[0]:hits[0] + 3]
     return "\n".join(lines)
 
 

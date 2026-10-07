@@ -244,8 +244,12 @@ def test_classifier_degrades_unknown_reasons_rather_than_guessing() -> None:
     outcome, autonomy, train = classify_terminal_reason("some_new_reason_code")
     assert (outcome, train) == ("unknown", False)
     assert autonomy == "intent_written"
-    # ...but a terminal phase that unambiguously means "it landed" wins.
-    assert classify_terminal_reason("", "COMPLETED")[0] == "success"
+    # ...but a terminal phase that unambiguously means "it landed" wins --
+    # spelled from the enum the orchestrator emits. The old hand-typed
+    # "COMPLETED" matched no phase that exists, so every landing was unknown.
+    from backend.core.ouroboros.governance.op_context import OperationPhase
+    assert classify_terminal_reason("complete", OperationPhase.COMPLETE.name)[0] == "success"
+    assert classify_terminal_reason("", "COMPLETED")[0] == "unknown"
 
 
 @pytest.mark.asyncio

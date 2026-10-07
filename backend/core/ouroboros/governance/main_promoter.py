@@ -295,6 +295,9 @@ class MainPromotionTransport:
         self._queue: Optional["asyncio.Queue[Tuple[str, str]]"] = None
         self._worker: Optional["asyncio.Task[None]"] = None
         self._loop: Any = None
+        #: Live landing-provenance passes this transport started; owned here
+        #: so they end with the transport rather than outliving its loop.
+        self._label_tasks: Set["asyncio.Task[Any]"] = set()
 
     def bind(self, comm: Any) -> None:
         """The protocol to announce outcomes on (built after its transports)."""
@@ -384,6 +387,16 @@ class MainPromotionTransport:
                 else f"{outcome.unpushed} commit(s) not on origin",
             )
             await self._sweep_merged(outcome.target)
+            # The landing is now git truth on the target: label the corpus
+            # rows whose candidate it is (proven by content hash, never by
+            # op membership alone). Fire-and-forget; never delays promotion.
+            from backend.core.ouroboros.governance.observability.landing_provenance import (  # noqa: PLC0415
+                schedule_live_label,
+            )
+            task = schedule_live_label(sha)
+            if task is not None:
+                self._label_tasks.add(task)
+                task.add_done_callback(self._label_tasks.discard)
         await self._announce(op_id, outcome, promoted, state, detail)
 
     async def _sweep_merged(self, target: str) -> None:
@@ -428,12 +441,16 @@ class MainPromotionTransport:
 
     async def aclose(self) -> None:
         """Cancel the worker. A queued landing is not lost: its branch is
-        never deleted unmerged, so it remains promotable by hand."""
+        never deleted unmerged, so it remains promotable by hand. Pending
+        provenance passes are cancelled too -- their labels are re-derived from
+        git by the next full pass, so nothing is lost by stopping them."""
         worker, self._worker = self._worker, None
-        if worker is not None and not worker.done():
-            worker.cancel()
+        pending = [t for t in (worker, *self._label_tasks) if t is not None and not t.done()]
+        for t in pending:
+            t.cancel()
+        for t in pending:
             try:
-                await worker
+                await t
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
 
