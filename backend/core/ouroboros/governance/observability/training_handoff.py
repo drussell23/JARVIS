@@ -74,6 +74,7 @@ _ENV_SMOKE_N = "JARVIS_TRAINING_SMOKE_PROMPTS"
 _ENV_SMOKE_TIMEOUT = "JARVIS_TRAINING_SMOKE_TIMEOUT_S"
 _ENV_HTTP_TIMEOUT = "JARVIS_TRAINING_JPRIME_TIMEOUT_S"
 _ENV_LAUNCHER = "JARVIS_TRAINING_HANDOFF_LAUNCH_CMD"
+_ENV_TIME_RESERVE = "JARVIS_TRAINING_TIME_RESERVE_S"
 
 STATES = ("IDLE", "LABELING", "PREFLIGHT", "BASELINE", "LEASING", "TRAINING", "CONVERTING", "PUBLISHING",
           "RESTORING", "VERIFYING", "COMMITTED", "ROLLED_BACK", "REFUSED", "FAILED")
@@ -236,9 +237,17 @@ def _train_argv(run_dir: Path, base: str) -> Optional[List[str]]:
     if not root or not py:
         return None
     from backend.core.ouroboros.governance.observability.trajectory_recorder import events_dir
+    # The time the trainer may spend STEPPING: this cycle's training timeout
+    # less what the run needs around the steps (the calibration child, the
+    # rung's model load, saving). The runner fits its step count to it, so a
+    # correctly sized but slow window ends with an adapter instead of being
+    # killed by the timeout with nothing.
+    budget = (tt._num(tt._ENV_TRAIN_TIMEOUT, 43200.0, 60.0, 172800.0)
+              - tt._num(_ENV_TIME_RESERVE, 2700.0, 0.0, 86400.0))
     return [py, "-u", str(root / "scripts" / "run_grpo_training.py"), "--model", base,
             "--telemetry-dir", str(events_dir()), "--output-dir", str(run_dir),
             "--json-out", str(run_dir / "train_report.json"),
+            "--time-budget-s", str(max(0.0, budget)),
             *shlex.split(os.environ.get(_ENV_TRAIN_ARGS, ""))]
 
 

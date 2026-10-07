@@ -137,6 +137,8 @@ def test_happy_path_commits_the_new_adapter_and_returns_the_card(env, monkeypatc
         < paths.index("/v1/lease/release")
     train = next(c for c in seen if "run_grpo_training.py" in " ".join(c))
     assert train[train.index("--model") + 1] == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+    # the trainer is told how long it may step: timeout less the reserve
+    assert float(train[train.index("--time-budget-s") + 1]) == 43200.0 - 2700.0
 
 
 def test_nothing_to_learn_never_touches_the_card(env, monkeypatch):

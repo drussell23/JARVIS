@@ -451,17 +451,49 @@ async def _read_json(resp: Any) -> Any:
         return await resp.json()
 
 
-def _extract_completion(data: "Dict[str, Any]") -> "Tuple[str, int, int]":
+def _retry_after_s(resp: Any) -> "Optional[float]":
+    try:
+        raw = (getattr(resp, "headers", None) or {}).get("Retry-After")
+        return float(raw) if raw not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def _read_reply(resp: Any) -> "Tuple[Any, int, Optional[float]]":
+    """``(payload, status, retry_after_s)``. An error status keeps the RAW
+    body (it may be plain text, and decoding it as JSON would raise a decode
+    error that hides the engine's message all over again)."""
+    status = int(getattr(resp, "status", 200) or 200)
+    if status >= 400:
+        try:
+            body: Any = await resp.text()
+        except Exception as exc:  # noqa: BLE001
+            body = f"<unreadable error body: {type(exc).__name__}>"
+        return body, status, _retry_after_s(resp)
+    return await _read_json(resp), status, None
+
+
+def _extract_completion(data: "Dict[str, Any]", status: int = 200,
+                        retry_after_s: "Optional[float]" = None) -> "Tuple[str, int, int]":
     """``(text, completion_tokens, prompt_tokens)`` from EITHER dialect's
     non-streaming reply. Dispatches on SHAPE, not on config, so a proxy that
     answers in the other dialect is still read correctly. Missing counts are
-    0 (the caller labels the estimate). NEVER raises on a well-formed reply of
-    either shape; a malformed one raises KeyError like the old path did."""
+    0 (the caller labels the estimate).
+
+    An error status, an error body, or a body of neither shape raises
+    :class:`LocalEngineError` carrying the engine's own message -- never a
+    KeyError about a field an error body was never going to have."""
+    if status >= 400 or not isinstance(data, dict) or _error_frame(data) is not None:
+        raise LocalEngineError(status, _engine_error_message(data), data, retry_after_s)
     if isinstance(data.get("message"), dict):              # ollama native
         text = str(data["message"].get("content") or "")
         return (text, int(data.get("eval_count") or 0),
                 int(data.get("prompt_eval_count") or 0))
-    text = data["choices"][0]["message"]["content"]         # OpenAI-compat
+    choices = data.get("choices")
+    if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)
+            and isinstance(choices[0].get("message"), dict)):
+        raise LocalEngineError(status, f"reply has neither dialect's shape (keys {sorted(data)[:12]})", data)
+    text = choices[0]["message"].get("content") or ""         # OpenAI-compat
     usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
     return (text, int(usage.get("completion_tokens", 0) or 0),
             int(usage.get("prompt_tokens", 0) or 0))
@@ -487,6 +519,9 @@ def _parse_ndjson_delta(line: "bytes") -> "Any":
         obj = _json.loads(s)
         if not isinstance(obj, dict):
             return None
+        err = _error_frame(obj)
+        if err is not None:
+            return err
         msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
         content = msg.get("content") or None
         if obj.get("done"):
@@ -1521,6 +1556,76 @@ class _SSEUsage(NamedTuple):
     completion_tokens: int
 
 
+class LocalEngineError(RuntimeError):
+    """The inference engine answered with an ERROR, not a completion.
+
+    Before this, an engine failure surfaced as ``KeyError: 'choices'`` -- the
+    reply parser reaching for a field an error body does not have -- and the
+    engine's own words were thrown away (measured 2026-10-07: llama.cpp's
+    ``Unexpected empty grammar stack after accepting piece`` behind a corrupt
+    adapter read as a KeyError). This carries the HTTP status, the engine's
+    message unwrapped from whatever envelope it arrived in, and the raw
+    payload. Deliberately NOT an infrastructure fault (see
+    ``inference_gateway._INFRA_FAULTS``): an engine refusing or crashing on a
+    request says nothing about whether the host is up -- the same verdict the
+    old KeyError got, now with its cause attached.
+    """
+
+    def __init__(self, status: int, message: str, payload: Any = None,
+                 retry_after_s: "Optional[float]" = None) -> None:
+        super().__init__(f"engine error HTTP {status}: {message}")
+        self.status = int(status)
+        self.engine_message = message
+        self.payload = payload
+        self.retry_after_s = retry_after_s
+
+
+def _engine_error_message(payload: Any) -> str:
+    """The innermost human message in an error body. Proxies nest: J-Prime
+    wraps llama-server's ``{"error": {"message": ...}}`` as a JSON STRING
+    inside its own ``{"error": ...}``. Unwraps strings that are JSON, dicts
+    with ``error``/``message``, and stops at the first plain text. Pure."""
+    import json as _json  # noqa: PLC0415
+    seen = 0
+    while seen < 8:
+        seen += 1
+        if isinstance(payload, (bytes, bytearray)):
+            payload = payload.decode("utf-8", "replace")
+        if isinstance(payload, str):
+            s = payload.strip()
+            if s[:1] in "{[":
+                try:
+                    payload = _json.loads(s)
+                    continue
+                except ValueError:
+                    pass
+            return s[:2000]
+        if isinstance(payload, dict):
+            for key in ("error", "message", "detail"):
+                if key in payload and payload[key] not in (None, ""):
+                    payload = payload[key]
+                    break
+            else:
+                return _json.dumps(payload)[:2000]
+            continue
+        return str(payload)[:2000]
+    return str(payload)[:2000]
+
+
+@dataclass(frozen=True)
+class _StreamError:
+    """An error frame inside a stream that opened with 200 (the engine failed
+    after the headers were sent). Returned by the line parsers, raised by
+    the read loop -- never silently treated as a keep-alive."""
+    message: str
+
+
+def _error_frame(obj: Any) -> "Optional[_StreamError]":
+    if isinstance(obj, dict) and "error" in obj and not obj.get("choices") and not obj.get("message"):
+        return _StreamError(_engine_error_message(obj))
+    return None
+
+
 def _parse_sse_delta(line: bytes) -> "Any":
     """Parse ONE line of an ollama /v1/chat/completions SSE stream. Returns the
     incremental content string, the ``_SSE_DONE`` sentinel on ``data: [DONE]``,
@@ -1541,6 +1646,9 @@ def _parse_sse_delta(line: bytes) -> "Any":
             return _SSE_DONE
         import json as _json  # noqa: PLC0415
         obj = _json.loads(payload)
+        err = _error_frame(obj)
+        if err is not None:
+            return err
         choices = obj.get("choices") or []
         if not choices:
             # No choices AND a usage object -> the accounting frame. No
@@ -1836,16 +1944,19 @@ class LocalPrimeClient:
                         _what, resp.status, _body_txt[:160],
                     )
                     async with sess.post(url, json=body) as resp2:
-                        data = await _read_json(resp2)
+                        data, _status, _retry = await _read_reply(resp2)
                 else:
-                    resp.raise_for_status()
-                    data = await _read_json(resp)
+                    # The engine refused the REQUEST; its body says why, and
+                    # it was just read -- raise_for_status() discarded it.
+                    raise LocalEngineError(resp.status, _engine_error_message(_body_txt),
+                                           _body_txt, _retry_after_s(resp))
             else:
-                data = await _read_json(resp)
+                data, _status, _retry = await _read_reply(resp)
         total_ms = (time.monotonic() - t0) * 1000.0
         # Shape-dispatched: reads the native reply (``message.content`` +
-        # ``eval_count``) or the OpenAI one (``choices[0]`` + ``usage``).
-        text, _reported, _prompt_reported = _extract_completion(data)
+        # ``eval_count``) or the OpenAI one (``choices[0]`` + ``usage``); an
+        # error status or body raises LocalEngineError with the engine's words.
+        text, _reported, _prompt_reported = _extract_completion(data, _status, _retry)
         _usage = {"prompt_tokens": _prompt_reported}
         # Estimation is the LAST resort, and it is labelled when used. The
         # `or` chain that preceded this silently produced the same int for
@@ -1996,6 +2107,12 @@ class LocalPrimeClient:
                 raise _freeze()
             resp = _enter_task.result()  # re-raises genuine request errors faithfully
             try:
+                if int(getattr(resp, "status", 200) or 200) >= 400:
+                    # Refused before the first byte of the stream: the body
+                    # is the engine's explanation, not a stream to parse.
+                    _err_body, _err_status, _err_retry = await _read_reply(resp)
+                    raise LocalEngineError(_err_status, _engine_error_message(_err_body),
+                                           _err_body, _err_retry)
                 reader = resp.content  # aiohttp StreamReader (line-iterable)
                 # Phase 1 (chunk loop): the SAME long-lived waiter raced against
                 # each readline. The instant the OS signal fires the event, the
@@ -2068,6 +2185,12 @@ class LocalPrimeClient:
                     delta = _parse_stream_line(line)
                     if delta is _SSE_DONE:
                         break
+                    if isinstance(delta, _StreamError):
+                        # The engine failed AFTER sending 200 headers (a
+                        # decoder/grammar crash mid-generation). Its words,
+                        # not an empty completion.
+                        raise LocalEngineError(int(getattr(resp, "status", 200) or 200),
+                                               delta.message, delta.message)
                     if isinstance(delta, _SSEUsage):
                         # The accounting frame. NOT output: it must never
                         # reach `parts` or `_emit_stream_token`, and it is
