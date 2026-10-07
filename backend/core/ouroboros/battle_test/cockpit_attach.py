@@ -779,7 +779,17 @@ class CockpitAttachBridge:
             # field — naming a model we are not certain of is worse than
             # naming none.
             "model": _safe(self._active_model, ""),
+            # WHO stands behind that name: engine, adapter version and where
+            # its training evidence ends, and the vision lane. Resolved once
+            # at the boot gate (served_identity); a new adapter keeps the same
+            # tag, so the name alone cannot say the organism has learned.
+            "serving": _safe(self._served_identity, {}),
         }
+
+    @staticmethod
+    def _served_identity() -> Dict[str, Any]:
+        from backend.core.ouroboros.governance.served_identity import current
+        return current()
 
     @staticmethod
     def _active_model() -> str:

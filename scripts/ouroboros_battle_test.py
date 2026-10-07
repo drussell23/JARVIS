@@ -1202,6 +1202,35 @@ def _validate_model_pin_or_die() -> None:
         print(f"  Model: {_BOLD}{resolved}{_RESET} ({origin})")
 
 
+def _resolve_served_identity() -> None:
+    """Name the engine, adapter and vision lane this session is served by.
+    Local lane only (a paid lane names itself). NEVER raises; never fatal."""
+    try:
+        from backend.core.ouroboros.governance import served_identity as si
+        from backend.core.ouroboros.governance.candidate_generator import resolve_display_model
+        from backend.core.ouroboros.governance.local_inference_director import (
+            LocalConfig, local_prime_enabled,
+        )
+        if _usable_paid_lanes() or not local_prime_enabled():
+            return
+        vision_base, vision_model = "", ""
+        try:
+            from backend.vision.local_vision_client import LocalVisionClient
+            vc = LocalVisionClient()
+            if vc.enabled:
+                vision_base, vision_model = vc.base_url, vc.model
+        except Exception:  # noqa: BLE001 -- vision is optional; its absence is not an error
+            pass
+        identity = si.resolve(base=LocalConfig.from_env().base_url, model=resolve_display_model(),
+                              vision_base=vision_base, vision_model=vision_model)
+        si.set_current(identity)
+        line = si.describe_line(identity)
+        if line:
+            print(f"  Serving: {line}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (served identity unavailable: {type(exc).__name__}: {exc})")
+
+
 def _local_registry_tags() -> "Optional[dict]":
     """The engine's ``/api/tags`` payload, or None when it cannot be read.
 
@@ -2134,6 +2163,9 @@ def main(argv: "list[str] | None" = None) -> None:
     # the first already has an owner. Running this first would report a
     # missing model when the truth is a stopped engine.
     _validate_model_pin_or_die()
+    # WHO answers -- engine, adapter, vision -- resolved once, here, where the
+    # lane and the pin were just proven. The cockpit reads this cache.
+    _resolve_served_identity()
 
     # ------------------------------------------------------------------
     # Zombie reaper — kill lingering battle tests from prior sessions

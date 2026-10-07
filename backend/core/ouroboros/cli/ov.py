@@ -740,6 +740,16 @@ def _render_hydration(console: Any, payload: dict) -> None:
         if _model:
             head.append(f"  {_dot}  model ", style=_muted)
             head.append(_model, style=_body)
+            # Who stands behind the name -- engine and adapter -- from the
+            # daemon's boot-resolved identity. Omitted when the daemon could
+            # not resolve it, never back-filled from this process.
+            try:
+                from backend.core.ouroboros.governance.served_identity import short_label
+                _via = short_label(payload.get("serving") or {})
+            except Exception:  # noqa: BLE001
+                _via = ""
+            if _via:
+                head.append(f" ({_via})", style=_muted)
         head.append(f"  {_dot}  cost ", style=_muted)
         head.append(f"${cost:.2f}", style=_body)
         head.append(f"/${budget:.2f}", style=_muted)
@@ -2029,6 +2039,17 @@ class AttachUI:
         except Exception:  # noqa: BLE001
             return []
 
+    def set_serving(self, identity: object) -> None:
+        """Record the daemon's served identity (engine/adapter). NEVER raises;
+        an empty frame keeps the last known identity."""
+        try:
+            from backend.core.ouroboros.governance.served_identity import short_label
+            label = short_label(identity if isinstance(identity, dict) else {})
+            if label:
+                self._serving = label
+        except Exception:  # noqa: BLE001
+            pass
+
     def set_model(self, model: object) -> None:
         """Record the model the daemon named in its hydration frame. NEVER
         raises; an empty value leaves the last known name in place rather
@@ -2329,8 +2350,10 @@ class AttachUI:
         # a local lane it is the one thing that changes between sessions
         # (base vs fine-tune). From the daemon's hydration frame, never the
         # client's environment. Silent until the daemon has named one.
+        _via = getattr(self, "_serving", "")
         model_seg = (
-            f"[{_SEM['neural']}]{self._model}[/{_SEM['neural']}] · "
+            f"[{_SEM['neural']}]{self._model}[/{_SEM['neural']}]"
+            + (f" [{_SEM['provider']}]{_via}[/{_SEM['provider']}]" if _via else "") + " · "
             if getattr(self, "_model", "") else ""
         )
         return (f"{model_seg}{head}{audio.lstrip(' ·')}{keys} "
@@ -4815,6 +4838,7 @@ def run_attach(console: Any) -> int:
             _render_hydration(console, payload)
             try:
                 ui.set_model(payload.get("model"))
+                ui.set_serving(payload.get("serving"))
             except Exception:  # noqa: BLE001
                 pass
             # Health, from the SAME frame — the doctor's own verdicts on the
