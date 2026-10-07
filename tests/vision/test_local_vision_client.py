@@ -180,3 +180,14 @@ def test_model_failure_keeps_the_window_summary(server, monkeypatch):
     r = asyncio.run(h.handle_query("what's on desktop 2")).results[0]
     assert r.content_summary == "Notepad: notes.txt"
     assert r.vision_analysis == {"error": "reasoning_only", "source": "vision_model", "model": "jarvis-vision:8b"}
+
+
+def test_vision_is_served_by_the_mind_by_default(monkeypatch):
+    # Vision follows J-Prime -- the endpoint the generation lane resolves --
+    # not a hardcoded Ollama address; an explicit URL is still an override.
+    monkeypatch.delenv("JARVIS_LOCAL_VISION_URL", raising=False)
+    monkeypatch.delenv("JARVIS_PRIME_URL", raising=False)
+    monkeypatch.setenv("JARVIS_LOCAL_MODEL_BASE_URL", "http://127.0.0.1:8000")
+    assert LocalVisionClient(model="m").base_url == "http://127.0.0.1:8000/v1"
+    monkeypatch.setenv("JARVIS_LOCAL_VISION_URL", "http://elsewhere:9/v1")
+    assert LocalVisionClient(model="m").base_url == "http://elsewhere:9/v1"

@@ -1,15 +1,17 @@
 """Local vision model client: screenshots -> text through an OpenAI-compatible server.
 
-The paid vision lanes (Claude, DoubleWord) are off on a local-first host, and
-the J-Prime LLaVA lane assumes a GCP vision server. This client asks any
-OpenAI-compatible ``/chat/completions`` endpoint that accepts ``image_url``
-data URIs -- Ollama on the same host is the intended one.
+The paid vision lanes (Claude, DoubleWord) are off on a local-first host. This
+client asks an OpenAI-compatible ``/chat/completions`` endpoint that accepts
+``image_url`` data URIs. By default that is J-Prime -- the same Mind the
+generation lane is served by (llama.cpp with the model's --mmproj projector),
+so one process owns the card, the training lease covers vision too, and the
+primary model is never evicted for a screenshot (J-Prime pins it).
 
 Configuration (no model name is hardcoded):
   JARVIS_VISION_MODEL_NAME      model to ask; unset = client disabled.
                                 Shared with InteractiveBrainRouter's vision lane.
-  JARVIS_LOCAL_VISION_URL       base URL, default http://127.0.0.1:11434/v1
-                                (from WSL, mirrored networking reaches Windows Ollama)
+  JARVIS_LOCAL_VISION_URL       base URL override; default: J-Prime's endpoint
+                                (trinity_siblings, the generation lane's own) + /v1
   JARVIS_LOCAL_VISION_ENABLED   "false" disables even when a model is named
   JARVIS_LOCAL_VISION_MAX_DIM   longest image side sent, default 1280
   JARVIS_LOCAL_VISION_TIMEOUT_S request timeout, default 120 (covers a cold load)
@@ -60,11 +62,18 @@ def _to_jpeg(image: Any, max_dim: int) -> bytes:
     return buf.getvalue()
 
 
+def _mind_v1() -> str:
+    """J-Prime's OpenAI surface: the endpoint the generation lane and the
+    sibling bring-up resolve, never a second literal that can drift."""
+    from backend.core.ouroboros.governance.trinity_siblings import _jprime_url
+    return _jprime_url().rstrip("/") + "/v1"
+
+
 class LocalVisionClient:
     def __init__(self, base_url: Optional[str] = None, model: Optional[str] = None,
                  timeout_s: Optional[float] = None, max_dim: Optional[int] = None) -> None:
         self.base_url = (base_url or os.environ.get("JARVIS_LOCAL_VISION_URL")
-                         or "http://127.0.0.1:11434/v1").rstrip("/")
+                         or _mind_v1()).rstrip("/")
         self.model = model if model is not None else os.environ.get("JARVIS_VISION_MODEL_NAME", "").strip()
         self.timeout_s = timeout_s or float(os.environ.get("JARVIS_LOCAL_VISION_TIMEOUT_S", "120"))
         self.max_dim = max_dim or int(os.environ.get("JARVIS_LOCAL_VISION_MAX_DIM", "1280"))
