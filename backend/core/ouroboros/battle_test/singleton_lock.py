@@ -470,6 +470,16 @@ def register_shipped_invariants() -> list:
 # organism's-socket + exit-75 attribution). One reader, zero disagreement.
 
 
+def _is_zombie(pid: int) -> bool:
+    """True when ``pid`` has exited but is not yet reaped (state Z/X). Reads
+    /proc where it exists; elsewhere the signal-0 answer stands. NEVER raises."""
+    try:
+        raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8", errors="replace")
+        return raw[raw.rindex(")") + 2:].split()[0] in ("Z", "X")
+    except (OSError, ValueError, IndexError):
+        return False
+
+
 def read_lock_holder(
     project_root: Optional[Path] = None,
     *,
@@ -492,12 +502,16 @@ def read_lock_holder(
             return None
         try:
             os.kill(pid, 0)
-            alive = True
+            # Signal 0 succeeds on a ZOMBIE (exited, not yet reaped by its
+            # parent): the pid still exists but the organism does not, and
+            # it holds nothing. Every consumer here asks "is the organism
+            # alive", so an exited holder must read as dead.
+            alive = not _is_zombie(pid)
         except ProcessLookupError:
             alive = False
         except PermissionError:
             # The PID EXISTS (kernel refused the signal, not the lookup).
-            alive = True
+            alive = not _is_zombie(pid)
         age_s = (_time.time() - ts) if ts > 0 else float("inf")
         return (pid, age_s, alive)
     except (ValueError, OSError, KeyError, TypeError):

@@ -310,12 +310,20 @@ _REQUEST_FILE = "request.json"
 
 def _proc_start_ticks(pid: int) -> Optional[int]:
     """The kernel's start time for ``pid`` (clock ticks since boot), or None
-    when no such process exists. Together with the pid it names ONE process."""
+    when no such process is RUNNING. Together with the pid it names ONE process.
+
+    A zombie (exited, not yet reaped by its parent) still has a /proc entry
+    with its old start time, but it holds no lock, no card and no lane: it is
+    gone in every sense this module asks about."""
     try:
         raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8", errors="replace")
         # comm (field 2) may contain spaces and parentheses; fields resume
-        # after the LAST ')'. starttime is field 22 -> index 19 after it.
-        return int(raw[raw.rindex(")") + 2:].split()[19])
+        # after the LAST ')'. state is field 3 -> index 0; starttime is
+        # field 22 -> index 19.
+        fields = raw[raw.rindex(")") + 2:].split()
+        if fields[0] in ("Z", "X"):
+            return None
+        return int(fields[19])
     except (OSError, ValueError, IndexError):
         return None
 
@@ -592,24 +600,13 @@ async def _trained_through(model: str) -> Tuple[float, str]:
     e.g. the Ollama-built adapter) is bounded by its weight file's mtime:
     nothing committed after the file was written can have trained it.
     No adapter at all -> 0 (every landing is unlearned)."""
+    # The decision is shared with the cockpit (served_identity), so the
+    # adapter training counts against is the adapter the operator is shown.
+    from backend.core.ouroboros.governance.served_identity import adapter_provenance
     versions = await _http("GET", f"/v1/adapters/{model}", timeout=30)
-    active = versions.get("active")
-    entry = next((v for v in versions.get("versions") or [] if v.get("version") == active), None)
-    through = ((entry or {}).get("source") or {}).get("trained_through")
-    if through:
-        return float(through), f"registry:{active}"
     show = await _http("POST", "/api/show", body={"model": model}, timeout=30)
-    adapters = show.get("adapters") or []
-    if not adapters:
-        return 0.0, "no_adapter"
-    mtimes = [a.get("mtime") for a in adapters if a.get("mtime")]
-    if len(mtimes) != len(adapters):
-        # An adapter IS served but where its evidence ends is unknowable:
-        # treating that as "learned nothing" would count every landing as new
-        # and start an hours-long cycle on evidence it may already hold.
-        raise RuntimeError(f"{model} serves {len(adapters)} adapter(s) with no readable training "
-                           "cutoff (J-Prime too old to report adapter mtime?)")
-    return float(max(mtimes)), "adapter_file_mtime"
+    prov = adapter_provenance(versions, show.get("adapters"))   # raises when unknowable
+    return float(prov.trained_through or 0.0), prov.source
 
 
 async def training_yield(model: Optional[str] = None) -> Dict[str, Any]:

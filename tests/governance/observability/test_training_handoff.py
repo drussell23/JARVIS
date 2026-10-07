@@ -12,6 +12,10 @@ from backend.core.ouroboros.governance.observability import training_handoff as 
 from backend.core.ouroboros.governance.observability import training_trigger as tt
 
 
+#: The production liveness reader, before any fixture replaces it.
+_REAL_ORGANISM_LIVE = th._organism_live
+
+
 class FakeJPrime:
     """Records every call; the lease is held between acquire and release."""
 
@@ -385,9 +389,13 @@ def _child(seconds):
     return subprocess.Popen([sys.executable, "-c", f"import time; time.sleep({seconds})"])
 
 
-def _as_organism(monkeypatch, proc):
-    """The lock holder is `proc` while it lives -- as live_incumbent_pid reads it."""
-    monkeypatch.setattr(th, "_organism_live", lambda: proc.pid if proc.poll() is None else None)
+def _as_organism(monkeypatch, proc, *, stale_name=False):
+    """The lock holder is `proc` while it runs. ``stale_name``: the lock file
+    keeps naming it after it exits, as a lock file on disk does. Liveness is
+    the product's own definition (a zombie is gone), never Popen.poll(), which
+    races a reaper thread."""
+    monkeypatch.setattr(th, "_organism_live", lambda: proc.pid if stale_name or th._proc_start_ticks(proc.pid)
+                        is not None else None)
 
 
 def _reap_later(proc, after_s):
@@ -510,3 +518,40 @@ def test_the_session_end_hook_names_this_process_and_its_budget(monkeypatch):
                                                 release_within_s=777.0))
     assert out["fired"] is True
     assert seen["requester_pid"] == th.os.getpid() and seen["release_within_s"] == 777.0
+
+
+def test_an_exited_requester_still_named_by_the_lock_file_is_not_live(env, monkeypatch):
+    # The REAL liveness path: a lock file on disk naming the requester, read
+    # by singleton_lock.read_lock_holder. Signal 0 succeeds on a zombie, so
+    # an exited-but-unreaped requester used to read as a live organism.
+    _, tmp = env
+    root = tmp / "repo"
+    (root / ".jarvis").mkdir(parents=True)
+    proc = _child(0.5)                         # never reaped until the end: it becomes a zombie
+    (root / ".jarvis" / "intake_router.lock").write_text(json.dumps({"pid": proc.pid, "ts": time.time()}))
+    from backend.core.ouroboros.cli import thin_client
+    monkeypatch.setattr(thin_client, "repo_root", lambda: root)
+    monkeypatch.setattr(th, "_organism_live", _REAL_ORGANISM_LIVE)
+    assert th._organism_live() == proc.pid     # running: it IS the incumbent
+    th._write_request("session_end:bt-z", proc.pid, release_within_s=30)
+    run, _ = stages()
+    monkeypatch.setattr(tt, "_run", run)
+    monkeypatch.setattr(th, "_smoke", smoke([2, 2]))
+    try:
+        out = cycle()
+        assert out["state"] == "COMMITTED", out
+        from backend.core.ouroboros.battle_test.singleton_lock import read_lock_holder
+        assert read_lock_holder(root)[2] is False      # the zombie holder reads as dead
+    finally:
+        proc.wait()
+
+
+def test_a_zombie_is_not_a_running_process():
+    proc = _child(0.2)
+    start = th._proc_start_ticks(proc.pid)
+    assert start is not None
+    deadline = time.monotonic() + 10
+    while th._proc_start_ticks(proc.pid) is not None and time.monotonic() < deadline:
+        time.sleep(0.05)                       # exits; NOT reaped -> zombie
+    assert th._proc_start_ticks(proc.pid) is None
+    proc.wait()
