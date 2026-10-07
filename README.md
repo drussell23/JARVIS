@@ -27,17 +27,17 @@ the repositories it describes.
 
 | Repository | Lines | Files | Python | Commits |
 |---|---:|---:|---:|---:|
-| **JARVIS (Body)** | 4,903,821 | 10,258 | 3,706,381 (7,535 files) | 10,300 |
-| **J-Prime (Mind)** | 147,759 | 229 | 139,419 (199 files) | 275 |
-| **Reactor Core (Soul)** | 112,942 | 186 | 97,901 (151 files) | 121 |
-| **Trinity total** | **5,164,522** (~5.16M) | | 3,943,701 | **10,696** |
+| **JARVIS (Body)** | 5,069,221 | 10,713 | 3,863,944 (7,947 files) | 10,782 |
+| **J-Prime (Mind)** | 147,815 | 230 | 139,419 (199 files) | 276 |
+| **Reactor Core (Soul)** | 130,855 | 242 | 115,087 (199 files) | 172 |
+| **Trinity total** | **5,347,891** (~5.35M) | | 4,118,450 | **11,230** |
 
 Within JARVIS, by path — each row is reproducible from its own prefix:
 
 | Subset | Path | Lines | Files |
 |---|---|---:|---:|
-| **O+V engine** | `backend/core/ouroboros/` | 946,820 | 1,522 |
-| **Test spine** | `tests/` | 1,107,445 | 3,498 |
+| **O+V engine** | `backend/core/ouroboros/` | 1,025,479 | 1,634 |
+| **Test spine** | `tests/` | 1,178,309 | 3,778 |
 
 _3 of 3 repositories measured._
 
