@@ -555,3 +555,58 @@ def test_a_zombie_is_not_a_running_process():
         time.sleep(0.05)                       # exits; NOT reaped -> zombie
     assert th._proc_start_ticks(proc.pid) is None
     proc.wait()
+
+
+# ---------------------------------------------------------------------------
+# A cycle stopped from outside: ABORTED recorded, card returned
+# ---------------------------------------------------------------------------
+
+def test_a_cancelled_cycle_records_aborted_and_returns_the_card(env, monkeypatch):
+    jp, tmp = env
+    started = asyncio.Event()
+
+    async def run(cmd, *, timeout_s, cwd=None, env=None, log_path=None):
+        if cmd[0] == "preflight":
+            return 0, "{}"
+        started.set()
+        await asyncio.sleep(3600)                  # the trainer, mid-step
+
+    monkeypatch.setattr(tt, "_run", run)
+
+    async def scenario():
+        task = asyncio.ensure_future(th.run_cycle(trigger="t"))
+        await asyncio.wait_for(started.wait(), 30)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    asyncio.run(scenario())
+    rows = [json.loads(line) for line in (tmp / "state" / "history.jsonl").read_text().splitlines()]
+    assert rows[-1]["state"] == "ABORTED" and rows[-1]["outcome"] == "aborted in TRAINING"
+    assert not jp.held and ("POST", "/v1/lease/release") in jp.calls
+
+
+def test_sigterm_stops_a_cycle_gracefully_instead_of_killing_it(tmp_path):
+    marker = tmp_path / "finally-ran"
+    script = tmp_path / "child.py"
+    script.write_text(
+        "import asyncio, sys\n"
+        "from backend.core.ouroboros.governance.observability import training_handoff as th\n"
+        "async def cycle():\n"
+        "    try:\n"
+        "        print('running', flush=True)\n"
+        "        await asyncio.sleep(3600)\n"
+        "    finally:\n"
+        f"        open({str(marker)!r}, 'w').write('released')\n"
+        "res = asyncio.run(th._until_signalled(cycle()))\n"
+        "sys.exit(0 if res is None else 1)\n")
+    repo = str(Path(th.__file__).resolve().parents[5])
+    proc = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True, cwd=repo,
+                            env={**__import__("os").environ, "PYTHONPATH": repo})
+    try:
+        assert proc.stdout.readline().strip() == "running"
+        proc.terminate()                           # SIGTERM, as a Task Scheduler stop sends
+        assert proc.wait(timeout=30) == 0
+        assert marker.read_text() == "released"
+    finally:
+        if proc.poll() is None:
+            proc.kill()

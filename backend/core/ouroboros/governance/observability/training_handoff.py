@@ -77,7 +77,7 @@ _ENV_LAUNCHER = "JARVIS_TRAINING_HANDOFF_LAUNCH_CMD"
 _ENV_TIME_RESERVE = "JARVIS_TRAINING_TIME_RESERVE_S"
 
 STATES = ("IDLE", "AWAITING_REQUESTER", "LABELING", "PREFLIGHT", "BASELINE", "LEASING", "TRAINING", "CONVERTING", "PUBLISHING",
-          "RESTORING", "VERIFYING", "COMMITTED", "ROLLED_BACK", "REFUSED", "FAILED")
+          "RESTORING", "VERIFYING", "COMMITTED", "ROLLED_BACK", "REFUSED", "FAILED", "ABORTED")
 
 
 def state_dir() -> Path:
@@ -665,6 +665,15 @@ async def run_cycle(*, trigger: str = "manual", force: bool = False,
             if deploy_gguf is not None:
                 return await _deploy_only(cycle, Path(deploy_gguf))
             return await _run(cycle, force=force)
+        except asyncio.CancelledError:
+            # Stopped from outside (a signal, a supervisor). The trainer's
+            # process group was already reaped by the cancelled _run; the
+            # finally below gives the card back. Record the ending so the
+            # state file never claims a phase nothing is running.
+            cycle.outcome = f"aborted in {cycle.state}"
+            with contextlib.suppress(Exception):
+                _record(cycle, "ABORTED", outcome=cycle.outcome)
+            raise
         finally:
             _consume_request()
             if cycle.lease_token:
@@ -923,6 +932,28 @@ def request_cycle(*, trigger: str, requester_pid: Optional[int] = None,
         return {"requested": False, "reason": repr(exc)}
 
 
+async def _until_signalled(coro: Any) -> Optional[Dict[str, Any]]:
+    """Run a cycle so that SIGTERM / SIGINT / SIGHUP STOP it gracefully.
+
+    Without this, SIGTERM -- what a Task Scheduler stop or a plain ``kill``
+    sends -- ended the process at once: no ``finally``, so the lease stayed
+    held until its TTL, and the trainer (its own process group, by design)
+    kept the card. A signal now cancels the cycle; cancellation reaps the
+    trainer's group, records ABORTED, and releases the lease. Returns the
+    cycle record, or None when it was stopped.
+    """
+    import signal as _signal
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(coro)
+    for sig in (_signal.SIGTERM, _signal.SIGINT, _signal.SIGHUP):
+        with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+            loop.add_signal_handler(sig, task.cancel)
+    try:
+        return await task
+    except asyncio.CancelledError:
+        return None
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     import argparse
     ap = argparse.ArgumentParser(prog="training_handoff")
@@ -953,10 +984,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "yield":
         print(json.dumps(asyncio.run(training_yield()), indent=2, default=str))
         return 0
-    if args.cmd == "deploy":
-        res = asyncio.run(run_cycle(trigger=args.trigger, deploy_gguf=Path(args.gguf)))
-    else:
-        res = asyncio.run(run_cycle(trigger=args.trigger, force=args.force))
+    coro = (run_cycle(trigger=args.trigger, deploy_gguf=Path(args.gguf)) if args.cmd == "deploy"
+            else run_cycle(trigger=args.trigger, force=args.force))
+    res = asyncio.run(_until_signalled(coro))
+    if res is None:
+        print(json.dumps({"state": "ABORTED"}))
+        return 1
     print(json.dumps(res, indent=2, default=str))
     return 0 if res.get("state") in ("COMMITTED", "REFUSED") else 1
 
