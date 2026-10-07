@@ -167,7 +167,7 @@ All figures are measured on the reference host — RTX 5090 (32,607 MiB), Window
 
 This initiative is **not a software refactor**. It is the genesis of an autonomous, self-evolving **Artificial Intelligence Operating System**. The project explicitly rejects the rigid paradigms of traditional software engineering in favor of a symbiotic design: **the models and agents carry intelligence; the codebase is the nervous system** that connects senses, cognition, and safe execution.
 
-> `StrategicDirectionService` reads this section at boot and injects the seven principles into every O+V generation prompt. The full text, including the zero-shortcut mandate, lives in [`TRINITY_MANIFESTO.md`](TRINITY_MANIFESTO.md).
+> `StrategicDirectionService` reads this section at boot and injects the seven principles into every O+V generation prompt. The full original text, including the zero-shortcut mandate and the five execution contexts, is preserved in [`docs/architecture/MANIFESTO.md`](docs/architecture/MANIFESTO.md).
 
 ### The seven principles
 
