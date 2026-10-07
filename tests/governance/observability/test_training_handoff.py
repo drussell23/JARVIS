@@ -86,7 +86,7 @@ def env(tmp_path, monkeypatch):
 def stages(*, preflight=0, train=0, convert=0, save_adapter=True):
     seen = []
 
-    async def run(cmd, *, timeout_s, cwd=None, env=None):
+    async def run(cmd, *, timeout_s, cwd=None, env=None, log_path=None):
         seen.append(cmd)
         if cmd[0] == "preflight":
             return preflight, "{}"
@@ -221,7 +221,7 @@ def test_unknown_base_refuses_rather_than_training_the_wrong_model(env, monkeypa
 def test_cancellation_mid_training_releases_the_lease(env, monkeypatch):
     jp, _ = env
 
-    async def run(cmd, *, timeout_s, cwd=None, env=None):
+    async def run(cmd, *, timeout_s, cwd=None, env=None, log_path=None):
         if cmd[0] == "preflight":
             return 0, "{}"
         raise asyncio.CancelledError
@@ -235,7 +235,7 @@ def test_second_cycle_is_refused_while_one_runs(env, monkeypatch):
     jp, _ = env
     gate = asyncio.Event()
 
-    async def run(cmd, *, timeout_s, cwd=None, env=None):
+    async def run(cmd, *, timeout_s, cwd=None, env=None, log_path=None):
         if cmd[0] == "preflight":
             await gate.wait()
             return 2, "{}"
@@ -364,3 +364,145 @@ def test_a_rollback_that_does_not_reproduce_the_baseline_is_flagged(env, monkeyp
     out = cycle()
     assert out["state"] == "ROLLED_BACK" and "UNVERIFIED" in out["outcome"]
     assert out["detail"]["rolled_back"]["rollback_verified"] is False
+
+
+# ---------------------------------------------------------------------------
+# The requester: a session asks from its own teardown, so it is still alive
+# when the cycle starts. 2026-10-07 handoff-20261007-075127 refused pid
+# 76605 -- the organism that had just asked for it.
+# ---------------------------------------------------------------------------
+
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+import time  # noqa: E402
+
+
+def _child(seconds):
+    return subprocess.Popen([sys.executable, "-c", f"import time; time.sleep({seconds})"])
+
+
+def _as_organism(monkeypatch, proc):
+    """The lock holder is `proc` while it lives -- as live_incumbent_pid reads it."""
+    monkeypatch.setattr(th, "_organism_live", lambda: proc.pid if proc.poll() is None else None)
+
+
+def _reap_later(proc, after_s):
+    import threading
+    threading.Timer(after_s, proc.wait).start()
+
+
+def test_the_requester_in_teardown_is_waited_out_then_the_cycle_runs(env, monkeypatch):
+    jp, tmp = env
+    proc = _child(1.0)
+    _reap_later(proc, 0)
+    _as_organism(monkeypatch, proc)
+    th._write_request("session_end:bt-x", proc.pid, release_within_s=30)
+    run, _ = stages()
+    monkeypatch.setattr(tt, "_run", run)
+    monkeypatch.setattr(th, "_smoke", smoke([2, 2]))
+    t0 = time.monotonic()
+    out = cycle()
+    assert out["state"] == "COMMITTED", out
+    assert time.monotonic() - t0 < 25          # ended on the exit EVENT, not the deadline
+    hist = [json.loads(line) for line in (tmp / "state" / "history.jsonl").read_text().splitlines()]
+    assert hist[0]["state"] == "AWAITING_REQUESTER" and hist[0]["pid"] == proc.pid
+    assert th._read_request() is None          # consumed by the cycle that served it
+
+
+def test_a_requester_outliving_its_own_deadline_is_refused(env, monkeypatch):
+    proc = _child(60)
+    try:
+        _as_organism(monkeypatch, proc)
+        th._write_request("session_end:bt-x", proc.pid, release_within_s=0.5)
+        out = cycle()
+        assert out["state"] == "REFUSED" and str(proc.pid) in out["outcome"], out
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_a_different_organism_is_still_refused_without_waiting(env, monkeypatch):
+    other = _child(60)
+    try:
+        _as_organism(monkeypatch, other)
+        th._write_request("session_end:bt-x", 1, release_within_s=30)   # pid 1 asked, not `other`
+        t0 = time.monotonic()
+        out = cycle()
+        assert out["state"] == "REFUSED" and str(other.pid) in out["outcome"], out
+        assert time.monotonic() - t0 < 5
+    finally:
+        other.kill()
+        other.wait()
+
+
+def test_a_reused_pid_is_not_the_requester(env, monkeypatch):
+    proc = _child(60)
+    try:
+        _as_organism(monkeypatch, proc)
+        rec = th._write_request("session_end:bt-x", proc.pid, release_within_s=30)
+        rec["requester_start"] = rec["requester_start"] - 1      # a different process once had this pid
+        (th.state_dir() / th._REQUEST_FILE).write_text(json.dumps(rec))
+        out = cycle()
+        assert out["state"] == "REFUSED", out
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_an_organism_booting_during_baseline_keeps_its_card(env, monkeypatch):
+    jp, _ = env
+    seen = {"n": 0}
+
+    def live():
+        seen["n"] += 1
+        return None if seen["n"] == 1 else 4242    # absent at start, present at LEASING
+    monkeypatch.setattr(th, "_organism_live", live)
+    run, _ = stages()
+    monkeypatch.setattr(tt, "_run", run)
+    out = cycle()
+    assert out["state"] == "REFUSED" and "before the card was taken" in out["outcome"], out
+    assert ("POST", "/v1/lease/acquire") not in jp.calls
+
+
+def test_await_exit_is_event_driven_and_bounded():
+    proc = _child(0.3)
+    _reap_later(proc, 0)
+    start = th._proc_start_ticks(proc.pid)
+    assert start is not None
+    assert asyncio.run(th._await_exit(proc.pid, start, 20)) is True
+    slow = _child(60)
+    try:
+        t0 = time.monotonic()
+        assert asyncio.run(th._await_exit(slow.pid, th._proc_start_ticks(slow.pid), 0.4)) is False
+        assert time.monotonic() - t0 < 5
+    finally:
+        slow.kill()
+        slow.wait()
+
+
+def test_the_request_names_its_requester(env, monkeypatch):
+    monkeypatch.setenv("JARVIS_TRAINING_HANDOFF_LAUNCH_CMD", f"{sys.executable} -c pass")
+    out = th.request_cycle(trigger="session_end:bt-y", requester_pid=th.os.getpid(), release_within_s=120)
+    assert out["requested"] is True
+    rec = th._read_request()
+    assert rec["requester_pid"] == th.os.getpid()
+    assert rec["requester_start"] == th._proc_start_ticks(th.os.getpid())
+    assert 100 < rec["release_by"] - time.time() <= 120
+
+
+def test_the_session_end_hook_names_this_process_and_its_budget(monkeypatch):
+    seen = {}
+
+    def req(**kw):
+        seen.update(kw)
+        return {"requested": True}
+
+    async def met(model=None):
+        return {"met": True}
+    monkeypatch.setenv("JARVIS_GRPO_AUTOTRAIN_ENABLED", "true")
+    monkeypatch.setattr(th, "request_cycle", req)
+    monkeypatch.setattr(th, "training_yield", met)
+    out = asyncio.run(tt.maybe_train_after_soak(stop_reason="wall_clock_cap", session_id="s",
+                                                release_within_s=777.0))
+    assert out["fired"] is True
+    assert seen["requester_pid"] == th.os.getpid() and seen["release_within_s"] == 777.0

@@ -190,8 +190,15 @@ async def _run(
     timeout_s: float,
     cwd: Optional[Path] = None,
     env: Optional[Dict[str, str]] = None,
+    log_path: Optional[Path] = None,
 ) -> Tuple[int, str]:
     """Run a child in its OWN process group; kill the GROUP on every exit.
+
+    ``log_path`` sends the child's output straight to that file instead of a
+    pipe: readable while the child runs, kept when a timeout reaps it, never
+    held in this process's memory. A multi-hour trainer otherwise reported
+    nothing until it exited and, on a timeout, nothing at all -- the case
+    its log is needed most. The returned text is then the file's tail.
 
     ``start_new_session=True`` puts the child in a fresh group so that a
     timeout can reap the whole tree. A trainer forks dataloader workers and
@@ -199,14 +206,23 @@ async def _run(
     resident on the GPU, and the NEXT soak then fails to load a model for
     reasons entirely unrelated to itself.
     """
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        cwd=str(cwd) if cwd else None,
-        env={**os.environ, **(env or {})},
-        start_new_session=True,
-    )
+    sink = None
+    if log_path is not None:
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        sink = open(log_path, "ab", buffering=0)  # noqa: SIM115 -- closed in finally
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=sink if sink is not None else asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(cwd) if cwd else None,
+            env={**os.environ, **(env or {})},
+            start_new_session=True,
+        )
+    except BaseException:
+        if sink is not None:
+            sink.close()
+        raise
 
     def _kill_group(sig: int) -> None:
         try:
@@ -217,9 +233,13 @@ async def _run(
             except ProcessLookupError:
                 pass
 
+    def _tail() -> str:
+        return _log_tail(log_path) if log_path is not None else ""
+
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-        return proc.returncode or 0, (out or b"").decode("utf-8", "replace")
+        text = _tail() if sink is not None else (out or b"").decode("utf-8", "replace")
+        return proc.returncode or 0, text
     except asyncio.TimeoutError:
         _kill_group(signal.SIGTERM)
         grace = _num(_ENV_KILL_GRACE, 20.0, 1.0, 300.0)
@@ -227,7 +247,8 @@ async def _run(
             await asyncio.wait_for(proc.wait(), timeout=grace)
         except asyncio.TimeoutError:
             _kill_group(signal.SIGKILL)
-        return 124, f"timeout after {timeout_s:.0f}s; process group reaped"
+        head = f"timeout after {timeout_s:.0f}s; process group reaped"
+        return 124, f"{head}\n{_tail()}" if sink is not None else head
     except asyncio.CancelledError:
         # Teardown is cancelling us. Do NOT leave a trainer on the card.
         _kill_group(signal.SIGKILL)
@@ -235,6 +256,19 @@ async def _run(
     finally:
         if proc.returncode is None:
             _kill_group(signal.SIGKILL)
+        if sink is not None:
+            sink.close()
+
+
+def _log_tail(path: Path, limit: int = 1 << 20) -> str:
+    """The last ``limit`` bytes of a child's log (what callers parse)."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - limit))
+            return fh.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +279,7 @@ async def maybe_train_after_soak(
     *,
     stop_reason: str,
     session_id: str = "",
+    release_within_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """REQUEST a training cycle if this ending qualifies. Returns at once.
 
@@ -284,7 +319,10 @@ async def maybe_train_after_soak(
             verdict["reason"] = (f"below_training_batch:{y.get('unlearned', '?')}<{y.get('threshold')}"
                                  + (f" ({y['error']})" if y.get("error") else ""))
             return verdict
-        out = await asyncio.to_thread(request_cycle, trigger=f"session_end:{session_id}")
+        # This process is the requester and is still ending: the cycle
+        # waits for it (bounded by this teardown's own budget), not refuses it.
+        out = await asyncio.to_thread(request_cycle, trigger=f"session_end:{session_id}",
+                                      requester_pid=os.getpid(), release_within_s=release_within_s)
     except Exception as exc:  # noqa: BLE001
         verdict["reason"] = f"request_failed:{type(exc).__name__}"
         return verdict

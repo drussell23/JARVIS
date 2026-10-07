@@ -2821,6 +2821,9 @@ class BattleTestHarness:
                     _train_verdict = await _maybe_train(
                         stop_reason=self._stop_reason,
                         session_id=self._session_id,
+                        # The most this teardown may still take: the cycle
+                        # waits for this process that long, and no longer.
+                        release_within_s=self._teardown_budget_s(),
                     )
                     logger.info("[AutoTrain] %s", _train_verdict)
             except asyncio.CancelledError:

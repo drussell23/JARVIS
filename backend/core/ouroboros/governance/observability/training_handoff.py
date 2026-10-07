@@ -76,7 +76,7 @@ _ENV_HTTP_TIMEOUT = "JARVIS_TRAINING_JPRIME_TIMEOUT_S"
 _ENV_LAUNCHER = "JARVIS_TRAINING_HANDOFF_LAUNCH_CMD"
 _ENV_TIME_RESERVE = "JARVIS_TRAINING_TIME_RESERVE_S"
 
-STATES = ("IDLE", "LABELING", "PREFLIGHT", "BASELINE", "LEASING", "TRAINING", "CONVERTING", "PUBLISHING",
+STATES = ("IDLE", "AWAITING_REQUESTER", "LABELING", "PREFLIGHT", "BASELINE", "LEASING", "TRAINING", "CONVERTING", "PUBLISHING",
           "RESTORING", "VERIFYING", "COMMITTED", "ROLLED_BACK", "REFUSED", "FAILED")
 
 
@@ -205,6 +205,118 @@ def _organism_live() -> Optional[int]:
         return live_incumbent_pid(repo_root(), exclude_pid=os.getpid())
     except Exception:  # noqa: BLE001 -- unknown is not "live"; the lease still guards the card
         return None
+
+
+# ---------------------------------------------------------------------------
+# The requester: the organism that asked for this cycle is still ending
+# ---------------------------------------------------------------------------
+#
+# A session asks for a cycle from inside its own teardown, so for the first
+# seconds of the cycle the requester still holds the organism lock. The
+# exclusivity gate cannot tell "the organism that is handing over the card"
+# from "an organism that is using it", and refused every automatic request
+# (2026-10-07: handoff-20261007-075127 refused pid 76605 -- its own caller).
+#
+# So the request is a durable record naming the requester by (pid, kernel
+# start time) -- a pid alone can be reused -- and the latest moment its own
+# teardown budget lets it live. The cycle waits for exactly that process
+# to exit, on its pidfd (an event, not a poll), until that moment. Any OTHER
+# live organism is still a refusal, and so is a requester outliving its own
+# deadline: a wedged teardown is not a card handed over.
+
+_REQUEST_FILE = "request.json"
+
+
+def _proc_start_ticks(pid: int) -> Optional[int]:
+    """The kernel's start time for ``pid`` (clock ticks since boot), or None
+    when no such process exists. Together with the pid it names ONE process."""
+    try:
+        raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8", errors="replace")
+        # comm (field 2) may contain spaces and parentheses; fields resume
+        # after the LAST ')'. starttime is field 22 -> index 19 after it.
+        return int(raw[raw.rindex(")") + 2:].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _write_request(trigger: str, requester_pid: int, release_within_s: float) -> Dict[str, Any]:
+    rec = {"trigger": trigger, "requester_pid": int(requester_pid),
+           "requester_start": _proc_start_ticks(requester_pid),
+           "requested_at": time.time(), "release_by": time.time() + max(0.0, float(release_within_s))}
+    d = state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / (_REQUEST_FILE + ".tmp")
+    tmp.write_text(json.dumps(rec), encoding="utf-8")
+    os.replace(tmp, d / _REQUEST_FILE)
+    return rec
+
+
+def _read_request() -> Optional[Dict[str, Any]]:
+    """The pending request, when it is still within its requester's deadline."""
+    try:
+        rec = json.loads((state_dir() / _REQUEST_FILE).read_text(encoding="utf-8"))
+        if float(rec["release_by"]) >= time.time() and rec.get("requester_start") is not None:
+            return rec
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def _consume_request() -> None:
+    with contextlib.suppress(OSError):
+        (state_dir() / _REQUEST_FILE).unlink()
+
+
+async def _await_exit(pid: int, start: int, timeout_s: float) -> bool:
+    """True once the process (pid, start) no longer exists; False at timeout."""
+    if _proc_start_ticks(pid) != start:
+        return True
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return True
+    except (AttributeError, OSError):
+        fd = None
+    if fd is None:
+        # No pidfd on this kernel/interpreter: re-check on the lease's own
+        # renewal cadence fraction, never longer than what remains.
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            await asyncio.sleep(min(deadline - time.monotonic(), max(0.05, timeout_s / 100.0)))
+            if _proc_start_ticks(pid) != start:
+                return True
+        return _proc_start_ticks(pid) != start
+    try:
+        # The pid may have been reused between the check and the open.
+        if _proc_start_ticks(pid) != start:
+            return True
+        loop = asyncio.get_running_loop()
+        exited = loop.create_future()
+        loop.add_reader(fd, lambda: exited.done() or exited.set_result(True))
+        try:
+            await asyncio.wait_for(exited, timeout=max(0.0, timeout_s))
+            return True
+        except asyncio.TimeoutError:
+            return _proc_start_ticks(pid) != start
+        finally:
+            loop.remove_reader(fd)
+    finally:
+        os.close(fd)
+
+
+async def _blocking_organism(cycle: Cycle) -> Optional[int]:
+    """The pid of a live organism this cycle must not take the card from,
+    else None. The requester-in-teardown is waited out, not refused."""
+    live = _organism_live()
+    req = _read_request()
+    if live and req and live == req["requester_pid"] and _proc_start_ticks(live) == req["requester_start"]:
+        remaining = float(req["release_by"]) - time.time()
+        _record(cycle, "AWAITING_REQUESTER", pid=live, trigger=req.get("trigger"),
+                within_s=round(max(0.0, remaining), 1))
+        if not await _await_exit(live, int(req["requester_start"]), remaining):
+            return live
+        live = _organism_live()
+    return live
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +588,7 @@ async def run_cycle(*, trigger: str = "manual", force: bool = False,
                 return await _deploy_only(cycle, Path(deploy_gguf))
             return await _run(cycle, force=force)
         finally:
+            _consume_request()
             if cycle.lease_token:
                 # Every exit path gives the card back and restores serving.
                 with contextlib.suppress(Exception):
@@ -503,6 +616,9 @@ async def _baseline(cycle: Cycle) -> Tuple[List[Dict[str, Any]], int]:
 async def _lease(cycle: Cycle, purpose: str) -> Optional[Dict[str, Any]]:
     """Take the card from J-Prime and verify it on this side too. Returns
     None on success, else the finished (FAILED) cycle record."""
+    live = _organism_live()
+    if live:
+        return await _finish(cycle, "REFUSED", f"organism pid {live} started before the card was taken")
     _record(cycle, "LEASING")
     ttl = tt._num(_ENV_LEASE_TTL, 900.0, 60.0, 86400.0)
     try:
@@ -521,7 +637,7 @@ async def _lease(cycle: Cycle, purpose: str) -> Optional[Dict[str, Any]]:
 
 
 async def _run(cycle: Cycle, *, force: bool) -> Dict[str, Any]:
-    live = _organism_live()
+    live = await _blocking_organism(cycle)
     if live:
         return await _finish(cycle, "REFUSED", f"organism pid {live} is running; a cycle needs the card")
     if not cycle.model:
@@ -573,16 +689,16 @@ async def _run(cycle: Cycle, *, force: bool) -> Dict[str, Any]:
     _record(cycle, "TRAINING", argv=argv)
     renew = asyncio.create_task(_renew_forever(cycle.lease_token, tt._num(_ENV_LEASE_TTL, 900.0, 60.0, 86400.0)))
     try:
+        # The trainer's output is the only record of its per-step metrics
+        # (rewards, clipped ratio, grad norms). It streams to train.log as
+        # it is written: watchable for the hours the run takes, and kept
+        # when a timeout reaps the trainer. Without it a "successful" cycle
+        # cannot show whether the policy loss contributed or only the
+        # router's auxiliary loss did.
         rc, out = await tt._run(argv, timeout_s=tt._num(tt._ENV_TRAIN_TIMEOUT, 43200.0, 60.0, 172800.0),
-                                cwd=tt._reactor_root())
+                                cwd=tt._reactor_root(), log_path=run_dir / "train.log")
     finally:
         renew.cancel()
-    # The trainer's full output is the only record of its per-step metrics
-    # (rewards, clipped ratio, grad norms): kept with the run, never only in
-    # memory. Without it a "successful" cycle cannot show whether the policy
-    # loss contributed or only the router's auxiliary loss did.
-    with contextlib.suppress(OSError):
-        (run_dir / "train.log").write_text(out, encoding="utf-8")
     report: Dict[str, Any] = {}
     with contextlib.suppress(OSError, ValueError):
         report = json.loads((run_dir / "train_report.json").read_text(encoding="utf-8"))
@@ -614,7 +730,7 @@ async def _deploy_only(cycle: Cycle, gguf: Path) -> Dict[str, Any]:
     """An adapter produced elsewhere enters service through EXACTLY the gates a
     trained one does: exclusive lease, registry validation, restore, O+V's
     own verification, reject-and-restore on failure."""
-    live = _organism_live()
+    live = await _blocking_organism(cycle)
     if live:
         return await _finish(cycle, "REFUSED", f"organism pid {live} is running; a deploy needs the card")
     if not cycle.model:
@@ -695,12 +811,18 @@ def request_timeout_s() -> float:
     return tt._num("JARVIS_TRAINING_HANDOFF_REQUEST_TIMEOUT_S", 180.0, 10.0, 1800.0)
 
 
-def request_cycle(*, trigger: str) -> Dict[str, Any]:
+def request_cycle(*, trigger: str, requester_pid: Optional[int] = None,
+                  release_within_s: Optional[float] = None) -> Dict[str, Any]:
     """Start a cycle that outlives the caller. Returns at once. NEVER raises.
 
     ``JARVIS_TRAINING_HANDOFF_LAUNCH_CMD`` declares how (on this host:
     Task Scheduler via scripts/windows/start_detached_wsl.ps1, so the WSL VM
     stays up for the hours a 30B cycle takes). ``{trigger}`` is substituted.
+
+    An organism asking from its own teardown names itself
+    (``requester_pid``) and the most its teardown may still take
+    (``release_within_s``); the cycle waits for exactly that process to exit
+    instead of refusing it. See :func:`_blocking_organism`.
     """
     cmd = (os.environ.get(_ENV_LAUNCHER, "") or "").strip()
     if not cmd:
@@ -712,6 +834,9 @@ def request_cycle(*, trigger: str) -> Dict[str, Any]:
             return {"requested": False, "reason": f"a cycle is in progress ({status().get('state')})"}
     import subprocess
     try:
+        if requester_pid is not None:
+            _write_request(trigger, requester_pid,
+                           request_timeout_s() if release_within_s is None else release_within_s)
         argv = [p.replace("{trigger}", trigger) for p in shlex.split(cmd)]
         log = state_dir() / "launch.log"
         state_dir().mkdir(parents=True, exist_ok=True)

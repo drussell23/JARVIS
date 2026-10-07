@@ -155,7 +155,8 @@ def test_qualifying_stop_requests_a_detached_cycle(monkeypatch) -> None:
     _yield(monkeypatch, met=True, unlearned=18)
     v = _fire(stop_reason="wall_clock_cap", session_id="bt-1")
     assert v["fired"] is True and v["reason"] == "requested"
-    assert calls == [{"trigger": "session_end:bt-1"}]
+    # The requester names itself: it is still alive while the cycle starts.
+    assert calls == [{"trigger": "session_end:bt-1", "requester_pid": os.getpid(), "release_within_s": None}]
 
 
 def test_refused_request_is_reported_not_raised(monkeypatch) -> None:
@@ -228,3 +229,42 @@ def test_discovery_returns_none_rather_than_guessing(monkeypatch) -> None:
     assert tt._reactor_root() is None
     monkeypatch.setenv(tt._ENV_TRAIN_PY, "/nonexistent/python")
     assert tt._reactor_python() is None
+
+
+# ---------------------------------------------------------------------------
+# _run(log_path=...): a trainer's output is watchable live and survives a kill
+# ---------------------------------------------------------------------------
+
+def test_log_path_streams_while_the_child_runs(tmp_path) -> None:
+    log = tmp_path / "train.log"
+    child = ("import sys,time,pathlib;print('step 1',flush=True);"
+             f"p=pathlib.Path({str(tmp_path / 'go')!r})\n"
+             "while not p.exists(): time.sleep(0.05)\nprint('step 2')")
+
+    async def scenario():
+        task = asyncio.create_task(tt._run([sys.executable, "-c", child], timeout_s=30, log_path=log))
+        for _ in range(200):
+            if log.exists() and "step 1" in log.read_text():
+                break
+            await asyncio.sleep(0.05)
+        live = log.read_text()
+        (tmp_path / "go").touch()
+        return live, await task
+
+    live, (rc, out) = asyncio.run(scenario())
+    assert "step 1" in live and "step 2" not in live
+    assert rc == 0 and "step 1" in out and "step 2" in out
+    assert "step 2" in log.read_text()
+
+
+def test_log_path_keeps_the_output_a_timeout_used_to_discard(tmp_path) -> None:
+    log = tmp_path / "train.log"
+    child = "import time;print('step 7 loss=0.1',flush=True);time.sleep(60)"
+    rc, out = asyncio.run(tt._run([sys.executable, "-c", child], timeout_s=1.5, log_path=log))
+    assert rc == 124 and out.startswith("timeout after")
+    assert "step 7 loss=0.1" in out and "step 7 loss=0.1" in log.read_text()
+
+
+def test_without_log_path_output_is_returned_as_before(tmp_path) -> None:
+    rc, out = asyncio.run(tt._run([sys.executable, "-c", "print('hi')"], timeout_s=30))
+    assert rc == 0 and out.strip() == "hi"
