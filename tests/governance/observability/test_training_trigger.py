@@ -29,8 +29,15 @@ from backend.core.ouroboros.governance.observability import training_trigger as 
 @pytest.fixture(autouse=True)
 def _ledger(tmp_path, monkeypatch):
     """Every session ending writes a decision row to the handoff ledger;
-    never the operator's real one."""
+    never the operator's real one. The productivity measurement that follows
+    it reads live services (J-Prime, git); here it answers from a stub."""
     monkeypatch.setenv("JARVIS_TRAINING_HANDOFF_DIR", str(tmp_path / "handoff"))
+    from backend.core.ouroboros.governance.observability import adapter_productivity as ap
+
+    async def measured(model=None):
+        return {"model": "m", "active": "v2", "incumbent": "origin", "verdict": "insufficient_evidence",
+                "detail": "0.5 of 6.0 organism hours served", "rate_ratio": None, "p_better": None}
+    monkeypatch.setattr(ap, "measure", measured)
     return tmp_path / "handoff"
 
 
@@ -312,8 +319,13 @@ def test_a_cancelled_child_is_asked_to_stop_before_it_is_killed(tmp_path, monkey
 # Every ending is recorded: requested, or deferred with its numbers
 # --------------------------------------------------------------------------
 
-def _ledger_rows(d):
-    return [json.loads(l) for l in (d / "history.jsonl").read_text().splitlines()]
+def _ledger_rows(d, state=None):
+    rows = [json.loads(l) for l in (d / "history.jsonl").read_text().splitlines()]
+    return [r for r in rows if state is None or r["state"] in state]
+
+
+def _decision(d):
+    return _ledger_rows(d, ("REQUESTED", "DEFERRED"))[-1]
 
 
 def test_a_session_below_the_threshold_records_the_deferral(monkeypatch, _ledger) -> None:
@@ -326,7 +338,7 @@ def test_a_session_below_the_threshold_records_the_deferral(monkeypatch, _ledger
     monkeypatch.setattr(th, "training_yield", thin)
     v = _fire(stop_reason="wall_clock_cap", session_id="bt-x", elapsed_s=32400.4)
     assert v["fired"] is False and v["reason"] == "below_training_batch:14<15"
-    row = _ledger_rows(_ledger)[-1]
+    row = _decision(_ledger)
     assert row["state"] == "DEFERRED" and row["session_id"] == "bt-x"
     assert (row["unlearned"], row["threshold"], row["elapsed_s"]) == (14, 15, 32400.4)
     assert row["stop_reason"] == "wall_clock_cap"
@@ -338,7 +350,7 @@ def test_an_ungraceful_ending_is_recorded_too(monkeypatch, _ledger) -> None:
     _clear(monkeypatch)
     monkeypatch.setenv("JARVIS_GRPO_AUTOTRAIN_ENABLED", "true")
     v = _fire(stop_reason="shutdown_signal", session_id="bt-k")
-    row = _ledger_rows(_ledger)[-1]
+    row = _decision(_ledger)
     assert row["state"] == "DEFERRED" and row["reason"] == "stop_reason_not_graceful:shutdown_signal"
     assert v["recorded"]["state"] == "DEFERRED"
 
@@ -354,7 +366,7 @@ def test_a_requested_cycle_is_recorded_as_requested(monkeypatch, _ledger) -> Non
     monkeypatch.setattr(th, "request_cycle", lambda **kw: {"requested": True, "rc": 0})
     v = _fire(stop_reason="wall_clock_cap", session_id="bt-r")
     assert v["fired"] is True
-    row = _ledger_rows(_ledger)[-1]
+    row = _decision(_ledger)
     assert row["state"] == "REQUESTED" and row["unlearned"] == 17
 
 
@@ -378,3 +390,28 @@ def test_the_harness_hands_the_decision_to_the_summary() -> None:
     assert "elapsed_s=(time.time() - self._started_at)" in src
     assert 'learning_loop=getattr(self, "_learning_loop", None)' in src
     assert "learning_loop" in inspect.signature(session_recorder.SessionRecorder.save_summary).parameters
+
+
+def test_every_ending_also_records_the_served_adapters_productivity(monkeypatch, _ledger) -> None:
+    """The longitudinal half: each session end writes the active adapter's
+    standing against its incumbent, after the decision row."""
+    _clear(monkeypatch)
+    monkeypatch.setenv("JARVIS_GRPO_AUTOTRAIN_ENABLED", "true")
+    v = _fire(stop_reason="shutdown_signal", session_id="bt-p")
+    rows = _ledger_rows(_ledger)
+    assert [r["state"] for r in rows[-2:]] == ["DEFERRED", "PRODUCTIVITY"]
+    prod = rows[-1]
+    assert prod["session_id"] == "bt-p" and prod["active"] == "v2" and prod["verdict"] == "insufficient_evidence"
+    assert v["productivity"]["verdict"] == "insufficient_evidence"
+
+
+def test_an_unmeasurable_productivity_never_breaks_the_ending(monkeypatch, _ledger) -> None:
+    _clear(monkeypatch)
+    monkeypatch.setenv("JARVIS_GRPO_AUTOTRAIN_ENABLED", "true")
+    from backend.core.ouroboros.governance.observability import adapter_productivity as ap
+
+    async def broken(model=None):
+        raise RuntimeError("J-Prime unreachable")
+    monkeypatch.setattr(ap, "measure", broken)
+    v = _fire(stop_reason="shutdown_signal", session_id="bt-q")
+    assert v["recorded"]["state"] == "DEFERRED" and "productivity" not in v

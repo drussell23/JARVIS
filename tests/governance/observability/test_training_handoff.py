@@ -504,6 +504,11 @@ def test_the_request_names_its_requester(env, monkeypatch):
 
 def test_the_session_end_hook_names_this_process_and_its_budget(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_TRAINING_HANDOFF_DIR", str(tmp_path / "state"))   # never the real ledger
+    from backend.core.ouroboros.governance.observability import adapter_productivity as ap
+
+    async def measured(model=None):                 # never a live J-Prime / git read
+        return {"verdict": "insufficient_evidence"}
+    monkeypatch.setattr(ap, "measure", measured)
     seen = {}
 
     def req(**kw):
