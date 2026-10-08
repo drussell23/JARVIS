@@ -464,6 +464,29 @@ async def _blocking_organism(cycle: Cycle) -> Optional[int]:
 # Stages
 # ---------------------------------------------------------------------------
 
+#: Reactor's contract filter (grpo_pipeline.accepted_output_schemas reads it).
+_ENV_OUTPUT_SCHEMAS = "REACTOR_GRPO_OUTPUT_SCHEMAS"
+
+
+def _training_contracts() -> Dict[str, str]:
+    """The env that tells Reactor which prompts are still current: rows whose
+    prompt imposed a contract O+V asks for TODAY (providers'
+    ``single_file_output_schemas``). Reactor cannot know O+V's policy, so the
+    one process that does hands it over -- to preflight and the trainer alike,
+    so the gate and the run count the same rows. An explicit env value wins
+    (an operator narrowing a run). Empty when the policy cannot be read: the
+    trainer then applies no contract filter and says so in its report."""
+    explicit = os.environ.get(_ENV_OUTPUT_SCHEMAS, "").strip()
+    if explicit:
+        return {_ENV_OUTPUT_SCHEMAS: explicit}
+    try:
+        from backend.core.ouroboros.governance.providers import single_file_output_schemas
+        return {_ENV_OUTPUT_SCHEMAS: ",".join(single_file_output_schemas())}
+    except Exception:  # noqa: BLE001
+        logger.warning("[TrainingHandoff] output-contract policy unreadable", exc_info=True)
+        return {}
+
+
 async def _base_model(model: str) -> str:
     """The HF base the served adapter was trained on, from the adapter's OWN
     header (served by J-Prime /api/show). Env override wins. Empty = refuse:
@@ -794,11 +817,13 @@ async def _run(cycle: Cycle, *, force: bool) -> Dict[str, Any]:
         return await _finish(cycle, "REFUSED", "below_training_batch", yield_=y)
 
     # 2. The trainer's own corpus gate.
-    _record(cycle, "PREFLIGHT")
+    contracts = _training_contracts()
+    _record(cycle, "PREFLIGHT", output_schemas=contracts.get(_ENV_OUTPUT_SCHEMAS))
     pre = tt._preflight_cmd()
     if not pre:
         return await _finish(cycle, "REFUSED", "preflight command unresolved")
-    rc, out = await tt._run(pre, timeout_s=tt._num(tt._ENV_PREFLIGHT_TIMEOUT, 300.0, 10.0, 3600.0))
+    rc, out = await tt._run(pre, timeout_s=tt._num(tt._ENV_PREFLIGHT_TIMEOUT, 300.0, 10.0, 3600.0),
+                            env=contracts)
     if rc == 2:
         return await _finish(cycle, "REFUSED", "corpus_not_trainable", tail=out[-600:])
     if rc != 0:
@@ -839,7 +864,7 @@ async def _run(cycle: Cycle, *, force: bool) -> Dict[str, Any]:
         # cannot show whether the policy loss contributed or only the
         # router's auxiliary loss did.
         rc, out = await tt._run(argv, timeout_s=tt._num(tt._ENV_TRAIN_TIMEOUT, 43200.0, 60.0, 172800.0),
-                                cwd=tt._reactor_root(), log_path=run_dir / "train.log")
+                                cwd=tt._reactor_root(), log_path=run_dir / "train.log", env=contracts)
     finally:
         renew.cancel()
     report: Dict[str, Any] = {}

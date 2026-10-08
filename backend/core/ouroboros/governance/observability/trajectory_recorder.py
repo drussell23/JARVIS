@@ -550,6 +550,12 @@ class _PendingGeneration:
     draw_kind: str = "unknown"
     temperature: Optional[float] = None
     sampling: Dict[str, Any] = field(default_factory=dict)
+    # The output contract this generation's PROMPT imposed (e.g. "2b.1-diff"),
+    # as the prompt builder decided it -- not what the reply claimed. GRPO
+    # re-generates from the prompt, so the prompt's contract decides whether
+    # a rollout can fit the completion window. Empty = not recorded (every
+    # row written before the field existed).
+    output_schema: str = ""
 
 
 #: Draw kinds. ONE vocabulary, shared by the record seam, the persisted row,
@@ -799,8 +805,14 @@ class TrajectoryRecorder:
         is_repair: bool = False,
         sampling: Any = None,
         temperature: Optional[float] = None,
+        output_schema: str = "",
     ) -> bool:
         """Queue one generation. Non-blocking. NEVER raises.
+
+        ``output_schema`` is the contract the prompt asked for, from the
+        builder that wrote it (``providers.requested_output_schema``); it is
+        persisted as ``metadata.output_schema``, the tag Reactor's training
+        loader selects on.
 
         ``is_repair`` / ``sampling`` / ``temperature`` are the draw's
         PROVENANCE: whether an L2 repair context was present, the sampling
@@ -925,6 +937,7 @@ class TrajectoryRecorder:
             ),
             temperature=(None if temperature is None else float(temperature)),
             sampling=_sampling_overrides_of(sampling),
+            output_schema=str(output_schema or ""),
         )
         if self._offer(pending):
             self._stats["generations_queued"] += 1
@@ -1685,6 +1698,11 @@ class TrajectoryRecorder:
                         # sibling); an L2 repair iteration is a different
                         # prompt's answer and never a sibling of these.
                         "draw_kind": gen.draw_kind,
+                        # The contract the PROMPT imposed. Reactor trains
+                        # only on rows tagged with a contract O+V still asks
+                        # for; an untagged row predates the tag and is never
+                        # guessed at.
+                        "output_schema": gen.output_schema,
                         "temperature": gen.temperature,
                         "sampling": dict(gen.sampling),
                         # Deterministic discriminator: "noop" for a

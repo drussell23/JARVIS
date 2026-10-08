@@ -594,9 +594,10 @@ _HEALABLE: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
 _HEALABLE_LOCK = threading.Lock()
 
 
-def _healable_max() -> int:
-    """How many ops may hold parked rejections — derived from the pool, so a
-    bigger fleet keeps more and a single-worker lane keeps almost none."""
+def _inflight_ops_max() -> int:
+    """How many ops a per-op memory in this module keeps (parked rejections,
+    requested output schemas) — derived from the pool, so a bigger fleet keeps
+    more and a single-worker lane keeps almost none."""
     try:
         return max(4, int(os.environ.get("JARVIS_BG_POOL_SIZE", "3") or 3) * 4)
     except (TypeError, ValueError):
@@ -620,7 +621,7 @@ def _park_healable_rejection(
                 "source": source,
             })
             _HEALABLE.move_to_end(oid)
-            while len(_HEALABLE) > _healable_max():
+            while len(_HEALABLE) > _inflight_ops_max():
                 _HEALABLE.popitem(last=False)
     except Exception:  # noqa: BLE001
         pass
@@ -1109,6 +1110,55 @@ def _announce_schema_decision(ctx, *, force_full_content: bool, diff: bool) -> N
         )
     except Exception:  # noqa: BLE001
         pass
+
+
+#: The output contract each op's prompt asked for, keyed by op. Written by the
+#: prompt builders where they choose the schema instruction, read by the
+#: trajectory recorder, so every corpus row carries the contract its prompt
+#: imposed -- the tag Reactor's training loader selects on. Recorded, never
+#: inferred from prompt text: the stored prompt is capped and may have lost
+#: the instruction. Bounded like _HEALABLE.
+_REQUESTED_SCHEMA: "OrderedDict[str, str]" = OrderedDict()
+_REQUESTED_SCHEMA_LOCK = threading.Lock()
+
+
+def _note_requested_schema(ctx: Any, schema_version: str) -> None:
+    """Record the contract ``ctx``'s prompt is about to impose. NEVER raises."""
+    try:
+        oid = str(getattr(ctx, "op_id", "") or "")
+        if not oid:
+            return
+        with _REQUESTED_SCHEMA_LOCK:
+            _REQUESTED_SCHEMA[oid] = str(schema_version or "")
+            _REQUESTED_SCHEMA.move_to_end(oid)
+            while len(_REQUESTED_SCHEMA) > _inflight_ops_max():
+                _REQUESTED_SCHEMA.popitem(last=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def requested_output_schema(op_id: str) -> str:
+    """The contract the op's latest prompt imposed; "" when none was recorded
+    (a read-only op, or one evicted from the bound). NEVER raises."""
+    try:
+        with _REQUESTED_SCHEMA_LOCK:
+            return _REQUESTED_SCHEMA.get(str(op_id or ""), "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def single_file_output_schemas() -> Tuple[str, ...]:
+    """The contracts O+V asks for a single-file change TODAY.
+
+    With the diff schema armed, a large file is asked for a unified diff and a
+    small one (or a brain the capability gate does not trust with diffs) for
+    full content; with it off, only full content. This is the training side's
+    definition of "current": a row tagged with one of these was produced under
+    the policy still in force. A multi-file or execution-graph contract is not
+    single-file work. NEVER raises."""
+    if single_file_diff_schema_enabled():
+        return (_SCHEMA_VERSION_DIFF, _SCHEMA_VERSION)
+    return (_SCHEMA_VERSION,)
 
 
 def reported_model_name(ctx: Any, response: Any = None) -> str:
@@ -3818,6 +3868,7 @@ def _build_lean_codegen_prompt(
         # capability-resolved and requested — the exact 14/14 case measured in
         # bt-2026-09-17-205140, which no test could see.
         _attest_declare(ctx, "diff_schema", "lean builder emitted 2b.1-diff")
+        _note_requested_schema(ctx, _SCHEMA_VERSION_DIFF)
         schema_instruction = diff_schema_instruction(
             _lean_primary_sha,
             source_label=(
@@ -3826,6 +3877,7 @@ def _build_lean_codegen_prompt(
             ),
         )
     else:
+        _note_requested_schema(ctx, _SCHEMA_VERSION)
         schema_instruction = f"""## Output Schema
 
 CRITICAL OUTPUT CONTRACT: Your very first character MUST be `{{`. Do not write any prose, analysis, headers, or markdown fences before or after the JSON. The response is parsed by `json.loads` on the raw text — anything else breaks the parser.
@@ -4612,6 +4664,7 @@ def _build_codegen_prompt(
     # schema shape we emit, and the model will otherwise attempt to
     # write code that the orchestrator will refuse at APPLY.
     if bool(getattr(ctx, "is_read_only", False)):
+        requested_schema = ""            # no candidate is asked for
         schema_instruction = (
             "<CRITICAL_SYSTEM_DIRECTIVE>\n"
             "This operation is mathematically locked into READ-ONLY mode. "
@@ -4641,6 +4694,7 @@ def _build_codegen_prompt(
         "acceptance_tests": ["pytest tests/... -q"]
       }""".splitlines()
         )
+        requested_schema = _SCHEMA_VERSION_EXECUTION_GRAPH
         schema_instruction = f"""## Output Schema
 
 Return a JSON object matching **exactly** this structure (schema_version: "{_SCHEMA_VERSION_EXECUTION_GRAPH}"):
@@ -4675,6 +4729,7 @@ Rules:
             f'        "{r}": [{{"file_path": "...", "full_content": "...", "op": "modify"}}]'
             for r in ctx.repo_scope
         )
+        requested_schema = _SCHEMA_VERSION_MULTI
         schema_instruction = f"""## Output Schema
 
 Return a JSON object matching **exactly** this structure (schema_version: "{_SCHEMA_VERSION_MULTI}"):
@@ -4725,6 +4780,7 @@ Rules:
             except OSError:
                 pass
 
+        requested_schema = _SCHEMA_VERSION_DIFF
         schema_instruction = diff_schema_instruction(_primary_sha)
     elif _is_bg_route:
         # BACKGROUND variant — minimal, single-candidate, explicit rationale
@@ -4732,6 +4788,7 @@ Rules:
         # tell it unambiguously that the field is mandatory. The prose
         # rules list below is deliberately tight: small models respect
         # short imperative rule lists better than long schema explanations.
+        requested_schema = _SCHEMA_VERSION
         schema_instruction = f"""## Output Schema (BACKGROUND route — strict)
 
 Return a JSON object matching **exactly** this structure (schema_version: "{_SCHEMA_VERSION}"):
@@ -4763,6 +4820,7 @@ CRITICAL Rules — every single one is mandatory:
 - Python files must be syntactically valid (`ast.parse()`-clean).
 - No extra keys at any level. Return ONLY the JSON object."""
     else:
+        requested_schema = _SCHEMA_VERSION
         schema_instruction = f"""## Output Schema
 
 Return a JSON object matching **exactly** this structure (schema_version: "{_SCHEMA_VERSION}"):
@@ -4793,6 +4851,8 @@ Rules:
   be rejected by the downstream schema validator.
 - Python files must be syntactically valid (`ast.parse()`-clean).
 - No extra keys at any level. Return ONLY the JSON object."""
+
+    _note_requested_schema(ctx, requested_schema)
 
     # ── 4. Assemble final prompt ─────────────────────────────────────────
     file_block = "\n\n".join(file_sections) if file_sections else "_No target files._"
@@ -7945,6 +8005,7 @@ class PrimeProvider:
                 # raises NameError into the except below and turns the
                 # whole hook into a silent no-op that still compiles.
                 prompt=prompt,
+                output_schema=requested_output_schema(str(getattr(context, "op_id", "") or "")),
                 generation_result=_prime_final,
                 latency_ms=duration * 1000.0,
                 task_type="code_repair",
@@ -12540,6 +12601,7 @@ class ClaudeProvider:
             _traj_record_generation(
                 op_id=str(getattr(context, "op_id", "") or ""),
                 prompt=prompt_text,
+                output_schema=requested_output_schema(str(getattr(context, "op_id", "") or "")),
                 generation_result=_final,
                 latency_ms=duration * 1000.0,
                 # Deliberately NOT one of dpo_pair_generator's
