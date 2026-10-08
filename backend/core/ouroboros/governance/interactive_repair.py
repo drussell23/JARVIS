@@ -280,7 +280,7 @@ class InteractiveRepairLoop:
                 from datetime import datetime, timedelta, timezone
                 deadline = datetime.now(timezone.utc) + timedelta(seconds=_micro_timeout_s())
                 raw = await self._provider.plan(prompt, deadline)
-                fix = self._parse_micro_fix(raw, file_path, current)
+                fix = self._parse_micro_fix(raw, file_path, current, window=self._window(current, err))
             except Exception as exc:
                 logger.warning("[InteractiveRepair] Provider failed iter %d: %s", iteration, exc)
                 break
@@ -712,13 +712,21 @@ class InteractiveRepairLoop:
             return ""
 
     @staticmethod
+    def _window(content: str, error: ExtractedError) -> Tuple[int, int]:
+        """The 1-based inclusive span the model is SHOWN for *error*. One
+        definition: the prompt renders it and the reply is read against it --
+        a reply can only legitimately change what its author saw."""
+        lines = content.split("\n")
+        return max(0, error.line_number - 5) + 1, min(len(lines), error.line_number + 5)
+
+    @staticmethod
     def _build_micro_prompt(
         file_path: str, content: str, error: ExtractedError, *, api_contract: str = "",
     ) -> str:
         """Build focused micro-prompt for one error."""
         lines = content.split("\n")
-        start = max(0, error.line_number - 5)
-        end = min(len(lines), error.line_number + 5)
+        first, end = InteractiveRepairLoop._window(content, error)
+        start = first - 1
         ctx = "\n".join(
             f"{'>>>' if i + start + 1 == error.line_number else '   '} "
             f"{i + start + 1:4d} | {line}"
@@ -738,7 +746,7 @@ class InteractiveRepairLoop:
 
     @staticmethod
     def _parse_micro_fix(
-        raw: str, file_path: str, original: str = "",
+        raw: str, file_path: str, original: str = "", *, window: Optional[Tuple[int, int]] = None,
     ) -> Optional[MicroFix]:
         """The micro-fix contract, or a translation of the provider's cage.
 
@@ -770,7 +778,7 @@ class InteractiveRepairLoop:
                 micro_fix_contract,
             )
             contract = micro_fix_contract(
-                raw, original=original, file_path=file_path,
+                raw, original=original, file_path=file_path, window=window,
             )
         except Exception:  # noqa: BLE001
             logger.debug("[InteractiveRepair] adapter unavailable", exc_info=True)
@@ -786,6 +794,12 @@ class InteractiveRepairLoop:
 
     @staticmethod
     def _apply_fix(content: str, fix: MicroFix) -> str:
+        """Replace lines ``line_range`` (1-based inclusive) with the
+        replacement's LINES. ``splitlines`` so a replacement that carries its
+        last line's newline (every patch the payload adapter derives does) is
+        not read as one extra empty line -- ``split("\\n")`` inserted a blank
+        line into every translated fix -- and so an empty replacement deletes
+        the range instead of leaving a blank line where it was."""
         lines = content.split("\n")
-        lines[fix.line_range[0] - 1:fix.line_range[1]] = fix.replacement.split("\n")
+        lines[fix.line_range[0] - 1:fix.line_range[1]] = fix.replacement.splitlines()
         return "\n".join(lines)

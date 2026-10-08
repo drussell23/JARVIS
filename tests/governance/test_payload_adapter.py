@@ -186,3 +186,82 @@ def test_unusable_response_still_returns_none():
 def test_translation_never_raises_on_junk():
     for junk in ("", "{}", "[]", '{"candidates": []}', '{"candidates": [1,2]}'):
         InteractiveRepairLoop._parse_micro_fix(junk, "m.py", ORIGINAL)
+
+
+# ---------------------------------------------------------------------------
+# The reply is read against the window the model was SHOWN (2026-10-08)
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+from backend.core.ouroboros.governance import payload_adapter as _pa
+
+_ORIG = "".join(f"line_{i} = {i}\n" for i in range(1, 41))          # 40-line file
+_WIN = (16, 25)                                                       # what the model saw
+
+
+def _env(content, path="tests/test_x.py"):
+    return _json.dumps({"schema_version": "2b.1", "candidates": [
+        {"candidate_id": "0", "file_path": path, "full_content": content, "rationale": "r"}]})
+
+
+def _apply(original, c):
+    """The repair loop's OWN apply -- a test that re-implements it validates a
+    different apply than the one that runs (that is how a blank line per fix
+    went unseen)."""
+    from backend.core.ouroboros.governance.interactive_repair import InteractiveRepairLoop, MicroFix
+    return InteractiveRepairLoop._apply_fix(original, MicroFix(
+        target_file="tests/test_x.py", line_range=(c["start_line"], c["end_line"]),
+        replacement=c["replacement"], reasoning=""))
+
+
+def test_an_applied_translation_reproduces_the_proposal_exactly():
+    """Every derived patch applied through the loop's own _apply_fix -- edit,
+    insertion, deletion -- reproduces the proposed file byte for byte."""
+    for after in ("a\nB\nc\n", "a\nNEW\nb\nc\n", "a\nc\n"):
+        before = "a\nb\nc\n"
+        c = _pa.line_patch(before, after).as_contract()
+        assert _apply(before, c) == after, after
+
+
+def test_a_rewrite_of_the_window_replaces_exactly_the_window():
+    """The live failure: the model rewrote the lines it was shown, the cage
+    wrapped them as "full content", and the diff against the whole file
+    deleted everything else (L1-338 <- 44 lines)."""
+    shown = _ORIG.splitlines(keepends=True)[15:25]
+    fragment = "".join(shown).replace("line_20 = 20", "line_20 = 'fixed'")
+    c = _pa.micro_fix_contract(_env(fragment), original=_ORIG, file_path="tests/test_x.py", window=_WIN)
+    assert c is not None and _WIN[0] <= c["start_line"] <= c["end_line"] <= _WIN[1]
+    out = _apply(_ORIG, c)
+    assert "line_20 = 'fixed'" in out
+    assert out.count("\n") == _ORIG.count("\n")                       # nothing outside the window lost
+    assert "line_1 = 1" in out and "line_40 = 40" in out
+
+
+def test_a_whole_file_reply_that_stays_inside_the_window_is_accepted():
+    whole = _ORIG.replace("line_18 = 18", "line_18 = 'fixed'")
+    c = _pa.micro_fix_contract(_env(whole), original=_ORIG, file_path="tests/test_x.py", window=_WIN)
+    assert c is not None and _apply(_ORIG, c) == whole
+
+
+def test_a_whole_file_reply_that_changes_unseen_lines_is_refused():
+    whole = _ORIG.replace("line_3 = 3", "line_3 = 'invented'").replace("line_18 = 18", "line_18 = 'fixed'")
+    assert _pa.micro_fix_contract(_env(whole), original=_ORIG, file_path="tests/test_x.py", window=_WIN) is None
+
+
+def test_without_a_window_the_reply_is_read_as_before():
+    whole = _ORIG.replace("line_3 = 3", "line_3 = 'x'")
+    c = _pa.micro_fix_contract(_env(whole), original=_ORIG, file_path="tests/test_x.py")
+    assert c is not None and _apply(_ORIG, c) == whole
+
+
+def test_the_repair_loop_reads_replies_against_the_window_it_rendered():
+    from types import SimpleNamespace
+    from backend.core.ouroboros.governance.interactive_repair import InteractiveRepairLoop as L
+    err = SimpleNamespace(line_number=20, error_type="AssertionError", message="m", traceback_excerpt="t",
+                          file_path="tests/test_x.py")
+    first, last = L._window(_ORIG, err)
+    prompt = L._build_micro_prompt("tests/test_x.py", _ORIG, err)
+    assert f'"start_line": {first}, "end_line": {last}' in prompt
+    assert f"{first:4d} | " in prompt and f"{last:4d} | " in prompt
+    assert f"{last + 1:4d} | " not in prompt

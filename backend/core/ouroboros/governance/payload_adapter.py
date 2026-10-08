@@ -215,20 +215,65 @@ def _note_attempt() -> None:
         pass
 
 
+def _version_of_window(proposed: str, original: str, window: Tuple[int, int]) -> bool:
+    """Is *proposed* a version of the WINDOW the model was shown, rather than
+    of the whole file? Decided by which of the two texts it is closer to --
+    a rewrite of 11 shown lines resembles those 11 lines, a whole file
+    resembles the whole file."""
+    lines = original.splitlines(keepends=True)
+    shown = "".join(lines[window[0] - 1:window[1]])
+    near_window = difflib.SequenceMatcher(None, shown, proposed, autojunk=False).ratio()
+    near_file = difflib.SequenceMatcher(None, original, proposed, autojunk=False).ratio()
+    return near_window > near_file
+
+
 def micro_fix_contract(
     raw: str, *, original: str, file_path: str = "",
+    window: Optional[Tuple[int, int]] = None,
 ) -> Optional[Dict[str, Any]]:
     """A ``{start_line, end_line, replacement}`` dict from a caged response.
 
     The fallback path for ``_parse_micro_fix``: tried only after the strict
     contract fails, so a provider that answers correctly is never routed
     through a comparison it does not need. NEVER raises.
+
+    ``window`` (1-based inclusive) is the span the model was SHOWN. The cage
+    makes it answer in a whole-file envelope, but it only ever saw those
+    lines, so its "full content" is usually its rewrite of the window -- and
+    comparing that against the whole file read as "delete everything else":
+    live 2026-10-08, patches like ``L1-338 <- 44 line(s)`` gutted test files
+    and the next iteration failed on the damage. With a window, a reply that
+    is a version of the window replaces exactly the window; a reply that is a
+    version of the whole file is accepted only if every change falls inside
+    the window -- a change to lines the model never saw is not a repair of
+    what it was shown, and is refused.
     """
     _note_attempt()
     proposed = candidate_contents(raw, file_path=file_path)
     if proposed is None:
         return None
-    patch = line_patch(original, proposed)
+    if window is not None:
+        lines = original.splitlines(keepends=True)
+        ws, we = max(1, int(window[0])), min(len(lines), int(window[1]))
+        if ws > we:
+            return None
+        if _version_of_window(proposed, original, (ws, we)):
+            # The window's lines keep their newlines; a rewrite that dropped
+            # the last one would glue the window's end onto the next line.
+            shown_ends_line = "".join(lines[ws - 1:we]).endswith("\n")
+            body = proposed if proposed.endswith("\n") or not shown_ends_line else proposed + "\n"
+            patch = line_patch(original, "".join(lines[:ws - 1]) + body + "".join(lines[we:]))
+        else:
+            patch = line_patch(original, proposed)
+            if patch is not None and (patch.start_line < ws or patch.end_line > we):
+                logger.info(
+                    "[PayloadAdapter] response for %s changes %s, outside the "
+                    "L%d-%d window the model was shown -- refused", file_path or "target",
+                    patch.render(), ws, we,
+                )
+                return None
+    else:
+        patch = line_patch(original, proposed)
     if patch is None:
         logger.info(
             "[PayloadAdapter] caged response for %s proposed no change — "
