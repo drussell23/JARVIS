@@ -3157,6 +3157,60 @@ def _profiler_round_hint_s(client: Any, prompt: str) -> Optional[float]:
         return None
 
 
+#: Manifest tools the generation prompt does not advertise, and why. Every
+#: other tool in ``tool_executor._L1_MANIFESTS`` must appear in the prompt --
+#: a test holds the two together, because a tool that exists but is never
+#: shown cannot be chosen (``delegate_to_agent`` sat unadvertised while the
+#: fleet behind it was wired, and soak bt-2026-10-08-121243 used it 0 times).
+_UNADVERTISED_BY_DESIGN: Dict[str, str] = {
+    "ask_human": "needs a human answer; headless soaks have none, and policy gates it to NOTIFY_APPLY+ ops",
+    "task_create": "the operator's task board -- an interactive surface, not generation work",
+    "task_update": "the operator's task board -- an interactive surface, not generation work",
+    "task_complete": "the operator's task board -- an interactive surface, not generation work",
+    "monitor": "a long-running subprocess watch; a generation round is bounded",
+    "hypothesize": "carries a USD budget (paid inference)",
+    "web_browse": "JS-rendered browsing; web_fetch/web_search cover generation's research needs",
+    "web_follow": "link-following session for web_browse",
+    "web_cite": "writes a citation record; research-session bookkeeping, not code work",
+}
+
+
+def _subagent_tools_block() -> str:
+    """The subagent tools, rendered from the SAME sources the policy judges a
+    call by: the allowed ``dispatch_subagent`` types
+    (``subagent_contracts.tool_schema_subagent_types``, locked to the policy's
+    set) and ``delegate_to_agent`` from its manifest, shown only when the
+    policy would let it run. The block used to be hand-written ("Phase 1
+    supports subagent_type='explore' only") while review/plan/general were
+    wired and allowed. NEVER raises -- an unreadable source drops that tool
+    from the advertisement rather than advertising a guess."""
+    out = ["**Subagents (each runs in its OWN context; your context is not spent):**\n"]
+    try:
+        from backend.core.ouroboros.governance.subagent_contracts import tool_schema_subagent_types
+        types = tuple(tool_schema_subagent_types())
+    except Exception:  # noqa: BLE001
+        types = ()
+    if types:
+        out.append(
+            f'- `dispatch_subagent(subagent_type, goal, target_files=[], scope_paths=[], '
+            f'parallel_scopes=1, timeout_s=120)` — subagent_type one of {", ".join(types)}.\n'
+            "    `explore`: read-only investigation of a large area BEFORE changing it -- reads,\n"
+            "    searches, traces call graphs and returns structured findings; fans out across up\n"
+            "    to 3 scopes concurrently. Other types are described by the tool schema; every\n"
+            "    subagent is caged (no recursion; mutations only where its type allows).\n"
+        )
+    try:
+        from backend.core.ouroboros.governance.tool_executor import _L1_MANIFESTS, delegate_agent_enabled
+        if delegate_agent_enabled() and "delegate_to_agent" in _L1_MANIFESTS:
+            m = _L1_MANIFESTS["delegate_to_agent"]
+            props = (m.arg_schema or {}).get("properties", {}) or {}
+            sig = ", ".join(props) if props else "..."
+            out.append(f"- `delegate_to_agent({sig})` — {m.description}\n")
+    except Exception:  # noqa: BLE001
+        pass
+    return "".join(out) + "\n" if len(out) > 1 else ""
+
+
 def _build_tool_section(
     mcp_tools: Optional[List[Dict[str, Any]]] = None,
     *,
@@ -3302,16 +3356,8 @@ def _build_tool_section(
         "**Web:**\n"
         "- `web_fetch(url)` — fetch URL, return text content (HTML stripped)\n"
         '- `web_search(query, max_results=5)` — search the web (DuckDuckGo)\n\n'
-        "**Subagents (Phase 1 — graduated 2026-04-18, enabled by default):**\n"
-        '- `dispatch_subagent(subagent_type="explore", goal, target_files=[], scope_paths=[], parallel_scopes=1, timeout_s=120)` —\n'
-        "    Spawn a read-only subagent to explore the codebase in its own context.\n"
-        "    Use this when you need to understand a large area BEFORE making changes:\n"
-        "    the subagent reads files, searches code, traces call graphs, and returns\n"
-        "    structured findings WITHOUT polluting your context budget. Can fan out in\n"
-        "    parallel across up to 3 scopes concurrently via asyncio.TaskGroup. Phase 1\n"
-        "    supports subagent_type='explore' only. The subagent is mathematically\n"
-        "    forbidden from mutations; Iron Gate rejects shallow (low-diversity) results.\n\n"
-        "**Write tools (Iron-Gate-governed, env: JARVIS_TOOL_EDIT_ALLOWED=true):**\n"
+        + _subagent_tools_block()
+        + "**Write tools (Iron-Gate-governed, env: JARVIS_TOOL_EDIT_ALLOWED=true):**\n"
         "- `edit_file(path, old_text, new_text)` — surgical find-and-replace.\n"
         "    `old_text` MUST appear exactly once. You MUST call `read_file(path)`\n"
         "    before editing — edits to un-read files are rejected.\n"

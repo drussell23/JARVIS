@@ -739,6 +739,14 @@ def _validate_python_syntax(rel_path: str, content: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+def delegate_agent_enabled() -> bool:
+    """Whether ``delegate_to_agent`` may run -- ONE reading, shared by the
+    policy that judges a call and the prompt that advertises the tool, so the
+    model is never shown a tool the policy would deny (or denied one it was
+    never shown)."""
+    return os.environ.get("JARVIS_TOOL_DELEGATE_AGENT_ENABLED", "true").lower() == "true"
+
+
 def _dynamic_subagent_type_enum() -> Tuple[str, ...]:
     """Resolve the dispatch_subagent tool's enum dynamically from the
     canonical SubagentType source (Slice 1, 2026-05-02). Called at
@@ -3765,11 +3773,7 @@ class GoverningToolPolicy:
         # scope, so there are no path arguments to validate at the policy
         # layer — the fleet's own read-only tooling enforces repo containment.
         elif name == "delegate_to_agent":
-            allowed = (
-                os.environ.get("JARVIS_TOOL_DELEGATE_AGENT_ENABLED", "true").lower()
-                == "true"
-            )
-            if not allowed:
+            if not delegate_agent_enabled():
                 return PolicyResult(
                     decision=PolicyDecision.DENY,
                     reason_code="tool.denied.delegate_disabled",
