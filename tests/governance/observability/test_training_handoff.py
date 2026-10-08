@@ -610,3 +610,114 @@ def test_sigterm_stops_a_cycle_gracefully_instead_of_killing_it(tmp_path):
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+# ---------------------------------------------------------------------------
+# Attestation: the cycle itself says whether it ran with no human in it
+# ---------------------------------------------------------------------------
+
+def _published_sources(monkeypatch, jp):
+    sources = []
+
+    async def spy(method, path, **kw):
+        if path.endswith("/publish"):
+            sources.append(json.loads(kw["headers"]["X-Adapter-Source"]))
+        return await jp(method, path, **kw)
+    monkeypatch.setattr(th, "_http", spy)
+    return sources
+
+
+def test_an_organism_requested_cycle_that_reaches_a_verdict_is_attested_unattended(env, monkeypatch):
+    jp, tmp = env
+    run, _ = stages()
+    monkeypatch.setattr(tt, "_run", run)
+    monkeypatch.setattr(th, "_smoke", smoke([1, 1]))
+    sources = _published_sources(monkeypatch, jp)
+    th._write_request("session_end:bt-a", 4242, release_within_s=30)
+    out = asyncio.run(th.run_cycle(trigger="session_end:bt-a"))
+    assert out["state"] == "COMMITTED"
+    assert out["origin"]["by"] == "organism" and out["origin"]["unattended"] is True
+    assert out["origin"]["requester_pid"] == 4242
+    # the served version carries who started the cycle that made it
+    assert sources[0]["origin"]["by"] == "organism" and sources[0]["origin"]["trigger"] == "session_end:bt-a"
+    last = json.loads((tmp / "state" / "history.jsonl").read_text().splitlines()[-1])
+    assert last["origin"]["unattended"] is True and th.status()["origin"]["unattended"] is True
+
+
+def test_a_rollback_is_a_verdict_too(env, monkeypatch):
+    run, _ = stages()
+    monkeypatch.setattr(tt, "_run", run)
+    monkeypatch.setattr(th, "_smoke", smoke([2, 1, 2]))
+    th._write_request("session_end:bt-r", 4242, release_within_s=30)
+    out = asyncio.run(th.run_cycle(trigger="session_end:bt-r"))
+    assert out["state"] == "ROLLED_BACK" and out["origin"]["unattended"] is True
+
+
+def test_a_cycle_started_from_a_shell_is_an_operators(env, monkeypatch):
+    run, _ = stages()
+    monkeypatch.setattr(tt, "_run", run)
+    monkeypatch.setattr(th, "_smoke", smoke([1, 1]))
+    out = asyncio.run(th.run_cycle(trigger="restart:budget-overflow"))
+    assert out["state"] == "COMMITTED"
+    assert out["origin"]["by"] == "operator" and out["origin"]["unattended"] is False
+
+
+def test_a_request_for_another_trigger_does_not_vouch_for_this_cycle(env, monkeypatch):
+    run, _ = stages()
+    monkeypatch.setattr(tt, "_run", run)
+    monkeypatch.setattr(th, "_smoke", smoke([1, 1]))
+    th._write_request("session_end:bt-old", 4242, release_within_s=30)
+    out = asyncio.run(th.run_cycle(trigger="manual"))
+    assert out["origin"]["by"] == "operator" and out["origin"]["unattended"] is False
+
+
+def test_a_requester_that_already_exited_still_asked(env, monkeypatch):
+    run, _ = stages()
+    monkeypatch.setattr(tt, "_run", run)
+    monkeypatch.setattr(th, "_smoke", smoke([1, 1]))
+    th._write_request("session_end:bt-s", 4242, release_within_s=0)   # deadline long gone
+    out = asyncio.run(th.run_cycle(trigger="session_end:bt-s"))
+    assert out["origin"]["by"] == "organism" and out["origin"]["unattended"] is True
+
+
+def test_a_forced_cycle_is_never_unattended(env, monkeypatch):
+    run, _ = stages()
+    monkeypatch.setattr(tt, "_run", run)
+    monkeypatch.setattr(th, "_smoke", smoke([1, 1]))
+    th._write_request("session_end:bt-f", 4242, release_within_s=30)
+    out = asyncio.run(th.run_cycle(trigger="session_end:bt-f", force=True))
+    assert out["state"] == "COMMITTED"
+    assert out["origin"]["by"] == "organism" and out["origin"]["force"] is True
+    assert out["origin"]["unattended"] is False
+
+
+def test_a_cycle_that_decided_nothing_is_not_unattended(env, monkeypatch):
+    run, _ = stages(train=1)
+    monkeypatch.setattr(tt, "_run", run)
+    th._write_request("session_end:bt-x", 4242, release_within_s=30)
+    out = asyncio.run(th.run_cycle(trigger="session_end:bt-x"))
+    assert out["state"] == "FAILED" and out["origin"]["unattended"] is False
+
+
+def test_an_aborted_organism_cycle_is_recorded_as_not_unattended(env, monkeypatch):
+    jp, tmp = env
+    started = asyncio.Event()
+
+    async def run(cmd, *, timeout_s, cwd=None, env=None, log_path=None):
+        if cmd[0] == "preflight":
+            return 0, "{}"
+        started.set()
+        await asyncio.sleep(3600)
+    monkeypatch.setattr(tt, "_run", run)
+    th._write_request("session_end:bt-k", 4242, release_within_s=30)
+
+    async def scenario():
+        task = asyncio.ensure_future(th.run_cycle(trigger="session_end:bt-k"))
+        await asyncio.wait_for(started.wait(), 30)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    asyncio.run(scenario())
+    last = json.loads((tmp / "state" / "history.jsonl").read_text().splitlines()[-1])
+    assert last["state"] == "ABORTED"
+    assert last["origin"]["by"] == "organism" and last["origin"]["unattended"] is False

@@ -148,6 +148,9 @@ class Cycle:
     previous_version: str = ""
     detail: Dict[str, Any] = field(default_factory=dict)
     outcome: str = ""
+    #: Who started this cycle and whether it reached its verdict untouched.
+    #: See :func:`_origin` / :func:`_attest`.
+    origin: Dict[str, Any] = field(default_factory=dict)
 
     def public(self) -> Dict[str, Any]:
         d = dict(self.__dict__)
@@ -340,15 +343,64 @@ def _write_request(trigger: str, requester_pid: int, release_within_s: float) ->
     return rec
 
 
-def _read_request() -> Optional[Dict[str, Any]]:
-    """The pending request, when it is still within its requester's deadline."""
+def _request_record() -> Optional[Dict[str, Any]]:
+    """The request file as written, whatever its age; None when absent or unreadable."""
     try:
         rec = json.loads((state_dir() / _REQUEST_FILE).read_text(encoding="utf-8"))
-        if float(rec["release_by"]) >= time.time() and rec.get("requester_start") is not None:
+        return rec if isinstance(rec, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _read_request() -> Optional[Dict[str, Any]]:
+    """The pending request, when it is still within its requester's deadline."""
+    rec = _request_record()
+    try:
+        if rec and float(rec["release_by"]) >= time.time() and rec.get("requester_start") is not None:
             return rec
-    except (OSError, ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError):
         pass
     return None
+
+
+# ---------------------------------------------------------------------------
+# Attestation: did this cycle run with no human in it?
+# ---------------------------------------------------------------------------
+#
+# "The loop ran unattended" is a claim about a specific cycle, so the cycle
+# states it itself instead of leaving it to be reconstructed from logs
+# afterwards. (2026-10-07: the first committed adapter came from a cycle an
+# operator relaunched -- trigger "restart:budget-overflow" -- after aborting
+# the organism's own request. Only the history file said so.)
+#
+# The evidence is what started the cycle and what happened on the way:
+#   * by "organism": the organism's request record names THIS trigger. It is
+#     written by request_cycle() inside the organism, before the launcher
+#     runs, so a cycle started from a shell has no such record (or one for a
+#     different trigger). The deadline does not matter here -- a requester
+#     that already exited still asked.
+#   * force: an operator bypassed a gate.
+#   * the verdict: only a cycle that reached COMMITTED or ROLLED_BACK on its
+#     own decided anything. ABORTED (a signal), REFUSED and FAILED did not.
+
+#: The terminal states in which a cycle decided the served adapter by itself.
+VERDICTS = ("COMMITTED", "ROLLED_BACK")
+
+
+def _origin(trigger: str, *, force: bool) -> Dict[str, Any]:
+    rec = _request_record()
+    if rec and rec.get("trigger") == trigger:
+        return {"by": "organism", "trigger": trigger, "force": force,
+                "requester_pid": rec.get("requester_pid"), "requested_at": rec.get("requested_at")}
+    return {"by": "operator", "trigger": trigger, "force": force}
+
+
+def _attest(origin: Dict[str, Any], state: str) -> Dict[str, Any]:
+    """``origin`` plus the one derived fact: did this cycle run unattended."""
+    out = dict(origin)
+    out["unattended"] = bool(origin.get("by") == "organism" and not origin.get("force")
+                             and state in VERDICTS)
+    return out
 
 
 def _consume_request() -> None:
@@ -661,6 +713,8 @@ async def run_cycle(*, trigger: str = "manual", force: bool = False,
     with _single_flight() as mine:
         if not mine:
             return {"run_id": run_id, "state": "REFUSED", "outcome": "another cycle is running"}
+        # Read before anything can consume the request (the finally below).
+        cycle.origin = _origin(trigger, force=force)
         try:
             if deploy_gguf is not None:
                 return await _deploy_only(cycle, Path(deploy_gguf))
@@ -671,8 +725,9 @@ async def run_cycle(*, trigger: str = "manual", force: bool = False,
             # finally below gives the card back. Record the ending so the
             # state file never claims a phase nothing is running.
             cycle.outcome = f"aborted in {cycle.state}"
+            cycle.origin = _attest(cycle.origin, "ABORTED")
             with contextlib.suppress(Exception):
-                _record(cycle, "ABORTED", outcome=cycle.outcome)
+                _record(cycle, "ABORTED", outcome=cycle.outcome, origin=cycle.origin)
             raise
         finally:
             _consume_request()
@@ -686,7 +741,8 @@ async def run_cycle(*, trigger: str = "manual", force: bool = False,
 
 async def _finish(cycle: Cycle, state: str, outcome: str, **detail: Any) -> Dict[str, Any]:
     cycle.outcome = outcome
-    _record(cycle, state, outcome=outcome, **detail)
+    cycle.origin = _attest(cycle.origin, state)
+    _record(cycle, state, outcome=outcome, origin=cycle.origin, **detail)
     return cycle.public()
 
 
@@ -809,7 +865,9 @@ async def _run(cycle: Cycle, *, force: bool) -> Dict[str, Any]:
     source = {"run_id": cycle.run_id, "base": cycle.base_model,
               "steps": (report.get("result") or {}).get("global_step"),
               # The newest landing this corpus held: the yield's next cutoff.
-              "trained_through": y.get("newest_unlearned") or y.get("trained_through")}
+              "trained_through": y.get("newest_unlearned") or y.get("trained_through"),
+              # The served version carries who started the cycle that made it.
+              "origin": cycle.origin}
     return await _publish_and_verify(cycle, gguf, source, rows, baseline, train=_train_summary(report))
 
 
@@ -830,8 +888,8 @@ async def _deploy_only(cycle: Cycle, gguf: Path) -> Dict[str, Any]:
     failed = await _lease(cycle, f"adapter deploy to {cycle.model}")
     if failed:
         return failed
-    return await _publish_and_verify(cycle, gguf, {"run_id": cycle.run_id, "deployed_from": str(gguf)},
-                                     rows, baseline)
+    return await _publish_and_verify(cycle, gguf, {"run_id": cycle.run_id, "deployed_from": str(gguf),
+                                                   "origin": cycle.origin}, rows, baseline)
 
 
 async def _publish_and_verify(cycle: Cycle, gguf: Path, source: Dict[str, Any],
