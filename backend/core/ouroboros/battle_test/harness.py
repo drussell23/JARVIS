@@ -2829,8 +2829,11 @@ class BattleTestHarness:
                     logger.info("[AutoTrain] %s", _train_verdict)
                     # The summary written next carries it: whether this
                     # session handed its evidence to training, and if not why.
-                    self._learning_loop = _train_verdict.get("recorded") or {
-                        k: _train_verdict.get(k) for k in ("fired", "reason")}
+                    self._learning_loop = {
+                        **(_train_verdict.get("recorded") or {
+                            k: _train_verdict.get(k) for k in ("fired", "reason")}),
+                        "productivity": _train_verdict.get("productivity"),
+                    }
             except asyncio.CancelledError:
                 raise
             except Exception as _autotrain_exc:  # noqa: BLE001 — fail-open

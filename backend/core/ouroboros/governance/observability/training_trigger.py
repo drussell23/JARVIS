@@ -304,6 +304,20 @@ async def maybe_train_after_soak(
         verdict["recorded"] = record_session_decision(verdict, elapsed_s=elapsed_s)
     except Exception:  # noqa: BLE001
         logger.warning("[AutoTrain] session decision unrecorded: %s", verdict, exc_info=True)
+    # The other half of the loop's evidence: is the adapter that served this
+    # session landing more than the one it replaced? Measured at every ending,
+    # so each operational window extends the record without anyone asking.
+    try:
+        from backend.core.ouroboros.governance.observability.adapter_productivity import (  # noqa: PLC0415
+            measure,
+        )
+        from backend.core.ouroboros.governance.observability.training_handoff import (  # noqa: PLC0415
+            record_productivity, request_timeout_s,
+        )
+        report = await asyncio.wait_for(measure(), timeout=request_timeout_s())
+        verdict["productivity"] = record_productivity(report, session_id=session_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("[AutoTrain] adapter productivity unmeasured", exc_info=True)
     return verdict
 
 

@@ -260,6 +260,36 @@ def _secret() -> Optional[str]:
     return _roadmap_secret()
 
 
+async def surviving_commit_times(labels: Dict[str, Dict[str, Any]], *,
+                                 authored: bool = False) -> Dict[str, float]:
+    """``commit_sha -> time`` for every landed commit still on the branch, one
+    per commit however many labels name it.
+
+    The default is the COMMITTER time a label recorded (``committed_at``),
+    resolved from git for labels written before that field existed -- the
+    clock the training yield and its cutoff both use. ``authored=True`` asks
+    git for the AUTHOR time of every commit instead: when the organism made
+    the change. A rebase rewrites committer time (df968c3004: authored 08:17,
+    committed 09:25 when it was rebased), so anything that places a landing
+    inside the session that produced it must use the author's. A commit git
+    cannot resolve keeps its label's time (0 when it has none). NEVER raises
+    out of the git call."""
+    commits: Dict[str, float] = {}
+    for lab in labels.values():
+        if lab.get("landed") and lab.get("surviving") and lab.get("commit_sha"):
+            commits[str(lab["commit_sha"])] = float(lab.get("committed_at") or 0.0)
+    need = list(commits) if authored else [s for s, t in commits.items() if not t]
+    if need:
+        root, _ = await resolve_repo_and_ref()
+        if root is not None:
+            rc, txt = await _git(["show", "-s", f"--format=%H {'%at' if authored else '%ct'}", *need], root)
+            for line in txt.splitlines() if rc == 0 else []:
+                sha, _, ts = line.partition(" ")
+                if sha in commits and ts.strip().isdigit():
+                    commits[sha] = float(ts)
+    return commits
+
+
 def read_labels(path: Optional[Path] = None) -> Tuple[Dict[str, Dict[str, Any]], str, int]:
     """``(subject_event_id -> latest VERIFIED label, chain tip, rejected count)``.
     A row whose chain link or MAC fails is ignored -- an unverifiable label

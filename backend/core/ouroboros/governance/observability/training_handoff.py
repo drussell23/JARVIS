@@ -78,7 +78,7 @@ _ENV_TIME_RESERVE = "JARVIS_TRAINING_TIME_RESERVE_S"
 
 STATES = ("IDLE", "AWAITING_REQUESTER", "LABELING", "PREFLIGHT", "BASELINE", "LEASING", "TRAINING", "CONVERTING", "PUBLISHING",
           "RESTORING", "VERIFYING", "COMMITTED", "ROLLED_BACK", "REFUSED", "FAILED", "ABORTED",
-          "EXCLUSIVE", "COMPLETED", "REQUESTED", "DEFERRED")
+          "EXCLUSIVE", "COMPLETED", "REQUESTED", "DEFERRED", "PRODUCTIVITY")
 
 
 def state_dir() -> Path:
@@ -221,6 +221,27 @@ def record_session_decision(verdict: Dict[str, Any], *, elapsed_s: Optional[floa
                    row["session_id"], row["state"].lower(), row["reason"],
                    row["unlearned"] if row["unlearned"] is not None else "?",
                    row["threshold"] if row["threshold"] is not None else "?")
+    return row
+
+
+def record_productivity(report: Dict[str, Any], *, session_id: str = "") -> Dict[str, Any]:
+    """Append the served adapter's productivity against its incumbent, as of
+    this session's end (``adapter_productivity.measure``): the longitudinal
+    record of whether training made the organism land more. Returns the row.
+    NEVER raises."""
+    matched = report.get("matched") or {}
+    row: Dict[str, Any] = {
+        "run_id": f"session-{session_id or '?'}", "state": "PRODUCTIVITY", "session_id": session_id,
+        **{k: report.get(k) for k in ("model", "active", "incumbent", "verdict", "detail",
+                                      "rate_ratio", "p_better", "error")},
+        "active_window": matched.get("active"), "incumbent_window": matched.get("incumbent"),
+    }
+    try:
+        _append_history(row)
+    except Exception:  # noqa: BLE001
+        logger.warning("[TrainingHandoff] productivity not recorded: %s", row, exc_info=True)
+    logger.warning("[TrainingHandoff] adapter %s vs %s: %s (rate ratio %s, p=%s)", row["active"],
+                   row["incumbent"], row["verdict"], row["rate_ratio"], row["p_better"])
     return row
 
 
@@ -771,24 +792,10 @@ async def training_yield(model: Optional[str] = None) -> Dict[str, Any]:
     out: Dict[str, Any] = {"model": model, "threshold": min_training_batch()}
     try:
         from backend.core.ouroboros.governance.observability.landing_provenance import (
-            label_landings, read_labels)
+            label_landings, read_labels, surviving_commit_times)
         await label_landings()                      # current with git before counting
         labels, _, _ = read_labels()
-        commits: Dict[str, float] = {}
-        for lab in labels.values():
-            if lab.get("landed") and lab.get("surviving"):
-                commits[lab["commit_sha"]] = float(lab.get("committed_at") or 0.0)
-        missing = [s for s, t in commits.items() if not t]
-        if missing:                                 # labels written before committed_at existed
-            from backend.core.ouroboros.governance.observability.landing_provenance import (
-                _git, resolve_repo_and_ref)
-            root, _ = await resolve_repo_and_ref()
-            if root is not None:
-                rc, txt = await _git(["show", "-s", "--format=%H %ct", *missing], root)
-                for line in txt.splitlines() if rc == 0 else []:
-                    sha, _, ct = line.partition(" ")
-                    if sha in commits and ct.strip().isdigit():
-                        commits[sha] = float(ct)
+        commits = await surviving_commit_times(labels)
         through, source = await _trained_through(model)
         newer = sorted(t for t in commits.values() if t > through)
         out.update({"unlearned": len(newer), "landed_total": len(commits), "trained_through": through,

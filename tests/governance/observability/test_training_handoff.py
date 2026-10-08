@@ -833,3 +833,80 @@ def test_the_exclusive_verb_takes_the_command_after_the_separator(monkeypatch):
     assert rc == 0
     assert got["job"] == ["python", "-u", "run.py", "--profile-rollout"]
     assert got["purpose"] == "profile" and got["timeout_s"] == 900.0
+
+
+# ---------------------------------------------------------------------------
+# The yield accumulates across sessions; nothing is counted twice
+# ---------------------------------------------------------------------------
+#
+# Every other test here stubs training_yield. These drive the real one: the
+# threshold is "landed, surviving commits newer than what the ACTIVE adapter
+# learned", keyed by commit -- there is no session boundary in it, so a
+# session that ends at 14 hands those 14 to the next one.
+
+def _labels(*commits):
+    """One landing label per (sha, committed_at, surviving), as the ledger holds them."""
+    return {f"evt-{i}": {"landed": True, "surviving": surv, "commit_sha": sha, "committed_at": t}
+            for i, (sha, t, surv) in enumerate(commits)}
+
+
+@pytest.fixture
+def real_yield(monkeypatch):
+    monkeypatch.setenv("JARVIS_LOCAL_MODEL_NAME", "qwen3-coder-ov:30b")
+    monkeypatch.setenv("JARVIS_MIN_TRAINING_BATCH", "15")
+    state = {"labels": {}, "through": 0.0}
+
+    async def no_relabel():
+        return None
+    monkeypatch.setattr(lp, "label_landings", no_relabel)
+    monkeypatch.setattr(lp, "read_labels", lambda path=None: (state["labels"], "tip", 0))
+
+    async def through(model):
+        return state["through"], "registry:test"
+    monkeypatch.setattr(th, "_trained_through", through)
+    return state
+
+
+def _y():
+    return asyncio.run(th.training_yield())
+
+
+def test_a_deferred_sessions_landings_carry_into_the_next(real_yield):
+    session_1 = [(f"a{i}", 1000.0 + i, True) for i in range(14)]
+    real_yield["labels"] = _labels(*session_1)
+    first = _y()
+    assert first["unlearned"] == 14 and first["met"] is False          # deferred at 14/15
+    real_yield["labels"] = _labels(*session_1, ("b0", 2000.0, True))   # the next session lands one
+    second = _y()
+    assert second["unlearned"] == 15 and second["met"] is True
+    assert second["newest_unlearned"] == 2000.0
+
+
+def test_one_commit_is_counted_once_however_many_labels_name_it(real_yield):
+    """A commit relabelled on a later boot (or by two sessions' labelers)
+    is one landing, not two."""
+    dup = [("same", 1000.0, True)] * 3 + [(f"c{i}", 1001.0 + i, True) for i in range(13)]
+    real_yield["labels"] = _labels(*dup)
+    assert _y()["unlearned"] == 14
+
+
+def test_what_the_active_adapter_learned_is_not_counted_again(real_yield):
+    real_yield["labels"] = _labels(*[(f"d{i}", 1000.0 + i, True) for i in range(20)])
+    real_yield["through"] = 1009.0                 # the served adapter learned d0..d9
+    assert _y()["unlearned"] == 10
+
+
+def test_a_rolled_back_adapters_evidence_counts_again(real_yield):
+    """A rejected adapter is deleted and the previous one is active again:
+    its cutoff is the active one's, so what the rejected one 'learned' is
+    unlearned once more -- the evidence is not lost with the bad adapter."""
+    real_yield["labels"] = _labels(*[(f"e{i}", 1000.0 + i, True) for i in range(16)])
+    real_yield["through"] = 1015.0                 # the new adapter, while it was active
+    assert _y()["unlearned"] == 0
+    real_yield["through"] = 900.0                  # rolled back to the incumbent
+    assert _y()["unlearned"] == 16 and _y()["met"] is True
+
+
+def test_a_reverted_landing_does_not_count(real_yield):
+    real_yield["labels"] = _labels(*[(f"f{i}", 1000.0 + i, True) for i in range(15)], ("gone", 1100.0, False))
+    assert _y()["unlearned"] == 15
