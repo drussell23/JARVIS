@@ -670,6 +670,26 @@ def _verify_response(text: str, row: Dict[str, Any]) -> str:
     return f"candidates:{len(getattr(res, 'candidates', ()) or ())}"
 
 
+@contextlib.asynccontextmanager
+async def evaluation_scope(model: str, *, ttl_s: float):
+    """O+V's own client, with J-Prime serving ``model`` reproducibly for the
+    duration: no prompt-cache reuse while the scope is open (greedy decoding
+    drifts between a cold and a warm cache). The scope is bounded by
+    ``ttl_s`` at J-Prime too, so an abandoned one closes itself. Yields the
+    client; always closes both."""
+    from backend.core.ouroboros.governance.local_inference_director import LocalConfig, LocalPrimeClient
+    client = LocalPrimeClient(LocalConfig.from_env())
+    await _http("POST", f"/v1/models/{model}/evaluation", body={"on": True, "ttl_s": ttl_s}, timeout=30)
+    try:
+        yield client
+    finally:
+        with contextlib.suppress(Exception):
+            if hasattr(client, "aclose"):
+                await client.aclose()
+        with contextlib.suppress(Exception):
+            await _http("POST", f"/v1/models/{model}/evaluation", body={"on": False}, timeout=30)
+
+
 async def _smoke(model: str, rows: List[Dict[str, Any]]) -> Tuple[int, List[str]]:
     """How many real tasks the SERVED model answers in a form O+V would act
     on (judged by O+V's own parsers, :func:`_verify_response`), through O+V's
@@ -679,18 +699,10 @@ async def _smoke(model: str, rows: List[Dict[str, Any]]) -> Tuple[int, List[str]
     not of a sample, so the incumbent and the candidate are compared on the
     same footing and a restored adapter reproduces its baseline exactly.
     Returns (accepted, per-task notes)."""
-    from backend.core.ouroboros.governance.local_inference_director import LocalConfig, LocalPrimeClient
-    client = LocalPrimeClient(LocalConfig.from_env())
     notes: List[str] = []
     accepted = 0
     timeout = tt._num(_ENV_SMOKE_TIMEOUT, 600.0, 10.0, 7200.0)
-    # Reproducible measurement: J-Prime serves this model with no prompt-cache
-    # reuse while the scope is open (greedy decoding drifts between cold and
-    # warm cache). Bounded by the most this measurement can take, so an
-    # abandoned scope closes itself.
-    await _http("POST", f"/v1/models/{model}/evaluation",
-                body={"on": True, "ttl_s": timeout * max(1, len(rows)) + 60}, timeout=30)
-    try:
+    async with evaluation_scope(model, ttl_s=timeout * max(1, len(rows)) + 60) as client:
         for i, row in enumerate(rows):
             prompt = row["prompt"]
             try:
@@ -702,12 +714,6 @@ async def _smoke(model: str, rows: List[Dict[str, Any]]) -> Tuple[int, List[str]
                 accepted += 1
             except Exception as exc:  # noqa: BLE001
                 notes.append(f"{i}:FAIL:{type(exc).__name__}:{str(exc)[:160]}")
-    finally:
-        with contextlib.suppress(Exception):
-            if hasattr(client, "aclose"):
-                await client.aclose()
-        with contextlib.suppress(Exception):
-            await _http("POST", f"/v1/models/{model}/evaluation", body={"on": False}, timeout=30)
     return accepted, notes
 
 
