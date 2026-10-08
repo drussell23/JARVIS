@@ -427,3 +427,56 @@ def test_invariant_generate_reserve_always_honored():
             f"plan_budget={plan_budget} → generate_left="
             f"{remaining_for_generate} < reserve={reserve}"
         )
+
+
+# ---------------------------------------------------------------------------
+# The callers hand generate_plan the OP's deadline (2026-10-08)
+# ---------------------------------------------------------------------------
+#
+# Task #97 made generate_plan carve PLAN's share out of the OUTER op deadline,
+# but both callers kept passing now + PLAN_TIMEOUT_S (45 s). With the 60 s
+# GENERATE reserve that is a 0 s PLAN on every op: soak bt-2026-10-08-121243
+# skipped 10 of 10 PLANs with op_remaining=45.0s while the ops had ~17,600 s
+# of pipeline left.
+
+def test_plan_deadline_is_the_ops_own():
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    from backend.core.ouroboros.governance import plan_generator as pg
+    far = datetime.now(tz=timezone.utc) + timedelta(hours=5)
+    assert pg.plan_deadline_for(SimpleNamespace(pipeline_deadline=far)) == far
+
+
+def test_an_op_without_a_deadline_falls_back_to_the_plan_timeout():
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from backend.core.ouroboros.governance import plan_generator as pg
+    d = pg.plan_deadline_for(SimpleNamespace(pipeline_deadline=None))
+    assert abs((d - datetime.now(tz=timezone.utc)).total_seconds() - pg.PLAN_TIMEOUT_S) < 2
+
+
+def test_a_naive_deadline_is_read_as_utc_not_rejected():
+    from datetime import datetime, timedelta
+    from types import SimpleNamespace
+    from backend.core.ouroboros.governance import plan_generator as pg
+    naive = datetime.utcnow() + timedelta(hours=1)
+    assert pg.plan_deadline_for(SimpleNamespace(pipeline_deadline=naive)).tzinfo is not None
+
+
+def test_with_a_real_op_deadline_plan_gets_a_budget():
+    from datetime import datetime, timedelta, timezone
+    from backend.core.ouroboros.governance import plan_generator as pg
+    far = datetime.now(tz=timezone.utc) + timedelta(seconds=17_600)
+    budget = pg._compute_plan_phase_budget_s((far - datetime.now(tz=timezone.utc)).total_seconds())
+    assert budget >= pg._resolve_plan_phase_min_budget_s()
+    # the caller's hard bound is derived from that same budget, never a constant below it
+    assert pg.plan_call_timeout_s(far) >= budget
+
+
+def test_both_callers_use_the_op_deadline_and_the_derived_bound():
+    root = Path(__file__).resolve().parents[2] / "backend" / "core" / "ouroboros" / "governance"
+    for rel in ("orchestrator.py", "phase_runners/plan_runner.py"):
+        src = (root / rel).read_text(encoding="utf-8")
+        assert "_plan_deadline = plan_deadline_for(ctx)" in src, rel
+        assert "timeout=plan_call_timeout_s(_plan_deadline)" in src, rel
+        assert "seconds=PLAN_TIMEOUT_S" not in src, rel

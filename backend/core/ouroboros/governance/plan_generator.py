@@ -187,6 +187,33 @@ def _resolve_plan_phase_min_budget_s() -> float:
     return _shared()
 
 
+def plan_deadline_for(ctx: Any) -> datetime:
+    """The deadline :meth:`PlanGenerator.generate_plan` sizes PLAN from: the
+    OP's own deadline (``ctx.pipeline_deadline``, stamped once at submit).
+
+    Since Task #97 ``generate_plan`` treats its ``deadline`` as the OUTER op
+    deadline and carves PLAN's share out of it (a fraction of what remains,
+    always leaving the GENERATE reserve). Both callers kept handing it
+    ``now + PLAN_TIMEOUT_S`` (45 s) instead -- so with a 60 s reserve PLAN's
+    share was 0 on every op, on every route: 10 of 10 PLANs skipped in soak
+    bt-2026-10-08-121243 while the same ops had ~17,600 s of pipeline left.
+    ``PLAN_TIMEOUT_S`` remains only for an op that carries no deadline."""
+    deadline = getattr(ctx, "pipeline_deadline", None)
+    if isinstance(deadline, datetime):
+        return deadline if deadline.tzinfo else deadline.replace(tzinfo=timezone.utc)
+    return datetime.now(tz=timezone.utc) + timedelta(seconds=PLAN_TIMEOUT_S)
+
+
+def plan_call_timeout_s(deadline: datetime) -> float:
+    """The caller's hard bound on one ``generate_plan`` call: the phase
+    budget it will itself compute from ``deadline``, plus its own grace for
+    the call and again for the work around it (prompt build, parsing). One
+    derivation -- a separate constant here would cut a correctly sized PLAN
+    off (the old ``PLAN_TIMEOUT_S + 5`` capped it at 50 s)."""
+    remaining = max(0.0, (deadline - datetime.now(tz=timezone.utc)).total_seconds())
+    return _compute_plan_phase_budget_s(remaining) + 2 * _PLAN_PHASE_WAIT_FOR_GRACE_S_DEFAULT
+
+
 def _compute_plan_phase_budget_s(op_remaining_s: float) -> float:
     """Task #97 legacy math kernel — delegates to shared phase_budget
     kernel parameterized for the PLAN phase.

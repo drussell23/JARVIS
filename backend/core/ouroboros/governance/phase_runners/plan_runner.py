@@ -64,7 +64,7 @@ import dataclasses
 import logging
 from pathlib import Path
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, List, Optional
 
 from backend.core.ouroboros.governance.approval_provider import (
@@ -250,15 +250,14 @@ class PLANRunner(PhaseRunner):
         _plan_review_required_now = _plan_review_required()
         try:
             from backend.core.ouroboros.governance.plan_generator import (
-                PlanGenerator, PLAN_TIMEOUT_S,
+                PlanGenerator, plan_call_timeout_s, plan_deadline_for,
             )
             _plan_gen = PlanGenerator(
                 generator=orch._generator,
                 repo_root=orch._config.project_root,
             )
-            _plan_deadline = datetime.now(tz=timezone.utc) + timedelta(
-                seconds=PLAN_TIMEOUT_S,
-            )
+            # The OP's deadline: generate_plan carves PLAN's share out of it.
+            _plan_deadline = plan_deadline_for(ctx)
             # Move 6.5 PLAN seam (v2.97, 2026-05-10) — canonical
             # integration. When all 3 master flags are on AND the
             # route+posture gates pass (route=complex +
@@ -292,7 +291,7 @@ class PLANRunner(PhaseRunner):
             if _plan_result is None:
                 _plan_result = await asyncio.wait_for(
                     _plan_gen.generate_plan(ctx, _plan_deadline),
-                    timeout=PLAN_TIMEOUT_S + 5.0,
+                    timeout=plan_call_timeout_s(_plan_deadline),
                 )
 
             if not _plan_result.skipped:
