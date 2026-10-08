@@ -415,3 +415,24 @@ def test_an_unmeasurable_productivity_never_breaks_the_ending(monkeypatch, _ledg
     monkeypatch.setattr(ap, "measure", broken)
     v = _fire(stop_reason="shutdown_signal", session_id="bt-q")
     assert v["recorded"]["state"] == "DEFERRED" and "productivity" not in v
+
+
+def test_both_summary_paths_carry_the_decision_and_the_service_declares_its_providers() -> None:
+    """The clean report AND the atexit fallback (a signal-stopped session --
+    bt-2026-10-08-121243 wrote learning_loop=None through it) carry the
+    decision; and GovernedLoopService declares the paid-lane provider
+    references in __init__, so with paid lanes off the boot checks take their
+    own "no provider" path instead of AttributeError."""
+    import ast
+    import inspect
+    from pathlib import Path as _P
+    from backend.core.ouroboros.battle_test import harness
+    from backend.core.ouroboros.governance import governed_loop_service as gls
+    src = _P(inspect.getsourcefile(harness)).read_text(encoding="utf-8")
+    assert src.count('learning_loop=getattr(self, "_learning_loop", None)') == 2
+    tree = ast.parse(_P(inspect.getsourcefile(gls)).read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "GovernedLoopService")
+    init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    assigned = {t.attr for n in ast.walk(init) for t in getattr(n, "targets", [getattr(n, "target", None)])
+                if isinstance(t, ast.Attribute)}
+    assert {"_doubleword_ref", "_claude_ref"} <= assigned

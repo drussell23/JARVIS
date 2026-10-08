@@ -1317,6 +1317,10 @@ class BattleTestHarness:
                 # summary still surfaces them to PRD/audit trails.
                 suspension_likely=getattr(self, "_suspension_likely", False),
                 suspension_ratio=getattr(self, "_suspension_ratio", None),
+                # The session-end training decision, when the hook ran before
+                # this fallback: a signal-stopped session is exactly the one
+                # whose "why no training" must not exist only in the ledger.
+                learning_loop=getattr(self, "_learning_loop", None),
             )
             self._summary_written = True
             # Can't trust logger during interpreter teardown — fallback

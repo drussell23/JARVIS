@@ -1594,6 +1594,14 @@ class GovernedLoopService:
         # Built during start()
         self._orchestrator: Optional[GovernedOrchestrator] = None
         self._generator: Optional[CandidateGenerator] = None
+        # The paid-lane provider references exist on EVERY service, None
+        # until (and unless) their build branch runs. They were assigned only
+        # inside those branches, so with paid lanes off the boot preflight and
+        # the Slice 40 surface sweep (and the MCP wiring) raised AttributeError
+        # instead of taking their own "no provider" path. Live 2026-10-08:
+        # "Slice 40 surface sweep skipped ... no attribute '_doubleword_ref'".
+        self._doubleword_ref: Optional[Any] = None
+        self._claude_ref: Optional[Any] = None
         self._approval_provider: Optional[CLIApprovalProvider] = None
         self._validation_runner: Optional[Any] = None
         self._health_probe_task: Optional[asyncio.Task] = None
