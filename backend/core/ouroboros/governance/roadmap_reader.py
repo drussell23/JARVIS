@@ -563,16 +563,25 @@ def parse_roadmap(
 ) -> Tuple[Optional[Dict[str, Any]], Tuple[RoadmapGoal, ...]]:
     """Parse raw text → (document_dict, goals_tuple). NEVER
     raises. Returns (None, ()) on parse failure or malformed
-    structure."""
+    structure.
+
+    EVERY goal of the signed document, in document order. The document is
+    the operator-signed source of truth that the cage looks goals up in and
+    reconciliation reads; it is never truncated here. It used to be cut to
+    ``max_goals()`` by POSITION -- and the roadmap is append-only, so the cut
+    removed exactly the newest goals: on 2026-10-08 a 833-goal roadmap showed
+    the cage only its first 100, every goal the Sentinel had signed since was
+    ``goal_not_found``, and the Sentinel spun 581 refused passes in 22
+    minutes. The cap bounds work instead -- see
+    :func:`emit_roadmap_envelopes`."""
     doc = _parse_document_text(raw)
     if doc is None:
         return None, ()
     goals_raw = doc.get("goals")
     if not isinstance(goals_raw, list):
         return doc, ()
-    cap = max_goals()
     goals: List[RoadmapGoal] = []
-    for entry in goals_raw[:cap]:
+    for entry in goals_raw:
         g = _parse_goal_entry(entry)
         if g is not None:
             goals.append(g)
@@ -786,8 +795,14 @@ async def emit_roadmap_envelopes(
     router: Any = None,
     now_unix: Optional[float] = None,
 ) -> Tuple[GoalEmitOutcome, ...]:
-    """Emit one IntentEnvelope per goal via the router's
+    """Emit one IntentEnvelope per ACTIVE goal via the router's
     canonical ``ingest`` method. NEVER raises.
+
+    At most ``max_goals()`` active (not yet satisfied) goals are emitted per
+    read, NEWEST first: the roadmap is append-only, so the most recently
+    filed work is at the end, and a bound must never be the reason it is
+    the work left out. Satisfied goals are reported without counting toward
+    the bound; active goals past it are reported as deferred to a later read.
 
     When ``router`` is None, builds envelopes but does NOT
     submit (useful for dry-run / testing). Returns the per-goal
@@ -814,7 +829,16 @@ async def emit_roadmap_envelopes(
                 _satisfied[_gid] = _rec.commit_sha
     except Exception:  # noqa: BLE001 — reconciliation is additive, never fatal
         _satisfied = {}
-    for goal in document.goals:
+    budget = max_goals()
+    for goal in reversed(document.goals):          # newest first
+        if goal.goal_id not in _satisfied:
+            if budget <= 0:
+                outcomes.append(GoalEmitOutcome(
+                    goal_id=goal.goal_id, emitted=False, idempotency_key="",
+                    error="deferred: emission bound reached this read",
+                ))
+                continue
+            budget -= 1
         if goal.goal_id in _satisfied:
             outcomes.append(GoalEmitOutcome(
                 goal_id=goal.goal_id,
@@ -1365,8 +1389,9 @@ def register_flags(registry: Any) -> int:
             type=FlagType.INT,
             default=_DEFAULT_MAX_GOALS,
             description=(
-                "Max goals processed per roadmap. Default "
-                "100. Clamped to [1, 10_000]."
+                "Max ACTIVE goals emitted per roadmap read, newest "
+                "first (the document itself is always read whole). "
+                "Default 100. Clamped to [1, 10_000]."
             ),
             category=Category.CAPACITY,
             source_file=src,

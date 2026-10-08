@@ -285,7 +285,10 @@ def test_parse_skips_invalid_goals():
     assert ids == {"g1", "g2"}
 
 
-def test_parse_cap_max_goals(monkeypatch):
+def test_parse_never_truncates_the_signed_document(monkeypatch):
+    """The cap bounds WORK, not the document. Truncating by position removed
+    the newest goals of an append-only roadmap: on 2026-10-08 the cage saw
+    the first 100 of 833 and refused every newer goal as goal_not_found."""
     monkeypatch.setenv(_ENV_MAX_GOALS, "3")
     raw = json.dumps({
         "goals": [
@@ -294,7 +297,34 @@ def test_parse_cap_max_goals(monkeypatch):
         ],
     })
     _, goals = parse_roadmap(raw)
-    assert len(goals) == 3
+    assert [g.goal_id for g in goals] == [f"g{i}" for i in range(10)]
+
+
+def _doc_of(n):
+    return RoadmapDocument(
+        version=1, operator_id="op", signed_at_iso="", signature_hex="", signature_valid=True,
+        goals=tuple(RoadmapGoal(goal_id=f"g{i}", title=f"Goal {i}", description="", priority=GoalPriority.MEDIUM,
+                                target_files=(f"backend/m{i}.py",), success_criteria="", depends_on=(),
+                                max_duration_s=0) for i in range(n)),
+        raw_bytes=10)
+
+
+def test_emission_is_bounded_newest_first(monkeypatch):
+    monkeypatch.setenv(_ENV_MAX_GOALS, "3")
+
+    class _Router:
+        def __init__(self):
+            self.ids = []
+
+        async def ingest(self, env):
+            self.ids.append(env.evidence.get("goal_id"))
+            return "ok"
+    r = _Router()
+    outcomes = _run(emit_roadmap_envelopes(_doc_of(10), router=r))
+    assert r.ids == ["g9", "g8", "g7"]                       # the most recently filed work
+    deferred = [o.goal_id for o in outcomes if "deferred" in o.error]
+    assert sorted(deferred) == sorted(f"g{i}" for i in range(7))
+    assert len(outcomes) == 10                                # every goal is accounted for
 
 
 # read_roadmap
