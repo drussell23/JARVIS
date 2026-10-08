@@ -77,7 +77,8 @@ _ENV_LAUNCHER = "JARVIS_TRAINING_HANDOFF_LAUNCH_CMD"
 _ENV_TIME_RESERVE = "JARVIS_TRAINING_TIME_RESERVE_S"
 
 STATES = ("IDLE", "AWAITING_REQUESTER", "LABELING", "PREFLIGHT", "BASELINE", "LEASING", "TRAINING", "CONVERTING", "PUBLISHING",
-          "RESTORING", "VERIFYING", "COMMITTED", "ROLLED_BACK", "REFUSED", "FAILED", "ABORTED")
+          "RESTORING", "VERIFYING", "COMMITTED", "ROLLED_BACK", "REFUSED", "FAILED", "ABORTED",
+          "EXCLUSIVE", "COMPLETED")
 
 
 def state_dir() -> Path:
@@ -216,10 +217,16 @@ def cycle_alive() -> bool:
 # model. Each is bounded by its OWN knob (the one the phase spends), so the
 # latest moment a cycle can still hold the lane is derived, never guessed.
 _HOLDING = ("LEASING", "TRAINING", "CONVERTING", "PUBLISHING", "RESTORING", "VERIFYING")
+#: A job run under :func:`run_exclusive`: it holds the card for its own
+#: budget, then the lease is released -- no phases follow it.
+_EXCLUSIVE = "EXCLUSIVE"
 
 
 def _phase_budget_s(state: str, detail: Dict[str, Any]) -> float:
     http = tt._num(_ENV_HTTP_TIMEOUT, 900.0, 5.0, 86400.0)
+    if state == _EXCLUSIVE:
+        # The job's own budget, then the release that follows it.
+        return float(((detail or {}).get("exclusive") or {}).get("timeout_s") or 0.0) + http
     if state == "TRAINING":
         return tt._num(tt._ENV_TRAIN_TIMEOUT, 43200.0, 60.0, 172800.0)
     if state == "CONVERTING":
@@ -269,12 +276,13 @@ def occupancy() -> Optional[Dict[str, Any]]:
         state = str(st.get("state") or "")
         out: Dict[str, Any] = {"run_id": st.get("run_id"), "state": state,
                                "trigger": st.get("trigger"), "model": st.get("model"),
-                               "holds_lane": state in _HOLDING, "since": None, "release_by": None}
-        if state in _HOLDING:
+                               "holds_lane": state in _HOLDING or state == _EXCLUSIVE,
+                               "since": None, "release_by": None}
+        if out["holds_lane"]:
             since = _state_entered_at(str(st.get("run_id")), state)
             out["since"] = since
             if since is not None:
-                rest = _HOLDING[_HOLDING.index(state):]
+                rest = (state,) if state == _EXCLUSIVE else _HOLDING[_HOLDING.index(state):]
                 out["release_by"] = since + sum(_phase_budget_s(s, st.get("detail") or {}) for s in rest)
         return out
     except Exception:  # noqa: BLE001
@@ -731,22 +739,35 @@ async def run_cycle(*, trigger: str = "manual", force: bool = False,
     existing adapter through the SAME publish/verify/reject tail. ``force``
     bypasses the yield threshold (never the other gates). Returns the cycle
     record. NEVER raises (except CancelledError, after the lease is released)."""
-    run_id = time.strftime("handoff-%Y%m%d-%H%M%S")
-    cycle = Cycle(run_id=run_id, trigger=trigger, model=_model())
+    cycle = Cycle(run_id=time.strftime("handoff-%Y%m%d-%H%M%S"), trigger=trigger, model=_model())
+    async with _exclusive(cycle, force=force) as held:
+        if not held:
+            return {"run_id": cycle.run_id, "state": "REFUSED", "outcome": "another cycle is running"}
+        if deploy_gguf is not None:
+            return await _deploy_only(cycle, Path(deploy_gguf))
+        return await _run(cycle, force=force)
+
+
+@contextlib.asynccontextmanager
+async def _exclusive(cycle: Cycle, *, force: bool = False):
+    """The envelope every holder of the card runs in: a cycle, or a job under
+    :func:`run_exclusive`. Yields False when another holder has it.
+
+    * one at a time (the kernel lock);
+    * who started it, read before anything can consume the request;
+    * stopped from outside (a signal, a supervisor) -> ABORTED is recorded, so
+      the state file never claims a phase nothing is running; the child's
+      process group was already reaped by the cancelled ``tt._run``;
+    * every exit path gives the card back and restores serving.
+    """
     with _single_flight() as mine:
         if not mine:
-            return {"run_id": run_id, "state": "REFUSED", "outcome": "another cycle is running"}
-        # Read before anything can consume the request (the finally below).
-        cycle.origin = _origin(trigger, force=force)
+            yield False
+            return
+        cycle.origin = _origin(cycle.trigger, force=force)
         try:
-            if deploy_gguf is not None:
-                return await _deploy_only(cycle, Path(deploy_gguf))
-            return await _run(cycle, force=force)
+            yield True
         except asyncio.CancelledError:
-            # Stopped from outside (a signal, a supervisor). The trainer's
-            # process group was already reaped by the cancelled _run; the
-            # finally below gives the card back. Record the ending so the
-            # state file never claims a phase nothing is running.
             cycle.outcome = f"aborted in {cycle.state}"
             cycle.origin = _attest(cycle.origin, "ABORTED")
             with contextlib.suppress(Exception):
@@ -755,11 +776,39 @@ async def run_cycle(*, trigger: str = "manual", force: bool = False,
         finally:
             _consume_request()
             if cycle.lease_token:
-                # Every exit path gives the card back and restores serving.
                 with contextlib.suppress(Exception):
                     await asyncio.shield(_http("POST", "/v1/lease/release",
                                                body={"token": cycle.lease_token}))
                     cycle.lease_token = ""
+
+
+async def run_exclusive(argv: List[str], *, purpose: str, timeout_s: float, trigger: str = "manual",
+                        log_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Run ``argv`` holding the card exclusively: J-Prime drains and VERIFIES
+    the VRAM free, the lease is renewed while the job runs, the job runs in its
+    own process group (reaped on timeout or a stop: SIGTERM, grace, SIGKILL),
+    and the card goes back on every exit path. The same machinery a training
+    cycle uses, for anything else that needs the GPU -- a profiler, a
+    calibration, a benchmark -- so no such job ever leases the card by hand.
+    O+V's boot guard sees it as holding the lane until ``timeout_s`` (+ the
+    release) has passed. NEVER raises (except CancelledError, after the
+    release)."""
+    cycle = Cycle(run_id=time.strftime("exclusive-%Y%m%d-%H%M%S"), trigger=trigger, model=_model())
+    async with _exclusive(cycle) as held:
+        if not held:
+            return {"run_id": cycle.run_id, "state": "REFUSED", "outcome": "another holder has the card"}
+        failed = await _lease(cycle, purpose)
+        if failed:
+            return failed
+        _record(cycle, _EXCLUSIVE, argv=list(argv), purpose=purpose, timeout_s=float(timeout_s),
+                log=str(log_path) if log_path else None)
+        renew = asyncio.create_task(_renew_forever(cycle.lease_token,
+                                                   tt._num(_ENV_LEASE_TTL, 900.0, 60.0, 86400.0)))
+        try:
+            rc, out = await tt._run(list(argv), timeout_s=float(timeout_s), log_path=log_path)
+        finally:
+            renew.cancel()
+        return await _finish(cycle, "COMPLETED" if rc == 0 else "FAILED", f"rc={rc}", tail=out[-800:])
 
 
 async def _finish(cycle: Cycle, state: str, outcome: str, **detail: Any) -> Dict[str, Any]:
@@ -1050,6 +1099,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub.add_parser("yield", help="how much unlearned landed evidence has accumulated")
     q = sub.add_parser("request", help="start a detached cycle")
     q.add_argument("--trigger", default="manual")
+    x = sub.add_parser("exclusive", help="run a command holding the GPU exclusively (lease, renew, "
+                                         "release on every exit)")
+    x.add_argument("--purpose", required=True)
+    x.add_argument("--timeout-s", type=float, required=True)
+    x.add_argument("--log", default="", help="the job's output, streamed to this file")
+    x.add_argument("--trigger", default="manual")
+    x.add_argument("job", nargs=argparse.REMAINDER, help="-- the command")
     sub.add_parser("status")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -1067,14 +1123,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "yield":
         print(json.dumps(asyncio.run(training_yield()), indent=2, default=str))
         return 0
-    coro = (run_cycle(trigger=args.trigger, deploy_gguf=Path(args.gguf)) if args.cmd == "deploy"
-            else run_cycle(trigger=args.trigger, force=args.force))
+    if args.cmd == "exclusive":
+        job = args.job[1:] if args.job[:1] == ["--"] else list(args.job)
+        if not job:
+            ap.error("exclusive: give the command after --")
+        coro = run_exclusive(job, purpose=args.purpose, timeout_s=args.timeout_s, trigger=args.trigger,
+                             log_path=Path(args.log) if args.log else None)
+    elif args.cmd == "deploy":
+        coro = run_cycle(trigger=args.trigger, deploy_gguf=Path(args.gguf))
+    else:
+        coro = run_cycle(trigger=args.trigger, force=args.force)
     res = asyncio.run(_until_signalled(coro))
     if res is None:
         print(json.dumps({"state": "ABORTED"}))
         return 1
     print(json.dumps(res, indent=2, default=str))
-    return 0 if res.get("state") in ("COMMITTED", "REFUSED") else 1
+    return 0 if res.get("state") in ("COMMITTED", "REFUSED", "COMPLETED") else 1
 
 
 if __name__ == "__main__":

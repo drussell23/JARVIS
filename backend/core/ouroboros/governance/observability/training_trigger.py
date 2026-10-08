@@ -236,22 +236,30 @@ async def _run(
     def _tail() -> str:
         return _log_tail(log_path) if log_path is not None else ""
 
-    try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-        text = _tail() if sink is not None else (out or b"").decode("utf-8", "replace")
-        return proc.returncode or 0, text
-    except asyncio.TimeoutError:
+    async def _reap() -> None:
+        # SIGTERM first: a child that traps it (the rollout profiler flushes
+        # what it measured) gets the grace period to finish; SIGKILL after,
+        # so nothing outlives the reap either way.
         _kill_group(signal.SIGTERM)
         grace = _num(_ENV_KILL_GRACE, 20.0, 1.0, 300.0)
         try:
             await asyncio.wait_for(proc.wait(), timeout=grace)
         except asyncio.TimeoutError:
             _kill_group(signal.SIGKILL)
+
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        text = _tail() if sink is not None else (out or b"").decode("utf-8", "replace")
+        return proc.returncode or 0, text
+    except asyncio.TimeoutError:
+        await _reap()
         head = f"timeout after {timeout_s:.0f}s; process group reaped"
         return 124, f"{head}\n{_tail()}" if sink is not None else head
     except asyncio.CancelledError:
-        # Teardown is cancelling us. Do NOT leave a trainer on the card.
-        _kill_group(signal.SIGKILL)
+        # Teardown is cancelling us. Do NOT leave a trainer on the card --
+        # but let it stop the way a timeout lets it. A second cancellation
+        # during the grace lands in the finally below: SIGKILL.
+        await _reap()
         raise
     finally:
         if proc.returncode is None:

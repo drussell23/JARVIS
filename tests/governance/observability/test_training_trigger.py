@@ -268,3 +268,31 @@ def test_log_path_keeps_the_output_a_timeout_used_to_discard(tmp_path) -> None:
 def test_without_log_path_output_is_returned_as_before(tmp_path) -> None:
     rc, out = asyncio.run(tt._run([sys.executable, "-c", "print('hi')"], timeout_s=30))
     assert rc == 0 and out.strip() == "hi"
+
+
+def test_a_cancelled_child_is_asked_to_stop_before_it_is_killed(tmp_path, monkeypatch):
+    """Cancellation reaps the way a timeout does -- SIGTERM, a grace, then
+    SIGKILL -- so a child that traps SIGTERM (the rollout profiler flushes
+    what it measured) can finish, and nothing outlives the reap either way."""
+    marker = tmp_path / "flushed"
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import signal, sys, time\n"
+        f"def h(*a):\n    open({str(marker)!r}, 'w').write('ok'); sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, h)\n"
+        "print('up', flush=True)\n"
+        "time.sleep(600)\n")
+    monkeypatch.setenv("JARVIS_GRPO_AUTOTRAIN_KILL_GRACE_S", "10")
+    log = tmp_path / "child.log"
+
+    async def scenario():
+        task = asyncio.ensure_future(tt._run([sys.executable, str(child)], timeout_s=600, log_path=log))
+        for _ in range(200):
+            await asyncio.sleep(0.05)
+            if log.exists() and "up" in log.read_text():
+                break
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    asyncio.run(scenario())
+    assert marker.read_text() == "ok"

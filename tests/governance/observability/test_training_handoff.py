@@ -721,3 +721,114 @@ def test_an_aborted_organism_cycle_is_recorded_as_not_unattended(env, monkeypatc
     last = json.loads((tmp / "state" / "history.jsonl").read_text().splitlines()[-1])
     assert last["state"] == "ABORTED"
     assert last["origin"]["by"] == "organism" and last["origin"]["unattended"] is False
+
+
+# ---------------------------------------------------------------------------
+# run_exclusive: any GPU job, in the same envelope a cycle runs in
+# ---------------------------------------------------------------------------
+
+def _job_runner(rc=0, seen=None):
+    async def run(cmd, *, timeout_s, cwd=None, env=None, log_path=None):
+        if seen is not None:
+            seen.append({"cmd": cmd, "timeout_s": timeout_s, "log_path": log_path})
+        return rc, "job output"
+    return run
+
+
+def test_an_exclusive_job_holds_the_card_and_gives_it_back(env, monkeypatch, tmp_path):
+    jp, tmp = env
+    seen = []
+    monkeypatch.setattr(tt, "_run", _job_runner(0, seen))
+    out = asyncio.run(th.run_exclusive(["prof", "--x"], purpose="profile", timeout_s=900,
+                                       log_path=tmp_path / "job.log"))
+    assert out["state"] == "COMPLETED" and not jp.held
+    paths = [p for _, p in jp.calls]
+    assert paths.index("/v1/lease/acquire") < paths.index("/v1/lease/release")
+    assert seen == [{"cmd": ["prof", "--x"], "timeout_s": 900.0, "log_path": tmp_path / "job.log"}]
+    states = [json.loads(l)["state"] for l in (tmp / "state" / "history.jsonl").read_text().splitlines()]
+    assert states == ["LEASING", "LEASING", "EXCLUSIVE", "COMPLETED"]
+
+
+def test_a_failing_exclusive_job_still_gives_the_card_back(env, monkeypatch):
+    jp, _ = env
+    monkeypatch.setattr(tt, "_run", _job_runner(3))
+    out = asyncio.run(th.run_exclusive(["prof"], purpose="p", timeout_s=60))
+    assert out["state"] == "FAILED" and out["outcome"] == "rc=3" and not jp.held
+
+
+def test_an_exclusive_job_never_runs_beside_a_live_organism(env, monkeypatch):
+    jp, _ = env
+    monkeypatch.setattr(th, "_organism_live", lambda: 4242)
+    monkeypatch.setattr(tt, "_run", _job_runner(0))
+    out = asyncio.run(th.run_exclusive(["prof"], purpose="p", timeout_s=60))
+    assert out["state"] == "REFUSED" and ("POST", "/v1/lease/acquire") not in jp.calls
+
+
+def test_an_exclusive_job_holds_the_lane_for_its_own_budget(env, monkeypatch):
+    """O+V's boot guard reads occupancy(): it must see the lane held, and
+    until when -- the job's budget plus the release, no cycle phases."""
+    jp, _ = env
+    probe = {}
+
+    async def run(cmd, *, timeout_s, cwd=None, env=None, log_path=None):
+        probe["occ"] = th.occupancy()
+        return 0, ""
+    monkeypatch.setattr(tt, "_run", run)
+    monkeypatch.setenv("JARVIS_TRAINING_JPRIME_TIMEOUT_S", "100")
+    asyncio.run(th.run_exclusive(["prof"], purpose="p", timeout_s=900))
+    occ = probe["occ"]
+    assert occ["state"] == "EXCLUSIVE" and occ["holds_lane"] is True
+    assert occ["release_by"] == pytest.approx(occ["since"] + 900 + 100)
+
+
+def test_a_cancelled_exclusive_job_is_aborted_and_returns_the_card(env, monkeypatch):
+    jp, tmp = env
+    started = asyncio.Event()
+
+    async def run(cmd, *, timeout_s, cwd=None, env=None, log_path=None):
+        started.set()
+        await asyncio.sleep(3600)
+    monkeypatch.setattr(tt, "_run", run)
+
+    async def scenario():
+        task = asyncio.ensure_future(th.run_exclusive(["prof"], purpose="p", timeout_s=60))
+        await asyncio.wait_for(started.wait(), 30)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    asyncio.run(scenario())
+    last = json.loads((tmp / "state" / "history.jsonl").read_text().splitlines()[-1])
+    assert last["state"] == "ABORTED" and last["outcome"] == "aborted in EXCLUSIVE"
+    assert not jp.held
+
+
+def test_an_exclusive_job_and_a_cycle_exclude_each_other(env, monkeypatch):
+    gate = asyncio.Event()
+
+    async def run(cmd, *, timeout_s, cwd=None, env=None, log_path=None):
+        await gate.wait()
+        return 0, ""
+    monkeypatch.setattr(tt, "_run", run)
+
+    async def both():
+        job = asyncio.ensure_future(th.run_exclusive(["prof"], purpose="p", timeout_s=60))
+        await asyncio.sleep(0.2)
+        cyc = await th.run_cycle(trigger="t")
+        gate.set()
+        return await job, cyc
+    job, cyc = asyncio.run(both())
+    assert cyc["state"] == "REFUSED" and job["state"] == "COMPLETED"
+
+
+def test_the_exclusive_verb_takes_the_command_after_the_separator(monkeypatch):
+    got = {}
+
+    async def fake(job, **kw):
+        got.update(job=job, **kw)
+        return {"state": "COMPLETED"}
+    monkeypatch.setattr(th, "run_exclusive", fake)
+    rc = th.main(["exclusive", "--purpose", "profile", "--timeout-s", "900", "--",
+                  "python", "-u", "run.py", "--profile-rollout"])
+    assert rc == 0
+    assert got["job"] == ["python", "-u", "run.py", "--profile-rollout"]
+    assert got["purpose"] == "profile" and got["timeout_s"] == 900.0
