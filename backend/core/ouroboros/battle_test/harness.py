@@ -2824,8 +2824,13 @@ class BattleTestHarness:
                         # The most this teardown may still take: the cycle
                         # waits for this process that long, and no longer.
                         release_within_s=self._teardown_budget_s(),
+                        elapsed_s=(time.time() - self._started_at) if self._started_at else None,
                     )
                     logger.info("[AutoTrain] %s", _train_verdict)
+                    # The summary written next carries it: whether this
+                    # session handed its evidence to training, and if not why.
+                    self._learning_loop = _train_verdict.get("recorded") or {
+                        k: _train_verdict.get(k) for k in ("fired", "reason")}
             except asyncio.CancelledError:
                 raise
             except Exception as _autotrain_exc:  # noqa: BLE001 — fail-open
@@ -11152,6 +11157,7 @@ class BattleTestHarness:
                 # treats suspension_likely=True as graduation-evidence-invalid.
                 suspension_likely=self._suspension_likely,
                 suspension_ratio=self._suspension_ratio,
+                learning_loop=getattr(self, "_learning_loop", None),
             )
             # Flag prevents the atexit fallback from double-writing a
             # partial summary on top of the clean one.

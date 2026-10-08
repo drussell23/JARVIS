@@ -78,7 +78,7 @@ _ENV_TIME_RESERVE = "JARVIS_TRAINING_TIME_RESERVE_S"
 
 STATES = ("IDLE", "AWAITING_REQUESTER", "LABELING", "PREFLIGHT", "BASELINE", "LEASING", "TRAINING", "CONVERTING", "PUBLISHING",
           "RESTORING", "VERIFYING", "COMMITTED", "ROLLED_BACK", "REFUSED", "FAILED", "ABORTED",
-          "EXCLUSIVE", "COMPLETED")
+          "EXCLUSIVE", "COMPLETED", "REQUESTED", "DEFERRED")
 
 
 def state_dir() -> Path:
@@ -159,15 +159,20 @@ class Cycle:
         return d
 
 
+def _append_history(row: Dict[str, Any]) -> None:
+    """The append-only ledger every transition and decision goes to."""
+    d = state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    with (d / "history.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"ts": time.time(), **row}, default=str) + "\n")
+
+
 def _record(cycle: Cycle, state: str, **detail: Any) -> None:
     cycle.state = state
     if detail:
         cycle.detail[state.lower()] = detail
     d = state_dir()
-    d.mkdir(parents=True, exist_ok=True)
-    row = {"ts": time.time(), "run_id": cycle.run_id, "state": state, **detail}
-    with (d / "history.jsonl").open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(row, default=str) + "\n")
+    _append_history({"run_id": cycle.run_id, "state": state, **detail})
     tmp = d / "state.json.tmp"
     tmp.write_text(json.dumps(cycle.public(), indent=2, default=str), encoding="utf-8")
     os.replace(tmp, d / "state.json")
@@ -180,6 +185,62 @@ def status() -> Dict[str, Any]:
         return json.loads((state_dir() / "state.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {"state": "IDLE"}
+
+
+# ---------------------------------------------------------------------------
+# The session-end decision: requested, or deferred -- never silent
+# ---------------------------------------------------------------------------
+#
+# A session that ends below the batch threshold starts nothing, and until now
+# said so only in its own debug log: from the outside a deferred cycle and a
+# broken trigger looked the same. Every ending now leaves one row in THIS
+# ledger -- beside the cycles it did or did not start -- naming the session,
+# how it ended, the evidence count against the threshold, and why.
+
+def record_session_decision(verdict: Dict[str, Any], *, elapsed_s: Optional[float] = None) -> Dict[str, Any]:
+    """Append the organism's end-of-session training decision. Returns the
+    row written. NEVER raises -- a ledger that cannot be written is logged,
+    and the session still ends."""
+    y = verdict.get("yield") or {}
+    row: Dict[str, Any] = {
+        "run_id": f"session-{verdict.get('session_id') or '?'}",
+        "state": "REQUESTED" if verdict.get("fired") else "DEFERRED",
+        "session_id": verdict.get("session_id"),
+        "stop_reason": verdict.get("stop_reason"),
+        "elapsed_s": None if elapsed_s is None else round(float(elapsed_s), 1),
+        "reason": verdict.get("reason"),
+        "unlearned": y.get("unlearned"),
+        "threshold": y.get("threshold"),
+        "yield_error": y.get("error"),
+    }
+    try:
+        _append_history(row)
+    except Exception:  # noqa: BLE001
+        logger.warning("[TrainingHandoff] session decision not recorded: %s", row, exc_info=True)
+    logger.warning("[TrainingHandoff] session %s: training %s (%s; landed evidence %s/%s)",
+                   row["session_id"], row["state"].lower(), row["reason"],
+                   row["unlearned"] if row["unlearned"] is not None else "?",
+                   row["threshold"] if row["threshold"] is not None else "?")
+    return row
+
+
+def last_session_decision() -> Optional[Dict[str, Any]]:
+    """The most recent REQUESTED / DEFERRED row, or None. NEVER raises."""
+    try:
+        with (state_dir() / "history.jsonl").open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - (1 << 16)))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("state") in ("REQUESTED", "DEFERRED"):
+            return row
+    return None
 
 
 @contextlib.contextmanager
@@ -1123,7 +1184,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     from backend.core.env_bootstrap import load_env_once
     load_env_once()
     if args.cmd == "status":
-        print(json.dumps(status(), indent=2, default=str))
+        print(json.dumps({**status(), "last_session_decision": last_session_decision()},
+                         indent=2, default=str))
         return 0
     if args.cmd == "request":
         out = request_cycle(trigger=args.trigger)

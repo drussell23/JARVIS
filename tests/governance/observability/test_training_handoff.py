@@ -502,7 +502,8 @@ def test_the_request_names_its_requester(env, monkeypatch):
     assert 100 < rec["release_by"] - time.time() <= 120
 
 
-def test_the_session_end_hook_names_this_process_and_its_budget(monkeypatch):
+def test_the_session_end_hook_names_this_process_and_its_budget(monkeypatch, tmp_path):
+    monkeypatch.setenv("JARVIS_TRAINING_HANDOFF_DIR", str(tmp_path / "state"))   # never the real ledger
     seen = {}
 
     def req(**kw):

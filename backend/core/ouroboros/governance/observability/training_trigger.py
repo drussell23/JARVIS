@@ -288,6 +288,30 @@ async def maybe_train_after_soak(
     stop_reason: str,
     session_id: str = "",
     release_within_s: Optional[float] = None,
+    elapsed_s: Optional[float] = None,
+) -> Dict[str, Any]:
+    """REQUEST a training cycle if this ending qualifies, and RECORD the
+    decision either way (``training_handoff.record_session_decision``): a
+    session never ends with training bypassed and nothing said about it.
+    ``elapsed_s`` is the session's own duration, for the record. NEVER
+    raises."""
+    verdict = await _decide_after_soak(stop_reason=stop_reason, session_id=session_id,
+                                       release_within_s=release_within_s)
+    try:
+        from backend.core.ouroboros.governance.observability.training_handoff import (  # noqa: PLC0415
+            record_session_decision,
+        )
+        verdict["recorded"] = record_session_decision(verdict, elapsed_s=elapsed_s)
+    except Exception:  # noqa: BLE001
+        logger.warning("[AutoTrain] session decision unrecorded: %s", verdict, exc_info=True)
+    return verdict
+
+
+async def _decide_after_soak(
+    *,
+    stop_reason: str,
+    session_id: str = "",
+    release_within_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """REQUEST a training cycle if this ending qualifies. Returns at once.
 

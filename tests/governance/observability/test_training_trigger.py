@@ -26,8 +26,18 @@ from backend.core.ouroboros.governance.observability import training_trigger as 
 # helpers
 # --------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _ledger(tmp_path, monkeypatch):
+    """Every session ending writes a decision row to the handoff ledger;
+    never the operator's real one."""
+    monkeypatch.setenv("JARVIS_TRAINING_HANDOFF_DIR", str(tmp_path / "handoff"))
+    return tmp_path / "handoff"
+
+
 def _clear(monkeypatch) -> None:
     for k in list(os.environ):
+        if k == "JARVIS_TRAINING_HANDOFF_DIR":
+            continue                          # the isolated ledger above
         if k.startswith(("JARVIS_GRPO_AUTOTRAIN", "TRINITY_GRPO", "JARVIS_TRAINING_HANDOFF")):
             monkeypatch.delenv(k, raising=False)
 
@@ -296,3 +306,75 @@ def test_a_cancelled_child_is_asked_to_stop_before_it_is_killed(tmp_path, monkey
             await task
     asyncio.run(scenario())
     assert marker.read_text() == "ok"
+
+
+# --------------------------------------------------------------------------
+# Every ending is recorded: requested, or deferred with its numbers
+# --------------------------------------------------------------------------
+
+def _ledger_rows(d):
+    return [json.loads(l) for l in (d / "history.jsonl").read_text().splitlines()]
+
+
+def test_a_session_below_the_threshold_records_the_deferral(monkeypatch, _ledger) -> None:
+    _clear(monkeypatch)
+    monkeypatch.setenv("JARVIS_GRPO_AUTOTRAIN_ENABLED", "true")
+    from backend.core.ouroboros.governance.observability import training_handoff as th
+
+    async def thin(model=None):
+        return {"met": False, "unlearned": 14, "threshold": 15}
+    monkeypatch.setattr(th, "training_yield", thin)
+    v = _fire(stop_reason="wall_clock_cap", session_id="bt-x", elapsed_s=32400.4)
+    assert v["fired"] is False and v["reason"] == "below_training_batch:14<15"
+    row = _ledger_rows(_ledger)[-1]
+    assert row["state"] == "DEFERRED" and row["session_id"] == "bt-x"
+    assert (row["unlearned"], row["threshold"], row["elapsed_s"]) == (14, 15, 32400.4)
+    assert row["stop_reason"] == "wall_clock_cap"
+    assert v["recorded"] == {k: row[k] for k in v["recorded"]}
+    assert th.last_session_decision()["session_id"] == "bt-x"
+
+
+def test_an_ungraceful_ending_is_recorded_too(monkeypatch, _ledger) -> None:
+    _clear(monkeypatch)
+    monkeypatch.setenv("JARVIS_GRPO_AUTOTRAIN_ENABLED", "true")
+    v = _fire(stop_reason="shutdown_signal", session_id="bt-k")
+    row = _ledger_rows(_ledger)[-1]
+    assert row["state"] == "DEFERRED" and row["reason"] == "stop_reason_not_graceful:shutdown_signal"
+    assert v["recorded"]["state"] == "DEFERRED"
+
+
+def test_a_requested_cycle_is_recorded_as_requested(monkeypatch, _ledger) -> None:
+    _clear(monkeypatch)
+    monkeypatch.setenv("JARVIS_GRPO_AUTOTRAIN_ENABLED", "true")
+    from backend.core.ouroboros.governance.observability import training_handoff as th
+
+    async def met(model=None):
+        return {"met": True, "unlearned": 17, "threshold": 15}
+    monkeypatch.setattr(th, "training_yield", met)
+    monkeypatch.setattr(th, "request_cycle", lambda **kw: {"requested": True, "rc": 0})
+    v = _fire(stop_reason="wall_clock_cap", session_id="bt-r")
+    assert v["fired"] is True
+    row = _ledger_rows(_ledger)[-1]
+    assert row["state"] == "REQUESTED" and row["unlearned"] == 17
+
+
+def test_an_unwritable_ledger_never_breaks_the_ending(monkeypatch, tmp_path) -> None:
+    _clear(monkeypatch)
+    monkeypatch.setenv("JARVIS_GRPO_AUTOTRAIN_ENABLED", "true")
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    monkeypatch.setenv("JARVIS_TRAINING_HANDOFF_DIR", str(blocker / "handoff"))
+    v = _fire(stop_reason="shutdown_signal", session_id="bt-u")
+    assert v["fired"] is False and v["recorded"]["state"] == "DEFERRED"
+
+
+def test_the_harness_hands_the_decision_to_the_summary() -> None:
+    """The decision must reach summary.json, not only the debug log."""
+    from pathlib import Path as _P
+    import inspect
+
+    from backend.core.ouroboros.battle_test import harness, session_recorder
+    src = _P(inspect.getsourcefile(harness)).read_text(encoding="utf-8")
+    assert "elapsed_s=(time.time() - self._started_at)" in src
+    assert 'learning_loop=getattr(self, "_learning_loop", None)' in src
+    assert "learning_loop" in inspect.signature(session_recorder.SessionRecorder.save_summary).parameters

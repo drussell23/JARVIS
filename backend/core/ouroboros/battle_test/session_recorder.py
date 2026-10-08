@@ -483,6 +483,7 @@ class SessionRecorder:
         last_activity_ts: Optional[float] = None,
         suspension_likely: Optional[bool] = None,
         suspension_ratio: Optional[float] = None,
+        learning_loop: Optional[Dict[str, Any]] = None,
     ) -> Path:
         """Write ``summary.json`` and (if any) ``review_queue.jsonl`` to *output_dir*.
 
@@ -570,6 +571,11 @@ class SessionRecorder:
             summary["suspension_likely"] = bool(suspension_likely)
         if suspension_ratio is not None:
             summary["suspension_ratio"] = float(suspension_ratio)
+        # Additive: this session's end-of-session training decision
+        # (requested / deferred, the evidence count against the threshold,
+        # the reason) -- the same row the training ledger holds.
+        if learning_loop is not None:
+            summary["learning_loop"] = dict(learning_loop)
 
         # v1.1a: emit ``ops_digest`` only when at least one real APPLY
         # was observed. Empty sessions produce no digest key at all so
