@@ -1052,11 +1052,14 @@ def _model_family(model_id: str) -> str:
 _SINGLE_FILE_DIFF_SCHEMA_ENV = "JARVIS_SINGLE_FILE_DIFF_SCHEMA_ENABLED"
 
 
-def single_file_diff_schema_enabled() -> bool:
+def single_file_diff_schema_enabled(environ: Any = None) -> bool:
     """Master switch (default FALSE) re-enabling the 2b.1-diff schema for
     single-file ops whose brain is diff-capable. OFF is byte-identical to the
-    hardcoded-off legacy (commit c7b518aabb). NEVER raises."""
-    raw = (os.environ.get(_SINGLE_FILE_DIFF_SCHEMA_ENV, "false") or "").strip().lower()
+    hardcoded-off legacy (commit c7b518aabb). ``environ`` answers for an
+    environment other than this process's (the training handoff asks about
+    the ORGANISM's). NEVER raises."""
+    env = os.environ if environ is None else environ
+    raw = (env.get(_SINGLE_FILE_DIFF_SCHEMA_ENV, "false") or "").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
@@ -1147,7 +1150,7 @@ def requested_output_schema(op_id: str) -> str:
         return ""
 
 
-def single_file_output_schemas() -> Tuple[str, ...]:
+def single_file_output_schemas(environ: Any = None) -> Tuple[str, ...]:
     """The contracts O+V asks for a single-file change TODAY.
 
     With the diff schema armed, a large file is asked for a unified diff and a
@@ -1155,8 +1158,9 @@ def single_file_output_schemas() -> Tuple[str, ...]:
     full content; with it off, only full content. This is the training side's
     definition of "current": a row tagged with one of these was produced under
     the policy still in force. A multi-file or execution-graph contract is not
-    single-file work. NEVER raises."""
-    if single_file_diff_schema_enabled():
+    single-file work. ``environ`` as for :func:`single_file_diff_schema_enabled`.
+    NEVER raises."""
+    if single_file_diff_schema_enabled(environ):
         return (_SCHEMA_VERSION_DIFF, _SCHEMA_VERSION)
     return (_SCHEMA_VERSION,)
 

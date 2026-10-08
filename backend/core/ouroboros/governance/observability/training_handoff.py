@@ -483,13 +483,22 @@ def _training_contracts() -> Dict[str, str]:
     one process that does hands it over -- to preflight and the trainer alike,
     so the gate and the run count the same rows. An explicit env value wins
     (an operator narrowing a run). Empty when the policy cannot be read: the
-    trainer then applies no contract filter and says so in its report."""
+    trainer then applies no contract filter and says so in its report.
+
+    The policy is the ORGANISM's, not this process's: every organism launcher
+    hydrates the production envelope over ``.env`` (which is where the diff
+    schema is armed), and this process is not an organism. The envelope is
+    applied to a COPY of the environment, with the launcher's own
+    operator-wins semantics, and the predicate asked about that copy."""
     explicit = os.environ.get(_ENV_OUTPUT_SCHEMAS, "").strip()
     if explicit:
         return {_ENV_OUTPUT_SCHEMAS: explicit}
     try:
+        from backend.core.ouroboros.governance.production_envelope import hydrate
         from backend.core.ouroboros.governance.providers import single_file_output_schemas
-        return {_ENV_OUTPUT_SCHEMAS: ",".join(single_file_output_schemas())}
+        organism_env = dict(os.environ)
+        hydrate(environ=organism_env)
+        return {_ENV_OUTPUT_SCHEMAS: ",".join(single_file_output_schemas(organism_env))}
     except Exception:  # noqa: BLE001
         logger.warning("[TrainingHandoff] output-contract policy unreadable", exc_info=True)
         return {}

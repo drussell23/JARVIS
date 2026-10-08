@@ -187,3 +187,22 @@ def test_the_trainer_gets_the_same_contracts_as_the_gate():
 
     src = inspect.getsource(th._run)
     assert src.count("env=contracts") == 2
+
+
+def test_the_policy_is_the_organisms_envelope_not_this_processs(cycle_env, monkeypatch):
+    """The diff schema is armed by the production envelope every organism
+    launcher hydrates -- not by .env. The handoff is not an organism, so
+    reading its own environment would call diffs non-current and train on
+    nothing but full content. Measured 2026-10-08: the exec .env has no
+    JARVIS_SINGLE_FILE_DIFF_SCHEMA_ENABLED line at all."""
+    import os
+    monkeypatch.delenv("JARVIS_SINGLE_FILE_DIFF_SCHEMA_ENABLED", raising=False)
+    asyncio.run(th.run_cycle(trigger="t"))
+    assert cycle_env["preflight"]["REACTOR_GRPO_OUTPUT_SCHEMAS"] == "2b.1-diff,2b.1"
+    assert "JARVIS_SINGLE_FILE_DIFF_SCHEMA_ENABLED" not in os.environ      # a copy was hydrated
+
+
+def test_an_operator_disarming_the_diff_schema_is_respected(cycle_env, monkeypatch):
+    monkeypatch.setenv("JARVIS_SINGLE_FILE_DIFF_SCHEMA_ENABLED", "false")
+    asyncio.run(th.run_cycle(trigger="t"))
+    assert cycle_env["preflight"]["REACTOR_GRPO_OUTPUT_SCHEMAS"] == "2b.1"
