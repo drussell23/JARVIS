@@ -14,9 +14,11 @@ Three mechanisms, each acting ONLY in the runner's own process. A
 ``multiprocessing`` fork child inherits these patches and must still be able to
 ``os._exit``, so every check first asks "am I the runner?".
 
-**Why not a per-test SIGALRM.** pytest-timeout (``--timeout-method=signal``)
-already owns SIGALRM per test, and a process has one handler per signal: a
-second handler would silently disable the timeout. The harness watchdog's
+**Why not a per-test SIGALRM.** pytest-timeout owns the per-test cap (this
+repo and VALIDATE use ``--timeout-method=thread``: its timer thread dumps
+stacks and calls ``os._exit``), and a process has one handler per signal: a
+second handler would silently disable it. Its ``os._exit`` is therefore let
+through the fence -- see :func:`_exit_is_pytest_timeouts`. The harness watchdog's
 ``os._exit`` is a deliberate PRODUCTION safety net (a wedged shutdown must
 die); it is fenced here only while tests run, never removed.
 """
@@ -33,6 +35,18 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tupl
 
 _ENV_MODE = "JARVIS_TEST_ISOLATION_MODE"          # report (default) | strict
 _ENV_REAP_GRACE_S = "JARVIS_TEST_REAP_GRACE_S"
+
+
+def _exit_is_pytest_timeouts() -> bool:
+    """Is the ``os._exit`` in progress being made by pytest-timeout itself?
+    Decided by the calling frame's module, two frames up (pytest-timeout ->
+    the fence's ``_exit`` -> here): the plugin's timer is the only code
+    whose exit is the runner's own decision."""
+    import sys
+    try:
+        return sys._getframe(2).f_globals.get("__name__", "") == "pytest_timeout"
+    except ValueError:
+        return False
 
 
 def isolation_mode() -> str:
@@ -128,7 +142,14 @@ class RunnerFence:
         real = self._real
 
         def _exit(code: int = 0) -> None:
-            if not self._is_runner():
+            # pytest-timeout's thread method ends a hung test exactly this way
+            # (dump stacks, then os._exit from its timer thread). That is the
+            # runner's own per-test cap, not code under test escaping it --
+            # fencing it raised SystemExit in the timer thread, which
+            # threading's excepthook swallows, so every hung test ran on to
+            # the outer cap: per-test timeouts dead in every run under tests/
+            # since 2026-09-26 (VALIDATE: 45 s cap, killed at 180 s instead).
+            if not self._is_runner() or _exit_is_pytest_timeouts():
                 real["_exit"](code)
             self._record("os._exit", str(code))
             raise SystemExit(code)

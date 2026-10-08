@@ -236,3 +236,56 @@ def test_oracle_release_does_not_save_a_half_built_graph():
     release = inspect.getsource(TheOracle.release_resources)
     assert "_save_cache" not in release
     assert "release_resources()" in inspect.getsource(TheOracle.shutdown)
+
+
+# --------------------------------------------------------------------------
+# The fence never disarms the runner's own per-test cap (2026-10-08)
+# --------------------------------------------------------------------------
+#
+# pytest-timeout's thread method ends a hung test by calling os._exit from
+# its timer thread. The fence turned that into SystemExit in the timer thread,
+# which threading's excepthook swallows: every hung test ran on to the outer
+# cap (VALIDATE: 45 s per-test cap, killed at 180 s) in every run since the
+# fence landed.
+
+def test_an_exit_made_by_pytest_timeout_is_recognised():
+    probe = {}
+    stand_in_for_the_fence = lambda: probe.setdefault("ok", iso._exit_is_pytest_timeouts())  # noqa: E731
+    ns = {"__name__": "pytest_timeout"}
+    exec("def timeout_timer(fn):\n    return fn()\n", ns)                 # the plugin's frame
+    ns["timeout_timer"](stand_in_for_the_fence)
+    assert probe["ok"] is True
+
+
+def test_an_exit_from_anything_else_is_still_fenced():
+    probe = {}
+    ns = {"__name__": "backend.core.ouroboros.battle_test.harness"}
+    exec("def watchdog(fn):\n    return fn()\n", ns)
+    ns["watchdog"](lambda: probe.setdefault("ok", iso._exit_is_pytest_timeouts()))
+    assert probe["ok"] is False
+
+
+def test_a_hung_test_is_ended_by_the_per_test_cap_with_the_fence_installed(tmp_path):
+    """End to end: the fence installed exactly as the repo installs it, a
+    test that never returns, pytest-timeout's thread method at 2 s. The run
+    must end on the per-test cap -- not hang to the outer timeout."""
+    repo = Path(__file__).resolve().parents[1]
+    (tmp_path / "conftest.py").write_text(
+        "import pytest\n"
+        "from tests.support import isolation_guard as iso\n"
+        "_F = iso.RunnerFence()\n"
+        "@pytest.fixture(scope='session', autouse=True)\n"
+        "def _fence():\n"
+        "    _F.install()\n"
+        "    yield\n"
+        "    _F.uninstall()\n")
+    (tmp_path / "test_hang.py").write_text("import time\n\ndef test_hangs():\n    time.sleep(600)\n")
+    started = time.monotonic()
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-o", "addopts=",
+         "--timeout=2", "--timeout-method=thread", str(tmp_path / "test_hang.py")],
+        cwd=str(tmp_path), capture_output=True, text=True, timeout=120,
+        env={**os.environ, "PYTHONPATH": str(repo)})
+    elapsed = time.monotonic() - started
+    assert elapsed < 60, f"the per-test cap did not end the run ({elapsed:.0f}s)"
+    assert "Timeout" in (proc.stdout + proc.stderr)
