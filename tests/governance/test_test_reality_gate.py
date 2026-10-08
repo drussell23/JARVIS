@@ -264,3 +264,30 @@ def test_l2_runs_the_gate_before_its_sandbox_with_no_fall_through():
     block = inner[gate:inner.index("await self._structural_validate(")]
     assert "continue  # regenerate with the structural correction" in block
     assert "_max_struct_rejects" not in block and "MAX_REJECTS" not in block  # no escape to the sandbox
+
+
+# ---------------------------------------------------------------------------
+# The goal never asks for what this gate rejects (2026-10-08)
+# ---------------------------------------------------------------------------
+
+def test_the_synthesis_instruction_asks_for_verification_not_a_bare_import():
+    """Both goal builders demanded "an import smoke test" -- an import with no
+    assertion, which verifies_nothing rejects. Op ...b9f lost two of three
+    first-round candidates to exactly that."""
+    from backend.core.ouroboros.governance.test_reality import synthesis_instruction
+    text = synthesis_instruction("backend/autonomy/x.py", "tests/test_x.py")
+    assert "smoke test" not in text
+    assert "VERIFY" in text and "pytest.raises" in text
+    assert "IsolatedAsyncioTestCase" in text              # rule 1 stated, not discovered
+    assert "do NOT modify it" in text and "`tests/test_x.py`" in text
+
+
+def test_both_goal_builders_use_the_one_instruction():
+    from backend.core.ouroboros.governance.autonomy import goal_dag, goal_discovery
+    from backend.core.ouroboros.governance.test_reality import synthesis_instruction
+    import inspect
+    assert "synthesis_instruction(" in inspect.getsource(goal_discovery.DiscoveredWork.describe)
+    assert "synthesis_instruction(" in inspect.getsource(goal_dag._spec_a)
+    assert "import smoke test" not in inspect.getsource(goal_discovery)
+    assert "import smoke test" not in inspect.getsource(goal_dag)
+    assert synthesis_instruction  # imported, not re-typed

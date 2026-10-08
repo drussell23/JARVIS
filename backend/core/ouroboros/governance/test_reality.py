@@ -244,6 +244,30 @@ def _changed(tests, baseline: Optional[ast.Module]) -> List[Tuple[str, ast.AST, 
     return [t for t in tests if before.get(t[0]) != ast.dump(t[1])]
 
 
+def synthesis_instruction(subject: str, test_file: str) -> str:
+    """What a test-synthesis goal asks for -- stated as THIS gate's invariants,
+    so a goal can never require what the gate rejects.
+
+    Both goal builders (discovery and the DAG substitution) used to ask for
+    "an import smoke test": an import with no assertion, which rule 2
+    (``verifies_nothing``) rejects. Live 2026-10-08 (op ...b9f): two of three
+    first-round candidates were refused for exactly the smoke test the goal
+    had demanded. One definition, beside the rules it restates."""
+    return (
+        f"`{subject}` has no corresponding test module. CREATE `{test_file}` "
+        f"containing focused tests for its public behaviour and edge cases: tests "
+        f"for the key public functions and the edge cases those functions actually "
+        f"branch on. Every test must VERIFY something (an `assert`, an `assert*` "
+        f"call, or `pytest.raises`) -- a test that only imports or only calls is "
+        f"rejected before it runs. Import `{subject}` and exercise what it defines; "
+        f"never assert on a mock of the subject itself. An `async def` test belongs "
+        f"in plain pytest functions or `unittest.IsolatedAsyncioTestCase`, never a "
+        f"plain `TestCase` (it would never be awaited). Read `{subject}` to derive "
+        f"the tests; do NOT modify it -- the only file this goal authorises you to "
+        f"write is `{test_file}`."
+    )
+
+
 def analyze_test_source(
     source: str,
     *,

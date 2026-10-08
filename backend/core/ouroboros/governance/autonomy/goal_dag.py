@@ -213,18 +213,13 @@ def _spec_a(plan: SubstitutionPlan) -> Any:
     from backend.core.ouroboros.governance.operator_goal_sanction import (  # noqa: PLC0415
         GoalSpec,
     )
+    from backend.core.ouroboros.governance.test_reality import synthesis_instruction  # noqa: PLC0415
     return GoalSpec(
         goal_id=plan.goal_a_id,
         title=f"[dag] test synthesis: {Path(plan.test_file).name}",
         description=(
-            f"`{plan.subject_file}` has no corresponding test module, so a "
-            f"change to it cannot be validated. CREATE `{plan.test_file}` "
-            "containing focused tests for its public behaviour and edge "
-            "cases: an import smoke test, tests for the key public functions, "
-            "and the edge cases those functions actually branch on. Read "
-            f"`{plan.subject_file}` to derive the tests; do NOT modify it — "
-            f"the only file this goal authorises you to write is "
-            f"`{plan.test_file}`."
+            f"A change to `{plan.subject_file}` cannot be validated until it has "
+            f"tests. " + synthesis_instruction(plan.subject_file, plan.test_file)
         ),
         target_files=(plan.test_file,),
         success_criteria=(

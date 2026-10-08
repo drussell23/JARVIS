@@ -194,16 +194,8 @@ class DiscoveredWork:
                 f"is genuinely wrong, decline and say so rather than editing "
                 f"the assertion."
             )
-        subject = self.subject_file or self.target_file
-        return (
-            f"`{subject}` has no corresponding test module. CREATE "
-            f"`{self.target_file}` containing focused tests for its public "
-            f"behaviour and edge cases: an import smoke test, tests for the "
-            f"key public functions, and the edge cases those functions "
-            f"actually branch on. Read `{subject}` to derive the tests; do "
-            f"NOT modify it — the only file this goal authorises you to write "
-            f"is `{self.target_file}`."
-        )
+        from backend.core.ouroboros.governance.test_reality import synthesis_instruction  # noqa: PLC0415
+        return synthesis_instruction(self.subject_file or self.target_file, self.target_file)
 
 
 # ---------------------------------------------------------------------------
