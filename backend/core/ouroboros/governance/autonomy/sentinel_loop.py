@@ -282,9 +282,14 @@ class SentinelLoop:
                     continue
                 self.passes += 1
                 self._emit(outcome)
-                # Idle only when there was nothing to do; otherwise go straight
-                # to the next-best evidence.
-                if outcome.state in ("idle", "refused"):
+                # Go straight to the next-best evidence only when this pass
+                # actually RAN work (an op was dispatched: its own duration is
+                # the pacing). A pass that dispatched nothing -- idle, refused,
+                # or failed before an op existed (sanction refused, the cage
+                # refused the claim) -- took milliseconds, and repeating it at
+                # once is a spin, not progress: 581 such passes in 22 minutes
+                # on 2026-10-08, each re-parsing the roadmap on the loop.
+                if outcome.state in ("idle", "refused") or not outcome.op_id:
                     try:
                         await asyncio.wait_for(
                             self._stopping.wait(), timeout=loop_interval_s(),
@@ -403,7 +408,10 @@ class SentinelLoop:
         # means "target absent AND not a test file", which the index does not
         # participate in; building it here would put a second filesystem walk
         # on the dispatch path to sharpen a distinction this never makes.
-        live = [w for w in candidates if gd.is_dispatchable(w, self._repo_root)]
+        # Off the event loop: each verdict imports and asks git (measured
+        # ~70 stalls / ~40 s of blocked loop in one soak).
+        live = await asyncio.to_thread(
+            lambda: [w for w in candidates if gd.is_dispatchable(w, self._repo_root)])
         if not live:
             logger.warning(
                 "[Sentinel] ExecutionQueueStarved: all %d eligible candidate(s) "
@@ -425,7 +433,9 @@ class SentinelLoop:
             )
 
         work = live[0]
-        result = gd.synthesize_and_sign(work)
+        # Off the event loop: signing reads and rewrites the whole roadmap
+        # (660 KB of YAML, ~630 ms per parse, measured on 2026-10-08).
+        result = await asyncio.to_thread(gd.synthesize_and_sign, work)
         # The SIGNER is authoritative about the id — including on a duplicate
         # refusal, where the id it reports is the one already on the roadmap.
         goal_id = str(getattr(result, "goal_id", "") or "") or work.goal_id

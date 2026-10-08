@@ -1145,6 +1145,29 @@ def _dispatch_refusal(liveness: int, verdict: Any) -> str:
         return ""
 
 
+#: The last exclusion reported per target, across passes. A pass re-walks
+#: every candidate, and reporting every excluded one on every pass is not
+#: telemetry: 184,123 "is cooling" lines in one 2026-10-08 soak, ~312 per
+#: pass, for a handful of state changes. Each target's exclusion is said when
+#: it BEGINS or CHANGES; a target that is admitted again forgets it, so a
+#: later exclusion is said again. Scoped to the cooldown ledger the passes
+#: share (its path), so two loops -- or two tests -- never silence each
+#: other. Bounded by the repository's own files.
+_REPORTED_EXCLUSION: Dict[Tuple[str, str], str] = {}
+
+
+def _scope(cooldown: Any) -> str:
+    return str(getattr(cooldown, "path", "") or "")
+
+
+def _report_exclusion(cooldown: Any, target: str, state: str, message: str, *args: Any) -> None:
+    key = (_scope(cooldown), target)
+    if _REPORTED_EXCLUSION.get(key) == state:
+        return
+    _REPORTED_EXCLUSION[key] = state
+    logger.info(message, *args)
+
+
 class _EligibilityGate:
     """The pass's one filter. Every source is judged by this and nothing else.
 
@@ -1179,9 +1202,8 @@ class _EligibilityGate:
             return False
         try:
             if self._cooldown.is_cooling(target):
-                logger.info(
-                    "[GoalDiscovery] %s is cooling — skipped this pass", target,
-                )
+                _report_exclusion(self._cooldown, target, "cooling",
+                                  "[GoalDiscovery] %s is cooling — skipped until its cooldown ends", target)
                 return True
         except Exception:  # noqa: BLE001
             pass
@@ -1225,10 +1247,9 @@ class _EligibilityGate:
         # SCORING a dispatch that had already happened. Nothing asked it before
         # choosing. This is that question, asked first.
         if item.goal_id and item.goal_id in settled_ids:
-            logger.info(
-                "[GoalDiscovery] %s already SATISFIED (%s) — not re-selecting "
-                "work that has landed", target, item.goal_id,
-            )
+            _report_exclusion(self._cooldown, target, f"satisfied:{item.goal_id}",
+                              "[GoalDiscovery] %s already SATISFIED (%s) — not re-selecting "
+                              "work that has landed", target, item.goal_id)
             return False
         # DAG gate. A goal whose prerequisite has not landed must not be
         # scheduled; enforcing it HERE, at selection, is what makes "B never
@@ -1240,11 +1261,12 @@ class _EligibilityGate:
             item.goal_id, self._dag_index, settled_ids, self._cooldown,
         )
         if _dep is not None and not _dep.runnable:
-            logger.info("[GoalDiscovery] %s %s", target, _dep.render())
+            _report_exclusion(self._cooldown, target, f"blocked:{_dep.render()}", "[GoalDiscovery] %s %s", target, _dep.render())
             return False
         if self._cooling(item):
             return False
         self.seen.add(target)
+        _REPORTED_EXCLUSION.pop((_scope(self._cooldown), target), None)   # admitted: a later exclusion is news again
         return True
 
 

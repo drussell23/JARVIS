@@ -205,3 +205,23 @@ def test_a_hostile_oracle_degrades_to_no_suppression(tmp_path):
         GD._settled_goal_ids([_Work("g", "t")], repo_root=tmp_path, settled=_Boom())
     )
     assert got == frozenset(), "a broken oracle must not suppress real work"
+
+
+def test_an_exclusion_is_reported_when_it_begins_not_on_every_pass(tmp_path, caplog):
+    """184,123 "is cooling" lines in one 2026-10-08 soak (~312 per pass): the
+    same unchanged exclusion re-said every pass. It is said once per state
+    change, per cooldown ledger; admission resets it."""
+    from backend.core.ouroboros.governance.autonomy import goal_discovery as gd
+    from backend.core.ouroboros.governance.autonomy.sentinel_cooldown import TargetCooldownLedger
+
+    ledger = TargetCooldownLedger(tmp_path / "cd.json")
+    with caplog.at_level("INFO"):
+        for _ in range(5):
+            gd._report_exclusion(ledger, "tests/test_a.py", "cooling", "[GoalDiscovery] %s is cooling", "tests/test_a.py")
+        gd._report_exclusion(ledger, "tests/test_a.py", "satisfied:g1", "[GoalDiscovery] %s satisfied", "tests/test_a.py")
+        other = TargetCooldownLedger(tmp_path / "other.json")
+        gd._report_exclusion(other, "tests/test_a.py", "cooling", "[GoalDiscovery] %s is cooling", "tests/test_a.py")
+    lines = [r.getMessage() for r in caplog.records if "test_a.py" in r.getMessage()]
+    assert lines == ["[GoalDiscovery] tests/test_a.py is cooling",       # begins
+                     "[GoalDiscovery] tests/test_a.py satisfied",        # changes
+                     "[GoalDiscovery] tests/test_a.py is cooling"]       # another ledger: its own news

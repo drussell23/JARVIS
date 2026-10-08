@@ -470,3 +470,62 @@ def test_the_live_candidate_is_taken_past_the_dead_ones(repo, tmp_path, monkeypa
     res = asyncio.run(loop.run_once())
     assert res.state == "landed"
     assert res.target == TARGET
+
+
+# --------------------------------------------------------------------------
+# Cadence: a pass that dispatched nothing never repeats at once
+# --------------------------------------------------------------------------
+
+def _paced(repo, tmp_path, monkeypatch, outcome, *, max_passes):
+    """How many passes run in a short window when every pass returns
+    ``outcome``, with a long interval."""
+    monkeypatch.setenv("JARVIS_SENTINEL_INTERVAL_S", "30")
+    monkeypatch.setenv("JARVIS_SENTINEL_MAX_PASSES", str(max_passes))
+    loop = SentinelLoop(repo_root=repo, dispatch=lambda **kw: "", watcher=None,
+                        cooldown=TargetCooldownLedger(path=tmp_path / "cool.jsonl"))
+    calls = []
+
+    async def once():
+        calls.append(1)
+        return outcome
+
+    loop.run_once = once                               # type: ignore[assignment]
+
+    async def scenario():
+        task = asyncio.ensure_future(loop._run())
+        await asyncio.sleep(0.3)
+        loop._stopping.set()
+        await asyncio.wait_for(task, 5)
+    asyncio.run(scenario())
+    return len(calls)
+
+
+@pytest.mark.parametrize("outcome", [
+    PassOutcome("failed", TARGET, "ov-auto-x", detail="not dispatched"),
+    PassOutcome("failed", TARGET, "ov-auto-x", detail="sanction refused: governance"),
+    PassOutcome("refused", TARGET),
+    PassOutcome("idle"),
+])
+def test_a_pass_that_dispatched_nothing_waits_the_interval(repo, tmp_path, monkeypatch, outcome):
+    """2026-10-08: a cage refusal returned "failed" with no op, the loop went
+    straight on, and 581 passes ran in 22 minutes. A pass that ran nothing
+    took milliseconds; repeating it at once is a spin."""
+    assert _paced(repo, tmp_path, monkeypatch, outcome, max_passes=50) == 1
+
+
+def test_a_pass_that_ran_an_op_goes_straight_on(repo, tmp_path, monkeypatch):
+    """An op that ran and failed already took its own time: the next-best
+    evidence is worth taking immediately."""
+    ran = PassOutcome("failed", TARGET, "ov-auto-x", op_id="op-1", detail="validation failed")
+    assert _paced(repo, tmp_path, monkeypatch, ran, max_passes=5) == 5
+
+
+def test_signing_and_dispatchability_run_off_the_event_loop():
+    """Signing re-reads and rewrites the whole roadmap (~630 ms per parse on
+    a 660 KB roadmap); the dispatchability sweep imports and asks git. Both
+    stalled the loop that drives every op."""
+    import inspect as _inspect
+    from backend.core.ouroboros.governance.autonomy import sentinel_loop as sl
+    src = _inspect.getsource(sl.SentinelLoop)
+    assert "asyncio.to_thread(gd.synthesize_and_sign, work)" in src
+    assert "await asyncio.to_thread(\n            lambda: [w for w in candidates if gd.is_dispatchable" in src
