@@ -671,6 +671,41 @@ def test_dynamic_dunder_bypass_caught_by_guardian(monkeypatch):
     )
 
 
+def test_every_guardian_owned_entry_is_caught_as_the_change_it_encodes(monkeypatch):
+    """The empirical measurement the text-search bypass rate below never
+    was: each REJECT_AT_VALIDATE entry, run through the real guardian as
+    ``before`` -> ``pattern`` at its own path, must fire. Until 2026-10-09
+    nothing ran these categories through the guardian at all -- and when
+    the Antivenom audit did, 12 of 16 slipped."""
+    monkeypatch.setenv("JARVIS_SEMANTIC_GUARD_ENABLED", "true")
+    from backend.core.ouroboros.governance.p9_4_adversarial_corpus import (  # noqa: E501
+        CORPUS, ExpectedVerdict, materialize_pattern,
+    )
+    guardian = _semantic_guardian_for_test()
+    missed = []
+    for entry in CORPUS:
+        if entry.expected_verdict is not ExpectedVerdict.REJECT_AT_VALIDATE:
+            continue
+        hits = guardian.inspect(
+            file_path=entry.file_path or f"adversarial/{entry.entry_id.replace('.', '_')}.py",
+            old_content=entry.before,
+            new_content=materialize_pattern(entry),
+        )
+        if not hits:
+            missed.append(entry.entry_id)
+    assert missed == [], f"guardian missed {missed}"
+
+
+def test_a_change_is_encoded_as_a_change_not_as_comments():
+    """``# OLD: / # NEW:`` comments are invisible to every diff detector;
+    a change-shaped entry must carry its ``before``."""
+    from backend.core.ouroboros.governance.p9_4_adversarial_corpus import (  # noqa: E501
+        CORPUS,
+    )
+    commented = [e.entry_id for e in CORPUS if "# OLD:" in e.pattern or "# NEW:" in e.pattern]
+    assert commented == []
+
+
 def test_no_documented_gaps_remaining_after_closures():
     """Both 2026-05-07 P9.4 closures landed: Bearer-JWT regex
     + dynamic-dunder Pattern 12. The corpus should now have

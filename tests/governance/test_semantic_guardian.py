@@ -101,7 +101,9 @@ def test_all_pattern_names_is_exhaustive():
     # Task #7 added test_assertion_weakened (F8 closure): 21 → 22.
     # 2026-07-22 supply-chain response added dependency_pin_weakened +
     # high_entropy_gutting (the promoted-lockfile-gutting fix): 22 → 24.
-    assert len(all_pattern_names()) == 24
+    # 2026-10-09 Antivenom closure added test_tautology (P9.4 quine shape,
+    # which no detector caught): 24 → 25.
+    assert len(all_pattern_names()) == 25
 
 
 # ---------------------------------------------------------------------------
@@ -219,13 +221,22 @@ def test_guard_boolean_inverted_reverse_direction(guard):
     assert any(f.pattern == "guard_boolean_inverted" for f in findings)
 
 
-def test_guard_complex_condition_silent(guard):
-    """Only bare Name conditions are flagged — complex expressions
-    aren't (too many false positives)."""
+def test_guard_negation_that_swaps_its_exit_is_a_refactor(guard):
+    """Negating a guard AND swapping what it guards is the same function:
+    the key includes the guarded exit, so this stays silent. (This test
+    used to pin that ANY compound condition is ignored -- which also hid
+    the real inversion below.)"""
+    old = "def f(a, b):\n    if a and b:\n        return 1\n    return 2\n"
+    new = "def f(a, b):\n    if not (a and b):\n        return 2\n    return 1\n"
+    findings = guard.inspect(file_path="x.py", old_content=old, new_content=new)
+    assert not any(f.pattern == "guard_boolean_inverted" for f in findings)
+
+
+def test_guard_compound_condition_inverted_fires(guard):
     old = "def f(a, b):\n    if a and b:\n        return 1\n    return 2\n"
     new = "def f(a, b):\n    if not (a and b):\n        return 1\n    return 2\n"
     findings = guard.inspect(file_path="x.py", old_content=old, new_content=new)
-    assert not any(f.pattern == "guard_boolean_inverted" for f in findings)
+    assert any(f.pattern == "guard_boolean_inverted" for f in findings)
 
 
 # ---------------------------------------------------------------------------

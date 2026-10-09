@@ -28,6 +28,7 @@ Pattern set (all deterministic, ~10ms total):
   4. credential_shape_introduced (hard)
   5. test_assertion_inverted (hard)
   6. return_value_flipped (soft)
+  (+) test_tautology (hard) -- a test that verifies only its own doubles
   7. permission_loosened (hard)
   8. silent_exception_swallow (soft)
   9. hardcoded_url_swap (soft)
@@ -373,6 +374,45 @@ def _body_is_trivial(body: List[ast.stmt]) -> bool:
     return False
 
 
+def _parameter_names(fn: ast.AST) -> Set[str]:
+    args = getattr(fn, "args", None)
+    if args is None:
+        return set()
+    names = {a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)}
+    names.update(a.arg for a in (args.vararg, args.kwarg) if a is not None)
+    return names - {"self", "cls"}
+
+
+def _reads(body: List[ast.stmt], names: Set[str]) -> bool:
+    return any(
+        isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in names
+        for stmt in body for n in ast.walk(stmt)
+    )
+
+
+def _ignores_its_inputs(old_fn: ast.AST, new_fn: ast.AST) -> bool:
+    """A function that DECIDED from its inputs now returns a constant.
+
+    The other collapse shape: ``authorize(user, action)`` gutted to
+    ``return True`` (P9.4.007) is not ``pass`` -- it returns a value, so the
+    sentinel check never fired -- yet it is the more dangerous collapse,
+    because it answers every caller "yes". Judged by data dependence, not
+    by the constant: the old body read its parameters and the new body
+    is a single constant return that reads none. A function whose old body
+    never looked at its inputs computed a constant all along, so folding
+    it to one is a refactor, not a collapse."""
+    params = _parameter_names(old_fn) & _parameter_names(new_fn)
+    if not params or not _reads(old_fn.body, params):
+        return False
+    stmts = list(new_fn.body)
+    if _get_docstring(stmts) is not None:
+        stmts = stmts[1:]
+    if len(stmts) != 1 or not isinstance(stmts[0], ast.Return):
+        return False
+    value = stmts[0].value
+    return value is None or isinstance(value, ast.Constant)
+
+
 def _substantive_body_size(body: List[ast.stmt]) -> int:
     """Count non-docstring, non-pass, non-ellipsis top-level statements."""
     count = 0
@@ -471,7 +511,7 @@ def _pat_function_body_collapsed(
             continue
         if _substantive_body_size(old_fn.body) < 3:
             continue
-        if not _body_is_trivial(new_fn.body):
+        if not (_body_is_trivial(new_fn.body) or _ignores_its_inputs(old_fn, new_fn)):
             continue
         collapsed.append(name)
     if not collapsed:
@@ -480,7 +520,7 @@ def _pat_function_body_collapsed(
         pattern="function_body_collapsed",
         severity="hard",
         message=(
-            f"Function body collapsed to pass/…/raise: "
+            f"Function body collapsed to pass/…/raise/a constant: "
             f"{', '.join(collapsed[:3])}"
             + (" …" if len(collapsed) > 3 else "")
         ),
@@ -492,64 +532,33 @@ def _pat_function_body_collapsed(
 # ---------------------------------------------------------------------------
 # PATTERN 3 — guard_boolean_inverted
 # ---------------------------------------------------------------------------
-# SOFT: a top-level function return-guard ``if X: return Y`` flipped to
-# ``if not X: return Y`` (or the reverse). Conservative: only flags
-# single-statement if-return guards where the condition is a bare Name.
-
-
-def _unparse_simple(node: ast.AST) -> Optional[str]:
-    """Return a stable string repr for simple lookups — Name or an
-    attribute chain rooted at a Name (e.g. ``user.is_admin``,
-    ``self.flag.enabled``). Anything more complex returns None so the
-    guard stays conservative.
-    """
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        parts: list = [node.attr]
-        current: ast.AST = node.value
-        while isinstance(current, ast.Attribute):
-            parts.append(current.attr)
-            current = current.value
-        if isinstance(current, ast.Name):
-            parts.append(current.id)
-            return ".".join(reversed(parts))
-    return None
+# SOFT: a top-level guard -- ``if C: return ...`` or ``if C: raise ...`` --
+# whose condition's polarity flipped while it guards the same exit.
+# Polarity is read by ``_polarity``, so ``not x``, ``!=``, ``is not``,
+# ``not in`` and ``>=`` are all flips. (It used to accept only a bare name
+# guarding a return: ``if not authed(u): raise`` -> ``if authed(u): raise``
+# -- the canonical auth-bypass shape -- was invisible.)
 
 
 def _extract_guard_return_names(module: ast.Module) -> Set[Tuple[str, bool, str]]:
-    """Return a set of (condition_key, is_negated, return_repr) tuples
-    from every ``if X: return Y`` at the top of a function body, where
-    ``X`` is either a bare Name or a simple attribute chain rooted at
-    a Name. Complex expressions (BoolOp, Call, Compare) are not
-    considered — too many false positives.
-    """
+    """``(fn::canonical condition, negated, guarded exit)`` for every
+    single-statement return/raise guard at the top of a function body."""
     out: Set[Tuple[str, bool, str]] = set()
     funcs = _functions_by_name(module)
     for qname, fn in funcs.items():
         for node in fn.body:
             if not isinstance(node, ast.If):
                 continue
-            test = node.test
-            key: Optional[str] = None
-            is_not = False
-            if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-                inner = _unparse_simple(test.operand)
-                if inner is not None:
-                    key = inner
-                    is_not = True
-            else:
-                simple = _unparse_simple(test)
-                if simple is not None:
-                    key = simple
-            if key is None:
+            # A guard's body is ONE terminal statement: it returns early or
+            # it refuses. The same condition guarding the same exit, with
+            # its polarity flipped, is an inversion however the condition
+            # is spelled -- a refactor that negates the condition also
+            # swaps what it guards, which changes the key.
+            if len(node.body) != 1 or not isinstance(node.body[0], (ast.Return, ast.Raise)):
                 continue
-            # Body must be exactly one Return.
-            if len(node.body) != 1 or not isinstance(node.body[0], ast.Return):
-                continue
-            ret = node.body[0].value
+            is_not, key = _polarity(node.test)
             try:
-                ret_repr = ast.unparse(ret) if ret is not None else "None"
+                ret_repr = ast.unparse(node.body[0])
             except Exception:  # noqa: BLE001
                 ret_repr = "?"
             out.add((f"{qname}::{key}", is_not, ret_repr))
@@ -599,9 +608,17 @@ def _pat_guard_boolean_inverted(
 # assignment). Never ship a key.
 
 
+#: The binding names whose string value IS a credential. One list, read
+#: by both the textual assignment shape below and the AST bindings view.
+_CREDENTIAL_NAMES = ("API_KEY", "SECRET_KEY", "ACCESS_TOKEN", "AUTH_TOKEN", "PRIVATE_KEY")
+
 _CREDENTIAL_SHAPES = [
-    (r"sk-[A-Za-z0-9]{20,}", "OpenAI-style secret key"),
     (r"sk-ant-[A-Za-z0-9_-]{20,}", "Anthropic API key"),
+    # Segmented keys (``sk-proj-…``, ``sk-svcacct-…``) carry hyphens; the
+    # old ``sk-[A-Za-z0-9]{20,}`` stopped at the first one and never matched
+    # a project key (P9.4.008 was caught only by its variable NAME). A key
+    # carries a digit; a hyphenated identifier like ``sk-learn-…`` need not.
+    (r"sk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9][A-Za-z0-9_-]{19,}", "OpenAI-style secret key"),
     (r"AKIA[A-Z0-9]{16}", "AWS access key id"),
     (r"ghp_[A-Za-z0-9]{30,}", "GitHub personal access token"),
     (r"gho_[A-Za-z0-9]{30,}", "GitHub OAuth token"),
@@ -612,7 +629,7 @@ _CREDENTIAL_SHAPES = [
     # non-empty literals since false positives here are cheap (soft-ish)
     # but real keys are disastrous.
     (
-        r"(API_KEY|SECRET_KEY|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY)\s*=\s*['\"][^'\"\n]{8,}['\"]",
+        r"(" + "|".join(_CREDENTIAL_NAMES) + r")\s*=\s*['\"][^'\"\n]{8,}['\"]",
         "hardcoded credential assignment",
     ),
     # Bearer JWT in Authorization header — discovered by P9.4
@@ -625,6 +642,75 @@ _CREDENTIAL_SHAPES = [
         "Bearer JWT in Authorization header",
     ),
 ]
+
+
+def _folded_string(node: ast.AST) -> Optional[str]:
+    """The string a constant expression evaluates to -- a literal, a
+    ``+`` chain of literals (``'sk-' + 'proj…'``), or an f-string with no
+    substitutions -- else None. Parentheses are not nodes, so ``('…')`` is
+    already the literal."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _folded_string(node.left), _folded_string(node.right)
+        return None if left is None or right is None else left + right
+    if isinstance(node, ast.JoinedStr):
+        parts = [_folded_string(v) for v in node.values]
+        return None if any(p is None for p in parts) else "".join(parts)  # type: ignore[arg-type]
+    return None
+
+
+def _binding_name(target: ast.AST) -> Optional[str]:
+    if isinstance(target, ast.Name):
+        return target.id
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    if isinstance(target, ast.Subscript):
+        return _folded_string(target.slice)
+    return None
+
+
+def _credential_evidence(content: str) -> List[Tuple[int, str]]:
+    """``(line, text)`` the credential shapes are matched against.
+
+    The raw lines (comments, non-Python files) PLUS, for Python, what the
+    program actually binds: every maximal constant string expression,
+    folded, and every ``name = <string>`` binding -- assignment, keyword
+    argument, dict entry, subscript store -- rendered in the one canonical
+    ``NAME = '<value>'`` spelling the assignment shape reads. A textual
+    regex sees spelling; the evidence is what the code evaluates to, so
+    ``API_KEY = ('…')`` and ``'sk-' + 'proj…'`` are the same key."""
+    out: List[Tuple[int, str]] = list(enumerate((content or "").splitlines(), 1))
+    tree = _safe_parse(content)
+    if tree is None:
+        return out
+    inside_folded: Set[int] = set()      # parts of an expression already folded whole
+    for node in ast.walk(tree):          # breadth-first: an outer chain precedes its parts
+        if id(node) in inside_folded:
+            continue
+        value = _folded_string(node)
+        if value is not None:
+            out.append((getattr(node, "lineno", 0), value))
+            inside_folded.update(id(n) for n in ast.walk(node) if n is not node)
+            continue
+        pairs: List[Tuple[Optional[str], ast.AST]] = []
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            pairs.extend((_binding_name(t), node.value) for t in targets)
+        elif isinstance(node, ast.keyword) and node.arg:
+            pairs.append((node.arg, node.value))
+        elif isinstance(node, ast.Dict):
+            pairs.extend(
+                (_folded_string(k), v) for k, v in zip(node.keys, node.values) if k is not None
+            )
+        for name, value_node in pairs:
+            text = _folded_string(value_node)
+            if name and text is not None:
+                out.append((
+                    getattr(value_node, "lineno", 0),
+                    f"{name.upper()} = '{text}'",
+                ))
+    return out
 
 
 def _line_numbers_for_pattern(text: str, compiled: "re.Pattern") -> List[int]:
@@ -640,17 +726,20 @@ def _pat_credential_shape_introduced(
 ) -> Optional[Detection]:
     # Only flag credentials that are NEW in the candidate. If the old
     # content already had the shape, it's a pre-existing artifact outside
-    # our scope.
+    # our scope. Both sides are read through the same evidence view, so a
+    # key that was merely re-spelled is still pre-existing.
+    new_ev = _credential_evidence(new_content)
+    old_ev = _credential_evidence(old_content)
     for raw_pat, human in _CREDENTIAL_SHAPES:
         pat = re.compile(raw_pat)
-        new_hits = pat.findall(new_content)
+        new_hits = [h for _ln, text in new_ev for h in pat.findall(text)]
         if not new_hits:
             continue
-        old_hits = pat.findall(old_content)
+        old_hits = [h for _ln, text in old_ev for h in pat.findall(text)]
         # Only flag if there are MORE matches in new than old.
         if len(new_hits) <= len(old_hits):
             continue
-        line_nos = _line_numbers_for_pattern(new_content, pat)
+        line_nos = sorted({ln for ln, text in new_ev if pat.search(text)})
         return Detection(
             pattern="credential_shape_introduced",
             severity="hard",
@@ -675,29 +764,103 @@ def _is_test_file(file_path: str) -> bool:
     return name.startswith("test_") or name.endswith("_test.py")
 
 
+#: A single comparison operator and the positive operator it negates:
+#: ``a != b`` is ``not (a == b)``; ``a >= b`` is ``not (a < b)``.
+_NEGATED_COMPARE = {
+    ast.NotEq: ast.Eq, ast.IsNot: ast.Is, ast.NotIn: ast.In,
+    ast.GtE: ast.Lt, ast.Gt: ast.LtE,
+}
+#: ``Not`` as a camelCase word or ``not`` as a snake_case word inside a
+#: verification method name: ``assertNotEqual``/``assertIsNotNone``/
+#: ``assert_not_called``. Removing it names the positive method.
+_NOT_WORD = re.compile(r"Not(?=[A-Z]|$)|_not(?=_|$)")
+#: Boolean-named verifications whose negation is the opposite boolean.
+_BOOL_WORDS = {"False": "True"}
+
+
+def _polarity(expr: ast.AST) -> Tuple[bool, str]:
+    """``(negated, canonical positive repr)`` of a condition.
+
+    THE one reading of a condition's polarity, shared by every detector
+    that asks "was this flipped?". Polarity has many spellings -- ``not x``,
+    ``a != b``, ``a is not b``, ``a not in b``, ``a >= b`` -- and a detector
+    that knows only ``not`` misses every other one (the P9.4 corpus's
+    ``assert result == 42`` -> ``!= 42`` and ``if not authed(u): raise`` ->
+    ``if authed(u): raise`` both slipped through). Double negation
+    cancels."""
+    negated = False
+    while isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not):
+        negated = not negated
+        expr = expr.operand
+    if isinstance(expr, ast.Compare) and len(expr.ops) == 1:
+        positive = _NEGATED_COMPARE.get(type(expr.ops[0]))
+        if positive is not None:
+            negated = not negated
+            expr = ast.Compare(left=expr.left, ops=[positive()], comparators=expr.comparators)
+    try:
+        return negated, ast.unparse(expr)
+    except Exception:  # noqa: BLE001
+        return negated, "?"
+
+
+def _verification_method(call: ast.Call) -> Optional[str]:
+    """The method name when ``call`` is a verification call --
+    ``self.assertEqual(...)``, ``mock.assert_called_once()`` -- else None."""
+    func = call.func
+    if isinstance(func, ast.Attribute) and re.match(r"assert(?:[A-Z_]|$)", func.attr):
+        return func.attr
+    return None
+
+
+def _call_polarity(call: ast.Call, method: str) -> Tuple[bool, str]:
+    """``(negated, canonical repr)`` of a verification CALL, by the same
+    polarity grammar: the ``Not`` word removed (``assertNotIn`` ->
+    ``assertIn``), a boolean word swapped (``assertFalse(x)`` ->
+    ``assertTrue(x)``, negated)."""
+    negated = False
+    positive, removed = _NOT_WORD.subn("", method, count=1)
+    if removed:
+        negated = True
+    for neg_word, pos_word in _BOOL_WORDS.items():
+        if positive.endswith(neg_word):
+            positive = positive[: -len(neg_word)] + pos_word
+            negated = not negated
+    try:
+        receiver = ast.unparse(call.func.value)  # type: ignore[attr-defined]
+        args = ", ".join(ast.unparse(a) for a in call.args)
+    except Exception:  # noqa: BLE001
+        return negated, "?"
+    return negated, f"{receiver}.{positive}({args})"
+
+
+def _verifications(fn: ast.AST) -> List[Tuple[ast.AST, bool, str]]:
+    """``(node, negated, canonical repr)`` for every verification in ``fn``
+    -- ``assert`` statements and verification calls alike."""
+    out: List[Tuple[ast.AST, bool, str]] = []
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assert):
+            out.append((node, *_polarity(node.test)))
+        elif isinstance(node, ast.Call):
+            method = _verification_method(node)
+            if method is not None:
+                out.append((node, *_call_polarity(node, method)))
+    return out
+
+
+def _is_test_function(qname: str) -> bool:
+    return qname.split(".")[-1].startswith("test_")
+
+
 def _extract_assertions(module: ast.Module) -> Set[Tuple[str, bool, str]]:
-    """Set of (qualified_test_name::asserted_repr, is_negated, rough_key)."""
+    """Set of ``(test qname, negated, canonical positive repr)`` -- every
+    spelling of an assertion's polarity reduced to one, so a flip is a
+    flip however it is written."""
     out: Set[Tuple[str, bool, str]] = set()
-    funcs = _functions_by_name(module)
-    for qname, fn in funcs.items():
-        if not qname.split(".")[-1].startswith("test_"):
+    for qname, fn in _functions_by_name(module).items():
+        if not _is_test_function(qname):
             continue
-        for node in ast.walk(fn):
-            if not isinstance(node, ast.Assert):
-                continue
-            test = node.test
-            is_not = False
-            if (
-                isinstance(test, ast.UnaryOp)
-                and isinstance(test.op, ast.Not)
-            ):
-                is_not = True
-                test = test.operand
-            try:
-                expr_repr = ast.unparse(test) if hasattr(ast, "unparse") else repr(test)
-            except Exception:  # noqa: BLE001
-                expr_repr = "?"
-            out.add((qname, is_not, expr_repr))
+        for _node, negated, expr_repr in _verifications(fn):
+            out.add((qname, negated, expr_repr))
     return out
 
 
@@ -800,6 +963,187 @@ def _pat_test_assertion_weakened(
 
 
 # ---------------------------------------------------------------------------
+# test_tautology — a test that can only ever verify its own doubles
+# ---------------------------------------------------------------------------
+# HARD: a new or changed test whose every verification is about objects the
+# test itself fabricated (mocks, patches) or compares an expression with
+# itself, AND that never calls anything real. It passes whatever the code
+# under test does -- the P9.4 quine shape (``assert mock.m() == mock.m()``,
+# ``assert MagicMock(spec=P).process()``, patching then asserting the patch).
+# Coverage it reports is false: the module it names is marked tested.
+
+
+def _mock_factories() -> frozenset:
+    """Names that construct a test double: every mock class ``unittest.mock``
+    exports (read from the module, so a new one is known), plus its factory
+    functions."""
+    try:
+        import unittest.mock as _um  # noqa: PLC0415
+        classes = {
+            name for name in getattr(_um, "__all__", ())
+            if isinstance(getattr(_um, name, None), type)
+            and issubclass(getattr(_um, name), _um.NonCallableMock)
+        }
+        functions = {
+            name for name in getattr(_um, "__all__", ())
+            if callable(getattr(_um, name, None)) and name not in classes
+            and not isinstance(getattr(_um, name), type)
+        }
+        return frozenset(classes | functions)
+    except Exception:  # noqa: BLE001
+        return frozenset()
+
+
+def _dotted_parts(node: ast.AST) -> List[str]:
+    parts: List[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return parts
+
+
+def _root_name(node: ast.AST) -> Optional[str]:
+    while isinstance(node, (ast.Attribute, ast.Subscript, ast.Call)):
+        node = node.func if isinstance(node, ast.Call) else node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _is_factory_call(node: ast.AST, factories: frozenset) -> bool:
+    return isinstance(node, ast.Call) and any(p in factories for p in _dotted_parts(node.func))
+
+
+def _doubles_of(fn: ast.AST, factories: frozenset) -> Set[str]:
+    """Names in ``fn`` bound to a test double: assigned from a factory,
+    ``with patch(...) as p``, or injected by a ``@patch`` decorator."""
+    doubles: Set[str] = set()
+    patched_params = sum(1 for d in getattr(fn, "decorator_list", ()) if _is_factory_call(d, factories))
+    if patched_params:
+        params = [a.arg for a in fn.args.args if a.arg not in ("self", "cls")]  # type: ignore[attr-defined]
+        doubles.update(params[-patched_params:])
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assign) and _is_factory_call(node.value, factories):
+            doubles.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.withitem) and _is_factory_call(node.context_expr, factories):
+            if isinstance(node.optional_vars, ast.Name):
+                doubles.add(node.optional_vars.id)
+    return doubles
+
+
+def _references(node: ast.AST, factories: frozenset) -> Set[str]:
+    """Names an expression reads, not counting a factory's own name or what
+    is handed TO a factory (``MagicMock(spec=Real)`` reads no ``Real``)."""
+    out: Set[str] = set()
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if _is_factory_call(n, factories):
+            continue
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+            out.add(n.id)
+        stack.extend(ast.iter_child_nodes(n))
+    return out
+
+
+def _verification_subjects(node: ast.AST) -> List[ast.AST]:
+    if isinstance(node, ast.Assert):
+        return [node.test]
+    if isinstance(node, ast.Call):
+        func = node.func
+        receiver = [func.value] if isinstance(func, ast.Attribute) and _root_name(func) not in ("self", "cls") else []
+        return receiver + list(node.args) + [k.value for k in node.keywords]
+    return []
+
+
+def _is_self_comparison(node: ast.AST) -> bool:
+    test = node.test if isinstance(node, ast.Assert) else None
+    if not isinstance(test, ast.Compare):
+        return False
+    try:
+        sides = {ast.unparse(test.left), *(ast.unparse(c) for c in test.comparators)}
+    except Exception:  # noqa: BLE001
+        return False
+    return len(sides) == 1
+
+
+def _tautological_tests(module: ast.Module, changed: Set[str]) -> List[str]:
+    import builtins as _builtins  # noqa: PLC0415
+    factories = _mock_factories()
+    if not factories:
+        return []
+    inert = set(dir(_builtins))
+    out: List[str] = []
+    for qname, fn in _functions_by_name(module).items():
+        if qname not in changed or not _is_test_function(qname):
+            continue
+        checks = _verifications(fn)
+        if not checks:
+            continue
+        doubles = _doubles_of(fn, factories)
+        verification_nodes = {id(n) for n, _neg, _r in checks}
+        exercised = False
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call) or id(node) in verification_nodes:
+                continue
+            if _is_factory_call(node, factories):
+                continue
+            root = _root_name(node.func)
+            # A call on a double -- or on a double built inline,
+            # ``MagicMock(...).process()`` -- runs no real code.
+            if root is not None and root not in doubles and root not in factories and root not in inert:
+                exercised = True
+                break
+
+        def tautological(node: ast.AST) -> bool:
+            # ``x == x`` verifies nothing whatever ran before it. A check
+            # on doubles is a real interaction check ONLY when real code
+            # ran (``run(hook); hook.assert_called_once()``).
+            if _is_self_comparison(node):
+                return True
+            if exercised:
+                return False
+            subjects = _verification_subjects(node)
+            names = set().union(*(_references(s, factories) for s in subjects)) if subjects else set()
+            fabricated = any(
+                _is_factory_call(n, factories) for s in subjects for n in ast.walk(s)
+            )
+            return bool(names <= doubles and (names or fabricated))
+        if all(tautological(n) for n, _neg, _r in checks):
+            out.append(qname)
+    return out
+
+
+def _pat_test_tautology(
+    *, file_path: str, old_content: str, new_content: str,
+) -> Optional[Detection]:
+    if not _is_test_file(file_path):
+        return None
+    new_tree = _safe_parse(new_content)
+    if new_tree is None:
+        return None
+    old_tree = _safe_parse(old_content)
+    old_fns = _functions_by_name(old_tree) if old_tree is not None else {}
+    changed = {
+        q for q, fn in _functions_by_name(new_tree).items()
+        if q not in old_fns or ast.dump(old_fns[q]) != ast.dump(fn)
+    }
+    hits = _tautological_tests(new_tree, changed)
+    if not hits:
+        return None
+    return Detection(
+        pattern="test_tautology",
+        severity="hard",
+        message=(
+            "Test verifies only its own test doubles and exercises no real code: "
+            + ", ".join(hits[:3]) + (" …" if len(hits) > 3 else "")
+        ),
+        file_path=file_path,
+        snippet=f"tests: {', '.join(hits)}",
+    )
+
+
+# ---------------------------------------------------------------------------
 # PATTERN 6 — return_value_flipped
 # ---------------------------------------------------------------------------
 # SOFT: a function's FIRST top-level return statement flipped from
@@ -872,9 +1216,151 @@ _PERM_LOOSE_RE = re.compile(
 )
 
 
+#: Words that make a boolean binding a restriction (True = restricted) or a
+#: permission (True = permitted), matched inside the binding's name with
+#: separators removed (``is_read_only`` -> ``isreadonly``). Permission words
+#: are read first, so ``disable_guard`` is a permission. Env-overridable,
+#: comma-separated.
+_ENV_RESTRICTIVE_WORDS = "JARVIS_SEMGUARD_RESTRICTIVE_FLAG_WORDS"
+_ENV_PERMISSIVE_WORDS = "JARVIS_SEMGUARD_PERMISSIVE_FLAG_WORDS"
+_DEFAULT_RESTRICTIVE_WORDS = (
+    "readonly,require,enforce,strict,protect,lock,deny,block,sandbox,"
+    "verify,approv,guard,immutable,forbid,secure,restrict"
+)
+_DEFAULT_PERMISSIVE_WORDS = (
+    "allow,permit,bypass,skip,disable,unsafe,insecure,trust,override,"
+    "force,unlock,unrestrict"
+)
+
+
+def _flag_words(env: str, default: str) -> Tuple[str, ...]:
+    raw = os.environ.get(env, "") or default
+    return tuple(w for w in (s.strip().lower() for s in raw.split(",")) if w)
+
+
+def _scoped_bindings(module: ast.Module) -> dict:
+    """``(scope, binding) -> value node`` for every assignment and keyword
+    argument, scoped by enclosing function/class so the same name in two
+    functions stays two bindings. A keyword binds as ``callee(kw=)``."""
+    collector = _BindingCollector()
+    collector.visit(module)
+    return collector.out
+
+
+class _BindingCollector(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.scope: List[str] = []
+        self.out: dict = {}
+
+    def _scoped(self, node: ast.AST) -> None:
+        self.scope.append(getattr(node, "name", ""))
+        self.generic_visit(node)
+        self.scope.pop()
+
+    visit_FunctionDef = visit_AsyncFunctionDef = visit_ClassDef = _scoped
+
+    def _bind(self, binding: str, value: ast.AST) -> None:
+        scope = ".".join(self.scope)
+        self.out[(f"{scope}." if scope else "", binding)] = value
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        for target in node.targets:
+            self._bind(ast.unparse(target), node.value)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if node.value is not None:
+            self._bind(ast.unparse(node.target), node.value)
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        callee = ast.unparse(node.func)
+        for kw in node.keywords:
+            if kw.arg:
+                self._bind(f"{callee}({kw.arg}=)", kw.value)
+        self.generic_visit(node)
+
+
+def _tier_rank(node: ast.AST, order: dict) -> Optional[int]:
+    """Rank of a value naming a risk tier (``RiskTier.SAFE_AUTO``,
+    ``SAFE_AUTO``, ``"safe_auto"``) on the active ladder, else None."""
+    name = (
+        node.attr if isinstance(node, ast.Attribute)
+        else node.id if isinstance(node, ast.Name)
+        else node.value if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        else None
+    )
+    return order.get(name.lower()) if isinstance(name, str) else None
+
+
+def _active_tier_order() -> dict:
+    """The canonical risk-tier ladder, operator-adapted tiers included --
+    the ladder ``risk_tier_floor`` itself enforces. Empty if unavailable
+    (the tier check then abstains; the boolean check still runs)."""
+    try:
+        from backend.core.ouroboros.governance.risk_tier_floor import (  # noqa: PLC0415
+            get_active_tier_order,
+        )
+        return dict(get_active_tier_order())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _governance_loosenings(old_content: str, new_content: str) -> List[str]:
+    """Bindings whose value moved toward LESS restriction: a risk tier
+    lowered on the active ladder, a restriction flag turned off, a
+    permission flag turned on. Same binding in the same scope only -- a
+    new binding is not a loosening of anything."""
+    old_tree, new_tree = _safe_parse(old_content), _safe_parse(new_content)
+    if old_tree is None or new_tree is None:
+        return []
+    old_b, new_b = _scoped_bindings(old_tree), _scoped_bindings(new_tree)
+    order = _active_tier_order()
+    permissive = _flag_words(_ENV_PERMISSIVE_WORDS, _DEFAULT_PERMISSIVE_WORDS)
+    restrictive = _flag_words(_ENV_RESTRICTIVE_WORDS, _DEFAULT_RESTRICTIVE_WORDS)
+    found: List[str] = []
+    for key, new_v in new_b.items():
+        old_v = old_b.get(key)
+        if old_v is None:
+            continue
+        label = f"{key[0]}{key[1]}"
+        old_rank, new_rank = _tier_rank(old_v, order), _tier_rank(new_v, order)
+        if old_rank is not None and new_rank is not None and new_rank < old_rank:
+            found.append(f"{label}: {ast.unparse(old_v)} -> {ast.unparse(new_v)}")
+            continue
+        if not (
+            isinstance(old_v, ast.Constant) and isinstance(new_v, ast.Constant)
+            and isinstance(old_v.value, bool) and isinstance(new_v.value, bool)
+            and old_v.value != new_v.value
+        ):
+            continue
+        word = re.sub(r"[^a-z0-9]", "", key[1].split("(")[-1].lower())
+        if any(w in word for w in permissive):
+            loosened = new_v.value is True
+        elif any(w in word for w in restrictive):
+            loosened = new_v.value is False
+        else:
+            continue
+        if loosened:
+            found.append(f"{label}: {old_v.value} -> {new_v.value}")
+    return found
+
+
 def _pat_permission_loosened(
     *, file_path: str, old_content: str, new_content: str,
 ) -> Optional[Detection]:
+    governance = _governance_loosenings(old_content, new_content)
+    if governance:
+        return Detection(
+            pattern="permission_loosened",
+            severity="hard",
+            message=(
+                "Permission loosened: " + "; ".join(governance[:3])
+                + (" …" if len(governance) > 3 else "")
+            ),
+            file_path=file_path,
+            snippet="; ".join(governance)[:300],
+        )
     new_hits = _PERM_LOOSE_RE.findall(new_content)
     if not new_hits:
         return None
@@ -1553,6 +2039,7 @@ _ALL_PATTERNS: Tuple[str, ...] = (
     "credential_shape_introduced",
     "test_assertion_inverted",
     "test_assertion_weakened",
+    "test_tautology",
     "return_value_flipped",
     "permission_loosened",
     "silent_exception_swallow",
@@ -1576,6 +2063,7 @@ _PATTERNS: dict = {
     "credential_shape_introduced": _pat_credential_shape_introduced,
     "test_assertion_inverted": _pat_test_assertion_inverted,
     "test_assertion_weakened": _pat_test_assertion_weakened,
+    "test_tautology": _pat_test_tautology,
     "return_value_flipped": _pat_return_value_flipped,
     "permission_loosened": _pat_permission_loosened,
     "silent_exception_swallow": _pat_silent_exception_swallow,

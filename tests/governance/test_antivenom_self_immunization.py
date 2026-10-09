@@ -147,17 +147,18 @@ class TestTaxonomies:
 
 
 class TestMutators:
-    def test_whitespace_drift_adds_indent(self):
-        text = "x = 1\ny = 2\n"
+    def test_whitespace_drift_respaces_and_stays_the_same_program(self):
+        text = "x = f(a, b)\nif x:\n    y = [1, 2]\n"
         out = mutate_pattern(text, MutationKind.WHITESPACE_DRIFT)
-        assert "  x = 1" in out
-        assert "  y = 2" in out
+        assert out != text
+        assert ast.dump(ast.parse(out)) == ast.dump(ast.parse(text))
 
-    def test_whitespace_drift_preserves_blank_lines(self):
-        text = "x = 1\n\ny = 2"
+    def test_whitespace_drift_never_indents_module_code_into_an_error(self):
+        # The old drift indented every line: module-level code became an
+        # IndentationError, scored as a guardian "gap" (P9.4.024).
+        text = "obj = type('X', (), {})()\ngetattr(obj, 'a' + 'b')\n"
         out = mutate_pattern(text, MutationKind.WHITESPACE_DRIFT)
-        # Empty lines stay empty
-        assert "\n\n" in out
+        ast.parse(out)
 
     def test_comment_insertion(self):
         text = "x = 1\ny = 2\n"
@@ -169,12 +170,33 @@ class TestMutators:
         out = mutate_pattern("x = 1", MutationKind.COMMENT_INSERTION)
         assert "antivenom_probe" in out
 
-    def test_rename_variable(self):
-        text = "foo_bar = 42\nprint(foo_bar)\n"
+    def test_rename_variable_renames_a_local_everywhere(self):
+        text = "def f(n):\n    total = n * 2\n    return total + n\n"
         out = mutate_pattern(text, MutationKind.RENAME_VARIABLE)
-        assert "av_alias = 42" in out
-        # Only first assignment renamed
-        assert "print(foo_bar)" in out
+        assert "total" not in out
+        assert "av_alias = n * 2" in out and "return av_alias + n" in out
+
+    def test_rename_never_touches_a_module_level_name(self):
+        # A module-level name is the module's interface: renaming
+        # API_KEY is a different module, not the same program.
+        text = "API_KEY = 'x' * 9\nprint(API_KEY)\n"
+        assert mutate_pattern(text, MutationKind.RENAME_VARIABLE) == text
+
+    def test_rename_leaves_attributes_keywords_and_strings_alone(self):
+        text = "def f(o):\n    v = o.v\n    return g(v=v, s='v')\n"
+        out = mutate_pattern(text, MutationKind.RENAME_VARIABLE)
+        assert "o.v" in out and "g(v=av_alias, s='v')" in out
+
+    def test_rename_alias_never_collides(self):
+        text = "def f():\n    a = 1\n    av_alias = 2\n    return a + av_alias\n"
+        out = mutate_pattern(text, MutationKind.RENAME_VARIABLE)
+        assert "av_alias_ = 1" in out and "return av_alias_ + av_alias" in out
+
+    def test_rename_splices_by_bytes_on_non_ascii_lines(self):
+        text = "def f():\n    s = 'é'; x = 1\n    return x\n"
+        out = mutate_pattern(text, MutationKind.RENAME_VARIABLE)
+        ast.parse(out)
+        assert "av_alias = 'é'" in out
 
     def test_rename_variable_noop_on_no_assignment(self):
         text = "print('hello')\n"
@@ -203,8 +225,31 @@ class TestMutators:
         out = mutate_pattern(
             text, MutationKind.STRING_SPLIT_CONCAT,
         )
-        # Pattern requires 4-40 char literal — short ones untouched
         assert out == text
+
+    def test_string_split_reads_single_quotes_and_folds_back(self):
+        # Every credential in the corpus is single-quoted; the old
+        # double-quote regex never split one.
+        text = "KEY = 'abcdefgh'\n"
+        out = mutate_pattern(text, MutationKind.STRING_SPLIT_CONCAT)
+        assert out != text
+        ns: dict = {}
+        exec(compile(out, "<t>", "exec"), {}, ns)
+        assert ns["KEY"] == "abcdefgh"
+
+    def test_string_split_skips_docstrings(self):
+        text = 'def f():\n    """A long docstring."""\n    return 1\n'
+        assert mutate_pattern(text, MutationKind.STRING_SPLIT_CONCAT) == text
+
+    def test_a_mutation_that_breaks_the_program_is_refused(self, monkeypatch):
+        from backend.core.ouroboros.governance import antivenom_self_immunization as m
+        monkeypatch.setitem(m._MUTATORS, MutationKind.PARENS_WRAP, lambda t: "  " + t)
+        assert mutate_pattern("x = 1\n", MutationKind.PARENS_WRAP) == "x = 1\n"
+
+    def test_an_ast_preserving_mutation_that_changes_the_tree_is_refused(self, monkeypatch):
+        from backend.core.ouroboros.governance import antivenom_self_immunization as m
+        monkeypatch.setitem(m._MUTATORS, MutationKind.COMMENT_INSERTION, lambda t: t.replace("1", "2"))
+        assert mutate_pattern("x = 1\n", MutationKind.COMMENT_INSERTION) == "x = 1\n"
 
     def test_parens_wrap(self):
         text = "x = a + b\n"
@@ -344,10 +389,50 @@ class TestAggregator:
         monkeypatch.setenv(_ENV_MASTER, "true")
         report = audit_self_immunization()
         assert report.master_enabled is True
-        # Real corpus has 25 entries × 5 mutations = 125 probes
-        assert report.probes_run >= 100
-        # Coverage ratio is bounded [0, 1]
+        from backend.core.ouroboros.governance.antivenom_self_immunization import (
+            _guardian_owned,
+        )
+        from backend.core.ouroboros.governance.p9_4_adversarial_corpus import CORPUS
+        owned = [e for e in CORPUS if _guardian_owned(e)]
+        assert report.probes_run == len(owned) * len(MutationKind)
+        assert report.out_of_scope_count == len(CORPUS) - len(owned)
         assert 0.0 <= report.coverage_ratio <= 1.0
+
+    def test_the_guardian_is_immune_to_the_whole_corpus(self, monkeypatch):
+        """The audit's verdict on the real guardian: every guardian-owned
+        entry caught as the change it encodes, and every equivalent
+        variant of it caught too. 2026-10-09 this read gaps=5
+        baseline_miss=105 -- a measurement fault and six real detector
+        holes, all closed."""
+        monkeypatch.setenv(_ENV_MASTER, "true")
+        report = audit_self_immunization()
+        assert report.baseline_miss_count == 0, report.diagnostic
+        assert report.gap_count == 0, report.diagnostic
+        assert report.coverage_ratio == 1.0
+        # Coverage is earned by probes that varied the input.
+        assert report.immunized_count - report.inapplicable_count > 0
+
+    def test_out_of_scope_entries_are_not_probed(self, monkeypatch):
+        monkeypatch.setenv(_ENV_MASTER, "true")
+        from backend.core.ouroboros.governance.p9_4_adversarial_corpus import (
+            AdversarialCategory, get_entries_by_category,
+        )
+        foreign = get_entries_by_category(AdversarialCategory.MODE_BLOCKED_MUTATION)
+        report = audit_self_immunization(corpus_override=foreign)
+        assert report.probes_run == 0
+        assert report.out_of_scope_count == len(foreign)
+        assert report.baseline_miss_count == 0
+
+    def test_inapplicable_probes_do_not_earn_coverage(self, monkeypatch):
+        monkeypatch.setenv(_ENV_MASTER, "true")
+        from backend.core.ouroboros.governance.p9_4_adversarial_corpus import get_entry_by_id
+        # 011 has no string literal and no function: nothing to split.
+        report = audit_self_immunization(
+            corpus_override=[get_entry_by_id("p9.4.011")],
+            mutation_kinds=[MutationKind.STRING_SPLIT_CONCAT],
+        )
+        assert report.inapplicable_count == 1
+        assert report.coverage_ratio == 0.0
 
     def test_corpus_override_for_testing(self, monkeypatch):
         """Tests can inject a synthetic corpus subset."""
