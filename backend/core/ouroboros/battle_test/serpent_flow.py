@@ -44,7 +44,7 @@ import time
 logger = logging.getLogger("Ouroboros.SerpentFlow")
 from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from rich.console import Console
 from rich.live import Live
@@ -388,7 +388,10 @@ _FAILURE_SUGGESTIONS: list = [
     ("empty", "No output from provider. Retry will use fresh context"),
     # Iron Gate / approval
     ("rejected", "Human rejected at Iron Gate. Constraint recorded — organism will avoid this pattern"),
-    ("blocked", "Risk tier BLOCKED. Requires /risk notify_apply or JARVIS_DEFAULT_RISK_TIER=NOTIFY_APPLY"),
+    # Before the generic "blocked": a route whose provider the lane topology
+    # blocks is a LANE problem, and risk-tier advice sent operators to /risk.
+    ("topology", "No lane could serve this route. Check /lanes and that the local engine is serving"),
+    ("blocked","Risk tier BLOCKED. Requires /risk notify_apply or JARVIS_DEFAULT_RISK_TIER=NOTIFY_APPLY"),
     ("approval", "Needs human approval. Use /risk safe_auto for auto-approve or respond in REPL"),
     # Repair failures
     ("repair failed", "L2 repair exhausted 5 iterations. Manual intervention needed on this file"),
@@ -408,10 +411,18 @@ _FAILURE_SUGGESTIONS: list = [
 
 
 def _actionable_suggestion(reason: str, phase: str, elapsed: float) -> str:
-    """Map a failure reason to a concrete next-step suggestion."""
-    reason_lower = reason.lower()
+    """Map a failure reason to a concrete next-step suggestion.
+
+    Matched on whole TOKENS, not substrings. Reasons are reason codes
+    (`background_dw_blocked_by_topology`), so substring matching let
+    ``lock`` fire inside ``blocked`` and advise on file locks. A pattern
+    matches when its words appear as a contiguous run of the reason's
+    tokens."""
+    tokens = re.findall(r"[a-z0-9]+", reason.lower())
     for pattern, suggestion in _FAILURE_SUGGESTIONS:
-        if pattern in reason_lower:
+        words = re.findall(r"[a-z0-9]+", pattern.lower())
+        n = len(words)
+        if n and any(tokens[i:i + n] == words for i in range(len(tokens) - n + 1)):
             return suggestion
 
     # Phase-specific fallbacks
@@ -711,51 +722,54 @@ def _sparkline(values: List[float]) -> str:
     return "".join(chars)
 
 
-def _parse_unified_diff(diff_text: str) -> tuple:
-    """Parse a unified diff into (added, removed, hunks).
+def _split_unified_diff(diff_text: str) -> List[Tuple[str, str]]:
+    """A unified patch, split into ``(path, section)`` per file.
 
-    Returns
-    -------
-    added : int
-        Total lines added across all hunks.
-    removed : int
-        Total lines removed across all hunks.
-    hunks : list of dict
-        Each dict has ``old_start``, ``new_start``, and ``lines``
-        (raw diff lines including the +/-/space prefix).
+    A section starts at a ``diff --git`` line, or at a ``--- `` header that
+    is not already part of one, and runs to the next. A header is ``--- ``
+    IMMEDIATELY followed by ``+++ ``: a removed line whose text begins
+    ``-- `` (a SQL comment) also reads ``--- …`` and must stay in its hunk.
+    The path is the NEW side
+    (``+++ b/path``); a deletion has ``/dev/null`` there and is named by its
+    old side. Text with no ``@@`` hunk is not a diff (a candidate's full
+    content travels on the same preview field) and yields ``[]``. NEVER
+    raises.
     """
-    added = 0
-    removed = 0
-    hunks: List[Dict[str, Any]] = []
-    current_hunk: Optional[Dict[str, Any]] = None
-
-    _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
-
-    for line in diff_text.split("\n"):
-        # Skip file headers
-        if line.startswith("diff ") or line.startswith("index "):
-            continue
-        if line.startswith("--- ") or line.startswith("+++ "):
-            continue
-
-        hunk_match = _HUNK_RE.match(line)
-        if hunk_match:
-            current_hunk = {
-                "old_start": int(hunk_match.group(1)),
-                "new_start": int(hunk_match.group(2)),
-                "lines": [],
-            }
-            hunks.append(current_hunk)
-            continue
-
-        if current_hunk is not None:
-            current_hunk["lines"].append(line)
-            if line.startswith("+"):
-                added += 1
-            elif line.startswith("-"):
-                removed += 1
-
-    return added, removed, hunks
+    try:
+        text = str(diff_text or "")
+        if "@@" not in text:
+            return []
+        sections: List[List[str]] = []
+        current: Optional[List[str]] = None
+        lines_in = text.split("\n")
+        for i, line in enumerate(lines_in):
+            header = (line.startswith("--- ") and i + 1 < len(lines_in)
+                      and lines_in[i + 1].startswith("+++ "))
+            # A `diff --git` section owns the `---/+++` pair that follows it.
+            owned = bool(current) and current[0].startswith("diff --git ") \
+                and not any(l.startswith("+++ ") for l in current)
+            if line.startswith("diff --git ") or (header and not owned):
+                current = [line]
+                sections.append(current)
+            elif current is not None:
+                current.append(line)
+        out: List[Tuple[str, str]] = []
+        for lines in sections:
+            old = new = ""
+            for line in lines:
+                if line.startswith("--- ") and not old:
+                    old = line[4:].split("\t")[0].strip()
+                elif line.startswith("+++ ") and not new:
+                    new = line[4:].split("\t")[0].strip()
+            path = new if new and new != "/dev/null" else old
+            if path.startswith(("a/", "b/")):
+                path = path[2:]
+            body = "\n".join(lines)
+            if path and "@@" in body:
+                out.append((path, body))
+        return out
+    except Exception:  # noqa: BLE001
+        return []
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1056,6 +1070,12 @@ class SerpentFlow:
         self._op_sensors: Dict[str, str] = {}
         # Per-op reasoning — captured at GENERATE, shown at ⏺ Update
         self._op_rationales: Dict[str, str] = {}
+        # Per-op file updates (show_diff): files whose diff has rendered,
+        # files announced before their diff existed, and whether the op's
+        # reasoning has been spoken. A file renders once per op.
+        self._shown_diff_files: Dict[str, Set[str]] = {}
+        self._pending_diff_files: Dict[str, Set[str]] = {}
+        self._reasoning_shown: Set[str] = set()
         # Dedup (op_id, round_index) set for tool-call preamble rendering.
         # A parallel batch of N tools emits N "start" narration events with
         # the same shared preamble; without this, op_tool_start would print
@@ -1774,8 +1794,13 @@ class SerpentFlow:
         elapsed_s: float,
         failure_reason: str = "",
         failure_phase: str = "",
+        render: bool = True,
     ) -> None:
         """Emit a single inline op-completion receipt line.
+
+        ``render=False`` when the collapsed line already closes the op: one
+        fact, one line. The Moltbook post below is not presentation and
+        happens either way.
 
         UI Slice 6 (2026-04-30): grep-friendly summary line emitted
         whenever an op reaches a terminal state. Format:
@@ -1844,7 +1869,8 @@ class SerpentFlow:
         except Exception:  # noqa: BLE001
             pass
         # Attach mirror: the grep-friendly op receipt (outcome + cost).
-        self._print_mirrored(receipt)
+        if render:
+            self._print_mirrored(receipt)
 
     def _close_op_block(self, op_id: str) -> None:
         """Print the bottom border of an op block with running stats.
@@ -1864,6 +1890,11 @@ class SerpentFlow:
             get_inflight_tools,
         )
         get_inflight_tools().clear(op_id)
+        # Per-op file-update state ends with the op; a long session must not
+        # accumulate one set per op it has ever run.
+        self._shown_diff_files.pop(op_id, None)
+        self._pending_diff_files.pop(op_id, None)
+        self._reasoning_shown.discard(op_id)
         # Update swarm tally + last_completed for the digest
         snap = self._swarm_snapshots.get(op_id)
         if snap is not None:
@@ -1987,7 +2018,7 @@ class SerpentFlow:
         except Exception:  # noqa: BLE001
             return ""
 
-    def _op_line(self, op_id: str, text: str) -> None:
+    def _op_line(self, op_id: str, text: str, *, essential: bool = False) -> None:
         """Print a line within an active op block, prefixed with │.
 
         Refactored 2026-05-03: snapshot is recorded for the swarm
@@ -2001,6 +2032,13 @@ class SerpentFlow:
         ``/expand <op-id>`` can re-render the full block later.
         Non-disruptive parallel recording — existing console output
         is unchanged.
+
+        ``essential`` lines bypass the lens. The lens exists to keep a
+        concurrent op's EXPLORATION out of the focused op's block, but it
+        also swallowed what every op exists to produce: under the AUTO lens
+        with three workers, a file change rendered only if its op happened
+        to hold focus at APPLY, so the operator almost never saw a diff.
+        An op's product is never noise.
         """
         # Provenance rides the ONE chokepoint. Applied here, above every
         # consumer, so the local console, the cockpit mirror, the op buffer
@@ -2023,7 +2061,7 @@ class SerpentFlow:
         if op_id and op_id in self._active_ops:
             self._maybe_buffer_op_line(op_id, text)
         if op_id and op_id in self._active_ops:
-            if not self._is_focused(op_id):
+            if not essential and not self._is_focused(op_id):
                 return
             self._mirror_markup(f"  {text}")
             if self._borderless():
@@ -2145,7 +2183,8 @@ class SerpentFlow:
             import contextlib
             return contextlib.nullcontext()
 
-    def _maybe_buffer_op_commit(self, op_id: str, summary: str) -> None:
+    def _maybe_buffer_op_commit(self, op_id: str, summary: str,
+                                tone: str = "done") -> None:
         """Commit the block AND render its collapsed line. NEVER raises.
 
         The second half is the point. `JARVIS_OP_COLLAPSE_ENABLED` was
@@ -2179,12 +2218,12 @@ class SerpentFlow:
         except Exception:
             pass  # best-effort — never crash the lifecycle
         try:
-            self._render_collapsed_block(op_id, summary, block)
+            self._render_collapsed_block(op_id, summary, block, tone=tone)
         except Exception:
             pass  # a summary that fails must not fail the op
 
     def _render_collapsed_block(
-        self, op_id: str, summary: str, block: Any,
+        self, op_id: str, summary: str, block: Any, tone: str = "done",
     ) -> None:
         """One line standing in for a finished op. NEVER raises.
 
@@ -2219,7 +2258,9 @@ class SerpentFlow:
         _mark = _deck.bullet(markup=False)
         if _mark and label.startswith(_mark):
             label = label[len(_mark):].lstrip()
-        line = (f"{_deck.bullet()} [{_SEM['neural']}]{_escape_markup(label)}"
+        _tone = {"done": _deck.DONE_TONE, "failed": _deck.FAILED_TONE,
+                 "pending": _deck.PENDING_TONE}.get(tone, _deck.DONE_TONE)
+        line = (f"{_deck.bullet(_tone)} [{_SEM['neural']}]{_escape_markup(label)}"
                 f"[/{_SEM['neural']}]{tail}")
         self._print_mirrored(f"  {line}")
 
@@ -2709,7 +2750,15 @@ class SerpentFlow:
         self, op_id: str, goal: str, target_files: List[str], risk_tier: str,
         sensor: str = "",
     ) -> None:
-        """A new operation was sensed — open an op block."""
+        """A new operation was sensed — open an op block.
+
+        Once per op. The pipeline restates an op's INTENT when its change
+        reaches the apply stage; reopening on that drew the op's header a
+        second time mid-block and reset its clock, so a 2-minute landing
+        reported 0.0s.
+        """
+        if op_id and op_id in self._active_ops:
+            return
         self._op_starts[op_id] = time.time()
         # Gap #3 Slice 3 — start buffering (master-flag-gated, defensive)
         self._maybe_buffer_op_start(op_id)
@@ -2784,16 +2833,16 @@ class SerpentFlow:
         if phase_upper == "COMMIT":
             self._render_commit_phase(op_id, **kwargs)
             return
-        phase_map = {
-            "GATE": ("🛡️", "governance gate"),
-            "APPROVE": ("👤", "awaiting approval"),
-            "VERIFY": ("🔍", "verifying"),
-        }
-        emoji, verb = phase_map.get(phase_upper, ("▸", phase.lower()))
-        self._op_line(
-            op_id,
-            f"[{_SEM['neural']}]{emoji} {verb}[/{_SEM['neural']}]",
-        )
+        # Every other phase is LIVE state: the status line and the heartbeat
+        # already say `Phase: GATE 15s`, and rewrite themselves. Writing each
+        # transition into the transcript too left `▸ brain_routing` six times,
+        # `▸ sandbox`, `▸ ledger`, `🔍 verifying` twice, around every op. Only
+        # a phase that needs the operator earns a line, and it is not noise
+        # wherever the lens is.
+        if phase_upper == "APPROVE":
+            from backend.core.ouroboros.ui import deck_grammar as _deck
+            self._op_line(op_id, _deck.action(
+                "Awaiting approval", tone=_deck.PENDING_TONE), essential=True)
 
     def _render_plan_phase(self, op_id: str, **kwargs: Any) -> None:
         """Render the PLAN phase with complexity and change count."""
@@ -3169,15 +3218,7 @@ class SerpentFlow:
             )
         except Exception:  # noqa: BLE001 — never crash the render path
             composed = None
-        if composed is not None:
-            if composed.header_markup:
-                self._op_line(op_id, composed.header_markup)
-            if composed.summary_markup:
-                self._op_line(op_id, composed.summary_markup)
-            for line in composed.body_lines_markup:
-                self._op_line(op_id, line)
-            if composed.expansion_hint:
-                self._op_line(op_id, composed.expansion_hint)
+        if self._emit_composed(op_id, composed):
             return
 
         # ── Legacy path (master flag off) ──
@@ -3416,115 +3457,98 @@ class SerpentFlow:
         if reasoning:
             self._op_rationales[op_id] = reasoning.strip()
 
+    def _emit_composed(self, op_id: str, composed: Any, *,
+                       essential: bool = False) -> bool:
+        """Land one composed tool block (header, summary, body, hint) on the
+        op's lines. The single emitter for `tool_render_view` output, shared
+        by tool calls and file updates. Returns whether anything landed."""
+        if composed is None:
+            return False
+        for line in (composed.header_markup, composed.summary_markup,
+                     *composed.body_lines_markup, composed.expansion_hint):
+            if line:
+                self._op_line(op_id, line, essential=essential)
+        return True
+
+    def _display_path(self, file_path: str) -> str:
+        """*file_path* as the operator knows it: relative to the tree it
+        lives in. APPLY writes into the execution root (an autonomous
+        worktree under `.worktrees/`), so the absolute path carried a
+        workspace name no operator has heard of. NEVER raises."""
+        text = str(file_path or "")
+        if not os.path.isabs(text):
+            return text
+        # The tree a file lives in is the nearest ancestor holding `.git` (a
+        # directory for a checkout, a FILE for a linked worktree). Asked of
+        # the filesystem rather than of configuration, it is right for the
+        # operator tree, the autonomous workspace and any L3 unit alike,
+        # whatever the environment says.
+        try:
+            real = os.path.realpath(text)
+            here = os.path.dirname(real)
+            while True:
+                if os.path.exists(os.path.join(here, ".git")):
+                    return os.path.relpath(real, here)
+                parent = os.path.dirname(here)
+                if parent == here:
+                    break
+                here = parent
+        except Exception:  # noqa: BLE001
+            pass
+        return text
+
     def show_diff(
         self, file_path: str, diff_text: str = "", op_id: str = "",
         reasoning: str = "",
     ) -> None:
-        """Show a CC-style inline update block for a file change.
+        """One file's change as Claude Code shows it: ``● Update(path)``, a
+        summary in its words, then the hunks with a line-number gutter,
+        syntax highlighting and add/remove bands.
 
-        Renders the Claude Code ``⏺ Update(path)`` pattern with summary
-        counts, numbered context lines, and colored +/- diff markers.
-        Falls back to a compact one-liner when no diff is available.
+        Composed by `tool_render_view` as an ``edit_file`` result, the same
+        composer every tool block uses, so a diff here and a diff from an
+        edit tool are one format with one elision and one ``/expand`` ref.
+        This method used to draw its own flat red/green copy.
+
+        A file renders ONCE per op. The pipeline announces a target before
+        the change exists (no diff yet) and again with the diff, and the
+        op's completion names its files a third time. Without a diff there
+        is nothing to show, so the file waits; when the diff arrives it
+        renders; the completion only renders files that never got one.
         """
         if not diff_text:
             diff_text = self._get_git_diff(file_path)
-
-        short_path = file_path
-        if len(file_path) > 60:
-            parts = file_path.split("/")
-            short_path = "/".join(parts[-3:]) if len(parts) >= 3 else file_path
-
         if not diff_text:
-            self._op_line(
-                op_id,
-                f"{_bullet()} [{_SEM['neural']}]Update[/{_SEM['neural']}]"
-                f"([{_SEM['file']}]{short_path}[/{_SEM['file']}])",
-            )
+            self._pending_diff_files.setdefault(op_id, set()).add(
+                self._display_path(file_path))
             return
+        shown_path = self._display_path(file_path)
+        shown = self._shown_diff_files.setdefault(op_id, set())
+        if shown_path in shown:
+            return
+        shown.add(shown_path)
+        self._pending_diff_files.get(op_id, set()).discard(shown_path)
 
-        # Parse unified diff into structured hunks
-        added, removed, hunks = _parse_unified_diff(diff_text)
-
-        # ── Header: ⏺ Update(path) ──
-        self._op_line(
-            op_id,
-            f"{_bullet()} [{_SEM['neural']}]Update[/{_SEM['neural']}]"
-            f"([{_SEM['file']}]{short_path}[/{_SEM['file']}])",
-        )
-
-        # ── Summary: ⎿  Added N lines, removed M lines ──
-        parts: List[str] = []
-        if added:
-            parts.append(f"[{_SEM['code_add']}]Added {added} line{'s' if added != 1 else ''}[/{_SEM['code_add']}]")
-        if removed:
-            parts.append(f"[{_SEM['code_del']}]removed {removed} line{'s' if removed != 1 else ''}[/{_SEM['code_del']}]")
-        summary = ", ".join(parts) if parts else "no changes"
-        self._op_line(op_id, f"[{_SEM['dim']}]⎿[/{_SEM['dim']}]  {summary}")
-
-        # ── Reasoning: why the organism made this change ──
-        # Check explicit parameter first, then stored per-op reasoning
         _reason = reasoning or self._op_rationales.get(op_id, "")
-        if _reason:
-            # Escape markup in model-generated text
-            safe_reason = _reason.replace("[", "\\[")[:120]
-            self._op_line(
-                op_id,
-                f"[{_SEM['dim']}]⎿  reasoning: {safe_reason}[/{_SEM['dim']}]",
+        if _reason and op_id not in self._reasoning_shown:
+            self._reasoning_shown.add(op_id)
+            from backend.core.ouroboros.ui import deck_grammar as _deck
+            self._op_line(op_id, _deck.voice(" ".join(_reason.split())),
+                          essential=True)
+        try:
+            from backend.core.ouroboros.battle_test.tool_render_view import (
+                compose_if_enabled, store_for_view,
             )
-
-        # ── Contextual diff lines (max 3 hunks, 20 lines each) ──
-        hunk_limit = 3
-        lines_per_hunk = 20
-        for hunk_idx, hunk in enumerate(hunks[:hunk_limit]):
-            old_start = hunk["old_start"]
-            new_start = hunk["new_start"]
-            old_lineno = old_start
-            new_lineno = new_start
-
-            shown = 0
-            for diff_line in hunk["lines"][:lines_per_hunk]:
-                kind = diff_line[0] if diff_line else " "
-                content = diff_line[1:] if len(diff_line) > 1 else ""
-                # Escape Rich markup in code content
-                safe = content.replace("[", "\\[")
-
-                if kind == "-":
-                    self._op_line(
-                        op_id,
-                        f"    [{_SEM['dim']}]{old_lineno:>5}[/{_SEM['dim']}] "
-                        f"[{_SEM['code_del']}]- {safe}[/{_SEM['code_del']}]",
-                    )
-                    old_lineno += 1
-                elif kind == "+":
-                    self._op_line(
-                        op_id,
-                        f"    [{_SEM['dim']}]{new_lineno:>5}[/{_SEM['dim']}] "
-                        f"[{_SEM['code_add']}]+ {safe}[/{_SEM['code_add']}]",
-                    )
-                    new_lineno += 1
-                else:
-                    # Context line
-                    self._op_line(
-                        op_id,
-                        f"    [{_SEM['dim']}]{new_lineno:>5}   {safe}[/{_SEM['dim']}]",
-                    )
-                    old_lineno += 1
-                    new_lineno += 1
-                shown += 1
-
-            remaining_in_hunk = len(hunk["lines"]) - shown
-            if remaining_in_hunk > 0:
-                self._op_line(
-                    op_id,
-                    f"    [{_SEM['dim']}]      ... +{remaining_in_hunk} lines[/{_SEM['dim']}]",
-                )
-
-        remaining_hunks = len(hunks) - hunk_limit
-        if remaining_hunks > 0:
-            self._op_line(
-                op_id,
-                f"    [{_SEM['dim']}]      ... +{remaining_hunks} more hunk{'s' if remaining_hunks != 1 else ''}[/{_SEM['dim']}]",
+            composed = compose_if_enabled(
+                "edit_file", shown_path, diff_text, op_id=op_id,
+                palette=_SEM, store=store_for_view(),
             )
+        except Exception:  # noqa: BLE001 — never crash the render path
+            composed = None
+        if not self._emit_composed(op_id, composed, essential=True):
+            from backend.core.ouroboros.ui import deck_grammar as _deck
+            self._op_line(op_id, _deck.action("Update", shown_path),
+                          essential=True)
 
     def show_diff_preview(
         self,
@@ -3532,37 +3556,24 @@ class SerpentFlow:
         target_files: Optional[List[str]] = None,
         op_id: str = "",
     ) -> None:
-        """Render a CC-style diff preview for the approval flow.
+        """A proposed change, one block per file, BEFORE it is applied.
 
-        Uses the same ``⏺ Update(path)`` layout as ``show_diff`` but
-        renders per-file blocks for each target file in the diff.
+        Each file renders from its OWN section of the patch. This passed the
+        whole multi-file diff to every file's block, so each file showed
+        every file's changes. A preview that is not a unified diff (a
+        candidate's full content) has no hunks to show and renders as the
+        files it names.
         """
-        if not target_files:
-            target_files = []
-
-        # Parse the full diff to get per-file counts
-        added, removed, hunks = _parse_unified_diff(diff_text)
-
-        for tf in target_files:
-            short = tf
-            if len(tf) > 60:
-                parts = tf.split("/")
-                short = "/".join(parts[-3:]) if len(parts) >= 3 else tf
-            # Show each file with its own update block
-            self.show_diff(tf, diff_text=diff_text, op_id=op_id)
-
-        # If no target files provided, show a standalone summary
-        if not target_files and diff_text:
-            parts_sum: List[str] = []
-            if added:
-                parts_sum.append(f"[{_SEM['code_add']}]+{added}[/{_SEM['code_add']}]")
-            if removed:
-                parts_sum.append(f"[{_SEM['code_del']}]-{removed}[/{_SEM['code_del']}]")
-            summary = " ".join(parts_sum) if parts_sum else "no changes"
-            self._op_line(
-                op_id,
-                f"{_bullet(_PENDING_TONE)} [{_SEM['neural']}]Proposed changes[/{_SEM['neural']}]  {summary}",
-            )
+        sections = _split_unified_diff(diff_text)
+        if sections:
+            for path, section in sections:
+                self.show_diff(path, diff_text=section, op_id=op_id)
+            return
+        from backend.core.ouroboros.ui import deck_grammar as _deck
+        for tf in target_files or []:
+            self._op_line(op_id, _deck.action(
+                "Update", self._display_path(tf), tone=_deck.PENDING_TONE),
+                essential=True)
 
     # ── NOTIFY_APPLY rich preview (V1) ────────────────────────────
     #
@@ -3824,24 +3835,31 @@ class SerpentFlow:
         prov = _prov(self._op_providers.pop(op_id, provider))
         self._cost_total += cost_usd
 
-        # Store reasoning for display in ⏺ Update blocks
         if reasoning:
             self._op_rationales[op_id] = reasoning
 
-        # Show diffs as CC-style ⏺ Update blocks (reasoning shown inline)
-        if files_changed:
-            for f in files_changed[:5]:
-                self.show_diff(f, op_id=op_id)
+        # A file whose diff never arrived gets one more chance (the change is
+        # on disk now); the rest already rendered when their diff did.
+        for f in list(files_changed or ()):
+            self.show_diff(f, op_id=op_id)
+        for f in sorted(self._pending_diff_files.pop(op_id, set())):
+            from backend.core.ouroboros.ui import deck_grammar as _deck
+            self._op_line(op_id, _deck.action("Update", f), essential=True)
+            self._shown_diff_files.setdefault(op_id, set()).add(f)
 
-        # Evolution line
-        files_str = f"{len(files_changed)} file{'s' if len(files_changed) != 1 else ''}"
-        cost_str = f" [{_SEM['dim']}]│[/{_SEM['dim']}] 💰 ${cost_usd:.4f}" if cost_usd > 0 else ""
-
-        self._op_line(
-            op_id,
-            f"[{_SEM['life']}]✨ evolved[/{_SEM['life']}]     "
-            f"{files_str} [{_SEM['dim']}]│[/{_SEM['dim']}] ⏱ {elapsed:.1f}s{cost_str}",
-        )
+        # What changed is what the op's own updates showed, not what the
+        # DECISION happened to list: change_engine's DECISION carries no
+        # file list, so every landing read "0 files evolved".
+        changed = self._shown_diff_files.get(op_id) or set(files_changed or ())
+        files_str = f"{len(changed)} file{'s' if len(changed) != 1 else ''}"
+        cost_str = f" · 💰 ${cost_usd:.4f}" if cost_usd > 0 else ""
+        collapse = self._op_collapse_enabled()
+        if not collapse:
+            self._op_line(
+                op_id,
+                f"[{_SEM['life']}]✨ evolved[/{_SEM['life']}]     "
+                f"{files_str} [{_SEM['dim']}]│[/{_SEM['dim']}] ⏱ {elapsed:.1f}s{cost_str}",
+            )
 
         # Close the op block and clean up per-op state
         self._op_rationales.pop(op_id, None)
@@ -3851,8 +3869,7 @@ class SerpentFlow:
         # collapsed summary line so /expand <op-id> can recover the
         # full output later.
         self._maybe_buffer_op_commit(
-            op_id,
-            f"{files_str} evolved · ⏱ {elapsed:.1f}s · 💰 ${cost_usd:.4f}",
+            op_id, f"{files_str} evolved · ⏱ {elapsed:.1f}s{cost_str}",
         )
         # Gap #7 Slice 4 — clear the terminal title back to idle when
         # no other ops are active (the resolver picks any remaining
@@ -3870,6 +3887,7 @@ class SerpentFlow:
             kind="success",
             cost_usd=cost_usd,
             elapsed_s=elapsed,
+            render=not collapse,
         )
 
     def op_failed(self, op_id: str, reason: str, phase: str = "") -> None:
@@ -3881,20 +3899,19 @@ class SerpentFlow:
         self._op_rationales.pop(op_id, None)
 
         phase_str = f" at [{_SEM['neural']}]{phase}[/{_SEM['neural']}]" if phase else ""
-
-        self._op_line(
-            op_id,
-            f"[{_SEM['death']}]💀 shed[/{_SEM['death']}]        "
-            f"[{_SEM['death']}]{reason[:70]}[/{_SEM['death']}]{phase_str}"
-            f"  [{_SEM['dim']}]⏱ {elapsed:.1f}s[/{_SEM['dim']}]",
-        )
-
-        # Actionable next-step based on failure reason
         suggestion = _actionable_suggestion(reason, phase, elapsed)
-        self._op_line(
-            op_id,
-            f"[{_SEM['dim']}]             💡 {suggestion}[/{_SEM['dim']}]",
-        )
+        collapse = self._op_collapse_enabled()
+        if not collapse:
+            self._op_line(
+                op_id,
+                f"[{_SEM['death']}]💀 shed[/{_SEM['death']}]        "
+                f"[{_SEM['death']}]{reason[:70]}[/{_SEM['death']}]{phase_str}"
+                f"  [{_SEM['dim']}]⏱ {elapsed:.1f}s[/{_SEM['dim']}]",
+            )
+            self._op_line(
+                op_id,
+                f"[{_SEM['dim']}]             💡 {suggestion}[/{_SEM['dim']}]",
+            )
 
         # Close the op block
         self._close_op_block(op_id)
@@ -3903,8 +3920,15 @@ class SerpentFlow:
         # collapsed failure summary so /expand can recover the trail.
         self._maybe_buffer_op_commit(
             op_id,
-            f"💀 shed · {reason[:60]} · ⏱ {elapsed:.1f}s",
+            f"💀 shed · {reason[:60]}" + (f" at {phase}" if phase else "")
+            + f" · ⏱ {elapsed:.1f}s",
+            tone="failed",
         )
+        if collapse and suggestion:
+            # The way forward, under the headline it explains. A failure is
+            # never noise, so it reaches the transcript focused or not.
+            from backend.core.ouroboros.ui import deck_grammar as _deck
+            self._print_mirrored(f"  {_deck.detail(suggestion)}")
         # Gap #7 Slice 4 — clear / refresh terminal title
         if not self._active_ops:
             self._maybe_set_terminal_title()
@@ -3920,6 +3944,7 @@ class SerpentFlow:
             elapsed_s=elapsed,
             failure_reason=reason,
             failure_phase=phase,
+            render=not collapse,
         )
 
     def op_noop(self, op_id: str, reason: str = "") -> None:
@@ -4258,15 +4283,38 @@ class SerpentFlow:
         color = _ROUTE_COLOR.get(route_norm, _SEM["neural"])
         label = _ROUTE_SHORT.get(route_norm, route_norm[:3].upper())
         meta_bits: List[str] = []
+        # A budget names a LANE, and a lane that may not spend is not where
+        # this op will run: with paid lanes off every op read `dw≤180s` while
+        # J-Prime served it. The cascade's budgets show only for lanes the
+        # dispatch-time verdict allows; otherwise the line names the engine
+        # that actually serves.
+        def _allowed(provider: str) -> bool:
+            try:
+                from backend.core.ouroboros.governance.paid_lanes import (
+                    allowed_verdict,
+                )
+                return bool(allowed_verdict(provider).allowed)
+            except Exception:  # noqa: BLE001 — unknowable: do not claim it
+                return False
         if isinstance(budget_profile, dict):
             max_wait = budget_profile.get("max_dw_wait_s")
             reserve = budget_profile.get("tier1_reserve_s")
-            if max_wait is not None:
+            if max_wait is not None and _allowed("doubleword"):
                 meta_bits.append(f"dw≤{float(max_wait):.0f}s")
-            if reserve:
+            if reserve and _allowed("claude"):
                 meta_bits.append(f"cld+{float(reserve):.0f}s")
         elif budget_profile:
             meta_bits.append(str(budget_profile)[:24])
+        if not meta_bits:
+            try:
+                from backend.core.ouroboros.governance.served_identity import (
+                    current,
+                )
+                _engine = ((current().get("engine") or {}).get("name") or "")
+                if _engine:
+                    meta_bits.append(_engine)
+            except Exception:  # noqa: BLE001
+                pass
         if reason:
             meta_bits.append(str(reason)[:48])
         meta = f"  [{_SEM['dim']}]{' │ '.join(meta_bits)}[/{_SEM['dim']}]" if meta_bits else ""
@@ -5760,11 +5808,21 @@ class SerpentTransport:
                 await self._handle_msg_decision(op_id, payload)
 
             elif msg_type == "POSTMORTEM":
-                self._flow.op_failed(
-                    op_id=op_id,
-                    reason=payload.get("root_cause", "unknown"),
-                    phase=payload.get("failed_phase", ""),
+                from backend.core.ouroboros.governance.comm_protocol import (
+                    CommProtocol,
                 )
+                if CommProtocol.postmortem_is_failure(payload):
+                    self._flow.op_failed(
+                        op_id=op_id,
+                        reason=payload.get("root_cause", "unknown"),
+                        phase=payload.get("failed_phase", ""),
+                    )
+                elif op_id in self._flow._active_ops:
+                    # A closure that is not a failure, for an op no DECISION
+                    # closed (a read-only or cosmetic no-op). A landing was
+                    # already closed by its DECISION and needs nothing here.
+                    _cause = str(payload.get("root_cause") or "")
+                    self._flow.op_noop(op_id, reason="" if _cause == "none" else _cause)
 
         except Exception:
             pass  # The serpent never crashes the pipeline

@@ -62,13 +62,13 @@ class TestItDrivesTheRealRenderer:
         regress silently."""
         text = "\n".join(_lines(ov_demo.compose_live_script()))
         # Numbers no beat contains: the registry counted them.
-        assert "847 lines read" in text
-        assert "14 matches" in text
+        assert "Read 847 lines" in text
+        assert "Found 14 matches" in text
         assert "command failed" in text
         # And nothing in the beat list pre-computed them.
         beats = repr(ov_demo._LIVE_BEATS)
-        assert "847 lines read" not in beats
-        assert "14 matches" not in beats
+        assert "Read 847 lines" not in beats
+        assert "Found 14 matches" not in beats
 
     def test_every_tool_shape_the_cockpit_can_draw_is_exercised(self):
         """Header-only, match list, diff, log, and a FAILING call — the shapes

@@ -12,6 +12,7 @@ NEVER raises.
 from __future__ import annotations
 
 import os
+import re
 from typing import Tuple
 
 _ENV_BODY_MAX = "JARVIS_TOOL_RENDER_BODY_MAX_CHARS"
@@ -50,4 +51,17 @@ def clip_lines(text: str, max_chars: int) -> Tuple[str, int]:
         return (text or "")[: max(0, max_chars)], 0
 
 
-__all__ = ["body_max_chars", "clip_lines"]
+#: The marker :func:`clip_lines` appends, as a pattern, so a renderer can tell
+#: it from content. A diff renderer that could not numbered it as code.
+CLIP_MARKER_RE = re.compile(r"^… (?:\d+ more lines?|more) \([\d,]+ chars\) not kept$")
+
+
+def is_clip_marker(line: str) -> bool:
+    """Whether *line* is the marker :func:`clip_lines` wrote. NEVER raises."""
+    try:
+        return bool(CLIP_MARKER_RE.match(str(line).strip()))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+__all__ = ["CLIP_MARKER_RE", "body_max_chars", "clip_lines", "is_clip_marker"]

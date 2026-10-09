@@ -468,22 +468,56 @@ def _diff_wrapper_for(body_lines: Any,
     except Exception:  # noqa: BLE001
         path = None
 
-    state = {"old": 0, "new": 0}
+    # Which hunk headers have NO visible form. Claude Code does not print
+    # `@@ -a,b +c,d @@`; it marks the gap BETWEEN hunks. A header with nothing
+    # before it (the first hunk) has no gap to mark, and one that follows an
+    # elision marker (the resume point the registry states for the gutter)
+    # sits under a gap the marker already shows. Positions count only the
+    # lines this wrapper is called for: elision markers are styled elsewhere.
+    silent: set = set()
+    try:
+        from backend.core.ouroboros.battle_test.tool_render_registry import (
+            is_elision_line as _is_marker,
+        )
+        seen_body, after_gap, ordinal = False, True, 0
+        for raw in list(body_lines or ()):
+            text = str(raw)
+            if _is_marker(text):
+                after_gap = True
+                continue
+            if text.startswith("@@") and (after_gap or not seen_body):
+                silent.add(ordinal)
+            elif not text.startswith(("+++", "---", "@@")):
+                seen_body = True
+            after_gap = False
+            ordinal += 1
+    except Exception:  # noqa: BLE001 — no silence: every header shows
+        silent = set()
 
-    def _wrap(line: str, palette: Optional[Mapping[str, str]]) -> str:
+    state = {"old": 0, "new": 0, "i": 0}
+
+    def _wrap(line: str, palette: Optional[Mapping[str, str]]) -> Optional[str]:
+        """One diff line, or ``None`` for a structural line with no visible
+        form. Classified on its FIRST character, the unified-diff prefix: a
+        context line is ``' '`` + the code, and stripping it first lost the
+        code's indentation and read an indented ``- item`` as a removal."""
+        index = state["i"]
+        state["i"] += 1
         try:
             text = str(line)
-            stripped = text.lstrip()
-            if stripped.startswith("@@"):
+            if text.startswith("@@"):
                 # Reset both counters from the hunk header. `-a,b +c,d` — the two
                 # origins are independent and both are needed.
                 import re as _re
-                m = _re.search(r"-(\d+)(?:,\d+)?\s+\+(\d+)", stripped)
+                m = _re.search(r"-(\d+)(?:,\d+)?\s+\+(\d+)", text)
                 if m:
                     state["old"] = int(m.group(1))
                     state["new"] = int(m.group(2))
-                return _wrap_diff_line(text, palette)
-            if stripped.startswith(("+++", "---")):
+                if index in silent:
+                    return None
+                c = _palette_value(palette, "dim")
+                return f"[{c}]{_escape(_gap_glyph())}[/{c}]"
+            if text.startswith(("+++", "---")):
                 return _wrap_diff_line(text, palette)
             from backend.core.ouroboros.ui import deck_grammar as _deck
             # None, deliberately: `deck.diff` asks `resolve_deck_width` itself, and
@@ -491,16 +525,17 @@ def _diff_wrapper_for(body_lines: Any,
             # width here was the second opinion that gave the same hunk two right
             # edges depending on which path drew it.
             width = None
-            if stripped.startswith("+"):
+            sign, body = text[:1], text[1:]
+            if sign == "+":
                 lineno = state["new"] or None
                 state["new"] += 1
-                return _deck.diff(lineno, "+", stripped[1:], path=path,
-                                  width=width)
-            if stripped.startswith("-"):
+                return _deck.diff(lineno, "+", body, path=path, width=width)
+            if sign == "-":
                 lineno = state["old"] or None
                 state["old"] += 1
-                return _deck.diff(lineno, "-", stripped[1:], path=path,
-                                  width=width)
+                return _deck.diff(lineno, "-", body, path=path, width=width)
+            if sign == "\\":
+                return _wrap_diff_line(text, palette)   # "\ No newline at end of file"
             # Context: advances BOTH sides, and is shown against the new file
             # because that is the one the operator is about to be living with.
             lineno = state["new"] or None
@@ -508,7 +543,7 @@ def _diff_wrapper_for(body_lines: Any,
                 state["new"] += 1
             if state["old"]:
                 state["old"] += 1
-            body = stripped[1:] if stripped.startswith(" ") else stripped
+            body = body if sign == " " else text
             return _deck.diff(lineno, " ", body, path=path, width=width)
         except Exception:  # noqa: BLE001
             # The previous rendering is a perfectly good fallback; losing the diff
@@ -516,6 +551,15 @@ def _diff_wrapper_for(body_lines: Any,
             return _wrap_diff_line(str(line), palette)
 
     return _wrap
+
+
+def _gap_glyph() -> str:
+    """The mark between two hunks: the theme's ellipsis, ASCII-degraded."""
+    try:
+        from backend.core.ouroboros.ui.theme import supports_unicode
+        return "⋮" if supports_unicode() else "..."
+    except Exception:  # noqa: BLE001
+        return "..."
 
 
 def _wrap_log_line(
@@ -759,9 +803,15 @@ def _compose_summary(
     # `---`/`+++` header), so a count beside a summary that already says
     # `+5 / -2 lines` read as a second, contradicting change size. The ref is
     # the information; the expansion shows the number.
+    #
+    # And only for a block that shows NO body. A trimmed body carries its own
+    # marker, which names the ref; a body that merely lost noise to the
+    # denoiser (a diff's `---`/`+++`, pytest's progress dots) is fully shown,
+    # and advertising a way back to it says something is hidden when nothing
+    # is. `elided` counts both, so it cannot make this decision.
     suffix = ""
     if (isinstance(expansion_ref, str) and expansion_ref and not marker_in_body
-            and (not body_present or elided > 0)):
+            and not body_present):
         suffix = f" · /expand {expansion_ref}"
     summary_markup = (
         f"[{c_dim}]{_detail_prefix()}{_escape(summary_text)}{_escape(suffix)}[/{c_dim}]"
@@ -934,14 +984,15 @@ def compose(
     # block: `⎿ 47 passed` over a body ending `47 passed`. The summary line
     # keeps it, because that is where the eye lands.
     _said = " ".join(str(rendered.body_summary or "").split())
-    body_lines_markup: Tuple[str, ...] = tuple(
-        _indent + (
-            _wrap_marker_line(ln, palette)
-            if is_elision_line(ln)
-            else wrapper(ln, palette)
-        )
+    _wrapped = (
+        _wrap_marker_line(ln, palette) if is_elision_line(ln) else wrapper(ln, palette)
         for ln in rendered.body_lines
         if not (_said and " ".join(str(ln).split()) == _said)
+    )
+    # A wrapper returns None for a structural line with no visible form (a
+    # diff's leading hunk header): it shaped the lines after it, not the view.
+    body_lines_markup: Tuple[str, ...] = tuple(
+        _indent + w for w in _wrapped if w is not None
     )
 
     # SHELL VISIBILITY — for a bash call, show the command it ran on its own

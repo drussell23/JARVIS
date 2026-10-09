@@ -2119,9 +2119,20 @@ class ToolExecutor:
         pattern: str = args["pattern"]
         file_glob: str = args.get("file_glob", "*.py")
 
-        # Prefer ripgrep (rg) for 5-10x speedup; fall back to grep
+        # Search what the REPOSITORY contains, not what happens to sit on disk.
+        #
+        # ripgrep honours `.gitignore`; the old fallback, `grep -r`, honours
+        # nothing. On a host without `rg` (the soak daemon's PATH) every search
+        # walked `.worktrees/`, where each L3 unit and the autonomous workspace
+        # keep a FULL copy of the repo, so one real match came back as five and
+        # the model read stale copies of files it was about to edit. `git grep`
+        # applies the same ignore rules by definition (`--untracked` keeps new,
+        # unignored files), and git is present wherever O+V can commit. Plain
+        # grep remains only for a root that is not a git work tree.
         import shutil
         rg_path = shutil.which("rg")
+        git_path = shutil.which("git") if not rg_path else None
+        in_git = bool(git_path) and (Path(self._repo_root) / ".git").exists()
 
         try:
             if rg_path:
@@ -2131,18 +2142,35 @@ class ToolExecutor:
                     "--max-count", "200",
                     "--", pattern, str(self._repo_root),
                 ]
+                cwd = None
+            elif in_git:
+                # Paths come back repo-relative because git runs IN the root.
+                # `-E` matches rg's syntax for the alternations and classes the
+                # model writes; `-I` skips binaries as rg does.
+                cmd = [
+                    git_path, "grep", "-n", "-I", "-E", "--untracked",
+                    "--max-count", "200", "-e", pattern, "--", file_glob,
+                ]
+                cwd = str(self._repo_root)
             else:
                 cmd = [
                     "grep", "-r", "--include", file_glob, "-n",
                     "--", pattern, str(self._repo_root),
                 ]
+                cwd = None
             proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=15,
+                cmd, capture_output=True, text=True, timeout=15, cwd=cwd,
             )
         except subprocess.TimeoutExpired:
             return "(search timed out after 15s — try a more specific pattern or file_glob)"
 
         raw_lines = (proc.stdout or "").splitlines()
+        # All three searchers exit 1 for "no match" and >1 for an error (a
+        # malformed pattern, an unreadable root). Reporting an error as "no
+        # matches" sends the model off concluding the code does not exist.
+        if not raw_lines and proc.returncode not in (0, 1):
+            detail = " ".join((proc.stderr or "").split())[:200] or f"exit {proc.returncode}"
+            return f"(search error for pattern={pattern!r}: {detail})"
         if not raw_lines:
             return (
                 f"(no matches for pattern={pattern!r} glob={file_glob}). "

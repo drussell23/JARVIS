@@ -204,13 +204,21 @@ def test_show_diff_still_reaches_the_cockpit() -> None:
     pytest.fail("show_diff is gone")
 
 
-def test_a_diffless_change_still_prints_its_header() -> None:
-    """Degradation, not disappearance: `show_diff` falls back to a compact
-    one-liner when no diff can be read."""
-    src = _SRC.read_text()
-    for node in ast.walk(ast.parse(src)):
-        if isinstance(node, ast.FunctionDef) and node.name == "show_diff":
-            body = ast.unparse(node)
-            assert "if not diff_text" in body
-            return
-    pytest.fail("show_diff is gone")
+def test_a_diffless_change_still_prints_its_header(tmp_path) -> None:
+    """Degradation, not disappearance. SUPERSEDED 2026-10-09: `show_diff`
+    used to print a bare header the moment a target was announced, before
+    any diff existed, and again when the diff arrived. A file with no diff
+    now WAITS; the op's completion prints the header for any file whose diff
+    never came, so the change still appears, once."""
+    from io import StringIO
+    from rich.console import Console
+    from backend.core.ouroboros.battle_test.serpent_flow import SerpentFlow
+    flow = SerpentFlow(repo_path=tmp_path)
+    flow.console = Console(file=StringIO(), width=120, color_system=None)
+    lines: list = []
+    flow.markup_mirror = lines.append
+    flow.op_started("op-x", "goal", ["a.py"], "SAFE_AUTO")
+    flow.show_diff("a.py", op_id="op-x")               # no diff obtainable
+    assert not any("Update(" in ln for ln in lines)
+    flow.op_completed("op-x", files_changed=[])
+    assert sum("Update(" in ln and "a.py" in ln for ln in lines) == 1

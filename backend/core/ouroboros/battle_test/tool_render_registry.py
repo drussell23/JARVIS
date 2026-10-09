@@ -66,7 +66,7 @@ from __future__ import annotations
 import enum
 import re
 from dataclasses import dataclass
-from typing import Callable, Mapping, Optional, Tuple
+from typing import Callable, List, Mapping, Optional, Tuple
 
 
 # ===========================================================================
@@ -272,21 +272,69 @@ def _line_count(s: str) -> int:
     return s.count("\n") + (0 if s.endswith("\n") else 1)
 
 
+#: `read_file`'s own header, `# path  (lines A-B of N)` (tool_executor).
+_READ_WINDOW = re.compile(r"\(lines (\d+)-(\d+) of (\d+)\)")
+
+
 def _summarize_read(result: str, status: ToolStatus) -> str:
+    """``Read 165 lines``, or ``Read 40 of 165 lines`` for a window.
+
+    From the tool's own header, which states what was read; counting the
+    result's lines counted the header too, and counted a truncated narration
+    preview as if it were the file."""
     if status is not ToolStatus.SUCCESS:
         return f"read failed ({status.value})"
-    n = _line_count(result)
-    return f"{n} line{'s' if n != 1 else ''} read"
+    m = _READ_WINDOW.search(str(result or "").split("\n", 1)[0])
+    if m:
+        first, last, total = (int(g) for g in m.groups())
+        shown = max(0, last - first + 1)
+        if shown >= total:
+            return f"Read {_plural(total, 'line')}"
+        return f"Read {shown} of {_plural(total, 'line')}"
+    return f"Read {_plural(len(_result_lines(result)), 'line')}"
+
+
+def _plural(n: int, noun: str, plural: str = "") -> str:
+    return f"{n} {noun if n == 1 else (plural or noun + 's')}"
+
+
+def _is_tool_note(line: str) -> bool:
+    """A line the TOOL wrote about the result rather than a result: the
+    parenthesised status every Venom tool uses (``(no matches for …)``,
+    ``(search error …)``, ``(not a directory: …)``) and its truncation
+    markers (``... [N more matches truncated] ...``)."""
+    s = line.strip()
+    return (s.startswith("(") and s.endswith(")")) or s.startswith(("...", "…"))
+
+
+def _result_lines(result: str) -> List[str]:
+    """The result's own lines: non-empty, and not the tool's notes. Counting
+    the notes made ``(no matches)`` read as ``1 path matched``."""
+    return [ln for ln in str(result or "").splitlines()
+            if ln.strip() and not _is_tool_note(ln)]
+
+
+def _tool_note(result: str) -> str:
+    """The tool's own first note, unwrapped, for a result that has nothing
+    else: ``no matches for pattern='x' glob=*.py``."""
+    for ln in str(result or "").splitlines():
+        if ln.strip() and _is_tool_note(ln):
+            s = ln.strip()
+            return s[1:-1] if s.startswith("(") else s
+    return ""
 
 
 def _summarize_search(result: str, status: ToolStatus) -> str:
+    """``Found 4 matches in 3 files``, Claude Code's phrasing. A match line is
+    ``path:line:text``; the file count is how many paths they span."""
     if status is not ToolStatus.SUCCESS:
         return f"search failed ({status.value})"
-    if not result:
-        return "no matches"
-    # Heuristic: count non-empty result lines as match-equivalent units
-    matches = sum(1 for ln in result.splitlines() if ln.strip())
-    return f"{matches} match{'es' if matches != 1 else ''}"
+    lines = _result_lines(result)
+    if not lines:
+        return _tool_note(result) or "No matches"
+    files = {ln.split(":", 1)[0] for ln in lines if ":" in ln}
+    found = f"Found {_plural(len(lines), 'match', 'matches')}"
+    return f"{found} in {_plural(len(files), 'file')}" if files else found
 
 
 def _summarize_edit(result: str, status: ToolStatus) -> str:
@@ -304,7 +352,13 @@ def _summarize_edit(result: str, status: ToolStatus) -> str:
     if added == 0 and removed == 0:
         n = _line_count(result)
         return f"edit applied ({n} line{'s' if n != 1 else ''} affected)"
-    return f"+{added} / -{removed} lines"
+    # Claude Code's phrasing: a pure addition says "Added", a pure removal
+    # "Removed", anything else names both sides.
+    if not removed:
+        return f"Added {_plural(added, 'line')}"
+    if not added:
+        return f"Removed {_plural(removed, 'line')}"
+    return f"{_plural(added, 'addition')} and {_plural(removed, 'removal')}"
 
 
 def _summarize_write(result: str, status: ToolStatus) -> str:
@@ -354,32 +408,37 @@ def _summarize_tests(result: str, status: ToolStatus) -> str:
 def _summarize_callers(result: str, status: ToolStatus) -> str:
     if status is not ToolStatus.SUCCESS:
         return f"caller scan failed ({status.value})"
-    if not result:
-        return "no callers found"
-    # Each line typically corresponds to one caller site
-    n = sum(1 for ln in result.splitlines() if ln.strip())
-    return f"{n} caller{'s' if n != 1 else ''} found"
+    lines = _result_lines(result)
+    if not lines:
+        return _tool_note(result) or "No callers found"
+    return f"Found {_plural(len(lines), 'caller')}"
 
 
 def _summarize_glob(result: str, status: ToolStatus) -> str:
     if status is not ToolStatus.SUCCESS:
         return f"glob failed ({status.value})"
-    n = sum(1 for ln in result.splitlines() if ln.strip())
-    return f"{n} path{'s' if n != 1 else ''} matched"
+    lines = _result_lines(result)
+    if not lines:
+        return _tool_note(result) or "No files found"
+    return f"Found {_plural(len(lines), 'file')}"
 
 
 def _summarize_list_dir(result: str, status: ToolStatus) -> str:
     if status is not ToolStatus.SUCCESS:
         return f"list_dir failed ({status.value})"
-    n = sum(1 for ln in result.splitlines() if ln.strip())
-    return f"{n} entr{'ies' if n != 1 else 'y'}"
+    lines = _result_lines(result)
+    if not lines:
+        return _tool_note(result) or "Empty"
+    return f"Listed {_plural(len(lines), 'entry', 'entries')}"
 
 
 def _summarize_list_symbols(result: str, status: ToolStatus) -> str:
     if status is not ToolStatus.SUCCESS:
         return f"list_symbols failed ({status.value})"
-    n = sum(1 for ln in result.splitlines() if ln.strip())
-    return f"{n} symbol{'s' if n != 1 else ''}"
+    lines = _result_lines(result)
+    if not lines:
+        return _tool_note(result) or "No symbols"
+    return f"Found {_plural(len(lines), 'symbol')}"
 
 
 def _summarize_git_log(result: str, status: ToolStatus) -> str:
@@ -851,7 +910,15 @@ def is_elision_line(line: str) -> bool:
     """Whether a body line is an elision marker, in either form -- the one
     question every renderer asks before styling it as a marker."""
     text = str(line).strip()
-    return bool(_ELISION_MARKER.match(text) or _RECOVERABLE_MARKER.match(text))
+    if _ELISION_MARKER.match(text) or _RECOVERABLE_MARKER.match(text):
+        return True
+    # The bound a result was clipped at upstream (`text_bounds.clip_lines`)
+    # is an elision too, whoever applied it.
+    try:
+        from backend.core.ouroboros.ui.text_bounds import is_clip_marker
+        return is_clip_marker(text)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _recoverable_marker(line: str, ref: str) -> str:
@@ -915,10 +982,45 @@ def _extract_body(
     shown = head_count + tail_count
     elided = total - shown
     marker = f"… +{elided} more line{'s' if elided != 1 else ''} elided …"
+    tail = list(lines[-tail_count:])
+    if shape is BodyShape.DIFF:
+        # The gutter numbers a diff by walking it from its `@@` header, so a
+        # tail shown after an elided middle restarted at the hunk's first
+        # line: `… +143 lines` and then line 4. Where the tail resumes is
+        # computable from the lines it skipped, and stating it as a hunk
+        # header re-anchors the gutter the same way any later hunk does.
+        resume = _diff_resume_header(lines[: len(lines) - tail_count])
+        if resume and not tail[0].startswith("@@"):
+            tail.insert(0, resume)
     return (
-        (*lines[:head_count], marker, *lines[-tail_count:]),
+        (*lines[:head_count], marker, *tail),
         elided,
     )
+
+
+_HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def _diff_resume_header(before: List[str]) -> Optional[str]:
+    """``@@ -O +N @@``: the old and new line numbers of the line that
+    follows *before*, walked from its last hunk header. ``None`` when no
+    hunk header precedes it (not a numbered diff)."""
+    old = new = None
+    for line in before:
+        m = _HUNK_HEADER.match(line)
+        if m:
+            old, new = int(m.group(1)), int(m.group(2))
+            continue
+        if old is None or line.startswith("\\"):
+            continue                      # before any hunk / "\ No newline"
+        if line.startswith("+"):
+            new += 1
+        elif line.startswith("-"):
+            old += 1
+        else:
+            old += 1
+            new += 1
+    return None if old is None else f"@@ -{old} +{new} @@"
 
 
 __all__ = [

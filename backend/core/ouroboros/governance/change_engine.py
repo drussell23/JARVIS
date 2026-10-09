@@ -1268,10 +1268,14 @@ class ChangeEngine:
                     n=3,
                 ))
                 if _diff_lines:
-                    _diff_text = "".join(_diff_lines)
-                    # Cap at 5000 chars to avoid flooding the transport
-                    if len(_diff_text) > 5000:
-                        _diff_text = _diff_text[:5000] + "\n... truncated"
+                    # Bounded by the cockpit's own result budget, at a line
+                    # boundary, with the marker every renderer recognises. A
+                    # fixed 5000-char slice cut mid-line and appended text
+                    # the diff renderer numbered as a line of code.
+                    from backend.core.ouroboros.ui.text_bounds import (
+                        body_max_chars, clip_lines,
+                    )
+                    _diff_text, _ = clip_lines("".join(_diff_lines), body_max_chars())
                     await self._comm.emit_heartbeat(
                         op_id=op_id, phase="APPLY", progress_pct=75.0,
                         target_file=str(target),

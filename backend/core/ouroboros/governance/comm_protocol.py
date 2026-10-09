@@ -318,6 +318,23 @@ class CommProtocol:
         )
         await self._emit(msg)
 
+    @staticmethod
+    def postmortem_is_failure(payload: Any) -> bool:
+        """Whether a POSTMORTEM payload reports a FAILURE.
+
+        POSTMORTEM closes every op, not only failed ones. Every emitter that
+        reports a failure names the phase it failed in; the closures that are
+        not failures pass ``failed_phase=None``: a landed change
+        (``root_cause="none"``), a cosmetic or read-only no-op, a recovered
+        provider. Reading any POSTMORTEM as a death painted every successful
+        landing in the cockpit as ``💀 shed none``. The phase is the
+        contract; ``root_cause`` is free text. NEVER raises.
+        """
+        try:
+            return bool((payload or {}).get("failed_phase"))
+        except Exception:  # noqa: BLE001 — unreadable: not evidence of failure
+            return False
+
     async def emit_postmortem(
         self,
         op_id: str,

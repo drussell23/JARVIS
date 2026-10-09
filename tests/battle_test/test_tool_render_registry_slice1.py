@@ -238,15 +238,15 @@ def test_args_summarizer_handles_none_safely():
 
 def test_read_summary_pluralizes():
     desc = get_descriptor("read_file")
-    assert desc.summarize_result("a\nb\nc", ToolStatus.SUCCESS) == "3 lines read"
-    assert desc.summarize_result("only", ToolStatus.SUCCESS) == "1 line read"
-    assert desc.summarize_result("", ToolStatus.SUCCESS) == "0 lines read"
+    assert desc.summarize_result("a\nb\nc", ToolStatus.SUCCESS) == "Read 3 lines"
+    assert desc.summarize_result("only", ToolStatus.SUCCESS) == "Read 1 line"
+    assert desc.summarize_result("", ToolStatus.SUCCESS) == "Read 0 lines"
 
 
 def test_edit_summary_parses_unified_diff():
     desc = get_descriptor("edit_file")
     diff = "+added one\n+added two\n-removed one\n context"
-    assert desc.summarize_result(diff, ToolStatus.SUCCESS) == "+2 / -1 lines"
+    assert desc.summarize_result(diff, ToolStatus.SUCCESS) == "2 additions and 1 removal"
 
 
 def test_edit_summary_falls_back_when_no_diff_markers():
@@ -263,7 +263,7 @@ def test_write_summary_pluralizes():
 def test_search_summary_counts_matches():
     desc = get_descriptor("search_code")
     out = desc.summarize_result("hit1\nhit2\n\nhit3", ToolStatus.SUCCESS)
-    assert out == "3 matches"
+    assert out == "Found 3 matches"
 
 
 def test_search_summary_empty_returns_no_matches():
@@ -430,7 +430,7 @@ def test_render_non_string_expansion_ref_dropped():
 def test_render_status_string_coerced():
     desc = get_descriptor("read_file")
     out = render(desc, "f", "x\nx", "success")
-    assert "lines read" in out.body_summary
+    assert out.body_summary.startswith("Read ")
 
 
 def test_render_deterministic():
@@ -455,7 +455,7 @@ def test_render_handles_none_inputs():
         desc, None, None, ToolStatus.SUCCESS,  # type: ignore[arg-type]
     )
     assert out.header_line == "Read(file)"
-    assert "0 lines read" == out.body_summary
+    assert "Read 0 lines" == out.body_summary
 
 
 # ===========================================================================

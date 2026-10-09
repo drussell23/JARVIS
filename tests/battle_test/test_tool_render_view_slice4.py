@@ -220,7 +220,7 @@ def test_compose_summary_uses_continuation_glyph():
         "read_file", "foo.py", "a\nb\nc",
         explicit_density=_density(),
     )
-    assert "⏎" in out.summary_markup or "lines read" in out.summary_markup
+    assert "⏎" in out.summary_markup or "Read " in out.summary_markup
 
 
 def test_compose_no_body_for_read_file_descriptor():

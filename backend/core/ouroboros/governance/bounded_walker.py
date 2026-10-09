@@ -69,7 +69,8 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, List, Optional, Set
+import threading
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 
 logger = logging.getLogger("Ouroboros.BoundedWalker")
@@ -172,6 +173,116 @@ def default_skip_dirs() -> Set[str]:
     except Exception:  # noqa: BLE001
         pass
     return skip
+
+
+def _dir_pruner(root: Path, skip: Set[str]) -> Callable[[Any], bool]:
+    """THE pruning rule both walkers use: a directory is skipped when its
+    name is in the skip set or git ignores it.
+
+    Ignored paths are compared as REAL paths: the walk builds entry paths
+    from *root* as given, git answers from its resolved top, and a symlinked
+    checkout spells the two differently. The prefix is mapped once, so no
+    directory pays a ``realpath``. NEVER raises.
+    """
+    ignored = vcs_ignored_dirs(root)
+    root_str = str(root)
+    root_real = os.path.realpath(root_str)
+
+    def pruned(entry: Any) -> bool:
+        try:
+            if entry.name in skip:
+                return True
+            return bool(ignored) and os.path.normpath(
+                root_real + entry.path[len(root_str):]
+            ) in ignored
+        except Exception:  # noqa: BLE001 — unsure: walk it, as before
+            return False
+    return pruned
+
+
+def respect_vcs_ignore() -> bool:
+    """``JARVIS_TOOL_GLOB_RESPECT_GITIGNORE`` — default true."""
+    return os.environ.get(
+        "JARVIS_TOOL_GLOB_RESPECT_GITIGNORE", "1",
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def ignore_cache_ttl_s() -> float:
+    """``JARVIS_TOOL_GLOB_IGNORE_TTL_S`` — default 60. How long one
+    answer about a tree's ignored directories is reused."""
+    return _env_float("JARVIS_TOOL_GLOB_IGNORE_TTL_S", 60.0, minimum=0.0)
+
+
+_IGNORED_CACHE: Dict[str, Tuple[float, Tuple[float, ...], frozenset]] = {}
+_IGNORED_LOCK = threading.Lock()
+
+
+def _ignore_stamp(top: str) -> Tuple[float, ...]:
+    """mtimes of the ignore sources that change most: the top-level
+    ``.gitignore`` and the repository's ``info/exclude``. Nested
+    ``.gitignore`` files are covered by the TTL."""
+    stamps = []
+    for rel in (".gitignore", os.path.join(".git", "info", "exclude")):
+        try:
+            stamps.append(os.stat(os.path.join(top, rel)).st_mtime)
+        except OSError:
+            stamps.append(0.0)
+    return tuple(stamps)
+
+
+def vcs_ignored_dirs(root: Path) -> frozenset:
+    """Real paths of every directory git IGNORES under *root*'s work tree.
+
+    The fixed skip set names directories that are big everywhere. It cannot
+    name what THIS repository ignores, and `.worktrees/` is the case that
+    mattered: each L3 unit and the autonomous workspace keep a full copy of
+    the repo there, so a walk found every file once per copy. Glob returned
+    duplicates, and blast radius counted each copy of an importer as another
+    importer.
+
+    Asked of git once per tree, with ``--directory`` so an ignored directory
+    comes back as one entry rather than being walked, and cached until the
+    ignore files change or the TTL lapses. Not a git work tree, git absent,
+    or any failure → ``frozenset()``, which is exactly the previous
+    behaviour. NEVER raises.
+    """
+    if not respect_vcs_ignore():
+        return frozenset()
+    try:
+        import shutil
+        import subprocess
+        git = shutil.which("git")
+        if not git:
+            return frozenset()
+        top = subprocess.run(
+            [git, "-C", str(root), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=glob_timeout_s(),
+        ).stdout.strip()
+        if not top:
+            return frozenset()
+        top = os.path.realpath(top)
+        stamp = _ignore_stamp(top)
+        now = time.monotonic()
+        with _IGNORED_LOCK:
+            hit = _IGNORED_CACHE.get(top)
+            if hit and hit[1] == stamp and now - hit[0] < ignore_cache_ttl_s():
+                return hit[2]
+        out = subprocess.run(
+            [git, "-C", top, "ls-files", "-z", "--others", "--ignored",
+             "--exclude-standard", "--directory", "--no-empty-directory"],
+            capture_output=True, timeout=glob_timeout_s(),
+        )
+        if out.returncode != 0:
+            return frozenset()
+        dirs = frozenset(
+            os.path.normpath(os.path.join(top, rel.decode("utf-8", "replace")))
+            for rel in out.stdout.split(b"\0") if rel.endswith(b"/")
+        )
+        with _IGNORED_LOCK:
+            _IGNORED_CACHE[top] = (now, stamp, dirs)
+        return dirs
+    except Exception:  # noqa: BLE001 — an unanswerable question changes nothing
+        return frozenset()
 
 
 # ============================================================================
@@ -330,6 +441,8 @@ def bounded_glob(
             root=str(root), pattern=pattern_str,
         )
 
+    pruned = _dir_pruner(root, eff_skip)
+
     # Iterative DFS with explicit stack — no recursion to keep
     # call-stack bounded even on deep trees. Push the root path;
     # pop and process one dir at a time.
@@ -366,7 +479,7 @@ def bounded_glob(
                     except OSError:
                         is_dir = False
                     if is_dir:
-                        if name in eff_skip:
+                        if pruned(entry):
                             continue
                         stack.append(Path(entry.path))
                         continue
@@ -469,6 +582,7 @@ def iter_bounded_files(
     cap."""
     t0 = time.monotonic()
     eff_skip = skip_dirs if skip_dirs is not None else default_skip_dirs()
+    pruned = _dir_pruner(root, eff_skip)
     scanned = 0
     try:
         if not root.is_dir():
@@ -496,7 +610,7 @@ def iter_bounded_files(
                     except OSError:
                         is_dir = False
                     if is_dir:
-                        if name in eff_skip:
+                        if pruned(entry):
                             continue
                         stack.append(Path(entry.path))
                         continue
