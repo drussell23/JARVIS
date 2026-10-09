@@ -294,6 +294,26 @@ def _connect_timeout_s() -> float:
         return 0.5
 
 
+def _frame_limit() -> int:
+    """The attach socket's read limit, from the ONE frame budget both ends
+    share (``ui.block_protocol.frame_limit_bytes``). asyncio's own default is
+    64 KiB, below a block carrying a full tool result."""
+    try:
+        from backend.core.ouroboros.ui.block_protocol import frame_limit_bytes
+        return frame_limit_bytes()
+    except Exception:  # noqa: BLE001
+        return 4 * 1024 * 1024
+
+
+def _live_blocks_held() -> int:
+    """``JARVIS_ATTACH_LIVE_BLOCKS_MAX``: live blocks the bridge holds for
+    replay to a cockpit that attaches mid-flight (default 256)."""
+    try:
+        return max(8, int(os.environ.get("JARVIS_ATTACH_LIVE_BLOCKS_MAX", "") or 256))
+    except ValueError:
+        return 256
+
+
 def tool_activity_enabled() -> bool:
     """Master gate for the typed ``markup`` frame (CC-style tool blocks /
     diffs mirrored to attached cockpits). Default ON. NEVER raises."""
@@ -566,6 +586,11 @@ class CockpitAttachBridge:
         self._server: Optional[asyncio.AbstractServer] = None
         self._sentinel_task: Optional[asyncio.Task] = None
         self._clients: Set[asyncio.StreamWriter] = set()
+        # Latest revision of each LIVE transcript block, for cockpits that
+        # attach mid-flight (publish_block / _replay_live_blocks).
+        from collections import OrderedDict as _OD
+        self._live_blocks: "_OD[str, Any]" = _OD()
+        self._blocks_lock = threading.Lock()
         # Fire-and-forget attach-briefing tasks, kept referenced so a
         # scheduled greeting is not garbage-collected before it runs.
         self._briefing_tasks: Set["asyncio.Task"] = set()
@@ -600,8 +625,10 @@ class CockpitAttachBridge:
                     self._path.unlink()
             except OSError:
                 pass
+            from backend.core.ouroboros.ui.block_protocol import frame_limit_bytes
             self._server = await asyncio.start_unix_server(
                 self._on_client, path=str(self._path),
+                limit=frame_limit_bytes(),
             )
             try:
                 os.chmod(self._path, 0o600)
@@ -921,6 +948,100 @@ class CockpitAttachBridge:
                 loop.call_soon_threadsafe(self._broadcast, msg)
         except Exception:  # noqa: BLE001
             logger.debug("[CockpitAttach] markup publish degraded", exc_info=True)
+
+    # ---- typed blocks (ui.block_protocol) ----
+
+    def publish_block(self, block: Any) -> None:
+        """Publish one transcript block to every attached cockpit, ambient.
+
+        A cockpit that declared the block protocol gets the block itself and
+        re-renders it in place as revisions arrive. One that did not (an
+        older client, a thin client) gets the block's lines as ordinary
+        markup frames, once, when the block is final: a live revision means
+        nothing to a line renderer. The latest revision of every LIVE block
+        is held, so a cockpit that attaches mid-tool sees what is in flight.
+        Thread-safe, non-blocking. NEVER raises."""
+        try:
+            if not tool_activity_enabled():
+                return
+            with self._blocks_lock:
+                if block.final:
+                    self._live_blocks.pop(block.id, None)
+                else:
+                    self._live_blocks[block.id] = block
+                    self._live_blocks.move_to_end(block.id)
+                    while len(self._live_blocks) > _live_blocks_held():
+                        self._live_blocks.popitem(last=False)
+            if not self._clients:
+                if block.final:
+                    for line in block.lines:
+                        self._retain_unheard({"type": "markup", "text": str(line),
+                                              "ts": time.time()})
+                return
+            loop = self._loop
+            if loop is None or loop.is_closed():
+                return
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                self._broadcast_block(block)
+            else:
+                loop.call_soon_threadsafe(self._broadcast_block, block)
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitAttach] block publish degraded", exc_info=True)
+
+    def _renders_blocks(self, writer: Any, sessions: Dict[Any, str]) -> bool:
+        try:
+            from backend.core.ouroboros.battle_test.terminal_capabilities import (
+                capabilities_for,
+            )
+            caps = capabilities_for(sessions.get(writer))
+            return bool(caps is not None and caps.blocks)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _broadcast_block(self, block: Any) -> None:
+        """Deliver one block, per cockpit, in the form that cockpit renders."""
+        from backend.core.ouroboros.ui.block_protocol import encode_frame, fit
+        sessions = {w: sid for sid, w in self._sessions.items()}
+        as_block = encode_frame(block)
+        # The line form is bounded by the same rule as the block form: an
+        # oversized block reached a line-only cockpit as forty thousand
+        # frames.
+        fitted = fit(block) if block.final else None
+        as_lines = b"".join(
+            (json.dumps({"type": "markup", "text": str(line), "ts": time.time(),
+                         "addressed": False}, separators=(",", ":")) + "\n").encode()
+            for line in fitted.lines
+        ) if fitted is not None else b""
+        for w in list(self._clients):
+            data = as_block if (as_block and self._renders_blocks(w, sessions)) else as_lines
+            if not data:
+                continue
+            try:
+                if w.is_closing():
+                    self._drop(w)
+                    continue
+                w.write(data)
+            except Exception:  # noqa: BLE001 — ANY writer fault = drop
+                self._drop(w)
+        self.stats["blocks_published"] = self.stats.get("blocks_published", 0) + 1
+
+    def _replay_live_blocks(self, writer: Any, session: str) -> None:
+        """Send a newly declared block cockpit everything still live, in
+        creation order, so it joins mid-tool rather than mid-silence."""
+        try:
+            from backend.core.ouroboros.ui.block_protocol import encode_frame
+            with self._blocks_lock:
+                live = sorted(self._live_blocks.values(), key=lambda b: b.seq)
+            for block in live:
+                data = encode_frame(block)
+                if data and not writer.is_closing():
+                    writer.write(data)
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitAttach] live block replay degraded", exc_info=True)
 
     # ---- the Transactional Viewport Lock (autonomy pause refcount) ----
 
@@ -1671,6 +1792,8 @@ class CockpitAttachBridge:
                         _caps = TerminalCapabilities.from_wire(frame)
                         if _caps is not None and _sid:
                             declare(_sid, _caps)
+                            if _caps.blocks:
+                                self._replay_live_blocks(writer, _sid)
                     except Exception:  # noqa: BLE001
                         pass
                 elif ftype == "input":
@@ -1794,6 +1917,7 @@ class CockpitAttachClient:
         on_history_append: Optional[Callable[[str], None]] = None,
         on_autonomy_state: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_rewind_list: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_block: Optional[Callable[[Any], None]] = None,
         path: Optional[Path] = None,
     ) -> None:
         self._path = Path(path) if path is not None else attach_socket_path()
@@ -1824,6 +1948,10 @@ class CockpitAttachClient:
         self._on_autonomy_state = on_autonomy_state
         #: The Esc-Esc menu's hydration payload (locked restore points).
         self._on_rewind_list = on_rewind_list
+        #: Typed transcript blocks (ui.block_protocol). A cockpit declares the
+        #: protocol only when it can render it; without a handler the daemon
+        #: keeps sending this cockpit plain lines.
+        self._on_block = on_block
         #: This cockpit's identity for the life of the attachment. Declared
         #: on every outbound frame so the daemon can address answers back to
         #: the terminal that asked, instead of to all of them.
@@ -1868,7 +1996,8 @@ class CockpitAttachClient:
         retrying cannot help). NEVER raises."""
         try:
             self._reader, self._writer = await asyncio.wait_for(
-                asyncio.open_unix_connection(path=str(self._path)),
+                asyncio.open_unix_connection(
+                    path=str(self._path), limit=_frame_limit()),
                 timeout=timeout,
             )
             line = await asyncio.wait_for(
@@ -1980,6 +2109,11 @@ class CockpitAttachClient:
                 "wide_glyphs": self._wcwidth_available(),
                 "color_depth": depth,
             }
+            if self._on_block is not None:
+                from backend.core.ouroboros.ui.block_protocol import (
+                    BLOCK_PROTOCOL_VERSION,
+                )
+                frame["blocks"] = BLOCK_PROTOCOL_VERSION
             w.write((json.dumps(frame, separators=(",", ":")) + "\n").encode())
             return True
         except Exception:  # noqa: BLE001
@@ -2137,7 +2271,16 @@ class CockpitAttachClient:
             return
         try:
             while True:
-                line = await reader.readline()
+                try:
+                    line = await reader.readline()
+                except ValueError:
+                    # A frame over the read limit. `readline` has already
+                    # discarded through the next newline, so the stream is
+                    # back on a frame boundary: drop the one frame, keep the
+                    # session. Ending the read loop here detached the cockpit
+                    # over a single oversized line.
+                    logger.debug("[CockpitAttach] oversized frame skipped")
+                    continue
                 if not line:
                     break
                 try:
@@ -2145,6 +2288,14 @@ class CockpitAttachClient:
                 except (ValueError, TypeError):
                     continue
                 ftype = frame.get("type")
+                if ftype == "block":
+                    if self._on_block is not None:
+                        try:
+                            from backend.core.ouroboros.ui.block_protocol import Block
+                            self._on_block(Block.from_wire(frame.get("block")))
+                        except Exception:  # noqa: BLE001 — one bad frame, not the session
+                            pass
+                    continue
                 if ftype == "line":
                     self._safe_cb_text(self._on_line, str(frame.get("text", "")))
                 elif ftype == "markup":

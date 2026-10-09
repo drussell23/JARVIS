@@ -722,56 +722,6 @@ def _sparkline(values: List[float]) -> str:
     return "".join(chars)
 
 
-def _split_unified_diff(diff_text: str) -> List[Tuple[str, str]]:
-    """A unified patch, split into ``(path, section)`` per file.
-
-    A section starts at a ``diff --git`` line, or at a ``--- `` header that
-    is not already part of one, and runs to the next. A header is ``--- ``
-    IMMEDIATELY followed by ``+++ ``: a removed line whose text begins
-    ``-- `` (a SQL comment) also reads ``--- …`` and must stay in its hunk.
-    The path is the NEW side
-    (``+++ b/path``); a deletion has ``/dev/null`` there and is named by its
-    old side. Text with no ``@@`` hunk is not a diff (a candidate's full
-    content travels on the same preview field) and yields ``[]``. NEVER
-    raises.
-    """
-    try:
-        text = str(diff_text or "")
-        if "@@" not in text:
-            return []
-        sections: List[List[str]] = []
-        current: Optional[List[str]] = None
-        lines_in = text.split("\n")
-        for i, line in enumerate(lines_in):
-            header = (line.startswith("--- ") and i + 1 < len(lines_in)
-                      and lines_in[i + 1].startswith("+++ "))
-            # A `diff --git` section owns the `---/+++` pair that follows it.
-            owned = bool(current) and current[0].startswith("diff --git ") \
-                and not any(l.startswith("+++ ") for l in current)
-            if line.startswith("diff --git ") or (header and not owned):
-                current = [line]
-                sections.append(current)
-            elif current is not None:
-                current.append(line)
-        out: List[Tuple[str, str]] = []
-        for lines in sections:
-            old = new = ""
-            for line in lines:
-                if line.startswith("--- ") and not old:
-                    old = line[4:].split("\t")[0].strip()
-                elif line.startswith("+++ ") and not new:
-                    new = line[4:].split("\t")[0].strip()
-            path = new if new and new != "/dev/null" else old
-            if path.startswith(("a/", "b/")):
-                path = path[2:]
-            body = "\n".join(lines)
-            if path and "@@" in body:
-                out.append((path, body))
-        return out
-    except Exception:  # noqa: BLE001
-        return []
-
-
 # ══════════════════════════════════════════════════════════════
 # SerpentFlow — the flowing organism CLI
 # ══════════════════════════════════════════════════════════════
@@ -1073,8 +1023,8 @@ class SerpentFlow:
         # Per-op file updates (show_diff): files whose diff has rendered,
         # files announced before their diff existed, and whether the op's
         # reasoning has been spoken. A file renders once per op.
-        self._shown_diff_files: Dict[str, Set[str]] = {}
-        self._pending_diff_files: Dict[str, Set[str]] = {}
+        from backend.core.ouroboros.battle_test.file_updates import FileUpdates
+        self._file_updates = FileUpdates()
         self._reasoning_shown: Set[str] = set()
         # Dedup (op_id, round_index) set for tool-call preamble rendering.
         # A parallel batch of N tools emits N "start" narration events with
@@ -1892,8 +1842,7 @@ class SerpentFlow:
         get_inflight_tools().clear(op_id)
         # Per-op file-update state ends with the op; a long session must not
         # accumulate one set per op it has ever run.
-        self._shown_diff_files.pop(op_id, None)
-        self._pending_diff_files.pop(op_id, None)
+        self._file_updates.close(op_id)
         self._reasoning_shown.discard(op_id)
         # Update swarm tally + last_completed for the digest
         snap = self._swarm_snapshots.get(op_id)
@@ -3470,33 +3419,6 @@ class SerpentFlow:
                 self._op_line(op_id, line, essential=essential)
         return True
 
-    def _display_path(self, file_path: str) -> str:
-        """*file_path* as the operator knows it: relative to the tree it
-        lives in. APPLY writes into the execution root (an autonomous
-        worktree under `.worktrees/`), so the absolute path carried a
-        workspace name no operator has heard of. NEVER raises."""
-        text = str(file_path or "")
-        if not os.path.isabs(text):
-            return text
-        # The tree a file lives in is the nearest ancestor holding `.git` (a
-        # directory for a checkout, a FILE for a linked worktree). Asked of
-        # the filesystem rather than of configuration, it is right for the
-        # operator tree, the autonomous workspace and any L3 unit alike,
-        # whatever the environment says.
-        try:
-            real = os.path.realpath(text)
-            here = os.path.dirname(real)
-            while True:
-                if os.path.exists(os.path.join(here, ".git")):
-                    return os.path.relpath(real, here)
-                parent = os.path.dirname(here)
-                if parent == here:
-                    break
-                here = parent
-        except Exception:  # noqa: BLE001
-            pass
-        return text
-
     def show_diff(
         self, file_path: str, diff_text: str = "", op_id: str = "",
         reasoning: str = "",
@@ -3516,18 +3438,14 @@ class SerpentFlow:
         is nothing to show, so the file waits; when the diff arrives it
         renders; the completion only renders files that never got one.
         """
+        from backend.core.ouroboros.battle_test.file_updates import (
+            compose_update, git_diff,
+        )
         if not diff_text:
-            diff_text = self._get_git_diff(file_path)
-        if not diff_text:
-            self._pending_diff_files.setdefault(op_id, set()).add(
-                self._display_path(file_path))
+            diff_text = git_diff(file_path, str(self._repo_path))
+        shown_path = self._file_updates.claim(op_id, file_path, diff_text)
+        if shown_path is None:
             return
-        shown_path = self._display_path(file_path)
-        shown = self._shown_diff_files.setdefault(op_id, set())
-        if shown_path in shown:
-            return
-        shown.add(shown_path)
-        self._pending_diff_files.get(op_id, set()).discard(shown_path)
 
         _reason = reasoning or self._op_rationales.get(op_id, "")
         if _reason and op_id not in self._reasoning_shown:
@@ -3535,16 +3453,7 @@ class SerpentFlow:
             from backend.core.ouroboros.ui import deck_grammar as _deck
             self._op_line(op_id, _deck.voice(" ".join(_reason.split())),
                           essential=True)
-        try:
-            from backend.core.ouroboros.battle_test.tool_render_view import (
-                compose_if_enabled, store_for_view,
-            )
-            composed = compose_if_enabled(
-                "edit_file", shown_path, diff_text, op_id=op_id,
-                palette=_SEM, store=store_for_view(),
-            )
-        except Exception:  # noqa: BLE001 — never crash the render path
-            composed = None
+        composed = compose_update(shown_path, diff_text, op_id=op_id, palette=_SEM)
         if not self._emit_composed(op_id, composed, essential=True):
             from backend.core.ouroboros.ui import deck_grammar as _deck
             self._op_line(op_id, _deck.action("Update", shown_path),
@@ -3564,7 +3473,10 @@ class SerpentFlow:
         candidate's full content) has no hunks to show and renders as the
         files it names.
         """
-        sections = _split_unified_diff(diff_text)
+        from backend.core.ouroboros.battle_test.file_updates import (
+            display_path, split_unified_diff,
+        )
+        sections = split_unified_diff(diff_text)
         if sections:
             for path, section in sections:
                 self.show_diff(path, diff_text=section, op_id=op_id)
@@ -3572,7 +3484,7 @@ class SerpentFlow:
         from backend.core.ouroboros.ui import deck_grammar as _deck
         for tf in target_files or []:
             self._op_line(op_id, _deck.action(
-                "Update", self._display_path(tf), tone=_deck.PENDING_TONE),
+                "Update", display_path(tf), tone=_deck.PENDING_TONE),
                 essential=True)
 
     # ── NOTIFY_APPLY rich preview (V1) ────────────────────────────
@@ -3842,15 +3754,14 @@ class SerpentFlow:
         # on disk now); the rest already rendered when their diff did.
         for f in list(files_changed or ()):
             self.show_diff(f, op_id=op_id)
-        for f in sorted(self._pending_diff_files.pop(op_id, set())):
+        for f in self._file_updates.unresolved(op_id):
             from backend.core.ouroboros.ui import deck_grammar as _deck
             self._op_line(op_id, _deck.action("Update", f), essential=True)
-            self._shown_diff_files.setdefault(op_id, set()).add(f)
 
         # What changed is what the op's own updates showed, not what the
         # DECISION happened to list: change_engine's DECISION carries no
         # file list, so every landing read "0 files evolved".
-        changed = self._shown_diff_files.get(op_id) or set(files_changed or ())
+        changed = self._file_updates.changed(op_id) or set(files_changed or ())
         files_str = f"{len(changed)} file{'s' if len(changed) != 1 else ''}"
         cost_str = f" · 💰 ${cost_usd:.4f}" if cost_usd > 0 else ""
         collapse = self._op_collapse_enabled()
@@ -5099,68 +5010,6 @@ class SerpentFlow:
             f"  [{_SEM['dim']}]{'━' * width}[/{_SEM['dim']}]",
             highlight=False,
         )
-
-    def _is_untracked(self, file_path: str) -> bool:
-        """Is this path outside git's index? NEVER raises.
-
-        Answered with `ls-files --error-unmatch`, which is a pure index
-        lookup — no working-tree scan, so it stays cheap inside a tool loop.
-        A non-zero exit means git has never heard of the file.
-        """
-        try:
-            result = subprocess.run(
-                ["git", "ls-files", "--error-unmatch", "--", file_path],
-                cwd=self._repo_path, capture_output=True, text=True,
-                timeout=2,
-            )
-            return result.returncode != 0
-        except Exception:  # noqa: BLE001
-            return False
-
-    def _get_git_diff(self, file_path: str) -> str:
-        """The diff for a file, including one git does not track yet.
-
-        Two gaps this closes, both of which produced a silently empty diff:
-
-          * a NEW file is untracked, so every `git diff` form returns nothing
-            — exactly the case a `write_file` produces. `--no-index` against
-            /dev/null renders it as all-additions, which is what it is;
-          * three invocations at 5s each is up to 15 seconds inside a tool
-            loop that may edit repeatedly. The timeout is per-call and tight,
-            and the ladder stops at the first answer.
-
-        Returns "" on anything unreadable — `show_diff` then falls back to its
-        compact one-liner, so a missing diff costs a detail, never the line.
-        """
-        candidates = [
-            ["git", "diff", "--", file_path],
-            ["git", "diff", "--cached", "--", file_path],
-        ]
-        # `--no-index` against /dev/null renders ANY existing file as
-        # all-additions — including an UNCHANGED one. Gating it on the file
-        # actually being untracked is what keeps "nothing changed" meaning
-        # nothing changed; without the gate, every unmodified file an op
-        # touched would render as if it had just been written.
-        if self._is_untracked(file_path):
-            candidates.append(
-                ["git", "diff", "--no-index", "--", os.devnull, file_path],
-            )
-        for args in candidates:
-            try:
-                result = subprocess.run(
-                    args, cwd=self._repo_path,
-                    capture_output=True, text=True, timeout=2,
-                )
-                if result.stdout.strip():
-                    return result.stdout.strip()
-            except Exception:  # noqa: BLE001
-                continue
-        return ""
-
-
-    # ══════════════════════════════════════════════════════════
-    # ExecutionGraph rendering (Phase 3b multi-op visibility)
-    # ══════════════════════════════════════════════════════════
 
     def render_execution_graph(
         self,

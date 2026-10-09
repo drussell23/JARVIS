@@ -88,6 +88,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+import os
 import textwrap
 import time
 from collections import OrderedDict
@@ -403,6 +404,16 @@ def _humanise(code: object) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _live_tool_keys_max() -> int:
+    """``JARVIS_CLAUDE_STYLE_LIVE_TOOLS_MAX``: tool starts held awaiting
+    their completion (default 256). A start whose completion never comes
+    must not be held forever."""
+    try:
+        return max(8, int(os.environ.get("JARVIS_CLAUDE_STYLE_LIVE_TOOLS_MAX", "") or 256))
+    except ValueError:
+        return 256
+
+
 class ClaudeStyleTransport:
     """Drop-in alternative to :class:`SerpentTransport`. Renders
     CommProtocol messages in Claude Code's idiom: one line per op
@@ -465,6 +476,20 @@ class ClaudeStyleTransport:
         # cockpits as `stream_inflight` frames through the ONE producer in
         # stream_renderer, coalesced to `stream_flush_ms()`.
         self._streams: Dict[str, _StreamState] = {}
+        # An op's file changes: each file renders once, a file whose diff
+        # never arrived gets its header at completion. The SAME rule
+        # SerpentTransport uses (battle_test/file_updates.py).
+        from backend.core.ouroboros.battle_test.file_updates import FileUpdates
+        self._file_updates = FileUpdates()
+        # THE BLOCK SINK (ui/block_protocol). Wired by the harness to
+        # ``bridge.publish_block`` beside ``markup_mirror``. A tool call is one
+        # block: LIVE from its start (it re-renders in place on the cockpit),
+        # FINAL at its completion. ``None`` until wired: then completed blocks
+        # travel as plain mirrored lines, as before.
+        self.block_sink: Optional[Callable[[Any], None]] = None
+        from backend.core.ouroboros.ui.block_protocol import BlockClock
+        self._block_clock = BlockClock()
+        self._live_tools: "OrderedDict[tuple, List[Any]]" = OrderedDict()
         self._subscribe_narrative()
 
     # -- composer feed (CC2.1) --------------------------------------
@@ -557,6 +582,11 @@ class ClaudeStyleTransport:
             return
         if risk_tier == "routing":
             return  # internal routing decision, not an op start
+        if op_id in self._op_state:
+            # The pipeline restates an op's INTENT when its change reaches the
+            # apply stage. Treating that as a new op drew the header twice and
+            # reset the op's clock, so a two-minute landing read 0.0s.
+            return
 
         # Flush boot recovery summary on first real INTENT
         if self._boot_recovery_count > 0 and not self._boot_recovery_flushed:
@@ -628,12 +658,30 @@ class ClaudeStyleTransport:
         if tool_name:
             if payload.get("tool_starting"):
                 self._narrate_preamble(op_id, tool_name, payload)
+                self._tool_started(op_id, tool_name, payload)
                 return
             self._render_tool_call(op_id, tool_name, payload)
             return
+        phase = str(payload.get("phase", "") or "")
+        # An op's PRODUCT. This transport is the default renderer and it
+        # ignored the APPLY diff, so on the production cockpit a landing was
+        # `✓ … · 0.0s` and no code at all.
+        if phase.upper() == "APPLY" and payload.get("target_file"):
+            self._render_file_update(
+                op_id, str(payload["target_file"]),
+                str(payload.get("diff_text", "") or ""))
+            return
+        if phase in ("notify_apply_diff", "safe_auto_diff_preview"):
+            from backend.core.ouroboros.battle_test.file_updates import (
+                split_unified_diff,
+            )
+            for path, section in split_unified_diff(
+                    str(payload.get("diff_preview", "") or "")):
+                self._render_file_update(op_id, path, section)
+            return
         if not show_heartbeats():
             return
-        phase = str(payload.get("phase", "") or "").lower()
+        phase = phase.lower()
         if not phase or op_id not in self._op_state:
             return
         self._safe_print(f"  [dim]└ {phase}[/dim]")
@@ -677,12 +725,12 @@ class ClaudeStyleTransport:
         except Exception:  # noqa: BLE001 — composer fault → minimal line
             composed = None
         if composed is not None:
-            for line in (
-                composed.header_markup, composed.summary_markup,
-                *composed.body_lines_markup, composed.expansion_hint,
-            ):
-                if line:
-                    self._safe_print(f"  {line}")
+            self._tool_finished(op_id, tool_name, payload, [
+                f"  {line}" for line in (
+                    composed.header_markup, composed.summary_markup,
+                    *composed.body_lines_markup, composed.expansion_hint,
+                ) if line
+            ])
             return
         tone = _SEM["death"] if status not in ("success", "ok") else _SEM["dim"]
         head = (
@@ -721,9 +769,14 @@ class ClaudeStyleTransport:
         path_budget = max(20, line_chars() // 2)
 
         if outcome in ("completed", "applied", "auto_approved"):
-            files = payload.get("files_changed") or payload.get(
-                "affected_files",
-            ) or []
+            from backend.core.ouroboros.ui import deck_grammar as _deck
+            for _f in self._file_updates.unresolved(op_id):
+                self._safe_print(f"  {_deck.action('Update', _f)}")
+            # What changed is what this op's updates showed: change_engine's
+            # DECISION carries no file list.
+            files = sorted(self._file_updates.changed(op_id)) or list(
+                payload.get("files_changed") or payload.get("affected_files") or [])
+            self._file_updates.close(op_id)
             tail = f" [dim]{sep} {elapsed}"
             if files:
                 tail += f" {sep} {_escape(_short_path(files[0], path_budget))}"
@@ -797,8 +850,26 @@ class ClaudeStyleTransport:
     def _handle_postmortem(
         self, op_id: str, payload: Dict[str, Any],
     ) -> None:
-        """POSTMORTEM — explicit failure annotation. Symmetric to a
-        failed DECISION; some pipelines emit POSTMORTEM separately."""
+        """POSTMORTEM: every op's closure, not only a failed one.
+
+        Judged by ``CommProtocol.postmortem_is_failure`` (the failing phase
+        is the contract). A landing's POSTMORTEM (``root_cause="none"``)
+        rendered here as ``✗ Operation · postmortem: none``: every success
+        on the production cockpit ended in a failure line. A closure that is
+        not a failure closes the op as a no-op if no DECISION already did,
+        and is otherwise silent."""
+        from backend.core.ouroboros.governance.comm_protocol import CommProtocol
+        self._file_updates.close(op_id)
+        if not CommProtocol.postmortem_is_failure(payload):
+            state = self._op_state.pop(op_id, None)
+            if state is None:
+                return
+            cause = str(payload.get("root_cause") or "")
+            tail = f" [dim]{_theme.mark('dot')} no change {_theme.mark('dot')} " \
+                   f"{self._resolve_elapsed(state, payload)}[/dim]"
+            self._safe_print(self._lead(OpStatusGlyph.NOOP, state, tail=tail))
+            self._print_detail("" if cause == "none" else _humanise(cause))
+            return
         state = self._op_state.pop(op_id, None)
         elapsed = (
             self._resolve_elapsed(state, payload)
@@ -1085,6 +1156,128 @@ class ClaudeStyleTransport:
             if line.strip():
                 self._safe_print(line)
 
+    # -- blocks (ui/block_protocol) ----------------------------------
+
+    def _publish_block(self, block: Any) -> None:
+        """One block to the cockpit and, when final, the local console.
+
+        Through the block sink when wired: the bridge sends the block to
+        cockpits that render blocks and its final lines to those that do
+        not. Without a sink, a final block's lines take the mirrored path
+        every line always took, and a live block (which only means anything
+        to a block renderer) is not sent. NEVER raises."""
+        try:
+            sink = self.block_sink
+            if sink is not None:
+                try:
+                    sink(block)
+                except Exception:  # noqa: BLE001 — a sink fault never costs the line
+                    sink = None
+            if not block.final:
+                return
+            for line in block.lines:
+                if sink is None:
+                    self._safe_print(line)
+                else:
+                    self._print_local(line)
+        except Exception:  # noqa: BLE001
+            logger.debug("[claude_style_transport] block publish degraded",
+                         exc_info=True)
+
+    @staticmethod
+    def _tool_key(op_id: str, tool_name: str, payload: Dict[str, Any]) -> tuple:
+        return (op_id, tool_name, str(payload.get("tool_args_summary", "") or ""),
+                int(payload.get("round_index", 0) or 0))
+
+    def _tool_started(self, op_id: str, tool_name: str,
+                      payload: Dict[str, Any]) -> None:
+        """A tool call began: name it on the live channel (the heartbeat's
+        in-flight label) and open its LIVE block. NEVER raises."""
+        try:
+            from backend.core.ouroboros.battle_test.serpent_flow import tool_call_label
+            from backend.core.ouroboros.battle_test.tool_inflight import get_inflight_tools
+            from backend.core.ouroboros.ui import deck_grammar as _deck
+            from backend.core.ouroboros.ui.block_protocol import TOOL
+            label = tool_call_label(tool_name, str(payload.get("tool_args_summary", "") or ""))
+            get_inflight_tools().started(op_id, label)
+            if self.block_sink is None:
+                return
+            verb, _, rest = label.partition("(")
+            arg = rest[:-1] if rest.endswith(")") else rest
+            block = self._block_clock.open(
+                TOOL, op_id=op_id,
+                lines=(f"  {_deck.action(verb, arg, tone=_deck.PENDING_TONE)}",),
+                meta={"tool": tool_name})
+            self._live_tools.setdefault(self._tool_key(op_id, tool_name, payload), []).append(block)
+            while len(self._live_tools) > _live_tool_keys_max():
+                self._live_tools.popitem(last=False)
+            self._publish_block(block)
+        except Exception:  # noqa: BLE001
+            logger.debug("[claude_style_transport] tool start degraded", exc_info=True)
+
+    def _tool_finished(self, op_id: str, tool_name: str,
+                       payload: Dict[str, Any], lines: List[str]) -> None:
+        """A tool call completed: its live block becomes its final form in
+        place. A completion whose start was never seen opens and finishes in
+        one step. NEVER raises."""
+        try:
+            from backend.core.ouroboros.battle_test.serpent_flow import tool_call_label
+            from backend.core.ouroboros.battle_test.tool_inflight import get_inflight_tools
+            from backend.core.ouroboros.ui.block_protocol import FINAL, TOOL
+            get_inflight_tools().finished(op_id, tool_call_label(
+                tool_name, str(payload.get("tool_args_summary", "") or "")))
+            key = self._tool_key(op_id, tool_name, payload)
+            waiting = self._live_tools.get(key) or []
+            live = waiting.pop(0) if waiting else None
+            if not waiting:
+                self._live_tools.pop(key, None)
+            meta = {"tool": tool_name, "status": str(payload.get("status", "") or "success")}
+            block = (self._block_clock.revise(live, lines=tuple(lines), meta=meta, state=FINAL)
+                     if live is not None else
+                     self._block_clock.open(TOOL, op_id=op_id, lines=tuple(lines),
+                                            meta=meta, state=FINAL))
+            self._publish_block(block)
+        except Exception:  # noqa: BLE001
+            for line in lines:
+                self._safe_print(line)
+
+    def _render_file_update(self, op_id: str, file_path: str, diff_text: str) -> None:
+        """One file's change, once per op, as a final DIFF block. NEVER raises."""
+        try:
+            import os as _os
+            from backend.core.ouroboros.battle_test.file_updates import (
+                compose_update, git_diff,
+            )
+            from backend.core.ouroboros.ui import deck_grammar as _deck
+            from backend.core.ouroboros.ui.block_protocol import DIFF, FINAL
+            if not diff_text and not _os.path.isabs(file_path):
+                diff_text = git_diff(file_path, _os.getcwd())
+            shown = self._file_updates.claim(op_id, file_path, diff_text)
+            if shown is None:
+                return
+            composed = compose_update(shown, diff_text, op_id=op_id, palette=_SEM)
+            lines = [f"  {ln}" for ln in (
+                composed.header_markup, composed.summary_markup,
+                *composed.body_lines_markup, composed.expansion_hint,
+            ) if ln] if composed is not None else [f"  {_deck.action('Update', shown)}"]
+            self._publish_block(self._block_clock.open(
+                DIFF, op_id=op_id, lines=tuple(lines),
+                meta={"path": shown}, state=FINAL))
+        except Exception:  # noqa: BLE001
+            logger.debug("[claude_style_transport] file update degraded", exc_info=True)
+
+    def _print_local(self, text: str) -> None:
+        """The local console only (the cockpit got the line another way)."""
+        try:
+            console = self._console
+            if console is not None and hasattr(console, "print"):
+                from backend.core.ouroboros.ui.block_wrap import block
+                console.print(block(text), highlight=False)
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        logger.debug("[claude_style_transport] %s", text)
+
     def _safe_print(self, text: str) -> None:
         """Console.print with defensive try/except. Falls back to
         logger DEBUG if console is missing or print raises.
@@ -1102,15 +1295,7 @@ class ClaudeStyleTransport:
             except Exception:  # noqa: BLE001 — a mirror never breaks the render
                 logger.debug("[claude_style_transport] mirror degraded",
                              exc_info=True)
-        try:
-            console = self._console
-            if console is not None and hasattr(console, "print"):
-                from backend.core.ouroboros.ui.block_wrap import block
-                console.print(block(text), highlight=False)
-                return
-        except Exception:  # noqa: BLE001 — defensive
-            pass
-        logger.debug("[claude_style_transport] %s", text)
+        self._print_local(text)
 
     # -- RenderBackend Protocol (CC2.2) -----------------------------
     # ClaudeStyleTransport doubles as a RenderBackend so it can
@@ -1283,54 +1468,16 @@ class ClaudeStyleTransport:
             [diff hunks first ~5 lines, dim]
         """
         try:
+            # One file-update renderer for every source of one. This drew
+            # its own `Update(path)` with the path and diff text unescaped
+            # into markup and a third diff format.
             metadata = getattr(event, "metadata", None) or {}
             path = str(metadata.get("path", "") or "")
             if not path:
                 return
-            line = metadata.get("line")
-            line_repr = f":{line}" if line else ""
-            # Diff stats from metadata if present (added/removed)
-            added = metadata.get("added_lines")
-            removed = metadata.get("removed_lines")
-            diff_text = str(metadata.get("diff_text", "") or "")
-            self._safe_print(
-                f"  [bold]Update[/bold]("
-                f"[{_SEM['neural']}]{path}{line_repr}[/])"
-            )
-            if added is not None or removed is not None:
-                stats = []
-                if added is not None:
-                    stats.append(f"Added {added} lines")
-                if removed is not None:
-                    stats.append(f"removed {removed} lines")
-                if stats:
-                    self._safe_print(
-                        f"  [dim]{', '.join(stats)}[/dim]"
-                    )
-            elif diff_text:
-                # Fallback: count + and - lines from diff_text
-                added_n = sum(
-                    1 for ln in diff_text.splitlines()
-                    if ln.startswith("+") and not ln.startswith("+++")
-                )
-                removed_n = sum(
-                    1 for ln in diff_text.splitlines()
-                    if ln.startswith("-") and not ln.startswith("---")
-                )
-                if added_n or removed_n:
-                    self._safe_print(
-                        f"  [dim]Added {added_n} lines, "
-                        f"removed {removed_n} lines[/dim]"
-                    )
-                # First 5 lines of diff for context
-                preview_lines = diff_text.splitlines()[:5]
-                for prev in preview_lines:
-                    color = (
-                        "green" if prev.startswith("+")
-                        else "red" if prev.startswith("-")
-                        else "dim"
-                    )
-                    self._safe_print(f"    [{color}]{prev[:80]}[/{color}]")
+            self._render_file_update(
+                str(metadata.get("op_id", "") or ""), path,
+                str(metadata.get("diff_text", "") or ""))
         except Exception:  # noqa: BLE001 — defensive
             logger.debug(
                 "[claude_style_transport] _handle_file_ref failed",

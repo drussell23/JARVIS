@@ -683,6 +683,17 @@ class TranscriptFlow:
         except Exception:  # noqa: BLE001
             return [line]
 
+    def fork(self) -> "TranscriptFlow":
+        """A copy that continues from this flow's state without changing it.
+
+        For lines that are SHOWN after the history but not yet part of it
+        (live blocks): they get the rhythm they will have once frozen,
+        while the real flow only advances when they actually freeze."""
+        twin = TranscriptFlow()
+        twin._started, twin._pending_blank = self._started, self._pending_blank
+        twin._detail_open, twin._base = self._detail_open, self._base
+        return twin
+
     @staticmethod
     def _continue(raw: str) -> str:
         """A second ``⎿`` in one block becomes its column of spaces."""

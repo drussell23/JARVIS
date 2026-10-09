@@ -471,6 +471,12 @@ class BipartiteLayout:
         from backend.core.ouroboros.ui.deck_grammar import TranscriptFlow
         self._flow = TranscriptFlow()
         self._flow_lock = threading.Lock()
+        # The LIVE region: what is still happening, drawn after the history
+        # and rebuilt every frame (Ink's dynamic area beneath `<Static>`).
+        # Keyed, so independent producers (live blocks, the streaming tail)
+        # cannot overwrite each other; ordered by first use.
+        from collections import OrderedDict as _OD
+        self._live_regions: "_OD[str, tuple]" = _OD()
 
     # -- the Ouroboros hero animation -----------------------------------
 
@@ -554,11 +560,51 @@ class BipartiteLayout:
         actual mechanic, rather than a strip below the deck approximating
         it. NEVER raises.
         """
+        # Through the live region. It used to go to the buffer's pending slot,
+        # which `_visible_lines` never read (it reads `snapshot()`), so the
+        # streaming tail never reached the canvas at all.
+        self.set_live("stream", str(text or "").splitlines())
+
+    def set_live(self, key: str, lines: Any) -> None:
+        """Replace one producer's share of the live region. Empty clears it.
+        NEVER raises."""
         try:
-            self._buffer.set_pending(text)
+            shown = tuple(str(ln) for ln in (lines or ()))
+            with self._flow_lock:
+                if shown:
+                    self._live_regions[str(key)] = shown
+                else:
+                    self._live_regions.pop(str(key), None)
         except Exception:  # noqa: BLE001
             return
         self._invalidate_now()
+
+    def _transcript(self) -> Tuple[str, ...]:
+        """History then the live region: what the canvas sizes, scrolls and
+        draws. One view for all three, so the live tail cannot be counted by
+        one of them and missing from another."""
+        try:
+            return tuple(self._buffer.snapshot()) + tuple(self._live_lines())
+        except Exception:  # noqa: BLE001
+            return tuple(self._buffer.snapshot())
+
+    def _live_lines(self) -> List[str]:
+        """The live region as it will look once frozen: fed through a FORK of
+        the transcript flow, so its spacing continues the history's and the
+        real flow advances only when blocks actually freeze."""
+        try:
+            with self._flow_lock:
+                if not self._live_regions:
+                    return []
+                flow = self._flow.fork()
+                regions = list(self._live_regions.values())
+            out: List[str] = []
+            for lines in regions:
+                for ln in lines:
+                    out.extend(flow.feed(ln))
+            return out
+        except Exception:  # noqa: BLE001
+            return []
 
     def push_raw(self, markup_line: str) -> None:
         """Push a pre-formatted Rich-markup line (e.g. piped Sentinel stdout).
@@ -769,7 +815,7 @@ class BipartiteLayout:
                 hero = getattr(self._sprite, "rows", None)
                 want = int(hero) if isinstance(hero, int) and hero > 0 else 12
                 return max(3, min(want + chrome, ceiling))
-            lines = len(self._buffer.snapshot())
+            lines = len(self._transcript())
             if lines <= 0:
                 # Not zero: the idle line still needs somewhere to be drawn.
                 return min(1 + chrome, ceiling)
@@ -795,7 +841,7 @@ class BipartiteLayout:
     def scroll_metrics(self) -> tuple:
         """``(total, budget)`` — what the scroll keys clamp against."""
         try:
-            return len(self._buffer.snapshot()), self._line_budget()
+            return len(self._transcript()), self._line_budget()
         except Exception:  # noqa: BLE001
             return 0, 1
 
@@ -810,7 +856,7 @@ class BipartiteLayout:
         """
         try:
             budget = self._line_budget()
-            snap = self._buffer.snapshot()
+            snap = self._transcript()
             if not scrollback_enabled():
                 return self._anchor(list(snap[-budget:]))
             visible, above, below = self._viewport.window(

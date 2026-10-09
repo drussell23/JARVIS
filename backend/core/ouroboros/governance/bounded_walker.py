@@ -255,7 +255,7 @@ def vcs_ignored_dirs(root: Path) -> frozenset:
         if not git:
             return frozenset()
         top = subprocess.run(
-            [git, "-C", str(root), "rev-parse", "--show-toplevel"],
+            [git, "--no-optional-locks", "-C", str(root), "rev-parse", "--show-toplevel"],
             capture_output=True, text=True, timeout=glob_timeout_s(),
         ).stdout.strip()
         if not top:
@@ -268,7 +268,7 @@ def vcs_ignored_dirs(root: Path) -> frozenset:
             if hit and hit[1] == stamp and now - hit[0] < ignore_cache_ttl_s():
                 return hit[2]
         out = subprocess.run(
-            [git, "-C", top, "ls-files", "-z", "--others", "--ignored",
+            [git, "--no-optional-locks", "-C", top, "ls-files", "-z", "--others", "--ignored",
              "--exclude-standard", "--directory", "--no-empty-directory"],
             capture_output=True, timeout=glob_timeout_s(),
         )

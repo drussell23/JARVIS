@@ -122,6 +122,9 @@ class TerminalCapabilities:
     wide_glyphs: bool = True
     #: 1 / 8 / 256 / 16_777_216, or 0 for "did not say".
     color_depth: int = 0
+    #: The typed-block protocol version this cockpit renders
+    #: (``ui.block_protocol.BLOCK_PROTOCOL_VERSION``); 0 = lines only.
+    blocks: int = 0
 
     def clamped(self) -> "TerminalCapabilities":
         lo, hi = _min_cols(), _max_cols()
@@ -150,6 +153,7 @@ class TerminalCapabilities:
                 theme=theme,
                 wide_glyphs=bool(msg.get("wide_glyphs", True)),
                 color_depth=int(msg.get("color_depth") or 0),
+                blocks=max(0, int(msg.get("blocks") or 0)),
             ).clamped()
         except Exception:  # noqa: BLE001
             return None

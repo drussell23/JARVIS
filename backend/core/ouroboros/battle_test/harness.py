@@ -5793,6 +5793,11 @@ class BattleTestHarness:
                     _pot = getattr(self, "_per_op_transport", None)
                     if _pot is not None and hasattr(_pot, "markup_mirror"):
                         _pot.markup_mirror = bridge.publish_markup
+                    # Typed transcript blocks (ui.block_protocol): a tool call
+                    # is LIVE on the cockpit from its start and becomes its
+                    # final form in place. Same idiom, same bridge.
+                    if _pot is not None and hasattr(_pot, "block_sink"):
+                        _pot.block_sink = bridge.publish_block
                     # The token stream rides the telemetry lane. A DIRECT
                     # bridge ref, same idiom as markup_mirror above — never
                     # the module-global helper, whose _ACTIVE_BRIDGE is

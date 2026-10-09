@@ -4982,10 +4982,40 @@ def run_attach(console: Any) -> int:
             except Exception:  # noqa: BLE001 — a transcript miss never breaks attach
                 pass
 
+        # THE COMPONENT TREE (ui.block_store). Typed blocks from the daemon:
+        # a LIVE block (a tool call in flight) is drawn in the canvas's live
+        # region and re-rendered in place as revisions arrive; a FINAL block
+        # freezes into the transcript exactly once, through the same ambient
+        # path every daemon line takes, so the deck's severity routing and the
+        # transcript's block rhythm apply to it unchanged.
+        from backend.core.ouroboros.ui.block_store import BlockStore, block_lines
+
+        def _freeze_block(block: Any) -> None:
+            for _line in block_lines(block):
+                _markup_sink(_line, False)
+
+        def _show_live(blocks: Any) -> None:
+            from backend.core.ouroboros.battle_test.bipartite_layout import (
+                get_active_canvas,
+            )
+            canvas = get_active_canvas()
+            if canvas is not None and hasattr(canvas, "set_live"):
+                canvas.set_live("blocks", [ln for b in blocks for ln in block_lines(b)])
+
+        block_store = BlockStore(on_freeze=_freeze_block, on_live=_show_live)
+
+        def _on_telemetry(frame: Any) -> None:
+            ui.on_telemetry(frame)
+            # The 1 Hz heartbeat is the clock live blocks expire on: a block
+            # nothing has refreshed within its TTL was abandoned upstream.
+            if isinstance(frame, dict) and frame.get("kind") == "heartbeat":
+                block_store.expire()
+
         client = CockpitAttachClient(
             on_hydration=_on_hydration, on_line=_print_line,
             on_markup=_markup_sink,
-            on_telemetry=ui.on_telemetry,
+            on_block=block_store.apply,
+            on_telemetry=_on_telemetry,
             # Gates as DATA — the id + deadline the shield needs to defer one
             # safely and still answer the right op.
             on_prompt=lambda frame: _on_prompt_frame(ui, frame),
@@ -5179,6 +5209,10 @@ def run_attach(console: Any) -> int:
                 highlight=False,
             )
         finally:
+            # The stream is over: nothing is live any more. What was live
+            # freezes, marked interrupted, rather than staying drawn as if
+            # still running.
+            block_store.abandon()
             await client.close()
         return 0
 

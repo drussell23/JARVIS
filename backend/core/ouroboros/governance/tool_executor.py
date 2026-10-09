@@ -2147,8 +2147,10 @@ class ToolExecutor:
                 # Paths come back repo-relative because git runs IN the root.
                 # `-E` matches rg's syntax for the alternations and classes the
                 # model writes; `-I` skips binaries as rg does.
+                # `--no-optional-locks`: a search must never take the index
+                # lock, which a timeout kill would leave behind.
                 cmd = [
-                    git_path, "grep", "-n", "-I", "-E", "--untracked",
+                    git_path, "--no-optional-locks", "grep", "-n", "-I", "-E", "--untracked",
                     "--max-count", "200", "-e", pattern, "--", file_glob,
                 ]
                 cwd = str(self._repo_root)

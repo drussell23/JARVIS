@@ -25,7 +25,7 @@ from rich.console import Console
 from rich.text import Text
 
 from backend.core.ouroboros.battle_test.serpent_flow import (
-    SerpentFlow, _actionable_suggestion, _split_unified_diff,
+    SerpentFlow, _actionable_suggestion,
 )
 from backend.core.ouroboros.battle_test.tool_render_registry import (
     ToolStatus, get_descriptor, is_elision_line,
@@ -181,8 +181,9 @@ def test_hunk_headers_are_gaps_not_text():
 def test_a_multi_file_patch_splits_and_a_sql_comment_stays_in_its_hunk():
     patch = ("diff --git a/a.sql b/a.sql\n--- a/a.sql\n+++ b/a.sql\n@@ -1,2 +1,1 @@\n"
              "--- old comment\n keep\n--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n-x\n+y\n")
-    assert [p for p, _ in _split_unified_diff(patch)] == ["a.sql", "b.py"]
-    assert _split_unified_diff("def f():\n    return 1\n") == []
+    from backend.core.ouroboros.battle_test.file_updates import split_unified_diff
+    assert [p for p, _ in split_unified_diff(patch)] == ["a.sql", "b.py"]
+    assert split_unified_diff("def f():\n    return 1\n") == []
 
 
 def test_a_clipped_diff_ends_in_an_elision_not_a_numbered_line():

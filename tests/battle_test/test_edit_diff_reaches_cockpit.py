@@ -25,6 +25,7 @@ from typing import Any, List
 
 import pytest
 
+from backend.core.ouroboros.battle_test.file_updates import git_diff
 from backend.core.ouroboros.battle_test.serpent_flow import (
     SerpentFlow,
     _extract_path_arg,
@@ -32,6 +33,8 @@ from backend.core.ouroboros.battle_test.serpent_flow import (
 
 _REPO = pathlib.Path(__file__).resolve().parents[2]
 _SRC = _REPO / "backend/core/ouroboros/battle_test/serpent_flow.py"
+#: The diff reader moved here (2026-10-09) so both per-op renderers share it.
+_DIFF_SRC = _REPO / "backend/core/ouroboros/battle_test/file_updates.py"
 
 
 @pytest.fixture()
@@ -59,7 +62,7 @@ def _flow(repo: pathlib.Path) -> Any:
 
 def test_a_modified_file_yields_its_diff(git_repo: pathlib.Path) -> None:
     (git_repo / "mod.py").write_text("def f():\n    return 2\n")
-    diff = _flow(git_repo)._get_git_diff("mod.py")
+    diff = git_diff("mod.py", str(git_repo))
     assert "-    return 1" in diff and "+    return 2" in diff
 
 
@@ -68,7 +71,7 @@ def test_a_BRAND_NEW_file_renders_as_additions(git_repo: pathlib.Path) -> None:
     diff` form — and that is exactly what `write_file` creates. Rendering it
     as all-additions is what it is."""
     (git_repo / "brand_new.py").write_text("print('hello')\n")
-    diff = _flow(git_repo)._get_git_diff("brand_new.py")
+    diff = git_diff("brand_new.py", str(git_repo))
     assert diff, "a new file produced no diff at all"
     assert "+print('hello')" in diff
 
@@ -76,13 +79,13 @@ def test_a_BRAND_NEW_file_renders_as_additions(git_repo: pathlib.Path) -> None:
 def test_a_staged_change_is_found(git_repo: pathlib.Path) -> None:
     (git_repo / "mod.py").write_text("def f():\n    return 9\n")
     subprocess.run(["git", "add", "mod.py"], cwd=git_repo, check=False)
-    assert "return 9" in _flow(git_repo)._get_git_diff("mod.py")
+    assert "return 9" in git_diff("mod.py", str(git_repo))
 
 
 def test_an_unchanged_file_yields_nothing(git_repo: pathlib.Path) -> None:
     """Empty is correct here — `show_diff` then falls back to its compact
     one-liner, so a missing diff costs a detail, never the line."""
-    assert _flow(git_repo)._get_git_diff("mod.py") == ""
+    assert git_diff("mod.py", str(git_repo)) == ""
 
 
 def test_an_unchanged_TRACKED_file_is_not_shown_as_new(
@@ -92,14 +95,12 @@ def test_an_unchanged_TRACKED_file_is_not_shown_as_new(
     existing file as all-additions, so an untouched tracked file appeared to
     have just been written. The fallback is gated on the file genuinely being
     untracked."""
-    flow = _flow(git_repo)
-    assert flow._is_untracked("mod.py") is False
-    assert flow._get_git_diff("mod.py") == ""
+    assert git_diff("mod.py", str(git_repo)) == ""
 
 
 def test_an_untracked_file_is_recognised(git_repo: pathlib.Path) -> None:
     (git_repo / "fresh.py").write_text("x = 1\n")
-    assert _flow(git_repo)._is_untracked("fresh.py") is True
+    assert "+x = 1" in git_diff("fresh.py", str(git_repo))
 
 
 def test_the_untracked_check_is_an_index_lookup() -> None:
@@ -107,33 +108,33 @@ def test_the_untracked_check_is_an_index_lookup() -> None:
     scan, so it stays cheap inside a tool loop that edits repeatedly."""
     import ast
 
-    for node in ast.walk(ast.parse(_SRC.read_text())):
-        if isinstance(node, ast.FunctionDef) and node.name == "_is_untracked":
+    for node in ast.walk(ast.parse(_DIFF_SRC.read_text())):
+        if isinstance(node, ast.FunctionDef) and node.name == "git_diff":
             body = ast.unparse(node)
             assert "ls-files" in body and "--error-unmatch" in body
             return
-    pytest.fail("_is_untracked is gone")
+    pytest.fail("git_diff is gone")
 
 
 def test_a_missing_file_never_raises(git_repo: pathlib.Path) -> None:
-    assert isinstance(_flow(git_repo)._get_git_diff("nope.py"), str)
+    assert isinstance(git_diff("nope.py", str(git_repo)), str)
 
 
 def test_outside_a_git_repo_never_raises(tmp_path: pathlib.Path) -> None:
     (tmp_path / "loose.py").write_text("x = 1\n")
-    assert isinstance(_flow(tmp_path)._get_git_diff("loose.py"), str)
+    assert isinstance(git_diff("loose.py", str(tmp_path)), str)
 
 
 def test_the_lookup_is_time_bounded() -> None:
     """Three invocations at 5s each is up to 15 seconds inside a tool loop
     that may edit repeatedly."""
-    src = _SRC.read_text()
-    for node in ast.walk(ast.parse(src)):
-        if isinstance(node, ast.FunctionDef) and node.name == "_get_git_diff":
-            body = ast.unparse(node)
-            assert "timeout=2" in body, "the per-call timeout was loosened"
-            return
-    pytest.fail("_get_git_diff is gone")
+    import os
+    from backend.core.ouroboros.battle_test import file_updates
+    os.environ.pop("JARVIS_FILE_UPDATE_GIT_TIMEOUT_S", None)
+    src = _DIFF_SRC.read_text()
+    assert "JARVIS_FILE_UPDATE_GIT_TIMEOUT_S" in src and "or 2.0" in src, (
+        "the per-call timeout is no longer bounded by default")
+    assert callable(file_updates.git_diff)
 
 
 # --------------------------------------------------------------------------
