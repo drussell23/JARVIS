@@ -34,8 +34,17 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_POLL_S = float(os.environ.get("JARVIS_INTENT_DISCOVERY_INTERVAL_S", "900"))
 _MAX_INTENTS_PER_CYCLE = int(os.environ.get("JARVIS_INTENT_DISCOVERY_MAX_PER_CYCLE", "5"))
-_DW_MODEL = os.environ.get("JARVIS_INTENT_DISCOVERY_MODEL", "Qwen/Qwen3.5-35B-A3B-FP8")
+# No model name in code: unset -> the answering tier's own default.
+_DW_MODEL = os.environ.get("JARVIS_INTENT_DISCOVERY_MODEL", "").strip() or None
 _DW_MAX_TOKENS = int(os.environ.get("JARVIS_INTENT_DISCOVERY_MAX_TOKENS", "2000"))
+
+
+def _any_tier_available() -> bool:
+    try:
+        from backend.core.ouroboros.governance.rt_gate import any_tier_available
+        return bool(any_tier_available())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _conception_grounding_enabled() -> bool:
@@ -266,10 +275,22 @@ class IntentDiscoverySensor:
         strategic = self._get_strategic()
         dream = self._get_dream_engine()
 
-        # Gate: need at least DW + (strategic OR oracle)
-        if dw is None:
+        # Gate: a model tier + (strategic OR oracle). Synthesis goes through
+        # the RT gate, so ANY tier serves -- it required a DoubleWord handle
+        # and so never ran on a local-only host (2026-10-09).
+        if dw is None and not _any_tier_available():
             logger.debug(
-                "[IntentDiscovery] cycle %d skipped: no DW provider", self._cycle
+                "[IntentDiscovery] cycle %d skipped: no model tier available",
+                self._cycle,
+            )
+            return []
+        # Background work on a lane that may serve one request at a time:
+        # never start while live work holds it.
+        from backend.core.ouroboros.governance.lane_idleness import default_lane
+        if default_lane().busy():
+            logger.debug(
+                "[IntentDiscovery] cycle %d deferred: model lane busy with live work",
+                self._cycle,
             )
             return []
 
@@ -368,18 +389,34 @@ class IntentDiscoverySensor:
 
         # Phase 4: DW synthesis — ask the model to generate concrete intents
         prompt = self._build_synthesis_prompt(context_parts)
+        from backend.core.ouroboros.governance.lane_idleness import (
+            Preempted, run_unless_wanted,
+        )
+        from backend.core.ouroboros.governance.rt_gate import gate_completion
         try:
-            raw = await dw.prompt_only(
-                prompt=prompt,
-                model=_DW_MODEL,
-                caller_id="intent_discovery_sensor",
-                response_format={"type": "json_object"},
-                sla="strict",   # deadline-bound cognition → RT tier (2026-07-21)
-                max_tokens=_DW_MAX_TOKENS,
+            raw = await run_unless_wanted(
+                gate_completion(
+                    prompt,
+                    caller_id="intent_discovery_sensor",
+                    response_format={"type": "json_object"},
+                    max_tokens=_DW_MAX_TOKENS,
+                    dw_provider=dw,
+                    dw_model=_DW_MODEL,
+                    prefer="dw",
+                    accept=lambda text: bool(self._parse_intents(text, unique_results)),
+                ),
+                default_lane(),
+                holding=1,
             )
+        except Preempted:
+            logger.info(
+                "[IntentDiscovery] cycle %d: synthesis preempted — live work "
+                "wanted the model lane", self._cycle,
+            )
+            return []
         except Exception as exc:
             logger.warning(
-                "[IntentDiscovery] cycle %d: DW synthesis failed: %s",
+                "[IntentDiscovery] cycle %d: synthesis failed: %s",
                 self._cycle, exc,
             )
             return []
@@ -848,6 +885,7 @@ class IntentDiscoverySensor:
             "total_submitted": self._total_intents_submitted,
             "cooldown_pool": len(self._cooldown_files),
             "has_dw": self._get_dw() is not None,
+            "has_model_tier": _any_tier_available(),
             "has_oracle": self._get_oracle() is not None,
             "has_strategic": self._get_strategic() is not None,
             "has_dream": self._get_dream_engine() is not None,

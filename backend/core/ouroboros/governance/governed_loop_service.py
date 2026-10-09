@@ -1685,7 +1685,13 @@ class GovernedLoopService:
         self._vm_capability: Optional[dict] = None
 
         # Concurrency & dedup
-        self._active_ops: Set[str] = set()
+        # Stamps when membership last changed: background lane users
+        # (lane_idleness) measure the quiet period exactly, not by polling.
+        from backend.core.ouroboros.governance.lane_idleness import (
+            LaneIdleness, StampedOpSet, set_default_lane,
+        )
+        self._active_ops: Set[str] = StampedOpSet()
+        set_default_lane(LaneIdleness(self._active_ops))
         # PRD §27.5: the reader `start()` lends to `why_engine`, held so
         # teardown can take back exactly what this instance gave — see
         # `_release_why_live_source`. Assigned here, before `start()`, so a
@@ -5959,6 +5965,7 @@ class GovernedLoopService:
                 ledger=self._ledger,
                 exhaustion_watcher=_exhaustion_watcher,
                 jprime=primary,
+                repo_root=self._config.project_root,
             )
             self._exhaustion_watcher = _exhaustion_watcher
 
@@ -6743,17 +6750,22 @@ class GovernedLoopService:
                 os.environ.get("JARVIS_SELF_CRITIQUE_ENABLED", "true").lower() == "true"
             )
             if _self_critique_enabled:
+                from backend.core.ouroboros.governance.rt_gate import (
+                    any_tier_available,
+                )
                 from backend.core.ouroboros.governance.self_critique import (
                     CritiqueEngine,
-                    DoublewordCritiqueProvider,
+                    GateCritiqueProvider,
                     set_default_engine,
                 )
                 from backend.core.ouroboros.governance.user_preference_memory import (
                     get_default_store,
                 )
                 _dw_ref = getattr(self, "_doubleword_ref", None)
-                if _dw_ref is not None:
-                    _critique_provider = DoublewordCritiqueProvider(
+                # The critique goes through the RT gate; what it needs is
+                # ANY tier the gate would try, not a DoubleWord handle.
+                if _dw_ref is not None or any_tier_available():
+                    _critique_provider = GateCritiqueProvider(
                         dw_provider=_dw_ref,
                         max_tokens=int(
                             os.environ.get("JARVIS_CRITIQUE_MAX_TOKENS", "512")
@@ -6782,14 +6794,15 @@ class GovernedLoopService:
                     self._orchestrator.set_critique_engine(self._critique_engine)
                     set_default_engine(self._critique_engine)
                     logger.info(
-                        "[GLS] Self-critique engine wired (provider=doubleword, "
+                        "[GLS] Self-critique engine wired (provider=rt_gate, "
                         "user_prefs=%s, memory_engine=%s)",
                         "yes" if _user_store is not None else "no",
                         "yes" if _memory_engine is not None else "no",
                     )
                 else:
                     logger.info(
-                        "[GLS] Self-critique skipped: DoublewordProvider not available"
+                        "[GLS] Self-critique skipped: no model tier available "
+                        "(local lane off, no paid lane admitted)"
                     )
             else:
                 logger.info("[GLS] Self-critique disabled via JARVIS_SELF_CRITIQUE_ENABLED")

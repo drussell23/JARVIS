@@ -29,6 +29,21 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _POLL_INTERVAL_S = float(os.environ.get("JARVIS_PERF_REGRESSION_INTERVAL_S", "3600"))
+def _record_epoch(record: Any) -> float:
+    """A record's timestamp as epoch seconds -- the store yields
+    ``datetime``; anything else (a float, nothing) still orders."""
+    ts = getattr(record, "timestamp", None)
+    if hasattr(ts, "timestamp"):
+        try:
+            return float(ts.timestamp())
+        except Exception:  # noqa: BLE001
+            return 0.0
+    try:
+        return float(ts or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 _BASELINE_WINDOW = int(os.environ.get("JARVIS_PERF_BASELINE_WINDOW", "20"))
 _RECENT_WINDOW = int(os.environ.get("JARVIS_PERF_RECENT_WINDOW", "5"))
 _LATENCY_REGRESSION_FACTOR = float(
@@ -240,28 +255,38 @@ class PerformanceRegressionSensor:
             logger.debug("[PerfSensor] PerformanceRecordPersistence not available")
             return []
 
-        # Get all records, grouped by task_type
+        # Records per task type, through the store's own API. The sensor
+        # called ``persistence.get_all()``, which the store has never had:
+        # the AttributeError was logged at DEBUG and the sensor never judged
+        # a single record (2026-10-09). Task types come from each model's
+        # most recent window -- a type absent from every recent window has
+        # no recent regression to find -- and each type's window is then
+        # read across ALL models by the store's per-task query (the JSON
+        # backend has none; its grouped records serve instead).
+        window = _BASELINE_WINDOW + _RECENT_WINDOW
         try:
-            all_records = persistence.get_all()
+            by_model = await persistence.load_records(limit=window)
         except Exception:
-            logger.debug("[PerfSensor] Failed to read performance records")
+            logger.warning("[PerfSensor] performance records unreadable", exc_info=True)
             return []
-
-        if len(all_records) < _BASELINE_WINDOW + _RECENT_WINDOW:
-            return []  # Insufficient data
-
-        # Group by task_type
+        grouped: Dict[str, list] = {}
+        for records_of_model in (by_model or {}).values():
+            for record in records_of_model:
+                grouped.setdefault(getattr(record, "task_type", "unknown"), []).append(record)
         by_type: Dict[str, list] = {}
-        for record in all_records:
-            task_type = getattr(record, "task_type", "unknown")
-            by_type.setdefault(task_type, []).append(record)
+        for task_type, fallback in grouped.items():
+            try:
+                exact = await persistence.get_records_by_task(task_type, limit=window)
+            except Exception:
+                exact = []
+            by_type[task_type] = list(exact) or fallback
 
         for task_type, records in by_type.items():
             if len(records) < _BASELINE_WINDOW + _RECENT_WINDOW:
                 continue
 
             # Sort by timestamp (oldest first)
-            records.sort(key=lambda r: getattr(r, "timestamp", 0))
+            records.sort(key=_record_epoch)
 
             baseline = records[-(_BASELINE_WINDOW + _RECENT_WINDOW):-_RECENT_WINDOW]
             recent = records[-_RECENT_WINDOW:]

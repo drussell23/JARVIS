@@ -42,7 +42,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -257,12 +257,32 @@ async def plan_and_route_once(router: Any, *, repo_root: "Optional[str]" = None)
         from backend.core.ouroboros.governance.conception_proposal_bridge import (  # noqa: PLC0415
             get_default_bridge,
         )
-        await get_default_bridge().route(list(steps), router)
-        logger.info(
-            "[EpistemicPlanner] cycle: %d sub-roadmap step(s) -> conception "
-            "bridge (EV-scored: route or incubate)", len(steps),
-        )
-        return len(steps)
+        outcomes = await get_default_bridge().route(list(steps), router) or []
+        # Report what the bridge DID, not what was handed to it: it returns
+        # [] when its own master is off, and a proposal parked awaiting a
+        # human acknowledgement is not work the organism will do. The old
+        # line logged "N steps" in every one of those cases.
+        tally: Dict[str, int] = {}
+        for outcome in outcomes:
+            key = (
+                getattr(outcome, "ingest_result", "") or getattr(outcome, "reason", "")
+                if getattr(outcome, "routed", False)
+                else getattr(outcome, "reason", "")
+            ) or "unknown"
+            tally[key] = tally.get(key, 0) + 1
+        enqueued = tally.get("enqueued", 0)
+        if not outcomes:
+            logger.info(
+                "[EpistemicPlanner] cycle: %d step(s) synthesized, 0 routed — "
+                "the conception bridge is off or declined the batch", len(steps),
+            )
+        else:
+            logger.info(
+                "[EpistemicPlanner] cycle: %d step(s) -> %s",
+                len(steps),
+                ", ".join(f"{k}={v}" for k, v in sorted(tally.items())),
+            )
+        return enqueued
     except Exception:  # noqa: BLE001 — autonomous planning must never break intake
         logger.debug("[EpistemicPlanner] cycle degraded", exc_info=True)
         return 0

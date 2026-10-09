@@ -222,6 +222,11 @@ class DocStalenessSensor:
         self._merkle_full_scans: int = 0
 
     async def start(self) -> None:
+        if not sensor_enabled():
+            # No poll task, no "Started" line: a disabled sensor that
+            # announced itself and woke every interval to do nothing.
+            logger.info("[DocSensor] not started — JARVIS_DOC_STALENESS_ENABLED is off")
+            return
         self._running = True
         self._task = asyncio.create_task(
             self._poll_loop(), name=f"doc_staleness_sensor_{self._repo}"

@@ -55,6 +55,7 @@ default + wires the orchestrator call site.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Optional, Sequence
@@ -171,7 +172,57 @@ def review_plan_for_generate_injection(
             op_id=op_id, findings=(),
             skip_reason="hook_service_exception",
         )
+    return _injection_from(review, op_id, bridge)
 
+
+async def areview_plan_for_generate_injection(
+    *,
+    op_id: str,
+    plan_text: str,
+    target_files: Sequence[str] = (),
+    risk_tier_name: Optional[str] = None,
+    service: Optional[AdversarialReviewerService] = None,
+    provider=None,
+    bridge=None,
+) -> GenerateInjection:
+    """:func:`review_plan_for_generate_injection` for the pipeline: the
+    review is AWAITED (a model call must not hold the event loop), and a
+    service built without a provider is handed the RT-gate lane -- so the
+    reviewer finally reviews. Same render + bridge steps, same never-raises
+    contract; a cancellation propagates."""
+    svc = service or get_default_service()
+    if provider is None:
+        try:
+            from backend.core.ouroboros.governance.adversarial_reviewer_provider import (  # noqa: PLC0415
+                default_review_provider,
+            )
+            provider = default_review_provider()
+        except Exception:  # noqa: BLE001 -- no lane → the service skips no_provider
+            provider = None
+    try:
+        review = await svc.areview_plan(
+            op_id=op_id,
+            plan_text=plan_text,
+            target_files=target_files,
+            risk_tier_name=risk_tier_name,
+            provider=provider,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[AdversarialReviewerHook] op=%s service raised "
+            "(should be best-effort): %s", op_id, exc,
+        )
+        review = AdversarialReview(
+            op_id=op_id, findings=(),
+            skip_reason="hook_service_exception",
+        )
+    return _injection_from(review, op_id, bridge)
+
+
+def _injection_from(review: AdversarialReview, op_id: str, bridge) -> GenerateInjection:
+    """Render + bridge, shared by both entries."""
     # 2. Render the GENERATE-prompt injection.
     injection = ""
     if not review.was_skipped and review.findings:
@@ -313,5 +364,6 @@ __all__ = [
     "GenerateInjection",
     "feed_review_to_bridge",
     "inject_into_generate_prompt",
+    "areview_plan_for_generate_injection",
     "review_plan_for_generate_injection",
 ]

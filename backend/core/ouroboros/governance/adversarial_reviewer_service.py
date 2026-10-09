@@ -54,6 +54,8 @@ Slice 5 graduation flips the default + wires the orchestrator hook.
 """
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import logging
 import os
@@ -61,7 +63,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Protocol, Sequence
+from typing import Any, Optional, Protocol, Sequence
 
 from backend.core.ouroboros.governance.adversarial_reviewer import (
     AdversarialReview,
@@ -272,6 +274,56 @@ class AdversarialReviewerService:
         ``"NOTIFY_APPLY"`` / ``"APPROVAL_REQUIRED"``) so this module
         avoids importing the risk_tier enum (authority cage).
         """
+        gate = self._preflight(op_id, plan_text, target_files, risk_tier_name, None)
+        if isinstance(gate, AdversarialReview):
+            return gate
+        provider, prompt = gate
+        try:
+            result = provider.review(prompt)
+        except Exception as exc:  # noqa: BLE001
+            return self._provider_failed(op_id, exc)
+        return self._finish(op_id, result, target_files)
+
+    async def areview_plan(
+        self,
+        *,
+        op_id: str,
+        plan_text: str,
+        target_files: Sequence[str] = (),
+        risk_tier_name: Optional[str] = None,
+        provider: Optional[ReviewProvider] = None,
+    ) -> AdversarialReview:
+        """:meth:`review_plan` for an async caller. The provider's
+        ``review`` may be a coroutine (a real model call) or a plain
+        function; either way the event loop is never held by it. A
+        per-call ``provider`` serves when the service was built without
+        one -- the integration layer supplies the lane, so this module's
+        only I/O stays its audit ledger. Never raises; a cancellation
+        propagates."""
+        gate = self._preflight(op_id, plan_text, target_files, risk_tier_name, provider)
+        if isinstance(gate, AdversarialReview):
+            return gate
+        chosen, prompt = gate
+        try:
+            result = chosen.review(prompt)
+            if inspect.isawaitable(result):
+                result = await result
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return self._provider_failed(op_id, exc)
+        return self._finish(op_id, result, target_files)
+
+    def _preflight(
+        self,
+        op_id: str,
+        plan_text: str,
+        target_files: Sequence[str],
+        risk_tier_name: Optional[str],
+        provider: Optional[ReviewProvider],
+    ):
+        """Skip paths 1-4, shared by both entries. Returns a skipped
+        :class:`AdversarialReview`, or ``(provider, prompt)``."""
         # 1. Master-off short-circuit.
         if not is_enabled():
             return self._skip(op_id, "master_off")
@@ -284,25 +336,22 @@ class AdversarialReviewerService:
         if not plan_text or not str(plan_text).strip():
             return self._skip(op_id, "empty_plan")
 
-        # 4. Provider check.
-        provider = self._provider
-        if provider is None:
-            # Slice 5 graduation will wire a default Claude provider
-            # via build_adversarial_reviewer_service(). Until then,
-            # skip silently so the orchestrator wiring stays harmless.
+        # 4. Provider check: the service's own, else the caller's.
+        chosen = self._provider if self._provider is not None else provider
+        if chosen is None:
             return self._skip(op_id, "no_provider")
+        return chosen, build_review_prompt(plan_text, target_files)
 
-        # 5. Build prompt + call provider.
-        prompt = build_review_prompt(plan_text, target_files)
-        try:
-            result = provider.review(prompt)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[AdversarialReviewer] op=%s provider raised: %s",
-                op_id, exc,
-            )
-            return self._skip(op_id, "provider_error", model_used="")
+    def _provider_failed(self, op_id: str, exc: BaseException) -> AdversarialReview:
+        logger.warning(
+            "[AdversarialReviewer] op=%s provider raised: %s", op_id, exc,
+        )
+        return self._skip(op_id, "provider_error", model_used="")
 
+    def _finish(
+        self, op_id: str, result: Any, target_files: Sequence[str],
+    ) -> AdversarialReview:
+        """Steps 5-8 on the provider's answer, shared by both entries."""
         if not isinstance(result, ReviewProviderResult):
             logger.warning(
                 "[AdversarialReviewer] op=%s provider returned "

@@ -57,6 +57,7 @@ __all__ = [
     "PROFILES",
     "ProductionEnvelope",
     "build",
+    "PRESENTATION_KEYS",
     "export_lines",
     "hydrate",
 ]
@@ -74,6 +75,28 @@ PROFILES: Dict[str, Tuple[int, int, float]] = {
     "soak": (9000, 1800, 0.50),
     "cockpit": (3600, 900, 0.50),
 }
+
+#: The ONLY values a profile may add: its presentation surface. Everything
+#: that changes what the organism DOES is in the shared core of
+#: :func:`build`, so a soak measures the organism the operator runs; a test
+#: pins that two profiles differ only in :data:`PRESENTATION_KEYS`.
+_PRESENTATION: Dict[str, Dict[str, object]] = {
+    "cockpit": {
+        "JARVIS_OV_PRESENTATION": "cockpit",
+        "JARVIS_PRESENTATION_RESTRAINT_ENABLED": True,
+        "JARVIS_REPL_COMPLETION_ENABLED": True,
+        "JARVIS_REPL_INPUT_POLISH_ENABLED": True,
+        "JARVIS_LIVE_STATUS_LINE_ENABLED": True,
+        "JARVIS_OP_COLLAPSE_ENABLED": True,
+        "JARVIS_TOOL_RENDER_REGISTRY_ENABLED": True,
+        "JARVIS_NARRATIVE_INTENT_ENABLED": True,
+        "JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED": True,
+        "JARVIS_BTW_ENABLED": True,
+        # The Yellow-tier preview's on-screen veto window.
+        "JARVIS_NOTIFY_APPLY_DELAY_S": 8,
+    },
+}
+PRESENTATION_KEYS = frozenset(k for layer in _PRESENTATION.values() for k in layer)
 
 
 def _bg_pool_size() -> int:
@@ -332,31 +355,39 @@ def build(
         "JARVIS_ORANGE_PR_ENABLED": False,
         # --- the approval gate (see phase 3) --------------------------------
         "JARVIS_APPROVAL_DEADLINE_S": approval,
+        # --- pipeline behaviour: ONE organism ------------------------------
+        # These lived in the cockpit-only block, so `ov` and a soak routed
+        # big files and scoped L2 repair differently -- soak results did not
+        # describe the organism the operator runs (and swarm routing only
+        # matched because the clone's .env happened to set it).
+        "JARVIS_SWARM_ROUTING_ENABLED": True,
+        "JARVIS_L2_SYMBOL_SCOPED_ENABLED": True,
+        # The NOTIFY_APPLY review branch. Its window is spent only while an
+        # operator is attached: in a process nobody has attached to, the
+        # coordinator answers SKIPPED (auto-apply with notice) instead of
+        # expiring every review into a reject. So one setting serves both.
+        # Review branches stay LOCAL; the air-gap above stops them reaching
+        # origin.
+        "JARVIS_REVIEW_BRANCH_ENABLED": True,
+        "JARVIS_REVIEW_TIMEOUT_S": 900,
+        # Cross-session continuity: the last sessions' outcomes (read-only,
+        # at most a few summary.json files) inform this one's context.
+        "JARVIS_LAST_SESSION_SUMMARY_ENABLED": True,
+        # NOT armed, each for a stated reason:
+        #   JARVIS_CONVERSATION_BRIDGE_ENABLED -- headless, its only source is
+        #     postmortem lines, which LessonMemory already injects; arming it
+        #     duplicates them into a 32k window.
+        #   JARVIS_EPISTEMIC_PLANNER_ENABLED / JARVIS_CONCEPTION_BRIDGE_ENABLED
+        #     -- every proposal is routed requires_human_ack=True and parks
+        #     until a human acknowledges it; unattended it is a sink. Arming
+        #     it is a governance decision (who may sanction model-invented
+        #     work), not a capability switch.
+        #   JARVIS_AWE_TRIGGER_ENABLED -- spawns a NEW soak on DoubleWord
+        #     recovery; inside a running soak that is a second organism on
+        #     the same GPU.
     }
 
-    if key == "cockpit":
-        values.update({
-            # Presentation — the cockpit's own surface. These do not touch
-            # execution; the budgets above are identical to the soak's,
-            # which is the point of unifying them.
-            "JARVIS_OV_PRESENTATION": "cockpit",
-            "JARVIS_PRESENTATION_RESTRAINT_ENABLED": True,
-            "JARVIS_REPL_COMPLETION_ENABLED": True,
-            "JARVIS_REPL_INPUT_POLISH_ENABLED": True,
-            "JARVIS_LIVE_STATUS_LINE_ENABLED": True,
-            "JARVIS_OP_COLLAPSE_ENABLED": True,
-            "JARVIS_TOOL_RENDER_REGISTRY_ENABLED": True,
-            "JARVIS_NARRATIVE_INTENT_ENABLED": True,
-            "JARVIS_TOOL_PREAMBLE_FALLBACK_ENABLED": True,
-            "JARVIS_BTW_ENABLED": True,
-            "JARVIS_SWARM_ROUTING_ENABLED": True,
-            "JARVIS_L2_SYMBOL_SCOPED_ENABLED": True,
-            "JARVIS_NOTIFY_APPLY_DELAY_S": 8,
-            "JARVIS_REVIEW_TIMEOUT_S": 900,
-            # Review branches stay LOCAL. The lane may build them; the
-            # air-gap above is what stops them reaching origin.
-            "JARVIS_REVIEW_BRANCH_ENABLED": True,
-        })
+    values.update(_PRESENTATION.get(key, {}))
 
     return ProductionEnvelope(
         profile=key,

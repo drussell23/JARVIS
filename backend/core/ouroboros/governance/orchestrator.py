@@ -8940,20 +8940,16 @@ class GovernedOrchestrator:
             # ---- Risk floor override (REPL /risk command) ----
             # JARVIS_RISK_CEILING env var sets the minimum risk tier floor.
             # E.g. /risk notify_apply → everything is at least NOTIFY_APPLY.
-            _risk_floor_str = os.environ.get("JARVIS_RISK_CEILING", "")
-            if _risk_floor_str:
-                _floor_map = {
-                    "SAFE_AUTO": RiskTier.SAFE_AUTO,
-                    "NOTIFY_APPLY": RiskTier.NOTIFY_APPLY,
-                    "APPROVAL_REQUIRED": RiskTier.APPROVAL_REQUIRED,
-                }
-                _floor = _floor_map.get(_risk_floor_str.upper())
-                if _floor is not None and risk_tier.value < _floor.value:
-                    logger.info(
-                        "[Orchestrator] GATE: risk floor %s → escalating %s to %s; op=%s",
-                        _risk_floor_str, risk_tier.name, _floor.name, ctx.op_id,
-                    )
-                    risk_tier = _floor
+            from backend.core.ouroboros.governance.risk_tier_floor import (
+                apply_operator_risk_override,
+            )
+            _before_override = risk_tier
+            risk_tier, _override = apply_operator_risk_override(risk_tier)
+            if _override is not None:
+                logger.info(
+                    "[Orchestrator] GATE: risk floor %s → escalating %s to %s; op=%s",
+                    _override, _before_override.name, risk_tier.name, ctx.op_id,
+                )
 
             # ---- SemanticGuardian: deterministic pre-APPLY pattern check ----
             #
@@ -9517,53 +9513,16 @@ class GovernedOrchestrator:
                     # does — so downstream APPLY routing is unchanged.
                     # SKIPPED / FAILED outcomes fall through to the legacy
                     # rich-preview / plain-sleep path below.
-                    _review_handled = False
-                    try:
-                        from backend.core.ouroboros.governance.review_coordinator import (
-                            get_default_coordinator,
-                            is_master_flag_enabled as _review_flag_on,
-                            ReviewDecision,
-                        )
-                        from backend.core.ouroboros.governance.review_branch_manager import (
-                            ReviewBranchManager,
-                        )
-                        if _review_flag_on() and _changes:
-                            _coordinator = get_default_coordinator()
-                            if _coordinator.branch_manager is None:
-                                _coordinator.attach_branch_manager(
-                                    ReviewBranchManager(self._config.project_root),
-                                )
-                            _files_for_review = [
-                                (c.path, c.new_content)
-                                for c in _changes
-                                if getattr(c, "status", "") != "deleted"
-                            ]
-                            if _files_for_review:
-                                _review = await _coordinator.coordinate_review(
-                                    ctx.op_id, _files_for_review,
-                                    risk_tier="notify_apply",
-                                    summary=_reason or "",
-                                    cancel_check=_cancel_check,
-                                )
-                                if _review.decision in (
-                                    ReviewDecision.ACCEPTED,
-                                    ReviewDecision.REJECTED,
-                                    ReviewDecision.EXPIRED,
-                                ):
-                                    _cancelled = not _review.decision.implies_apply
-                                    _review_handled = True
-                                    logger.info(
-                                        "[Orchestrator] review-branch decision "
-                                        "op=%s decision=%s elapsed=%.1fs",
-                                        ctx.op_id, _review.decision.value,
-                                        _review.elapsed_s,
-                                    )
-                    except Exception:
-                        logger.debug(
-                            "[Orchestrator] review_coordinator hook failed; "
-                            "falling through to legacy preview",
-                            exc_info=True,
-                        )
+                    from backend.core.ouroboros.governance.review_coordinator import (
+                        coordinate_notify_apply_review,
+                    )
+                    _review_outcome = await coordinate_notify_apply_review(
+                        self._config.project_root, ctx.op_id, _changes,
+                        summary=_reason or "", cancel_check=_cancel_check,
+                    )
+                    _review_handled = _review_outcome is not None
+                    if _review_handled:
+                        _cancelled = _review_outcome[0]
                     # When _review_handled, the legacy preview branches
                     # below short-circuit — see the elif chain. _cancelled
                     # carries the operator decision either way.

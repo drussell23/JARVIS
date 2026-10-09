@@ -298,20 +298,16 @@ class GATERunner(PhaseRunner):
             )
 
         # ---- Risk floor override (REPL /risk command) ----
-        _risk_floor_str = os.environ.get("JARVIS_RISK_CEILING", "")
-        if _risk_floor_str:
-            _floor_map = {
-                "SAFE_AUTO": RiskTier.SAFE_AUTO,
-                "NOTIFY_APPLY": RiskTier.NOTIFY_APPLY,
-                "APPROVAL_REQUIRED": RiskTier.APPROVAL_REQUIRED,
-            }
-            _floor = _floor_map.get(_risk_floor_str.upper())
-            if _floor is not None and risk_tier.value < _floor.value:
-                logger.info(
-                    "[Orchestrator] GATE: risk floor %s → escalating %s to %s; op=%s",
-                    _risk_floor_str, risk_tier.name, _floor.name, ctx.op_id,
-                )
-                risk_tier = _floor
+        from backend.core.ouroboros.governance.risk_tier_floor import (
+            apply_operator_risk_override,
+        )
+        _before_override = risk_tier
+        risk_tier, _override = apply_operator_risk_override(risk_tier)
+        if _override is not None:
+            logger.info(
+                "[Orchestrator] GATE: risk floor %s → escalating %s to %s; op=%s",
+                _override, _before_override.name, risk_tier.name, ctx.op_id,
+            )
 
         # ---- SemanticGuardian: deterministic pre-APPLY pattern check ----
         _guardian_findings: list = []
@@ -847,8 +843,21 @@ class GATERunner(PhaseRunner):
                 _serpent_flow = getattr(orch._stack, "serpent_flow", None)
                 _cancel_check = lambda: orch._is_cancel_requested(ctx.op_id)
                 _cancelled = False
+                _cancel_reason = "user_rejected_notify_apply"
 
-                if _serpent_flow is not None and hasattr(_serpent_flow, "show_notify_apply_preview"):
+                # IDE-native review branch: decides when enabled and a
+                # reviewer exists; otherwise None and the preview below runs.
+                from backend.core.ouroboros.governance.review_coordinator import (
+                    coordinate_notify_apply_review,
+                )
+                _review = await coordinate_notify_apply_review(
+                    orch._config.project_root, ctx.op_id, _changes,
+                    summary=_reason or "", cancel_check=_cancel_check,
+                )
+
+                if _review is not None:
+                    _cancelled, _cancel_reason = _review
+                elif _serpent_flow is not None and hasattr(_serpent_flow, "show_notify_apply_preview"):
                     logger.info(
                         "[Orchestrator] NOTIFY_APPLY rich preview — op=%s "
                         "files=%d delay=%.1fs",
@@ -905,15 +914,15 @@ class GATERunner(PhaseRunner):
                 if _cancelled:
                     ctx = ctx.advance(
                         OperationPhase.CANCELLED,
-                        terminal_reason_code="user_rejected_notify_apply",
+                        terminal_reason_code=_cancel_reason,
                     )
                     await orch._record_ledger(
                         ctx, OperationState.FAILED,
-                        {"reason": "user_rejected_notify_apply"},
+                        {"reason": _cancel_reason},
                     )
                     return PhaseResult(
                         next_ctx=ctx, next_phase=None, status="fail",
-                        reason="user_rejected_notify_apply",
+                        reason=_cancel_reason,
                         artifacts={"risk_tier": risk_tier, "best_candidate": best_candidate},
                     )
         # ---- end verbatim transcription ----

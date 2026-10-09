@@ -53,6 +53,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
@@ -195,6 +196,73 @@ def _read(path: Path) -> str:
         return ""
 
 
+_SKIP_DIRS = frozenset({
+    ".git", ".venv", "node_modules", "__pycache__", ".pytest_cache",
+    ".tox", "dist", "build", ".mypy_cache", "htmlcov",
+})
+
+
+class _SourceCorpus:
+    """Every Python file of ONE analysis cycle, listed once, read once,
+    parsed once, shared by every analyzer.
+
+    Each analyzer used to ``rglob`` the whole repo (descending into
+    ``.worktrees`` and virtualenvs and discarding the hits after) and re-read
+    and re-parse every file itself -- five walks and up to five parses per
+    file per cycle -- and the cycle overran its 60s process-pool deadline
+    every time it ran (2026-10-09). The file list comes from the shared
+    ``repo_state.module_index`` (pruned during the walk, rebuilt only when the
+    tree moves); the sensor's own skip list still applies."""
+
+    def __init__(
+        self, repo_root: Path, *,
+        only: Optional[Sequence[Path]] = None,
+        texts: Optional[Dict[Path, str]] = None,
+    ) -> None:
+        """``only`` restricts the corpus to a batch of files (the incremental
+        cycle's stale set); ``texts`` supplies contents already read."""
+        self.root = Path(repo_root)
+        self._paths: Optional[Tuple[Path, ...]] = (
+            tuple(Path(p) for p in only) if only is not None else None
+        )
+        self._text: Dict[Path, str] = dict(texts or {})
+        self._tree: Dict[Path, Optional[ast.Module]] = {}
+
+    def _all(self) -> Tuple[Path, ...]:
+        if self._paths is None:
+            try:
+                from backend.core.ouroboros.governance.repo_state import module_index
+                found: Iterable[Path] = module_index(self.root).paths()
+            except Exception:  # noqa: BLE001 -- the shared index is an optimisation
+                found = _iter_py_files(self.root)
+            kept = []
+            for p in found:
+                try:
+                    parts = p.relative_to(self.root).parts
+                except ValueError:
+                    parts = p.parts
+                if not any(part in _SKIP_DIRS for part in parts) and p.is_file():
+                    kept.append(p)
+            self._paths = tuple(kept)
+        return self._paths
+
+    def paths(self, under: Optional[Path] = None) -> Tuple[Path, ...]:
+        if under is None:
+            return self._all()
+        base = Path(under)
+        return tuple(p for p in self._all() if p == base or base in p.parents)
+
+    def text(self, path: Path) -> str:
+        if path not in self._text:
+            self._text[path] = _read(path)
+        return self._text[path]
+
+    def tree(self, path: Path) -> Optional[ast.Module]:
+        if path not in self._tree:
+            self._tree[path] = _safe_parse(self.text(path))
+        return self._tree[path]
+
+
 def _rel(path: Path, repo_root: Path) -> str:
     try:
         return str(path.relative_to(repo_root))
@@ -324,14 +392,14 @@ def _return_annotation_kind(fn: ast.AST) -> str:
 
 
 def analyze_contract_drift(
-    *, repo_root: Path,
+    *, repo_root: Path, corpus: Optional[_SourceCorpus] = None,
 ) -> List[DeepAnalysisFinding]:
     """Walk every Python file; for each function/method, compare
     docstring + annotation promises against the implementation."""
     out: List[DeepAnalysisFinding] = []
-    for path in _iter_py_files(repo_root):
-        src = _read(path)
-        tree = _safe_parse(src)
+    corpus = corpus or _SourceCorpus(repo_root)
+    for path in corpus.paths():
+        tree = corpus.tree(path)
         if tree is None:
             continue
         rel_path = _rel(path, repo_root)
@@ -723,12 +791,12 @@ def _has_stem_overlap(
 
 
 def analyze_purpose_drift(
-    *, repo_root: Path,
+    *, repo_root: Path, corpus: Optional[_SourceCorpus] = None,
 ) -> List[DeepAnalysisFinding]:
     out: List[DeepAnalysisFinding] = []
-    for path in _iter_py_files(repo_root):
-        src = _read(path)
-        tree = _safe_parse(src)
+    corpus = corpus or _SourceCorpus(repo_root)
+    for path in corpus.paths():
+        tree = corpus.tree(path)
         if tree is None:
             continue
         module_doc = ast.get_docstring(tree) or ""
@@ -782,69 +850,73 @@ def analyze_purpose_drift(
 #   pass 2 — for each def, grep every other file for its name
 
 
+def _public_defs_of(path: Path, tree: Optional[ast.Module], repo_root: Path) -> List[Tuple[str, int]]:
+    """``(name, lineno)`` of the top-level public functions *path* defines,
+    when it is a non-test, non-``__init__`` module under ``backend/``.
+    Deliberately narrow: we don't try to track class methods (would need
+    per-class scoping + inheritance analysis), and we skip ``__init__.py``
+    (those are re-exports by convention). One rule for the whole-corpus and
+    the incremental paths."""
+    backend = Path(repo_root) / "backend"
+    if tree is None or path.name == "__init__.py":
+        return []
+    if not (path == backend or backend in path.parents):
+        return []
+    if path.name.startswith("test_") or "/tests/" in str(path):
+        return []
+    out: List[Tuple[str, int]] = []
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name.startswith("_"):
+            continue
+        # Dunder / protocol-ish names don't count — __init__ etc.
+        if node.name.startswith("__") and node.name.endswith("__"):
+            continue
+        out.append((node.name, node.lineno))
+    return out
+
+
 def _index_public_defs(
-    repo_root: Path,
+    repo_root: Path, corpus: Optional[_SourceCorpus] = None,
 ) -> Dict[str, Tuple[Path, int]]:
     """name → (file, lineno) for every top-level public function in
-    ``backend/``. Deliberately narrow: we don't try to track class
-    methods (would need per-class scoping + inheritance analysis),
-    and we skip ``__init__.py`` (those are re-exports by convention)."""
+    ``backend/`` (see :func:`_public_defs_of`)."""
     out: Dict[str, Tuple[Path, int]] = {}
     backend = repo_root / "backend"
     if not backend.is_dir():
         return out
-    for path in _iter_py_files(backend):
-        if path.name == "__init__.py":
-            continue
-        # Skip test files.
-        if path.name.startswith("test_") or "/tests/" in str(path):
-            continue
-        src = _read(path)
-        tree = _safe_parse(src)
-        if tree is None:
-            continue
-        for node in tree.body:
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            if node.name.startswith("_"):
-                continue
-            # Dunder / protocol-ish names don't count — __init__ etc.
-            if node.name.startswith("__") and node.name.endswith("__"):
-                continue
+    corpus = corpus or _SourceCorpus(repo_root)
+    for path in corpus.paths(backend):
+        for name, lineno in _public_defs_of(path, corpus.tree(path), repo_root):
             # First definition wins; duplicates are rare but we don't
             # want to overwrite a real-backend-function with a re-export.
-            if node.name not in out:
-                out[node.name] = (path, node.lineno)
+            out.setdefault(name, (path, lineno))
     return out
 
 
-def analyze_orphan_surface(
-    *, repo_root: Path,
+_IDENTIFIER = re.compile(r"\b[A-Za-z_]\w*\b")
+
+
+def _identifiers(text: str) -> Set[str]:
+    return set(_IDENTIFIER.findall(text or ""))
+
+
+def _orphans_from(
+    defs: Dict[str, Tuple[str, int]],
+    files_containing: Dict[str, int],
+    own_tokens: Dict[str, Set[str]],
 ) -> List[DeepAnalysisFinding]:
+    """Orphan findings from per-file facts: a definition is referenced
+    elsewhere iff the number of files containing its name, less its own
+    file, is non-zero. ``defs`` maps name -> (rel_path, lineno)."""
     out: List[DeepAnalysisFinding] = []
-    defs = _index_public_defs(repo_root)
-    if not defs:
-        return out
-    # Build one concatenated corpus of "everywhere except the file
-    # itself" per definition. For efficiency we read each file once
-    # and check which def names appear in it.
-    file_cache: Dict[Path, str] = {}
-    for path in _iter_py_files(repo_root):
-        file_cache[path] = _read(path)
-    # For each definition, scan every OTHER file for a reference.
-    for name, (def_path, lineno) in defs.items():
-        referenced = False
-        # Compile once per name.
-        pattern = re.compile(rf"\b{re.escape(name)}\b")
-        for other_path, text in file_cache.items():
-            if other_path == def_path:
-                continue
-            if pattern.search(text):
-                referenced = True
-                break
-        if referenced:
+    for name, (rel_path, lineno) in defs.items():
+        elsewhere = files_containing.get(name, 0) - (
+            1 if name in own_tokens.get(rel_path, ()) else 0
+        )
+        if elsewhere > 0:
             continue
-        rel_path = _rel(def_path, repo_root)
         specifics = f"public function {name} defined but never referenced"
         fid = _finding_hash("orphan_surface", rel_path, specifics)
         out.append(DeepAnalysisFinding(
@@ -861,6 +933,30 @@ def analyze_orphan_surface(
             },
         ))
     return out
+
+
+def analyze_orphan_surface(
+    *, repo_root: Path, corpus: Optional[_SourceCorpus] = None,
+) -> List[DeepAnalysisFinding]:
+    """One pass over the corpus: for every identifier, the number of files
+    it appears in (this was one regex per definition over every file --
+    definitions x corpus -- which alone overran the cycle deadline)."""
+    corpus = corpus or _SourceCorpus(repo_root)
+    defs_abs = _index_public_defs(repo_root, corpus)
+    if not defs_abs:
+        return []
+    defs = {name: (_rel(p, repo_root), ln) for name, (p, ln) in defs_abs.items()}
+    def_files = {rel for rel, _ln in defs.values()}
+    files_containing: Dict[str, int] = {}
+    own_tokens: Dict[str, Set[str]] = {}
+    for path in corpus.paths():
+        tokens = _identifiers(corpus.text(path))
+        for token in tokens:
+            files_containing[token] = files_containing.get(token, 0) + 1
+        rel = _rel(path, repo_root)
+        if rel in def_files:
+            own_tokens[rel] = tokens
+    return _orphans_from(defs, files_containing, own_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -906,16 +1002,19 @@ def _is_identity_literal(node: ast.AST) -> bool:
     return v is not None and not isinstance(v, bool) and v is not Ellipsis
 
 
-def analyze_latent_defects(*, repo_root: Path) -> List[DeepAnalysisFinding]:
+def analyze_latent_defects(
+    *, repo_root: Path, corpus: Optional[_SourceCorpus] = None,
+) -> List[DeepAnalysisFinding]:
     """High-precision AST bug patterns — REAL defects. Near-zero FP by
     construction. NEVER raises (per-file fallible)."""
     out: List[DeepAnalysisFinding] = []
     max_files = _int_env(_ENV_DEFECT_MAX_FILES, 800, lo=1, hi=1_000_000)
     scanned = 0
-    for path in _iter_py_files(repo_root):
+    corpus = corpus or _SourceCorpus(repo_root)
+    for path in corpus.paths():
         if scanned >= max_files:
             break
-        tree = _safe_parse(_read(path))
+        tree = corpus.tree(path)
         if tree is None:
             continue
         scanned += 1
@@ -1016,6 +1115,248 @@ def analyze_latent_defects(*, repo_root: Path) -> List[DeepAnalysisFinding]:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Incremental cycle — analyze what CHANGED, within the cycle's budget
+# ---------------------------------------------------------------------------
+#
+# A full pass parses every Python file: measured 2026-10-09 at ~16 ms per
+# file over 7,956 files (~130 s) -- more than twice the 60 s process-pool
+# deadline before a single analyzer ran, and ~5 GB if every tree were kept.
+# No amount of de-duplication makes a full pass fit, so the sensor no longer
+# makes one per cycle. Every per-file fact (findings of the per-file
+# analyzers, public definitions, identifier set) is cached on disk keyed by
+# the file's content hash and the analyzers' own source hash; a cycle
+# analyzes only stale files, as many as its time budget admits (sized from a
+# measured, adaptive cost per character), and the cross-file orphan analysis
+# runs from cached facts -- no parsing -- once every file is covered.
+
+_ENV_CACHE_PATH = "JARVIS_DEEP_ANALYSIS_CACHE_PATH"
+_ENV_BUDGET_FRACTION = "JARVIS_DEEP_ANALYSIS_CYCLE_BUDGET_FRACTION"
+_DEFAULT_BUDGET_FRACTION = 0.5
+#: Per-file analyzers whose findings are cached (orphan_surface is cross-file;
+#: coverage_gap is git-history-scoped and cheap): (label, env gate, fn).
+_PER_FILE_ANALYZERS: Tuple[Tuple[str, str, Any], ...] = (
+    ("contract_drift", _ENV_CONTRACT, analyze_contract_drift),
+    ("purpose_drift", _ENV_PURPOSE, analyze_purpose_drift),
+    ("latent_defect", _ENV_DEFECT, analyze_latent_defects),
+)
+
+
+def _analyzer_version() -> str:
+    """Hash of this module's own source: a change to any analyzer
+    invalidates every cached result, with no version to remember to bump."""
+    try:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def _cache_path(repo_root: Path) -> Path:
+    raw = os.environ.get(_ENV_CACHE_PATH, "").strip()
+    return Path(raw) if raw else Path(repo_root) / ".jarvis" / "deep_analysis_cache.sqlite3"
+
+
+def _cycle_budget_s() -> float:
+    """The share of the process-pool deadline one cycle may spend analyzing."""
+    try:
+        frac = float(os.environ.get(_ENV_BUDGET_FRACTION, "") or _DEFAULT_BUDGET_FRACTION)
+    except ValueError:
+        frac = _DEFAULT_BUDGET_FRACTION
+    frac = frac if 0.0 < frac < 1.0 else _DEFAULT_BUDGET_FRACTION
+    try:
+        from backend.core.ouroboros.governance.cooperative_fs_io import (
+            fs_process_pool_deadline_s,
+        )
+        deadline = float(fs_process_pool_deadline_s())
+    except Exception:  # noqa: BLE001
+        deadline = 60.0
+    return max(1.0, deadline * frac)
+
+
+def _finding_to_row(f: DeepAnalysisFinding) -> Dict[str, Any]:
+    return {
+        "category": f.category, "file": f.file, "finding_id": f.finding_id,
+        "description": f.description, "line": f.line, "evidence": f.evidence,
+        "urgency": f.urgency, "confidence": f.confidence,
+    }
+
+
+def _finding_from_row(row: Dict[str, Any]) -> DeepAnalysisFinding:
+    return DeepAnalysisFinding(**row)
+
+
+class _FactCache:
+    """sqlite: one row per file -- content hash, analyzer version, findings,
+    public defs, identifiers -- plus a meta row for the adaptive cost rate."""
+
+    def __init__(self, path: Path) -> None:
+        import sqlite3
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._db = sqlite3.connect(str(path))
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, sha TEXT, "
+            "version TEXT, findings TEXT, defs TEXT, tokens TEXT)"
+        )
+        self._db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+
+    def rows(self) -> Dict[str, Tuple[str, str]]:
+        return {p: (s, v) for p, s, v in self._db.execute("SELECT path, sha, version FROM files")}
+
+    def facts(self) -> Iterable[Tuple[str, str, str, str]]:
+        return self._db.execute("SELECT path, findings, defs, tokens FROM files")
+
+    def put(self, path: str, sha: str, version: str, findings: list, defs: list, tokens: Set[str]) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?)",
+            (path, sha, version, json.dumps(findings), json.dumps(defs),
+             json.dumps(sorted(tokens))),
+        )
+
+    def drop(self, paths: Iterable[str]) -> None:
+        self._db.executemany("DELETE FROM files WHERE path = ?", [(p,) for p in paths])
+
+    def get_meta(self, key: str) -> Optional[str]:
+        row = self._db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self._db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, value))
+
+    def close(self) -> None:
+        self._db.commit()
+        self._db.close()
+
+
+def run_incremental_cycle(*, repo_root: Path) -> Tuple[List[DeepAnalysisFinding], Dict[str, Any]]:
+    """One budgeted cycle: analyze stale files, return every current finding
+    (cached + fresh) and the cycle's coverage stats. Runs in the process
+    pool; NEVER raises (an unusable cache degrades to an empty result)."""
+    import time as _time
+    t0 = _time.monotonic()
+    root = Path(repo_root)
+    stats: Dict[str, Any] = {"files": 0, "stale": 0, "analyzed": 0, "complete": False}
+    try:
+        cache = _FactCache(_cache_path(root))
+    except Exception:  # noqa: BLE001
+        logger.debug("[DeepAnalysis] fact cache unavailable", exc_info=True)
+        return [], stats
+    try:
+        version = _analyzer_version()
+        listing = _SourceCorpus(root)
+        texts: Dict[Path, str] = {}
+        shas: Dict[str, str] = {}
+        rel_of: Dict[Path, str] = {}
+        for path in listing.paths():
+            text = listing.text(path)
+            rel = _rel(path, root)
+            texts[path], rel_of[path] = text, rel
+            shas[rel] = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+        stats["files"] = len(shas)
+        cached = cache.rows()
+        cache.drop(p for p in cached if p not in shas)
+        stale = [
+            p for p in texts
+            if cached.get(rel_of[p]) != (shas[rel_of[p]], version)
+        ]
+        stats["stale"] = len(stale)
+        # Most recently touched first: a cycle that cannot finish the backlog
+        # spends its budget where the organism is working.
+        stale.sort(key=lambda p: -(p.stat().st_mtime if p.exists() else 0.0))
+        try:
+            rate = float(cache.get_meta("s_per_char") or 0.0)
+        except ValueError:
+            rate = 0.0
+        budget = _cycle_budget_s()
+        # With a measured cost rate the batch is chosen up front; on a cold
+        # cache (no rate yet) the loop below is bounded by elapsed time and
+        # its first batch MEASURES the rate for every later cycle.
+        if rate > 0:
+            batch: List[Path] = []
+            predicted = 0.0
+            for p in stale:
+                cost = len(texts[p]) * rate
+                if batch and predicted + cost > budget:
+                    break
+                batch.append(p)
+                predicted += cost
+        else:
+            batch = list(stale)
+        t_an = _time.monotonic()
+        analyzed_chars = 0
+        for p in batch:
+            if _time.monotonic() - t_an > budget:
+                break
+            # A one-file corpus: the tree lives only as long as this file's
+            # turn (never more than one tree held).
+            corpus = _SourceCorpus(root, only=(p,), texts={p: texts[p]})
+            per_file: List[DeepAnalysisFinding] = []
+            for _label, _env, fn in _PER_FILE_ANALYZERS:
+                try:
+                    per_file.extend(fn(repo_root=root, corpus=corpus))
+                except Exception:  # noqa: BLE001 -- one analyzer, one file
+                    logger.debug("[DeepAnalysis] %s raised on %s", _label, p, exc_info=True)
+            cache.put(
+                rel_of[p], shas[rel_of[p]], version,
+                [_finding_to_row(f) for f in per_file],
+                _public_defs_of(p, corpus.tree(p), root), _identifiers(texts[p]),
+            )
+            analyzed_chars += len(texts[p])
+            stats["analyzed"] += 1
+        elapsed = _time.monotonic() - t_an
+        if analyzed_chars:
+            measured = elapsed / analyzed_chars
+            new_rate = measured if rate <= 0 else 0.5 * rate + 0.5 * measured
+            cache.set_meta("s_per_char", repr(new_rate))
+        remaining = stats["stale"] - stats["analyzed"]
+        stats["complete"] = remaining <= 0
+        # Every current finding: the cached per-file ones, filtered to the
+        # categories enabled NOW, plus the cross-file orphans once complete.
+        enabled = {lbl for lbl, env, _fn in _PER_FILE_ANALYZERS if _per_category_enabled(env)}
+        out: List[DeepAnalysisFinding] = []
+        defs_all: Dict[str, Tuple[str, int]] = {}
+        files_containing: Dict[str, int] = {}
+        own_tokens: Dict[str, Set[str]] = {}
+        def_files: Set[str] = set()
+        rows = list(cache.facts())
+        for rel, findings_json, defs_json, _tok in rows:
+            for row in json.loads(findings_json or "[]"):
+                if row.get("category") in enabled:
+                    out.append(_finding_from_row(row))
+            for name, lineno in json.loads(defs_json or "[]"):
+                if name not in defs_all:
+                    defs_all[name] = (rel, int(lineno))
+                    def_files.add(rel)
+        if stats["complete"] and _per_category_enabled(_ENV_ORPHAN) and defs_all:
+            for rel, _f, _d, tokens_json in rows:
+                tokens = set(json.loads(tokens_json or "[]"))
+                for token in tokens:
+                    files_containing[token] = files_containing.get(token, 0) + 1
+                if rel in def_files:
+                    own_tokens[rel] = tokens
+            out.extend(_orphans_from(defs_all, files_containing, own_tokens))
+        if _per_category_enabled(_ENV_COVERAGE):
+            try:
+                out.extend(analyze_coverage_gap(repo_root=root, lookback=_lookback_commits()))
+            except Exception:  # noqa: BLE001
+                logger.debug("[DeepAnalysis] coverage_gap raised", exc_info=True)
+        stats["elapsed_s"] = round(_time.monotonic() - t0, 2)
+        by_category: Dict[str, int] = {}
+        for f in out:
+            by_category[f.category] = by_category.get(f.category, 0) + 1
+        stats["by_category"] = by_category      # before the per-cycle cap
+        _rank = {"critical": 0, "high": 1, "normal": 2, "low": 3}
+        out.sort(key=lambda f: _rank.get(f.urgency, 3))
+        return out[: _max_findings_per_cycle() * 4], stats
+    except Exception:  # noqa: BLE001
+        logger.debug("[DeepAnalysis] incremental cycle degraded", exc_info=True)
+        return [], stats
+    finally:
+        try:
+            cache.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def run_all_analyzers(*, repo_root: Path) -> List[DeepAnalysisFinding]:
     """Run every enabled analyzer and return the merged finding list.
 
@@ -1040,9 +1381,11 @@ def run_all_analyzers(*, repo_root: Path) -> List[DeepAnalysisFinding]:
         if part:
             merged.extend(part)
 
+    # One listing, one read and one parse per file, shared by every analyzer.
+    corpus = _SourceCorpus(repo_root)
     _run(
         "contract_drift", _ENV_CONTRACT, analyze_contract_drift,
-        repo_root=repo_root,
+        repo_root=repo_root, corpus=corpus,
     )
     _run(
         "coverage_gap", _ENV_COVERAGE, analyze_coverage_gap,
@@ -1050,15 +1393,15 @@ def run_all_analyzers(*, repo_root: Path) -> List[DeepAnalysisFinding]:
     )
     _run(
         "purpose_drift", _ENV_PURPOSE, analyze_purpose_drift,
-        repo_root=repo_root,
+        repo_root=repo_root, corpus=corpus,
     )
     _run(
         "orphan_surface", _ENV_ORPHAN, analyze_orphan_surface,
-        repo_root=repo_root,
+        repo_root=repo_root, corpus=corpus,
     )
     _run(
         "latent_defect", _ENV_DEFECT, analyze_latent_defects,
-        repo_root=repo_root,
+        repo_root=repo_root, corpus=corpus,
     )
     # Substance-first stable sort: proven defects (high urgency) survive the
     # per-cycle cap ahead of the low-urgency advisory heuristics. Stable, so
@@ -1146,16 +1489,25 @@ class DeepAnalysisSensor:
             is_offload_error,
         )
         result = await offload(
-            run_all_analyzers, repo_root=self._root, cpu_bound=True,
+            run_incremental_cycle, repo_root=self._root, cpu_bound=True,
         )
         if is_offload_error(result):
-            logger.debug(
-                "[DeepAnalysis] scan_once offload failed for repo=%s "
-                "— degrading to empty finding list", self._repo,
+            logger.warning(
+                "[DeepAnalysis] cycle offload failed for repo=%s — no findings "
+                "this cycle", self._repo,
             )
             findings: List[DeepAnalysisFinding] = []
         else:
-            findings = result
+            findings, stats = result
+            logger.info(
+                "[DeepAnalysis] cycle: %d/%d stale file(s) analyzed of %d, "
+                "coverage %s, %d finding(s) %s, %.1fs",
+                stats.get("analyzed", 0), stats.get("stale", 0),
+                stats.get("files", 0),
+                "complete" if stats.get("complete") else "partial",
+                len(findings), stats.get("by_category", {}),
+                float(stats.get("elapsed_s", 0.0)),
+            )
         self._last_cycle_count = len(findings)
         fresh = self._filter_cooldown(findings)
         # Apply per-cycle cap so intake doesn't flood.

@@ -3157,6 +3157,17 @@ def _profiler_round_hint_s(client: Any, prompt: str) -> Optional[float]:
         return None
 
 
+def _negotiated_prompt_window(client: Any) -> Optional[Any]:
+    """The local client's negotiated prompt window, or None. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.local_inference_director import (  # noqa: PLC0415
+            prompt_window_for,
+        )
+        return prompt_window_for(client)
+    except Exception:  # noqa: BLE001 -- sizing must never break generation
+        return None
+
+
 #: Manifest tools the generation prompt does not advertise, and why. Every
 #: other tool in ``tool_executor._L1_MANIFESTS`` must appear in the prompt --
 #: a test holds the two together, because a tool that exists but is never
@@ -7784,6 +7795,9 @@ class PrimeProvider:
                     # EWMA-coupled: the plan's round arithmetic follows the
                     # node's measured physics (None on profiler-less seats).
                     round_budget_hint_s=_profiler_round_hint_s(self._client, prompt),
+                    # The window this client NEGOTIATED (num_ctx), with the
+                    # transport's own fitter -- None on a lane without one.
+                    prompt_window=_negotiated_prompt_window(self._client),
                 )
             finally:
                 # Idempotent close — no-op when master flag off.

@@ -888,17 +888,29 @@ class PLANRunner(PhaseRunner):
         # construction — the hook returns text only, never gates.
         try:
             from backend.core.ouroboros.governance.adversarial_reviewer_hook import (
-                review_plan_for_generate_injection,
+                areview_plan_for_generate_injection,
+            )
+            from backend.core.ouroboros.governance.risk_tier_floor import (
+                effective_risk_tier,
             )
             _adv_plan_text = getattr(ctx, "implementation_plan", "") or ""
-            _adv_risk_name = (
-                ctx.risk_tier.name if ctx.risk_tier is not None else None
+            # The tier the gate WILL hold this op to -- governance floor +
+            # operator override -- not the CLASSIFY tier: an op raised to
+            # APPROVAL_REQUIRED must not be skipped here as "safe_auto".
+            _adv_tier = (
+                effective_risk_tier(
+                    ctx.risk_tier,
+                    signal_source=str(getattr(ctx, "signal_source", "") or ""),
+                    op_id=ctx.op_id,
+                    target_files=ctx.target_files or (),
+                )
+                if ctx.risk_tier is not None else None
             )
-            _adv_injection = review_plan_for_generate_injection(
+            _adv_injection = await areview_plan_for_generate_injection(
                 op_id=ctx.op_id,
                 plan_text=_adv_plan_text,
                 target_files=ctx.target_files or (),
-                risk_tier_name=_adv_risk_name,
+                risk_tier_name=_adv_tier.name if _adv_tier is not None else None,
             )
             if _adv_injection.injection_text:
                 _existing = getattr(ctx, "strategic_memory_prompt", "") or ""

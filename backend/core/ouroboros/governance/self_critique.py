@@ -275,14 +275,35 @@ def build_critique_prompt(request: CritiqueRequest) -> str:
     )
 
 
-class DoublewordCritiqueProvider:
-    """Cheap critique backend powered by DoubleWord 397B prompt_only()."""
+async def _critique_with_name(provider: Any, request: "CritiqueRequest") -> Tuple[str, str]:
+    """``(raw, provider_name)``: the answering tier's name when the provider
+    reports it (a router), else the provider's own name."""
+    detailed = getattr(provider, "critique_detailed", None)
+    if detailed is not None:
+        return await detailed(request)
+    return await provider.critique(request), provider.name
 
-    name = "doubleword"
+
+#: rt_gate tier name -> the provider name the critique record and the cost
+#: estimate use.
+_TIER_PROVIDER_NAMES = {"dw": "doubleword", "claude": "claude", "local": "local"}
+
+
+class GateCritiqueProvider:
+    """Critique backend over the unified RT gate: the local lane first where
+    it is enabled, then whichever paid tiers the paid-lane authority admits.
+
+    It was ``DoublewordCritiqueProvider`` -- and wired only when a DoubleWord
+    handle existed, although the gate never needed one; with paid lanes off,
+    self-critique never ran ("Self-critique skipped: DoublewordProvider not
+    available", 2026-10-09). ``critique_detailed`` reports the tier that
+    actually answered, so a free local critique is recorded as free."""
+
+    name = "rt_gate"
 
     def __init__(
         self,
-        dw_provider: Any,
+        dw_provider: Any = None,
         *,
         max_tokens: int = 512,
         caller_id: str = "self_critique",
@@ -292,17 +313,17 @@ class DoublewordCritiqueProvider:
         self._caller_id = caller_id
 
     async def critique(self, request: CritiqueRequest) -> str:
+        return (await self.critique_detailed(request))[0]
+
+    async def critique_detailed(self, request: CritiqueRequest) -> Tuple[str, str]:
+        """``(raw, provider_name)`` -- raw text or raises (the engine
+        handles swallowing)."""
         prompt = build_critique_prompt(request)
-        # Phase 2 RT repositioning (2026-07-16): critique blocks apply/PR — it
-        # buys TIME, so it routes through the unified Claude-RT-first gate
-        # router with this backend's DW handle as the opportunistic fallback.
-        # Engine-facing contract unchanged: returns raw text or raises (the
-        # engine handles swallowing).
-        from backend.core.ouroboros.governance.rt_gate import gate_completion
+        from backend.core.ouroboros.governance.rt_gate import gate_completion_detailed
 
         try:
-            return await asyncio.wait_for(
-                gate_completion(
+            raw, tier = await asyncio.wait_for(
+                gate_completion_detailed(
                     prompt,
                     caller_id=self._caller_id,
                     response_format={"type": "json_object"},
@@ -315,8 +336,13 @@ class DoublewordCritiqueProvider:
             raise
         except Exception as exc:
             # Surface to engine for logging; engine handles swallowing.
-            logger.debug("[DWCritique] provider call failed: %s", exc)
+            logger.debug("[GateCritique] provider call failed: %s", exc)
             raise
+        return raw, _TIER_PROVIDER_NAMES.get(tier, tier)
+
+
+#: The pre-2026-10-09 name, kept for importers.
+DoublewordCritiqueProvider = GateCritiqueProvider
 
 
 class ClaudeCritiqueProvider:
@@ -699,9 +725,9 @@ class CritiqueEngine:
     ) -> Tuple[Optional[str], str, Optional[str]]:
         """Try primary → fallback. Returns (raw|None, provider_name, error_str)."""
         try:
-            raw = await self._provider.critique(request)
+            raw, name = await _critique_with_name(self._provider, request)
             if raw and raw.strip():
-                return raw, self._provider.name, None
+                return raw, name, None
             err = "empty_response"
         except asyncio.TimeoutError:
             err = "timeout"

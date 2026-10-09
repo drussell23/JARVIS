@@ -3897,7 +3897,13 @@ class CandidateGenerator:
         latency_tracker: Optional[DwLatencyTracker] = None,
         exhaustion_watcher: Optional[Any] = None,  # ProviderExhaustionWatcher
         jprime: Optional[Any] = None,  # PrimeProvider (Phase 3 Scope α primacy)
+        repo_root: Optional[Any] = None,  # observation root; see _execution_root
     ) -> None:
+        # Every source read this class makes (swarm slicing, token estimates,
+        # sibling fingerprints, the F3c wrapper) was relative to a
+        # ``_repo_root`` nothing ever set -- i.e. to the process cwd, the
+        # operator's main checkout, while APPLY writes the session worktree.
+        self._repo_root = repo_root
         self._primary = primary
         self._fallback = fallback
         self._tier0 = tier0
@@ -4361,7 +4367,7 @@ class CandidateGenerator:
         result: Dict[str, int] = {}
         try:
             files = list(getattr(context, "target_files", ()) or ())
-            repo_root = getattr(self, "_repo_root", None)
+            repo_root = self._execution_root_or_none()
             for f in files:
                 try:
                     import os as _os
@@ -4689,11 +4695,35 @@ class CandidateGenerator:
             )
             return None
 
-    def _read_source_for_swarm(self, rel_or_abs: str) -> Optional[str]:
-        """Read a target file's current on-disk content (repo_root-joined).
-        Returns None on any miss → the short-circuit declines. Never raises."""
+    def _execution_root(self) -> Optional[str]:
+        """The tree the op mutates -- the session worktree when the ledger-
+        sovereignty workspace is armed, else the configured root -- resolved
+        at READ time through the one canonical seam (the workspace env var is
+        exported after this generator is built). ``None`` when no root was
+        configured (cwd-relative, as before). Raises ``ExecutionRootInvalid``
+        for an armed-but-broken workspace: a read must not silently fall back
+        to the operator's tree."""
+        if self._repo_root is None:
+            return None
+        from backend.core.ouroboros.governance.autonomous_workspace import (
+            effective_execution_root,
+        )
+        return str(effective_execution_root(self._repo_root))
+
+    def _execution_root_or_none(self) -> Optional[str]:
+        """:meth:`_execution_root` for advisory reads (estimates,
+        fingerprints): an invalid workspace yields None, never a raise."""
         try:
-            repo_root = getattr(self, "_repo_root", None)
+            return self._execution_root()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _read_source_for_swarm(self, rel_or_abs: str) -> Optional[str]:
+        """Read a target file's current on-disk content in the execution
+        root. Returns None on any miss → the short-circuit declines. Never
+        raises (an invalid workspace is a decline, not a fallback)."""
+        try:
+            repo_root = self._execution_root()
             path = rel_or_abs
             if repo_root and not os.path.isabs(rel_or_abs):
                 path = os.path.join(repo_root, rel_or_abs)
@@ -4790,9 +4820,19 @@ class CandidateGenerator:
         path = target_files[0]
         source = self._read_source_for_swarm(path)
         if source is None:
-            logger.info(
-                "[CandidateGenerator] swarm decline: source unreadable for %s "
-                "(repo_root=%s)", path, getattr(self, "_repo_root", None))
+            # Two different facts, named apart: the swarm slices and stitches
+            # an EXISTING file, so a target the op is about to create is a
+            # correct decline (the standard route writes it), not a fault.
+            _root = self._execution_root_or_none()
+            _abs = path if os.path.isabs(path) or not _root else os.path.join(_root, path)
+            if not os.path.exists(_abs):
+                logger.info(
+                    "[CandidateGenerator] swarm decline: creation target %s "
+                    "(absent in %s) — standard route", path, _root or "cwd")
+            else:
+                logger.info(
+                    "[CandidateGenerator] swarm decline: source unreadable for %s "
+                    "(execution_root=%s)", path, _root)
             return None
         try:
             from backend.core.ouroboros.governance.chunked_generation import (
@@ -4828,6 +4868,7 @@ class CandidateGenerator:
                 _budget.ingest_ceiling_tokens, _budget.window_tokens)
             return None
 
+        _t_resolve = time.monotonic_ns()
         res = resolve_target_symbols(
             source=source, file_path=path,
             traceback_frames=self._swarm_frames_from_ctx(context),
@@ -4839,6 +4880,7 @@ class CandidateGenerator:
             # target the operator never authorised.
             declared_symbols=_declared_symbols_for(context, path),
         )
+        _t_resolved = time.monotonic_ns()
         if not res.resolved:
             logger.info(
                 "[CandidateGenerator] swarm: resolver FAIL-CLOSED for %s — "
@@ -4875,6 +4917,19 @@ class CandidateGenerator:
         # recorded as such — the exploration gate otherwise refuses this
         # route for the tool calls it structurally never makes.
         _reads: List[Any] = []
+        # The resolver's call-graph expansion IS a caller/callee walk of the
+        # target -- recorded as the get_callers it is (it went unreported,
+        # leaving the swarm one exploration category short of the gate).
+        if tuple(getattr(res, "cluster", ()) or ()):
+            try:
+                from backend.core.ouroboros.governance.tool_executor import system_read_record
+                _reads.append(system_read_record(
+                    op_id=getattr(context, "op_id", "") or "", tool_name="get_callers",
+                    path=path, output_bytes=len(",".join(res.cluster).encode("utf-8")),
+                    started_at_ns=_t_resolve, ended_at_ns=_t_resolved,
+                ))
+            except Exception:  # noqa: BLE001 — evidence is additive
+                pass
         _t_anchor = time.monotonic_ns()
         try:
             from backend.core.ouroboros.governance.ast_signature_anchor import extract_public_api
@@ -4906,7 +4961,7 @@ class CandidateGenerator:
         agent = ProductionAgentTurnFn(
             client=client,
             tool_backend=None,                       # pure-completion node repair (v1)
-            repo_root=getattr(self, "_repo_root", "."),
+            repo_root=self._execution_root_or_none() or ".",
             op_id=getattr(context, "op_id", ""),
             model_name=getattr(client, "_model", "") or "",  # client default, no hardcode
             system_prompt=_system,
@@ -6250,7 +6305,7 @@ class CandidateGenerator:
                         not in ("0", "false", "no", "off")
                     _provider = _F3cPrimeProvider(
                         _client,
-                        repo_root=self._repo_root if hasattr(self, "_repo_root") else None,
+                        repo_root=self._execution_root_or_none(),
                         tool_loop=(getattr(getattr(self, "_primary", None),
                                            "_tool_loop", None)
                                    if _venom_on else None),
@@ -6512,7 +6567,7 @@ class CandidateGenerator:
         # Fingerprint against the file each candidate proposes to REPLACE
         # (hunk-level) when the repo root is known; whole-file otherwise.
         # Resolved the way every other path in this class is resolved.
-        _fp_root = getattr(self, "_repo_root", None) or None
+        _fp_root = self._execution_root_or_none()
         _seen_fps: List[str] = list(
             _ent.fingerprint_candidates(merged, _fp_root),
         )

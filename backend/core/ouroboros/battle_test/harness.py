@@ -3951,20 +3951,24 @@ class BattleTestHarness:
                             _claude_ref = _fb
                     _dream_metrics = DreamMetricsTracker()
 
-                    # Lightweight stubs — battle test always considers user "idle"
-                    # and never yields to resource pressure.
-                    class _ActivityStub:
-                        def last_activity_s(self) -> float:
-                            return 9999.0  # Always idle
-                    class _GovernorStub:
-                        async def should_yield(self) -> bool:
-                            return False  # Never yield
+                    # The lane is shared with the pipeline and the local
+                    # engine serves one request at a time: the dreamer
+                    # yields while any op is in flight or any generation
+                    # holds the lane, and dreams only after a quiet period.
+                    # (It was handed "always idle / never yield" stubs.)
+                    from backend.core.ouroboros.governance.lane_idleness import (
+                        default_lane,
+                    )
+                    from backend.core.ouroboros.governance.rt_gate import (
+                        local_tier_enabled as _local_tier_enabled,
+                    )
+                    _lane = default_lane()
 
                     _dream_instance = DreamEngine(
                         health_cortex=_cortex,
                         memory_engine=_memory,
-                        activity_monitor=_ActivityStub(),
-                        resource_governor=_GovernorStub(),
+                        activity_monitor=_lane,
+                        resource_governor=_lane,
                         metrics_tracker=_dream_metrics,
                         config=_c_config,
                         jprime_url=os.environ.get("JPRIME_URL", ""),
@@ -3975,10 +3979,11 @@ class BattleTestHarness:
                         repo_path=str(self._config.repo_path),
                     )
                     logger.info(
-                        "DreamEngine booted (dw=%s, claude=%s, jprime=%s)",
+                        "DreamEngine booted (dw=%s, claude=%s, local=%s) — "
+                        "yields to live ops on the shared lane",
                         "active" if _dw_ref else "none",
                         "active" if _claude_ref else "none",
-                        "active" if os.environ.get("JPRIME_URL") else "none",
+                        "active" if _local_tier_enabled() else "none",
                     )
                 except Exception as _dream_exc:
                     logger.debug("DreamEngine boot failed, using stub: %s", _dream_exc)

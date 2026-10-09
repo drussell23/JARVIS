@@ -240,6 +240,12 @@ class ModuleIndex:
         """Every file called *filename*, shortest path first."""
         return self._table.get(filename, ())
 
+    def paths(self) -> Tuple[Path, ...]:
+        """Every indexed Python file, in a stable order."""
+        return tuple(sorted(
+            (p for group in self._table.values() for p in group), key=str,
+        ))
+
     def __len__(self) -> int:
         return len(self._table)
 

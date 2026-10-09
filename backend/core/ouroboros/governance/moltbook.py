@@ -57,6 +57,15 @@ logger = logging.getLogger("Ouroboros.Moltbook")
 
 MOLT_POST_SCHEMA_VERSION = "molt_post.v1"
 
+
+def _log_body_chars() -> int:
+    """How much of a post the session log carries
+    (``JARVIS_MOLTBOOK_LOG_BODY_CHARS``, default 200)."""
+    try:
+        return max(0, int(os.environ.get("JARVIS_MOLTBOOK_LOG_BODY_CHARS", "") or 200))
+    except ValueError:
+        return 200
+
 _TRUTHY = ("1", "true", "yes", "on")
 
 #: Closed taxonomy of post kinds — social verbs, zero authority.
@@ -642,6 +651,15 @@ async def post_molt(
         stored = await get_default_store().add(post)
         if stored is None:
             return None
+        # The session's own record. Every other channel below is in-memory
+        # or needs an attached cockpit, so a headless soak kept 377 posts in
+        # SQLite and showed none of them (2026-10-09). The body is already
+        # ref-fenced; volume is bounded by the reply budget and cooldown.
+        logger.info(
+            "[Moltbook] %s @%s/%s op=%s: %s", stored.ref, stored.handle,
+            getattr(stored.kind, "value", stored.kind), stored.op_id or "-",
+            stored.body[:_log_body_chars()],
+        )
         try:
             from backend.core.ouroboros.governance.ide_observability_stream import (  # noqa: E501
                 publish_task_event,

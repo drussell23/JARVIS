@@ -983,6 +983,51 @@ def fit_prompt_to_window(
     return system, head + marker + tail, True
 
 
+def input_budget_tokens(num_ctx: int, max_tokens: "Optional[int]" = None) -> int:
+    """The INPUT window: ``num_ctx`` minus a BOUNDED output reserve (not the
+    full ``max_tokens`` cap, so the input stays wide). One definition for the
+    transport that fits every payload and for anything that must agree with
+    it about what fits."""
+    reserve = _int_env("JARVIS_FAILOVER_OUTPUT_RESERVE_TOKENS", _OUTPUT_RESERVE_TOKENS_DEFAULT)
+    if max_tokens:
+        reserve = min(int(max_tokens), reserve)
+    return max(256, int(num_ctx) - reserve)
+
+
+@dataclass(frozen=True)
+class PromptWindow:
+    """A negotiated prompt window, in the units the tool loop counts (chars)
+    and with the transport's own fitting function. The tool loop sized its
+    cap from a module constant while the transport fit payloads to the
+    negotiated ``num_ctx``: the loop aborted ``tool_loop_context_overflow``
+    on prompts the transport would have fitted (2026-10-09)."""
+
+    input_tokens: int
+
+    @property
+    def max_chars(self) -> int:
+        # The inverse of estimate_tokens -- the same ~4 chars/token.
+        return self.input_tokens * 4
+
+    def fit(self, text: str) -> str:
+        """``text`` fitted to this window by the transport's own compressor."""
+        return fit_prompt_to_window("", text or "", max_tokens=self.input_tokens)[1]
+
+
+def prompt_window_for(client: Any) -> "Optional[PromptWindow]":
+    """The window a local client negotiated, or None (a lane that publishes
+    none). Unwraps the tiered composite the way the profiler hint does."""
+    for candidate in (client, getattr(client, "_light", None)):
+        cfg = getattr(candidate, "_cfg", None) or getattr(candidate, "cfg", None)
+        num_ctx = getattr(cfg, "num_ctx", None)
+        if num_ctx:
+            try:
+                return PromptWindow(input_tokens=input_budget_tokens(int(num_ctx)))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def _physics_ledger_enabled() -> bool:
     return (os.environ.get("JARVIS_LATENCY_LEDGER_ENABLED", "true") or "").strip().lower() \
         not in ("0", "false", "no", "off")
@@ -1791,12 +1836,8 @@ class LocalPrimeClient:
         if self._cfg.num_ctx:
             # Reserve only a BOUNDED output slice (not the full max_tokens cap) so
             # the input window stays wide -> less compression -> fewer empty results.
-            _reserve_out = min(
-                max_tokens or 0,
-                _int_env("JARVIS_FAILOVER_OUTPUT_RESERVE_TOKENS", _OUTPUT_RESERVE_TOKENS_DEFAULT),
-            ) if max_tokens else _int_env(
-                "JARVIS_FAILOVER_OUTPUT_RESERVE_TOKENS", _OUTPUT_RESERVE_TOKENS_DEFAULT)
-            _in_budget = max(256, int(self._cfg.num_ctx) - _reserve_out)
+            _in_budget = input_budget_tokens(int(self._cfg.num_ctx), max_tokens)
+            _reserve_out = int(self._cfg.num_ctx) - _in_budget
             system, user, _compressed = fit_prompt_to_window(
                 system, user, max_tokens=_in_budget,
             )

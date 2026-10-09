@@ -632,6 +632,11 @@ class InferenceGateway:
                 prompt_tokens=prompt_tokens, temperature=temperature,
                 max_tokens=max_tokens)
 
+    def inflight(self, base_url: str) -> int:
+        """Public read of the in-flight ledger: generations streaming on
+        *base_url* through any bracketed path. Unknowable reads as busy."""
+        return self._inflight_count(base_url)
+
     def _inflight_count(self, base_url: str) -> int:
         """Generations currently streaming on *base_url*. NEVER raises."""
         try:

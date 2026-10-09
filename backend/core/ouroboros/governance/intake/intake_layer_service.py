@@ -989,7 +989,7 @@ class IntakeLayerService:
         # ---- DocStalenessSensor (P2: automatic documentation gaps) ----
         try:
             from backend.core.ouroboros.governance.intake.sensors.doc_staleness_sensor import (
-                DocStalenessSensor,
+                DocStalenessSensor, sensor_enabled as _doc_enabled,
             )
             _doc_poll_s = float(
                 os.environ.get("JARVIS_DOC_STALENESS_INTERVAL_S", "86400")
@@ -1004,7 +1004,13 @@ class IntakeLayerService:
             # Slice 4 — dedicated reference for EventChannelServer push routing.
             # Mirrors the ``_github_issue_sensor`` slot populated below.
             self._doc_staleness_sensor = _doc_sensor
-            logger.info("[IntakeLayer] DocStalenessSensor added (documentation gap detection)")
+            # Registered either way and gated by its own sensor_enabled(), so
+            # "off" is visible in the boot log -- it read "added" while its
+            # master was off and every scan returned nothing.
+            logger.info(
+                "[IntakeLayer] DocStalenessSensor registered enabled=%s "
+                "(set JARVIS_DOC_STALENESS_ENABLED=1)", _doc_enabled(),
+            )
         except Exception as exc:
             logger.debug("[IntakeLayer] DocStalenessSensor skipped: %s", exc)
 
@@ -1650,9 +1656,12 @@ class IntakeLayerService:
 
             try:
                 from backend.core.ouroboros.governance.intake.sensors.doc_staleness_sensor import (
+                    sensor_enabled as _doc_sensor_on,
                     webhook_enabled as _doc_webhook_enabled,
                 )
-                doc_flag_on = _doc_webhook_enabled()
+                # A disabled sensor is not a push target, however its
+                # webhook flag reads.
+                doc_flag_on = _doc_webhook_enabled() and _doc_sensor_on()
             except Exception:
                 doc_flag_on = False
 

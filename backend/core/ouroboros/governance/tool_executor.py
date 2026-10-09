@@ -4849,11 +4849,18 @@ class AsyncProcessToolBackend:
         # Step 4 will plumb the real OperationContext through; for now a
         # SimpleNamespace with safe defaults is sufficient.
         import types
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        # The round's own budget IS the subagent's deadline. The orchestrator
+        # already clamps a subagent to its parent's pipeline_deadline -- but
+        # this shim passed None, so a subagent planned for its advertised
+        # timeout_s and was then killed by the hard wait below the moment
+        # the (shorter) round budget ran out, returning nothing. Handing the
+        # real bound in lets it finish inside it.
         parent_shim = types.SimpleNamespace(
             op_id=policy_ctx.op_id,
             provider_name="unknown",          # Step 4 plumbs real provider
             cost_remaining_usd=float("inf"),  # Step 4 plumbs CostGovernor
-            pipeline_deadline=None,
+            pipeline_deadline=_dt.now(_tz.utc) + _td(seconds=max(0.0, float(timeout))),
         )
 
         # Dispatch. The orchestrator handles parallel fan-out, Iron Gate
@@ -5019,6 +5026,49 @@ _COMPACT_THRESHOLD_CHARS = int(
     )
 )  # Trigger compaction at 75% of max to avoid hard crash
 
+
+@dataclass(frozen=True)
+class ContextBudget:
+    """One op's prompt budget: hard cap, soft watermark, compaction point.
+
+    The module constants above are the budget for a lane that publishes no
+    window (a paid API). A local engine NEGOTIATES one (``num_ctx``), and an
+    op on it must be sized against what was negotiated: sized against the
+    131k-char default, a 32k-token local window was overrun by the base
+    prompt alone, compaction never engaged, and the loop died
+    ``tool_loop_context_overflow`` (2026-10-09). The soft and compaction
+    points keep the configured RATIOS, so an operator's env tuning holds at
+    every window size."""
+
+    max_chars: int
+    soft_chars: int
+    compact_chars: int
+
+    @classmethod
+    def for_max(cls, max_chars: int) -> "ContextBudget":
+        cap = max(1, int(max_chars))
+        compact_ratio = _COMPACT_THRESHOLD_CHARS / max(1, _MAX_PROMPT_CHARS)
+        return cls(
+            max_chars=cap,
+            soft_chars=int(cap * _SOFT_OVERFLOW_PCT),
+            compact_chars=int(cap * compact_ratio),
+        )
+
+
+_DEFAULT_CONTEXT_BUDGET = ContextBudget(
+    max_chars=_MAX_PROMPT_CHARS,
+    soft_chars=_SOFT_OVERFLOW_CHARS,
+    compact_chars=_COMPACT_THRESHOLD_CHARS,
+)
+
+
+def context_budget_for(max_prompt_chars: Optional[int]) -> ContextBudget:
+    """The budget for an op: the caller's window when it has one (never
+    above the configured hard cap), else the configured default."""
+    if not max_prompt_chars or max_prompt_chars <= 0:
+        return _DEFAULT_CONTEXT_BUDGET
+    return ContextBudget.for_max(min(int(max_prompt_chars), _MAX_PROMPT_CHARS))
+
 # ---------------------------------------------------------------------------
 # Context-utilisation gauge
 # ---------------------------------------------------------------------------
@@ -5037,12 +5087,16 @@ _CONTEXT_GAUGE: "OrderedDict[str, float]" = OrderedDict()
 _CONTEXT_GAUGE_MAX = 32
 
 
-def note_context_utilisation(op_id: str, used_chars: int) -> None:
-    """Record how full an op's prompt is, as a fraction. NEVER raises."""
+def note_context_utilisation(
+    op_id: str, used_chars: int, budget: Optional["ContextBudget"] = None,
+) -> None:
+    """Record how full an op's prompt is, as a fraction of ITS budget.
+    NEVER raises."""
     try:
         if not op_id:
             return
-        pct = float(used_chars) / max(1, _MAX_PROMPT_CHARS)
+        cap = (budget or _DEFAULT_CONTEXT_BUDGET).max_chars
+        pct = float(used_chars) / max(1, cap)
         key = str(op_id)
         _CONTEXT_GAUGE.pop(key, None)
         _CONTEXT_GAUGE[key] = max(0.0, min(1.0, pct))
@@ -6216,6 +6270,11 @@ class ToolLoopCoordinator:
         # Widens BudgetPlan.max_per_round_s for slow heavy hardware; ``None``
         # (no profiler in the seat, e.g. DW) is byte-identical legacy.
         round_budget_hint_s: Optional[float] = None,
+        # The lane's negotiated prompt window (``max_chars`` + the transport's
+        # own ``fit``). Sizes the soft / compaction / hard thresholds and,
+        # past the hard cap, fits instead of failing. ``None`` (a lane that
+        # publishes no window) keeps the configured default budget.
+        prompt_window: Optional[Any] = None,
         # Sovereign Epistemological Context Matrix (spec §5.1) — memory-supplied
         # PrefetchEntry sequence. When present, a bounded, clearly-labelled
         # "memory-supplied hints" block is PREPENDED to the opening prompt so
@@ -6347,6 +6406,7 @@ class ToolLoopCoordinator:
             target_line_count=op_weight_lines,
         )
         _soft_overflow_warned = False
+        _ctx_budget = context_budget_for(getattr(prompt_window, "max_chars", None))
         # ── Slice 3E — convergence-force final-write nudge ──
         # ``_final_nudge_issued`` flips True when the final-write nudge
         # is appended to the prompt (either time-axis reserve hit OR
@@ -7237,21 +7297,21 @@ class ToolLoopCoordinator:
             # Publish utilisation every round — the watermark below fires
             # once, but an operator watching a long op needs the number
             # continuously, and it is already in hand.
-            note_context_utilisation(op_id, len(current_prompt))
+            note_context_utilisation(op_id, len(current_prompt), _ctx_budget)
             # round's instruction footer so the model knows to stop
             # fetching new context and write the patch. Lossless signal
             # that rides one round ahead of the lossy compactor.
             if (
                 not _soft_overflow_warned
-                and len(current_prompt) >= _SOFT_OVERFLOW_CHARS
-                and len(current_prompt) < _COMPACT_THRESHOLD_CHARS
+                and len(current_prompt) >= _ctx_budget.soft_chars
+                and len(current_prompt) < _ctx_budget.compact_chars
             ):
                 _soft_overflow_warned = True
-                _pct = 100.0 * len(current_prompt) / max(1, _MAX_PROMPT_CHARS)
+                _pct = 100.0 * len(current_prompt) / max(1, _ctx_budget.max_chars)
                 logger.warning(
                     "[ToolLoop] Soft overflow watermark for %s: %d/%d chars "
                     "(%.1f%%) — advising model to finalize",
-                    op_id[:12], len(current_prompt), _MAX_PROMPT_CHARS, _pct,
+                    op_id[:12], len(current_prompt), _ctx_budget.max_chars, _pct,
                 )
                 current_prompt += (
                     "\n\n[SYSTEM] Context budget at "
@@ -7268,7 +7328,7 @@ class ToolLoopCoordinator:
             # otherwise it falls back to the legacy char-based summarizer.
             # Runs on ANY round (including 0-1) to defend against single
             # large tool results that would otherwise blow past the hard cap.
-            if len(current_prompt) > _COMPACT_THRESHOLD_CHARS:
+            if len(current_prompt) > _ctx_budget.compact_chars:
                 current_prompt = await self._compact_prompt(
                     base_prompt=prompt,
                     current_prompt=current_prompt,
@@ -7278,20 +7338,36 @@ class ToolLoopCoordinator:
             # Pre-overflow shrink: if compaction didn't save enough (e.g. one
             # giant chunk that _compact_prompt can't split), force-truncate the
             # appendix tail to fit under the hard cap.
-            if len(current_prompt) > _MAX_PROMPT_CHARS:
-                _overflow = len(current_prompt) - _MAX_PROMPT_CHARS + 1024
+            if len(current_prompt) > _ctx_budget.max_chars:
+                _overflow = len(current_prompt) - _ctx_budget.max_chars + 1024
                 _appendix_start = len(prompt)
                 if len(current_prompt) - _appendix_start > _overflow:
                     _keep = len(current_prompt) - _appendix_start - _overflow
                     current_prompt = (
                         prompt
                         + current_prompt[_appendix_start:_appendix_start + _keep]
-                        + f"\n[CONTEXT FORCE-TRUNCATED: {_overflow:,} chars removed to fit {_MAX_PROMPT_CHARS:,} limit]\n"
+                        + f"\n[CONTEXT FORCE-TRUNCATED: {_overflow:,} chars removed to fit {_ctx_budget.max_chars:,} limit]\n"
                     )
                     logger.warning(
                         "[ToolLoop] Force-truncated %d chars for %s (prompt was %d, now %d)",
                         _overflow, op_id[:12],
                         len(prompt) + _keep + _overflow, len(current_prompt),
+                    )
+                elif prompt_window is not None:
+                    # The BASE prompt alone exceeds the window, so trimming
+                    # the tool appendix cannot help. The lane's transport
+                    # fits every payload to this window anyway (keeping the
+                    # head and the most recent tool output); fit HERE with
+                    # the same function so the loop continues on what will
+                    # actually be sent, instead of aborting an op the
+                    # transport would have served.
+                    _before = len(current_prompt)
+                    current_prompt = prompt_window.fit(current_prompt)
+                    logger.warning(
+                        "[ToolLoop] base prompt over the negotiated window for "
+                        "%s — fitted %d -> %d chars (cap %d)",
+                        op_id[:12], _before, len(current_prompt),
+                        _ctx_budget.max_chars,
                     )
                 else:
                     self._last_records = list(records)

@@ -837,6 +837,53 @@ def apply_floor_to_risk_tier(
         return risk_tier
 
 
+_ENV_RISK_CEILING = "JARVIS_RISK_CEILING"
+
+
+def apply_operator_risk_override(risk_tier: Any) -> Tuple[Any, Optional[str]]:
+    """The operator's ``/risk`` override (``JARVIS_RISK_CEILING``): every op
+    is at least this tier. Returns ``(tier, applied_name_or_None)``.
+
+    ONE reading of the override. It was parsed inline at each gate (with a
+    hand-typed three-entry map) and NOT at all before GENERATE, so a
+    pre-GENERATE consumer -- the adversarial reviewer -- saw the CLASSIFY
+    tier and skipped an op the operator had raised to APPROVAL_REQUIRED.
+    The name is resolved against the ``RiskTier`` enum itself, so every
+    member is accepted and an unknown name is ignored. Never weakens; never
+    raises."""
+    raw = (os.environ.get(_ENV_RISK_CEILING, "") or "").strip()
+    if not raw:
+        return risk_tier, None
+    try:
+        from backend.core.ouroboros.governance.risk_engine import RiskTier
+        override = RiskTier[raw.upper()]
+    except Exception:  # noqa: BLE001 — unknown name / enum unavailable
+        return risk_tier, None
+    try:
+        if risk_tier.value < override.value:
+            return override, override.name
+    except Exception:  # noqa: BLE001
+        pass
+    return risk_tier, None
+
+
+def effective_risk_tier(
+    risk_tier: Any, *,
+    signal_source: str = "",
+    op_id: Optional[str] = None,
+    target_files: Optional[Sequence[Any]] = None,
+) -> Any:
+    """The tier an op holds once every floor that does not depend on the
+    candidate applies: the governance floor, then the operator override.
+    For consumers that act BEFORE the gate has run (and must not see a
+    weaker tier than the gate will). Never raises."""
+    floored = apply_floor_to_risk_tier(
+        risk_tier, signal_source=signal_source, op_id=op_id,
+        target_files=target_files,
+    )
+    return apply_operator_risk_override(floored)[0]
+
+
 def floor_reason(
     now: Optional[datetime] = None,
     *,

@@ -380,6 +380,22 @@ class ReviewCoordinator:
                 error="timeout=0 (legacy auto-apply opt-in)",
             )
 
+        # Nobody can answer: no operator has ever attached to this process.
+        # NOTIFY_APPLY means "auto-apply with notice"; a review window here
+        # could only run out and be counted as a REJECT, discarding work no
+        # one ever looked at. Decided by attendance, not by which launcher
+        # started the process -- an operator who attaches to a running soak
+        # arms the gate and every later review waits for them. With the
+        # attention gate switched off the operator asked for wall-clock
+        # expiry, and gets it.
+        if attention_gate_enabled() and not get_attention_ledger().snapshot().armed:
+            return CoordinatedReview(
+                op_id=op_id, archive_ref="", branch_name=None,
+                decision=ReviewDecision.SKIPPED,
+                elapsed_s=0.0,
+                error="unattended (no operator has attached to this process)",
+            )
+
         if self._branch_manager is None:
             return CoordinatedReview(
                 op_id=op_id, archive_ref="", branch_name=None,
@@ -827,6 +843,75 @@ def reset_default_coordinator_for_tests() -> None:
         _default_coordinator = None
 
 
+#: Terminal reason for a NOTIFY_APPLY op whose review window ran out with no
+#: decision -- distinct from an operator's explicit reject.
+REVIEW_EXPIRED_REASON = "review_expired"
+USER_REJECTED_REASON = "user_rejected_notify_apply"
+
+
+async def coordinate_notify_apply_review(
+    project_root: Path,
+    op_id: str,
+    changes: Sequence[object],
+    *,
+    summary: str = "",
+    cancel_check: Optional[Callable[[], bool]] = None,
+    coordinator: Optional["ReviewCoordinator"] = None,
+) -> Optional[Tuple[bool, str]]:
+    """THE NOTIFY_APPLY review-branch step, for every GATE path.
+
+    Returns ``None`` when the review did not decide (flag off, nothing to
+    review, SKIPPED/FAILED, any fault) -- the caller then takes its legacy
+    preview. Otherwise ``(cancelled, terminal_reason)``: an operator ACCEPT
+    proceeds, a REJECT is ``user_rejected_notify_apply``, and an EXPIRY is
+    ``review_expired`` (it was reported as a user rejection).
+
+    It lived only in the inline orchestrator GATE, which the phase
+    dispatcher never reaches -- so the review branch never ran on the
+    shipping path (2026-10-09). With timeout 0 or the master off the
+    coordinator answers SKIPPED before any archive or branch exists, so an
+    unattended organism configured that way never waits. NEVER raises."""
+    try:
+        if not is_master_flag_enabled():
+            return None
+        files = [
+            (getattr(c, "path"), getattr(c, "new_content"))
+            for c in changes or ()
+            if getattr(c, "status", "") != "deleted"
+        ]
+        if not files:
+            return None
+        coord = coordinator or get_default_coordinator()
+        if coord.branch_manager is None:
+            coord.attach_branch_manager(ReviewBranchManager(Path(project_root)))
+        review = await coord.coordinate_review(
+            op_id, files, risk_tier="notify_apply",
+            summary=summary or "", cancel_check=cancel_check,
+        )
+        if review.decision not in (
+            ReviewDecision.ACCEPTED, ReviewDecision.REJECTED, ReviewDecision.EXPIRED,
+        ):
+            return None
+        cancelled = not review.decision.implies_apply
+        reason = (
+            REVIEW_EXPIRED_REASON if review.decision is ReviewDecision.EXPIRED
+            else USER_REJECTED_REASON
+        )
+        logger.info(
+            "[ReviewCoordinator] review-branch decision op=%s decision=%s "
+            "elapsed=%.1fs", op_id, review.decision.value, review.elapsed_s,
+        )
+        return cancelled, reason
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 -- fall through to the legacy preview
+        logger.debug(
+            "[ReviewCoordinator] NOTIFY_APPLY review failed; legacy preview",
+            exc_info=True,
+        )
+        return None
+
+
 __all__ = [
     "ATTENTION_GATE_ENV_VAR",
     "CANCEL_POLL_ENV_VAR",
@@ -837,7 +922,10 @@ __all__ = [
     "ReviewDecision",
     "TIMEOUT_ENV_VAR",
     "WALL_MULT_ENV_VAR",
+    "REVIEW_EXPIRED_REASON",
+    "USER_REJECTED_REASON",
     "attention_gate_enabled",
+    "coordinate_notify_apply_review",
     "get_default_coordinator",
     "is_master_flag_enabled",
     "read_cancel_poll_s",

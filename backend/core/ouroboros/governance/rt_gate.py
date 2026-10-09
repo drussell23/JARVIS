@@ -295,6 +295,28 @@ def local_tier_enabled() -> bool:
         return False
 
 
+#: The metered tiers the gate can cascade to.
+_CLOUD_TIERS = ("claude", "dw")
+
+
+def admitted_cloud_tiers(names: Any = _CLOUD_TIERS) -> Tuple[str, ...]:
+    """The metered tiers the paid-lane authority admits right now."""
+    try:
+        from backend.core.ouroboros.governance.paid_lanes import paid_lane_allowed
+    except Exception:  # noqa: BLE001 -- authority unavailable → admit none
+        return ()
+    return tuple(n for n in names if paid_lane_allowed(n))
+
+
+def any_tier_available() -> bool:
+    """Whether :func:`gate_completion` has ANY tier it would try -- the local
+    lane or an admitted metered tier. The question a gate consumer asks
+    before deciding it has no model, instead of asking for one specific
+    provider handle it does not need (self-critique and intent discovery
+    both required a DoubleWord handle and so never ran local-only)."""
+    return local_tier_enabled() or bool(admitted_cloud_tiers())
+
+
 def _accepts(accept: Optional[Callable[[str], bool]], raw: str) -> bool:
     """Whether a tier's non-empty text satisfies the caller's shape check.
     A predicate that raises REJECTS — the caller asked for a shape and the
@@ -374,9 +396,9 @@ async def gate_completion_detailed(
     # A cloud tier the paid-lane authority refuses is not in the order at
     # all — not tried-and-failed. With every paid lane off, the local tier
     # carries the gate alone (narration, briefings, cockpit chat, critique).
-    from backend.core.ouroboros.governance.paid_lanes import paid_lane_allowed
-    _refused = tuple(n for n, _t in _cloud if not paid_lane_allowed(n))
-    _cloud = tuple(p for p in _cloud if p[0] not in _refused)
+    _admitted = admitted_cloud_tiers(n for n, _t in _cloud)
+    _refused = tuple(n for n, _t in _cloud if n not in _admitted)
+    _cloud = tuple(p for p in _cloud if p[0] in _admitted)
     tiers = ((_l,) if local_tier_enabled() else ()) + _cloud
     if not tiers:
         raise GateProviderExhaustedError(

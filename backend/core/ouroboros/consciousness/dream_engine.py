@@ -55,6 +55,15 @@ from backend.core.ouroboros.consciousness.types import (
 
 logger = logging.getLogger(__name__)
 
+
+def _local_lane_enabled() -> bool:
+    """The RT gate's own answer to "is there a local tier?". NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.rt_gate import local_tier_enabled
+        return bool(local_tier_enabled())
+    except Exception:  # noqa: BLE001
+        return False
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -486,8 +495,14 @@ class DreamEngine:
         # Original gate required J-Prime healthy + model loaded (TC09).
         # With DW 35B and Claude as inference backends, J-Prime is no longer
         # required — skip the health check if an alternative is available.
+        # Inference goes through ``rt_gate.gate_completion_detailed``, whose
+        # local tier serves wherever the local lane is enabled -- so that
+        # lane IS a backend. Counting only the cloud handles left a host
+        # whose only model is local permanently refusing to dream
+        # ("Prime not healthy: status=unknown", 2026-10-09).
         _has_alt_backend = (
             self._dw_provider is not None or self._claude_provider is not None
+            or _local_lane_enabled()
         )
         if not _has_alt_backend:
             # Legacy path: require J-Prime health
@@ -1039,6 +1054,23 @@ class DreamEngine:
             f"estimated_cost_usd, suggested_approach, risk_assessment."
         )
 
+    async def _unless_lane_wanted(self, call: Any) -> Any:
+        """Await ``call`` unless live work wants the lane first; then the
+        dream is preempted (cancelled, cycle marked preempted, None).
+
+        The admission gates only decide whether a dream STARTS; an op that
+        arrives mid-dream must not wait out the dream on a one-slot lane.
+        The shared ``lane_idleness.run_unless_wanted`` does the watching."""
+        from backend.core.ouroboros.governance.lane_idleness import (
+            Preempted, run_unless_wanted,
+        )
+        try:
+            return await run_unless_wanted(call, self._resource_governor, holding=1)
+        except Preempted:
+            self._preempted.set()
+            logger.info("[DreamEngine] lane wanted by live work — preempting dream")
+            return None
+
     async def _call_inference(self, prompt: str) -> Optional[Dict[str, Any]]:
         """Send the prompt through the shared RT gate cascade.
 
@@ -1070,7 +1102,7 @@ class DreamEngine:
         # account's entitled model) — no hardcoded model names.
         _dw_model = os.environ.get("JARVIS_DREAM_DW_MODEL", "").strip() or None
         try:
-            raw, tier = await gate_completion_detailed(
+            outcome = await self._unless_lane_wanted(gate_completion_detailed(
                 prompt,
                 caller_id="dream_engine",
                 system_prompt=_DREAM_SYSTEM_PROMPT,
@@ -1082,13 +1114,14 @@ class DreamEngine:
                 dw_model=_dw_model,
                 prefer="dw",
                 accept=lambda text: self._parse_json_response(text) is not None,
-            )
+            ))
         except GateProviderExhaustedError as exc:
             raise DreamProviderExhaustedError(
                 f"all RT inference tiers exhausted ({exc})"
             ) from exc
-        if self._check_preempted():
+        if outcome is None or self._check_preempted():
             return None
+        raw, tier = outcome
         result = self._parse_json_response(raw)
         if result is None:
             # `accept` admitted it and the parser is deterministic; this is
