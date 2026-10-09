@@ -311,3 +311,78 @@ def test_hang_repeated_is_a_hard_stop_not_a_redispatch():
     from backend.core.ouroboros.governance.orchestrator import l2_stop_is_hard
 
     assert l2_stop_is_hard(f"hang_repeated:{_KEY}")
+
+
+# ---------------------------------------------------------------------------
+# An AWAIT deadlock is attributable too (2026-10-08)
+# ---------------------------------------------------------------------------
+#
+# Soak bt-2026-10-08-121243: a candidate test drove LangGraphPhaseManager into
+# a re-entrant acquire of an asyncio.Lock -- a coroutine waiting on itself.
+# A suspended coroutine is on no thread's stack (the main thread shows only
+# the loop in select()), so the run read as "no repo-owned frame" and was
+# filed infra. The runner fence now prints the running loops' pending tasks
+# when the per-test cap fires; the task stack carries the repo frame.
+
+LOCKER = '''\
+import asyncio
+
+
+class Manager:
+    def __init__(self):
+        self._lock = asyncio.Lock()
+
+    async def transition(self, again=True):
+        async with self._lock:
+            if again:
+                await self.transition(again=False)
+'''
+
+DEADLOCK_TEST = '''\
+import asyncio
+
+from backend.locker import Manager
+
+
+def test_retry_exhaustion_fails_the_task():
+    asyncio.run(Manager().transition())
+'''
+
+FENCE_CONFTEST = '''\
+import importlib.util
+import sys
+import pytest
+_spec = importlib.util.spec_from_file_location("isolation_guard", {guard!r})
+iso = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = iso          # dataclasses resolve their module through sys.modules
+_spec.loader.exec_module(iso)
+_F = iso.RunnerFence()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _fence():
+    _F.install()
+    yield
+    _F.uninstall()
+'''
+
+
+def test_an_await_deadlock_is_attributed_to_the_awaiting_repo_frame(tmp_path, monkeypatch):
+    real_repo = Path(__file__).resolve().parents[2]
+    (tmp_path / "pytest.ini").write_text("[pytest]\npythonpath = .\ntimeout_method = thread\n")
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "backend/locker.py").write_text(LOCKER)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/test_locker.py").write_text(DEADLOCK_TEST)
+    # The fence is loaded by FILE from the real repository: putting the real
+    # repo on the path would shadow this tree's own `backend` and `tests`.
+    guard = real_repo / "tests" / "support" / "isolation_guard.py"
+    (tmp_path / "tests/conftest.py").write_text(FENCE_CONFTEST.format(guard=str(guard)))
+    runner = TR.TestRunner(repo_root=tmp_path, timeout=60, per_test_timeout_s=3)
+    result = asyncio.run(runner.run((tmp_path / "tests/test_locker.py",)))
+    assert result.timed_out
+    assert "Stack for <Task" in result.stdout, "the pending task's stack was not dumped"
+    assert result.hang, "an await deadlock in repo code must be attributed, not filed infra"
+    assert "FAILED tests/test_locker.py::test_retry_exhaustion_fails_the_task" in result.hang
+    assert "awaited something that never resolves, at backend/locker.py:" in result.hang
+    assert "not re-entrant" in result.hang                    # the await advice, not the I/O advice

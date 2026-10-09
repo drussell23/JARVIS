@@ -485,15 +485,25 @@ async def parse_failure(
 #: per-test cap" (``test_runner`` reads it from here).
 TIMEOUT_BANNER_RE = re.compile(r"\+{3,}\s*Timeout\s*\+{3,}|^Timeout:\s", re.M)
 
-# One thread's stack, in either dialect a hang is reported in:
+# One stack, in any dialect a hang is reported in:
 #   pytest-timeout (per-test cap):   ~~~~ Stack of MainThread (1403...) ~~~~
 #   faulthandler   (wall cap):       Current thread 0x7f.. (most recent call first):
+#   a pending asyncio task:          Stack for <Task pending name=...> (most recent call last):
+# The last is what makes an AWAIT hang attributable. A coroutine suspended on
+# a lock or future that never resolves is on no thread's stack -- the main
+# thread shows only the event loop in select() -- so a run whose test
+# deadlocked on `await` (2026-10-08: a re-entrant acquire of an asyncio.Lock)
+# read as "no repo-owned frame" and was filed as infrastructure. The runner
+# fence prints the running loops' pending tasks when the per-test cap fires
+# (tests/support/isolation_guard.py), in Task.print_stack's own format.
 _STACK_HEADER = re.compile(
     r"^(?:~+ Stack of .+? ~+"
-    r"|(?:Current thread|Thread) 0x[0-9a-fA-F]+ \(most recent call first\):)\s*$",
+    r"|(?:Current thread|Thread) 0x[0-9a-fA-F]+ \(most recent call first\):"
+    r"|Stack for <Task .+> \(most recent call last\):)\s*$",
     re.M,
 )
 _INNERMOST_FIRST = "most recent call first"
+_TASK_STACK = "Stack for <Task"
 
 
 def _is_test_file(path: str) -> bool:
@@ -535,6 +545,9 @@ class HangSite:
     call_site: Frame
     blocking: Frame
     source_line: str
+    #: Stuck on an ``await`` that never resolves (from a pending task's
+    #: stack), not on blocking I/O -- a different defect with a different fix.
+    awaiting: bool = False
 
     @property
     def key(self) -> str:
@@ -554,6 +567,19 @@ class HangSite:
         )
         code = f": `{self.source_line}`" if self.source_line else ""
         outcome = "ERROR" if self.collection else "FAILED"
+        if self.awaiting:
+            return (
+                "=========================== short test summary info "
+                "============================\n"
+                f"{outcome} {self.node_id} - TestHangError: awaited something that "
+                f"never resolves, at {where}{code} (suspended in "
+                f"{self.blocking.function or '?'}() at "
+                f"{Path(self.blocking.file_path).name}:{self.blocking.line_number}) -- "
+                "a coroutine waiting on a lock its own call chain already holds (an "
+                "asyncio.Lock is not re-entrant), or on a future/event nothing will "
+                "set, or on a loop the test started and never stopped. Fix that "
+                "path, or drive the subject so the awaited result is produced."
+            )
         return (
             "=========================== short test summary info "
             "============================\n"
@@ -614,11 +640,19 @@ def hang_site(
             name = frame.file_path
             return any(name.endswith(p) or p.endswith(name) for p in preferred)
 
+        stacks = [(h, fr) for h, fr in _stacks(output)
+                  if fr and any(_owned(f.file_path, root) for f in fr)]
+        # A pending asyncio task with repo frames IS where an await hang is:
+        # the thread stacks then show only the event loop idling in select(),
+        # waiting on that coroutine. Thread stacks are the evidence only when
+        # no task stack names repo code.
+        tasks = [(h, fr) for h, fr in stacks if h.startswith(_TASK_STACK)]
+        awaiting = bool(tasks)
+        pool = tasks or stacks
+
         chosen: Optional[Tuple[Frame, ...]] = None
         fallback: Optional[Tuple[Frame, ...]] = None
-        for _header, frames in _stacks(output):
-            if not frames or not any(_owned(f.file_path, root) for f in frames):
-                continue
+        for _header, frames in pool:
             if preferred and any(_is_preferred(f) for f in frames):
                 chosen = frames
                 break
@@ -631,8 +665,11 @@ def hang_site(
         owned = [f for f in frames if _owned(f.file_path, root)]
         call = owned[-1]
         blocking = frames[-1]
+        # The test that hung: a coroutine's stack starts inside asyncio.run and
+        # never holds the test frame, so it is looked up across every stack.
         entry = next(
-            (f for f in owned if _is_preferred(f) or _is_test_file(f.file_path)),
+            (f for _h, fr in [(None, frames)] + stacks for f in fr
+             if _owned(f.file_path, root) and (_is_preferred(f) or _is_test_file(f.file_path))),
             None,
         )
         collection = bool(entry and entry.function == "<module>")
@@ -648,6 +685,7 @@ def hang_site(
             call_site=Frame(_rel(call.file_path, root), call.line_number, call.function),
             blocking=Frame(_rel(blocking.file_path, root), blocking.line_number, blocking.function),
             source_line=_source_at(call.file_path, call.line_number, root),
+            awaiting=awaiting,
         )
     except Exception:  # noqa: BLE001 — attribution is best-effort; None = infra
         logger.debug("[PytestTraceback] hang attribution degraded", exc_info=True)

@@ -49,6 +49,45 @@ def _exit_is_pytest_timeouts() -> bool:
         return False
 
 
+def _dump_pending_tasks(stream=None) -> int:
+    """Print every running event loop's pending asyncio tasks, each in
+    ``Task.print_stack``'s own format, before pytest-timeout ends the run.
+
+    pytest-timeout dumps THREAD stacks. A test deadlocked on ``await`` (a lock
+    re-acquired by its holder, a future nobody resolves) is a suspended
+    coroutine, on no thread's stack: the dump shows only the loop in
+    ``select()``, and the hang reads as having no repo-owned frame. The
+    coroutine frames live on the pending tasks. Called from pytest-timeout's
+    timer thread with the main thread blocked; best effort, NEVER raises.
+    Returns how many task stacks were printed."""
+    import asyncio
+    import gc
+    import sys
+    out = stream if stream is not None else sys.stderr
+    printed = 0
+    try:
+        loops = [o for o in gc.get_objects()
+                 if isinstance(o, asyncio.AbstractEventLoop) and o.is_running()]
+    except Exception:  # noqa: BLE001
+        return 0
+    for loop in loops:
+        try:
+            tasks = list(asyncio.all_tasks(loop))
+        except Exception:  # noqa: BLE001 -- the set moved under us; a dump is best effort
+            continue
+        for task in tasks:
+            try:
+                task.print_stack(file=out)
+                printed += 1
+            except Exception:  # noqa: BLE001
+                continue
+    try:
+        out.flush()
+    except Exception:  # noqa: BLE001
+        pass
+    return printed
+
+
 def isolation_mode() -> str:
     raw = (os.environ.get(_ENV_MODE, "") or "").strip().lower()
     return raw if raw in ("report", "strict") else "report"
@@ -149,7 +188,10 @@ class RunnerFence:
             # threading's excepthook swallows, so every hung test ran on to
             # the outer cap: per-test timeouts dead in every run under tests/
             # since 2026-09-26 (VALIDATE: 45 s cap, killed at 180 s instead).
-            if not self._is_runner() or _exit_is_pytest_timeouts():
+            if not self._is_runner():
+                real["_exit"](code)
+            if _exit_is_pytest_timeouts():
+                _dump_pending_tasks()
                 real["_exit"](code)
             self._record("os._exit", str(code))
             raise SystemExit(code)
