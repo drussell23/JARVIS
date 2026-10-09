@@ -43,6 +43,12 @@ _GOOGLE_CSE_KEY = os.environ.get("GOOGLE_CSE_API_KEY", "")
 _GOOGLE_CSE_CX = os.environ.get("GOOGLE_CSE_CX", "")
 
 _MAX_RESULTS = int(os.environ.get("JARVIS_WEB_SEARCH_MAX_RESULTS", "3"))
+
+
+def max_results() -> int:
+    """How many results one ``web_search`` returns. The prompt states this
+    rather than offering a ``max_results`` argument the search never read."""
+    return _MAX_RESULTS
 _SEARCH_TIMEOUT_S = float(os.environ.get("JARVIS_WEB_SEARCH_TIMEOUT_S", "10"))
 _MAX_SNIPPET_CHARS = int(os.environ.get("JARVIS_WEB_SEARCH_MAX_SNIPPET", "2000"))
 _MAX_PAGE_CHARS = int(os.environ.get("JARVIS_WEB_SEARCH_MAX_PAGE", "6000"))

@@ -1,0 +1,24 @@
+# MCP servers O+V's tool loop may call, as `mcp_{server}_{tool}`.
+#
+# Copy to one of (first found wins, see mcp_tool_client.resolve_config_path):
+#   $JARVIS_MCP_CONFIG            an explicit path
+#   <repo>/.jarvis/mcp.yaml       this repository's servers (.jarvis/ is gitignored)
+#   ~/.jarvis/mcp.yaml            the operator's own
+#
+# Every lane sees the tools, the local J-Prime model included: the model
+# decides to call them. Each server sits behind its own circuit breaker
+# (governance/external_breaker.py): a hung or malformed server costs the
+# calling op one bounded tool error and is skipped until it recovers.
+#
+# ${VAR} values are read from the environment; never write a secret here.
+
+servers:
+  github:
+    transport: stdio
+    command: ["npx", "-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_TOKEN}"
+
+# Outward-facing actions, both OFF unless you turn them on:
+auto_issue: false   # open a GitHub issue for every failed op
+auto_pr: false      # open a PR for every completed op

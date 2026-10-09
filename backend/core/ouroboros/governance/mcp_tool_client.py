@@ -60,7 +60,11 @@ class MCPClientConfig:
     """Configuration for all MCP server connections."""
 
     servers: Dict[str, MCPServerConfig] = field(default_factory=dict)
-    auto_issue: bool = True       # Create GitHub issues on POSTMORTEM
+    #: Create GitHub issues on POSTMORTEM. OPT-IN, like auto_pr: it posts to
+    #: an outside service on every failed op, and the client now actually
+    #: connects, so a default of True would publish an issue per failure the
+    #: moment a GitHub server was configured for its TOOLS.
+    auto_issue: bool = False
     auto_pr: bool = False         # Create PRs on COMPLETE (opt-in)
     enabled: bool = True
 
@@ -93,7 +97,7 @@ class MCPClientConfig:
                 )
             return cls(
                 servers=servers,
-                auto_issue=data.get("auto_issue", True),
+                auto_issue=data.get("auto_issue", False),
                 auto_pr=data.get("auto_pr", False),
                 enabled=bool(servers),
             )
@@ -103,11 +107,52 @@ class MCPClientConfig:
 
     @classmethod
     def from_env(cls) -> MCPClientConfig:
-        """Load config from JARVIS_MCP_CONFIG env var."""
-        config_path = os.getenv("JARVIS_MCP_CONFIG", "")
+        """Load the config :func:`resolve_config_path` finds, or disabled."""
+        config_path = resolve_config_path()
         if not config_path:
             return cls(enabled=False)
         return cls.from_file(config_path)
+
+
+def resolve_config_path() -> str:
+    """Where the MCP config is, adaptively: ``JARVIS_MCP_CONFIG`` when set,
+    else the first existing of ``<cwd>/.jarvis/mcp.yaml`` (this repository's
+    servers) and ``~/.jarvis/mcp.yaml`` (the operator's own). An env value
+    that names a missing file is reported, not silently replaced: the
+    operator asked for that file. "" when there is none."""
+    explicit = os.getenv("JARVIS_MCP_CONFIG", "").strip()
+    if explicit:
+        if not Path(explicit).expanduser().is_file():
+            logger.warning("[MCPClient] JARVIS_MCP_CONFIG=%s does not exist", explicit)
+            return ""
+        return str(Path(explicit).expanduser())
+    for candidate in (Path.cwd() / ".jarvis" / "mcp.yaml",
+                      Path.home() / ".jarvis" / "mcp.yaml"):
+        try:
+            if candidate.is_file():
+                return str(candidate)
+        except OSError:
+            continue
+    return ""
+
+
+def _connect_budget_s() -> float:
+    """``JARVIS_MCP_START_BUDGET_S``: total time start() may take (default
+    20s). Servers connect in PARALLEL inside it."""
+    try:
+        return max(1.0, float(os.getenv("JARVIS_MCP_START_BUDGET_S", "") or 20.0))
+    except ValueError:
+        return 20.0
+
+
+def _tool_cache_ttl_s() -> float:
+    """``JARVIS_MCP_TOOL_CACHE_TTL_S``: how long one discovery answers
+    (default 300s). Discovery runs at prompt construction; asking every
+    server on every generation would put their latency on every op."""
+    try:
+        return max(0.0, float(os.getenv("JARVIS_MCP_TOOL_CACHE_TTL_S", "") or 300.0))
+    except ValueError:
+        return 300.0
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +492,8 @@ class GovernanceMCPClient:
         self._config = config or MCPClientConfig.from_env()
         self._available_servers: Dict[str, bool] = {}
         self._connections: Dict[str, MCPServerConnection] = {}
+        self._tool_cache: List[Dict[str, Any]] = []
+        self._tool_cache_at: float = 0.0
 
     @property
     def is_enabled(self) -> bool:
@@ -462,21 +509,32 @@ class GovernanceMCPClient:
         if not self.is_enabled:
             logger.debug("MCP client disabled -- no servers configured")
             return
-        for name, server in self._config.servers.items():
+
+        async def _one(name: str, server: MCPServerConfig) -> None:
             if server.transport == "stdio" and server.command:
                 conn = MCPServerConnection(server)
                 connected = await conn.connect()
                 self._available_servers[name] = connected
                 if connected:
                     self._connections[name] = conn
-                status = "connected" if connected else "unavailable"
-                logger.info("MCP server %s: %s", name, status)
+                logger.info("MCP server %s: %s", name,
+                            "connected" if connected else "unavailable")
             else:
                 # SSE or other transports — availability check only
                 available = await self._check_server(server)
                 self._available_servers[name] = available
-                status = "available" if available else "unavailable"
-                logger.info("MCP server %s: %s", name, status)
+                logger.info("MCP server %s: %s", name,
+                            "available" if available else "unavailable")
+
+        # In PARALLEL, inside one budget: one slow server no longer delays
+        # the others, and none can hold the boot.
+        jobs = [asyncio.ensure_future(_one(n, s)) for n, s in self._config.servers.items()]
+        done, pending = await asyncio.wait(jobs, timeout=_connect_budget_s())
+        for job in pending:
+            job.cancel()
+        for job in done:
+            if job.exception() is not None:
+                logger.warning("[MCPClient] server start failed: %s", job.exception())
 
     async def stop(self) -> None:
         """Disconnect all live MCP server connections."""
@@ -518,18 +576,26 @@ class GovernanceMCPClient:
         external tools are available. Fire-and-forget on failure.
         """
         tools: List[Dict[str, Any]] = []
-        if not self.is_enabled:
+        if not self.is_enabled or not self._connections:
             return tools
+        import time as _time
+        if self._tool_cache_at and _time.monotonic() - self._tool_cache_at < _tool_cache_ttl_s():
+            return list(self._tool_cache)
+        from backend.core.ouroboros.governance.external_breaker import guard
         for name, conn in self._connections.items():
             if not conn.connected:
                 continue
             try:
-                result = await asyncio.wait_for(
-                    conn.list_tools(timeout=_MCP_REQUEST_TIMEOUT),
-                    timeout=_MCP_REQUEST_TIMEOUT + 2.0,
+                outcome = await guard(
+                    f"mcp:{name}",
+                    lambda c=conn: c.list_tools(timeout=_MCP_REQUEST_TIMEOUT),
+                    timeout=_MCP_REQUEST_TIMEOUT,
+                    valid=lambda r: isinstance(r, dict),
                 )
-                if result is None:
+                if not outcome.ok:
+                    logger.debug("[MCPClient] discovery skipped %s: %s", name, outcome.reason)
                     continue
+                result = outcome.value
                 raw_tools = result.get("tools", [])
                 for tool in raw_tools:
                     tool_name = tool.get("name", "")
@@ -547,7 +613,18 @@ class GovernanceMCPClient:
                 )
             except Exception as exc:
                 logger.debug("[MCPClient] Tool discovery failed for %s: %s", name, exc)
+        self._tool_cache, self._tool_cache_at = list(tools), _time.monotonic()
         return tools
+
+    def server_of(self, qualified_name: str) -> str:
+        """The connected server a ``mcp_{server}_{tool}`` name addresses,
+        longest match first (server names may contain underscores)."""
+        remainder = str(qualified_name or "")[len("mcp_"):] if str(
+            qualified_name or "").startswith("mcp_") else ""
+        for server_name in sorted(self._connections, key=len, reverse=True):
+            if remainder.startswith(server_name + "_"):
+                return server_name
+        return ""
 
     async def call_tool(
         self,

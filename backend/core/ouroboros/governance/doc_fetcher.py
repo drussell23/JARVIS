@@ -56,6 +56,12 @@ _ALLOWED_DOMAINS = frozenset({
     "redis.io",
 })
 
+def allowed_domains() -> tuple:
+    """The hosts ``web_fetch`` may reach, for the prompt that offers it: a
+    model told it can fetch any URL spends rounds on refusals."""
+    return tuple(sorted(_ALLOWED_DOMAINS))
+
+
 # Known package -> doc URL patterns (deterministic mapping)
 _PYPI_API_TEMPLATE = "https://pypi.org/pypi/{package}/json"
 _GITHUB_README_TEMPLATE = (

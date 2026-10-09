@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -946,6 +947,38 @@ def derive_safe_num_ctx(
         return flr
 
 
+def _protected_section_titles() -> "Tuple[str, ...]":
+    """``JARVIS_WINDOW_PROTECTED_SECTIONS``: comma-separated ``##`` section
+    titles window fitting never compresses (default: the tool section)."""
+    raw = os.environ.get("JARVIS_WINDOW_PROTECTED_SECTIONS", "") or "Available Tools"
+    return tuple(t.strip().lower() for t in raw.split(",") if t.strip())
+
+
+def _split_protected_sections(text: str) -> "Tuple[List[str], str]":
+    """``(protected_sections, remainder)``. A section is a ``## `` header and
+    everything up to the next ``## `` header; deeper headers stay inside
+    their section. NEVER raises."""
+    try:
+        titles = _protected_section_titles()
+        if not titles or "## " not in text:
+            return [], text
+        parts = re.split(r"(?m)^(?=## )", text)
+        protected = [p for p in parts if p.startswith("## ")
+                     and p[3:].split("\n", 1)[0].strip().lower() in titles]
+        if not protected:
+            return [], text
+        return protected, "".join(p for p in parts if p not in protected)
+    except Exception:  # noqa: BLE001
+        return [], text
+
+
+def _head_boundary(text: str, near: int) -> int:
+    """The end of the line at or after *near*, so a re-inserted section
+    never lands mid-line."""
+    nl = text.find("\n", max(0, near))
+    return len(text) if nl < 0 else nl + 1
+
+
 def fit_prompt_to_window(
     system: str,
     user: str,
@@ -968,6 +1001,33 @@ def fit_prompt_to_window(
     if user_budget_toks <= 0:
         return system, "[context omitted: system prompt already fills the VRAM-safe window]", True
     char_budget = user_budget_toks * 4
+    # STRUCTURE-AWARE. The head/tail cut below is blind to what it removes,
+    # and on a long op the elided middle is where `## Available Tools` sits:
+    # the local model lost its tool list exactly when the history was
+    # longest. Protected sections are taken out first, the rest is
+    # compressed against what remains, and they go back between the head
+    # (the task) and the tail (the newest tool output).
+    protected, rest = _split_protected_sections(user)
+    if protected:
+        from backend.core.ouroboros.ui.text_bounds import clip_lines
+        kept = "".join(protected)
+        if len(kept) > char_budget:
+            # `clip_lines` bounds the CONTENT and then appends its marker
+            # line, so its output can exceed the budget by the marker. The
+            # window is a hard limit: shrink the content budget by the
+            # overshoot until the whole result fits.
+            content_budget = char_budget
+            clipped = clip_lines(kept, content_budget)[0]
+            while len(clipped) > char_budget and content_budget > 0:
+                content_budget -= len(clipped) - char_budget
+                clipped = clip_lines(kept, max(0, content_budget))[0]
+            return system, clipped[:char_budget], True
+        _s, compressed_rest, _c = fit_prompt_to_window(
+            "", rest, max_tokens=max(1, (char_budget - len(kept)) // 4),
+            head_frac=head_frac, tail_frac=tail_frac,
+        )
+        cut = _head_boundary(compressed_rest, int(len(compressed_rest) * head_frac))
+        return system, compressed_rest[:cut] + "\n\n" + kept + "\n\n" + compressed_rest[cut:], True
     head_chars = max(0, int(char_budget * head_frac))
     tail_chars = max(0, int(char_budget * tail_frac))
     if len(user) <= head_chars + tail_chars or head_chars + tail_chars == 0:

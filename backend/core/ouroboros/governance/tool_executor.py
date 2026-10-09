@@ -4311,16 +4311,25 @@ class AsyncProcessToolBackend:
         connection. Returns structured output or error.
         """
         try:
-            result = await asyncio.wait_for(
-                self._mcp_client.call_tool(call.name, call.arguments or {}, timeout=timeout),
-                timeout=timeout,
+            # Through the server's circuit breaker: a hung or garbage-speaking
+            # server costs this call one bounded error, and stops being asked
+            # by every op that follows until it recovers.
+            from backend.core.ouroboros.governance.external_breaker import guard
+            server = getattr(self._mcp_client, "server_of", lambda _n: "")(call.name) or "unknown"
+            outcome = await guard(
+                f"mcp:{server}",
+                lambda: self._mcp_client.call_tool(
+                    call.name, call.arguments or {}, timeout=timeout),
+                timeout=timeout, valid=lambda r: isinstance(r, dict),
             )
-            if result is None:
+            if not outcome.ok:
                 return ToolResult(
                     tool_call=call, output="",
-                    error="MCP tool returned no result (server unavailable?)",
-                    status=ToolExecStatus.EXEC_ERROR,
+                    error=f"MCP server {server!r} unavailable: {outcome.reason}",
+                    status=(ToolExecStatus.TIMEOUT if outcome.reason == "timeout"
+                            else ToolExecStatus.EXEC_ERROR),
                 )
+            result = outcome.value
             # MCP tools return {"content": [{"type": "text", "text": "..."}]}
             content = result.get("content", [])
             if isinstance(content, list):
@@ -4346,6 +4355,56 @@ class AsyncProcessToolBackend:
                 status=ToolExecStatus.EXEC_ERROR,
             )
 
+    async def _run_web_tool(self, call: ToolCall, timeout: float, cap: int) -> ToolResult:
+        """web_search / web_fetch through their circuit breakers.
+
+        The client is always closed (it leaked on a timeout before), and a
+        fetch that fails says WHY: an empty string let the model read a
+        refused domain as an empty page. A domain refused by the allowlist is
+        policy, not a broken server, and does not count against the breaker.
+        """
+        from urllib.parse import urlparse
+        from backend.core.ouroboros.governance.external_breaker import guard
+        if call.name == "web_search":
+            from backend.core.ouroboros.governance.web_search import WebSearchCapability
+            ws = WebSearchCapability()
+            try:
+                outcome = await guard(
+                    "web:search", lambda: ws.search(call.arguments.get("query", "")),
+                    timeout=timeout)
+                output = ws.format_for_prompt(outcome.value) if outcome.ok else ""
+            finally:
+                await ws.close()
+        else:
+            from backend.core.ouroboros.governance.doc_fetcher import DocFetcher
+            url = str(call.arguments.get("url", "") or "")
+            fetcher = DocFetcher()
+            try:
+                outcome = await guard(
+                    f"web:fetch:{urlparse(url).hostname or 'invalid'}",
+                    lambda: fetcher.fetch_urls([url]), timeout=timeout,
+                    valid=lambda r: isinstance(r, (list, tuple)))
+            finally:
+                await fetcher.close()
+            output = ""
+            if outcome.ok:
+                fetched = [r for r in outcome.value if getattr(r, "success", False)]
+                output = "\n".join(r.text for r in fetched)
+                if not fetched:
+                    why = "; ".join(str(getattr(r, "error", "") or "no content")
+                                    for r in outcome.value) or "no content"
+                    return ToolResult(tool_call=call, output="",
+                                      error=f"web_fetch {url!r}: {why}",
+                                      status=ToolExecStatus.EXEC_ERROR)
+        if not outcome.ok:
+            return ToolResult(
+                tool_call=call, output="",
+                error=f"{call.name} unavailable: {outcome.reason}",
+                status=(ToolExecStatus.TIMEOUT if outcome.reason == "timeout"
+                        else ToolExecStatus.EXEC_ERROR))
+        return ToolResult(tool_call=call, output=output[:cap],
+                          status=ToolExecStatus.SUCCESS)
+
     async def _run_async_native_tool(
         self, call: ToolCall, policy_ctx: PolicyContext, timeout: float, cap: int,
     ) -> ToolResult:
@@ -4357,21 +4416,8 @@ class AsyncProcessToolBackend:
         """
         try:
             output = ""
-            if call.name == "web_search":
-                from backend.core.ouroboros.governance.web_search import WebSearchCapability
-                ws = WebSearchCapability()
-                query = call.arguments.get("query", "")
-                response = await asyncio.wait_for(ws.search(query), timeout=timeout)
-                output = ws.format_for_prompt(response)
-                await ws.close()
-
-            elif call.name == "web_fetch":
-                from backend.core.ouroboros.governance.doc_fetcher import DocFetcher
-                fetcher = DocFetcher()
-                url = call.arguments.get("url", "")
-                results = await asyncio.wait_for(fetcher.fetch_urls([url]), timeout=timeout)
-                output = "\n".join(r.text for r in results if r.success)[:cap]
-                await fetcher.close()
+            if call.name in ("web_search", "web_fetch"):
+                return await self._run_web_tool(call, timeout, cap)
 
             elif call.name in ("web_browse", "web_follow", "web_cite"):
                 # §41.5 WebBrowser composer entry point. Routes through

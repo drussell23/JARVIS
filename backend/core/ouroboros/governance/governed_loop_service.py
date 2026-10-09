@@ -1678,6 +1678,7 @@ class GovernedLoopService:
         self._graph_coalescer: Optional[Any] = None
         self._advanced_autonomy: Optional[Any] = None
         self._mcp_client: Optional[Any] = None  # Phase A: GovernanceMCPClient, wired in start()
+        self._mcp_start_task: Optional[Any] = None  # its background connect
         self._docker_ready: Optional[bool] = None  # set in start() by docker_preflight; None = not yet run
 
         # Compute-class admission gate (set externally after fetching /v1/capability;
@@ -2932,6 +2933,19 @@ class GovernedLoopService:
             return
 
         self._state = ServiceState.STOPPING
+        # MCP servers are child PROCESSES the client spawned. Disconnected
+        # here, bounded, so a hung server cannot hold the shutdown and none
+        # outlives the daemon.
+        _mcp = getattr(self, "_mcp_client", None)
+        if _mcp is not None:
+            _task = getattr(self, "_mcp_start_task", None)
+            if _task is not None and not _task.done():
+                _task.cancel()
+            try:
+                await asyncio.wait_for(_mcp.stop(), timeout=float(
+                    os.environ.get("JARVIS_MCP_STOP_TIMEOUT_S", "") or 10.0))
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                logger.debug("[GovernedLoop] MCP stop degraded", exc_info=True)
         try:
             from backend.core.ouroboros.governance.op_context import (
                 unregister_phase_transition_observer,
@@ -6493,10 +6507,30 @@ class GovernedLoopService:
                     _be = getattr(_tool_coordinator, "_backend", None)
                     if _be is not None and hasattr(_be, "_mcp_client"):
                         _be._mcp_client = _mcp
-                # Gap #7: inject MCP client into providers for tool section rendering
-                if self._doubleword_ref is not None and hasattr(self._doubleword_ref, "_mcp_client"):
-                    self._doubleword_ref._mcp_client = _mcp
-                logger.info("[GLS] GovernanceMCPClient wired (tools forwarded to generation context)")
+                # Every provider SEAT, not only DoubleWord. ClaudeProvider was
+                # never given the client, and the local J-Prime lane builds its
+                # provider from the primary seat's, so a client held by DW
+                # alone reached the local lane only when DW was primary.
+                _seats = [self._doubleword_ref]
+                _gen = getattr(self, "_generator", None)
+                for _attr in ("_primary", "_fallback", "_tier0"):
+                    _seats.append(getattr(_gen, _attr, None) if _gen is not None else None)
+                for _seat in _seats:
+                    if _seat is not None and hasattr(_seat, "_mcp_client"):
+                        _seat._mcp_client = _mcp
+                # CONNECT. `start()` was never called in production: the client
+                # was constructed, injected and never connected, so discovery
+                # returned [] and every MCP call returned None. Started in the
+                # background (it spawns server processes and handshakes), so a
+                # slow server cannot hold the boot; discovery reports no tools
+                # until a server is connected.
+                self._mcp_start_task = asyncio.ensure_future(_mcp.start())
+                from backend.core.ouroboros.governance.mcp_tool_client import (
+                    resolve_config_path,
+                )
+                logger.info("[GLS] GovernanceMCPClient wired on every lane; connecting "
+                            "%d server(s) from %s", len(_mcp._config.servers),
+                            resolve_config_path())
             else:
                 logger.debug("[GLS] GovernanceMCPClient: no servers configured")
         except Exception as exc:
@@ -7596,18 +7630,6 @@ class GovernedLoopService:
             logger.info("[GLS] ScopedToolGate wired (role-based tool restrictions)")
         except Exception as exc:
             logger.debug("[GLS] ScopedToolGate skipped: %s", exc)
-
-        # ---- Wire DeferredToolRegistry (P2: lazy tool loading) ----
-        self._tool_registry = None
-        try:
-            from backend.core.ouroboros.governance.deferred_tool_registry import get_tool_registry
-            self._tool_registry = get_tool_registry()
-            logger.info(
-                "[GLS] DeferredToolRegistry wired (%d tools, lazy loading)",
-                len(self._tool_registry.list_available()),
-            )
-        except Exception as exc:
-            logger.debug("[GLS] DeferredToolRegistry skipped: %s", exc)
 
         # ---- Wire CheckpointManager (P2: interactive rewind) ----
         self._checkpoint_mgr = None

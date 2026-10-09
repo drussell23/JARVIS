@@ -3092,12 +3092,10 @@ def compact_tool_section(section: str) -> str:
                 out.append(body)
             i += 2
         result = _re_compact.sub(r"\n{3,}", "\n\n", "".join(out)).strip()
-        budget = _compact_tool_budget()
-        if len(result) > budget:
-            result = result[:budget].rstrip() + (
-                "\n... [tool list truncated for compact context] ...\n"
-            )
-        return result
+        # At a LINE boundary, through the shared bound: a mid-line cut could
+        # leave half a tool signature, which reads as a different tool.
+        from backend.core.ouroboros.ui.text_bounds import clip_lines
+        return clip_lines(result, _compact_tool_budget())[0]
     except Exception:  # noqa: BLE001
         return section
 
@@ -3184,6 +3182,49 @@ _UNADVERTISED_BY_DESIGN: Dict[str, str] = {
     "web_follow": "link-following session for web_browse",
     "web_cite": "writes a citation record; research-session bookkeeping, not code work",
 }
+
+
+def _web_tools_block() -> str:
+    """The **Web:** section: what the web tools are FOR, not only that they
+    exist.
+
+    A four-hour soak called web_search and web_fetch zero times. They were
+    listed as bare signatures under an exploration protocol that names only
+    read_file / search_code / get_callers, so the model never learned when
+    looking outside the repository beats looking inside it. Everything here
+    is derived from the tools themselves: the fetchable hosts from
+    DocFetcher's allowlist, the result count from web_search, and the live
+    state of each tool's circuit breaker, so the prompt never offers a tool
+    that would refuse the call. NEVER raises.
+    """
+    try:
+        from backend.core.ouroboros.governance.doc_fetcher import allowed_domains
+        from backend.core.ouroboros.governance.web_search import max_results
+        from backend.core.ouroboros.governance.external_breaker import snapshot_all
+        hosts = ", ".join(allowed_domains())
+        n = max_results()
+        down = {k: v for k, v in snapshot_all().items()
+                if k.startswith("web:") and v.get("state") == "open"}
+        lines = [
+            "**Web (outside this repository):**",
+            f"- `web_search(query)` — top {n} results (title, URL, snippet).",
+            f"- `web_fetch(url)` — the text of one page. Reachable hosts: {hosts}.",
+            "Use them for facts this repository cannot tell you: a third-party "
+            "library's API or version-specific behaviour, an error raised inside a "
+            "dependency, a deprecation or changelog entry. Search first, then fetch "
+            "a result. Never use them for anything about THIS codebase: "
+            "`read_file`/`search_code` are exact and free, the web is neither.",
+        ]
+        if "web:search" in down:
+            lines.append(f"- web_search is temporarily unavailable "
+                         f"({down['web:search']['reason']}); do not call it.")
+        fetch_down = sorted(k[len("web:fetch:"):] for k in down if k.startswith("web:fetch:"))
+        if fetch_down:
+            lines.append(f"- web_fetch to {', '.join(fetch_down)} is temporarily unavailable.")
+        return "\n".join(lines) + "\n\n"
+    except Exception:  # noqa: BLE001
+        return ("**Web:**\n- `web_fetch(url)` — fetch a documentation page\n"
+                "- `web_search(query)` — search the web\n\n")
 
 
 def _subagent_tools_block() -> str:
@@ -3364,9 +3405,7 @@ def _build_tool_section(
         "- `run_tests(paths)` — run pytest (list of test paths), returns structured summary\n"
         "- `bash(command, timeout=30)` — sandboxed shell command (allowlisted, Iron Gate filtered)\n"
         '- `code_explore(snippet)` — run a Python snippet in sandbox to test a hypothesis\n\n'
-        "**Web:**\n"
-        "- `web_fetch(url)` — fetch URL, return text content (HTML stripped)\n"
-        '- `web_search(query, max_results=5)` — search the web (DuckDuckGo)\n\n'
+        + _web_tools_block()
         + _subagent_tools_block()
         + "**Write tools (Iron-Gate-governed, env: JARVIS_TOOL_EDIT_ALLOWED=true):**\n"
         "- `edit_file(path, old_text, new_text)` — surgical find-and-replace.\n"
@@ -3680,13 +3719,7 @@ def _build_exploration_manifest_block(manifest: Any) -> str:
             if _extra_ft > 0:
                 lines.append(f"- _(+{_extra_ft} more)_")
 
-        _section = "\n".join(lines)
-        # Cognitive armor: when the failover FSM reports J-Prime (7B) is the
-        # active generator, dynamically compact the section to cut cognitive load
-        # + context overflow. Fail-soft -> the full section.
-        if _should_compact_for_jprime():
-            _section = compact_tool_section(_section)
-        return _section
+        return "\n".join(lines)
     except Exception:  # noqa: BLE001 — Slice 89 never-raises contract
         return ""
 
@@ -3895,6 +3928,11 @@ def _build_lean_codegen_prompt(
         voice_plain_language=voice_plain_language,
         provider_route=str(getattr(ctx, "provider_route", "") or ""),
     )
+    # Cognitive armor for a small local model, on the section it was written
+    # for. It used to be applied to the "Prior Exploration" block, which has
+    # none of the headers it strips, so it never touched the tool section.
+    if _tool_section and _should_compact_for_jprime():
+        _tool_section = compact_tool_section(_tool_section)
 
     # ── 8. Output schema ────────────────────────────────────────────────
     # Lean mode always uses full_content schema — simpler for the model
@@ -7448,8 +7486,8 @@ class PrimeProvider:
                 preloaded_out=_preloaded_files,
             )
             logger.info(
-                "[ClaudeProvider] Using lean prompt (%d chars, ~%d tokens, preloaded=%d)",
-                len(prompt), len(prompt) // 4, len(_preloaded_files),
+                "[%s] Using lean prompt (%d chars, ~%d tokens, preloaded=%d)",
+                type(self).__name__, len(prompt), len(prompt) // 4, len(_preloaded_files),
             )
         else:
             # fs-hot-tier Phase 2 (audit row 4, 2026-07-02):
@@ -7501,10 +7539,11 @@ class PrimeProvider:
             )
             if is_offload_error(_prompt_result):
                 logger.debug(
-                    "[ClaudeProvider] _build_codegen_prompt offload "
+                    "[%s] _build_codegen_prompt offload "
                     "degraded (%s: %s) — retrying inline "
                     "synchronously so genuine business exceptions "
                     "(e.g. prompt_too_large) still propagate",
+                    type(self).__name__,
                     _prompt_result.exc_type, _prompt_result.message,
                 )
                 # A failed offload may have partially appended before dying —
