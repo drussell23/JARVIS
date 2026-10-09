@@ -397,6 +397,15 @@ class ValidationResult:
     #: ids the differential gate excluded as ambient (red BEFORE the
     #: candidate) — the verdict VERIFY judges by; rides ``ctx.validation``.
     ambient_red_tests: Tuple[str, ...] = ()
+    #: EVERY failing node id the adapters reported -- ``failed_tests`` is the
+    #: digest's display list and is capped; a decision that acts on failing
+    #: tests must see all of them.
+    failed_node_ids: Tuple[str, ...] = ()
+    #: An adapter run was cut off rather than judged.
+    timed_out: bool = False
+    #: Authored tests removed because the subject refuted them, before this
+    #: (re-)validation passed -- see ``test_reality.prune_failing_tests``.
+    pruned_tests: Tuple[str, ...] = ()
 
 
 #: Cap on the summary handed to the re-planner. The field's own comment

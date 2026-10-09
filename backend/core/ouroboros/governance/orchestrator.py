@@ -34,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import copy
 import dataclasses
 import inspect
 from dataclasses import asdict as _dc_asdict, dataclass, field
@@ -1038,6 +1039,17 @@ def _discover_tests_for_gate_worker(
             found.append(str(candidate))
     return sorted(found)
 
+
+def _write_candidate_contents(candidate: "Dict[str, Any]", contents: "Dict[str, str]") -> None:
+    """Replace file bodies in ``candidate`` -- the primary pair and every
+    ``files`` entry -- by path. The candidate shape has two places a body
+    lives; this is the one writer for both."""
+    primary = str(candidate.get("file_path", "") or "")
+    if primary in contents:
+        candidate["full_content"] = contents[primary]
+    for entry in candidate.get("files") or ():
+        if isinstance(entry, dict) and str(entry.get("file_path", "")) in contents:
+            entry["full_content"] = contents[str(entry["file_path"])]
 
 
 def _swe_bench_test_advisory(
@@ -13552,7 +13564,11 @@ class GovernedOrchestrator:
                 ),
                 adapter_names_run=(),
             )
+        _core_t0 = time.monotonic()
         result = await self._run_validation_core(ctx, candidate, remaining_s)
+        result = await self._land_passing_majority(
+            ctx, candidate, result, remaining_s - (time.monotonic() - _core_t0),
+        )
         # Lesson confidence: a pass after injected lessons boosts them.
         try:
             if result is not None and result.passed:
@@ -13606,6 +13622,69 @@ class GovernedOrchestrator:
             getattr(ctx, "op_id", "") or "",
             candidate, result,
         )
+
+    async def _land_passing_majority(
+        self,
+        ctx: OperationContext,
+        candidate: Dict[str, Any],
+        result: Optional[ValidationResult],
+        remaining_s: float,
+    ) -> Optional[ValidationResult]:
+        """A test-synthesis candidate whose authored tests mostly pass lands
+        the passing ones (``test_reality.prune_failing_tests`` owns every
+        refusal). The pruned copy is validated again FROM SCRATCH; only a pass
+        is adopted, written into ``candidate`` in place -- the dict APPLY
+        applies -- with the original content kept under ``test_prune``. Once
+        per candidate. Any other outcome returns ``result`` unchanged."""
+        try:
+            if (
+                result is None or result.passed or result.failure_class != "test"
+                or result.timed_out or not result.failed_node_ids
+                or result.test_failed != len(result.failed_node_ids)
+                or result.test_total <= result.test_failed
+                or not candidate or "test_prune" in candidate or remaining_s <= 0
+            ):
+                return result
+            from backend.core.ouroboros.governance.differential_validation import (
+                acceptance_names,
+            )
+            from backend.core.ouroboros.governance.test_reality import (
+                _op_subject, prune_failing_tests,
+            )
+            files = self._iter_candidate_files(candidate)
+            desc = str(getattr(ctx, "description", "") or "")
+            subject = _op_subject(
+                getattr(ctx, "target_files", ()) or (), desc, self._config.project_root,
+            )
+            decision = prune_failing_tests(
+                files, result.failed_node_ids,
+                repo_root=self._config.project_root, subject=subject,
+                protected=acceptance_names(desc, getattr(ctx, "target_symbols", ()) or ()),
+            )
+            candidate["test_prune"] = {"attempted": True}
+            if decision is None:
+                return result
+            contents, pruned = decision
+            trial = copy.deepcopy(candidate)
+            _write_candidate_contents(trial, contents)
+            retry = await self._run_validation_core(ctx, trial, remaining_s)
+            logger.warning(
+                "[TestPrune] op=%s pruned %d/%d authored test(s) refuted by the "
+                "subject (%s) -> re-validation %s",
+                str(getattr(ctx, "op_id", ""))[:16], len(pruned), result.test_total,
+                ", ".join(pruned)[:300], "PASSED" if retry and retry.passed else "failed",
+            )
+            if retry is None or not retry.passed:
+                return result
+            candidate["test_prune"] = {
+                "pruned": list(pruned),
+                "original": {p: c for p, c in files if p in contents},
+            }
+            _write_candidate_contents(candidate, contents)
+            return dataclasses.replace(retry, best_candidate=candidate, pruned_tests=pruned)
+        except Exception:  # noqa: BLE001 -- pruning is additive; the verdict stands
+            logger.debug("[TestPrune] skipped", exc_info=True)
+            return result
 
     async def _run_validation_core(
         self,
@@ -13832,6 +13911,11 @@ class GovernedOrchestrator:
         # validated by the format gate above and don't need execution.
         multi = None
         t0 = time.monotonic()
+        # Bound HERE, not only inside the candidate-tree branch that computes
+        # it: every legacy fallback (tree disabled, degraded baseline, budget
+        # skip) reached the result constructor with it unbound and died on
+        # UnboundLocalError -- an infra crash for a candidate nobody judged.
+        _dv_ignored: tuple = ()
 
         # ── Slice 12AE: per-envelope repo_root resolution ──────────
         # Compose the canonical Slice 12AC seam to honour per-envelope
@@ -14017,7 +14101,7 @@ class GovernedOrchestrator:
                         # Failures entirely within that set are ambient —
                         # the environment's, not the candidate's.
                         _dv_baseline: frozenset = frozenset()
-                        _dv_ignored: tuple = ()
+                        _dv_ignored = ()
                         try:
                             from backend.core.ouroboros.governance.differential_validation import (
                                 baseline_budget_s as _dv_budget,
@@ -14363,6 +14447,13 @@ class GovernedOrchestrator:
             failed_tests=_failed_tests,
             test_total=_test_total,
             test_failed=_test_failed,
+            failed_node_ids=tuple(dict.fromkeys(
+                str(t) for r in multi.adapter_results
+                for t in (getattr(r.test_result, "failed_tests", ()) or ()) if str(t)
+            )),
+            timed_out=any(
+                bool(getattr(r.test_result, "timed_out", False)) for r in multi.adapter_results
+            ),
         )
 
     def _swe_bench_write_root(self, ctx: OperationContext) -> Optional[Path]:

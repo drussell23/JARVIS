@@ -49,6 +49,8 @@ __all__ = [
     "Violation",
     "analyze_test_source",
     "hollow_test_in_candidate",
+    "prune_failing_tests",
+    "prune_test_source",
 ]
 
 #: The VALIDATE failure class for a candidate this gate rejects.
@@ -395,4 +397,137 @@ def hollow_test_in_candidate(
                 return str(path), verdict
         return None
     except Exception:  # noqa: BLE001 -- a gate fault must never reject real work
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Land the passing majority (2026-10-09)
+# ---------------------------------------------------------------------------
+#
+# A synthesized test file whose tests mostly pass died WHOLE at VALIDATE: one
+# wrong expectation among nine real ones discarded all nine, and the retry
+# re-generated the file from nothing. For a test the op itself AUTHORED, a
+# failing test is a claim about the subject that the subject refutes -- the
+# claim is wrong, not the code (the op changed no code). Removing exactly the
+# refuted claims and re-running the rest is a proof, not a waiver: the pruned
+# file is validated again from scratch and lands only if it passes.
+#
+# It is NOT a way to hide a red test, so it refuses whenever that could be
+# what is happening: any non-test file in the candidate, a failing id it
+# cannot place in a file the candidate wrote, a failing test that already
+# exists on disk (a human's test), an acceptance test the op was asked to
+# deliver, a cut-off run, or a remainder that no longer exercises the subject.
+
+def _id_parts(node_id: str) -> Tuple[str, Tuple[str, ...]]:
+    """``tests/t.py::Cls::test_x[p]`` -> ``("tests/t.py", ("Cls", "test_x"))``."""
+    parts = str(node_id).strip().split("::")
+    names = tuple(p.split("[", 1)[0].strip() for p in parts[1:])
+    return parts[0].replace("\\", "/"), names
+
+
+def _same_file(id_path: str, file_path: str) -> bool:
+    a, b = id_path.strip("./"), str(file_path).replace("\\", "/").strip("./")
+    return bool(a and b) and (a == b or a.endswith("/" + b) or b.endswith("/" + a))
+
+
+def _span(node: ast.AST) -> Tuple[int, int]:
+    decorators = getattr(node, "decorator_list", ()) or ()
+    start = min([node.lineno] + [d.lineno for d in decorators])
+    return start, node.end_lineno or node.lineno
+
+
+def prune_test_source(
+    source: str, names: Iterable[str], *, subject: Optional[str] = None,
+) -> Optional[Tuple[str, Tuple[str, ...]]]:
+    """``source`` with the named tests deleted, and the names that were.
+
+    ``names`` are qualified the way :func:`_tests` qualifies them
+    (``test_x`` / ``TestCls.test_x``). ``None`` -- refuse -- when a name is not
+    a test in this file, when no test would remain, when the remainder stops
+    parsing, or (``subject`` given) when the remainder no longer exercises the
+    subject. A class left with no body is deleted whole. NEVER raises.
+    """
+    try:
+        tree = ast.parse(source)
+        wanted = set(names)
+        tests = {name: (node, cls) for name, node, cls in _tests(tree)}
+        if not wanted or not wanted <= set(tests) or not set(tests) - wanted:
+            return None
+        spans: List[Tuple[int, int]] = []
+        emptied = {}
+        for name in wanted:
+            node, cls = tests[name]
+            if cls is not None:
+                emptied.setdefault(cls, set()).add(node)
+            spans.append(_span(node))
+        for cls, gone in emptied.items():
+            if all(item in gone for item in cls.body):
+                spans.append(_span(cls))
+        lines = source.splitlines(keepends=True)
+        drop = {i for lo, hi in spans for i in range(lo - 1, hi)}
+        pruned = "".join(line for i, line in enumerate(lines) if i not in drop)
+        after = ast.parse(pruned)
+        if not _tests(after):
+            return None
+        if subject:
+            imported, bound = _subject_bindings(after, subject)
+            if not imported or not _referenced(after, bound):
+                return None
+        return pruned, tuple(sorted(wanted))
+    except Exception:  # noqa: BLE001 -- refuse, never raise
+        return None
+
+
+def prune_failing_tests(
+    files: Sequence[Tuple[str, str]],
+    failed_ids: Sequence[str],
+    *,
+    repo_root,
+    subject: Optional[str],
+    protected: Iterable[str] = (),
+) -> Optional[Tuple[Dict[str, str], Tuple[str, ...]]]:
+    """``({path: pruned content}, pruned qualified names)`` or ``None``.
+
+    The one decision for "land the passing majority" -- see the block comment
+    above for every refusal and why. ``files`` is the candidate's
+    ``(path, content)`` list; ``failed_ids`` the adapter's own, uncapped,
+    failing node ids. NEVER raises.
+    """
+    try:
+        from pathlib import Path as _Path  # noqa: PLC0415
+
+        from backend.core.ouroboros.governance.ast_signature_anchor import (  # noqa: PLC0415
+            is_test_path,
+        )
+        if not subject or not files or not failed_ids:
+            return None
+        if not all(is_test_path(str(p)) and str(p).endswith(".py") for p, _c in files):
+            return None
+        protected = {str(n) for n in protected}
+        by_file: Dict[str, Set[str]] = {}
+        for node_id in failed_ids:
+            id_path, names = _id_parts(node_id)
+            owner = next((str(p) for p, _c in files if _same_file(id_path, str(p))), None)
+            if owner is None or not names or names[-1] in protected:
+                return None
+            by_file.setdefault(owner, set()).add(".".join(names))
+        root = _Path(repo_root)
+        out: Dict[str, str] = {}
+        pruned_names: List[str] = []
+        for path, content in files:
+            names = by_file.get(str(path))
+            if not names:
+                continue
+            on_disk = root / str(path)
+            if on_disk.is_file():
+                existing = {n for n, _node, _c in _tests(ast.parse(on_disk.read_text(encoding="utf-8", errors="replace")))}
+                if names & existing:
+                    return None              # a test the op did not author
+            result = prune_test_source(content or "", names, subject=subject)
+            if result is None:
+                return None
+            out[str(path)] = result[0]
+            pruned_names.extend(f"{path}::{n.replace('.', '::')}" for n in result[1])
+        return (out, tuple(pruned_names)) if out else None
+    except Exception:  # noqa: BLE001
         return None
