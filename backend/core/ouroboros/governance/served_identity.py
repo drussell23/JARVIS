@@ -44,7 +44,7 @@ logger = logging.getLogger("Ouroboros.ServedIdentity")
 
 __all__ = ["EngineIdentity", "AdapterProvenance", "AdapterCutoffUnknown", "engine_identity",
            "adapter_provenance", "read_adapter_provenance", "resolve", "current", "set_current",
-           "describe_line", "short_label"]
+           "describe_line", "short_label", "model_name", "model_card"]
 
 
 class AdapterCutoffUnknown(RuntimeError):
@@ -68,6 +68,32 @@ class AdapterProvenance:
     #: ``adapter_file_mtime``, ``no_adapter`` or ``no_registry``.
     source: str
     published_at: Optional[float] = None
+    #: Which ACCEPTED tune this is, 1-based, in the registry's publish order
+    #: (rejected versions and the pre-registry ``origin`` do not count).
+    #: ``None`` when the version is not a registry tune.
+    tune: Optional[int] = None
+
+
+def _tune_number(versions: Optional[Dict[str, Any]], active: str) -> Optional[int]:
+    """The active version's place among the registry's accepted tunes.
+
+    Derived from the registry's own records: a version is a tune when the
+    loop published it (it has ``published_at``) and it was not rejected.
+    Order is publish time, not list position, so a registry that rewrites
+    its list cannot renumber history.
+    """
+    try:
+        tunes = sorted(
+            (v for v in (versions or {}).get("versions") or []
+             if v.get("published_at") and v.get("status") != "rejected"),
+            key=lambda v: float(v["published_at"]),
+        )
+        for i, v in enumerate(tunes, 1):
+            if v.get("version") == active:
+                return i
+    except Exception:  # noqa: BLE001 — a missing number is cosmetic
+        pass
+    return None
 
 
 def _timeout() -> float:
@@ -124,7 +150,8 @@ def adapter_provenance(versions: Optional[Dict[str, Any]],
     published = (entry or {}).get("published_at")
     through = ((entry or {}).get("source") or {}).get("trained_through")
     if through:
-        return AdapterProvenance(active, float(through), f"registry:{active}", published)
+        return AdapterProvenance(active, float(through), f"registry:{active}", published,
+                                 _tune_number(versions, active))
     adapters = show_adapters or []
     if not adapters:
         return AdapterProvenance("", None, "no_adapter" if versions is not None else "no_registry")
@@ -132,20 +159,49 @@ def adapter_provenance(versions: Optional[Dict[str, Any]],
     if len(mtimes) != len(adapters):
         raise AdapterCutoffUnknown(f"{len(adapters)} adapter(s) served with no readable training cutoff "
                                    "(J-Prime too old to report adapter mtime?)")
-    return AdapterProvenance(active or "unregistered", float(max(mtimes)), "adapter_file_mtime", published)
+    return AdapterProvenance(active or "unregistered", float(max(mtimes)), "adapter_file_mtime", published,
+                             _tune_number(versions, active))
 
 
-def read_adapter_provenance(base: str, model: str, *, timeout: Optional[float] = None) -> AdapterProvenance:
+def _show(base: str, model: str, *, timeout: Optional[float] = None) -> Dict[str, Any]:
+    """The engine's ``POST /api/show`` for *model*. Raises the transport's errors."""
+    show = _get_json(base, "/api/show", body={"model": model}, timeout=timeout)
+    return show if isinstance(show, dict) else {}
+
+
+def read_adapter_provenance(base: str, model: str, *, timeout: Optional[float] = None,
+                            show: Optional[Dict[str, Any]] = None) -> AdapterProvenance:
     """Fetch both records and decide. Raises what :func:`adapter_provenance`
-    raises, and the transport's errors -- callers choose their failure mode."""
+    raises, and the transport's errors -- callers choose their failure mode.
+    A caller that already holds the ``/api/show`` record passes it as *show*
+    rather than asking the engine twice."""
     try:
         versions = _get_json(base, f"/v1/adapters/{urllib.parse.quote(model, safe=':')}", timeout=timeout)
     except urllib.error.HTTPError as exc:
         if exc.code != 404:
             raise
         versions = None                              # an engine without a registry
-    show = _get_json(base, "/api/show", body={"model": model}, timeout=timeout)
-    return adapter_provenance(versions, (show or {}).get("adapters"))
+    if show is None:
+        show = _show(base, model, timeout=timeout)
+    return adapter_provenance(versions, show.get("adapters"))
+
+
+def model_card(show: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """What the engine says the weights ARE, from the GGUF metadata it serves.
+
+    ``general.name`` is the model's own name ("Qwen3 Coder 30B A3B Instruct");
+    ``general.finetune`` and ``general.size_label`` let a reader shorten it
+    without a lookup table. Only fields the engine reported are kept. NEVER
+    raises; an engine that reports none yields ``{}``.
+    """
+    try:
+        info = (show or {}).get("model_info") or {}
+        card = {"name": info.get("general.name"),
+                "finetune": info.get("general.finetune"),
+                "size": info.get("general.size_label")}
+        return {k: str(v).strip() for k, v in card.items() if v and str(v).strip()}
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +219,16 @@ def resolve(*, base: str, model: str, vision_base: str = "", vision_model: str =
         eng = engine_identity(base)
         out["engine"] = asdict(eng)
         if eng.name:
+            show: Optional[Dict[str, Any]] = None
             try:
-                out["adapter"] = asdict(read_adapter_provenance(eng.url, model))
+                show = _show(eng.url, model)
+                card = model_card(show)
+                if card:
+                    out["card"] = card
+            except Exception:  # noqa: BLE001 -- no card: the tag names the model
+                show = None
+            try:
+                out["adapter"] = asdict(read_adapter_provenance(eng.url, model, show=show))
             except Exception as exc:  # noqa: BLE001 -- named as unknown, never guessed
                 out["adapter"] = {"version": "", "error": f"{type(exc).__name__}: {exc}"[:200]}
         if vision_model:
@@ -189,6 +253,58 @@ def _day(ts: Optional[float]) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts)) if ts else ""
 
 
+def _short_day(ts: Optional[float], *, now: Optional[float] = None) -> str:
+    """``Oct 7``, or ``Oct 7 2025`` outside the current year. Built from the
+    struct, not ``%-d``, which Windows' strftime does not support."""
+    try:
+        if not ts:
+            return ""
+        t = time.localtime(float(ts))
+        label = f"{time.strftime('%b', t)} {t.tm_mday}"
+        if t.tm_year != time.localtime(now).tm_year:
+            label += f" {t.tm_year}"
+        return label
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def model_name(identity: Optional[Dict[str, Any]], fallback: str = "") -> str:
+    """The served model as a person reads it: the engine's own name, shorn of
+    its finetune word, or *fallback* (the routing tag) when the engine gave
+    none. ``Qwen3 Coder 30B A3B Instruct`` → ``Qwen3 Coder 30B A3B``.
+
+    Subtractive and derived, never a lookup table: the GGUF metadata names its
+    own finetune, so dropping it needs no list of words. NEVER raises.
+    """
+    try:
+        card = (identity or {}).get("card") or {}
+        name = " ".join(str(card.get("name") or "").split())
+        finetune = str(card.get("finetune") or "").strip()
+        if name and finetune and name.lower().endswith(" " + finetune.lower()):
+            name = name[: -len(finetune) - 1].rstrip()
+        return name or str(fallback or (identity or {}).get("model") or "").strip()
+    except Exception:  # noqa: BLE001
+        return str(fallback or "")
+
+
+def _adapter_short(adapter: Dict[str, Any]) -> str:
+    """The adapter in a few words: which tune and when it went live."""
+    if not adapter:
+        return ""
+    if adapter.get("error"):
+        return "adapter?"
+    version = str(adapter.get("version") or "")
+    if not version:
+        return "base" if adapter.get("source") == "no_adapter" else ""
+    tune = adapter.get("tune")
+    when = _short_day(adapter.get("published_at") or adapter.get("trained_through"))
+    if tune:
+        return f"tune #{tune}" + (f" · {when}" if when else "")
+    # Not a registry tune (the pre-registry `origin`, an unregistered file):
+    # its version name IS its identity.
+    return f"{version} adapter"
+
+
 def _adapter_text(adapter: Dict[str, Any]) -> str:
     if not adapter:
         return ""
@@ -197,7 +313,9 @@ def _adapter_text(adapter: Dict[str, Any]) -> str:
     if not adapter.get("version"):
         return "base weights" if adapter.get("source") == "no_adapter" else ""
     through = _day(adapter.get("trained_through"))
-    return f"adapter {adapter['version']}" + (f" (learned through {through})" if through else "")
+    tune = f"tune #{adapter['tune']} " if adapter.get("tune") else ""
+    return (f"{tune}adapter {adapter['version']}"
+            + (f" (learned through {through})" if through else ""))
 
 
 def _engine_text(engine: Dict[str, Any]) -> str:
@@ -210,7 +328,9 @@ def describe_line(identity: Dict[str, Any]) -> str:
     """One full sentence for the boot log and the cockpit banner."""
     if not identity or not identity.get("model"):
         return ""
-    parts = [f"{identity['model']} via {_engine_text(identity.get('engine') or {})}"]
+    name = model_name(identity, identity["model"])
+    named = name if name == identity["model"] else f"{name} ({identity['model']})"
+    parts = [f"{named} via {_engine_text(identity.get('engine') or {})}"]
     adapter = _adapter_text(identity.get("adapter") or {})
     if adapter:
         parts.append(adapter)
@@ -221,13 +341,20 @@ def describe_line(identity: Dict[str, Any]) -> str:
 
 
 def short_label(identity: Dict[str, Any]) -> str:
-    """The compact suffix for the always-visible toolbar: engine/adapter."""
-    if not identity:
+    """The compact suffix for the always-visible toolbar: ``J-Prime · tune #1 · Oct 7``.
+
+    It used to join engine and the raw registry version with a slash
+    (``J-Prime/20261007-143931-238e06c10f8f``): a timestamp and a hash the
+    operator had to decode to learn what they wanted to know, namely which
+    tune is serving and since when. The full version stays in
+    :func:`describe_line`. NEVER raises.
+    """
+    try:
+        if not identity:
+            return ""
+        engine = (identity.get("engine") or {}).get("name") or ""
+        adapter = _adapter_short(identity.get("adapter") or {})
+        return " · ".join(p for p in (engine, adapter) if p)
+    except Exception:  # noqa: BLE001
         return ""
-    engine = (identity.get("engine") or {}).get("name") or ""
-    adapter = identity.get("adapter") or {}
-    version = adapter.get("version") or ("base" if adapter.get("source") == "no_adapter" else "")
-    if adapter.get("error"):
-        version = "adapter?"
-    return "/".join(p for p in (engine, version) if p)
 

@@ -990,6 +990,18 @@ def _short_model(model: str) -> str:
         text = str(model or "").strip()
         if not text:
             return ""
+        # The SERVED model has a name its engine reported at boot (the GGUF's
+        # `general.name`). When this is that model, use it, so the status bar
+        # and the cockpit's model line name the same weights the same way.
+        try:
+            from backend.core.ouroboros.governance.served_identity import (
+                current, model_name,
+            )
+            ident = current()
+            if ident.get("model") == text and ident.get("card"):
+                return model_name(ident, text)[:28]
+        except Exception:  # noqa: BLE001 — the id still names it
+            pass
         text = text.rsplit("/", 1)[-1]          # drop the vendor namespace
         # Trailing build/quantisation markers carry no identity at a glance.
         for suffix in ("-dottxt", "-FP8", "-fp8", "-instruct", "-Instruct"):

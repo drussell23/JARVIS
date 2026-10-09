@@ -26,7 +26,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from backend.core.ouroboros.ui.deck_grammar import TranscriptFlow
 from backend.core.ouroboros.ui.theme import build_console
@@ -754,16 +754,21 @@ def _render_hydration(console: Any, payload: dict) -> None:
         # exactly the guess this replaces.
         _model = str(payload.get("model") or "").strip()
         if _model:
-            head.append(f"  {_dot}  model ", style=_muted)
-            head.append(_model, style=_body)
-            # Who stands behind the name -- engine and adapter -- from the
-            # daemon's boot-resolved identity. Omitted when the daemon could
-            # not resolve it, never back-filled from this process.
+            # The engine's own name for the weights when the daemon resolved
+            # one, else the tag; then who stands behind it (engine and tune).
+            # Both from the daemon's boot-resolved identity, never back-filled
+            # from this process.
+            _ident = payload.get("serving") or {}
             try:
-                from backend.core.ouroboros.governance.served_identity import short_label
-                _via = short_label(payload.get("serving") or {})
+                from backend.core.ouroboros.governance.served_identity import (
+                    model_name, short_label,
+                )
+                _name = model_name(_ident, _model)
+                _via = short_label(_ident)
             except Exception:  # noqa: BLE001
-                _via = ""
+                _name, _via = _model, ""
+            head.append(f"  {_dot}  model ", style=_muted)
+            head.append(_name, style=_body)
             if _via:
                 head.append(f" ({_via})", style=_muted)
         head.append(f"  {_dot}  cost ", style=_muted)
@@ -1370,6 +1375,9 @@ class AttachUI:
         #: beside the key hints. Client-side only for RENDER; the daemon is
         #: the single source of truth (a client cannot load `.env`).
         self._model: str = ""
+        #: The daemon's boot-resolved served identity (engine, model card,
+        #: adapter). `served_identity` turns it into words; this only holds it.
+        self._identity: Dict[str, Any] = {}
         self._focus_lines: List[str] = []
         self._focus_note: str = ""
         self._flash_text: str = ""
@@ -2059,12 +2067,38 @@ class AttachUI:
         """Record the daemon's served identity (engine/adapter). NEVER raises;
         an empty frame keeps the last known identity."""
         try:
-            from backend.core.ouroboros.governance.served_identity import short_label
-            label = short_label(identity if isinstance(identity, dict) else {})
-            if label:
-                self._serving = label
+            if isinstance(identity, dict) and identity:
+                self._identity = dict(identity)
         except Exception:  # noqa: BLE001
             pass
+
+    def _model_segment(self) -> str:
+        """``Qwen3 Coder 30B A3B (J-Prime · tune #1 · Oct 7)``, styled.
+
+        The NAME is what the engine says its weights are, falling back to the
+        routing tag the daemon resolved. The suffix is which engine and which
+        tune. Both words come from `served_identity`, the same module the boot
+        log and the hydration banner ask, so the three cannot disagree. Silent
+        until the daemon has named a model. NEVER raises.
+        """
+        try:
+            from rich.markup import escape
+            from backend.core.ouroboros.governance.served_identity import (
+                model_name, short_label,
+            )
+            name = model_name(self._identity, self._model)
+            if not name:
+                return ""
+            via = short_label(self._identity)
+            seg = f"[{_SEM['neural']}]{escape(name)}[/{_SEM['neural']}]"
+            if via:
+                # Parenthesised, as the hydration banner does: the line's own
+                # separator is `·`, and the suffix contains it, so without a
+                # group the engine and tune read as two more hints.
+                seg += f" [{_SEM['dim']}]({escape(via)})[/{_SEM['dim']}]"
+            return seg
+        except Exception:  # noqa: BLE001
+            return ""
 
     def set_model(self, model: object) -> None:
         """Record the model the daemon named in its hydration frame. NEVER
@@ -2366,12 +2400,8 @@ class AttachUI:
         # a local lane it is the one thing that changes between sessions
         # (base vs fine-tune). From the daemon's hydration frame, never the
         # client's environment. Silent until the daemon has named one.
-        _via = getattr(self, "_serving", "")
-        model_seg = (
-            f"[{_SEM['neural']}]{self._model}[/{_SEM['neural']}]"
-            + (f" [{_SEM['provider']}]{_via}[/{_SEM['provider']}]" if _via else "") + " · "
-            if getattr(self, "_model", "") else ""
-        )
+        model_seg = self._model_segment()
+        model_seg = f"{model_seg} · " if model_seg else ""
         return (f"{model_seg}{head}{audio.lstrip(' ·')}{keys} "
                 f"· 'detach' to leave")
 
