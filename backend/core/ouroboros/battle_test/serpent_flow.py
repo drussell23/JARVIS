@@ -83,6 +83,11 @@ from backend.core.ouroboros.ui.theme import (  # noqa: E402
     OUROBOROS_SPINNER_INTERVAL_S as _OUROBOROS_FRAME_INTERVAL_S,
     ouroboros_frame as _theme_ouroboros_frame,
 )
+from backend.core.ouroboros.ui.deck_grammar import (  # noqa: E402
+    FAILED_TONE as _FAILED_TONE,
+    PENDING_TONE as _PENDING_TONE,
+    bullet as _bullet,
+)
 
 
 def _approval_deadline_s() -> Optional[float]:
@@ -961,25 +966,22 @@ def _local_agent_rows() -> list:
         return []
 
 
-def _tool_chrome_line(
+def tool_call_label(
     tool_name: str, args_summary: str = "", mcp_servers: Any = None,
 ) -> str:
-    """``⏺ Read(backend/…/thin_client.py)`` — one tool call, CC-style.
+    """``Read(backend/…/thin_client.py)``: one tool call, as plain text.
 
-    The ARGUMENT is the point: `⏺ Read()` says an op is busy; `⏺ Read(path)`
-    says what it is busy with.
+    The ARGUMENT is the point. `Read()` says an op is busy; `Read(path)` says
+    what it is busy with. Plain, not markup: this is the LIVE label the
+    heartbeat carries while the call runs. The transcript records the call
+    once, when it completes (`tool_render_view._compose_header`).
     """
-    try:
-        from backend.core.ouroboros.ui import theme as _ov_theme
-        act = _ov_theme.mark("action")
-    except Exception:  # noqa: BLE001 — the theme never raises; belt and braces
-        act = "*"
     try:
         verb = derive_verb(tool_name, mcp_servers)
         arg = _clip_arg(args_summary)
-        return f"{act} {verb}({arg})" if arg else f"{act} {verb}"
-    except Exception:  # noqa: BLE001 — chrome must never break a tool round
-        return f"{act} {tool_name or 'Tool'}"
+        return f"{verb}({arg})" if arg else verb
+    except Exception:  # noqa: BLE001 — a label must never break a tool round
+        return str(tool_name or "Tool")
 
 
 class SerpentFlow:
@@ -1856,6 +1858,12 @@ class SerpentFlow:
         was_focused = self._is_focused(op_id)
         self._active_ops.discard(op_id)
         self._op_sensors.pop(op_id, None)
+        # A failure path can end an op mid-tool. Whatever it left running is
+        # no longer running, and the heartbeat must not keep saying so.
+        from backend.core.ouroboros.battle_test.tool_inflight import (
+            get_inflight_tools,
+        )
+        get_inflight_tools().clear(op_id)
         # Update swarm tally + last_completed for the digest
         snap = self._swarm_snapshots.get(op_id)
         if snap is not None:
@@ -2019,8 +2027,12 @@ class SerpentFlow:
                 return
             self._mirror_markup(f"  {text}")
             if self._borderless():
+                # The SAME line the cockpit receives. Prefixing every op line
+                # with `⎿` put the glyph in front of action headers and of
+                # lines that already carry their own `⎿`. The line knows its
+                # structure; the chokepoint only indents it.
                 self._emit_fit(
-                    f"  [{_SEM['dim']}]{self._result_glyph()}[/{_SEM['dim']}] {text}",
+                    f"  {text}",
                     mirror=False,    # mirrored just above; do not relay twice
                 )
             else:
@@ -2199,7 +2211,16 @@ class SerpentFlow:
             tail = (f"  [{_SEM['dim']}]{ref} · {lines} lines · /expand {ref}"
                     f"[/{_SEM['dim']}]" if lines
                     else f"  [{_SEM['dim']}]{ref} · /expand {ref}[/{_SEM['dim']}]")
-        line = f"[{_SEM['neural']}]{label}[/{_SEM['neural']}]{tail}"
+        # The bullet is the RENDERER's, so the label must not bring its own:
+        # a label derived from the block's first line (`● Read(x)`) or from a
+        # summary buffered before the mark moved here would show two.
+        from rich.markup import escape as _escape_markup
+        from backend.core.ouroboros.ui import deck_grammar as _deck
+        _mark = _deck.bullet(markup=False)
+        if _mark and label.startswith(_mark):
+            label = label[len(_mark):].lstrip()
+        line = (f"{_deck.bullet()} [{_SEM['neural']}]{_escape_markup(label)}"
+                f"[/{_SEM['neural']}]{tail}")
         self._print_mirrored(f"  {line}")
 
     @staticmethod
@@ -3084,20 +3105,25 @@ class SerpentFlow:
                     pass
                 self._op_line(op_id, _line)
 
-        # The MIRRORED half of the start event.
+        # The REMOTE half of the start event.
         #
         # `_start_status` renders a Rich spinner, which is local-only: it
         # never passes through `_op_line`, the chokepoint that reaches an
-        # attached cockpit. So the tool NAME and its ARGUMENTS — which file
-        # is being read, which pattern is being searched — rendered on the
-        # daemon's own terminal and nowhere else. An operator saw an op
-        # working with no idea what it was touching.
+        # attached cockpit. So an attached operator could not see which file
+        # was being read or which pattern was being searched.
         #
-        # The spinner stays: it is the right affordance locally, where a
-        # transient in-place animation costs nothing. The cockpit gets a
-        # PERSISTENT line instead, because a remote surface has no spinner to
-        # erase and a vanishing status is worse than none.
-        self._op_line(op_id, _tool_chrome_line(tool_name, args_summary))
+        # This used to be fixed with a PERSISTENT transcript line. That made
+        # every tool appear twice in scrollback, once here and again as the
+        # completed header in `op_tool_call`. A start is LIVE state, so it
+        # goes to the live channel: the heartbeat names the running call and
+        # rewrites itself when the call ends. The transcript records the call
+        # once, when it completes, the way Claude Code does.
+        from backend.core.ouroboros.battle_test.tool_inflight import (
+            get_inflight_tools,
+        )
+        get_inflight_tools().started(
+            op_id, tool_call_label(tool_name, args_summary),
+        )
         self._start_status(
             f"{prefix}{icon} T{round_index + 1} {tool_name}{summary}",
             spinner=_active_spinner_name(),
@@ -3123,6 +3149,12 @@ class SerpentFlow:
             old behavior byte-identical.
         """
         self._stop_status()
+        from backend.core.ouroboros.battle_test.tool_inflight import (
+            get_inflight_tools,
+        )
+        get_inflight_tools().finished(
+            op_id, tool_call_label(tool_name, args_summary),
+        )
 
         # ── Gap #2 Slice 4: registry-driven path (master-flag-gated) ──
         try:
@@ -3207,7 +3239,7 @@ class SerpentFlow:
             path = args_summary[:60] if args_summary else "file"
             self._op_line(
                 op_id,
-                f"[{_SEM['neural']}]⏺ Write[/{_SEM['neural']}]"
+                f"{_bullet()} [{_SEM['neural']}]Write[/{_SEM['neural']}]"
                 f"([{_SEM['file']}]{path}[/{_SEM['file']}]){dur}",
             )
             if result_preview:
@@ -3223,7 +3255,7 @@ class SerpentFlow:
             path = args_summary[:60] if args_summary else "file"
             self._op_line(
                 op_id,
-                f"[{_SEM['neural']}]⏺ Read[/{_SEM['neural']}]"
+                f"{_bullet()} [{_SEM['neural']}]Read[/{_SEM['neural']}]"
                 f"([{_SEM['file']}]{path}[/{_SEM['file']}]){dur}{status_mark}",
             )
             return
@@ -3301,7 +3333,7 @@ class SerpentFlow:
             files_str += f" +{len(files) - 3}"
         prefix = "  │  " if op_id in self._active_ops else "  "
         self._start_status(
-            f"{prefix}⏺ Verify({files_str})",
+            f"{prefix}{_bullet(_PENDING_TONE)} Verify({files_str})",
             spinner=_active_spinner_name(),
         )
 
@@ -3320,7 +3352,7 @@ class SerpentFlow:
         if test_total == 0:
             self._op_line(
                 op_id,
-                f"[{_SEM['heal']}]⏺ Verify[/{_SEM['heal']}]({files_str})",
+                f"{_bullet()} [{_SEM['heal']}]Verify[/{_SEM['heal']}]({files_str})",
             )
             self._op_line(
                 op_id,
@@ -3329,7 +3361,7 @@ class SerpentFlow:
         elif passed:
             self._op_line(
                 op_id,
-                f"[{_SEM['life']}]⏺ Verify[/{_SEM['life']}]({files_str})",
+                f"{_bullet()} [{_SEM['life']}]Verify[/{_SEM['life']}]({files_str})",
             )
             self._op_line(
                 op_id,
@@ -3339,7 +3371,7 @@ class SerpentFlow:
             passing = test_total - test_failures
             self._op_line(
                 op_id,
-                f"[{_SEM['death']}]⏺ Verify[/{_SEM['death']}]({files_str})",
+                f"{_bullet(_FAILED_TONE)} [{_SEM['death']}]Verify[/{_SEM['death']}]({files_str})",
             )
             self._op_line(
                 op_id,
@@ -3405,7 +3437,7 @@ class SerpentFlow:
         if not diff_text:
             self._op_line(
                 op_id,
-                f"[{_SEM['neural']}]⏺ Update[/{_SEM['neural']}]"
+                f"{_bullet()} [{_SEM['neural']}]Update[/{_SEM['neural']}]"
                 f"([{_SEM['file']}]{short_path}[/{_SEM['file']}])",
             )
             return
@@ -3416,7 +3448,7 @@ class SerpentFlow:
         # ── Header: ⏺ Update(path) ──
         self._op_line(
             op_id,
-            f"[{_SEM['neural']}]⏺ Update[/{_SEM['neural']}]"
+            f"{_bullet()} [{_SEM['neural']}]Update[/{_SEM['neural']}]"
             f"([{_SEM['file']}]{short_path}[/{_SEM['file']}])",
         )
 
@@ -3529,7 +3561,7 @@ class SerpentFlow:
             summary = " ".join(parts_sum) if parts_sum else "no changes"
             self._op_line(
                 op_id,
-                f"[{_SEM['neural']}]⏺ Proposed changes[/{_SEM['neural']}]  {summary}",
+                f"{_bullet(_PENDING_TONE)} [{_SEM['neural']}]Proposed changes[/{_SEM['neural']}]  {summary}",
             )
 
     # ── NOTIFY_APPLY rich preview (V1) ────────────────────────────
@@ -3593,7 +3625,7 @@ class SerpentFlow:
             )
             self._mirror_markup(
                 f"  [{_SEM['dim']}]⎿  /reject {_short} to cancel — "
-                f"diff follows as ⏺ Update[/{_SEM['dim']}]"
+                f"diff follows as {_bullet(markup=False)} Update[/{_SEM['dim']}]"
             )
         except Exception:  # noqa: BLE001
             pass
@@ -3820,7 +3852,7 @@ class SerpentFlow:
         # full output later.
         self._maybe_buffer_op_commit(
             op_id,
-            f"⏺ {files_str} evolved · ⏱ {elapsed:.1f}s · 💰 ${cost_usd:.4f}",
+            f"{files_str} evolved · ⏱ {elapsed:.1f}s · 💰 ${cost_usd:.4f}",
         )
         # Gap #7 Slice 4 — clear the terminal title back to idle when
         # no other ops are active (the resolver picks any remaining
@@ -3937,7 +3969,8 @@ class SerpentFlow:
         goal_str = f"  [{_SEM['dim']}]{goal[:70]}[/{_SEM['dim']}]" if goal else ""
         self._op_line(
             op_id,
-            f"[{_SEM.get('neural', 'cyan')}]⏺ Subagent({subagent_type})"
+            f"{_bullet(_PENDING_TONE)} "
+            f"[{_SEM.get('neural', 'cyan')}]Subagent({subagent_type})"
             f"[/{_SEM.get('neural', 'cyan')}]  "
             f"[{_SEM['dim']}]{short_sub}[/{_SEM['dim']}]{goal_str}",
         )
@@ -4746,7 +4779,7 @@ class SerpentFlow:
         # the next attached-terminal line resolves the race below.
         try:
             self._mirror_markup(
-                f"  [{_SEM['heal']}]⏺ Iron Gate[/{_SEM['heal']}]"
+                f"  {_bullet(_PENDING_TONE)} [{_SEM['heal']}]Iron Gate[/{_SEM['heal']}]"
                 f"([{_SEM['dim']}]op:{short}[/{_SEM['dim']}]) — approval required"
             )
             for _bl in body_lines:
@@ -5126,8 +5159,13 @@ class SerpentFlow:
             "cancelled": _SEM["heal"],
         }.get(phase_value, _SEM["dim"])
 
+        graph_tone = (
+            _FAILED_TONE if phase_value == "failed"
+            else None if phase_value == "completed"
+            else _PENDING_TONE
+        )
         header = (
-            f"[{_SEM['neural']}]⏺ Graph[/{_SEM['neural']}]"
+            f"{_bullet(graph_tone)} [{_SEM['neural']}]Graph[/{_SEM['neural']}]"
             f"([{_SEM['file']}]{progress.graph_id[:12]}[/{_SEM['file']}])"
             f"  [{phase_color}]{phase_value}[/{phase_color}]"
             f"  [{_SEM['dim']}]{pct}% done"
@@ -5262,7 +5300,7 @@ class SerpentFlow:
             return
         kind_value = getattr(event.kind, "value", str(event.kind))
         glyphs = {
-            "graph.submitted": ("⏺", _SEM["dim"], "submitted"),
+            "graph.submitted": (_bullet(markup=False), _SEM["dim"], "submitted"),
             "graph.started": ("⏵", _SEM["neural"], "started"),
             "graph.completed": ("✔", _SEM["life"], "completed"),
             "graph.failed": ("✗", _SEM["death"], "failed"),
@@ -9022,7 +9060,7 @@ class SerpentREPL:
             )
             return
         self._flow.console.print(
-            f"  [{_SEM['neural']}]⏺ {stored.tool_name}[/{_SEM['neural']}] "
+            f"  {_bullet()} [{_SEM['neural']}]{stored.tool_name}[/{_SEM['neural']}] "
             f"[{_SEM['dim']}]{ref} · {stored.summary}[/{_SEM['dim']}]",
             highlight=False,
         )
@@ -9058,7 +9096,7 @@ class SerpentREPL:
             )
             return
         self._flow.console.print(
-            f"  [{_SEM['neural']}]⏺ Diff[/{_SEM['neural']}] "
+            f"  {_bullet()} [{_SEM['neural']}]Diff[/{_SEM['neural']}] "
             f"[{_SEM['dim']}]{ref} · {archived.op_id} · "
             f"{archived.apply_outcome.value}[/{_SEM['dim']}]",
             highlight=False,
@@ -9097,7 +9135,7 @@ class SerpentREPL:
             if not controller.open(ref):
                 return False
             self._flow.console.print(
-                f"  [{_SEM['dim']}]⏺ {ref} — esc closes[/{_SEM['dim']}]",
+                f"  {_bullet()} [{_SEM['dim']}]{ref} — esc closes[/{_SEM['dim']}]",
                 highlight=False,
             )
             return True
@@ -9120,7 +9158,7 @@ class SerpentREPL:
             return
         buf.mark_expanded(ref)
         self._flow.console.print(
-            f"  [{_SEM['neural']}]⏺ Op {block.op_id}[/{_SEM['neural']}] "
+            f"  {_bullet()} [{_SEM['neural']}]Op {block.op_id}[/{_SEM['neural']}] "
             f"[{_SEM['dim']}]{ref} · {block.line_count} lines · "
             f"{block.state.value}[/{_SEM['dim']}]",
             highlight=False,
@@ -9175,7 +9213,7 @@ class SerpentREPL:
             )
             return
         self._flow.console.print(
-            f"  [{_SEM['neural']}]⏺ Narrative[/{_SEM['neural']}] "
+            f"  {_bullet()} [{_SEM['neural']}]Narrative[/{_SEM['neural']}] "
             f"[{_SEM['dim']}]{ref} · {frame.op_id} · {frame.kind.value} · "
             f"{frame.state.value}[/{_SEM['dim']}]",
             highlight=False,
@@ -9213,7 +9251,7 @@ class SerpentREPL:
             )
             return
         self._flow.console.print(
-            f"  [{_SEM['neural']}]⏺ Permission[/{_SEM['neural']}] "
+            f"  {_bullet()} [{_SEM['neural']}]Permission[/{_SEM['neural']}] "
             f"[{_SEM['dim']}]{ref} · tool={record.tool_name} · "
             f"op={record.op_id} · "
             f"decision={record.decision_value}[/{_SEM['dim']}]",
@@ -9310,7 +9348,7 @@ class SerpentREPL:
             if prune_reason is not None else ""
         )
         self._flow.console.print(
-            f"  [{_SEM['neural']}]⏺ Repair Branch[/{_SEM['neural']}] "
+            f"  {_bullet()} [{_SEM['neural']}]Repair Branch[/{_SEM['neural']}] "
             f"[{_SEM['dim']}]{ref} · op={entry.op_id} · L{branch.layer_index} · "
             f"{outcome}{prune_str} · "
             f"score={branch.validator_score:.2f}"

@@ -1421,9 +1421,11 @@ class BattleTestHarness:
                 return
         except Exception:  # noqa: BLE001
             return
-        line = "⏺ organism rests · session closed"
+        from backend.core.ouroboros.ui import deck_grammar as _deck
+        mark = _deck.bullet()
+        line = f"{mark} organism rests · session closed"
         try:
-            parts = ["⏺ organism rests"]
+            parts = [f"{mark} organism rests"]
             gls = getattr(self, "_governed_loop_service", None)
             completed = len(getattr(gls, "_completed_ops", {}) or {})
             if completed:
@@ -4825,8 +4827,9 @@ class BattleTestHarness:
                 body = body.replace("[", "\\[")
                 handle = handle.replace("[", "\\[")
             kind_seg = f" [dim]· {kind}[/dim]" if kind else ""
+            from backend.core.ouroboros.ui import deck_grammar as _deck
             return (
-                f"  [bold]⏺ {glyph} {handle}[/bold]{kind_seg}\n"
+                f"  {_deck.bullet()} [bold]{glyph} {handle}[/bold]{kind_seg}\n"
                 f"  [dim]⎿[/dim]  {body}"
             )
         except Exception:  # noqa: BLE001

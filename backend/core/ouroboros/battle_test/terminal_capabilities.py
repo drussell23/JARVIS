@@ -122,12 +122,6 @@ class TerminalCapabilities:
     wide_glyphs: bool = True
     #: 1 / 8 / 256 / 16_777_216, or 0 for "did not say".
     color_depth: int = 0
-    #: True when the terminal DRAWS a narrow text symbol (``⏺`` U+23FA) inside
-    #: its one cell. Some (Windows Terminal) advance one cell but paint the
-    #: emoji glyph two wide, over the next character -- ``⏺Search`` with the
-    #: space eaten. Not measurable from the cursor (the advance IS one), so
-    #: the client declares it; absent from an older client -> True (unchanged).
-    symbol_glyphs: bool = True
 
     def clamped(self) -> "TerminalCapabilities":
         lo, hi = _min_cols(), _max_cols()
@@ -156,7 +150,6 @@ class TerminalCapabilities:
                 theme=theme,
                 wide_glyphs=bool(msg.get("wide_glyphs", True)),
                 color_depth=int(msg.get("color_depth") or 0),
-                symbol_glyphs=bool(msg.get("symbol_glyphs", True)),
             ).clamped()
         except Exception:  # noqa: BLE001
             return None
@@ -228,8 +221,10 @@ def _ambient() -> Optional[TerminalCapabilities]:
         return TerminalCapabilities(
             cols=cols, rows=rows, theme=theme,
             wide_glyphs=all(c.wide_glyphs for c in live),
-            color_depth=min((c.color_depth for c in live), default=0),
-            symbol_glyphs=all(c.symbol_glyphs for c in live),
+            # Over the cockpits that SAID. 0 is "did not say", not "no
+            # colour", so one silent client must not strip everyone's colour.
+            color_depth=min((c.color_depth for c in live if c.color_depth > 0),
+                            default=0),
         ).clamped()
     except Exception:  # noqa: BLE001
         return None
@@ -298,7 +293,6 @@ def snapshot() -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 sid: {
                     "cols": c.cols, "rows": c.rows, "theme": c.theme,
                     "wide_glyphs": c.wide_glyphs, "color_depth": c.color_depth,
-                    "symbol_glyphs": c.symbol_glyphs,
                 }
                 for sid, c in _CAPS.items()
             }

@@ -241,6 +241,11 @@ def build_default_registry() -> EventBreadcrumbRegistry:
     reg = EventBreadcrumbRegistry()
     # These two already have tailored, prompt-aware bespoke listeners in the TUI.
     reg.mark_bespoke("shadow_action_trapped", "provider_state_changed")
+    try:
+        from backend.core.ouroboros.ui.theme import mark
+        act = mark("action") or "●"
+    except Exception:  # noqa: BLE001
+        act = "●"
 
     seed = [
         BreadcrumbDescriptor("circuit_breaker_tripped", "✖", "red bold", SEV_CRITICAL, _f_circuit, "provider"),
@@ -312,7 +317,7 @@ def build_default_registry() -> EventBreadcrumbRegistry:
                              lambda p: f"swarm stitched {str(p.get('file','?')).rsplit('/',1)[-1]} — "
                                        f"{p.get('succeeded','?')} ok / {p.get('failed','?')} failed "
                                        f"(peak {p.get('max_in_flight','?')} agents)", "swarm"),
-        BreadcrumbDescriptor("worker_op_claimed", "⏺", "cyan", SEV_INFO,
+        BreadcrumbDescriptor("worker_op_claimed", act, "cyan", SEV_INFO,
                              lambda p: f"worker {p.get('worker_id','?')} claimed op "
                                        f"(queue {p.get('queue_depth','?')}) — "
                                        f"{str(p.get('goal',''))[:48]}", "pool"),

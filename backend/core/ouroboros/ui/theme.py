@@ -128,6 +128,32 @@ def _declared_glyph_support() -> Optional[bool]:
         return None
 
 
+def _declared_color_tier() -> Optional[ColorTier]:
+    """The colour tier the displaying cockpit declared, or ``None``.
+
+    ``color_depth`` arrives on the cockpit's caps frame (1 / 8 / 256 /
+    16_777_216; 0 means "did not say"). Same lazy, fail-soft consultation as
+    :func:`_declared_glyph_support`: absent the capability layer, ``None``.
+    """
+    try:
+        from backend.core.ouroboros.battle_test.terminal_capabilities import (
+            current_capabilities,
+        )
+        caps = current_capabilities()
+        depth = int(getattr(caps, "color_depth", 0) or 0) if caps else 0
+        if depth <= 0:
+            return None
+        if depth >= 1 << 24:
+            return ColorTier.TRUECOLOR
+        if depth >= 256:
+            return ColorTier.C256
+        if depth >= 8:
+            return ColorTier.STANDARD
+        return ColorTier.NONE
+    except Exception:  # noqa: BLE001 — colour choice must never raise
+        return None
+
+
 def supports_unicode(env: Optional[Mapping[str, str]] = None) -> bool:
     """True when the terminal that will DISPLAY this can render the glyph.
 
@@ -311,6 +337,18 @@ def active_tier() -> ColorTier:
     Panel printed elsewhere) resolve tokens to concrete styles for the live
     environment via :func:`styles`. Cached for the session. NEVER raises.
     """
+    forced = _forced_tier_from_env()
+    if forced is not None:
+        return forced
+    # The terminal that will DISPLAY this outranks the one this process owns,
+    # exactly as for glyphs (`_declared_glyph_support`). A daemon writes its
+    # stdout to a log, so its own probe answers NONE and every semantic colour
+    # it composed into a mirrored line resolved to nothing, while the cockpit
+    # showing that line had declared truecolor. Consulted per call, never
+    # cached: cockpits attach and detach.
+    declared = _declared_color_tier()
+    if declared is not None:
+        return declared
     global _active_tier_cache
     if _active_tier_cache is None:
         try:
@@ -355,7 +393,11 @@ _GLYPHS: Mapping[str, tuple] = {
     # Design-language semantic ration (OV_DESIGN_LANGUAGE.md §2) —
     # the SIX operator-plane glyphs, each with an ASCII degradation
     # so 16-color/none terminals keep identical geometry.
-    "action": ("⏺", "*"),   # an actor did/does something
+    # `●` (U+25CF), not `⏺` (U+23FA): ⏺ advances one cell but Windows
+    # Terminal paints it as a two-cell emoji over the next character
+    # (`⏺Search`). ● draws inside its cell everywhere. Coloured by the
+    # `action` role (venom green) where it marks an outcome.
+    "action": ("●", "*"),   # an actor did/does something
     "detail": ("⎿", "-"),   # continuation under an action
     "voice": ("💭", "K:"),  # the organism speaking
     "human": ("🗣", "you:"),  # the operator's words echoed
@@ -372,46 +414,6 @@ _GLYPHS: Mapping[str, tuple] = {
 }
 
 
-#: Unicode marks some terminals DRAW two cells wide while advancing one, with
-#: the substitute that stays inside its cell. Claude Code's own rule: ``⏺`` on
-#: macOS, ``●`` elsewhere -- Windows Terminal paints ``⏺`` as an emoji over
-#: the following space (``⏺Search``).
-_SYMBOL_SUBSTITUTES: Mapping[str, str] = {"action": "●"}
-_ENV_SYMBOL_GLYPHS = "JARVIS_OV_SYMBOL_GLYPHS"
-
-
-def local_symbol_glyphs(env: Optional[Mapping[str, str]] = None) -> bool:
-    """Whether THIS process's terminal draws text symbols in one cell: the
-    operator's ``JARVIS_OV_SYMBOL_GLYPHS`` when set, else true only on macOS
-    (whose terminals render ``⏺`` as text). NEVER raises."""
-    try:
-        source = os.environ if env is None else env
-        raw = str(source.get(_ENV_SYMBOL_GLYPHS, "") or "").strip().lower()
-        if raw in ("1", "true", "yes", "on"):
-            return True
-        if raw in ("0", "false", "no", "off"):
-            return False
-        import sys as _sys
-        return _sys.platform == "darwin"
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _symbol_glyphs() -> bool:
-    """The DISPLAYING terminal's answer: an attached cockpit's declaration
-    when there is one, else this process's own terminal."""
-    try:
-        from backend.core.ouroboros.battle_test.terminal_capabilities import (
-            current_capabilities,
-        )
-        caps = current_capabilities()
-        if caps is not None:
-            return bool(getattr(caps, "symbol_glyphs", True))
-    except Exception:  # noqa: BLE001
-        pass
-    return local_symbol_glyphs()
-
-
 def mark(name: str, *, unicode: Optional[bool] = None) -> str:
     """Return a glyph by semantic name, degraded to ASCII when needed.
 
@@ -422,13 +424,7 @@ def mark(name: str, *, unicode: Optional[bool] = None) -> str:
     if pair is None:
         return ""
     use_unicode = supports_unicode() if unicode is None else unicode
-    if not use_unicode:
-        return pair[1]
-    # Auto-detected unicode only: a caller that asked for the canonical glyph
-    # explicitly gets it.
-    if unicode is None and name in _SYMBOL_SUBSTITUTES and not _symbol_glyphs():
-        return _SYMBOL_SUBSTITUTES[name]
-    return pair[0]
+    return pair[0] if use_unicode else pair[1]
 
 
 # ===========================================================================

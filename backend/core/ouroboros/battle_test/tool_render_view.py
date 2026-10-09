@@ -566,32 +566,6 @@ def _escape(text: str) -> str:
 # ===========================================================================
 
 
-def _arg_colour(
-    arg_kind: str, palette: Optional[Mapping[str, str]],
-) -> str:
-    """Style for a tool's ARGUMENT, chosen by what the argument IS.
-
-    Every argument used to take the file style, because the only descriptors
-    reaching this branch were file tools. Once every tool routed through it,
-    `Bash(python3 -m pytest …)` and `Search("except Exception")` came out
-    blue-underlined — the convention this deck uses for a path you can open.
-    A command is not a location, and underlining one invites a click that
-    goes nowhere.
-
-    Falls back to the file style for an unknown kind, matching the behaviour
-    of every descriptor written before `arg_kind` existed.
-    """
-    try:
-        return {
-            "path": _palette_value(palette, "file"),
-            "command": _palette_value(palette, "dim"),
-            "text": _palette_value(palette, "dim"),
-            "url": _palette_value(palette, "file"),
-        }.get(str(arg_kind or ""), _palette_value(palette, "file"))
-    except Exception:  # noqa: BLE001
-        return _palette_value(palette, "file")
-
-
 def _compose_header(
     rendered_header: str,
     descriptor_cc_verb: Optional[str],
@@ -599,19 +573,12 @@ def _compose_header(
     status_enum: ToolStatus,
     palette: Optional[Mapping[str, str]],
     tool_name: str = "",
-    arg_kind: str = "text",
 ) -> str:
-    """Build the Rich-markup header line.
+    """Build the Rich-markup header line: ``● Read(foo.py)  42ms``.
 
-    For CC-verb descriptors (Read/Update/Write):
-
-      ``[accent]⏺ Read[/accent]([muted]foo.py[/muted])  [muted]42ms[/muted]``
-
-    For icon descriptors (everything else):
-
-      ``[accent]search_code "pat"[/accent]  [muted]120ms[/muted]``
-
-    Failure status appends a [danger]✗[/danger] mark.
+    Composed by `deck_grammar.action`: the bullet carries the outcome colour,
+    the verb is ink and the argument muted, whatever kind of argument it is.
+    Failure status appends a ✗ mark.
     """
     duration_part = ""
     if duration_ms and duration_ms > 0:
@@ -626,49 +593,29 @@ def _compose_header(
         c = _palette_value(palette, "death")
         status_part = f"  [{c}]✗[/{c}]"
 
-    if descriptor_cc_verb:
-        # rendered_header looks like "Read(foo.py)" — split into verb
-        # + path-in-parens so we can colour each piece independently.
-        verb_color = _palette_value(palette, "neural")
-        arg_color = _arg_colour(arg_kind, palette)
-        # Find the parens; if not present (defensive), fall back to dim.
-        lparen = rendered_header.find("(")
-        rparen = rendered_header.rfind(")")
-        if 0 < lparen < rparen:
-            verb = rendered_header[:lparen]
-            inner = rendered_header[lparen + 1 : rparen]
-            return (
-                f"[{verb_color}]{_theme.mark('action')} {verb}[/{verb_color}]"
-                f"([{arg_color}]{_escape(inner)}[/{arg_color}])"
-                f"{duration_part}{status_part}"
-            )
-        # Fall-through: emit as a plain neural-coloured header
-        return (
-            f"[{verb_color}]{_theme.mark('action')} {_escape(rendered_header)}[/{verb_color}]"
-            f"{duration_part}{status_part}"
-        )
-
-    # Unknown tool — MCP-forwarded, typically. SAME shape as everything
-    # else: a tool this registry has never heard of is still a tool call,
-    # and a distinct layout for it tells the operator about our descriptor
-    # table rather than about their work.
-    verb_color = _palette_value(palette, "neural")
-    file_color = _arg_colour(arg_kind, palette)
+    # ONE header grammar for the whole deck: `deck_grammar.action`. This
+    # built its own (cyan verb, per-kind argument colours, its own dot) while
+    # the deck's other block openers used the grammar -- two dialects in one
+    # transcript. The dot's colour is the outcome (DONE_TONE / FAILED_TONE).
     lparen = rendered_header.find("(")
     rparen = rendered_header.rfind(")")
-    inner = rendered_header[lparen + 1 : rparen] if 0 < lparen < rparen else ""
-    try:
-        from backend.core.ouroboros.battle_test.tool_render_registry import (
-            _titlecase_kind,
-        )
-        verb = _titlecase_kind(tool_name) if tool_name else rendered_header
-    except Exception:  # noqa: BLE001
-        verb = rendered_header
-    return (
-        f"[{verb_color}]{_theme.mark('action')} {_escape(verb)}[/{verb_color}]"
-        f"([{file_color}]{_escape(inner)}[/{file_color}])"
-        f"{duration_part}{status_part}"
-    )
+    if 0 < lparen < rparen:
+        verb, inner = rendered_header[:lparen], rendered_header[lparen + 1 : rparen]
+    else:
+        verb, inner = rendered_header, ""
+    if not descriptor_cc_verb:
+        # Unknown tool -- MCP-forwarded, typically. Named from the caller's
+        # tool name (the default descriptor's own kind is "default").
+        try:
+            from backend.core.ouroboros.battle_test.tool_render_registry import (
+                _titlecase_kind,
+            )
+            verb = _titlecase_kind(tool_name) if tool_name else verb
+        except Exception:  # noqa: BLE001
+            pass
+    from backend.core.ouroboros.ui import deck_grammar as _deck
+    tone = _deck.DONE_TONE if status_enum is ToolStatus.SUCCESS else _deck.FAILED_TONE
+    return _deck.action(verb, inner, tone=tone) + duration_part + status_part
 
 
 def _detail_prefix() -> str:
@@ -736,6 +683,17 @@ def _bash_command_line(args_str: str, palette: "Optional[Mapping[str, str]]",
         return None
 
 
+def _header_shows(header_markup: str, args_str: str) -> bool:
+    """Whether the composed header already shows *args_str* in full
+    (whitespace-normalised, as the header renders it). NEVER raises."""
+    try:
+        from rich.text import Text
+        want = " ".join(str(args_str or "").split())
+        return bool(want) and want in Text.from_markup(header_markup).plain
+    except Exception:  # noqa: BLE001 — unsure: show the command
+        return False
+
+
 def _body_indent() -> str:
     """Leading spaces that put a body line under the summary's text.
 
@@ -796,12 +754,15 @@ def _compose_summary(
     # a count. It is added only when something is not on screen -- a summary-
     # only block, or a body trimmed without an in-body marker (an in-body
     # marker already names the ref). A fully shown body needs no way back.
+    #
+    # No count. `elided` includes lines the denoiser dropped (a diff's
+    # `---`/`+++` header), so a count beside a summary that already says
+    # `+5 / -2 lines` read as a second, contradicting change size. The ref is
+    # the information; the expansion shows the number.
     suffix = ""
-    if isinstance(expansion_ref, str) and expansion_ref and not marker_in_body:
-        if not body_present:
-            suffix = f" · /expand {expansion_ref}"
-        elif elided > 0:
-            suffix = f" · +{elided} line{'s' if elided != 1 else ''} · /expand {expansion_ref}"
+    if (isinstance(expansion_ref, str) and expansion_ref and not marker_in_body
+            and (not body_present or elided > 0)):
+        suffix = f" · /expand {expansion_ref}"
     summary_markup = (
         f"[{c_dim}]{_detail_prefix()}{_escape(summary_text)}{_escape(suffix)}[/{c_dim}]"
     )
@@ -933,7 +894,6 @@ def compose(
         # MCP-forwarded call rendered as `Default(#eng)`. This layer has
         # the real name and is the only one that does.
         tool_name=str(tool_name or ""),
-        arg_kind=getattr(descriptor, "arg_kind", "text"),
     )
 
     body_present = bool(rendered.body_lines)
@@ -970,6 +930,10 @@ def compose(
     # as console output that escaped the block. The wrappers keep owning
     # COLOUR; this owns POSITION, and neither has to know the other's rules.
     _indent = _body_indent()
+    # A body line that IS the summary says the same thing twice in one
+    # block: `⎿ 47 passed` over a body ending `47 passed`. The summary line
+    # keeps it, because that is where the eye lands.
+    _said = " ".join(str(rendered.body_summary or "").split())
     body_lines_markup: Tuple[str, ...] = tuple(
         _indent + (
             _wrap_marker_line(ln, palette)
@@ -977,6 +941,7 @@ def compose(
             else wrapper(ln, palette)
         )
         for ln in rendered.body_lines
+        if not (_said and " ".join(str(ln).split()) == _said)
     )
 
     # SHELL VISIBILITY — for a bash call, show the command it ran on its own
@@ -984,7 +949,11 @@ def compose(
     # short form and the natural-language "why" rides the 🗣 preamble, so this
     # is the literal command the operator can read and trust. Additive — a
     # non-bash tool is byte-identical. NEVER raises.
-    if str(tool_name or "").strip().lower() == "bash":
+    #
+    # Only when the header CLIPPED it. A command the header already shows in
+    # full would read twice, `● Bash(pytest -q)` over `$ pytest -q`.
+    if (str(tool_name or "").strip().lower() == "bash"
+            and not _header_shows(header_markup, str(args_str or ""))):
         _cmd_line = _bash_command_line(str(args_str or ""), palette, _body_indent())
         if _cmd_line:
             body_lines_markup = (_cmd_line,) + body_lines_markup

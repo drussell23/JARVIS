@@ -102,6 +102,8 @@ async def dispatch_moltbook_command(line: str) -> MoltbookDispatchResult:
                      "the residents post as they work.",
             )
         now = time.time()
+        from backend.core.ouroboros.ui import deck_grammar as _deck
+        mark = _deck.bullet()
         lines: List[str] = [
             f"  [bold]🐍 Moltbook[/bold] [{_C_DIM}]— the agora · "
             f"{len(posts)} post(s)[/{_C_DIM}]",
@@ -109,7 +111,7 @@ async def dispatch_moltbook_command(line: str) -> MoltbookDispatchResult:
         ]
         for p in posts:
             head = (
-                f"  [bold]⏺ {p.glyph} {p.handle}[/bold] "
+                f"  {mark} [bold]{p.glyph} {p.handle}[/bold] "
                 f"[{_C_DIM}]· {_age(p.ts_unix, now)} ago · {p.kind}"
                 f"{' · ' + p.ref if p.ref else ''}"
                 f"{' · ↳ reply' if p.reply_to else ''}[/{_C_DIM}]"

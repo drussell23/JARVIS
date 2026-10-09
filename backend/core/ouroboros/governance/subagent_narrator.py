@@ -83,7 +83,9 @@ def _clip(text: str, limit: int = _GOAL_MAX) -> str:
 
 def render_spawn(subagent_type: Any, goal: str) -> str:
     """``⏺ Explore(goal)`` — §04: ⏺ opens a primary action."""
-    return f"⏺ {_voice(subagent_type)}({_clip(goal)})"
+    from backend.core.ouroboros.ui import deck_grammar as _deck
+    return _deck.action(_voice(subagent_type), _clip(goal),
+                        tone=_deck.PENDING_TONE)
 
 
 def render_result(result: Any, elapsed_s: Optional[float] = None) -> str:

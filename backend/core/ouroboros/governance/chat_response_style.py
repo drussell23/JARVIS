@@ -114,7 +114,8 @@ def acknowledge(action: str, message: str = "") -> str:
     phrase, _deferred = _voice(action)
     if not phrase:
         return ""
-    return f"⏺ {phrase}"
+    from backend.core.ouroboros.ui import deck_grammar as _deck
+    return f"{_deck.bullet()} {phrase}"
 
 
 def _dispatched_now(receipt: str) -> bool:
@@ -404,18 +405,19 @@ def compose_reply(
     failure degrades to the plain receipt.
     """
     try:
+        from backend.core.ouroboros.ui import deck_grammar as _deck
         lines: List[str] = []
 
         # A social turn's reply IS the response. Wrapping it in chrome would
         # make "Hey." look like a system event.
         if action == "social_ack" and social_reply:
-            lines.append(f"⏺ {social_reply}")
+            lines.append(f"{_deck.bullet()} {social_reply}")
         else:
             if _dispatched_now(receipt):
                 # It is RUNNING. Say so, and hand the operator the ref the op
                 # chrome will narrate under — so the ⏺/⎿ lines that follow
                 # are recognisably the answer to what they just typed.
-                lines.append("⏺ on it")
+                lines.append(f"{_deck.bullet(_deck.PENDING_TONE)} on it")
                 lines.append(f"  ⎿ dispatched {_short_ref(receipt)} · "
                              f"immediate · watching")
             elif is_dedup_receipt(receipt):
@@ -423,7 +425,7 @@ def compose_reply(
                 # operator actually did — asked twice — because "adding that
                 # to the backlog" would describe the safety net as if it were
                 # the outcome.
-                lines.append("⏺ you have already asked for this")
+                lines.append(f"{_deck.bullet()} you have already asked for this")
             else:
                 head = acknowledge(action, message)
                 if head:

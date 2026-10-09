@@ -175,7 +175,11 @@ class PlanChecklist:
         """
         if not checklist_visible() or len(self._items) < 2:
             return []
-        lines = [f"⏺ Plan({self.done}/{self.total} changes)"]
+        from backend.core.ouroboros.ui import deck_grammar as _deck
+        lines = [_deck.action(
+            "Plan", f"{self.done}/{self.total} changes",
+            tone=_deck.DONE_TONE if self.complete else _deck.PENDING_TONE,
+        )]
         # UNFINISHED work first among the hidden: if a plan is longer than the
         # window, the steps still to come are what an operator needs.
         shown = self._items[:max_shown]

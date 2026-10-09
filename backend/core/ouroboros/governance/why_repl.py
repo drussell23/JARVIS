@@ -101,7 +101,9 @@ def render(explanation: Any) -> str:
     """The whole account as one block. Pure; no I/O."""
     lines: List[str] = []
     flight = "  · IN FLIGHT" if explanation.in_flight else ""
-    lines.append(f"⏺ why {explanation.ref}  {explanation.op_id[:24]}{flight}")
+    from backend.core.ouroboros.ui import deck_grammar as _deck
+    lines.append(f"{_deck.bullet()} why {explanation.ref}  "
+                 f"{explanation.op_id[:24]}{flight}")
     for band in explanation.bands:
         lines.extend(_render_band(band))
 

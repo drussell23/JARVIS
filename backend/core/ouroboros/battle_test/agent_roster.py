@@ -333,8 +333,7 @@ class AgentEntry:
         # ⏺ filled = this session; ◯ hollow = delegated work happening
         # elsewhere. Failure and loss are NOT the same mark: one reported
         # back, the other never did.
-        return {"running": "◯", "finished": "⏺",
-                "failed": "✗", "unknown": "?"}.get(self.state, "◯")
+        return _state_glyph(self.state)
 
     def label(self, width: int = 48) -> str:
         goal = " ".join(self.goal.split())
@@ -488,7 +487,11 @@ class AgentRoster:
             took = format_duration(entry.elapsed(self._clock()))
             goal = entry.label(60) or entry.kind
             tail = f" · {entry.detail}" if entry.detail else ""
-            return f'⏺ Agent "{goal}" {verb} · {took}{tail}'
+            from backend.core.ouroboros.ui import deck_grammar as _deck
+            mark = _deck.bullet(
+                _deck.DONE_TONE if entry.state == "finished"
+                else _deck.FAILED_TONE)
+            return f'{mark} Agent "{goal}" {verb} · {took}{tail}'
         except Exception:  # noqa: BLE001
             return ""
 
@@ -594,7 +597,25 @@ class AgentRoster:
 #: state → mark. Failure and loss are NOT the same: one reported back, the
 #: other never did. Defined once here because the reader may be holding a
 #: snapshot from a process whose AgentEntry class it never imported.
-_GLYPHS = {"running": "◯", "finished": "⏺", "failed": "✗", "unknown": "?"}
+#: ``finished`` is the theme's action mark, resolved per call (see
+#: :func:`_state_glyph`) so it degrades to ASCII with the rest of the deck.
+_GLYPHS = {"running": "◯", "failed": "✗", "unknown": "?"}
+
+
+def _action_mark() -> str:
+    """The theme's action mark as plain text. Lazy and fail-soft: the reader
+    half stays importable where the theme (and Rich) is not."""
+    try:
+        from backend.core.ouroboros.ui.theme import mark
+        return mark("action") or "●"
+    except Exception:  # noqa: BLE001
+        return "●"
+
+
+def _state_glyph(state: str) -> str:
+    if state == "finished":
+        return _action_mark()
+    return _GLYPHS.get(state, "◯")
 
 
 def _clip(text: Any, width: int) -> str:
@@ -852,11 +873,11 @@ def render_roster(
         # `main` stays, because it is the row the cursor rests on and the
         # thing every other row is a child of.
         lines = []
-        lines.append(f"{'❯' if selected is None else ' '} ⏺ main")
+        lines.append(f"{'❯' if selected is None else ' '} {_action_mark()} main")
         for row in rows:
             state = str(row.get("state") or "running")
             mark = "❯" if selected and selected == row.get("id") else " "
-            glyph = _GLYPHS.get(state, "◯")
+            glyph = _state_glyph(state)
             elapsed = float(row.get("elapsed_s") or 0.0)
             if state == "running":
                 elapsed += age

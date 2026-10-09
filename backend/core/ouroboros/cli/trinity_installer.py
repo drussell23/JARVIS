@@ -46,6 +46,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, List, Optional
 
+
+def _act() -> str:
+    """The theme's action mark as plain text (every sink here prints with
+    ``markup=False``). Lazy and fail-soft. NEVER raises."""
+    try:
+        from backend.core.ouroboros.ui.deck_grammar import bullet
+        return bullet(markup=False)
+    except Exception:  # noqa: BLE001
+        return "●"
+
+
 # No hardcoding — every identity/path is env-overridable with a default.
 SUPERVISOR_LABEL = os.environ.get("JARVIS_SUPERVISOR_LABEL", "com.jarvis.supervisor")
 APP_BUNDLE_ID = os.environ.get("JARVIS_APP_BUNDLE_ID", "com.jarvis.trinity")
@@ -262,7 +273,7 @@ def install_supervisor_agent(
         except Exception:
             loaded = rc == 0
         if loaded:
-            return (f"⏺ resident supervisor installed + verified loaded "
+            return (f"{_act()} resident supervisor installed + verified loaded "
                     f"({SUPERVISOR_LABEL}) — {path}")
         return (f"⚠ supervisor plist written to {path} but launchctl "
                 f"bootstrap did NOT load it (rc={rc}"
@@ -292,7 +303,7 @@ def uninstall_supervisor_agent(
             path.unlink(missing_ok=True)
         except OSError:
             pass
-        return (f"⏺ resident supervisor uninstalled ({SUPERVISOR_LABEL})"
+        return (f"{_act()} resident supervisor uninstalled ({SUPERVISOR_LABEL})"
                 if existed else "⎿ no resident supervisor was installed")
     except Exception as exc:
         return f"⚠ supervisor uninstall failed: {exc}"
@@ -631,7 +642,7 @@ def run_install(
         if app_dest is not None:
             report.app_path = generate_app_bundle(app_dest)
             report.messages.append(
-                f"⏺ Thin-Bundle app generated — {report.app_path}")
+                f"{_act()} Thin-Bundle app generated — {report.app_path}")
 
         # ---- Stateful Pre-Flight Teardown (mandate 2): clear TCP/UDS
         # contention BEFORE launchctl bootstrap so the daemon never dies on
@@ -641,7 +652,7 @@ def run_install(
             signaller=signaller, sleeper=sleeper)
         if td.terminated or td.escalated:
             report.messages.append(
-                f"⏺ pre-flight teardown: SIGTERM {td.terminated}"
+                f"{_act()} pre-flight teardown: SIGTERM {td.terminated}"
                 + (f", SIGKILL {td.escalated}" if td.escalated else "")
                 + " — " + td.detail)
         if not td.clean:
@@ -684,7 +695,7 @@ def installer_main(argv: Optional[List[str]] = None, console=None) -> int:
         for m in report.messages:
             console.print(m, markup=False)
         console.print(
-            "⏺ background persistence active — the supervisor now "
+            f"{_act()} background persistence active — the supervisor now "
             "auto-starts at login and restarts on crash", markup=False)
         return 0
     except Exception as exc:

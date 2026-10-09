@@ -26,11 +26,13 @@ def _marks() -> str:
         found = set()
         for pair in getattr(theme, "_GLYPHS", {}).values():
             found.update(str(g) for g in pair if g and len(str(g)) <= 2)
-        found.update(getattr(theme, "_SYMBOL_SUBSTITUTES", {}).values())
         found.add("│")
+        # The pre-● action mark: an attached cockpit may render lines from an
+        # older daemon, and their wrapped continuations still need the column.
+        found.add("⏺")
         return "".join(sorted(found, key=len, reverse=True))
     except Exception:  # noqa: BLE001
-        return "⏺●⎿│*-"
+        return "●⏺⎿│*-"
 
 
 _PREFIX_RE: Optional["re.Pattern[str]"] = None

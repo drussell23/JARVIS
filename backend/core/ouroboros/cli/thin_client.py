@@ -66,6 +66,16 @@ _TRUTHY = ("1", "true", "yes", "on")
 AGENT_LABEL = "com.jarvis.ov.daemon"
 
 
+def _mark() -> str:
+    """The theme's action mark as plain text — every sink here prints raw.
+    Resolved at call time so module import stays stdlib-only. NEVER raises."""
+    try:
+        from backend.core.ouroboros.ui.theme import mark
+        return mark("action") or "●"
+    except Exception:  # noqa: BLE001
+        return "●"
+
+
 def thin_client_enabled() -> bool:
     """Master gate — default ON (the split IS the product now);
     ``JARVIS_OV_THIN_CLIENT=false`` or ``ov --legacy-boot`` reverts to
@@ -991,7 +1001,7 @@ async def _await_ignition_window(
             # "absent" and "stale" too — it would report a corpse as live.
             # Caught by the existing starved-organism suite.
             if await probe_socket(path, deep=True) == "live":
-                say("⏺ organism live — attaching")
+                say(f"{_mark()} organism live — attaching")
                 return True
             # (b) it let go: the lock is free, so ignite again.
             if _live_incumbent() is None:
@@ -1001,7 +1011,7 @@ async def _await_ignition_window(
                     on_progress=on_progress,
                     child_poll=getattr(proc, "poll", None),
                 ):
-                    say("⏺ organism live — attaching")
+                    say(f"{_mark()} organism live — attaching")
                     return True
         except Exception:  # noqa: BLE001 — a failed probe is just another tick
             pass
@@ -1064,10 +1074,10 @@ async def ensure_daemon(
             else:
                 # A daemon is home but boot-starved — its socket must NOT be
                 # cleaned and no second ignition raced. Wait for it to serve.
-                _say("⏺ organism already waking — waiting for it to serve")
+                _say(f"{_mark()} organism already waking — waiting for it to serve")
                 if await await_socket(path, on_tick=_mk_tick(_say, on_progress),
                                       on_progress=on_progress):
-                    _say("⏺ organism live — attaching")
+                    _say(f"{_mark()} organism live — attaching")
                     return True
                 _say(
                     "⚠ the waking organism never served — "
@@ -1083,12 +1093,12 @@ async def ensure_daemon(
             incumbent = _live_incumbent()
             if incumbent is not None:
                 _say(
-                    f"⏺ organism (PID {incumbent}) is alive but not "
+                    f"{_mark()} organism (PID {incumbent}) is alive but not "
                     "serving — waiting, never cleaning a live socket"
                 )
                 if await await_socket(path, on_tick=_mk_tick(_say, on_progress),
                                       on_progress=on_progress):
-                    _say("⏺ organism live — attaching")
+                    _say(f"{_mark()} organism live — attaching")
                     return True
                 _say(
                     f"⚠ organism PID {incumbent} is alive but its "
@@ -1098,7 +1108,7 @@ async def ensure_daemon(
                 return False
             _say("⎿ ghost socket from a dead organism — cleaning")
             clean_stale_socket(path)
-        _say("⏺ no organism awake — igniting one in the background")
+        _say(f"{_mark()} no organism awake — igniting one in the background")
         proc = spawn_daemon(spawner=spawner)
         if proc is None:
             _say("⚠ ignition failed — see " + str(daemon_log_path()))
@@ -1110,7 +1120,7 @@ async def ensure_daemon(
             on_progress=on_progress,
             record_boot=True,   # this branch SPAWNED — it is a real boot
         ):
-            _say("⏺ organism live — attaching")
+            _say(f"{_mark()} organism live — attaching")
             return True
         rc = None
         try:
@@ -1247,10 +1257,10 @@ def install_agent(
             )
         except Exception:  # noqa: BLE001
             return (
-                f"⏺ resident agent written to {path} — load it with: "
+                f"{_mark()} resident agent written to {path} — load it with: "
                 f"launchctl bootstrap gui/$UID {path}"
             )
-        return f"⏺ resident organism installed ({AGENT_LABEL}) — {path}"
+        return f"{_mark()} resident organism installed ({AGENT_LABEL}) — {path}"
     except Exception as exc:  # noqa: BLE001
         return f"⚠ install failed: {exc}"
 
@@ -1277,7 +1287,7 @@ def uninstall_agent(
         except OSError:
             pass
         return (
-            f"⏺ resident organism uninstalled ({AGENT_LABEL})"
+            f"{_mark()} resident organism uninstalled ({AGENT_LABEL})"
             if existed else "⎿ no resident agent was installed"
         )
     except Exception as exc:  # noqa: BLE001

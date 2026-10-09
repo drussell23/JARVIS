@@ -66,15 +66,6 @@ from typing import (
 
 logger = logging.getLogger("Ouroboros.CockpitAttach")
 
-
-def _local_symbol_glyphs() -> bool:
-    """This terminal's answer, from the one rule the theme owns."""
-    try:
-        from backend.core.ouroboros.ui.theme import local_symbol_glyphs
-        return bool(local_symbol_glyphs())
-    except Exception:  # noqa: BLE001
-        return True
-
 COCKPIT_ATTACH_SCHEMA_VERSION = "cockpit_attach.v2"
 
 #: Closed taxonomy of daemon→TUI audio FSM states (the morphing
@@ -1988,7 +1979,6 @@ class CockpitAttachClient:
                 # aligned ASCII gutter beats a misaligned pretty one.
                 "wide_glyphs": self._wcwidth_available(),
                 "color_depth": depth,
-                "symbol_glyphs": _local_symbol_glyphs(),
             }
             w.write((json.dumps(frame, separators=(",", ":")) + "\n").encode())
             return True

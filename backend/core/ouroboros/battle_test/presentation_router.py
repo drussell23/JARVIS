@@ -32,6 +32,7 @@ NEVER raises anywhere on the UI plane.
 from __future__ import annotations
 
 import enum
+import functools
 import logging
 import os
 import re
@@ -74,9 +75,23 @@ def _mark(g: "Glyph") -> str:
         return ""
 
 
+@functools.lru_cache(maxsize=1)
 def canonical_glyph_chars() -> frozenset:
-    """The unicode characters of the six rationed marks."""
-    return frozenset("⏺⎿💭🗣⚠🎙")
+    """The unicode characters of the six rationed marks, read from
+    ``theme._GLYPHS`` so the ration cannot drift from the theme."""
+    try:
+        from backend.core.ouroboros.ui.theme import _GLYPHS
+        return frozenset(_GLYPHS[g.value][0] for g in Glyph)
+    except Exception:  # noqa: BLE001
+        return frozenset("●⎿💭🗣⚠🎙")
+
+
+def _action_unicode() -> str:
+    try:
+        from backend.core.ouroboros.ui.theme import _GLYPHS
+        return _GLYPHS["action"][0]
+    except Exception:  # noqa: BLE001
+        return "●"
 
 
 #: Structure/typography set — allowed everywhere, not rationed (§2).
@@ -91,6 +106,8 @@ TYPOGRAPHIC_CHARS = frozenset("·✓✗›─▸")
 #: haven't been re-voiced yet.
 LEGACY_GLYPH_ALIASES = {
     "⛲": "⚠",
+    # The pre-● action mark, still emitted by older daemons.
+    "⏺": _action_unicode(),
 }
 
 

@@ -13,9 +13,10 @@ with no idea what it was touching:
     ⏺ Explore(find every place we parse a socket path)
       ⎿ 3 files · 2.1s          ← the summary, but never the steps
 
-The spinner stays — it is the right affordance locally. The cockpit gets a
-PERSISTENT line, because a remote surface has no spinner to erase and a
-vanishing status is worse than none.
+The spinner stays — it is the right affordance locally. The cockpit first got
+a PERSISTENT line; since 2026-10-09 it gets the running call on the LIVE
+channel instead (`tool_inflight` → heartbeat verb), because the completed
+header is persistent too and a tool must not read twice in scrollback.
 """
 from __future__ import annotations
 
@@ -25,7 +26,7 @@ from typing import Any
 
 import pytest
 
-from backend.core.ouroboros.battle_test.serpent_flow import _tool_chrome_line
+from backend.core.ouroboros.battle_test.serpent_flow import tool_call_label
 
 _REPO = Path(__file__).resolve().parents[2]
 _SRC = _REPO / "backend/core/ouroboros/battle_test/serpent_flow.py"
@@ -36,19 +37,19 @@ _SRC = _REPO / "backend/core/ouroboros/battle_test/serpent_flow.py"
 # --------------------------------------------------------------------------
 
 def test_the_file_being_read_is_named() -> None:
-    """THE request. `⏺ Read()` says an op is busy; `⏺ Read(path)` says what
-    it is busy with."""
-    out = _tool_chrome_line("read_file", "backend/core/ouroboros/cli/thin_client.py")
-    assert out == "⏺ Read(backend/core/ouroboros/cli/thin_client.py)"
+    """THE request. `Read()` says an op is busy; `Read(path)` says what it
+    is busy with."""
+    out = tool_call_label("read_file", "backend/core/ouroboros/cli/thin_client.py")
+    assert out == "Read(backend/core/ouroboros/cli/thin_client.py)"
 
 
 def test_a_search_shows_its_pattern() -> None:
-    out = _tool_chrome_line("search_code", 'pattern="socket path" glob=*.py')
-    assert "socket path" in out and out.startswith("⏺ Search(")
+    out = tool_call_label("search_code", 'pattern="socket path" glob=*.py')
+    assert "socket path" in out and out.startswith("Search(")
 
 
 def test_a_command_shows_what_ran() -> None:
-    assert "pytest tests/cli -q" in _tool_chrome_line("bash", "pytest tests/cli -q")
+    assert "pytest tests/cli -q" in tool_call_label("bash", "pytest tests/cli -q")
 
 
 @pytest.mark.parametrize("token,verb", [
@@ -58,7 +59,7 @@ def test_a_command_shows_what_ran() -> None:
 ])
 def test_each_tool_is_SPOKEN_not_tokenised(token: str, verb: str) -> None:
     """`read_file` is a routing identifier; `Read` is what an operator reads."""
-    assert _tool_chrome_line(token, "x").startswith(f"⏺ {verb}(")
+    assert tool_call_label(token, "x").startswith(f"{verb}(")
 
 
 def test_an_unknown_tool_renders_under_its_own_name() -> None:
@@ -70,7 +71,7 @@ def test_an_unknown_tool_renders_under_its_own_name() -> None:
 
     A new tool must appear, not vanish: MCP tools arrive at runtime and
     cannot be enumerated ahead of time."""
-    out = _tool_chrome_line("mcp_github_search", "q=x")
+    out = tool_call_label("mcp_github_search", "q=x")
     assert "github" in out and "search" in out
     assert "mcp_" not in out, "the raw routing prefix leaked to the operator"
 
@@ -87,53 +88,92 @@ def test_a_deep_path_keeps_BOTH_ends() -> None:
 
     The filename still identifies the file — that part was right."""
     deep = "backend/core/ouroboros/governance/" + ("x" * 60) + "/thin_client.py"
-    out = _tool_chrome_line("read_file", deep)
+    out = tool_call_label("read_file", deep)
     assert "thin_client.py" in out
     assert "backend" in out, "the repo root was thrown away"
     assert "…" in out
 
 
 def test_a_line_stays_a_line() -> None:
-    assert len(_tool_chrome_line("read_file", "y" * 400)) < 80
+    assert len(tool_call_label("read_file", "y" * 400)) < 80
 
 
 def test_multiline_args_are_flattened() -> None:
     """A newline inside chrome breaks the ⏺/⎿ pairing visually."""
-    assert "\n" not in _tool_chrome_line("bash", "line one\nline two")
+    assert "\n" not in tool_call_label("bash", "line one\nline two")
 
 
 def test_a_tool_with_no_arguments_still_renders() -> None:
-    assert _tool_chrome_line("list_dir", "") == "⏺ List"
+    assert tool_call_label("list_dir", "") == "List"
 
 
 @pytest.mark.parametrize("junk", [None, 42, object()])
 def test_it_never_raises(junk: Any) -> None:
-    assert isinstance(_tool_chrome_line(junk, junk), str)
+    assert isinstance(tool_call_label(junk, junk), str)
 
 
 # --------------------------------------------------------------------------
 # 3. it reaches the cockpit, and the spinner survives
 # --------------------------------------------------------------------------
 
-def _start_event_body() -> str:
-    src = _SRC.read_text()
-    for node in ast.walk(ast.parse(src)):
+def _method_body(name: str) -> str:
+    for node in ast.walk(ast.parse(_SRC.read_text())):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and \
-                "_start_status(" in (ast.unparse(node) or ""):
-            body = ast.unparse(node)
-            if "_tool_chrome_line" in body:
-                return body
+                node.name == name:
+            return ast.unparse(node)
     return ""
 
 
-def test_the_start_event_goes_through_the_MIRRORED_path() -> None:
-    """`_op_line` mirrors to attached cockpits; `_start_status` does not.
-    Asserted on the AST rather than a text window — a character slice measures
-    how much prose sits between two calls, which is not the invariant."""
+def _start_event_body() -> str:
+    return _method_body("op_tool_start")
+
+
+def test_the_start_event_goes_to_the_LIVE_channel() -> None:
+    """SUPERSEDED 2026-10-09: this asserted the start went through `_op_line`,
+    a PERSISTENT transcript line. The completed header in `op_tool_call` is
+    persistent too, so every tool read twice in scrollback. A start is live
+    state, so it is recorded for the heartbeat, which rewrites itself."""
     body = _start_event_body()
-    assert body, "the tool-start renderer no longer emits chrome"
-    assert "_op_line" in body
-    assert "_tool_chrome_line" in body
+    assert "get_inflight_tools().started" in body
+    assert "tool_call_label" in body
+
+
+def test_the_start_event_writes_NOTHING_to_the_transcript() -> None:
+    """The duplicate, pinned shut. Any `_op_line` call left in the start
+    handler that carries the call label would bring it back."""
+    tree = ast.parse(_start_event_body())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "_op_line":
+            assert "tool_call_label" not in ast.unparse(node)
+
+
+def test_completion_retires_the_live_label_and_op_close_clears_it() -> None:
+    assert "get_inflight_tools().finished" in _method_body("op_tool_call")
+    assert "get_inflight_tools().clear" in _method_body("_close_op_block")
+
+
+def test_the_heartbeat_names_the_running_tool(monkeypatch) -> None:
+    """End to end over the real composer: a running call outranks the phase
+    verb, and the phase verb comes back the moment it finishes."""
+    from backend.core.ouroboros.battle_test import attach_heartbeat, status_line
+    from backend.core.ouroboros.battle_test.tool_inflight import get_inflight_tools
+
+    class _Builder:
+        def snapshot(self):
+            return status_line.StatusSnapshot(phase="GENERATE",
+                                              primary_op_id="op-live")
+
+    monkeypatch.setattr(status_line, "get_status_line_builder", lambda: _Builder())
+    tools = get_inflight_tools()
+    label = tool_call_label("read_file", "backend/a.py")
+    tools.started("op-live", label)
+    try:
+        payload = attach_heartbeat.build_heartbeat_payload()
+        assert payload["verb"] == "Read(backend/a.py)" and payload["active"]
+        tools.finished("op-live", label)
+        assert attach_heartbeat.build_heartbeat_payload()["verb"] != label
+    finally:
+        tools.clear("op-live")
 
 
 def test_the_local_spinner_is_KEPT() -> None:
@@ -238,7 +278,7 @@ def test_a_single_enormous_filename_keeps_its_tail() -> None:
 def test_a_command_is_clipped_from_the_RIGHT() -> None:
     """A shell command is identified by its head. Eliding `pytest` to keep
     `--no-header` would be exactly backwards."""
-    out = _tool_chrome_line(
+    out = tool_call_label(
         "bash", "pytest tests/cli/test_thin_client.py -q --tb=short -x --no-header",
     )
     assert "pytest" in out
@@ -248,10 +288,10 @@ def test_a_command_is_clipped_from_the_RIGHT() -> None:
 def test_a_command_containing_a_slash_is_not_mistaken_for_a_path() -> None:
     """`pytest tests/cli -q` has a slash but is not a path — the
     discriminator is whether the FIRST token is itself the path."""
-    out = _tool_chrome_line("bash", "pytest " + "tests/cli/x " * 20)
-    assert out.startswith("⏺ Bash(pytest")
+    out = tool_call_label("bash", "pytest " + "tests/cli/x " * 20)
+    assert out.startswith("Bash(pytest")
 
 
 def test_a_bare_long_path_IS_treated_as_one() -> None:
-    out = _tool_chrome_line("read_file", "backend/core/ouroboros/" + "d/" * 20 + "f.py")
+    out = tool_call_label("read_file", "backend/core/ouroboros/" + "d/" * 20 + "f.py")
     assert out.endswith("f.py)")

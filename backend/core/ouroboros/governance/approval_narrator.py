@@ -98,12 +98,15 @@ def render_gate_prompt(
     """
     parts = [p for p in str(op_id or "").split("-") if p]
     ref = "-".join(parts[-2:]) if len(parts) >= 3 else (op_id or "op")
-    head = f"⏺ Iron Gate({ref})"
+    from backend.core.ouroboros.ui import deck_grammar as _deck
+    from rich.markup import escape as _escape
+    head = f"{_deck.bullet(_deck.PENDING_TONE)} Iron Gate({_escape(ref)})"
     if risk:
-        head += f" · {risk}"
-    detail = f" · {reason}" if reason else ""
+        head += f" · {_escape(str(risk))}"
+    detail = f" · {_escape(str(reason))}" if reason else ""
     expiry = f" · expires in {int(timeout_s)}s" if timeout_s > 0 else ""
-    return f"{head}\n  ⎿ approve? [y/n]{detail}{expiry}"
+    # `[y/n]` is a Rich tag to the markup sink and vanished; escaped, it is text.
+    return f"{head}\n  ⎿ approve? {_escape('[y/n]')}{detail}{expiry}"
 
 
 async def await_decision_with_operator(

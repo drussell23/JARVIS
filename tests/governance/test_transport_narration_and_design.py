@@ -392,8 +392,9 @@ def test_the_second_glyph_table_is_gone():
 
 def test_tool_chrome_and_composer_degrade_with_the_theme(monkeypatch):
     monkeypatch.setattr(theme, "supports_unicode", lambda env=None: False)
-    from backend.core.ouroboros.battle_test.serpent_flow import _tool_chrome_line
-    assert _tool_chrome_line("read_file", "x.py").startswith("* ")
+    from rich.text import Text
+    from backend.core.ouroboros.ui import deck_grammar
+    assert deck_grammar.bullet(markup=False) == "*"
     from backend.core.ouroboros.battle_test.tool_render_view import (
         compose_if_enabled, store_for_view,
     )
@@ -401,7 +402,8 @@ def test_tool_chrome_and_composer_degrade_with_the_theme(monkeypatch):
         "read_file", "x.py", "ok", status="success", duration_ms=1.0,
         op_id="op", round_index=0, palette=cst._SEM, store=store_for_view(),
     )
-    assert out is not None and "* Read" in out.header_markup and "⏺" not in out.header_markup
+    plain = Text.from_markup(out.header_markup).plain if out is not None else ""
+    assert plain.startswith("* Read") and "●" not in plain and "⏺" not in plain
 
 
 # ---------------------------------------------------------------------------

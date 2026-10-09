@@ -918,6 +918,7 @@ class StreamRenderer:
                 return
 
             from rich.markup import escape
+            from backend.core.ouroboros.ui import deck_grammar as _deck
 
             lines = chunk.splitlines()
             sent_any = False
@@ -931,9 +932,9 @@ class StreamRenderer:
                 if len(text) > _MIRROR_MAX_LINE_CHARS:
                     body += "…"
                 if not self._mirror_opened:
-                    # One ⏺ opens the block, as assistant prose does in the
-                    # deck's grammar; continuations indent under it.
-                    lead = f"⏺ {body}"
+                    # One action mark opens the block, as assistant prose does
+                    # in the deck's grammar; continuations indent under it.
+                    lead = f"{_deck.bullet()} {body}"
                     self._mirror_opened = True
                 else:
                     lead = f"  {body}"

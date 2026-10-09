@@ -39,8 +39,22 @@ logger = logging.getLogger(__name__)
 
 TRANSCRIPT_HATCHES_SCHEMA_VERSION: str = "transcript_hatches.1"
 
-#: Plain-text prefixes that open a block worth jumping to.
+#: Plain-text prefixes that open a block worth jumping to, besides the
+#: theme's action mark (see :func:`_block_markers`). ``⏺`` stays because an
+#: attached cockpit may be replaying lines from an older daemon.
 _BLOCK_MARKERS = ("⏺", "❯", "⚡", "◆")
+
+
+def _action_mark() -> str:
+    try:
+        from backend.core.ouroboros.ui.theme import mark
+        return mark("action") or "●"
+    except Exception:  # noqa: BLE001
+        return "●"
+
+
+def _block_markers() -> Tuple[str, ...]:
+    return (_action_mark(),) + _BLOCK_MARKERS
 
 _MARKUP_RE = re.compile(r"\[/?[a-zA-Z0-9 #_.,=-]*\]")
 
@@ -218,9 +232,10 @@ def jump_block(event: Any, direction: int) -> None:
         lines = transcript_lines()
         if not lines:
             return
+        leads = _block_markers()
         markers = [
             i for i, ln in enumerate(lines)
-            if ln.lstrip().startswith(_BLOCK_MARKERS)
+            if ln.lstrip().startswith(leads)
         ]
         if direction < 0:
             candidates = [i for i in markers if i < top]
@@ -682,6 +697,7 @@ def install_transcript_hatches(kb: Any, ui: Any, client: Any) -> bool:
         )
         scrolled = Condition(transcript_surface_active)
         bound = 0
+        act = _action_mark()
 
         bound += bind_action(
             kb, "transcript:dump", ("[",), dump_to_scrollback,
@@ -698,13 +714,13 @@ def install_transcript_hatches(kb: Any, ui: Any, client: Any) -> bool:
             kb, "transcript:prevBlock", ("{",),
             lambda e: jump_block(e, -1),
             context="Transcript", filter=scrolled,
-            description="jump to the previous ⏺/❯ block (while scrolled)",
+            description=f"jump to the previous {act}/❯ block (while scrolled)",
         )
         bound += bind_action(
             kb, "transcript:nextBlock", ("}",),
             lambda e: jump_block(e, +1),
             context="Transcript", filter=scrolled,
-            description="jump to the next ⏺/❯ block (while scrolled)",
+            description=f"jump to the next {act}/❯ block (while scrolled)",
         )
         bound += bind_action(
             kb, "app:redraw", ("ctrl+l",), force_redraw,

@@ -18,6 +18,14 @@ from backend.core.ouroboros.ui.block_wrap import block
 from backend.core.ouroboros.ui.text_bounds import clip_lines
 
 
+@pytest.fixture(autouse=True)
+def _unicode_terminal(monkeypatch):
+    """These tests are written in the glyphs a UTF-8 cockpit shows; the ASCII
+    degradation has its own test, which overrides this."""
+    from backend.core.ouroboros.ui import theme
+    monkeypatch.setattr(theme, "supports_unicode", lambda env=None: True)
+
+
 def _render(line: str, width: int = 60) -> list:
     c = Console(file=StringIO(), width=width, force_terminal=False, color_system=None)
     c.print(block(line))
@@ -131,35 +139,174 @@ def test_a_fully_shown_body_offers_no_expand():
 # ------------------------------------------------------------------ glyphs
 
 
-def test_the_action_glyph_follows_the_displaying_terminal(monkeypatch):
+def test_the_action_mark_is_the_green_dot(monkeypatch):
+    """The operator's request: ● in O+V's green, not ⏺. Owned by the theme,
+    tinted by the outcome, so one table answers every surface."""
+    from backend.core.ouroboros.ui import deck_grammar, theme
+    monkeypatch.setattr(theme, "supports_unicode", lambda env=None: True)
+    monkeypatch.setattr(theme, "active_tier", lambda: theme.ColorTier.TRUECOLOR)
+    assert theme.mark("action") == "●"
+    green = theme.semantic("venom_green", theme.ColorTier.TRUECOLOR)
+    assert green and deck_grammar.bullet() == f"[{green}]●[/{green}]"
+    assert deck_grammar.bullet(markup=False) == "●"
+    red = theme.semantic(deck_grammar.FAILED_TONE, theme.ColorTier.TRUECOLOR)
+    assert deck_grammar.bullet(deck_grammar.FAILED_TONE) == f"[{red}]●[/{red}]"
+
+
+def test_the_mark_degrades_to_ascii(monkeypatch):
+    from backend.core.ouroboros.ui import deck_grammar, theme
+    monkeypatch.setattr(theme, "supports_unicode", lambda env=None: False)
+    assert deck_grammar.bullet(markup=False) == "*"
+
+
+def test_a_completed_header_is_tinted_by_its_outcome(monkeypatch):
+    from backend.core.ouroboros.ui import deck_grammar, theme
+    monkeypatch.setattr(theme, "active_tier", lambda: theme.ColorTier.TRUECOLOR)
+    ok = _compose("read_file", "x")
+    green = theme.semantic(deck_grammar.DONE_TONE, theme.ColorTier.TRUECOLOR)
+    assert ok.header_markup.startswith(f"[{green}]")
+    from backend.core.ouroboros.battle_test.tool_render_store import BoundedBodyStore
+    from backend.core.ouroboros.battle_test.tool_render_view import compose
+    bad = compose("read_file", "pkg/mod.py", "boom", status="error",
+                  store=BoundedBodyStore(), op_id="op-1")
+    red = theme.semantic(deck_grammar.FAILED_TONE, theme.ColorTier.TRUECOLOR)
+    assert bad.header_markup.startswith(f"[{red}]")
+
+
+def test_the_daemon_colours_for_the_DISPLAYING_cockpit(monkeypatch):
+    """A daemon writes to a log, so its own probe says NONE. The cockpit's
+    declared depth decides; a cockpit that did not say is not 'no colour'."""
     from backend.core.ouroboros.battle_test import terminal_capabilities as tc
     from backend.core.ouroboros.ui import theme
-    monkeypatch.setattr(theme, "supports_unicode", lambda env=None: True)
-    monkeypatch.setattr(tc, "current_capabilities",
-                        lambda: tc.TerminalCapabilities(cols=120, rows=40, symbol_glyphs=False))
-    assert theme.mark("action") == "●"
-    monkeypatch.setattr(tc, "current_capabilities",
-                        lambda: tc.TerminalCapabilities(cols=120, rows=40, symbol_glyphs=True))
-    assert theme.mark("action") == "⏺"
-    assert theme.mark("action", unicode=True) == "⏺"         # explicit wins
+    monkeypatch.delenv("JARVIS_UI_THEME_FORCE_TIER", raising=False)
+    monkeypatch.setattr(theme, "_active_tier_cache", theme.ColorTier.NONE)
+    try:
+        tc.declare("cc-a", tc.TerminalCapabilities(cols=120, rows=40, color_depth=16_777_216))
+        tc.declare("cc-b", tc.TerminalCapabilities(cols=120, rows=40, color_depth=0))
+        assert theme.active_tier() == theme.ColorTier.TRUECOLOR
+        tc.declare("cc-c", tc.TerminalCapabilities(cols=120, rows=40, color_depth=8))
+        assert theme.active_tier() == theme.ColorTier.STANDARD
+    finally:
+        for sid in ("cc-a", "cc-b", "cc-c"):
+            tc.forget(sid)
+    assert theme.active_tier() == theme.ColorTier.NONE
 
 
-@pytest.mark.parametrize("env,expected", [
-    ({"JARVIS_OV_SYMBOL_GLYPHS": "1"}, True),
-    ({"JARVIS_OV_SYMBOL_GLYPHS": "0"}, False),
+# ------------------------------------------------------------------ flow
+
+
+def _flow(lines):
+    from backend.core.ouroboros.ui.deck_grammar import TranscriptFlow
+    f, out = TranscriptFlow(), []
+    for ln in lines:
+        out.extend(f.feed(ln))
+    return out
+
+
+def test_one_blank_before_each_action_and_none_at_the_top():
+    assert _flow(["", "● A(x)", "  ⎿  r", "● B(y)"]) == \
+        ["● A(x)", "  ⎿  r", "", "● B(y)"]
+
+
+def test_no_blank_inside_a_block_and_runs_collapse():
+    assert _flow(["● A(x)", "", "  ⎿  r", "", "", "body", "", "", "● B"]) == \
+        ["● A(x)", "  ⎿  r", "", "body", "", "● B"]
+
+
+def test_one_continuation_glyph_per_block():
+    out = _flow(["● A(x)", "  ⎿  one", "  ⎿  two", "● B", "  ⎿  three"])
+    assert out == ["● A(x)", "  ⎿  one", "     two", "", "● B", "  ⎿  three"]
+
+
+def test_a_block_indented_by_its_sink_is_still_one_block():
+    """The daemon mirrors op lines two columns in, so `⎿` lands at column 4.
+    Measured from column 0 it read as body: blanks inside the block survived
+    and every `⎿` stayed. Measured from the opener, it is the same block."""
+    out = _flow(["  ● Read(a.py)", "", "    ⎿  3 lines", "    ⎿  more", "  ● B"])
+    assert out == ["  ● Read(a.py)", "    ⎿  3 lines", "       more", "", "  ● B"]
+
+
+def test_the_flow_never_raises_and_passes_unknown_lines_through():
+    assert _flow([None, 42, "[bad markup"]) == ["42", "[bad markup"]
+
+
+def test_the_canvas_applies_the_flow_at_its_single_sink():
+    from backend.core.ouroboros.battle_test import bipartite_layout as bl
+    src = inspect.getsource(bl.BipartiteLayout)
+    assert "self._flow.feed(" in src and "def _append(" in src
+
+
+# ------------------------------------------------------------------ duplicates
+
+
+def test_the_summary_suffix_carries_the_ref_not_a_count():
+    """`+5 / -2 lines · +2 lines · /expand t-8` read as two change sizes; the
+    second counted denoised diff headers. The ref is the information."""
+    import re
+    from rich.text import Text
+    plain = Text.from_markup(
+        _compose("list_dir", "\n".join(f"f{i}.py" for i in range(30))).summary_markup,
+    ).plain
+    assert re.search(r" · /expand t-\d+$", plain)
+    assert not re.search(r"\+\d+ lines? · /expand", plain)
+
+
+@pytest.mark.parametrize("tool,result", [
+    ("run_tests", "a PASSED\nb PASSED\n47 passed in 3.98s"),
+    ("bash", "collected 3 items\n3 passed in 0.10s"),
 ])
-def test_local_symbol_rule_honours_the_operator(env, expected):
-    from backend.core.ouroboros.ui.theme import local_symbol_glyphs
-    assert local_symbol_glyphs(env) is expected
+def test_no_body_line_restates_the_summary(tool, result):
+    from rich.text import Text
+    from backend.core.ouroboros.ui import theme
+    r = _compose(tool, result)
+    said = Text.from_markup(r.summary_markup).plain.replace(
+        theme.mark("detail"), "", 1).strip()
+    bodies = [Text.from_markup(b).plain.strip() for b in r.body_lines_markup]
+    assert said and said not in bodies
 
 
-def test_capability_wire_carries_symbol_glyphs_and_defaults_safe():
-    from backend.core.ouroboros.battle_test.terminal_capabilities import TerminalCapabilities
-    assert TerminalCapabilities.from_wire({"cols": 80, "rows": 24}).symbol_glyphs is True
-    assert TerminalCapabilities.from_wire(
-        {"cols": 80, "rows": 24, "symbol_glyphs": False}).symbol_glyphs is False
-    from backend.core.ouroboros.battle_test import cockpit_attach
-    assert '"symbol_glyphs": _local_symbol_glyphs()' in inspect.getsource(cockpit_attach)
+def test_a_short_command_is_not_repeated_under_its_header():
+    from backend.core.ouroboros.battle_test.tool_render_store import BoundedBodyStore
+    from backend.core.ouroboros.battle_test.tool_render_view import compose
+    from rich.text import Text
+    r = compose("bash", "pytest -q", "ok\n1 passed", store=BoundedBodyStore(), op_id="op")
+    assert not any(Text.from_markup(b).plain.strip().startswith("$ ")
+                   for b in r.body_lines_markup)
+
+
+def test_a_clipped_command_still_shows_in_full():
+    from backend.core.ouroboros.battle_test.tool_render_store import BoundedBodyStore
+    from backend.core.ouroboros.battle_test.tool_render_view import compose
+    from rich.text import Text
+    cmd = "pytest " + " ".join(f"tests/x/test_{i}.py" for i in range(20))
+    r = compose("bash", cmd, "ok", store=BoundedBodyStore(), op_id="op")
+    assert any(Text.from_markup(b).plain.strip().startswith("$ ")
+               for b in r.body_lines_markup)
+
+
+# ------------------------------------------------------------------ live tool
+
+
+def test_inflight_tools_track_parallel_calls_and_expire():
+    from backend.core.ouroboros.battle_test.tool_inflight import InflightTools
+    t = InflightTools()
+    t.started("op", "Read(a)", now=100.0)
+    t.started("op", "Search(b)", now=100.0)
+    assert t.current("op", now=101.0) == "Search(b) (+1)"
+    t.finished("op", "Search(b)")
+    assert t.current("op", now=101.0) == "Read(a)"
+    assert t.current("op", now=100.0 + 10 ** 6) == ""      # a hung tool goes quiet
+    t.clear("op")
+    assert t.current("op") == ""
+
+
+def test_inflight_tools_are_bounded(monkeypatch):
+    from backend.core.ouroboros.battle_test.tool_inflight import InflightTools
+    monkeypatch.setenv("JARVIS_TOOL_INFLIGHT_MAX_OPS", "2")
+    t = InflightTools()
+    for i in range(5):
+        t.started(f"op{i}", "Read(x)")
+    assert [t.current(f"op{i}") for i in range(5)] == ["", "", "", "Read(x)", "Read(x)"]
 
 
 # ------------------------------------------------------------------ palette

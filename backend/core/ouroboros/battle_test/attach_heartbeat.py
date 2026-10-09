@@ -264,6 +264,19 @@ def build_heartbeat_payload() -> Optional[Dict[str, Any]]:
         active = bool(thinking_active or phase_verb)
         if not verb or not thinking_active:
             verb = phase_verb or verb
+        # A running tool call is the most specific thing the op is doing.
+        # It outranks the phase and the thinking verb, and it is shown HERE
+        # rather than in the transcript, which records the call once, when
+        # it completes.
+        try:
+            from backend.core.ouroboros.battle_test.tool_inflight import (
+                get_inflight_tools,
+            )
+            running_tool = get_inflight_tools().current(op_id) if op_id else ""
+        except Exception:  # noqa: BLE001 — the phase verb still describes it
+            running_tool = ""
+        if running_tool:
+            verb, active = running_tool, True
         if elapsed_s <= 0.0:
             # Post-GENERATE phases: the builder's detail is "NNs".
             detail = (snap.phase_detail or "").strip()

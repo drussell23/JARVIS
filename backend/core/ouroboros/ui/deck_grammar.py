@@ -42,13 +42,15 @@ from __future__ import annotations
 import functools
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 logger = logging.getLogger("Ouroboros.DeckGrammar")
 
 __all__ = [
     "ACTION_COLUMN", "DETAIL_COLUMN", "GUTTER_WIDTH",
-    "action", "detail", "voice", "diff", "blank", "body_column",
+    "DONE_TONE", "FAILED_TONE", "PENDING_TONE",
+    "TranscriptFlow", "action", "bullet", "detail", "voice", "diff", "blank",
+    "body_column",
 ]
 
 #: Where an action's text begins: ``⏺ Read(...)``. CC's column.
@@ -138,15 +140,40 @@ def _lead(glyph: str, column: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-def action(verb: str, arg: str = "", *, tone: str = "ok") -> str:
-    """``⏺ Read(governance/risk_tier_floor.py)`` — opens a block.
+#: The action dot's colour IS the outcome -- Claude Code's mechanic, O+V's
+#: palette: the organism's own green when an action completed, crit when it
+#: failed, muted while it is still in flight. Semantic names, tier-resolved.
+DONE_TONE: str = "venom_green"
+FAILED_TONE: str = "crit"
+PENDING_TONE: str = "muted"
 
-    The bullet carries the outcome (``ok`` / ``crit`` / ``warn``); the verb is
-    ink; the argument is muted, because WHICH file is context and WHAT
+
+def bullet(tone: Optional[str] = None, *, markup: bool = True) -> str:
+    """The action mark alone, ``●`` in the outcome's colour, as Rich markup.
+
+    For a line that opens a block but is not a ``Verb(arg)`` call, such as
+    ``● organism live — attaching``. Every such line asks here rather than
+    typing the glyph, so the mark, its ASCII degradation and its colour have
+    one owner. ``markup=False`` is for a sink that prints raw text (a plain
+    ``print`` to a pipe), where a Rich tag would be literal noise. NEVER raises.
+    """
+    try:
+        g = _glyph("action")
+        return _tint(g, _style(tone or DONE_TONE)) if markup else g
+    except Exception:  # noqa: BLE001
+        return "*"
+
+
+def action(verb: str, arg: str = "", *, tone: Optional[str] = None) -> str:
+    """``● Read(governance/risk_tier_floor.py)`` — opens a block.
+
+    The bullet carries the outcome (:data:`DONE_TONE` by default,
+    :data:`FAILED_TONE`, :data:`PENDING_TONE`, or any semantic name); the verb
+    is ink; the argument is muted, because WHICH file is context and WHAT
     happened is the content. Colouring both the same is the flat wall.
     """
     try:
-        lead = _tint(_lead(_glyph("action"), ACTION_COLUMN), _style(tone))
+        lead = _tint(_lead(_glyph("action"), ACTION_COLUMN), _style(tone or DONE_TONE))
         head = _tint(_escape(verb), _style("ink"))
         if arg:
             paren = _style("faint")
@@ -567,3 +594,97 @@ def blank() -> str:
     remove it and twenty correct lines read as one paragraph.
     """
     return ""
+
+
+# ---------------------------------------------------------------------------
+# The block RHYTHM, applied to a stream of deck lines
+# ---------------------------------------------------------------------------
+#
+# Rule 1 above cannot be kept by producers one at a time: a transcript is
+# written by several (tool renders, op chrome, the voice line, the agora),
+# each emitting lines without knowing what the last one was. Measured on the
+# demo deck (2026-10-09): three blank lines after one block and none before
+# the next, a blank line INSIDE a block between `● Gate(...)` and its `⎿`, and
+# six `⎿` glyphs stacked under one action. The rhythm is a property of the
+# STREAM, so it is kept where the stream is: one TranscriptFlow per sink.
+
+
+def _line_kind(plain: str, base: int = 0) -> Tuple[str, int]:
+    """``(kind, indent)``. Kind is ``opener`` (an action / voice / recap mark
+    at the action indent), ``detail`` (a ``⎿`` continuation of the block
+    whose opener sits at *base*), ``blank``, or ``body``.
+
+    A detail is measured from its OPENER, not from column 0: a sink that
+    indents a whole op (the daemon mirrors op lines two columns in) moves
+    the action and its ``⎿`` together, and the block is the same block.
+    """
+    if not plain.strip():
+        return "blank", 0
+    stripped = plain.lstrip(" ")
+    indent = len(plain) - len(stripped)
+    for name in ("action", "voice", "recap"):
+        g = _glyph(name)
+        if g and stripped.startswith(g) and indent <= ACTION_COLUMN:
+            return "opener", indent
+    g = _glyph("detail")
+    if g and stripped.startswith(g) and indent <= base + _DETAIL_INDENT:
+        return "detail", indent
+    return "body", indent
+
+
+class TranscriptFlow:
+    """Claude Code's block rhythm over a line stream. One per sink.
+
+    * A block opener gets exactly ONE blank line before it (none at the top).
+    * A blank line never lands inside a block: a blank followed by that
+      block's ``⎿`` is dropped; a blank followed by other content is kept
+      (once -- runs of blanks collapse).
+    * One ``⎿`` per block: later continuations keep the column, not the glyph.
+
+    Blanks are DEFERRED until the next line shows what they separate, so
+    nothing is retracted and a stream ending in a blank simply ends.
+    ``feed`` returns the lines to emit (zero or more). NEVER raises.
+    """
+
+    def __init__(self) -> None:
+        self._started = False
+        self._pending_blank = False
+        self._detail_open = False
+        self._base = 0          # the current block opener's indent
+
+    def feed(self, line: Any) -> list:
+        try:
+            raw = "" if line is None else str(line)
+            try:
+                from rich.text import Text
+                plain = (Text.from_ansi(raw) if "\x1b" in raw else Text.from_markup(raw)).plain
+            except Exception:  # noqa: BLE001 -- unparseable markup: judge the raw text
+                plain = raw
+            kind, indent = _line_kind(plain, self._base)
+            if kind == "blank":
+                self._pending_blank = self._started
+                return []
+            out: list = []
+            if kind == "opener":
+                if self._started:
+                    out.append(blank())
+                self._detail_open = False
+                self._base = indent
+            elif kind == "detail":
+                if self._detail_open:
+                    raw = self._continue(raw)
+                self._detail_open = True
+            elif self._pending_blank:
+                out.append(blank())
+            self._pending_blank = False
+            self._started = True
+            out.append(raw)
+            return out
+        except Exception:  # noqa: BLE001
+            return [line]
+
+    @staticmethod
+    def _continue(raw: str) -> str:
+        """A second ``⎿`` in one block becomes its column of spaces."""
+        g = _glyph("detail")
+        return raw.replace(g, " " * _cells(g), 1) if g else raw

@@ -708,10 +708,20 @@ async def assess_fleet(specs: Optional[Tuple[DaemonSpec, ...]] = None, *,
                 recommendation="raise JARVIS_FLEET_DEADLINE_S to look harder"))
     return FleetHealth(daemons=tuple(out))
 
+#: HEALTHY is absent on purpose: it is the theme's action mark, resolved at
+#: render time (:func:`_action_mark`) so it degrades with the rest of the deck.
 _GLYPH = {
-    Health.HEALTHY: "⏺", Health.ZOMBIE: "✗", Health.DOWN: "○",
+    Health.ZOMBIE: "✗", Health.DOWN: "○",
     Health.DEGRADED: "▲", Health.UNKNOWN: "·",
 }
+
+
+def _action_mark() -> str:
+    try:
+        from backend.core.ouroboros.ui.theme import mark
+        return mark("action") or "●"
+    except Exception:  # noqa: BLE001
+        return "●"
 
 
 def status_main(console=None) -> int:
@@ -722,8 +732,9 @@ def status_main(console=None) -> int:
             from backend.core.ouroboros.ui.theme import build_console
             console = build_console()
         fleet = asyncio.run(assess_fleet())
+        act = _action_mark()
         for row in fleet.daemons:
-            g = _GLYPH.get(row.state, "·")
+            g = act if row.state is Health.HEALTHY else _GLYPH.get(row.state, "·")
             console.print(f"{g} {row.title}: {row.state.value}", markup=False)
             console.print(f"  ⎿ {row.detail}", markup=False)
             if row.recommendation:

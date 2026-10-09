@@ -31,6 +31,17 @@ from pathlib import Path
 from typing import Any, Callable, List, Optional
 
 
+def _act() -> str:
+    """The theme's action mark as plain text (every sink here prints with
+    ``markup=False``). Lazy and fail-soft. NEVER raises."""
+    try:
+        from backend.core.ouroboros.ui.deck_grammar import bullet
+        return bullet(markup=False)
+    except Exception:  # noqa: BLE001
+        return "●"
+
+
+
 def venv_dir() -> Path:
     """The hermetic venv root (``~/.jarvis/venv``), env-overridable."""
     base = os.environ.get("JARVIS_VENV_DIR", "~/.jarvis/venv")
@@ -219,7 +230,7 @@ def bootstrap_env(
             return rep
         active = [s.name for s in resolve_active_shards()]
         rep.messages.append(
-            f"⏺ install payload: shards={active} "
+            f"{_act()} install payload: shards={active} "
             f"({len(req_files)} requirement file(s))")
         # Clean any stale staging from a prior crashed run.
         if tmp.exists():
@@ -274,7 +285,7 @@ def bootstrap_env(
         rep.ok = True
         rep.python = venv_python(final)
         rep.messages.append(
-            f"⏺ hermetic venv ready at {final} "
+            f"{_act()} hermetic venv ready at {final} "
             + ("(atomically swapped)" if rep.swapped else "(fresh)"))
         return rep
     except Exception as exc:  # noqa: BLE001
@@ -304,7 +315,7 @@ def env_main(argv: Optional[List[str]] = None, console=None) -> int:
         shards = [s.name for s in resolve_active_shards()]
         skipped = [s.name for s in _SHARDS if s.name not in shards]
         console.print(
-            f"⏺ building hermetic venv at {venv_dir()} — shards: {shards}"
+            f"{_act()} building hermetic venv at {venv_dir()} — shards: {shards}"
             + (f" (skipping {skipped} — toggled off)" if skipped else "")
             + ". Core installs always; heavy ML only when its subsystem is "
             "enabled. This can take several minutes…", markup=False)
@@ -315,7 +326,7 @@ def env_main(argv: Optional[List[str]] = None, console=None) -> int:
             console.print(f"✗ bootstrap-env failed: {rep.reason}", markup=False)
             return 1
         console.print(
-            f"⏺ hermetic seal complete — the daemon will run from {rep.python}. "
+            f"{_act()} hermetic seal complete — the daemon will run from {rep.python}. "
             "Now run `trinity install`.", markup=False)
         return 0
     except Exception as exc:  # noqa: BLE001

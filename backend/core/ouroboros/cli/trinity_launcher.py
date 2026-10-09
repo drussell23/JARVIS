@@ -28,6 +28,17 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+
+def _act() -> str:
+    """The theme's action mark as plain text (every sink here prints with
+    ``markup=False``). Lazy and fail-soft. NEVER raises."""
+    try:
+        from backend.core.ouroboros.ui.deck_grammar import bullet
+        return bullet(markup=False)
+    except Exception:  # noqa: BLE001
+        return "●"
+
+
 _APP_NAME = "JARVIS"                       # `open -a JARVIS` (the .app)
 _HELP = """trinity — the JARVIS + O+V ecosystem, one command
 
@@ -172,7 +183,7 @@ def _launch_native_app(console) -> bool:
             capture_output=True, text=True, timeout=15,
         )
         if r.returncode == 0:
-            console.print("⏺ JARVIS-Apple launched — pairs to "
+            console.print(f"{_act()} JARVIS-Apple launched — pairs to "
                           "http://localhost:8010", markup=False)
             return True
         console.print(
@@ -209,7 +220,7 @@ def _down(console) -> int:
         if pid > 0:
             try:
                 os.kill(pid, _sig.SIGTERM)
-                console.print(f"⏺ backend stopping (pid {pid}, SIGTERM)",
+                console.print(f"{_act()} backend stopping (pid {pid}, SIGTERM)",
                               markup=False)
                 return 0
             except ProcessLookupError:
@@ -250,7 +261,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # up / app / cockpit all ensure the backend is live first.
     if not _backend_alive():
-        console.print("⏺ igniting the organism (unified_supervisor)…",
+        console.print(f"{_act()} igniting the organism (unified_supervisor)…",
                       markup=False)
         pid = _spawn_backend()
         if pid is None:
@@ -258,13 +269,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                           ".jarvis/logs/trinity-backend.log", markup=False)
             return 1
     else:
-        console.print("⏺ organism already awake", markup=False)
+        console.print(f"{_act()} organism already awake", markup=False)
 
     if verb == "app":
         _launch_native_app(console)
 
     if verb == "up":
-        console.print("⏺ backend running detached. `trinity` to attach, "
+        console.print(f"{_act()} backend running detached. `trinity` to attach, "
                       "`trinity status` to check, `trinity down` to stop.",
                       markup=False)
         return 0

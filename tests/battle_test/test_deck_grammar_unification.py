@@ -28,6 +28,7 @@ from backend.core.ouroboros.battle_test.tool_render_registry import (
 )
 from backend.core.ouroboros.battle_test.tool_render_view import compose
 from backend.core.ouroboros.ui import deck_grammar as deck
+from backend.core.ouroboros.ui import theme
 
 
 def _plain(markup: str) -> str:
@@ -50,7 +51,7 @@ class TestOneHeaderShape:
     @pytest.mark.parametrize("kind", sorted(_DESCRIPTORS))
     def test_every_builtin_renders_the_action_shape(self, kind):
         out = compose(kind, "arg", "result", duration_ms=10)
-        assert _plain(out.header_markup).startswith("⏺ "), kind
+        assert _plain(out.header_markup).startswith(f"{theme.mark('action')} "), kind
 
     @pytest.mark.parametrize("kind", sorted(_DESCRIPTORS))
     def test_no_builtin_leaks_its_internal_id(self, kind):
@@ -64,7 +65,7 @@ class TestOneHeaderShape:
         it would tell the operator about our descriptor table."""
         out = compose("mcp_slack_post_message", "#eng", "ok")
         plain = _plain(out.header_markup)
-        assert plain.startswith("⏺ McpSlackPostMessage(")
+        assert plain.startswith(f"{theme.mark('action')} McpSlackPostMessage(")
         assert "_default" not in plain
 
 
@@ -125,43 +126,22 @@ class TestTheGlyphIsCanonical:
         assert "✗" in _plain(out.header_markup)
 
 
-class TestArgumentsAreStyledByWhatTheyARE:
-    """A regression introduced by the unification itself.
-
-    Routing every tool through the CC-verb branch also routed every argument
-    through the FILE style, because the only descriptors that had ever
-    reached that branch were file tools. `Bash(python3 -m pytest …)` and
-    `Search("except Exception")` came out blue-underlined — this deck's
-    convention for a path you can open — inviting a click that goes nowhere.
-    """
-
-    def test_a_path_still_looks_like_a_path(self):
-        out = compose("read_file", "governance/risk_tier_floor.py", "x")
-        assert "underline" in out.header_markup
+class TestArgumentsAreContextNotLinks:
+    """SUPERSEDED 2026-10-09: per-kind argument styling (a path underlined
+    like a link, a command dim) is gone with `arg_kind`. The header is one
+    grammar, `deck_grammar.action`: the bullet carries the outcome, the verb
+    is ink, and the argument, whatever it is, is muted context. Nothing in
+    the header invites a click that goes nowhere."""
 
     @pytest.mark.parametrize("kind,arg", [
+        ("read_file", "governance/risk_tier_floor.py"),
         ("bash", "python3 -m pytest -q"),
         ("search_code", "except Exception"),
-        ("type_check", "mypy backend/"),
     ])
-    def test_a_command_or_pattern_does_NOT(self, kind, arg):
+    def test_no_argument_is_styled_as_a_link(self, kind, arg):
         out = compose(kind, arg, "x")
-        assert "underline" not in out.header_markup, (
-            f"{kind} argument styled as a clickable path"
-        )
+        assert "underline" not in out.header_markup
+        assert arg in _plain(out.header_markup)
 
-    def test_every_descriptor_declares_what_its_argument_is(self):
-        """Data, not a code path — the same shape as the verbs."""
-        for kind, desc in _DESCRIPTORS.items():
-            assert desc.arg_kind in ("path", "command", "text", "url"), (
-                f"{kind} has arg_kind={desc.arg_kind!r}"
-            )
-
-    def test_an_unknown_kind_degrades_to_the_old_behaviour(self):
-        """Every descriptor written before `arg_kind` existed behaved as a
-        file tool; an unrecognised value must keep doing that rather than
-        rendering unstyled."""
-        from backend.core.ouroboros.battle_test.tool_render_view import (
-            _arg_colour,
-        )
-        assert _arg_colour("nonsense", None) == _arg_colour("path", None)
+    def test_the_descriptor_no_longer_carries_a_styling_kind(self):
+        assert not any(hasattr(d, "arg_kind") for d in _DESCRIPTORS.values())

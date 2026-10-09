@@ -264,7 +264,7 @@ def _compose(kind: str, args: Sequence[Any]) -> str:
             # `(verb, arg, tone)` — tone is keyword-only on the grammar so a
             # call site cannot pass a colour where an argument belongs.
             return deck.action(args[0], args[1] if len(args) > 1 else "",
-                               tone=(args[2] if len(args) > 2 else "ok"))
+                               tone=(args[2] if len(args) > 2 else None))
         if kind == "det":
             return deck.detail(args[0], tone=(args[1] if len(args) > 1
                                               else "muted"))
@@ -406,8 +406,13 @@ def scene_transcript(console: Any, argv: Sequence[str] = ()) -> int:
     # "it doesn't look like Claude Code" actually means most of the time.
     # `compose_live_script` already inserts the blank separators before each
     # new action, so the projection carries the deck's grouping with it.
+    # Through the same block rhythm the cockpit canvas applies, so this scene
+    # shows the transcript the operator actually gets.
+    from backend.core.ouroboros.ui.deck_grammar import TranscriptFlow
+    flow = TranscriptFlow()
     for line in transcript_lines():
-        _markup(console, line)
+        for out in flow.feed(line):
+            _markup(console, out)
 
 
     _say(console)
@@ -654,7 +659,7 @@ _LIVE_BEATS: List[Any] = [
     # The op FINISHES, and collapses to one line. Before #70250 nothing
     # rendered this: an unfocused op left no trace at all, and a focused
     # one stayed fully expanded forever.
-    (22.0, "collapse", ("⏺ risk_tier_floor.py evolved · ⏱ 21.6s · 💰 $0.0031",
+    (22.0, "collapse", ("risk_tier_floor.py evolved · ⏱ 21.6s · 💰 $0.0031",
                         "o-1", 27)),
     (22.4, "act", ("Complete", "7759-86 · 22.4s · $0.011")),
 ]
@@ -701,12 +706,24 @@ def _collapsed_beat(args: Sequence[Any]) -> str:
         summary, ref, lines = (list(args) + ["", "", 0])[:3]
         label = derive_label(summary_line=str(summary), fallback="op complete")
         tail = f"{ref} · {lines} lines · /expand {ref}" if ref else ""
-        return (f"  [{_THEME('neural')}]{label}[/{_THEME('neural')}]"
+        return (f"  {_bullet()} [{_THEME('neural')}]{_escape(label)}[/{_THEME('neural')}]"
                 f"  [{_THEME('dim')}]{tail}[/{_THEME('dim')}]"
-                if tail else f"  {label}")
+                if tail else f"  {_bullet()} {_escape(label)}")
     except Exception:  # noqa: BLE001
         logger.debug("[OvDemo] collapsed beat unavailable", exc_info=True)
-        return "  ⏺ op complete"
+        return f"  {_bullet()} op complete"
+
+
+def _bullet(*, markup: bool = True) -> str:
+    """The theme's action mark in the done colour (`deck_grammar.bullet`)."""
+    from backend.core.ouroboros.ui import deck_grammar
+    return deck_grammar.bullet(markup=markup)
+
+
+def _escape(text: Any) -> str:
+    """Operator-typed text is data, never markup."""
+    from rich.markup import escape
+    return escape(str(text))
 
 
 def _THEME(slot: str) -> str:
@@ -1076,7 +1093,7 @@ def _live_toolbar(
                 now_mono=now, arrival_mono=now,
             )
             if done:
-                return f"  ⏺ demo complete · {int(ends_at)}s — q to quit"
+                return f"  {_bullet(markup=False)} demo complete · {int(ends_at)}s — q to quit"
             return f"{line.strip()} — q to quit" if line else (
                 "ov demo live — q to quit")
         except Exception:  # noqa: BLE001
@@ -1991,7 +2008,7 @@ def _live_exit_bindings() -> Any:
         # working key indistinguishable from a broken one.
         shim = LocalCockpitClient(
             send_input=lambda line: _demo_notice(
-                f"  ⏺ {line} — (demo: no organism to run it)"),
+                f"  {_bullet()} {_escape(line)} — (demo: no organism to run it)"),
             flash=lambda msg, *_a, **_k: _demo_notice(f"  {msg}"),
         )
         # One shim serves as both `ui` and `client`; the installer only ever
@@ -2017,7 +2034,7 @@ def _live_exit_bindings() -> Any:
             visible."""
 
             def send_input(self, line: str) -> None:
-                _demo_notice(f"  ⏺ {line} — (demo: no organism to stop)")
+                _demo_notice(f"  {_bullet()} {_escape(line)} — (demo: no organism to stop)")
 
         install_stop_all_binding(
             kb, _DemoOrganism(), notify=_demo_notice,

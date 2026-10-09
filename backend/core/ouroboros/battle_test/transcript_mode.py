@@ -357,12 +357,14 @@ def shortcut_panel() -> List[str]:
     try:
         for action, defaults, meaning in _VIEWER_ACTIONS:
             rows.append(f"    {_keys(action, defaults):<18} {meaning}")
+        from backend.core.ouroboros.ui.theme import mark
+        act = mark("action") or "●"
         for action, defaults, meaning in (
             ("transcript:search", ("/",), "search"),
             ("transcript:nextMatch", ("n",), "next match"),
             ("transcript:prevMatch", ("N",), "previous match"),
-            ("transcript:prevBlock", ("{",), "previous ⏺/❯ block"),
-            ("transcript:nextBlock", ("}",), "next ⏺/❯ block"),
+            ("transcript:prevBlock", ("{",), f"previous {act}/❯ block"),
+            ("transcript:nextBlock", ("}",), f"next {act}/❯ block"),
             ("transcript:dump", ("[",), "write to native scrollback"),
             ("transcript:editor", ("v",), "open in $EDITOR"),
             ("transcript:exit", ("q", "escape"), "leave the viewer"),

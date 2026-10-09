@@ -39,7 +39,16 @@ __all__ = ["stream_can_carry_glyphs", "ensure_glyph_capable_streams"]
 #: glyphs already in use rather than an invented list: the tool-activity dot,
 #: the box-drawing result arm, the thinking balloon, and the em dash every
 #: status line uses. If a stream can carry these it can carry the rest.
-_PROBE = "⏺⎿💭—·"
+#: The action dot is read from the theme by :func:`_probe`; this is the rest.
+_PROBE = "⎿💭—·"
+
+
+def _probe() -> str:
+    try:
+        from backend.core.ouroboros.ui.theme import _GLYPHS
+        return _GLYPHS["action"][0] + _PROBE
+    except Exception:  # noqa: BLE001
+        return "●" + _PROBE
 
 
 def stream_can_carry_glyphs(stream: Any) -> bool:
@@ -53,7 +62,7 @@ def stream_can_carry_glyphs(stream: Any) -> bool:
         enc = getattr(stream, "encoding", None)
         if not enc:
             return True
-        _PROBE.encode(enc)
+        _probe().encode(enc)
         return True
     except (LookupError, UnicodeEncodeError):
         return False

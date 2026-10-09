@@ -44,6 +44,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
+
+def _act() -> str:
+    """The theme's action mark as plain text (every sink here prints with
+    ``markup=False``). Lazy and fail-soft. NEVER raises."""
+    try:
+        from backend.core.ouroboros.ui.deck_grammar import bullet
+        return bullet(markup=False)
+    except Exception:  # noqa: BLE001
+        return "●"
+
+
 #: Notary terminal states (anything else = keep polling).
 _TERMINAL = {"Accepted", "Invalid", "Rejected"}
 
@@ -325,7 +336,7 @@ async def run_release(
             rep.aborted = True
             rep.reason = f"codesign failed: {msg}"
             return rep
-        rep.messages.append(f"⏺ signed with: {ident}")
+        rep.messages.append(f"{_act()} signed with: {ident}")
 
         # ---- Deep verify (mandate 2) ----
         vok, vmsg = codesign_verify(app_path, runner=sync_runner)
@@ -334,7 +345,7 @@ async def run_release(
             rep.aborted = True
             rep.reason = f"deep verify failed: {vmsg}"
             return rep
-        rep.messages.append("⏺ codesign --verify --deep --strict passed")
+        rep.messages.append(f"{_act()} codesign --verify --deep --strict passed")
 
         # ---- Notary auth (mandate 1) ----
         notary_auth = auth if auth is not None else notary_auth_args()
@@ -358,7 +369,7 @@ async def run_release(
             rep.aborted = True
             rep.reason = "notarytool submit failed (check credentials/network)"
             return rep
-        rep.messages.append(f"⏺ submitted to notary (id={submission_id}); polling…")
+        rep.messages.append(f"{_act()} submitted to notary (id={submission_id}); polling…")
 
         status = await poll_notary_status(
             submission_id, notary_auth, runner=async_runner, sleeper=sleeper)
@@ -369,7 +380,7 @@ async def run_release(
                           f"notarytool log {submission_id}")
             return rep
         rep.notarized = True
-        rep.messages.append("⏺ notary: Accepted")
+        rep.messages.append(f"{_act()} notary: Accepted")
 
         # ---- Staple (mandate 2 — airgap) ----
         st = await staple(app_path, runner=async_runner)
@@ -379,7 +390,7 @@ async def run_release(
             rep.reason = "stapler staple failed (ticket not embedded)"
             return rep
         await staple_validate(app_path, runner=async_runner)
-        rep.messages.append("⏺ ticket stapled — offline Gatekeeper trust")
+        rep.messages.append(f"{_act()} ticket stapled — offline Gatekeeper trust")
         return rep
     except Exception as exc:  # noqa: BLE001
         rep.aborted = True
@@ -408,7 +419,7 @@ def release_main(argv: Optional[List[str]] = None, console=None) -> int:
             console.print(f"✗ release aborted: {report.reason}", markup=False)
             return 1
         if report.shippable:
-            console.print(f"⏺ SHIPPABLE — notarized + stapled: {report.app_path}",
+            console.print(f"{_act()} SHIPPABLE — notarized + stapled: {report.app_path}",
                           markup=False)
             return 0
         console.print("▲ release incomplete — see messages above", markup=False)

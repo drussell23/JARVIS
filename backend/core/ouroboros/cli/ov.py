@@ -23,10 +23,12 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Sequence
 
+from backend.core.ouroboros.ui.deck_grammar import TranscriptFlow
 from backend.core.ouroboros.ui.theme import build_console
 
 _VERBS = {"cockpit", "run", "daemon", "status", "attach", "system", "hive",
@@ -308,6 +310,12 @@ def client_verbs() -> "dict":
     return out
 
 
+#: The canvas-less sink's block rhythm. The canvas owns its own
+#: (`BipartiteLayout._flow`); this one serves the late-bound console path.
+_FALLBACK_FLOW = TranscriptFlow()
+_FALLBACK_FLOW_LOCK = threading.Lock()
+
+
 def _render_markup_frame(text: str, console: Any = None) -> None:
     """Render ONE daemon-composed styled line (the typed ``markup`` frame:
     CC-style ⏺/⎿ tool blocks + numbered diffs). Unlike the untyped ``line``
@@ -362,9 +370,14 @@ def _render_markup_frame(text: str, console: Any = None) -> None:
             _late = _Console(**{k: v for k, v in _kw.items()
                                 if k != "highlight"})
             # As a BLOCK: a wrapped tool result stays under its `⎿` instead
-            # of falling back to column 0 (ui.block_wrap).
+            # of falling back to column 0 (ui.block_wrap). Through the same
+            # block rhythm the canvas applies, so a cockpit without a canvas
+            # spaces its transcript the same way.
             from backend.core.ouroboros.ui.block_wrap import block as _block
-            _late.print(_block(safe), highlight=False)
+            with _FALLBACK_FLOW_LOCK:
+                _flowed = _FALLBACK_FLOW.feed(safe)
+            for _ln in _flowed:
+                _late.print(_block(_ln), highlight=False)
             _emitted = True
         except Exception:  # noqa: BLE001 — never lose the frame
             _emitted = False
@@ -3353,7 +3366,8 @@ async def _run_client_shell(ui: Any, client: Any, text: str) -> None:
             def _escape(s: str) -> str:
                 return s
         if callable(sink):
-            sink(_escape(f"⏺ ! {cmd}"), True)
+            from backend.core.ouroboros.ui import deck_grammar as _deck
+            sink(f"{_deck.bullet()} " + _escape(f"! {cmd}"), True)
             for ln in output.splitlines()[:200]:
                 sink("  " + _escape(ln), True)
         elif ui is not None and hasattr(ui, "flash"):
@@ -4029,9 +4043,17 @@ def _shield_show(ui: Any, prompt: Any) -> None:
         left = prompt.seconds_left(time.monotonic())
         expiry = "" if left == float("inf") else f" · {int(left)}s left"
         body = str(prompt.text or "approve?").replace("\n", " ").strip()
-        lines = [f"⏺ Iron Gate({prompt.ref}){risk}",
-                 f"  ⎿ {body}  [y/n]{expiry}"]
         sink = getattr(ui, "markup_sink", None)
+        from backend.core.ouroboros.ui import deck_grammar as _deck
+        if callable(sink):
+            from rich.markup import escape as _esc
+            mark = _deck.bullet(_deck.PENDING_TONE)
+        else:
+            _esc, mark = str, _deck.bullet(markup=False)
+        # The markup sink reads `[y/n]` (and any bracket in the gate's text)
+        # as a Rich tag; escaped, it is text. The flash path is plain text.
+        lines = [f"{mark} Iron Gate({_esc(str(prompt.ref))}){_esc(risk)}",
+                 f"  ⎿ {_esc(body)}  {_esc('[y/n]')}{expiry}"]
         if callable(sink):
             for line in lines:
                 # ADDRESSED: a question put to this operator belongs in their

@@ -605,9 +605,19 @@ async def run_doctor() -> DoctorReport:
     return report
 
 
+#: READY is absent on purpose: it is the theme's action mark, resolved at
+#: render time (:func:`_action_mark`) so it degrades with the rest of the deck.
 _GLYPH: Dict[Status, str] = {
-    Status.READY: "⏺", Status.WARN: "▲", Status.FAIL: "✗", Status.SKIPPED: "○",
+    Status.WARN: "▲", Status.FAIL: "✗", Status.SKIPPED: "○",
 }
+
+
+def _action_mark() -> str:
+    try:
+        from backend.core.ouroboros.ui.theme import mark
+        return mark("action") or "●"
+    except Exception:  # noqa: BLE001
+        return "●"
 
 
 def render_report(report: DoctorReport, console) -> None:
@@ -616,21 +626,22 @@ def render_report(report: DoctorReport, console) -> None:
     fails = sum(1 for r in report.results if r.status is Status.FAIL)
     warns = sum(1 for r in report.results if r.status is Status.WARN)
     remediated = [r for r in report.results if r.remediation]
+    act = _action_mark()
     for r in report.results:
-        g = _GLYPH.get(r.status, "·")
+        g = act if r.status is Status.READY else _GLYPH.get(r.status, "·")
         console.print(f"{g} {r.name}: {r.status.value} — {r.detail}",
                       markup=False)
         if r.remediation:
             console.print(f"  ⎿ remediated: {r.remediation}", markup=False)
     console.print("", markup=False)
     if remediated:
-        console.print(f"⏺ auto-remediated {len(remediated)} issue(s) "
+        console.print(f"{act} auto-remediated {len(remediated)} issue(s) "
                       "(ghost sockets cleared)", markup=False)
     if fails:
         console.print(f"✗ {fails} blocking issue(s), {warns} warning(s) — "
                       "resolve the ✗ items before `trinity up`", markup=False)
     else:
-        console.print(f"⏺ environment READY ({warns} warning(s)) — "
+        console.print(f"{act} environment READY ({warns} warning(s)) — "
                       "`trinity up` is clear to boot", markup=False)
 
 

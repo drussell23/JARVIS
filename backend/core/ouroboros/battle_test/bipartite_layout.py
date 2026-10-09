@@ -462,6 +462,15 @@ class BipartiteLayout:
         # threads both read False before either writes and both seed.
         self._masthead_lock = threading.RLock()
         self._masthead_seeded: set = set()
+        # The transcript's block rhythm (deck_grammar.TranscriptFlow): one
+        # blank before each action, none inside a block, one `⎿` per block.
+        # It is applied HERE, the single place every producer's line lands
+        # (relayed events, mirrored markup, REPL output), so no producer has
+        # to know what came before it. The flow is stateful, so it gets its
+        # own lock: producers push from more than one thread.
+        from backend.core.ouroboros.ui.deck_grammar import TranscriptFlow
+        self._flow = TranscriptFlow()
+        self._flow_lock = threading.Lock()
 
     # -- the Ouroboros hero animation -----------------------------------
 
@@ -515,7 +524,7 @@ class BipartiteLayout:
             _sev, text = reg.render(event_type, dict(payload or {}))
             glyph = getattr(desc, "glyph", "·")
             color = getattr(desc, "color", "white")
-            self._buffer.push(f"[{color}]{glyph} {text}[/{color}]")
+            self._append(f"[{color}]{glyph} {text}[/{color}]")
         except Exception:  # noqa: BLE001 — a bad event never breaks the canvas
             logger.debug("[Bipartite] emit failed", exc_info=True)
         # Feed the Reactive Theme Singleton — a state-mapped event mutates the
@@ -554,11 +563,23 @@ class BipartiteLayout:
     def push_raw(self, markup_line: str) -> None:
         """Push a pre-formatted Rich-markup line (e.g. piped Sentinel stdout).
         Never raises."""
-        try:
-            self._buffer.push(str(markup_line))
-        except Exception:  # noqa: BLE001
-            pass
+        self._append(str(markup_line))
         self._invalidate_now()
+
+    def _append(self, line: str) -> None:
+        """Land ONE transcript line through the block rhythm. A line the
+        flow defers (a blank waiting to see what it separates) lands later
+        or never; a line it reshapes lands reshaped. Never raises."""
+        try:
+            with self._flow_lock:
+                out = self._flow.feed(line)
+                for ln in out:
+                    self._buffer.push(ln)
+        except Exception:  # noqa: BLE001 — never lose the line itself
+            try:
+                self._buffer.push(str(line))
+            except Exception:  # noqa: BLE001
+                pass
 
     # -- rendering ------------------------------------------------------
 
