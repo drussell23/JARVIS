@@ -136,6 +136,40 @@ def similarity_threshold() -> float:
     return _env_float("JARVIS_POSTMORTEM_RECALL_SIM_THRESHOLD", 0.5, minimum=0.0)
 
 
+def outlier_z() -> float:
+    """`JARVIS_POSTMORTEM_RECALL_OUTLIER_Z` — default ``1.5``. How far above
+    this query's own similarity distribution a postmortem must sit."""
+    return _env_float("JARVIS_POSTMORTEM_RECALL_OUTLIER_Z", 1.5, minimum=0.0)
+
+
+def min_distribution_sample() -> int:
+    """`JARVIS_POSTMORTEM_RECALL_MIN_SAMPLE` — default ``8``. Below this many
+    candidates a distribution says nothing, and only the floor applies."""
+    return _env_int("JARVIS_POSTMORTEM_RECALL_MIN_SAMPLE", 8, minimum=2)
+
+
+def adaptive_cutoff(similarities: List[float], floor: float) -> float:
+    """The similarity a postmortem must reach to count as RELATED.
+
+    A fixed cosine threshold assumes unrelated text scores near zero. With a
+    sentence embedder it does not: unrelated postmortems scored 0.50-0.59
+    against the 0.5 threshold, so every op of the 2026-10-09 soak was
+    "matched" -- and handed an unrelated failure as context. Related means
+    standing OUT from this query's similarity to everything else: ``mean +
+    z*stdev`` of the candidates, never below the configured floor. With too
+    few candidates to form a distribution, the floor alone decides.
+    NEVER raises."""
+    try:
+        n = len(similarities)
+        if n < min_distribution_sample():
+            return floor
+        mean = sum(similarities) / n
+        var = sum((s - mean) ** 2 for s in similarities) / (n - 1)
+        return max(floor, mean + outlier_z() * (var ** 0.5))
+    except Exception:  # noqa: BLE001
+        return floor
+
+
 def max_postmortems_to_scan() -> int:
     """`JARVIS_POSTMORTEM_RECALL_MAX_SCAN` — default ``500``.
 
@@ -507,20 +541,21 @@ class PostmortemRecallService:
             threshold = similarity_threshold()
             halflife = decay_days()
 
-            scored: List[RecallMatch] = []
+            candidates: List[RecallMatch] = []
             for rec, vec in zip(records, corpus_vecs):
                 raw_sim = float(_cosine(query_vec, vec))
                 age_seconds = max(0.0, now_unix - rec.timestamp_unix)
                 decay = _decay_factor(age_seconds, halflife)
-                decayed = raw_sim * decay
-                if decayed < threshold:
-                    continue
-                scored.append(RecallMatch(
+                candidates.append(RecallMatch(
                     record=rec,
                     raw_similarity=raw_sim,
-                    decayed_similarity=decayed,
+                    decayed_similarity=raw_sim * decay,
                     age_days=age_seconds / 86400.0,
                 ))
+            cutoff = adaptive_cutoff(
+                [m.decayed_similarity for m in candidates], threshold,
+            )
+            scored = [m for m in candidates if m.decayed_similarity >= cutoff]
 
             scored.sort(key=lambda m: m.decayed_similarity, reverse=True)
             k = top_k_override if top_k_override is not None else top_k()
@@ -543,6 +578,9 @@ class PostmortemRecallService:
                 top_k_override if top_k_override is not None else top_k(),
                 result[0].decayed_similarity,
             )
+            from backend.core.ouroboros.governance.proof_of_work import emit_evidence
+            emit_evidence("postmortem_recall", "recalled",
+                          detail=f"{len(result)} related, top={result[0].decayed_similarity:.2f}")
         return result
 
     def _persist_to_ledger(

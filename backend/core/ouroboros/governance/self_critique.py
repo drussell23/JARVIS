@@ -683,6 +683,11 @@ class CritiqueEngine:
         cost_usd = self._estimate_cost(raw_response, used_provider)
         self._cumulative_cost_usd += cost_usd
         self._total_critiques += 1
+        from backend.core.ouroboros.governance.proof_of_work import emit_evidence
+        emit_evidence(
+            "self_critique", f"rated_{int(parsed['rating'])}" if parse_ok else "unparsed",
+            op_id=str(op_id), detail=f"via {used_provider}",
+        )
 
         result = CritiqueResult(
             op_id=op_id,

@@ -48,7 +48,17 @@ _TRUTHY = ("1", "true", "yes", "on")
 
 # Router ingest results that mean "the proposal is in the queue" — all of them
 # imply the blueprint is now routed and must be deduped on subsequent events.
-_ROUTED_RESULTS = frozenset({"enqueued", "pending_ack", "deduplicated"})
+_ROUTED_RESULTS = frozenset({
+    "enqueued", "pending_ack", "deduplicated",
+    # The proposal inbox (sanctioned route): filed, or already filed.
+    "inboxed", "duplicate",
+})
+
+
+def _router_project_root(router: Any) -> Optional[Any]:
+    """The repository the router serves -- where the proposal inbox lives."""
+    config = getattr(router, "_config", None)
+    return getattr(config, "project_root", None)
 
 
 # ---------------------------------------------------------------------------
@@ -507,27 +517,55 @@ class ConceptionProposalBridge:
                 make_envelope,
             )
 
-            envelope = make_envelope(
-                source="auto_proposed",
-                description=str(getattr(bp, "description", "") or getattr(bp, "title", "")),
-                target_files=tuple(str(t) for t in bp.target_files),
-                repo=str(getattr(bp, "repo", "") or ""),
-                confidence=max(0.0, min(1.0, float(ev.ev))),
-                urgency="low",
-                evidence={
-                    "sensor": "conception_bridge",
-                    # `signature` drives the router's own dedup_key — deterministic
-                    # per blueprint, a second structural guard against duplicates.
-                    "signature": bid,
-                    "blueprint_id": bid,
-                    "category": str(getattr(bp, "category", "")),
-                    "ev": round(float(ev.ev), 4),
-                    "threshold": round(float(threshold), 4),
-                    "conception_value": ev.to_dict() if hasattr(ev, "to_dict") else {},
-                },
-                requires_human_ack=True,  # proactive conception surfaces for ack
+            from backend.core.ouroboros.governance.autonomy.proposal_inbox import (
+                Proposal, route_proposal, sanction_enabled,
             )
-            result = str(await router.ingest(envelope))
+
+            description = str(getattr(bp, "description", "") or getattr(bp, "title", ""))
+            evidence = {
+                "sensor": "conception_bridge",
+                # `signature` drives the router's own dedup_key — deterministic
+                # per blueprint, a second structural guard against duplicates.
+                "signature": bid,
+                "blueprint_id": bid,
+                "category": str(getattr(bp, "category", "")),
+                "ev": round(float(ev.ev), 4),
+                "threshold": round(float(threshold), 4),
+                "conception_value": ev.to_dict() if hasattr(ev, "to_dict") else {},
+            }
+
+            def _legacy_envelope() -> Any:
+                return make_envelope(
+                    source="auto_proposed",
+                    description=description,
+                    target_files=tuple(str(t) for t in bp.target_files),
+                    repo=str(getattr(bp, "repo", "") or ""),
+                    confidence=max(0.0, min(1.0, float(ev.ev))),
+                    urgency="low",
+                    evidence=evidence,
+                    requires_human_ack=True,  # proactive conception surfaces for ack
+                )
+
+            # One proposal per target (each becomes its own scoped goal); on
+            # the legacy route the factory builds one envelope for all of
+            # them, so route_proposal is called once there.
+            targets = tuple(str(t) for t in bp.target_files) or ("",)
+            results = []
+            for target in targets if sanction_enabled() else targets[:1]:
+                results.append(await route_proposal(
+                    router=router,
+                    repo_root=_router_project_root(router),
+                    proposal=Proposal(
+                        producer=str(getattr(bp, "model_used", "") or "conception_bridge"),
+                        target_file=target,
+                        description=description,
+                        rationale=str(getattr(bp, "suggested_approach", "") or ""),
+                        score=max(0.0, min(1.0, float(ev.ev))),
+                        evidence=evidence,
+                    ),
+                    envelope_factory=_legacy_envelope,
+                ))
+            result = next((r for r in results if r in _ROUTED_RESULTS), results[-1])
             # Mark routed on ANY in-queue result (incl. router-side dedup).
             if result in _ROUTED_RESULTS:
                 self._registry.mark(bid, now)

@@ -81,6 +81,21 @@ _KIND_WEIGHT: Dict[str, float] = {
     "uncovered_module": 0.4,
 }
 
+#: Model-proposed work (the proposal inbox) is a HYPOTHESIS, not a recorded
+#: fact, so its ceiling sits below every evidence kind; the producer's own
+#: grounded score scales it within that ceiling. Env-tunable, but clamped
+#: under the weakest evidence kind so a proposal can never outrank a fact.
+_ENV_PROPOSAL_WEIGHT = "JARVIS_PROPOSAL_WEIGHT_CEILING"
+
+
+def _proposal_weight_ceiling() -> float:
+    floor_of_evidence = min(_KIND_WEIGHT.values())
+    try:
+        raw = float(os.environ.get(_ENV_PROPOSAL_WEIGHT, "") or floor_of_evidence * 0.75)
+    except ValueError:
+        raw = floor_of_evidence * 0.75
+    return max(0.0, min(raw, floor_of_evidence * 0.999))
+
 
 def discovery_enabled() -> bool:
     """Whether the organism may author its own goals. Default OFF. NEVER raises."""
@@ -175,7 +190,12 @@ class DiscoveredWork:
         # sensor filing it twice.
         stem = Path(self.subject_file or self.target_file).stem[:32]
         slug = re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-") or "target"
-        return f"ov-auto-{self.kind.replace('_', '-')}-{slug}"
+        base = f"ov-auto-{self.kind.replace('_', '-')}-{slug}"
+        # A proposal is a specific TASK on a file, not "the work this file
+        # needs": two different proposals for one file are two goals, and the
+        # same proposal re-made is one (its key is content-derived).
+        key = str(self.detail.get("proposal_key") or "") if self.kind == "model_proposal" else ""
+        return f"{base}-{key[:8]}" if key else base
 
     def describe(self) -> str:
         """The task text handed to the model."""
@@ -186,6 +206,19 @@ class DiscoveredWork:
             # a DAG's repair half, the derived text would be the "write tests
             # for X" template, i.e. exactly the wrong job.
             return str(self.detail.get("description") or self.evidence or "")
+        if self.kind == "model_proposal":
+            # The proposer's own task and reasoning, plus the contract every
+            # autonomous change is held to -- a proposal is a hypothesis, and
+            # the model is told it may decline one that does not hold up.
+            rationale = str(self.detail.get("rationale") or "").strip()
+            return (
+                f"{self.detail.get('description') or self.evidence}\n\n"
+                + (f"Why this was proposed: {rationale}\n\n" if rationale else "")
+                + "This task was proposed by the organism itself, not observed "
+                "as a failure. Verify the premise by reading the code first; if "
+                "the change is unnecessary or already done, decline and say so. "
+                "Any behaviour you change must be covered by tests that pass."
+            )
         if self.kind == "ambient_red":
             return (
                 f"A test is failing at HEAD against `{self.target_file}`: "
@@ -560,6 +593,38 @@ def _from_roadmap_goals(repo_root: Path) -> List[DiscoveredWork]:
             ))
     except Exception as exc:  # noqa: BLE001 — a source may never break a pass
         logger.warning("[GoalDiscovery] roadmap scan degraded: %r", exc)
+    return out
+
+
+def _from_proposal_inbox(repo_root: Path) -> List[DiscoveredWork]:
+    """Pending model-proposed work as ``DiscoveredWork``. NEVER raises.
+
+    The un-signable floor is re-applied here (the inbox refuses governance
+    targets at the door; a rule change since must still hold)."""
+    out: List[DiscoveredWork] = []
+    try:
+        from backend.core.ouroboros.governance.autonomy.proposal_inbox import pending
+        ceiling = _proposal_weight_ceiling()
+        for p in pending(repo_root):
+            target = p.target_file.replace("\\", "/")
+            if _is_governance(target):
+                continue
+            out.append(DiscoveredWork(
+                target_file=target,
+                subject_file=target,
+                kind="model_proposal",
+                evidence=f"{p.producer}: {p.rationale or p.description}"[:300],
+                weight=ceiling * max(0.0, min(1.0, float(p.score))),
+                detail={
+                    "description": p.description,
+                    "rationale": p.rationale,
+                    "producer": p.producer,
+                    "proposal_key": p.key,
+                    "proposal_evidence": dict(p.evidence),
+                },
+            ))
+    except Exception as exc:  # noqa: BLE001 — a source may never break a pass
+        logger.warning("[GoalDiscovery] proposal inbox unreadable: %r", exc)
     return out
 
 
@@ -1366,7 +1431,10 @@ async def discover(
     # Weight still breaks ties, so within a liveness tier the ranking is
     # unchanged. The walk is one pass, off the event loop, reused by every key.
     root = Path(repo_root)
-    pool = signed + reds
+    # Model-proposed work joins the SAME pool, so every filter below applies
+    # to it exactly as to discovered work; its weight keeps it below facts.
+    proposed = await asyncio.to_thread(_from_proposal_inbox, root)
+    pool = signed + reds + proposed
     # ONE reading of the tree for the whole pass. Everything below that is a
     # pure function of (tree, environment) is answered from `_TREE_PURE` while
     # that reading stands; everything that depends on cooldowns, on what has
@@ -1599,6 +1667,10 @@ def synthesize_and_sign(work: DiscoveredWork, **kwargs) -> Any:
             success_criteria=(
                 "the named test passes and no previously-passing test regresses"
                 if work.kind == "ambient_red"
+                else "the proposed change is made (or declined with a reason), its "
+                "behaviour is covered by passing tests, and no previously-passing "
+                "test regresses"
+                if work.kind == "model_proposal"
                 else "new tests cover the module's public behaviour and pass"
             ),
             note=f"synthesized by the Goal Discovery Sensor; evidence: {work.evidence}"[:400],

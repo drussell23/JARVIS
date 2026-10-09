@@ -345,6 +345,11 @@ class MemoryEngine:
         insight = self._build_insight(entries)
         if insight is not None:
             self._merge_or_append_insight(insight)
+            # Ingestion was silent: 37 recorded outcomes in a soak and no
+            # line saying any became memory.
+            from backend.core.ouroboros.governance.proof_of_work import emit_evidence
+            emit_evidence("memory_engine", "ingested", op_id=str(op_id),
+                          detail=str(getattr(insight, "category", "")))
             try:
                 self._append_insight_to_disk(insight)
             except OSError as exc:

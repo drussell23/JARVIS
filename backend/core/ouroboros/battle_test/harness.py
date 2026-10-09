@@ -11178,6 +11178,18 @@ class BattleTestHarness:
         except Exception as exc:
             logger.warning("Failed to save session summary: %s", exc)
 
+        # --- Proof of work: what this session verifiably did, chained ---
+        # After the summary, so the record carries its learning_loop row.
+        # Capabilities fired, commits verified in git, lessons that changed
+        # an outcome -- one record per session, hash-linked to the last.
+        try:
+            from backend.core.ouroboros.governance.proof_of_work import (
+                write_session_proof,
+            )
+            await write_session_proof(self._config.repo_path, self._session_dir)
+        except Exception:  # noqa: BLE001 — the proof never blocks the report
+            logger.debug("[ProofOfWork] session proof skipped", exc_info=True)
+
         # --- Phase 4 P4 Slice 5 follow-up: MetricsSessionObserver ---
         # Wires the metrics observer at the harness session-end site
         # (deferred from Slice 5 graduation 2026-04-26). Reads the

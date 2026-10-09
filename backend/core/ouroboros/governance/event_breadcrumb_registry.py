@@ -295,6 +295,10 @@ def build_default_registry() -> EventBreadcrumbRegistry:
                                        f"backoff {p.get('backoff_s','?')}s): {p.get('reason','')}", "supervisor"),
         BreadcrumbDescriptor("sentinel_telemetry", "·", "bright_black", SEV_VERBOSE,
                              lambda p: str(p.get("line", "")).strip(), "supervisor"),
+        BreadcrumbDescriptor("capability_evidence", "✓", "green", SEV_IMPORTANT,
+                             lambda p: f"{p.get('capability','?')}: {p.get('outcome','?')}"
+                                       + (f" — {str(p.get('detail',''))[:96]}" if p.get('detail') else ""),
+                             "evidence"),
         BreadcrumbDescriptor("molt_post", "🐍", "magenta", SEV_IMPORTANT,
                              lambda p: f"{p.get('glyph','')} {p.get('handle','@?')}: "
                                        f"{str(p.get('body',''))[:72]}"

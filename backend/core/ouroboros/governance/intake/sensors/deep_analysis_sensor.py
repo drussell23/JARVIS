@@ -1508,6 +1508,12 @@ class DeepAnalysisSensor:
                 len(findings), stats.get("by_category", {}),
                 float(stats.get("elapsed_s", 0.0)),
             )
+            from backend.core.ouroboros.governance.proof_of_work import emit_evidence
+            emit_evidence(
+                "deep_analysis",
+                "coverage_complete" if stats.get("complete") else "coverage_partial",
+                detail=f"{stats.get('analyzed', 0)} analyzed, {len(findings)} finding(s)",
+            )
         self._last_cycle_count = len(findings)
         fresh = self._filter_cooldown(findings)
         # Apply per-cycle cap so intake doesn't flood.

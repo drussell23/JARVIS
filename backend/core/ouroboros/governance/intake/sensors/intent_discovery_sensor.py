@@ -480,32 +480,60 @@ class IntentDiscoverySensor:
                     "[IntentDiscovery] value grounding skipped", exc_info=True,
                 )
 
-            envelope = make_envelope(
-                source="intent_discovery",
-                description=description,
-                target_files=target_files,
-                repo=self._repo,
-                confidence=confidence,
-                urgency=urgency,
-                evidence={
-                    "sensor": "intent_discovery",
-                    "cycle": self._cycle,
-                    "principle": intent.get("principle", ""),
-                    "rationale": intent.get("rationale", ""),
-                    "oracle_scores": {
-                        f: s for f, s in unique_results
-                        if f in target_files
-                    },
-                    "blueprint_count": len(blueprints),
-                    "dw_model": _DW_MODEL,
-                    "conception_value": value_detail,  # Gap 3 grounding (may be {})
+            evidence = {
+                "sensor": "intent_discovery",
+                "cycle": self._cycle,
+                "principle": intent.get("principle", ""),
+                "rationale": intent.get("rationale", ""),
+                "oracle_scores": {
+                    f: s for f, s in unique_results
+                    if f in target_files
                 },
-                requires_human_ack=True,  # AC2 safety invariant
-            )
+                "blueprint_count": len(blueprints),
+                "dw_model": _DW_MODEL,
+                "conception_value": value_detail,  # Gap 3 grounding (may be {})
+            }
+
+            def _legacy_envelope(
+                _d=description, _t=target_files, _c=confidence, _u=urgency, _e=evidence,
+            ) -> Any:
+                return make_envelope(
+                    source="intent_discovery",
+                    description=_d,
+                    target_files=_t,
+                    repo=self._repo,
+                    confidence=_c,
+                    urgency=_u,
+                    evidence=_e,
+                    requires_human_ack=True,  # AC2 safety invariant (sanction off)
+                )
 
             try:
-                result = await self._router.ingest(envelope)
-                if result in ("enqueued", "pending_ack"):
+                # Sanction on: one proposal per target, signed through the
+                # same path as discovered work. Off: the human-ack envelope.
+                from backend.core.ouroboros.governance.autonomy.proposal_inbox import (
+                    Proposal, route_proposal, sanction_enabled,
+                )
+                results = []
+                for target in (target_files if sanction_enabled() else target_files[:1]):
+                    results.append(await route_proposal(
+                        router=self._router,
+                        repo_root=getattr(getattr(self._router, "_config", None), "project_root", None),
+                        proposal=Proposal(
+                            producer="intent_discovery",
+                            target_file=str(target),
+                            description=description,
+                            rationale=str(intent.get("rationale", "") or ""),
+                            score=confidence,
+                            evidence=evidence,
+                        ),
+                        envelope_factory=_legacy_envelope,
+                    ))
+                result = next(
+                    (r for r in results if r in ("enqueued", "pending_ack", "inboxed")),
+                    results[-1] if results else "none",
+                )
+                if result in ("enqueued", "pending_ack", "inboxed"):
                     for f in target_files:
                         self._cooldown_files[f] = self._cycle
                     self._total_intents_submitted += 1
@@ -536,6 +564,9 @@ class IntentDiscoverySensor:
             self._cycle, elapsed, len(context_parts), len(unique_results),
             len(intents), len(submitted), self._total_intents_submitted,
         )
+        from backend.core.ouroboros.governance.proof_of_work import emit_evidence
+        emit_evidence("intent_discovery", "cycle_complete",
+                      detail=f"{len(intents)} intent(s), {len(submitted)} filed")
         return submitted
 
     # ------------------------------------------------------------------

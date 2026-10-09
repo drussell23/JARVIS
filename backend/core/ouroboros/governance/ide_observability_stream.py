@@ -1525,6 +1525,10 @@ _VALID_EVENT_TYPES = frozenset({
     # scatter/stitch + worker-pool pickup — the cockpit sees agents spawn.
     # Moltbook (the agora): one post = one molt_post event.
     "molt_post",
+    # One type for every capability's "I ran, here is what happened"
+    # (proof_of_work.emit_evidence): the cockpit shows it through the
+    # generic breadcrumb path, the session proof tallies it.
+    "capability_evidence",
     "swarm_scatter",
     "swarm_stitched",
     "worker_op_claimed",

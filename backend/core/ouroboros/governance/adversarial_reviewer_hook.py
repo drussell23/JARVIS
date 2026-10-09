@@ -218,6 +218,16 @@ async def areview_plan_for_generate_injection(
             op_id=op_id, findings=(),
             skip_reason="hook_service_exception",
         )
+    try:
+        from backend.core.ouroboros.governance.proof_of_work import emit_evidence
+        emit_evidence(
+            "adversarial_reviewer",
+            f"skipped:{review.skip_reason}" if review.was_skipped else "reviewed",
+            op_id=op_id,
+            detail="" if review.was_skipped else f"{len(review.findings)} finding(s) via {review.model_used or '?'}",
+        )
+    except Exception:  # noqa: BLE001
+        pass
     return _injection_from(review, op_id, bridge)
 
 

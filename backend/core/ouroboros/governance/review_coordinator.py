@@ -901,6 +901,9 @@ async def coordinate_notify_apply_review(
             "[ReviewCoordinator] review-branch decision op=%s decision=%s "
             "elapsed=%.1fs", op_id, review.decision.value, review.elapsed_s,
         )
+        from backend.core.ouroboros.governance.proof_of_work import emit_evidence
+        emit_evidence("review_branch", review.decision.value, op_id=op_id,
+                      detail=f"{review.elapsed_s:.0f}s")
         return cancelled, reason
     except asyncio.CancelledError:
         raise

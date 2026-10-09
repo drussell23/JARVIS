@@ -475,6 +475,11 @@ class SentinelLoop:
         # absorbs clock skew between them without letting a previous
         # session's verdict through — which is the bug being closed.
         dispatched_at = time.time() - 2.0
+        # Which SOURCE the organism's work came from this pass -- a signed
+        # roadmap goal, a red test, an uncovered module, or its own sanctioned
+        # proposal -- so "is it finding its own work" has an answer.
+        from backend.core.ouroboros.governance.proof_of_work import emit_evidence
+        emit_evidence("sentinel", f"dispatched:{work.kind}", detail=goal_id)
         try:
             # The intake submitter REFUSES to run on the event loop — it would
             # have to await intake from inside the loop intake runs on, which

@@ -373,15 +373,21 @@ def build(
         # Cross-session continuity: the last sessions' outcomes (read-only,
         # at most a few summary.json files) inform this one's context.
         "JARVIS_LAST_SESSION_SUMMARY_ENABLED": True,
+        # Model-proposed work is SANCTIONED the way signed goals are (operator
+        # decision, 2026-10-09): the Epistemic Planner (north-star gaps), the
+        # DreamEngine (via the conception bridge) and IntentDiscovery file
+        # proposals into the inbox; Goal Discovery ranks them BELOW evidence-
+        # backed work under every cage refusal, and the Sentinel signs them
+        # through the one signer. Off -> the legacy human-ack route.
+        # The operator's voice reaches the model: what is typed in the
+        # cockpit, ask_human answers, voice. Dialogue only -- failure memory
+        # lives in PostmortemRecall + LessonMemory -- so a headless soak's
+        # bridge is empty and costs nothing.
+        "JARVIS_CONVERSATION_BRIDGE_ENABLED": True,
+        "JARVIS_AUTONOMOUS_PROPOSAL_SANCTION_ENABLED": True,
+        "JARVIS_EPISTEMIC_PLANNER_ENABLED": True,
+        "JARVIS_CONCEPTION_BRIDGE_ENABLED": True,
         # NOT armed, each for a stated reason:
-        #   JARVIS_CONVERSATION_BRIDGE_ENABLED -- headless, its only source is
-        #     postmortem lines, which LessonMemory already injects; arming it
-        #     duplicates them into a 32k window.
-        #   JARVIS_EPISTEMIC_PLANNER_ENABLED / JARVIS_CONCEPTION_BRIDGE_ENABLED
-        #     -- every proposal is routed requires_human_ack=True and parks
-        #     until a human acknowledges it; unattended it is a sink. Arming
-        #     it is a governance decision (who may sanction model-invented
-        #     work), not a capability switch.
         #   JARVIS_AWE_TRIGGER_ENABLED -- spawns a NEW soak on DoubleWord
         #     recovery; inside a running soak that is a second organism on
         #     the same GPU.

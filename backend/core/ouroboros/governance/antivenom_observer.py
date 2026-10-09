@@ -79,6 +79,8 @@ class AntivenomObserver:
             await ledger.settle(CAPABILITY, ok=gaps == 0, detail=str(getattr(report, "diagnostic", ""))[:300])
             log = logger.warning if gaps else logger.info
             log("[AntivenomObserver] guardian immunity: %s (%s)", finding, getattr(report, "diagnostic", ""))
+            from backend.core.ouroboros.governance.proof_of_work import emit_evidence
+            emit_evidence("antivenom", finding, detail=str(getattr(report, "diagnostic", ""))[:200])
             return report
         except asyncio.CancelledError:
             raise

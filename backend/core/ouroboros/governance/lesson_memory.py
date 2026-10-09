@@ -515,6 +515,8 @@ async def reinforce_validation_pass(op_id: str) -> int:
     _INJECTED.pop(op_id, None)
     if n:
         logger.info("[LessonMemory] reinforced %d lesson(s) after VALIDATE pass op=%s", n, str(op_id)[:12])
+        from backend.core.ouroboros.governance.proof_of_work import emit_evidence
+        emit_evidence("lesson_memory", "helped_a_pass", op_id=str(op_id), detail=f"{n} lesson(s)")
     return n
 
 
@@ -657,6 +659,9 @@ async def inject_lessons(context: Any) -> Any:
             len(matches), len(block), ",".join(sorted(module_keys(getattr(context, "target_files", ()) or ()))) or "-",
             str(getattr(context, "op_id", ""))[:12],
         )
+        from backend.core.ouroboros.governance.proof_of_work import emit_evidence
+        emit_evidence("lesson_memory", "injected", op_id=str(getattr(context, "op_id", "")),
+                      detail=f"{len(matches)} lesson(s)")
         return stamped
     except Exception as exc:  # noqa: BLE001
         logger.warning("[LessonMemory] injection degraded (%s) — generation proceeds with the base anchor", exc)

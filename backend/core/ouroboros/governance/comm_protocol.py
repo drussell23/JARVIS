@@ -346,36 +346,9 @@ class CommProtocol:
         )
         await self._emit(msg)
 
-        # ConversationBridge v1.1: capture the one-line op closure as an
-        # assistant turn so the *next* op's CONTEXT_EXPANSION sees recent
-        # prior-op history. Deterministic payload + K-cap + TTL prevent a
-        # long successful run from burying fresh user intent. Best-effort
-        # — bridge failures never propagate into the POSTMORTEM path.
-        try:
-            from backend.core.ouroboros.governance.conversation_bridge import (
-                format_postmortem_payload,
-                get_default_bridge,
-            )
-            _pm_line = format_postmortem_payload(
-                op_id=op_id,
-                terminal_reason_code=failed_phase or "unknown",
-                root_cause=root_cause,
-            )
-            if _pm_line is None:
-                # Empty / "none" root_cause → not a conversational signal.
-                # Single DEBUG per capture attempt so it's visible but not noisy.
-                logger.debug(
-                    "[ConversationBridge] skipped postmortem op=%s "
-                    "(empty root_cause)",
-                    op_id,
-                )
-            else:
-                get_default_bridge().record_turn(
-                    "assistant", _pm_line,
-                    source="postmortem", op_id=op_id,
-                )
-        except Exception:
-            logger.debug(
-                "[ConversationBridge] postmortem capture failed",
-                exc_info=True,
-            )
+        # Op closures are NOT copied into the ConversationBridge. Failure
+        # memory has one owner each: PostmortemRecall (similarity-matched,
+        # newest sessions first, current included) and LessonMemory
+        # (module-keyed, reinforced on a later pass). The bridge carries
+        # DIALOGUE -- operator, ask_human, voice -- and a copy here put the
+        # same failure into the prompt twice (2026-10-09).

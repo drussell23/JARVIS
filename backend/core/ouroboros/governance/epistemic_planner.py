@@ -282,6 +282,11 @@ async def plan_and_route_once(router: Any, *, repo_root: "Optional[str]" = None)
                 len(steps),
                 ", ".join(f"{k}={v}" for k, v in sorted(tally.items())),
             )
+        from backend.core.ouroboros.governance.proof_of_work import emit_evidence
+        emit_evidence(
+            "epistemic_planner", "planned",
+            detail=", ".join(f"{k}={v}" for k, v in sorted(tally.items())) or f"{len(steps)} step(s), 0 routed",
+        )
         return enqueued
     except Exception:  # noqa: BLE001 — autonomous planning must never break intake
         logger.debug("[EpistemicPlanner] cycle degraded", exc_info=True)

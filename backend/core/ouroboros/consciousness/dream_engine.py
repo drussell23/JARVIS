@@ -1069,6 +1069,8 @@ class DreamEngine:
         except Preempted:
             self._preempted.set()
             logger.info("[DreamEngine] lane wanted by live work — preempting dream")
+            from backend.core.ouroboros.governance.proof_of_work import emit_evidence
+            emit_evidence("dream_engine", "preempted_for_live_work")
             return None
 
     async def _call_inference(self, prompt: str) -> Optional[Dict[str, Any]]:
@@ -1131,6 +1133,8 @@ class DreamEngine:
             )
         result["_inference_provider"] = _TIER_PROVIDER_LABELS.get(tier, tier)
         logger.info("[DreamEngine] RT inference succeeded via %s tier", tier)
+        from backend.core.ouroboros.governance.proof_of_work import emit_evidence
+        emit_evidence("dream_engine", "dreamed", detail=f"via {tier}")
         return result
 
     @staticmethod

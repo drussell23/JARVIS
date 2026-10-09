@@ -13633,6 +13633,12 @@ class GovernedOrchestrator:
                 str(getattr(ctx, "op_id", ""))[:16], len(pruned), result.test_total,
                 ", ".join(pruned)[:300], "PASSED" if retry and retry.passed else "failed",
             )
+            from backend.core.ouroboros.governance.proof_of_work import emit_evidence
+            emit_evidence(
+                "test_prune", "landed_majority" if retry and retry.passed else "revalidation_failed",
+                op_id=str(getattr(ctx, "op_id", "")),
+                detail=f"pruned {len(pruned)}/{result.test_total}",
+            )
             if retry is None or not retry.passed:
                 return result
             candidate["test_prune"] = {
