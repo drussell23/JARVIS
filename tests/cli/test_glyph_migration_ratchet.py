@@ -55,7 +55,9 @@ _OUTPUT = re.compile(r"(say\(|\.print\(|lines\.append\(|append\(|return )")
 _PROSE = ("#", '"""', "'''", "*", ":", "•")
 
 #: Current unmigrated OUTPUT sites. LOWER THIS as batches land; never raise it.
-_CEILING = 6
+#: 0 since 2026-10-09: the last twelve sites moved to `_glyph`, so any new
+#: hardcoded glyph at an output site now fails here.
+_CEILING = 0
 
 
 def _unmigrated(path: Path) -> list:

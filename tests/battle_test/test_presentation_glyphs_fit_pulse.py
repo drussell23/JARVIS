@@ -28,7 +28,7 @@ class _FakeStdout:
 def test_glyphs_utf8(monkeypatch):
     monkeypatch.setattr(theme, "supports_unicode", lambda env=None: True)
     g = PR.glyphs()
-    assert g["action"] == "⏺" and g["result"] == "⎿"
+    assert g["action"] == theme._GLYPHS["action"][0] and g["result"] == "⎿"
     monkeypatch.setattr(sys, "stdout", _FakeStdout("utf-8"))
     assert PR.spinner_name() == "dots"
 

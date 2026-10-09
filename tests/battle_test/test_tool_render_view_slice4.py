@@ -36,6 +36,20 @@ from backend.core.ouroboros.battle_test.tool_render_view import (
     compose_if_enabled,
     is_master_flag_enabled,
 )
+from backend.core.ouroboros.ui import theme
+
+
+def _plain(markup: str) -> str:
+    """Header markup tints the mark and the verb separately
+    (deck_grammar.action), so substrings are checked on plain text."""
+    from rich.text import Text
+    return Text.from_markup(markup).plain
+
+
+def _act(verb: str = "") -> str:
+    """The theme's action mark (ASCII-degraded when needed), plus a verb."""
+    mark = theme.mark("action")
+    return f"{mark} {verb}" if verb else mark
 
 
 # ===========================================================================
@@ -124,7 +138,7 @@ def test_compose_cc_verb_header_for_read():
         "read_file", "backend/foo.py", "x" * 100,
         explicit_density=_density(),
     )
-    assert "⏺ Read" in out.header_markup
+    assert _act("Read") in _plain(out.header_markup)
     assert "backend/foo.py" in out.header_markup
 
 
@@ -133,7 +147,7 @@ def test_compose_cc_verb_header_for_edit():
         "edit_file", "backend/foo.py", "+added\n-removed",
         explicit_density=_density(),
     )
-    assert "⏺ Update" in out.header_markup
+    assert _act("Update") in _plain(out.header_markup)
 
 
 def test_compose_cc_verb_header_for_write():
@@ -141,7 +155,7 @@ def test_compose_cc_verb_header_for_write():
         "write_file", "new.py", "line1\nline2",
         explicit_density=_density(),
     )
-    assert "⏺ Write" in out.header_markup
+    assert _act("Write") in _plain(out.header_markup)
 
 
 def test_compose_icon_header_for_search():
@@ -149,8 +163,8 @@ def test_compose_icon_header_for_search():
         "search_code", "pattern", "hit1\nhit2",
         explicit_density=_density(),
     )
-    # INVERTED: one grammar. `⏺ Search("pattern")`, not `🔍 search_code`.
-    assert "⏺" in out.header_markup
+    # INVERTED: one grammar. `● Search("pattern")`, not `🔍 search_code`.
+    assert _act() in out.header_markup
     assert "Search" in out.header_markup
     assert "🔍" not in out.header_markup
     assert "search_code" not in out.header_markup
@@ -168,7 +182,7 @@ def test_compose_default_descriptor_for_unknown_tool():
         "mcp_unknown", "args", "result",
         explicit_density=_density(),
     )
-    assert "⏺" in out.header_markup
+    assert _act() in out.header_markup
     assert "McpUnknown" in out.header_markup
     assert "🔧" not in out.header_markup
     assert "_default" not in out.header_markup
@@ -457,7 +471,7 @@ def test_compose_if_enabled_returns_render_when_flag_on():
         explicit_density=_density(),
     )
     assert out is not None
-    assert "⏺ Read" in out.header_markup
+    assert _act("Read") in _plain(out.header_markup)
 
 
 def test_compose_if_enabled_swallows_compose_failure(monkeypatch):
@@ -490,7 +504,7 @@ def test_console_renders_header_via_compose():
     )
     console.print(out.header_markup)
     text = console.export_text()
-    assert "⏺ Read" in text
+    assert _act("Read") in text
     assert "foo.py" in text
 
 
@@ -516,7 +530,7 @@ def test_console_renders_full_pipeline():
     # The deck's column discipline, end to end: the summary indents under
     # the action and the body indents under the summary.
     lines = [ln for ln in text.splitlines() if ln.strip()]
-    assert lines[0].startswith("⏺ ")
+    assert lines[0].startswith(f"{_act()} ")
     assert lines[1].startswith("  ⎿  ")
     assert lines[2].startswith("     ")
     assert "elided" in text

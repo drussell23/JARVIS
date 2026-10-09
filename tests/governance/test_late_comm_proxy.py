@@ -196,4 +196,6 @@ def test_a_tool_call_reaches_the_cockpit_mirror_through_the_proxy() -> None:
 
     asyncio.run(main())
     assert channel.failure_count == 0
-    assert any("⏺" in m and "pattern=foo" in m for m in mirrored), mirrored
+    from backend.core.ouroboros.ui import theme
+    assert any(theme.mark("action") in m and "pattern=foo" in m
+               for m in mirrored), mirrored

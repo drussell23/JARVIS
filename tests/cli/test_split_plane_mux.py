@@ -235,7 +235,7 @@ def test_collision_surface_renders_the_emblem():
     from pathlib import Path
     root = Path(__file__).resolve().parents[2]
     src = (root / "scripts/ouroboros_battle_test.py").read_text()
-    idx = src.index("⏺ the organism is already awake")
+    idx = src.index("{_act} the organism is already awake")
     region = src[max(0, idx - 3000):idx]
     assert "print_static_crest" in region
 

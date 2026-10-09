@@ -36,6 +36,13 @@ from backend.core.ouroboros.governance.approval_narrator import (
     interpret_answer,
     render_gate_prompt,
 )
+from backend.core.ouroboros.ui import theme
+
+
+def _plain(markup: str) -> str:
+    """The prompt is Rich markup: a tinted bullet and an escaped `[y/n]`."""
+    from rich.text import Text
+    return Text.from_markup(markup).plain
 
 _REPO = Path(__file__).resolve().parents[2]
 
@@ -86,8 +93,9 @@ async def _answer(text: str, delay: float = 0.03) -> None:
 def test_the_prompt_names_the_op_and_the_deadline() -> None:
     """Stating the expiry is what makes the silence honest: the operator
     learns both that a question is open and that not answering IS an answer."""
-    out = render_gate_prompt("op-019fa4d2-246e-7759-86", "APPROVAL_REQUIRED",
-                             "credential shape introduced", 300)
+    out = _plain(render_gate_prompt(
+        "op-019fa4d2-246e-7759-86", "APPROVAL_REQUIRED",
+        "credential shape introduced", 300))
     assert "7759-86" in out
     assert "approve? [y/n]" in out
     assert "300s" in out
@@ -101,8 +109,8 @@ def test_the_op_ref_is_the_distinguishing_tail() -> None:
 
 
 def test_it_opens_and_closes_the_glyph_pair() -> None:
-    out = render_gate_prompt("op-1-2-3", timeout_s=60)
-    assert out.startswith("⏺ Iron Gate(")
+    out = _plain(render_gate_prompt("op-1-2-3", timeout_s=60))
+    assert out.startswith(f"{theme.mark('action')} Iron Gate(")
     assert "⎿" in out
 
 

@@ -27,7 +27,15 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_glyph_ration_is_closed_six():
-    assert pr.canonical_glyph_chars() == frozenset("⏺⎿💭🗣⚠🎙")
+    # The ration is read from theme._GLYPHS (the action mark moved off the
+    # legacy U+23FA to the theme's mark); the legacy mark is an ALIAS, not a
+    # member of the ration.
+    from backend.core.ouroboros.ui import theme
+    six = ("action", "detail", "voice", "human", "warn", "audio")
+    assert pr.canonical_glyph_chars() == frozenset(
+        theme._GLYPHS[name][0] for name in six)
+    assert "⏺" not in pr.canonical_glyph_chars()
+    assert pr.LEGACY_GLYPH_ALIASES["⏺"] == theme._GLYPHS["action"][0]
     assert set(g.value for g in pr.Glyph) == {
         "action", "detail", "voice", "human", "warn", "audio",
     }
@@ -42,8 +50,18 @@ def test_scrub_aliases_legacy_liquidity_glyph():
 
 
 def test_scrub_preserves_ration_and_typography():
-    line = "⏺ apply · ✓ verified ⎿ detail ─ 💭 thinking ⚠ hot 🎙 live 🗣 you"
+    from backend.core.ouroboros.ui import theme
+    action = theme._GLYPHS["action"][0]
+    line = (f"{action} apply · ✓ verified ⎿ detail ─ 💭 thinking ⚠ hot "
+            "🎙 live 🗣 you")
     assert pr.scrub_glyphs(line) == line
+
+
+def test_scrub_aliases_legacy_action_mark():
+    """Input simulating an older daemon: its ⏺ is recast to the theme's mark."""
+    from backend.core.ouroboros.ui import theme
+    action = theme._GLYPHS["action"][0]
+    assert pr.scrub_glyphs("⏺ apply") == f"{action} apply"
 
 
 def test_scrub_never_raises():
@@ -98,7 +116,8 @@ def test_ascii_tier_keeps_geometry(monkeypatch):
     assert theme.mark("action", unicode=False) == "*"
     assert theme.mark("warn", unicode=False) == "!"
     assert theme.mark("audio", unicode=False) == "mic"
-    assert theme.mark("action", unicode=True) == "⏺"
+    assert theme.mark("action", unicode=True) == theme._GLYPHS["action"][0]
+    assert theme.mark("action", unicode=True) != "⏺"   # legacy mark retired
 
 
 def test_router_never_raises_on_garbage():

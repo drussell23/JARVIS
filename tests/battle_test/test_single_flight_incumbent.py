@@ -156,6 +156,8 @@ def test_cockpit_collision_surface_present():
 
 def test_collision_surface_speaks_design_language():
     src = _src()
-    idx = src.index("⏺ the organism is already awake")
-    body = src[max(0, idx - 200):idx + 1500]
-    assert "⏺" in body and "⎿" in body      # rationed glyphs only
+    idx = src.index("{_act} the organism is already awake")
+    body = src[max(0, idx - 600):idx + 1500]
+    # The design language's marks, asked of the theme, never typed.
+    assert '_mark("action")' in body and '_mark("detail")' in body
+    assert "⏺" not in body and "⎿" not in body

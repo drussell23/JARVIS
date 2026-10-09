@@ -10,10 +10,12 @@ A line is an event; "who is working right now" is a STATE.
 from __future__ import annotations
 
 import pytest
+from rich.text import Text
 
 from backend.core.ouroboros.battle_test.agent_roster import (
     AgentRoster, format_duration,
 )
+from backend.core.ouroboros.ui import theme
 
 
 class _Clock:
@@ -45,7 +47,7 @@ def test_dispatched_agents_appear_under_main(roster) -> None:
     r, _c = roster
     r.spawn("sub-3f2a", "Explore", "Map ov completion architecture")
     lines = r.render()
-    assert "❯ ⏺ main" in lines
+    assert f"❯ {theme.mark('action')} main" in lines
     assert any("Explore" in ln and "Map ov completion" in ln for ln in lines)
     # NO permanent hint row: it cost two rows on every render, forever, to
     # teach two keys once. They are registered with `keybinding_registry`,
@@ -59,7 +61,7 @@ def test_a_running_agent_is_hollow_and_a_finished_one_is_filled(roster) -> None:
     assert any("◯" in ln for ln in r.render())
     c.now += 5
     r.finish("a")
-    assert any("⏺ Explore" in ln for ln in r.render())
+    assert any(f"{theme.mark('action')} Explore" in ln for ln in r.render())
 
 
 def test_failure_and_loss_are_different_marks(roster) -> None:
@@ -162,8 +164,10 @@ def test_the_finished_notice_quotes_the_GOAL(roster) -> None:
     r.spawn("sub-3f2a", "Explore", "Map ov completion architecture")
     c.now += 339
     notice = r.finished_notice(r.finish("sub-3f2a"))
-    assert notice == (
-        '⏺ Agent "Map ov completion architecture" finished · 5m 39s'
+    # The mark is now tinted markup (deck_grammar.bullet); compare plain text.
+    assert Text.from_markup(notice).plain == (
+        f'{theme.mark("action")} Agent "Map ov completion architecture" '
+        'finished · 5m 39s'
     )
 
 

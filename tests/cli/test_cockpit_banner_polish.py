@@ -83,13 +83,15 @@ def _render(payload=None, width=96) -> str:
 class TestGlyphDegradation:
     def test_utf8_terminals_get_the_real_glyphs(self, utf8):
         out = _render()
-        assert "⏺" in out and "⎿" in out and "⚠" in out
+        assert theme._GLYPHS["action"][0] in out and "⎿" in out and "⚠" in out
 
     def test_a_non_utf8_locale_gets_ascii(self, ascii_only):
         """ssh, cron and CI routinely have no UTF-8 locale. The degradation
         existed and was unreachable from this client."""
         out = _render()
-        for glyph in ("⏺", "⎿", "⚠"):
+        # The theme's action mark, plus the retired legacy one: neither may
+        # survive an ASCII render.
+        for glyph in (theme._GLYPHS["action"][0], "⏺", "⎿", "⚠"):
             assert glyph not in out, f"{glyph} survived ASCII degradation"
 
     def test_the_banner_is_never_MIXED(self, ascii_only):
@@ -101,7 +103,8 @@ class TestGlyphDegradation:
         as damage rather than as a fallback.
         """
         out = _render()
-        unicode_glyphs = sum(out.count(g) for g in ("⏺", "⎿", "⚠", "·"))
+        unicode_glyphs = sum(out.count(g) for g in (
+            theme._GLYPHS["action"][0], "⏺", "⎿", "⚠", "·"))
         assert unicode_glyphs == 0, (
             f"{unicode_glyphs} unicode glyph(s) left in an ASCII render — "
             f"the banner is half-migrated")

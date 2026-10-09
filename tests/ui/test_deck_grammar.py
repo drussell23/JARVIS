@@ -46,7 +46,8 @@ def _column_of(line: str, marker: str) -> int:
 
 class TestColumns:
     def test_action_body_sits_in_claude_codes_column(self):
-        assert _plain(deck.action("Read", "foo.py")).startswith("⏺ Read(")
+        assert _plain(deck.action("Read", "foo.py")).startswith(
+            f"{theme.mark('action')} Read(")
 
     def test_detail_body_and_diff_body_share_one_column(self):
         """THE regression. Two literals, one column, no one to notice.

@@ -18,6 +18,7 @@ import pytest
 
 from backend.core.ouroboros.battle_test import cockpit_attach as ca
 from backend.core.ouroboros.battle_test.stream_renderer import StreamRenderer
+from backend.core.ouroboros.ui import deck_grammar
 
 
 class _Bridge:
@@ -57,13 +58,15 @@ def _feed(r, *chunks, final=False):
 class TestItReachesTheDeck:
     def test_completed_lines_are_mirrored(self, bridge):
         _feed(_renderer(), "the vision floor raises\n")
-        assert bridge.sent == ["⏺ the vision floor raises"]
+        assert bridge.sent == [f"{deck_grammar.bullet()} the vision floor raises"]
 
     def test_the_block_opens_ONCE(self, bridge):
-        """One ⏺ opens the block, as assistant prose does in the deck's
+        """One action mark opens the block, as assistant prose does in the deck's
         grammar; continuations indent under it."""
         _feed(_renderer(), "first\n", "second\n", "third\n")
-        assert bridge.sent[0].startswith("⏺ ")
+        from rich.text import Text
+        assert Text.from_markup(bridge.sent[0]).plain.startswith(
+            f"{deck_grammar.bullet(markup=False)} ")
         assert all(s.startswith("  ") for s in bridge.sent[1:])
 
     def test_a_partial_line_WAITS_for_its_newline(self, bridge):

@@ -114,7 +114,9 @@ class _Flow:
 
     @staticmethod
     def _action_glyph() -> str:
-        return "⏺"
+        # The real flow's mark (theme-owned), not a retyped literal.
+        from backend.core.ouroboros.battle_test.serpent_flow import SerpentFlow
+        return SerpentFlow._action_glyph()
 
 
 def _render(**payload) -> str:
@@ -189,7 +191,7 @@ def test_rendering_never_raises() -> None:
 
         @staticmethod
         def _action_glyph():
-            return "⏺"
+            return SerpentFlow._action_glyph()
 
     SerpentFlow.note_intake_signal(_Broken(), {"source": "x"})  # type: ignore[arg-type]
 

@@ -97,9 +97,15 @@ def test_it_uses_the_decks_own_grammar(local_tty) -> None:
     same content would read as a different kind of event."""
     r, buf = _renderer()
     _mirror(r, "first line\nsecond line\nthird line\n")
-    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
-    assert lines[0].lstrip().startswith("⏺")
-    assert all(not ln.lstrip().startswith("⏺") for ln in lines[1:])
+    # The mark is the theme's, tinted by deck_grammar.bullet(); the console is
+    # a forced terminal, so compare on the ANSI-stripped plain text.
+    from rich.text import Text
+    from backend.core.ouroboros.ui import theme
+    mark = theme.mark("action")
+    lines = [Text.from_ansi(ln).plain for ln in buf.getvalue().splitlines()
+             if ln.strip()]
+    assert lines[0].lstrip().startswith(mark)
+    assert all(not ln.lstrip().startswith(mark) for ln in lines[1:])
 
 
 def test_only_complete_lines_are_emitted(local_tty) -> None:

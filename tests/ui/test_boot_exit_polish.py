@@ -10,6 +10,13 @@ import pytest
 
 from backend.core.ouroboros.ui import boot_labels as bl
 from backend.core.ouroboros.ui import crest
+from backend.core.ouroboros.ui import theme
+
+
+def _plain(markup: str) -> str:
+    """The exit line opens with deck_grammar.bullet() markup."""
+    from rich.text import Text
+    return Text.from_markup(markup).plain
 
 
 @pytest.fixture(autouse=True)
@@ -107,8 +114,8 @@ def test_exit_line_with_full_data(monkeypatch):
     h._governed_loop_service = _GLS()
     _emit(h, monkeypatch)
     assert len(h.lines) == 1
-    line = h.lines[0]
-    assert line.startswith("⏺ organism rests")
+    line = _plain(h.lines[0])
+    assert line.startswith(f"{theme.mark('action')} organism rests")
     assert "2 changes landed" in line
     assert "$0.42" in line
     assert "34m" in line
@@ -117,7 +124,8 @@ def test_exit_line_with_full_data(monkeypatch):
 def test_exit_line_null_data_falls_back_clean(monkeypatch):
     h = _H()                                   # everything missing/None
     _emit(h, monkeypatch)
-    assert h.lines == ["⏺ organism rests · session closed"]
+    assert [_plain(ln) for ln in h.lines] == [
+        f"{theme.mark('action')} organism rests · session closed"]
 
 
 def test_exit_line_soak_is_silent(monkeypatch):

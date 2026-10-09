@@ -1,5 +1,6 @@
 """Sovereign Terminal UI — borderless render + sub-flag regression suite."""
 import backend.core.ouroboros.battle_test.presentation_restraint as PR
+from backend.core.ouroboros.ui import theme
 
 
 # --------------------------------------------------------------------------- flags
@@ -78,7 +79,7 @@ def test_open_block_borderless_action_glyph(monkeypatch):
     flow._open_op_block("op-test-cccc", "VoiceCommand")
     out = buf.getvalue()
     assert "┌" not in out
-    assert ("⏺" in out) or ("*" in out)        # action glyph
+    assert any(g in out for g in theme._GLYPHS["action"])  # action glyph
     assert "VoiceCommand" in out
 
 
@@ -214,7 +215,7 @@ def test_full_lifecycle_borderless_clean(monkeypatch):
     flow._close_op_block(op)
     out = buf.getvalue()
     assert not any(c in out for c in _BOX_CHARS)          # borderless throughout
-    assert ("⏺" in out) or ("*" in out)                   # action glyph
+    assert any(g in out for g in theme._GLYPHS["action"])  # action glyph
     assert "fix the thing" in out and "TestFailure" in out
     assert "🔬" not in out                                 # emoji demoted
     assert "\n\n" in out                                   # vertical rhythm

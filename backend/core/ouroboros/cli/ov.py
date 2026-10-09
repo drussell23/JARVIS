@@ -1013,7 +1013,8 @@ def _economic_evidence(reason: str, limit: int = 88) -> str:
             if msg:
                 text = msg
                 break
-        return text if len(text) <= limit else text[:limit - 1] + "…"
+        ell = _glyph("ellipsis", "...")
+        return text if len(text) <= limit else text[:max(0, limit - len(ell))] + ell
     except Exception:  # noqa: BLE001
         return str(reason or "")[:limit]
 
@@ -1488,7 +1489,7 @@ class AttachUI:
         # edge: "when Claude hasn't created any checklist items yet, the
         # toggle has no visible effect because there's nothing to display."
         # Saying how many there are is what distinguishes the two.
-        return f"tasks: shown · {self._agent_count()} running"
+        return "tasks: shown " + _glyph("dot", "-") + f" {self._agent_count()} running"
 
     def _agent_count(self) -> int:
         """Running agents in the daemon's last snapshot. NEVER raises."""
@@ -1620,7 +1621,8 @@ class AttachUI:
                     + " daemon unreachable — no telemetry in "
                     + f"{int(waited)}s "
                     + _glyph("dot", "-") + " 'detach' to leave")
-        return "  " + _glyph("action", "*") + " awaiting daemon telemetry…"
+        return ("  " + _glyph("action", "*") + " awaiting daemon telemetry"
+                + _glyph("ellipsis", "..."))
 
     #: Set by the surface that has nowhere else to draw the palette. Default
     #: False so the cockpit, which floats it, never double-renders.
@@ -2340,21 +2342,24 @@ class AttachUI:
 
     def _key_hints(self) -> str:
         """The affordance list — what the line you are typing on can do."""
+        # ONE separator for the whole line, and the same one the strip below
+        # removes: a theme-degraded "-" stripped with a literal " ·" survived.
+        sep = _glyph("dot", "-")
         note = self._TOOLBAR_NOTES.get(self.audio_state)
         if note is not None:
-            audio = f" · {note}"
+            audio = f" {sep} {note}"
         elif self.audio_state == "OFFLINE":
-            audio = " · voice: off ('wake')"
+            audio = f" {sep} voice: off ('wake')"
         else:
-            audio = f" · voice: {self.audio_state.lower()}"
+            audio = f" {sep} voice: {self.audio_state.lower()}"
         try:
             from backend.core.ouroboros.battle_test.cockpit_fsm import (
                 MODE_FLOW, selection_enabled,
             )
             keys = ""
             if selection_enabled() and self.fsm is not None:
-                keys = (" · ^X ^L lanes" if self.fsm.mode == MODE_FLOW
-                        else " · esc back")
+                keys = (f" {sep} ^X ^L lanes" if self.fsm.mode == MODE_FLOW
+                        else f" {sep} esc back")
         except Exception:  # noqa: BLE001
             keys = ""
         # A pending approval outranks every other hint here: it is the only
@@ -2388,22 +2393,22 @@ class AttachUI:
         except Exception:  # noqa: BLE001
             floor = ""
         mic = self.acoustic_badge()
-        badge = f"{mic} · {badge}" if mic and badge else (mic or badge)
-        badge = f"{floor} · {badge}" if floor and badge else (floor or badge)
+        badge = f"{mic} {sep} {badge}" if mic and badge else (mic or badge)
+        badge = f"{floor} {sep} {badge}" if floor and badge else (floor or badge)
         # Health LAST in the composed line, so it survives truncation least —
         # it is the least time-critical of the three and the only one with a
         # dedicated verb (`ov doctor`) that recovers the full detail.
-        badge = f"{badge} · {health}" if badge and health else (badge or health)
-        head = f"{badge} · " if badge else ""
+        badge = f"{badge} {sep} {health}" if badge and health else (badge or health)
+        head = f"{badge} {sep} " if badge else ""
         # WHICH MODEL is answering, named persistently at the head of the
         # affordance line — Claude Code shows the model at all times, and on
         # a local lane it is the one thing that changes between sessions
         # (base vs fine-tune). From the daemon's hydration frame, never the
         # client's environment. Silent until the daemon has named one.
         model_seg = self._model_segment()
-        model_seg = f"{model_seg} · " if model_seg else ""
-        return (f"{model_seg}{head}{audio.lstrip(' ·')}{keys} "
-                f"· 'detach' to leave")
+        model_seg = f"{model_seg} {sep} " if model_seg else ""
+        return (f"{model_seg}{head}{audio.lstrip(' ' + sep)}{keys} "
+                f"{sep} 'detach' to leave")
 
     def _mode_lines(self) -> Optional[List[str]]:
         """SELECT / FOCUS rendering, or None to fall through to the deck.
@@ -2421,7 +2426,7 @@ class AttachUI:
             if fsm.mode == MODE_SELECT:
                 rows = fsm.rows()
                 if not rows:
-                    return ["  (no lanes) · esc"]
+                    return ["  (no lanes) " + _glyph("dot", "-") + " esc"]
                 out = ["  [bold]lanes[/bold] [dim]↑↓ move · ⏎ focus · esc[/dim]"]
                 for i, r in enumerate(rows[:8]):
                     cur = "▸" if i == fsm.cursor else " "
@@ -2438,7 +2443,8 @@ class AttachUI:
                     f"[dim]{self._focus_note} · esc to return[/dim]"
                 )
                 body = [f"  [dim]│[/dim] {ln}" for ln in self._focus_lines[-6:]]
-                return [head] + (body or ["  [dim]│ (hydrating…)[/dim]"])
+                return [head] + (body or [
+                    "  [dim]│ (hydrating" + _glyph("ellipsis", "...") + ")[/dim]"])
             return None
         except Exception:  # noqa: BLE001
             return None
@@ -2465,7 +2471,7 @@ class AttachUI:
                 return pulse_line
             lines = [pulse_line]
             for severity, text in rows:
-                lines.append(f"  {GLYPHS.get(severity, '·')} {text}")
+                lines.append("  " + GLYPHS.get(severity, _glyph("dot", "-")) + f" {text}")
             return "\n".join(lines)
         except Exception:  # noqa: BLE001
             return pulse_line
@@ -4468,15 +4474,18 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
                 # used only to pick a word we then do not trust to be green:
                 # an unreadable capability is not evidence of health.
                 state = "UNKNOWN"
-            t2.append("● ", style=_STATE_DOT.get(state, "rgb(227,179,65)"))
+            t2.append(_glyph("action", "*") + " ",
+                      style=_STATE_DOT.get(state, "rgb(227,179,65)"))
             t2.append(state.lower(), style="rgb(174,188,182)")
             # The tagline is a claim too. When the organism cannot dispatch,
             # "the organism drives" is false, so the reason takes its place.
             if state == "HEALTHY":
-                t2.append(" · ouroboros + venom · the organism drives",
+                _dot = _glyph("dot", "-")
+                t2.append(f" {_dot} ouroboros + venom {_dot} the organism drives",
                           style="rgb(108,125,119)")
             else:
-                t2.append(" · ouroboros + venom · ", style="rgb(108,125,119)")
+                _dot = _glyph("dot", "-")
+                t2.append(f" {_dot} ouroboros + venom {_dot} ", style="rgb(108,125,119)")
                 t2.append(_reason or "cannot verify capability",
                           style="rgb(227,179,65)")
             t3 = _Text(_home_path(), style="rgb(108,125,119)")
@@ -4651,8 +4660,10 @@ async def _bipartite_attach_loop(client: Any, console: Any, ui: Any) -> None:
             _m = _audio.get("mode") if isinstance(_audio, dict) else None
             _l = _audio.get("latch") if isinstance(_audio, dict) else None
             if _m is not None:
-                live = " ● mic" if (_l is not None and _l.is_open) else ""
-                return f"{base} · {_m.hint}{live}" if base else f"{_m.hint}{live}"
+                live = (" " + _glyph("action", "*") + " mic"
+                        if (_l is not None and _l.is_open) else "")
+                _dot = _glyph("dot", "-")
+                return f"{base} {_dot} {_m.hint}{live}" if base else f"{_m.hint}{live}"
         except Exception:  # noqa: BLE001
             pass
         return base
@@ -5131,7 +5142,7 @@ def run_attach(console: Any) -> int:
                 # separately from the banner so it survives even if the
                 # crash-log write failed.
                 try:
-                    console.print(f"⎿ to fix: {_surface.remedy}",
+                    console.print(_glyph("detail", "-") + f" to fix: {_surface.remedy}",
                                   markup=False, highlight=False)
                     ui.boot_warnings = [
                         *getattr(ui, "boot_warnings", ()),

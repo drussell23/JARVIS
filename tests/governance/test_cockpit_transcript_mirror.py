@@ -51,6 +51,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from backend.core.ouroboros.governance import claude_style_transport as cst  # noqa: E402
+from backend.core.ouroboros.ui import theme  # noqa: E402
 
 _HARNESS = _REPO / "backend" / "core" / "ouroboros" / "battle_test" / "harness.py"
 _OV = _REPO / "backend" / "core" / "ouroboros" / "cli" / "ov.py"
@@ -143,10 +144,10 @@ def test_a_completed_tool_call_renders_regardless_of_heartbeat_chatter(
     asyncio.run(t.send(_tool_heartbeat()))
     blob = "\n".join(console.prints)
     # The registry composer renders `read_file` in Claude Code's idiom as
-    # `⏺ Read(...)` — the human label, not the internal id. Assert the
+    # `● Read(...)` — the human label, not the internal id. Assert the
     # block, not the id: the action glyph, and the ARGUMENTS the model
     # chose, which is the part the operator actually reads.
-    assert "⏺" in blob, "a tool block must be rendered"
+    assert theme.mark("action") in blob, "a tool block must be rendered"
     assert "backend/x.py" in blob, "with the tool's arguments"
 
 
@@ -172,7 +173,8 @@ def test_a_tool_call_from_an_op_whose_intent_was_missed_still_renders(
     console = _Console()
     t = cst.ClaudeStyleTransport(console=console)
     asyncio.run(t.send(_tool_heartbeat(op_id="op-never-announced")))
-    assert any("⏺" in p and "backend/x.py" in p for p in console.prints)
+    assert any(theme.mark("action") in p and "backend/x.py" in p
+               for p in console.prints)
 
 
 def test_a_plain_phase_tick_keeps_its_old_gate(monkeypatch) -> None:
@@ -198,7 +200,7 @@ def test_a_failed_tool_call_says_so() -> None:
     t = cst.ClaudeStyleTransport(console=console)
     asyncio.run(t.send(_tool_heartbeat(status="error", result_preview="boom")))
     blob = "\n".join(console.prints)
-    assert "⏺" in blob and "backend/x.py" in blob
+    assert theme.mark("action") in blob and "backend/x.py" in blob
     assert "✗" in blob or "error" in blob or "failed" in blob, (
         "a failed call must be visibly a failure, not a success block")
 

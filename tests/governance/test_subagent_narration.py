@@ -23,8 +23,17 @@ from backend.core.ouroboros.governance.subagent_narrator import (
     SubagentNarrationSink,
     narration_enabled,
     render_result,
-    render_spawn,
+    render_spawn as _render_spawn_markup,
 )
+from backend.core.ouroboros.ui import theme
+
+
+def render_spawn(subagent_type: Any, goal: str) -> str:
+    """The spawn line as the operator reads it. Production composes it with
+    deck_grammar.action (tinted mark, verb and argument), so assertions on
+    shape and length run on the plain text, not the markup."""
+    from rich.text import Text
+    return Text.from_markup(_render_spawn_markup(subagent_type, goal)).plain
 
 _REPO = Path(__file__).resolve().parents[2]
 
@@ -52,9 +61,9 @@ class _Ok:
 # --------------------------------------------------------------------------
 
 def test_a_spawn_opens_with_the_primary_action_glyph() -> None:
-    """§04: ⏺ opens a primary action."""
+    """§04: the action mark opens a primary action."""
     line = render_spawn("explore", "find every caller of _normalize")
-    assert line.startswith("⏺ Explore(")
+    assert line.startswith(f"{theme.mark('action')} Explore(")
     assert "find every caller" in line
 
 
@@ -72,7 +81,8 @@ def test_a_result_is_subordinate_to_its_spawn() -> None:
 def test_each_kind_is_SPOKEN_not_tokenised(token: str, spoken: str) -> None:
     """The orchestrator's type is a routing identifier; this is the word an
     operator reads."""
-    assert render_spawn(token, "x").startswith(f"⏺ {spoken}(")
+    assert render_spawn(token, "x").startswith(
+        f"{theme.mark('action')} {spoken}(")
 
 
 def test_an_unknown_kind_still_renders() -> None:

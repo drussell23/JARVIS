@@ -183,6 +183,6 @@ def test_collision_surface_releases_the_mux():
     src = _read("scripts/ouroboros_battle_test.py")
     # Anchor on the PRINTED banner (the comment at the branch head also
     # contains the phrase) — the release call must sit between them.
-    idx = src.index("⏺ the organism is already awake")
+    idx = src.index("{_act} the organism is already awake")
     region = src[max(0, idx - 2500):idx]
     assert "release_boot_mux" in region

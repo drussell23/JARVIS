@@ -253,8 +253,13 @@ def test_the_render_uses_the_decks_own_glyphs():
     """One more op-scoped block in a transcript full of them, not a new
     visual language."""
     _seed()
+    from rich.text import Text
+    from backend.core.ouroboros.ui import theme
+    # The opener is deck_grammar.bullet() markup; compare its plain text. Only
+    # the head line is parsed: band bodies are not markup-escaped.
     text = wr.render(we.explain("o-1"))
-    assert text.startswith("⏺") and "⎿" in text
+    head = Text.from_markup(text.splitlines()[0]).plain
+    assert head.startswith(theme.mark("action")) and "⎿" in text
 
 
 def test_dispatch_never_raises_on_a_broken_engine(monkeypatch):

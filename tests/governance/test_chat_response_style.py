@@ -30,6 +30,13 @@ from backend.core.ouroboros.governance.chat_response_style import (
     compose_reply,
     trace_lines,
 )
+from backend.core.ouroboros.ui import theme
+
+
+def _plain(markup: str) -> str:
+    """Replies carry deck_grammar.bullet() markup; compare the text shown."""
+    from rich.text import Text
+    return Text.from_markup(markup).plain
 
 
 # --------------------------------------------------------------------------
@@ -57,8 +64,8 @@ def test_the_operator_message_is_not_echoed_back() -> None:
 
 def test_the_reply_opens_with_a_sentence() -> None:
     out = compose_reply("backlog_dispatch", receipt="r")
-    first = out.splitlines()[0]
-    assert first.startswith("⏺")
+    first = _plain(out.splitlines()[0])
+    assert first.startswith(theme.mark("action"))
     assert "backlog" in first.lower()
     assert ":" not in first, "a field separator is not a sentence"
 
@@ -157,7 +164,7 @@ def test_trace_with_nothing_to_say_emits_nothing() -> None:
 
 def test_a_greeting_renders_as_speech() -> None:
     out = compose_reply("social_ack", social_reply="Hey.")
-    assert out == "⏺ Hey."
+    assert _plain(out) == f"{theme.mark('action')} Hey."
     assert "queued" not in out and "social_ack" not in out
 
 
@@ -243,7 +250,8 @@ def test_a_filed_goal_still_says_queued() -> None:
     # Asserted on the ACKNOWLEDGEMENT LINE, not the whole reply: "on it" is a
     # substring of "…pick it up on its next sweep", so a naive `not in`
     # flags correct output as broken.
-    assert out.splitlines()[0] == "⏺ adding that to the backlog"
+    assert _plain(out.splitlines()[0]) == (
+        f"{theme.mark('action')} adding that to the backlog")
 
 
 def test_the_two_paths_are_told_apart_by_the_RECEIPT() -> None:

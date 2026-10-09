@@ -43,10 +43,22 @@ def test_no_canvas_means_empty_not_error() -> None:
     assert th.is_scrolled_back() is False
 
 
-def test_jump_block_moves_the_viewport_to_a_marker(live_canvas) -> None:
+def _current_action_mark() -> str:
+    from backend.core.ouroboros.ui import theme
+    return theme.mark("action")
+
+
+@pytest.mark.parametrize("marker", [
+    pytest.param(None, id="theme-mark"),
+    # Legacy input: an attached cockpit may replay an older daemon's lines,
+    # so the pre-theme action mark is still a block marker.
+    pytest.param("⏺", id="legacy-mark"),
+])
+def test_jump_block_moves_the_viewport_to_a_marker(live_canvas, marker) -> None:
+    marker = marker or _current_action_mark()
     for i in range(30):
         live_canvas.push_raw(f"· trace {i}")
-    live_canvas.push_raw("⏺ the block")
+    live_canvas.push_raw(f"{marker} the block")
     for i in range(30):
         live_canvas.push_raw(f"· more {i}")
     vp = live_canvas._viewport
@@ -58,7 +70,7 @@ def test_jump_block_moves_the_viewport_to_a_marker(live_canvas) -> None:
     lines = th.transcript_lines()
     total, budget = live_canvas.scroll_metrics()
     top = max(0, total - budget - vp.offset)
-    assert lines[top].startswith("⏺")
+    assert lines[top].startswith(marker)
     # and } walks forward again without leaving the ring
     th.jump_block(None, +1)
     assert vp.offset >= 0

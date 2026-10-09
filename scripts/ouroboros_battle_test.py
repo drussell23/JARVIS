@@ -975,23 +975,30 @@ def _single_flight_preflight(*, quiet: bool = False) -> None:
             _h = _read_lock_holder(_PROJECT_ROOT)
             if _h is not None and _h[1] not in (None, float("inf")):
                 _held = f" · up ~{max(1, int(_h[1] / 60))}m"
+            # The marks come from the theme, degraded on an ASCII locale, like
+            # every other operator-plane line.
+            try:
+                from backend.core.ouroboros.ui.theme import mark as _mark
+                _act, _det, _sep = _mark("action"), _mark("detail"), _mark("dot")
+            except Exception:  # noqa: BLE001 — a banner never blocks the exit
+                _act, _det, _sep = "*", "-", "-"
             print()
             print(
-                f"  {_BOLD}⏺ the organism is already awake{_RESET}"
+                f"  {_BOLD}{_act} the organism is already awake{_RESET}"
                 f"{_DIM} — pid {_pid}{_held}{_RESET}"
             )
             try:
                 from backend.core.ouroboros.cli.ov import status_digest
                 for _ln in status_digest().splitlines()[:3]:
-                    print(f"  {_DIM}⎿ {_ln}{_RESET}")
+                    print(f"  {_DIM}{_det} {_ln}{_RESET}")
             except Exception:
                 pass
             print(
-                f"  {_DIM}⎿ attach: ov attach (live view + input) · "
+                f"  {_DIM}{_det} attach: ov attach (live view + input) {_sep} "
                 f"stop: kill {_pid}{_RESET}"
             )
             print(
-                f"  {_DIM}⎿ force a second organism: "
+                f"  {_DIM}{_det} force a second organism: "
                 f"JARVIS_BATTLE_SINGLE_FLIGHT_ENABLED=false (budget/locks "
                 f"will contend){_RESET}"
             )

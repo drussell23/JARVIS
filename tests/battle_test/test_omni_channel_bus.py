@@ -23,6 +23,7 @@ from backend.core.ouroboros.battle_test import attach_session
 from backend.core.ouroboros.battle_test.cockpit_attach import (
     CockpitAttachBridge,
 )
+from backend.core.ouroboros.ui import theme
 
 
 class _Writer:
@@ -280,7 +281,7 @@ def test_a_live_post_renders_as_an_escaped_block() -> None:
         object.__new__(BattleTestHarness), _Post(),
     )
     assert "@cassandra" in line
-    assert "⏺" in line and "⎿" in line
+    assert theme.mark("action") in line and "⎿" in line
     assert "\\[bold]" in line or "[bold]about this[/bold]" not in line
 
 
