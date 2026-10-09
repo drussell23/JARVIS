@@ -258,9 +258,27 @@ def build(
         "JARVIS_WORK_ORDER_DEFAULT_URGENCY": "high",
         "JARVIS_ALLOW_ROADMAP_REVISIT": True,
         "JARVIS_DOC_STALENESS_ENABLED": False,
+        # RuntimeHealth stays off: pip-audit over the network proposing
+        # dependency upgrades is the riskiest unattended change O+V could make
+        # to its own environment. OpportunityMiner stays off: its ops need a
+        # human acknowledgment, so headless they only queue.
         "JARVIS_RUNTIME_HEALTH_SENSOR_ENABLED": False,
-        "JARVIS_GITHUB_ISSUE_SENSOR_ENABLED": False,
+        # GitHubIssue: read-only to GitHub (gh authenticated in the exec
+        # environment); open issues become intake work. Enabled 2026-10-09.
+        "JARVIS_GITHUB_ISSUE_SENSOR_ENABLED": True,
         "JARVIS_OPPORTUNITY_MINER_SENSOR_ENABLED": False,
+        # Local, rate-limited perception sensors (no network, no LLM), enabled
+        # 2026-10-09 to widen the supply of landable work. Each is token-bucket
+        # / storm-guarded by its own module; DeepAnalysis's detectors default
+        # on under this master and it runs off the event loop.
+        "JARVIS_AUDIT_DRIFT_SENSOR_ENABLED": True,
+        "JARVIS_CAGE_HYGIENE_SENSOR_ENABLED": True,
+        "JARVIS_MEMORY_HYGIENE_SENSOR_ENABLED": True,
+        "JARVIS_LIVENESS_SENSOR_ENABLED": True,
+        "JARVIS_DEEP_ANALYSIS_SENSOR_ENABLED": True,
+        # SemanticGuardian self-immunization (deterministic, no LLM), run by
+        # AntivenomObserver at boot and on its interval; its report persists.
+        "JARVIS_ANTIVENOM_IMMUNIZATION_ENABLED": True,
         "JARVIS_INTENT_TEST_INTERVAL_S": 86400,
         "JARVIS_TODO_SCAN_INTERVAL_S": 86400,
         "JARVIS_EXPLORATION_INTERVAL_S": 86400,

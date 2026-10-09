@@ -3335,6 +3335,26 @@ class GovernedLoopService:
             )
             self._invariant_drift_observer = None
 
+        # AntivenomObserver: the SemanticGuardian self-immunization audit had
+        # no production caller (its flag did nothing); this runs it at boot
+        # and on an interval and settles its verdict into the health ledger.
+        self._antivenom_observer = None
+        try:
+            from backend.core.ouroboros.governance.antivenom_self_immunization import (  # noqa: E501
+                master_enabled as antivenom_enabled,
+            )
+            if antivenom_enabled():
+                from backend.core.ouroboros.governance.antivenom_observer import (  # noqa: E501
+                    AntivenomObserver,
+                )
+                self._antivenom_observer = AntivenomObserver()
+                self._antivenom_observer.start()
+                _incr_observer_boot("antivenom")
+                logger.info("[GovernedLoop] AntivenomObserver started")
+        except Exception:  # noqa: BLE001
+            logger.warning("[GovernedLoop] AntivenomObserver startup failed (non-fatal)", exc_info=True)
+            self._antivenom_observer = None
+
         # CoherenceObserver (Priority #1 Slice 5b)
         self._coherence_observer = None
         try:
@@ -3712,6 +3732,7 @@ class GovernedLoopService:
 
         for attr_name in (
             "_invariant_drift_observer",
+            "_antivenom_observer",
             "_coherence_observer",
             "_cigw_observer",
             "_sbt_observer",

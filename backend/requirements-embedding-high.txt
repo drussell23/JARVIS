@@ -1,0 +1,21 @@
+# EmbeddingService HIGH tier (sentence-transformers on CPU) for the O+V host venv.
+#
+# Optional by design: EmbeddingService runs on its LITE tier (fastembed) without
+# these and promotes itself to HIGH when they import. Kept OUT of
+# governance/sandbox_profiles/requirements-governance.txt on purpose -- that
+# image is the lean, torch-free VERIFY sandbox.
+#
+# Install (CPU-only torch -- the default index would pull a multi-GB CUDA build,
+# and the GPU belongs to J-Prime):
+#   uv pip install --python ~/.venvs/ov/bin/python \
+#     --index-url https://download.pytorch.org/whl/cpu \
+#     --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match \
+#     -r backend/requirements-embedding-high.txt
+#
+# numpy is HELD at the venv's version: unconstrained, the resolver jumped it to
+# 2.x (a major-version change under every other numpy consumer in the venv).
+# Installed and verified 2026-10-09: HIGH tier loaded all-MiniLM-L6-v2 on CPU.
+torch==2.14.1+cpu
+sentence-transformers==6.1.0
+transformers==5.19.0
+numpy==1.24.3
