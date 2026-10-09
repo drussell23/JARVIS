@@ -232,7 +232,11 @@ class ToolNarrationChannel:
         if self._config.max_args_chars and args_summary:
             args_summary = args_summary[: self._config.max_args_chars]
         if self._config.max_preview_chars and result_preview:
-            result_preview = result_preview[: self._config.max_preview_chars]
+            # Bounded for the bus (it reaches the durable log), but at a LINE
+            # boundary with a marker -- a slice ended the cockpit's last line
+            # mid-word and passed a fragment off as the whole result.
+            from backend.core.ouroboros.ui.text_bounds import clip_lines
+            result_preview = clip_lines(result_preview, self._config.max_preview_chars)[0]
 
         # Preamble is only meaningful pre-exec. Drop it on success/error/
         # etc. so SerpentFlow doesn't re-render it after the round ends.

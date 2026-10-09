@@ -1105,7 +1105,8 @@ class ClaudeStyleTransport:
         try:
             console = self._console
             if console is not None and hasattr(console, "print"):
-                console.print(text, highlight=False)
+                from backend.core.ouroboros.ui.block_wrap import block
+                console.print(block(text), highlight=False)
                 return
         except Exception:  # noqa: BLE001 — defensive
             pass

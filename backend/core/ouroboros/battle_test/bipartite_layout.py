@@ -344,6 +344,26 @@ def bottom_anchor_enabled() -> bool:
     return fullscreen_enabled()
 
 
+_ENV_PALETTE_PLACEMENT = "JARVIS_OV_PALETTE_PLACEMENT"
+_PALETTE_PLACEMENTS = ("below", "overlay")
+
+
+def palette_placement() -> str:
+    """Where the slash palette opens: ``below`` the input (Claude Code's
+    mechanic, default) or ``overlay`` (the floating menu). NEVER raises."""
+    raw = (os.environ.get(_ENV_PALETTE_PLACEMENT, "") or "").strip().lower()
+    return raw if raw in _PALETTE_PLACEMENTS else _PALETTE_PLACEMENTS[0]
+
+
+def _completing() -> bool:
+    """A completion is open in the focused buffer. NEVER raises."""
+    try:
+        from prompt_toolkit.application.current import get_app
+        return get_app().current_buffer.complete_state is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def toolbar_above_prompt() -> bool:
     """Does the pulse row sit above the ``❯`` input, or beneath it?
 
@@ -839,7 +859,10 @@ class BipartiteLayout:
                 except Exception:  # noqa: BLE001
                     body = Text("  O + V", style="bold #5EE06A", justify="center")
             elif lines:
-                body = Group(*[_line_to_text(ln) for ln in lines])
+                # Each line as a BLOCK (ui.block_wrap): wrapped content keeps
+                # its column under its glyph rather than returning to column 0.
+                from backend.core.ouroboros.ui.block_wrap import block
+                body = Group(*[block(_line_to_text(ln)) for ln in lines])
             else:
                 body = Text("  idle — waiting for the organism to act", style="bright_black")
             n = self._buffer.line_count if hasattr(self._buffer, "line_count") else len(lines)
@@ -1904,12 +1927,34 @@ def build_bipartite_application(
     # It also keeps the geometry honest: the canvas bottom-anchors so the
     # newest event lands against the prompt, and a row wedged underneath meant
     # the LAST thing before the input was a status bar the deck did not own.
-    if _toolbar_row is not None and toolbar_above_prompt():
-        rows += [_toolbar_row, _rule(0), prompt, _rule(1)]
+    # The palette's place. BELOW the input box is Claude Code's mechanic: the
+    # suggestions open under what you are typing and the transcript is never
+    # painted over (the overlay float, with the prompt at the bottom, could
+    # only open UPWARD across the newest lines). The status line steps aside
+    # while it is open, so the bottom region changes height once, on the
+    # keystroke that opened it, and background frames cannot reflow it.
+    # `JARVIS_OV_PALETTE_PLACEMENT=overlay` restores the float.
+    _palette_below = _palette is not None and palette_placement() == "below"
+    _status_row = _toolbar_row
+    if _palette_below and _toolbar_row is not None and not toolbar_above_prompt():
+        try:
+            from prompt_toolkit.filters import Condition
+            from prompt_toolkit.layout import ConditionalContainer
+            _status_row = ConditionalContainer(
+                content=_toolbar_row, filter=~Condition(_completing),
+            )
+        except Exception:  # noqa: BLE001 — a status line that never hides
+            _status_row = _toolbar_row
+    if _status_row is not None and toolbar_above_prompt():
+        rows += [_status_row, _rule(0), prompt, _rule(1)]
+        if _palette_below:
+            rows.append(_palette)
     else:
         rows += [_rule(0), prompt, _rule(1)]
-        if _toolbar_row is not None:
-            rows.append(_toolbar_row)
+        if _palette_below:
+            rows.append(_palette)
+        if _status_row is not None:
+            rows.append(_status_row)
     # The standing state, under the box the operator types into.
     rows += _below_prompt
     # ── Region layout mount (PR #70213's seam, finally consumed) ──────
@@ -1931,7 +1976,7 @@ def build_bipartite_application(
     # `DynamicContainer` starts re-deriving per frame, and the next slice hangs
     # regions off a surface that has already been watched.
     root: Any = _mount_region_layout(rows)
-    if _palette is not None:
+    if _palette is not None and not _palette_below:
         # Z-INDEX OVERLAY, not a row.
         #
         # This cockpit takes asynchronous IPC continuously — Deck entries, Lane

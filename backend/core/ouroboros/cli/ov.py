@@ -361,7 +361,10 @@ def _render_markup_frame(text: str, console: Any = None) -> None:
                 _kw["width"] = _width
             _late = _Console(**{k: v for k, v in _kw.items()
                                 if k != "highlight"})
-            _late.print(safe, highlight=False)
+            # As a BLOCK: a wrapped tool result stays under its `⎿` instead
+            # of falling back to column 0 (ui.block_wrap).
+            from backend.core.ouroboros.ui.block_wrap import block as _block
+            _late.print(_block(safe), highlight=False)
             _emitted = True
         except Exception:  # noqa: BLE001 — never lose the frame
             _emitted = False

@@ -1167,24 +1167,24 @@ def spinner_name() -> str:
 
 
 def print_fit(console, markup: str, **print_kw: Any) -> None:
-    """Print one op-block line, truncated to the live console width with an
-    ellipsis -- never wraps (so the glyph column never moves). Width is read
-    from the console per call (SIGWINCH-adaptive; Rich defaults to 80
-    off-terminal). Fail-soft: on any Rich error, falls back to a plain crop
-    print, and if that fails too, swallows the error rather than crash the
-    render path.
+    """Print one op-block line laid out as a block (``ui.block_wrap``): the
+    prefix and glyph keep their column and the content wraps beneath itself
+    at the live console width (SIGWINCH-adaptive; Rich defaults to 80
+    off-terminal). It used to CROP with an ellipsis to keep the glyph column
+    still, which lost every character past the edge. Fail-soft: on any Rich
+    error, falls back to a plain crop print, and if that fails too, swallows
+    the error rather than crash the render path.
 
     ``print_kw`` rides through to BOTH prints unchanged. A caller that has
     already mirrored the line to the cockpit passes ``mirror=False`` so a
     relaying console does not carry it twice; this function has no opinion
     about that and must not eat the request on the fallback path either."""
     try:
-        from rich.text import Text
-        console.print(
-            Text.from_markup(markup),
-            no_wrap=True, overflow="ellipsis", crop=True, soft_wrap=False,
-            **print_kw,
-        )
+        # Wrapped INSIDE its block (ui.block_wrap): the prefix and glyph hold
+        # their column and the content folds beneath itself -- the glyph
+        # column never moves, and nothing past the width is cropped away.
+        from backend.core.ouroboros.ui.block_wrap import block
+        console.print(block(markup), soft_wrap=False, **print_kw)
     except Exception:  # noqa: BLE001
         try:
             width = getattr(console, "width", 80) or 80

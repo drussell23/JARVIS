@@ -5027,6 +5027,14 @@ _COMPACT_THRESHOLD_CHARS = int(
 )  # Trigger compaction at 75% of max to avoid hard crash
 
 
+def _clip_preview(text: str, max_chars: int) -> str:
+    """A narration preview bounded at a line boundary (0 = unbounded)."""
+    if not max_chars:
+        return text
+    from backend.core.ouroboros.ui.text_bounds import clip_lines
+    return clip_lines(text, max_chars)[0]
+
+
 @dataclass(frozen=True)
 class ContextBudget:
     """One op's prompt budget: hard cap, soft watermark, compaction point.
@@ -5836,10 +5844,15 @@ class ToolLoopCoordinator:
             "JARVIS_TOOL_NARRATION_ENABLED", "true",
         ).strip().lower() not in ("false", "0", "no", "off")
         self._on_tool_call = on_tool_call if _narration_on else None
-        # Result preview truncation — env-driven so narration-heavy sessions
-        # can tighten the budget without touching code.
+        # Result preview bound — the cockpit's own body bound unless the
+        # operator set one. It was 500 chars, cut mid-line: the renderer
+        # summarised the slice ("12 symbols" counted a fragment), showed a
+        # last line ending mid-word, and parked the slice, so /expand could
+        # never show the result. Cut at a line boundary (ui.text_bounds).
+        from backend.core.ouroboros.ui.text_bounds import body_max_chars
+        _explicit_preview = os.environ.get("JARVIS_TOOL_NARRATION_PREVIEW_CHARS", "").strip()
         self._narration_preview_chars: int = max(
-            0, int(os.environ.get("JARVIS_TOOL_NARRATION_PREVIEW_CHARS", "500"))
+            0, int(_explicit_preview) if _explicit_preview.isdigit() else body_max_chars(),
         )
         self._narration_args_chars: int = max(
             0, int(os.environ.get("JARVIS_TOOL_NARRATION_ARGS_CHARS", "80"))
@@ -7079,9 +7092,10 @@ class ToolLoopCoordinator:
                                 tool_name=tc_err.name,
                                 round_index=round_index,
                                 args_summary=self._args_summary_for(tc_err),
-                                result_preview=f"{type(res).__name__}: {res}"[
-                                    : self._narration_preview_chars or None
-                                ],
+                                result_preview=_clip_preview(
+                                    f"{type(res).__name__}: {res}",
+                                    self._narration_preview_chars,
+                                ),
                                 status="error",
                             )
                         else:
@@ -7116,8 +7130,7 @@ class ToolLoopCoordinator:
                     else:
                         _nstatus = "success"
                         _preview = tool_result.output or ""
-                    if self._narration_preview_chars:
-                        _preview = _preview[: self._narration_preview_chars]
+                    _preview = _clip_preview(_preview, self._narration_preview_chars)
                     self._notify_tool_call(
                         op_id=op_id,
                         tool_name=tc.name,

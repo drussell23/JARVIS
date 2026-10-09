@@ -372,6 +372,46 @@ _GLYPHS: Mapping[str, tuple] = {
 }
 
 
+#: Unicode marks some terminals DRAW two cells wide while advancing one, with
+#: the substitute that stays inside its cell. Claude Code's own rule: ``⏺`` on
+#: macOS, ``●`` elsewhere -- Windows Terminal paints ``⏺`` as an emoji over
+#: the following space (``⏺Search``).
+_SYMBOL_SUBSTITUTES: Mapping[str, str] = {"action": "●"}
+_ENV_SYMBOL_GLYPHS = "JARVIS_OV_SYMBOL_GLYPHS"
+
+
+def local_symbol_glyphs(env: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether THIS process's terminal draws text symbols in one cell: the
+    operator's ``JARVIS_OV_SYMBOL_GLYPHS`` when set, else true only on macOS
+    (whose terminals render ``⏺`` as text). NEVER raises."""
+    try:
+        source = os.environ if env is None else env
+        raw = str(source.get(_ENV_SYMBOL_GLYPHS, "") or "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if raw in ("0", "false", "no", "off"):
+            return False
+        import sys as _sys
+        return _sys.platform == "darwin"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _symbol_glyphs() -> bool:
+    """The DISPLAYING terminal's answer: an attached cockpit's declaration
+    when there is one, else this process's own terminal."""
+    try:
+        from backend.core.ouroboros.battle_test.terminal_capabilities import (
+            current_capabilities,
+        )
+        caps = current_capabilities()
+        if caps is not None:
+            return bool(getattr(caps, "symbol_glyphs", True))
+    except Exception:  # noqa: BLE001
+        pass
+    return local_symbol_glyphs()
+
+
 def mark(name: str, *, unicode: Optional[bool] = None) -> str:
     """Return a glyph by semantic name, degraded to ASCII when needed.
 
@@ -382,7 +422,13 @@ def mark(name: str, *, unicode: Optional[bool] = None) -> str:
     if pair is None:
         return ""
     use_unicode = supports_unicode() if unicode is None else unicode
-    return pair[0] if use_unicode else pair[1]
+    if not use_unicode:
+        return pair[1]
+    # Auto-detected unicode only: a caller that asked for the canonical glyph
+    # explicitly gets it.
+    if unicode is None and name in _SYMBOL_SUBSTITUTES and not _symbol_glyphs():
+        return _SYMBOL_SUBSTITUTES[name]
+    return pair[0]
 
 
 # ===========================================================================

@@ -523,7 +523,11 @@ def _make(
 
 
 _DESCRIPTORS: Mapping[str, ToolRenderDescriptor] = {
-    # ---- Read-shape (header-only by CC convention) ----------------------
+    # ---- Exploration-shape: header + one summary line (Claude Code's
+    # `⎿ Found 3 files`), the full result parked behind /expand. A read or a
+    # search is the model looking; its raw output is the model's context,
+    # not the operator's -- dumping it buried the work under listings.
+    # Bodies stay for what the operator must SEE: diffs, shell, tests.
     "read_file": _make(
         "read_file", "📄", "Read",
         BodyShape.NONE, None,
@@ -532,30 +536,30 @@ _DESCRIPTORS: Mapping[str, ToolRenderDescriptor] = {
     ),
     "list_symbols": _make(
         "list_symbols", "📋", "Symbols",
-        BodyShape.MULTI_LINE, "text",
+        BodyShape.NONE, None,
         _summarize_path_arg, _summarize_list_symbols,
         arg_kind="path",
     ),
     "list_dir": _make(
         "list_dir", "📂", "List",
-        BodyShape.MULTI_LINE, "text",
+        BodyShape.NONE, None,
         _summarize_path_arg, _summarize_list_dir,
         arg_kind="path",
     ),
     "glob_files": _make(
         "glob_files", "📁", "Glob",
-        BodyShape.MULTI_LINE, "text",
+        BodyShape.NONE, None,
         _summarize_search_arg, _summarize_glob,
         arg_kind="path",
     ),
     "search_code": _make(
         "search_code", "🔍", "Search",
-        BodyShape.MULTI_LINE, "text",
+        BodyShape.NONE, None,
         _summarize_search_arg, _summarize_search,
     ),
     "get_callers": _make(
         "get_callers", "🔗", "Callers",
-        BodyShape.MULTI_LINE, "text",
+        BodyShape.NONE, None,
         _summarize_default_arg, _summarize_callers,
         arg_kind="path",
     ),
@@ -600,7 +604,7 @@ _DESCRIPTORS: Mapping[str, ToolRenderDescriptor] = {
     # ---- Git-shape ------------------------------------------------------
     "git_log": _make(
         "git_log", "📜", "GitLog",
-        BodyShape.MULTI_LINE, "text",
+        BodyShape.NONE, None,
         _summarize_default_arg, _summarize_git_log,
     ),
     "git_diff": _make(
@@ -611,20 +615,20 @@ _DESCRIPTORS: Mapping[str, ToolRenderDescriptor] = {
     ),
     "git_blame": _make(
         "git_blame", "🔎", "GitBlame",
-        BodyShape.MULTI_LINE, "text",
+        BodyShape.NONE, None,
         _summarize_path_arg, _summarize_git_blame,
         arg_kind="path",
     ),
     # ---- Async-native (ToolManifest-only, not in _dispatch) -------------
     "web_fetch": _make(
         "web_fetch", "🌐", "Fetch",
-        BodyShape.MULTI_LINE, "text",
+        BodyShape.NONE, None,
         _summarize_default_arg, _summarize_web_fetch,
         arg_kind="url",
     ),
     "web_search": _make(
         "web_search", "🌐", "WebSearch",
-        BodyShape.MULTI_LINE, "text",
+        BodyShape.NONE, None,
         _summarize_search_arg, _summarize_web_search,
     ),
     "ask_human": _make(
@@ -766,6 +770,16 @@ def render(
         body_lines, elided = _extract_body(
             result_safe, max_body_lines, descriptor.body_shape,
         )
+        # ONE marker, and it carries the way back. With a parked body the
+        # elision line names its ref (`… +3 lines · /expand t-12`); a second
+        # "parked" line under the block restated the same count and is no
+        # longer emitted. Without a ref there is no way back, so the marker
+        # says only what was cut.
+        if isinstance(expansion_ref, str) and expansion_ref:
+            body_lines = tuple(
+                _recoverable_marker(ln, expansion_ref) if _is_elision_marker(ln) else ln
+                for ln in body_lines
+            )
 
     return RenderedToolResult(
         header_line=header_line,
@@ -847,6 +861,28 @@ def _is_diff_noise(line: str) -> bool:
 
 def _no_noise(_line: str) -> bool:
     return False
+
+
+_ELISION_MARKER = re.compile(r"^… \+(\d+) more lines? elided …$")
+_RECOVERABLE_MARKER = re.compile(r"^… \+\d+ lines? · /expand \S+$")
+
+
+def _is_elision_marker(line: str) -> bool:
+    return bool(_ELISION_MARKER.match(str(line).strip()))
+
+
+def is_elision_line(line: str) -> bool:
+    """Whether a body line is an elision marker, in either form -- the one
+    question every renderer asks before styling it as a marker."""
+    text = str(line).strip()
+    return bool(_ELISION_MARKER.match(text) or _RECOVERABLE_MARKER.match(text))
+
+
+def _recoverable_marker(line: str, ref: str) -> str:
+    """The elision marker, naming the verb that restores what it cut."""
+    m = _ELISION_MARKER.match(str(line).strip())
+    n = int(m.group(1)) if m else 0
+    return f"… +{n} line{'s' if n != 1 else ''} · /expand {ref}"
 
 
 def _body_profile(shape: object) -> Tuple[Callable[[str], bool], float]:

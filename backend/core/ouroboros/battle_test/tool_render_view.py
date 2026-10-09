@@ -59,6 +59,7 @@ from backend.core.ouroboros.battle_test.tool_render_registry import (
     BodyShape,
     ToolStatus,
     get_descriptor,
+    is_elision_line,
     render,
 )
 from backend.core.ouroboros.battle_test.tool_render_store import (
@@ -755,6 +756,8 @@ def _compose_summary(
     elided: int,
     body_present: bool,
     palette: Optional[Mapping[str, str]],
+    *,
+    marker_in_body: bool = False,
 ) -> Tuple[str, str]:
     """Build (summary_markup, expansion_hint).
 
@@ -788,22 +791,23 @@ def _compose_summary(
     # `⏺ Update(f.py)` / `⎿ +5 / -2` with the diff flat beneath it. Two
     # column disciplines, and the block structure is the indentation: remove
     # it and a transcript is a log.
+    # The way back rides the SUMMARY line, Claude Code's `⎿ Found 3 files
+    # (ctrl+r to expand)`: one line per result, never a second line restating
+    # a count. It is added only when something is not on screen -- a summary-
+    # only block, or a body trimmed without an in-body marker (an in-body
+    # marker already names the ref). A fully shown body needs no way back.
+    suffix = ""
+    if isinstance(expansion_ref, str) and expansion_ref and not marker_in_body:
+        if not body_present:
+            suffix = f" · /expand {expansion_ref}"
+        elif elided > 0:
+            suffix = f" · +{elided} line{'s' if elided != 1 else ''} · /expand {expansion_ref}"
     summary_markup = (
-        f"[{c_dim}]{_detail_prefix()}{_escape(summary_text)}[/{c_dim}]"
+        f"[{c_dim}]{_detail_prefix()}{_escape(summary_text)}{_escape(suffix)}[/{c_dim}]"
     )
-
-    expansion_hint = ""
-    if elided > 0 and isinstance(expansion_ref, str) and expansion_ref:
-        expansion_hint = (
-            f"[{c_dim} italic]   … +{elided} more line"
-            f"{'s' if elided != 1 else ''} parked · /expand {expansion_ref}"
-            f"[/{c_dim} italic]"
-        )
-    elif body_present and elided == 0:
-        # No elision needed; no hint.
-        pass
-
-    return (summary_markup, expansion_hint)
+    # Kept for the composed-render contract; the hint now lives on the
+    # summary line (or the in-body marker), so there is no separate line.
+    return (summary_markup, "")
 
 
 # ===========================================================================
@@ -880,11 +884,10 @@ def compose(
 
     # --- 3. Park body (issues expansion ref) if eligible
     expansion_ref: Optional[str] = None
-    body_eligible = (
-        descriptor.body_shape is not BodyShape.NONE
-        and policy.show_body
-        and bool(result_str)
-    )
+    # EVERY non-empty result is parked, whatever its shape: a summary-only
+    # block (Read, Search, Symbols -- Claude Code's convention) must still
+    # be one verb away from its full text, exactly like an elided body.
+    body_eligible = bool(result_str)
     if body_eligible and store is not None:
         try:
             stored = store.store(
@@ -940,6 +943,7 @@ def compose(
         rendered.elided_line_count,
         body_present,
         palette,
+        marker_in_body=any(is_elision_line(ln) for ln in rendered.body_lines),
     )
 
     # Body lines wrapped per shape. §41.3 #8 — when JSON was
@@ -969,7 +973,7 @@ def compose(
     body_lines_markup: Tuple[str, ...] = tuple(
         _indent + (
             _wrap_marker_line(ln, palette)
-            if "elided" in ln and ln.lstrip().startswith("…")
+            if is_elision_line(ln)
             else wrapper(ln, palette)
         )
         for ln in rendered.body_lines

@@ -471,11 +471,12 @@ def strip_native_completion_menu(app: Any) -> int:
 
 
 def build_palette_window(condition_style: str = "") -> Any:
-    """A full-width container that draws the palette above the prompt.
+    """A full-width container that draws the palette, mounted wherever the
+    cockpit places it (``bipartite_layout.palette_placement``: below the
+    input by default, as Claude Code does, or as an overlay float).
 
     Visible only while a completion is in progress, and it takes its height
-    from the content — so the prompt sits directly beneath the last entry
-    exactly as it does with no palette open. NEVER raises."""
+    from the content -- zero rows when nothing matches. NEVER raises."""
     try:
         from prompt_toolkit.application.current import get_app
         from prompt_toolkit.filters import Condition
