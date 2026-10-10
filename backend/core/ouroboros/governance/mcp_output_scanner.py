@@ -254,6 +254,7 @@ class CredentialKind(str, enum.Enum):
     AND this enum.
     """
 
+    ANTHROPIC_KEY = "anthropic_key"
     OPENAI_KEY = "openai_key"
     SLACK_TOKEN = "slack_token"
     AWS_KEY = "aws_key"
@@ -265,6 +266,7 @@ class CredentialKind(str, enum.Enum):
 # hyphenated) to the closed CredentialKind enum. Bytes-pinned via
 # AST so drift is structurally caught.
 _LABEL_TO_KIND: Dict[str, CredentialKind] = {
+    "anthropic-key": CredentialKind.ANTHROPIC_KEY,
     "openai-key": CredentialKind.OPENAI_KEY,
     "slack-token": CredentialKind.SLACK_TOKEN,
     "aws-access-key": CredentialKind.AWS_KEY,
@@ -666,11 +668,11 @@ def register_shipped_invariants() -> list:
         "clean", "credential_found", "disabled",
     }
     _EXPECTED_KINDS = {
-        "openai_key", "slack_token",
+        "anthropic_key", "openai_key", "slack_token",
         "aws_key", "private_key", "github_token",
     }
     _EXPECTED_LABELS = {
-        "openai-key", "slack-token", "aws-access-key",
+        "anthropic-key", "openai-key", "slack-token", "aws-access-key",
         "private-key-block", "github-token",
     }
 
@@ -742,7 +744,7 @@ def register_shipped_invariants() -> list:
     def _validate_label_map_coverage(
         tree: ast.AST, source: str,  # noqa: ARG001
     ) -> tuple:
-        """The _LABEL_TO_KIND dict MUST cover all 5 canonical
+        """The _LABEL_TO_KIND dict MUST cover every canonical
         redact_secrets labels verbatim. Drift = silently dropping
         a credential shape from the MCP scan."""
         for node in ast.walk(tree):

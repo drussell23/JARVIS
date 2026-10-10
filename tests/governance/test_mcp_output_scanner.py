@@ -138,15 +138,15 @@ class TestTaxonomies:
             "clean", "credential_found", "disabled",
         }
 
-    def test_credential_kind_5_values(self):
+    def test_credential_kind_values(self):
         assert {k.value for k in CredentialKind} == {
-            "openai_key", "slack_token", "aws_key",
+            "anthropic_key", "openai_key", "slack_token", "aws_key",
             "private_key", "github_token",
         }
 
-    def test_label_to_kind_covers_all_5(self):
+    def test_label_to_kind_covers_every_kind(self):
         assert set(_LABEL_TO_KIND.keys()) == {
-            "openai-key", "slack-token", "aws-access-key",
+            "anthropic-key", "openai-key", "slack-token", "aws-access-key",
             "private-key-block", "github-token",
         }
 
@@ -570,6 +570,7 @@ class McpScanVerdict(str, enum.Enum):
         synthetic = """
 import enum
 class CredentialKind(str, enum.Enum):
+    ANTHROPIC_KEY = "anthropic_key"
     OPENAI_KEY = "openai_key"
     SLACK_TOKEN = "slack_token"
     AWS_KEY = "aws_key"
@@ -712,7 +713,7 @@ class TestCanonicalReuse:
         assert "[REDACTED:private-key-block]" in redacted
         # And the scanner's label_to_kind covers each
         for label in (
-            "openai-key", "slack-token", "aws-access-key",
+            "anthropic-key", "openai-key", "slack-token", "aws-access-key",
             "github-token", "private-key-block",
         ):
             assert label in _LABEL_TO_KIND

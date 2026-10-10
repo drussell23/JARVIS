@@ -30,7 +30,8 @@ Legacy back-compat: ``source="tui"`` is silently remapped to
 ``"tui_user"`` for one release. Unknown sources are dropped (fail-closed).
 
 Secret redaction list (documented here per §8 — "one place to reason"):
-  * OpenAI-style keys:  ``sk-[A-Za-z0-9]{20,}``
+  * Anthropic keys:     ``sk-ant-[A-Za-z0-9_-]{20,}``
+  * OpenAI-style keys:  ``sk-…`` incl. segmented ``sk-proj-…`` (must carry a digit)
   * Slack tokens:       ``xox[abprs]-[A-Za-z0-9-]{10,}``
   * AWS access keys:    ``AKIA[0-9A-Z]{16}``
   * Private-key blocks: ``-----BEGIN ... PRIVATE KEY-----``
@@ -269,7 +270,17 @@ def _postmortem_ttl_s() -> float:
 # ---------------------------------------------------------------------------
 
 _SECRET_PATTERNS: List[tuple] = [
+    # Anthropic keys (``sk-ant-api03-…``) and segmented OpenAI keys
+    # (``sk-proj-…``, ``sk-svcacct-…``) carry a hyphen right after a short
+    # prefix, so the old ``sk-[A-Za-z0-9]{20,}`` matched NEITHER: the key this
+    # organism itself holds passed every redaction unchanged. Same shapes as
+    # semantic_guardian._CREDENTIAL_SHAPES, which was corrected for exactly
+    # this. The classic unsegmented shape is unchanged (a redactor's miss is a
+    # leak, its false positive only hides text); the SEGMENTED shape must carry
+    # a digit, which a key does and a hyphenated word like ``sk-learn-…`` does not.
+    (re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}"), "anthropic-key"),
     (re.compile(r"sk-[A-Za-z0-9]{20,}"), "openai-key"),
+    (re.compile(r"sk-[A-Za-z0-9]+-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{20,}"), "openai-key"),
     (re.compile(r"xox[abprs]-[A-Za-z0-9-]{10,}"), "slack-token"),
     (re.compile(r"AKIA[0-9A-Z]{16}"), "aws-access-key"),
     (re.compile(

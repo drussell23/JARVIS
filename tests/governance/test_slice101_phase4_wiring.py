@@ -34,7 +34,9 @@ def test_scanner_inert_when_master_off(monkeypatch):
         McpScanVerdict,
         scan_mcp_output,
     )
-    monkeypatch.delenv("JARVIS_MCP_OUTPUT_SCANNER_ENABLED", raising=False)
+    # The master GRADUATED to default-on (it runs in shadow by default; see
+    # mcp_output_scanner.master_enabled), so "off" is the explicit kill switch.
+    monkeypatch.setenv("JARVIS_MCP_OUTPUT_SCANNER_ENABLED", "false")
     report = scan_mcp_output("AKIAIOSFOD" + "NN7EXAMPLE", source_label="t")
     # master off → DISABLED, so the seam never redacts (byte-identical legacy)
     assert report.verdict == McpScanVerdict.DISABLED

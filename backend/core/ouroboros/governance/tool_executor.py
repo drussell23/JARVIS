@@ -7254,11 +7254,12 @@ class ToolLoopCoordinator:
                             tool_name=tc.name,
                         )
                         if _scan.injection_count > 0:
-                            tool_result = type(tool_result)(
-                                output=_scan.redacted,
-                                error=tool_result.error,
-                                status=tool_result.status,
-                            )
+                            # replace(), not a re-construction: ToolResult's
+                            # first field is the required tool_call, so
+                            # `type(tool_result)(output=...)` raised TypeError,
+                            # the except below swallowed it, and the UNREDACTED
+                            # output reached the model every time a scan fired.
+                            tool_result = _dc.replace(tool_result, output=_scan.redacted)
                     except ImportError:
                         pass  # firewall unavailable — skip
                     except Exception:  # noqa: BLE001 — defensive
@@ -7298,11 +7299,8 @@ class ToolLoopCoordinator:
                                     redact_secrets as _redact_secrets,
                                 )
                                 _redacted, _ = _redact_secrets(tool_result.output or "")
-                                tool_result = type(tool_result)(
-                                    output=_redacted,
-                                    error=tool_result.error,
-                                    status=tool_result.status,
-                                )
+                                # replace(): see the injection scan above.
+                                tool_result = _dc.replace(tool_result, output=_redacted)
                                 logger.warning(
                                     "[Venom] credential scan REDACTED shape(s) in "
                                     "tool=%s findings=%d bytes=%d",
