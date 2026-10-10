@@ -92,7 +92,9 @@ def test_the_repos_real_policy_declares_the_served_coder():
 
 def _fill(ledger, sid, outcomes, *, t0=1_000.0):
     for i, ok in enumerate(outcomes):
-        assert ledger.record(sid, ok, op_id=f"op-{i}", ts=t0 + i)
+        # One op per row: evidence is collapsed per op, and ids reused across
+        # calls would merge unrelated rows.
+        assert ledger.record(sid, ok, op_id=f"op-{t0 + i}", ts=t0 + i)
 
 
 def test_ledger_round_trips_per_model_oldest_first():
@@ -100,7 +102,7 @@ def test_ledger_round_trips_per_model_oldest_first():
     _fill(led, "m-a", [True, False, True]); _fill(led, "m-b", [False])
     rows = led.recent("m-a")
     assert [r.ok for r in rows] == [True, False, True]
-    assert rows[0].op_id == "op-0" and led.recent("m-b")[0].ok is False
+    assert rows[0].op_id == "op-1000.0" and led.recent("m-b")[0].ok is False
     assert led.recent("m-none") == () and led.recent("") == ()
 
 
@@ -294,3 +296,42 @@ async def test_resolver_corrects_the_slot_from_the_served_model(monkeypatch, tmp
         assert await GLS._resolve_served_capability(_Gls(), _Brain()) == ("qwen3-coder-ov:30b", smc.FULL_AND_DIFF)
         assert await GLS._resolve_served_capability(_Gls(), _Brain()) == ("qwen3-coder-ov:30b", smc.FULL_AND_DIFF)
     assert sum("resolved from the SERVED model" in r.getMessage() for r in caplog.records) == 1, "announced once"
+
+
+# --------------------------------------------------------------------------
+# evidence is per OP, not per attempt (2026-10-09 soak)
+# --------------------------------------------------------------------------
+
+def test_one_ops_retry_burst_does_not_demote_the_model(monkeypatch):
+    """Up to ~13 stateless layers retry a hunk that would not place, all
+    within seconds. Counted per attempt, one stubborn op's 8 failures
+    out-voted four ops that applied cleanly and demoted the model for all."""
+    monkeypatch.setenv("JARVIS_SERVED_CAPABILITY_MIN_SAMPLES", "3")
+    led = smc.ServedCapabilityLedger()
+    for i in range(8):
+        led.record("m", False, op_id="op-stubborn", ts=1_000.0 + i)
+    for i in range(4):
+        led.record("m", True, op_id=f"op-ok-{i}", ts=1_010.0 + i)
+    assert smc.observed_demotion("m", now_ts=1_020.0, ledger=led) is None
+
+
+def test_an_op_that_applied_on_retry_counts_as_one_success(monkeypatch):
+    monkeypatch.setenv("JARVIS_SERVED_CAPABILITY_MIN_SAMPLES", "2")
+    led = smc.ServedCapabilityLedger()
+    for ok in (False, False, True):                     # realigned, then placed
+        led.record("m", ok, op_id="op-a", ts=1_000.0)
+    led.record("m", False, op_id="op-b", ts=1_001.0)
+    # 1 of 2 OPS failed: at the 0.5 threshold, still evidence of failure...
+    assert smc.observed_demotion("m", now_ts=1_005.0, ledger=led)
+    led.record("m", True, op_id="op-c", ts=1_002.0)
+    # ...and 1 of 3 is not.
+    assert smc.observed_demotion("m", now_ts=1_005.0, ledger=led) is None
+
+
+def test_many_distinct_failing_ops_still_demote(monkeypatch):
+    monkeypatch.setenv("JARVIS_SERVED_CAPABILITY_MIN_SAMPLES", "3")
+    led = smc.ServedCapabilityLedger()
+    for i in range(4):
+        led.record("m", False, op_id=f"op-{i}", ts=1_000.0 + i)
+    led.record("m", True, op_id="op-ok", ts=1_005.0)
+    assert smc.observed_demotion("m", now_ts=1_010.0, ledger=led)

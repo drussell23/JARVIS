@@ -45,7 +45,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger("Ouroboros.ServedCapability")
 
@@ -279,6 +279,25 @@ class ServedCapabilityLedger:
         return tuple(out[-cap:])
 
 
+def _per_op(rows: Tuple["DiffOutcome", ...]) -> Tuple["DiffOutcome", ...]:
+    """One outcome per OP: whether any of its attempts applied, stamped at
+    its latest attempt. The ledger records every attempt, and an op that
+    fails to place a hunk is retried by up to ~13 stateless layers within
+    seconds: counted per attempt, one stubborn op's burst (8 failures in the
+    2026-10-09 soak) out-voted every other op and demoted the model for all
+    of them. Rows without an op id stay individual."""
+    by_op: Dict[str, "DiffOutcome"] = {}
+    loose: List["DiffOutcome"] = []
+    for r in rows:
+        if not r.op_id:
+            loose.append(r)
+            continue
+        prev = by_op.get(r.op_id)
+        by_op[r.op_id] = r if prev is None else DiffOutcome(
+            r.served_model, prev.ok or r.ok, max(prev.ts, r.ts), r.op_id)
+    return tuple(sorted(loose + list(by_op.values()), key=lambda d: d.ts))
+
+
 def observed_demotion(
     served_model: str, *, now_ts: Optional[float] = None, ledger: Optional[ServedCapabilityLedger] = None,
 ) -> Optional[str]:
@@ -286,7 +305,10 @@ def observed_demotion(
     enough to overrule its declaration (and the last failure is within the
     cooldown); ``None`` otherwise. NEVER raises."""
     try:
-        rows = (ledger or ServedCapabilityLedger()).recent(served_model)
+        # The bounded file tail, collapsed to ops, THEN the window: the window
+        # is a number of ops, not of attempts.
+        rows = _per_op((ledger or ServedCapabilityLedger()).recent(
+            served_model, limit=1_000_000))[-window():]
         if len(rows) < min_samples():
             return None
         failures = [r for r in rows if not r.ok]

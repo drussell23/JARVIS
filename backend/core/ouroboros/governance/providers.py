@@ -1115,12 +1115,22 @@ def _announce_schema_decision(ctx, *, force_full_content: bool, diff: bool) -> N
             return
         _SCHEMA_DECISION_SEEN.add(op)
         ri = getattr(getattr(ctx, "telemetry", None), "routing_intent", None)
+        # WHY full content was forced, so a soak can attribute it: the three
+        # inputs resolve_force_full_content and the override compose from.
+        why = "-"
+        if force_full_content:
+            if bool(getattr(ctx, "force_full_content_override", False)):
+                why = "retry_override"
+            elif str(getattr(ri, "schema_capability", "") or "") != "full_content_and_diff":
+                why = "capability"
+            else:
+                why = "creation"
         logger.warning(
             "[Schema] op=%s output=%s capability=%s served=%s brain=%s force_full=%s "
-            "targets=%d enabled=%s",
-            op[:16], "2b.1-diff" if diff else "full_content",
+            "why=%s targets=%d enabled=%s",
+            op, "2b.1-diff" if diff else "full_content",
             getattr(ri, "schema_capability", "?"), getattr(ri, "served_model", "") or "-",
-            getattr(ri, "brain_id", "") or "-", bool(force_full_content),
+            getattr(ri, "brain_id", "") or "-", bool(force_full_content), why,
             len(getattr(ctx, "target_files", ()) or ()), single_file_diff_schema_enabled(),
         )
     except Exception:  # noqa: BLE001

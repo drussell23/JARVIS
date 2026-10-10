@@ -179,6 +179,16 @@ def l2_stop_is_hard(stop_reason: str) -> bool:
     )
 
 
+def _diff_failure_degrades_to_full_content() -> bool:
+    """``JARVIS_DIFF_FAILURE_DEGRADES_TO_FULL_CONTENT`` (default false): the
+    Slice 235 rollback — a diff that failed to apply retries as a whole-file
+    rewrite. Off, the retry realigns the diff against the pinned current
+    source (2b.1-diff enforced for existing files). NEVER raises."""
+    return os.environ.get(
+        "JARVIS_DIFF_FAILURE_DEGRADES_TO_FULL_CONTENT", "false",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _goal_binding_kwargs(evidence_json: str) -> Dict[str, str]:
     """``roadmap_goal_id`` / ``roadmap_goal_digest`` kwargs for the
     auto-committer from an op's intake evidence; empty for non-roadmap ops
@@ -8471,7 +8481,9 @@ class GovernedOrchestrator:
                         or "StaleDiff" in _err_str
                         or "validate_diff" in _err_str
                     )
-                    if _diff_failed:
+                    _degrade = _diff_failed and _diff_failure_degrades_to_full_content()
+                    if _degrade:
+                        # Legacy rollback only (JARVIS_DIFF_FAILURE_DEGRADES_TO_FULL_CONTENT).
                         _retry_ctx_kwargs["force_full_content_override"] = True
                         _df_msg = (
                             "\n\n[SYSTEM] Your unified-diff patch failed to apply "
@@ -8479,15 +8491,44 @@ class GovernedOrchestrator:
                             "COMPLETE file content (full_content schema 2b.1), not "
                             "a diff."
                         )
+                    elif _diff_failed:
+                        # 2b.1-diff is ENFORCED for an existing file. Degrading
+                        # this retry to a whole-file rewrite contradicted the
+                        # provider's own realignment ("a whole-file rewrite is
+                        # not an acceptable repair") and won: 30 of the 10-09
+                        # soak's diff-capable ops were re-emitted whole after a
+                        # hunk missed, the null-churn / docstring-mangle class
+                        # the diff schema exists to prevent. The repair is the
+                        # exact current source where the hunk was aimed
+                        # (op_context_cache pins it; the retry opens with it).
+                        try:
+                            from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                                op_context_cache as _occ,
+                            )
+                            for _tf in (ctx.target_files or ())[:1]:
+                                _occ.pin_failed_hunk(ctx.op_id, str(_tf), _err_str)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        _df_msg = (
+                            "\n\n[SYSTEM] Your unified-diff patch failed to apply: "
+                            f"{_err_str[:300]}\n"
+                            "The current source around where your hunk was aimed "
+                            "opens your next attempt under 'Already gathered'. "
+                            "Copy context lines EXACTLY from it and emit a corrected "
+                            "unified_diff (schema 2b.1-diff). Do NOT switch to "
+                            "full_content."
+                        )
+                    if _diff_failed:
                         _df_existing = _retry_ctx_kwargs.get("strategic_memory_prompt", "") or ""
                         _retry_ctx_kwargs["strategic_memory_prompt"] = (
                             f"{_df_existing}{_df_msg}" if _df_existing else _df_msg.strip()
                         )
                         logger.warning(
-                            "[Orchestrator] Slice235 fail-safe: diff apply failed "
-                            "(%s) → degrading op=%s retry to full_content",
+                            "[Orchestrator] diff apply failed (%s) → op=%s retry %s",
                             _err_str[:80],
                             getattr(ctx, "op_id", "?"),
+                            "DEGRADED to full_content (legacy switch)" if _degrade
+                            else "realigns the diff against the pinned current source",
                         )
 
                     # Inject re-plan if available (appends to error feedback)
