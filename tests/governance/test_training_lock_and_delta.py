@@ -71,7 +71,7 @@ def test_the_toolbar_names_the_last_cycle(last: dict, label: str) -> None:
 
 def test_the_lock_block_names_the_holder_and_tails_its_log(tmp_path) -> None:
     log = tmp_path / "train.log"
-    log.write_text("step 1 loss 0.9\nstep 2 loss 0.8\r  50%|#####     |\r 60%|######    |\n")
+    log.write_text("step 1 loss 0.9\nstep 2 loss 0.8\n  50%|#####     |\r 60%|######    |\n")
     adm = la.LaneAdmission(False, "released", cycle={
         "holds_lane": True, "run_id": "handoff-20261010-1", "state": "TRAINING",
         "model": "qwen3-coder-ov:30b", "release_by": 7200.0, "log": str(log)})
