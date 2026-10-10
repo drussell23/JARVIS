@@ -66,6 +66,12 @@ def repo(tmp_path: Path) -> Path:
 def clean_env_and_singletons(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv(MASTER_FLAG_ENV_VAR, raising=False)
     monkeypatch.delenv(TIMEOUT_ENV_VAR, raising=False)
+    # These pin the review WINDOW (accept / reject / expire). Since 954262cf00
+    # a process no operator has attached to skips the window outright (it could
+    # only expire into a reject of work nobody looked at); the attention gate
+    # off is the documented wall-clock mode these tests describe. The skip is
+    # pinned by test_an_unattended_process_skips_the_review_window.
+    monkeypatch.setenv("JARVIS_REVIEW_ATTENTION_GATE_ENABLED", "false")
     reset_default_archive_for_tests()
     reset_default_coordinator_for_tests()
     yield
@@ -475,3 +481,25 @@ def test_orchestrator_notify_apply_block_contains_review_hook():
     assert "review_coordinator" in src
     assert "coordinate_review" in src
     assert "ReviewBranchManager" in src
+
+
+def test_an_unattended_process_skips_the_review_window(
+    monkeypatch, coordinator: ReviewCoordinator,
+):
+    """No operator has ever attached: a review window could only expire into a
+    reject of work nobody saw, so NOTIFY_APPLY proceeds with its notice."""
+    from backend.core.ouroboros.governance.attention_ledger import (
+        reset_attention_ledger_for_tests,
+    )
+    monkeypatch.setenv("JARVIS_REVIEW_ATTENTION_GATE_ENABLED", "true")
+    reset_attention_ledger_for_tests()
+    try:
+        result = asyncio.get_event_loop().run_until_complete(
+            coordinator.coordinate_review(
+                "op-unattended", [("foo.py", "x\n")], risk_tier="notify_apply",
+            )
+        )
+    finally:
+        reset_attention_ledger_for_tests()
+    assert result.decision is ReviewDecision.SKIPPED
+    assert "unattended" in (result.error or "")

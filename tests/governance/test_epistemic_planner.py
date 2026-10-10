@@ -246,5 +246,7 @@ async def test_plan_and_route_full_cycle_real_repo(frontier_repo, prd, monkeypat
     monkeypatch.setattr(cpb, "get_default_bridge", lambda: bridge)
     router = _CaptureRouter()
     n = await ep.plan_and_route_once(router, repo_root=str(frontier_repo))
-    assert n > 0
+    # The return is what was ENQUEUED as work (ffc3bb1c15), not what was
+    # synthesized: every step here scores low-EV, so all of them incubate.
+    assert n == 0
     assert bridge._incubating, "cycle must fill the backlog (incubation) autonomously"

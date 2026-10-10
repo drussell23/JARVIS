@@ -227,7 +227,8 @@ async def plan_and_route_once(router: Any, *, repo_root: "Optional[str]" = None)
     feed through the EXISTING ``ConceptionProposalBridge.route`` (EV-scored:
     high-EV steps route as auto_proposed envelopes, the rest incubate).
 
-    Returns the number of blueprints submitted. 0 when disabled / nothing to
+    Returns the number of steps ENQUEUED as work (incubated or parked steps
+    are not counted). 0 when disabled / nothing to
     plan. NEVER raises."""
     try:
         if not epistemic_planner_enabled():

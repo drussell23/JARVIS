@@ -161,6 +161,8 @@ def test_local_dispatch_checkpoints_on_interruption(tmp_path, monkeypatch):
 
     class _Stub:
         _repo_root = None
+        def _execution_root_or_none(self):   # the dispatch reads its tree (954262cf00)
+            return None
         def _remaining_seconds(self, dl):
             return 60.0
         async def _resolve_dispatch_model_name(self, ep):

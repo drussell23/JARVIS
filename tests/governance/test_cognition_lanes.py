@@ -147,7 +147,9 @@ def test_strict_consumers_are_tagged():
               "intent_discovery_sensor.py").read_text()
     dream = (root / "backend/core/ouroboros/consciousness/dream_engine.py").read_text()
     assert 'sla="strict"' in syn
-    assert 'sla="strict"' in intent
+    # IntentDiscovery joined the RT-gated group (954262cf00): its synthesis
+    # runs through rt_gate.gate_completion under the lane-idleness guard.
+    assert "gate_completion(" in intent and 'sla="strict"' not in intent
     assert 'sla="strict"' not in dream             # bulk stays bulk
 
 

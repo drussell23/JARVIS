@@ -630,8 +630,15 @@ class TestSubstrateRouting:
         calls = {"n": 0, "cpu_bound": None}
         real_offload = cooperative_fs_io.offload
 
+        # The cycle offloads run_incremental_cycle since 954262cf00 (only
+        # changed files re-parse; it calls the same analyzers). What is pinned
+        # is the PROCESS-POOL offload, whichever function carries the parse.
+        from backend.core.ouroboros.governance.intake.sensors.deep_analysis_sensor import (
+            run_incremental_cycle,
+        )
+
         async def _spy_offload(fn, *args, cpu_bound=False, **kwargs):
-            if fn is run_all_analyzers:
+            if fn is run_incremental_cycle:
                 calls["n"] += 1
                 calls["cpu_bound"] = cpu_bound
             return await real_offload(fn, *args, cpu_bound=cpu_bound, **kwargs)

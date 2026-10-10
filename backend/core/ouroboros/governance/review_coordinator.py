@@ -1212,10 +1212,14 @@ def register_shipped_invariants() -> list:
                 "in NOTIFY_APPLY block — review-branch hook may have been "
                 "removed by a refactor"
             )
-        if "coordinate_review" not in source:
+        # The NOTIFY_APPLY site calls the ONE seam both gate paths share
+        # (coordinate_notify_apply_review, which calls coordinate_review), or
+        # coordinate_review directly.
+        if "coordinate_notify_apply_review(" not in source and \
+                "coordinate_review(" not in source:
             violations.append(
-                "orchestrator.py does not invoke coordinator.coordinate_review "
-                "— IDE-native review flow is broken"
+                "orchestrator.py does not invoke coordinate_notify_apply_review "
+                "/ coordinator.coordinate_review — IDE-native review flow is broken"
             )
         return tuple(violations)
 

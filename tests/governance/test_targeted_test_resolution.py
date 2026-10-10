@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 from pathlib import Path
 
 import pytest
@@ -38,8 +39,18 @@ from backend.core.ouroboros.governance.test_runner import (
 )
 
 REPO = Path(__file__).resolve().parents[2]
-#: A source file this repo genuinely has no test for.
-UNCOVERED = REPO / "backend/api/audio_error_fallback.py"
+#: A source file this repo genuinely has no test for. It USED to be a path in
+#: this repo (backend/api/audio_error_fallback.py) until the organism wrote
+#: its test (0a1b918c45) -- an uncovered file in a repo O+V keeps covering
+#: cannot be a constant, so it is made fresh, under a name no test can know.
+UNCOVERED = REPO / "backend" / "api" / f"_uncovered_probe_{os.getpid()}.py"
+
+
+@pytest.fixture(autouse=True)
+def _uncovered_file():
+    UNCOVERED.write_text('"""a module nothing tests"""\n')
+    yield
+    UNCOVERED.unlink(missing_ok=True)
 #: A source file with a name-convention test.
 COVERED = REPO / "backend/core/ouroboros/governance/observability/recorder_lease.py"
 
