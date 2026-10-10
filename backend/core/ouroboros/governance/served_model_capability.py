@@ -346,10 +346,14 @@ class CapabilityVerdict:
 def effective_schema_capability(
     *, declared: str, served_model: Optional[str], policy: Mapping[str, Any],
     ledger: Optional[ServedCapabilityLedger] = None, now_ts: Optional[float] = None,
+    observed: bool = True,
 ) -> CapabilityVerdict:
     """Declared slot capability → served-model policy → observed demotion.
     Falls back to *declared* whenever the served model is unknown or the policy
-    declares nothing for it. NEVER raises."""
+    declares nothing for it. ``observed=False`` stops at the policy: the
+    demotion is a runtime fallback from the last hour's evidence, not a
+    property of a task, so a frozen benchmark must not inherit it. NEVER
+    raises."""
     base = _normalise_capability(declared) or FULL_ONLY
     sid = str(served_model or "").strip()
     try:
@@ -361,7 +365,7 @@ def effective_schema_capability(
         reason = "policy_match" if cap is not None else "no_policy_match"
         if cap is None:
             cap = base
-        if cap == FULL_AND_DIFF:
+        if cap == FULL_AND_DIFF and observed:
             demoted = observed_demotion(sid, now_ts=now_ts, ledger=ledger)
             if demoted:
                 return CapabilityVerdict(FULL_ONLY, demoted, sid, base)

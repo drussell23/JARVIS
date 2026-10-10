@@ -335,3 +335,19 @@ def test_many_distinct_failing_ops_still_demote(monkeypatch):
         led.record("m", False, op_id=f"op-{i}", ts=1_000.0 + i)
     led.record("m", True, op_id="op-ok", ts=1_005.0)
     assert smc.observed_demotion("m", now_ts=1_010.0, ledger=led)
+
+
+def test_a_frozen_benchmark_asks_the_policy_not_the_last_hour(monkeypatch):
+    """2026-10-10: a 10-minute soak's 7 failed ops demoted the model, and a
+    benchmark rebuilt in that window froze full_content on all 30 tasks the
+    previous build asked for diffs. observed=False stops at the policy."""
+    monkeypatch.setenv("JARVIS_SERVED_CAPABILITY_MIN_SAMPLES", "3")
+    led = smc.ServedCapabilityLedger()
+    for i in range(4):
+        led.record("qwen3-coder-ov:30b", False, op_id=f"op-{i}", ts=1_000.0 + i)
+    live = smc.effective_schema_capability(declared="full_content_only", served_model="qwen3-coder-ov:30b",
+                                           policy=POLICY, ledger=led, now_ts=1_010.0)
+    assert live.capability == smc.FULL_ONLY and live.reason.startswith("observed_demotion")
+    frozen = smc.effective_schema_capability(declared="full_content_only", served_model="qwen3-coder-ov:30b",
+                                             policy=POLICY, ledger=led, now_ts=1_010.0, observed=False)
+    assert frozen.capability == smc.FULL_AND_DIFF and frozen.reason == "policy_match"

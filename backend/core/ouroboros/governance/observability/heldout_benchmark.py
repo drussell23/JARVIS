@@ -264,13 +264,17 @@ def fingerprint(tasks: Sequence[Task]) -> str:
 
 
 def _contract_for(target: str, tree: Path, served_model: str) -> bool:
-    """force_full_content exactly as production would decide it for this
-    target and the served model: its effective capability (policy + observed
-    diff evidence), and creation-vs-edit."""
+    """force_full_content as production's POLICY decides it for this target
+    and the served model, and creation-vs-edit. Not the observed demotion:
+    measured 2026-10-10, a 10-minute soak's 7 failed ops demoted the model
+    for ~83 min and a rebuild in that window froze full_content on all 30
+    tasks the previous build had asked for diffs -- the same tasks asking a
+    different question, so no run on it was comparable."""
     from backend.core.ouroboros.governance import providers
     from backend.core.ouroboros.governance.brain_selector import BrainSelector
     from backend.core.ouroboros.governance.served_model_capability import FULL_ONLY
-    verdict = BrainSelector().effective_schema_capability(declared=FULL_ONLY, served_model=served_model)
+    verdict = BrainSelector().effective_schema_capability(declared=FULL_ONLY, served_model=served_model,
+                                                          observed=False)
     return providers.resolve_force_full_content(schema_capability=verdict.capability,
                                                 target_files=(target,), repo_root=tree)
 
