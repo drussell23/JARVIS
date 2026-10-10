@@ -404,6 +404,29 @@ def _humanise(code: object) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _weak_phase_observer(transport: "ClaudeStyleTransport") -> Callable[[str, str], None]:
+    """A phase observer that does not keep its transport alive. The observer
+    list is process-global; a transport that is gone unregisters itself on
+    the next transition instead of being pinned forever."""
+    import weakref
+    ref = weakref.ref(transport)
+
+    def _observe(op_id: str, phase_name: str) -> None:
+        t = ref()
+        if t is None:
+            try:
+                from backend.core.ouroboros.governance.op_context import (
+                    unregister_phase_transition_observer,
+                )
+                unregister_phase_transition_observer(_observe)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        t._pipeline_phase(op_id, phase_name)
+
+    return _observe
+
+
 def _live_tool_keys_max() -> int:
     """``JARVIS_CLAUDE_STYLE_LIVE_TOOLS_MAX``: tool starts held awaiting
     their completion (default 256). A start whose completion never comes
@@ -490,6 +513,22 @@ class ClaudeStyleTransport:
         from backend.core.ouroboros.ui.block_protocol import BlockClock
         self._block_clock = BlockClock()
         self._live_tools: "OrderedDict[tuple, List[Any]]" = OrderedDict()
+        # Every in-flight op as ONE live pipeline block (ui/pipeline_view):
+        # stages from the state machine's own transitions, the agents working
+        # in it, the gate's verdict. Freezes empty when the op ends; the
+        # closure line printed by DECISION/POSTMORTEM stays the record.
+        import threading as _threading
+        self._pipelines: Dict[str, List[Any]] = {}   # op_id -> [state, block]
+        self._pipelines_lock = _threading.Lock()
+        self._phase_observer = _weak_phase_observer(self)
+        try:
+            from backend.core.ouroboros.governance.op_context import (
+                register_phase_transition_observer,
+            )
+            register_phase_transition_observer(self._phase_observer)
+        except Exception:  # noqa: BLE001
+            logger.debug("[claude_style_transport] phase observer unavailable",
+                         exc_info=True)
         self._subscribe_narrative()
 
     # -- composer feed (CC2.1) --------------------------------------
@@ -609,6 +648,11 @@ class ClaudeStyleTransport:
             goal=str(payload.get("goal", "") or "").strip(),
         )
         self._op_state[op_id] = state
+
+        def _named(p: Any) -> bool:
+            p.sensor, p.summary = state.sensor, state.summary
+            return True
+        self._pipeline_update(op_id, _named)
         # CC2.1 — feed composer with current ACTIVE_OP + TASK_LIST
         self._feed_composer()
         # Render: `⏺ <Sensor> · <summary> [· risk] [path]`
@@ -753,6 +797,15 @@ class ClaudeStyleTransport:
     ) -> None:
         """DECISION — op outcome. Render the closing line."""
         outcome = str(payload.get("outcome", "") or "").lower()
+        if outcome in ("notify_apply", "escalated"):
+            # The gate spoke and the op continues: the verdict joins its block.
+            def _verdict(p: Any) -> bool:
+                p.verdict = _humanise(outcome)
+                return True
+            self._pipeline_update(op_id, _verdict)
+        elif outcome in ("completed", "applied", "auto_approved", "failed",
+                         "postmortem", "noop", "cancelled"):
+            self._pipeline_close(op_id)
         state = self._op_state.pop(op_id, None)
         if state is None:
             state = self._state_for_unannounced(op_id, payload)
@@ -860,6 +913,7 @@ class ClaudeStyleTransport:
         and is otherwise silent."""
         from backend.core.ouroboros.governance.comm_protocol import CommProtocol
         self._file_updates.close(op_id)
+        self._pipeline_close(op_id)
         if not CommProtocol.postmortem_is_failure(payload):
             state = self._op_state.pop(op_id, None)
             if state is None:
@@ -1184,6 +1238,74 @@ class ClaudeStyleTransport:
             logger.debug("[claude_style_transport] block publish degraded",
                          exc_info=True)
 
+    # -- the op's pipeline block (ui/pipeline_view) --------------------
+
+    def _pipeline_update(self, op_id: str, change: Callable[[Any], bool]) -> None:
+        """Apply ``change`` to the op's pipeline state and, when it reports a
+        visible change, publish the next revision. The block exists only
+        where a block renderer will draw it. NEVER raises."""
+        if not op_id or self.block_sink is None:
+            return
+        try:
+            from backend.core.ouroboros.ui import pipeline_view as _pv
+            from backend.core.ouroboros.ui.block_protocol import PIPELINE
+            with self._pipelines_lock:
+                held = self._pipelines.get(op_id)
+                if held is None:
+                    held = self._pipelines[op_id] = [_pv.PipelineState(op_id=op_id), None]
+                    known = self._op_state.get(op_id)
+                    if known is not None:
+                        held[0].sensor, held[0].summary = known.sensor, known.summary
+                if not change(held[0]) and held[1] is not None:
+                    return
+                state = held[0]
+                lines = _pv.expanded_lines(state, self._pipeline_agents(op_id))
+                meta = {"collapsed": _pv.collapsed_line(state),
+                        "phase": state.phase, "generating": bool(state.provider)}
+                held[1] = (self._block_clock.open(PIPELINE, op_id=op_id, lines=lines, meta=meta)
+                           if held[1] is None else
+                           self._block_clock.revise(held[1], lines=lines, meta=meta))
+                block = held[1]
+            self._publish_block(block)
+        except Exception:  # noqa: BLE001
+            logger.debug("[claude_style_transport] pipeline update degraded", exc_info=True)
+
+    def _pipeline_close(self, op_id: str) -> None:
+        """The op ended: its block leaves the live area, frozen EMPTY. The
+        closure line and recap already printed are the record; the block was
+        the view. NEVER raises."""
+        try:
+            from backend.core.ouroboros.ui.block_protocol import FINAL
+            with self._pipelines_lock:
+                held = self._pipelines.pop(op_id, None)
+            if held is not None and held[1] is not None:
+                self._publish_block(self._block_clock.revise(held[1], lines=(), state=FINAL))
+        except Exception:  # noqa: BLE001
+            logger.debug("[claude_style_transport] pipeline close degraded", exc_info=True)
+
+    def _pipeline_phase(self, op_id: str, phase_name: str) -> None:
+        """The state machine's transition (``op_context.advance``), the ONE
+        authoritative phase signal; heartbeat phase strings are free text."""
+        from backend.core.ouroboros.ui import pipeline_view as _pv
+        stage = _pv.stage_of(phase_name)
+        if stage not in {s.name for s in _pv.stages()}:
+            # A terminal phase. DECISION/POSTMORTEM close the block too; a
+            # transition is the backstop for an op that ends without one.
+            self._pipeline_close(op_id)
+            return
+        self._pipeline_update(op_id, lambda s: s.enter(phase_name))
+
+    @staticmethod
+    def _pipeline_agents(op_id: str) -> List[tuple]:
+        """The agents the roster has running under this op: (who, what)."""
+        try:
+            from backend.core.ouroboros.battle_test.agent_roster import get_agent_roster
+            return [(e.kind, e.detail or e.label())
+                    for e in get_agent_roster().entries()
+                    if e.op_id == op_id and e.running]
+        except Exception:  # noqa: BLE001
+            return []
+
     @staticmethod
     def _tool_key(op_id: str, tool_name: str, payload: Dict[str, Any]) -> tuple:
         return (op_id, tool_name, str(payload.get("tool_args_summary", "") or ""),
@@ -1200,6 +1322,12 @@ class ClaudeStyleTransport:
             from backend.core.ouroboros.ui.block_protocol import TOOL
             label = tool_call_label(tool_name, str(payload.get("tool_args_summary", "") or ""))
             get_inflight_tools().started(op_id, label)
+
+            def _tool(p: Any) -> bool:
+                p.tool = label
+                p.round_index = int(payload.get("round_index", 0) or 0) + 1
+                return True
+            self._pipeline_update(op_id, _tool)
             if self.block_sink is None:
                 return
             verb, _, rest = label.partition("(")
@@ -1226,6 +1354,11 @@ class ClaudeStyleTransport:
             from backend.core.ouroboros.ui.block_protocol import FINAL, TOOL
             get_inflight_tools().finished(op_id, tool_call_label(
                 tool_name, str(payload.get("tool_args_summary", "") or "")))
+
+            def _idle(p: Any) -> bool:
+                changed, p.tool = bool(p.tool), ""
+                return changed
+            self._pipeline_update(op_id, _idle)
             key = self._tool_key(op_id, tool_name, payload)
             waiting = self._live_tools.get(key) or []
             live = waiting.pop(0) if waiting else None
@@ -1357,6 +1490,11 @@ class ClaudeStyleTransport:
             self._cancel_flush(prior)
         state = _StreamState(op_id=op_id, provider=provider)
         self._streams[op_id] = state
+
+        def _holds(p: Any) -> bool:
+            p.provider = provider or "generating"
+            return True
+        self._pipeline_update(op_id, _holds)
         logger.info(
             "[claude_style_transport] stream begin op=%s provider=%s "
             "(carrying the token tail to cockpits)", op_id, provider,
@@ -1425,6 +1563,11 @@ class ClaudeStyleTransport:
         self._stream_flush(op_id, done=True)
         self._streams.pop(op_id, None)
 
+        def _released(p: Any) -> bool:
+            changed, p.provider = bool(p.provider), ""
+            return changed
+        self._pipeline_update(op_id, _released)
+
     @staticmethod
     def _cancel_flush(state: _StreamState) -> None:
         handle, state.flush_handle = state.flush_handle, None
@@ -1447,6 +1590,13 @@ class ClaudeStyleTransport:
                 get_default_channel,
             )
             get_default_channel().remove_commit_listener(self._on_narrative_commit)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from backend.core.ouroboros.governance.op_context import (
+                unregister_phase_transition_observer,
+            )
+            unregister_phase_transition_observer(self._phase_observer)
         except Exception:  # noqa: BLE001
             pass
         for task in tuple(self._narration_tasks):

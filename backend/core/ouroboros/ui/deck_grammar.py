@@ -114,7 +114,7 @@ def _escape(text: Any) -> str:
     not a Rich tag, and a deck that renders it as one loses the line.
 
     It is also not TERMINAL CONTROL. Tool arguments come from the model, and a
-    header rendered ``Bash(echo \\x1b[31mred …)`` with the raw escape intact:
+    header rendered ``Bash(echo <ESC>red …)`` with the raw SGR escape intact:
     any sequence a model emitted (cursor moves, clear-screen) reached the
     operator's terminal. Only the `$` line was sanitised. Every caller string
     in every deck line now passes the one sanitiser the live stream uses

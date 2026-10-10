@@ -398,6 +398,9 @@ _GLYPHS: Mapping[str, tuple] = {
     # (`⏺Search`). ● draws inside its cell everywhere. Coloured by the
     # `action` role (venom green) where it marks an outcome.
     "action": ("●", "*"),   # an actor did/does something
+    "pending": ("○", "o"),  # a pipeline stage not reached yet
+    "branch": ("├", "|"),   # an agent under its op, more follow
+    "branch_last": ("└", "`"),  # the last agent under its op
     "detail": ("⎿", "-"),   # continuation under an action
     "voice": ("💭", "K:"),  # the organism speaking
     "human": ("🗣", "you:"),  # the operator's words echoed

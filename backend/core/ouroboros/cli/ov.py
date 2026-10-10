@@ -5011,7 +5011,20 @@ def run_attach(console: Any) -> int:
             )
             canvas = get_active_canvas()
             if canvas is not None and hasattr(canvas, "set_live"):
-                canvas.set_live("blocks", [ln for b in blocks for ln in block_lines(b)])
+                # The density rules (ui/pipeline_view.arrange): one op
+                # expanded (the focused one, else the one holding the model,
+                # else the newest), the rest one line each, the whole area
+                # within its share of the terminal.
+                import shutil as _shutil
+                from backend.core.ouroboros.ui.pipeline_view import arrange
+                try:
+                    _rows: Optional[int] = _shutil.get_terminal_size().lines
+                except Exception:  # noqa: BLE001
+                    _rows = None
+                _fsm = getattr(ui, "fsm", None)
+                canvas.set_live("blocks", arrange(
+                    blocks, rows=_rows,
+                    focused_op=str(getattr(_fsm, "focused_lane", "") or "")))
 
         block_store = BlockStore(on_freeze=_freeze_block, on_live=_show_live)
 

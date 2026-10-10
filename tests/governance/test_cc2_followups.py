@@ -281,14 +281,19 @@ class TestFileRefUpdateBlock:
     def test_basic_file_ref_renders_update_block(self, fresh_registry):
         console = _RecordingConsole()
         t = cst.ClaudeStyleTransport(console=console)
+        # SUPERSEDED 2026-10-09 (battle_test/file_updates): a file named
+        # without its diff is held as pending, and its header renders when
+        # the op completes, once, never twice.
+        t._handle_intent("op-1", {"goal": "g"})
         event = SimpleNamespace(
             kind=SimpleNamespace(value="FILE_REF"),
-            metadata={"path": "backend/x.py", "line": 42},
+            metadata={"path": "backend/x.py", "line": 42, "op_id": "op-1"},
         )
         t.notify(event)
-        line = console.prints[0]
-        assert "Update" in line
-        assert "backend/x.py:42" in line
+        console.prints.clear()
+        t._handle_decision("op-1", {"outcome": "completed"})
+        line = next(p for p in console.prints if "Update" in p)
+        assert "backend/x.py" in line
 
     def test_diff_text_extracts_added_removed_count(
         self, fresh_registry,
@@ -303,11 +308,8 @@ class TestFileRefUpdateBlock:
             },
         )
         t.notify(event)
-        # Stats line should appear
-        assert any(
-            "Added 1 lines" in p and "removed 1 lines" in p
-            for p in console.prints
-        )
+        # Stats line, in Claude Code's words.
+        assert any("1 addition and 1 removal" in p for p in console.prints)
 
     def test_diff_preview_color_coded(self, fresh_registry):
         console = _RecordingConsole()
@@ -320,10 +322,14 @@ class TestFileRefUpdateBlock:
             },
         )
         t.notify(event)
-        # Added/removed lines wrapped in green/red Rich markup
-        joined = "\n".join(console.prints)
-        assert "[green]+added[/green]" in joined
-        assert "[red]-removed[/red]" in joined
+        # The SIGN's background band carries add/remove (deck_grammar.diff),
+        # so syntax colour stays legible on top of it.
+        from rich.text import Text
+        from backend.core.ouroboros.ui.semantic_tokens import _ROLE_BACKGROUNDS
+        add = [p for p in console.prints if "+ added" in Text.from_markup(p).plain]
+        rem = [p for p in console.prints if "- removed" in Text.from_markup(p).plain]
+        assert add and _ROLE_BACKGROUNDS["code_add_bg"] in add[0]
+        assert rem and _ROLE_BACKGROUNDS["code_del_bg"] in rem[0]
 
     def test_no_path_skipped(self, fresh_registry):
         console = _RecordingConsole()

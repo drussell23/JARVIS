@@ -220,6 +220,10 @@ def test_production_transport_emits_a_tool_as_one_live_then_final_block():
             "duration_ms": 4.0}
     tr._handle_heartbeat("op-1", start)
     tr._handle_heartbeat("op-1", done)
+    # The op's own pipeline block (ui/pipeline_view) revises alongside; the
+    # TOOL is still exactly one block, live then final.
+    from backend.core.ouroboros.ui.block_protocol import TOOL
+    blocks = [b for b in blocks if b.kind == TOOL]
     assert len(blocks) == 2 and blocks[0].id == blocks[1].id
     assert not blocks[0].final and blocks[1].final
     assert any("Read 3 lines" in ln for ln in blocks[1].lines)

@@ -61,33 +61,32 @@ def as_text(line: Any) -> Any:
         return Text(raw)
 
 
-class DeckLine:
-    """One laid-out deck line that still knows the line it came from.
+class DeckLine(str):
+    """One laid-out deck line that IS the line it came from.
 
-    It renders as the column-keeping layout. ``str()`` is the SOURCE line
-    (its markup), not a repr: a log, a relay or a test that stringifies what
-    it was handed sees ``● Read(x)`` rather than ``<rich.table.Table object
-    at 0x…>``. The layout and the line are one value, so they cannot drift.
+    A ``str`` whose value is the SOURCE line (its markup), carrying the
+    column-keeping layout beside it. Rich calls ``__rich__`` before it checks
+    for a string (``Console._collect_renderables``: ``rich_cast`` first), so a
+    console renders the layout; every other consumer (a log, a relay, a
+    captured test console doing ``"x" in line``) has the string it always
+    had. A wrapper that was NOT a str broke every one of those consumers.
+    The layout and the line are one value, so they cannot drift.
     """
 
-    __slots__ = ("source", "_renderable")
+    def __new__(cls, source: str, renderable: Any) -> "DeckLine":
+        obj = super().__new__(cls, source)
+        obj._renderable = renderable
+        return obj
 
-    def __init__(self, source: str, renderable: Any) -> None:
-        self.source = source
-        self._renderable = renderable
+    @property
+    def source(self) -> str:
+        return str.__str__(self)
 
-    def __rich_console__(self, console: Any, options: Any) -> Any:
-        yield self._renderable
-
-    def __rich_measure__(self, console: Any, options: Any) -> Any:
-        from rich.measure import Measurement
-        return Measurement.get(console, options, self._renderable)
-
-    def __str__(self) -> str:
-        return self.source
+    def __rich__(self) -> Any:
+        return self._renderable
 
     def __repr__(self) -> str:  # pragma: no cover — diagnostics only
-        return f"DeckLine({self.source!r})"
+        return f"DeckLine({str.__repr__(self)})"
 
 
 def _source_of(line: Any) -> str:

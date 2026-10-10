@@ -390,8 +390,11 @@ class TestPostmortem:
             "goal": "x", "outcome_source": "Operation",
         }))
         console.prints.clear()
+        # A failure names its phase (CommProtocol.postmortem_is_failure);
+        # emit_postmortem always sends failed_phase.
         await t.send(_msg("POSTMORTEM", "op-1", {
             "root_cause": "VERIFY phase exhausted retries",
+            "failed_phase": "VERIFY",
         }))
         line = console.prints[0]
         assert cst.OpStatusGlyph.FAILED.glyph in line

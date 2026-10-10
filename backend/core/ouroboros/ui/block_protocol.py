@@ -47,7 +47,8 @@ TOOL = "tool"
 DIFF = "diff"
 CLOSURE = "closure"
 LINE = "line"
-KINDS = frozenset({TOOL, DIFF, CLOSURE, LINE})
+PIPELINE = "pipeline"   # an in-flight op: stages, agents, verdicts (ui/pipeline_view)
+KINDS = frozenset({TOOL, DIFF, CLOSURE, LINE, PIPELINE})
 
 
 def frame_limit_bytes() -> int:
@@ -188,5 +189,5 @@ class BlockClock:
 
 __all__ = [
     "BLOCK_PROTOCOL_VERSION", "Block", "BlockClock", "CLOSURE", "DIFF", "FINAL",
-    "KINDS", "LINE", "LIVE", "TOOL", "encode_frame", "fit", "frame_limit_bytes",
+    "KINDS", "LINE", "LIVE", "PIPELINE", "TOOL", "encode_frame", "fit", "frame_limit_bytes",
 ]
