@@ -326,6 +326,9 @@ def record_lesson_sync(record: Any) -> str:
     """Persist through the arc's flock'd dedup/weight merge, then refresh the
     human-readable index. Returns the arc's outcome value. NEVER raises."""
     try:
+        from backend.core.ouroboros.governance.evaluation_scope import suppressed
+        if suppressed("LessonMemory"):
+            return "suppressed_evaluation"
         from backend.core.ouroboros.governance import failure_mode_memory as fmm
         outcome = fmm.record_failure_mode(record)
         try:

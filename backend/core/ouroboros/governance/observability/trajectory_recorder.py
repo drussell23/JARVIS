@@ -2000,6 +2000,9 @@ def reset_recorder_for_tests(
 def record_generation(**kwargs: Any) -> bool:
     """Fire-and-forget generation emit. NEVER raises."""
     try:
+        from backend.core.ouroboros.governance.evaluation_scope import suppressed
+        if suppressed("TrajectoryRecorder"):   # a measured answer is not training data
+            return False
         return get_recorder().record_generation(**kwargs)
     except Exception:  # noqa: BLE001
         logger.debug(

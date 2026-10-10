@@ -677,11 +677,15 @@ async def evaluation_scope(model: str, *, ttl_s: float):
     drifts between a cold and a warm cache). The scope is bounded by
     ``ttl_s`` at J-Prime too, so an abandoned one closes itself. Yields the
     client; always closes both."""
+    from backend.core.ouroboros.governance.evaluation_scope import measuring
     from backend.core.ouroboros.governance.local_inference_director import LocalConfig, LocalPrimeClient
     client = LocalPrimeClient(LocalConfig.from_env())
     await _http("POST", f"/v1/models/{model}/evaluation", body={"on": True, "ttl_s": ttl_s}, timeout=30)
     try:
-        yield client
+        # A measurement through O+V's own parser must not teach O+V: no
+        # lesson, capability evidence or trajectory row comes out of it.
+        with measuring(f"evaluation:{model}"):
+            yield client
     finally:
         with contextlib.suppress(Exception):
             if hasattr(client, "aclose"):

@@ -240,6 +240,9 @@ class ServedCapabilityLedger:
         sid = str(served_model or "").strip()
         if not sid:
             return False
+        from backend.core.ouroboros.governance.evaluation_scope import suppressed
+        if suppressed("ServedCapability"):    # a measurement is not production evidence
+            return False
         row = {"served_model": sid, "ok": bool(ok), "ts": float(ts if ts is not None else time.time()), "op_id": str(op_id or "")[:64]}
         try:
             from backend.core.ouroboros.governance.cross_process_jsonl import flock_append_line
