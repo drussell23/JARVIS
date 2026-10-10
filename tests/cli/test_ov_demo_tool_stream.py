@@ -94,8 +94,7 @@ class TestItDrivesTheRealRenderer:
         from backend.core.ouroboros.battle_test.tool_render_registry import is_elision_line
         from rich.text import Text as _T
         assert any(is_elision_line(_T.from_markup(ln).plain.strip())
-                   for ln in text.split("
-")), "no truncation was disclosed at all"
+                   for ln in text.splitlines()), "no truncation was disclosed at all"
         assert "/expand t-" in text, (
             "rows were withheld with no way back — a `None` store still "
             "renders but issues no ref, which is the affordance being shown"
