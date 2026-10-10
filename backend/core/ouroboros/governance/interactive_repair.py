@@ -724,13 +724,13 @@ class InteractiveRepairLoop:
         file_path: str, content: str, error: ExtractedError, *, api_contract: str = "",
     ) -> str:
         """Build focused micro-prompt for one error."""
+        from backend.core.ouroboros.governance import source_lines
         lines = content.split("\n")
         first, end = InteractiveRepairLoop._window(content, error)
         start = first - 1
         ctx = "\n".join(
-            f"{'>>>' if i + start + 1 == error.line_number else '   '} "
-            f"{i + start + 1:4d} | {line}"
-            for i, line in enumerate(lines[start:end])
+            f"{'>>>' if i + start + 1 == error.line_number else '   '} {numbered}"
+            for i, numbered in enumerate(source_lines.number_lines(lines[start:end], first))
         )
         return (
             f"MICRO-FIX REQUEST\n=================\n\n"
@@ -799,7 +799,10 @@ class InteractiveRepairLoop:
         last line's newline (every patch the payload adapter derives does) is
         not read as one extra empty line -- ``split("\\n")`` inserted a blank
         line into every translated fix -- and so an empty replacement deletes
-        the range instead of leaving a blank line where it was."""
+        the range instead of leaving a blank line where it was. Line numbers
+        copied from the numbered window are not code (``source_lines``)."""
+        from backend.core.ouroboros.governance import source_lines
         lines = content.split("\n")
-        lines[fix.line_range[0] - 1:fix.line_range[1]] = fix.replacement.splitlines()
+        lines[fix.line_range[0] - 1:fix.line_range[1]] = source_lines.strip_echoed(
+            fix.replacement.splitlines(), min_share=source_lines.hunk_share())[0]
         return "\n".join(lines)
