@@ -359,7 +359,8 @@ def occupancy() -> Optional[Dict[str, Any]]:
         out: Dict[str, Any] = {"run_id": st.get("run_id"), "state": state,
                                "trigger": st.get("trigger"), "model": st.get("model"),
                                "holds_lane": state in _HOLDING or state == _EXCLUSIVE,
-                               "since": None, "release_by": None}
+                               "since": None, "release_by": None, "log": _live_log(st),
+                               "purpose": ((st.get("detail") or {}).get("exclusive") or {}).get("purpose")}
         if out["holds_lane"]:
             since = _state_entered_at(str(st.get("run_id")), state)
             out["since"] = since
@@ -370,6 +371,18 @@ def occupancy() -> Optional[Dict[str, Any]]:
     except Exception:  # noqa: BLE001
         logger.debug("[TrainingHandoff] occupancy unreadable", exc_info=True)
         return None
+
+
+def _live_log(st: Dict[str, Any]) -> Optional[str]:
+    """The file a live cycle is writing to: the trainer's ``train.log`` in
+    its run directory, or an exclusive job's own ``log``. None: no log."""
+    excl = ((st.get("detail") or {}).get("exclusive") or {}).get("log")
+    if excl:
+        return str(excl)
+    if st.get("run_dir"):
+        p = Path(str(st["run_dir"])) / "train.log"
+        return str(p) if p.exists() else None
+    return None
 
 
 def _organism_live() -> Optional[int]:
@@ -571,18 +584,41 @@ def _training_contracts() -> Dict[str, str]:
     hydrates the production envelope over ``.env`` (which is where the diff
     schema is armed), and this process is not an organism. The envelope is
     applied to a COPY of the environment, with the launcher's own
-    operator-wins semantics, and the predicate asked about that copy."""
+    operator-wins semantics, and the predicate asked about that copy.
+
+    Also the APPLIER: the reward grades a diff by placing it with O+V's own
+    ``diff_apply`` (loaded by path in Reactor's venv), so what training
+    rewards as "lands" is exactly what APPLY will accept."""
+    out = _diff_applier_contract()
     explicit = os.environ.get(_ENV_OUTPUT_SCHEMAS, "").strip()
     if explicit:
-        return {_ENV_OUTPUT_SCHEMAS: explicit}
+        return {**out, _ENV_OUTPUT_SCHEMAS: explicit}
     try:
         from backend.core.ouroboros.governance.production_envelope import hydrate
         from backend.core.ouroboros.governance.providers import single_file_output_schemas
         organism_env = dict(os.environ)
         hydrate(environ=organism_env)
-        return {_ENV_OUTPUT_SCHEMAS: ",".join(single_file_output_schemas(organism_env))}
+        return {**out, _ENV_OUTPUT_SCHEMAS: ",".join(single_file_output_schemas(organism_env))}
     except Exception:  # noqa: BLE001
         logger.warning("[TrainingHandoff] output-contract policy unreadable", exc_info=True)
+        return out
+
+
+_ENV_DIFF_APPLIER = "REACTOR_GRPO_DIFF_APPLIER"
+
+
+def _diff_applier_contract() -> Dict[str, str]:
+    """``{REACTOR_GRPO_DIFF_APPLIER: <this checkout's diff_apply.py>}``; an
+    explicit operator value wins."""
+    explicit = os.environ.get(_ENV_DIFF_APPLIER, "").strip()
+    if explicit:
+        return {_ENV_DIFF_APPLIER: explicit}
+    try:
+        from backend.core.ouroboros.governance import diff_apply
+        return {_ENV_DIFF_APPLIER: str(Path(diff_apply.__file__).resolve())}
+    except Exception:  # noqa: BLE001
+        logger.warning("[TrainingHandoff] diff applier unresolvable: the reward cannot grade diffs",
+                       exc_info=True)
         return {}
 
 
@@ -1081,12 +1117,14 @@ async def _publish_and_verify(cycle: Cycle, gguf: Path, source: Dict[str, Any],
     notes: List[str] = []
     if restored.get("failed"):
         reason = f"failed to load: {restored['failed']}"
+        verdict = _verdict(len(rows), baseline, None)
     else:
         accepted, notes = await _smoke(cycle.model, rows)
+        verdict = _verdict(len(rows), baseline, accepted)
         if accepted >= need:
             return await _finish(cycle, "COMMITTED", f"{cycle.model} now serves {cycle.adapter_version} "
                                  f"({accepted}/{len(rows)} vs incumbent {baseline}/{len(rows)})",
-                                 smoke=notes, **detail)
+                                 smoke=notes, verdict=verdict, **detail)
         reason = (f"verification {accepted}/{len(rows)} below the incumbent's {baseline}/{len(rows)} "
                   f"(need {need}): {'; '.join(n for n in notes if ':FAIL:' in n)[:240]}")
 
@@ -1099,7 +1137,55 @@ async def _publish_and_verify(cycle: Cycle, gguf: Path, source: Dict[str, Any],
                          f"again, {back}/{len(rows)} vs baseline {baseline}/{len(rows)} -- "
                          f"{'verified' if verified else 'UNVERIFIED -- investigate'}",
                          smoke_new=notes or [reason], smoke_rollback=notes_back, rejected=rej,
-                         rollback_verified=verified, **detail)
+                         rollback_verified=verified, verdict=verdict, **detail)
+
+
+def _verdict(tasks: int, incumbent: int, candidate: Optional[int]) -> Dict[str, Any]:
+    """A cycle's verification as numbers (``candidate`` None: never loaded)."""
+    return {"tasks": int(tasks), "incumbent": int(incumbent),
+            "candidate": None if candidate is None else int(candidate)}
+
+
+def _ok_count(notes: Any) -> Optional[int]:
+    return sum(1 for n in notes if ":ok:" in str(n)) if isinstance(notes, list) else None
+
+
+def last_cycle_delta(*, tail_bytes: int = 1 << 20) -> Optional[Dict[str, Any]]:
+    """The newest finished training cycle's verdict, for every surface that
+    shows what the last cycle did: ``{run_id, state, version, tasks,
+    incumbent, candidate, ts}``. ``state`` is COMMITTED or ROLLED_BACK; an
+    exclusive GPU job is not a training cycle. Rows written before the
+    verdict was recorded as numbers are read from their own BASELINE row and
+    smoke notes. None when no cycle has finished. NEVER raises."""
+    try:
+        path = state_dir() / "history.jsonl"
+        with path.open("rb") as fh:
+            fh.seek(max(0, path.stat().st_size - max(4096, int(tail_bytes))))
+            rows = []
+            for raw in fh.read().decode("utf-8", "replace").splitlines():
+                try:
+                    rows.append(json.loads(raw))
+                except ValueError:
+                    continue                       # the first line may be cut by the seek
+        last = next((r for r in reversed(rows)
+                     if r.get("state") in ("COMMITTED", "ROLLED_BACK")
+                     and str(r.get("run_id") or "").startswith("handoff-")), None)
+        if last is None:
+            return None
+        v = dict(last.get("verdict") or {})
+        if not v:
+            notes = last.get("smoke") if last["state"] == "COMMITTED" else last.get("smoke_new")
+            base = next((r for r in rows if r.get("run_id") == last["run_id"]
+                         and r.get("state") == "BASELINE"), {})
+            v = {"tasks": base.get("tasks") or (len(notes) if isinstance(notes, list) else None),
+                 "incumbent": base.get("accepted"), "candidate": _ok_count(notes)}
+        version = next((r.get("version") for r in reversed(rows) if r.get("run_id") == last["run_id"]
+                        and r.get("state") == "RESTORING"), "") or ""
+        return {"run_id": last["run_id"], "state": last["state"], "version": version,
+                "ts": last.get("ts"), **v}
+    except Exception:  # noqa: BLE001
+        logger.debug("[TrainingHandoff] last cycle unreadable", exc_info=True)
+        return None
 
 
 def _train_summary(report: Dict[str, Any]) -> Dict[str, Any]:

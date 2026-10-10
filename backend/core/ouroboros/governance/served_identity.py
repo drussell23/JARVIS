@@ -233,9 +233,45 @@ def resolve(*, base: str, model: str, vision_base: str = "", vision_model: str =
                 out["adapter"] = {"version": "", "error": f"{type(exc).__name__}: {exc}"[:200]}
         if vision_model:
             out["vision"] = {"model": vision_model, "engine": asdict(engine_identity(vision_base))}
+        last = _last_cycle()
+        if last:
+            out["last_cycle"] = last
     except Exception as exc:  # noqa: BLE001
         logger.debug("[ServedIdentity] resolve degraded: %s", exc, exc_info=True)
     return out
+
+
+def _last_cycle() -> Optional[Dict[str, Any]]:
+    """What the newest training cycle did (training_handoff's ledger). NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.observability.training_handoff import last_cycle_delta
+        return last_cycle_delta()
+    except Exception:  # noqa: BLE001 -- no ledger: nothing to show
+        return None
+
+
+def _cycle_short(last: Dict[str, Any]) -> str:
+    """``last cycle +1 (4/6)`` / ``last cycle rolled back (2/6 < 3/6)``."""
+    if not last:
+        return ""
+    tasks, inc, cand = last.get("tasks"), last.get("incumbent"), last.get("candidate")
+    if last.get("state") == "COMMITTED" and isinstance(cand, int) and isinstance(inc, int):
+        return f"last cycle {cand - inc:+d} ({cand}/{tasks})"
+    if last.get("state") == "ROLLED_BACK":
+        if cand is None:
+            return "last cycle rolled back (did not load)"
+        return f"last cycle rolled back ({cand}/{tasks} < {inc}/{tasks})"
+    return ""
+
+
+def _cycle_text(last: Dict[str, Any]) -> str:
+    if not last or not _cycle_short(last):
+        return ""
+    verb = "committed" if last.get("state") == "COMMITTED" else "rolled back"
+    cand = last.get("candidate")
+    score = (f"{cand}/{last.get('tasks')} vs incumbent {last.get('incumbent')}/{last.get('tasks')}"
+             if cand is not None else "candidate did not load")
+    return f"last training cycle {last.get('run_id')} {verb} ({score}, {_day(last.get('ts'))})"
 
 
 def set_current(identity: Dict[str, Any]) -> None:
@@ -337,11 +373,15 @@ def describe_line(identity: Dict[str, Any]) -> str:
     vision = identity.get("vision") or {}
     if vision.get("model"):
         parts.append(f"vision {vision['model']} via {_engine_text(vision.get('engine') or {})}")
+    cycle = _cycle_text(identity.get("last_cycle") or {})
+    if cycle:
+        parts.append(cycle)
     return " · ".join(parts)
 
 
 def short_label(identity: Dict[str, Any]) -> str:
-    """The compact suffix for the always-visible toolbar: ``J-Prime · tune #1 · Oct 7``.
+    """The compact suffix for the always-visible toolbar:
+    ``J-Prime · tune #1 · Oct 7 · last cycle +1 (4/6)``.
 
     It used to join engine and the raw registry version with a slash
     (``J-Prime/20261007-143931-238e06c10f8f``): a timestamp and a hash the
@@ -354,7 +394,8 @@ def short_label(identity: Dict[str, Any]) -> str:
             return ""
         engine = (identity.get("engine") or {}).get("name") or ""
         adapter = _adapter_short(identity.get("adapter") or {})
-        return " · ".join(p for p in (engine, adapter) if p)
+        cycle = _cycle_short(identity.get("last_cycle") or {})
+        return " · ".join(p for p in (engine, adapter, cycle) if p)
     except Exception:  # noqa: BLE001
         return ""
 

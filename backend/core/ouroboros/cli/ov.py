@@ -5421,6 +5421,9 @@ def _run_cockpit_thin_inner(console: Any, alt_screen_active: bool) -> int:
                     _ok["v"] = await ensure_daemon(
                         on_status=_status,
                         on_progress=_animator.set_progress,
+                        # The lock block: GPU leased away -> a static screen
+                        # tailing the holder's log until the card returns.
+                        on_lock=_animator.set_lock,
                     )
                 finally:
                     _stop.set()

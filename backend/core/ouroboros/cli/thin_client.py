@@ -170,6 +170,56 @@ def _lane_lent_lines() -> "list[str]":
     return [head + " -- the full alert is in " + str(daemon_log_path())]
 
 
+def _lock_env(name: str, default: float, lo: float, hi: float) -> float:
+    try:
+        return max(lo, min(hi, float(os.environ.get(name, "") or default)))
+    except ValueError:
+        return default
+
+
+async def _hold_while_lent(
+    on_lock: Callable[[Optional[str], Optional[list]], None], say: Callable[[str], None],
+) -> bool:
+    """While the local model is leased away (a training cycle, an exclusive
+    GPU job), hold the screen on the LOCK BLOCK -- who has the card, when it
+    is due back, and the tail of the log the holder is writing -- re-read
+    every ``JARVIS_OV_LOCK_POLL_S``. Returns True as soon as the lane serves
+    again (or cannot be asked: reachability is the boot gate's question),
+    so the caller ignites; the holder's own phase budgets bound the wait,
+    and Ctrl-C leaves it. NEVER raises (except cancellation)."""
+    try:
+        from backend.core.ouroboros.governance.lane_admission import (
+            lock_lines, lock_title, read_admission,
+        )
+        from backend.core.ouroboros.governance.local_inference_director import LocalConfig
+        base = LocalConfig.from_env().base_url
+    except Exception:  # noqa: BLE001 -- unreadable: the daemon's gate decides
+        return True
+    poll = _lock_env("JARVIS_OV_LOCK_POLL_S", 2.0, 0.25, 60.0)
+    tail = int(_lock_env("JARVIS_OV_LOCK_TAIL_LINES", 8.0, 0.0, 200.0))
+    held = False
+    try:
+        while True:
+            adm = await asyncio.to_thread(read_admission, base)
+            if adm.admitting is not False:
+                if held:
+                    say(f"{_mark()} the local model is back — igniting")
+                return True
+            held = True
+            on_lock(lock_title(adm), await asyncio.to_thread(lock_lines, adm, tail=tail))
+            await asyncio.sleep(poll)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        return True
+    finally:
+        if held:
+            try:
+                on_lock(None, None)
+            except Exception:  # noqa: BLE001
+                pass
+
+
 #: How many stall windows a boot may take in TOTAL. The stall window says
 #: how long silence is tolerated; this says how long the whole thing may
 #: run even while it keeps talking. 4x.
@@ -1028,11 +1078,17 @@ async def ensure_daemon(
     on_status: Optional[Callable[[str], None]] = None,
     spawner: Callable[..., Any] = subprocess.Popen,
     on_progress: Optional[Callable[[str], None]] = None,
+    on_lock: Optional[Callable[[Optional[str], Optional[list]], None]] = None,
 ) -> bool:
     """The full zero-trust route: probe → (clean ghost) → (cold boot)
     → wait-for-live. True when a live daemon is reachable. NEVER
     raises; NEVER hangs past the boot deadline; NEVER shows a
-    traceback."""
+    traceback.
+
+    *on_lock*: a screen owner that can show the lock block. With one, a
+    cold boot while the local model is leased away holds on that block
+    until the card returns, then ignites; without one (headless), the
+    daemon's own gate refuses with exit 69 as before."""
     def _say(msg: str) -> None:
         if on_status is not None:
             try:
@@ -1108,6 +1164,8 @@ async def ensure_daemon(
                 return False
             _say("⎿ ghost socket from a dead organism — cleaning")
             clean_stale_socket(path)
+        if on_lock is not None and not await _hold_while_lent(on_lock, _say):
+            return False
         _say(f"{_mark()} no organism awake — igniting one in the background")
         proc = spawn_daemon(spawner=spawner)
         if proc is None:
@@ -1148,7 +1206,12 @@ async def ensure_daemon(
             # is lent to a training cycle. Retrying within the boot window
             # is pointless (the daemon already waited when the lane was due
             # back soon), so say who holds it and until when -- read fresh
-            # from the same reader the daemon's gate used.
+            # from the same reader the daemon's gate used. A screen owner
+            # holds on the lock block instead (the card was taken between
+            # this client's check and the daemon's gate) and boots after.
+            if on_lock is not None:
+                return await ensure_daemon(on_status=on_status, spawner=spawner,
+                                           on_progress=on_progress, on_lock=on_lock)
             for line in _lane_lent_lines():
                 _say(line)
             return False
