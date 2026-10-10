@@ -1,6 +1,9 @@
+# [Ouroboros] Modified by Ouroboros (op=op-01a1215b-) at 2026-10-09 15:56 UTC
+# Reason: Memory topic 'Project Ov Vs Claude Code Positioning' declares modules that no longer exist. Update its `modules:` frontm
+
 ---
 title: Project Ov Vs Claude Code Positioning
-modules: [orchestrator.py]
+modules: [backend/core/ouroboros/governance/orchestrator.py]
 status: historical
 source: project_ov_vs_claude_code_positioning.md
 ---

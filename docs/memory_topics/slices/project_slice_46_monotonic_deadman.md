@@ -1,6 +1,9 @@
+# [Ouroboros] Modified by Ouroboros (op=op-01a1215b-) at 2026-10-09 15:57 UTC
+# Reason: Memory topic 'Project Slice 46 Monotonic Deadman' declares modules that no longer exist. Update its `modules:` frontmatt
+
 ---
 title: Project Slice 46 Monotonic Deadman
-modules: [tests/.../test_todo_scanner_trigger_tag.py]
+modules: [tests/test_ouroboros_governance/test_todo_scanner_trigger_tag.py]
 status: historical
 source: project_slice_46_monotonic_deadman.md
 ---
