@@ -1530,7 +1530,9 @@ class AttachUI:
             before = {r["lane"] for r in self._op_rows}
             self._op_rows = [
                 {"lane": b.op_id, "kind": "op",
-                 "label": Text.from_markup(str(b.meta.get("collapsed") or "")).plain}
+                 "label": Text.from_markup(str(b.meta.get("collapsed") or "")).plain,
+                 "generating": bool(b.meta.get("generating")),
+                 "sensor": str(b.meta.get("sensor") or "")}
                 for b in blocks if getattr(b, "kind", "") == "pipeline" and b.op_id]
             # The focused op ended: its block froze into the transcript. Same
             # path as an expired lane — the daemon pressing Esc, named.
@@ -2374,6 +2376,26 @@ class AttachUI:
         except Exception:  # noqa: BLE001
             pass
 
+    def _work_summary(self, sep: str) -> str:
+        """`` · 2 ops · 3 agents · GPU: TestFailure`` — how much is in flight
+        and who holds the model, from what this cockpit already holds: the
+        live pipeline blocks and the daemon's agent snapshot. Empty at rest.
+        NEVER raises."""
+        try:
+            ops = len(self._op_rows)
+            agents = int((self._agents or {}).get("running") or 0)
+            if not ops and not agents:
+                return ""
+            out = f" {sep} {ops} op{'' if ops == 1 else 's'}"
+            if agents:
+                out += f" {sep} {agents} agent{'' if agents == 1 else 's'}"
+            holder = next((r for r in self._op_rows if r.get("generating")), None)
+            if holder is not None:
+                out += f" {sep} GPU: {holder.get('sensor') or holder.get('lane')}"
+            return out
+        except Exception:  # noqa: BLE001
+            return ""
+
     def _key_hints(self) -> str:
         """The affordance list — what the line you are typing on can do."""
         # ONE separator for the whole line, and the same one the strip below
@@ -2392,10 +2414,12 @@ class AttachUI:
             )
             keys = ""
             if selection_enabled() and self.fsm is not None:
-                keys = (f" {sep} ^X ^L lanes" if self.fsm.mode == MODE_FLOW
+                target = "ops" if self._op_rows else "lanes"
+                keys = (f" {sep} ^X ^L {target}" if self.fsm.mode == MODE_FLOW
                         else f" {sep} esc back")
         except Exception:  # noqa: BLE001
             keys = ""
+        keys = self._work_summary(sep) + keys
         # A pending approval outranks every other hint here: it is the only
         # one that says the organism is BLOCKED waiting on this operator.
         # Placed first so it survives a narrow terminal truncating the tail.

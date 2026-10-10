@@ -305,7 +305,9 @@ class TestCtrlOCollision:
 
         src = inspect.getsource(ov)
         assert "^O lanes" not in src
-        assert "^X ^L lanes" in src
+        # The chord, then what it selects: ops while any are live, else lanes
+        # (tests/cli/test_op_selection pins the rendered words).
+        assert 'f" {sep} ^X ^L {target}"' in src
 
 
 class TestQuestionMarkOwnership:

@@ -1261,7 +1261,8 @@ class ClaudeStyleTransport:
                 state = held[0]
                 lines = _pv.expanded_lines(state, self._pipeline_agents(op_id))
                 meta = {"collapsed": _pv.collapsed_line(state),
-                        "phase": state.phase, "generating": bool(state.provider)}
+                        "phase": state.phase, "generating": bool(state.provider),
+                        "sensor": state.sensor, "provider": state.provider}
                 held[1] = (self._block_clock.open(PIPELINE, op_id=op_id, lines=lines, meta=meta)
                            if held[1] is None else
                            self._block_clock.revise(held[1], lines=lines, meta=meta))

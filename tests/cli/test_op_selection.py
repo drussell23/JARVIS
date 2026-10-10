@@ -66,3 +66,18 @@ def test_a_focused_op_that_ends_returns_to_flow(ui) -> None:
     ui.set_op_rows([])
     assert ui.fsm.mode == MODE_FLOW
     assert "op-a finished" in (ui._flash_text or "")
+
+
+def test_the_status_line_counts_ops_agents_and_names_the_gpu_holder(ui) -> None:
+    clock = BlockClock()
+    a, b = _pipe(clock, "op-a"), _pipe(clock, "op-b")
+    b = clock.revise(b, meta={"generating": True, "sensor": "DocStaleness"})
+    ui.set_op_rows([a, b])
+    ui._agents = {"running": 3}
+    hints = ui._key_hints()
+    assert "2 ops" in hints and "3 agents" in hints and "GPU: DocStaleness" in hints
+    assert "^X ^L ops" in hints
+    ui.set_op_rows([])
+    ui._agents = {}
+    hints = ui._key_hints()
+    assert "ops" not in hints.split("^X")[0] and "^X ^L lanes" in hints
