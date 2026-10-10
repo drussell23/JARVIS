@@ -6466,6 +6466,44 @@ class ToolLoopCoordinator:
                 op_id[:12] if op_id else "?", repo_root,
             )
 
+        # ── OpContextCache: a retry opens with what this op already read ──
+        # Every retry layer enters here at round 0. What the op read before
+        # and is still current (file stamps, index, no edits since) opens the
+        # prompt instead of being re-fetched a model round at a time, and each
+        # shown result is credited to the exploration ledger as the read it is
+        # (same tool, same arguments hash). Folded into ``prompt`` (the
+        # compaction base), like the memory seed, so it is never compacted as
+        # a tool appendix. Sized as a share of this lane's prompt window.
+        _cache_shown: List[Tuple[ToolCall, ToolResult]] = []
+        try:
+            from backend.core.ouroboros.governance import op_context_cache as _occ
+            _window_chars = context_budget_for(getattr(prompt_window, "max_chars", None)).max_chars
+            _share = _occ._env_float("JARVIS_OP_CONTEXT_CACHE_SHARE", 0.3, 0.05, 0.8)
+            _cache_block, _cache_shown = _occ.opening(
+                op_id, repo_root, budget_chars=int(_window_chars * _share))
+            if _cache_block:
+                prompt = _cache_block + prompt
+                current_prompt = prompt
+                logger.info("[ToolLoop] op=%s opens with %d already-gathered result(s)",
+                            op_id[:12] if op_id else "?", len(_cache_shown))
+            # The exploration ledger dedups on (tool, arguments_hash): these
+            # records are the SAME reads, re-presented, not new ones.
+            for _c, _r in _cache_shown:
+                records.append(ToolExecutionRecord(
+                    schema_version="tool.exec.v1",
+                    op_id=op_id, call_id=f"{op_id}:cache:{_c.name}", round_index=-1,
+                    tool_name=_c.name, tool_version="op_context_cache",
+                    arguments_hash=_compute_args_hash(_c.arguments),
+                    repo=repo,
+                    policy_decision=PolicyDecision.ALLOW.value,
+                    policy_reason_code="op_context_cache",
+                    started_at_ns=None, ended_at_ns=None, duration_ms=None,
+                    output_bytes=len((_r.output or "").encode()),
+                    error_class=None, status=ToolExecStatus.SUCCESS,
+                ))
+        except Exception:  # noqa: BLE001 — a cache fault costs only the shortcut
+            _cache_shown = []
+
         # Deadline-based loop: iterate until the provider produces a final
         # answer (no tool call) or the deadline expires. effective_max_rounds
         # is the **budget-derived** safety ceiling — ≤ the configured
@@ -6484,8 +6522,12 @@ class ToolLoopCoordinator:
             _loop_breaker = None
         _breaker_nudged = False
         # Slice 85 Phase 3 — cumulative read-only-call counter (evasion-proof
-        # convergence axis; mixed-tool wandering still accrues here).
-        _cumulative_explore_calls = 0
+        # convergence axis; mixed-tool wandering still accrues here). Seeded
+        # by the already-gathered reads this loop opened with: they are reads
+        # the model has in front of it, so the floor that demands exploration
+        # and the axis that forces convergence both count them.
+        _cumulative_explore_calls = sum(
+            1 for _c, _r in _cache_shown if _c.name in _READONLY_EXPLORATION_TOOLS)
         # Slice 237 — scale the static Slice-85 threshold DOWN by op weight so a
         # heavy multi-file op forces convergence EARLIER (before its per-round
         # latency burns the deadline). op_weight_lines=None / light ops → the
@@ -7323,6 +7365,14 @@ class ToolLoopCoordinator:
                     except Exception:  # noqa: BLE001 — never break the tool loop
                         pass
 
+                    # What the model is about to see, for this op's retries
+                    # (op_context_cache); a non-read tool advances its epoch.
+                    try:
+                        from backend.core.ouroboros.governance import op_context_cache as _occ
+                        _occ.record(op_id, repo_root, tc, tool_result,
+                                    args_hash=_compute_args_hash(tc.arguments))
+                    except Exception:  # noqa: BLE001
+                        pass
                     prompt_appendix += _format_tool_result(tc, tool_result)
 
             self._last_records = list(records)

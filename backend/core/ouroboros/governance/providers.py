@@ -696,12 +696,24 @@ def _arm_diff_context_realignment(ctx: Any, target_file: str, rejection: str) ->
     without the hint. NEVER raises.
     """
     try:
+        # The exact current source around the line the rejection names opens
+        # the next attempt (op_context_cache), so the repair is a copy, not
+        # another model round spent re-reading the region.
+        pinned = False
+        try:
+            from backend.core.ouroboros.governance import op_context_cache as _occ  # noqa: PLC0415
+            pinned = _occ.pin_failed_hunk(
+                str(getattr(ctx, "op_id", "") or ""), target_file, str(rejection))
+        except Exception:  # noqa: BLE001
+            pinned = False
+        where = ("The current source around that line opens your next attempt under "
+                 "'Already gathered'; copy" if pinned else "Re-read the target region, copy")
         block = (
             "<diff_context_realignment>\n"
             f"Your previous unified_diff for `{target_file}` was REJECTED: "
             f"{str(rejection)[:300]}\n"
             "The context lines you emitted do not appear verbatim in the file. "
-            "Re-read the target region, copy the surrounding lines EXACTLY as "
+            f"{where} the surrounding lines EXACTLY as "
             "they are written there — including indentation and blank lines — "
             "and emit a corrected unified_diff. Do NOT switch to full_content; "
             "a whole-file rewrite is not an acceptable repair for a patch that "

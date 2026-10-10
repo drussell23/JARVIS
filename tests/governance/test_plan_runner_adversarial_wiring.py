@@ -112,10 +112,15 @@ def test_plan_runner_passes_risk_tier_name_string():
     """Pin: ctx.risk_tier (RiskTier enum or None) is normalized to
     .name string for the hook (which expects Optional[str])."""
     src = _read()
+    # 954262cf00: the tier passed is the one the gate WILL hold the op to
+    # (risk_tier_floor.effective_risk_tier over ctx.risk_tier), so an op
+    # raised to APPROVAL_REQUIRED is not skipped as "safe_auto".
+    assert "effective_risk_tier(\n                    ctx.risk_tier," in src, \
+        "wiring must resolve the effective tier from ctx.risk_tier"
     assert re.search(
-        r"ctx\.risk_tier\.name\s+if\s+ctx\.risk_tier\s+is\s+not\s+None",
+        r"risk_tier_name=_adv_tier\.name\s+if\s+_adv_tier\s+is\s+not\s+None\s+else\s+None",
         src,
-    ), "wiring must convert ctx.risk_tier to .name string"
+    ), "wiring must convert the tier to a .name string"
 
 
 # ===========================================================================
@@ -165,7 +170,10 @@ def test_wiring_uses_defensive_try_except_pattern():
     src = _read()
     marker = "Phase 5 P5: AdversarialReviewer pre-GENERATE injection"
     idx = src.find(marker)
-    block = src[idx:idx + 2500]
+    # The block runs to the next section marker, not a fixed character
+    # count (a fixed window broke the moment the block legitimately grew).
+    end = src.find("# ──", idx + len(marker))
+    block = src[idx:end if end > idx else idx + 6000]
     assert "try:" in block, "wiring must be in a try block"
     assert "except ImportError:" in block, (
         "wiring must catch ImportError (defensive — adversarial module may "
@@ -207,7 +215,10 @@ def test_wiring_logs_findings_count_on_injection():
     src = _read()
     marker = "Phase 5 P5: AdversarialReviewer pre-GENERATE injection"
     idx = src.find(marker)
-    block = src[idx:idx + 2500]
+    # The block runs to the next section marker, not a fixed character
+    # count (a fixed window broke the moment the block legitimately grew).
+    end = src.find("# ──", idx + len(marker))
+    block = src[idx:end if end > idx else idx + 6000]
     assert "AdversarialReviewer" in block and "findings injected" in block, (
         "wiring must log findings count + bridge_fed (operator visibility)"
     )
