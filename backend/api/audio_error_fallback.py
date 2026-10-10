@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# [Ouroboros] Modified by Ouroboros (op=op-01a126ad-) at 2026-10-10 16:40 UTC
+# Reason: Lift the hardcoded fallback policy (delay_ms 1000, max_retries 3) into named module-level constants so the retry contrac
+
 """
 Audio Error Fallback API
 Handles audio errors when ML audio backend is not available
@@ -8,13 +11,16 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 
 from backend.core.secure_logging import sanitize_for_log
 
 logger = logging.getLogger(__name__)
 
+# Fallback policy constants
+FALLBACK_DELAY_MS = 1000
+FALLBACK_MAX_RETRIES = 3
 router = APIRouter(prefix="/audio/ml", tags=["Audio Fallback"])
 
 class AudioError(BaseModel):
@@ -37,12 +43,12 @@ async def handle_audio_error(error: AudioError) -> Dict[str, Any]:
         "error_received": {
             "type": error.error_type,
             "message": error.message,
-            "timestamp": error.timestamp or datetime.now().isoformat()
+            "timestamp": error.timestamp or datetime.now(timezone.utc).isoformat()
         },
         "fallback_strategy": {
             "action": "retry",
-            "delay_ms": 1000,
-            "max_retries": 3,
+            "delay_ms": FALLBACK_DELAY_MS,
+            "max_retries": FALLBACK_MAX_RETRIES,
             "alternative": "use_basic_recognition"
         },
         "suggestions": []
