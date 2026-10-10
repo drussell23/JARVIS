@@ -103,8 +103,35 @@ class _Pool:
         return True
 
 
-def test_fleet_lanes_are_the_engines_slots_not_the_node_count() -> None:
+def test_a_local_primary_lane_counts_with_an_empty_fleet(monkeypatch) -> None:
+    """The fleet registry only ever holds FAILOVER nodes; the local primary
+    lane is never registered. Before this, an organism on its own J-Prime
+    kept the configured size (the hydrate-time fail-safe of 1) whatever its
+    engine reported."""
+    from backend.core.ouroboros.governance import governed_loop_service as gls
+    monkeypatch.setattr(gls, "_local_primary_endpoint", lambda: EP)
+    pool = _Pool()
+    gls._fleet_lane_sync(pool, 1, {})
+    assert pool.calls[-1] == (1, "fleet_topology", True), "unreported: one lane"
+    es.record(EP, 3)
+    gls._fleet_lane_sync(pool, 1, {})
+    assert pool.calls[-1] == (3, "fleet_topology", True)
+    gls._fleet_lane_sync(pool, 1, {"gpu": EP + "/"})       # the same node, once
+    assert pool.calls[-1] == (3, "fleet_topology", True)
+
+
+def test_a_paid_primary_with_an_empty_fleet_keeps_the_configured_size(monkeypatch) -> None:
+    from backend.core.ouroboros.governance import governed_loop_service as gls
+    monkeypatch.setattr(gls, "_local_primary_endpoint", lambda: "")
+    pool = _Pool()
+    gls._fleet_lane_sync(pool, 6, {})
+    assert pool.calls[-1] == (6, "fleet_topology", False)
+
+
+def test_fleet_lanes_are_the_engines_slots_not_the_node_count(monkeypatch) -> None:
+    from backend.core.ouroboros.governance import governed_loop_service as gls
     from backend.core.ouroboros.governance.governed_loop_service import _fleet_lane_sync
+    monkeypatch.setattr(gls, "_local_primary_endpoint", lambda: "")
     pool = _Pool()
     _fleet_lane_sync(pool, 1, {"local": EP})
     assert pool.calls[-1] == (1, "fleet_topology", True), "unknown engine: one lane, as before"

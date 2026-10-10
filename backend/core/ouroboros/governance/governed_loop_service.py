@@ -7331,7 +7331,7 @@ class GovernedLoopService:
                     # generation; a changed reading re-syncs below.
                     try:
                         _loop = asyncio.get_running_loop()
-                        for _ep in (snap or {}).values():
+                        for _ep in {*(snap or {}).values(), _local_primary_endpoint()} - {""}:
                             _loop.create_task(_engine_slots.refresh(_ep),
                                               name="engine-slots-refresh")
                     except RuntimeError:
@@ -9000,6 +9000,24 @@ class GovernedLoopService:
             logger.debug("[GovernedLoop] Unhandled command: %s", ct)
 
 
+def _local_primary_endpoint() -> str:
+    """The local generation lane's endpoint when it is PRIMARY, else "".
+    Composed from the two canonical readers (local_lane_capacity's lane
+    predicate, candidate_generator's endpoint resolver). NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.autonomy.local_lane_capacity import (  # noqa: PLC0415
+            local_lane_is_primary,
+        )
+        if not local_lane_is_primary():
+            return ""
+        from backend.core.ouroboros.governance.candidate_generator import (  # noqa: PLC0415
+            local_lane_endpoint,
+        )
+        return str(local_lane_endpoint() or "").strip().rstrip("/")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _fleet_lane_sync(pool: Any, configured_size: int, snapshot: "Dict[str, str]") -> None:
     """Topology observer -> pool lane target (Dynamic Fleet Service Discovery).
 
@@ -9011,13 +9029,21 @@ def _fleet_lane_sync(pool: Any, configured_size: int, snapshot: "Dict[str, str]"
     launched with --parallel N serves N. Empty fleet => the configured size
     restores, unlocked (DW-era regime). NEVER raises."""
     try:
-        _nodes = len(snapshot or {})
+        endpoints = [str(e).strip().rstrip("/") for e in (snapshot or {}).values()]
+        # The LOCAL primary lane serves too, and the fleet registry never
+        # holds it (only failover nodes register): without it here, a
+        # local-primary organism's lanes stayed at the configured size --
+        # the hydrate-time fail-safe of 1 -- whatever its engine reported.
+        _local = _local_primary_endpoint()
+        if _local and _local not in endpoints:
+            endpoints.append(_local)
+        _nodes = len(endpoints)
         if _nodes > 0:
             from backend.core.ouroboros.governance.autonomy.engine_slots import (  # noqa: PLC0415
                 lanes_for,
             )
             pool.set_target_pool_size(
-                lanes_for((snapshot or {}).values()), source="fleet_topology", lock=True)
+                lanes_for(endpoints), source="fleet_topology", lock=True)
         else:
             pool.set_target_pool_size(
                 max(1, int(configured_size)), source="fleet_topology", lock=False,
