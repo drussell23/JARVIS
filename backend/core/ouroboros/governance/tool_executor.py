@@ -7379,14 +7379,14 @@ class ToolLoopCoordinator:
                         _explore_only_rounds, op_id[:12],
                     )
 
-            # ── Soft overflow (pre-compaction) watermark ──
-            # When the accumulated prompt crosses the soft threshold but is
-            # still below the compaction ceiling, emit a single-line
-            # telemetry warning and stash a structured hint on the next
             # Publish utilisation every round — the watermark below fires
             # once, but an operator watching a long op needs the number
             # continuously, and it is already in hand.
             note_context_utilisation(op_id, len(current_prompt), _ctx_budget)
+            # ── Soft overflow (pre-compaction) watermark ──
+            # When the accumulated prompt crosses the soft threshold but is
+            # still below the compaction ceiling, emit a single-line
+            # telemetry warning and stash a structured hint on the next
             # round's instruction footer so the model knows to stop
             # fetching new context and write the patch. Lossless signal
             # that rides one round ahead of the lossy compactor.

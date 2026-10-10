@@ -33,7 +33,10 @@ def test_op_lifecycle_chrome_mirrors(flow):
     flow.op_completed("op-abc123", files_changed=[], cost_usd=0.01)
     joined = "\n".join(str(m) for m in flow._mirrored)
     assert "test_failure" in joined          # open action line
-    assert "op-" in joined                   # receipt line
+    # The op's identity. The separate `[✓] op-…` receipt no longer renders
+    # once the collapsed close line has ended the op (one fact, one line —
+    # `_emit_op_receipt(render=False)`); the short id rides the header.
+    assert "abc123" in joined
     assert "💰" in joined                    # close tally stats
 
 

@@ -2082,7 +2082,7 @@ def build_bipartite_application(
         except Exception:  # noqa: BLE001 — a cockpit without a menu still types
             logger.debug("[Bipartite] palette overlay unavailable",
                          exc_info=True)
-    elif completer is not None:
+    elif _palette is None and completer is not None:
         # No page palette available (import failure). Fall back to
         # prompt_toolkit's own widget rather than leaving completions
         # invisible: a bounded dropdown beats no menu at all.

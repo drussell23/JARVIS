@@ -340,13 +340,38 @@ def _compose_result(result_str, **kwargs):
         max_summary_chars=200,
         provenance="test:explicit",
     )
+    # A BODY-bearing tool. Since 2026-10-09 web_fetch is summary-only (Claude
+    # Code's convention for exploration tools) and its JSON is pretty-printed
+    # into the parked /expand body instead -- pinned separately below.
+    tool_name = kwargs.pop("tool_name", "bash")
+    args_str = kwargs.pop("args_str", "curl -s https://api.example.com/data")
     return compose(
-        tool_name="web_fetch",
-        args_str="https://api.example.com/data",
+        tool_name=tool_name,
+        args_str=args_str,
         result_str=result_str,
         explicit_density=policy,
         **kwargs,
     )
+
+
+def test_summary_only_fetch_parks_the_pretty_printed_body(monkeypatch):
+    """web_fetch shows no inline body, so the pretty form must reach the
+    one place it is read: the parked body /expand renders."""
+    from backend.core.ouroboros.battle_test.tool_render_store import (
+        BoundedBodyStore,
+    )
+    monkeypatch.setenv(MASTER_FLAG_ENV_VAR, "true")
+    monkeypatch.setenv(JSON_PRETTY_ENABLED_ENV_VAR, "true")
+    body = json.dumps({"users": [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]})
+    store = BoundedBodyStore(capacity=4)
+    result = _compose_result(
+        body, tool_name="web_fetch",
+        args_str="https://api.example.com/data", store=store,
+    )
+    assert result.body_lines_markup == ()
+    (ref,) = store.all_refs()
+    parked = store.lookup(ref).body
+    assert len(parked.splitlines()) > 1 and '"Alice"' in parked
 
 
 def test_compose_pretty_prints_json_body(monkeypatch):

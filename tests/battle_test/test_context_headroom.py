@@ -114,9 +114,11 @@ def test_the_loop_publishes_every_round_not_only_at_the_watermark() -> None:
     import ast
 
     src = (_REPO / "backend/core/ouroboros/governance/tool_executor.py").read_text()
-    assert "note_context_utilisation(op_id, len(current_prompt))" in src
+    # Measured against the op's OWN budget (954262cf00), not the default.
+    call = "note_context_utilisation(op_id, len(current_prompt), _ctx_budget)"
+    assert call in src
     # And it is published OUTSIDE the once-only watermark guard.
-    idx = src.index("note_context_utilisation(op_id, len(current_prompt))")
+    idx = src.index(call)
     assert "_soft_overflow_warned" not in src[idx - 200:idx]
 
 

@@ -50,6 +50,7 @@ def _history_n() -> int:
 
 
 async def dispatch_proof_command(line: str) -> ProofDispatchResult:
+    """Show the evidence that O+V is genuinely working, from its tamper-evident record."""
     from backend.core.ouroboros.governance import proof_of_work as pow_
     parts = str(line or "").strip().lstrip("/").split()
     sub = parts[1].lower() if len(parts) > 1 else ""

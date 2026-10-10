@@ -33,6 +33,15 @@ import pytest
 _REPO = Path(__file__).resolve().parents[2]
 
 
+@pytest.fixture(autouse=True)
+def _overlay_placement(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This file pins the OVERLAY placement. Since 22b8b9f119 the default is
+    `below` (Claude Code's mechanic: suggestions open under the input and never
+    paint over the transcript); `JARVIS_OV_PALETTE_PLACEMENT=overlay` is the
+    float these tests describe. The `below` contract is pinned at the end."""
+    monkeypatch.setenv("JARVIS_OV_PALETTE_PLACEMENT", "overlay")
+
+
 def _app(with_completer: bool = True) -> Any:
     from backend.core.ouroboros.battle_test.bipartite_layout import (
         BipartiteLayout, build_bipartite_application,
@@ -105,8 +114,12 @@ def test_the_palette_is_no_longer_a_row_in_the_split() -> None:
     from backend.core.ouroboros.battle_test import bipartite_layout
 
     src = inspect.getsource(bipartite_layout.build_bipartite_application)
-    assert "rows.append(_palette)" not in src, (
-        "the palette was re-added as an HSplit row"
+    # A row exists ONLY for the `below` placement; every append of it is
+    # gated on that decision, so the overlay placement never joins the grid.
+    appends = src.count("rows.append(_palette)")
+    gated = len(re.findall(r"if _palette_below:\n\s+rows\.append\(_palette\)", src))
+    assert appends == gated, (
+        "the palette was re-added as an HSplit row outside the `below` placement"
     )
     assert "floats=[Float(" in src
 
@@ -300,3 +313,45 @@ def test_the_router_mounts_bipartite_and_the_overlay_paints(
     )
     described = [r for r in rows if re.match(r"\s*/\S+\s{2,}\S", r)]
     assert described, f"no aligned description column: {rows[:3]}"
+
+
+# --------------------------------------------------------------------------
+# 4. the default placement: BELOW the input, one menu, never two
+# --------------------------------------------------------------------------
+
+@pytest.fixture()
+def _below(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JARVIS_OV_PALETTE_PLACEMENT", "below")
+
+
+def _below_app() -> Any:
+    return _app()
+
+
+def test_below_placement_mounts_no_native_dropdown(_below: None) -> None:
+    """The defect this pins: with the page palette mounted as a row, the
+    `elif completer` fallback ALSO floated prompt_toolkit's CompletionsMenu,
+    so `/` opened two menus at once. The fallback exists for a missing page
+    palette only."""
+    from prompt_toolkit.layout import FloatContainer
+    from backend.core.ouroboros.battle_test.palette_render import (
+        _is_native_completion_menu,
+    )
+    _mux, app = _below_app()
+    root = app.layout.container
+    if isinstance(root, FloatContainer):
+        assert not any(_is_native_completion_menu(f.content) for f in root.floats)
+
+
+def test_below_placement_opens_directly_under_the_input() -> None:
+    """The palette row follows the prompt's closing rule, before the status
+    line: it opens under what is being typed."""
+    import inspect
+
+    from backend.core.ouroboros.battle_test import bipartite_layout
+
+    src = inspect.getsource(bipartite_layout.build_bipartite_application)
+    assert re.search(
+        r"rows \+= \[_rule\(0\), prompt, _rule\(1\)\]\n\s+if _palette_below:\n"
+        r"\s+rows\.append\(_palette\)", src,
+    ), "the below palette is not the row directly under the input box"
