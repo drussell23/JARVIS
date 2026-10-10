@@ -348,7 +348,7 @@ class TestActionAliases:
             {"context": "Global", "bindings": {"ctrl+q": "chat:killAgents"}},
         ]}))
         monkeypatch.setenv(K.CONFIG_PATH_ENV_VAR, str(cfg))
-        K.get_store().maybe_reload()
+        K.get_store().maybe_reload(force=True)  # inside the reload throttle of an earlier load
         seqs = K.effective_key_sequences(
             "agents:stopAll", ("ctrl+x ctrl+k",), context="Global")
         flat = {" ".join(s) for s in seqs}
@@ -364,7 +364,7 @@ class TestActionAliases:
             {"context": "Global", "bindings": {"ctrl+q": "agents:stopAll"}},
         ]}))
         monkeypatch.setenv(K.CONFIG_PATH_ENV_VAR, str(cfg))
-        K.get_store().maybe_reload()
+        K.get_store().maybe_reload(force=True)  # inside the reload throttle of an earlier load
         seqs = K.effective_key_sequences(
             "agents:stopAll", ("ctrl+x ctrl+k",), context="Global")
         assert any("c-q" in " ".join(s) for s in seqs)

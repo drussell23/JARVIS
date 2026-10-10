@@ -325,9 +325,20 @@ def test_master_flag_off_takes_no_hold(monkeypatch) -> None:
 
 @pytest.fixture()
 def clean_floor(monkeypatch):
-    monkeypatch.delenv("JARVIS_MIN_RISK_TIER", raising=False)
+    # The dial has THREE stores, not one: the floor knob, the dial position
+    # (`/trust` writes os.environ directly) and the proactive-mode
+    # controller's live voters. Clearing only the knob let an earlier test's
+    # rung leak in, so these passed alone and failed as a file.
+    from backend.core.ouroboros.governance import proactive_mode, trust_repl as _tr
+
+    def _clear() -> None:
+        for name in (_tr._ENV_MIN_TIER, _tr._ENV_DIAL_POSITION):
+            os.environ.pop(name, None)
+        proactive_mode.reset_controller()
+
+    _clear()
     yield
-    os.environ.pop("JARVIS_MIN_RISK_TIER", None)
+    _clear()
 
 
 def test_trust_cycle_walks_the_dial(clean_floor) -> None:
