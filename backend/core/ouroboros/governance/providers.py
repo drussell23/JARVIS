@@ -2772,9 +2772,11 @@ def _diagnose_hunk(file_lines: List[str], orig_start: int, ops: List[Tuple[str, 
         else:
             return "anchors align but the hunk could not be placed"
     if best[0] < 0:
-        return (
-            f"context line {anchors[0][1]!r} not found within ±{window} lines of line {orig_start + 1}"
-        )
+        # Diagnosed over the span the placement searched (the anchored tier
+        # searches the whole file); a ±15 diagnosis named the wrong fracture.
+        where = ("anywhere in the file" if window >= n
+                 else f"within ±{window} lines of line {orig_start + 1}")
+        return f"context line {anchors[0][1]!r} not found {where}"
     return (
         f"context diverges after {best[0]} matching line(s): expected {best[2]!r}, "
         f"file line {best[1]} is {best[3]!r}"
@@ -2809,7 +2811,7 @@ def validate_diff_context(original: str, diff_text: str) -> None:
             continue
         raise StaleDiffError(
             f"Diff hunk at line {orig_start + 1} does not match source — "
-            f"{_diagnose_hunk(orig_lines, orig_start, ops, window)}. "
+            f"{_diagnose_hunk(orig_lines, orig_start, ops, len(orig_lines))}. "
             f"Searched the whole file by anchor; the bounded tiers used "
             f"±{window} lines.",
             hunk_line=orig_start + 1,
@@ -2889,7 +2891,7 @@ def _apply_unified_diff(original: str, diff_text: str) -> str:
         if aligned is None:
             raise ValueError(
                 f"Diff hunk at line {orig_start + 1} does not match source — "
-                f"{_diagnose_hunk(result, orig_start, ops, window)}"
+                f"{_diagnose_hunk(result, orig_start, ops, len(result))}"
             )
         start, stop, new_span = aligned
         result[start:stop] = new_span
