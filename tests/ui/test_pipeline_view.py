@@ -176,3 +176,20 @@ def test_shutdown_releases_the_phase_observer() -> None:
     assert len(op_context._PHASE_TRANSITION_OBSERVERS) == before + 1
     t.shutdown()
     assert len(op_context._PHASE_TRANSITION_OBSERVERS) == before
+
+
+def test_the_legend_uses_the_marks_the_strip_draws() -> None:
+    from backend.core.ouroboros.ui.theme import mark
+    text = "\n".join(pv.legend())
+    for word in ("op", "agent", "gate"):
+        assert f"  {word} " in text
+    for name in ("action", "check", "pending", "cross"):
+        assert mark(name) in text
+
+
+def test_question_mark_shows_the_legend_with_the_keys() -> None:
+    import inspect
+    from backend.core.ouroboros.cli import ov
+    src = inspect.getsource(ov)
+    block = src.split("def _show_help(event: Any) -> None:", 1)[1].split("bind_action(", 1)[0]
+    assert "legend()" in block

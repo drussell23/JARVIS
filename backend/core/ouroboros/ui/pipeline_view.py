@@ -33,7 +33,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __all__ = [
     "PipelineState", "Stage", "arrange", "collapsed_line", "expanded_lines",
-    "live_share", "stage_of", "stages",
+    "legend", "live_share", "stage_of", "stages",
 ]
 
 
@@ -137,7 +137,7 @@ def _mark(name: str) -> str:
         from backend.core.ouroboros.ui.theme import mark
         return mark(name) or ""
     except Exception:  # noqa: BLE001
-        return {"check": "+", "pending": "o", "action": "*",
+        return {"check": "+", "pending": "o", "action": "*", "cross": "x",
                 "branch": "|", "branch_last": "`", "dot": "-"}.get(name, "")
 
 
@@ -234,6 +234,24 @@ def collapsed_line(state: PipelineState) -> str:
         return head
     except Exception:  # noqa: BLE001
         return f"o {state.sensor} {state.phase}"
+
+
+def legend() -> Tuple[str, ...]:
+    """What the live area's words and marks mean, for the ``?`` sheet. The
+    marks are the theme's, so the legend cannot drift from what is drawn."""
+    try:
+        dot = _mark("dot")
+        return (
+            "Live area",
+            "  op     one job moving through the pipeline (a block)",
+            "  agent  a worker inside an op: Venom's tool loop, a subagent",
+            "  gate   the check that decides how a change may land",
+            f"  {_mark('action')} active   {_mark('check')} done   "
+            f"{_mark('pending')} not reached   {_mark('cross')} failed",
+            f"  ^X ^L select an op {dot} Enter expands it {dot} /agents the full roster",
+        )
+    except Exception:  # noqa: BLE001
+        return ()
 
 
 def live_share() -> float:

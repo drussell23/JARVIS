@@ -3587,6 +3587,17 @@ def _client_extra_bindings(ui: Any, client: Any) -> Any:
 
         def _show_help(event: Any) -> None:
             _render_client_keys(ui, "/keys")
+            # The live area's vocabulary rides the same sheet: one `?`, one
+            # place to learn what is on screen.
+            try:
+                from rich.markup import escape as _esc
+                from backend.core.ouroboros.ui.pipeline_view import legend
+                sink = getattr(ui, "markup_sink", None)
+                if callable(sink):
+                    for ln in ("",) + legend():
+                        sink(_esc(ln), True)
+            except Exception:  # noqa: BLE001
+                pass
 
         bind_action(
             kb, "app:help", ("?",), _show_help,
