@@ -1339,6 +1339,14 @@ class AttachUI:
         # carried — never a client-side cache, so the cursor always resolves
         # against what the daemon currently holds.
         self._lanes: List[dict] = []
+        #: The in-flight ops, one row per live pipeline block, in the order
+        #: the live area draws them. Selectable ahead of lanes: an op is what
+        #: the operator watches. Replaced wholesale on every live change, the
+        #: same rule as lanes: the block store IS the truth.
+        self._op_rows: List[dict] = []
+        #: Re-arranges the live area (set where the block store lives). A
+        #: focus change moves which op is expanded, with no frame arriving.
+        self.relayout_live: Optional[Callable[[], None]] = None
         #: The daemon's agent roster, as of the last heartbeat. A SNAPSHOT,
         #: not a local roster: this process dispatches nothing, so it has no
         #: business holding agent state of its own.
@@ -1388,7 +1396,8 @@ class AttachUI:
             from backend.core.ouroboros.battle_test.cockpit_fsm import (
                 CockpitFSM,
             )
-            self.fsm: Any = CockpitFSM(lanes_provider=lambda: self._lanes)
+            self.fsm: Any = CockpitFSM(
+                lanes_provider=lambda: self._op_rows + self._lanes)
         except Exception:  # noqa: BLE001
             self.fsm = None
 
@@ -1505,8 +1514,33 @@ class AttachUI:
 
     def refresh(self) -> None:
         """Repaint after a mode change. Alias of the invalidate seam so key
-        handlers read as intent rather than mechanism."""
+        handlers read as intent rather than mechanism. A mode change can move
+        which op is expanded, so the live area is re-arranged first."""
+        if self.relayout_live is not None:
+            try:
+                self.relayout_live()
+            except Exception:  # noqa: BLE001 — a relayout fault never blocks a repaint
+                pass
         self._invalidate()
+
+    def set_op_rows(self, blocks: Any) -> None:
+        """One selectable row per live pipeline block. NEVER raises."""
+        try:
+            from rich.text import Text
+            before = {r["lane"] for r in self._op_rows}
+            self._op_rows = [
+                {"lane": b.op_id, "kind": "op",
+                 "label": Text.from_markup(str(b.meta.get("collapsed") or "")).plain}
+                for b in blocks if getattr(b, "kind", "") == "pipeline" and b.op_id]
+            # The focused op ended: its block froze into the transcript. Same
+            # path as an expired lane — the daemon pressing Esc, named.
+            fsm = self.fsm
+            focused = fsm.focused_lane if fsm is not None else None
+            if focused in before and focused not in {r["lane"] for r in self._op_rows}:
+                fsm.escape()
+                self.flash(f"{focused} finished — returned to ambient view")
+        except Exception:  # noqa: BLE001
+            self._op_rows = []
 
     def on_lane_history(self, payload: dict) -> None:
         """Hydrate the focused pane from the daemon's ring. NEVER raises.
@@ -2417,6 +2451,7 @@ class AttachUI:
         one region, three states — so nothing competes for the terminal and
         the operator's input line is never disturbed."""
         try:
+            from rich.markup import escape as escape_markup
             from backend.core.ouroboros.battle_test.cockpit_fsm import (
                 MODE_SELECT,
             )
@@ -2426,10 +2461,13 @@ class AttachUI:
             if fsm.mode == MODE_SELECT:
                 rows = fsm.rows()
                 if not rows:
-                    return ["  (no lanes) " + _glyph("dot", "-") + " esc"]
-                out = ["  [bold]lanes[/bold] [dim]↑↓ move · ⏎ focus · esc[/dim]"]
+                    return ["  (no ops or lanes) " + _glyph("dot", "-") + " esc"]
+                out = ["  [bold]ops · lanes[/bold] [dim]↑↓ move · ⏎ focus · esc[/dim]"]
                 for i, r in enumerate(rows[:8]):
                     cur = "▸" if i == fsm.cursor else " "
+                    if r.get("kind") == "op":
+                        out.append(f"  {cur} {escape_markup(r.get('label') or r.get('lane', '?'))}")
+                        continue
                     dead = " [dim](finished)[/dim]" if r.get("tombstoned") else ""
                     out.append(
                         f"  {cur} {r.get('lane','?')}{dead} "
@@ -2437,6 +2475,11 @@ class AttachUI:
                     )
                 return out
             lane = fsm.focused_lane
+            if lane and any(r.get("lane") == lane for r in self._op_rows):
+                # An op's focus is its EXPANDED pipeline block in the live
+                # area above; there is no lane history to hydrate.
+                return [f"  [bold]{escape_markup(lane)}[/bold] "
+                        f"[dim]expanded above · esc to return[/dim]"]
             if lane:
                 head = (
                     f"  [bold]{lane}[/bold] "
@@ -3846,7 +3889,8 @@ def _build_selection_bindings(ui: Any, client: Any) -> Any:
 
         def _enter(event: Any) -> None:
             lane = fsm.selected_lane()
-            if fsm.focus_selected() and lane:
+            is_op = any(r.get("lane") == lane for r in getattr(ui, "_op_rows", ()))
+            if fsm.focus_selected() and lane and not is_op:
                 # Hydration is REQUESTED, never assumed present. The daemon
                 # answers from the lane's ring — including a tombstoned one.
                 try:
@@ -5009,6 +5053,7 @@ def run_attach(console: Any) -> int:
             from backend.core.ouroboros.battle_test.bipartite_layout import (
                 get_active_canvas,
             )
+            ui.set_op_rows(blocks)
             canvas = get_active_canvas()
             if canvas is not None and hasattr(canvas, "set_live"):
                 # The density rules (ui/pipeline_view.arrange): one op
@@ -5027,6 +5072,7 @@ def run_attach(console: Any) -> int:
                     focused_op=str(getattr(_fsm, "focused_lane", "") or "")))
 
         block_store = BlockStore(on_freeze=_freeze_block, on_live=_show_live)
+        ui.relayout_live = lambda: _show_live(block_store.live())
 
         def _on_telemetry(frame: Any) -> None:
             ui.on_telemetry(frame)
