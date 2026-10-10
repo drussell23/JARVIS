@@ -6080,6 +6080,17 @@ class CandidateGenerator:
         enhancement. Resolution is memoized per-endpoint, so doing it here costs
         one cached lookup rather than a second round trip."""
         try:
+            # The engine's slot count, read where the endpoint is already
+            # being asked about itself (TTL-cached, so this is one dict read
+            # between probes). The client-side J-Prime limit follows it; the
+            # pool's lanes follow it through engine_slots' listeners.
+            try:
+                from .autonomy import engine_slots as _engine_slots  # noqa: PLC0415
+                _slots = await _engine_slots.refresh(endpoint)
+                if _slots:
+                    self._jprime_state.resize(_slots)
+            except Exception:  # noqa: BLE001 — a slot reading is evidence, never a gate
+                pass
             model_bytes = await _resolve_served_model_bytes(endpoint)
             vram_bytes = _awakened_vram_bytes()
             if not model_bytes or not vram_bytes:

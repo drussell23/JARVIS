@@ -2953,6 +2953,18 @@ class GovernedLoopService:
             unregister_phase_transition_observer(self._on_pipeline_phase)
         except Exception:  # noqa: BLE001
             logger.debug("[GovernedLoop] phase observer release skipped", exc_info=True)
+        # The engine-slot listener holds this service's pool; a stopped
+        # service must not keep resizing it.
+        try:
+            _listener = getattr(self, "_engine_slots_listener", None)
+            if _listener is not None:
+                from backend.core.ouroboros.governance.autonomy.engine_slots import (
+                    remove_listener,
+                )
+                remove_listener(_listener)
+                self._engine_slots_listener = None
+        except Exception:  # noqa: BLE001
+            pass
 
         # Sovereign Epistemic Context Matrix LR2: reconcile this session's memory
         # quarantine vs live disk on teardown; refresh oracle for revalidated
@@ -7309,14 +7321,32 @@ class GovernedLoopService:
                 )
                 _pool_ref = self._bg_pool
                 _configured = int(self._bg_pool._pool_size)
-                get_fleet_registry().subscribe(
-                    lambda snap: _fleet_lane_sync(_pool_ref, _configured, snap)
+                from backend.core.ouroboros.governance.autonomy import (  # noqa: PLC0415
+                    engine_slots as _engine_slots,
                 )
+
+                def _on_topology(snap: "Dict[str, str]") -> None:
+                    _fleet_lane_sync(_pool_ref, _configured, snap)
+                    # Learn each node's slots now, not at its first
+                    # generation; a changed reading re-syncs below.
+                    try:
+                        _loop = asyncio.get_running_loop()
+                        for _ep in (snap or {}).values():
+                            _loop.create_task(_engine_slots.refresh(_ep),
+                                              name="engine-slots-refresh")
+                    except RuntimeError:
+                        pass                     # no loop: the negotiator reads it later
+
+                get_fleet_registry().subscribe(_on_topology)
+                # An engine relaunched with a different slot count moves the
+                # lanes at runtime, through the same observer path.
+                self._engine_slots_listener = (
+                    lambda _ep, _n: _fleet_lane_sync(
+                        _pool_ref, _configured, get_fleet_registry().snapshot()))
+                _engine_slots.add_listener(self._engine_slots_listener)
                 # Reconcile against the CURRENT fleet too (a node may already
                 # be serving when the pool boots -- resume/rebind paths).
-                _fleet_lane_sync(
-                    _pool_ref, _configured, get_fleet_registry().snapshot()
-                )
+                _on_topology(get_fleet_registry().snapshot())
             except Exception:  # noqa: BLE001 -- discovery is enhancement, never blocks boot
                 logger.debug("[GLS] fleet lane sync wiring skipped", exc_info=True)
             logger.info(
@@ -8973,16 +9003,21 @@ class GovernedLoopService:
 def _fleet_lane_sync(pool: Any, configured_size: int, snapshot: "Dict[str, str]") -> None:
     """Topology observer -> pool lane target (Dynamic Fleet Service Discovery).
 
-    Non-empty fleet snapshot => lanes strictly equal the serving sovereign
-    node count, LOCKED (hardware-derived truth overrides env/manifest).
-    Empty fleet => the configured size restores, unlocked (DW-era regime).
-    The snapshot dict is structurally extensible -- future golden-image
-    topology payloads (VRAM, tiers) can weight lanes here without touching
-    the observer channel. NEVER raises."""
+    Non-empty fleet snapshot => lanes equal the generations the serving
+    nodes can run at once: the SUM of each engine's reported slots
+    (autonomy/engine_slots), a node that has not reported counting as one.
+    LOCKED: hardware-derived truth overrides env/manifest. "One GPU = one
+    lane" was this rule before engines reported slots; a llama.cpp engine
+    launched with --parallel N serves N. Empty fleet => the configured size
+    restores, unlocked (DW-era regime). NEVER raises."""
     try:
         _nodes = len(snapshot or {})
         if _nodes > 0:
-            pool.set_target_pool_size(_nodes, source="fleet_topology", lock=True)
+            from backend.core.ouroboros.governance.autonomy.engine_slots import (  # noqa: PLC0415
+                lanes_for,
+            )
+            pool.set_target_pool_size(
+                lanes_for((snapshot or {}).values()), source="fleet_topology", lock=True)
         else:
             pool.set_target_pool_size(
                 max(1, int(configured_size)), source="fleet_topology", lock=False,

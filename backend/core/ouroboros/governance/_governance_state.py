@@ -706,6 +706,37 @@ class JPrimeState:
     # migration. Scope α neither reads nor writes this dict.
     model_stickiness: Dict[str, Any] = field(default_factory=dict)
     counters: JPrimeCounters = field(default_factory=JPrimeCounters)
+    #: The sem's current permit count. Starts at 1 (the Scope α contract);
+    #: :meth:`resize` makes it follow the slots the engine REPORTS
+    #: (autonomy/engine_slots). The "untrusted 50-slot queue" this guarded
+    #: against was a remote server's; a llama.cpp engine's slots are KV it
+    #: allocated at launch, so its count is a ceiling the client can trust.
+    slot_limit: int = 1
+
+    def resize(self, n: int) -> int:
+        """Follow the engine's slot count. Grow releases permits; shrink is
+        cooperative (a task takes permits back as in-flight calls finish, so
+        nothing running is interrupted). Call on the event loop. Returns the
+        new limit. NEVER raises."""
+        try:
+            n = max(1, int(n))
+            delta = n - self.slot_limit
+            if delta > 0:
+                for _ in range(delta):
+                    self.jprime_sem.release()
+            elif delta < 0:
+                sem = self.jprime_sem
+
+                async def _take_back(k: int) -> None:
+                    for _ in range(k):
+                        await sem.acquire()
+
+                asyncio.get_running_loop().create_task(
+                    _take_back(-delta), name="jprime-slot-shrink")
+            self.slot_limit = n
+        except Exception:  # noqa: BLE001
+            pass
+        return self.slot_limit
 
     @classmethod
     def fresh(cls) -> "JPrimeState":

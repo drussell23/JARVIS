@@ -139,6 +139,23 @@ def resolve_primary_concurrency(
         if not local_lane_is_primary():
             return LaneCapacity(max(1, int(cloud_default)), "cloud_lane")
 
+        ceiling = _env_int(_ENV_MAX_CONCURRENCY, max(1, int(cloud_default)))
+
+        # The engine's own answer, when it has given one. A llama.cpp engine
+        # allocates each slot's KV at launch, so its slot count is exact
+        # where the VRAM arithmetic below is an estimate.
+        try:
+            from backend.core.ouroboros.governance.autonomy import engine_slots
+            readings = engine_slots.known()
+            reported = (engine_slots.slots(endpoint) if endpoint
+                        else (next(iter(readings.values())) if len(readings) == 1 else None))
+            if reported:
+                cap = LaneCapacity(max(1, min(ceiling, int(reported))), "engine_slots")
+                logger.info("[LocalLaneCapacity] %s", cap.render())
+                return cap
+        except Exception:  # noqa: BLE001 — fall through to the derivation
+            pass
+
         vram = 0
         model = 0
         try:
@@ -166,8 +183,6 @@ def resolve_primary_concurrency(
                 model = 0
         except Exception:  # noqa: BLE001
             model = 0
-
-        ceiling = _env_int(_ENV_MAX_CONCURRENCY, max(1, int(cloud_default)))
 
         if vram <= 0 or model <= 0 or model >= vram:
             # Unknown or fully-consumed card. ONE — the failure being
