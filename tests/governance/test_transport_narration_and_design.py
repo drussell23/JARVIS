@@ -312,8 +312,12 @@ async def test_op_lines_carry_no_id_and_no_stray_bullets():
     }))
     blob = "\n".join(console.prints)
     assert "op7c17" not in blob
-    for stray in ("●", "◌", "⏭", "│"):
+    # Glyphs OUTSIDE the design language. `●` was on this list while the
+    # action mark was ⏺; since 2026-10-09 it IS the action mark, so it is
+    # derived from the theme rather than forbidden.
+    for stray in ("◌", "⏭", "│"):
         assert stray not in blob, stray
+    assert all(ln.count("●") <= 1 for ln in console.prints)
     assert console.prints[0].startswith(f"[{cst._SEM['neural']}]{theme.mark('action')}")
     assert "notify apply" in console.prints[0] and "NOTIFY_APPLY" not in blob
     assert "no change" in console.prints[1] and theme.mark("detail") in console.prints[1]
@@ -329,7 +333,8 @@ async def test_the_models_reason_is_bounded_in_height(monkeypatch):
     await t.send(_msg("DECISION", "op-1", {
         "outcome": "noop", "reason_code": "noop", "reason": "word " * 60,
     }))
-    detail = console.prints[2:]
+    # The recap (✻, every terminal outcome since 8405bfccae) is not detail.
+    detail = [p for p in console.prints[2:] if theme.mark("recap") not in p]
     assert len(detail) == 2 and detail[-1].rstrip("[/dim italic]").rstrip().endswith(
         theme.mark("ellipsis") + f"[/{cst._SEM['dim']} italic]",
     ) or detail[-1].count(theme.mark("ellipsis")) == 1
@@ -344,8 +349,10 @@ async def test_an_op_held_before_it_announced_itself_still_renders():
         "outcome": "escalated", "reason_code": "touches_kernel",
         "target_files": ["unified_supervisor.py"], "terminal_state": "blocked",
     }))
-    assert len(console.prints) == 1
-    line = console.prints[0]
+    # One op line, plus the recap every terminal outcome carries (8405bfccae).
+    ops = [p for p in console.prints if theme.mark("recap") not in p]
+    assert len(ops) == 1
+    line = ops[0]
     assert "held for review" in line and "touches kernel" in line
     assert "unified_supervisor.py" in line
 
