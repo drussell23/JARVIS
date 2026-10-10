@@ -69,12 +69,17 @@ def _con(width):
     return Console(file=StringIO(), width=width, force_terminal=False, color_system=None)
 
 
-def test_print_fit_truncates_to_width():
+def test_print_fit_wraps_within_width_and_loses_nothing():
+    """SUPERSEDED 2026-10-08 (block layout): print_fit used to CROP with an
+    ellipsis, losing every character past the edge. It now wraps the content
+    beneath its own column: no line exceeds the width, nothing is lost, and
+    the continuation stays indented under the glyph."""
     con = _con(40)
     PR.print_fit(con, "  ⎿ " + ("x/" * 80))            # far wider than 40
-    out = con.file.getvalue().rstrip("\n")
-    assert len(out) <= 40                               # never exceeds width
-    assert out.endswith("…") or out.endswith("...")     # ellipsis applied
+    lines = con.file.getvalue().rstrip("\n").split("\n")
+    assert all(len(ln.rstrip()) <= 40 for ln in lines)          # never exceeds width
+    assert "".join(ln.strip() for ln in lines).count("x/") == 80  # nothing cropped
+    assert len(lines) > 1 and all(ln.startswith(" " * 4) for ln in lines[1:])
 
 
 def test_print_fit_short_line_unchanged():
@@ -84,10 +89,15 @@ def test_print_fit_short_line_unchanged():
     assert "applied" in out and "…" not in out
 
 
-def test_print_fit_never_wraps_multiline():
+def test_print_fit_folds_an_unbreakable_token_inside_its_column():
+    """SUPERSEDED 2026-10-08: a token longer than the line used to be cropped
+    to one line. It now folds inside the column to the right of the glyph."""
     con = _con(20)
-    PR.print_fit(con, "⏺ " + ("verylongtokenwithoutspaces" * 4))
-    assert con.file.getvalue().count("\n") == 1        # exactly one line, no wrap
+    token = "verylongtokenwithoutspaces" * 4
+    PR.print_fit(con, "● " + token)
+    lines = con.file.getvalue().rstrip("\n").split("\n")
+    assert all(len(ln.rstrip()) <= 20 for ln in lines)
+    assert "".join(ln[2:].rstrip() for ln in lines) == token        # folded, not cut
 
 
 def test_print_fit_failsoft_on_bad_console():

@@ -91,7 +91,7 @@ class TestOneColumnDiscipline:
     @pytest.mark.parametrize("kind,result", [
         ("edit_file", "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new"),
         ("bash", "line one\nline two"),
-        ("search_code", "a.py:1: hit\nb.py:2: hit"),
+        ("type_check", "a.py:1: error: hit\nb.py:2: error: hit"),
     ])
     def test_every_body_SHAPE_indents(self, kind, result):
         """Diff, log and match bodies each have their own colour wrapper.
@@ -99,8 +99,15 @@ class TestOneColumnDiscipline:
         four times, once per wrapper."""
         out = compose(kind, "arg", result)
         assert out.body_lines_markup
-        assert all(_col(ln) == deck.DETAIL_COLUMN
-                   for ln in out.body_lines_markup)
+        if kind == "edit_file":
+            # A diff line STARTS at the body column with its gutter field;
+            # the number is right-aligned inside it, so the first visible
+            # character lands within the gutter, never left of it.
+            assert all(deck.DETAIL_COLUMN <= _col(ln) < deck.DETAIL_COLUMN + deck.GUTTER_WIDTH
+                       for ln in out.body_lines_markup)
+        else:
+            assert all(_col(ln) == deck.DETAIL_COLUMN
+                       for ln in out.body_lines_markup)
 
     def test_the_elision_marker_indents_with_its_body(self):
         """It described lines at column 5 from column 3."""
@@ -109,7 +116,8 @@ class TestOneColumnDiscipline:
         )
         big = "\n".join(f"line {i}" for i in range(200))
         out = compose("bash", "cmd", big, store=BoundedBodyStore())
-        markers = [ln for ln in out.body_lines_markup if "elided" in ln]
+        from backend.core.ouroboros.battle_test.tool_render_registry import is_elision_line
+        markers = [ln for ln in out.body_lines_markup if is_elision_line(_plain(ln).strip())]
         assert markers and _col(markers[0]) == deck.DETAIL_COLUMN
 
 

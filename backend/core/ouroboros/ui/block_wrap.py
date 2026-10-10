@@ -61,31 +61,72 @@ def as_text(line: Any) -> Any:
         return Text(raw)
 
 
+class DeckLine:
+    """One laid-out deck line that still knows the line it came from.
+
+    It renders as the column-keeping layout. ``str()`` is the SOURCE line
+    (its markup), not a repr: a log, a relay or a test that stringifies what
+    it was handed sees ``● Read(x)`` rather than ``<rich.table.Table object
+    at 0x…>``. The layout and the line are one value, so they cannot drift.
+    """
+
+    __slots__ = ("source", "_renderable")
+
+    def __init__(self, source: str, renderable: Any) -> None:
+        self.source = source
+        self._renderable = renderable
+
+    def __rich_console__(self, console: Any, options: Any) -> Any:
+        yield self._renderable
+
+    def __rich_measure__(self, console: Any, options: Any) -> Any:
+        from rich.measure import Measurement
+        return Measurement.get(console, options, self._renderable)
+
+    def __str__(self) -> str:
+        return self.source
+
+    def __repr__(self) -> str:  # pragma: no cover — diagnostics only
+        return f"DeckLine({self.source!r})"
+
+
+def _source_of(line: Any) -> str:
+    """The markup a line was written as (a Rich ``Text`` reports its own)."""
+    try:
+        from rich.text import Text
+        if isinstance(line, Text):
+            return line.markup
+    except Exception:  # noqa: BLE001
+        pass
+    return str(line)
+
+
 def block(line: Any) -> Any:
     """*line* as a renderable whose wrapped content keeps its column."""
     try:
         from rich.cells import cell_len
         from rich.table import Table
+        source = _source_of(line)
         text = as_text(line)
         plain = text.plain
         match = _prefix_re().match(plain)
         n = len(match.group(1)) if match else 0
         if n == 0 or n >= len(plain):
             text.overflow = "fold"
-            return text
+            return DeckLine(source, text)
         prefix, body = text[:n], text[n:]
         body.overflow = "fold"
         grid = Table.grid(padding=0, expand=False)
         grid.add_column(width=cell_len(prefix.plain), no_wrap=True)
         grid.add_column(overflow="fold")
         grid.add_row(prefix, body)
-        return grid
+        return DeckLine(source, grid)
     except Exception:  # noqa: BLE001
         try:
             from rich.text import Text
-            return Text(str(line))
+            return DeckLine(str(line), Text(str(line)))
         except Exception:  # noqa: BLE001
             return str(line)
 
 
-__all__ = ["as_text", "block"]
+__all__ = ["DeckLine", "as_text", "block"]

@@ -248,8 +248,10 @@ def test_compose_no_body_for_read_file_descriptor():
 
 
 def test_compose_body_for_search_code_within_budget():
+    """SUPERSEDED 2026-10-09: search is summary-only now; a body-bearing
+    tool exercises the budget instead."""
     out = compose(
-        "search_code", "pattern", "hit1\nhit2\nhit3",
+        "type_check", "pattern", "hit1\nhit2\nhit3",
         explicit_density=_density(max_body_lines=10),
         store=BoundedBodyStore(capacity=10),
     )
@@ -260,14 +262,17 @@ def test_compose_body_elided_when_over_budget():
     big = "\n".join(f"line{i}" for i in range(50))
     store = BoundedBodyStore(capacity=10)
     out = compose(
-        "search_code", "pattern", big,
+        "type_check", "pattern", big,
         explicit_density=_density(max_body_lines=10),
         store=store,
     )
     # Total emitted lines respects the budget.
     assert len(out.body_lines_markup) == 10
-    # Truncation marker appears.
-    assert any("elided" in ln for ln in out.body_lines_markup)
+    # Truncation marker appears, in the registry's own grammar.
+    from backend.core.ouroboros.battle_test.tool_render_registry import is_elision_line
+    from rich.text import Text
+    assert any(is_elision_line(Text.from_markup(ln).plain.strip())
+               for ln in out.body_lines_markup)
 
 
 def test_compose_expansion_hint_emitted_when_elided_with_store():
@@ -278,8 +283,10 @@ def test_compose_expansion_hint_emitted_when_elided_with_store():
         explicit_density=_density(max_body_lines=10),
         store=store,
     )
-    assert "/expand t-" in out.expansion_hint
-    assert "more line" in out.expansion_hint
+    # The way back rides the body's own marker (one line, never a second
+    # hint line restating a count).
+    assert out.expansion_hint == ""
+    assert any("/expand t-" in ln for ln in out.body_lines_markup)
 
 
 def test_compose_no_expansion_hint_without_store():
@@ -341,16 +348,17 @@ def test_compose_parks_body_in_store_when_eligible():
     assert parked.tool_name == "search_code"
 
 
-def test_compose_does_not_park_when_no_body_shape():
-    """``read_file`` is BodyShape.NONE — body is never parked
-    because the renderer never emits a body block in the first place."""
+def test_compose_parks_a_summary_only_result():
+    """SUPERSEDED 2026-10-09: every non-empty result is parked. A
+    summary-only block (``read_file``) shows no body, which is exactly why its
+    full text must be one /expand away."""
     store = BoundedBodyStore(capacity=10)
-    compose(
+    out = compose(
         "read_file", "foo.py", "x" * 1000,
         explicit_density=_density(max_body_lines=20),
         store=store,
     )
-    assert len(store) == 0
+    assert len(store) == 1 and "/expand t-" in out.summary_markup
 
 
 def test_compose_does_not_park_when_compact_density():
@@ -363,7 +371,9 @@ def test_compose_does_not_park_when_compact_density():
         ),
         store=store,
     )
-    assert len(store) == 0
+    # SUPERSEDED 2026-10-09: COMPACT hides the body, so the result is parked
+    # for /expand rather than dropped.
+    assert len(store) == 1
 
 
 # ===========================================================================
@@ -379,11 +389,15 @@ def test_compose_diff_body_uses_diff_colors():
         explicit_density=_density(max_body_lines=10),
         store=store,
     )
-    # body_lines_markup contains styled lines — green for +, red for -
-    add_lines = [ln for ln in out.body_lines_markup if "+added" in ln]
-    del_lines = [ln for ln in out.body_lines_markup if "-removed" in ln]
-    assert add_lines and "green" in add_lines[0]
-    assert del_lines and "red" in del_lines[0]
+    # SUPERSEDED 2026-10-09: a diff renders like Claude Code's: the SIGN's
+    # background band carries add/remove (`deck_grammar.diff`), so syntax
+    # colour stays legible on top of it.
+    from backend.core.ouroboros.ui.semantic_tokens import _ROLE_BACKGROUNDS
+    from rich.text import Text
+    add_lines = [ln for ln in out.body_lines_markup if "+ added" in Text.from_markup(ln).plain]
+    del_lines = [ln for ln in out.body_lines_markup if "- removed" in Text.from_markup(ln).plain]
+    assert add_lines and _ROLE_BACKGROUNDS["code_add_bg"] in add_lines[0]
+    assert del_lines and _ROLE_BACKGROUNDS["code_del_bg"] in del_lines[0]
 
 
 def test_compose_log_body_uses_dim():
@@ -408,13 +422,16 @@ def test_compose_palette_override_changes_colors():
         "code_hunk": "cyan",
         "heal": "yellow",
     }
+    custom["dim"] = "magenta"
     out = compose(
         "read_file", "foo.py", "x",
         palette=custom,
         explicit_density=_density(),
     )
-    assert "magenta" in out.header_markup
-    assert "yellow underline" in out.header_markup
+    # SUPERSEDED 2026-10-09: the HEADER is composed by deck_grammar (one
+    # grammar for every block opener, outcome-tinted bullet); the caller's
+    # palette still styles what the composer owns: the summary and body.
+    assert "magenta" in out.summary_markup
 
 
 # ===========================================================================
@@ -513,7 +530,7 @@ def test_console_renders_full_pipeline():
     big = "\n".join(f"line{i}" for i in range(20))
     store = BoundedBodyStore(capacity=10)
     out = compose(
-        "search_code", "pat", big,
+        "type_check", "pat", big,
         explicit_density=_density(max_body_lines=8),
         store=store,
     )
@@ -525,15 +542,13 @@ def test_console_renders_full_pipeline():
     if out.expansion_hint:
         console.print(out.expansion_hint)
     text = console.export_text()
-    assert "Search" in text
-    assert "matches" in text
+    assert "TypeCheck" in text or "Type" in text
     # The deck's column discipline, end to end: the summary indents under
     # the action and the body indents under the summary.
     lines = [ln for ln in text.splitlines() if ln.strip()]
     assert lines[0].startswith(f"{_act()} ")
     assert lines[1].startswith("  ⎿  ")
     assert lines[2].startswith("     ")
-    assert "elided" in text
     assert "/expand t-" in text
 
 
@@ -592,8 +607,11 @@ def test_view_module_imports_substrate_only():
 
 def test_a_bash_call_shows_the_command_on_a_dollar_line(monkeypatch):
     monkeypatch.delenv("JARVIS_SHELL_COMMAND_LINE_ENABLED", raising=False)
+    # Long enough that the HEADER clips it: the `$` line exists to show the
+    # command in full, and only appears when the header cannot.
+    _cmd = "pytest -q tests/foo.py " + " ".join(f"--deselect=t{i}" for i in range(12))
     out = compose(
-        "bash", "pytest -q tests/foo.py", "3 passed",
+        "bash", _cmd, "3 passed",
         explicit_density=_density(max_body_lines=10),
         store=BoundedBodyStore(capacity=10),
     )
@@ -614,18 +632,21 @@ def test_a_non_bash_call_has_no_dollar_line():
 
 def test_the_command_line_strips_ansi_escape_codes():
     out = compose(
-        "bash", "echo \x1b[31mred\x1b[0m done", "ok",
+        "bash", "echo \x1b[31mred\x1b[0m done " + "x" * 120, "ok",
         explicit_density=_density(max_body_lines=10),
         store=BoundedBodyStore(capacity=10),
     )
     joined = "\n".join(out.body_lines_markup)
     assert "\x1b[" not in joined and "$ echo red done" in joined
+    # And the header never carries terminal control either.
+    assert "\x1b" not in out.header_markup
 
 
 def test_a_heredoc_command_is_flattened_and_clipped(monkeypatch):
     monkeypatch.setenv("JARVIS_SHELL_COMMAND_MAX_CHARS", "40")
     out = compose(
-        "bash", "for i in 1 2 3; do\n  echo very-long-loop-body-$i\ndone",
+        "bash", "for i in 1 2 3; do\n  echo very-long-loop-body-$i\n"
+                "  echo another-very-long-line-in-the-loop-$i\ndone",
         "ok", explicit_density=_density(max_body_lines=10),
         store=BoundedBodyStore(capacity=10),
     )

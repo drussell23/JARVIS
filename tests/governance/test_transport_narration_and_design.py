@@ -67,7 +67,7 @@ class _Console:
         self.prints: List[str] = []
 
     def print(self, text: str, **kw: Any) -> None:
-        self.prints.append(text)
+        self.prints.append(str(text))   # a DeckLine stringifies to its source line
 
 
 def _msg(kind: str, op_id: str, payload: dict) -> Any:

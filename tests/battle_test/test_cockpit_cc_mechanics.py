@@ -71,7 +71,8 @@ def test_every_surface_lays_lines_out_as_blocks():
     from backend.core.ouroboros.governance import claude_style_transport
     assert "block(_line_to_text(ln))" in inspect.getsource(bipartite_layout)
     assert "block(markup)" in inspect.getsource(presentation_restraint.print_fit)
-    assert "_block(safe)" in inspect.getsource(ov._render_markup_frame)
+    # Each line the transcript flow emits is laid out as a block.
+    assert "_block(_ln)" in inspect.getsource(ov._render_markup_frame)
     assert "block(text)" in inspect.getsource(claude_style_transport)
 
 

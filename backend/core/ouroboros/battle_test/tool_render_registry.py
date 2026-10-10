@@ -303,8 +303,11 @@ def _is_tool_note(line: str) -> bool:
     parenthesised status every Venom tool uses (``(no matches for …)``,
     ``(search error …)``, ``(not a directory: …)``) and its truncation
     markers (``... [N more matches truncated] ...``)."""
+    # Every Venom tool note OPENS with "(" and a result line (`path:line:text`,
+    # a path, a symbol) never does. Requiring a closing ")" too missed
+    # search's own `(no matches for …). Try a broader file_glob …`.
     s = line.strip()
-    return (s.startswith("(") and s.endswith(")")) or s.startswith(("...", "…"))
+    return s.startswith(("(", "...", "…"))
 
 
 def _result_lines(result: str) -> List[str]:
@@ -319,8 +322,13 @@ def _tool_note(result: str) -> str:
     else: ``no matches for pattern='x' glob=*.py``."""
     for ln in str(result or "").splitlines():
         if ln.strip() and _is_tool_note(ln):
+            # Unwrap only the parentheses that are there: search's note is
+            # `(no matches …). Try a broader file_glob`, which ends in text.
             s = ln.strip()
-            return s[1:-1] if s.startswith("(") else s
+            if s.startswith("("):
+                s = s[1:]
+                s = s[:-1] if s.endswith(")") else s.replace(")", "", 1)
+            return s.strip()
     return ""
 
 

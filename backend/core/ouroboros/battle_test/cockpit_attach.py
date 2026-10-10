@@ -1656,6 +1656,19 @@ class CockpitAttachBridge:
         for sid, sw in list(self._sessions.items()):
             if sw is w:
                 del self._sessions[sid]
+                # Retire this display's declaration HERE, where the session
+                # is removed: every exit path (detach, write fault, stop)
+                # passes through this one place. The read loop's own cleanup
+                # ran after this deletion and so never found the session,
+                # leaving a departed cockpit's width, glyph and colour
+                # declaration steering the daemon's renders for its life.
+                try:
+                    from backend.core.ouroboros.battle_test.terminal_capabilities import (  # noqa: E501
+                        forget,
+                    )
+                    forget(sid)
+                except Exception:  # noqa: BLE001
+                    pass
                 # Safe resumption: a cockpit that dies with its rewind
                 # menu open must release its autonomy hold NOW, not at
                 # TTL expiry — a SIGKILL'd terminal cannot send resume.
@@ -1867,20 +1880,11 @@ class CockpitAttachBridge:
         except Exception:  # noqa: BLE001
             pass
         finally:
+            # `_drop` retires this display's capability declaration (ambient
+            # renders take the MINIMUM width across live subscribers, so a
+            # departed 40-column terminal would otherwise squeeze every
+            # future broadcast).
             self._drop(writer)
-            # Retire this display's declaration. Ambient renders take the
-            # MINIMUM width across live subscribers, so a departed 40-column
-            # terminal would otherwise squeeze every future broadcast for the
-            # life of the daemon — a dead cockpit constraining live ones.
-            try:
-                from backend.core.ouroboros.battle_test.terminal_capabilities import (  # noqa: E501
-                    forget,
-                )
-                for _sid, _w in list(getattr(self, "_sessions", {}).items()):
-                    if _w is writer:
-                        forget(_sid)
-            except Exception:  # noqa: BLE001
-                pass
             logger.info(
                 "[CockpitAttach] terminal detached (subscribers=%d)",
                 len(self._clients),

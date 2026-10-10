@@ -529,11 +529,13 @@ def _diff_wrapper_for(body_lines: Any,
             if sign == "+":
                 lineno = state["new"] or None
                 state["new"] += 1
-                return _deck.diff(lineno, "+", body, path=path, width=width)
+                return _deck.diff(lineno, "+", body, path=path, width=width,
+                                  column=0)
             if sign == "-":
                 lineno = state["old"] or None
                 state["old"] += 1
-                return _deck.diff(lineno, "-", body, path=path, width=width)
+                return _deck.diff(lineno, "-", body, path=path, width=width,
+                                  column=0)
             if sign == "\\":
                 return _wrap_diff_line(text, palette)   # "\ No newline at end of file"
             # Context: advances BOTH sides, and is shown against the new file
@@ -544,7 +546,8 @@ def _diff_wrapper_for(body_lines: Any,
             if state["old"]:
                 state["old"] += 1
             body = body if sign == " " else text
-            return _deck.diff(lineno, " ", body, path=path, width=width)
+            return _deck.diff(lineno, " ", body, path=path, width=width,
+                                  column=0)
         except Exception:  # noqa: BLE001
             # The previous rendering is a perfectly good fallback; losing the diff
             # to a styling failure is not.

@@ -90,7 +90,8 @@ class TestHierarchy:
 
     def test_outcome_tone_reaches_the_bullet(self):
         assert theme.semantic("crit") in deck.action("Validate", tone="crit")
-        assert theme.semantic("ok") in deck.action("Validate")
+        # The default is the outcome tone DONE_TONE (O+V venom green).
+        assert theme.semantic(deck.DONE_TONE) in deck.action("Validate")
 
     def test_additions_and_removals_are_told_apart(self):
         """The band belongs to the SIGN -- and it is a BACKGROUND role.

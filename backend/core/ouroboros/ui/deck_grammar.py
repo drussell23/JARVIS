@@ -111,12 +111,30 @@ def _glyph(name: str) -> str:
 
 def _escape(text: Any) -> str:
     """Caller text is CONTENT. ``except Exception:  # [BLE001]`` is a comment,
-    not a Rich tag, and a deck that renders it as one loses the line."""
+    not a Rich tag, and a deck that renders it as one loses the line.
+
+    It is also not TERMINAL CONTROL. Tool arguments come from the model, and a
+    header rendered ``Bash(echo \\x1b[31mred …)`` with the raw escape intact:
+    any sequence a model emitted (cursor moves, clear-screen) reached the
+    operator's terminal. Only the `$` line was sanitised. Every caller string
+    in every deck line now passes the one sanitiser the live stream uses
+    (`live_tool_stream.sanitize_stream_text`: repaints collapsed, ANSI and
+    control characters stripped, credential shapes redacted) before markup
+    escaping."""
+    raw = str(text)
+    try:
+        from backend.core.ouroboros.battle_test.live_tool_stream import (
+            sanitize_stream_text,
+        )
+        if raw:
+            raw = sanitize_stream_text(raw)
+    except Exception:  # noqa: BLE001 — unsure: strip what is certainly unsafe
+        raw = "".join(ch for ch in raw if ch in "\t" or ch >= " ")
     try:
         from rich.markup import escape
-        return escape(str(text))
+        return escape(raw)
     except Exception:  # noqa: BLE001
-        return str(text)
+        return raw
 
 
 def _tint(text: str, style: str) -> str:
@@ -520,7 +538,8 @@ def _highlight_to_markup(code: str, path: Optional[str], bg: str) -> str:
 
 
 def diff(lineno: Optional[int], sign: str, code: str,
-         *, path: Optional[str] = None, width: Optional[int] = None) -> str:
+         *, path: Optional[str] = None, width: Optional[int] = None,
+         column: Optional[int] = None) -> str:
     """``     412 +    except RiskFloorConfigError:`` — a hunk under a result.
 
     Anchored on :data:`DETAIL_COLUMN`, so it cannot step out from under the
@@ -536,6 +555,11 @@ def diff(lineno: Optional[int], sign: str, code: str,
     ``width`` pads the background band to a fixed column so an added block reads as
     a solid slab rather than a ragged right edge that stops at each line's text.
     """
+    # ``column`` is where the line STARTS. A surface that prints it directly
+    # takes the deck's body column; a composer that positions every body line
+    # itself (tool_render_view's one indent seam) asks for 0, or the hunk is
+    # indented twice.
+    col = DETAIL_COLUMN if column is None else max(0, int(column))
     try:
         gutter = (f"{int(lineno):>{GUTTER_WIDTH}}" if lineno is not None
                   else " " * GUTTER_WIDTH)
@@ -575,16 +599,18 @@ def diff(lineno: Optional[int], sign: str, code: str,
             room = band_fill(
                 len(code) + 2,               # the code plus "<sign> "
                 width,
+                # The band ends at the terminal edge wherever the line is
+                # finally placed, so it is measured from the DECK column.
                 indent=DETAIL_COLUMN + GUTTER_WIDTH + 1,
             )
             if room:
                 pad = _tint(" " * room, bg)
         sign_mark = _tint(f"{sign} ", bg) if bg else f"{sign} "
-        return (" " * DETAIL_COLUMN
+        return (" " * col
                 + _tint(gutter, _style("faint")) + " "
                 + sign_mark + body + pad)
     except Exception:  # noqa: BLE001
-        return f"     {sign} {code}"
+        return " " * col + f"{sign} {code}"
 
 
 def blank() -> str:

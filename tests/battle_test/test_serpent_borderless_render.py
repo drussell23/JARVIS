@@ -60,7 +60,10 @@ def test_op_line_borderless_no_box(monkeypatch):
     flow._op_line(op, "applied · doubleword · $0.004")
     out = buf.getvalue()
     assert not any(c in out for c in _BOX_CHARS)
-    assert ("⎿" in out) or (">" in out)       # result glyph (utf8 or ascii)
+    # SUPERSEDED 2026-10-09: the chokepoint no longer stamps `⎿` in front of
+    # every op line (it landed before action headers and before lines with
+    # their own `⎿`). It indents; the line carries its own structure.
+    assert out.startswith("  applied · doubleword · $0.004")
 
 
 def test_op_line_legacy_box_when_master_off(monkeypatch):

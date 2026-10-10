@@ -303,7 +303,10 @@ def render(record: Dict[str, Any]) -> str:
     learn = (record.get("learning") or {}).get("learning_loop") or {}
     verified = [c for c in land.get("verified") or [] if c.get("exists")]
     lines = [
-        f"Proof of work — {record.get('session_id') or 'live'}: {record.get('verdict', '?').upper()}",
+        # A record that carries no verdict (an older chain link, another
+        # writer) is judged by the same rule rather than shown as "?".
+        f"Proof of work — {record.get('session_id') or 'live'}: "
+        f"{(record.get('verdict') or verdict(record)).upper()}",
         f"  capabilities: {counts.get('FIRING', 0)} firing, {counts.get('SILENT', 0)} silent, "
         f"{counts.get('UNKNOWN', 0)} unobservable (over {cap.get('sessions_scanned', 0)} session(s))",
         f"  landed on {land.get('target') or '?'}: {len(verified)} verified commit(s); "

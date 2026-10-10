@@ -352,8 +352,16 @@ def test_the_shipping_gate_path_calls_the_review():
 
 
 def test_profiles_differ_only_in_presentation():
-    from backend.core.ouroboros.governance.production_envelope import PRESENTATION_KEYS, build
-    soak, cockpit = build("soak").values, build("cockpit").values
+    """Given the SAME session budget, the two profiles differ only in
+    presentation: what the organism does is identical. (Their DEFAULT session
+    lengths differ, and every op budget is derived from the session length, so
+    comparing defaults would compare two budgets, not two organisms.)"""
+    from backend.core.ouroboros.governance.production_envelope import (
+        PRESENTATION_KEYS, PROFILES, build,
+    )
+    wall, idle, cost = PROFILES["soak"]
+    soak = build("soak", wall_s=wall, idle_timeout_s=idle, cost_cap_usd=cost).values
+    cockpit = build("cockpit", wall_s=wall, idle_timeout_s=idle, cost_cap_usd=cost).values
     differing = {k for k in set(soak) | set(cockpit) if soak.get(k) != cockpit.get(k)}
     assert differing <= PRESENTATION_KEYS, differing - PRESENTATION_KEYS
 
@@ -416,9 +424,14 @@ def test_a_molt_post_reaches_the_session_log(tmp_path, monkeypatch, caplog):
 
 def test_perf_sensor_reads_through_the_store_api(monkeypatch):
     from backend.core.ouroboros.governance.intake.sensors import performance_regression_sensor as prs
-    src = inspect.getsource(prs.PerformanceRegressionSensor.scan_once)
-    assert "get_all()" not in src
-    assert "load_records(" in src and "get_records_by_task(" in src
+    import ast
+    import textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(prs.PerformanceRegressionSensor.scan_once)))
+    # Calls, not text: the comment explaining the fix names `get_all()`.
+    called = {n.func.attr for n in ast.walk(tree)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    assert "get_all" not in called
+    assert {"load_records", "get_records_by_task"} <= called
 
 
 def test_record_epoch_orders_mixed_timestamps():

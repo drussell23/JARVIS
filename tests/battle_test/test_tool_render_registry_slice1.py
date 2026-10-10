@@ -181,8 +181,10 @@ def test_bash_is_log_shape():
     assert get_descriptor("bash").body_shape is BodyShape.LOG
 
 
-def test_search_code_is_multi_line():
-    assert get_descriptor("search_code").body_shape is BodyShape.MULTI_LINE
+def test_search_code_is_summary_only():
+    """SUPERSEDED 2026-10-09: exploration tools collapse to a summary
+    (`Found N matches in M files`); the full result is one /expand away."""
+    assert get_descriptor("search_code").body_shape is BodyShape.NONE
 
 
 def test_default_descriptor_is_single_line():
@@ -268,7 +270,7 @@ def test_search_summary_counts_matches():
 
 def test_search_summary_empty_returns_no_matches():
     desc = get_descriptor("search_code")
-    assert desc.summarize_result("", ToolStatus.SUCCESS) == "no matches"
+    assert desc.summarize_result("", ToolStatus.SUCCESS) == "No matches"
 
 
 def test_bash_summary_counts_output_lines():
@@ -386,7 +388,8 @@ def test_render_body_shape_none_yields_no_body_even_with_budget():
 
 
 def test_render_body_fits_in_budget_no_elision():
-    desc = get_descriptor("search_code")
+    # A tool that still shows a body (exploration tools are summary-only).
+    desc = get_descriptor("type_check")
     out = render(
         desc, "pat", "a\nb\nc", ToolStatus.SUCCESS, max_body_lines=10,
     )
@@ -395,7 +398,7 @@ def test_render_body_fits_in_budget_no_elision():
 
 
 def test_render_body_exceeds_budget_head_tail_elision():
-    desc = get_descriptor("search_code")
+    desc = get_descriptor("type_check")
     big = "\n".join(f"line{i}" for i in range(100))
     out = render(desc, "pat", big, ToolStatus.SUCCESS, max_body_lines=10)
     # Total line count must respect the budget exactly.

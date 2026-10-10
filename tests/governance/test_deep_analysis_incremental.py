@@ -49,7 +49,8 @@ def test_cycle_covers_everything_then_has_nothing_stale(repo):
 def test_incremental_orphans_equal_the_whole_corpus_answer(repo):
     findings, _ = d.run_incremental_cycle(repo_root=repo)
     whole = d.analyze_orphan_surface(repo_root=repo)
-    assert _orphans(findings) == _orphans(whole) == ["lonely"]
+    # `f` (the latent-defect fixture) is never called either: it is an orphan too.
+    assert _orphans(findings) == _orphans(whole) == ["f", "lonely"]
 
 
 def test_a_changed_file_is_reanalyzed_and_answers_change(repo):
@@ -60,14 +61,14 @@ def test_a_changed_file_is_reanalyzed_and_answers_change(repo):
     )
     findings, stats = d.run_incremental_cycle(repo_root=repo)
     assert stats["stale"] == 1 and stats["analyzed"] == 1
-    assert _orphans(findings) == []
+    assert _orphans(findings) == ["f"]            # lonely is now called
 
 
 def test_a_deleted_file_leaves_the_cache(repo):
     d.run_incremental_cycle(repo_root=repo)
     (repo / "backend" / "pkg" / "orphan.py").unlink()
     findings, stats = d.run_incremental_cycle(repo_root=repo)
-    assert stats["files"] == 3 and _orphans(findings) == []
+    assert stats["files"] == 3 and _orphans(findings) == ["f"]
 
 
 def test_partial_coverage_withholds_cross_file_orphans(repo, monkeypatch):
