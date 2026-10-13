@@ -247,3 +247,63 @@ def test_the_launcher_refuses_rather_than_running_on_defaults():
         "the envelope build has no refusal path — a failed build would fall "
         "through to a cockpit running on default budgets"
     )
+
+
+# --- A test run sees the code, not the organism ------------------------------
+#
+# Soak bt-2026-10-10-201126: the promotion gate's pytest inherited the
+# envelope and refused every landing on 25 failures that a shell run of the
+# same files did not have (JARVIS_SINGLE_FILE_DIFF_SCHEMA_ENABLED alone flips
+# two prompt-shape pins in test_providers.py).
+
+
+def test_environ_for_tests_drops_every_declared_name_whoever_set_it():
+    from backend.core.ouroboros.governance.production_envelope import (
+        SAFETY_PINS, environ_for_tests,
+    )
+    declared = set(build("soak").values) | set(build("cockpit").values)
+    parent = {name: "operator-set" for name in declared}
+    parent.update({"PATH": "/usr/bin", "HOME": "/home/x", "UNRELATED_FLAG": "1"})
+    child = environ_for_tests(parent)
+    assert "JARVIS_SINGLE_FILE_DIFF_SCHEMA_ENABLED" not in child
+    assert not (declared - SAFETY_PINS) & set(child)
+    assert child["PATH"] == "/usr/bin" and child["UNRELATED_FLAG"] == "1"
+
+
+def test_safety_pins_are_repinned_safe_never_dropped():
+    """An unset JARVIS_ORANGE_PR_ENABLED self-arms the review lane, which
+    pushes; candidate code under test must never get that."""
+    from backend.core.ouroboros.governance.production_envelope import (
+        environ_for_tests,
+    )
+    child = environ_for_tests({
+        "JARVIS_ORANGE_PR_ENABLED": "true", "JARVIS_REMOTE_PUSH_AIRGAP": "false",
+    })
+    assert child["JARVIS_ORANGE_PR_ENABLED"] == "false"
+    assert child["JARVIS_REMOTE_PUSH_AIRGAP"] == "true"
+    assert environ_for_tests({})["JARVIS_ORANGE_PR_ENABLED"] == "false"
+
+
+def test_the_pytest_seam_hands_children_the_test_environ(monkeypatch, tmp_path):
+    import sys
+    from backend.core.ouroboros.governance import test_subprocess_helper as h
+
+    monkeypatch.setenv("JARVIS_SINGLE_FILE_DIFF_SCHEMA_ENABLED", "true")
+    monkeypatch.setenv("OV_SEAM_PROBE", "kept")
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import os\n"
+        "print('DIFF=' + os.environ.get('JARVIS_SINGLE_FILE_DIFF_SCHEMA_ENABLED', '<unset>'))\n"
+        "print('PROBE=' + os.environ.get('OV_SEAM_PROBE', '<unset>'))\n",
+        encoding="utf-8",
+    )
+    got = h.run_pytest_subprocess_sync(
+        [sys.executable, str(probe)], timeout_s=30, caller="envelope_test",
+    )
+    assert "DIFF=<unset>" in got.stdout, got.stdout
+    assert "PROBE=kept" in got.stdout, got.stdout
+    explicit = h.run_pytest_subprocess_sync(
+        [sys.executable, str(probe)], timeout_s=30, caller="envelope_test",
+        env={"JARVIS_SINGLE_FILE_DIFF_SCHEMA_ENABLED": "true", "PATH": "/usr/bin:/bin"},
+    )
+    assert "DIFF=true" in explicit.stdout, "an explicit env must pass through untouched"

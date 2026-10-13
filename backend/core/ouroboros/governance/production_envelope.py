@@ -60,6 +60,8 @@ __all__ = [
     "PRESENTATION_KEYS",
     "export_lines",
     "hydrate",
+    "SAFETY_PINS",
+    "environ_for_tests",
 ]
 
 # --- The two ratios that tie the budgets together -------------------------
@@ -97,6 +99,12 @@ _PRESENTATION: Dict[str, Dict[str, object]] = {
     },
 }
 PRESENTATION_KEYS = frozenset(k for layer in _PRESENTATION.values() for k in layer)
+
+#: Kill-switches whose envelope value is the SAFE side. A child that runs
+#: candidate code must keep them at that value whatever its parent says, so
+#: :func:`environ_for_tests` re-pins them instead of dropping them: an unset
+#: ``JARVIS_ORANGE_PR_ENABLED`` self-arms the review lane, which pushes.
+SAFETY_PINS = frozenset({"JARVIS_REMOTE_PUSH_AIRGAP", "JARVIS_ORANGE_PR_ENABLED"})
 
 
 def _bg_pool_size() -> int:
@@ -444,6 +452,48 @@ def hydrate(
         ", ".join(sorted(overridden)[:6]) or "none",
     )
     return applied, tuple(sorted(overridden))
+
+
+_DECLARED: Optional[Tuple[frozenset, Dict[str, str]]] = None
+
+
+def _declared() -> Tuple[frozenset, Dict[str, str]]:
+    """Every name any profile declares, plus the safe value of each pin.
+
+    Names do not depend on the environment (only some values do), so one
+    build per profile per process is enough."""
+    global _DECLARED
+    if _DECLARED is None:
+        names: set = set()
+        for profile in PROFILES:
+            names.update(build(profile).values)
+        soak = build("soak").values
+        _DECLARED = (frozenset(names), {k: soak[k] for k in SAFETY_PINS if k in soak})
+    return _DECLARED
+
+
+def environ_for_tests(environ: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+    """The environment a test run should see: *environ* minus the envelope.
+
+    The envelope is how the ORGANISM runs (budgets, sensors, the diff schema,
+    sibling sampling). A test asks how the CODE behaves, and its answer must be
+    the one CI gets. Inherited whole, the envelope turned 25 green tests red
+    under the promotion gate (soak bt-2026-10-10-201126: every landing refused,
+    e.g. ``JARVIS_SINGLE_FILE_DIFF_SCHEMA_ENABLED`` flipping a prompt-shape pin)
+    while the same files passed in a shell. Removal is by NAME, so a value from
+    ``.env`` or a launcher export goes too: whoever set it, it is still organism
+    posture. :data:`SAFETY_PINS` are re-pinned to their safe value, never
+    dropped. NEVER raises; on failure returns *environ* unchanged.
+    """
+    src = dict(os.environ if environ is None else environ)
+    try:
+        names, pins = _declared()
+    except Exception:  # noqa: BLE001 — an unbuildable envelope strips nothing
+        logger.debug("[ProductionEnvelope] environ_for_tests fell back", exc_info=True)
+        return src
+    out = {k: v for k, v in src.items() if k not in names}
+    out.update(pins)
+    return out
 
 
 def export_lines(
