@@ -1,0 +1,54 @@
+<!-- ADVBLOCK part-i -->
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. The §4 invariant forbids work "the human would not have sanctioned", yet §1.2 says O+V decides for itself what to work on. By October (§93.7) goals found by Goal Discovery are signed automatically by <code>synthesize_and_sign()</code>. Is that still sanction, or has proactivity quietly eaten the invariant?</summary>
+<p>In the April design, sanction was spread across the pipeline rather than given per item. Sensors proposed work (§1.1), the risk ladder set a tier (§9.1), and only Orange work waited for a human (§14.1). Green and Yellow work was sanctioned by policy: the operator had agreed in advance to what those tiers allow.</p>
+<p>§93.7 makes that policy explicit and narrows it. Every source of work, including model-invented proposals, must pass through one signer ("There is no second sanction path"). Goal Discovery may only sign evidence-only work, such as ambient red tests and uncovered modules. The Sentinel auto-approves only up to a tier ceiling, and BLOCKED work, Order-2 self-modification and anything touching the cage always escalate.</p>
+<p>A defensible position is that this is still sanction, but sanction of a class of work rather than of each item. The operator signs a rule ("evidence-only goals below this tier"), not each goal. The weakness is that a rule can admit items the operator would have refused. §93.14 records four wrong landings out of 91: one hollow, one with no intended change, one that dropped content and one that flattened text.</p>
+<p>The evidence that would settle it is the rate at which auto-signed goals produce landings the operator later reverts or repairs, compared with operator-sanctioned goals. If auto-signed work is reverted much more often, the class-level rule is too wide and the invariant is being honoured in form only.</p>
+</details>
+<details class="cq-adv"><summary>A2. Principle 6 says three consecutive successes make "a pattern" (§3), and §78 adds "under comparable conditions". Why would that bar still fail to show that the Reactor learning loop of §93.11 made the model better?</summary>
+<p>Principle 6 measures <em>repeatability</em>: can a capability succeed again and again under the same conditions (§3, §78)? It does not compare against a baseline. A model that was already able to write a passing test file would pass three times in a row whether or not training changed anything.</p>
+<p>§93.11 shows the gap in practice. The first adapter beat the incumbent 4/6 to 3/6 on the handoff's greedy comparison. The project's own notes reject this as evidence of learning: only three answers contributed, the gradient norm was about 1e-4, and the margin was one greedy flip. On a held-out benchmark of 30 tasks drawn from human commits with hidden tests, the adapter solved 0, with a mean gain of 0.03.</p>
+<p>So the learning question needs a controlled comparison that Principle 6 does not demand: the same held-out tasks, the incumbent as control, and a gain that exceeds run-to-run noise. The operator's standing rule, that no training-derived change is pushed until a held-out gain is shown (§93.11), is that missing clause. Graduation asks "does it keep working?" The learning loop must also ask "does it work better than before?"</p>
+</details>
+<details class="cq-adv"><summary>A3. §1.2 says the model "cannot deceive the skeleton because the skeleton is not listening to language". §93.3 reports that about 8.8% of LLM-generated adversarial mutations escape the static cage. Does the second result refute the first?</summary>
+<p>Not directly. The two claims are about different things. §1.2 is about <em>persuasion</em>: the gate does not read arguments, so no wording can talk it into allowing a path or command. Nothing in §93.3 suggests the escapes worked by persuasion.</p>
+<p>§93.3 is about <em>visibility</em>. The North Star attributes the residue to <code>eval</code>, <code>exec</code>, <code>subprocess</code> and <code>pickle</code> called on strings built at runtime. A gate that reads file paths, token types and exit codes can only judge structure that is present in the text it reads. A string that becomes code only when it runs is invisible to it by construction. So "cannot be deceived" is true, while "cannot be evaded" is false at about twice the 4.4% gate.</p>
+<p>This also explains the stated remedy: OS-level runtime containment, not more AST rules (§93.3). It fits the April design's own split, where execution was meant to happen inside a sandbox with process isolation (§5.3), and the October PID-namespace containment for test runs (§93.8). The paper notes that no re-measurement after the later hardening was found, so the open evidence is the escape rate with runtime containment in place.</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (quantitative).</strong> §4 imagines an agent doing "most of" a senior engineer's 32 weekly maintenance hours. Test this against §93.10. Givens: the 6.03 h soak <code>bt-2026-10-05-012717</code> made 6 substantive landings, with "1.34/h in the first 2.98 h" and nothing landing in a window from 22:24 to 00:29. The 1.97 h soak <code>bt-2026-09-26-143412</code> made 3 substantive landings. There were 91 autonomous landings dated 2026-09-06 to 2026-10-10, of which 84 were test files. (a) Compute the substantive rate in the second part of the 6.03 h soak. (b) What fraction of that soak was the idle window? (c) Compute the average daily landing rate over the 91-landing period. (d) Say which of the §4 maintenance tasks this evidence covers.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Treat the 1.34/h figure as a substantive rate, multiply it out to get landings in the first part, and subtract from 6. Count calendar days inclusively for (c).</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Assumption: the "1.34/h in the first 2.98 h" note sits in the substantive-per-hour column, so it is read as a substantive rate.</p>
+<p>(a) Substantive landings in the first part: 1.34 × 2.98 ≈ 3.99, so about 4. The remaining 6 − 4 = 2 landed in 6.03 − 2.98 = 3.05 h, which is about 0.66 per hour. That is roughly half the early rate. This is the "supply wall" that PRD §34 records: after about four hours on uncovered modules, yield is bounded by the supply of landable work, not by the model.</p>
+<p>(b) From 22:24 to 00:29 is 2 h 5 min, or about 2.08 h. 2.08 / 6.03 ≈ 0.345, so about a third of the soak landed nothing.</p>
+<p>(c) 2026-09-06 to 2026-10-10 inclusive is 25 days in September plus 10 in October, which is 35 days. 91 / 35 = 2.6 landings per day. Test files alone give 84 / 35 = 2.4 per day.</p>
+<p>(d) §4 lists flaky-test investigation, doc drift, lint, dependency bumps, edge-case tests, renames, refactors, issue triage and alerts. The evidence covers one item strongly (writing tests: 84 of 91), docs weakly (2 landings, one repaired by hand), and production fixes thinly (5 landings, one reverted). §93.14 says production-code landings at cadence are "not demonstrated".</p>
+<p>Conclusion: the rate is real but narrow. It covers a slice of one §4 task, it is limited by work supply, and it is far from "most of" 32 hours. Check: 4 + 2 = 6 matches the table, and 1.00 per hour over 6.03 h also gives about 6.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (adversarial).</strong> The §4 invariant says the organism may never do work that "cannot be rolled back". Build an operation that respects every file-level rule yet breaks this invariant in spirit: a generated test file whose body calls <code>pkill -f jarvis</code> (an event §93.8 records really happened). The target path is ordinary, the content is ASCII, and the model explored first. Go through the April layers in §1.2, §5.3, §12.4 and §15 and decide which, if any, stops it. Then name what the October paper added.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask what each layer actually reads. Does the bash blocklist see a test file's body? What does a <code>RollbackArtifact</code> restore?</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Walk the layers in order.</p>
+<ul>
+<li><strong>Protected paths (§9.1 Rule 0).</strong> A new file under <code>tests/</code> matches none of <code>.env</code>, <code>credentials.*</code>, <code>.git/</code> or supervisor files. It passes.</li>
+<li><strong>GENERATE Iron Gates (§12.4).</strong> The exploration-first and ASCII checks look at the model's behaviour and the bytes of the content. Both pass by assumption.</li>
+<li><strong>Bash blocklist (§1.2, §12.3).</strong> This gates the <code>bash</code> <em>tool call</em>. Here the dangerous command is inside a test that VALIDATE or VERIFY runs as part of a normal test run. The blocklist does not inspect test bodies, so nothing in the paper says it would fire.</li>
+<li><strong>Rollback (§15.1, §15.2).</strong> <code>RollbackArtifact</code> snapshots and restores <em>files</em>. Killing a process is not a file change, so there is nothing for it to restore.</li>
+<li><strong>Sandbox (§5.3).</strong> April's answer was to run tests inside Reactor with process isolation. That is the only layer that could stop it, and only if the isolation stops a test from signalling processes outside its sandbox.</li>
+</ul>
+<p>What happened: §93.8 records that the candidate test killed the daemon. So in the environment that ran it, no layer stopped it. The paper does not say why the §5.3 isolation did not apply there. The fix was containment at the OS level: test runs now execute in a PID namespace (<code>6b00b8adf5</code>), so the test cannot see the daemon's process to kill it.</p>
+<p>Lesson: the invariant's "rollback" is defined over repository state, but executing candidate code has side effects outside the repository. Only runtime containment covers those. This matches §93.3's conclusion for the cage. Check: a PID namespace leaves every file-level rule unchanged, so this fix closes the gap without weakening any other layer.</p>
+</details>
+</div>
+</div>
+<!-- END -->

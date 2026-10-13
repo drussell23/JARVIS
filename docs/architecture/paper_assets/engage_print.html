@@ -1,0 +1,7 @@
+<script>
+/* PDF build only: questions stay in place, answers move to Appendix G. */
+document.documentElement.classList.add("print-build");
+Array.prototype.forEach.call(document.querySelectorAll("details.answer-key"), function (d) {
+  d.open = true;
+});
+</script>

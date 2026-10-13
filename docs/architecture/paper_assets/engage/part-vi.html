@@ -1,0 +1,112 @@
+<!-- CHECKPOINT before: ## §42. Urgency-Aware Provider Routing -->
+<aside class="checkpoint" id="cp-part-vi-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">Every operation must be sent to one of several providers. Would you make that choice with a quick model call that reads the task, or with plain code? What would each choice cost?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>Plain code. A pure-code <code>UrgencyRouter</code> maps <code>(urgency, source, complexity)</code> to a <code>ProviderRoute</code> in under a millisecond, with no network call and no LLM. The paper gives three reasons. Replaying a signal gives the same route. A model call on every routing decision would double the bill. And agent work runs on tight per-phase time budgets. See §42 and §42.4.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- ENDBLOCK part-vi -->
+#### Check your understanding: PART VI — The Provider Ecosystem
+
+<div class="engage" id="engage-part-vi">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why does the failback state machine apply zero backoff to a CONTENT_FAILURE but up to 900 seconds to a CONNECTION_ERROR?</summary>
+<p>The backoff answers one question: when will the provider's infrastructure work again? In a content failure the provider did answer, but the answer was malformed: bad JSON, missing fields or oversized output. The infrastructure is fine, so waiting gains nothing, and the next operation can try the primary at once (§40.1). A connection error means the host is unreachable, which can take minutes or hours to fix, so its base backoff (120s) and cap (900s) are the largest in the table. Matching the backoff to the failure mode keeps the cheap primary in use. A single bad answer does not push work onto the expensive fallback, and a real outage is not hammered with retries (§40, §40.2).</p>
+</details>
+<details class="cq"><summary>2. In what sense is the April 2026 "topology seal" a safety feature and not a limitation?</summary>
+<p>As of 2026-04-16, every agent-generation route had <code>dw_allowed: false</code>. Three routes cascaded to Claude and two used skip-and-queue (§43.1). The trigger was evidence: two isolation tests showed the same "SSE stream stalled (no data for 30s)" signature (§43.2). The seal sends work around a failure that had been observed but not yet repaired, and it is fully reversible. Each route sits behind one YAML flag and can be turned back on by itself, with a shadow-mode comparison before full promotion (§43.3). The pipeline code never changed. That is possible because the orchestrator only sees the uniform <code>CandidateProvider</code> protocol (§39.4).</p>
+</details>
+<details class="cq"><summary>3. Compare the April 2026 three-provider topology with the October 2026 topology in §93.6. Which parts of Part VI still describe how the system works, and which do not?</summary>
+<p>As of April 2026, cost drove the routing. DoubleWord was the cheap backbone, Claude was the heavyweight and the fallback, and J-Prime was "the self-hosted backup when available" (§39). By October, J-Prime is the only lane. It is a local llama.cpp server on one RTX 5090. With no paid credential configured, the free-lane policy sends every route to the local engine, and <code>JARVIS_PAID_LANES_ENABLED=false</code> stops Claude and DoubleWord from being constructed at all (§93.6). Three ideas survive: the route names, the deterministic router, and the pluggable provider protocol. Two things lose their purpose: the per-route cost table, and a failback machine built to protect a cheap primary from an expensive fallback. The switch-off is a configuration change, not a code change, which follows the same reversibility idea as the April seal (§43.3, §93.6).</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-vi">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. A primary provider times out three times in a row. Using the §40.2 formula, what is the recovery ETA after the third failure?</p>
+<ol class="mcq-options" type="A">
+<li>90 seconds</li>
+<li>135 seconds</li>
+<li>180 seconds</li>
+<li>300 seconds</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> TIMEOUT has a 45s base, so 45 times 2 to the power 2 is 180s. That is below the 300s cap. The sequence runs 45, 90, 180, then caps at 300 (§40.2).</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">2. A signal arrives from <code>test_failure</code> with urgency CRITICAL and complexity <code>heavy_code</code>. Which route does the §42.3 algorithm return?</p>
+<ol class="mcq-options" type="A">
+<li><code>IMMEDIATE</code>, because test failures are reflex-critical</li>
+<li><code>STANDARD</code>, the default cascade</li>
+<li><code>BACKGROUND</code>, because the source is a sensor</li>
+<li><code>COMPLEX</code>, because complexity is checked first</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> The first branch of <code>classify</code> tests complexity against <code>_COMPLEX_COMPLEXITIES</code>. <code>heavy_code</code> matches, so the IMMEDIATE check is never reached (§42.3).</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">3. In DoubleWord's Tier 1 webhook path, what stops an attacker from resolving a pending batch future with a fake result?</p>
+<ol class="mcq-options" type="A">
+<li>HMAC-SHA256 signature verification on each incoming webhook</li>
+<li>A TTL that prunes futures older than a few minutes</li>
+<li>Adaptive-backoff polling that re-checks every result</li>
+<li>The 60s hard fallback cap on the Claude provider</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> <code>EventChannelServer</code> checks the Standard Webhooks HMAC-SHA256 signature before it resolves a future. The paper ties this to Principle 6, the Iron Gate (§41.2, §41.4).</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. Under the seal in force on 2026-04-16, what was DoubleWord still used for?</p>
+<ol class="mcq-options" type="A">
+<li>Only the SPECULATIVE batch route</li>
+<li>Three structured-JSON callers on Gemma 4 31B</li>
+<li>BACKGROUND work, with no Claude fallback</li>
+<li>Nothing; it was removed from the code base</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> Every agent-generation route had <code>dw_allowed: false</code>. DoubleWord kept only <code>semantic_triage</code>, <code>ouroboros_plan</code> and the Phase 0 <code>compaction</code>, all on Gemma 4 31B (§43.1).</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-vi">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> As of April 2026, DoubleWord is the primary on the STANDARD route, and its FSM is in <code>PRIMARY_ACTIVE</code>. At time 0 a DW call times out. Trace the next few minutes. What state does the FSM enter? When does <code>should_attempt_primary()</code> return true again? How often is the primary probed as that time approaches? What happens if the retry also times out?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Combine three tables: failure modes (§40.1), FSM states (§40.3) and probe intervals (§40.5).</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The exception is classified as <code>TIMEOUT</code>, with a 45s base and a 300s cap. One consecutive failure gives a recovery ETA of 45 times 2 to the power 0, which is 45s (§40.1, §40.2). The primary is now in backoff, so the FSM moves to <code>FALLBACK_ACTIVE</code>, and operations go straight to the fallback (§40.3).</p>
+<p><code>should_attempt_primary()</code> returns <code>now &gt;= recovery_eta</code> in that state, so it becomes true at t = 45s (§40.4). Probes follow the distance to the ETA (§40.5). At t = 0 the ETA is 45s away, which falls in the 30 to 60s band, so the interval is 20s. After t = 15s the ETA is under 30s away, so the interval drops to 10s. Past the ETA it drops to 5s.</p>
+<p>If the retry also times out, the failure count becomes 2 and the ETA becomes 90s. The doubling continues to 180s and then stops at the 300s cap. A content failure on the retry would add no backoff (§40.1).</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> The October 2026 system (§93.6) has a single local lane, J-Prime on one RTX 5090. Paid lanes are switched off and never constructed. Someone proposes deleting the failback state machine (§40) and the per-route deadline split (§42.6), since "there is nothing to fail back to." Argue for and against. Use §93.5 to explain why a failure classifier still matters when every lane is free.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask what each mechanism protected. Then ask what §93.5 says happened when a 402 response was read as an outage.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>For the proposal: much of Part VI exists to protect a cheap primary from an expensive fallback. The route cost table (§42.1), the Tier 0/Tier 1 split (§42.6) and the probe-cost tuning (§40.5) all assume two paid lanes with different prices. With one local lane and the free-lane policy routing everything locally (§93.6), the cost argument goes away. A fallback reserve has nothing to reserve for.</p>
+<p>Against the proposal: the system still has to tell kinds of failure apart. §93.5 shows the cost of getting this wrong. When the paid credit ran out, the classifier read HTTP 402 as an outage, and one session produced 125 false awaken triggers. The fix was a table-driven ECONOMIC state that separates "out of money" from rate limits and outages. Classifying failures, and not penalising a lane for a content failure (§40.1), is about telling the truth about causes, not only about cost.</p>
+<p>Two more reasons to keep it. Re-enabling paid lanes is "a configuration change, not a code change" (§93.6), and that relies on the machinery still existing. The uniform provider protocol (§39.4) is what lets J-Prime be swapped in without changing the pipeline. A sound answer keeps classification and the protocol, and accepts that the cost tables are dormant.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/candidate_generator.py</code> and find <code>class FailureMode</code> and the <code>_RECOVERY_PARAMS</code> table below it. Compare them with the five-row table in §40.1. Which modes exist in code but not in the paper? What backoff profile does each get? What does the set <code>_PRIMARY_INNOCENT_MODES</code> add to the paper's description of CONTENT_FAILURE?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Read the comments next to each extra enum member. They say whose fault each failure is.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The five modes in the paper are all present, with the same base and max values: RATE_LIMITED 15/120, TIMEOUT 45/300, SERVER_ERROR 60/600, CONNECTION_ERROR 120/900 and CONTENT_FAILURE 0/0 (§40.1). The code adds four more. <code>CONTEXT_OVERFLOW</code> means the prompt exceeded the size limit, and it has a zero profile. <code>TRANSIENT_TRANSPORT</code> covers HTTP/2 disconnects and early stream closes, with a 5s base and 30s cap. <code>TEMPORAL_SHED</code> is a routing refusal, not a fact about DW's health, and it has a zero profile. <code>LOCAL_DEFECT</code> covers TypeError, AttributeError and similar bugs in O+V's own call path, also with a zero profile.</p>
+<p><code>_PRIMARY_INNOCENT_MODES</code> takes the idea behind CONTENT_FAILURE ("the infrastructure is fine, so no backoff") and makes it a named set. The set contains CONTENT_FAILURE, TEMPORAL_SHED and LOCAL_DEFECT. For these, the operation still cascades, but the provider's FSM is not penalised.</p>
+<p>The LOCAL_DEFECT comment explains why. Unrecognised exceptions used to fall through to the TIMEOUT default. One signature drift in O+V's own code then locked DoubleWord out and sent every later operation to Claude, while the logs blamed an upstream provider that was never called. The point of §40.1 is that the backoff should match the real cause. The code applies that idea to failure causes the April paper did not list.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- END -->

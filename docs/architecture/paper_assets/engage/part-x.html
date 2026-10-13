@@ -1,0 +1,114 @@
+<!-- CHECKPOINT before: ## §60. The Safety-Autonomy Trade-Off -->
+<aside class="checkpoint" id="cp-part-x-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">In most autonomous-AI systems, more safety means less autonomy. After reading twelve hard gates, predict: does adding more Iron Gate rules give O+V less autonomy or more? Why?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>More. Because the gate is structural, operations that pass it do not need human approval. Default-allow tools are safe, and low-risk operations auto-apply because the gate has already vetted them. The trade-off flips: more Iron Gate means fewer approvals and so more autonomy. Approval remains only where the gate cannot decide (<code>APPROVAL_REQUIRED</code>). See §60.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- ENDBLOCK part-x -->
+#### Check your understanding: PART X — The Iron Gate: Safety Philosophy
+
+<div class="engage" id="engage-part-x">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why must the Iron Gate be pre-linguistic and model-uninfluenced, rather than a careful reviewer that reads the model's reasoning?</summary>
+<p>The paper's claim is that an autonomous system is safe only if its safety layer cannot be talked out of its decisions. A gate that reads natural language can be persuaded by a well-argued rationale. The Iron Gate reads only file paths, AST nodes, tokens, exit codes and command strings, so no prompt can change its verdict. The protected-paths example makes this concrete: a model that "reasons" about why it needs to modify <code>.env</code> is still refused. Determinism and logging then make every decision repeatable and auditable. See §57 and §58.2.</p>
+</details>
+<details class="cq"><summary>2. The paper accepts that the gate will sometimes reject a valid operation. Why is that an acceptable cost?</summary>
+<p>§59 says the gate is not an oracle. False positives are acceptable because a rejected operation can be retried with different inputs. The errors the gates exist to stop are often irreversible: <code>rm -rf /</code>, a forced push to main, leaked credentials, unbounded spend. A conservative, hand-curated rule that sometimes says no costs one retry. A clever rule that sometimes says yes to the wrong thing can cost the repository. Keeping one deterministic rule per gate, with no voting and no intent reasoning, keeps each verdict predictable. See §58.3 and §59.</p>
+</details>
+<details class="cq"><summary>3. Gates 8, 9 and 12 (approval timeouts, worker ceilings, file-lock TTL) do not inspect code at all. Why do they belong in a safety inventory?</summary>
+<p>They protect liveness rather than correctness. An unanswered approval would block forever without the 600s timeout that moves it to <code>CANCELLED</code>. A wedged worker would hold a pool slot forever without the wall-clock ceiling. A crashed operation's file lock would starve every later operation on that file without the 300s TTL. Each is still a deterministic rule the model cannot override, which is the paper's definition of an Iron Gate. A safe system has to keep making progress, not only avoid bad writes. See §58.8, §58.9 and §58.12.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-x">
+<div class="mcq" data-answer="2">
+<p class="mcq-q">1. By default, how many exploration tool calls must the model make before a candidate may proceed to VALIDATE?</p>
+<ol class="mcq-options" type="A">
+<li>One</li>
+<li>Two</li>
+<li>Five</li>
+<li>None, unless the ledger is enabled</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> <code>JARVIS_MIN_EXPLORATION_CALLS</code> defaults to 2. The candidate is also blocked if the ExplorationLedger's diversity score is below the complexity-tier floor. See §58.4.</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">2. An approval request goes unanswered for longer than <code>approval_timeout_s</code>. What happens to the operation?</p>
+<ol class="mcq-options" type="A">
+<li>It is auto-approved so the loop keeps moving</li>
+<li>It is escalated to <code>BLOCKED</code> and the file is protected</li>
+<li>It keeps waiting until a human responds</li>
+<li>It transitions to <code>CANCELLED</code></li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> The default timeout is 600s, and an unanswered approval moves the operation to <code>CANCELLED</code> rather than waiting forever. See §58.8.</p>
+</details>
+</div>
+<div class="mcq" data-answer="3">
+<p class="mcq-q">3. Which statement matches how §59 describes the Iron Gate?</p>
+<ol class="mcq-options" type="A">
+<li>It combines verdicts from several models by majority vote</li>
+<li>It reasons about the operator's intent before allowing an action</li>
+<li>It may reject a valid operation, and that is acceptable</li>
+<li>It replaces the approval mechanism in every risk tier</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> The gate is not an oracle. It can produce false positives, which is acceptable because a rejected op can be retried. It is not an AI, not a consensus engine and not an approval queue. See §59.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">4. At APPLY, Gate 11 finds that a target file's hash differs from its GENERATE-time hash. What does the paper say it does?</p>
+<ol class="mcq-options" type="A">
+<li>Produces a warning and a ledger entry</li>
+<li>Rolls back the whole operation and blocks the file</li>
+<li>Re-runs GENERATE automatically on the new file state</li>
+<li>Force-releases the file lock on that target</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> Gate 11 recomputes target hashes at APPLY, and a mismatch produces a warning and a ledger entry. Its purpose is to catch candidates built on stale state during concurrent modification. See §58.11.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-x">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> An operation's ROUTE phase expects four files. The model makes one <code>read_file</code> call. It then returns a candidate whose <code>files: [...]</code> list covers three of the four files, and one file contains a stray non-ASCII codepoint. Which post-GENERATE gates react, and what does each do? Can this candidate reach VALIDATE?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Three gates live at the orchestrator's post-GENERATE checkpoint. Check each one against the candidate separately.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Gate 4 (exploration-first): one call is below the default minimum of 2, so the candidate cannot proceed to VALIDATE (§58.4).</p>
+<p>Gate 5 (ASCII strictness): the codepoint is caught and, if possible, auto-repaired with an ASCII approximation. Only a failed repair would cause rejection (§58.5). On its own, this gate would not stop the candidate.</p>
+<p>Gate 6 (multi-file coverage): three of four declared files are covered, so the gate rejects. A partial multi-file change would leave the codebase inconsistent (§58.6).</p>
+<p>The candidate does not reach VALIDATE. The paper does not give an order for these checks, but either Gate 4 or Gate 6 alone is enough to stop it. None of these verdicts depend on the model's explanation of why it acted as it did.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> Someone proposes replacing the hand-curated bash blocklist (Gate 3) with an LLM judge. The judge would read each command and decide whether it is dangerous, so it can catch new destructive patterns the list misses. Critique the proposal using Part X's philosophy and trade-off.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Check the proposal against the five properties in §57 and the four "is not" statements in §59.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>An LLM judge breaks the properties that define the gate (§57). It reasons about language, so it is not pre-linguistic. Crafted input can influence it, so it is not model-uninfluenced. The same command could get different verdicts, so it is not deterministic. §59 also says the gate is explicitly not an AI.</p>
+<p>It would weaken §60's argument too. The autonomy dividend exists because a structural gate needs no human backstop. A persuadable judge would push the operator back toward approvals, so autonomy would shrink.</p>
+<p>A defensible variant keeps the blocklist as the authoritative gate, since the paper calls it expandable, and uses any model only as an advisory signal. For example, the model could propose new patterns for a human to add to the list. It would never decide whether a command runs.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/multi_file_coverage_gate.py</code>. Read the module docstring and <code>check_candidate</code>. What does the function return when the gate passes, and what when it fails? What happens for an operation with zero or one target file? What gate number does the file use for itself, compared with §58.6?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The return contract is spelled out at the end of the docstring. The single-file case is one of the first checks in the function body.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><code>check_candidate</code> returns <code>None</code> when the candidate is fine. Otherwise it returns a tuple <code>(reason, missing_paths)</code>, and the missing paths are echoed back to the model in retry feedback.</p>
+<p>If the operation has one target file or none (<code>len(targets) &lt;= 1</code>), the gate no-ops. It also no-ops when <code>JARVIS_MULTI_FILE_ENFORCEMENT</code> is set to false. Otherwise every target path must appear in the candidate's <code>files</code> list, and a legacy single-file candidate on a multi-target op is rejected with every target listed as missing. That matches §58.6.</p>
+<p>The docstring calls the file "Iron Gate 5" and explains the Session O background. §58.6 numbers it Gate 6 in the inventory, while §64.3 and §64.4 in the session log also say "Iron Gate 5". The numbering is not consistent across the paper. The gate's behaviour is the same either way.</p>
+<p>The file also contains later slices the paper does not cover, such as a subset-coverage exception for resolved test-to-source attribution.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- END -->

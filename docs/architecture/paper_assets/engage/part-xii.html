@@ -1,0 +1,112 @@
+<!-- CHECKPOINT before: ## §70. Autonomous Commit Signature -->
+<aside class="checkpoint" id="cp-part-xii-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">Voice and the thought log fade or scroll away. If a developer runs <code>git blame</code> a year from now, what would an autonomous commit need to carry so they can tell who wrote a line, and which parts of O+V took part?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>Every AutoCommitter commit carries a <code>Generated-By</code> trailer and a fixed git author, <code>JARVIS Ouroboros &lt;ouroboros@jarvis.local&gt;</code>. The trailer always names <code>Ouroboros</code>, adds <code>+ Venom</code> when tool execution records exist, and adds <code>+ Consciousness</code> when the <code>ConsciousnessBridge</code> was active. That separates human commits from O+V commits, and within O+V commits it shows which subsystems contributed. See §70.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- ENDBLOCK part-xii -->
+#### Check your understanding: PART XII — The Observability Stack
+
+<div class="engage" id="engage-part-xii">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why does O+V need five observability layers instead of one very detailed log?</summary>
+<p>Each layer serves a different axis of need (§73). Voice gives real-time presence to an operator who is away from the terminal. The thought log is a durable trace of reasoning that reads like prose. Commit signatures give historical attribution long after the session ends. Telemetry gives structured counters and timings, and SerpentFlow gives an interactive live view. One log could hold the data, but it would not reach the human through the right medium at the right granularity. Principle 7 is about every decision being visible in the form the human actually needs.</p>
+</details>
+<details class="cq"><summary>2. Voice narration speaks only at INTENT, DECISION and POSTMORTEM, with a 60-second debounce. What would go wrong without those limits?</summary>
+<p>The organism emits many heartbeats and phase transitions per operation (§71). If each one were spoken, narration would become noise, and the operator would stop listening. The debounce (<code>OUROBOROS_VOICE_DEBOUNCE_S</code>, default 60s) and the short event list keep speech for the semantically significant transitions (§68). The trade-off is that voice is not a complete record. The thought log and telemetry exist to hold the detail that voice drops.</p>
+</details>
+<details class="cq"><summary>3. §72.3 describes a rendering detail: <code>Console(force_terminal=True)</code> plus <code>patch_stdout(raw=True)</code>. Why does a cosmetic detail like this matter for observability?</summary>
+<p>SerpentFlow combines Rich for ANSI output with prompt_toolkit for the REPL. prompt_toolkit replaces stdout with a proxy, so without these settings Rich output shows up as raw escape sequences such as <code>?[2m</code> (§72.3). The information would still be "there", but a human could not read it. An observability layer that the operator cannot read fails at its only job, so the terminal plumbing is part of the visibility guarantee, not decoration.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-xii">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. Where does the <code>GoalMemoryBridge</code> write the thought log?</p>
+<ol class="mcq-options" type="A">
+<li><code>.ouroboros/sessions/&lt;id&gt;/debug.log</code></li>
+<li><code>~/.jarvis/thoughts/session.json</code></li>
+<li><code>.jarvis/ouroboros_thoughts.jsonl</code></li>
+<li><code>.jarvis/posture_audit.jsonl</code></li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> The thought log is a human-readable JSONL file at <code>.jarvis/ouroboros_thoughts.jsonl</code>, also logged at INFO so <code>battle_test.py -v</code> shows it live. See §69.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. A commit's trailer reads <code>Generated-By: Ouroboros + Venom</code>. What can you conclude?</p>
+<ol class="mcq-options" type="A">
+<li>The op used multi-turn tools, and ConsciousnessBridge was not active.</li>
+<li>The op used memory and prediction, but no tools were called.</li>
+<li>A human approved the commit through the Orange PR lane.</li>
+<li>The commit was made by DoubleWord rather than Claude.</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> <code>+ Venom</code> appears when <code>tool_execution_records</code> exist, and <code>+ Consciousness</code> appears only when the <code>ConsciousnessBridge</code> is active. Its absence means the bridge was not active. See §70.</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">3. Which telemetry object records what the router decided and why?</p>
+<ol class="mcq-options" type="A">
+<li><code>HostTelemetry</code></li>
+<li><code>TelemetryContext</code></li>
+<li><code>_CommTelemetrySink</code></li>
+<li><code>RoutingIntentTelemetry</code></li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> <code>RoutingIntentTelemetry</code> holds the routing decision. <code>HostTelemetry</code> is hardware state, <code>TelemetryContext</code> is the span tree, and <code>_CommTelemetrySink</code> bridges telemetry into CommProtocol heartbeats. See §71.</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. During a battle test the operator types <code>/pause</code> in SerpentFlow. What happens to an op that is already in flight?</p>
+<ol class="mcq-options" type="A">
+<li>It is cancelled cooperatively at the next phase boundary.</li>
+<li>It continues; only new op dispatch is suspended.</li>
+<li>It is rolled back and re-queued for after <code>/resume</code>.</li>
+<li>It is frozen in place until the operator types <code>/resume</code>.</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> <code>/pause</code> suspends new op dispatch while in-flight ops continue. Cancelling a specific op is a separate command, <code>cancel &lt;op-id&gt;</code>. See §72.2.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-xii">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> An op fixes a failing test. It recalls past memories, reads two files with Venom, generates a patch, needs one L2 repair iteration, then completes and is committed. Walk through which observability layers record this op and what each one shows, from start to the commit.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Use the thought-log phase table in §69 for the middle, then add the layers from §68, §70, §71 and §72.1 at the points where they fire.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>At start, SerpentFlow prints the op header block with the sensor type on INTENT, and voice may announce the intent, subject to the 60-second debounce (§68, §72.1). Telemetry attaches <code>HostTelemetry</code> and <code>RoutingIntentTelemetry</code> to the op context, and each phase transition emits a heartbeat through <code>_CommTelemetrySink</code> (§71).</p>
+<p>The thought log records a <code>MEMORY_RECALL</code> entry with how many memories were found and their relevance, then <code>TOOL</code> entries for each read with the reason, then a <code>GENERATE</code> entry with strategy and provider, and a <code>REPAIR</code> entry for the L2 iteration (§69). In parallel SerpentFlow shows <code>Read(path)</code> blocks, a <code>synthesized</code> block, an <code>immune</code> validation block and a <code>repair</code> block (§72.1).</p>
+<p>On completion SerpentFlow prints the <code>complete</code> block with provider, cost and duration; voice announces the DECISION; the thought log writes <code>POST_APPLY</code>. Finally the AutoCommitter writes a commit with <code>Generated-By: Ouroboros + Venom</code>, plus <code>+ Consciousness</code> if the bridge was active, under the O+V git author (§70).</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> A teammate proposes cutting the voice debounce to zero and narrating every heartbeat, "for maximum observability". Using §68 and §73, argue whether this improves Principle 7, and say which layer is the right home for per-heartbeat detail.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>§73 says each layer covers a different axis. Ask what axis voice is for.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Principle 7 asks that every decision be visible at the granularity and medium the human needs, not that every event be pushed through every medium (§73). Voice exists for real-time presence: it lets an operator away from the terminal hear the semantically significant transitions (§68).</p>
+<p>Narrating every heartbeat would flood that channel. The operator would stop listening, so the significant events would be lost in noise. That lowers effective visibility even though more is being said.</p>
+<p>Per-heartbeat detail already has a home: telemetry, where heartbeats carry structured metrics through <code>_CommTelemetrySink</code> (§71), and the thought log for reasoning at each phase (§69). The proposal should be rejected; the debounce is a design choice, not a gap.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/auto_committer.py</code> and find the module-level constants that define the O+V commit signature. Compare what you find with the commit example in §70. Does the code today emit a <code>Generated-By</code> trailer and the <code>ouroboros@jarvis.local</code> address?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Search the file for names starting with <code>_OV_</code>, and also search for the literal string <code>Generated-By</code>.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Near line 95 the file defines <code>_OV_SIGNATURE = "Ouroboros+Venom [O+V] — Autonomous Self-Development Engine"</code> and <code>_OV_COAUTHOR = "Co-Authored-By: Ouroboros+Venom &lt;ouroboros@jarvis.trinity&gt;"</code>. The module docstring shows the same two lines.</p>
+<p>A search for <code>Generated-By</code> in this file finds nothing, and the address is <code>ouroboros@jarvis.trinity</code>, not <code>ouroboros@jarvis.local</code>. So the signature format has changed since the paper's §70 example was written.</p>
+<p>The underlying goal of §70 still holds: every O+V commit carries a fixed, greppable marker that separates it from human commits. The lesson for a reader is that a paper's example can drift from the code, and the code is what to check before relying on a specific string in a <code>git log</code> search.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- END -->

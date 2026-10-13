@@ -1,0 +1,112 @@
+<!-- CHECKPOINT before: ## §56. UnifiedIntakeRouter -->
+<aside class="checkpoint" id="cp-part-ix-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">A signal has survived the event spine's debouncing and fingerprinting and a sensor has turned it into a <code>SignalEnvelope</code>. What questions do you think the final gate must still ask before the envelope may reach the pipeline?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>The <code>UnifiedIntakeRouter</code> asks four: is it a duplicate of a recent signal (<code>dedup_key</code>), does it conflict with a file already under operation (<code>file_lock</code>), what is its priority score, and can it be coalesced with a recent similar envelope (<code>coalesce_window</code>). The output is a sorted priority queue with conflicts and coalescing already applied. See §56.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- ENDBLOCK part-ix -->
+#### Check your understanding: PART IX — The Intake Layer
+
+<div class="engage" id="engage-part-ix">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why does the intake layer use four separate storm-protection layers instead of one strong deduplicator?</summary>
+<p>Each layer sits at a different stage and catches a different kind of repeat. <code>FileWatchGuard</code> absorbs bursts of file saves with a 0.3s debounce, checksums and an LRU cache; the <code>TrinityEventBus</code> drops identical events from many producers with a 60s SHA-256 fingerprint window; <code>TestFailureSensor</code> waits 2s before spawning pytest; and the router's envelope <code>dedup_key</code> stops duplicate operations. The paper calls the layers orthogonal: they compose, so an actionable event has already passed at least two of them. One deduplicator at the end would let every burst travel through the bus and spawn pytest runs before it was suppressed. See §55.2.</p>
+</details>
+<details class="cq"><summary>2. The intake layer is push-based, yet every sensor keeps <code>scan_once()</code> and its poll loop. Is that a contradiction?</summary>
+<p>No. Push is the primary path because it gives low latency: producers publish to the event spine immediately and sensors subscribe (Manifesto §3). The poll loops are kept as safety nets for when the event spine is unavailable, and <code>scan_once()</code> serves manual or CLI use. So push makes the common case fast, and polling makes sure detection still works when the push path fails. See §54 and §55.</p>
+</details>
+<details class="cq"><summary>3. The WAL exists for disaster recovery, but it also caused a bug. What was the bug, and what does the fix teach about recovery mechanisms?</summary>
+<p>The WAL in <code>.jarvis/intake_wal.jsonl</code> is replayed on restart so a crashed harness does not lose pending work. In Session N, replay put stale envelopes from a crashed session beside fresh ones, and coalescing merged them into one operation, half of it from the old session. The fix guards coalescing by session id, so envelopes from different sessions never merge, and stale entries are pruned by TTL. The lesson is that recovered state needs its origin recorded. Otherwise the recovery path quietly mixes old intent with new. See §56.2, §56.3 and §63.1.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-ix">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. Which storm-protection layer removes duplicates using a SHA-256 fingerprint over a 60-second window?</p>
+<ol class="mcq-options" type="A">
+<li><code>FileWatchGuard</code></li>
+<li><code>TestFailureSensor</code></li>
+<li><code>TrinityEventBus</code></li>
+<li><code>IntakeRouter</code></li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> The TrinityEventBus does SHA-256 fingerprint dedup with a 60s window. FileWatchGuard debounces and checksums, TestFailureSensor debounces before spawning pytest, and the router uses <code>dedup_key</code>. See §55.2.</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">2. The 16-slot priority queue is full and a new envelope arrives. What does the paper say happens?</p>
+<ol class="mcq-options" type="A">
+<li>The new envelope is rejected and permanently discarded</li>
+<li>The oldest envelope is evicted regardless of priority</li>
+<li>The queue grows past 16 slots until the pipeline catches up</li>
+<li>The lowest-priority envelope is evicted and logged, and may come back later</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> When the queue is full, the lowest-priority envelopes are evicted and logged. They can be re-ingested if the sensor fires again. See §56.1.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">3. When is an envelope's entry cleared from the intake WAL?</p>
+<ol class="mcq-options" type="A">
+<li>When the envelope transitions to <code>dispatched</code></li>
+<li>When the operation's commit is written by the AutoCommitter</li>
+<li>When the envelope is first written to the priority queue</li>
+<li>Only when the operator deletes the file by hand</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> WAL entries are cleared when the pipeline picks the envelope up, that is, when it transitions to <code>dispatched</code>. Stale entries from crashed sessions are pruned by TTL. See §56.2.</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. In a deployment where <code>repo_registry</code> is not set, how are sensors instantiated?</p>
+<ol class="mcq-options" type="A">
+<li>One sensor per repo found on disk under the workspace</li>
+<li>A single "jarvis" sensor of each kind</li>
+<li>No sensors start until a registry is configured</li>
+<li>Only <code>CrossRepoDriftSensor</code> runs, covering all repos</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> Sensors fan out per registered repo when <code>repo_registry</code> is set. Otherwise each falls back to a single "jarvis" sensor. Cross-repo drift is handled separately by CrossRepoDriftSensor. See §55.3.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-ix">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> A developer saves a <code>.py</code> file twice within 0.2 seconds, and the change breaks a test. Trace the signal from the file save to a queued envelope. Name each component it passes and say which storm-protection layer acts at each step.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Follow the producer column of the event-spine diagram, then the four numbered storm layers, then the router's four questions.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The save is seen by <code>FileWatchGuard</code> (watchdog), via the Phase 1 <code>FileSystemEventBridge</code>. Its 0.3s debounce and checksum dedup fold the two saves into one change (layer 1). It publishes an <code>fs.changed.*</code> event to the TrinityEventBus, which drops any identical fingerprint seen within 60s (layer 2).</p>
+<p><code>TestFailureSensor</code> subscribes to debounced <code>.py</code> changes and waits 2s before spawning pytest (layer 3). The pytest plugin writes <code>.jarvis/test_results.json</code>, and the sensor emits a <code>SignalEnvelope</code> for the failure.</p>
+<p>The <code>UnifiedIntakeRouter</code> checks the <code>dedup_key</code> (layer 4) and the file lock, scores priority, and checks whether to coalesce. It then places the envelope in the 16-slot priority queue, which is persisted to <code>.jarvis/intake_wal.jsonl</code>. See §54, §55.1, §55.2 and §56.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> A teammate says: "The paper tells us to <code>rm .jarvis/intake_wal.jsonl</code> before every session anyway, so let us delete the WAL entirely and keep the queue only in memory." Evaluate the proposal using the paper's reasons for the WAL and its account of the Session N bug.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask which problem the WAL solves and which problem the cleanup step solves. Are they the same problem?</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The WAL is disaster recovery. When a harness crashes, replaying the log rehydrates the queue so pending work is not lost (§56.2). An in-memory queue would lose every pending envelope on a crash.</p>
+<p>The cleanup step and the Session N bug are a different problem. Replay merged stale envelopes into fresh operations through coalescing (§56.3, §63.1). The structural fix is the session-id guard on coalescing, plus TTL pruning of stale entries. Neither requires removing the log.</p>
+<p>So the proposal trades a real recovery guarantee for a problem that is already solved more narrowly. A better position is to keep the WAL and keep the session guard, and treat the manual cleanup as a clean-start step for controlled test sessions.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/intake/unified_intake_router.py</code> and find <code>_dedup_window_s</code> and <code>_is_duplicate</code>. Which envelope source gets a different window? What are the two default window lengths in the router's config? What window value turns deduplication off? Relate this to storm-protection layer 4 in §55.2.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Search the file for <code>voice_dedup_window_s</code>. The config dataclass declares both defaults next to each other.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><code>_dedup_window_s</code> returns <code>voice_dedup_window_s</code> when <code>envelope.source == "voice_human"</code>, and <code>dedup_window_s</code> otherwise. The config defaults are 300.0 seconds for voice and 600.0 seconds for everything else.</p>
+<p><code>_is_duplicate</code> returns False when the window is 0 or less, so a zero window disables deduplication. Otherwise it looks up the last monotonic time recorded for the envelope's <code>dedup_key</code> and reports a duplicate if that time falls inside the window.</p>
+<p>This is layer 4 of §55.2, "envelope <code>dedup_key</code> prevents duplicate operations." The code adds one detail the paper does not state: the window is shorter for human voice commands than for sensor-generated signals.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- END -->

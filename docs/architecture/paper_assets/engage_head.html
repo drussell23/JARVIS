@@ -1,0 +1,173 @@
+<style>
+/* Reader engagement: conceptual questions, quizzes, problem sets, pop-up checkpoints.
+   Colours come from the tokens in docs/benchmarks/_report_style.css. */
+.engage {
+  margin: 1.2em 0 2.4em;
+  padding: 1em 1.2em 1.2em;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-top: 3px solid var(--accent);
+  border-radius: 6px;
+}
+.engage-kicker {
+  margin: 1.4em 0 0.5em;
+  font-size: 0.78em;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent-dark);
+}
+.engage-kicker:first-child { margin-top: 0; }
+.engage details, .checkpoint details {
+  margin: 0.45em 0;
+  padding: 0.5em 0.8em;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+.engage summary, .checkpoint summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.engage details[open] > summary, .checkpoint details[open] > summary { margin-bottom: 0.4em; }
+.engage details p, .checkpoint details p { margin: 0.4em 0; }
+
+/* Quiz */
+.mcq {
+  margin: 0.8em 0;
+  padding: 0.7em 0.9em;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  page-break-inside: avoid;
+}
+.mcq-q { margin: 0 0 0.4em; font-weight: 600; }
+.mcq-options { margin: 0.3em 0 0.4em; padding-left: 1.8em; }
+.mcq-options li { margin: 0.25em 0; padding: 0.3em 0.5em; border-radius: 4px; }
+.js-engage .mcq-options li {
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: #fff;
+  transition: background 0.15s, border-color 0.15s;
+}
+.js-engage .mcq-options li:hover { border-color: var(--accent); background: var(--bg-quote); }
+.js-engage .mcq-options li:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.js-engage .mcq.answered .mcq-options li { cursor: default; }
+.js-engage .mcq.answered .mcq-options li:hover { background: #fff; border-color: var(--border); }
+.mcq-options li.is-correct, .js-engage .mcq.answered .mcq-options li.is-correct:hover {
+  background: #dafbe1; border-color: var(--success);
+}
+.mcq-options li.is-wrong, .js-engage .mcq.answered .mcq-options li.is-wrong:hover {
+  background: #ffebe9; border-color: var(--danger);
+}
+.mcq-verdict { margin: 0.3em 0 0; font-weight: 600; }
+.mcq-verdict.ok { color: var(--success); }
+.mcq-verdict.no { color: var(--danger); }
+.js-engage .mcq-why { border: 0; padding: 0; background: transparent; }
+.quiz-score {
+  display: flex; align-items: center; gap: 0.8em; flex-wrap: wrap;
+  margin: 0.6em 0 0; font-weight: 600; color: var(--accent-dark);
+}
+.quiz-score button, .cp-toast button {
+  font: inherit; font-size: 0.85em; cursor: pointer;
+  padding: 0.3em 0.8em; border-radius: 4px;
+  border: 1px solid var(--accent); background: #fff; color: var(--accent-dark);
+}
+.quiz-score button:hover, .cp-toast button:hover { background: var(--bg-quote); }
+
+/* Problem sets */
+.problem {
+  margin: 0.8em 0;
+  padding: 0.7em 0.9em;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warn);
+  border-radius: 5px;
+  page-break-inside: avoid;
+}
+.problem-q { margin: 0 0 0.4em; }
+
+/* Advanced tier */
+.engage-kicker-adv {
+  margin-top: 1.8em;
+  padding-top: 1em;
+  border-top: 1px dashed var(--border-strong);
+  color: var(--danger);
+}
+.engage-kicker-adv::after {
+  content: "Advanced";
+  margin-left: 0.6em;
+  padding: 0.1em 0.5em;
+  font-size: 0.85em;
+  letter-spacing: 0.04em;
+  border: 1px solid var(--danger);
+  border-radius: 999px;
+}
+.engage-kicker-adv ~ .engage-kicker-adv { margin-top: 1.4em; border-top: 0; padding-top: 0; }
+.problem-adv { border-left-color: var(--danger); }
+.engage details.cq-adv { border-left: 3px solid var(--danger); }
+
+/* Inline checkpoint */
+.checkpoint {
+  margin: 1.4em 0;
+  padding: 0.8em 1em;
+  background: var(--bg-quote);
+  border-left: 4px solid var(--accent);
+  border-radius: 0 6px 6px 0;
+  page-break-inside: avoid;
+}
+.cp-label {
+  margin: 0 0 0.3em;
+  font-size: 0.78em; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--accent-dark);
+}
+.cp-q { margin: 0.2em 0 0.4em; font-weight: 600; }
+
+/* Pop-up checkpoint card */
+.cp-toast {
+  position: fixed; right: 16px; bottom: 16px; z-index: 50;
+  width: min(380px, calc(100vw - 32px));
+  max-height: 70vh; overflow: auto;
+  padding: 0.9em 1em 0.8em;
+  background: #fff; color: var(--text);
+  border: 1px solid var(--border); border-top: 3px solid var(--accent);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(31, 35, 40, 0.18);
+  font-size: 0.92em;
+  transform: translateY(0); opacity: 1;
+  transition: transform 0.25s ease, opacity 0.25s ease;
+}
+.cp-toast[hidden] { display: none; }
+.cp-toast.entering { transform: translateY(16px); opacity: 0; }
+.cp-toast .cp-q { margin: 0.3em 0 0.6em; }
+.cp-toast .cp-answer { margin: 0.4em 0 0.6em; padding-top: 0.5em; border-top: 1px solid var(--border); }
+.cp-toast .cp-actions { display: flex; gap: 0.5em; flex-wrap: wrap; align-items: center; }
+.cp-toast .cp-off {
+  margin-left: auto; border: 0; background: transparent; color: var(--text-muted);
+  text-decoration: underline; padding: 0.3em 0;
+}
+.cp-toast .cp-off:hover { background: transparent; color: var(--text); }
+@media (prefers-reduced-motion: reduce) {
+  .cp-toast, .js-engage .mcq-options li { transition: none; }
+}
+
+/* Answer key (Appendix G) */
+.answer-key-unit { margin: 0.6em 0 1.2em; }
+.answer-key-unit h4 { margin: 1em 0 0.4em; }
+.answer-key-unit p { margin: 0.3em 0; }
+.answer-key .ak-q { font-weight: 600; margin-top: 0.6em; }
+
+/* Print build (PDF): questions in place, answers only in Appendix G */
+@media print {
+  .cp-toast, .quiz-score { display: none !important; }
+}
+.print-build .mcq-why, .print-build .problem-hint, .print-build .problem-sol,
+.print-build .cp-a, .print-build .cq > p, .print-build .cq-adv > p { display: none !important; }
+.print-build .cq > summary, .print-build .cq-adv > summary,
+.print-build .answer-key > summary { list-style: none; cursor: default; }
+.print-build .cq > summary::-webkit-details-marker,
+.print-build .cq-adv > summary::-webkit-details-marker { display: none; }
+.print-build .engage details.cq-adv { border-top: 0; border-right: 0; border-bottom: 0; background: transparent; }
+.print-build .answer-key > summary { display: none; }
+.print-build .cq { border: 0; padding: 0.2em 0; background: transparent; }
+</style>

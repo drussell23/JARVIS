@@ -1,0 +1,112 @@
+<!-- CHECKPOINT before: ## §7. Multi-Repo Operation — The Saga Pattern -->
+<aside class="checkpoint" id="cp-part-ii-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">A fix must edit one file in the Body repo and one in the Mind repo. The Body edit applies cleanly, then the Mind edit fails. What should the system do, and what end states should it never allow?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>It should undo the Body edit. The Saga pattern walks already-applied patches in reverse order and reverts each through <code>ChangeEngine.rollback()</code>, a step called compensation. The only allowed end states are fully applied or fully reverted; a half-applied contract change would break the protocol between the two repos. See §7.1 and §7.2.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- ENDBLOCK part-ii -->
+#### Check your understanding: PART II — The Trinity Architecture
+
+<div class="engage" id="engage-part-ii">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why does Venom's <code>bash</code> and <code>run_tests</code> execution happen inside Reactor Core rather than on the Body's own shell?</summary>
+<p>The Body has privileged access to the operator's screen, keyboard, audio and filesystem. Reactor Core provides sandboxes with resource limits, process isolation and syscall filtering. Running model-requested commands there means that even a command the Iron Gate permits cannot reach the Body's privileges directly. The paper says this separation "is what makes the Iron Gate's containment guarantees meaningful": the gate decides what may run, and the sandbox limits what a permitted command can touch. See §5.1 and §5.3.</p>
+</details>
+<details class="cq"><summary>2. The Governed Loop Service only delegates <code>submit()</code> to the orchestrator and does no pipeline work itself. What does this separation buy?</summary>
+<p>The Service is a lifecycle manager: it wires providers, runs health probes, keeps the file-touch cache and the Oracle index loop, and handles clean startup and shutdown. The pipeline's phases live in the orchestrator. Because of the split, adding or changing a phase does not require touching the Service. It also keeps responsibilities clear: the Service ensures every in-flight operation is completed or gracefully abandoned, while the orchestrator owns phase transitions. See §6 and §6.2.</p>
+</details>
+<details class="cq"><summary>3. Why is the <code>CrossRepoVerifier</code> needed if every repo patch has already passed validation on its own?</summary>
+<p>Each patch validated in isolation only proves that repo is internally consistent. A multi-repo change exists because two repos must agree, for example on an HTTP contract between Body and Mind. Only tests that run across the union of patches can check that agreement. So the verifier runs after all patches apply and before commit, and if it fails the Saga compensates even though every individual patch was valid. See §7.1 and §7.2.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-ii">
+<div class="mcq" data-answer="2">
+<p class="mcq-q">1. J-Prime reports itself unhealthy. What does the paper say happens to generation?</p>
+<ol class="mcq-options" type="A">
+<li>All operations pause until J-Prime recovers</li>
+<li>The CandidateGenerator promotes DoubleWord to primary</li>
+<li>The Service moves to the FAILED state</li>
+<li>Generation moves into the Reactor Core sandbox</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> §5.2 says J-Prime is used when available but is not required; if it is unhealthy, the CandidateGenerator promotes DoubleWord to primary. The architecture is deliberately resilient to J-Prime being offline.</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">2. O+V has already modified a file three times in the last ten minutes. What does the Service's file-touch cache do with a fourth attempt?</p>
+<ol class="mcq-options" type="A">
+<li>Raises the operation's risk tier by one step</li>
+<li>Sends the operation to the Orange PR reviewer</li>
+<li>Lets it through but writes a ledger warning</li>
+<li>Hard-blocks it until the window resets</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> §6 describes <code>_file_touch_cache</code> as a three-touches-per-ten-minutes counter; further modifications are hard-blocked until the window resets. It is a concurrency guard.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">3. Which pipeline phase knows that an operation is a multi-repo Saga?</p>
+<ol class="mcq-options" type="A">
+<li>Only APPLY, which dispatches to <code>SagaApplyStrategy</code></li>
+<li>Only CLASSIFY, which tags the op with schema <code>2c.1</code></li>
+<li>Every phase, which runs once per repo in the saga</li>
+<li>Only VERIFY, which calls the <code>CrossRepoVerifier</code></li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> §7.3 says the phases run once per operation, not once per repo, and only APPLY knows it is handling a Saga. Multi-repo complexity is kept inside the apply strategy so the 11 phases stay uniform.</p>
+</details>
+</div>
+<div class="mcq" data-answer="3">
+<p class="mcq-q">4. In the Service state machine, what distinguishes DEGRADED from FAILED?</p>
+<ol class="mcq-options" type="A">
+<li>DEGRADED happens at boot; FAILED only at shutdown</li>
+<li>DEGRADED blocks new ops; FAILED cancels in-flight ops</li>
+<li>DEGRADED keeps ops flowing; FAILED is terminal and stops them</li>
+<li>DEGRADED needs a human; FAILED recovers automatically</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> §6.1 defines DEGRADED as steady-state with some providers unhealthy but operations still flowing, and FAILED as a terminal failure state that prevents further operations.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-ii">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> A Saga carries a <code>2c.1</code> candidate with patches for <code>jarvis</code>, <code>jarvis-prime</code> and <code>jarvis-reactor</code>, applied in that dependency order. All three apply, but the <code>CrossRepoVerifier</code> fails. Trace what happens next, in order, and state the final state of each repo.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Compensation walks the applied patches in a specific direction, using the undo descriptor each <code>RepoPatch</code> recorded.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Each <code>RepoPatch</code> recorded an undo descriptor when it was applied (§7.2). The verifier runs after all patches apply but before commit, so nothing has been committed yet.</p>
+<p>Its failure triggers compensation even though each patch validated alone. The Saga walks applied patches in reverse: first <code>jarvis-reactor</code>, then <code>jarvis-prime</code>, then <code>jarvis</code>, each reverted with <code>ChangeEngine.rollback()</code>.</p>
+<p>All three repos end in their pre-operation state: "fully reverted", never partially applied. The rest of the pipeline treats this as one operation, since only APPLY knew it was a Saga (§7.3). See §7.2.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> A contributor suggests that every pipeline phase should loop over repos, so CLASSIFY, GENERATE and VALIDATE each run once per repo in a Saga. Using §7.3 and §6.2, argue for or against this, naming what the current design protects.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask who would need to understand Saga semantics under each design.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The current design runs the phases once per operation and lets only APPLY dispatch to <code>SagaApplyStrategy</code> (§7.3). That keeps all 11 phases uniform and lets a reader follow the orchestrator without knowing Saga semantics.</p>
+<p>Looping every phase over repos would spread multi-repo logic into every phase, so every phase author would need to handle partial progress across repos. It would also split one operation into several partial ones, which works against the single all-or-nothing result the Saga guarantees.</p>
+<p>The same principle appears in §6.2: the Service delegates to the orchestrator so that pipeline changes do not ripple into lifecycle code. Encapsulating complexity in one place is the pattern. The argument favours keeping the current design. See §6.2 and §7.3.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/governed_loop_service.py</code>. (a) Find the <code>ServiceState</code> enum and compare its members with the diagram in §6.1. (b) Search for <code>_file_touch_cache</code> and find the cooldown guard. What are its window and hit-count constants, and which phase does a blocked operation advance to?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The guard sits under a comment beginning "Cooldown guard"; look at the <code>return</code> inside the loop.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) <code>ServiceState</code> has six members: <code>INACTIVE</code>, <code>STARTING</code>, <code>ACTIVE</code>, <code>DEGRADED</code>, <code>STOPPING</code> and <code>FAILED</code>. These match the six states in the §6.1 diagram.</p>
+<p>(b) The guard sets <code>_COOLDOWN_WINDOW_S = 600.0</code> (ten minutes) and <code>_COOLDOWN_MAX_HITS = 3</code>. For each target file it keeps a deque of timestamps keyed by the resolved path, drops entries older than the window, appends the current time, and blocks if the count exceeds 3. So the fourth touch inside ten minutes is the one blocked, which matches §6's "three touches" description.</p>
+<p>A blocked operation calls <code>ctx.advance(OperationPhase.CANCELLED)</code>, so in code the "hard block" takes the form of a cancellation, and a warning is logged naming the file and op id. See §6.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- END -->

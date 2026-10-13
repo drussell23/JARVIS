@@ -1,0 +1,198 @@
+<script>
+/* Reader engagement: clickable quizzes and pop-up checkpoints.
+   Without this script every question still works as a native <details>
+   disclosure, which is also how the Markdown renders on GitHub. */
+(function () {
+  "use strict";
+  var root = document.documentElement;
+  if (root.classList.contains("print-build")) return;
+  root.classList.add("js-engage");
+
+  var STORE = "ov-paper-engage-v1";
+  function load() {
+    try { return JSON.parse(localStorage.getItem(STORE)) || {}; } catch (e) { return {}; }
+  }
+  function save(state) {
+    try { localStorage.setItem(STORE, JSON.stringify(state)); } catch (e) { /* storage unavailable */ }
+  }
+  var state = load();
+  state.quiz = state.quiz || {};
+  state.seen = state.seen || {};
+
+  /* ---------- Quizzes ---------- */
+  function letter(i) { return String.fromCharCode(65 + i); }
+
+  function setupQuiz(quiz) {
+    var items = Array.prototype.slice.call(quiz.querySelectorAll(".mcq"));
+    var score = document.createElement("p");
+    score.className = "quiz-score";
+    var label = document.createElement("span");
+    var reset = document.createElement("button");
+    reset.type = "button";
+    reset.textContent = "Try again";
+    score.appendChild(label);
+    score.appendChild(reset);
+    quiz.appendChild(score);
+
+    var saved = state.quiz[quiz.id] || {};
+
+    function refresh() {
+      var done = 0, right = 0;
+      items.forEach(function (m) {
+        if (m.classList.contains("answered")) { done++; if (m.dataset.result === "ok") right++; }
+      });
+      label.textContent = done === 0
+        ? "Pick an answer for each question."
+        : "Score: " + right + " / " + items.length + (done < items.length ? "  (" + (items.length - done) + " left)" : "");
+      reset.hidden = done === 0;
+    }
+
+    function answer(m, chosen, persist) {
+      if (m.classList.contains("answered")) return;
+      var opts = m.querySelectorAll(".mcq-options li");
+      var correct = parseInt(m.dataset.answer, 10) - 1;
+      if (!(correct >= 0 && correct < opts.length)) return;
+      m.classList.add("answered");
+      m.dataset.result = chosen === correct ? "ok" : "no";
+      opts[correct].classList.add("is-correct");
+      if (chosen !== correct) opts[chosen].classList.add("is-wrong");
+      Array.prototype.forEach.call(opts, function (li) { li.setAttribute("aria-disabled", "true"); });
+      var v = document.createElement("p");
+      v.className = "mcq-verdict " + (chosen === correct ? "ok" : "no");
+      v.textContent = chosen === correct ? "Correct." : "Not quite. The answer is " + letter(correct) + ".";
+      var why = m.querySelector(".mcq-why");
+      m.insertBefore(v, why);
+      if (why) why.open = true;
+      if (persist) {
+        saved[m.dataset.idx] = chosen;
+        state.quiz[quiz.id] = saved;
+        save(state);
+      }
+      refresh();
+    }
+
+    items.forEach(function (m, idx) {
+      m.dataset.idx = String(idx);
+      var opts = m.querySelectorAll(".mcq-options li");
+      Array.prototype.forEach.call(opts, function (li, i) {
+        li.setAttribute("role", "button");
+        li.setAttribute("tabindex", "0");
+        li.addEventListener("click", function () { answer(m, i, true); });
+        li.addEventListener("keydown", function (ev) {
+          if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); answer(m, i, true); }
+        });
+      });
+      if (saved[idx] !== undefined && saved[idx] < opts.length) answer(m, saved[idx], false);
+    });
+
+    reset.addEventListener("click", function () {
+      items.forEach(function (m) {
+        m.classList.remove("answered");
+        delete m.dataset.result;
+        var v = m.querySelector(".mcq-verdict");
+        if (v) v.remove();
+        var why = m.querySelector(".mcq-why");
+        if (why) why.open = false;
+        Array.prototype.forEach.call(m.querySelectorAll(".mcq-options li"), function (li) {
+          li.classList.remove("is-correct", "is-wrong");
+          li.removeAttribute("aria-disabled");
+        });
+      });
+      saved = {};
+      delete state.quiz[quiz.id];
+      save(state);
+      refresh();
+    });
+    refresh();
+  }
+  Array.prototype.forEach.call(document.querySelectorAll(".quiz"), setupQuiz);
+
+  /* ---------- Pop-up checkpoints ---------- */
+  var checkpoints = document.querySelectorAll(".checkpoint");
+  if (!checkpoints.length || !("IntersectionObserver" in window)) return;
+
+  var toast = document.createElement("div");
+  toast.className = "cp-toast";
+  toast.hidden = true;
+  toast.setAttribute("role", "dialog");
+  toast.setAttribute("aria-live", "polite");
+  toast.setAttribute("aria-label", "Pause and predict");
+  document.body.appendChild(toast);
+  var current = null;
+
+  function closeToast() { toast.hidden = true; current = null; }
+
+  function showToast(cp) {
+    if (state.popupsOff || state.seen[cp.id] || current) return;
+    current = cp;
+    state.seen[cp.id] = 1;
+    save(state);
+    var q = cp.querySelector(".cp-q");
+    var a = cp.querySelector(".cp-a");
+    toast.innerHTML = "";
+    var lab = document.createElement("p");
+    lab.className = "cp-label";
+    lab.textContent = "Pause and predict";
+    var qq = document.createElement("p");
+    qq.className = "cp-q";
+    qq.textContent = q ? q.textContent : "";
+    var ans = document.createElement("div");
+    ans.className = "cp-answer";
+    ans.hidden = true;
+    if (a) {
+      Array.prototype.forEach.call(a.querySelectorAll("p"), function (p) {
+        ans.appendChild(p.cloneNode(true));
+      });
+    }
+    var actions = document.createElement("div");
+    actions.className = "cp-actions";
+    var reveal = document.createElement("button");
+    reveal.type = "button";
+    reveal.textContent = "Reveal answer";
+    var later = document.createElement("button");
+    later.type = "button";
+    later.textContent = "Keep reading";
+    var off = document.createElement("button");
+    off.type = "button";
+    off.className = "cp-off";
+    off.textContent = "Turn off pop-ups";
+    reveal.addEventListener("click", function () {
+      ans.hidden = false;
+      reveal.hidden = true;
+      later.textContent = "Done";
+      if (a) a.open = true;
+    });
+    later.addEventListener("click", closeToast);
+    off.addEventListener("click", function () {
+      state.popupsOff = true;
+      save(state);
+      closeToast();
+    });
+    actions.appendChild(reveal);
+    actions.appendChild(later);
+    actions.appendChild(off);
+    toast.appendChild(lab);
+    toast.appendChild(qq);
+    toast.appendChild(ans);
+    toast.appendChild(actions);
+    toast.classList.add("entering");
+    toast.hidden = false;
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () { toast.classList.remove("entering"); });
+    });
+  }
+
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key === "Escape" && current) closeToast();
+  });
+
+  var io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (en) {
+      if (en.isIntersecting) { showToast(en.target); io.unobserve(en.target); }
+    });
+  }, { rootMargin: "0px 0px -35% 0px", threshold: 0 });
+  Array.prototype.forEach.call(checkpoints, function (cp) {
+    if (cp.id && !state.seen[cp.id]) io.observe(cp);
+  });
+})();
+</script>

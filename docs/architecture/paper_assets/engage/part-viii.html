@@ -1,0 +1,112 @@
+<!-- CHECKPOINT before: ## §53. What the Refinements Teach -->
+<aside class="checkpoint" id="cp-part-viii-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">Look back over the twelve refinements. How many do you think were planned in the original design? Most of them could have been an "env var workaround" or a change to the architecture. Which kind of fix do you expect dominates?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>None were planned up front. Each one responds to a real observation, so the architecture is "hardened, not pristine". Most were solved by changing the architecture, not by adding a configuration workaround. Examples are a TTL on locks, a scope fix on APPLY and a convergence metric on lessons. This reflects the Manifesto's rule of structural repair, not patches. See §53.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- ENDBLOCK part-viii -->
+#### Check your understanding: PART VIII — Edge Case Hardening (Twelve Refinements)
+
+<div class="engage" id="engage-part-viii">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Refinement 11 (lock TTL) and Refinement 14 (file-hash stale guard) both deal with concurrent operations on one file. How do they differ in what they protect?</summary>
+<p>Refinement 11 protects progress. A crashed operation could leave a file locked forever, and every later signal for that file would queue behind it. Locks older than <code>JARVIS_FILE_LOCK_TTL_S</code> (300s) are therefore force-released with a warning (§52.4). Refinement 14 protects correctness. A candidate built from a read of file X at time T1 might be applied after another operation changed X. File SHA-256 hashes taken at GENERATE are compared again at APPLY to detect this (§52.7). The TTL can release a lock early by design, so the hash check is a second line of defence behind the DAG lock (§46). It catches stale candidates that the lock system did not prevent.</p>
+</details>
+<details class="cq"><summary>2. Refinement 15 merges same-file signals that arrive within 30 seconds, but lets HIGH-urgency signals skip the merge. What trade-off does that make?</summary>
+<p>Coalescing removes redundant work. Without it, several sensors that notice the same file within seconds would create N separate operations on the same target (§52.8). The price is latency: a signal may wait up to the window, 30s by default, in case others join it. For routine work that delay is cheap and the saving is real. For urgent signals the delay is the costly part, so HIGH urgency skips the buffer, because those signals "should not wait 30s for potential merges". The design accepts some duplicated work on urgent paths in exchange for responsiveness.</p>
+</details>
+<details class="cq"><summary>3. Several refinements make the system correct itself instead of relying on an operator. Pick two and explain what each one corrects, and against what evidence.</summary>
+<p>Refinement 18, the convergence metric, judges the lessons buffer by results. Every 10 operations after the first lesson, it compares the success rate before and after lessons. If lessons made things worse, it clears them (§52.11). Refinement 19, exploration budget control, judges model behaviour against a fixed budget. After <code>JARVIS_MAX_EXPLORATION_ROUNDS</code> (5) exploration-only rounds, it nudges the model to produce its change (§52.12). Both turn an open-ended failure, misleading guidance or an endless read loop, into a bounded one with a deterministic trigger. This is the §53 point: the fix is built into the architecture, not left to an operator noticing.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-viii">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. What did Refinement 13 (session intelligence thread-safety) change?</p>
+<ol class="mcq-options" type="A">
+<li>It wrapped <code>_session_lessons</code> in a threading lock</li>
+<li>It moved the lessons buffer into its own process</li>
+<li>It documented asyncio safety and when a lock becomes necessary</li>
+<li>It cut the lessons buffer from 20 entries to 1</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> Access is safe under asyncio's single-threaded event loop. The fix documents this and adds a comment that an <code>asyncio.Lock</code> is needed if the orchestrator ever becomes multi-threaded (§52.6).</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. What happens once a model reaches <code>JARVIS_MAX_EXPLORATION_ROUNDS</code>?</p>
+<ol class="mcq-options" type="A">
+<li>A system message tells it to produce its final change now</li>
+<li>The operation is cancelled with reason <code>user_cancelled</code></li>
+<li>The operation moves up one risk tier</li>
+<li>The model is switched to the fallback provider</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> Exploration-only rounds are capped at 5 by default. After that, a system message says: "You have enough context. Produce your final code change now." (§52.12).</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">3. Where does Refinement 16 check the cooperative cancellation flag set by <code>cancel &lt;op-id&gt;</code>?</p>
+<ol class="mcq-options" type="A">
+<li>On every tool call inside the Venom loop</li>
+<li>Only at the final COMPLETE phase</li>
+<li>Through an OS signal sent to the orchestrator process</li>
+<li>At the GENERATE and APPLY phase boundaries</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> The flag is checked at the GENERATE and APPLY phase boundaries. A cancelled operation moves to <code>CANCELLED</code> with reason <code>user_cancelled</code>, and the process keeps running (§52.9).</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. Why is the dependency credit in Refinement 9 capped at 3?</p>
+<ol class="mcq-options" type="A">
+<li>The priority queue holds only three slots</li>
+<li>To stop runaway promotion of a single signal</li>
+<li>Three is the number of enqueue paths</li>
+<li>To match the three DoubleWord tiers</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> <code>_dep_credit</code> counts the envelopes queued behind the files an operation would touch. The cap of 3 stops that count from pushing one signal to the top no matter what else is waiting (§52.2).</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-viii">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> At t = 0, operation A starts on <code>parser.py</code> and then crashes without releasing its lock. At t = 10s, two sensors each send a normal-urgency signal for <code>parser.py</code>. At t = 20s, a HIGH-urgency test failure for <code>parser.py</code> arrives. Using Refinements 11 and 15, describe what happens to each signal. When is the lock first eligible for force-release?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Coalescing (30s window) and the file lock (300s TTL) are separate mechanisms. Apply each one in turn.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The two normal-urgency signals arrive within <code>JARVIS_COALESCE_WINDOW_S</code> (30s) of each other for the same file, so they merge into one multi-goal operation (§52.8). The HIGH-urgency signal skips coalescing and goes straight to dispatch (§52.8).</p>
+<p>Both the merged operation and the HIGH signal then hit the DAG check. <code>parser.py</code> is still registered to crashed operation A, so each is queued behind A (§46.1). A will never complete, so <code>release_op</code> will never run for it.</p>
+<p>Refinement 11 breaks the deadlock. Locks carry timestamps, and <code>_find_file_conflict()</code> force-releases any lock older than <code>JARVIS_FILE_LOCK_TTL_S</code>, 300s by default, with a warning (§52.4). The lock first becomes eligible once it is more than 300s old, at about t = 300s, and it is released when the next conflict check runs. Until then even the urgent test failure waits, because skipping the coalescing window does not override a file lock.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> Refinement 14 (stale exploration guard) is currently a soft gate: a hash mismatch at APPLY gives a warning and a ledger entry. A reviewer wants it to be a hard gate that rejects the candidate. Using §52.7 and §53, argue both sides and say what evidence would justify the change.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The paper says why it is soft: "without blocking routine operations in low-concurrency scenarios". Ask what a mismatch means in each case.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>For a hard gate: a mismatch means the candidate was built on stale file state. If applied, it "would overwrite the concurrent change", which is silent data loss (§52.7). A warning records the problem but does not stop it.</p>
+<p>For keeping it soft: the paper says the soft gate exists to avoid "blocking routine operations in low-concurrency scenarios" (§52.7). When little runs concurrently, mismatches should be rare. A hard reject would throw away work that took a GENERATE call, and any false positive would cost real throughput. The DAG lock (§46) is already the first line of defence against two operations editing the same file.</p>
+<p>The §53 approach points to deciding from evidence. The ledger entries the soft gate writes are that evidence. If they show mismatches that matched real lost edits, the structural fix is justified, and it could be narrow: hard-fail only when the hash differs and another operation is known to have written the file, or route the candidate back to GENERATE against the new state instead of rejecting it. If the ledger shows almost no mismatches, the soft gate is doing its job cheaply.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Refinement 15 lives in <code>backend/core/ouroboros/governance/intake/unified_intake_router.py</code>. Find where <code>_coalesce_window_s</code> is read, the method <code>_coalesce_key</code>, and the dispatch-loop branch commented "HIGH urgency: bypass coalescing". What exact condition skips the buffer? How are envelopes grouped? What happens to envelopes that have no target files?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The docstring of <code>_coalesce_key</code> describes a soak that merged two unrelated problems into one operation.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The window is read as <code>float(os.environ.get("JARVIS_COALESCE_WINDOW_S", "30"))</code>, which matches the 30s default in §52.8.</p>
+<p>The bypass condition is <code>envelope.urgency == "high" or self._coalesce_window_s &lt;= 0</code>. A HIGH signal, or a window set to zero or less, dispatches at once. Everything else is appended to <code>_coalesce_buffer[key]</code>, and the time of first arrival is recorded. <code>_flush_expired_coalesce_buffers</code> dispatches each buffer once the window has passed since that first arrival.</p>
+<p><code>_coalesce_key</code> groups envelopes by their sorted target files joined with "|", which implements "same file" from §52.8. Envelopes with empty <code>target_files</code> do not share an empty key. They fall back to the envelope's provenance <code>signature</code>, and failing that to its unique <code>idempotency_key</code>, so they never merge. The docstring says why: soak bt-2026-05-17-213727 merged two distinct problems into one "Frankenstein" operation through the shared empty key. This edge case was found after the April paper and fixed in the same structural way §53 describes.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- END -->

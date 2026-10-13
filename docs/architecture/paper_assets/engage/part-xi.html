@@ -1,0 +1,131 @@
+<!-- CHECKPOINT before: ## §63. Sessions H–O — The Unmasking Ladder and First APPLY -->
+<aside class="checkpoint" id="cp-part-xi-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">Sessions A–G proved the ExplorationLedger works. The next step is to run the whole pipeline end to end until something lands on disk. Do you expect one large blocker, or many small ones? How will they be found?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>Many. Sessions H through N each exposed a different latent failure: a headless TTY crash, risk escalation, an L3 mode switch, a new-file rollback error, two timeout ceilings and WAL cross-session coalescing. Each fix unmasked the next. None of them were in the original design, and all were found by running against real work. Session O then produced the first autonomous APPLY to disk. See §63.1 and §63.2.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- CHECKPOINT before: ## §66. What the Battle Tests Prove (Honest Accounting) -->
+<aside class="checkpoint" id="cp-part-xi-2">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">Session W landed all four files, the AutoCommitter committed them, and 20 of 20 tests pass. Before you read on, list reasons why the paper might still decline to call multi-file autonomy a proven capability.</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>The paper gives three. Durability: Manifesto §6 asks for three consecutive successes, and W is one. Scope: W only created new test files from a detailed description, and refactors, migrations and cross-file edits remain unproven. Workarounds: W depends on three deferred items, including <code>JARVIS_MAX_VALIDATE_RETRIES=0</code> masking the re-validation flake. See §66.2.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- ENDBLOCK part-xi -->
+#### Check your understanding: PART XI — Battle Test Breakthrough Log
+
+<div class="engage" id="engage-part-xi">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why did the arc run the ExplorationLedger in shadow mode (Session A) before enforcing it (Session B)?</summary>
+<p>Shadow mode shows what a new gate would decide without letting it block anything. In Session A, the ledger flagged a shallow pattern (<code>score=3.00</code>, one category, four <code>read_file</code> calls) that the legacy <code>tool_calls &gt;= 2</code> counter would have waved through. That was evidence that the new scorer sees something the old one misses, gathered before it had any authority. Session B then turned enforcement on and showed that the same pattern caused a hard rejection, which proved the toggle works. Session G showed the payoff: retry feedback made the model diversify its tools, so the ledger also steers behaviour as well as filtering it. See §62.1, §62.2 and §62.5.</p>
+</details>
+<details class="cq"><summary>2. Session S landed 0 of 4 files, yet the paper counts it as proof that multi-file enforcement works. Why is that a fair reading?</summary>
+<p>Session S was built to isolate one mechanism. The exploration gate was turned off so it could not hide the result. There were zero <code>multi_file_coverage</code> rejections in the log, and TestRunner saw all four target paths after the gate, so coverage enforcement did its job. The files did not land because of a separate problem: a type error sent the op to VALIDATE_RETRY and L2, which ran out of time before the idle timeout. The paper names that as Follow-up A, a VALIDATE/L2 timebox issue orthogonal to enforcement. Splitting "did the gate work" from "did the op persist" is what let the next sessions aim at the right bug. See §64.3.</p>
+</details>
+<details class="cq"><summary>3. What exactly was wrong with <code>JARVIS_L2_TIMEBOX_S</code>, and why was adding an INFO line that names both clocks part of the fix?</summary>
+<p>L2 was handed the op's drained <code>ctx.pipeline_deadline</code>, not its own timebox. In Session V, the setting was 600s, but L2 reported 120s remaining because that was all VALIDATE had left. The setting did not do what its name said. The fix computes L2's deadline fresh at dispatch (<code>now + JARVIS_L2_TIMEBOX_S</code>) and reconciles the pipeline deadline upward so later phases see a consistent clock. The mandatory INFO line records both clocks and which cap won, so the bug cannot hide again. In Session W it showed <code>pipeline_remaining=0.0s</code> beside <code>winning_cap=l2_timebox_fresh</code>. This fits the paper's pattern of hypothesize, instrument, confirm or falsify, fix, and verify in one session. See §65.3, §65.4 and §66.1.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-xi">
+<div class="mcq" data-answer="4">
+<p class="mcq-q">1. Why does the paper treat <code>debug.log</code>, not <code>summary.json</code>, as the canonical answer to "did the loop work"?</p>
+<ol class="mcq-options" type="A">
+<li><code>summary.json</code> is only written when a session ends cleanly</li>
+<li><code>debug.log</code> is the only artifact that records cost</li>
+<li><code>summary.json</code> omits the session's letter label</li>
+<li><code>summary.json</code> has a counter bug that leaves op stats at zero</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> <code>summary.json</code> has a known bug: <code>stats.attempted / completed / failed</code> stays at zero even when ops fire. The debug log records every provider call, FSM transition and Iron Gate verdict. See §61.1.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. In Session V, L2 reported only 120s remaining even though <code>JARVIS_L2_TIMEBOX_S=600</code>. Why?</p>
+<ol class="mcq-options" type="A">
+<li>L2 was passed the pipeline deadline that VALIDATE had already drained</li>
+<li>The environment variable failed to load at boot</li>
+<li>A hard-coded 120s cap inside the repair engine overrode it</li>
+<li>The cost governor shortened L2 to protect the budget</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> <code>_l2_hook</code> received <code>ctx.pipeline_deadline</code> directly, and only 120s remained after VALIDATE. The timebox setting was effectively advisory. See §65.3.</p>
+</details>
+</div>
+<div class="mcq" data-answer="3">
+<p class="mcq-q">3. Session O was the first autonomous APPLY, but only one of four target files landed. What caused that?</p>
+<ol class="mcq-options" type="A">
+<li>The ASCII gate rejected the other three files</li>
+<li>The cost cap was reached after the first file</li>
+<li>The winning candidate did not populate a <code>files: [...]</code> list</li>
+<li>L2 repair failed to converge on the other three files</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> Without a <code>files</code> list, the <code>_apply_multi_file_candidate</code> fan-out path was never taken. That gap led to the multi-file enforcement work in Sessions Q–S. See §63.2.</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. What made Session G the "crucial observation" of the ExplorationLedger arc?</p>
+<ol class="mcq-options" type="A">
+<li>It was the first session to write a file to disk</li>
+<li>The model changed its tool choices on retry and then passed the ledger</li>
+<li>It ran with the ledger in shadow mode at zero cost</li>
+<li>It proved that the legacy counter gate was strictly stronger</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> On retry, the model used <code>get_callers</code>, <code>git_blame</code> and <code>search_code</code> for the first time and scored 25.50 across five categories. That showed the ledger works as a steering signal, not just a filter. See §62.5.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-xi">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> Walk through the Session O chain from backlog detection to POSTMORTEM. At each step, name the mechanism that acted. Then identify two earlier sessions whose fixes were required for this run to succeed, and say what each fix was.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Compare the steps in §63.2 with the failure-mode table in §63.1. Pay special attention to the new-file path.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The BacklogSensor detected the task, and the router classified it <code>complex</code>. The first attempt failed the ExplorationLedger at <code>score=0.00</code>. Retry injected sharpened feedback, and the second attempt scored 11.00 across four categories.</p>
+<p>ASCII auto-repair fixed two codepoints, and GATE allowed the candidate. APPROVE auto-approved through the headless bypass. In ChangeEngine, <code>RollbackArtifact.capture()</code> handled the new file, and DECISION was <code>applied</code> / <code>safe_auto_passed</code>.</p>
+<p>VERIFY found test critiques, L2 converged in iteration 1, a second DECISION applied, and POSTMORTEM reported <code>root_cause=none</code>.</p>
+<p>Prerequisites: Session K's commit <code>28d52274ec</code> fixed the <code>RollbackArtifact [Errno 2]</code> new-file path, without which APPLY of a new file failed. Session H's commit <code>d8c1cb4d30</code> fixed the headless TTY crash. Session N's WAL cleanup stopped stale envelopes from merging into the task. The sharpened retry feedback came from the A–G commit <code>ad05fb7c7e</code>. See §62.6, §63.1 and §63.2.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> Instead of the deadline-reconciliation fix, a reviewer proposes raising <code>JARVIS_L2_TIMEBOX_S</code> to 1200. Using Sessions T, V and W, explain why this would not have helped. Then state what the actual fix changed.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Look at the value of <code>pipeline_remaining</code> at L2 dispatch in Session W's log.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Session T already raised the timebox to 600s, and it made no difference. The env vars loaded, but the stall happened before L2 ever ran (§65.1).</p>
+<p>Session V showed why the value would not matter even once L2 ran. L2 received the residual pipeline deadline, not its timebox, so it got 120s whatever the setting said (§65.3). In Session W, <code>pipeline_remaining</code> was 0.0s at dispatch. Under the old behaviour, L2 would have received a 0s deadline and died instantly, whether the timebox was 600 or 1200.</p>
+<p>Commit <code>53e6bd9f76</code> computes L2's deadline fresh at dispatch and reconciles <code>ctx.pipeline_deadline</code> upward through <code>with_pipeline_deadline()</code>. It also logs both clocks and which cap won. After the fix, L2 got 600s and converged in a single 50-second iteration (§65.4).</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (analysis).</strong> Using the §65.5 table and §65.6: list the human-shipped commits in the Q–W arc and the blocker each addressed. Estimate the average cost per session in that arc. Then say how many more W-like successes Manifesto §6 would require before multi-file autonomy counts as a capability.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Count the commit column, skipping the rows marked "—". §65.6 gives both the total cost and the number of sessions.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The six human commits are:</p>
+<ul>
+<li><code>6c3cce92c6</code>: parser accepts the multi-file shape (R).</li>
+<li><code>31504a8f12</code>: multi-file coverage enforcement (S).</li>
+<li><code>37a371e65d</code>: per-op exhaustion dedup (S).</li>
+<li><code>d6aa78c8ba</code>: FSM instrumentation that disproved the silent-exit hypothesis and exposed the non-determinism (U).</li>
+<li><code>58709f27de</code>: env-tunable validate retries (V).</li>
+<li><code>53e6bd9f76</code>: L2 deadline reconciliation (W).</li>
+</ul>
+<p>Six matches §65.6, which also names a seventh commit, <code>0890a7b6f0</code>, made by the AutoCommitter.</p>
+<p>About 2.50 US dollars over seven sessions is roughly 0.36 US dollars per session. That is in line with W's own 0.32 US dollars.</p>
+<p>§66.2 says Manifesto §6 needs three consecutive successes, and W is one. So at least two more consecutive W-like runs under comparable conditions are needed. Until then, multi-file autonomy is a "data point", not a "capability".</p>
+</details>
+</div>
+</div>
+</div>
+<!-- END -->
