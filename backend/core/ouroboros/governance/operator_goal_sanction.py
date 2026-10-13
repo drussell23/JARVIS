@@ -491,11 +491,16 @@ def build_scoped_envelope(
     urgency: str = "",
     confidence: float = 0.95,
     extra_evidence: Optional[Dict[str, Any]] = None,
+    causal_id: str = "",
 ) -> Optional[Any]:
     """The ``IntentEnvelope`` that injects a sanctioned goal as one scoped op.
 
     ``extra_evidence`` rides along (a foreground session's ``seed_ref``) but
     can never replace the provenance fields the cage verifies.
+
+    ``causal_id`` becomes the op's id (intake mints ``ctx.op_id`` from it), so
+    a caller that must recognise the op later -- Esc targeting, a session's
+    owned-op routing -- passes the id it will hold.
 
     Byte-identical in shape to ``WorkOrderSensor``'s: ``source="roadmap"`` plus
     an ``evidence.provenance`` claim POINTER at the signed goal. Returns None
@@ -546,6 +551,7 @@ def build_scoped_envelope(
             urgency=str(urgency or _default_urgency()),
             evidence=evidence,
             requires_human_ack=False,  # the operator already authorized it
+            causal_id=str(causal_id or ""),
         )
     except Exception:  # noqa: BLE001
         logger.debug("[OperatorGoalSanction] envelope degraded", exc_info=True)

@@ -6088,7 +6088,7 @@ class BattleTestHarness:
                 signal_id=origin_id,
             )
 
-            return self._dispatch_intake_envelope(envelope, origin_id)
+            return self._dispatch_intake_envelope(envelope)
         except Exception:  # noqa: BLE001
             # WARNING, not DEBUG. This is the operator's primary input path;
             # when it dies the goal silently degrades to a backlog file, and
@@ -6099,15 +6099,19 @@ class BattleTestHarness:
             )
             return None
 
-    def _dispatch_intake_envelope(
-        self, envelope: Any, origin_id: str,
-    ) -> Optional[str]:
+    def _dispatch_intake_envelope(self, envelope: Any) -> Optional[str]:
         """Resolve the shared intake router and submit a PRE-BUILT envelope,
         returning an honest receipt. The ONE dispatch seam for operator-origin
         work: a typed chat goal AND a sanctioned /goal both reach intake
         through here, so one set of router-resolution, cross-thread and
         receipt rules governs both. Returns None (the caller FILES + says so)
-        on any unreachable-intake condition. NEVER raises."""
+        on any unreachable-intake condition. NEVER raises.
+
+        The receipt id IS the envelope's ``causal_id``: intake mints
+        ``ctx.op_id`` from it, so the id the operator holds (Esc, a session's
+        owned ops) is the id the op's blocks carry. A separately minted id
+        here once named no op at all."""
+        origin_id = str(getattr(envelope, "causal_id", "") or "")
         try:
             from backend.core.ouroboros.governance.intake.unified_intake_router import (  # noqa: E501
                 get_default_intake_router,
@@ -7297,17 +7301,11 @@ class BattleTestHarness:
                 urgency=(os.environ.get("JARVIS_WORK_ORDER_DEFAULT_URGENCY", "")
                          or "high").strip(),
                 extra_evidence=extra_evidence,
+                causal_id=generate_operation_id("goal"),
             )
             if envelope is None:
                 return None
-            origin_id = generate_operation_id("goal")
-            try:
-                gls = getattr(self, "_governed_loop_service", None)
-                if gls is not None and hasattr(gls, "note_operator_op"):
-                    gls.note_operator_op(origin_id)
-            except Exception:  # noqa: BLE001
-                pass
-            return self._dispatch_intake_envelope(envelope, origin_id)
+            return self._dispatch_intake_envelope(envelope)
         except Exception:  # noqa: BLE001
             logger.warning(
                 "[OperatorGoal] sanctioned inject failed", exc_info=True)

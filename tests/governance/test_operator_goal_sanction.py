@@ -154,6 +154,32 @@ def test_envelope_none_when_goal_absent(sanction_env):
     ) is None
 
 
+def test_the_injected_ops_id_is_the_id_the_operator_holds(sanction_env):
+    """The receipt (what Esc targets, what a /session records as its own op)
+    must be the id intake mints ``ctx.op_id`` from -- the envelope's
+    causal_id. A separately minted receipt id named no op at all."""
+    import functools
+    from types import SimpleNamespace
+
+    from backend.core.ouroboros.battle_test.harness import BattleTestHarness
+
+    assert ogs.author_and_sign_goal(_spec(), path_override=sanction_env).ok
+    submitted, noted = [], []
+    router = SimpleNamespace(ingest=lambda env: submitted.append(env) or "enqueued")
+    gls = SimpleNamespace(_intake_router=router, note_operator_op=noted.append)
+    stub = SimpleNamespace(_governed_loop_service=gls,
+                           _operator_goal_receipt=BattleTestHarness._operator_goal_receipt)
+    stub._dispatch_intake_envelope = functools.partial(
+        BattleTestHarness._dispatch_intake_envelope, stub)
+
+    op_id = BattleTestHarness._inject_sanctioned_goal(
+        stub, goal_id="goal-1", description="d", target_files=(_TARGET,))
+
+    assert len(submitted) == 1 and op_id
+    assert op_id == submitted[0].causal_id
+    assert noted == [op_id]
+
+
 def test_normalize_target_files_dedupes_and_relativizes():
     out = ogs.normalize_target_files(["a/b.py", "a/b.py", "./c.py", ""])
     assert out == ("a/b.py", "./c.py")
