@@ -122,14 +122,58 @@ class TestTheSpeechPrimitiveHonoursIt:
         assert "except Exception" in gate and "pass" in gate
 
 
+class _FakeBridge:
+    """Starts, holds one cockpit, and answers any wiring attribute."""
+
+    def __init__(self, *a, started=True, **k) -> None:
+        self._clients = {"c0": object()}
+        self._started = started
+        self.stopped = False
+
+    async def start(self) -> bool:
+        return self._started
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+    def __getattr__(self, name):
+        return lambda *a, **k: None
+
+
+class _Host:
+    """Just enough harness for the mount; anything else it reaches for is
+    absent, and the mount is fail-soft around each wiring."""
+
+
+def _mount(monkeypatch, *, started: bool):
+    from backend.core.ouroboros.battle_test.harness import BattleTestHarness
+    made = []
+
+    def _factory(*a, **k):
+        made.append(_FakeBridge(started=started))
+        return made[-1]
+
+    monkeypatch.setattr(ca, "CockpitAttachBridge", _factory)
+    monkeypatch.setattr(ca, "attach_enabled", lambda: True)
+    host = _Host()
+    asyncio.run(BattleTestHarness._start_cockpit_attach_bridge(host))
+    assert made, "the mount never built a bridge"
+    return host, made[0]
+
+
 class TestTheHarnessPublishesTheBridge:
-    def test_it_registers_on_mount_and_clears_on_teardown(self):
-        import pathlib
-        src = pathlib.Path(
-            "backend/core/ouroboros/battle_test/harness.py"
-        ).read_text(encoding="utf-8")
-        assert "set_active_bridge(bridge)" in src
-        assert "set_active_bridge(None)" in src
+    def test_a_successful_mount_leaves_the_bridge_published(self, monkeypatch):
+        """The clear once sat after the mount's if/else, so it ran on every
+        SUCCESSFUL mount: the global was None for the daemon's whole life
+        and session_mode frames, the live tool stream and voice presence
+        all went dark while the bridge served cockpits."""
+        _host, bridge = _mount(monkeypatch, started=True)
+        assert ca._ACTIVE_BRIDGE is bridge
+        assert ca.attached_cockpits() == 1
+
+    def test_a_bridge_that_did_not_start_is_not_published(self, monkeypatch):
+        _mount(monkeypatch, started=False)
+        assert ca._ACTIVE_BRIDGE is None
 
 
 class TestNeverRaises:

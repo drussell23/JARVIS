@@ -5956,13 +5956,19 @@ class BattleTestHarness:
                                  exc_info=True)
             else:
                 self._cockpit_attach_bridge = None
-            try:
-                from backend.core.ouroboros.battle_test.cockpit_attach import (
-                    set_active_bridge,
-                )
-                set_active_bridge(None)
-            except Exception:  # noqa: BLE001
-                pass
+                # Cleared ONLY when the bridge did not start. This clear once
+                # sat after the if/else, so it ran on every SUCCESSFUL mount
+                # too: the global was None for the daemon's whole life, and
+                # every reader of it (session_mode frames, the live tool
+                # stream, /diff fetch, headless markup, voice presence) went
+                # dark while the bridge itself served cockpits.
+                try:
+                    from backend.core.ouroboros.battle_test.cockpit_attach import (
+                        set_active_bridge,
+                    )
+                    set_active_bridge(None)
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception:  # noqa: BLE001
             logger.debug("[CockpitAttach] mount degraded", exc_info=True)
             self._cockpit_attach_bridge = None
@@ -10669,6 +10675,10 @@ class BattleTestHarness:
             attach_bridge = getattr(self, "_cockpit_attach_bridge", None)
             if attach_bridge is not None:
                 await attach_bridge.stop()
+                from backend.core.ouroboros.battle_test.cockpit_attach import (
+                    set_active_bridge,
+                )
+                set_active_bridge(None)     # registered on mount, cleared on teardown
         except Exception:
             pass
         try:
