@@ -136,7 +136,12 @@ def save_state(state: Dict[str, Any]) -> None:
 
 def log(state: Dict[str, Any], msg: str) -> None:
     line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}"
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except (BrokenPipeError, OSError):
+        # The console that started us is gone (its shell was signalled, or
+        # the driver's wsl.exe went away). bench.log below is the record.
+        pass
     with open(run_dir(state["run"]) / "bench.log", "a", encoding="utf-8") as fh:
         fh.write(line + "\n")
 
