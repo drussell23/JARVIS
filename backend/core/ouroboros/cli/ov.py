@@ -1830,13 +1830,21 @@ class AttachUI:
         """
         try:
             from backend.core.ouroboros.battle_test.status_line import (
-                payload_to_snapshot, render_snapshot,
+                payload_to_snapshot, render_durable, render_snapshot,
             )
-            if self._heartbeat_age() is None:
-                return []
             snap = payload_to_snapshot(self._status)
             if snap is None:
                 return []
+            if self._heartbeat_age() is None:
+                # Lost contact (daemon gone, VM stopped, a soak holding the
+                # socket): keep the DURABLE facts, labelled with how long it
+                # has been silent, instead of vanishing or showing live work.
+                arrived = float(getattr(self, "_heartbeat_arrived", 0.0) or 0.0)
+                if not arrived:
+                    return []
+                import time as _time
+                line = render_durable(snap, lost_for_s=_time.monotonic() - arrived)
+                return [f"  [dim]{line}[/dim]"] if line else []
             line = render_snapshot(snap, width=self._terminal_size()[0])
             return [f"  {line}"] if line else []
         except Exception:  # noqa: BLE001

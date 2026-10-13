@@ -36,6 +36,16 @@ def _buffer_cap() -> int:
         return 400
 
 
+def _mark() -> str:
+    """The background row's glyph, from the theme's registry (the UI plane
+    admits no raw emoji literals; ASCII degradation comes with it)."""
+    try:
+        from backend.core.ouroboros.ui.theme import mark
+        return mark("cycle")
+    except Exception:  # noqa: BLE001
+        return "~"
+
+
 def _severity(text: str) -> str:
     """The deck's own classifier; an unclassifiable line is INFO."""
     try:
@@ -146,7 +156,7 @@ class SessionRouter:
 
     # ---- surfaces
     def summary_row(self, background_live: int) -> str:
-        """``⚙ 3 ops running · 1 finished · 1 warning · /bg`` -- or "" when
+        """``↻ 3 ops running · 1 finished · 1 warning · /bg`` -- or "" when
         there is nothing in the background."""
         if not self.active:
             return ""
@@ -160,7 +170,7 @@ class SessionRouter:
         if not parts and not self.sidelined:
             return ""
         parts.append("/bg")
-        return "⚙ " + " · ".join(parts)
+        return f"{_mark()} " + " · ".join(parts)
 
     def background(self, limit: int = 60) -> List[str]:
         """``/bg``: the newest sidelined lines, oldest first."""
@@ -173,7 +183,7 @@ class SessionRouter:
         """Shown once on leaving: a digest, not the flood."""
         if not self.sidelined and not self.finished:
             return []
-        out = [f"⚙ while you were in session {self.session_id}: "
+        out = [f"{_mark()} while you were in session {self.session_id}: "
                f"{self.sidelined} background line(s)"
                + (f" · {len(self.finished)} op(s) finished" if self.finished else "")
                + (f" · {self.warnings} warning(s)" if self.warnings else "")]

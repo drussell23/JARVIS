@@ -170,19 +170,21 @@ class TestTheMount:
         assert "get_status_line_builder" in src
         assert "render_snapshot" in src
 
-    def test_a_stale_frame_retires_the_line(self):
+    def test_a_stale_frame_retires_the_live_line(self):
         """A dead daemon must not leave its last phase showing under an idle
         pulse. Same window as the pulse and the roster — one definition of
-        lost contact, not three."""
+        lost contact, not three. What survives is the durable part, labelled
+        as no contact (render_durable), instead of the line vanishing."""
         import time
         from backend.core.ouroboros.cli.ov import AttachUI
         ui = AttachUI()
         ui.on_telemetry({"kind": "heartbeat", "active": True,
                          "status": snapshot_to_payload(StatusSnapshot(
                              phase="GENERATE", cost_budget_usd=0.5))})
-        assert ui._status_rows()
+        assert "GENERATE" in "".join(ui._status_rows())
         ui._heartbeat_arrived = time.monotonic() - 10_000
-        assert ui._status_rows() == []
+        rows = ui._status_rows()
+        assert rows and "no contact 2h" in rows[0] and "GENERATE" not in rows[0]
 
     def test_the_heartbeat_carries_it(self):
         import inspect
@@ -204,3 +206,25 @@ class TestNeverRaises:
     def test_the_master_flag_silences_it(self, busy, monkeypatch):
         monkeypatch.setenv("JARVIS_UI_STATUS_LINE_ENABLED", "0")
         assert render_snapshot(busy, width=200) == ""
+
+
+# --- lost contact keeps only the durable facts ---------------------------------
+
+def test_lost_contact_shows_landed_and_main_not_live_work():
+    """A dead daemon's last frame must not keep claiming work in flight; what
+    landed and where main is stay true, labelled with how long it has been
+    silent (render_durable)."""
+    from backend.core.ouroboros.battle_test import status_line as sl
+    from backend.core.ouroboros.battle_test.attach_heartbeat import _status_payload
+    snap = sl.StatusSnapshot(
+        phase="GENERATE", landed_total=3, landed_per_hour=2.7, landed_settled=True,
+        landed_uptime_s=4000, promotion_state="promoted", promotion_target="main",
+        promotion_sha="abc1234567ff", promotion_unpushed=3, promotion_total=3)
+    back = sl.payload_to_snapshot(_status_payload(snap))
+    line = sl.render_durable(back, lost_for_s=150)
+    assert line.endswith(("main ← abc1234567 · 3 unpushed",)) and "no contact 2m" in line
+    assert "landed 3" in line and "main ← abc1234567" in line
+    assert "GENERATE" not in line
+    assert sl.render_durable(None, lost_for_s=5) == ""
+    assert sl.render_durable(sl.payload_to_snapshot({"phase": "IDLE"}) or sl.StatusSnapshot(),
+                             lost_for_s=5).endswith("no contact 5s")

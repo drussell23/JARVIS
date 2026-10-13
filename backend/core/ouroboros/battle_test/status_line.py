@@ -1612,6 +1612,32 @@ def fit_to_width(line: str, width: Optional[int]) -> str:
         return line
 
 
+def render_durable(snap: Optional["StatusSnapshot"], *, lost_for_s: float) -> str:
+    """The status line for a daemon this cockpit has LOST CONTACT with.
+
+    Only the facts that stay true after contact is lost: what landed and
+    where main is. The live fields (phase, ops, agents, cost) are dropped,
+    because a dead daemon's last frame would keep claiming work in flight
+    -- the confident wrong picture ``_heartbeat_age`` exists to prevent. The
+    two tokens come from the same formatters the live line uses.
+    ``◇ no contact 2m · landed 3 · 2.7/h · main ← abc1234567``. The landed
+    token appears only when something landed (``landed 0 · 0m in`` is uptime,
+    which stopped meaning anything when contact did). NEVER raises; ``""``
+    when there is no snapshot.
+    """
+    try:
+        if snap is None:
+            return ""
+        from backend.core.ouroboros.ui.theme import mark
+        landed = _format_landed_token(snap) if int(getattr(snap, "landed_total", 0) or 0) > 0 else ""
+        toks = [t for t in (landed, _format_promotion_token(snap)) if t]
+        s = max(0, int(lost_for_s))
+        age = f"{s}s" if s < 120 else (f"{s // 60}m" if s < 7200 else f"{s // 3600}h")
+        return " · ".join([f"{mark('state_off')} no contact {age}"] + toks)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def render_snapshot(
     snap: Optional["StatusSnapshot"],
     *,

@@ -268,11 +268,15 @@ def _sink_with(monkeypatch, *, canvas_present: bool):
     src = _OV.read_text(encoding="utf-8")
     # Extract the sink body verbatim so the test exercises the shipped
     # routing rather than a re-typed copy of it.
-    start = src.index("        def _markup_sink(text: str, addressed: bool = False) -> None:")
+    start = src.index("        def _markup_sink(text: str, addressed: bool = False, routed: bool = False)")
     end = src.index("        client = CockpitAttachClient(", start)
     body = "\n".join(l[8:] for l in src[start:end].splitlines())
+    # The sink asks the session router first (FOREGROUND_SESSION §4); outside
+    # a session it routes everything to the transcript, which these tests pin.
+    from backend.core.ouroboros.ui.session_router import SIDELINE, SessionRouter
     ns = {"ui": ui, "console": None, "_render_markup_frame": O._render_markup_frame,
-          "_ambient_transcript_enabled": O._ambient_transcript_enabled}
+          "_ambient_transcript_enabled": O._ambient_transcript_enabled,
+          "router": SessionRouter(), "SIDELINE": SIDELINE}
     exec(body, ns)  # noqa: S102 — executing the repo's own source under test
     return ns["_markup_sink"], rendered, decked
 
