@@ -191,6 +191,40 @@ def parse_proposal(text: str) -> Optional[Dict[str, Any]]:
     return obj if cands else None
 
 
+def proposal_problem(proposal: Dict[str, Any], root: Optional[Path] = None) -> Optional[str]:
+    """Why this proposal cannot land as shown, or None when every candidate
+    would. A diff is checked with the pipeline's OWN applier against the file
+    as it is now -- the same test GENERATE's parse applies -- because a seed
+    that does not parse there is dropped and the op generates normally: the
+    operator would approve one change and get another. Found live: the model
+    returned the docstring's text as its "unified_diff", with no hunks."""
+    try:
+        from backend.core.ouroboros.governance.diff_apply import (  # noqa: PLC0415
+            apply_unified_diff, parse_unified_hunks,
+        )
+        base = Path(root) if root is not None else Path(".")
+        for c in proposal.get("candidates") or []:
+            path = str(c.get("file_path") or "")
+            if c.get("full_content"):
+                continue
+            diff = str(c.get("unified_diff") or "")
+            if not diff.strip():
+                return f"{path}: the proposal carries neither a diff nor file content"
+            if not parse_unified_hunks(diff):
+                return f"{path}: the proposed \"diff\" has no hunks (@@ … @@) — it is not a diff"
+            target = base / path
+            original = target.read_text(encoding="utf-8", errors="replace") if target.is_file() else ""
+            try:
+                patched = apply_unified_diff(original, diff)
+            except ValueError as exc:
+                return f"{path}: the diff does not apply to the file as it is now — {exc}"
+            if patched == original:
+                return f"{path}: the diff changes nothing"
+        return None
+    except Exception as exc:  # noqa: BLE001 — an unverifiable proposal is not offered as landable
+        return f"the proposal could not be checked: {type(exc).__name__}: {exc}"
+
+
 def summarize_turn(turn: SessionTurn) -> str:
     """Deterministic one-paragraph summary of an older turn: the question,
     what was looked at, and the answer's first paragraph. No model call."""
@@ -476,6 +510,12 @@ class SessionManager:
             turn.records = list(records or [])
             turn.proposal = parse_proposal(final)
             turn.answer = "" if turn.proposal is not None else str(final or "")
+            problem = proposal_problem(turn.proposal) if turn.proposal is not None else None
+            if problem:
+                # Not offered for /session apply: it could only land as
+                # something else (see proposal_problem).
+                turn.proposal = None
+                turn.error = f"the change it proposed cannot land as shown — {problem}; ask again"
         except asyncio.CancelledError:
             turn.error = "cancelled"
             s.turns.append(turn)

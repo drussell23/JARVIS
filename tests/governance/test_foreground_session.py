@@ -97,12 +97,48 @@ def test_a_turn_answers_the_cockpit_that_asked_and_keeps_the_reads():
     assert "governance/risk_tier_floor.py" in s.focus
 
 
-def test_a_change_is_captured_as_a_proposal_not_an_answer():
+def _repo_with_x(tmp_path, monkeypatch, text="a = 1\n"):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "backend").mkdir(exist_ok=True)
+    (tmp_path / "backend/x.py").write_text(text)
+
+
+def test_a_change_is_captured_as_a_proposal_not_an_answer(tmp_path, monkeypatch):
+    _repo_with_x(tmp_path, monkeypatch)
     m, _made, out = _manager(json.dumps(PROPOSAL))
     s = m.start("ck1")
     turn = asyncio.run(m.run_turn(s, "bump a"))
     assert turn.proposal == PROPOSAL and turn.answer == ""
     assert "/session apply" in out[-1][1]
+
+
+def test_a_diff_with_no_hunks_is_not_offered_for_apply(tmp_path, monkeypatch):
+    """Found live: the model returned the docstring's text as its
+    "unified_diff". GENERATE would drop that seed and generate normally --
+    the operator would approve one change and land another."""
+    _repo_with_x(tmp_path, monkeypatch)
+    bad = {"schema_version": "2b.1-diff", "candidates": [{
+        "candidate_id": "c1", "file_path": "backend/x.py",
+        "unified_diff": '"""A docstring, not a diff."""\n', "rationale": "doc"}]}
+    m, _made, out = _manager(json.dumps(bad))
+    s = m.start("ck1")
+    turn = asyncio.run(m.run_turn(s, "document it"))
+    assert turn.proposal is None and "no hunks" in turn.error
+    assert "/session apply" not in out[-1][1] and "no hunks" in out[-1][1]
+
+
+def test_apply_refuses_a_diff_the_file_has_moved_past(tmp_path, monkeypatch):
+    _repo_with_x(tmp_path, monkeypatch)
+    ops.set_injector(lambda **kw: "op-x")
+    import backend.core.ouroboros.governance.operator_goal_sanction as ogs
+    monkeypatch.setattr(ogs, "author_and_sign_goal",
+                        lambda spec, **_: SimpleNamespace(ok=True, goal_id=spec.goal_id))
+    m, *_ = _manager(json.dumps(PROPOSAL), tools=[("read_file", "backend/x.py")])
+    s = m.start("ck1")
+    asyncio.run(m.run_turn(s, "bump a"))
+    (tmp_path / "backend/x.py").write_text("b = 9\n")          # moved on since the proposal
+    ok, text = ops.apply_last(m, "ck1")
+    assert not ok and "does not apply" in text and s.owned_ops == []
 
 
 def test_older_turns_are_summarized_deterministically(monkeypatch):

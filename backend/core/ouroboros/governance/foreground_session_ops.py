@@ -114,6 +114,15 @@ def apply_last(manager: Any, cockpit: str) -> Tuple[bool, str]:
         if unread:
             return False, ("the session never read " + ", ".join(unread)
                            + " — ask it to look first, so the change is grounded")
+        # Re-checked here, not only when proposed: the file may have moved on
+        # since. A seed GENERATE cannot parse is dropped and the op generates
+        # normally -- the operator would approve one change and land another.
+        from backend.core.ouroboros.governance.foreground_session import (  # noqa: PLC0415
+            proposal_problem,
+        )
+        problem = proposal_problem(proposal)
+        if problem:
+            return False, f"not applied — {problem}"
         why = "; ".join(str(c.get("rationale", "")) for c in proposal.get("candidates", [])
                         if c.get("rationale")) or "operator-approved change from a session"
         asked = next((t.user for t in reversed(s.turns) if t.proposal is proposal), "")
