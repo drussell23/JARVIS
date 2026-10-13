@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # [Ouroboros] Modified by Ouroboros (op=op-01a126ad-) at 2026-10-10 16:40 UTC
 # [Ouroboros] Modified by Ouroboros (op=op-01a135e8-) at 2026-10-13 15:40 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-01a135e9-) at 2026-10-13 15:43 UTC
+# Reason: Lift the hardcoded fallback policy (delay_ms 1000, max_retries 3) into named module-level constants so the retry contrac
+
 # Reason: Lift the hardcoded fallback policy (delay_ms 1000, max_retries 3) into named module-level constants so the retry contrac
 
 # Reason: Lift the hardcoded fallback policy (delay_ms 1000, max_retries 3) into named module-level constants so the retry contrac
@@ -24,8 +27,8 @@ logger = logging.getLogger(__name__)
 # Fallback policy constants
 FALLBACK_DELAY_MS = 1000
 FALLBACK_MAX_RETRIES = 3
-FAKE_TIMESTAMP = datetime.now(timezone.utc).isoformat()
 router = APIRouter(prefix="/audio/ml", tags=["Audio Fallback"])
+
 
 class AudioError(BaseModel):
     """Audio error model"""
@@ -47,7 +50,7 @@ async def handle_audio_error(error: AudioError) -> Dict[str, Any]:
     "error_received": {
         "type": error.error_type,
         "message": error.message,
-        "timestamp": error.timestamp or FAKE_TIMESTAMP
+        "timestamp": error.timestamp or datetime.now(timezone.utc).isoformat()
     },
     "fallback_strategy": {
         "action": "retry",
