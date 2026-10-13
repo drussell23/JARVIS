@@ -1,0 +1,124 @@
+<!-- CHECKPOINT before: ## §28. ProphecyEngine — Regression Prediction -->
+<aside class="checkpoint" id="cp-part-v-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">MemoryEngine now holds a success rate and a fragility score for every file. If you had to turn those records into a regression-risk prediction cheaply, would you train a model or write a formula? How confident should the result claim to be?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>ProphecyEngine uses a fixed formula with no LLM: 0.3 times the failure rate, plus 0.3 times fragility, plus 0.2 times dependents over 20, plus a 0.1 baseline. The score maps to LOW, MEDIUM, HIGH or CRITICAL. Because the scoring is heuristic, confidence is capped at 0.6. The engine flags concern rather than making final decisions. See §28.</p>
+</details>
+</aside>
+<!-- END -->
+
+<!-- CHECKPOINT before: ## §32. ConsciousnessBridge — Integration Points -->
+<aside class="checkpoint" id="cp-part-v-2">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">The engines and awareness layers produce risk scores, hotspots and advice. Where in the pipeline should they be consulted? And should a low-risk reading from them ever be allowed to relax a safety decision?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>ConsciousnessBridge exposes five methods, each called at a specific point: CLASSIFY, GENERATE_RETRY, intake gating, POST-APPLY, and PRE-GENERATE. Their outputs are advisory only. Consciousness can raise caution, for example elevating a Green operation to Yellow, but it can never reduce safety. The Iron Gate, routing, risk tiers and approval gating stay deterministic code. See §32.</p>
+</details>
+</aside>
+<!-- END -->
+
+<!-- ENDBLOCK part-v -->
+#### Check your understanding: PART V — Trinity Consciousness: The Metacognition Layer
+
+<div class="engage" id="engage-part-v">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why is every consciousness component, from ConsciousnessBridge to ConversationBridge to LastSessionSummary, held to an advisory-only authority invariant?</summary>
+<p>The paper describes consciousness as a fluid-intelligence layer that can drift, produce noise, or even be compromised (§32.2). If safety-critical decisions such as the Iron Gate, UrgencyRouter, risk tiers, FORBIDDEN_PATH checks and approval gating depended on it, any of those failures would weaken safety. So the invariant is one-directional: consciousness may only increase caution, never reduce it. The dialogue and session-history channels are held to the same rule because their content is untrusted. It can dominate the prompt, but it is structurally cut off from authority (§34, §35.1). The result is that the pipeline is enhanced by consciousness but never gated by it.</p>
+</details>
+<details class="cq"><summary>2. ProphecyEngine is a four-coefficient heuristic, not a learned model. What does the paper say this buys, and what does it cost?</summary>
+<p>A heuristic needs no training data, training pipeline or re-training as the codebase changes. It is inspectable and debuggable, and it can be tuned by editing four coefficients (§28.2). Its cost is accuracy: it will sometimes misjudge risk. The paper accepts this because the price of a false positive is only an occasional extra human review on a low-risk operation. An opaque learned model could drift and misclassify in ways that are hard to debug. The engine is also honest about its limits: confidence is capped at 0.6, so it signals concern rather than claiming certainty (§28).</p>
+</details>
+<details class="cq"><summary>3. MemoryEngine stores no weights or training signal. How, then, does O+V "learn" across operations, and which single integration point would break that learning if removed?</summary>
+<p>Learning here is non-parametric. MemoryEngine keeps behavioral records per file (success rate, fragility, co-failures, last outcome) that persist across sessions with a 168-hour TTL (§27, §27.1). Those records are read back at CLASSIFY through <code>assess_regression_risk()</code>, which can raise the risk tier for files that keep breaking (§27, §28.1). The records are written by <code>record_operation_outcome()</code> at POST-APPLY, which also feeds GoalMemoryBridge for semantic retrieval later (§32.1, §33). Remove that write and the loop in §38 is cut: reputations would never update, so every later operation would see a stale or empty history, however many times a file failed.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-v">
+<div class="mcq" data-answer="2">
+<p class="mcq-q">1. At what value is ProphecyEngine's confidence capped, and why?</p>
+<ol class="mcq-options" type="A">
+<li>0.8, because CRITICAL starts at 0.8</li>
+<li>0.6, because the scoring is heuristic, not model-derived</li>
+<li>0.5, because a file's success rate below 0.5 raises risk</li>
+<li>1.0, because the formula is fully deterministic</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> Confidence is capped at 0.6 because the scoring is heuristic. The paper calls this honesty a feature: the engine flags concern rather than deciding (§28).</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">2. Which of these is ConsciousnessBridge permitted to do?</p>
+<ol class="mcq-options" type="A">
+<li>Lower a Yellow operation to Green when a file's history is clean</li>
+<li>Override an Iron Gate denial when UAE awareness is HYPERAWARE</li>
+<li>Skip the approval gate when fused confidence is high</li>
+<li>Raise a Green operation to Yellow based on MemoryEngine history</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> Consciousness can only increase caution. Elevating Green to Yellow is the paper's own example. Reducing a tier, overriding the Iron Gate or skipping approval would break the authority invariant (§32.2).</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">3. Why does GoalMemoryBridge use a vector database instead of exact-key lookup?</p>
+<ol class="mcq-options" type="A">
+<li>Related operations are often described in different words</li>
+<li>Vector search lets records outlive the 168-hour TTL</li>
+<li>ChromaDB can store per-file fragility scores more compactly</li>
+<li>Embeddings let it update the provider's model weights</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> Signals do not carry identical keys. "Fix the test flake in test_provider.py" and "resolve the intermittent failure in TestProvider.test_cascade" mean nearly the same thing but share few words, and vector retrieval recognizes that (§33).</p>
+</details>
+</div>
+<div class="mcq" data-answer="3">
+<p class="mcq-q">4. SemanticIndex leaves POSTMORTEM turns out of its centroid by default. What is the stated reason?</p>
+<ol class="mcq-options" type="A">
+<li>Postmortems may contain secrets the redactor misses</li>
+<li>Postmortems are too long for the 16,384-character cap</li>
+<li>Failures would pull the inferred theme toward themselves</li>
+<li>Postmortems are already counted through the git commits</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> Excluding postmortems avoids "failure gravity" biasing the inferred theme (§36). This fits §36.1's concern that naive goal inference drifts toward whatever dominated recent work.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-v">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> A Green (<code>SAFE_AUTO</code>) operation targets <code>backend/utils/cache.py</code>. MemoryEngine reports a success rate of 0.25, a fragility score of 0.7, and 12 dependents. Compute ProphecyEngine's risk score and level. Then say what CLASSIFY does with it. Finally, say what happens to this file's record if the operation is applied and verified successfully.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Use the §28 formula term by term, then the level table. Check §28.1 for the escalation rule and §32.1 for the write-back.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Failure term: (1 - 0.25) times 0.3 = 0.225. Fragility term: 0.7 times 0.3 = 0.21. Dependents term: (12 / 20) times 0.2 = 0.12. Baseline: 0.1. Total risk = 0.655 (§28).</p>
+<p>From the level table, 0.655 falls between 0.6 and 0.8, so the level is HIGH. Confidence is still at most 0.6.</p>
+<p>At CLASSIFY, <code>ConsciousnessBridge.assess_regression_risk()</code> queries ProphecyEngine for each target file. Because one file is HIGH, the operation's tier is raised by one step, from Green to Yellow. It now gets extra human visibility before it runs (§28.1, §32.1).</p>
+<p>After a successful APPLY and VERIFY, <code>record_operation_outcome()</code> feeds the outcome back into MemoryEngine and GoalMemoryBridge. The file's success rate improves, so the next operation on it starts from a better reputation (§32.1, §38).</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> To reduce human review load, someone proposes: "When UAE reports risk below 0.2 with awareness level DORMANT, automatically lower a Yellow operation to Green." Evaluate this proposal against the architecture in Part V. Is there a version of the idea that would be allowed?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask which direction consciousness is allowed to move a safety decision.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The proposal violates the authority invariant in §32.2. Consciousness outputs are advisory. They may increase caution but never reduce safety, and risk-tier escalation is one of the safety-critical decisions that must stay deterministic code.</p>
+<p>The paper's reason applies directly. The consciousness layer can drift, produce noise or be compromised. A UAE reading built from CAI and SAI heuristics, or from prompt content that came through untrusted channels, would become a lever for weakening safety. UAE's fused confidence is also bounded by the less confident of CAI and SAI (§31.3), so a low score is not strong evidence.</p>
+<p>An allowed version keeps the signal advisory. Low-risk awareness can shape things consciousness already controls: a smaller thinking budget, a suggested provider tier, or lighter context expansion (§31.3). Relaxing the tier itself would have to come from the deterministic risk policy, not from consciousness.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/consciousness/prophecy_engine.py</code>. Find the module constants for the risk weights, the dependents normaliser, the confidence caps and the level thresholds, and the formula in the module docstring. Compare them with §28. What does the code do that the paper's formula omits? What is the highest score a file can reach, and can a single file reach CRITICAL?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Look closely at how fragility and the dependents ratio enter the formula in the docstring.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The constants match §28: <code>_RISK_WEIGHT_FAILURE_RATE</code> 0.3, <code>_RISK_WEIGHT_FRAGILITY</code> 0.3, <code>_RISK_WEIGHT_DEPENDENTS</code> 0.2, <code>_RISK_BASELINE</code> 0.1, and <code>_DEPENDENTS_NORMALISER</code> 20.0. The thresholds are 0.8 critical, 0.6 high, 0.3 medium and 0.0 low. <code>_CONFIDENCE_CAP_HEURISTIC</code> is 0.6, and a separate <code>_CONFIDENCE_CAP_JPRIME</code> of 1.0 is reserved for a future LLM pass.</p>
+<p>The difference: the code wraps fragility and the dependents ratio in <code>min(..., 1.0)</code>. The paper's formula has no clamp, which taken literally would let a file with 60 dependents add 0.6 from that term alone. In the code, every dependent beyond 20 adds nothing more.</p>
+<p>Maximum score: the failure term is at most 0.3 (success rate 0), fragility at most 0.3, dependents at most 0.2, plus the 0.1 baseline, for a total of 0.9. Since 0.9 is at least 0.8, CRITICAL is reachable. It requires a file that is failing almost always, highly fragile, and heavily depended on.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- END -->

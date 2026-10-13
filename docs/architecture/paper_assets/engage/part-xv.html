@@ -1,0 +1,122 @@
+<!-- CHECKPOINT before: ## §84. The Attachment Substrate -->
+<aside class="checkpoint" id="cp-part-xv-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">An image's metadata (path, mime type, short hash) is passed around separately from its bytes. How could a constructor make it impossible for a caller to hand in a mismatched path, mime type and hash, and what else should a safe attachment object refuse to leak?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>The canonical constructor <code>Attachment.from_file(path, kind=..., app_id=...)</code> computes <code>hash8</code> from the actual file bytes and infers <code>mime_type</code> from the extension, so the caller never supplies them. <code>__post_init__</code> then rechecks every field against its whitelist, regex or length cap. The <code>__repr__</code> is redaction-safe: it shows only the basename and <code>hash8</code>, never the full path. See §84.1.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- CHECKPOINT before: ## §87. Live-Fire Behavioral Proof -->
+<aside class="checkpoint" id="cp-part-xv-2">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">Unit tests and log lines can show that bytes were sent. How would you design one test that proves the model actually read the contents of an attached PDF, rather than guessing from the prompt?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>Embed a specific, unguessable line in the PDF and check whether the model quotes it verbatim. The test PDF contained "BUG: division by zero on line 42 of compute.py", and the prompt did not include that text. Claude's reply quoted it byte for byte inside a well-formed <code>2b.1-noop</code> response, which it could not have done without parsing the PDF. See §87.1 and §87.4.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- ENDBLOCK part-xv -->
+#### Check your understanding: PART XV — Multi-Modal Perception: The Senses→Mind Bridge
+
+<div class="engage" id="engage-part-xv">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Most of the pieces for multi-modal input already existed before the arc. Why could the system still not see a single image at GENERATE time?</summary>
+<p>The parts did not agree on their contracts (§82.2). Producer and consumer disagreed on the sidecar filename, on the timestamp key, and on the hash format (decimal integer versus 16 lowercase hex characters), and the OCR function was never passed to the sensor. Each mismatch made the pipeline fail silently at a different point. Even after fixing these, nothing populated <code>ctx.attachments</code> at intake, the serializer's purpose allow-list lacked <code>"generate"</code>, and neither provider called the serializer during code generation. The lesson is that having the components is not the same as having the capability; the connections are where it failed.</p>
+</details>
+<details class="cq"><summary>2. Why do both ingress paths converge on one <code>ctx.attachments</code> tuple instead of letting the provider handle each source differently?</summary>
+<p>The Manifesto §1 implication used here is that Body and Mind talk through stable interfaces, not origin-aware dispatch (§83.4). If the provider had to branch on "did this come from Ferrari or from the operator", Body implementation details would leak into the Mind's prompt shaping. With one surface, the provider sees one shape of content block regardless of source. A new ingress, such as a Slack webhook, only adds a <code>kind</code> at the hoist layer and needs zero provider changes (§88).</p>
+</details>
+<details class="cq"><summary>3. The attachment hoist at intake catches every exception and logs at DEBUG. Is that a safety gap or the right choice?</summary>
+<p>The paper calls it fail-closed discipline (§83.3). If the frame file vanished, an <code>/attach</code> file was deleted, or a mime check failed, the op is demoted to text-only instead of breaking intake. "Closed" here means no pixels ship when anything is wrong; the op still enters CLASSIFY. The trade-off is visibility: a DEBUG breadcrumb is easy to miss, so an operator might not notice that an op lost its image. The safety boundary is preserved, because a failed check never results in unvalidated bytes being sent.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-xv">
+<div class="mcq" data-answer="2">
+<p class="mcq-q">1. Why was the OCR adapter's default switched from Fast to Accurate?</p>
+<ol class="mcq-options" type="A">
+<li>Fast mode crashed on Retina-downscaled frames.</li>
+<li>Fast mode dropped the top lines of a sparse traceback frame.</li>
+<li>Accurate mode was faster after warm-up on Apple Silicon.</li>
+<li>Fast mode could not read credential-shaped strings.</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> On a 1280x800 frame with one traceback in the top-left, Fast returned 53 characters and missed <code>Traceback (most recent call last):</code>, which the Tier-1 regex needs; Accurate returned 198 characters including it. See §82.2 and §89.2.</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">2. An op routed BACKGROUND carries a valid PNG attachment. What does <code>_serialize_attachments()</code> return for it?</p>
+<ol class="mcq-options" type="A">
+<li>An OpenAI-compatible <code>image_url</code> block</li>
+<li>A Claude image block with base64 data</li>
+<li>A WARNING and a text description of the image</li>
+<li>An empty list, because BG and SPEC routes are stripped</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> The route gate returns an empty list for background and speculative routes regardless of the other gates, because those routes target text-only, cost-optimized models. See §84.4 and §85.3.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">3. An operator attaches a PDF to an op that ends up on DoubleWord. What happens?</p>
+<ol class="mcq-options" type="A">
+<li>The PDF is dropped with a WARNING and the op continues.</li>
+<li>The PDF is converted to one image per page.</li>
+<li>The request is sent and DoubleWord returns a 400 error.</li>
+<li>The op is automatically rerouted to Claude.</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> The OpenAI-compatible schema is image-only, so the serializer drops PDFs with a WARNING and keeps any image attachments. PDF-to-image conversion is future work, and forcing Claude needs <code>JARVIS_PROVIDER_OVERRIDE=claude-api</code>. See §85.2 and §89.5.</p>
+</details>
+</div>
+<div class="mcq" data-answer="3">
+<p class="mcq-q">4. Why is the per-attachment cap 10 MiB when Anthropic accepts PDFs up to 32 MiB?</p>
+<ol class="mcq-options" type="A">
+<li>DoubleWord rejects anything larger than 10 MiB.</li>
+<li>The macOS Vision framework cannot read larger files.</li>
+<li>It matches the image budget and leaves headroom after base64 inflation.</li>
+<li>It was lowered from 32 MiB after a payload-oversize incident.</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> 10 MiB matches the image budget, forces pre-summarizing large documents, and inflates to roughly 14 MiB in base64, leaving room for the prompt scaffold under 32 MiB. The cap was not changed during the arc. See §84.2.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-xv">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> An operator types <code>/attach /tmp/claude/bug.png "what is misaligned here?"</code> in SerpentFlow. Trace the file from the REPL to the Claude request, naming each check it passes and the two log lines you could grep for afterwards.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Follow §83.2, then the hoist in §83.3, then the gates in §84.4 and the block shape in §85.1. The log lines are in §85.4.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><code>SerpentFlow._handle_attach()</code> parses the path and description, then runs the validation perimeter: absolute path, file exists, extension in <code>_ATTACHMENT_EXT_TO_MIME</code>, size within the 10 MiB default, and <code>_is_protected_path(path)</code> returns None (§83.2). It builds an envelope with <code>source="voice_human"</code>, empty <code>target_files</code>, and <code>evidence["user_attachments"]</code>, and calls the intake router's <code>ingest</code>.</p>
+<p>In <code>_dispatch</code>, the hoist reads <code>user_attachments</code>, calls <code>Attachment.from_file(path, kind="user_provided")</code>, which computes <code>hash8</code> and infers <code>image/png</code>, and logs <code>[IntakeRouter] attachments_hoisted ... kind=user_provided</code>. The context gets the tuple via <code>with_attachments</code> (§83.3).</p>
+<p>At GENERATE, <code>_serialize_attachments()</code> checks the purpose is allowed, the kill switch is on, attachments exist, and the route is not BG or SPEC, then reads the bytes within budget (§84.4). For Claude it emits an image block, and <code>_generate_raw</code> places it before the text block (§85.1). The provider logs <code>[ClaudeProvider] multi_modal op=... blocks=1 ... mime_kinds=[image/png]</code> (§85.4, §90.2). Grepping the op id finds both lines.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> A teammate wants to raise the attachment cap to 32 MiB so long PDFs fit, arguing "Anthropic allows it". Using §84.2, §88 and §89.6, argue for or against, and suggest a better path for long documents.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Consider base64 inflation, the prompt scaffold, and what §88 says about relaxing gates.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Against. At 10 MiB the base64 payload is about 14 MiB, leaving headroom under Anthropic's 32 MiB limit for system text and tool manifests (§84.2). A 32 MiB file would inflate well past 32 MiB and risk a payload-oversize 400.</p>
+<p>The paper also treats the cap as a hard gate. It says relaxing a safety budget to fit a new code path is the anti-pattern that Manifesto §6 forbids, and §88 confirms none of the gates were relaxed.</p>
+<p>Even within the cap, §89.6 notes that a long PDF sent as one block can push token counts above the context window. The better path is the future work it describes: per-page extraction with page-range arguments to <code>/attach</code>, or operators pre-summarizing large documents, which the cap already encourages.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/providers.py</code> and find <code>_serialize_attachments</code> (search for <code>_ATTACHMENT_PURPOSES_ALLOWED</code>). List the early-return checks in the order they appear, and compare them with the five gates named in §84.4. Is there a check in the code that the paper's list does not name?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Read from the line <code>if purpose not in _ATTACHMENT_PURPOSES_ALLOWED</code> down to where the <code>blocks</code> list is created.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The function returns an empty list, in order, when: the purpose is not in <code>_ATTACHMENT_PURPOSES_ALLOWED</code> (which holds <code>sensor_classify</code>, <code>visual_verify</code> and <code>generate</code>); the purpose is <code>generate</code> and <code>_generate_attachments_enabled()</code> is false; <code>ctx.attachments</code> is empty; the route is in <code>_ATTACHMENT_STRIPPED_ROUTES</code>; and the provider kind is not in <code>_ATTACHMENT_PROVIDER_KINDS</code>.</p>
+<p>The first four match §84.4's known-purpose, env-kill, non-empty ctx and live-route gates. The fifth paper gate, the per-attachment read budget, happens later inside the loop when bytes are read.</p>
+<p>The unknown-provider-kind check is in the code but not in the paper's list of five. It logs at DEBUG and drops all attachments for a provider that is not Claude, DoubleWord or J-Prime.</p>
+<p>One more drift is worth noticing: the function's docstring still says purpose must be <code>sensor_classify</code> or <code>visual_verify</code>, while the allow-list constant includes <code>generate</code>. The constant is what runs.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- END -->

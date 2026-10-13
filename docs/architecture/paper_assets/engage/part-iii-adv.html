@@ -1,0 +1,54 @@
+<!-- ADVBLOCK part-iii -->
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. The governance contract (§8.2) guarantees every transition is logged, every exception reaches POSTMORTEM, and every retry is bounded. Yet §93.8 reports 524 byte-identical VALIDATE_RETRY iterations re-validating a frozen pool, and 532 micro-fix runs that made zero repairs. What does the contract guarantee, and what does it not?</summary>
+<p>The five clauses are about <em>termination and visibility</em>. No operation leaks (§8.1). No crash is silent. No loop runs forever. No pre-rejected op wastes work. Cost is always tracked. Every one of those held during the 524 retries: they were bounded, logged and ended in a terminal state.</p>
+<p>What the contract does not promise is <em>efficacy</em>: that a rung, once reached, actually changes anything. A retry that re-validates the same frozen candidate is reachable, bounded and logged, and it still does nothing. That is exactly the "brute-force retries without diagnosis" the Zero-Shortcut Mandate forbids (§3), and the contract cannot see it, because it checks the shape of the run, not its effect.</p>
+<p>§93.12 names the missing dimension. The reachability ledger tracks each capability through registered, invoked and <em>effective</em>, and a full scan found 131 features "DARK". The evidence needed per rung is simple: did the retry produce a different candidate, and did the repair change the verdict? A rung that runs often but never changes the candidate or the verdict is inert, however clean its ledger looks.</p>
+</details>
+<details class="cq-adv"><summary>A2. The exploration-first gate (§12.4) is hard: a patch without at least two exploration calls goes to GENERATE_RETRY. What happens when that hard gate meets a model that cannot reliably satisfy it, and why was the October fix not to soften the gate?</summary>
+<p>A hard gate turns non-compliance into retries, and repeated non-compliance into zero throughput. §93.6 shows this live: before the fix, the local 30B produced 106 in-loop rejections and zero candidates in <code>bt-2026-08-31-155308</code>. The gate did its safety job perfectly and stopped the pipeline completely.</p>
+<p>Softening the gate would have bought throughput by giving up the property the gate exists for: patches written by a model that had read the code first (§12.4, Part VII §47). That would be a bypass, which the Zero-Shortcut Mandate rules out (§3).</p>
+<p>The fix was structural instead. Stateful tool masking (lever 3, <code>tool_masking.py</code>) changes the constrained-decoding grammar so that only tool calls are allowed until the minimum exploration is met. With nothing else changed, the full tool union explored 0/3, {tool, noop} gave 3/3 noop, and {tool} explored 3/3 (§93.6). The gate stayed hard. The model was simply made unable to violate it. The general lesson is that a hard gate on a weak generator should be enforced at the point of generation, not only checked after it.</p>
+</details>
+<details class="cq-adv"><summary>A3. VERIFY runs only tests that exercise the changed files (§16.1). §93.10 reports that 84 of 91 autonomous landings were new test files. What does a VERIFY "pass" actually tell you for such a landing, and is the Test Reality Gate the right fix?</summary>
+<p>When the candidate is itself a new test file, the scoped run is mostly the candidate testing itself. A test that asserts nothing, or never imports the module it claims to test, passes trivially. For this class of landing, VERIFY's pass is close to vacuous: it shows the file runs, not that it checks anything.</p>
+<p>The paper records this failure happening. A hollow landing (<code>c985ccaee4</code>) reached <code>main</code> and was reverted (<code>fcc50352f0</code>). The Test Reality Gate followed: it rejects candidate tests that cannot execute, assert nothing, or never import their subject (§93.8). Separately, the Antivenom audit added a detector for tautological ("quine") tests (§93.12).</p>
+<p>A reasonable position is that the Reality Gate is necessary but not sufficient. It rules out tests that are hollow in form, but a test can import its subject and assert something true without being able to catch a real bug. The evidence that would settle it is a mutation check on the subject module. Proposal (not in the paper): plant a small fault in the subject and require the new test to fail. If a meaningful share of Reality-Gate-passing tests still pass against the mutant, the gate is too weak for a corpus that is 92% tests.</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (quantitative).</strong> Use only the April defaults to test whether the budgets fit together. Givens: STANDARD worker watchdog 120 s and COMPLEX 180 s, "plus grace and tool-loop overhead" (§2); test runs time out at <code>JARVIS_VERIFY_TIMEOUT_S</code> = 60 s (§13.1, §16.1); <code>JARVIS_MAX_VALIDATE_RETRIES</code> = 2 (§13.2); L2 timebox 120 s (§13.3); Orange approval wait 600 s (§14.1). Assume every test run uses its full timeout and ignore generation time. (a) Compute a lower bound for the test-and-repair time of a STANDARD op that uses every rung in VALIDATE and VERIFY. (b) Compare the Orange approval wait with the COMPLEX watchdog. (c) Say what §93.12 did about this.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>VALIDATE is one run plus two retries, then L2. VERIFY is one run, then L2, then a re-run of VERIFY (§16.2).</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Assumptions: each test run takes its full 60 s timeout, generation and grace are left out, and L2 uses its full 120 s timebox. Leaving out generation makes this a lower bound.</p>
+<p>(a) VALIDATE: the first run plus two retries is 3 × 60 = 180 s. Escalating to L2 adds 120 s, for 300 s. VERIFY: one run is 60 s. On failure L2 adds 120 s, and the re-run of VERIFY adds 60 s, for 240 s. The total is 300 + 240 = 540 s, which is 4.5 times the 120 s STANDARD watchdog. Even the minimum path, one VALIDATE run and one VERIFY run, is 120 s at full timeout: the whole watchdog, with nothing left for generation.</p>
+<p>(b) An Orange op can wait 600 s for a human. That is 600 / 180 ≈ 3.3 times the COMPLEX watchdog. A watchdog that is not suspended during the approval wait would fire long before the human answered.</p>
+<p>(c) The paper does not say how April resolved these overlaps; the unspecified "grace and tool-loop overhead" may have absorbed some of them. What §93.12 records is the structural fix. About 40 run budgets are now derived from one wall-clock figure instead of being set independently, with tests that pin them against drift. The inline approval wait now has a deadline below the pipeline budget and fails closed.</p>
+<p>Conclusion: independently set timeouts can each be sensible and still contradict each other. Deriving them from one figure makes the contradiction impossible to write down. Check: re-add the sums (180 + 120 + 60 + 120 + 60 = 540) and confirm that every term is a default quoted in Part III or §2.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (cross-Part trace).</strong> §93.10 lists landing <code>f97f8195d6</code> (2026-09-07) on <code>governance/candidate_generator.py</code>. It was meant to make the generator decline multi-file swarm ops, but only a punctuation rewrite landed, and it was reverted (<code>c8430f9b6a</code>). Trace a change like this through the Part III phases and the October path to <code>main</code> (§93.7, §93.8). At each gate, say whether it would catch "valid code that does not do what the goal asked". Then say what kind of check would catch it, labelling anything new as a proposal.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Every gate you will meet checks safety, syntax, tests or structure. Look for one that compares the diff with the goal's intent.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Trace the phases.</p>
+<ul>
+<li><strong>CLASSIFY and ROUTE (§9).</strong> The path is not protected, so the op is not BLOCKED. A governance file may raise the tier, but tiering is about risk, not intent.</li>
+<li><strong>GENERATE (§12.4).</strong> Exploration-first and ASCII checks look at behaviour and bytes. A punctuation edit passes both.</li>
+<li><strong>VALIDATE (§13.1).</strong> Syntax, types and tests all pass, because punctuation changes nothing they measure. The Test Reality Gate (§93.8) only applies to candidate tests.</li>
+<li><strong>GATE and APPROVE (§14).</strong> With the Sentinel, approval is automatic up to a tier ceiling. BLOCKED work, Order-2 self-modification and anything touching the cage escalate (§93.7). This file was none of those, so nothing escalated.</li>
+<li><strong>APPLY and VERIFY (§15, §16).</strong> The write succeeds and the scoped tests still pass.</li>
+<li><strong>Promotion gate (§93.7).</strong> It checks provenance, coverage, and that no public symbol vanished. A punctuation edit keeps every symbol. It passes.</li>
+</ul>
+<p>So every gate described would let this through, because each one asks "is it safe and well-formed?" and none asks "did it do the task?" The paper says this was reverted by hand. It does not say which gates were active on 2026-09-07, so this trace uses the gates as described.</p>
+<p>What exists nearby: the declared-symbol contract carries the goal's target symbol to GENERATE (§93.8), and §93.4 mentions a "candidate value gate" from July without describing its rule. The paper does not show either one judging a diff against intent.</p>
+<p>Proposal (not in the paper): a deterministic post-VALIDATE check that the diff touches the declared target symbol, and that it is not whitespace or punctuation only. Ops failing it would go to VALIDATE_RETRY with that feedback. It is pure code, so it keeps Principle 5's rule that deterministic code decides (§3). To check it, replay <code>f97f8195d6</code>'s candidate and confirm it is rejected while <code>e7b3bdfec2</code>, the +9-line retry that stands, passes.</p>
+</details>
+</div>
+</div>
+<!-- END -->
