@@ -25,6 +25,8 @@ presence lowers nothing.
 """
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import logging
 import secrets
@@ -128,21 +130,64 @@ def apply_last(manager: Any, cockpit: str) -> Tuple[bool, str]:
                           f"{getattr(res, 'detail', '')}".strip()
         records = tuple(r for t in s.turns for r in getattr(t, "records", ()) or ())
         ref = _put_seed(json.dumps(proposal), s.id, records)
-        op_id = _INJECTOR(goal_id=goal_id, description=spec.description, target_files=files,
-                          extra_evidence={"foreground_session": {"session_id": s.id, "seed_ref": ref}})
-        if not op_id:
-            with _LOCK:
-                _SEEDS.pop(ref, None)
-            return False, "the pipeline refused the change at intake (see the debug log)"
-        s.owned_ops.append(str(op_id))
-        # The cockpit routes this op's blocks to the transcript from now on.
-        if hasattr(manager, "notify_mode"):
-            manager.notify_mode(cockpit, s)
-        return True, (f"{op_id} · sent through the pipeline (validate → gate → apply → verify) · "
-                      f"{', '.join(files)}")
+        inject = functools.partial(
+            _INJECTOR, goal_id=goal_id, description=spec.description, target_files=files,
+            extra_evidence={"foreground_session": {"session_id": s.id, "seed_ref": ref}})
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            # Already off the loop (a worker thread): intake can be awaited here.
+            return _settle(manager, cockpit, s, ref, files, inject())
+        # ON the loop -- where /session runs (the operator input consumer).
+        # The injector awaits intake's verdict, which it must NOT do from the
+        # loop that runs intake: the dispatch seam refuses that ("submitter
+        # called ON the event loop") and every apply was FILED, never run.
+        # It goes to a worker, as the chat executor's submissions do; the
+        # receipt is reported when intake answers.
+        loop.create_task(_inject_off_loop(manager, cockpit, s, ref, files, inject))
+        return True, f"sending {', '.join(files)} through the pipeline (validate → gate → apply → verify)…"
     except Exception as exc:  # noqa: BLE001
         logger.warning("[Session] apply failed", exc_info=True)
         return False, f"apply failed: {type(exc).__name__}: {exc}"
+
+
+def _settle(manager: Any, cockpit: str, s: Any, ref: str, files: Tuple[str, ...],
+            op_id: Optional[str]) -> Tuple[bool, str]:
+    """Intake answered. A refusal releases the seed; an accepted op becomes
+    the session's own, so the cockpit routes its blocks to the transcript."""
+    if not op_id:
+        with _LOCK:
+            _SEEDS.pop(ref, None)
+        return False, "the pipeline refused the change at intake (see the debug log)"
+    s.owned_ops.append(str(op_id))
+    if hasattr(manager, "notify_mode"):
+        manager.notify_mode(cockpit, s)
+    return True, (f"{op_id} · sent through the pipeline (validate → gate → apply → verify) · "
+                  f"{', '.join(files)}")
+
+
+async def _inject_off_loop(manager: Any, cockpit: str, s: Any, ref: str,
+                           files: Tuple[str, ...], inject: Callable[[], Optional[str]]) -> None:
+    """The on-loop apply's second half. NEVER raises."""
+    try:
+        op_id = await asyncio.to_thread(inject)
+        ok, text = _settle(manager, cockpit, s, ref, files, op_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Session] apply injection failed", exc_info=True)
+        with _LOCK:
+            _SEEDS.pop(ref, None)
+        ok, text = False, f"apply failed: {type(exc).__name__}: {exc}"
+    try:
+        from backend.core.ouroboros.ui.theme import mark  # noqa: PLC0415
+        from rich.markup import escape  # noqa: PLC0415
+        emit = getattr(manager, "_emit", None)
+        if emit is not None:
+            glyph = mark("check" if ok else "cross")
+            emit(f"{glyph} {escape(text)}", cockpit)
+    except Exception:  # noqa: BLE001
+        logger.debug("[Session] apply receipt not shown", exc_info=True)
 
 
 def reset_for_tests() -> None:

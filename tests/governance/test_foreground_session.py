@@ -186,6 +186,49 @@ def test_apply_sanctions_injects_and_owns_the_op(tmp_path, monkeypatch):
     assert json.loads(raw) == PROPOSAL and len(recs) == 1
 
 
+def test_apply_on_the_loop_injects_from_a_worker_and_reports_when_intake_answers(
+        tmp_path, monkeypatch):
+    """Found live: /session runs ON the event loop (the operator input
+    consumer), and the injector awaits intake's verdict -- which the dispatch
+    seam refuses from the loop that runs intake ("submitter called ON the
+    event loop"), so every apply was FILED, never run. The injection goes to
+    a worker; the session owns the op and the receipt is shown once intake
+    answers."""
+    import threading
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "backend/x.py").write_text("a = 1\n")
+    injected_on = []
+
+    def inject(**kw):
+        injected_on.append(threading.current_thread())
+        return "op-88"
+
+    ops.set_injector(inject)
+    import backend.core.ouroboros.governance.operator_goal_sanction as ogs
+    monkeypatch.setattr(ogs, "author_and_sign_goal",
+                        lambda spec, **_: SimpleNamespace(ok=True, goal_id=spec.goal_id))
+    m, _made, out = _manager(json.dumps(PROPOSAL), tools=[("read_file", "backend/x.py")])
+    s = m.start("ck1")
+
+    async def run():
+        await m.run_turn(s, "bump a")
+        loop_thread = threading.current_thread()
+        ok, text = ops.apply_last(m, "ck1")                 # synchronous, on the loop
+        assert ok and "sending backend/x.py" in text and s.owned_ops == []
+        for _ in range(200):
+            if s.owned_ops:
+                break
+            await asyncio.sleep(0.01)
+        return loop_thread
+
+    loop_thread = asyncio.run(run())
+    assert injected_on and injected_on[0] is not loop_thread
+    assert s.owned_ops == ["op-88"]
+    assert out[-1][0] == "ck1" and "op-88" in out[-1][1]
+
+
 # ---- the verb and plain-text routing --------------------------------------------
 
 def test_plain_text_outside_a_session_is_not_taken(monkeypatch):
