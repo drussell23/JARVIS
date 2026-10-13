@@ -9,8 +9,8 @@ date: "2026-04-16"
 
 > **Prepared by:** Derek J. Russell
 > **Report date:** 2026-04-16
-> **Last updated:** 2026-05-13 — see **§92. Recent Developments (April 17 – May 13, 2026)** for arcs landed since the 2026-04-16 stamp. The original §1–§91 substrate is unchanged; §92 is appended per the addendum policy in Appendix F.
-> **Repository:** `github.com/drussell23/JARVIS-AI-Agent`
+> **Last updated:** 2026-10-13. See **§93. Developments (May 14 – October 13, 2026)** for the local-model era, the first autonomous landings and the Trinity learning loop, and **§92** for April 17 – May 13. The original §1–§91 substrate is unchanged; both addenda are appended per the policy in Appendix F, and §93.16 lists the earlier text they supersede.
+> **Repository:** `github.com/drussell23/JARVIS` (formerly `JARVIS-AI-Agent`, which redirects)
 > **Canonical technical reference:** `docs/architecture/OUROBOROS.md` (2,774 lines)
 > **This paper:** research-paper treatment of the above — plain-English explanation, analogies, architectural narrative, visual diagrams, honest evidence-backed claims.
 
@@ -1735,6 +1735,8 @@ This is the integrated picture. Every operation touches every layer. Every layer
 ---
 
 # PART VI — The Provider Ecosystem
+
+> **Superseded as of 2026-10-13.** This Part describes the provider topology as of 2026-04-16. Since September 2026 the paid lanes (DoubleWord, Claude) are switched off by declaration and J-Prime, a local llama.cpp server on a single RTX 5090, carries every route. The text below is kept as the historical record; see **§93.6** for the current topology.
 
 > **Big Picture:** O+V does not own a language model. It *orchestrates* calls to external language-model providers, treating them as interchangeable sources of intelligence via a uniform protocol. This Part describes the three-provider ecosystem (DoubleWord, Claude, J-Prime), the adaptive failback state machine that recovers from provider outages, the DoubleWord 3-tier event-driven architecture that eliminates polling, and the urgency-aware routing algorithm that picks the right provider for each operation.
 
@@ -4791,6 +4793,316 @@ The empirical demonstrations are stable. The formal arc has been opened. The fou
 
 ---
 
+## §93. Developments (May 14 – October 13, 2026)
+
+> **Big Picture.** §92 left O+V as a cloud-provider organism (DoubleWord + Claude) that had graduated much of its substrate to default-on and was about to attempt sustained autonomy. The five months since went somewhere the April paper did not predict. The paid lanes ran dry in August, and the organism had to learn to run entirely on a single local GPU. What followed was the first period in which O+V **landed its own commits at a repeatable cadence**: 91 autonomous commits on `main` between 2026-09-06 and 2026-10-10, made by a 30-billion-parameter model on an RTX 5090, under signed goals, with \$0 of paid inference. The Trinity also closed its loop for the first time: J-Prime now serves the model, and Reactor trains a LoRA adapter on what O+V produced. The honest counterweight runs through this whole section. Nearly all of those landings are new test files. No trained adapter has yet shown a held-out gain. One headline safety figure from §92 had to be revised once it was measured at scale.
+
+This section follows the addendum policy in Appendix F. §1–§92 are not edited. Where this section supersedes earlier text, §93.16 says so explicitly.
+
+**How this section was assembled.** Every arc below was traced through `git log` on `main` across the three repositories (`JARVIS`, `JARVIS-Prime`, `JARVIS-Reactor`), cross-checked against the PRD and North Star documents, and spot-checked in code. Figures come from commit messages, the PRD evidence tables (§33, §34), or soak artefacts, and each cites its source. The window contains 3,122 JARVIS commits on `main`.
+
+**A note on commit availability.** Items marked **†** are on the author's local `main` and were not yet pushed to GitHub at the time of writing (local `main` was 109 commits ahead of `origin/main`, whose tip is `bc4c338dd8`, 2026-10-07). Their hashes will resolve on GitHub once the branch is pushed.
+
+---
+
+### §93.1 The Five Months at a Glance
+
+| Window | What dominated | Headline evidence |
+|---|---|---|
+| May 14 – Jun 30 | Hardening the cloud substrate; chasing the A1 dispatch gate | Stream first-token 94,638 ms → 722 ms (Quiescence Protocol); GOAL-001 still never dispatched |
+| July | Run-by-run autopsy of the validation chain; distributed Body/Brain; DoubleWord economics | First autonomous real-code repair, on a deliberately planted defect (`abbddeec24`) |
+| August | Paid credit exhausted; the move to a local model on the RTX 5090 | Local-primary routing at \$0.00; tool masking turns 0/3 exploring into 3/3 |
+| September | First-order proofs; Autonomous Sentinel Mode; promotion to `main`; paid lanes switched off | First autonomous landing `704f98b1d5` (2026-09-06) |
+| Oct 1 – 13 | Cadence soaks; J-Prime Engine; the Reactor learning loop | 6.03 h soak with 10 landings; 51-commit soak on 10-09; first adapter served, no held-out gain |
+
+---
+
+### §93.2 Hardening the Cloud Substrate (May – June)
+
+The first seven weeks continued the April architecture: cloud providers fronted by an increasingly defensive transport layer.
+
+- **Autonomous Quiescence Protocol** (2026-05-14, `3dfb407bdf`, `governance/quiescence.py`, default on). Long Claude first-token waits turned out to be event-loop starvation caused by the organism's own background load, chiefly the Oracle boot index, and not the network. One global `asyncio.Event` pauses background work while a critical stream starts. Measured in `bt-2026-05-15-052902`: first raw event 94,638 ms → 722 ms.
+- **Aegis** (`backend/core/ouroboros/aegis/`, graduated `280e47f6f0`, `JARVIS_AEGIS_ENABLED` default true). An out-of-process credential and spend proxy. The main process no longer holds provider keys, and every paid call is admitted, reserved and reconciled into a write-ahead log. Its audit corrected a felt "\$26" soak bill to about **\$1.90 across 821 Claude calls** (North Star §51.11.34).
+- **DoubleWord transport resilience** (Slices 2A–50, 127, 168–195). Canonical JSONL for `/v1/files`, a transport-health ledger, a three-state `TransportCircuitBreaker`, provider quarantine, and a realtime-versus-batch hedge. A DoubleWord-only repair soak reached 16/16 `state=applied` at \$0.00225 total (`4db580af76`). The batch path never completed inside its 180 s budget (`1fa295394d`).
+- **Two-phase commit for writes** (`65469704d5`, `JARVIS_CHANGE_ENGINE_IO_VERIFY` default on). `ChangeEngine` had recorded `APPLIED` before VERIFY ran; a phantom `written=True` appeared across 15 cloud runs. A write is now claimed only after a SHA-256 check of the file on disk.
+- **Oracle on SQLite** (`JARVIS_ORACLE_SQLITE_PERSISTENCE_ENABLED` default true). 214,854 nodes and 402,321 edges, peak RSS 575 MB, 7.79 s warm reboot (`9c274691f3`).
+- **Operator Commit Authority** (`governance/operator_commit_authority.py`, default off). A grant daemon and signed out-of-repo enable for commits, built after an IDE agent committed on a borrowed grant.
+
+### §93.3 Evaluation and the Cage, Measured
+
+Two measurement programmes in this window produced numbers that temper earlier claims.
+
+**SWE-Bench-Pro** (May 16 – Jun 3). The harness gained containerised scoring and a multi-instance sweep. The first resolved instance (qutebrowser, 21 held-out tests, \$0.24, served by Claude) is explicitly N=1. The six-instance EVAL-2 sweep resolved **1/6 (16.7%)**; three instances were inconclusive because of a clone race and a provider outage.
+
+**The adversarial cage at scale.** §92.4 reported zero escapes across 38 adversarial inputs. A mutation harness then generated adversarial variants with an LLM and measured how many escaped the static cage:
+
+| Run | Mutations | Escape rate | Gate |
+|---|---|---|---|
+| Slice 86 | — | 21.9% → 18.8% | — |
+| Slice 95e | 1,566 | 8.91% | 4.4% — **fail** |
+| Slice 95e2 | 1,472 | 8.73% | 4.4% — **fail** |
+
+The two large runs converge at about **8.8%, roughly twice the gate**. The North Star attributes the residue to code the static cage cannot see by construction: `eval`/`exec`/`subprocess`/`pickle` of runtime-constructed strings. Its stated remedy is OS-level runtime containment, not more AST rules. No re-measurement after the later hardening slices was found. The 0/38 result in §92.4 stands as stated, but it should be read as a small curated set and not as the escape rate. A Z3 SMT prover (`smt_invariant_prover.py`, default off) machine-checked the recursion-depth bound with a negative control. Its commit states that it mirrors the gate's structure by hand and does not claim full AST extraction.
+
+### §93.4 The A1 Wall and the First Autonomous Repairs (June – July)
+
+From June the North Star named one gate above all others. **A1**: trace a signed strategic sub-goal from "enqueued" to "dispatched". Operator-signed GOAL-001 was followed through `RoadmapReader`, decomposition and the intake router. Its first file never dispatched, even with the system funded, attested and quiet. The North Star's own words (§51.11.34): *"the cost work … did NOT unblock the goal."* Its composite self-assessment held at about 35% through June and July.
+
+July turned to a run-by-run autopsy of the validation chain (A1 runs #15–#26, Slices 5–14). This produced the attribution bridge from a failing test to the source it covers, VALIDATE against the actual candidate tree, VERIFY against the tree APPLY actually wrote, the `WorkspacePromoter`, and the candidate value gate. It also produced the first landings that did anything, and they were modest:
+
+- **Run-22.** The only autonomous commit was a duplicated `requirements.txt` comment. It landed twice and was reverted twice (`cba789d58c`/`56ef119bf6`, reverted by `0bab3ce559`/`32964dff19`).
+- **Run-23.** The first autonomous real-code repair (`abbddeec24`, 2026-07-13): a 3-line fix to `clamp01`. The target was a deliberately planted defect (`4b9e573127`).
+
+Run-24's verdict, that *everything O+V initiates on its own is "annotation-grade"*, led to the **appetite layer** (`signal_value.py`, `WorkOrderSensor`, `substance_ledger.py`). It routes on verifiable evidence of value and treats the operator's own roadmap as a source of work.
+
+Other July arcs, all present but default off: a **distributed Body/Brain** split with an mTLS event bus, a write-ahead outbound log and a generation fence against split-brain writes (`JARVIS_DISTRIBUTED_BUS_ENABLED` false); a **Sovereign Failover Mesh** to a 32B model on GCP L4 GPUs (end-to-end handoff `bt-2026-06-29-074457`); an event-sourced **cross-repo causal graph**; and **chunked generation with a parallel "Super-Agent" swarm** for very large files (`JARVIS_SWARM_ROUTING_ENABLED` false).
+
+### §93.5 The Credit Runs Out (August)
+
+In early August both paid lanes began refusing every request. As of 2026-08-08 the liquidity panel still read "runway: ok" while a live DoubleWord probe returned `402 Account balance too low`. Two defects followed. The failover classifier read 402 as an outage, which produced 125 false awaken triggers in one session; only an unrelated environment variable prevented a GCE VM from being provisioned (`5f8b4d7b8e`). And every GENERATE attempt re-walked a cascade whose outcome the ledger already knew.
+
+The responses:
+
+- **ECONOMIC state** (`governance/economic_state.py`, `42dd6137ff`). A table-driven classifier separates "out of money" from rate limits and outages. A 402 now freezes the lane and emits `provider_funding_required`; a 429 is retried.
+- **Rehearsal tier** (`governance/rehearsal_tier.py`, `41c648784b`, default off). When every lane is dry, an op ends in a `RehearsalOutcome` that records what was exhausted and when it lifts, plus a replay token. The outcome has no diff, patch or file field by construction, and AST-pinned tests keep it that way.
+
+### §93.6 The Local Lane on the RTX 5090 (August – October)
+
+> **Big Picture.** The April paper describes J-Prime as "the self-hosted backup when available" (§39). By October it is the only lane. A single 32 GB consumer GPU now serves every route.
+
+**The split host.** O+V cannot run natively on Windows (about 55 modules import `fcntl`). It runs in WSL2. The model server runs natively on Windows and owns the GPU, and the two meet over loopback with mirrored networking (`docs/BRINGUP_WINDOWS_WSL2.md`).
+
+**Making a small model usable.** The model went from qwen2.5-coder:32b to Qwen3-Coder-30B-A3B (a mixture-of-experts model with 3B active parameters), served as `qwen3-coder-ov:30b`. Each of the following was a defect found in a live run:
+
+- The 5090 had been sized as a 24 GiB L4, which halved context to 16,896 tokens (`42978d2a88`, `model_physics.py`).
+- The client cache was keyed by URL alone, so a model swap silently kept the old weights (`284f290b7e`).
+- `JARVIS_LOCAL_MODEL_NAME` was ignored (`f28375eb3a`).
+- A signed `target_symbol` cut generation scope from about 126,600 tokens to about 750 (`7a39d750cf`).
+- **Stateful tool masking, lever 3** (`8eae037b75`, `tool_masking.py`, default on). The constrained-decoding grammar allows only tool calls until the minimum exploration is met. Before it, the 30B produced 106 in-loop rejections and zero candidates in `bt-2026-08-31-155308`. With the grammar alone changed: full union 0/3 explored, {tool, noop} 3/3 noop, {tool} 3/3 explored.
+
+**Free-lane policy** (`7bcb3ded51`, default on). With no paid credential configured, every route goes to the local engine. `bt-2026-08-28-104222`: 17 local-primary interceptions, \$0.00.
+
+**Paid lanes switched off** (`f13823059b`, 2026-09-26). `governance/paid_lanes.py` is now the single authority. It answers three separate questions: is a paid lane *switched on*, *configured*, and *allowed* (the last also consults the economic ledger). The declared switch `JARVIS_PAID_LANES_ENABLED=false` keeps Claude and DoubleWord from being constructed at all. Re-enabling them is a configuration change, not a code change.
+
+**J-Prime Engine** (2026-10-07; `JARVIS-Prime` `fb85d481fb`, `378b91085d`, `cba367752d`). J-Prime replaced Ollama as the serving layer. It is a supervisor and protocol layer around llama.cpp `llama-server` (build b11462, CUDA 13.4) on `127.0.0.1:8000`. It exposes OpenAI- and Ollama-compatible routes, plus routes for an **exclusive training lease** and a **versioned adapter registry** (publish / activate / rollback / reject). Measured on real O+V traffic at one slot and 32,768 context (J-Prime `BENCHMARKS.md`†):
+
+- Decode p50 172 tok/s (p10 152, p90 184; n = 337).
+- Prefill about 6.5k tok/s for 4–8k new tokens.
+- Cold load 15 s to 18.9 GiB resident.
+- The lease verifiably releases 21,236 MiB for training.
+
+JARVIS boot now brings up J-Prime and Reactor itself (`e05fe5b1ab`). Since 2026-10-10 local concurrency follows the engine's reported slot count (`fadde8d9c4`†). A slot sweep measured aggregate throughput of 124 / 165 / 177 tok/s at 1 / 2 / 3 slots, so the knee is at 2. The vision model (`jarvis-vision:8b`) is declared in J-Prime, but at the time of writing is still partly served by Ollama.
+
+### §93.7 How Work Reaches `main` Today
+
+> **Big Picture.** In April, a human started a battle-test session and approved what mattered. By October the organism finds its own work, signs it with the same key the operator uses, executes it in an isolated worktree, and fast-forwards verified results onto the local `main` branch. It never pushes to a remote.
+
+The path, stage by stage:
+
+1. **Sources of work.**
+   - The signed roadmap, `.jarvis/roadmap.yaml` (HMAC-SHA256, `strategy_signer.py` / `roadmap_reader.py`).
+   - Operator `/goal sanction` (`operator_goal_sanction.py`).
+   - **Goal Discovery** (`autonomy/goal_discovery.py`). Evidence-only work, with ambient red tests ranked above uncovered modules, turned into signed goals by `synthesize_and_sign()`.
+   - The **proposal inbox**† (`autonomy/proposal_inbox.py`, `ffc3bb1c15`†). Model-invented work from the Epistemic Planner, DreamEngine and IntentDiscovery, ranked below evidence and signed through the *same* single signer. There is no second sanction path.
+   - `WorkOrderSensor`, and 24 intake sensors in total.
+2. **Autonomous Sentinel Mode** (`autonomy/sentinel.py`, 2026-09-08 onward). The Sentinel auto-approves up to a tier ceiling (`JARVIS_SENTINEL_AUTO_APPROVE_MAX_TIER`, default APPROVAL_REQUIRED). BLOCKED operations, Order-2 self-modification and anything touching the cage always escalate. Since 2026-09-26 a bare `ov` arms the Sentinel and the production-soak profile (`04f2f3ade0`). Before that, soaks and the cockpit had been, in the commit's words, two organisms behind one name.
+3. **Execution** in a sovereignty worktree on `ouroboros/auto/<session>-<nonce>`. AutoCommit adds `Signal:`, `Session:` and an O+V co-author trailer.
+4. **Accumulation** onto `ouroboros/battle-test/<ts>`.
+5. **Promotion gate** (`accumulation_promotion_gate.py`, `3b49ed8e08`). Provenance, coverage, and a structural check that no public symbol vanished. The structural check is the one that caught a whole-file re-emission. Landings that fail go to `ouroboros/quarantine/*`.
+6. **Local `main` promotion** (`main_promoter.py`, `077417b478`). Fast-forward only.
+7. **Zero-push air-gap** (`remote_push_guard.py`, `JARVIS_REMOTE_PUSH_AIRGAP` on). Every push site goes through one guard, and an AST test fails on any unguarded push. Publishing to GitHub remains an operator act.
+
+`GoalReconciliationLedger` (`ae33e1a37d`) binds each goal to its commit using state derived from git ancestry rather than from logs.
+
+### §93.8 Inside the Pipeline: What Changed
+
+The phase set is unchanged since §92. `OperationPhase` still has the members it had after VISUAL_VERIFY was added on 2026-04-18. What changed is how the phases work on a small local model.
+
+- **Context the model can trust.**
+  - **AST-Signature Anchor** (`ast_signature_anchor.py`, `f50632edb9`…`700489df01`): injects the real module API, so the model stops inventing functions.
+  - **LessonMemory** (`78b5dbf3a1`): module-keyed failure lessons injected before generation. 1,115 lessons; 424 injections were followed by a VALIDATE pass.
+  - **Declared-symbol contract** (`59839c58ec`): the goal's target symbol reaches GENERATE.
+- **One owner for VALIDATE.** `phase_runners/validate_runner.py` is now the sole VALIDATE implementation; the inline twin and its kill switch were deleted. Inside VALIDATE the order is:
+  1. a traceback-guided **micro-fix** (`interactive_repair.py`, bounded by `micro_fix_governor.py`);
+  2. then a **VALIDATE_RETRY** that actually regenerates;
+  3. then L2 repair.
+
+  The rungs had existed before, but live runs showed several of them inert: 524 byte-identical retry iterations re-validated a frozen pool (`ab1d8c008c`), and 532 micro-fix runs made zero repairs (`ddd54bcf10`).
+- **Test Reality Gate** (`70935a4bee`, 2026-10-04). Rejects candidate tests that cannot execute, assert nothing, or never import their subject. It was added after a hollow landing (`c985ccaee4`) reached `main` and had to be reverted (`fcc50352f0`).
+- **Diff output.** For existing files the model must answer in the `2b.1-diff` schema. Source is shown with numbered lines, the numbers the model copies back are stripped, and a single stdlib applier applies the diff (`98ab8c03dd`†, `aa677f2161`†). This is still the leading way operations die (§93.14).
+- **Containment of the code under test.**
+  - A candidate test once ran `pkill -f jarvis` and killed the daemon. Test runs now execute in a PID namespace (`6b00b8adf5`).
+  - A resource-aware execution lock prevents a test suite from out-of-memory-killing a running soak (`4d43f3e5b4`).
+  - Modules that execute on import are quarantined (`environment_integrity.py`).
+
+### §93.9 The `ov` Cockpit
+
+The operator surface is now the `ov` command (`backend/core/ouroboros/cli/ov.py`, a PEP 621 console script). The battle-test runner of Part XI remains the engine underneath. A bare `ov` attaches to the running organism, or cold-boots one in the background. Other verbs include `run`/`daemon` (headless), `attach`, `status`, `doctor`, `hive` and `link`.
+
+The cockpit renders a Claude-Code-style transcript: intent, tool calls and results, with a live block per in-flight operation. A toolbar shows the served model, a `landed N` counter, promotion status, and a GPU-lease lock screen while training holds the card.
+
+Slash commands come from an auto-discovered registry of `*_repl.py` modules, about 70 of them, plus handlers in the harness. The ones most relevant to this section:
+
+- `/goal sanction` and `/goal inject`
+- `/proof`: a tamper-evident SHA-256 chain of per-session evidence at `.jarvis/proof/chain.jsonl`†
+- `/reach`: a ratchet on features that are registered but never reached
+- `/why`: four bands — trigger, context, logic, action
+- `/spend`: day × provider × route
+
+### §93.10 First-Order Proofs: The Landings Ledger
+
+> **Big Picture.** This is the result the April paper was building toward: commits the organism made on its own, under signed goals, that passed validation, survived promotion, and now sit on `main`.
+
+**Counting rule.** An autonomous landing is a commit carrying the trailer `Co-Authored-By: Ouroboros+Venom <ouroboros@jarvis.trinity>`. On `main` there are **91** dated 2026-09-06 → 2026-10-10. 52 of them (†) are local-only. Four more, all dated 2026-07-13, are the Run-22 and Run-23 commits described in §93.4: the two duplicated `requirements.txt` comments, and two identical 3-line landings (`abbddeec24`, `90c253bf65`) against the planted target.
+
+| Kind | Count | Notes |
+|---|---|---|
+| Test files only | 84 | New test modules for untested source modules — the 30B's strongest, repeatable skill (PRD §33) |
+| Production `.py` | 5 | See below |
+| Other (documentation) | 2 | From the 10-09 soak; one flattened the author's name and punctuation and was repaired by hand (`50689d1a30`†) |
+
+The five production-code landings, in full:
+
+| Commit | File | What it did | Outcome |
+|---|---|---|---|
+| `3a7d155218` (09-07) | `governance/dw_capacity_probe.py` | Completion tracer backs off an AUTH_FAILED surface (+80/−50) | Stands |
+| `f97f8195d6` (09-07) | `governance/candidate_generator.py` | Intended: decline multi-file swarm ops | **Reverted** (`c8430f9b6a`): only a punctuation rewrite landed |
+| `e7b3bdfec2` (09-07) | `governance/candidate_generator.py` | Same goal, retried: +9 lines | Stands |
+| `7f8c686ce0` (09-08) | `backend/api/sse_contract.py` | Log broad excepts with `exc_info` | Stands; content it dropped restored in `ff214d7b2c` |
+| `84ff726539`† (10-10) | `backend/api/audio_error_fallback.py` | Named retry constants; timezone-aware timestamp | Stands |
+
+The first autonomous landing was `704f98b1d5` (2026-09-06). The first multi-file atomic landing was `78eb95aa7c`. Before 2026-09-09 the landing sessions were served by the GCP-hosted J-Prime and, in two sessions, DoubleWord. From 2026-09-09 every landing was made by the local `qwen3-coder-ov:30b`.
+
+**Cadence soaks** (PRD §34 and session artefacts):
+
+| Session | Wall | Landings | Substantive | Substantive / h | Notes |
+|---|---|---|---|---|---|
+| `bt-2026-09-26-143412` | 1.97 h | 3 | 3 | 1.52 | 0 paid calls; ended by host commit exhaustion |
+| `bt-2026-10-04-215048` | 2.98 h | 3 | 2 | 0.67 | |
+| `bt-2026-10-05-012717` | 6.03 h | 10 | 6 | 1.00 | 1.34/h in the first 2.98 h; nothing landed 22:24 → 00:29 |
+| `bt-2026-10-08-121243` | 1.25 h | 0 | 0 | 0 | Stopped by the operator; root causes fixed after |
+| `bt-2026-10-09-154724`† | ~9 h | 51 merged | — | — | Mostly tests for `backend/api/*`; proof chain reads "PRODUCTIVE, 13 commits verified on main" at its check |
+| `bt-2026-10-10-180726`† (3 slots) | 2.0 h | 0 | 0 | 0 | Slot A/B arm |
+| `bt-2026-10-10-201126`† (2 slots) | 1.76 h | 40 into the funnel, refused at promotion | — | — | Goal mix differed from the 3-slot arm; VM stopped mid-run; 1-slot arm never ran |
+
+Two lessons are recorded in PRD §34. **The supply wall**: after about four hours on a diet of uncovered modules, yield is bounded by the supply of landable work, not by the model. And the session summary undercounted landings (2 vs 3, 1 vs 10), so the ledger and git, not the summary, are the source of truth.
+
+**Where this sits on the Ten Orders (§92.18).** Three of the five production landings modified files inside the governance package, under signed, operator-sanctioned goals. None touched a safety gate (`iron_gate.py`, `semantic_guardian.py`, the cage), and none was self-initiated governance change. The system is still at **Mechanic**: the Neurosurgeon threshold, autonomous modification of the governance substrate on the organism's own initiative, has not been crossed, and the tier ceiling and cage escalation in §93.7 are designed to make crossing it an operator decision.
+
+### §93.11 The Trinity Closes the Loop: Recorder → Reactor → J-Prime
+
+> **Big Picture.** In April the "soul" — JARVIS-Reactor, the training repository — was architecture on paper. By October one full cycle has run end to end. O+V recorded its own attempts, git proved which survived, Reactor trained an adapter on them, and J-Prime now serves that adapter. The cycle ran; it has not yet shown that it made the model better.
+
+The data path:
+
+1. The **trajectory recorder** (`observability/trajectory_recorder.py`, `089c218405`) writes one `ExperienceEvent` per candidate. The local lane draws three or more **sibling candidates** per operation, each labelled with its own VALIDATE verdict (`b92f622477`).
+2. **Landing provenance** (`7d5ffed26c`) joins git-proven `landed` / `surviving` labels onto corpus rows. 35 of 39 landings were proven, and trainable success rows went from 0 to 26.
+3. **Reactor** trains with **GRPO** (Dr. GRPO loss, β = 0), not the DPO of the earlier design, on `Qwen/Qwen3-Coder-30B-A3B-Instruct`.
+   - Stock 4-bit quantization left the fused experts in bf16, so Reactor quantizes each expert to NF4 itself (`moe_quant.py`), landing the 30B at 15.64 GiB resident.
+   - The LoRA covers attention only: 13.4M parameters, about a 27 MB adapter.
+   - Truncated completions are masked; the stated rule is never to train on a truncated answer.
+   - A preflight refuses to train when too few groups show contrast.
+4. The **Training Lifecycle Handoff** (`eecadb334f`) runs one exclusive GPU cycle. It leases J-Prime (verifying the VRAM release), trains, converts the LoRA to GGUF, publishes it to J-Prime's registry, and runs a greedy comparison against the incumbent. It then activates the adapter or rolls back.
+5. Each cycle **attests** whether a human was in it (`3cbc54ace9`†), and every row carries its **output contract**, so training sees only current formats (`0c0f39c7dd`†).
+
+**Measured result, stated plainly.** The first official cycle (handoff `20261007-092520`) published adapter `20261007-143931-238e06c10f8f`, which J-Prime now serves. Its gate score was 4/6 against the incumbent's 3/6. The project's own notes call that *not* evidence of learning: three contributing answers, gradient norm about 1e-4, one greedy flip.
+
+The root finding was that 86% of training prompts (1,044 of 1,215) asked for whole-file rewrites that cannot fit the completion window. That finding drove the move to diff output in §93.8.
+
+On a **held-out benchmark** of 30 tasks drawn from human commits with hidden tests (`6bf0a04cfb`†), the served adapter was accepted on 1/30 with unnumbered prompts and 3/30 with numbered prompts. It solved 0, and the mean gain was 0.03. **No held-out gain has yet been demonstrated.** The operator's standing rule is that no training-derived change is pushed until one is.
+
+### §93.12 Safety and Honesty Infrastructure
+
+- **Reachability.** A full scan found **131 features "DARK"**: the flag is on and the module is on disk, but nothing in production imports it (`d203c8dfa1`). A reachability ledger now tracks each capability through registered → invoked → effective, and `/reach` ratchets the count down. A related audit revived several wired-but-dead features: the adversarial reviewer, DreamEngine with preemption, self-critique, and incremental DeepAnalysis (`954262cf00`†). Self-critique was then found dying on 38 of 38 operations and fixed (`6feecf3079`†).
+- **Antivenom audit** (`dc04233637`†). The guardian's mutation self-audit had been mismeasuring: 105 apparent misses came from the wrong owner, comment-encoded diffs and invalid mutations. Six real detector holes were closed and a tautological-test ("quine") detector was added. Gaps went from 5 to 0. It now has a production caller that feeds the capability-health ledger.
+- **Capability assurance** (`capability_assurance.py`). The system refuses to run an operation below its declared envelope, rather than degrading silently.
+- **Production envelope** (`production_envelope.py`). About 40 run budgets are now derived from one wall-clock figure instead of set independently, with tests that pin them against drift.
+- **Bounded human approval.** The inline approval wait now has a deadline below the pipeline budget and fails closed.
+
+### §93.13 Updated Topline (as of 2026-10-13)
+
+These figures use a simple, reproducible method: line counts over git-tracked `.py` files, blank and comment lines included. They are **not** directly comparable to the §92.11 figures, which used a different method.
+
+| Measure | Value |
+|---|---|
+| JARVIS commits on `main` (all time) | 10,905 |
+| JARVIS commits in this window | 3,122 (3,013 on GitHub) |
+| JARVIS-Prime / JARVIS-Reactor commits on `main` in this window | 25 / 60 (plus unmerged feature branches) |
+| Python lines in tracked `.py` files, JARVIS | 3,891,413 |
+| … of which under `backend/core/ouroboros/` | 1,036,602 |
+| `test_*.py` files under `tests/` | 3,667 |
+| Intake sensor modules | 24 |
+| Autonomous landings on `main` (O+V trailer), 2026-09-06 → 10-10 | 91 (84 tests, 5 production, 2 docs) |
+| Paid inference spend on the landing soaks from 2026-09-26 | \$0 |
+
+### §93.14 Limitations, Stated Plainly
+
+1. **The landings are mostly tests.** 84 of 91 autonomous commits add test files. Production-code landings at cadence and self-planned feature work are listed as *not demonstrated* in the PRD §33 capability envelope.
+2. **Some landings were wrong.** One was hollow (reverted), one carried no intended change (reverted), one dropped content (restored by hand), and one autonomous documentation edit flattened text (repaired by hand). The promotion gate and the Test Reality Gate exist because of these.
+3. **Diff fidelity is the leading failure mode.** On the held-out set, numbering the source made diffs apply more often (apply failures 28 → 21) but broke modules more often (syntax failures 1 → 6). The 10-09 soak still produced 219 whole-file answers against 6 diffs.
+4. **The learning loop has not shown learning.** One adapter is served, and no held-out gain has been measured.
+5. **Supply, not model, bounds long soaks.** This is the supply wall in §93.10.
+6. **The cage escape rate is about 8.8%** at scale, against a 4.4% gate (§93.3).
+7. **One GPU.** The 5090 holds one large model at a time. Training, serving and vision contend for it through the lease.
+8. **Slot scaling is unproven in production.** The slot A/B was inconclusive.
+9. **Known open defects** include an `asyncio.Lock` re-entry deadlock in `LangGraphPhaseManager.transition` and a handful of test paths still pinned to the author's original machine.
+10. **Deliberately off.** The Epistemic Planner, the distributed bus, the swarm router, the rehearsal tier and the SMT prover remain default-off pending graduation.
+
+### §93.15 What Comes Next
+
+The working order recorded on 2026-10-09/10:
+
+1. Make diffs land: fidelity of the `2b.1-diff` path on the 30B.
+2. Measure a held-out gain before any training-derived change is pushed.
+3. Widen the supply of landable work beyond uncovered modules, including evidence-ranked red tests and sanctioned model proposals.
+4. Arm the Epistemic Planner and Conception bridge on a soak only after (1)–(3), so the backlog does not fill faster than it drains.
+5. Settle the slot count with a complete three-arm A/B.
+
+The formal questions of §92.12 are unchanged. The engineering since then has mostly supplied better measurements to put in front of them.
+
+### §93.16 Corrections and Superseded Text
+
+| Earlier text | Status as of 2026-10-13 |
+|---|---|
+| Repository `github.com/drussell23/JARVIS-AI-Agent` (front matter, Abstract, §5) | Now `github.com/drussell23/JARVIS`; the old URL redirects. The front matter has been updated. |
+| Part VI (§39–§43): DoubleWord and Claude as primary providers, J-Prime as backup; the 2026-04-16 topology seal | **Superseded** by §93.6. J-Prime (local, llama.cpp) is the only active lane; paid lanes are switched off by declaration. |
+| §1.1 "16 autonomous sensors" | 24 sensor modules today. |
+| Part XI: the battle-test runner as the way to operate O+V | The engine remains; the operator surface is the `ov` cockpit (§93.9). |
+| §92.4: 0/38 adversarial escapes | Stands for that curated set; the at-scale mutation measurement is about 8.8% (§93.3). |
+| §92.18: autonomous commits limited to ledger writes | 91 autonomous landings since, 5 of them production code (§93.10); still Mechanic. |
+
+### §93.17 Glossary Additions
+
+| Term | Meaning |
+|---|---|
+| `ov` cockpit | The operator command and live view of the running organism |
+| Autonomous Sentinel Mode | Unattended discover → sign → execute → (auto-)approve loop, under a tier ceiling |
+| Goal Discovery | Turns evidence (red tests, uncovered modules) into signed roadmap goals |
+| Proposal inbox | Model-invented work, sanctioned by the same single signer as evidence |
+| Accumulation branch | Per-session `ouroboros/battle-test/<ts>` branch that collects landings |
+| Promotion gate | Provenance + coverage + no-public-symbol-removed check before `main` |
+| Zero-push air-gap | One guard on every push site; publishing is an operator act |
+| First-order proof | An autonomous landing that does real work for a signed goal |
+| Supply wall | The point where yield is bounded by landable work, not by the model |
+| ECONOMIC state | A provider refusal caused by funding, distinct from quota and outage |
+| Rehearsal tier | A code-free, honest ending when every paid lane is dry |
+| Free lane / paid-lane authority | Local-primary routing; one module answering switched-on / configured / allowed |
+| J-Prime Engine | llama.cpp-based local server with lease and adapter registry |
+| Engine slots | Parallel decode slots; O+V concurrency follows them |
+| Tool masking (lever 3) | Grammar that allows only tool calls until exploration is satisfied |
+| AST-Signature Anchor | Real module API injected into GENERATE |
+| LessonMemory | Module-keyed failure lessons injected before generation |
+| Test Reality Gate | Rejects tests that cannot run, assert nothing, or never import their subject |
+| `2b.1-diff` | The diff output schema required for existing files |
+| Trajectory recorder / sibling candidates | Per-candidate training rows; three or more candidates per operation |
+| Landing provenance | Git-proven `landed` / `surviving` labels on training rows |
+| Training Lifecycle Handoff | One exclusive GPU cycle: lease → train → publish → verify → commit or roll back |
+| Held-out benchmark | Gain measured on human commits with hidden tests, never on training rows |
+| DARK feature | Flag on, module present, never reached in production |
+| Proof of work (`/proof`) | Hash-chained, per-session evidence record |
+
+---
+
 ## Appendix A — Glossary for Non-Technical Readers
 
 **Agent / agentic workload** — An AI system that takes actions, observes outcomes, and repeats. Distinct from a chatbot, which responds to one prompt at a time.
@@ -5074,7 +5386,7 @@ The outline post-processor parses the HTML TOC, maps each entry to a named PDF d
 
 ---
 
-**Report prepared 2026-04-16.**
+**Report prepared 2026-04-16.** Addenda: §92 (2026-05-13), §93 (2026-10-13).
 
 **Author:** Derek J. Russell — JARVIS Trinity Architect, RSI/AGI Researcher.
 
