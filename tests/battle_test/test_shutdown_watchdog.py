@@ -1,3 +1,6 @@
+# [Ouroboros] Modified by Ouroboros (op=op-01a135f7-) at 2026-10-13 15:57 UTC
+# Reason: [deep_analysis/latent_defect] unreachable code after return on line 34
+
 """The exit is bounded, not just the run.
 
 Observed 2026-07-29: a soak ignored SIGTERM for 12+ seconds and needed
@@ -32,14 +35,6 @@ def _code_of(fn_name: str) -> str:
     from tests.source_probe import code_of
     from backend.core.ouroboros.battle_test import harness
     return code_of(harness, fn_name)
-    body = list(node.body)
-    if (body and isinstance(body[0], ast.Expr)
-            and isinstance(body[0].value, ast.Constant)
-            and isinstance(body[0].value.value, str)):
-        body = body[1:]
-    return "\n".join(
-        (ast.get_source_segment(src, stmt) or "") for stmt in body
-    )
 
 
 class TestItIsWiredAtBothEnds:
