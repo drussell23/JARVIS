@@ -31,6 +31,7 @@ from .intake_priority_queue import (
 )
 from .intent_envelope import IntentEnvelope
 from .intent_envelope import SOVEREIGN_SOURCES as _SOVEREIGN_SOURCES
+from .intent_envelope import is_sovereign as _is_sovereign
 from .wal import WAL, WALEntry
 
 logger = logging.getLogger(__name__)
@@ -800,7 +801,7 @@ def _compute_priority(
     # Slice 246 — sovereign human primacy. A direct human-origin intent outranks
     # EVERYTHING, including a resurrected survivor, so the autonomous organism can
     # never starve a live human. Checked first; the host keeps ultimate control.
-    if getattr(envelope, "source", "") in _SOVEREIGN_SOURCES:
+    if _is_sovereign(getattr(envelope, "source", ""), getattr(envelope, "evidence", None)):
         return _sovereign_human_priority(), None
 
     # Slice 245 — a hibernation survivor gets Absolute-Max Primacy, short-

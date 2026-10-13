@@ -147,6 +147,40 @@ SOVEREIGN_SOURCES = frozenset({
     "voice_human", "cli_emergency", "human_override", "operator_chat",
 })
 
+#: Evidence key an OPERATOR path sets on a goal it sanctioned and injected
+#: (``/goal`` sanction, ``/session apply``). Such an envelope must say
+#: ``source="roadmap"`` -- classify re-derives the operator's authority from the
+#: signed roadmap -- so the source alone cannot tell it from the Sentinel's own
+#: self-signed dispatches, which share that source AND the same injector.
+#: Only operator call sites set this key; the envelope is built in-process,
+#: never from model output.
+OPERATOR_ORIGIN_KEY = "operator_origin"
+
+
+def is_sovereign(source: Any, evidence: Any = None) -> bool:
+    """THE human-primacy predicate: a human-origin source, or an operator-
+    sanctioned goal. Intake ordering, pool ordering and preemption all ask
+    this one question, so they cannot disagree about who the human is.
+    NEVER raises."""
+    try:
+        if str(source or "") in SOVEREIGN_SOURCES:
+            return True
+        return bool(isinstance(evidence, dict) and evidence.get(OPERATOR_ORIGIN_KEY) is True)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def context_is_sovereign(ctx: Any) -> bool:
+    """:func:`is_sovereign` for an OperationContext, whose envelope evidence
+    travels as ``intake_evidence_json``. NEVER raises."""
+    try:
+        import json  # noqa: PLC0415
+        raw = getattr(ctx, "intake_evidence_json", "") or ""
+        evidence = json.loads(raw) if raw else {}
+        return is_sovereign(getattr(ctx, "signal_source", ""), evidence)
+    except Exception:  # noqa: BLE001
+        return is_sovereign(getattr(ctx, "signal_source", ""), None)
+
 # F2 Slice 2 — allowed values for the optional ``routing_override``
 # envelope field. Empty string is the "no override" sentinel (default).
 # Non-empty values MUST be one of the five ProviderRoute enum values.

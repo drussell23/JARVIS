@@ -4858,12 +4858,14 @@ class BattleTestHarness:
                 self._op_input_q = q
                 q.start()
                 # /session apply turns an accepted change into a sanctioned
-                # op through the SAME injector /goal uses.
+                # op through the SAME injector /goal uses -- as the operator's.
                 try:
+                    import functools as _functools
                     from backend.core.ouroboros.governance.foreground_session_ops import (  # noqa: E501
                         set_injector,
                     )
-                    set_injector(self._inject_sanctioned_goal)
+                    set_injector(_functools.partial(
+                        self._inject_sanctioned_goal, operator_origin=True))
                 except Exception:  # noqa: BLE001
                     logger.debug("[Session] injector not wired", exc_info=True)
                 # Publish for read-only observers (the heartbeat), so the
@@ -7262,6 +7264,7 @@ class BattleTestHarness:
 
         op_id = self._inject_sanctioned_goal(
             goal_id=goal_id, description=description, target_files=target_files,
+            operator_origin=True,
         )
         if op_id:
             self._repl_print(
@@ -7277,6 +7280,7 @@ class BattleTestHarness:
     def _inject_sanctioned_goal(self, *, goal_id: str, description: str,
                                 target_files,
                                 extra_evidence: Optional[Dict[str, Any]] = None,
+                                operator_origin: bool = False,
                                 ) -> Optional[str]:
         """Inject a signed, file-scoped goal as ONE scoped op through the
         shared intake router. The envelope carries ``source=\"roadmap\"`` +
@@ -7301,12 +7305,21 @@ class BattleTestHarness:
             #
             # Read from the SAME knob WorkOrderSensor uses so the operator's
             # lane policy is stated once and the two paths cannot disagree.
+            # The operator's own sanction outranks every autonomous op
+            # (intent_envelope.is_sovereign). The Sentinel dispatches through
+            # this same injector and never sets it.
+            evidence = dict(extra_evidence or {})
+            if operator_origin:
+                from backend.core.ouroboros.governance.intake.intent_envelope import (  # noqa: E501,PLC0415
+                    OPERATOR_ORIGIN_KEY,
+                )
+                evidence[OPERATOR_ORIGIN_KEY] = True
             envelope = build_scoped_envelope(
                 goal_id=goal_id, description=description,
                 target_files=tuple(target_files),
                 urgency=(os.environ.get("JARVIS_WORK_ORDER_DEFAULT_URGENCY", "")
                          or "high").strip(),
-                extra_evidence=extra_evidence,
+                extra_evidence=evidence or None,
                 causal_id=generate_operation_id("goal"),
             )
             if envelope is None:

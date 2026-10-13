@@ -178,6 +178,36 @@ def test_the_injected_ops_id_is_the_id_the_operator_holds(sanction_env):
     assert len(submitted) == 1 and op_id
     assert op_id == submitted[0].causal_id
     assert noted == [op_id]
+    # The Sentinel dispatches through this same injector: unmarked by default.
+    from backend.core.ouroboros.governance.intake.intent_envelope import OPERATOR_ORIGIN_KEY
+    assert OPERATOR_ORIGIN_KEY not in submitted[0].evidence
+
+
+def test_the_operators_sanction_is_marked_operator_origin(sanction_env):
+    """/goal and /session apply outrank autonomous work only if they say so;
+    the injector's default (the Sentinel's path) never does."""
+    import functools
+    from types import SimpleNamespace
+
+    from backend.core.ouroboros.battle_test.harness import BattleTestHarness
+    from backend.core.ouroboros.governance.intake.intent_envelope import (
+        OPERATOR_ORIGIN_KEY, is_sovereign,
+    )
+
+    assert ogs.author_and_sign_goal(_spec(), path_override=sanction_env).ok
+    submitted = []
+    router = SimpleNamespace(ingest=lambda env: submitted.append(env) or "enqueued")
+    stub = SimpleNamespace(_governed_loop_service=SimpleNamespace(_intake_router=router),
+                           _operator_goal_receipt=BattleTestHarness._operator_goal_receipt)
+    stub._dispatch_intake_envelope = functools.partial(
+        BattleTestHarness._dispatch_intake_envelope, stub)
+    BattleTestHarness._inject_sanctioned_goal(
+        stub, goal_id="goal-1", description="d", target_files=(_TARGET,),
+        extra_evidence={"foreground_session": {"seed_ref": "r"}}, operator_origin=True)
+    ev = submitted[0].evidence
+    assert ev[OPERATOR_ORIGIN_KEY] is True and ev["foreground_session"] == {"seed_ref": "r"}
+    assert ev["provenance"]["goal_id"] == "goal-1"          # the cage's claim untouched
+    assert is_sovereign(submitted[0].source, ev)
 
 
 def test_normalize_target_files_dedupes_and_relativizes():

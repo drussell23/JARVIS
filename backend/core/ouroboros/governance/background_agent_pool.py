@@ -61,7 +61,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Ty
 # Slice 246 — leaf imports (no cycle: intent_envelope + preemption import neither
 # this module nor the orchestrator).
 from backend.core.ouroboros.governance.intake.intent_envelope import (
-    SOVEREIGN_SOURCES as _SOVEREIGN_SOURCES,
+    context_is_sovereign as _context_is_sovereign,
 )
 from backend.core.ouroboros.governance import preemption as _preemption
 from backend.core.ouroboros.governance.preemption import OperationPreemptedError
@@ -545,6 +545,10 @@ class BackgroundAgentPool:
         )
         self._submit_counter: int = 0
         self._ops: Dict[str, BackgroundOp] = {}
+        #: sovereign bgop id -> the ctx op id asked to yield a lane for it.
+        #: Withdrawn when the sovereign op starts on a lane that freed first,
+        #: so no autonomous op yields for nothing.
+        self._yield_for: Dict[str, str] = {}
         self._workers: List[asyncio.Task] = []  # type: ignore[type-arg]
         # Lease-Based In-Flight Lock reaper (armed in start()). Sweeps expired
         # op leases and re-queues wedged ops. None until started.
@@ -974,7 +978,8 @@ class BackgroundAgentPool:
         # human or a survivor. See _autonomous_pool_priority for the measured
         # starvation this closes.
         _autonomous_goal = ""
-        if _signal_src in _SOVEREIGN_SOURCES:
+        _sovereign = _context_is_sovereign(op_context)
+        if _sovereign:
             _priority = _sovereign_pool_priority()
         elif getattr(op_context, "resurrected_from_hibernation", False):
             _priority = _resurrection_pool_priority()
@@ -1023,18 +1028,90 @@ class BackgroundAgentPool:
         # preemption so it gracefully yields at its next round boundary (the
         # worker re-ingests it — micro-hibernation). Queue ordering alone can't
         # preempt an already-running op. Gated + fail-soft.
-        if _signal_src in _SOVEREIGN_SOURCES and _preemption.human_preemption_enabled():
+        if _sovereign and _preemption.human_preemption_enabled():
             try:
-                for _running_id in self.running_resurrected_op_ids():
+                _resurrected = self.running_resurrected_op_ids()
+                for _running_id in _resurrected:
                     _preemption.request_preemption(_running_id)
                     logger.info(
                         "[BGPool] PREEMPTION requested for running resurrected "
                         "op=%s — yielding to human override (source=%s)",
                         _running_id, _signal_src,
                     )
+                if not _resurrected:
+                    self._yield_lane_for(op_id)
             except Exception:  # noqa: BLE001 — sentinel must never block submit
                 logger.exception("[BGPool] preemption sentinel failed")
         return op_id
+
+    def _lanes(self) -> int:
+        """Lanes that may run an op right now: the topology target, held to
+        the live throughput ceiling when one applies. NEVER raises."""
+        try:
+            lanes = int(self._target_pool_size)
+            ceiling = self._throughput_lane_ceiling()
+            return max(1, min(lanes, int(ceiling)) if ceiling is not None else lanes)
+        except Exception:  # noqa: BLE001
+            return max(1, int(getattr(self, "_target_pool_size", 1) or 1))
+
+    def _yield_lane_for(self, sovereign_bgop: str) -> Optional[str]:
+        """A human op arrived and every lane is busy: ask ONE running
+        autonomous op to yield at its next round boundary.
+
+        Queue order alone cannot help -- the human op is already at the head,
+        but the head waits for a whole op to finish (tens of minutes on the
+        local 30B). Preemption is the pool's existing cooperative checkpoint
+        (Slice 246): the op yields only between tool-loop rounds, never inside
+        a generation, keeps its OperationContext and op id, and is re-ingested
+        at resurrection primacy to resume from its last durable phase. Its
+        goal claim stays with that same op id, so nothing is re-admitted.
+
+        The youngest running op is chosen: it has the least sunk wall in its
+        current phase. Already-sovereign ops and ops already asked are never
+        chosen. Returns the ctx op id asked, or None. NEVER raises."""
+        try:
+            running = [op for op in self._ops.values() if op.status == "running"]
+            pending = sum(
+                1 for op in self._ops.values()
+                if op.status == "queued" and _context_is_sovereign(op.context))
+            if len(running) + pending <= self._lanes():
+                return None                      # a lane is (or will be) free
+            asked = set(self._yield_for.values())
+            candidates = [
+                op for op in running
+                if not _context_is_sovereign(op.context)
+                and str(getattr(op.context, "op_id", "") or "") not in asked
+            ]
+            if not candidates:
+                return None
+            victim = max(candidates, key=lambda op: op.started_at or 0.0)
+            ctx_id = str(getattr(victim.context, "op_id", "") or "")
+            if not ctx_id:
+                return None
+            _preemption.request_preemption(ctx_id)
+            self._yield_for[sovereign_bgop] = ctx_id
+            logger.info(
+                "[BGPool] YIELD requested from autonomous op=%s for human op=%s "
+                "— it pauses at its next round boundary and resumes after",
+                ctx_id, sovereign_bgop,
+            )
+            return ctx_id
+        except Exception:  # noqa: BLE001
+            logger.debug("[BGPool] yield-lane selection degraded", exc_info=True)
+            return None
+
+    def _withdraw_yield(self, sovereign_bgop: str) -> None:
+        """The human op got a lane. If the op asked to yield for it has not
+        yielded yet, withdraw the request -- it should finish undisturbed.
+        NEVER raises."""
+        try:
+            ctx_id = self._yield_for.pop(sovereign_bgop, "")
+            if ctx_id and _preemption.is_preemption_requested(ctx_id):
+                _preemption.clear_preemption(ctx_id)
+                logger.info("[BGPool] yield request withdrawn from op=%s (a lane freed first)",
+                            ctx_id)
+        except Exception:  # noqa: BLE001
+            pass
 
     def running_resurrected_op_ids(self) -> List[str]:
         """Slice 246 — ctx.op_id of every currently-RUNNING resurrected survivor.
@@ -1426,6 +1503,8 @@ class BackgroundAgentPool:
                 op.status = "running"
                 op.started_at = time.monotonic()
                 op.task = asyncio.current_task()
+                if op.op_id in self._yield_for:
+                    self._withdraw_yield(op.op_id)
 
                 # Cockpit visibility (2026-07-24): worker pickup on the
                 # canonical broker — the mirrored breadcrumb router shows
@@ -1754,7 +1833,8 @@ class BackgroundAgentPool:
                     # ceiling; this worker is the only place that does.
                     _lease_op_id = str(getattr(_ctx_to_run, "op_id", "") or "")
                     _register_recorder_lease(_lease_op_id, _op_timeout_s)
-                    _run_task = asyncio.ensure_future(_orch.run(_ctx_to_run))
+                    _run_task = asyncio.ensure_future(
+                        _run_with_priority(_orch, _ctx_to_run))
                     _fsm_granted_s = 0.0
                     _next_timeout_s = _op_timeout_s
                     try:
@@ -1965,6 +2045,24 @@ class BackgroundAgentPool:
             logger.exception("Worker %d crashed unexpectedly", worker_id)
         finally:
             logger.debug("Worker %d exited", worker_id)
+
+
+async def _run_with_priority(orch: Any, ctx: Any) -> Any:
+    """Run one op; a HUMAN op runs as a foreground claim on the local lane.
+
+    ``generation_admission`` is the existing reservation a /session turn
+    holds: its own generations are never gated, and background admission
+    stops at capacity-1 while it lives, so after the generation that is
+    already running finishes, the next slot is the human's. A running
+    generation is never cut -- llama.cpp cannot checkpoint one, and
+    discarding it would re-run GENERATE. Autonomous ops run unchanged."""
+    if not _context_is_sovereign(ctx):
+        return await orch.run(ctx)
+    from backend.core.ouroboros.governance.generation_admission import (  # noqa: PLC0415
+        admission,
+    )
+    async with admission().foreground_turn():
+        return await orch.run(ctx)
 
 
 def _fsm_timebox_extension_s(already_granted_s: float) -> float:
