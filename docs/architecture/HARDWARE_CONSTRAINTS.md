@@ -4,6 +4,16 @@
 > machine, not assumed. Re-measure before trusting it on different hardware;
 > the commands are given so this document can be regenerated rather than
 > maintained by hand.
+>
+> **Serving changed on 2026-10-07.** The measurements below were taken under
+> Ollama on `:11434`. The model is now served by the **J-Prime Engine**
+> (`jarvis_prime/engine/`, llama.cpp `llama-server`) on `127.0.0.1:8000`,
+> running natively on the Windows host and reached from WSL2 over mirrored
+> networking. It speaks the same Ollama-compatible API (`/api/tags`,
+> `/api/show`), so the regeneration commands in §8 work unchanged against the
+> new port. The VRAM arithmetic (§3) is a property of the model, not the
+> server, and still holds; where a lever is server-specific (§6) both forms are
+> given.
 
 This exists because a whole diagnostic arc was spent reading a **hardware**
 failure as a **model-quality** failure. Thirteen of thirty ops in one session
@@ -25,7 +35,7 @@ constraint is VRAM, not intelligence.
 | Driver | 610.62 | `nvidia-smi --query-gpu=driver_version --format=csv` |
 | CPU (WSL guest) | 24 cores | `nproc` |
 | RAM (WSL guest) | 47 GiB | `free -g` |
-| Serving runtime | Ollama @ `127.0.0.1:11434` | `curl -s localhost:11434/api/tags` |
+| Serving runtime | J-Prime Engine (llama.cpp `llama-server`) @ `127.0.0.1:8000`, Ollama-compatible API. Measured here under Ollama @ `:11434`, which it replaced on 2026-10-07 | `curl -s localhost:8000/api/tags` |
 
 ## 2. The model
 
@@ -64,8 +74,8 @@ KV bytes per token = (key_length + value_length) × head_count_kv × bytes × la
 Headroom = 31.8 GiB card − 17.3 GiB weights = **14.5 GiB**.
 
 **The measured failure**: 4 concurrent streams at num_ctx=32768 →
-12 GiB KV + 17.3 GiB weights = **29.3 GiB of 31.8 GiB (92%)**, before Ollama's
-compute buffers and MoE routing overhead. The card had nothing left.
+12 GiB KV + 17.3 GiB weights = **29.3 GiB of 31.8 GiB (92%)**, before the
+server's (then Ollama's) compute buffers and MoE routing overhead. The card had nothing left.
 
 ## 4. Why it fails SILENTLY (the part that cost the most time)
 
@@ -117,24 +127,36 @@ The same ordering bit the envelope itself — see §7.
 ## 6. Optimisation levers, in order of measured value
 
 Stated honestly: **these are configuration levers, not low-level coding
-problems.** llama.cpp/Ollama already ship hand-tuned CUDA kernels for this
+problems.** llama.cpp (which J-Prime runs, and which Ollama wraps) already ships hand-tuned CUDA kernels for this
 architecture; hand-written C/C++ or assembly would not beat them and is not
 where the headroom is on this host. The headroom is in KV cache and
 concurrency.
 
 1. **KV cache quantization** — the single biggest lever.
-   `OLLAMA_KV_CACHE_TYPE=q8_0` halves KV (96 → 48 KiB/token), turning a 32k
-   context from 3.0 GiB into 1.5 GiB and roughly doubling safe concurrency.
-   `q4_0` quarters it. Quality impact on KV is far smaller than on weights.
+   A `q8_0` KV cache halves KV (96 → 48 KiB/token), turning a 32k context
+   from 3.0 GiB into 1.5 GiB and roughly doubling safe concurrency. `q4_0`
+   quarters it. Quality impact on KV is far smaller than on weights. On
+   J-Prime, pass llama-server's `--cache-type-k q8_0 --cache-type-v q8_0`
+   through `JPRIME_ENGINE_EXTRA_ARGS` (flash attention, which a quantized V
+   cache needs, is on by default via `JPRIME_ENGINE_FLASH_ATTN`); under Ollama
+   the equivalent was `OLLAMA_KV_CACHE_TYPE=q8_0`. J-Prime's admission
+   estimate (`gguf_meta.kv_bytes_per_token`) assumes an f16 cache, so it
+   over-reserves until the engine's measured footprint for that
+   (model, ctx, slots) replaces the estimate — conservative, never an
+   oversubscription.
 2. **num_ctx discipline** — KV scales linearly with context. A goal that needs
    8k does not need 32k, and the Context-Hardware Negotiator already derives
    this; feeding it a correct VRAM number (§5) is worth more than raising it.
 3. **Concurrency clamping** — implemented in
    `governance/autonomy/local_lane_capacity.py`; derives the lane's
    concurrency from `vram − weights` and fails safe to 1.
-4. **`OLLAMA_NUM_PARALLEL`** — Ollama's own request parallelism. Should agree
-   with (3); two components disagreeing about concurrency is how the card gets
-   oversubscribed by a factor nobody chose.
+4. **Server-side parallelism** — on J-Prime, generation slots per
+   `llama-server` (`JPRIME_ENGINE_PARALLEL`: a count, or `auto`, sized from
+   free VRAM and the model's KV geometry and clamped to
+   `JPRIME_ENGINE_PARALLEL_MAX`, default 4); under Ollama it was
+   `OLLAMA_NUM_PARALLEL`. It should agree with (3); two components disagreeing
+   about concurrency is how the card gets oversubscribed by a factor nobody
+   chose.
 5. **Model choice per phase** — a 30B for GENERATE and something smaller for
    cheap classification is a legitimate trade, but only after (1)–(4), since it
    costs a second resident model (VRAM) unless the small one is CPU-served.
@@ -172,7 +194,8 @@ concurrency.
 ```bash
 nvidia-smi --query-gpu=name,memory.total,memory.free,driver_version --format=csv,noheader
 nproc && free -g | head -2
-curl -s localhost:11434/api/tags | python3 -m json.tool | grep -E '"name"|"size"'
-curl -s localhost:11434/api/show -d '{"name":"qwen3-coder-ov:30b"}' \
+# J-Prime Engine (Ollama-compatible API); use :11434 for an Ollama server
+curl -s localhost:8000/api/tags | python3 -m json.tool | grep -E '"name"|"size"'
+curl -s localhost:8000/api/show -d '{"name":"qwen3-coder-ov:30b"}' \
   | python3 -m json.tool | grep -E 'block_count|head_count_kv|key_length|value_length|quantization'
 ```
