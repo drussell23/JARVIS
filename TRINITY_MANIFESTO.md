@@ -15,6 +15,24 @@
 
 ---
 
+## Status — reconciled with the code, 2026-10-13
+
+This Manifesto says that when code and document disagree, one of them is a bug. These are the places where the deployment has moved on from the text below. **The laws in §5.2 and §6 are unchanged and still hold.** The Immutable Orange floor is `critical_elevation._IMMUTABLE_ORANGE_REPOS = frozenset({"prime", "reactor"})`.
+
+| Section | The text says | The code and deployment today |
+|---|---|---|
+| §0, §1 Axis A — the Mind | J-Prime serves 11 GGUF specialists; code → `Qwen2.5-Coder-7B` | J-Prime is the **J-Prime Engine** (`jarvis_prime/engine/`, llama.cpp), serving `qwen3-coder-ov:30b` (Qwen3-Coder-30B-A3B base + a Reactor-trained LoRA) on the author's local RTX 5090 at `127.0.0.1:8000`. It also lends the GPU for training (lease) and keeps a versioned adapter registry. |
+| §0, §1 Axis B — the provider chain | DoubleWord is PRIMARY; J-Prime is last-resort insurance | Inverted. Paid lanes are switched off by declaration (`JARVIS_PAID_LANES_ENABLED=false`, single authority `governance/paid_lanes.py`); the free-lane policy serves **every route** on J-Prime. DoubleWord and Claude return by configuration alone. |
+| §1 — names | Body / Mind / **Nerves** | Reactor-Core is also called the **Soul** (`CLAUDE.md`, the README, the research paper). Same repository, same role. |
+| §3 — the RSI flywheel | DPO pairs from DoubleWord repairs fine-tune the 7B; zero-downtime redeploy | The trajectory recorder writes one row per candidate (three or more sibling candidates per operation); git-proven landing labels mark the winners; Reactor trains a **GRPO** LoRA (Dr. GRPO loss, attention-only, per-expert NF4) on the **30B**. The Training Lifecycle Handoff (`observability/training_handoff.py`, in this repo) leases the GPU, publishes the adapter to J-Prime and keeps it only if it scores at least as well as the incumbent. Cycles are started by the operator (auto-train is off). One adapter is served; no held-out gain has been shown yet. |
+| §4 — sovereign failover | A GCP golden image awakens when DoubleWord collapses | The machinery is still in the code (`failover_lifecycle.py`). The deployment no longer depends on it: the local J-Prime is the primary lane, not the failover. |
+| §5.1 G2 — the air-gapped sandbox | Candidates are validated in an ephemeral Docker network | G2 applies to **cross-repo** mutations (`saga/trinity_integration_gate.py`). Single-repo candidates, which are all of the autonomous landings so far, are contained in the Body: a git-worktree candidate tree, an unprivileged PID namespace (`process_session.py`) and a cgroup admission lock for test runs (`test_execution_lock.py`). |
+| (not in the text) — publication | — | The organism never pushes. The zero-push air-gap (`remote_push_guard.py`, default on) guards every push site; O+V lands on **local** `main` through a four-check promotion gate, and publishing is the operator's act. |
+
+The research paper's §94 ([HTML](https://drussell23.github.io/JARVIS/architecture/OV_RESEARCH_PAPER_2026-04-16.html)) describes the current system end to end and lists these corrections in its §93.16.
+
+---
+
 ## 0. The One-Paragraph Truth
 
 JARVIS is a tri-partite organism. The **Body** (JARVIS) runs the autonomous development loop. The **Mind** (J-Prime) is a self-hosted LLM that generates code. The **Nerves** (Reactor-Core) train the Mind on the Body's own experience. An external provider (**DoubleWord**) does the cheap day-to-day generation; the Trinity exists so the organism *survives and improves itself* when that external dependency fails. The organism can author changes into all three repositories — but the one capability that could let it rewrite its own Mind unwatched is made **structurally impossible** by construction. Every autonomous power is **default-OFF, fail-CLOSED, and cost-bounded.**
