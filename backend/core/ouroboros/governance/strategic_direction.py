@@ -962,53 +962,87 @@ class StrategicDirectionService:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _manifesto_bounds(readme_content: str) -> Optional[Tuple[int, int]]:
+        """Locate the manifesto section as ``(start, end)`` character offsets.
+
+        Boundaries are real Markdown headings, never substrings: a
+        ``"## "`` probe also matches inside ``"### "``, which cut the
+        section down to its opening paragraph. The section starts at the
+        manifesto heading and ends at the next heading of the same or a
+        higher level, or at the sub-sections that follow the principles.
+        Lines inside fenced code blocks are not headings (a shell comment
+        such as ``# Clone the repo`` would otherwise end the section).
+        """
+        start_titles = (
+            "Symbiotic AI-Native Manifesto",
+            "The seven principles",
+        )
+        stop_titles = (
+            "Five core execution contexts",
+            "The zero-shortcut mandate",
+        )
+        start = -1
+        start_level = 0
+        offset = 0
+        in_fence = False
+        for line in readme_content.splitlines(keepends=True):
+            stripped = line.strip()
+            if stripped.startswith(("```", "~~~")):
+                in_fence = not in_fence
+            elif not in_fence:
+                heading = re.match(r"(#{1,6})\s+(.*)", stripped)
+                if heading:
+                    level = len(heading.group(1))
+                    title = heading.group(2).strip()
+                    if start < 0:
+                        if title.startswith(start_titles):
+                            start, start_level = offset, level
+                    elif level <= start_level or title.startswith(stop_titles):
+                        return start, offset
+                elif start < 0 and stripped.startswith("**1. The unified organism"):
+                    # A README with the principles but no heading above them.
+                    start, start_level = offset, 2
+            offset += len(line)
+        if start < 0:
+            return None
+        return start, len(readme_content)
+
+    @staticmethod
     def _extract_principles(readme_content: str) -> List[str]:
-        """Extract the 7 numbered principles from the README manifesto."""
+        """Extract the 7 numbered principles from the README manifesto.
+
+        Searched inside the manifesto section, so a numbered bold line
+        elsewhere in the README cannot take a principle's place and the
+        principles are found wherever the README places them. Without a
+        manifesto section, the first ``_MAX_DOC_CHARS`` are scanned.
+        """
+        bounds = StrategicDirectionService._manifesto_bounds(readme_content)
+        if bounds is None:
+            scope = readme_content[:_MAX_DOC_CHARS]
+        else:
+            scope = readme_content[bounds[0]:bounds[1]]
         principles: List[str] = []
+        seen: set = set()
         # Match patterns like "**1. The unified organism (tri-partite microkernel)**"
         pattern = re.compile(
             r"\*\*(\d+)\.\s+([^*]+)\*\*",
             re.MULTILINE,
         )
-        for match in pattern.finditer(readme_content[:_MAX_DOC_CHARS]):
-            num = match.group(1)
+        for match in pattern.finditer(scope):
+            num = int(match.group(1))
             title = match.group(2).strip()
-            if 1 <= int(num) <= 7:
+            if 1 <= num <= 7 and num not in seen:
+                seen.add(num)
                 principles.append(f"{num}. {title}")
         return principles[:7]
 
     @staticmethod
     def _extract_manifesto(readme_content: str) -> str:
         """Extract the manifesto section from README.md."""
-        # Find the manifesto header and extract ~2000 chars
-        markers = [
-            "## Symbiotic AI-Native Manifesto",
-            "### The seven principles",
-            "**1. The unified organism",
-        ]
-        start = -1
-        for marker in markers:
-            idx = readme_content.find(marker)
-            if idx >= 0:
-                start = idx
-                break
-
-        if start < 0:
+        bounds = StrategicDirectionService._manifesto_bounds(readme_content)
+        if bounds is None:
             return ""
-
-        # Extract from start to the zero-shortcut mandate (end of principles)
-        end_markers = [
-            "### Five core execution contexts",
-            "### The zero-shortcut mandate",
-            "## ",  # next h2
-        ]
-        end = len(readme_content)
-        for em in end_markers:
-            idx = readme_content.find(em, start + 100)
-            if idx > start:
-                end = min(end, idx)
-
-        section = readme_content[start:end].strip()
+        section = readme_content[bounds[0]:bounds[1]].strip()
         # Cap at ~4000 chars to stay within prompt budget
         if len(section) > 4000:
             section = section[:4000] + "\n\n[... truncated for prompt budget]"
