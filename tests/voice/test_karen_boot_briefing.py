@@ -1,3 +1,6 @@
+# [Ouroboros] Modified by Ouroboros (op=op-01a135e9-) at 2026-10-13 15:45 UTC
+# Reason: [deep_analysis/latent_defect] unreachable code after raise on line 121
+
 # tests/voice/test_karen_boot_briefing.py
 """Boot briefing: live-state composition, DW primary, 4s breaker that
 provably falls back to the LOCAL live-state line without stalling (spec
@@ -119,7 +122,6 @@ async def test_run_never_raises(monkeypatch):
     class ExplodingSynth:
         async def synthesize(self, view):
             raise RuntimeError("provider exploded")
-            yield  # pragma: no cover
     b = BootBriefing(synthesizer=ExplodingSynth(),
                      speak_sink=lambda s: (_ for _ in ()).throw(RuntimeError("sink!")),
                      vectors_override=V)
