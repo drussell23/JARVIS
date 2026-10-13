@@ -405,6 +405,24 @@ def _terminal_size() -> "tuple":
         return (100, 24)
 
 
+def _split_rows(markup: str) -> List[str]:
+    """One markup string per row. Parsed once and re-emitted per line, so a
+    style opened on one line and closed on a later one stays applied to
+    every row it covered (a naive split on newlines would leave a dangling
+    tag on each). Unparseable markup splits as text. NEVER raises."""
+    if "\n" not in markup:
+        return [markup]
+    try:
+        from rich.text import Text
+        # emoji=False: the row keeps ":code:" text for the renderer to treat
+        # exactly as it treated the unsplit frame.
+        text = (Text.from_ansi(markup) if "\x1b" in markup
+                else Text.from_markup(markup, emoji=False))
+        return [row.markup for row in text.split("\n", allow_blank=True)]
+    except Exception:  # noqa: BLE001
+        return markup.split("\n")
+
+
 class BipartiteLayout:
     """The TUI multiplexer: a bounded Zone-1 telemetry ring + Rich composition of
     the two zones + resize recompute. Pure/headless-testable — the live
@@ -613,14 +631,21 @@ class BipartiteLayout:
         self._invalidate_now()
 
     def _append(self, line: str) -> None:
-        """Land ONE transcript line through the block rhythm. A line the
+        """Land transcript line(s) through the block rhythm. A line the
         flow defers (a blank waiting to see what it separates) lands later
-        or never; a line it reshapes lands reshaped. Never raises."""
+        or never; a line it reshapes lands reshaped. Never raises.
+
+        ONE ENTRY PER ROW. A frame may carry many lines (a /session
+        proposal's whole diff arrives as one markup frame). Pushed whole,
+        the ring counted it as one line while it drew as forty rows: the
+        viewport's budget was wrong, the region cropped at the bottom, and
+        everything after the block sat below the fold -- found live as a
+        transcript that "stopped" mid-diff and never showed the receipt."""
         try:
             with self._flow_lock:
-                out = self._flow.feed(line)
-                for ln in out:
-                    self._buffer.push(ln)
+                for part in _split_rows(str(line)):
+                    for ln in self._flow.feed(part):
+                        self._buffer.push(ln)
         except Exception:  # noqa: BLE001 — never lose the line itself
             try:
                 self._buffer.push(str(line))

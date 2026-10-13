@@ -99,6 +99,34 @@ class TestTheOperatorVisibleSymptom:
             + repr([ln.strip()[:40] for ln in lines[-3:]])
         )
 
+    def test_a_line_after_a_many_line_frame_is_visible(self, fullscreen):
+        """Found live: a /session proposal's diff arrives as ONE markup frame
+        of many lines. Counted as one transcript line but drawn as sixty rows,
+        it pushed everything after it below the fold -- the transcript seemed
+        to stop mid-diff and the apply receipt never appeared."""
+        from backend.core.ouroboros.battle_test.bipartite_layout import (
+            BipartiteLayout,
+        )
+        mux = BipartiteLayout()
+        for i in range(50):
+            mux.push_raw(f"deckline{i}")
+        mux.push_raw("[bold]● Propose[/bold](x.py)\n" + "\n".join(
+            f"  [dim]diff row {i}[/dim]" for i in range(60)))
+        mux.push_raw("RECEIPT op-1 sent through the pipeline")
+        _render_once(_heavy_app(mux))
+        lines = _visible(mux)
+        assert any("RECEIPT" in ln for ln in lines), (
+            "the line after a many-line frame is not visible; tail was "
+            + repr([ln.strip()[:40] for ln in lines[-3:]]))
+        assert len(lines) <= mux.height
+
+    def test_a_style_spanning_rows_survives_the_split(self):
+        from backend.core.ouroboros.battle_test.bipartite_layout import _split_rows
+        from rich.text import Text
+        rows = _split_rows("[dim]one\ntwo[/dim]")
+        assert [Text.from_markup(r).plain for r in rows] == ["one", "two"]
+        assert all(Text.from_markup(r).spans for r in rows)
+
     def test_the_deck_never_produces_more_lines_than_it_was_given(self, fullscreen):
         """The mechanism behind the symptom. Producing more rows than the window
         holds is silent — prompt_toolkit simply drops them — so nothing but an
