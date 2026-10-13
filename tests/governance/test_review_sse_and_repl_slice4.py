@@ -3,6 +3,8 @@ REPL verb regression checks.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from backend.core.ouroboros.governance.ide_observability_stream import (
@@ -12,6 +14,8 @@ from backend.core.ouroboros.governance.ide_observability_stream import (
     EVENT_TYPE_REVIEW_BRANCH_REJECTED,
     publish_review_branch_event,
 )
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 # ===========================================================================
@@ -76,7 +80,7 @@ def test_serpent_flow_dispatches_accept_verb():
     that drops this branch would silently break the IDE-native review
     operator decision flow."""
     src = open(
-        "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/"
+        f"{_REPO_ROOT}/"
         "backend/core/ouroboros/battle_test/serpent_flow.py"
     ).read()
     assert "Gap #4 Slice 4" in src
@@ -92,7 +96,7 @@ def test_serpent_flow_handler_methods_defined():
     class. Removing any of them would break the dispatch the previous
     test pins."""
     src = open(
-        "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/"
+        f"{_REPO_ROOT}/"
         "backend/core/ouroboros/battle_test/serpent_flow.py"
     ).read()
     assert "async def _handle_accept" in src
@@ -109,7 +113,7 @@ def test_coordinator_publishes_state_event():
     """The coordinator's _publish_state_event helper must be present
     and called from the lifecycle hooks."""
     src = open(
-        "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/"
+        f"{_REPO_ROOT}/"
         "backend/core/ouroboros/governance/review_coordinator.py"
     ).read()
     assert "_publish_state_event" in src

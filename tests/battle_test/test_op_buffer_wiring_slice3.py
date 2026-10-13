@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 
-_REPO = Path("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent")
+_REPO = Path(__file__).resolve().parents[2]
 _SERPENT_FLOW = _REPO / "backend/core/ouroboros/battle_test/serpent_flow.py"
 
 

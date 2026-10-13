@@ -116,7 +116,7 @@ def test_a_rejected_hunk_pins_the_current_source_where_it_was_aimed(repo) -> Non
     _read(repo)
     block, _ = occ.opening(OP, repo, budget_chars=10_000)
     assert block.index("[CURRENT SOURCE] a.py") < block.index("contents of a")
-    assert "   50  line 50" in block
+    assert "50│line 50" in block  # source_lines format
 
 
 def test_the_realignment_hint_pins_the_region_and_points_at_it(repo) -> None:
@@ -125,7 +125,7 @@ def test_the_realignment_hint_pins_the_region_and_points_at_it(repo) -> None:
     _arm_diff_context_realignment(ctx, "a.py", "context line 'x' not found within ±8 lines of line 12")
     assert "opens your next attempt" in ctx.strategic_memory_prompt
     block, _ = occ.opening(OP, repo, budget_chars=10_000)
-    assert "   12  line 12" in block
+    assert "12│line 12" in block  # source_lines format
 
 
 # --------------------------------------------------------------------------

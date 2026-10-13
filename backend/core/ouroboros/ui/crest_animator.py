@@ -398,6 +398,9 @@ class CrestAnimator:
         #: The single live progress line, rendered under the transcript. A
         #: value, not a history — see `set_progress`.
         self._progress: str = ""
+        #: The lock block -- (title, lines) while the GPU is leased away from
+        #: the organism, else None. See `set_lock`.
+        self._locked: Optional[Tuple[str, List[str]]] = None
         self._lock = threading.Lock()
         # The resting emblem — the static crest's OWN raster (full fidelity).
         self._base: Dict[Tuple[int, int], Tuple[int, int, int]] = {}
@@ -589,6 +592,36 @@ class CrestAnimator:
         except Exception:  # noqa: BLE001
             pass
 
+    def set_lock(self, title: Optional[str], lines: Optional[List[str]] = None) -> None:
+        """Show (or, with None, lift) the lock block: a STATIC screen -- the
+        resting emblem over a fixed panel naming who holds the card and the
+        tail of the log it is writing -- in place of the boot transcript.
+        Thread-safe; never raises; the next frame picks it up."""
+        try:
+            with self._lock:
+                self._locked = None if title is None else (str(title), [str(x) for x in (lines or [])])
+        except Exception:  # noqa: BLE001
+            pass
+
+    def lock_renderable(self) -> Any:
+        try:
+            from rich.panel import Panel
+            from rich.text import Text
+            with self._lock:
+                locked = self._locked
+            if locked is None:
+                return None
+            title, lines = locked
+            body = Text(no_wrap=True, overflow="ellipsis")
+            for i, ln in enumerate(lines):
+                body.append(ln, style=_LOG_RGB)
+                if i < len(lines) - 1:
+                    body.append("\n")
+            return Panel(body, title=f"[bold]{title}[/bold]", title_align="left",
+                         border_style="yellow", expand=True)
+        except Exception:  # noqa: BLE001
+            return None
+
     def add_log(self, line: str) -> None:
         """Append one async boot log to the BOTTOM partition — never touches the
         crest matrix. Thread-safe; never raises."""
@@ -639,6 +672,9 @@ class CrestAnimator:
         try:
             from rich.console import Group
             from rich.text import Text
+            lock = self.lock_renderable()
+            if lock is not None:
+                return Group(self.resting_text(), Text(""), lock)
             return Group(self.crest_frame_text(phase), Text(""), self.logs_renderable())
         except Exception:  # noqa: BLE001
             return self.crest_frame_text(phase)

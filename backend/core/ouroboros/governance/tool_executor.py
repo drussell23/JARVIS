@@ -1956,7 +1956,8 @@ class ToolExecutor:
         total = len(all_lines)
         selected = all_lines[lines_from - 1 : lines_to]
         header = f"# {path_str}  (lines {lines_from}-{min(lines_to, total)} of {total})\n"
-        return header + "".join(f"{lines_from + i}: {line}" for i, line in enumerate(selected))
+        from backend.core.ouroboros.governance import source_lines
+        return header + source_lines.number("".join(selected), lines_from)
 
     def _read_file_sliced(
         self,

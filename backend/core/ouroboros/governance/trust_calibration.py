@@ -463,8 +463,8 @@ def relax_tier_for_op(
 
 
 def _tier_name(risk_tier: Any) -> str:
-    v = getattr(risk_tier, "name", None) or getattr(risk_tier, "value", None) or risk_tier
-    return str(v).lower()
+    from backend.core.ouroboros.governance.risk_engine import tier_name  # noqa: PLC0415
+    return tier_name(risk_tier)
 
 
 def _tier_from_name(name: str, like: Any) -> Any:

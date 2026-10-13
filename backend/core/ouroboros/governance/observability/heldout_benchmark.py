@@ -264,13 +264,17 @@ def fingerprint(tasks: Sequence[Task]) -> str:
 
 
 def _contract_for(target: str, tree: Path, served_model: str) -> bool:
-    """force_full_content exactly as production would decide it for this
-    target and the served model: its effective capability (policy + observed
-    diff evidence), and creation-vs-edit."""
+    """force_full_content as production's POLICY decides it for this target
+    and the served model, and creation-vs-edit. Not the observed demotion:
+    measured 2026-10-10, a 10-minute soak's 7 failed ops demoted the model
+    for ~83 min and a rebuild in that window froze full_content on all 30
+    tasks the previous build had asked for diffs -- the same tasks asking a
+    different question, so no run on it was comparable."""
     from backend.core.ouroboros.governance import providers
     from backend.core.ouroboros.governance.brain_selector import BrainSelector
     from backend.core.ouroboros.governance.served_model_capability import FULL_ONLY
-    verdict = BrainSelector().effective_schema_capability(declared=FULL_ONLY, served_model=served_model)
+    verdict = BrainSelector().effective_schema_capability(declared=FULL_ONLY, served_model=served_model,
+                                                          observed=False)
     return providers.resolve_force_full_content(schema_capability=verdict.capability,
                                                 target_files=(target,), repo_root=tree)
 
@@ -423,12 +427,15 @@ async def run(taskset: Path, *, model: Optional[str] = None, repo: Optional[Path
                                           note=f"{type(exc).__name__}: {str(exc)[:160]}"))
             completions.append(text)
             results[-1].completion_chars = len(text)
-    rewards = await _reward_scores(completions)
+    rewards = await _reward_scores(completions, [t.prompt for t in tasks])
     for r, s in zip(results, rewards):
         r.reward = s
     record = {"fingerprint": header["fingerprint"], "taskset": str(taskset), "model": model,
               "adapter": adapter, "identity": ident,
               "ran_at": time.time(), "results": [asdict(r) for r in results],
+              # What the model wrote, per task: a failure class is read from
+              # these, not inferred from a score.
+              "completions": {t.task_id: c for t, c in zip(tasks, completions)},
               "summary": summarize(results)}
     out = benchmark_dir() / "runs" / f"run-{time.strftime('%Y%m%d-%H%M%S')}-{header['fingerprint'][:12]}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -472,11 +479,15 @@ async def _score(repo: Path, t: Task, text: str) -> TaskResult:
                                   note="no candidate for the target file")
 
 
-async def _reward_scores(completions: Sequence[str]) -> List[Optional[float]]:
+async def _reward_scores(completions: Sequence[str],
+                         prompts: Sequence[str] = ()) -> List[Optional[float]]:
     """The training reward's own score for each completion (Reactor's
     ``grpo_verifier.verify_any``, in Reactor's interpreter -- the two repos
     share no venv), recorded BESIDE the gain: never the benchmark's score.
-    None when Reactor cannot be reached."""
+    Graded against the task's prompt, with the applier the trainer is given,
+    so a diff is scored by where it lands. None when Reactor cannot be
+    reached."""
+    from backend.core.ouroboros.governance.observability import training_handoff as th
     from backend.core.ouroboros.governance.observability import training_trigger as tt
     py, root = tt._reactor_python(), tt._reactor_root()
     if not py or not root or not completions:
@@ -484,14 +495,15 @@ async def _reward_scores(completions: Sequence[str]) -> List[Optional[float]]:
     script = ("import json,sys\n"
               "from reactor_core.training.grpo_verifier import verify_any\n"
               "for line in open(sys.argv[1], encoding='utf-8'):\n"
-              "    print(json.dumps(verify_any(json.loads(line)).score), flush=True)\n")
+              "    row = json.loads(line)\n"
+              "    print(json.dumps(verify_any(row['c'], prompt=row['p']).score), flush=True)\n")
     with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8") as fh:
-        for c in completions:
-            fh.write(json.dumps(c) + "\n")
+        for i, c in enumerate(completions):
+            fh.write(json.dumps({"c": c, "p": prompts[i] if i < len(prompts) else ""}) + "\n")
         feed = fh.name
     try:
         rc, out = await tt._run([py, "-c", script, feed], timeout_s=_num(_ENV_TEST_TIMEOUT, 300.0),
-                                cwd=root, env={"PYTHONPATH": str(root)})
+                                cwd=root, env={"PYTHONPATH": str(root), **th._diff_applier_contract()})
         vals = [float(x) for x in out.split() if x.strip()]
         return vals if rc == 0 and len(vals) == len(completions) else [None] * len(completions)
     except Exception:  # noqa: BLE001

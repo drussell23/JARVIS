@@ -43,6 +43,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple
 
+from backend.core.ouroboros.governance import source_lines
+
 logger = logging.getLogger("Ouroboros.DiffHealer")
 
 __all__ = [
@@ -76,16 +78,15 @@ class HealableRejection:
 
 
 def _intent_lines(diff_text: str) -> Tuple[str, ...]:
-    """The ``+``/``-`` lines — the change itself, stripped of hunk headers."""
-    out: List[str] = []
-    for ln in (diff_text or "").splitlines():
-        if ln.startswith("@@"):
-            continue
-        if ln.startswith(("+++", "---")):
-            continue
-        if ln.startswith(("+", "-")):
-            out.append(ln.rstrip("\r\n"))
-    return tuple(out)
+    """The ``+``/``-`` lines — the change itself, stripped of hunk headers —
+    read through the ONE hunk parser, so a line number one side copied from
+    a numbered region and the other did not is not a change of intent."""
+    from backend.core.ouroboros.governance.diff_apply import parse_unified_hunks
+    return tuple(
+        f"{kind}{text.rstrip(chr(13) + chr(10))}"
+        for _start, ops in parse_unified_hunks(diff_text or "")
+        for kind, text in ops if kind in ("+", "-")
+    )
 
 
 def intent_preserved(original_diff: str, healed_diff: str) -> bool:
@@ -111,7 +112,7 @@ def _region(source: str, rejection: str, radius: int) -> str:
     centre = int(m.group(1)) if m else 1
     lo = max(0, centre - radius)
     hi = min(len(lines), centre + radius)
-    return "\n".join(f"{i + 1:>5} | {lines[i]}" for i in range(lo, hi))
+    return "\n".join(source_lines.number_lines(lines[lo:hi], lo + 1))
 
 
 def build_alignment_prompt(

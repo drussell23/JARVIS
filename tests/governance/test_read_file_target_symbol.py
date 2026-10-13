@@ -382,7 +382,7 @@ def test_legacy_read_file_unchanged(
     assert "(lines 1-" in result
     assert "of " in result
     # All numbered lines.
-    assert "1: " in result
+    assert "1│" in result  # source_lines format
 
 
 def test_legacy_lines_range_unchanged(

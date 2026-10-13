@@ -44,6 +44,8 @@ from backend.core.ouroboros.governance.ast_slicer import (
     TokenCounterProtocol,
 )
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 # ---------------------------------------------------------------------------
 # Stub TokenCounter — we don't need tiktoken for behavior tests; the
@@ -464,7 +466,7 @@ def test_smart_context_module_no_longer_defines_ast_chunker() -> None:
     """The old definition is gone — no shadow class lurking in
     smart_context.py."""
     src = Path(
-        "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/backend/core/smart_context.py"
+        f"{_REPO_ROOT}/backend/core/smart_context.py"
     ).read_text(encoding="utf-8")
     # Only the re-export remains; no `class ASTChunker:` definition.
     assert "class ASTChunker:" not in src

@@ -72,6 +72,27 @@ class RiskTier(Enum):
     ORDER_2_GOVERNANCE = auto()
 
 
+def tier_name(risk_tier: "RiskTier | str | None") -> str:
+    """The one lower-case spelling of a tier: ``"safe_auto"`` etc.
+
+    A ``RiskTier`` is spelled by its NAME (its values are ``auto()`` ints).
+    Strings are accepted as already-spelled tiers; ``None`` is ``"unknown"``.
+    Anything else is a caller bug and raises rather than being judged under a
+    made-up tier. Self-critique once declared ``str`` and called ``.lower()``
+    on the enum ``OperationContext.risk_tier`` carries, and died on every op
+    (soak bt-2026-10-10-201126: 38 of 38) behind a DEBUG log.
+    """
+    if risk_tier is None:
+        return "unknown"
+    if isinstance(risk_tier, Enum):
+        return risk_tier.name.lower()
+    if isinstance(risk_tier, str):
+        return risk_tier.strip().lower() or "unknown"
+    raise TypeError(
+        f"risk_tier must be a RiskTier, str or None, not {type(risk_tier).__name__}"
+    )
+
+
 class ChangeType(Enum):
     """Kind of filesystem mutation the operation performs."""
 

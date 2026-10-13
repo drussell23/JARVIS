@@ -263,5 +263,6 @@ def test_the_repair_loop_reads_replies_against_the_window_it_rendered():
     first, last = L._window(_ORIG, err)
     prompt = L._build_micro_prompt("tests/test_x.py", _ORIG, err)
     assert f'"start_line": {first}, "end_line": {last}' in prompt
-    assert f"{first:4d} | " in prompt and f"{last:4d} | " in prompt
-    assert f"{last + 1:4d} | " not in prompt
+    # source_lines format: `<n>│` (right-aligned to the window's widest number)
+    assert f"{first}│" in prompt and f"{last}│" in prompt
+    assert f"{last + 1}│" not in prompt

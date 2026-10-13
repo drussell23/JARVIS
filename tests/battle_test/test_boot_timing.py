@@ -18,7 +18,7 @@ from backend.core.ouroboros.battle_test.boot_timing import (
 )
 
 
-_REPO = Path("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent")
+_REPO = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture(autouse=True)

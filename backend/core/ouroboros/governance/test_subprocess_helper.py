@@ -93,7 +93,7 @@ import signal
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 logger = logging.getLogger("Ouroboros.PytestHelper")
@@ -233,6 +233,19 @@ def _killpg_safe(pid: int) -> None:
     reap_session(pid, owner="pytest")
 
 
+def _child_env(env: Optional[Mapping[str, str]]) -> Dict[str, str]:
+    """What the child sees. An explicit *env* is used exactly as given; the
+    inherited one is the parent's MINUS the production envelope, so a test run
+    under the organism answers what the same run answers in CI (see
+    ``production_envelope.environ_for_tests``)."""
+    if env is not None:
+        return dict(env)
+    from backend.core.ouroboros.governance.production_envelope import (  # noqa: PLC0415
+        environ_for_tests,
+    )
+    return environ_for_tests()
+
+
 # ============================================================================
 # Public surface — run_pytest_subprocess
 # ============================================================================
@@ -276,8 +289,8 @@ async def run_pytest_subprocess(
         the result. Operators grep ``[PytestHelper] caller=<X>``
         to find every spawn site of pytest in the session.
     env:
-        Optional environment overrides. ``None`` inherits the
-        parent's environment.
+        Optional environment, used exactly as given. ``None`` inherits
+        the parent's environment minus the production envelope.
     output_cap_chars:
         Maximum number of characters retained in
         ``result.stdout``. Default 200_000 (≈ a few hundred KB of
@@ -329,7 +342,7 @@ async def run_pytest_subprocess(
             stderr=asyncio.subprocess.STDOUT,
             stdin=asyncio.subprocess.DEVNULL,
             cwd=cwd,
-            env=dict(env) if env is not None else None,
+            env=_child_env(env),
             # POSIX-only: place child in its own session so we can
             # killpg() the entire descendant tree (pytest-xdist
             # workers etc.). On non-POSIX this kwarg is silently
@@ -557,7 +570,7 @@ def run_pytest_subprocess_sync(
             text=True,
             timeout=float(timeout_s),
             cwd=cwd,
-            env=dict(env) if env is not None else None,
+            env=_child_env(env),
             stdin=_subprocess.DEVNULL,
             start_new_session=True,
         )

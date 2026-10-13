@@ -44,7 +44,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger("Ouroboros.LaneAdmission")
 
-__all__ = ["LaneAdmission", "read_admission", "await_admission", "describe", "EXIT_LANE_LENT"]
+__all__ = ["LaneAdmission", "read_admission", "await_admission", "describe", "lock_title",
+           "lock_lines", "EXIT_LANE_LENT"]
 
 #: POSIX ``sysexits.h`` EX_UNAVAILABLE: a service this program needs is not
 #: available right now. Distinct from EX_CONFIG (78, nothing resolves on its
@@ -186,6 +187,54 @@ def _who(adm: LaneAdmission) -> str:
     if adm.holder:
         return f"{adm.holder} ({adm.engine_state})"
     return f"engine {adm.engine_state}"
+
+
+def lock_title(adm: LaneAdmission) -> str:
+    """``System locked: VRAM leased to Reactor training`` -- who has the card."""
+    cyc = adm.cycle or {}
+    if cyc.get("holds_lane"):
+        what = (f"GPU job ({cyc['purpose']})" if cyc.get("purpose")
+                else "Reactor training" if str(cyc.get("run_id") or "").startswith("handoff-")
+                else f"GPU job {cyc.get('run_id')}")
+    else:
+        what = adm.holder or f"engine ({adm.engine_state})"
+    return f"System locked: VRAM leased to {what}"
+
+
+def _tail(path: str, n: int, *, max_bytes: int = 65536) -> List[str]:
+    """The last *n* non-empty lines of a log a trainer is still writing.
+    A progress bar rewrites one line with ``\\r``; its last state is the line."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            text = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    lines = [ln.split("\r")[-1].rstrip() for ln in text.split("\n")]
+    return [ln for ln in lines if ln.strip()][-n:] if n > 0 else []
+
+
+def lock_lines(adm: LaneAdmission, *, tail: int, now: Optional[float] = None) -> List[str]:
+    """The lock block's body: who holds the card and until when, then the
+    live log the holder is writing. Static in shape -- the caller renders
+    it in a fixed-height region and re-reads it on its own cadence."""
+    body = describe(adm, now=now)[1:-2]        # the facts, without the boot advice
+    cyc = adm.cycle or {}
+    log = cyc.get("log")
+    body.append("")
+    if log:
+        body.append(f"  ── {log}")
+        got = ["  " + ln for ln in _tail(str(log), tail)]
+        # Fixed height: a Live region that grows as the log fills repaints
+        # by scrolling, which is the jump the boot transcript pads against.
+        body.extend(got + [""] * (max(0, tail) - len(got)))
+    else:
+        body.append(f"  ── {cyc.get('state') or adm.engine_state}: no log to follow")
+    body.append("")
+    body.append("  The organism starts by itself when the card comes back. Ctrl-C leaves.")
+    return body
 
 
 def describe(adm: LaneAdmission, *, now: Optional[float] = None) -> List[str]:

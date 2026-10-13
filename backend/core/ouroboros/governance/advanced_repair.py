@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from backend.core.ouroboros.governance import source_lines
+
 logger = logging.getLogger(__name__)
 
 
@@ -98,10 +100,8 @@ class HierarchicalFaultLocalizer:
                     # Stage 3: Extract focused context (±5 lines around function)
                     ctx_start = max(0, start - 1)
                     ctx_end = min(len(lines), end + 1)
-                    snippet = "\n".join(
-                        f"{i + ctx_start + 1:4d} | {line}"
-                        for i, line in enumerate(lines[ctx_start:ctx_end])
-                    )
+                    snippet = "\n".join(source_lines.number_lines(
+                        lines[ctx_start:ctx_end], ctx_start + 1))
                     locations.append(FaultLocation(
                         file_path=rel_path,
                         function_name=func_name,

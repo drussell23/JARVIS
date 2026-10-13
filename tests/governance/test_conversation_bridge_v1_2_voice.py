@@ -41,6 +41,8 @@ from backend.core.ouroboros.governance.conversation_bridge import (
     reset_default_bridge,
 )
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 # ---------------------------------------------------------------------------
 # Isolation
@@ -328,7 +330,7 @@ class TestVoiceBridgeWiring:
 
     def test_voice_bridge_imports_record_voice_transcript(self):
         path = Path(
-            "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/"
+            f"{_REPO_ROOT}/"
             "backend/voice/jarvis_voice_bridge.py",
         )
         src = path.read_text(encoding="utf-8")
@@ -342,7 +344,7 @@ class TestVoiceBridgeWiring:
 
     def test_voice_bridge_calls_record_inside_on_transcript(self):
         path = Path(
-            "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/"
+            f"{_REPO_ROOT}/"
             "backend/voice/jarvis_voice_bridge.py",
         )
         src = path.read_text(encoding="utf-8")

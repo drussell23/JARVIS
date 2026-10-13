@@ -312,18 +312,18 @@ class TestIsSafePathHelper:
     """Unit tests for the _is_safe_path security helper."""
 
     def test_path_inside_repo_is_safe(self) -> None:
-        repo = Path("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent")
+        repo = Path(__file__).resolve().parents[3]
         inside = repo / "backend" / "core" / "foo.py"
         assert _is_safe_path(inside, repo) is True
 
     def test_tmp_path_is_safe(self, tmp_path) -> None:
         tmp = tmp_path / "test_safe_check.py"
         tmp.write_text("# safe check\n")
-        repo = Path("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent")
+        repo = Path(__file__).resolve().parents[3]
         assert _is_safe_path(tmp, repo) is True
 
     def test_outside_path_is_unsafe(self) -> None:
-        repo = Path("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent")
+        repo = Path(__file__).resolve().parents[3]
         outside = Path("/etc/passwd")
         assert _is_safe_path(outside, repo) is False
 

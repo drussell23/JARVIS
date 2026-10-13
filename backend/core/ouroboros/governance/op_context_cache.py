@@ -48,6 +48,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from backend.core.ouroboros.governance import source_lines
+
 logger = logging.getLogger("Ouroboros.OpContextCache")
 
 __all__ = ["enabled", "note_mutation", "opening", "pin_failed_hunk", "record",
@@ -255,7 +257,7 @@ def _pinned_region(repo_root: Path, path: str, line: int) -> str:
     except OSError:
         return ""
     lo, hi = max(1, line - half), min(len(lines), line + half)
-    body = "\n".join(f"{i:>5}  {lines[i - 1]}" for i in range(lo, hi + 1))
+    body = "\n".join(source_lines.number_lines(lines[lo - 1:hi], lo))
     return (f"[CURRENT SOURCE] {path} lines {lo}-{hi} (read now; your rejected hunk "
             f"was aimed here — copy context lines EXACTLY from this)\n{body}\n[END CURRENT SOURCE]\n")
 
