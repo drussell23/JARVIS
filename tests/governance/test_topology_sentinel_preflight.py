@@ -284,7 +284,7 @@ def test_harness_env_forwards_sentinel_master_flag(
     harness builds env, subprocess sees it."""
     monkeypatch.setenv("JARVIS_TOPOLOGY_SENTINEL_ENABLED", "true")
     h = lfs.LiveFireSoakHarness(
-        project_root=Path("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent"),
+        project_root=Path(__file__).resolve().parents[2],
     )
     env = h._build_env_for_flag("JARVIS_DECISION_TRACE_LEDGER_ENABLED")
     assert env.get("JARVIS_TOPOLOGY_SENTINEL_ENABLED") == "true"
@@ -298,7 +298,7 @@ def test_harness_env_does_not_inject_sentinel_when_unset(
     handles it. Forwarding ≠ defaulting."""
     monkeypatch.delenv("JARVIS_TOPOLOGY_SENTINEL_ENABLED", raising=False)
     h = lfs.LiveFireSoakHarness(
-        project_root=Path("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent"),
+        project_root=Path(__file__).resolve().parents[2],
     )
     env = h._build_env_for_flag("JARVIS_DECISION_TRACE_LEDGER_ENABLED")
     assert "JARVIS_TOPOLOGY_SENTINEL_ENABLED" not in env or (
@@ -311,7 +311,7 @@ def test_harness_env_forwards_force_severed(
 ) -> None:
     monkeypatch.setenv("JARVIS_TOPOLOGY_FORCE_SEVERED", "true")
     h = lfs.LiveFireSoakHarness(
-        project_root=Path("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent"),
+        project_root=Path(__file__).resolve().parents[2],
     )
     env = h._build_env_for_flag("JARVIS_DECISION_TRACE_LEDGER_ENABLED")
     assert env.get("JARVIS_TOPOLOGY_FORCE_SEVERED") == "true"
@@ -324,7 +324,7 @@ def test_harness_env_forwards_state_dir(
         "JARVIS_TOPOLOGY_SENTINEL_STATE_DIR", str(tmp_path),
     )
     h = lfs.LiveFireSoakHarness(
-        project_root=Path("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent"),
+        project_root=Path(__file__).resolve().parents[2],
     )
     env = h._build_env_for_flag("JARVIS_DECISION_TRACE_LEDGER_ENABLED")
     assert env.get("JARVIS_TOPOLOGY_SENTINEL_STATE_DIR") == str(tmp_path)
@@ -339,7 +339,7 @@ def test_harness_env_forwards_every_propagated_var(
     for name in ts.sentinel_propagated_vars():
         monkeypatch.setenv(name, f"{sentinel_value}-{name}")
     h = lfs.LiveFireSoakHarness(
-        project_root=Path("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent"),
+        project_root=Path(__file__).resolve().parents[2],
     )
     env = h._build_env_for_flag("JARVIS_DECISION_TRACE_LEDGER_ENABLED")
     for name in ts.sentinel_propagated_vars():

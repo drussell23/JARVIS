@@ -102,7 +102,7 @@ def _get_validator(name: str):
 
 
 def _load(rel_path: str):
-    repo = Path("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent")
+    repo = Path(__file__).resolve().parents[2]
     src = (repo / rel_path).read_text()
     return ast.parse(src), src
 

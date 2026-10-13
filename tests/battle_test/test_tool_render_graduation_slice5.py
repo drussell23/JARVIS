@@ -125,9 +125,7 @@ def test_register_shipped_invariants_returns_three():
 
 def test_register_shipped_invariants_target_files_resolve():
     """Every pin's target_file must be a real path in the repo."""
-    repo_root = Path(
-        "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent"
-    )
+    repo_root = Path(__file__).resolve().parents[2]
     for inv in register_shipped_invariants():
         full = repo_root / inv.target_file
         assert full.is_file(), f"{inv.invariant_name} → {full} not found"
@@ -140,9 +138,7 @@ def test_register_shipped_invariants_target_files_resolve():
 
 def _load_ast(rel_path: str) -> tuple:
     """Helper: load (tree, source) for a repo-relative path."""
-    repo_root = Path(
-        "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent"
-    )
+    repo_root = Path(__file__).resolve().parents[2]
     src = (repo_root / rel_path).read_text()
     return ast.parse(src), src
 

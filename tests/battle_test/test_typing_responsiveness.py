@@ -37,7 +37,7 @@ from backend.core.ouroboros.battle_test.live_status_line import (
 )
 
 
-_REPO = Path("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent")
+_REPO = Path(__file__).resolve().parents[2]
 
 
 # ===========================================================================

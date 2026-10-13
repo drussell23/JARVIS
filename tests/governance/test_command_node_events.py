@@ -13,9 +13,13 @@ Covers:
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 # ---------------------------------------------------------------------------
@@ -312,8 +316,8 @@ def test_blast_radius_endpoint_authority_free():
     """
     import ast
     obs_path = (
-        "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/"
-        ".claude/worktrees/command-node-phase1/backend/core/"
+        f"{_REPO_ROOT}/"
+        "backend/core/"
         "ouroboros/governance/ide_observability.py"
     )
     with open(obs_path) as f:
@@ -378,8 +382,8 @@ def test_new_event_types_are_additive():
 def test_blast_radius_route_registered():
     """Confirms the route /observability/blast-radius/{op_id} is registered."""
     path = (
-        "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/"
-        ".claude/worktrees/command-node-phase1/backend/core/"
+        f"{_REPO_ROOT}/"
+        "backend/core/"
         "ouroboros/governance/ide_observability.py"
     )
     with open(path) as f:
@@ -446,8 +450,8 @@ def test_publish_helpers_importable():
 def test_convergence_watchdog_uses_publish_sovereign_yield():
     """Confirms the upgrade in convergence_watchdog.emit_sovereign_yield."""
     path = (
-        "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/"
-        ".claude/worktrees/command-node-phase1/backend/core/"
+        f"{_REPO_ROOT}/"
+        "backend/core/"
         "ouroboros/governance/convergence_watchdog.py"
     )
     with open(path) as f:

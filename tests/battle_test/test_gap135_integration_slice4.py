@@ -6,6 +6,8 @@ and cleanup paths (discard_active for cancelled ops).
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import threading
 from unittest import mock
 
@@ -23,6 +25,8 @@ from backend.core.ouroboros.battle_test.op_block_buffer import (
     OpBlockState,
     reset_default_buffer_for_tests,
 )
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture(autouse=True)
@@ -66,7 +70,7 @@ def test_op_collapse_default_off_buffer_unused(monkeypatch):
     # source. (Direct invocation requires Console+prompt_toolkit
     # construction.)
     src = open(
-        "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/"
+        f"{_REPO_ROOT}/"
         "backend/core/ouroboros/battle_test/serpent_flow.py"
     ).read()
     assert "_op_collapse_enabled" in src
@@ -196,7 +200,7 @@ def test_both_master_flags_off_yields_full_legacy(monkeypatch):
     assert status_line_enabled() is False
     # Op collapse flag also OFF (verified at source level)
     src = open(
-        "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/"
+        f"{_REPO_ROOT}/"
         "backend/core/ouroboros/battle_test/serpent_flow.py"
     ).read()
     assert "_op_collapse_enabled" in src

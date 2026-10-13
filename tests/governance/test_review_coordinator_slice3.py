@@ -32,6 +32,8 @@ from backend.core.ouroboros.governance.review_coordinator import (
     reset_default_coordinator_for_tests,
 )
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 # ===========================================================================
 # Fixtures
@@ -473,7 +475,7 @@ def test_orchestrator_notify_apply_block_contains_review_hook():
     refactor that removes it would silently regress the IDE-native
     review flow."""
     src = open(
-        "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/"
+        f"{_REPO_ROOT}/"
         "backend/core/ouroboros/governance/orchestrator.py"
     ).read()
     # Slice 3 marker comment + key imports + the coordinator call
