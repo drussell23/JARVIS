@@ -20,6 +20,21 @@ def _blk(op, phase="GENERATE"):
     return SimpleNamespace(op_id=op, meta={"phase": phase})
 
 
+def test_the_buffer_is_markup_a_raw_line_stays_literal_and_markup_renders():
+    """/bg renders the buffer as markup. A raw line is inert data (escaped
+    on entry, so its brackets print literally); a markup frame keeps its
+    styling instead of printing as tag source."""
+    from rich.text import Text
+
+    r = _router()
+    r.apply_mode({"session": "s-1"})
+    r.route_line("list[int] [bold]not styling[/bold]")
+    r.route_markup("[cyan]●[/] [bold]Operation[/bold]", addressed=False)
+    raw, styled = (Text.from_markup(x) for x in r.background())
+    assert raw.plain == "list[int] [bold]not styling[/bold]"
+    assert styled.plain == "● Operation" and styled.spans
+
+
 def test_outside_a_session_nothing_changes():
     r = _router()
     assert r.route_markup("anything", addressed=False) == TRANSCRIPT

@@ -12,7 +12,9 @@ session every frame goes where it always has. Inside one:
 
 Sidelined frames are buffered (bounded) and summarized in ONE live row;
 ``/bg`` reads the buffer and leaving the session replays a collapsed digest
-once. Invariant 3: each frame is routed exactly once, and the counters
+once. The buffer holds MARKUP: markup frames and block lines as composed,
+raw ``line`` frames escaped on the way in (they are inert data), so a
+reader renders every entry one way. Invariant 3: each frame is routed exactly once, and the counters
 account for every sidelined frame even after the buffer wraps.
 
 The cockpit's sinks (markup, raw line, frozen block, live blocks) all ask
@@ -113,7 +115,13 @@ class SessionRouter:
         return SIDELINE
 
     def route_line(self, text: str) -> str:
-        """A raw ``line`` frame: never addressed."""
+        """A raw ``line`` frame: never addressed, and inert data -- escaped
+        before it joins the markup buffer."""
+        try:
+            from rich.markup import escape
+            text = escape(str(text))
+        except Exception:  # noqa: BLE001
+            pass
         return self.route_markup(text, addressed=False)
 
     def route_block(self, op_id: str, lines: Iterable[str], *, finished: bool = False) -> str:

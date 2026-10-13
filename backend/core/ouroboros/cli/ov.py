@@ -2906,9 +2906,10 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
         if low in ("/bg", "bg"):
             router = getattr(ui, "session_router", None) if ui is not None else None
             lines = router.background() if router is not None else []
-            from rich.markup import escape as _esc
+            # The buffer is markup (raw lines were escaped on entry);
+            # _render_markup_frame validates and escapes anything malformed.
             for _l in lines or ["(nothing in the background)"]:
-                _render_markup_frame(_esc(str(_l)))
+                _render_markup_frame(str(_l))
             _report_local_history(client, text)
             return "handled"
 
@@ -5153,9 +5154,8 @@ def run_attach(console: Any) -> int:
             """Entered / left / changed a /session (daemon-addressed). Leaving
             replays the background digest ONCE, then the live area redraws."""
             replay = router.apply_mode(dict(frame or {}))
-            from rich.markup import escape
             for _l in replay or []:
-                _render_markup_frame(escape(_l), console)
+                _render_markup_frame(str(_l), console)
             _show_live(block_store.live())
 
         ui.session_router = router
