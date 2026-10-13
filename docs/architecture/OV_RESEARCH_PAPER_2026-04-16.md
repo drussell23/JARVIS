@@ -9673,7 +9673,7 @@ The responses:
 - Cold load 15 s to 18.9 GiB resident.
 - The lease verifiably releases 21,236 MiB for training.
 
-JARVIS boot now brings up J-Prime and Reactor itself (`e05fe5b1ab`). Since 2026-10-10 local concurrency follows the engine's reported slot count (`fadde8d9c4`†). A slot sweep measured aggregate throughput of 124 / 165 / 177 tok/s at 1 / 2 / 3 slots, so the knee is at 2. The vision model (`jarvis-vision:8b`) is declared in J-Prime, but at the time of writing is still partly served by Ollama.
+JARVIS boot now brings up J-Prime and Reactor itself (`e05fe5b1ab`). Since 2026-10-10 local concurrency follows the engine's reported slot count (`fadde8d9c4`†). A slot sweep measured aggregate throughput of 124 / 165 / 177 tok/s at 1 / 2 / 3 slots, so the knee is at 2. The sweep's one-slot figure (124 tok/s) is lower than the 172 tok/s decode p50 above because the two were measured differently. The sweep used one fixed 11,159-token prompt with 768-token outputs. The p50 comes from 337 real O+V requests of mixed length. A longer context makes every decode step more expensive, which is the likely cause of the gap. Compare figures within one of these measurements, not across them. The vision model (`jarvis-vision:8b`) is declared in J-Prime, but at the time of writing is still partly served by Ollama.
 
 <!-- engage:begin -->
 <div class="quick-check" id="qc-93-6">
@@ -10007,6 +10007,8 @@ The formal questions of §92.12 are unchanged. The engineering since then has mo
 | Part XI: the battle-test runner as the way to operate O+V | The engine remains; the operator surface is the `ov` cockpit (§93.9). |
 | §92.4: 0/38 adversarial escapes | Stands for that curated set; the at-scale mutation measurement is about 8.8% (§93.3). |
 | §92.18: autonomous commits limited to ledger writes | 91 autonomous landings since, 5 of them production code (§93.10); still Mechanic. |
+| §86 is titled "The Twelve-Commit Arc", while §91 says the arc "shipped 14 commits" | The §86 table has twelve numbered steps, and step 12 has four commits (12a–12d), so the arc is **15 commits**. "Twelve" counts the steps and "14" is a miscount. |
+| §52.5: an exploration-first violation "produce[s] a warning" at VALIDATE | Superseded by §47.2, which matches the code: the check runs after GENERATE, raises `ExplorationInsufficientError` and sends the operation to `GENERATE_RETRY` with feedback (`phase_runners/generate_runner.py`). It is a hard gate, not a warning. |
 
 <!-- engage:begin -->
 <div class="quick-check" id="qc-93-16">
