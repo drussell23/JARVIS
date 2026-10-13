@@ -1885,6 +1885,27 @@ class LocalPrimeClient:
                        sampling: "Optional[Any]" = None,
                        response_format: Any = RESPONSE_FORMAT_LADDER,
                        on_token: "Optional[Any]" = None) -> LocalCompletion:
+        """One request to the local engine, admitted through the foreground
+        reservation (governance/generation_admission): every local
+        generation in the process passes here, so a /session turn keeps a
+        slot across its rounds without touching background work in flight."""
+        from backend.core.ouroboros.governance.generation_admission import admission
+        async with admission().generation(str(getattr(self._cfg, "base_url", "") or "")):
+            return await self._complete_unadmitted(
+                system=system, user=user, prompt_tokens=prompt_tokens,
+                temperature=temperature, max_tokens=max_tokens, stream=stream,
+                prefill=prefill, sampling=sampling, response_format=response_format,
+                on_token=on_token,
+            )
+
+    async def _complete_unadmitted(self, *, system: str, user: str, prompt_tokens: int,
+                                   temperature: float = 0.2,
+                                   max_tokens: "Optional[int]" = None,
+                                   stream: "Optional[bool]" = None,
+                                   prefill: str = "",
+                                   sampling: "Optional[Any]" = None,
+                                   response_format: Any = RESPONSE_FORMAT_LADDER,
+                                   on_token: "Optional[Any]" = None) -> LocalCompletion:
         sess = await self._ensure_session()
         url = chat_endpoint(self._cfg)
         # Dynamic Cognitive Compression + num_ctx injection (Context-Hardware

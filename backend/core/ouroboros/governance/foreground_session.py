@@ -456,16 +456,23 @@ class SessionManager:
             from backend.core.ouroboros.governance.providers import (  # noqa: PLC0415
                 _build_tool_section, _parse_tool_call_response,
             )
-            coordinator = self._coordinator(on_tool_call)
-            final, records = await coordinator.run(
-                prompt=prompt + "\n\n" + _build_tool_section(),
-                generate_fn=self._generate,
-                parse_fn=_parse_tool_call_response,
-                repo="jarvis",
-                op_id=f"session-{s.id}-t{len(s.turns) + 1}",
-                deadline=time.monotonic() + turn_timeout_s(),
-                is_read_only=True,
+            from backend.core.ouroboros.governance.generation_admission import (  # noqa: PLC0415
+                admission,
             )
+            coordinator = self._coordinator(on_tool_call)
+            # The reservation is held for the WHOLE turn: between rounds the
+            # slot is not handed to a background generation (FOREGROUND_SESSION
+            # §5). Released on every exit, including cancel and timeout.
+            async with admission().foreground_turn():
+                final, records = await coordinator.run(
+                    prompt=prompt + "\n\n" + _build_tool_section(),
+                    generate_fn=self._generate,
+                    parse_fn=_parse_tool_call_response,
+                    repo="jarvis",
+                    op_id=f"session-{s.id}-t{len(s.turns) + 1}",
+                    deadline=time.monotonic() + turn_timeout_s(),
+                    is_read_only=True,
+                )
             turn.records = list(records or [])
             turn.proposal = parse_proposal(final)
             turn.answer = "" if turn.proposal is not None else str(final or "")
