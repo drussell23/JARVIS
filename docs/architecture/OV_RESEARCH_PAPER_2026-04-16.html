@@ -15517,7 +15517,13 @@ context (J-Prime <code>BENCHMARKS.md</code>†):</p>
 (<code>e05fe5b1ab</code>). Since 2026-10-10 local concurrency follows
 the engine&#39;s reported slot count (<code>fadde8d9c4</code>†). A slot
 sweep measured aggregate throughput of 124 / 165 / 177 tok/s at 1 / 2 /
-3 slots, so the knee is at 2. The vision model
+3 slots, so the knee is at 2. The sweep&#39;s one-slot figure (124 tok/s) is
+lower than the 172 tok/s decode p50 above because the two were measured
+differently. The sweep used one fixed 11,159-token prompt with 768-token
+outputs. The p50 comes from 337 real O+V requests of mixed length. A
+longer context makes every decode step more expensive, which is the
+likely cause of the gap. Compare figures within one of these
+measurements, not across them. The vision model
 (<code>jarvis-vision:8b</code>) is declared in J-Prime, but at the time
 of writing is still partly served by Ollama.</p>
 <!-- engage:begin -->
@@ -16251,6 +16257,22 @@ about 8.8% (§93.3).</td>
 <td>§92.18: autonomous commits limited to ledger writes</td>
 <td>91 autonomous landings since, 5 of them production code (§93.10);
 still Mechanic.</td>
+</tr>
+<tr>
+<td>§86 is titled &quot;The Twelve-Commit Arc&quot;, while §91 says the arc
+&quot;shipped 14 commits&quot;</td>
+<td>The §86 table has twelve numbered steps, and step 12 has four
+commits (12a–12d), so the arc is <strong>15 commits</strong>. &quot;Twelve&quot;
+counts the steps and &quot;14&quot; is a miscount.</td>
+</tr>
+<tr>
+<td>§52.5: an exploration-first violation &quot;produce[s] a warning&quot; at
+VALIDATE</td>
+<td>Superseded by §47.2, which matches the code: the check runs after
+GENERATE, raises <code>ExplorationInsufficientError</code> and sends the
+operation to <code>GENERATE_RETRY</code> with feedback
+(<code>phase_runners/generate_runner.py</code>). It is a hard gate, not
+a warning.</td>
 </tr>
 </tbody>
 </table>
