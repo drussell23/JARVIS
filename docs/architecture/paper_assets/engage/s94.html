@@ -81,7 +81,7 @@
 </details>
 </div>
 <div class="mcq" data-answer="2">
-<p class="mcq-q">4. Running <code>strategic_direction.py</code>'s own extractors on the current README shows the organism is told six principle titles, not seven. Which one is missing, and why?</p>
+<p class="mcq-q">4. Running <code>strategic_direction.py</code>'s own extractors on the 2026-10-13 README, before the same-day fix, showed the organism was told six principle titles, not seven. Which one is missing, and why?</p>
 <ol class="mcq-options" type="A">
 <li>Principle 1, because its marker is matched by the manifesto heading</li>
 <li>Principle 7, because it now begins past the 20,000-character window</li>
@@ -119,7 +119,7 @@
 </details>
 </div>
 <div class="problem">
-<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/strategic_direction.py</code> and read <code>_MAX_DOC_CHARS</code>, <code>_extract_principles</code> and <code>_extract_manifesto</code>. Find (a) the line that makes Principle 7 invisible once the README grows, (b) the end marker that truncates the manifesto, and why <code>find</code> matches it inside a <code>"### "</code> heading, and (c) a fix consistent with §94.9's description. What does the organism lose from its prompts because of these two defects?</p>
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/strategic_direction.py</code> as it was at <code>21634caddb</code> (before the fix described in §94.9) and read <code>_MAX_DOC_CHARS</code>, <code>_extract_principles</code> and <code>_extract_manifesto</code>. Find (a) the line that makes Principle 7 invisible once the README grows, (b) the end marker that truncates the manifesto, and why <code>find</code> matches it inside a <code>"### "</code> heading, and (c) a fix consistent with §94.9's description. What does the organism lose from its prompts because of these two defects?</p>
 <details class="problem-hint"><summary>Hint</summary>
 <p>Look at what slice of <code>readme_content</code> the principle regex iterates over, and at the third entry of <code>end_markers</code>. A string search for "## " does not care what character precedes it.</p>
 </details>

@@ -16793,7 +16793,10 @@ the organism&#39;s prompts</td>
 (2026-10-13): <code>strategic_direction.py</code> extracts 6 principle
 titles (Principle 7 now lies past its 20,000-character window) and a
 464-character opening paragraph (its <code>&quot;## &quot;</code> end marker
-matches inside <code>&quot;### &quot;</code>). See §94.9.</td>
+matches inside <code>&quot;### &quot;</code>). See §94.9. <strong>Fixed the same
+day</strong> in <code>078e21da7c</code> (PR #70697): the section is
+located by headings and the principles are matched inside it, so all
+seven are injected.</td>
 </tr>
 </tbody>
 </table>
@@ -17339,10 +17342,11 @@ converter</td>
 <p>The names are not used consistently, and a reader of the repositories
 will meet all of them. Reactor is the &quot;Soul&quot; in <code>CLAUDE.md</code>
 and the README&#39;s generated table. It is the &quot;Nerves&quot; in
-<code>TRINITY_MANIFESTO.md</code>, in both sibling READMEs and in O+V&#39;s
-own bring-up code (<code>trinity_siblings.py</code>). It is the &quot;Immune
-system / Sandbox&quot; in older parts of the JARVIS README. This paper uses
-Body, Mind and Soul.</p>
+<code>TRINITY_MANIFESTO.md</code> and in O+V&#39;s own bring-up code
+(<code>trinity_siblings.py</code>), and it was the &quot;Nerves&quot; in both
+sibling READMEs and the &quot;Immune system / Sandbox&quot; in the JARVIS README
+until all three were rewritten on 2026-10-13. This paper uses Body, Mind
+and Soul.</p>
 <p><strong>Scale.</strong> The figures below are tracked source on
 <code>origin/main</code>.</p>
 <table>
@@ -17474,9 +17478,11 @@ practice, not yet.</p>
 to a <code>VoiceCommandSensor</code>, which the intake layer constructs
 and the supervisor binds to the voice bridge. The intake router maps the
 <code>voice_human</code> source to it.</li>
-<li>The README says plainly that the voice loop &quot;has never completed a
-full cycle in production&quot;, and lists &quot;voice as an intake channel into
-the 11-phase pipeline&quot; as <em>next</em>.</li>
+<li>The README before its 2026-10-13 rewrite (at
+<code>21634caddb</code>) said plainly that the voice loop &quot;has never
+completed a full cycle in production&quot;, and listed &quot;voice as an intake
+channel into the 11-phase pipeline&quot; as <em>next</em>. Nothing since has
+changed that.</li>
 <li>What works today is typed: <code>/goal sanction</code> and
 <code>/goal inject</code> in the cockpit (§93.7), and ordinary cockpit
 conversation, which becomes an intake envelope with source
@@ -17607,8 +17613,9 @@ when a candidate actually <em>runs</em>.</p>
 
 <h3 id="945-j-prime--the-mind">§94.5 J-Prime — the Mind</h3>
 <p><strong>From cloud to card.</strong> In April, J-Prime was a GCP
-virtual machine. Its README still describes eleven CPU-served models on
-a GCP &quot;Invincible Node&quot;, and in the provider cascade it was a backup
+virtual machine. Until 2026-10-13 its README still described eleven
+CPU-served models on a GCP &quot;Invincible Node&quot; (it was rewritten that day
+to describe the engine), and in the provider cascade it was a backup
 behind DoubleWord and Claude (Part VI). Since 2026-10-07 J-Prime has
 been the <strong>J-Prime Engine</strong>,
 <code>jarvis_prime/engine/</code>, written in seven commits that day
@@ -17748,8 +17755,9 @@ always-on local lane.</p>
 <!-- engage:end -->
 
 <h3 id="946-reactor--the-soul">§94.6 Reactor — the Soul</h3>
-<p><strong>What it is.</strong> Reactor&#39;s README calls it &quot;the training
-and learning layer of the JARVIS AGI ecosystem&quot;. The part that runs is
+<p><strong>What it is.</strong> Reactor&#39;s earlier README called it &quot;the
+training and learning layer of the JARVIS AGI ecosystem&quot; (it was
+rewritten on 2026-10-13 around the GRPO path). The part that runs is
 newer and narrower: &quot;GRPO training over O+V telemetry — config,
 in-memory dataset, trainer&quot;
 (<code>reactor_core/training/grpo_pipeline.py</code>). Reactor is where
@@ -18268,11 +18276,17 @@ end marker was never written to tell headings apart.</li>
 </ul>
 <p>So the organism is told six principle titles and one paragraph, and
 the principle it is not told is the one about observability. This is
-recorded in §93.16. A README rewrite on the author&#39;s local branches
-(<code>docs/readme-overhaul</code>†) brings all seven principles back
-inside the window, but the end-marker defect would remain. The durable
-fix is in the extractor: select by heading rather than by a fixed
-window, and stop at the next heading of the same level.</p>
+recorded in §93.16. <strong>It was fixed the same day</strong>
+(<code>078e21da7c</code>, PR #70697) in the extractor, where the durable
+fix belongs: the manifesto section is now located by real Markdown
+headings, ending at the next heading of the same or a higher level
+(fenced code ignored), and the principles are matched inside it, with no
+fixed window. Measured after the fix: seven principles and a
+4,035-character excerpt from the same README, and seven principles and
+the whole 2,147-character manifesto section from the rewritten README
+that replaced it the same day (PR #70698). Seven regression tests pin
+the behaviour, one of them against the repository&#39;s own README, and they
+run in CI.</p>
 <p><strong>(b) North Star context: the definition of done, for dreaming
 only.</strong> <code>governance/north_star_context.py</code>
 (<code>797b52acf9</code>, July) reads the PRD and the North Star file.
@@ -18769,7 +18783,7 @@ Goal</h4>
 </details>
 </div>
 <div class="mcq" data-answer="2">
-<p class="mcq-q">4. Running <code>strategic_direction.py</code>&#39;s own extractors on the current README shows the organism is told six principle titles, not seven. Which one is missing, and why?</p>
+<p class="mcq-q">4. Running <code>strategic_direction.py</code>&#39;s own extractors on the 2026-10-13 README, before the same-day fix, showed the organism was told six principle titles, not seven. Which one is missing, and why?</p>
 <ol class="mcq-options" type="A">
 <li>Principle 1, because its marker is matched by the manifesto heading</li>
 <li>Principle 7, because it now begins past the 20,000-character window</li>
@@ -18807,7 +18821,7 @@ Goal</h4>
 </details>
 </div>
 <div class="problem">
-<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/strategic_direction.py</code> and read <code>_MAX_DOC_CHARS</code>, <code>_extract_principles</code> and <code>_extract_manifesto</code>. Find (a) the line that makes Principle 7 invisible once the README grows, (b) the end marker that truncates the manifesto, and why <code>find</code> matches it inside a <code>&quot;### &quot;</code> heading, and (c) a fix consistent with §94.9&#39;s description. What does the organism lose from its prompts because of these two defects?</p>
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/strategic_direction.py</code> as it was at <code>21634caddb</code> (before the fix described in §94.9) and read <code>_MAX_DOC_CHARS</code>, <code>_extract_principles</code> and <code>_extract_manifesto</code>. Find (a) the line that makes Principle 7 invisible once the README grows, (b) the end marker that truncates the manifesto, and why <code>find</code> matches it inside a <code>&quot;### &quot;</code> heading, and (c) a fix consistent with §94.9&#39;s description. What does the organism lose from its prompts because of these two defects?</p>
 <details class="problem-hint"><summary>Hint</summary>
 <p>Look at what slice of <code>readme_content</code> the principle regex iterates over, and at the third entry of <code>end_markers</code>. A string search for &quot;## &quot; does not care what character precedes it.</p>
 </details>
@@ -21602,7 +21616,7 @@ appear.</p>
 <p><strong>A.</strong> One 32 GB card cannot hold the 30B for inference and a GRPO step at the same time (<code>lease.py</code>), so J-Prime drains, proves the memory free with <code>nvidia-smi</code>, and lends it (§94.5).</p>
 <p class="ak-q">Quiz 3. Reactor&#39;s :8090 service goes down during a soak. What happens?</p>
 <p><strong>D.</strong> Reactor is not required. The recorder keeps writing to disk, and the receiver resumes from its persisted byte offsets when it returns (§94.7, §94.6).</p>
-<p class="ak-q">Quiz 4. Running <code>strategic_direction.py</code>&#39;s own extractors on the current README shows the organism is told six principle titles, not seven. Which one is missing, and why?</p>
+<p class="ak-q">Quiz 4. Running <code>strategic_direction.py</code>&#39;s own extractors on the 2026-10-13 README, before the same-day fix, showed the organism was told six principle titles, not seven. Which one is missing, and why?</p>
 <p><strong>B.</strong> <code>_extract_principles</code> scans only the first 20,000 characters, and Principle 7, <em>Absolute observability</em>, begins at character 24,496. The <code>&quot;## &quot;</code> marker is a separate defect: it truncates the manifesto text to 464 characters (§94.9).</p>
 <p class="ak-q"><strong>Problem 1 (trace).</strong> O+V generates a candidate test file for a signed goal; it passes, lands and survives. Follow that one candidate through all three loops of §94.7 until the model that wrote it has been retrained and the result could be published. At each boundary between subsystems, name the contract that carries it. Then say what happens if the handoff process dies after taking the lease.</p>
 <p><strong>Loop 1 (inference).</strong> The candidate generator routes to the local lane under the free-lane policy, and <code>LocalPrimeClient</code> calls J-Prime over the Ollama-native <code>/api/chat</code> or OpenAI <code>/v1/chat/completions</code>. Contract: the Ollama and OpenAI wire protocols. J-Prime answers with <code>qwen3-coder-ov:30b</code>, which is the base weights plus the active Reactor LoRA plus its sampling defaults (§94.5).</p>
@@ -21613,7 +21627,7 @@ appear.</p>
 <p>Threshold: 2 landings per hour. 09-26: 3 / 1.97 h ≈ 1.52 per hour. 10-04: 3 / 2.98 h ≈ 1.01. 10-05: 10 / 6.03 h ≈ 1.66. 10-08: 0 / 1.25 h = 0. 10-09: 51 merged in about 9 h ≈ 5.7 per hour.</p>
 <p>Only the 10-09 soak clears 2 per hour over its whole session; four of five fall below. That is what &quot;met in-window, not sustained&quot; means: the rate has been reached within a window but not held across sessions. The 10-05 soak also shows why &quot;sustained&quot; is hard: nothing landed from 22:24 to 00:29, which PRD §34 attributes to the supply wall (§93.10). Note too that the 10-09 row reports no substantive count, so its high rate is mostly tests for <code>backend/api/*</code>.</p>
 <p>The anti-goals in §6 list &quot;a smarter model&quot;, &quot;more model calls&quot; and &quot;shipping faster&quot; as things that do not by themselves count as progress (§94.8). A criterion is met by the observed outcome, sustained landed commits with a clean record, not by an input that might raise it. A faster or better model helps only if it moves the measured rate; and when yield is bounded by supply, it would not. The 2026-10-04 note adds the honest qualification that on the local 30B, model capability <em>is</em> a measured constraint, so it is not irrelevant, just not progress on its own.</p>
-<p class="ak-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/strategic_direction.py</code> and read <code>_MAX_DOC_CHARS</code>, <code>_extract_principles</code> and <code>_extract_manifesto</code>. Find (a) the line that makes Principle 7 invisible once the README grows, (b) the end marker that truncates the manifesto, and why <code>find</code> matches it inside a <code>&quot;### &quot;</code> heading, and (c) a fix consistent with §94.9&#39;s description. What does the organism lose from its prompts because of these two defects?</p>
+<p class="ak-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/strategic_direction.py</code> as it was at <code>21634caddb</code> (before the fix described in §94.9) and read <code>_MAX_DOC_CHARS</code>, <code>_extract_principles</code> and <code>_extract_manifesto</code>. Find (a) the line that makes Principle 7 invisible once the README grows, (b) the end marker that truncates the manifesto, and why <code>find</code> matches it inside a <code>&quot;### &quot;</code> heading, and (c) a fix consistent with §94.9&#39;s description. What does the organism lose from its prompts because of these two defects?</p>
 <p>(a) <code>_MAX_DOC_CHARS = 20_000</code>, and <code>_extract_principles</code> runs its <code>\*\*(\d+)\.\s+([^*]+)\*\*</code> pattern over <code>readme_content[:_MAX_DOC_CHARS]</code>. Any principle heading that starts after character 20,000 is never seen. §94.9 measured Principle 7 at character 24,496, so the list stops at six. The docstring still says &quot;Extract the 7 numbered principles&quot;.</p>
 <p>(b) <code>end_markers</code> contains <code>&quot;## &quot;</code>, commented &quot;next h2&quot;, and the code takes the earliest match after <code>start + 100</code>. But every level-3 heading, <code>&quot;### ...&quot;</code>, contains the substring <code>&quot;## &quot;</code> starting at its second character, so <code>find</code> matches inside the first <code>&quot;### &quot;</code> sub-heading after the start. The section is cut at the first sub-heading, which §94.9 measured as 464 characters: only the opening paragraph.</p>
 <p>(c) §94.9&#39;s fix: extract by heading rather than a fixed character window, and stop at a heading of the <em>same</em> level, for example by matching <code>&quot;\n## &quot;</code> at a line start and excluding deeper levels, and by locating each principle under the manifesto heading wherever it falls.</p>
