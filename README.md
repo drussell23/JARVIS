@@ -24,17 +24,17 @@ JARVIS is the control plane of the **Trinity** platform: three repositories, sol
 
 | Repository | Lines | Files | Python | Commits |
 |---|---:|---:|---:|---:|
-| **JARVIS (Body)** | 5,072,684 | 10,727 | 3,868,263 (7,959 files) | 10,796 |
-| **J-Prime (Mind)** | 148,565 | 243 | 142,431 (211 files) | 283 |
-| **Reactor Core (Soul)** | 129,993 | 247 | 116,230 (203 files) | 179 |
-| **Trinity total** | **5,351,242** (~5.35M) | | 4,126,924 | **11,258** |
+| **JARVIS (Body)** | 5,578,534 | 10,829 | 3,895,380 (8,065 files) | 10,957 |
+| **J-Prime (Mind)** | 149,129 | 247 | 142,808 (213 files) | 292 |
+| **Reactor Core (Soul)** | 131,790 | 252 | 118,022 (208 files) | 190 |
+| **Trinity total** | **5,859,453** (~5.86M) | | 4,156,210 | **11,439** |
 
 Within JARVIS, by path — each row is reproducible from its own prefix:
 
 | Subset | Path | Lines | Files |
 |---|---|---:|---:|
-| **O+V engine** | `backend/core/ouroboros/` | 1,027,813 | 1,639 |
-| **Test spine** | `tests/` | 1,179,765 | 3,784 |
+| **O+V engine** | `backend/core/ouroboros/` | 1,039,453 | 1,665 |
+| **Test spine** | `tests/` | 1,194,658 | 3,864 |
 
 _3 of 3 repositories measured._
 
