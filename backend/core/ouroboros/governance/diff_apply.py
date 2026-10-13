@@ -480,7 +480,8 @@ def alignment(known: KnownSource, diff_text: str) -> Dict[str, object]:
     """How *diff_text* measures against the source the model was shown.
 
     ``hunks``: per hunk ``{anchors, present, in_order, placed, checkable,
-    header_error, echoed}`` -- ``present`` is the share of its context and
+    header_error, echoed, classes}`` (``classes``: :func:`anchor_classes`)
+    -- ``present`` is the share of its context and
     removal lines that exist in the shown source at all, ``in_order`` the
     longest run of them that matches consecutively from where its first
     line occurs; ``header_error`` is |stated start - placed start| in lines.
@@ -511,10 +512,13 @@ def alignment(known: KnownSource, diff_text: str) -> Dict[str, object]:
                     break
                 if 0 <= rel < len(seg) + len(anchors):
                     row["checkable"] = True
+            run = (0, 0)
             if anchors and not row["placed"]:
-                row["in_order"] = _longest_in_order(segs, anchors) / len(anchors)
+                run = _best_run(segs, anchors)
+                row["in_order"] = run[1] / len(anchors)
             elif row["placed"]:
                 row["in_order"] = 1.0
+            row["classes"] = anchor_classes(h.ops, present_set, run, bool(row["placed"]))
             rows.append(row)
         checkable = [r for r in rows if r["checkable"]]
         applies: Optional[bool] = (None if not rows or len(checkable) < len(rows)
@@ -534,7 +538,14 @@ def _longest_in_order(segs: List[Tuple[int, List[str]]], anchors: List[Tuple[int
     """The most anchors matched consecutively (blank file lines skipped) from
     any line where one of them occurs -- how far the hunk got before it
     diverged from the file, wherever it starts."""
-    best = 0
+    return _best_run(segs, anchors)[1]
+
+
+def _best_run(segs: List[Tuple[int, List[str]]],
+              anchors: List[Tuple[int, str]]) -> Tuple[int, int]:
+    """``(first_anchor, length)`` of the longest in-order run (see
+    :func:`_longest_in_order`)."""
+    best = (0, 0)
     keys = [a for _i, a in anchors]
     for _first, seg in segs:
         stripped = [ln.strip() for ln in seg]
@@ -549,12 +560,40 @@ def _longest_in_order(segs: List[Tuple[int, List[str]]], anchors: List[Tuple[int
                         break
                     run += 1
                     fi += 1
-                best = max(best, run)
-                if best == len(keys):
+                if run > best[1]:
+                    best = (start_key, run)
+                if best[1] == len(keys):
                     return best
     return best
 
 
-__all__ = ["Hunk", "KnownSource", "HUNK_RE", "align_hunk", "alignment", "apply_unified_diff",
+def anchor_classes(ops: Ops, present_set: set, run: Tuple[int, int],
+                   placed: bool) -> Dict[str, Dict[str, int]]:
+    """Every locator of one hunk, by line kind and by what the file says:
+
+    * ``exact`` -- inside the hunk's placement (or its longest in-order run
+      when it did not place): the file has this line HERE;
+    * ``displaced`` -- the file has the line, but not in this sequence;
+    * ``fabricated`` -- the line exists nowhere in the shown source.
+
+    ``context`` and ``removal`` are kept apart because deleting a line the
+    file does not have is a stronger claim than citing it as context. This
+    is what the GRPO diff reward's penalty matrix weighs."""
+    out = {k: {"exact": 0, "displaced": 0, "fabricated": 0} for k in ("context", "removal")}
+    lo, length = run
+    for pos, (op_i, key) in enumerate(hunk_anchors(ops)):
+        kind = "removal" if ops[op_i][0] == "-" else "context"
+        if placed or lo <= pos < lo + length:
+            cls = "exact"
+        elif key in present_set:
+            cls = "displaced"
+        else:
+            cls = "fabricated"
+        out[kind][cls] += 1
+    return out
+
+
+__all__ = ["Hunk", "KnownSource", "HUNK_RE", "align_hunk", "alignment", "anchor_classes",
+           "apply_unified_diff",
            "diagnose_hunk", "find_hunk_start", "fuzzy_window", "hunk_anchors", "norm_lines",
            "parse_hunks", "parse_unified_hunks", "place", "source_from_prompt"]
