@@ -1,0 +1,135 @@
+<!-- CHECKPOINT before: ### §94.4 O+V — the Engine Inside the Body -->
+<aside class="checkpoint" id="cp-s94-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">§5.3 said that Reactor, the Soul, runs O+V's tests and permitted <code>bash</code> commands in sandboxes with resource limits, process isolation and syscall filtering. Before reading on, predict where a generated candidate's tests actually run on <code>origin/main</code> today, and which isolation layer, if any, is switched off.</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>Not in Reactor. Reactor has no such code; its only sandbox is a Dockerized browser for its documentation scraper. Containment lives in the Body, inside O+V's VALIDATE phase. Tests run against a git-worktree copy of the candidate, candidate processes run in a PID namespace, test runs beside a soak go through a cgroup memory cap, and landings use per-operation worktrees. All of those are on. The Docker + seccomp runtime sandbox exists but is <strong>off</strong>. See §94.4.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- CHECKPOINT before: ### §94.7 How the Four Work Together -->
+<aside class="checkpoint" id="cp-s94-2">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">Reactor trains adapters and J-Prime serves them. Predict which component calls J-Prime to take the GPU and publish a newly trained adapter: Reactor, J-Prime itself, or something else? And what happens to O+V if Reactor is down?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>Neither Reactor nor J-Prime. The Training Lifecycle Handoff, which is JARVIS code (<code>observability/training_handoff.py</code>), takes the lease, runs Reactor's trainer as a subprocess, converts the adapter and publishes it to J-Prime's registry. Reactor contains no call to the lease or adapter endpoints, and J-Prime calls no one. If Reactor is down, "the organism still works; it just stops learning": the recorder keeps writing to disk and the receiver catches up from its saved offsets. See §94.7.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- CHECKPOINT before: ### §94.9 From North Star to Running Code -->
+<aside class="checkpoint" id="cp-s94-3">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">The project has a written definition of done (the seven A-level criteria in PRD §6) and a planner that can read it and file work toward it. The organism has made 91 autonomous landings. Predict whether those landings were chosen by reading the definition of done.</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>No. The Epistemic Planner and the Conception Bridge that would turn the §6 gap into work are built but both default to off, and no tracked file arms them. The 91 landings came from a chain that does not read §6: the signed roadmap, Goal Discovery turning evidence into signed goals, operator <code>/goal sanction</code>, the Sentinel, and the goal-reconciliation ledger. The organism is proactive about the codebase's hygiene, not yet about building JARVIS toward the PRD. See §94.9.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- ENDBLOCK s94 -->
+#### Check your understanding: §94 — The Whole System: Four Subsystems, One Goal
+
+<div class="engage" id="engage-s94">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. The North Star says JARVIS should develop itself "fully autonomously", yet the same documents insist the operator remains the zero-order doll. Is that a contradiction, and where in the running code does the operator's role actually live today?</summary>
+<p>It is not a contradiction, because the documents define autonomy as a <em>migration of authority</em>, not its removal (§94.1). The operator moves from per-PR reviewer to batch approver to roadmap signer, and the PRD history lists what the North Star does not mean: the operator does not become irrelevant, safety gates are not removed, and even the top tier works inside an operator-signed roadmap, budget and scope. The Manifesto's line is that the organism "can write its own brain. It can never merge its own brain."</p>
+<p>In code the boundary is concrete. The zero-push air-gap means O+V can land on local <code>main</code> but only the operator publishes (§93.7). The Order-2 review queue's <code>amendment_requires_operator()</code> is locked true, the recursion-depth gate blocks past a depth of 3 governance-touching APPLYs, and any change under <code>governance/</code> forces approval (§94.10). The Conception Bridge stamps every self-filed proposal <code>requires_human_ack=True</code> (§94.9). So the end state is not a system without a human; it is one where the human's job has moved up a level, and §94.11 records that as the intended design, not a gap.</p>
+</details>
+<details class="cq"><summary>2. §94 repeatedly separates "built", "wired", "productive" and "default-on". Using one example of each gap, explain why the North Star's 2026-06-06 scorecard ("~30–35 %") and its 2026-09-19 revision ("~10-15%") can both be honest and still disagree.</summary>
+<p>Built but not wired: Bucket A, where 9 of 10 sampled modules still had zero live callers, and the M10 second-order driver with "0 references in <code>orchestrator.py</code>" (§94.8). Wired but off: the Epistemic Planner and Conception Bridge, both reachable but defaulting to false (§94.9). On but feeding the wrong consumer: <code>north_star_context.py</code> is on by default, but it feeds the DreamEngine's speculative prompt, not GENERATE. On and wired but defective: <code>strategic_direction.py</code> runs every time, yet tells the organism six principle titles and one paragraph instead of seven principles and the manifesto.</p>
+<p>The June scorecard counted mechanisms that existed and marked tiers "CLOSED". The September revision re-verified by checking live callers, and found that the landings moved Order 1 "from nominally wired to actually productive" but "did not touch Order 2". Both assessments can be honest about what they measured; they measured different things. The paper treats the September figure as current because it measures reachability and effect, which is the lesson the reachability ledger (§93.12) was built to enforce.</p>
+</details>
+<details class="cq"><summary>3. Why does it matter that §5.3's "Reactor as sandbox" was wrong, beyond keeping the record straight? What would a reader who trusted §5 believe about containment that the code does not support?</summary>
+<p>§5.3 said permitted <code>bash</code> and <code>run_tests</code> execute inside Reactor, with resource limits, process isolation and syscall filtering, and that this "is what makes the Iron Gate's containment guarantees meaningful". A reader who trusted that would believe a second subsystem, on a separate boundary, contains anything the static checks let through.</p>
+<p>The code says otherwise (§94.4, §93.16). Reactor is a training repository. Containment is in the Body: candidate trees, a PID namespace that "degrades to uncontained if the kernel refuses" unless the <code>..._REQUIRED</code> flag is set, a cgroup memory cap, and per-operation worktrees. The layer that would do syscall filtering, Docker + seccomp, is off. That matters because the static cage has a measured at-scale escape rate of about 8.8%, concentrated in runtime-built <code>eval</code>/<code>exec</code>/<code>subprocess</code> strings that a static check cannot see (§93.3). The layers that bound damage when a candidate actually runs are real but narrower than §5 implied, and the strongest one described in April is not on.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-s94">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. Which component takes J-Prime's GPU lease, runs the trainer and publishes the new adapter to J-Prime's registry?</p>
+<ol class="mcq-options" type="A">
+<li>Reactor's :8090 service, once ingestion fills its buffer</li>
+<li>J-Prime itself, through its adapter registry's scheduler</li>
+<li>The Training Lifecycle Handoff, which is JARVIS code</li>
+<li>O+V's trajectory recorder, at the end of each soak</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> The handoff (<code>observability/training_handoff.py</code>) leases J-Prime, runs Reactor's trainer as a subprocess, converts and publishes the adapter, then verifies it. Reactor never calls J-Prime, and J-Prime calls no one (§94.7).</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. Why must J-Prime <em>lend</em> the GPU for training rather than train beside serving?</p>
+<ol class="mcq-options" type="A">
+<li>Inference (about 21 GiB) plus a GRPO step (about 28 GiB) exceeds the 32 GB card</li>
+<li>llama.cpp cannot load a model while a PyTorch process is running</li>
+<li>The adapter registry refuses to publish while any model is pinned</li>
+<li>Training must run on Windows, but J-Prime runs inside WSL2</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> One 32 GB card cannot hold the 30B for inference and a GRPO step at the same time (<code>lease.py</code>), so J-Prime drains, proves the memory free with <code>nvidia-smi</code>, and lends it (§94.5).</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">3. Reactor's :8090 service goes down during a soak. What happens?</p>
+<ol class="mcq-options" type="A">
+<li>O+V halts at GENERATE, because Reactor scores every candidate</li>
+<li>The recorder buffers rows in memory and drops them after a TTL</li>
+<li>J-Prime rolls back to the <code>origin</code> adapter as a precaution</li>
+<li>The organism keeps working and stops learning; the receiver catches up later</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> Reactor is not required. The recorder keeps writing to disk, and the receiver resumes from its persisted byte offsets when it returns (§94.7, §94.6).</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. Running <code>strategic_direction.py</code>'s own extractors on the current README shows the organism is told six principle titles, not seven. Which one is missing, and why?</p>
+<ol class="mcq-options" type="A">
+<li>Principle 1, because its marker is matched by the manifesto heading</li>
+<li>Principle 7, because it now begins past the 20,000-character window</li>
+<li>Principle 4, because the regex skips titles containing parentheses</li>
+<li>Principle 7, because the <code>"## "</code> end marker cuts the list short</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> <code>_extract_principles</code> scans only the first 20,000 characters, and Principle 7, <em>Absolute observability</em>, begins at character 24,496. The <code>"## "</code> marker is a separate defect: it truncates the manifesto text to 464 characters (§94.9).</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-s94">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> O+V generates a candidate test file for a signed goal; it passes, lands and survives. Follow that one candidate through all three loops of §94.7 until the model that wrote it has been retrained and the result could be published. At each boundary between subsystems, name the contract that carries it. Then say what happens if the handoff process dies after taking the lease.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Use the contracts table in §94.7. Loop 1 is seconds, Loop 2 hours, Loop 3 days; the human appears in only one of them.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>Loop 1 (inference).</strong> The candidate generator routes to the local lane under the free-lane policy, and <code>LocalPrimeClient</code> calls J-Prime over the Ollama-native <code>/api/chat</code> or OpenAI <code>/v1/chat/completions</code>. Contract: the Ollama and OpenAI wire protocols. J-Prime answers with <code>qwen3-coder-ov:30b</code>, which is the base weights plus the active Reactor LoRA plus its sampling defaults (§94.5).</p>
+<p><strong>Loop 2 (learning).</strong> The trajectory recorder writes one <code>ExperienceEvent</code> line for the candidate into <code>~/.jarvis/trinity/events/</code>. Contract: the shared JSONL schema, a file, not an HTTP call. Landing provenance adds git-proven <code>landed</code> and <code>surviving</code> labels to the hash-chained ledger, so this row becomes a success example (§94.6). Reactor's receiver tails the stream, and the GRPO reader reads the same files. The operator then runs the handoff on demand (autotrain is off): it refuses to run beside a live organism, acquires the lease (contract: token, TTL, freed MiB, state), runs <code>run_grpo_training.py</code> (contract: exit code 0/1/2/3 and a JSON report), converts the adapter to GGUF, publishes it with its sha256 (contract: a header-validated, versioned registry entry), releases the lease, and verifies greedily inside J-Prime's evaluation scope. The cycle ends COMMITTED or ROLLED_BACK.</p>
+<p><strong>Loop 3 (governance).</strong> The landed test sits on local <code>main</code>. Only the operator publishes to GitHub, and the standing rule is that no training-derived change is pushed without a held-out gain (§93.11).</p>
+<p><strong>Handoff dies holding the lease.</strong> The lease expires and J-Prime restores service through the same measured VRAM admission, so "expiry can never cause an OOM" (§94.5, §94.7). Until then, new generations get 503 with <code>Retry-After</code>, and an organism booting meanwhile exits with code 69.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (analysis).</strong> The A-level throughput criterion in PRD §6 is "sustained ≥ 1 commit per 30 minutes of session time", and PRD §34.9 scores it "Met in-window, not sustained". Using the cadence table in §93.10, compute landings per hour for the 09-26, 10-04, 10-05, 10-08 and 10-09 soaks, compare each with the threshold, and explain the verdict. Then say why §6's anti-goals would not count a faster model, by itself, as progress toward this criterion.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>One commit per 30 minutes is 2 per hour. Count all landings, not only substantive ones, since the criterion says "commit".</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Threshold: 2 landings per hour. 09-26: 3 / 1.97 h ≈ 1.52 per hour. 10-04: 3 / 2.98 h ≈ 1.01. 10-05: 10 / 6.03 h ≈ 1.66. 10-08: 0 / 1.25 h = 0. 10-09: 51 merged in about 9 h ≈ 5.7 per hour.</p>
+<p>Only the 10-09 soak clears 2 per hour over its whole session; four of five fall below. That is what "met in-window, not sustained" means: the rate has been reached within a window but not held across sessions. The 10-05 soak also shows why "sustained" is hard: nothing landed from 22:24 to 00:29, which PRD §34 attributes to the supply wall (§93.10). Note too that the 10-09 row reports no substantive count, so its high rate is mostly tests for <code>backend/api/*</code>.</p>
+<p>The anti-goals in §6 list "a smarter model", "more model calls" and "shipping faster" as things that do not by themselves count as progress (§94.8). A criterion is met by the observed outcome, sustained landed commits with a clean record, not by an input that might raise it. A faster or better model helps only if it moves the measured rate; and when yield is bounded by supply, it would not. The 2026-10-04 note adds the honest qualification that on the local 30B, model capability <em>is</em> a measured constraint, so it is not irrelevant, just not progress on its own.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/strategic_direction.py</code> and read <code>_MAX_DOC_CHARS</code>, <code>_extract_principles</code> and <code>_extract_manifesto</code>. Find (a) the line that makes Principle 7 invisible once the README grows, (b) the end marker that truncates the manifesto, and why <code>find</code> matches it inside a <code>"### "</code> heading, and (c) a fix consistent with §94.9's description. What does the organism lose from its prompts because of these two defects?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Look at what slice of <code>readme_content</code> the principle regex iterates over, and at the third entry of <code>end_markers</code>. A string search for "## " does not care what character precedes it.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) <code>_MAX_DOC_CHARS = 20_000</code>, and <code>_extract_principles</code> runs its <code>\*\*(\d+)\.\s+([^*]+)\*\*</code> pattern over <code>readme_content[:_MAX_DOC_CHARS]</code>. Any principle heading that starts after character 20,000 is never seen. §94.9 measured Principle 7 at character 24,496, so the list stops at six. The docstring still says "Extract the 7 numbered principles".</p>
+<p>(b) <code>end_markers</code> contains <code>"## "</code>, commented "next h2", and the code takes the earliest match after <code>start + 100</code>. But every level-3 heading, <code>"### ..."</code>, contains the substring <code>"## "</code> starting at its second character, so <code>find</code> matches inside the first <code>"### "</code> sub-heading after the start. The section is cut at the first sub-heading, which §94.9 measured as 464 characters: only the opening paragraph.</p>
+<p>(c) §94.9's fix: extract by heading rather than a fixed character window, and stop at a heading of the <em>same</em> level, for example by matching <code>"\n## "</code> at a line start and excluding deeper levels, and by locating each principle under the manifesto heading wherever it falls.</p>
+<p>The loss: the organism is told six principle titles and one paragraph, and the principle it is not told is Absolute observability. The README, §3 and the module docstring all claim seven are injected; this is recorded as a measured correction in §93.16. It is a clean example of code that is on and wired but not doing what the documents say.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- END -->

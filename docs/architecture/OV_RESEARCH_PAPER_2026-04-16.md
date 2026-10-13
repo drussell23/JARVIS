@@ -9,7 +9,7 @@ date: "2026-04-16"
 
 > **Prepared by:** Derek J. Russell
 > **Report date:** 2026-04-16
-> **Last updated:** 2026-10-13. See **§93. Developments (May 14 – October 13, 2026)** for the local-model era, the first autonomous landings and the Trinity learning loop, and **§92** for April 17 – May 13. The original §1–§91 substrate is unchanged; both addenda are appended per the policy in Appendix F, and §93.16 lists the earlier text they supersede.
+> **Last updated:** 2026-10-13. See **§93. Developments (May 14 – October 13, 2026)** for the local-model era, the first autonomous landings and the Trinity learning loop; **§94. The Whole System: Four Subsystems, One Goal** for how JARVIS, O+V, J-Prime and Reactor work together, the North Star and the Reverse Russian Doll; and **§92** for April 17 – May 13. The original §1–§91 substrate is unchanged; both addenda are appended per the policy in Appendix F, and §93.16 lists the earlier text they supersede.
 > **Repository:** `github.com/drussell23/JARVIS` (formerly `JARVIS-AI-Agent`, which redirects)
 > **Canonical technical reference:** `docs/architecture/OUROBOROS.md` (2,774 lines)
 > **This paper:** research-paper treatment of the above — plain-English explanation, analogies, architectural narrative, visual diagrams, honest evidence-backed claims.
@@ -10174,6 +10174,11 @@ The formal questions of §92.12 are unchanged. The engineering since then has mo
 | §92.18: autonomous commits limited to ledger writes | 91 autonomous landings since, 5 of them production code (§93.10); still Mechanic. |
 | §86 is titled "The Twelve-Commit Arc", while §91 says the arc "shipped 14 commits" | The §86 table has twelve numbered steps, and step 12 has four commits (12a–12d), so the arc is **15 commits**. "Twelve" counts the steps and "14" is a miscount. |
 | §52.5: an exploration-first violation "produce[s] a warning" at VALIDATE | Superseded by §47.2, which matches the code: the check runs after GENERATE, raises `ExplorationInsufficientError` and sends the operation to `GENERATE_RETRY` with feedback (`phase_runners/generate_runner.py`). It is a hard gate, not a warning. |
+| §5.2: J-Prime "Runs on: Google Cloud Platform virtual machines", a Tier 2 backup in the provider cascade | **Superseded** by §94.5. J-Prime is the J-Prime Engine (llama.cpp) on the author's RTX 5090, the only active lane. The GCP code remains in the repository but is not imported by the engine. |
+| §5.3: Reactor Core as the "sandboxed execution runtime" where `run_tests` and permitted `bash` commands execute | **Not accurate for the code.** Reactor is the training repository (§93.11, §94.6); its only sandbox is a Dockerized browser for its documentation scraper. Containment of O+V's candidates lives in the Body: candidate trees, a PID namespace and a cgroup admission lock (§94.4). |
+| §5.4: Body ↔ Soul "sandbox invocation protocol"; Mind ↔ Soul calls | Superseded by §94.7: O+V and Reactor share a file contract (the experience stream); the handoff in JARVIS calls J-Prime; Reactor never calls J-Prime. |
+| §92.12 (item 3) and §92.17 cite "§3, §50" for the Reverse Russian Doll | **Unsupported.** Neither §3 nor §50 mentions it. The definitions are in PRD §23 and North Star §51.1; §94.10 traces it through the code. |
+| §3 and the README: the seven Manifesto principles are injected into the organism's prompts | **Measured otherwise** on `origin/main` (2026-10-13): `strategic_direction.py` extracts 6 principle titles (Principle 7 now lies past its 20,000-character window) and a 464-character opening paragraph (its `"## "` end marker matches inside `"### "`). See §94.9. |
 
 <!-- engage:begin -->
 <div class="quick-check" id="qc-93-16">
@@ -10434,6 +10439,841 @@ The formal questions of §92.12 are unchanged. The engineering since then has mo
 <p><strong>(3)</strong> The full matrices hold 2,048 × 4,096 ≈ 8.39M parameters for q, 1.05M each for k and v, and 8.39M for o. That is about 18.9M per layer, or about 906M across 48 layers. The adapter is 13.4/906 ≈ 1.5% of the attention weights, and about 0.045% of the 30B model. The mixture-of-experts feed-forward weights, the bulk of the model, are not adapted at all.</p>
 <p><strong>(4)</strong> A full update to a d × d matrix needs d<sup>2</sup> numbers. A rank-r update needs 2rd, which is linear in d, not quadratic. For q, the ratio is 16 × 6,144 / (2,048 × 4,096) ≈ 1.2%. That is why the adapter is small enough to convert to GGUF and to publish, activate or roll back in J-Prime's registry as a separate artifact while the base weights stay fixed (§93.6, §93.11).</p>
 <p>The cost is expressiveness. ΔW has rank at most 16, so each adapted matrix can change its output in at most 16 directions of its input space. The current results do not show that this limit is what binds. The paper's own diagnosis points elsewhere: three contributing answers, a gradient norm of about 1e-4, and 86% of prompts unable to fit their whole-file answer (§93.11). With that little signal, a higher rank would mostly add parameters with nothing to learn from. The architecture's next lever is the data and the diff contract, not the adapter's rank.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- engage:end -->
+
+---
+
+## §94. The Whole System: Four Subsystems, One Goal
+
+> **Big Picture.** The paper so far has been about O+V, the engine that changes code. O+V, though, is one of four subsystems, and none of the four makes sense alone. **JARVIS** is the assistant and the codebase being developed. **O+V** is the self-development engine inside it. **J-Prime** is the local model server that does the thinking. **Reactor** is the training pipeline that turns O+V's own attempts into a better model. This section explains what each one is *today*, how the four work together, and what they are all for: the project's **North Star**, that JARVIS should develop itself through O+V, safely and under governance, with the human as the authority who signs the roadmap rather than the person who writes every line. It then traces that goal from the planning documents into the running code, including the parts that are built but switched off, and does the same for the **Reverse Russian Doll**, the containment idea behind the whole design.
+
+This section follows the addendum policy in Appendix F. It was written on 2026-10-13 against `origin/main` of all three repositories: `JARVIS` at `34b2aadc14`, `JARVIS-Prime` at `6b87252` and `JARVIS-Reactor` at `e380ec6`. Claims are cited to a file path or a commit. Where the code and a project document disagree, the code is reported, and the disagreement is named. Items marked † exist only on the author's local branches, as in §93.
+
+§5 described the Trinity as it was designed in April. Two of its descriptions no longer match the code: J-Prime is not a GCP service and Reactor is not a sandbox. §94.3–§94.6 replace them, and §93.16 lists the change.
+
+### §94.1 The Ultimate Goal, in the Project's Own Words
+
+The goal has been written down several times, each time more concretely.
+
+**The vision (PRD §2, refreshed 2026-04-30).** The PRD (`docs/architecture/OUROBOROS_VENOM_PRD.md`) describes O+V as "the proactive autonomous opposite of Claude Code". A coding assistant waits to be prompted. O+V is meant to operate "as a sovereign computing organism", shipping the JARVIS Trinity "without human prompting except when context and severity demand operator approval". §2 turns this into eight success criteria:
+1. self-initiating;
+2. exploring the codebase as well as a capable human-driven assistant does;
+3. developing the repository without intervention;
+4. bringing the human in only when severity demands it;
+5. understanding the operator's direction and goals;
+6. A-level execution;
+7. an immune system that tightens itself;
+8. an immune system that validates itself over time.
+
+**The North Star (PRD history §41.1, 2026-05-11).** On 2026-05-11 the operator bound one sentence as *the* goal rather than *a* goal: "O+V develops the JARVIS repo proactively + fully autonomously, while doing so safely and governance-bounded" (`docs/architecture/OUROBOROS_VENOM_PRD_HISTORY.md`). The reason given is that otherwise the operator "becomes the bottleneck on every Trinity expansion arc". A one-person project that adds a fourth subsystem, a vision model or a voice loop cannot also hand-write every test and every fix in the other three.
+
+**The plain version (PRD §33, 2026-09-20).** After the cloud credit ran out (§93.5), the operator restated the goal in the plainest form: *"I can't build JARVIS forever. It has to develop itself using O+V."* §33.5 then says what that can honestly mean on a local 30B model: "O+V carries the volume of well-defined implementation work; intent, decomposition and design stay with the operator and the planner."
+
+**What the goal is not.** The documents are explicit about this, and it matters as much as the goal itself.
+- The PRD history §41.1 lists three things the North Star does *not* mean:
+  - not that the "operator becomes irrelevant", because the operator remains the **zero-order doll**, the structural authority;
+  - not "remove all safety gates";
+  - not "infinitely autonomous", because the most autonomous tier still works inside an operator-signed roadmap, budget and scope.
+- The North Star document §51.8 calls the change "a **migration of authority**": from per-PR reviewer, to batch approver, to quarterly roadmap signer. It adds that "fully-autonomous is unsafe today and must not be switched on as-is" and that the final tier is "earned, not flipped".
+- The Trinity Manifesto puts the same boundary in one line: the organism "can write its own brain. It can never merge its own brain."
+
+So the end state is not a system without a human. It is a system in which the human's job has moved up a level: from writing and reviewing every change to setting direction, signing scope and deciding what gets published. The zero-push air-gap of §93.7 is the current form of that boundary. O+V can land work on the author's local `main`, but only the operator can publish it.
+
+**One part of the goal is still undefined.** PRD §33.8 is meant to list "the three or four things JARVIS must do on day one", written as runnable acceptance checks ("say X, it does Y"). As of the PRD's latest revision it is marked *"Open — operator input required."* The engine's done-criteria are written down (§94.8). The assistant's are not yet.
+
+<!-- engage:begin -->
+<div class="quick-check" id="qc-94-1">
+<p class="qc-label">Quick check · §94.1</p>
+<details class="qc"><summary>1. Why did the operator bind the North Star as <em>the</em> goal rather than <em>a</em> goal?</summary>
+<p>Because otherwise the operator "becomes the bottleneck on every Trinity expansion arc". A one-person project cannot add new subsystems and also hand-write every test and fix in the existing ones.</p>
+</details>
+<details class="qc"><summary>2. What does "migration of authority" mean, and what does it rule out?</summary>
+<p>The human's role moves from per-PR reviewer to batch approver to roadmap signer. It rules out reading the goal as removing the human, removing safety gates, or unbounded autonomy: the top tier is "earned, not flipped" and still works inside an operator-signed roadmap, budget and scope.</p>
+</details>
+<details class="qc"><summary>3. Which half of "done" is still undefined, and why does that matter?</summary>
+<p>The assistant's. PRD §33.8, the day-one acceptance checks ("say X, it does Y"), is marked "Open — operator input required". The engine's done-criteria exist in PRD §6, so the system has a target for O+V but not yet for the JARVIS it is meant to build.</p>
+</details>
+</div>
+<!-- engage:end -->
+
+### §94.2 The Four Subsystems at a Glance
+
+| Subsystem | Trinity role | Repository | Runs where (this host) | What it does | Status |
+|---|---|---|---|---|---|
+| **JARVIS** | Body | `drussell23/JARVIS` | WSL2 (Ubuntu) on Windows 11; the macOS surfaces need a Mac | The assistant: vision, voice, UI automation, the unified supervisor; also the codebase being developed | Assistant surfaces mostly dormant on this host (§94.3) |
+| **O+V** | The engine inside the Body | `drussell23/JARVIS`, `backend/core/ouroboros/` | WSL2, started by `ov` | Senses work, plans, generates, validates, gates and lands commits | Active; 91 autonomous landings 2026-09-06 → 10-10 (§93.10) |
+| **J-Prime** | Mind | `drussell23/JARVIS-Prime` | Natively on Windows, owns the RTX 5090; `127.0.0.1:8000` | Serves the local model, lends the GPU for training, keeps the adapter registry | Active; serves `qwen3-coder-ov:30b` |
+| **Reactor** | Soul | `drussell23/JARVIS-Reactor` | WSL2; `127.0.0.1:8090` | Ingests O+V's experience rows; GRPO trainer and adapter converter | Active as an ingestion service; training runs by handoff (§94.6) |
+
+The names are not used consistently, and a reader of the repositories will meet all of them. Reactor is the "Soul" in `CLAUDE.md` and the README's generated table. It is the "Nerves" in `TRINITY_MANIFESTO.md`, in both sibling READMEs and in O+V's own bring-up code (`trinity_siblings.py`). It is the "Immune system / Sandbox" in older parts of the JARVIS README. This paper uses Body, Mind and Soul.
+
+**Scale.** The figures below are tracked source on `origin/main`.
+
+| Repository | First commit | Size of main package | The part that matters now |
+|---|---|---|---|
+| JARVIS | 2025-08-13 (public); built locally from 2025-02 | `backend/core/ouroboros/` alone: 1,634 files, about 1.03M lines (README stats) | O+V; `unified_supervisor.py` is 98,238 lines |
+| JARVIS-Prime | 2025-11-08 | `jarvis_prime/`: 145 Python files, about 119,000 lines | `jarvis_prime/engine/`: 11 files, about 2,350 lines, all from 2026-10-07 |
+| JARVIS-Reactor | 2025-11-08 | `reactor_core/`: 135 Python files, about 96,000 lines | The GRPO path, written 2026-08-30 → 10-07 |
+
+The last column is the honest one. In each sibling repository, the code that runs today is a small, recent part of a larger codebase written for the April design. The rest is still there, mostly not imported by anything that runs.
+
+**Runtime topology on the author's machine** (Windows 11, WSL2 with mirrored networking, one RTX 5090 with 32 GB):
+
+```
+ Windows host ───────────────────────────────────────────────────────────────
+   J-Prime Engine   127.0.0.1:8000   llama.cpp llama-server, one per model
+     • qwen3-coder-ov:30b  = Qwen3-Coder-30B-A3B base + Reactor LoRA + defaults
+     • /v1/lease (GPU lending)   /v1/adapters (registry)   OpenAI + Ollama APIs
+ WSL2 guest (jarvis_svc, ext4 execution clone) ──────────────────────────────
+   O+V organism (ov daemon) ──generation──▶ J-Prime :8000
+     └─ trajectory recorder ──files──▶ ~/.jarvis/trinity/events/*.jsonl
+   Reactor-Core     127.0.0.1:8090   tails the events directory (ingest only)
+   Training Lifecycle Handoff (JARVIS code, run on demand, exclusive)
+     lease J-Prime ▶ run Reactor's trainer ▶ convert LoRA ▶ publish ▶ verify
+```
+
+<!-- engage:begin -->
+<div class="quick-check" id="qc-94-2">
+<p class="qc-label">Quick check · §94.2</p>
+<details class="qc"><summary>1. The sibling repositories are about 119,000 and 96,000 lines. Why does the paper call the last column of its scale table "the honest one"?</summary>
+<p>Because the code that actually runs is a small recent slice: J-Prime's engine is 11 files and about 2,350 lines, all from 2026-10-07, and Reactor's GRPO path dates from 2026-08-30 onward. Most of each repository was written for the April design and is not imported by anything that runs.</p>
+</details>
+<details class="qc"><summary>2. Reactor is called the Soul, the Nerves, and the Immune system / Sandbox. Why does the naming matter to a reader of the repositories?</summary>
+<p>A reader will meet all three names in different files, and the older "Sandbox" label describes a role Reactor does not have in code. The paper fixes one vocabulary (Body, Mind, Soul) so its descriptions are not confused with the stale ones.</p>
+</details>
+</div>
+<!-- engage:end -->
+
+### §94.3 JARVIS — the Body
+
+**What it is for.** JARVIS is the assistant the project is ultimately building: something the operator talks to and that acts on the operator's machine. Its surfaces, as documented and present in code, are:
+- **Vision.** `backend/vision/`: continuous screen capture (ScreenCaptureKit), Apple Vision OCR, and a capture → think → act computer-use loop.
+- **Voice.** `backend/voice/`: wake word, conversation manager and text-to-speech; voice-biometric unlock in `backend/voice_unlock/`.
+- **Ghost Hands.** `backend/ghost_hands/`: UI automation that does not steal focus, through Playwright, AppleScript and Quartz event injection.
+- **Execution contexts and clients.** Five execution contexts in `backend/core_contexts/`, a REST/WebSocket API, a React front end and a native macOS client.
+
+**The kernel.** `unified_supervisor.py` (98,238 lines on `origin/main`) is the monolithic kernel that boots everything in numbered zones. Zones 0–3 are protection, foundation, utilities and resource managers. Zone 4 is the intelligence layer, zone 5 process orchestration, including the Trinity integrator, zone 6 the kernel proper, and zone 7 the entry point. O+V's services boot inside zone 6:
+- 6.8 the Governed Loop Service;
+- 6.9 the intake layer;
+- 6.10 autonomy iteration;
+- 6.11 Trinity Consciousness;
+- 6.12 the proactive drive.
+
+Boot follows the Manifesto's *progressive awakening*: local senses come up first and heavy resources arrive asynchronously (§3, Principle 2).
+
+**What actually runs today.** Two facts change the April picture.
+1. **O+V no longer boots through the supervisor on this host.** It is started by `ov` (`backend/core/ouroboros/cli/ov.py`), which hands off to `scripts/ouroboros_battle_test.py`. That script boots a six-layer stack directly: Governed Loop Service, intake (24 sensors), Trinity Consciousness, strategic direction, the communication protocol and the renderer.
+2. **The machine moved from a Mac to Windows with WSL2.** Most assistant surfaces depend on macOS frameworks (Quartz, AppKit, CoreAudio, ScreenCaptureKit). Inside WSL2 they have nothing to bind to, so on the current host the Body's *assistant* half is effectively dormant and its *codebase* half is what O+V works on. This is inferred from the imports, not from a live probe. The bring-up runbook (`docs/BRINGUP_WINDOWS_WSL2.md`) still describes the Mac as "the Body" and the Windows machine as the "Engine". A link that would join them (`ov link`, `JARVIS_LINK_BRIDGE_ENABLED`) exists and is off by default. A Windows desktop vision agent was built and tested locally† but is not on `origin/main`.
+
+**Can the assistant hand work to O+V?** In code, yes; in practice, not yet.
+- `backend/voice/jarvis_voice_bridge.py` routes code tasks to a `VoiceCommandSensor`, which the intake layer constructs and the supervisor binds to the voice bridge. The intake router maps the `voice_human` source to it.
+- The README says plainly that the voice loop "has never completed a full cycle in production", and lists "voice as an intake channel into the 11-phase pipeline" as *next*.
+- What works today is typed: `/goal sanction` and `/goal inject` in the cockpit (§93.7), and ordinary cockpit conversation, which becomes an intake envelope with source `operator_chat`.
+- PRD §34.9 lists the JARVIS → O+V handoff as step 4 of the self-development sequence: *not started*.
+
+<!-- engage:begin -->
+<div class="quick-check" id="qc-94-3">
+<p class="qc-label">Quick check · §94.3</p>
+<details class="qc"><summary>1. Why is the Body's assistant half effectively dormant on the current host?</summary>
+<p>Most assistant surfaces depend on macOS frameworks (Quartz, AppKit, CoreAudio, ScreenCaptureKit), and inside WSL2 on Windows they have nothing to bind to. The paper notes this is inferred from the imports, not from a live probe.</p>
+</details>
+<details class="qc"><summary>2. "Can the assistant hand work to O+V? In code, yes; in practice, not yet." What is the code path, and what works instead?</summary>
+<p>The voice bridge routes code tasks to a <code>VoiceCommandSensor</code> that intake maps to the <code>voice_human</code> source, but the voice loop has never completed a full production cycle. What works is typed: <code>/goal sanction</code>, <code>/goal inject</code>, and cockpit conversation, which becomes an <code>operator_chat</code> envelope.</p>
+</details>
+<details class="qc"><summary>3. How does O+V boot today, compared with the supervisor's zone 6?</summary>
+<p>It is started by <code>ov</code>, which hands off to <code>scripts/ouroboros_battle_test.py</code> and boots a six-layer stack directly. The supervisor's zones 6.8–6.12 describe the designed boot, not the path used on this host.</p>
+</details>
+</div>
+<!-- engage:end -->
+
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-s94-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">§5.3 said that Reactor, the Soul, runs O+V's tests and permitted <code>bash</code> commands in sandboxes with resource limits, process isolation and syscall filtering. Before reading on, predict where a generated candidate's tests actually run on <code>origin/main</code> today, and which isolation layer, if any, is switched off.</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>Not in Reactor. Reactor has no such code; its only sandbox is a Dockerized browser for its documentation scraper. Containment lives in the Body, inside O+V's VALIDATE phase. Tests run against a git-worktree copy of the candidate, candidate processes run in a PID namespace, test runs beside a soak go through a cgroup memory cap, and landings use per-operation worktrees. All of those are on. The Docker + seccomp runtime sandbox exists but is <strong>off</strong>. See §94.4.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
+### §94.4 O+V — the Engine Inside the Body
+
+O+V lives in the JARVIS repository because it develops that repository: self-development happens on the Body's own code (§5.1). Parts II–IV and §93.7–§93.9 describe it in detail. This subsection places it among the other three.
+
+**What O+V does, in one cycle.**
+1. **Sense.** One of 24 intake sensors, the signed roadmap, Goal Discovery or the operator produces an intent envelope.
+2. **Process.** The orchestrator runs it through CLASSIFY → ROUTE → [CONTEXT_EXPANSION] → [PLAN] → GENERATE → VALIDATE → GATE → [APPROVE] → APPLY → VERIFY → COMPLETE (§8). GENERATE is the step that calls J-Prime.
+3. **Land.** A passing candidate is committed in a sovereignty worktree with the O+V co-author trailer, collected on an accumulation branch, checked by the promotion gate and fast-forwarded onto local `main` (§93.7). It is never pushed (§93.7, the zero-push air-gap).
+4. **Record.** Every candidate, good or bad, is written as a training row for Reactor (§94.7).
+
+**Where the sandbox went.** §5.3 said Reactor ran O+V's tests in sandboxes with "resource limits, process isolation, syscall filtering". No such code exists in Reactor. Its only sandbox is a Dockerized browser for its web-documentation scraper (`reactor_core/scout/sandbox_executor.py`). Containment lives in the Body, inside O+V's VALIDATE phase.
+
+| Layer | Module | Default |
+|---|---|---|
+| Candidate tree: tests run against a git-worktree copy of the candidate, not the live checkout | `governance/repair_sandbox.py`, enabled by `JARVIS_VALIDATE_CANDIDATE_TREE_ENABLED` | On |
+| PID namespace: candidate processes run under `unshare --user --pid --fork`, so a generated test cannot see or signal the organism (added after one ran `pkill -f jarvis`) | `governance/process_session.py`, `JARVIS_CANDIDATE_ISOLATION_ENABLED` | On; degrades to uncontained if the kernel refuses, unless `..._REQUIRED` is set |
+| Memory admission: a cgroup scope with a hard memory cap for test runs started *beside* a soak (the soak's own VALIDATE is exempt, already inside its budget) | `governance/test_execution_lock.py` | On |
+| Per-operation worktrees for landings and parallel units | `worktree_manager.py`, sovereignty worktrees | On |
+| Docker + seccomp runtime sandbox | `governance/runtime_sandbox.py`, profiles in `governance/sandbox_profiles/` | **Off** |
+
+The Iron Gate (Part X) and the Semantic Guardian sit in front of all of this as static checks. The layers above are what bound the damage when a candidate actually *runs*.
+
+<!-- engage:begin -->
+<div class="quick-check" id="qc-94-4">
+<p class="qc-label">Quick check · §94.4</p>
+<details class="qc"><summary>1. Why does O+V live in the JARVIS repository rather than in its own?</summary>
+<p>Because it develops that repository: self-development happens on the Body's own code (§5.1). Its commits land on JARVIS's local <code>main</code>.</p>
+</details>
+<details class="qc"><summary>2. The PID namespace was added after a generated test ran <code>pkill -f jarvis</code>. What does it prevent, and what is its weak point?</summary>
+<p>Candidate processes run under <code>unshare --user --pid --fork</code>, so a generated test cannot see or signal the organism. If the kernel refuses, it degrades to running uncontained unless the <code>..._REQUIRED</code> flag is set.</p>
+</details>
+<details class="qc"><summary>3. Why are the Iron Gate and Semantic Guardian not enough on their own?</summary>
+<p>They are static checks in front of execution. The containment layers bound the damage when a candidate actually <em>runs</em>, which a static check cannot fully predict.</p>
+</details>
+</div>
+<!-- engage:end -->
+
+### §94.5 J-Prime — the Mind
+
+**From cloud to card.** In April, J-Prime was a GCP virtual machine. Its README still describes eleven CPU-served models on a GCP "Invincible Node", and in the provider cascade it was a backup behind DoubleWord and Claude (Part VI). Since 2026-10-07 J-Prime has been the **J-Prime Engine**, `jarvis_prime/engine/`, written in seven commits that day (`fb85d48` through `6b87252`). In its own words, it is "J-Prime serving GGUF models on a local or cloud GPU. The Mind of the Trinity serves its own models." It replaced an Ollama daemon without O+V changing: it speaks "the protocol O+V's local lane already speaks".
+
+**How it serves.** The engine supervises one llama.cpp `llama-server` process per resident model (`engine_pool.py`). It deliberately imports no torch and no Python bindings.
+- **Admission.** Before loading a model, it checks `nvidia-smi` free memory against the model's file size plus a KV cache computed from the model's own GGUF geometry.
+- **Eviction.** Idle models are evicted least-recently-used. Pinned models (the preloaded 30B) are never evicted to make room for an unpinned one.
+- **In-flight safety.** A response in progress holds a reference, so its model cannot be evicted mid-answer.
+- **No orphans.** Child processes are bound to the engine (a kill-on-close Job Object on Windows, `PR_SET_PDEATHSIG` on Linux), so a crash leaves no orphaned model holding VRAM.
+
+**What it serves.** `qwen3-coder-ov:30b` is not a single file. It is defined as "the qwen3-coder 30B base weights PLUS a Reactor-trained LoRA adapter PLUS the sampling defaults it was published with" (`model_store.py`). The base is Qwen3-Coder-30B-A3B, a mixture-of-experts model: 30.5B parameters, 128 experts per layer, 8 active per token, served as a quantized GGUF. A vision model, `jarvis-vision:8b` (Qwen3-VL-8B with its projector), is declared and sha256-verified (`6b87252`). End-to-end vision serving through the engine has not been demonstrated.
+
+**Its endpoints**, grouped by purpose:
+
+| Purpose | Endpoints |
+|---|---|
+| Generation (OpenAI) | `POST /v1/chat/completions`, `/v1/completions`, `GET /v1/models` |
+| Generation and management (Ollama-compatible) | `POST /api/chat`, `/api/generate`, `/api/show`; `GET /api/tags`, `/api/ps`, `/api/version` |
+| GPU training lease | `GET /v1/lease`; `POST /v1/lease/acquire`, `/renew`, `/release` |
+| Adapter registry | `GET /v1/adapters/{model}`; `POST …/publish`, `/rollback`, `/reject`, `/activate` |
+| Reproducible evaluation | `POST /v1/models/{model}/evaluation` |
+| Health | `GET /`, `/health` |
+
+**The training lease.** One 32 GB card cannot hold the 30B for inference (about 21 GiB) and train its adapter (a GRPO step needs about 28 GiB) at the same time (`lease.py`). So J-Prime *lends* the GPU:
+- **States.** SERVING → DRAINING → RELEASED → RESTORING → SERVING.
+- **Draining.** DRAINING refuses new generations with HTTP 503 and `Retry-After`, and waits for the ones in flight.
+- **Proof of release.** RELEASED is declared only when `nvidia-smi` shows the memory actually free: "'We sent terminate' is not evidence; the card is."
+- **Expiry.** An expired lease restores service only through the same measured admission, so "expiry can never cause an OOM".
+- **Effect on O+V.** O+V checks the lease at boot and exits with code 69 if the lane is lent (§93.9.2).
+
+**The adapter registry.** J-Prime owns which LoRA its models carry (`adapter_registry.py`, `cba3677`, `cdd7b3a`).
+- **Validation.** A published adapter is checked from its own file header: GGUF magic, type `adapter`, type `lora`, and the same architecture as the base. Its sha256 must match the one the publisher declared.
+- **Versioning.** Versions are kept and never overwritten. Activation rewrites the model declaration atomically.
+- **Rejection.** A *rejected* version is deleted, kept as an audit record, and can never be reactivated.
+- **Fallback.** The adapter that predates the registry is kept as `origin`, the fallback of last resort.
+
+**Reproducible evaluation** (`71b0ca4`) turns off prompt-cache reuse for a model for a bounded time. Cold-cache and warm-cache greedy runs had been measured to differ. With the cache off, three of three outputs were byte-identical, which is what makes a before/after adapter comparison meaningful.
+
+**What remains of the old design.** `run_server.py` (4,387 lines), the "Neural Orchestrator", the GCP model-swap coordinator, a brain selector and a Packer golden image for a GCP failover GPU are all still in the repository. Nothing in the engine imports them. On the O+V side, endpoint discovery still tries the GCP failover sources first, gated by a lifecycle flag, before the always-on local lane.
+
+<!-- engage:begin -->
+<div class="quick-check" id="qc-94-5">
+<p class="qc-label">Quick check · §94.5</p>
+<details class="qc"><summary>1. Why is RELEASED declared only when <code>nvidia-smi</code> shows the memory free?</summary>
+<p>Because asking a process to stop does not prove its memory is gone: "'We sent terminate' is not evidence; the card is." Training starting into memory still held would OOM.</p>
+</details>
+<details class="qc"><summary>2. <code>qwen3-coder-ov:30b</code> "is not a single file". What is it, and why does that matter for rollback?</summary>
+<p>It is the 30B base weights plus a Reactor-trained LoRA plus the sampling defaults it was published with. The adapter can be changed, rejected or rolled back to a kept version (or <code>origin</code>) while the base stays fixed.</p>
+</details>
+<details class="qc"><summary>3. Why does reproducible evaluation switch off prompt-cache reuse?</summary>
+<p>Cold-cache and warm-cache greedy runs had been measured to differ. With the cache off, three of three outputs were byte-identical, which makes a before/after adapter comparison meaningful.</p>
+</details>
+</div>
+<!-- engage:end -->
+
+### §94.6 Reactor — the Soul
+
+**What it is.** Reactor's README calls it "the training and learning layer of the JARVIS AGI ecosystem". The part that runs is newer and narrower: "GRPO training over O+V telemetry — config, in-memory dataset, trainer" (`reactor_core/training/grpo_pipeline.py`). Reactor is where O+V's own successes and failures become a better model, or, as §93.11 reports honestly, where they are meant to.
+
+**The :8090 service** (`reactor_core/api/server.py`, 3,335 lines) exposes 55 routes, most from the earlier design: training jobs, telemetry, a scheduler, a model registry with A/B tests, hot reload and experience streams. What it does today is narrower (`ddb0a40`):
+- **Tailing.** It tails O+V's experience files without consuming them, using persisted byte offsets, reading only complete lines, surviving rotation and never deleting.
+- **Not training.** Ingestion does not trigger training. The buffer only flushes unless `TRINITY_RECEIVER_AUTOTRAIN` is set, and it is not.
+- **Loopback only.** The launch script binds it to `127.0.0.1`, because the server's own default of `0.0.0.0` would expose the training API to the LAN under WSL's mirrored networking.
+
+On its first live run it ingested all 4,801 recorded events in about 30 seconds with no errors. **The 30B training cycle is not run by this service.** It is run by the handoff (§94.7).
+
+**The trainer.** The trainer uses TRL's GRPO with the **Dr. GRPO** loss (`loss_type="dr_grpo"`), which removes the length normalisation that biases standard GRPO toward long completions. It runs with no reference model (β = 0), masks truncated completions, and uses the DAPO "clip-higher" bound (ε<sub>high</sub> = 0.28). Its main parts:
+- **Model.** The target is the bf16 checkpoint `Qwen/Qwen3-Coder-30B-A3B-Instruct`, quantized at load.
+- **Quantization.** Stock 4-bit loading skipped the fused expert tensors, so "the 'bnb-NF4 30B' was never 4-bit" (about 54 GiB on a 32 GiB card). Reactor's `moe_quant.py` quantizes each expert to NF4 itself and refuses to load if any expert stays bf16 (`b32f644`, `eb30fef`).
+- **Adapter.** The LoRA is rank 16 (α = 32) on the attention projections only (q, k, v, o across 48 layers, 192 projections). That is 13.4M parameters and about 27 MB. Adapting the experts would mean 18,432 projections and about 830M parameters, and is opt-in.
+- **Reward.** The reward comes from a tiered verifier: envelope, shape, syntax (`ast.parse`), substance, and an operator-configured authority command that is absent by default (`grpo_verifier.py`).
+- **Converter.** `reactor_core/quantization/adapter_gguf.py` turns the trained PEFT adapter into a GGUF LoRA without merging, because merging needs the bf16 base: 57 GiB against a WSL guest capped at 47 GiB.
+
+SFT is the pipeline's default strategy, and DPO exists as a refinement step after SFT. The only adapter evidenced as served came from GRPO.
+
+**Where the training data comes from.** One shared reader (`iter_trajectory_rows`) reads O+V's experience files:
+- **Genuine draws only.** It admits only real candidate draws (primary or sibling).
+- **Landing labels.** It joins O+V's hash-chained landing-label ledger, so a row whose candidate landed *and survived* becomes a success example (`972b0a9`).
+- **Never promoted.** A landed-then-reverted row is never promoted.
+- **Broken chain.** The join stops at the first ledger row that does not chain to its predecessor.
+
+<!-- engage:begin -->
+<div class="quick-check" id="qc-94-6">
+<p class="qc-label">Quick check · §94.6</p>
+<details class="qc"><summary>1. Why does Reactor's launch script bind :8090 to <code>127.0.0.1</code>?</summary>
+<p>The server's own default is <code>0.0.0.0</code>, which under WSL's mirrored networking would expose the training API to the LAN.</p>
+</details>
+<details class="qc"><summary>2. Why is the adapter converted to a GGUF LoRA without merging it into the base?</summary>
+<p>Merging needs the bf16 base, about 57 GiB, and the WSL guest is capped at 47 GiB. An unmerged adapter can also be published and swapped in J-Prime's registry on its own.</p>
+</details>
+<details class="qc"><summary>3. What makes a row a success example, and what stops a bad one from becoming one?</summary>
+<p>A join with the hash-chained landing-label ledger: the candidate must have landed and survived. A landed-then-reverted row is never promoted, and the join stops at the first ledger row that does not chain to its predecessor.</p>
+</details>
+</div>
+<!-- engage:end -->
+
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-s94-2">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">Reactor trains adapters and J-Prime serves them. Predict which component calls J-Prime to take the GPU and publish a newly trained adapter: Reactor, J-Prime itself, or something else? And what happens to O+V if Reactor is down?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>Neither Reactor nor J-Prime. The Training Lifecycle Handoff, which is JARVIS code (<code>observability/training_handoff.py</code>), takes the lease, runs Reactor's trainer as a subprocess, converts the adapter and publishes it to J-Prime's registry. Reactor contains no call to the lease or adapter endpoints, and J-Prime calls no one. If Reactor is down, "the organism still works; it just stops learning": the recorder keeps writing to disk and the receiver catches up from its saved offsets. See §94.7.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
+### §94.7 How the Four Work Together
+
+The four subsystems are joined by three loops on different time scales: one per generation, one per training cycle, and one per publication.
+
+**Loop 1 — inference (seconds).**
+- **Routing.** For every generation, O+V's candidate generator routes to the local lane. When the free-lane policy holds (local lane enabled, no paid lane configured), *any* route is served locally (`_try_local_primary`, `_free_lane_active` in `candidate_generator.py`).
+- **The call.** `LocalPrimeClient` (`local_inference_director.py`) calls J-Prime over the Ollama-native `/api/chat` or the OpenAI `/v1/chat/completions`.
+- **Configuration.** The address comes from configuration (`JARVIS_PRIME_URL`, then `JARVIS_LOCAL_MODEL_BASE_URL`). The code default is still Ollama's `:11434`, and `:8000` is set by the host's environment.
+- **Served identity.** `served_identity.py` asks J-Prime once per session *who is answering* — engine, model, adapter and vision model — and the cockpit shows it (§93.9.4).
+
+**Loop 2 — learning (hours).**
+1. **Record.** O+V's trajectory recorder writes one `ExperienceEvent` line per candidate into `~/.jarvis/trinity/events/`. The contract is a shared schema in a shared directory, not an HTTP call: "one stream, two consumers, zero translation code". The recorder is off in the module and armed by O+V's production envelope.
+2. **Label.** Landing provenance writes git-proven `landed` / `surviving` labels into a hash-chained ledger beside it.
+3. **Ingest.** Reactor's :8090 receiver tails the stream; the GRPO reader reads the same files.
+4. **Train.** The **Training Lifecycle Handoff** runs one exclusive cycle. It is JARVIS code (`observability/training_handoff.py`), not Reactor code:
+   - it refuses to run beside a live organism;
+   - it takes the GPU lease from J-Prime (`POST /v1/lease/acquire`);
+   - it runs Reactor's trainer as a subprocess (`scripts/run_grpo_training.py`), renewing the lease while it trains;
+   - it converts the adapter with Reactor's converter;
+   - it publishes the GGUF to J-Prime's registry with its sha256;
+   - it releases the lease;
+   - it verifies the new adapter greedily inside J-Prime's evaluation scope.
+
+   The cycle ends COMMITTED or ROLLED_BACK. A candidate that scores below the incumbent is rejected through the registry, and the incumbent is restored and re-verified. Automatic triggering (`JARVIS_GRPO_AUTOTRAIN_ENABLED`) is off, so cycles run on demand.
+5. **Serve.** J-Prime now serves the new adapter, and Loop 1 uses it.
+
+**Loop 3 — governance (days).** O+V lands on local `main`. The operator reviews it and publishes it to GitHub, and the operator alone can do this (§93.7). The operator's standing rule (§93.11) is that no training-derived change is pushed until it shows a gain on held-out tasks. In this loop the human is the zero-order doll of §94.10.
+
+**The contracts between them.**
+
+| Contract | From → to | Where it is defined |
+|---|---|---|
+| `ExperienceEvent` JSONL (input, output, model, outcome, confidence, should-train, draw kind) | O+V → Reactor | `trajectory_recorder.py`; `reactor_core/schemas/experience_schema.py` |
+| Landing labels, hash-chained | O+V → Reactor | `<events>/provenance/landing_labels.jsonl` |
+| Trainer exit code (0/1/2/3) and JSON report | Reactor trainer → JARVIS handoff | `run_grpo_training.py` |
+| Training lease (token, TTL, freed MiB, state) | JARVIS handoff ↔ J-Prime | `jarvis_prime/engine/lease.py` |
+| Adapter registry entry (GGUF LoRA, header-validated, sha256, versioned) | JARVIS handoff → J-Prime | `jarvis_prime/engine/adapter_registry.py` |
+| Ollama and OpenAI wire protocols | O+V → J-Prime | `jarvis_prime/engine/app.py`, `protocol.py` |
+
+Two things the April design assumed are absent. **Reactor never calls J-Prime**: on `origin/main` it contains no call to the lease or adapter endpoints, and JARVIS does the publishing. And **J-Prime calls no one**: it is a passive server.
+
+**When one of them is down.**
+
+| Down | What happens |
+|---|---|
+| J-Prime | O+V's bring-up (`trinity_siblings.py`) tries to start it. With the local lane on and no paid lane, there is nothing to generate with, so no work proceeds; the paid lanes are off by declaration (§93.6). |
+| J-Prime lent to training | New generations get 503 + `Retry-After`; a booting organism exits with code 69. |
+| Reactor | Not required. "Without it the organism still works; it just stops learning." The recorder keeps writing to disk, and the receiver catches up from its saved offsets when it returns. |
+| The handoff dies mid-cycle | J-Prime's lease expires and service is restored through measured VRAM admission. |
+| JARVIS / O+V | J-Prime keeps serving; Reactor idles. A training cycle *needs* the organism stopped. |
+
+<!-- engage:begin -->
+<div class="quick-check" id="qc-94-7">
+<p class="qc-label">Quick check · §94.7</p>
+<details class="qc"><summary>1. O+V and Reactor share a file contract, not an HTTP call. What does that buy when Reactor is down?</summary>
+<p>The organism is not blocked: the recorder keeps writing to disk, and the receiver catches up from saved offsets when it returns. "Without it the organism still works; it just stops learning."</p>
+</details>
+<details class="qc"><summary>2. Which two calls the April design assumed are absent?</summary>
+<p>Reactor never calls J-Prime (JARVIS's handoff does the leasing and publishing), and J-Prime calls no one; it is a passive server.</p>
+</details>
+<details class="qc"><summary>3. Where is the human in the three loops?</summary>
+<p>Only in Loop 3, governance: the operator reviews what landed and alone publishes it, and no training-derived change is pushed without a held-out gain. (Today the operator also starts training cycles, because automatic triggering is off.)</p>
+</details>
+</div>
+<!-- engage:end -->
+
+### §94.8 The North Star: the Document, the Criteria and the Ladders
+
+**The document.** `docs/architecture/OUROBOROS_VENOM_NORTH_STAR.md` is PRD §51, split into its own file in June (`9f8625a775`). Its latest revision is `d96870a071` (2026-09-19). Its sections are:
+- what "North Star Galaxy" means;
+- the architect's mandate;
+- a convergence audit;
+- three buckets of gaps: Bucket A, "unwired brain", 14 modules with no live callers; Bucket B, a cage not yet ready for the top tier; Bucket C, missing drivers;
+- a research frontier;
+- a redefined critical path;
+- what "fully autonomous" means;
+- a verification ledger;
+- the live roadmap.
+
+It defines the North Star as "the Mechanic Order fully realized + the first safe step into the Neurosurgeon Order" (§94.10 explains the Orders).
+
+**Four axes that "advance together or not at all".**
+1. **Operating tier**, A → B → C → D: how much oversight the operator gives (PRD history §41).
+2. **Reverse Russian Doll order**, 0 → 1 → 2: what O+V acts *on* (PRD §23).
+3. **Convergence of recursive self-improvement** in Wang's sense (PRD §5; §92.17 here).
+4. **Safety**, moving from methodology to property (PRD §43).
+
+**Two ladders, not one.** They are easy to confuse.
+
+| Operating tier (PRD history §41.2) | Operator reviews | Operator's role |
+|---|---|---|
+| A | Weekly | Per-PR reviewer |
+| B | Monthly | Batch approver |
+| C | Quarterly | Dashboard overseer |
+| D, "Fully Autonomous JARVIS Development" | Roadmap-level only | Roadmap signer (the zero-order doll) |
+
+| Galaxy roadmap tier (North Star §51.7) | Content |
+|---|---|
+| 1 | Close the learning loop: wire the Bucket A modules |
+| 2 | Make the cage worthy of Tier D (the §43 safety arcs and a lineage depth bound) |
+| 3 | Wire and graduate the second-order driver (M10, the ArchitectureProposer) |
+| 4 | The Layer-4 authority decision: *operator-only*, a signed roadmap |
+| 5 | Evidence: M10 proposals 0 → 100, audited O+V commits 2 → 200, unsupervised days 0 → 90; "~12–18 months" |
+
+The document's own estimate is that "the engineering to reach Tier D is the easy ~15%". The safety substrate, the evidence and the operator's Layer-4 decision "are the real 85%".
+
+**The definition of done (PRD §6).** The A-level criteria are not in the North Star file. They are a seven-row table in PRD §6, and "when all 7 … land simultaneously, O+V is A-level". The PRD's own scoring as of 2026-10-04 (§34.9) is:
+
+| Dimension | A-level signal | Status (PRD §34.9) |
+|---|---|---|
+| Autonomous initiation | ≥ 3 self-formed goals per session that a human would not have written | Met narrowly (hygiene goals, not product goals) |
+| Cross-session learning | Postmortem-driven prompt changes visible in ≥ 30% of later operations | Not measured |
+| Reliability | ≥ 90% session completion with a clean stop reason | Not met / not measurable yet |
+| Throughput | Sustained ≥ 1 commit per 30 minutes of session time | Met in-window, not sustained |
+| Operator UX | < 30 s from "I want X" to "X is being worked on" | Not measured |
+| Cognitive depth | A self-model producing a behaviour summary the operator can read | Not measured |
+| RSI convergence | Composite score non-decreasing over a rolling 30 days | Not measured |
+
+§6 also lists anti-goals, things that do *not* count as progress toward A-level: a smarter model, more sensors, more configuration knobs, bigger context windows, more model calls, shipping faster. A 2026-10-04 note qualifies the first. On the local 30B, model capability *is* a measured constraint (§33).
+
+**What "A1" was.** §93.4 describes the June–July "A1 wall". A1 was not an A-level criterion. It was item A1 of the North Star's *Tier A — the autonomy blocker* list: trace a signed sub-goal's first file from "enqueued" to "dispatched". The milestone of a first autonomous landing was gated on nothing else. It was diagnosed as a default-off roadmap ignition daemon plus a silent-drop race in the intake tee, and marked **CLOSED on 2026-09-08** ("Do not work this item"), with `3a7d155218` and `e7b3bdfec2` as proof. The successor gate is *cadence*, not dispatch. The latest revision opens: "P0 is CLOSED. The gate is no longer one landing — it is the LANDING RATE."
+
+**Two self-assessments that disagree.** The North Star file contains both, and a reader should know which is current.
+- **2026-06-06.** A post-arc scorecard marks roadmap tiers 1 and 2 "CLOSED", puts the mechanism substrate at "~92 %" and the whole at "~30–35 %".
+- **2026-09-19.** The latest revision re-verifies Bucket A and finds "9 of 10 sampled modules still at zero live callers". It finds the M10 second-order driver still has "0 references in `orchestrator.py`", and concludes that the September landings moved Order 1 "from nominally wired to actually productive" but "did not touch Order 2". "The ~10-15%-to-Tier-D figure stands."
+
+The September figure is the current one. Read together, the two show that *built* is not *wired*, and *wired* is not *productive*. This is the same lesson the reachability ledger (§93.12) was built to enforce.
+
+<!-- engage:begin -->
+<div class="quick-check" id="qc-94-8">
+<p class="qc-label">Quick check · §94.8</p>
+<details class="qc"><summary>1. What is the difference between the operating tiers A–D and the Galaxy roadmap tiers 1–5?</summary>
+<p>Operating tiers measure how much oversight the operator gives (per-PR reviewer up to roadmap signer). Galaxy tiers are the critical path of work to get there: learning loop, cage, second-order driver, the Layer-4 decision, evidence.</p>
+</details>
+<details class="qc"><summary>2. A1 was closed on 2026-09-08. Why was it not an A-level criterion, and what replaced it as the gate?</summary>
+<p>A1 was item A1 of the North Star's Tier A blocker list (trace a signed sub-goal from enqueued to dispatched), not one of PRD §6's seven dimensions. Its successor gate is cadence: "the LANDING RATE".</p>
+</details>
+<details class="qc"><summary>3. Why does the North Star say engineering is "the easy ~15%"?</summary>
+<p>Because the remaining 85% is the safety substrate, the evidence (for example 90 unsupervised days) and the operator's Layer-4 decision, none of which more code alone produces.</p>
+</details>
+</div>
+<!-- engage:end -->
+
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-s94-3">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">The project has a written definition of done (the seven A-level criteria in PRD §6) and a planner that can read it and file work toward it. The organism has made 91 autonomous landings. Predict whether those landings were chosen by reading the definition of done.</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>No. The Epistemic Planner and the Conception Bridge that would turn the §6 gap into work are built but both default to off, and no tracked file arms them. The 91 landings came from a chain that does not read §6: the signed roadmap, Goal Discovery turning evidence into signed goals, operator <code>/goal sanction</code>, the Sentinel, and the goal-reconciliation ledger. The organism is proactive about the codebase's hygiene, not yet about building JARVIS toward the PRD. See §94.9.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
+### §94.9 From North Star to Running Code
+
+The North Star becomes behaviour through three mechanisms. Only one of them is fully on.
+
+**(a) Strategic direction: the Manifesto in every prompt.** `governance/strategic_direction.py` (`6bda4a5100`, April) reads the README (the Manifesto), `docs/architecture/OUROBOROS.md` and `docs/architecture/BRAIN_ROUTING.md` at boot. It adds the themes of the last 50 commits ("git momentum"), and injects a digest headed "Strategic Direction (Manifesto v4)" into CLASSIFY and into every generation's strategic-memory prompt. Benchmark operations are insulated from it. It has no master switch, so it runs whenever the loop service has loaded it. It reads neither the North Star file nor the PRD.
+
+*A measured defect.* The README, §3 of this paper and the module's own docstring say the seven Manifesto principles are injected. Running the module's own extractors on the README on `origin/main` (2026-10-13) gives a different result.
+- **Six principles, not seven.** `_extract_principles` scans only the first 20,000 characters, and Principle 7, *Absolute observability*, now begins at character 24,496.
+- **Only the opening paragraph of the manifesto.** `_extract_manifesto` returns 464 characters, the opening paragraph, because its end marker `"## "` also matches inside the next `"### "` sub-heading.
+- **The cause.** The README grew past the window, and the end marker was never written to tell headings apart.
+
+So the organism is told six principle titles and one paragraph, and the principle it is not told is the one about observability. This is recorded in §93.16. A README rewrite on the author's local branches (`docs/readme-overhaul`†) brings all seven principles back inside the window, but the end-marker defect would remain. The durable fix is in the extractor: select by heading rather than by a fixed window, and stop at the next heading of the same level.
+
+**(b) North Star context: the definition of done, for dreaming only.** `governance/north_star_context.py` (`797b52acf9`, July) reads the PRD and the North Star file. Within a 6,000-character budget it returns PRD §6 verbatim, under the heading "The A-level definition of DONE (PRD §6 — close THIS gap)", followed by the outlines of both documents. It is "explicitly NOT a RAG pipeline", just deterministic extraction. It is **on by default** (`JARVIS_DREAM_NORTH_STAR_CONTEXT_ENABLED`), but its consumer is the DreamEngine's speculative prompt, not GENERATE. It also exposes `a_level_criteria()`, which parses the §6 table into structured pairs for the planner below.
+
+**(c) The Epistemic Planner and the Conception Bridge: self-filed work toward the goal.** This is the mechanism the North Star most depends on, and it is **off**.
+
+```
+ PRD §6 table ──a_level_criteria()──┐
+                                    ├─▶ epistemic_planner.synthesize_gap_blueprints()
+ git momentum (the "frontier") ─────┘        ≤ 3 steps, ≤ 2 existing files each, zero model calls
+                                                  │  ImprovementBlueprint
+                                                  ▼
+                              ConceptionProposalBridge.route()   EV ≥ max(0.5, batch mean)
+                                                  │  source="auto_proposed", urgency low,
+                                                  │  requires_human_ack=True
+                                                  ▼
+                                      UnifiedIntakeRouter.ingest()  → the pipeline
+```
+
+- **The idea.** The planner's docstring calls itself "the stop-condition for human prompting". It compares the **frontier**, where the human's recent commits ended, with the **North Star**, the §6 criteria. It then writes up to three roadmap steps of the form "advance '<dimension>' in <module>", each pointing only at existing files the human recently touched ("a step can never point at fiction").
+- **The bridge.** The Conception Bridge routes the highest-value blueprints into intake. Every envelope it creates carries `requires_human_ack=True`, so even when armed it *proposes*; it does not act alone.
+- **Two switches.** `JARVIS_EPISTEMIC_PLANNER_ENABLED` and `JARVIS_CONCEPTION_BRIDGE_ENABLED` both default to false. The bridge returns nothing when it is off, so the planner does nothing unless both are on.
+- **Not armed yet.** No tracked file arms them.
+
+**Why it is off, and when it comes on.** PRD §34.9 records the operator's four-step self-development sequence (2026-09-20) and its status:
+
+| Step | Status (PRD §34.9) |
+|---|---|
+| 1. Prove the loop lands validated work at a cadence | Met for test synthesis |
+| 2. Restore package-degraded features | Not started |
+| 3. Arm the Epistemic Planner + Conception Bridge on a soak | Not started — built, default-off |
+| 4. JARVIS → O+V handoff through the `/goal` seam | Not started |
+
+The reason for the order is the supply wall of §93.10. Arming a planner that fills the backlog faster than the loop can drain it produces a longer queue, not more landings. §93.15 places the arming after diff fidelity, a held-out gain and wider supply.
+
+**What actually produced the landings.** The 91 landings of §93.10 came from a different chain, which does not read §6 at all:
+- the signed roadmap (`.jarvis/roadmap.yaml`);
+- Goal Discovery turning evidence (uncovered modules, red tests) into signed goals;
+- operator `/goal sanction`;
+- the Sentinel driving them through the pipeline;
+- the goal-reconciliation ledger recording each one SATISFIED.
+
+So today the organism is proactive about the codebase's *hygiene*: tests, red tests, signed goals. It is not yet proactive about *building JARVIS toward the PRD*. The mechanism for that is built and deliberately switched off.
+
+<!-- engage:begin -->
+<div class="quick-check" id="qc-94-9">
+<p class="qc-label">Quick check · §94.9</p>
+<details class="qc"><summary>1. Both <code>JARVIS_EPISTEMIC_PLANNER_ENABLED</code> and <code>JARVIS_CONCEPTION_BRIDGE_ENABLED</code> must be on before self-filed work reaches intake. Even then, what stops it acting alone?</summary>
+<p>Every envelope the bridge creates carries <code>requires_human_ack=True</code>, so the armed planner <em>proposes</em> rather than acts. Self-filed work needs both switches AND a human acknowledgement.</p>
+</details>
+<details class="qc"><summary>2. Why does the planner's step "never point at fiction"?</summary>
+<p>Each step may name only existing files that the human's recent commits touched, at most two per step. The planner cannot invent a module to work on.</p>
+</details>
+<details class="qc"><summary>3. <code>north_star_context.py</code> is on by default. Why does it not steer what O+V builds?</summary>
+<p>Its consumer is the DreamEngine's speculative prompt, not GENERATE. The prompts that do shape generation get the strategic-direction digest, which reads neither the North Star file nor the PRD.</p>
+</details>
+</div>
+<!-- engage:end -->
+
+### §94.10 The Reverse Russian Doll, Traced Through the Code
+
+**The idea, in the architect's words.** The PRD §23 epigraph (2026-04-26): "In a standard Russian doll, the layers compress inward, getting smaller and simpler. We are doing the exact opposite. We have established the solid core, and we are building the mechanisms for the core to autonomously carve an exponentially larger, smarter shell around itself." The North Star's §51.1 adds the safety half: a volatile core "sealed inside an expanding, un-bypassable shell of deterministic Python constraints — and as the core carves a smarter shell around itself, the immune system scales proportionally so it never crushes the core." The same section names three readings of the term: the AI architecture, the operator's own life architecture, and a thesis under formal investigation (§92.17).
+
+**The Orders: what O+V acts on.** PRD §23 defines an axis orthogonal to the pipeline phases and the operating tiers.
+
+| Order | Meaning | Status |
+|---|---|---|
+| 0 | AI as exoskeleton: it "freezes when the human stops typing". In the code, the *zero-order doll* is the operator. | The human's role |
+| 1 | O+V as the autonomic nervous system: it "expands the body outward", changing the codebase around it | "This is what currently runs." The Mechanic Order: shipping |
+| 2 | O+V "turns inward, safely rewrites its own cognitive architecture" | Caged, with no driver: the Neurosurgeon Order |
+
+The North Star's telos vocabulary maps Order 1 to *Mechanic* (✅ shipping), Order 2 to *Neurosurgeon* (⚠️ caged but no driver), and a far horizon to *Apotheosis* (❌). §93 ends the period at Mechanic, and the "first safe step into Neurosurgeon" is the North Star itself.
+
+**The shells, as built.** The design was carried out in three passes, all on 2026-04-26, before §92 was written, and extended in May.
+
+| Pass / shell | What it built | Commits | Default today |
+|---|---|---|---|
+| Pass A — reconciliation | Found no prior "Order" vocabulary in the four canonical docs, mapped Order 1 onto existing subsystems, and named five rungs to Order 2. Every immune-system layer "already exists as a deterministic gate. None of them learn." | Design only; PRD §23 landed in `b4706e455d` | — |
+| Pass B — the Order-2 cage | An Order-2 manifest of protected cognitive code; a risk class `ORDER_2_GOVERNANCE` *above* `BLOCKED`; an AST validator for phase runners; shadow replay against a golden corpus; a meta phase runner; a review queue whose `amendment_requires_operator()` is locked true; the `/order2` command | `2ca8f5d919` … `5a2e1bab81` (9 slices) | Manifest and risk class **on**; meta runner **off**; amendment always needs the operator |
+| Pass C — adaptive Anti-Venom | An append-only adaptation ledger that "refuses to persist loosening proposals"; guardian patterns mined from postmortems; an exploration-floor tightener; per-order mutation budgets; a risk-tier extender; a category rebalancer; a meta-governor and `/adapt` | `f264e598c2` … `251813a567` (6 slices); graduated `c6f92c713f` (2026-04-29) | **On** (ledger and mined guardian verified) |
+| Boundary gate | Three dolls: the outer doll (operator); the middle doll (`governance/`, O+V's own cage); the inner doll (everything else). Any change under `governance/` forces approval. | `06c2440903` (2026-05-10) | **On** |
+| Recursion-depth gate | Counts consecutive governance-touching APPLYs and blocks past a depth of 3: "the human remains the structural authority (the zero-order doll)". Its specification is proved in Z3. | Slice 104; Z3 Slices 129–130 | **On** |
+| Second-order doll metric | Measures Order-2 activity | `10ddd45598` | Off; no live callers |
+
+Two invariants run through all of it. **Adaptive gates may only tighten**: any loosening must go through the Order-2 amendment path, and that path always needs the operator. And **no adaptation is autonomous**: every proposal goes to the operator's queue. In §92.17's notation, the shell S<sub>n</sub> may grow only in the direction of more constraint unless the zero-order doll signs otherwise.
+
+**Mapping the doll onto the four subsystems.** The doll is not only an O+V idea. It describes the whole Trinity.
+- **The core.** The volatile core *C* is the model J-Prime serves.
+- **The shell.** The deterministic shell S<sub>n</sub> is O+V's gates and containment (§94.4) inside the Body.
+- **The proposed change.** The mutation operator *M* is O+V's pipeline proposing a patch δ.
+- **The growing core.** Reactor is how the *core itself* changes: each committed adapter is a new *C*.
+
+The governance rule that no training-derived change is published without a held-out gain (§93.11) is therefore the doll's own requirement applied to the core, not just to the shell. The core may grow only if something outside it measures that it got better. PRD §23 records the operator's decision that Order 2 is "Trinity-wide eventually; JARVIS-Body cognitive code only for now".
+
+**Honest status.** The North Star's verdict: "We have the doll's outer wall but not the doll's hand." The cage for Order 2 is built and mostly on. The driver that would *use* it, M10, has no reference in the orchestrator, so Order 2 has never been exercised. The doll's central safety claims are, in the document's words, "engineering assertions, not proven theorems". The one machine-checked piece is the Z3 proof of the recursion-depth specification. §92.17 states the bounded-RSI property as a conjecture, and §92.12 lists it as open.
+
+**A correction.** §92.12 and §92.17 cite "§3, §50" for the Reverse Russian Doll. Neither section mentions it. §3 is the seven Manifesto principles and §50 is cost-aware prioritization, and the term first appears in this paper at §92.12. The definitions are in PRD §23 and North Star §51.1, as given above. This is recorded in §93.16.
+
+<!-- engage:begin -->
+<div class="quick-check" id="qc-94-10">
+<p class="qc-label">Quick check · §94.10</p>
+<details class="qc"><summary>1. What are the doll's two invariants, and how does the adaptation ledger enforce the first?</summary>
+<p>Adaptive gates may only tighten, and no adaptation is autonomous. The ledger "refuses to persist loosening proposals"; any loosening must go through the Order-2 amendment path, which always needs the operator.</p>
+</details>
+<details class="qc"><summary>2. Map C, S<sub>n</sub>, M and "a growing core" onto the four subsystems.</summary>
+<p>C is the model J-Prime serves; S<sub>n</sub> is O+V's gates and containment in the Body; M is O+V's pipeline proposing a patch; Reactor is how the core itself changes, each committed adapter being a new C.</p>
+</details>
+<details class="qc"><summary>3. "We have the doll's outer wall but not the doll's hand." What is missing?</summary>
+<p>The driver that would use the Order-2 cage. M10, the ArchitectureProposer, has no reference in the orchestrator, so Order 2 has never been exercised. Only the recursion-depth specification is machine-checked (in Z3).</p>
+</details>
+</div>
+<!-- engage:end -->
+
+### §94.11 Where the Goal Stands
+
+| Question | Answer as of 2026-10-13 | Where |
+|---|---|---|
+| Does O+V develop JARVIS without the human writing the code? | Yes, for one kind of work: 91 landings, 84 of them new test files, 5 production changes | §93.10 |
+| Does it choose *what* to build toward the product goal? | No. Its goals come from hygiene evidence and signed roadmap items; the planner that reads the definition of done is off | §94.9 |
+| Is the human out of the loop? | No, by design. The human signs scope and alone publishes; that is the North Star's intended end state, not a gap | §94.1, §93.7 |
+| Does the system learn from its own work? | The loop runs end to end, but no held-out gain has been shown | §93.11, §94.7 |
+| Can it change its own cognition (Order 2)? | No. The cage exists; the driver is not wired | §94.10 |
+| Which A-level criteria are met? | Throughput (in-window), autonomous initiation (narrowly); five are unmeasured or unmet | §94.8 |
+| Is the North Star's own estimate optimistic or pessimistic? | Its latest estimate is about 10–15% of the way to Tier D, and it says the remaining 85% is safety, evidence and the operator's decision rather than engineering | §94.8 |
+
+What the four subsystems add up to, then, is a working *Mechanic*. A local model, served by J-Prime, writes code that O+V validates, contains and lands. Reactor turns the record of that work into training data and has already completed one full cycle back into J-Prime, and the human holds the publication key. The next steps toward the North Star are written down and ordered (§93.15, §94.9):
+1. make diffs land;
+2. show a held-out gain;
+3. widen the supply of work;
+4. then let the planner read the definition of done.
+
+<!-- engage:begin -->
+<div class="quick-check" id="qc-94-11">
+<p class="qc-label">Quick check · §94.11</p>
+<details class="qc"><summary>1. Why is "Is the human out of the loop? No" listed as the intended end state rather than a gap?</summary>
+<p>Because the North Star's goal is a human who signs scope and alone publishes, not no human at all. The zero-push air-gap and the operator's publication key are the design working.</p>
+</details>
+<details class="qc"><summary>2. Why are the next steps ordered with "let the planner read the definition of done" last?</summary>
+<p>Diffs must land, a held-out gain must be shown and supply widened first; otherwise the planner fills the backlog faster than the loop drains it, producing a longer queue rather than more landings (§94.9).</p>
+</details>
+</div>
+<!-- engage:end -->
+
+### §94.12 Glossary Additions
+
+| Term | Meaning |
+|---|---|
+| North Star | The operator-bound goal: O+V develops JARVIS proactively and autonomously, safely and under governance (PRD history §41.1) |
+| A-level | The seven-dimension definition of done in PRD §6 |
+| Operating tiers A–D | How much oversight the operator gives, from per-PR review (A) to roadmap signing (D) |
+| Galaxy roadmap tiers 1–5 | The North Star's critical path: learning loop, cage, second-order driver, Layer-4 decision, evidence |
+| Zero-order doll | The operator, as the structural authority every shell answers to |
+| Order 1 / Order 2 | O+V changing the codebase around it / changing its own cognitive architecture |
+| Mechanic / Neurosurgeon | The North Star's names for Order 1 (shipping) and Order 2 (caged, no driver) |
+| Epistemic Planner | Writes roadmap steps from the gap between the frontier and the §6 criteria; built, off |
+| Conception Bridge | Routes high-value blueprints into intake as acknowledged proposals; built, off |
+| J-Prime Engine | J-Prime's llama.cpp server: model pool, GPU lease, adapter registry, evaluation scope |
+| Training lease | J-Prime lending the GPU to training, with VRAM release verified by `nvidia-smi` |
+| Experience stream | The shared directory of `ExperienceEvent` rows that joins O+V to Reactor |
+
+<!-- engage:begin -->
+<div class="quick-check" id="qc-94-12">
+<p class="qc-label">Quick check · §94.12</p>
+<details class="qc"><summary>1. Using the glossary, explain why "Mechanic" and "Order 1" name the same thing, and why the Neurosurgeon Order is not reached by changing governance files under signed goals.</summary>
+<p>Mechanic is the North Star's name for Order 1, O+V changing the codebase around it. Neurosurgeon is Order 2, O+V changing its own cognitive architecture; it is "caged, no driver", and §93.10 adds that it means doing so on the organism's own initiative, which has not happened.</p>
+</details>
+</div>
+<!-- engage:end -->
+
+<!-- engage:begin -->
+#### Check your understanding: §94 — The Whole System: Four Subsystems, One Goal
+
+<div class="engage" id="engage-s94">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. The North Star says JARVIS should develop itself "fully autonomously", yet the same documents insist the operator remains the zero-order doll. Is that a contradiction, and where in the running code does the operator's role actually live today?</summary>
+<p>It is not a contradiction, because the documents define autonomy as a <em>migration of authority</em>, not its removal (§94.1). The operator moves from per-PR reviewer to batch approver to roadmap signer, and the PRD history lists what the North Star does not mean: the operator does not become irrelevant, safety gates are not removed, and even the top tier works inside an operator-signed roadmap, budget and scope. The Manifesto's line is that the organism "can write its own brain. It can never merge its own brain."</p>
+<p>In code the boundary is concrete. The zero-push air-gap means O+V can land on local <code>main</code> but only the operator publishes (§93.7). The Order-2 review queue's <code>amendment_requires_operator()</code> is locked true, the recursion-depth gate blocks past a depth of 3 governance-touching APPLYs, and any change under <code>governance/</code> forces approval (§94.10). The Conception Bridge stamps every self-filed proposal <code>requires_human_ack=True</code> (§94.9). So the end state is not a system without a human; it is one where the human's job has moved up a level, and §94.11 records that as the intended design, not a gap.</p>
+</details>
+<details class="cq"><summary>2. §94 repeatedly separates "built", "wired", "productive" and "default-on". Using one example of each gap, explain why the North Star's 2026-06-06 scorecard ("~30–35 %") and its 2026-09-19 revision ("~10-15%") can both be honest and still disagree.</summary>
+<p>Built but not wired: Bucket A, where 9 of 10 sampled modules still had zero live callers, and the M10 second-order driver with "0 references in <code>orchestrator.py</code>" (§94.8). Wired but off: the Epistemic Planner and Conception Bridge, both reachable but defaulting to false (§94.9). On but feeding the wrong consumer: <code>north_star_context.py</code> is on by default, but it feeds the DreamEngine's speculative prompt, not GENERATE. On and wired but defective: <code>strategic_direction.py</code> runs every time, yet tells the organism six principle titles and one paragraph instead of seven principles and the manifesto.</p>
+<p>The June scorecard counted mechanisms that existed and marked tiers "CLOSED". The September revision re-verified by checking live callers, and found that the landings moved Order 1 "from nominally wired to actually productive" but "did not touch Order 2". Both assessments can be honest about what they measured; they measured different things. The paper treats the September figure as current because it measures reachability and effect, which is the lesson the reachability ledger (§93.12) was built to enforce.</p>
+</details>
+<details class="cq"><summary>3. Why does it matter that §5.3's "Reactor as sandbox" was wrong, beyond keeping the record straight? What would a reader who trusted §5 believe about containment that the code does not support?</summary>
+<p>§5.3 said permitted <code>bash</code> and <code>run_tests</code> execute inside Reactor, with resource limits, process isolation and syscall filtering, and that this "is what makes the Iron Gate's containment guarantees meaningful". A reader who trusted that would believe a second subsystem, on a separate boundary, contains anything the static checks let through.</p>
+<p>The code says otherwise (§94.4, §93.16). Reactor is a training repository. Containment is in the Body: candidate trees, a PID namespace that "degrades to uncontained if the kernel refuses" unless the <code>..._REQUIRED</code> flag is set, a cgroup memory cap, and per-operation worktrees. The layer that would do syscall filtering, Docker + seccomp, is off. That matters because the static cage has a measured at-scale escape rate of about 8.8%, concentrated in runtime-built <code>eval</code>/<code>exec</code>/<code>subprocess</code> strings that a static check cannot see (§93.3). The layers that bound damage when a candidate actually runs are real but narrower than §5 implied, and the strongest one described in April is not on.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-s94">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. Which component takes J-Prime's GPU lease, runs the trainer and publishes the new adapter to J-Prime's registry?</p>
+<ol class="mcq-options" type="A">
+<li>Reactor's :8090 service, once ingestion fills its buffer</li>
+<li>J-Prime itself, through its adapter registry's scheduler</li>
+<li>The Training Lifecycle Handoff, which is JARVIS code</li>
+<li>O+V's trajectory recorder, at the end of each soak</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> The handoff (<code>observability/training_handoff.py</code>) leases J-Prime, runs Reactor's trainer as a subprocess, converts and publishes the adapter, then verifies it. Reactor never calls J-Prime, and J-Prime calls no one (§94.7).</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. Why must J-Prime <em>lend</em> the GPU for training rather than train beside serving?</p>
+<ol class="mcq-options" type="A">
+<li>Inference (about 21 GiB) plus a GRPO step (about 28 GiB) exceeds the 32 GB card</li>
+<li>llama.cpp cannot load a model while a PyTorch process is running</li>
+<li>The adapter registry refuses to publish while any model is pinned</li>
+<li>Training must run on Windows, but J-Prime runs inside WSL2</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> One 32 GB card cannot hold the 30B for inference and a GRPO step at the same time (<code>lease.py</code>), so J-Prime drains, proves the memory free with <code>nvidia-smi</code>, and lends it (§94.5).</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">3. Reactor's :8090 service goes down during a soak. What happens?</p>
+<ol class="mcq-options" type="A">
+<li>O+V halts at GENERATE, because Reactor scores every candidate</li>
+<li>The recorder buffers rows in memory and drops them after a TTL</li>
+<li>J-Prime rolls back to the <code>origin</code> adapter as a precaution</li>
+<li>The organism keeps working and stops learning; the receiver catches up later</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> Reactor is not required. The recorder keeps writing to disk, and the receiver resumes from its persisted byte offsets when it returns (§94.7, §94.6).</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. Running <code>strategic_direction.py</code>'s own extractors on the current README shows the organism is told six principle titles, not seven. Which one is missing, and why?</p>
+<ol class="mcq-options" type="A">
+<li>Principle 1, because its marker is matched by the manifesto heading</li>
+<li>Principle 7, because it now begins past the 20,000-character window</li>
+<li>Principle 4, because the regex skips titles containing parentheses</li>
+<li>Principle 7, because the <code>"## "</code> end marker cuts the list short</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> <code>_extract_principles</code> scans only the first 20,000 characters, and Principle 7, <em>Absolute observability</em>, begins at character 24,496. The <code>"## "</code> marker is a separate defect: it truncates the manifesto text to 464 characters (§94.9).</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-s94">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> O+V generates a candidate test file for a signed goal; it passes, lands and survives. Follow that one candidate through all three loops of §94.7 until the model that wrote it has been retrained and the result could be published. At each boundary between subsystems, name the contract that carries it. Then say what happens if the handoff process dies after taking the lease.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Use the contracts table in §94.7. Loop 1 is seconds, Loop 2 hours, Loop 3 days; the human appears in only one of them.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>Loop 1 (inference).</strong> The candidate generator routes to the local lane under the free-lane policy, and <code>LocalPrimeClient</code> calls J-Prime over the Ollama-native <code>/api/chat</code> or OpenAI <code>/v1/chat/completions</code>. Contract: the Ollama and OpenAI wire protocols. J-Prime answers with <code>qwen3-coder-ov:30b</code>, which is the base weights plus the active Reactor LoRA plus its sampling defaults (§94.5).</p>
+<p><strong>Loop 2 (learning).</strong> The trajectory recorder writes one <code>ExperienceEvent</code> line for the candidate into <code>~/.jarvis/trinity/events/</code>. Contract: the shared JSONL schema, a file, not an HTTP call. Landing provenance adds git-proven <code>landed</code> and <code>surviving</code> labels to the hash-chained ledger, so this row becomes a success example (§94.6). Reactor's receiver tails the stream, and the GRPO reader reads the same files. The operator then runs the handoff on demand (autotrain is off): it refuses to run beside a live organism, acquires the lease (contract: token, TTL, freed MiB, state), runs <code>run_grpo_training.py</code> (contract: exit code 0/1/2/3 and a JSON report), converts the adapter to GGUF, publishes it with its sha256 (contract: a header-validated, versioned registry entry), releases the lease, and verifies greedily inside J-Prime's evaluation scope. The cycle ends COMMITTED or ROLLED_BACK.</p>
+<p><strong>Loop 3 (governance).</strong> The landed test sits on local <code>main</code>. Only the operator publishes to GitHub, and the standing rule is that no training-derived change is pushed without a held-out gain (§93.11).</p>
+<p><strong>Handoff dies holding the lease.</strong> The lease expires and J-Prime restores service through the same measured VRAM admission, so "expiry can never cause an OOM" (§94.5, §94.7). Until then, new generations get 503 with <code>Retry-After</code>, and an organism booting meanwhile exits with code 69.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (analysis).</strong> The A-level throughput criterion in PRD §6 is "sustained ≥ 1 commit per 30 minutes of session time", and PRD §34.9 scores it "Met in-window, not sustained". Using the cadence table in §93.10, compute landings per hour for the 09-26, 10-04, 10-05, 10-08 and 10-09 soaks, compare each with the threshold, and explain the verdict. Then say why §6's anti-goals would not count a faster model, by itself, as progress toward this criterion.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>One commit per 30 minutes is 2 per hour. Count all landings, not only substantive ones, since the criterion says "commit".</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Threshold: 2 landings per hour. 09-26: 3 / 1.97 h ≈ 1.52 per hour. 10-04: 3 / 2.98 h ≈ 1.01. 10-05: 10 / 6.03 h ≈ 1.66. 10-08: 0 / 1.25 h = 0. 10-09: 51 merged in about 9 h ≈ 5.7 per hour.</p>
+<p>Only the 10-09 soak clears 2 per hour over its whole session; four of five fall below. That is what "met in-window, not sustained" means: the rate has been reached within a window but not held across sessions. The 10-05 soak also shows why "sustained" is hard: nothing landed from 22:24 to 00:29, which PRD §34 attributes to the supply wall (§93.10). Note too that the 10-09 row reports no substantive count, so its high rate is mostly tests for <code>backend/api/*</code>.</p>
+<p>The anti-goals in §6 list "a smarter model", "more model calls" and "shipping faster" as things that do not by themselves count as progress (§94.8). A criterion is met by the observed outcome, sustained landed commits with a clean record, not by an input that might raise it. A faster or better model helps only if it moves the measured rate; and when yield is bounded by supply, it would not. The 2026-10-04 note adds the honest qualification that on the local 30B, model capability <em>is</em> a measured constraint, so it is not irrelevant, just not progress on its own.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/strategic_direction.py</code> and read <code>_MAX_DOC_CHARS</code>, <code>_extract_principles</code> and <code>_extract_manifesto</code>. Find (a) the line that makes Principle 7 invisible once the README grows, (b) the end marker that truncates the manifesto, and why <code>find</code> matches it inside a <code>"### "</code> heading, and (c) a fix consistent with §94.9's description. What does the organism lose from its prompts because of these two defects?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Look at what slice of <code>readme_content</code> the principle regex iterates over, and at the third entry of <code>end_markers</code>. A string search for "## " does not care what character precedes it.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) <code>_MAX_DOC_CHARS = 20_000</code>, and <code>_extract_principles</code> runs its <code>\*\*(\d+)\.\s+([^*]+)\*\*</code> pattern over <code>readme_content[:_MAX_DOC_CHARS]</code>. Any principle heading that starts after character 20,000 is never seen. §94.9 measured Principle 7 at character 24,496, so the list stops at six. The docstring still says "Extract the 7 numbered principles".</p>
+<p>(b) <code>end_markers</code> contains <code>"## "</code>, commented "next h2", and the code takes the earliest match after <code>start + 100</code>. But every level-3 heading, <code>"### ..."</code>, contains the substring <code>"## "</code> starting at its second character, so <code>find</code> matches inside the first <code>"### "</code> sub-heading after the start. The section is cut at the first sub-heading, which §94.9 measured as 464 characters: only the opening paragraph.</p>
+<p>(c) §94.9's fix: extract by heading rather than a fixed character window, and stop at a heading of the <em>same</em> level, for example by matching <code>"\n## "</code> at a line start and excluding deeper levels, and by locating each principle under the manifesto heading wherever it falls.</p>
+<p>The loss: the organism is told six principle titles and one paragraph, and the principle it is not told is Absolute observability. The README, §3 and the module docstring all claim seven are injected; this is recorded as a measured correction in §93.16. It is a clean example of code that is on and wired but not doing what the documents say.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-adv">Advanced conceptual questions</p>
+<details class="cq-adv"><summary>A1. §92.17 treats the core C as provider-agnostic and puts all the growth in the shell S<sub>n</sub>. §94.10 maps C onto the model J-Prime serves and says Reactor is how "the core itself changes". What does a changing core do to the bounded-RSI conjecture's three claims, and why does that make the held-out-gain rule a doll requirement rather than just a quality bar?</summary>
+<p>In §92.17 the iteration is (C, S<sub>n</sub>) → δ → δ′ → S<sub>n+1</sub>. Only the shell changes; C is a fixed thermal source. Claim (a), monotone deterministic entropy of the shell, and the "only tighten" invariant of §94.10 are statements about S<sub>n</sub>. Claim (c) is the one that refers to the core: net agentic entropy is bounded by a constant "depending on C's base capacity and S<sub>n</sub>'s growth rate".</p>
+<p>Once Reactor closes Loop 2, C is no longer fixed. Each committed adapter is a new C (§94.10). The constant in (c) is then a moving target, and (b), the shell's restraint on C's unconstrained output, was only ever argued for a given C. A new core could in principle produce candidates that sit in exactly the regions the shell does not bound. The empirical evidence for that region exists: the static cage misses about 8.8% of mutated escapes at scale (§93.3).</p>
+<p>That is why §94.10 calls the held-out-gain rule "the doll's own requirement applied to the core": the core may grow only if something outside it measures that it got better. The rule is enforced outside C (a benchmark from human commits with hidden tests) and outside the shell (the operator alone publishes, Loop 3). I would add a limit the paper does not claim to cover: the held-out rule measures capability, not containment. It checks that C improved, not that S<sub>n</sub> still bounds the improved C. Evidence that would settle whether this matters is re-running the at-scale mutation harness (§93.3) against candidates drawn from each new adapter and checking that the escape rate does not rise.</p>
+<p>One more synthesis point. §92.17 lists "a new test" among the ways M extends the shell. 84 of the 91 landings are new test files (§93.10). In the conjecture's own vocabulary, most of what the Mechanic has done so far is grow S<sub>n</sub>, while the one completed training cycle has not yet shown that C grew at all (§93.11).</p>
+</details>
+<details class="cq-adv"><summary>A2. The training handoff and the organism must never hold the GPU at the same time. List every mechanism in §94.5–§94.7 that enforces this exclusion, say which side each protects, and identify a crash window the paper does not fully specify.</summary>
+<p>Five mechanisms, from both ends. (1) The handoff "refuses to run beside a live organism" (§94.7), which protects training from an organism generating mid-cycle. (2) The organism checks the lease at boot and exits with code 69 if the lane is lent (§94.5, §93.9.2), which protects the cycle from an organism started during it. (3) DRAINING refuses new generations with 503 and <code>Retry-After</code> and waits for in-flight ones, and an in-flight response holds a reference so its model cannot be evicted mid-answer, which protects any generation already running. (4) RELEASED is declared only when <code>nvidia-smi</code> shows the memory free, which protects the trainer from starting into memory that is still held. (5) Lease expiry restores service only through measured admission, which protects serving from an OOM when the handoff disappears.</p>
+<p>The exclusion is therefore enforced by measurement at the GPU, not only by agreement between processes: "'We sent terminate' is not evidence; the card is." Child processes bound by a kill-on-close Job Object or <code>PR_SET_PDEATHSIG</code> close a further hole, a crashed engine leaving an orphan holding VRAM.</p>
+<p>The window the paper leaves open is a crash <em>after</em> publication and <em>before</em> verification ends. §94.7 says the cycle ends COMMITTED or ROLLED_BACK, and a losing candidate is rejected through the registry with the incumbent restored and re-verified, but it does not say what the registry holds if the handoff dies between those steps. What the paper does guarantee bounds the damage: versions are never overwritten, activation rewrites the model declaration atomically (so the served model is one version or the other, never half of each), the <code>origin</code> adapter remains as the fallback of last resort, and nothing training-derived is published to GitHub without a held-out gain. The evidence that would settle the open question is a fault-injection run that kills the handoff at each step and reads <code>GET /v1/adapters/{model}</code> and the served identity afterwards.</p>
+</details>
+<details class="cq-adv"><summary>A3. PRD §6 lists "a smarter model" as an anti-goal, yet one of the four subsystems, Reactor, exists to make the model smarter. Is the Trinity's learning loop working against its own definition of done? Argue a position and name the evidence that would settle it.</summary>
+<p>My position: no, provided Reactor's output is judged by the §6 criteria and never by its own training metrics. The anti-goals list inputs that do not count as progress: a smarter model, more sensors, more knobs, bigger context, more model calls, shipping faster (§94.8). The point is that A-level is defined by observed outcomes such as sustained throughput, reliability and cross-session learning. An adapter is an input like the others. The 2026-10-04 note qualifies the first anti-goal: on the local 30B, model capability is a measured constraint (§33), so improving it can be a means. It cannot be the measure.</p>
+<p>The design already reflects that distinction in three places. The handoff's own gate (4/6 against 3/6) was rejected by the project's notes as evidence of learning (§93.11). The operator's push rule requires a held-out gain, not a training-loss improvement. And the reward is a tiered verifier anchored in what the pipeline needs (envelope, shape, syntax, substance), not in model-centric scores (§94.6).</p>
+<p>There is a real way the loop could work against the goal, though. Cross-session learning, one of the seven dimensions, is defined in PRD §6 as postmortem-driven prompt changes visible in later operations, and it is "Not measured". If effort flows into adapters because Loop 2 is the visible, finished pipeline, the unmeasured dimensions stay unmeasured. The evidence that would settle the question is a two-step test: first a held-out gain for an adapter (§93.15 step 2), then a change in an A-level measurement, for example landings per hour on a fixed goal mix, attributable to that adapter. A held-out gain with no change in landed work would show the loop improving the model without moving JARVIS toward done.</p>
+</details>
+<p class="engage-kicker engage-kicker-adv">Challenge problems</p>
+<div class="pset pset-adv">
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 1 (adversarial).</strong> Assume a future in which the Epistemic Planner and Conception Bridge are armed and the Sentinel runs at its default ceiling. Construct three routes by which the organism might loosen its own governance without the operator choosing to: (1) the planner files a step "advance 'Reliability' in <code>governance/&lt;some gate&gt;.py</code>" that, once generated, lowers a threshold; (2) an adaptive Anti-Venom component mines postmortems and proposes relaxing a guardian pattern that blocked several good candidates; (3) a Reactor adapter, trained on landed work, becomes systematically better at producing candidates the static checks accept. For each, find the layer in §94.9, §94.10 or §93.7 that stops it, or show honestly that none does and what would.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Separate three things: who decides the work enters (intake), who approves the change (Sentinel, boundary gate, Order-2 path), and what a change to the core rather than the shell is subject to.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>Route 1: self-filed governance edit.</strong> The bridge stamps every envelope <code>source="auto_proposed"</code>, low urgency and <code>requires_human_ack=True</code>, so the proposal cannot proceed until a human acknowledges it (§94.9). Even after an acknowledgement, the boundary gate forces approval for any change under <code>governance/</code>; the Sentinel always escalates Order-2 self-modification and anything touching the cage (§93.7); and the recursion-depth gate blocks past three consecutive governance-touching APPLYs (§94.10). There is one honest caveat. The Sentinel's auto-approval ceiling defaults to APPROVAL_REQUIRED, and the paper does not say how the boundary gate's forced approval interacts with that ceiling for a governance file that is neither in the Order-2 manifest nor part of the cage. §93.10 shows governance-package files (<code>dw_capacity_probe.py</code>, <code>candidate_generator.py</code>) did land under signed, operator-sanctioned goals. So the decisive stop for this route is the human acknowledgement on the proposal, not the approval gate alone.</p>
+<p><strong>Route 2: adaptive loosening.</strong> Stopped by construction. The adaptation ledger "refuses to persist loosening proposals"; adaptive gates may only tighten; any loosening must go through the Order-2 amendment path, whose <code>amendment_requires_operator()</code> is locked true; and no adaptation is autonomous, since every proposal goes to the operator's queue (§94.10). This is the shell's monotonicity invariant, claim (a) of §92.17, enforced in code.</p>
+<p><strong>Route 3: a core that games the shell.</strong> No shell layer stops this, because nothing in the shell changes: the adapter changes C. What bounds it is outside both. The adapter must win a held-out evaluation and the operator alone publishes (§93.11, Loop 3); the registry can reject or roll back an adapter, and a rejected version can never be reactivated (§94.5). But the held-out benchmark measures solved tasks, not escape behaviour, and the static cage already misses about 8.8% of mutated escapes (§93.3), while Docker + seccomp, the runtime layer that would catch runtime-built <code>eval</code>/<code>exec</code>, is off (§94.4). Honest conclusion: the design does not currently test whether a new core is <em>harder to contain</em>. A proposal (mine, not the paper's): add the at-scale mutation escape rate, run on candidates from the new adapter, to the handoff's verification step, and reject any adapter that raises it.</p>
+<p>Check: routes 1 and 2 each meet at least two independent human-authority points; route 3 meets only the publication key, which is why it is the weakest.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 2 (quantitative).</strong> §94.9 and §93.15 say that arming the planner before the supply wall is fixed "produces a longer queue, not more landings". Model it. Givens from the paper: the planner writes at most 3 steps per synthesis; every bridged envelope carries <code>requires_human_ack=True</code>; the pre-wall rate was about 1.52 substantive landings per hour (09-26 soak, §93.10); the 10-09 soak produced 219 whole-file answers against 6 diffs (§93.8, §93.14). Assumptions (not in the paper): the planner synthesizes once per hour and 2 of its 3 steps pass the bridge's EV floor; the operator acknowledges 10 proposals per day; each acknowledged proposal edits an existing file. (a) Compute the arrival rate of proposals and the growth of the acknowledgement backlog. (b) Bound the landing rate the proposals can add after the wall. (c) Use Little's law to find the wait in the ack queue after one week. (d) State what this says about the order of §93.15.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The human acknowledgement is a server in series with the pipeline. A queue whose arrival rate exceeds its service rate has no steady state; its length grows linearly. The diff fraction is an upper bound on how often an edit to an existing file is even in the right format.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>(a)</strong> Arrivals: 2 per hour × 24 = 48 proposals per day. Service at the ack step: 10 per day. Utilisation ρ = 48/10 = 4.8, far above 1, so the queue is unstable. The backlog grows by 48 − 10 = 38 proposals per day.</p>
+<p><strong>(b)</strong> Throughput through the ack step is capped at 10 per day, about 0.42 per hour. Each acknowledged proposal edits an existing file, which goes down the <code>2b.1-diff</code> path. In the 10-09 soak only 6 of 225 answers (6 diffs against 219 whole-file) were diffs, about 2.7%. Being a diff is necessary, not sufficient, for landing, so 2.7% is a generous upper bound on landing per proposal. Added landings ≤ 0.42 × 0.027 ≈ 0.011 per hour, roughly one every four days, against the 1.52 per hour the loop achieved on evidence-sourced work before the wall.</p>
+<p><strong>(c)</strong> After 7 days the backlog is about 38 × 7 = 266 proposals. Little's law, W = L/λ, applied to the service rate at which the queue drains (10 per day, since that is the rate items leave), gives the wait a newly arrived proposal faces: 266/10 ≈ 27 days. Strictly, Little's law describes a steady state, which this queue does not have; the figure is the wait at that moment, and it grows by 3.8 days for every day the planner stays armed.</p>
+<p><strong>(d)</strong> Both bottlenecks the model exposes are named in §93.15. The ack queue shows that arming the planner turns the operator into the server, which is exactly the outcome the North Star exists to avoid: otherwise the operator "becomes the bottleneck on every Trinity expansion arc" (§94.1). The format bound shows that the proposals would die at the leading failure mode. Step 1 (diffs land) raises the 2.7%, step 3 (wider supply) keeps evidence-sourced work flowing past the wall, and only then does step 4 add arrivals the system can serve. Check: if the operator could acknowledge 48 per day and the diff rate were near 100%, the same model gives a stable queue, so the conclusion depends on the two measured bottlenecks, not on the assumed planner cadence.</p>
+</details>
+</div>
+<div class="problem problem-adv">
+<p class="problem-q"><strong>Challenge 3 (cross-Part trace).</strong> The operator, at the assistant, says "JARVIS, write tests for the audio error fallback." Trace that utterance as far as the code on <code>origin/main</code> can take it on the current host, using §94.3 for the Body, the intake and approval path of §93.7, and the pipeline of §94.4. Identify exactly where it stops today, what works instead, and which item in PRD §34.9's sequence closing the gap corresponds to.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Look at what the voice surfaces bind to, and what the host is. Then ask which typed seam reaches the same intake.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>In code, the path exists.</strong> <code>backend/voice/jarvis_voice_bridge.py</code> routes code tasks to a <code>VoiceCommandSensor</code>, which the intake layer constructs and the supervisor binds to the voice bridge; the intake router maps the <code>voice_human</code> source to it (§94.3). From intake, the envelope would go through the orchestrator's phases (CLASSIFY → ROUTE → … → GENERATE, which calls J-Prime → VALIDATE in a candidate tree under a PID namespace → GATE → APPLY → VERIFY), land in a sovereignty worktree, pass the promotion gate and fast-forward onto local <code>main</code> (§94.4, §93.7).</p>
+<p><strong>Where it stops.</strong> At the first step. The voice surfaces depend on macOS frameworks (CoreAudio, AppKit and others), and on WSL2 they have nothing to bind to, so the assistant half of the Body is effectively dormant on this host (§94.3; the paper notes this is inferred from imports, not a live probe). Second, O+V no longer boots through the supervisor here; <code>ov</code> boots its own six-layer stack, so the supervisor binding that connects the voice bridge to the sensor is not the path in use. Third, even on a Mac, the README says the voice loop "has never completed a full cycle in production". The link that would join a Mac Body to the Windows engine (<code>ov link</code>, <code>JARVIS_LINK_BRIDGE_ENABLED</code>) is off by default.</p>
+<p><strong>What works instead.</strong> The operator types the request in the cockpit: either as conversation, which becomes an intake envelope with source <code>operator_chat</code>, or as <code>/goal sanction</code> / <code>/goal inject</code> (§94.3). From there the trace above applies unchanged, and a test-file request is the 30B's strongest kind of work (84 of 91 landings, §93.10). The landing would stay on local <code>main</code>; publishing remains the operator's act.</p>
+<p><strong>Which step closes it.</strong> Step 4 of PRD §34.9, the JARVIS → O+V handoff through the <code>/goal</code> seam, marked not started (§94.9). Note the ordering: the seam it names is the typed one that already works, so the gap is the assistant surface reaching that seam, not the pipeline. Check: the claim "in code, yes; in practice, not yet" in §94.3 is exactly this trace.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker engage-kicker-x">Connections</p>
+<div class="pset pset-x">
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 1 (Physics of the hardware: VRAM arithmetic behind the lease).</strong> From the paper: the 30B needs about 21 GiB for inference and a GRPO step about 28 GiB (§94.5); the card is a 32 GB RTX 5090, which §94.6 also calls "a 32 GiB card"; the base has 30.5B parameters; Reactor's per-expert NF4 load lands it at 15.64 GiB resident (§93.11); stock 4-bit loading that left the experts in bf16 needed "about 54 GiB"; merging an adapter needs the bf16 base, 57 GiB, against a 47 GiB WSL guest (§94.6). Assume, from Qwen3-30B-A3B's published configuration and not from the paper: 48 layers, hidden size 2,048, expert intermediate size 768, three projections per expert (gate, up, down). Take the card as 32 GiB. (1) Show why serving and training cannot share the card, and how much is missing. (2) Check the 57 GiB merge figure and a pure 4-bit estimate against the 15.64 GiB measurement. (3) Count the expert parameters and use them to explain the "about 54 GiB". (4) What does the arithmetic say about the lease's design?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>bf16 is 2 bytes per parameter and 4-bit is 0.5 bytes; 1 GiB is 2<sup>30</sup> bytes. One expert holds 3 × 2,048 × 768 weights, and there are 128 experts in each of 48 layers.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>(1)</strong> 21 + 28 = 49 GiB against 32 GiB: short by 17 GiB, more than half a second card. Even with training alone resident, 32 − 28 = 4 GiB remains, about a fifth of what inference needs. No partial sharing works; one job must leave the card completely. Hence the lease: SERVING → DRAINING → RELEASED → RESTORING → SERVING (§94.5).</p>
+<p><strong>(2)</strong> bf16 base: 30.5 × 10<sup>9</sup> × 2 = 61.0 × 10<sup>9</sup> bytes = 56.8 GiB, which is the paper's 57 GiB. Merging cannot fit in a 47 GiB guest, which is why the converter writes an unmerged GGUF LoRA. Pure 4-bit: 30.5 × 10<sup>9</sup> × 0.5 = 15.25 × 10<sup>9</sup> bytes = 14.2 GiB. The measured 15.64 GiB is about 1.4 GiB higher. The paper does not break that down; plausible contributors are NF4's per-block scale constants and layers that are not quantized (embeddings, norms, routers). That is an inference, not a measurement.</p>
+<p><strong>(3)</strong> One expert: 3 × 2,048 × 768 = 4,718,592 weights. All experts: 48 × 128 × 4,718,592 = 28.99 × 10<sup>9</sup>, about 95% of the 30.5B. In bf16 that is 28.99 × 10<sup>9</sup> × 2 = 57.98 × 10<sup>9</sup> bytes = 54.0 GiB. So "about 54 GiB" is almost exactly the expert weights left in bf16: stock loading quantized only the 5% that was not in experts. That is why "the 'bnb-NF4 30B' was never 4-bit", and why <code>moe_quant.py</code> refuses to load if any expert stays bf16.</p>
+<p><strong>(4)</strong> The margins are large and one-sided: a 17 GiB shortfall cannot be closed by tuning batch size or KV cache. The design therefore makes the swap safe rather than trying to avoid it. It drains in-flight work, proves release with <code>nvidia-smi</code> instead of trusting a terminate signal, and restores on expiry only through measured admission. And because 49 GiB can never be co-resident, the organism exiting with code 69 when the lane is lent is not caution but arithmetic.</p>
+</details>
+</div>
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 2 (Combinatorics and linear algebra: adapting the experts).</strong> §94.6 says the default LoRA is rank 16 on the 192 attention projections (13.4M parameters, about 27 MB), and that adapting the experts "would mean 18,432 projections and about 830M parameters", opt-in. §94.5 says the base routes each token to 8 of 128 experts per layer. Use the same assumed configuration as Connection 1 (48 layers, hidden size 2,048, expert intermediate size 768, three projections per expert). (1) Derive 18,432 and the 830M figure, and the adapter's size at 2 bytes per parameter. (2) How many distinct expert subsets can a token be routed to in one layer, and what fraction of expert weights does a token touch? (3) Assuming routing spreads tokens evenly across experts (an assumption), what share of the training tokens reaches any one expert's adapter? (4) Relate this to §93.11's measured training signal and say what it implies for the default.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>A rank-r LoRA on a d<sub>out</sub> × d<sub>in</sub> matrix has r(d<sub>in</sub> + d<sub>out</sub>) parameters. The number of ways to choose 8 of 128 is the binomial coefficient C(128, 8).</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>(1)</strong> Projections: 48 layers × 128 experts × 3 = 18,432. Each expert projection is 2,048 × 768 or 768 × 2,048, so r(d<sub>in</sub> + d<sub>out</sub>) = 16 × 2,816 = 45,056 parameters. Total: 18,432 × 45,056 = 830.5 × 10<sup>6</sup>, matching "about 830M". At 2 bytes: about 1.66 GB, against about 27 MB for the attention-only adapter, roughly 62 times larger.</p>
+<p><strong>(2)</strong> C(128, 8) = 1,429,702,652,400, about 1.4 × 10<sup>12</sup> possible expert subsets per layer. A token touches 8/128 = 6.25% of each layer's experts. As a cross-check, with about 29.0B expert parameters (Connection 1), active weights per token are about 1.5B non-expert plus 29.0B × 0.0625 ≈ 1.8B expert, roughly 3.3B, consistent with the "A3B" in the model's name.</p>
+<p><strong>(3)</strong> Each token updates the adapters of its 8 chosen experts in each layer. Under even routing, any one expert sees 8/128 = 1/16 of the tokens. Every expert adapter therefore learns from about 6% of the data that each attention adapter sees, since every token passes through attention.</p>
+<p><strong>(4)</strong> §93.11 records a very thin signal from the first cycle: three contributing answers, gradient norm about 1e-4, one greedy flip. Splitting that across experts would give each expert adapter about a sixteenth of it, while multiplying the trainable parameters by 62. In linear-algebra terms, more directions to fit with less data per direction. That supports the default of attention only, and suggests expert adaptation is worth trying only after the corpus carries real contrast (diff-format rows, a held-out gain, §93.15). The size also matters operationally: a 27 MB adapter is cheap to publish, version and roll back in J-Prime's registry; a 1.66 GB one is not. The even-routing figure is an assumption; real routers are uneven, which would starve some experts further.</p>
+</details>
+</div>
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 3 (Graph theory: who calls whom).</strong> Build two directed graphs from §94.7. Nodes: O+V (the organism), H (the Training Lifecycle Handoff), J (J-Prime), R (Reactor's :8090 receiver), T (Reactor's trainer and converter, run by H), and E (the experience-stream directory with its landing-label ledger). In the <em>call graph</em>, draw an edge X → Y when X makes a request to Y or starts Y as a process. In the <em>data-flow graph</em>, draw an edge when data produced by X is consumed by Y. (1) List both edge sets. (2) Is the call graph acyclic? Give a topological order and name its sinks. (3) Find the cycle in the data-flow graph and the edge in it that no component triggers on its own. (4) Use reachability in the call graph to predict the "when one of them is down" table.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>E is a directory, not a service: nothing calls it, things write to and read from it. For (4), a failure of Y can stall X only if X has a call path to Y.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><strong>(1)</strong> Call graph: O+V → J (generation over <code>/api/chat</code> or <code>/v1/chat/completions</code>, the served-identity query, the boot-time lease check; bring-up also tries to start J); H → J (lease acquire, renew and release, adapter publish, evaluation scope); H → T (subprocess). Reactor makes no call to J, and J makes no call to anyone. Data-flow graph: O+V → E (recorder rows and landing labels); E → R (tailing); E → T (the GRPO reader); T → H (adapter file, exit code, JSON report); H → J (the published GGUF); J → O+V (generations from the served adapter).</p>
+<p><strong>(2)</strong> The call graph is acyclic. One topological order is H, T, O+V, J (R and E are isolated). J and T are sinks; nothing waits on O+V or H. Because no two services call each other, no cycle of waits between services can form: a distributed deadlock between components would need a cycle in this graph.</p>
+<p><strong>(3)</strong> The data-flow graph has the cycle O+V → E → T → H → J → O+V. That is Loop 2: the organism's own work becomes the model that does its next work. The edge into H is not triggered by any component: automatic triggering (<code>JARVIS_GRPO_AUTOTRAIN_ENABLED</code>) is off, so the operator starts each cycle. The receiver R is not on the cycle at all, because ingestion does not trigger training (§94.6). The learning cycle is closed only through a human-started edge, which is the doll's governance appearing in the graph.</p>
+<p><strong>(4)</strong> Nodes with a call path to J are O+V and H, so J down stalls generation and training: "nothing to generate with". R has no inbound call edges, so R down stalls nothing: "the organism still works; it just stops learning", and E buffers the data until R returns. H down mid-cycle leaves only J's lease state, which expires through measured admission. O+V down affects nothing in the call graph, matching "J-Prime keeps serving; Reactor idles". One rule is not visible in either graph: H and O+V must not run together. That is a mutual-exclusion constraint enforced through J's lease state (H refuses beside a live organism; O+V exits 69 when the lane is lent), which is why it needs a separate mechanism rather than an edge.</p>
 </details>
 </div>
 </div>
@@ -10725,7 +11565,7 @@ The outline post-processor parses the HTML TOC, maps each entry to a named PDF d
 
 ### Reader engagement layer (added 2026-10-13)
 
-Every section (and every subsection of §92 and §93) ends with a short *Quick check*. Each Part, plus §92 and §93, ends with conceptual questions, a quiz, a problem set, an advanced tier (harder conceptual questions and challenge problems) and, where a real subject applies, *Connections* problems (physics of the hardware, queueing theory, statistics, information theory, control theory and the like). Each Part also carries *Pause and predict* checkpoints. Their styling and behaviour live in `docs/architecture/paper_assets/`. Add these flags to the HTML command above:
+Every section (and every subsection of §92, §93 and §94) ends with a short *Quick check*. Each Part, plus §92, §93 and §94, ends with conceptual questions, a quiz, a problem set, an advanced tier (harder conceptual questions and challenge problems) and, where a real subject applies, *Connections* problems (physics of the hardware, queueing theory, statistics, information theory, control theory and the like). Each Part also carries *Pause and predict* checkpoints. Their styling and behaviour live in `docs/architecture/paper_assets/`. Add these flags to the HTML command above:
 
 ```bash
   --include-in-header=docs/architecture/paper_assets/engage_head.html \
@@ -12691,6 +13531,153 @@ Model answers and worked solutions for every section quick check, *Pause and pre
 <p><strong>(3)</strong> The full matrices hold 2,048 × 4,096 ≈ 8.39M parameters for q, 1.05M each for k and v, and 8.39M for o. That is about 18.9M per layer, or about 906M across 48 layers. The adapter is 13.4/906 ≈ 1.5% of the attention weights, and about 0.045% of the 30B model. The mixture-of-experts feed-forward weights, the bulk of the model, are not adapted at all.</p>
 <p><strong>(4)</strong> A full update to a d × d matrix needs d<sup>2</sup> numbers. A rank-r update needs 2rd, which is linear in d, not quadratic. For q, the ratio is 16 × 6,144 / (2,048 × 4,096) ≈ 1.2%. That is why the adapter is small enough to convert to GGUF and to publish, activate or roll back in J-Prime's registry as a separate artifact while the base weights stay fixed (§93.6, §93.11).</p>
 <p>The cost is expressiveness. ΔW has rank at most 16, so each adapted matrix can change its output in at most 16 directions of its input space. The current results do not show that this limit is what binds. The paper's own diagnosis points elsewhere: three contributing answers, a gradient norm of about 1e-4, and 86% of prompts unable to fit their whole-file answer (§93.11). With that little signal, a higher rank would mostly add parameters with nothing to learn from. The architecture's next lever is the data and the diff contract, not the adapter's rank.</p>
+</div>
+<div class="answer-key-unit" id="ak-s94">
+<h4>§94 — The Whole System: Four Subsystems, One Goal</h4>
+<p class="ak-q">Quick check · §94.1, 1. Why did the operator bind the North Star as <em>the</em> goal rather than <em>a</em> goal?</p>
+<p>Because otherwise the operator "becomes the bottleneck on every Trinity expansion arc". A one-person project cannot add new subsystems and also hand-write every test and fix in the existing ones.</p>
+<p class="ak-q">Quick check · §94.1, 2. What does "migration of authority" mean, and what does it rule out?</p>
+<p>The human's role moves from per-PR reviewer to batch approver to roadmap signer. It rules out reading the goal as removing the human, removing safety gates, or unbounded autonomy: the top tier is "earned, not flipped" and still works inside an operator-signed roadmap, budget and scope.</p>
+<p class="ak-q">Quick check · §94.1, 3. Which half of "done" is still undefined, and why does that matter?</p>
+<p>The assistant's. PRD §33.8, the day-one acceptance checks ("say X, it does Y"), is marked "Open — operator input required". The engine's done-criteria exist in PRD §6, so the system has a target for O+V but not yet for the JARVIS it is meant to build.</p>
+<p class="ak-q">Quick check · §94.2, 1. The sibling repositories are about 119,000 and 96,000 lines. Why does the paper call the last column of its scale table "the honest one"?</p>
+<p>Because the code that actually runs is a small recent slice: J-Prime's engine is 11 files and about 2,350 lines, all from 2026-10-07, and Reactor's GRPO path dates from 2026-08-30 onward. Most of each repository was written for the April design and is not imported by anything that runs.</p>
+<p class="ak-q">Quick check · §94.2, 2. Reactor is called the Soul, the Nerves, and the Immune system / Sandbox. Why does the naming matter to a reader of the repositories?</p>
+<p>A reader will meet all three names in different files, and the older "Sandbox" label describes a role Reactor does not have in code. The paper fixes one vocabulary (Body, Mind, Soul) so its descriptions are not confused with the stale ones.</p>
+<p class="ak-q">Quick check · §94.3, 1. Why is the Body's assistant half effectively dormant on the current host?</p>
+<p>Most assistant surfaces depend on macOS frameworks (Quartz, AppKit, CoreAudio, ScreenCaptureKit), and inside WSL2 on Windows they have nothing to bind to. The paper notes this is inferred from the imports, not from a live probe.</p>
+<p class="ak-q">Quick check · §94.3, 2. "Can the assistant hand work to O+V? In code, yes; in practice, not yet." What is the code path, and what works instead?</p>
+<p>The voice bridge routes code tasks to a <code>VoiceCommandSensor</code> that intake maps to the <code>voice_human</code> source, but the voice loop has never completed a full production cycle. What works is typed: <code>/goal sanction</code>, <code>/goal inject</code>, and cockpit conversation, which becomes an <code>operator_chat</code> envelope.</p>
+<p class="ak-q">Quick check · §94.3, 3. How does O+V boot today, compared with the supervisor's zone 6?</p>
+<p>It is started by <code>ov</code>, which hands off to <code>scripts/ouroboros_battle_test.py</code> and boots a six-layer stack directly. The supervisor's zones 6.8–6.12 describe the designed boot, not the path used on this host.</p>
+<p class="ak-q">Quick check · §94.4, 1. Why does O+V live in the JARVIS repository rather than in its own?</p>
+<p>Because it develops that repository: self-development happens on the Body's own code (§5.1). Its commits land on JARVIS's local <code>main</code>.</p>
+<p class="ak-q">Quick check · §94.4, 2. The PID namespace was added after a generated test ran <code>pkill -f jarvis</code>. What does it prevent, and what is its weak point?</p>
+<p>Candidate processes run under <code>unshare --user --pid --fork</code>, so a generated test cannot see or signal the organism. If the kernel refuses, it degrades to running uncontained unless the <code>..._REQUIRED</code> flag is set.</p>
+<p class="ak-q">Quick check · §94.4, 3. Why are the Iron Gate and Semantic Guardian not enough on their own?</p>
+<p>They are static checks in front of execution. The containment layers bound the damage when a candidate actually <em>runs</em>, which a static check cannot fully predict.</p>
+<p class="ak-q">Quick check · §94.5, 1. Why is RELEASED declared only when <code>nvidia-smi</code> shows the memory free?</p>
+<p>Because asking a process to stop does not prove its memory is gone: "'We sent terminate' is not evidence; the card is." Training starting into memory still held would OOM.</p>
+<p class="ak-q">Quick check · §94.5, 2. <code>qwen3-coder-ov:30b</code> "is not a single file". What is it, and why does that matter for rollback?</p>
+<p>It is the 30B base weights plus a Reactor-trained LoRA plus the sampling defaults it was published with. The adapter can be changed, rejected or rolled back to a kept version (or <code>origin</code>) while the base stays fixed.</p>
+<p class="ak-q">Quick check · §94.5, 3. Why does reproducible evaluation switch off prompt-cache reuse?</p>
+<p>Cold-cache and warm-cache greedy runs had been measured to differ. With the cache off, three of three outputs were byte-identical, which makes a before/after adapter comparison meaningful.</p>
+<p class="ak-q">Quick check · §94.6, 1. Why does Reactor's launch script bind :8090 to <code>127.0.0.1</code>?</p>
+<p>The server's own default is <code>0.0.0.0</code>, which under WSL's mirrored networking would expose the training API to the LAN.</p>
+<p class="ak-q">Quick check · §94.6, 2. Why is the adapter converted to a GGUF LoRA without merging it into the base?</p>
+<p>Merging needs the bf16 base, about 57 GiB, and the WSL guest is capped at 47 GiB. An unmerged adapter can also be published and swapped in J-Prime's registry on its own.</p>
+<p class="ak-q">Quick check · §94.6, 3. What makes a row a success example, and what stops a bad one from becoming one?</p>
+<p>A join with the hash-chained landing-label ledger: the candidate must have landed and survived. A landed-then-reverted row is never promoted, and the join stops at the first ledger row that does not chain to its predecessor.</p>
+<p class="ak-q">Quick check · §94.7, 1. O+V and Reactor share a file contract, not an HTTP call. What does that buy when Reactor is down?</p>
+<p>The organism is not blocked: the recorder keeps writing to disk, and the receiver catches up from saved offsets when it returns. "Without it the organism still works; it just stops learning."</p>
+<p class="ak-q">Quick check · §94.7, 2. Which two calls the April design assumed are absent?</p>
+<p>Reactor never calls J-Prime (JARVIS's handoff does the leasing and publishing), and J-Prime calls no one; it is a passive server.</p>
+<p class="ak-q">Quick check · §94.7, 3. Where is the human in the three loops?</p>
+<p>Only in Loop 3, governance: the operator reviews what landed and alone publishes it, and no training-derived change is pushed without a held-out gain. (Today the operator also starts training cycles, because automatic triggering is off.)</p>
+<p class="ak-q">Quick check · §94.8, 1. What is the difference between the operating tiers A–D and the Galaxy roadmap tiers 1–5?</p>
+<p>Operating tiers measure how much oversight the operator gives (per-PR reviewer up to roadmap signer). Galaxy tiers are the critical path of work to get there: learning loop, cage, second-order driver, the Layer-4 decision, evidence.</p>
+<p class="ak-q">Quick check · §94.8, 2. A1 was closed on 2026-09-08. Why was it not an A-level criterion, and what replaced it as the gate?</p>
+<p>A1 was item A1 of the North Star's Tier A blocker list (trace a signed sub-goal from enqueued to dispatched), not one of PRD §6's seven dimensions. Its successor gate is cadence: "the LANDING RATE".</p>
+<p class="ak-q">Quick check · §94.8, 3. Why does the North Star say engineering is "the easy ~15%"?</p>
+<p>Because the remaining 85% is the safety substrate, the evidence (for example 90 unsupervised days) and the operator's Layer-4 decision, none of which more code alone produces.</p>
+<p class="ak-q">Quick check · §94.9, 1. Both <code>JARVIS_EPISTEMIC_PLANNER_ENABLED</code> and <code>JARVIS_CONCEPTION_BRIDGE_ENABLED</code> must be on before self-filed work reaches intake. Even then, what stops it acting alone?</p>
+<p>Every envelope the bridge creates carries <code>requires_human_ack=True</code>, so the armed planner <em>proposes</em> rather than acts. Self-filed work needs both switches AND a human acknowledgement.</p>
+<p class="ak-q">Quick check · §94.9, 2. Why does the planner's step "never point at fiction"?</p>
+<p>Each step may name only existing files that the human's recent commits touched, at most two per step. The planner cannot invent a module to work on.</p>
+<p class="ak-q">Quick check · §94.9, 3. <code>north_star_context.py</code> is on by default. Why does it not steer what O+V builds?</p>
+<p>Its consumer is the DreamEngine's speculative prompt, not GENERATE. The prompts that do shape generation get the strategic-direction digest, which reads neither the North Star file nor the PRD.</p>
+<p class="ak-q">Quick check · §94.10, 1. What are the doll's two invariants, and how does the adaptation ledger enforce the first?</p>
+<p>Adaptive gates may only tighten, and no adaptation is autonomous. The ledger "refuses to persist loosening proposals"; any loosening must go through the Order-2 amendment path, which always needs the operator.</p>
+<p class="ak-q">Quick check · §94.10, 2. Map C, S<sub>n</sub>, M and "a growing core" onto the four subsystems.</p>
+<p>C is the model J-Prime serves; S<sub>n</sub> is O+V's gates and containment in the Body; M is O+V's pipeline proposing a patch; Reactor is how the core itself changes, each committed adapter being a new C.</p>
+<p class="ak-q">Quick check · §94.10, 3. "We have the doll's outer wall but not the doll's hand." What is missing?</p>
+<p>The driver that would use the Order-2 cage. M10, the ArchitectureProposer, has no reference in the orchestrator, so Order 2 has never been exercised. Only the recursion-depth specification is machine-checked (in Z3).</p>
+<p class="ak-q">Quick check · §94.11, 1. Why is "Is the human out of the loop? No" listed as the intended end state rather than a gap?</p>
+<p>Because the North Star's goal is a human who signs scope and alone publishes, not no human at all. The zero-push air-gap and the operator's publication key are the design working.</p>
+<p class="ak-q">Quick check · §94.11, 2. Why are the next steps ordered with "let the planner read the definition of done" last?</p>
+<p>Diffs must land, a held-out gain must be shown and supply widened first; otherwise the planner fills the backlog faster than the loop drains it, producing a longer queue rather than more landings (§94.9).</p>
+<p class="ak-q">Quick check · §94.12, 1. Using the glossary, explain why "Mechanic" and "Order 1" name the same thing, and why the Neurosurgeon Order is not reached by changing governance files under signed goals.</p>
+<p>Mechanic is the North Star's name for Order 1, O+V changing the codebase around it. Neurosurgeon is Order 2, O+V changing its own cognitive architecture; it is "caged, no driver", and §93.10 adds that it means doing so on the organism's own initiative, which has not happened.</p>
+<p class="ak-q">Pause and predict 1. §5.3 said that Reactor, the Soul, runs O+V's tests and permitted <code>bash</code> commands in sandboxes with resource limits, process isolation and syscall filtering. Before reading on, predict where a generated candidate's tests actually run on <code>origin/main</code> today, and which isolation layer, if any, is switched off.</p>
+<p>Not in Reactor. Reactor has no such code; its only sandbox is a Dockerized browser for its documentation scraper. Containment lives in the Body, inside O+V's VALIDATE phase. Tests run against a git-worktree copy of the candidate, candidate processes run in a PID namespace, test runs beside a soak go through a cgroup memory cap, and landings use per-operation worktrees. All of those are on. The Docker + seccomp runtime sandbox exists but is <strong>off</strong>. See §94.4.</p>
+<p class="ak-q">Pause and predict 2. Reactor trains adapters and J-Prime serves them. Predict which component calls J-Prime to take the GPU and publish a newly trained adapter: Reactor, J-Prime itself, or something else? And what happens to O+V if Reactor is down?</p>
+<p>Neither Reactor nor J-Prime. The Training Lifecycle Handoff, which is JARVIS code (<code>observability/training_handoff.py</code>), takes the lease, runs Reactor's trainer as a subprocess, converts the adapter and publishes it to J-Prime's registry. Reactor contains no call to the lease or adapter endpoints, and J-Prime calls no one. If Reactor is down, "the organism still works; it just stops learning": the recorder keeps writing to disk and the receiver catches up from its saved offsets. See §94.7.</p>
+<p class="ak-q">Pause and predict 3. The project has a written definition of done (the seven A-level criteria in PRD §6) and a planner that can read it and file work toward it. The organism has made 91 autonomous landings. Predict whether those landings were chosen by reading the definition of done.</p>
+<p>No. The Epistemic Planner and the Conception Bridge that would turn the §6 gap into work are built but both default to off, and no tracked file arms them. The 91 landings came from a chain that does not read §6: the signed roadmap, Goal Discovery turning evidence into signed goals, operator <code>/goal sanction</code>, the Sentinel, and the goal-reconciliation ledger. The organism is proactive about the codebase's hygiene, not yet about building JARVIS toward the PRD. See §94.9.</p>
+<p class="ak-q">Conceptual 1. The North Star says JARVIS should develop itself "fully autonomously", yet the same documents insist the operator remains the zero-order doll. Is that a contradiction, and where in the running code does the operator's role actually live today?</p>
+<p>It is not a contradiction, because the documents define autonomy as a <em>migration of authority</em>, not its removal (§94.1). The operator moves from per-PR reviewer to batch approver to roadmap signer, and the PRD history lists what the North Star does not mean: the operator does not become irrelevant, safety gates are not removed, and even the top tier works inside an operator-signed roadmap, budget and scope. The Manifesto's line is that the organism "can write its own brain. It can never merge its own brain."</p>
+<p>In code the boundary is concrete. The zero-push air-gap means O+V can land on local <code>main</code> but only the operator publishes (§93.7). The Order-2 review queue's <code>amendment_requires_operator()</code> is locked true, the recursion-depth gate blocks past a depth of 3 governance-touching APPLYs, and any change under <code>governance/</code> forces approval (§94.10). The Conception Bridge stamps every self-filed proposal <code>requires_human_ack=True</code> (§94.9). So the end state is not a system without a human; it is one where the human's job has moved up a level, and §94.11 records that as the intended design, not a gap.</p>
+<p class="ak-q">Conceptual 2. §94 repeatedly separates "built", "wired", "productive" and "default-on". Using one example of each gap, explain why the North Star's 2026-06-06 scorecard ("~30–35 %") and its 2026-09-19 revision ("~10-15%") can both be honest and still disagree.</p>
+<p>Built but not wired: Bucket A, where 9 of 10 sampled modules still had zero live callers, and the M10 second-order driver with "0 references in <code>orchestrator.py</code>" (§94.8). Wired but off: the Epistemic Planner and Conception Bridge, both reachable but defaulting to false (§94.9). On but feeding the wrong consumer: <code>north_star_context.py</code> is on by default, but it feeds the DreamEngine's speculative prompt, not GENERATE. On and wired but defective: <code>strategic_direction.py</code> runs every time, yet tells the organism six principle titles and one paragraph instead of seven principles and the manifesto.</p>
+<p>The June scorecard counted mechanisms that existed and marked tiers "CLOSED". The September revision re-verified by checking live callers, and found that the landings moved Order 1 "from nominally wired to actually productive" but "did not touch Order 2". Both assessments can be honest about what they measured; they measured different things. The paper treats the September figure as current because it measures reachability and effect, which is the lesson the reachability ledger (§93.12) was built to enforce.</p>
+<p class="ak-q">Conceptual 3. Why does it matter that §5.3's "Reactor as sandbox" was wrong, beyond keeping the record straight? What would a reader who trusted §5 believe about containment that the code does not support?</p>
+<p>§5.3 said permitted <code>bash</code> and <code>run_tests</code> execute inside Reactor, with resource limits, process isolation and syscall filtering, and that this "is what makes the Iron Gate's containment guarantees meaningful". A reader who trusted that would believe a second subsystem, on a separate boundary, contains anything the static checks let through.</p>
+<p>The code says otherwise (§94.4, §93.16). Reactor is a training repository. Containment is in the Body: candidate trees, a PID namespace that "degrades to uncontained if the kernel refuses" unless the <code>..._REQUIRED</code> flag is set, a cgroup memory cap, and per-operation worktrees. The layer that would do syscall filtering, Docker + seccomp, is off. That matters because the static cage has a measured at-scale escape rate of about 8.8%, concentrated in runtime-built <code>eval</code>/<code>exec</code>/<code>subprocess</code> strings that a static check cannot see (§93.3). The layers that bound damage when a candidate actually runs are real but narrower than §5 implied, and the strongest one described in April is not on.</p>
+<p class="ak-q">Quiz 1. Which component takes J-Prime's GPU lease, runs the trainer and publishes the new adapter to J-Prime's registry?</p>
+<p><strong>C.</strong> The handoff (<code>observability/training_handoff.py</code>) leases J-Prime, runs Reactor's trainer as a subprocess, converts and publishes the adapter, then verifies it. Reactor never calls J-Prime, and J-Prime calls no one (§94.7).</p>
+<p class="ak-q">Quiz 2. Why must J-Prime <em>lend</em> the GPU for training rather than train beside serving?</p>
+<p><strong>A.</strong> One 32 GB card cannot hold the 30B for inference and a GRPO step at the same time (<code>lease.py</code>), so J-Prime drains, proves the memory free with <code>nvidia-smi</code>, and lends it (§94.5).</p>
+<p class="ak-q">Quiz 3. Reactor's :8090 service goes down during a soak. What happens?</p>
+<p><strong>D.</strong> Reactor is not required. The recorder keeps writing to disk, and the receiver resumes from its persisted byte offsets when it returns (§94.7, §94.6).</p>
+<p class="ak-q">Quiz 4. Running <code>strategic_direction.py</code>'s own extractors on the current README shows the organism is told six principle titles, not seven. Which one is missing, and why?</p>
+<p><strong>B.</strong> <code>_extract_principles</code> scans only the first 20,000 characters, and Principle 7, <em>Absolute observability</em>, begins at character 24,496. The <code>"## "</code> marker is a separate defect: it truncates the manifesto text to 464 characters (§94.9).</p>
+<p class="ak-q"><strong>Problem 1 (trace).</strong> O+V generates a candidate test file for a signed goal; it passes, lands and survives. Follow that one candidate through all three loops of §94.7 until the model that wrote it has been retrained and the result could be published. At each boundary between subsystems, name the contract that carries it. Then say what happens if the handoff process dies after taking the lease.</p>
+<p><strong>Loop 1 (inference).</strong> The candidate generator routes to the local lane under the free-lane policy, and <code>LocalPrimeClient</code> calls J-Prime over the Ollama-native <code>/api/chat</code> or OpenAI <code>/v1/chat/completions</code>. Contract: the Ollama and OpenAI wire protocols. J-Prime answers with <code>qwen3-coder-ov:30b</code>, which is the base weights plus the active Reactor LoRA plus its sampling defaults (§94.5).</p>
+<p><strong>Loop 2 (learning).</strong> The trajectory recorder writes one <code>ExperienceEvent</code> line for the candidate into <code>~/.jarvis/trinity/events/</code>. Contract: the shared JSONL schema, a file, not an HTTP call. Landing provenance adds git-proven <code>landed</code> and <code>surviving</code> labels to the hash-chained ledger, so this row becomes a success example (§94.6). Reactor's receiver tails the stream, and the GRPO reader reads the same files. The operator then runs the handoff on demand (autotrain is off): it refuses to run beside a live organism, acquires the lease (contract: token, TTL, freed MiB, state), runs <code>run_grpo_training.py</code> (contract: exit code 0/1/2/3 and a JSON report), converts the adapter to GGUF, publishes it with its sha256 (contract: a header-validated, versioned registry entry), releases the lease, and verifies greedily inside J-Prime's evaluation scope. The cycle ends COMMITTED or ROLLED_BACK.</p>
+<p><strong>Loop 3 (governance).</strong> The landed test sits on local <code>main</code>. Only the operator publishes to GitHub, and the standing rule is that no training-derived change is pushed without a held-out gain (§93.11).</p>
+<p><strong>Handoff dies holding the lease.</strong> The lease expires and J-Prime restores service through the same measured VRAM admission, so "expiry can never cause an OOM" (§94.5, §94.7). Until then, new generations get 503 with <code>Retry-After</code>, and an organism booting meanwhile exits with code 69.</p>
+<p class="ak-q"><strong>Problem 2 (analysis).</strong> The A-level throughput criterion in PRD §6 is "sustained ≥ 1 commit per 30 minutes of session time", and PRD §34.9 scores it "Met in-window, not sustained". Using the cadence table in §93.10, compute landings per hour for the 09-26, 10-04, 10-05, 10-08 and 10-09 soaks, compare each with the threshold, and explain the verdict. Then say why §6's anti-goals would not count a faster model, by itself, as progress toward this criterion.</p>
+<p>Threshold: 2 landings per hour. 09-26: 3 / 1.97 h ≈ 1.52 per hour. 10-04: 3 / 2.98 h ≈ 1.01. 10-05: 10 / 6.03 h ≈ 1.66. 10-08: 0 / 1.25 h = 0. 10-09: 51 merged in about 9 h ≈ 5.7 per hour.</p>
+<p>Only the 10-09 soak clears 2 per hour over its whole session; four of five fall below. That is what "met in-window, not sustained" means: the rate has been reached within a window but not held across sessions. The 10-05 soak also shows why "sustained" is hard: nothing landed from 22:24 to 00:29, which PRD §34 attributes to the supply wall (§93.10). Note too that the 10-09 row reports no substantive count, so its high rate is mostly tests for <code>backend/api/*</code>.</p>
+<p>The anti-goals in §6 list "a smarter model", "more model calls" and "shipping faster" as things that do not by themselves count as progress (§94.8). A criterion is met by the observed outcome, sustained landed commits with a clean record, not by an input that might raise it. A faster or better model helps only if it moves the measured rate; and when yield is bounded by supply, it would not. The 2026-10-04 note adds the honest qualification that on the local 30B, model capability <em>is</em> a measured constraint, so it is not irrelevant, just not progress on its own.</p>
+<p class="ak-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/strategic_direction.py</code> and read <code>_MAX_DOC_CHARS</code>, <code>_extract_principles</code> and <code>_extract_manifesto</code>. Find (a) the line that makes Principle 7 invisible once the README grows, (b) the end marker that truncates the manifesto, and why <code>find</code> matches it inside a <code>"### "</code> heading, and (c) a fix consistent with §94.9's description. What does the organism lose from its prompts because of these two defects?</p>
+<p>(a) <code>_MAX_DOC_CHARS = 20_000</code>, and <code>_extract_principles</code> runs its <code>\*\*(\d+)\.\s+([^*]+)\*\*</code> pattern over <code>readme_content[:_MAX_DOC_CHARS]</code>. Any principle heading that starts after character 20,000 is never seen. §94.9 measured Principle 7 at character 24,496, so the list stops at six. The docstring still says "Extract the 7 numbered principles".</p>
+<p>(b) <code>end_markers</code> contains <code>"## "</code>, commented "next h2", and the code takes the earliest match after <code>start + 100</code>. But every level-3 heading, <code>"### ..."</code>, contains the substring <code>"## "</code> starting at its second character, so <code>find</code> matches inside the first <code>"### "</code> sub-heading after the start. The section is cut at the first sub-heading, which §94.9 measured as 464 characters: only the opening paragraph.</p>
+<p>(c) §94.9's fix: extract by heading rather than a fixed character window, and stop at a heading of the <em>same</em> level, for example by matching <code>"\n## "</code> at a line start and excluding deeper levels, and by locating each principle under the manifesto heading wherever it falls.</p>
+<p>The loss: the organism is told six principle titles and one paragraph, and the principle it is not told is Absolute observability. The README, §3 and the module docstring all claim seven are injected; this is recorded as a measured correction in §93.16. It is a clean example of code that is on and wired but not doing what the documents say.</p>
+<p class="ak-q">Advanced A1. §92.17 treats the core C as provider-agnostic and puts all the growth in the shell S<sub>n</sub>. §94.10 maps C onto the model J-Prime serves and says Reactor is how "the core itself changes". What does a changing core do to the bounded-RSI conjecture's three claims, and why does that make the held-out-gain rule a doll requirement rather than just a quality bar?</p>
+<p>In §92.17 the iteration is (C, S<sub>n</sub>) → δ → δ′ → S<sub>n+1</sub>. Only the shell changes; C is a fixed thermal source. Claim (a), monotone deterministic entropy of the shell, and the "only tighten" invariant of §94.10 are statements about S<sub>n</sub>. Claim (c) is the one that refers to the core: net agentic entropy is bounded by a constant "depending on C's base capacity and S<sub>n</sub>'s growth rate".</p>
+<p>Once Reactor closes Loop 2, C is no longer fixed. Each committed adapter is a new C (§94.10). The constant in (c) is then a moving target, and (b), the shell's restraint on C's unconstrained output, was only ever argued for a given C. A new core could in principle produce candidates that sit in exactly the regions the shell does not bound. The empirical evidence for that region exists: the static cage misses about 8.8% of mutated escapes at scale (§93.3).</p>
+<p>That is why §94.10 calls the held-out-gain rule "the doll's own requirement applied to the core": the core may grow only if something outside it measures that it got better. The rule is enforced outside C (a benchmark from human commits with hidden tests) and outside the shell (the operator alone publishes, Loop 3). I would add a limit the paper does not claim to cover: the held-out rule measures capability, not containment. It checks that C improved, not that S<sub>n</sub> still bounds the improved C. Evidence that would settle whether this matters is re-running the at-scale mutation harness (§93.3) against candidates drawn from each new adapter and checking that the escape rate does not rise.</p>
+<p>One more synthesis point. §92.17 lists "a new test" among the ways M extends the shell. 84 of the 91 landings are new test files (§93.10). In the conjecture's own vocabulary, most of what the Mechanic has done so far is grow S<sub>n</sub>, while the one completed training cycle has not yet shown that C grew at all (§93.11).</p>
+<p class="ak-q">Advanced A2. The training handoff and the organism must never hold the GPU at the same time. List every mechanism in §94.5–§94.7 that enforces this exclusion, say which side each protects, and identify a crash window the paper does not fully specify.</p>
+<p>Five mechanisms, from both ends. (1) The handoff "refuses to run beside a live organism" (§94.7), which protects training from an organism generating mid-cycle. (2) The organism checks the lease at boot and exits with code 69 if the lane is lent (§94.5, §93.9.2), which protects the cycle from an organism started during it. (3) DRAINING refuses new generations with 503 and <code>Retry-After</code> and waits for in-flight ones, and an in-flight response holds a reference so its model cannot be evicted mid-answer, which protects any generation already running. (4) RELEASED is declared only when <code>nvidia-smi</code> shows the memory free, which protects the trainer from starting into memory that is still held. (5) Lease expiry restores service only through measured admission, which protects serving from an OOM when the handoff disappears.</p>
+<p>The exclusion is therefore enforced by measurement at the GPU, not only by agreement between processes: "'We sent terminate' is not evidence; the card is." Child processes bound by a kill-on-close Job Object or <code>PR_SET_PDEATHSIG</code> close a further hole, a crashed engine leaving an orphan holding VRAM.</p>
+<p>The window the paper leaves open is a crash <em>after</em> publication and <em>before</em> verification ends. §94.7 says the cycle ends COMMITTED or ROLLED_BACK, and a losing candidate is rejected through the registry with the incumbent restored and re-verified, but it does not say what the registry holds if the handoff dies between those steps. What the paper does guarantee bounds the damage: versions are never overwritten, activation rewrites the model declaration atomically (so the served model is one version or the other, never half of each), the <code>origin</code> adapter remains as the fallback of last resort, and nothing training-derived is published to GitHub without a held-out gain. The evidence that would settle the open question is a fault-injection run that kills the handoff at each step and reads <code>GET /v1/adapters/{model}</code> and the served identity afterwards.</p>
+<p class="ak-q">Advanced A3. PRD §6 lists "a smarter model" as an anti-goal, yet one of the four subsystems, Reactor, exists to make the model smarter. Is the Trinity's learning loop working against its own definition of done? Argue a position and name the evidence that would settle it.</p>
+<p>My position: no, provided Reactor's output is judged by the §6 criteria and never by its own training metrics. The anti-goals list inputs that do not count as progress: a smarter model, more sensors, more knobs, bigger context, more model calls, shipping faster (§94.8). The point is that A-level is defined by observed outcomes such as sustained throughput, reliability and cross-session learning. An adapter is an input like the others. The 2026-10-04 note qualifies the first anti-goal: on the local 30B, model capability is a measured constraint (§33), so improving it can be a means. It cannot be the measure.</p>
+<p>The design already reflects that distinction in three places. The handoff's own gate (4/6 against 3/6) was rejected by the project's notes as evidence of learning (§93.11). The operator's push rule requires a held-out gain, not a training-loss improvement. And the reward is a tiered verifier anchored in what the pipeline needs (envelope, shape, syntax, substance), not in model-centric scores (§94.6).</p>
+<p>There is a real way the loop could work against the goal, though. Cross-session learning, one of the seven dimensions, is defined in PRD §6 as postmortem-driven prompt changes visible in later operations, and it is "Not measured". If effort flows into adapters because Loop 2 is the visible, finished pipeline, the unmeasured dimensions stay unmeasured. The evidence that would settle the question is a two-step test: first a held-out gain for an adapter (§93.15 step 2), then a change in an A-level measurement, for example landings per hour on a fixed goal mix, attributable to that adapter. A held-out gain with no change in landed work would show the loop improving the model without moving JARVIS toward done.</p>
+<p class="ak-q"><strong>Challenge 1 (adversarial).</strong> Assume a future in which the Epistemic Planner and Conception Bridge are armed and the Sentinel runs at its default ceiling. Construct three routes by which the organism might loosen its own governance without the operator choosing to: (1) the planner files a step "advance 'Reliability' in <code>governance/&lt;some gate&gt;.py</code>" that, once generated, lowers a threshold; (2) an adaptive Anti-Venom component mines postmortems and proposes relaxing a guardian pattern that blocked several good candidates; (3) a Reactor adapter, trained on landed work, becomes systematically better at producing candidates the static checks accept. For each, find the layer in §94.9, §94.10 or §93.7 that stops it, or show honestly that none does and what would.</p>
+<p><strong>Route 1: self-filed governance edit.</strong> The bridge stamps every envelope <code>source="auto_proposed"</code>, low urgency and <code>requires_human_ack=True</code>, so the proposal cannot proceed until a human acknowledges it (§94.9). Even after an acknowledgement, the boundary gate forces approval for any change under <code>governance/</code>; the Sentinel always escalates Order-2 self-modification and anything touching the cage (§93.7); and the recursion-depth gate blocks past three consecutive governance-touching APPLYs (§94.10). There is one honest caveat. The Sentinel's auto-approval ceiling defaults to APPROVAL_REQUIRED, and the paper does not say how the boundary gate's forced approval interacts with that ceiling for a governance file that is neither in the Order-2 manifest nor part of the cage. §93.10 shows governance-package files (<code>dw_capacity_probe.py</code>, <code>candidate_generator.py</code>) did land under signed, operator-sanctioned goals. So the decisive stop for this route is the human acknowledgement on the proposal, not the approval gate alone.</p>
+<p><strong>Route 2: adaptive loosening.</strong> Stopped by construction. The adaptation ledger "refuses to persist loosening proposals"; adaptive gates may only tighten; any loosening must go through the Order-2 amendment path, whose <code>amendment_requires_operator()</code> is locked true; and no adaptation is autonomous, since every proposal goes to the operator's queue (§94.10). This is the shell's monotonicity invariant, claim (a) of §92.17, enforced in code.</p>
+<p><strong>Route 3: a core that games the shell.</strong> No shell layer stops this, because nothing in the shell changes: the adapter changes C. What bounds it is outside both. The adapter must win a held-out evaluation and the operator alone publishes (§93.11, Loop 3); the registry can reject or roll back an adapter, and a rejected version can never be reactivated (§94.5). But the held-out benchmark measures solved tasks, not escape behaviour, and the static cage already misses about 8.8% of mutated escapes (§93.3), while Docker + seccomp, the runtime layer that would catch runtime-built <code>eval</code>/<code>exec</code>, is off (§94.4). Honest conclusion: the design does not currently test whether a new core is <em>harder to contain</em>. A proposal (mine, not the paper's): add the at-scale mutation escape rate, run on candidates from the new adapter, to the handoff's verification step, and reject any adapter that raises it.</p>
+<p>Check: routes 1 and 2 each meet at least two independent human-authority points; route 3 meets only the publication key, which is why it is the weakest.</p>
+<p class="ak-q"><strong>Challenge 2 (quantitative).</strong> §94.9 and §93.15 say that arming the planner before the supply wall is fixed "produces a longer queue, not more landings". Model it. Givens from the paper: the planner writes at most 3 steps per synthesis; every bridged envelope carries <code>requires_human_ack=True</code>; the pre-wall rate was about 1.52 substantive landings per hour (09-26 soak, §93.10); the 10-09 soak produced 219 whole-file answers against 6 diffs (§93.8, §93.14). Assumptions (not in the paper): the planner synthesizes once per hour and 2 of its 3 steps pass the bridge's EV floor; the operator acknowledges 10 proposals per day; each acknowledged proposal edits an existing file. (a) Compute the arrival rate of proposals and the growth of the acknowledgement backlog. (b) Bound the landing rate the proposals can add after the wall. (c) Use Little's law to find the wait in the ack queue after one week. (d) State what this says about the order of §93.15.</p>
+<p><strong>(a)</strong> Arrivals: 2 per hour × 24 = 48 proposals per day. Service at the ack step: 10 per day. Utilisation ρ = 48/10 = 4.8, far above 1, so the queue is unstable. The backlog grows by 48 − 10 = 38 proposals per day.</p>
+<p><strong>(b)</strong> Throughput through the ack step is capped at 10 per day, about 0.42 per hour. Each acknowledged proposal edits an existing file, which goes down the <code>2b.1-diff</code> path. In the 10-09 soak only 6 of 225 answers (6 diffs against 219 whole-file) were diffs, about 2.7%. Being a diff is necessary, not sufficient, for landing, so 2.7% is a generous upper bound on landing per proposal. Added landings ≤ 0.42 × 0.027 ≈ 0.011 per hour, roughly one every four days, against the 1.52 per hour the loop achieved on evidence-sourced work before the wall.</p>
+<p><strong>(c)</strong> After 7 days the backlog is about 38 × 7 = 266 proposals. Little's law, W = L/λ, applied to the service rate at which the queue drains (10 per day, since that is the rate items leave), gives the wait a newly arrived proposal faces: 266/10 ≈ 27 days. Strictly, Little's law describes a steady state, which this queue does not have; the figure is the wait at that moment, and it grows by 3.8 days for every day the planner stays armed.</p>
+<p><strong>(d)</strong> Both bottlenecks the model exposes are named in §93.15. The ack queue shows that arming the planner turns the operator into the server, which is exactly the outcome the North Star exists to avoid: otherwise the operator "becomes the bottleneck on every Trinity expansion arc" (§94.1). The format bound shows that the proposals would die at the leading failure mode. Step 1 (diffs land) raises the 2.7%, step 3 (wider supply) keeps evidence-sourced work flowing past the wall, and only then does step 4 add arrivals the system can serve. Check: if the operator could acknowledge 48 per day and the diff rate were near 100%, the same model gives a stable queue, so the conclusion depends on the two measured bottlenecks, not on the assumed planner cadence.</p>
+<p class="ak-q"><strong>Challenge 3 (cross-Part trace).</strong> The operator, at the assistant, says "JARVIS, write tests for the audio error fallback." Trace that utterance as far as the code on <code>origin/main</code> can take it on the current host, using §94.3 for the Body, the intake and approval path of §93.7, and the pipeline of §94.4. Identify exactly where it stops today, what works instead, and which item in PRD §34.9's sequence closing the gap corresponds to.</p>
+<p><strong>In code, the path exists.</strong> <code>backend/voice/jarvis_voice_bridge.py</code> routes code tasks to a <code>VoiceCommandSensor</code>, which the intake layer constructs and the supervisor binds to the voice bridge; the intake router maps the <code>voice_human</code> source to it (§94.3). From intake, the envelope would go through the orchestrator's phases (CLASSIFY → ROUTE → … → GENERATE, which calls J-Prime → VALIDATE in a candidate tree under a PID namespace → GATE → APPLY → VERIFY), land in a sovereignty worktree, pass the promotion gate and fast-forward onto local <code>main</code> (§94.4, §93.7).</p>
+<p><strong>Where it stops.</strong> At the first step. The voice surfaces depend on macOS frameworks (CoreAudio, AppKit and others), and on WSL2 they have nothing to bind to, so the assistant half of the Body is effectively dormant on this host (§94.3; the paper notes this is inferred from imports, not a live probe). Second, O+V no longer boots through the supervisor here; <code>ov</code> boots its own six-layer stack, so the supervisor binding that connects the voice bridge to the sensor is not the path in use. Third, even on a Mac, the README says the voice loop "has never completed a full cycle in production". The link that would join a Mac Body to the Windows engine (<code>ov link</code>, <code>JARVIS_LINK_BRIDGE_ENABLED</code>) is off by default.</p>
+<p><strong>What works instead.</strong> The operator types the request in the cockpit: either as conversation, which becomes an intake envelope with source <code>operator_chat</code>, or as <code>/goal sanction</code> / <code>/goal inject</code> (§94.3). From there the trace above applies unchanged, and a test-file request is the 30B's strongest kind of work (84 of 91 landings, §93.10). The landing would stay on local <code>main</code>; publishing remains the operator's act.</p>
+<p><strong>Which step closes it.</strong> Step 4 of PRD §34.9, the JARVIS → O+V handoff through the <code>/goal</code> seam, marked not started (§94.9). Note the ordering: the seam it names is the typed one that already works, so the gap is the assistant surface reaching that seam, not the pipeline. Check: the claim "in code, yes; in practice, not yet" in §94.3 is exactly this trace.</p>
+<p class="ak-q"><strong>Connection 1 (Physics of the hardware: VRAM arithmetic behind the lease).</strong> From the paper: the 30B needs about 21 GiB for inference and a GRPO step about 28 GiB (§94.5); the card is a 32 GB RTX 5090, which §94.6 also calls "a 32 GiB card"; the base has 30.5B parameters; Reactor's per-expert NF4 load lands it at 15.64 GiB resident (§93.11); stock 4-bit loading that left the experts in bf16 needed "about 54 GiB"; merging an adapter needs the bf16 base, 57 GiB, against a 47 GiB WSL guest (§94.6). Assume, from Qwen3-30B-A3B's published configuration and not from the paper: 48 layers, hidden size 2,048, expert intermediate size 768, three projections per expert (gate, up, down). Take the card as 32 GiB. (1) Show why serving and training cannot share the card, and how much is missing. (2) Check the 57 GiB merge figure and a pure 4-bit estimate against the 15.64 GiB measurement. (3) Count the expert parameters and use them to explain the "about 54 GiB". (4) What does the arithmetic say about the lease's design?</p>
+<p><strong>(1)</strong> 21 + 28 = 49 GiB against 32 GiB: short by 17 GiB, more than half a second card. Even with training alone resident, 32 − 28 = 4 GiB remains, about a fifth of what inference needs. No partial sharing works; one job must leave the card completely. Hence the lease: SERVING → DRAINING → RELEASED → RESTORING → SERVING (§94.5).</p>
+<p><strong>(2)</strong> bf16 base: 30.5 × 10<sup>9</sup> × 2 = 61.0 × 10<sup>9</sup> bytes = 56.8 GiB, which is the paper's 57 GiB. Merging cannot fit in a 47 GiB guest, which is why the converter writes an unmerged GGUF LoRA. Pure 4-bit: 30.5 × 10<sup>9</sup> × 0.5 = 15.25 × 10<sup>9</sup> bytes = 14.2 GiB. The measured 15.64 GiB is about 1.4 GiB higher. The paper does not break that down; plausible contributors are NF4's per-block scale constants and layers that are not quantized (embeddings, norms, routers). That is an inference, not a measurement.</p>
+<p><strong>(3)</strong> One expert: 3 × 2,048 × 768 = 4,718,592 weights. All experts: 48 × 128 × 4,718,592 = 28.99 × 10<sup>9</sup>, about 95% of the 30.5B. In bf16 that is 28.99 × 10<sup>9</sup> × 2 = 57.98 × 10<sup>9</sup> bytes = 54.0 GiB. So "about 54 GiB" is almost exactly the expert weights left in bf16: stock loading quantized only the 5% that was not in experts. That is why "the 'bnb-NF4 30B' was never 4-bit", and why <code>moe_quant.py</code> refuses to load if any expert stays bf16.</p>
+<p><strong>(4)</strong> The margins are large and one-sided: a 17 GiB shortfall cannot be closed by tuning batch size or KV cache. The design therefore makes the swap safe rather than trying to avoid it. It drains in-flight work, proves release with <code>nvidia-smi</code> instead of trusting a terminate signal, and restores on expiry only through measured admission. And because 49 GiB can never be co-resident, the organism exiting with code 69 when the lane is lent is not caution but arithmetic.</p>
+<p class="ak-q"><strong>Connection 2 (Combinatorics and linear algebra: adapting the experts).</strong> §94.6 says the default LoRA is rank 16 on the 192 attention projections (13.4M parameters, about 27 MB), and that adapting the experts "would mean 18,432 projections and about 830M parameters", opt-in. §94.5 says the base routes each token to 8 of 128 experts per layer. Use the same assumed configuration as Connection 1 (48 layers, hidden size 2,048, expert intermediate size 768, three projections per expert). (1) Derive 18,432 and the 830M figure, and the adapter's size at 2 bytes per parameter. (2) How many distinct expert subsets can a token be routed to in one layer, and what fraction of expert weights does a token touch? (3) Assuming routing spreads tokens evenly across experts (an assumption), what share of the training tokens reaches any one expert's adapter? (4) Relate this to §93.11's measured training signal and say what it implies for the default.</p>
+<p><strong>(1)</strong> Projections: 48 layers × 128 experts × 3 = 18,432. Each expert projection is 2,048 × 768 or 768 × 2,048, so r(d<sub>in</sub> + d<sub>out</sub>) = 16 × 2,816 = 45,056 parameters. Total: 18,432 × 45,056 = 830.5 × 10<sup>6</sup>, matching "about 830M". At 2 bytes: about 1.66 GB, against about 27 MB for the attention-only adapter, roughly 62 times larger.</p>
+<p><strong>(2)</strong> C(128, 8) = 1,429,702,652,400, about 1.4 × 10<sup>12</sup> possible expert subsets per layer. A token touches 8/128 = 6.25% of each layer's experts. As a cross-check, with about 29.0B expert parameters (Connection 1), active weights per token are about 1.5B non-expert plus 29.0B × 0.0625 ≈ 1.8B expert, roughly 3.3B, consistent with the "A3B" in the model's name.</p>
+<p><strong>(3)</strong> Each token updates the adapters of its 8 chosen experts in each layer. Under even routing, any one expert sees 8/128 = 1/16 of the tokens. Every expert adapter therefore learns from about 6% of the data that each attention adapter sees, since every token passes through attention.</p>
+<p><strong>(4)</strong> §93.11 records a very thin signal from the first cycle: three contributing answers, gradient norm about 1e-4, one greedy flip. Splitting that across experts would give each expert adapter about a sixteenth of it, while multiplying the trainable parameters by 62. In linear-algebra terms, more directions to fit with less data per direction. That supports the default of attention only, and suggests expert adaptation is worth trying only after the corpus carries real contrast (diff-format rows, a held-out gain, §93.15). The size also matters operationally: a 27 MB adapter is cheap to publish, version and roll back in J-Prime's registry; a 1.66 GB one is not. The even-routing figure is an assumption; real routers are uneven, which would starve some experts further.</p>
+<p class="ak-q"><strong>Connection 3 (Graph theory: who calls whom).</strong> Build two directed graphs from §94.7. Nodes: O+V (the organism), H (the Training Lifecycle Handoff), J (J-Prime), R (Reactor's :8090 receiver), T (Reactor's trainer and converter, run by H), and E (the experience-stream directory with its landing-label ledger). In the <em>call graph</em>, draw an edge X → Y when X makes a request to Y or starts Y as a process. In the <em>data-flow graph</em>, draw an edge when data produced by X is consumed by Y. (1) List both edge sets. (2) Is the call graph acyclic? Give a topological order and name its sinks. (3) Find the cycle in the data-flow graph and the edge in it that no component triggers on its own. (4) Use reachability in the call graph to predict the "when one of them is down" table.</p>
+<p><strong>(1)</strong> Call graph: O+V → J (generation over <code>/api/chat</code> or <code>/v1/chat/completions</code>, the served-identity query, the boot-time lease check; bring-up also tries to start J); H → J (lease acquire, renew and release, adapter publish, evaluation scope); H → T (subprocess). Reactor makes no call to J, and J makes no call to anyone. Data-flow graph: O+V → E (recorder rows and landing labels); E → R (tailing); E → T (the GRPO reader); T → H (adapter file, exit code, JSON report); H → J (the published GGUF); J → O+V (generations from the served adapter).</p>
+<p><strong>(2)</strong> The call graph is acyclic. One topological order is H, T, O+V, J (R and E are isolated). J and T are sinks; nothing waits on O+V or H. Because no two services call each other, no cycle of waits between services can form: a distributed deadlock between components would need a cycle in this graph.</p>
+<p><strong>(3)</strong> The data-flow graph has the cycle O+V → E → T → H → J → O+V. That is Loop 2: the organism's own work becomes the model that does its next work. The edge into H is not triggered by any component: automatic triggering (<code>JARVIS_GRPO_AUTOTRAIN_ENABLED</code>) is off, so the operator starts each cycle. The receiver R is not on the cycle at all, because ingestion does not trigger training (§94.6). The learning cycle is closed only through a human-started edge, which is the doll's governance appearing in the graph.</p>
+<p><strong>(4)</strong> Nodes with a call path to J are O+V and H, so J down stalls generation and training: "nothing to generate with". R has no inbound call edges, so R down stalls nothing: "the organism still works; it just stops learning", and E buffers the data until R returns. H down mid-cycle leaves only J's lease state, which expires through measured admission. O+V down affects nothing in the call graph, matching "J-Prime keeps serving; Reactor idles". One rule is not visible in either graph: H and O+V must not run together. That is a mutual-exclusion constraint enforced through J's lease state (H refuses beside a live organism; O+V exits 69 when the lane is lent), which is why it needs a separate mechanism rather than an edge.</p>
 </div>
 </details>
 <!-- answer-key:end -->

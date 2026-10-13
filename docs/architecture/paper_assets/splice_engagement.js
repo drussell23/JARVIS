@@ -11,7 +11,7 @@ const UNITS = [
   ["part-vii", /^# PART VIII —/], ["part-viii", /^# PART IX —/], ["part-ix", /^# PART X —/],
   ["part-x", /^# PART XI —/], ["part-xi", /^# PART XII —/], ["part-xii", /^# PART XIII —/],
   ["part-xiii", /^# PART XIV —/], ["part-xiv", /^# PART XV —/], ["part-xv", /^## §92\. /],
-  ["s92", /^## §93\. /], ["s93", /^## Appendix A — /],
+  ["s92", /^## §93\. /], ["s93", /^## §94. /], ["s94", /^## Appendix A — /],
 ];
 
 let text = fs.readFileSync(paperPath, "utf8").replace(/\r\n/g, "\n");
