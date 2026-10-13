@@ -1,0 +1,134 @@
+<!-- QUICKCHECK after: ## §82. The Multi-Modal Gap -->
+<div class="quick-check" id="qc-82">
+<p class="qc-label">Quick check · §82</p>
+<details class="qc"><summary>1. Why did the sensor report <code>degraded reason=ferrari_absent</code> even while Ferrari was writing fresh frames?</summary>
+<p>The server wrote metadata to <code>frame_meta.json</code>, but the sensor checked for <code>latest_frame.json</code>. Its liveness test, <code>os.path.exists</code> on its own metadata path, therefore failed on every scan. Contract violation 1, §82.2.</p>
+</details>
+<details class="qc"><summary>2. The server's dhash was a correct value. Why did the evidence still get dropped?</summary>
+<p>The server wrote the raw Python integer, which stringifies to decimal. The schema validator requires 16 lowercase hex characters, so the evidence envelope was dropped at validation. The fix formats it with <code>f"{dhash_val &amp; 0xFFFFFFFFFFFFFFFF:016x}"</code>. Contract violation 3.</p>
+</details>
+<details class="qc"><summary>3. Why did the missing OCR function fail silently rather than with an error?</summary>
+<p><code>scan_once</code> only calls OCR when <code>self._ocr_fn</code> is not <code>None</code>. The construction site never passed one, so the OCR text stayed empty and every scan ended as <code>skipped: no_regex_match ocr_chars=0</code>, which looks like a normal outcome. Contract violation 4.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §83. The Two-Ingress Architecture -->
+<div class="quick-check" id="qc-83">
+<p class="qc-label">Quick check · §83</p>
+<details class="qc"><summary>1. Why do VisionSensor envelopes have an empty <code>target_files</code>?</summary>
+<p>When the sensor emits, the op only means "there is a detected condition on screen". It has no file target yet. The orchestrator infers targets downstream from the OCR content, the app context and goal-relevance scoring. Empty is the honest value. See §83.1.</p>
+</details>
+<details class="qc"><summary>2. What does step 5 of the <code>/attach</code> validation reuse, and what happens if that helper cannot be imported?</summary>
+<p>It reuses Venom's <code>_is_protected_path()</code>, the same helper that guards <code>edit_file</code>, <code>write_file</code> and <code>delete_file</code> against <code>.git/</code>, <code>.env</code>, credentials and <code>FORBIDDEN_PATH</code> memories. If it becomes unimportable, the check fails closed instead of being skipped. See §83.2.</p>
+</details>
+<details class="qc"><summary>3. What does the <code>finding_cooldown</code> stage key on, and what does it prevent?</summary>
+<p>It keys on the tuple (verdict, app, matches) for 120 seconds. The same on-screen finding seen again in the next frames does not emit a new envelope each time. See the diagram in §83.1.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §84. The Attachment Substrate -->
+<div class="quick-check" id="qc-84">
+<p class="qc-label">Quick check · §84</p>
+<details class="qc"><summary>1. After the arc, who may read <code>ctx.attachments</code> bytes, and under what condition does the third reader qualify?</summary>
+<p><code>VisionSensor._ingest_frame()</code>, <code>visual_verify.py</code>, and <code>providers.py::_serialize_attachments()</code>. The third qualifies only when its purpose is one of <code>sensor_classify</code>, <code>visual_verify</code> or <code>generate</code>, and the <code>JARVIS_GENERATE_ATTACHMENTS_ENABLED</code> gate is truthy. See §84.3.</p>
+</details>
+<details class="qc"><summary>2. Which values turn off <code>JARVIS_GENERATE_ATTACHMENTS_ENABLED</code>, and which purpose does it affect?</summary>
+<p>After trimming and lowercasing, only <code>0</code>, <code>false</code>, <code>no</code> or <code>off</code> disable it; anything else, including unset, leaves it on. It applies only to the <code>generate</code> purpose, so the other two purposes keep working. See §84.4.</p>
+</details>
+<details class="qc"><summary>3. The AST test was extended to whitelist <code>providers.py</code>. What does that test enforce, and what does it leave to runtime?</summary>
+<p><code>test_attachment_export_ban.py</code> enforces which modules may read attachments at all. Whether a given call may read them is left to the runtime purpose gate and env gate. See §84.3.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §85. Provider-Side Serialization -->
+<div class="quick-check" id="qc-85">
+<p class="qc-label">Quick check · §85</p>
+<details class="qc"><summary>1. How does the Claude serializer choose between an image block and a document block?</summary>
+<p>It branches on <code>att.mime_type</code>. <code>application/pdf</code> becomes a <code>document</code> block, and any other allowed mime becomes an <code>image</code> block with that media type. See §85.1.</p>
+</details>
+<details class="qc"><summary>2. Where do the media blocks go relative to the prompt text, and why?</summary>
+<p>Before it: <code>user_content = [*_image_blocks, {"type": "text", "text": p}]</code>. Claude's prompt guidance recommends media first for the best reasoning quality.</p>
+</details>
+<details class="qc"><summary>3. In the <code>multi_modal</code> log line, why can <code>blocks</code> be smaller than <code>attachments</code>, and is <code>bytes</code> the payload size?</summary>
+<p><code>blocks</code> counts the blocks actually emitted, which can be fewer if some attachments were dropped at the per-attachment read gate. <code>bytes</code> is the sum of on-disk sizes, not the base64-inflated payload. See §85.4.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §86. The Twelve-Commit Arc (Chronological) -->
+<div class="quick-check" id="qc-86">
+<p class="qc-label">Quick check · §86</p>
+<details class="qc"><summary>1. Why did the filename contract need two commits, 2 and 3?</summary>
+<p>There were two consumers of the frame sidecar. Commit 2 renamed the file in <code>frame_server.py</code>, and commit 3 aligned the second consumer, the <code>lean_loop</code> capture adapter used by Visual VERIFY.</p>
+</details>
+<details class="qc"><summary>2. Why does the arc avoid squash commits and amend-in-place?</summary>
+<p>So every step of the debugging arc stays auditable. Each commit has a conventional subject and a body citing the specific failure mode it closes.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §87. Live-Fire Behavioral Proof -->
+<div class="quick-check" id="qc-87">
+<p class="qc-label">Quick check · §87</p>
+<details class="qc"><summary>1. Why did the driver submit through <code>make_envelope()</code> and <code>router.ingest()</code> instead of typing into the REPL?</summary>
+<p>Driving the SerpentFlow REPL from stdin needs an interactive terminal. Using the same factory and the same <code>ingest</code> call as <code>/attach</code> exercises the identical code path without one. See §87.2.</p>
+</details>
+<details class="qc"><summary>2. Why did this op go straight to Claude and skip DoubleWord?</summary>
+<p>The driver set <code>urgency="critical"</code> with <code>source="voice_human"</code>, which the router sends to IMMEDIATE: Claude direct, skip DW. See the trace in §87.3 and the route in §87.5.</p>
+</details>
+<details class="qc"><summary>3. Claude produced no candidate. Why is that a success here?</summary>
+<p>The request asked for a summary, not a code change. Returning a well-formed <code>2b.1-noop</code> instead of inventing a fix shows the model understood both the request and that no file edit was needed. See §87.4, fact 4.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §88. Manifesto Alignment -->
+<div class="quick-check" id="qc-88">
+<p class="qc-label">Quick check · §88</p>
+<details class="qc"><summary>1. Under §2 Progressive Awakening, what can be shed independently?</summary>
+<p>Setting <code>JARVIS_GENERATE_ATTACHMENTS_ENABLED=false</code> turns off GENERATE-time serialization. The intake-time <code>sensor_classify</code> and post-APPLY <code>visual_verify</code> paths keep working, so each phase can shed multi-modal load on its own.</p>
+</details>
+<details class="qc"><summary>2. Why is the route stamped at intake, before the hoist?</summary>
+<p>So the <code>route=</code> field in the observability log always reflects the real routing decision. See the §5 Tier Routing entry.</p>
+</details>
+<details class="qc"><summary>3. What happens to a PDF that violates any one of the hard gates?</summary>
+<p>It is dropped at the nearest boundary with a WARNING log. It is never shipped silently. See the §6 Iron Gate entry.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §89. Known Limitations & Future Work -->
+<div class="quick-check" id="qc-89">
+<p class="qc-label">Quick check · §89</p>
+<details class="qc"><summary>1. <code>frame_server.py</code> processes die after 6 to 7 minutes when the Terminal loses focus. Why is that acceptable for the sensor?</summary>
+<p>The supervisor reliably respawns them. In the 1 to 30 second gap, the staleness guard correctly emits <code>degraded reason=frame_stale</code>, and the scan loop resumes on the first fresh frame. See §89.1.</p>
+</details>
+<details class="qc"><summary>2. Attempt 3 of the VisionSensor graduation failed. Why does the paper say this was not a sensor flaw?</summary>
+<p>macOS rate-limits background processes bringing windows to the foreground, as an anti-hijack policy. The probe's Terminal window could not stay frontmost, so the traceback never reached the display's pixels. The sensor graduated on 2/2 clean captures plus the structural proof. See §89.3.</p>
+</details>
+<details class="qc"><summary>3. What future change would let DoubleWord and J-Prime reason over PDFs, and why was it left out?</summary>
+<p>A PDF-to-image adapter, for example <code>pdf_to_png</code> via PyMuPDF, emitting one image per page up to a page cap. It was scoped out so the provider-side contract would not grow while the Claude path was being stabilized. See §89.5.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §90. Reproduction Commands -->
+<div class="quick-check" id="qc-90">
+<p class="qc-label">Quick check · §90</p>
+<details class="qc"><summary>1. In the expected output of §90.1, what does <code>bytes=701</code> correspond to?</summary>
+<p>The on-disk size of the generated smoke-test PDF. The log field sums on-disk sizes, not base64 size.</p>
+</details>
+<details class="qc"><summary>2. What does the interactive session in §90.2 exercise that the one-command test does not?</summary>
+<p>The real <code>/attach</code> REPL command typed at the SerpentFlow prompt. The op then runs through CLASSIFY, ROUTE and GENERATE exactly as an autonomous VisionSensor op would, emitting the same two log lines.</p>
+</details>
+<details class="qc"><summary>3. Which grep in §90.3 measures the PDF gap on non-Claude providers?</summary>
+<p>The count of lines containing <code>does not support PDF documents</code>, the WARNING logged when DW or J-Prime drops a PDF.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §91. Summary -->
+<div class="quick-check" id="qc-91">
+<p class="qc-label">Quick check · §91</p>
+<details class="qc"><summary>1. Which four Manifesto invariants does the summary say the arc preserved?</summary>
+<p>§1 convergent ingress, §4 privacy-shield preservation, §6 Iron Gate preservation and §8 observability.</p>
+</details>
+<details class="qc"><summary>2. What is the difference between "behaviorally demonstrated" and "structurally plausible" here?</summary>
+<p>Structural plausibility means the wiring, gates and logs are in place. Behavioural demonstration means a real API call returned a verbatim quote of the PDF's contents, which shows the model actually read the bytes.</p>
+</details>
+</div>
+<!-- END -->

@@ -1,0 +1,205 @@
+<!-- QUICKCHECK after: ### §93.1 The Five Months at a Glance -->
+<div class="quick-check" id="qc-93-1">
+<p class="qc-label">Quick check · §93.1</p>
+<details class="qc"><summary>1. In May and June, stream first-token latency fell from 94,638 ms to 722 ms, yet GOAL-001 still never dispatched. What does that pairing tell you?</summary>
+<p>Raw speed was not the blocker. A substrate can get roughly 130 times faster at starting a stream and still fail to move one signed goal from enqueued to dispatched. That is the A1 wall that §93.4 describes.</p>
+</details>
+<details class="qc"><summary>2. Between the first autonomous real-code repair (July) and the first autonomous landing (September), what changed underneath the organism?</summary>
+<p>The money ran out. In August the paid credit was exhausted and the organism moved to a local model on the RTX 5090. By late September the paid lanes were switched off altogether.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §93.2 Hardening the Cloud Substrate (May – June) -->
+<div class="quick-check" id="qc-93-2">
+<p class="qc-label">Quick check · §93.2</p>
+<details class="qc"><summary>1. Long Claude first-token waits looked like a network problem. What were they, and how does the Quiescence Protocol fix them?</summary>
+<p>They were event-loop starvation caused by the organism's own background load, chiefly the Oracle boot index. One global <code>asyncio.Event</code> pauses background work while a critical stream starts. In the measured run the first raw event went from 94,638 ms to 722 ms.</p>
+</details>
+<details class="qc"><summary>2. <code>ChangeEngine</code> used to record <code>APPLIED</code> before VERIFY ran. What went wrong, and what is the rule now?</summary>
+<p>A phantom <code>written=True</code> appeared across 15 cloud runs, so writes were claimed that never happened. Now a write is claimed only after a SHA-256 check of the file on disk.</p>
+</details>
+<details class="qc"><summary>3. Aegis takes provider keys out of the main process. What else does routing every paid call through it provide?</summary>
+<p>An exact ledger. Every call is admitted, reserved and reconciled into a write-ahead log. Its audit corrected a felt soak bill of 26 US dollars to about 1.90 US dollars across 821 Claude calls.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §93.3 Evaluation and the Cage, Measured -->
+<div class="quick-check" id="qc-93-3">
+<p class="qc-label">Quick check · §93.3</p>
+<details class="qc"><summary>1. §92.4 reported 0/38 escapes, and §93.3 reports about 8.8%. Do these contradict each other?</summary>
+<p>No. They measure different populations. The 0/38 was a small hand-curated set. The 8.8% comes from more than 1,400 LLM-generated variants per run, two runs that converge on the same figure. The paper keeps the 0/38 "as stated" but says it is not the escape rate.</p>
+</details>
+<details class="qc"><summary>2. The Z3 prover machine-checked the recursion-depth bound "with a negative control". What does the control add, and what does the commit decline to claim?</summary>
+<p>The negative control shows the prover can reject a broken bound, so a pass means something and is not vacuous. The commit says the prover mirrors the gate's structure by hand and does not extract it from the AST. So it proves a model of the gate, not the gate's code.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §93.4 The A1 Wall and the First Autonomous Repairs (June – July) -->
+<div class="quick-check" id="qc-93-4">
+<p class="qc-label">Quick check · §93.4</p>
+<details class="qc"><summary>1. What exactly is the A1 gate?</summary>
+<p>A1 means tracing a signed strategic sub-goal from "enqueued" to "dispatched". GOAL-001's first file never dispatched, even with the system funded, attested and quiet. The North Star wrote that the cost work "did NOT unblock the goal".</p>
+</details>
+<details class="qc"><summary>2. Why does the paper call the first real-code repair (<code>abbddeec24</code>) modest?</summary>
+<p>It was a 3-line fix to <code>clamp01</code>, and the defect had been planted on purpose (<code>4b9e573127</code>). The only autonomous commit of the run before it was a duplicated <code>requirements.txt</code> comment, which was reverted twice.</p>
+</details>
+<details class="qc"><summary>3. Run-24 judged everything O+V initiated on its own to be "annotation-grade". What did the appetite layer change in response?</summary>
+<p>It routes work on verifiable evidence of value (<code>signal_value.py</code>, <code>substance_ledger.py</code>). It also treats the operator's own roadmap as a source of work through <code>WorkOrderSensor</code>, so the organism stops spending effort on what it can invent cheaply.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §93.5 The Credit Runs Out (August) -->
+<div class="quick-check" id="qc-93-5">
+<p class="qc-label">Quick check · §93.5</p>
+<details class="qc"><summary>1. A <code>RehearsalOutcome</code> has no diff, patch or file field "by construction", and AST-pinned tests keep it that way. Why go that far?</summary>
+<p>A rehearsal is the honest ending for an operation when every lane is dry. It records what was exhausted, when that lifts and a replay token. With nowhere to put code, it can never be mistaken for, or be used to carry, a real change.</p>
+</details>
+<details class="qc"><summary>2. Besides false failover triggers, what waste did the dry lanes cause on every GENERATE?</summary>
+<p>Each attempt re-walked the provider cascade, even though the ledger already knew how it would end. The ECONOMIC state fixes this by freezing a lane on 402, so it is not retried like a rate limit.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §93.6 The Local Lane on the RTX 5090 (August – October) -->
+<div class="quick-check" id="qc-93-6">
+<p class="qc-label">Quick check · §93.6</p>
+<details class="qc"><summary>1. The 5090 had been sized as a 24 GiB L4. What did that cost?</summary>
+<p>Half the context. The usable window was cut to 16,896 tokens, even though the card has 32 GB. The defect was fixed in <code>model_physics.py</code>.</p>
+</details>
+<details class="qc"><summary>2. The client cache was keyed by URL alone. Why was that a correctness bug and not just a cache miss?</summary>
+<p>The local server's URL does not change when its model is swapped. Keyed by URL, the cache kept handing out a client bound to the old weights, so a model swap silently did nothing.</p>
+</details>
+<details class="qc"><summary>3. <code>paid_lanes.py</code> answers three separate questions: is a lane switched on, configured and allowed? Why not just one?</summary>
+<p>They can disagree. A key can be present (configured) while the operator has declared the lane off. A lane can be on and configured yet unfunded, which "allowed" catches by consulting the economic ledger. With the switch set to false, Claude and DoubleWord are not even constructed, and turning them back on is configuration, not code.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §93.7 How Work Reaches `main` Today -->
+<div class="quick-check" id="qc-93-7">
+<p class="qc-label">Quick check · §93.7</p>
+<details class="qc"><summary>1. Model-invented proposals go through the same single signer as evidence-based goals. Why not give them their own sanction path?</summary>
+<p>A second path would be a second way to get work signed, and so a second thing to audit and to get wrong. With one signer, proposals are ranked below evidence and still face the same gate as everything else: "There is no second sanction path."</p>
+</details>
+<details class="qc"><summary>2. Which operations does the Sentinel always escalate, whatever its tier ceiling?</summary>
+<p>BLOCKED operations, Order-2 self-modification and anything that touches the cage. Auto-approval is capped at a tier, and these classes are never auto-approved.</p>
+</details>
+<details class="qc"><summary>3. <code>GoalReconciliationLedger</code> derives a goal's state from git ancestry, not from logs. Why?</summary>
+<p>Ancestry is the ground truth of whether a commit is on <code>main</code>. Logs can miss or misreport events. §93.10 found session summaries undercounting landings.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §93.8 Inside the Pipeline: What Changed -->
+<div class="quick-check" id="qc-93-8">
+<p class="qc-label">Quick check · §93.8</p>
+<details class="qc"><summary>1. What did "524 byte-identical retry iterations" reveal about VALIDATE_RETRY?</summary>
+<p>The rung existed and ran, but it re-validated a frozen pool of candidates instead of generating new ones, so every retry repeated the same verdict. Now VALIDATE_RETRY actually regenerates. Its place in the order is after the micro-fix and before L2.</p>
+</details>
+<details class="qc"><summary>2. What three kinds of test does the Test Reality Gate reject, and what made it necessary?</summary>
+<p>Tests that cannot execute, tests that assert nothing, and tests that never import their subject. It was added after a hollow test landing (<code>c985ccaee4</code>) reached <code>main</code> and had to be reverted.</p>
+</details>
+<details class="qc"><summary>3. In the <code>2b.1-diff</code> path the source is shown with numbered lines. Why must the numbers the model copies back be stripped?</summary>
+<p>The numbers help the model locate its edit, but they are not part of the code. Left in, they would be written into the file. Stripping them and applying through a single stdlib applier keeps the output clean.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §93.9 The `ov` Cockpit -->
+<div class="quick-check" id="qc-93-9">
+<p class="qc-label">Quick check · §93.9</p>
+<details class="qc"><summary>1. What does a bare <code>ov</code> do, and how does it relate to the battle-test runner?</summary>
+<p>It attaches to the running organism, or cold-boots one in the background if none is running. The battle-test runner of Part XI is still the engine underneath, and <code>ov</code> is the operator surface on top of it.</p>
+</details>
+<details class="qc"><summary>2. Why is <code>/proof</code> a SHA-256 <em>chain</em> rather than a plain list of evidence?</summary>
+<p>Each entry is chained to the previous one by hash. Editing any earlier entry breaks every later link, which makes the record tamper-evident.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §93.10 First-Order Proofs: The Landings Ledger -->
+<div class="quick-check" id="qc-93-10">
+<p class="qc-label">Quick check · §93.10</p>
+<details class="qc"><summary>1. Production landing <code>f97f8195d6</code> passed validation and was still reverted. Why?</summary>
+<p>Its goal was to make <code>candidate_generator.py</code> decline multi-file swarm ops, but only a punctuation rewrite landed. A commit can be valid and still carry none of its intended change. The retry, <code>e7b3bdfec2</code>, added 9 real lines and stands.</p>
+</details>
+<details class="qc"><summary>2. The session summary reported 2 landings where there were 3, and 1 where there were 10. What rule did PRD §34 draw from that?</summary>
+<p>The ledger and git are the source of truth, not the summary. Counting is done against commits on <code>main</code>.</p>
+</details>
+<details class="qc"><summary>3. Three production landings changed files inside the governance package. Why is the system still at Mechanic?</summary>
+<p>All three were under signed, operator-sanctioned goals, and none touched a safety gate. Neurosurgeon means modifying the governance substrate on the organism's own initiative, and that has not happened.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §93.11 The Trinity Closes the Loop: Recorder → Reactor → J-Prime -->
+<div class="quick-check" id="qc-93-11">
+<p class="qc-label">Quick check · §93.11</p>
+<details class="qc"><summary>1. Why does Reactor quantize each expert to NF4 itself instead of using stock 4-bit loading?</summary>
+<p>Stock 4-bit quantization left the fused experts in bf16, which is most of a mixture-of-experts model's weights. Quantizing each expert in <code>moe_quant.py</code> brings the 30B to 15.64 GiB resident, small enough to train on the one card.</p>
+</details>
+<details class="qc"><summary>2. Why are truncated completions masked out of training?</summary>
+<p>A cut-off answer is not the answer the model meant to give, so its reward would teach the wrong thing. The stated rule is never to train on a truncated answer. The same check found that 86% of prompts (1,044 of 1,215) asked for whole-file rewrites that could not fit, which drove the move to diff output.</p>
+</details>
+<details class="qc"><summary>3. Landing provenance took trainable success rows from 0 to 26. What does it add to a corpus row?</summary>
+<p>Git-proven <code>landed</code> and <code>surviving</code> labels. Training then learns from what actually reached and stayed on <code>main</code>, not just from what passed VALIDATE. 35 of 39 landings were proven.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §93.12 Safety and Honesty Infrastructure -->
+<div class="quick-check" id="qc-93-12">
+<p class="qc-label">Quick check · §93.12</p>
+<details class="qc"><summary>1. What makes a feature "DARK", and why is "flag on" not enough to call it working?</summary>
+<p>The flag is on and the module is on disk, but nothing in production imports it. The reachability ledger tracks each capability through registered, invoked and effective, because only the last shows it acting. 131 features were DARK.</p>
+</details>
+<details class="qc"><summary>2. The Antivenom self-audit showed 105 misses. How many were real?</summary>
+<p>Most were mismeasurement: the wrong owner, comment-encoded diffs and invalid mutations. Six real detector holes were found and closed, and a "quine" detector for tautological tests was added.</p>
+</details>
+<details class="qc"><summary>3. About 40 run budgets are now derived from one wall-clock figure. What goes wrong when they are set independently?</summary>
+<p>They can contradict each other, for example an inner wait that outlives the budget of the pipeline around it. Deriving them from one figure keeps them consistent, and tests pin them against drift. The approval wait follows the same rule: its deadline sits below the pipeline budget and it fails closed.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §93.13 Updated Topline (as of 2026-10-13) -->
+<div class="quick-check" id="qc-93-13">
+<p class="qc-label">Quick check · §93.13</p>
+<details class="qc"><summary>1. Can the 3,891,413 Python lines be compared with §92.11's 2.9M LOC to measure growth?</summary>
+<p>No. The new figure counts every line in git-tracked <code>.py</code> files, blanks and comments included, and the paper says the §92.11 figures used a different method.</p>
+</details>
+<details class="qc"><summary>2. The window has 3,122 JARVIS commits but only 3,013 on GitHub. What accounts for the difference?</summary>
+<p>The 109 commits on the author's local <code>main</code> that had not yet been pushed (the † items). That matches the "109 commits ahead of <code>origin/main</code>" in the section's introduction.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §93.14 Limitations, Stated Plainly -->
+<div class="quick-check" id="qc-93-14">
+<p class="qc-label">Quick check · §93.14</p>
+<details class="qc"><summary>1. Numbering the source cut apply failures from 28 to 21 but raised syntax failures from 1 to 6. What does that trade show?</summary>
+<p>Numbers help the model point at the right lines, so more diffs apply. But more of the applied diffs break the module, so the fix moved failures rather than removing them. That is why diff fidelity is still the leading failure mode.</p>
+</details>
+<details class="qc"><summary>2. What single figure from the 10-09 soak shows how far the 30B is from the diff schema?</summary>
+<p>219 whole-file answers against 6 diffs. Most of the time the model ignored the schema it was asked to use.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §93.15 What Comes Next -->
+<div class="quick-check" id="qc-93-15">
+<p class="qc-label">Quick check · §93.15</p>
+<details class="qc"><summary>1. Why does step 5 call for a <em>complete</em> three-arm slot A/B?</summary>
+<p>The earlier attempt never finished. The two arms that ran had different goal mixes, the VM stopped mid-run, and the 1-slot arm never ran (§93.10). Slot scaling is listed as unproven in production.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §93.16 Corrections and Superseded Text -->
+<div class="quick-check" id="qc-93-16">
+<p class="qc-label">Quick check · §93.16</p>
+<details class="qc"><summary>1. Part VI is marked "Superseded", while §92.4's 0/38 "Stands". What is the difference?</summary>
+<p>Part VI described a provider topology that no longer exists: J-Prime is now the only lane. The 0/38 is still true for the curated set it measured, and it now sits beside the at-scale figure of about 8.8%. Under the addendum policy neither earlier text is edited. The correction lives here.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §93.17 Glossary Additions -->
+<div class="quick-check" id="qc-93-17">
+<p class="qc-label">Quick check · §93.17</p>
+<details class="qc"><summary>1. How does the ECONOMIC state differ from the rehearsal tier?</summary>
+<p>ECONOMIC state classifies a provider refusal as a funding problem, distinct from quota or outage. The rehearsal tier is what an operation does once every paid lane is dry: it ends honestly, with no code.</p>
+</details>
+<details class="qc"><summary>2. Is every autonomous landing a first-order proof?</summary>
+<p>No. A first-order proof is a landing that does real work for a signed goal. A landing that carried no intended change, like the punctuation-only commit in §93.10, would not qualify.</p>
+</details>
+</div>
+<!-- END -->

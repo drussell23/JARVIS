@@ -1,0 +1,64 @@
+<!-- QUICKCHECK after: ## §39. The Three Providers -->
+<div class="quick-check" id="qc-39">
+<p class="qc-label">Quick check · §39</p>
+<details class="qc"><summary>1. What does the <code>CandidateProvider</code> protocol buy the orchestrator, and what does adding a fourth provider require?</summary>
+<p>The orchestrator calls <code>generate</code>, <code>plan</code> and <code>health_check</code> without knowing whether it is talking to DoubleWord, Claude, J-Prime or a test mock. A new provider only has to implement the protocol and register with the GovernedLoopService; pipeline code does not change (§39.4).</p>
+</details>
+<details class="qc"><summary>2. Why does the Claude provider carry a 60-second hard fallback cap (<code>_FALLBACK_MAX_TIMEOUT_S</code>)?</summary>
+<p>Claude is often the fallback in a cascade. Without a cap, an unreachable provider could consume the whole pipeline budget while the operation waits on it; the cap bounds that loss (§39.2).</p>
+</details>
+<details class="qc"><summary>3. In April 2026, how did J-Prime's pricing and role differ from the two paid providers?</summary>
+<p>J-Prime cost only the VM it ran on, with no per-token billing. It was an opt-in, Tier 2 provider for bounded-volume structured-JSON work, ran at a fixed temperature of 0.2 with schema enforcement, and was disabled when unhealthy (§39.3).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §40. Adaptive Provider Routing — The Failback State Machine -->
+<div class="quick-check" id="qc-40">
+<p class="qc-label">Quick check · §40</p>
+<details class="qc"><summary>1. What would go wrong if a failing primary were simply held down after an outage instead of being retried once its recovery ETA passes?</summary>
+<p>Every later operation would go to the fallback, which is usually the more expensive provider. Retrying the primary as soon as the backoff window elapses is what lets the cost optimization survive transient failures (§40, §40.4).</p>
+</details>
+<details class="qc"><summary>2. What is the difference between <code>FALLBACK_ACTIVE</code> and <code>QUEUE_ONLY</code>?</summary>
+<p>In <code>FALLBACK_ACTIVE</code> the primary is in backoff and work goes to the fallback directly. <code>QUEUE_ONLY</code> is entered when both primary and fallback fail with <code>CONNECTION_ERROR</code>; operations wait in the queue and <code>should_attempt_primary()</code> returns false until a probe succeeds (§40.3, §40.4).</p>
+</details>
+<details class="qc"><summary>3. Why does the probe interval shrink from 60 s to 5 s as the recovery ETA approaches?</summary>
+<p>Far from the ETA, recovery is unlikely and frequent probes would waste effort. Near and past the ETA, a fast probe detects recovery sooner. The paper calls this a cost optimization of the probe itself (§40.5).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §41. DoubleWord 3-Tier Event-Driven Architecture -->
+<div class="quick-check" id="qc-41">
+<p class="qc-label">Quick check · §41</p>
+<details class="qc"><summary>1. How does a Tier 1 batch call return to its caller without anyone polling?</summary>
+<p>The Body registers an <code>asyncio.Future</code> under the <code>batch_id</code> in the <code>BatchFutureRegistry</code>. When DoubleWord finishes, it POSTs to <code>/webhook/doubleword</code>; the <code>EventChannelServer</code> verifies the signature, finds the future and resolves it, so the waiting coroutine simply resumes (§41.2).</p>
+</details>
+<details class="qc"><summary>2. Tier 2 still polls. In what way does it differ from the fixed 5 s polling it replaced?</summary>
+<p>It starts at 2 s, grows by 1.5x per iteration up to a 30 s cap, adds plus or minus 25% jitter, and jumps to a 15 s base on connection errors. It is used only when webhooks cannot be configured (§41.3).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §42. Urgency-Aware Provider Routing -->
+<div class="quick-check" id="qc-42">
+<p class="qc-label">Quick check · §42</p>
+<details class="qc"><summary>1. A <code>runtime_health</code> signal arrives at normal (not CRITICAL) urgency with ordinary complexity. Which route does it get, and why?</summary>
+<p>STANDARD. The source is in <code>_IMMEDIATE_SOURCES</code>, but the IMMEDIATE branch also requires urgency of at least CRITICAL, so the signal falls through to the default cascade (§42.3).</p>
+</details>
+<details class="qc"><summary>2. The complexity check runs first in <code>classify</code>. What does that ordering decide?</summary>
+<p>Any <code>heavy_code</code> or <code>complex</code> operation goes to COMPLEX whatever its source or urgency, so even a background or speculative source gets the Claude-plans, DW-executes cascade when the work is heavy (§42.3).</p>
+</details>
+<details class="qc"><summary>3. What does the minimum fallback reserve in the deadline split protect against?</summary>
+<p>A slow primary consuming the entire generation deadline. Guaranteeing at least 20 s to the fallback (and at least 25 s to Tier 1) means the fallback always has runway to recover the operation (§42.6).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §43. The Current Topology Seal (As of 2026-04-16) -->
+<div class="quick-check" id="qc-43">
+<p class="qc-label">Quick check · §43</p>
+<details class="qc"><summary>1. When DoubleWord was sealed, why did BACKGROUND and SPECULATIVE use <code>skip_and_queue</code> instead of <code>cascade_to_claude</code>?</summary>
+<p>Those routes are DW-only by design (BACKGROUND has no Claude fallback, SPECULATIVE is fire-and-forget batch, §42.1). Sending low-priority work to Claude would break their cost contract, so it is skipped and queued instead of escalated (§43.1).</p>
+</details>
+<details class="qc"><summary>2. What evidence led to the seal, and what would justify lifting it on a given route?</summary>
+<p>Two isolation runs on 2026-04-14 showed the same <code>SSE stream stalled (no data for 30s)</code> signature. Lifting requires a sustained-concurrent-load validation with the DW gateway team, then a per-route flip to <code>dw_allowed: true</code> with a shadow-mode comparison against Claude for a battle-test cycle (§43.2, §43.3).</p>
+</details>
+</div>
+<!-- END -->

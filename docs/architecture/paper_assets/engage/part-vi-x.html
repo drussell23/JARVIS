@@ -1,0 +1,45 @@
+<!-- XBLOCK part-vi -->
+<p class="engage-kicker engage-kicker-x">Connections</p>
+<div class="pset pset-x">
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 1 (Economics).</strong> Use the April 2026 prices in §39: DoubleWord charges 0.10 US dollars per million input tokens and 0.40 per million output tokens; Claude Sonnet-class charges 3.00 and 15.00, Opus-class 15.00 and 75.00. Assume an operation with 20,000 input tokens and 2,000 output tokens (an assumption, not a paper figure). (a) Compute that operation's cost on each provider, and check the "150x more expensive Claude" claim in §41.1. (b) Take an assumed daily mix of 100 operations: 10 IMMEDIATE, 60 STANDARD, 10 COMPLEX, 15 BACKGROUND, 5 SPECULATIVE, priced at the per-op figures in §42.1. Compute the total. (c) Recompute it under the §43.1 seal, pricing every Claude-direct operation at the IMMEDIATE figure of about 0.03. What happens to the marginal cost of one more STANDARD operation?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The 150x claim only holds against one price class and one direction of tokens. Under the seal, two routes cost nothing because their work is not done.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) DoubleWord: 20,000 × 0.10 / 1,000,000 = 0.002, plus 2,000 × 0.40 / 1,000,000 = 0.0008, total 0.0028 US dollars. Sonnet-class: 0.06 + 0.03 = 0.09, about 32x DoubleWord. Opus-class: 0.30 + 0.15 = 0.45, about 161x. Per token, Sonnet is 30x (input) to 37.5x (output) and Opus is 150x to 187.5x. So "150x" matches the Opus-class input ratio; against Sonnet-class the gap is roughly 30 to 38x.</p>
+<p>(b) April mix: 10 × 0.03 = 0.30; 60 × 0.005 = 0.30; 10 × 0.015 = 0.15; 15 × 0.002 = 0.03; 5 × 0.001 = 0.005. Total about 0.79 US dollars per 100 operations.</p>
+<p>(c) Sealed: IMMEDIATE, STANDARD and COMPLEX all cascade to Claude (§43.1). At about 0.03 each that is 80 × 0.03 = 2.40. BACKGROUND and SPECULATIVE are <code>skip_and_queue</code>, so they cost nothing and produce nothing. The bill rises about 3x while 20 of the 100 operations are no longer done. The marginal cost of one more STANDARD operation goes from about 0.005 to about 0.03, a factor of 6. These are estimates built from the paper's approximate per-op figures, not measured spend.</p>
+<p>The lesson for the architecture: route choice in April was an economic decision, and the seal was a deliberate trade of cost for reliability. The October topology (§93.6) removes the per-token price entirely, so the marginal dollar cost of an operation becomes zero. The scarce resource then becomes GPU time, which is the subject of Connection 2.</p>
+</details>
+</div>
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 2 (Queueing theory and economics).</strong> In October (§93.6), J-Prime on one RTX 5090 serves every route. A slot sweep measured aggregate decode throughput of 124, 165 and 177 tokens per second at 1, 2 and 3 slots. Assume each operation decodes 2,000 output tokens and that prefill time is small enough to ignore (both assumptions). For each slot count, compute the decode time per operation and the operations per hour. Use Little's law to check the 2-slot numbers. Then say what "cost" means for routing when the marginal dollar price is zero.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Aggregate throughput is shared across the slots, so each stream gets the aggregate divided by the slot count. Little's law is L = λW.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>1 slot: each operation takes 2,000 / 124 = 16.1 s, so 3,600 / 16.1 = about 223 operations per hour.</p>
+<p>2 slots: each stream gets 165 / 2 = 82.5 tokens per second, so an operation takes 24.2 s. Throughput is 165 × 3,600 / 2,000 = about 297 operations per hour.</p>
+<p>3 slots: each stream gets 59 tokens per second, so an operation takes 33.9 s. Throughput is about 319 operations per hour.</p>
+<p>The second slot adds about 74 operations per hour (+33%) for a 50% longer per-operation latency. The third adds only about 22 per hour (+7%) for a further 40% latency increase. That is why the paper places the knee at 2 slots.</p>
+<p>Little's law check at 2 slots: λ = 297 / 3,600 = 0.0825 operations per second, W = 24.2 s, so L = 0.0825 × 24.2 = 2.0 operations in service, matching two busy slots. If work arrives faster than about 297 operations per hour, utilization exceeds 1 and the queue grows without bound, however many routes the router distinguishes.</p>
+<p>Note that the paper also reports a decode p50 of 172 tokens per second at one slot on real O+V traffic, a different measurement from the 124 in the sweep. Mixing the two would give wrong ratios, so the calculation uses the sweep alone.</p>
+<p>What this says about the architecture: in April, routing traded dollars against latency across providers (§42.1). In October every route lands on the same GPU, so the price of an operation is the GPU-seconds it occupies and the delay it imposes on everything queued behind it. The useful decisions move from "which provider" to admission and concurrency, which is why local concurrency now follows the engine's reported slot count (§93.6).</p>
+</details>
+</div>
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 3 (Markov chains).</strong> Model the §40 failback state machine for <code>TIMEOUT</code> failures as an absorbing Markov chain. After the k-th consecutive failure the primary waits b_k = min(45 × 2^(k−1), 300) seconds (§40.2), then is retried. Assume each retry fails independently with probability p (an assumption; real outages are correlated, and the paper gives no p). Let the transient states be F1, F2, F3 and F4+ (four or more consecutive failures, where the backoff stays at 300 s), and let success be the absorbing state. Starting just after a first failure, find the expected number of visits to each transient state, then the expected total backoff time for p = 0.2 and p = 0.5. Finally, show what happens to that expectation without the 300 s cap.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Each state moves forward with probability p and absorbs with probability 1 − p, except F4+, which loops on itself. The fundamental matrix N = (I − Q)^−1 gives expected visits; its first row here can be read off directly.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The transient block Q has F1 → F2, F2 → F3 and F3 → F4+ with probability p, and F4+ → F4+ with probability p. Every state goes to success with probability 1 − p. The first row of N = (I − Q)^−1 gives the expected visits from F1: F1 once, F2 p times, F3 p² times, and F4+ p³ / (1 − p) times (a geometric number of self-loops).</p>
+<p>Expected backoff is E = 45 + 90p + 180p² + 300p³ / (1 − p).</p>
+<p>For p = 0.2: 45 + 18 + 7.2 + 300 × 0.008 / 0.8 = 45 + 18 + 7.2 + 3 = about 73 s. For p = 0.5: 45 + 45 + 45 + 300 × 0.125 / 0.5 = 135 + 75 = 210 s. The expected number of retries before success is 1 / (1 − p): 1.25 and 2 respectively.</p>
+<p>Without the cap, b_k = 45 × 2^(k−1) for all k, so E = Σ 45 × (2p)^(k−1). That geometric series converges only when 2p &lt; 1. At p = 0.5 every term equals 45 and the sum diverges; for p &gt; 0.5 it diverges faster. So the cap is not cosmetic: it is what keeps the expected time in fallback finite when the primary fails at least half the time.</p>
+<p>During that backoff, work goes to the fallback (<code>FALLBACK_ACTIVE</code>, §40.3), which in April was the more expensive provider. The expected backoff is therefore also an expected period of paying fallback prices. The mode-specific caps in §40.1 (120 s to 900 s) bound that exposure per failure mode. The independence assumption is the weak point of the model: correlated outages make p rise after each failure, which lengthens the real stay in F4+ beyond these figures. These are model outputs, not measurements.</p>
+</details>
+</div>
+</div>
+<!-- END -->

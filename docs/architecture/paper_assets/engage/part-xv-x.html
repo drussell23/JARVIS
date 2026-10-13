@@ -1,0 +1,30 @@
+<!-- XBLOCK part-xv -->
+<p class="engage-kicker engage-kicker-x">Connections</p>
+<div class="pset pset-x">
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 1 (Probability and combinatorics).</strong> An attachment's identity is <code>hash8 = sha256(image_bytes)[:8]</code>: eight hex characters (§82.1, §84.1). §85.4 says the <code>hash8s</code> log field gives "per-attachment identity for cross-op dedup analysis." Treat the truncated SHA-256 output as uniformly random. (a) How many distinct values can <code>hash8</code> take? (b) What is the chance of at least one collision among the 8 attachments a single context may hold (<code>_ATTACHMENT_MAX_PER_CTX</code>)? (c) What is the chance among 1,000, 10,000 and 100,000 distinct attachments collected across many sessions, and at about what count does it reach 50%? (d) The VisionSensor's <code>frame_hash</code> is a 64-bit dhash. Does the same birthday arithmetic describe how its dedup can go wrong?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Birthday approximation: P(collision among n) is about 1 - exp(-n(n-1) / (2N)), where N is the number of possible values. The 50% point is at n of about sqrt(2N ln 2).</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) Eight hex characters carry 8 x 4 = 32 bits, so N = 2^32 = 4,294,967,296 values.</p>
+<p>(b) 8 attachments form 8 x 7 / 2 = 28 pairs. P is about 28 / 2^32 = about 6.5 x 10^-9. Within one op, a collision is negligible.</p>
+<p>(c) n = 1,000: 499,500 pairs / N = 1.16 x 10^-4, so P is about 0.012%. n = 10,000: 49,995,000 / N = 0.0116, so P = 1 - e^(-0.0116) = about 1.2%. n = 100,000: 4,999,950,000 / N = 1.164, so P = 1 - e^(-1.164) = about 69%. The 50% point is sqrt(2 x 2^32 x 0.693) = sqrt(5.95 x 10^9) = about 77,000 attachments.</p>
+<p>So <code>hash8</code> is a good label inside a session log, where it is always paired with an <code>op_id</code> (§85.4). Across a long history of tens of thousands of frames, a matching <code>hash8</code> is evidence that two attachments are the same, not proof; the full SHA-256 is needed for that. Uniformity gives no protection against deliberate collisions either. A second file matching a given <code>hash8</code> needs about 2^32 attempts on average, far fewer than for the full 256-bit hash.</p>
+<p>(d) No. A dhash is a perceptual hash: frames that look almost the same are meant to produce the same value. That is the point of Tier 0 dedup (§83.1). Its errors come from the image, not from chance: two meaningfully different screens can hash alike if the difference is small, for example a single changed line of text. The birthday bound describes accidental collisions of a uniform hash. It says nothing about a hash designed to collide on similar inputs. The two hashes do different jobs, identity and similarity, and they need different error analyses.</p>
+</details>
+</div>
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 2 (Queueing theory).</strong> Ferrari captures the display at about 15 fps (§82.1). The OCR adapter in Accurate mode takes about 130 ms warm and about 700 ms cold on Apple Silicon (§89.2). VisionSensor does not process every frame. It polls asynchronously with an adaptive 1 to 8 s throttle, and Tier 0 dedups by dhash before OCR runs (§83.1). Assume OCR runs on one worker, one frame at a time, and dominates the per-scan cost. (a) Compute the OCR utilization ρ = λS if every captured frame were OCR'd, warm and cold. (b) Compute ρ at the 1 s and 8 s poll intervals, in the worst case where every poll reaches OCR. (c) Use Little's law to find the average number of OCR jobs in progress at a 1 s poll. (d) What does this say about the design and about Fast mode?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>A single-server queue is stable only if ρ is below 1. The maximum throughput of the worker is 1/S.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) λ = 15 frames/s. Warm: ρ = 15 x 0.13 = 1.95. Cold: ρ = 15 x 0.7 = 10.5. Both exceed 1. The worker can finish at most 1/0.13 = about 7.7 frames/s warm, so a backlog would grow without bound and OCR results would describe screens that no longer exist.</p>
+<p>(b) At a 1 s poll, λ = 1/s. Warm ρ = 0.13, cold ρ = 0.7. At an 8 s poll, λ = 0.125/s and warm ρ = 0.125 x 0.13 = about 0.016. These are upper bounds: dedup and the app denylist stop many polls before OCR, so real utilization is lower.</p>
+<p>(c) Little's law: L = λW. With λ = 1/s and W of about 0.13 s (no queueing at this utilization), L = 0.13. On average the OCR worker is busy 13% of the time and idle the rest.</p>
+<p>(d) Separating the sampling rate from the capture rate turns an unstable queue into a lightly loaded one. Capture can run at 15 fps for freshness, while the expensive stage runs at most once per second. The dhash dedup ensures that a static screen is OCR'd only once. Because the 1 s rate is so far below capacity, Accurate mode's extra cost is affordable. That supports §89.2's choice of Accurate as the default: Fast mode would save CPU the system is not short of, at the cost of dropping the top lines of a sparse traceback, exactly the text the Tier-1 regex needs (§82.2). The proposed adaptive Fast/Accurate selection would matter only if the poll rate rose towards the 1/S limit, or if a cold start (ρ = 0.7 at 1 s) persisted.</p>
+</details>
+</div>
+</div>
+<!-- END -->

@@ -1,0 +1,39 @@
+<!-- QUICKCHECK after: ## §54. The Sixteen Sensors -->
+<div class="quick-check" id="qc-54">
+<p class="qc-label">Quick check · §54</p>
+<details class="qc"><summary>1. <code>TestFailureSensor</code> and <code>TodoScannerSensor</code> report latencies under 1s, while <code>ScheduledTriggerSensor</code> and <code>WebIntelligenceSensor</code> are "configurable". What explains the difference?</summary>
+<p>The fast sensors are triggered by pushed events, such as <code>fs.changed.*</code> on <code>*.py</code> or the pytest plugin, so they react as soon as the event arrives. The configurable ones depend on a cron schedule, web search results or idle detection, so their timing is set by configuration rather than by an event. See the table in §54.</p>
+</details>
+<details class="qc"><summary>2. <code>OpportunityMinerSensor</code>, <code>TodoScannerSensor</code> and <code>DocStalenessSensor</code> all react to <code>fs.changed.*</code>. Why are they separate sensors and not one?</summary>
+<p>They look for different things in the same event. One runs AST cyclomatic complexity analysis, one looks for FIXME/TODO/HACK markers, and one looks for undocumented modules. One file change can feed several independent detectors, each emitting its own <code>SignalEnvelope</code>. See §54.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §55. The Event Spine -->
+<div class="quick-check" id="qc-55">
+<p class="qc-label">Quick check · §55</p>
+<details class="qc"><summary>1. In the push model, who pushes, and who subscribes?</summary>
+<p>Producers push: <code>FileWatchGuard</code> for file changes, the pytest plugin, the post-commit hook, and the bus bridges (GapSignalBus, EventEmitter, EventChannelServer). They publish to the unified TrinityEventBus at once. Sensors and other consumers, such as SafetyNet (L3) and FeedbackEngine, subscribe to it. See the diagram in §55.</p>
+</details>
+<details class="qc"><summary>2. Why does a pytest plugin write <code>.jarvis/test_results.json</code>, instead of the sensor running the tests itself each time?</summary>
+<p>The plugin captures results "during any pytest run" (Phase 2, §55.1). Every test run therefore becomes a signal, including runs that someone else started. The sensor does not have to own test execution to learn that a test failed.</p>
+</details>
+<details class="qc"><summary>3. A deployment registers three repos in <code>repo_registry</code>. How many <code>TestFailureSensor</code> instances run, and how is contract drift between the repos caught?</summary>
+<p>Three, one per repo, each watching its own <code>test_results.json</code>. Drift between repos is not caught by these per-repo sensors. It is caught separately by <code>CrossRepoDriftSensor</code>. See §55.3.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §56. UnifiedIntakeRouter -->
+<div class="quick-check" id="qc-56">
+<p class="qc-label">Quick check · §56</p>
+<details class="qc"><summary>1. Two different signals, neither a duplicate of the other, target the same file. Which of the router's four questions handles this, and why is dedup not enough?</summary>
+<p>The <code>file_lock</code> check. Dedup only catches repeats of the same signal through its <code>dedup_key</code>. Two distinct signals can still conflict over a file that is already under operation, and the lock stops the second from dispatching against it. See §56.</p>
+</details>
+<details class="qc"><summary>2. Why does the router need a priority score at all, rather than serving envelopes first-in, first-out?</summary>
+<p>The queue is bounded at 16 slots. When it is full, something must be evicted, and the router evicts the lowest-priority envelopes. A score also decides dispatch order, since the router outputs a sorted priority queue. See §56 and §56.1.</p>
+</details>
+<details class="qc"><summary>3. The WAL is append-only. What two mechanisms keep it from filling up with old entries?</summary>
+<p>Entries are cleared when an envelope transitions to <code>dispatched</code>. Stale entries left by crashed sessions are pruned by TTL. See §56.2.</p>
+</details>
+</div>
+<!-- END -->

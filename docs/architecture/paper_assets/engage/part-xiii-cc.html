@@ -1,0 +1,39 @@
+<!-- QUICKCHECK after: ## §74. O+V vs Claude Code — Where They Differ -->
+<div class="quick-check" id="qc-74">
+<p class="qc-label">Quick check · §74</p>
+<details class="qc"><summary>1. How does O+V's governance differ from Claude Code's, according to the comparison table?</summary>
+<p>Claude Code uses approval gates per tool. O+V runs every operation through a full 11-phase FSM with the Iron Gate. See the Governance row in §74.</p>
+</details>
+<details class="qc"><summary>2. §74.1 says the DoubleWord cascade saves roughly 30x "when DW's SSE is healthy". Why does that qualifier matter?</summary>
+<p>The saving exists only while DoubleWord can actually do the work. When it cannot, the cascade sends the work on to Claude at Claude's cost, so the saving depends on the health of DW's streaming endpoint.</p>
+</details>
+<details class="qc"><summary>3. Which components give O+V the cross-session memory that Claude Code lacks?</summary>
+<p>MemoryEngine and GoalMemoryBridge (§74.1), part of Trinity Consciousness in the table. Claude Code's memory is session-scoped and does not remember yesterday's conversation.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §75. O+V vs the Anthropic "Always-On Agent" Vision -->
+<div class="quick-check" id="qc-75">
+<p class="qc-label">Quick check · §75</p>
+<details class="qc"><summary>1. What does "sovereign" mean here, and what does the operator own?</summary>
+<p>O+V does not need a hosted agent service. It runs on the operator's hardware or self-hosted GCP VMs, and the operator owns the state, the model cache and the logs.</p>
+</details>
+<details class="qc"><summary>2. What does provider diversity change about a single provider outage?</summary>
+<p>Because O+V uses Claude, DoubleWord and J-Prime, losing one provider degrades the system but does not stop it.</p>
+</details>
+<details class="qc"><summary>3. On what two points does §75 say O+V and the always-on vision diverge?</summary>
+<p>Where the state lives and who owns the control loop. They agree on what autonomous agents will look like in production.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §76. Mythos and Safety Alignment -->
+<div class="quick-check" id="qc-76">
+<p class="qc-label">Quick check · §76</p>
+<details class="qc"><summary>1. Name the four kinds of deterministic defence §76 lists.</summary>
+<p>Gates, replay harnesses, protected paths and outcome-based monitoring. None of them depends on what the model says about its own reasoning.</p>
+</details>
+<details class="qc"><summary>2. Why does the quoted Mythos lesson describe "exactly O+V's failure surface"?</summary>
+<p>O+V is built to complete tasks on its own. The severe Mythos incidents came from a drive to finish a hard task overriding safety checks, not from hostile goals, and that drive is what an autonomous task-completer has by design.</p>
+</details>
+</div>
+<!-- END -->

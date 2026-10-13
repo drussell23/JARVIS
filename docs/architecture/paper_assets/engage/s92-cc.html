@@ -1,0 +1,219 @@
+<!-- QUICKCHECK after: ### §92.1 Phase B Subagent Family — Graduated Default-True (2026-04-20) -->
+<div class="quick-check" id="qc-92-1">
+<p class="qc-label">Quick check · §92.1</p>
+<details class="qc"><summary>1. Of the four Phase B subagents, only GENERAL is wrapped in the Semantic Firewall and the mutation cage. What in its description explains why it gets the heaviest guard?</summary>
+<p>EXPLORE is read-only and REVIEW is a shadow-mode critique, so neither changes anything. GENERAL is the infrastructure subagent driven by its own LLM (<code>JARVIS_GENERAL_LLM_DRIVER_ENABLED</code>, now default-true) and able to use tools that mutate. That is why it gets injection and credential detectors, a recursion ban, an output quarantine fence, a hard-kill wrapper and a per-instance mutation budget.</p>
+</details>
+<details class="qc"><summary>2. A hard kill ends a GENERAL run abruptly. What keeps the record of what it did from dying with it?</summary>
+<p>The <code>state_mirror</code> dict. It keeps <code>exec_trace</code> outside the killed run, so the audit trail survives even when the cage terminates the subagent (§92.1).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §92.2 Sensor Event-Primary Campaign + IDE Observability Surface (2026-04-20) -->
+<div class="quick-check" id="qc-92-2">
+<p class="qc-label">Quick check · §92.2</p>
+<details class="qc"><summary>1. Four sensors (RuntimeHealth, WebIntelligence, ProactiveExploration, Scheduled) stayed on polling. Is that unfinished migration?</summary>
+<p>No. The paper says those four stay on polling "by design", calling it "architectural, not deferred". The other 9 of 13 moved to events: webhooks for GitHub and CI, <code>fs.changed.*</code> on the event bus for filesystem sensors, and the conversation bus for IntentDiscovery.</p>
+</details>
+<details class="qc"><summary>2. The observability route module may not import the orchestrator, policy or Iron Gate code, and this is grep-enforced. What property does that protect?</summary>
+<p>It keeps the surface read-only in a structural sense. A module that cannot import the decision-making code cannot influence decisions, whatever a request asks for. Loopback-only binding and a 120/min/IP rate limit narrow who can ask at all.</p>
+</details>
+<details class="qc"><summary>3. The SSE stream is bounded (8 subscribers × 64 queue × 512 history) and drops the oldest events. Why bound it, and why send a single <code>stream_lag</code> event?</summary>
+<p>Without bounds, a slow or stuck client could make the organism buffer without limit. Dropping the oldest event protects the server. The <code>stream_lag</code> event tells the client it missed events, so it can resync with <code>Last-Event-ID</code> replay from the 512-event history instead of silently showing a wrong picture.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §92.3 Wave 1 — Three Default-True Substrates Same Day (2026-04-21) -->
+<div class="quick-check" id="qc-92-3">
+<p class="qc-label">Quick check · §92.3</p>
+<details class="qc"><summary>1. <code>PostureObserver</code> runs every 300 s but applies 900 s of hysteresis. What does the hysteresis buy?</summary>
+<p>It stops the posture from flapping between values on every noisy reading. A new posture has to persist well beyond one observation before it takes over. The 0.75 confidence bypass lets a strong, unambiguous signal switch sooner, and operator overrides are clamped to 24 h so they cannot linger forever.</p>
+</details>
+<details class="qc"><summary>2. The SensorGovernor's emergency brake fires on <code>cost_burn&gt;0.9</code> OR <code>postmortem_rate&gt;0.6</code>. Why OR rather than AND?</summary>
+<p>Each condition is dangerous on its own. Spend running away is a reason to slow down even if ops succeed, and a high postmortem rate is a reason to slow down even if it is cheap. Requiring both would let a cheap failure loop, or an expensive successful one, run at full rate. Either trigger drops caps to 20%.</p>
+</details>
+<details class="qc"><summary>3. Why does a registry of 481+ <code>JARVIS_*</code> flags need typo detection?</summary>
+<p>An environment variable with a misspelled name is simply ignored, so the operator believes a feature is on or off when it is not. Bounded Levenshtein matching turns <code>JARVIS_POSTUR_ENABLED</code> into a suggestion of <code>JARVIS_POSTURE_ENABLED</code>, so the silent failure becomes visible.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §92.4 Battle-Test Harness Hardening + Adversarial Cage (2026-04-23 / 2026-04-27) -->
+<div class="quick-check" id="qc-92-4">
+<p class="qc-label">Quick check · §92.4</p>
+<details class="qc"><summary>1. On SIGHUP, SIGINT or SIGTERM the harness writes a partial <code>summary.json</code> before shutdown. Which failure class does this close?</summary>
+<p>Sessions killed from outside used to leave only <code>debug.log</code> and no auditable artifact. Now they leave a summary with <code>session_outcome=incomplete_kill</code> and a signal-specific <code>stop_reason</code>. The schema change is additive, so existing readers keep working.</p>
+</details>
+<details class="qc"><summary>2. What does <code>--headless</code> skip, and when does it switch on without being asked?</summary>
+<p>It skips the <code>SerpentREPL</code> input task. It switches on automatically when <code>sys.stdin.isatty()</code> is false, as in agent-run soaks, CI and daemons. It replaces the old trick of piping <code>tail -f /dev/null</code> into the process to keep stdin open.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §92.5 CLI / UX Identity Layer — Five Major Surfaces Same Day (2026-05-04) -->
+<div class="quick-check" id="qc-92-5">
+<p class="qc-label">Quick check · §92.5</p>
+<details class="qc"><summary>1. Why did the status line never appear before the TTY-gate fix?</summary>
+<p><code>should_render()</code> asked <code>sys.stdout.isatty()</code>. Under <code>patch_stdout(raw=True)</code>, <code>sys.stdout</code> is a patched stand-in that does not report a TTY, so the check always failed. The fix asks <code>sys.__stdout__</code>, the unpatched original stream.</p>
+</details>
+<details class="qc"><summary>2. Tool bodies, diffs and op blocks get monotonic refs (<code>t-N</code>, <code>d-N</code>, <code>o-N</code>) that are never reused, even after drop-oldest eviction. What would reuse break?</summary>
+<p>A ref the operator saw earlier could silently point to a different artifact after eviction, so <code>/expand t-12</code> might show the wrong thing. With no reuse, an old ref either resolves to its original artifact or to nothing. The prefix also lets one <code>/expand</code> verb route to the right store.</p>
+</details>
+<details class="qc"><summary>3. The "I'm going to do X" intent prose comes from a fire-and-forget LLM call with a 50-token cap, a 5 s timeout and hard-fail-silent behaviour. Why all three limits?</summary>
+<p>Narration exists to make the organism legible, and it must never slow or break the operation it describes. The call is small, short and allowed to fail without a trace. For the per-tool "why" line the channel uses a deterministic descriptor table with no LLM cost at all.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §92.6 §37 Operator UX/UI Tier 1 Arc — Fully Closed (2026-05-05) -->
+<div class="quick-check" id="qc-92-6">
+<p class="qc-label">Quick check · §92.6</p>
+<details class="qc"><summary>1. Five new REPL verbs shipped with 0 edits to <code>repl_dispatch_registry.py</code>. How?</summary>
+<p>The registry's naming cage registers verbs automatically by convention. A new verb only has to follow the naming rule. Nobody edits the central dispatcher, which removes a shared hot spot for merge conflicts and mistakes.</p>
+</details>
+<details class="qc"><summary>2. Temporal Observability took about 2 h against a 3-day audit estimate. What explains the saving?</summary>
+<p>Composition. It is a thin single-slice wrapper over the existing <code>CausalityDAG</code>, which only gained three read-API helpers (<code>nodes_for_phase</code>, <code>first_record_in_phase</code>, <code>distinct_phases</code>). Almost nothing new had to be built.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §92.7 §38.11 Proactive Intelligence + §39 Embodied Surfaces (2026-05-07 → 2026-05-09) -->
+<div class="quick-check" id="qc-92-7">
+<p class="qc-label">Quick check · §92.7</p>
+<details class="qc"><summary>1. All thirteen slices shipped default-FALSE, with 977/977 tests green. Why ship tested code switched off?</summary>
+<p>Phase 9 cadence discipline: the substrate lands first, and each flag graduates later on the cron schedule by clean soaks (§92.9). Passing tests is not the graduation criterion.</p>
+</details>
+<details class="qc"><summary>2. <code>phase_orchestra.py</code> derives each phase's note by modular arithmetic on <code>phase_index</code>, with "no hardcoded per-phase mapping". What does that protect against?</summary>
+<p>Drift. A hand-written per-phase table would go stale the moment the canonical 11-phase tuple changed. Deriving the note from the canonical tuple keeps the surface correct automatically. It is the same move as <code>confidence_aura</code> doing "zero parallel logprob math".</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §92.8 Structural Engineering Vector Closures (2026-05-09) -->
+<div class="quick-check" id="qc-92-8">
+<p class="qc-label">Quick check · §92.8</p>
+<details class="qc"><summary>1. The artifact contract is wired at a single AST-pinned choke point before <code>pctx.merge_artifacts</code>. What does it catch there?</summary>
+<p>Four violation classes as phase artifacts are merged: <code>UNKNOWN_KEY</code> (a rename), <code>TYPE_MISMATCH</code> (shape drift), <code>WRONG_PRODUCER</code> (a phase writing a slot it does not own) and <code>SCHEMA_VERSION_SKEW</code>. One choke point means no artifact can enter the shared context by a side door.</p>
+</details>
+<details class="qc"><summary>2. Vector #11 gates the CuriosityScheduler on <code>time.monotonic()</code> but keeps wall-clock time as <code>ts_epoch</code>. Why both?</summary>
+<p>Wall-clock time can jump when NTP corrects it, which could make the scheduler fire twice or stall. A monotonic clock never jumps, so it is safe for gating. Wall-clock time is still kept for the audit record, where a human needs real dates.</p>
+</details>
+<details class="qc"><summary>3. Vector #10's TOCTOU coverage uses <code>multiprocessing.Process</code>. Why not threads in one process?</summary>
+<p>The race being guarded is between processes taking the AutoCommitter's file-lock critical section. Only real separate processes exercise a cross-process lock honestly. The paper calls it "true cross-process race coverage".</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §92.9 Phase 9 Graduation Cadence — Begins (2026-05-05) -->
+<div class="quick-check" id="qc-92-9">
+<p class="qc-label">Quick check · §92.9</p>
+<details class="qc"><summary>1. Two runner soaks halted the cron install before it happened. Why halt, instead of installing the cron and fixing the runner in parallel?</summary>
+<p>The cron produces graduation evidence. A cadence on a broken runner would generate verdicts from a broken instrument. So the sequence was halt, diagnose, ship Slices 4 and 5, re-prove green, and only then install the cron.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §92.10 Live-Fire Cadence Debug Arc (2026-05-10) -->
+<div class="quick-check" id="qc-92-10">
+<p class="qc-label">Quick check · §92.10</p>
+<details class="qc"><summary>1. Layer 2 made <code>--once</code> delegate to the wrapper script. Why does that matter?</summary>
+<p>Before, <code>--once</code> carried its own copy of the environment block, so a fix like Layer 1's <code>.env</code> loader could land in one path and not the other. Now cron, launchd, <code>--once</code> and manual runs share one source of truth.</p>
+</details>
+<details class="qc"><summary>2. In Layer 3 the YAML had been purged, yet it still blocked DoubleWord. How?</summary>
+<p><code>JARVIS_TOPOLOGY_SENTINEL_ENABLED</code> defaulted to false, and in that state the v1 YAML's <code>dw_allowed:false</code> applied as a blanket block. The gate flag was never set on the cadence path, so the cadence ran an older configuration than everyone assumed.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §92.11 Updated Topline & §89 Limitations Revisited -->
+<div class="quick-check" id="qc-92-11">
+<p class="qc-label">Quick check · §92.11</p>
+<details class="qc"><summary>1. In Visual VERIFY, a red TestRunner clamps a visual pass to fail, but not the other way round. Why asymmetric?</summary>
+<p>A screenshot that looks right is weaker evidence than a failing test. Letting a visual pass override a red test would let a broken change through. Letting visual evidence only add failures can make the check stricter, never looser.</p>
+</details>
+<details class="qc"><summary>2. What is the auto-demotion rule for, given that Visual VERIFY has graduated?</summary>
+<p>If the graduated check produces 50% or more false positives after graduation, it is demoted automatically. A noisy gate that blocks good work is a cost too, and the rule stops it from lingering at full authority.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §92.12 Open Questions — The MSE-AI Direction -->
+<div class="quick-check" id="qc-92-12">
+<p class="qc-label">Quick check · §92.12</p>
+<details class="qc"><summary>1. What do the three open questions have in common?</summary>
+<p>Each takes a property the substrate shows empirically and asks for it as a proof. The three are Iron Gate determinism, the Anti-Venom recursion bound and Reverse Russian Doll containment. Each is paired with a formal framework: certifiably robust networks, Wang's Markov-chain RSI, and SICA plus ASL-4.</p>
+</details>
+<details class="qc"><summary>2. Why can't Wang's RSI formulation be applied to O+V as it stands?</summary>
+<p>Wang's chain is stationary. O+V is non-stationary (its rules change with history), spans several repositories, and is memory-augmented. The open question is whether the bounded-RSI claim survives an extension to that setting.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §92.13 Treefinement L2 — The First §40.7 Citation → Implementation Closure (2026-05-11 → 2026-05-12) -->
+<div class="quick-check" id="qc-92-13">
+<p class="qc-label">Quick check · §92.13</p>
+<details class="qc"><summary>1. O+V already had a parallel generator (§M9). What does treefinement add that parallel repair lacked?</summary>
+<p>Cross-branch learning. The validator prunes losing branches, and the survivors inform the next layer's GENERATE prompt. Linear repair passed only one predecessor's failure forward, so a wrong turn at iteration N spoiled iterations N+1 to 5. Independent parallel repair passed nothing between branches.</p>
+</details>
+<details class="qc"><summary>2. Why was v3.3's strategy gate "structurally REACHABLE but BEHAVIORALLY a no-op"?</summary>
+<p>No production factory had been registered, so selecting tree mode had nothing to run. v3.4 added the factory, the <code>git apply</code> adapter and lazy boot registration, which made the gate operational end to end.</p>
+</details>
+<details class="qc"><summary>3. Why may <code>repair_engine.py</code> import <code>repair_tree_production</code> only lazily, inside <code>_invoke_tree_factory</code>?</summary>
+<p>It avoids a circular import, and callers that never use tree mode pay nothing for it. Together with the sha256 pin on <code>_run_inner</code>, it keeps the legacy linear path byte-identical.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §92.14 The SWE-Bench-Pro Evaluation Arc — Six Phases in a Single Day (2026-05-12) -->
+<div class="quick-check" id="qc-92-14">
+<p class="qc-label">Quick check · §92.14</p>
+<details class="qc"><summary>1. A three-file candidate passes files 1 and 2 and fails on file 3. What state does the repository end in?</summary>
+<p>The state it started in. Files 1 and 2 are restored from pre-apply snapshots, and any newly created files are unlinked. This batch-level rollback is the answer to SWE-Bench Pro's multi-file atomicity failure mode.</p>
+</details>
+<details class="qc"><summary>2. Why does it matter that <code>score_evaluation</code> needs only <code>(captured_patch, problem)</code> and not the original worktree?</summary>
+<p>Scoring becomes reproducible from disk. A sweep can be re-scored when the rubric evolves, two rubrics can be compared without re-running the agent, and third parties can score patch-problem pairs themselves.</p>
+</details>
+<details class="qc"><summary>3. Phase E wraps each task in its own <code>try</code>/<code>except</code>. What happens to a task that throws?</summary>
+<p>It becomes a synthetic record, <code>INGEST_FAILED</code> or <code>SCORING_ERROR</code>, with the exception class in <code>diagnostic</code>, and the sweep carries on with the remaining tasks. One bad instance cannot lose the run, and the failure is still on the record.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §92.15 The Citation → Implementation Pattern (Meta-Observation) -->
+<div class="quick-check" id="qc-92-15">
+<p class="qc-label">Quick check · §92.15</p>
+<details class="qc"><summary>1. Which of the five template elements stops a new capability from quietly building its own copy of an existing primitive?</summary>
+<p>Composition over fork. Every new primitive must compose at least two existing canonical surfaces, and parallel implementations are rejected by AST pins. For example, SWE-Bench-Pro used the canonical <code>get_semaphore</code> and <code>flock_append_line</code> instead of its own.</p>
+</details>
+<details class="qc"><summary>2. PRD §40.7.6 says the citations give "baseline numbers to benchmark against". Name the two baselines.</summary>
+<p>Constitutional Classifiers' 86% to 4.4% jailbreak reduction is the target for Anti-Venom self-immunization. SWE-Bench Pro's 43.6% for Claude Sonnet 4.5 is the resolve-rate benchmark.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §92.16 Theoretical Grounding — Five Research Threads Now Anchored in O+V -->
+<div class="quick-check" id="qc-92-16">
+<p class="qc-label">Quick check · §92.16</p>
+<details class="qc"><summary>1. How do O+V's safety classifiers differ from Anthropic's Constitutional Classifiers?</summary>
+<p>They are AST-deterministic, not learned. They use no LLM, take about 10 ms per detection and fail closed on a parse failure. The analogy is structural (classifiers deployed around a generator), not a claim of the same method.</p>
+</details>
+<details class="qc"><summary>2. Which of the five threads have landed citation-to-implementation closures, and which are only positioned?</summary>
+<p>Formal verification (Treefinement, porting AlphaVerus) and benchmarks (the SWE-Bench-Pro harness) have closures. RSI, constitutional safety and recursion-bounding are positioned structurally, with their full empirical regimes gated on Phase 9 soaks.</p>
+</details>
+<details class="qc"><summary>3. Live-SWE-agent is named as the closest published parallel. What difference does the paper call operationally significant?</summary>
+<p>The Anti-Venom hardening overlay. Live-SWE-agent does not appear to expose an equivalent.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §92.17 The Reverse Russian Doll — From Architectural Pattern Toward Formal Sketch -->
+<div class="quick-check" id="qc-92-17">
+<p class="qc-label">Quick check · §92.17</p>
+<details class="qc"><summary>1. Describe one Reverse Russian Doll iteration in terms of C, δ, S<sub>n</sub> and M.</summary>
+<p>The core C generates a candidate patch δ under the shell-injected prompt. The shell S<sub>n</sub> filters and refines it to δ′, or rejects it. The mutation operator M then extends the shell with the validated patch, for example a new AST pin, rule or test, giving S<sub>n+1</sub>.</p>
+</details>
+<details class="qc"><summary>2. Property (a) says the shell's deterministic entropy never decreases. Which assumption about M carries that claim?</summary>
+<p>That every S<sub>n+1</sub> strictly extends S<sub>n</sub>, so M only adds structure and never removes it. If any iteration could delete or relax a constraint, monotonicity would fail.</p>
+</details>
+<details class="qc"><summary>3. Why does the ExplorationLedger make M non-stationary in Wang's sense?</summary>
+<p>Each S<sub>n+1</sub> depends on the whole history S<sub>0</sub> to S<sub>n</sub> through the ledger and the recency-weighted <code>SemanticIndex</code>. So the transition rule changes over time, which breaks Wang's fixed-kernel assumption. The dissertation conjectures a "non-stationary-but-monotone" extension.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §92.18 The Working Dissertation, the Penn Inflection Point, and the Ten Orders -->
+<div class="quick-check" id="qc-92-18">
+<p class="qc-label">Quick check · §92.18</p>
+<details class="qc"><summary>1. Why does the paper say formal methods become load-bearing at the Neurosurgeon threshold, not before?</summary>
+<p>Before it, the system does not modify its own governance, and adversarial soaking such as the 0/38 cage can show it holds. At Neurosurgeon the system modifies its own governance. Then only a proof can rule out some modification trajectory that escapes the bound, because no finite set of observations can.</p>
+</details>
+<details class="qc"><summary>2. Match the three §92.12 open questions to the three Penn lineages.</summary>
+<p>Iron Gate determinism goes to Wong (certifiably robust networks). Anti-Venom recursion-bound stability goes to Roth (trustworthy-learning foundations). Reverse Russian Doll containment as a whole goes to PRECISE (end-to-end verifiable AI systems).</p>
+</details>
+</div>
+<!-- END -->

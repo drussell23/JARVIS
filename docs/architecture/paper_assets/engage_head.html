@@ -107,6 +107,50 @@
 .problem-adv { border-left-color: var(--danger); }
 .engage details.cq-adv { border-left: 3px solid var(--danger); }
 
+/* Connections tier: real subjects (physics of hardware, queueing, statistics, ...) */
+.engage-kicker-x {
+  margin-top: 1.8em;
+  padding-top: 1em;
+  border-top: 1px dashed var(--border-strong);
+  color: var(--accent-dark);
+}
+.engage-kicker-x::after {
+  content: "Math · Physics · Systems";
+  margin-left: 0.6em;
+  padding: 0.1em 0.5em;
+  font-size: 0.85em;
+  letter-spacing: 0.04em;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+}
+.problem-x { border-left-color: var(--accent); }
+
+/* Per-section quick check */
+.quick-check {
+  margin: 1.4em 0 1.6em;
+  padding: 0.6em 0.9em 0.7em;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--success);
+  border-radius: 0 6px 6px 0;
+  background: var(--bg-subtle);
+  font-size: 0.95em;
+  page-break-inside: avoid;
+}
+.qc-label {
+  margin: 0 0 0.35em;
+  font-size: 0.78em; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--success);
+}
+.quick-check details {
+  margin: 0.3em 0;
+  padding: 0.35em 0.7em;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.quick-check summary { cursor: pointer; font-weight: 600; }
+.quick-check details p { margin: 0.35em 0 0.1em; }
+
 /* Inline checkpoint */
 .checkpoint {
   margin: 1.4em 0;
@@ -162,7 +206,11 @@
   .cp-toast, .quiz-score { display: none !important; }
 }
 .print-build .mcq-why, .print-build .problem-hint, .print-build .problem-sol,
-.print-build .cp-a, .print-build .cq > p, .print-build .cq-adv > p { display: none !important; }
+.print-build .cp-a, .print-build .cq > p, .print-build .cq-adv > p,
+.print-build .qc > p { display: none !important; }
+.print-build .qc > summary { list-style: none; cursor: default; }
+.print-build .qc > summary::-webkit-details-marker { display: none; }
+.print-build .quick-check details { border: 0; padding: 0.1em 0; background: transparent; }
 .print-build .cq > summary, .print-build .cq-adv > summary,
 .print-build .answer-key > summary { list-style: none; cursor: default; }
 .print-build .cq > summary::-webkit-details-marker,
