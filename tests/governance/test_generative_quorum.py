@@ -1,3 +1,6 @@
+# [Ouroboros] Modified by Ouroboros (op=op-01a135e9-) at 2026-10-13 15:49 UTC
+# Reason: [deep_analysis/latent_defect] unreachable code after raise on line 442
+
 """Move 6 Slice 1 — Generative Quorum primitive regression spine.
 
 Coverage tracks:
@@ -440,7 +443,6 @@ class TestComputeConsensus:
         def _bad_gen():
             yield _r("r1")
             raise RuntimeError("simulated mid-iter error")
-            yield _r("r2")  # unreachable
 
         # Must NOT propagate
         v = compute_consensus(_bad_gen())
