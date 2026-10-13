@@ -1,0 +1,115 @@
+<!-- CHECKPOINT before: ## §79. Deferred Latent Bugs (Load-Bearing Workarounds) -->
+<aside class="checkpoint" id="cp-part-xiv-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">Session W succeeded, but it leaned on some emergency fixes and settings. Predict one kind of workaround a pipeline might have used to get a clean run, and why such a workaround would block calling multi-file autonomy "production-hardened".</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>§79 lists three. <code>JARVIS_MAX_VALIDATE_RETRIES=0</code> skips the retry iteration because the same unchanged candidate could be reclassified as a non-retryable <code>'infra'</code> flake and kill the op. The cost governor logs a stale phase name in cost records. And a hardcoded 90-second <code>asyncio.wait_for</code> on a retry path is not configurable. Each one hides or hard-codes a problem instead of fixing it, so the success depends on them. See §79.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- ENDBLOCK part-xiv -->
+#### Check your understanding: PART XIV — The Road Ahead
+
+<div class="engage" id="engage-part-xiv">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why does "Functions, Not Agents" reframe DoubleWord instead of dropping it?</summary>
+<p>The 2026-04-14 tests showed DW's streaming endpoint could not sustain agent-shaped workloads (§77). But the non-streaming <code>/v1/chat/completions</code> endpoint with <code>stream=false</code> had never been exercised by O+V (§77.1). So the evidence condemned one transport and one workload shape, not the provider. Treating DW as an untested function provider lets it carry short, structured, non-streaming calls, which could take a large share of structured inference load without going near the streaming stall (§77.5).</p>
+</details>
+<details class="cq"><summary>2. In the Phase 3 BlastRadius design, the 397B score can only raise the risk tier, never lower it. Why?</summary>
+<p>The deterministic import-graph score stays as the floor, and the model score can only escalate (§77.4). This preserves the invariant that fluid intelligence never lowers a hard gate. If a model could de-escalate risk, a wrong or hallucinated answer could weaken a safety decision. Letting it only escalate means a model error can at worst make the system more cautious. The anti-hallucination check on <code>invariants_touched</code> adds a second guard: names not found in the diff cause rejection and a deterministic fallback.</p>
+</details>
+<details class="cq"><summary>3. Why does §78 demand three consecutive successes under comparable conditions, instead of counting Session W as proof?</summary>
+<p>One success may be luck. The Manifesto's §6 treats a single success as a data point, and graduation to "capability" needs three in a row (§78). "Comparable conditions" (same pipeline, Iron Gate settings and provider topology) stops a later success from being produced under easier settings. The no-regression requirement makes sure the gain did not come at the cost of the seven capabilities or the Iron Gate. The paper calls the bar deliberately conservative, to avoid false confidence.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-xiv">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. Which of these is NOT one of the six design invariants for every DW function caller?</p>
+<ol class="mcq-options" type="A">
+<li>Non-streaming only, with a single JSON response</li>
+<li>Shadow mode first, disabled by default</li>
+<li>Streaming with a short first-token deadline</li>
+<li>Per-call, per-op and global-rolling circuit breakers</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> The invariants require <code>stream=false</code> and no SSE loop. The others are invariants 1, 6 and 5. See §77.2.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. Why was context compaction chosen as the Phase 0 test bed for Gemma?</p>
+<ol class="mcq-options" type="A">
+<li>Bounded input, short output, and a trivial hallucination check</li>
+<li>It is the most expensive call in the whole pipeline</li>
+<li>It needs streaming output, which Gemma handles well</li>
+<li>It runs only once per session, so failures are rare</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> Compaction has a fully bounded input (entries already in memory), short output (under 1KB), and the summary must reference only preserved entry keys. See §77.3.</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">3. What is the impact of the cost governor staleness bug in §79.2?</p>
+<ol class="mcq-options" type="A">
+<li>Ops are charged twice, doubling the daily spend.</li>
+<li>The VALIDATE retry is skipped on every op.</li>
+<li>The cost cap is ignored after the CLASSIFY phase.</li>
+<li>Cost records can show the wrong phase name to a postmortem reader.</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> It is display-only, but cost records can show <code>phase=CLASSIFY</code> when the real phase is POSTMORTEM, which subtly compromises the audit trail. See §79.2.</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. In the graduation FSM, what happens when a push fails?</p>
+<ol class="mcq-options" type="A">
+<li>The worktree is discarded and the capability is reset to TRACKING.</li>
+<li><code>PUSH_FAILED</code> is an explicit phase and the code is kept locally.</li>
+<li>The FSM retries the push forever until it succeeds.</li>
+<li>The commit is squashed into the next graduation attempt.</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> Hardening requirement H3 makes <code>PUSH_FAILED</code> an explicit phase with code preserved locally, not lost. Discarding the worktree belongs to the approval timeout (H4). See §81.1 and §81.2.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-xiv">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> With Phase 3 live, an op changes one line: a retry-backoff constant. The import graph shows almost nothing depends on that file, so the deterministic BlastRadius score is low. The 397B analyst returns a higher score and lists an invariant name that does not appear in the diff. Trace what happens to the risk score.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Check the anti-hallucination gate before you apply the escalate-only rule.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The 397B output follows the <code>blast_radius.1</code> schema, including <code>invariants_touched</code> (§77.4).</p>
+<p>The anti-hallucination gate requires <code>invariants_touched</code> to be a subset of symbol names extracted from the actual diff. One listed name is not in the diff, so the output is a hallucination and is rejected.</p>
+<p>On rejection the system falls back to the deterministic score. So the final score is the low structural one, and the risk tier is not escalated by this call.</p>
+<p>This shows the cost of the guard: the case in §77.4 (a one-line backoff change with large real impact) is exactly what the model is meant to catch, but a malformed answer loses that benefit. Had the invariant names been valid, the higher score could have raised the tier, never lowered it.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> Someone proposes fixing §79.1 by making the <code>'infra'</code> failure class retryable, so a flake on iter=1 no longer kills the op. Compare this with the paper's proper fix, and explain what the proposal would hide.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask why the same unchanged candidate gets two different classifications.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The symptom is that the same unchanged candidate is classified <code>'test'</code> on iter=0 and <code>'infra'</code> on iter=1 (§79.1). The classification is non-deterministic, and that is the actual defect.</p>
+<p>Making <code>'infra'</code> retryable treats the symptom. It would also change behaviour for real infrastructure failures, which are non-retryable by design, so genuine sandbox problems could now loop through retries.</p>
+<p>The paper's proper fix is sandbox isolation between iter=0 and iter=1, so the same candidate yields the same classification. That removes the flake at its source and keeps the meaning of <code>'infra'</code> intact.</p>
+<p>It also matches the framing of §79: these load-bearing workarounds must be addressed before multi-file autonomy can be considered production-hardened, and a retry rule change would just be another workaround.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/context_compaction.py</code>. §77.3 says the deterministic summarizer is "type-counting plus phase-histogram" and that a semantic strategy is consulted with a deterministic fallback. Find the deterministic summarizer and the method that consults the strategy, and say what the strategy method returns when no strategy is injected, and when the strategy raises an exception.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Look at <code>_build_summary</code> and the method defined right after it.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><code>_build_summary</code> (around line 536) is the deterministic path. It counts entries by type (falling back to phase or role), counts phases seen, and finds the time span, then formats a string like "Compacted N entries: ... Phases covered: ...". Its docstring says "No model inference."</p>
+<p>The next method, <code>_build_semantic_or_fallback</code>, consults <code>self._semantic_strategy</code>, which is set from the <code>semantic_strategy</code> constructor argument. If the strategy is <code>None</code> or not enabled, it returns the deterministic summary unchanged.</p>
+<p>If <code>strategy.summarize</code> raises, the exception is logged and the deterministic summary is returned. The docstring also says that in shadow mode the deterministic summary is always returned while the strategy still runs for telemetry.</p>
+<p>One detail differs from the paper's wording: the delegation lives in this separate method rather than inside <code>_build_summary</code> itself. The behaviour matches §77.3: any failure falls back to the deterministic path.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- END -->

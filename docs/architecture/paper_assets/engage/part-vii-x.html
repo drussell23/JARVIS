@@ -1,0 +1,43 @@
+<!-- XBLOCK part-vii -->
+<p class="engage-kicker engage-kicker-x">Connections</p>
+<div class="pset pset-x">
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 1 (Graph theory).</strong> Model the §46 intake router as a wait-for graph. Nodes are operations; draw an edge X → Y when X is queued behind Y in <code>_queued_behind</code>. Use the rules in §46.1 and §46.2: a signal that conflicts on any target file is queued behind the active operation and takes none of its files, even ones that are free. Prove that this graph can never contain a cycle, so the router cannot deadlock. Then show a cycle that would appear if a signal targeting <code>[foo.py, bar.py]</code> were allowed to lock <code>bar.py</code> while it waits for <code>foo.py</code>. Finally, name the one way a queued signal can still wait forever, and the mechanism that handles it.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask which nodes can have an incoming edge. Conflicts are looked up in <code>_active_file_ops</code>, and a queued signal is not in it.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>A queued signal is placed in <code>_queued_behind[op_id]</code> and is never written to <code>_active_file_ops</code> (§46.1). Conflicts are found against <code>_active_file_ops</code>, so only active operations can be waited on. Active operations wait on nothing; they are running.</p>
+<p>So every edge goes from a queued node (in-degree 0) to an active node (out-degree 0). Every path has length 1, and a cycle needs a path that returns to its start, which requires some node with both an incoming and an outgoing edge. None exists, so the graph is acyclic. In deadlock terms, the router removes hold-and-wait: a waiting signal holds no files.</p>
+<p>Now allow partial locking. Signal S1 targets <code>[foo.py, bar.py]</code> and signal S2 targets <code>[bar.py, foo.py]</code>. S1 locks <code>foo.py</code> and S2 locks <code>bar.py</code>. S1 then waits for S2 on <code>bar.py</code> and S2 waits for S1 on <code>foo.py</code>: the cycle S1 → S2 → S1, and neither ever runs. The paper calls the all-or-nothing choice "conservative" (§46.2); this is the hazard it avoids, at the price of leaving <code>bar.py</code> idle while the signal waits.</p>
+<p>Release re-ingests the queued signal, which recomputes its conflicts from scratch (§46.1). It may be queued again behind another operation, but that is a new length-1 edge, not a cycle.</p>
+<p>The remaining failure is not a cycle but a dead sink: an active operation that crashes never calls <code>release_op</code>, so its waiters never re-ingest. The lock TTL (§46.3, default 300 s) is the fix. In graph terms, the router guarantees acyclicity by construction, and the TTL handles the one liveness failure that acyclicity cannot prevent.</p>
+</details>
+</div>
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 2 (Queueing theory).</strong> Treat the §50 priority queue as a single dispatch lane with strict priority (a simplification; the paper does not give the dispatch concurrency). Assume a mean service time of 4 minutes per operation, critical <code>test_failure</code> signals like A in §50.2 (priority −2) arriving at 12 per hour, and <code>opportunity_miner</code> signals like B (priority 6) arriving at 4 per hour. All three rates are assumptions. Compute the utilization of each class and the throughput left for B. What happens when critical arrivals reach 15 per hour? Can B's own score ever move ahead of A's?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Utilization is arrival rate times service time. Under strict priority, the low class gets only what the high class leaves. For the last part, find the lowest score a base-5 source can reach using the terms in §50.1.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The critical class has utilization 12 × 4 / 60 = 0.8. The opportunity class would need 4 × 4 / 60 = 0.27. Together they need 1.07, more than the lane can supply.</p>
+<p>Under strict priority all of the shortfall falls on the low class. B's class gets 1 − 0.8 = 0.2 of the lane, which is 0.2 × 60 / 4 = 3 operations per hour against 4 arriving. Its backlog grows by about 1 operation per hour, while A's class is served normally.</p>
+<p>At 15 critical arrivals per hour, the critical utilization is 15 × 4 / 60 = 1.0. B's class gets no capacity at all: starvation.</p>
+<p>Can B's score climb? Its best case is base 5, critical urgency (−3), one file (0), confidence of at least 0.9 (−1) and full dependency credit (−3): 5 − 3 + 0 − 1 − 3 = −2. That only ties A. A typical B has normal urgency and multiple files, so it sits well above −2. More importantly, every term in the formula is a property of the signal or of what is queued behind it. None of them grows with waiting time, so the formula as printed in §50.1 has no aging term.</p>
+<p>What this says about the architecture: the composite score orders work well under light load, which is the regime of the §50.2 example. Under sustained high-priority load it gives no fairness guarantee to low-priority sources. That is acceptable if critical bursts are short, and dependency credit (Refinement 9) helps only signals that block others. A system that must guarantee eventual service to mining or documentation work would need an age term or a capacity reserve. The paper does not describe one, so this is an inference from the formula, not a reported defect.</p>
+</details>
+</div>
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 3 (Combinatorics and probability).</strong> Use the ExplorationLedger rules in §47.3 and §47.4. A <code>moderate</code> operation needs a diversity score of at least 8.0 and at least 3 distinct categories, and a duplicate call (same tool, same <code>arguments_hash</code>) earns nothing. Suppose a model that ignores the gate picks each exploration call's category uniformly at random from the four categories that have tools today (COMPREHENSION, DISCOVERY, CALL_GRAPH, HISTORY; STRUCTURE is future). Assume all its calls succeed and are distinct, so score is not the binding constraint. If it makes exactly 3 calls, what is the probability that it covers at least 3 categories? With 4 calls? Explain what this says about the minimum-category floor versus the old raw count floor of 2.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Count the sequences of categories that use at least 3 distinct values out of 4^n. With 3 calls you need all distinct. With 4 calls, count exactly 3 and exactly 4 distinct using surjections.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>With 3 calls there are 4^3 = 64 equally likely category sequences. Covering 3 categories means all three differ: 4 × 3 × 2 = 24 sequences. The probability is 24 / 64 = 0.375.</p>
+<p>With 4 calls there are 4^4 = 256 sequences. All 4 distinct: 4! = 24. Exactly 3 distinct: choose the 3 categories in C(4,3) = 4 ways, then count the surjections from 4 calls onto 3 categories, which is 3^4 − 3 × 2^4 + 3 × 1 = 81 − 48 + 3 = 36. That gives 4 × 36 = 144. The total is 168, and 168 / 256 = about 0.66.</p>
+<p>So even a model choosing categories at random fails the category floor most of the time at 3 calls and about a third of the time at 4. A model that repeats one tool, like the <code>4× read_file</code> case in Session C with <code>categories=comprehension</code> (§47.5), always fails it. Under the old raw floor of 2 exploration calls (§47.2), the same 4 reads would have passed.</p>
+<p>What this says about the architecture: the category floor turns exploration from a count, which repetition can satisfy, into a coverage requirement, which only varied exploration can satisfy. Together with zero credit for duplicates and no coverage credit for failed calls (§47.4), it makes the cheap gaming strategies fail by construction. The uniform-random model is only a baseline for comparison, not a claim about how real models choose tools.</p>
+</details>
+</div>
+</div>
+<!-- END -->

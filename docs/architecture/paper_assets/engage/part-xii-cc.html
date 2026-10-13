@@ -1,0 +1,72 @@
+<!-- QUICKCHECK after: ## §68. Voice Narration -->
+<div class="quick-check" id="qc-68">
+<p class="qc-label">Quick check · §68</p>
+<details class="qc"><summary>1. Voice is wired to two narrators. What does each one cover?</summary>
+<p><code>IntelligentVoiceNarrator</code> speaks on the <code>INTENT</code>, <code>DECISION</code> and <code>POSTMORTEM</code> events of an operation. <code>CrossRepoNarrator</code> speaks on cross-repo saga events. See the table in §68.</p>
+</details>
+<details class="qc"><summary>2. What does the sample announcement tell an operator who is away from the terminal, and why is that enough for this layer?</summary>
+<p>It names the op, what was applied and for which sensor, the provider, the cost, and that there were no regressions. That is the outcome of the op in one breath. Voice is there so autonomy becomes audible, not to carry full detail.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §69. Thought Log -->
+<div class="quick-check" id="qc-69">
+<p class="qc-label">Quick check · §69</p>
+<details class="qc"><summary>1. Why is the thought log both logged at INFO and written to disk?</summary>
+<p>INFO logging lets <code>battle_test.py -v</code> show the reasoning in real time. The JSONL file at <code>.jarvis/ouroboros_thoughts.jsonl</code> keeps it for review after the session ends.</p>
+</details>
+<details class="qc"><summary>2. In the sample fragment, what does the <code>reason</code> field on a <code>TOOL</code> entry add beyond the tool name and path?</summary>
+<p>It records why the tool was called, for example "target file inspection before patch generation". That turns a list of actions into a trace of reasoning, which is the purpose of the log.</p>
+</details>
+<details class="qc"><summary>3. Which phase entry would show whether an L2 repair converged, and what does it record?</summary>
+<p>The <code>REPAIR</code> entry. It records L2 iteration progress, failure classification and convergence; the fragment shows <code>"iter": 1, "outcome": "converged"</code>.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §70. Autonomous Commit Signature -->
+<div class="quick-check" id="qc-70">
+<p class="qc-label">Quick check · §70</p>
+<details class="qc"><summary>1. Apart from the trailer, what in the commit message lets you trace a commit back to the operation that made it?</summary>
+<p>The body carries <code>op_id</code>, <code>saga_id</code>, <code>repo</code>, <code>provider</code> and <code>phase</code>. The <code>op_id</code> ties the commit to that op's records elsewhere.</p>
+</details>
+<details class="qc"><summary>2. Why is the signature dynamic instead of a fixed string?</summary>
+<p>Only <code>Ouroboros</code> is always present. <code>+ Venom</code> appears only when tool execution records exist, and <code>+ Consciousness</code> only when the <code>ConsciousnessBridge</code> was active. So the trailer records which subsystems actually took part in that change.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §71. Telemetry -->
+<div class="quick-check" id="qc-71">
+<p class="qc-label">Quick check · §71</p>
+<details class="qc"><summary>1. <code>HostTelemetry</code> is captured at op start. What does it record, and why is that useful afterwards?</summary>
+<p>It records hardware state when the op began: CPU load, memory pressure and disk pressure. A reader can then see whether the machine was under pressure when the op ran, alongside the routing decision and the phase timings.</p>
+</details>
+<details class="qc"><summary>2. How does telemetry reach <code>CommProtocol</code>?</summary>
+<p>The <code>_CommTelemetrySink</code> bridges FSM telemetry into CommProtocol heartbeats. Every phase transition emits a heartbeat with telemetry attached.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §72. SerpentFlow CLI -->
+<div class="quick-check" id="qc-72">
+<p class="qc-label">Quick check · §72</p>
+<details class="qc"><summary>1. Why does SerpentFlow use two libraries, Rich and prompt_toolkit?</summary>
+<p>Rich produces the ANSI-styled output and prompt_toolkit provides the interactive REPL. Combining them is what creates the stdout-proxy problem that §72.3 solves.</p>
+</details>
+<details class="qc"><summary>2. How does <code>cancel &lt;op-id&gt;</code> find the op, and what kind of cancellation is it?</summary>
+<p>It matches the op by prefix, so the full id is not needed. The cancellation is cooperative: the op is asked to stop rather than killed. See §72.2.</p>
+</details>
+<details class="qc"><summary>3. Which block appears on a NOTIFY_APPLY, and what does it show?</summary>
+<p>The <code>⚠ NOTIFY</code> block. It shows the reason code and the files involved. See §72.1.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §73. The Integrated Observability Story -->
+<div class="quick-check" id="qc-73">
+<p class="qc-label">Quick check · §73</p>
+<details class="qc"><summary>1. Which layer answers "what did O+V do last year?", and why can't voice or SerpentFlow answer it?</summary>
+<p>Commit signatures, which give historical attribution. Voice and SerpentFlow are real-time layers: they show what is happening now and are gone once the moment passes.</p>
+</details>
+<details class="qc"><summary>2. Two layers are real-time. How do they differ?</summary>
+<p>Voice gives presence: the operator hears what happens without watching. SerpentFlow is a rich, interactive, navigable CLI for an operator who is at the terminal.</p>
+</details>
+</div>
+<!-- END -->

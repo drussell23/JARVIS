@@ -1,0 +1,44 @@
+<!-- QUICKCHECK after: ## §5. The Three-Part Organism: Body, Mind, Soul -->
+<div class="quick-check" id="qc-5">
+<p class="qc-label">Quick check · §5</p>
+<details class="qc"><summary>1. Why does the paper say that running <code>bash</code> and <code>run_tests</code> inside Reactor Core is "what makes the Iron Gate's containment guarantees meaningful"?</summary>
+<p>The Body runs with privileged access to the screen, keyboard, audio and filesystem. Reactor provides sandboxes with resource limits, process isolation and syscall filtering. A command the Iron Gate permits still runs in that sandbox, not on the Body's shell, so a permitted command's reach stays bounded.</p>
+</details>
+<details class="qc"><summary>2. The three parts talk over explicit protocols rather than shared memory. What does every message carry, and what does that buy?</summary>
+<p>Every request carries an operation identifier and a phase identifier, and every response carries the context needed to rebuild the causal chain (§5.4). This lets the Body's ledger be correlated with the Mind's telemetry: Principle 7 applied at the boundary between parts. Shared memory would not work anyway, because the parts run on different hosts (macOS locally, GPU VMs on GCP).</p>
+</details>
+<details class="qc"><summary>3. Why does the O+V pipeline itself live in the Body rather than in the Mind?</summary>
+<p>Self-development happens on the Body's codebase, and the Body is where patches are written to disk (§5.1). The Mind is used for heavy reasoning when it is available, but the architecture is deliberately resilient to J-Prime being offline.</p>
+</details>
+</div>
+<!-- END -->
+
+<!-- QUICKCHECK after: ## §6. Zone 6.8 — The Governed Loop Service -->
+<div class="quick-check" id="qc-6">
+<p class="qc-label">Quick check · §6</p>
+<details class="qc"><summary>1. Why does <code>submit()</code> delegate all pipeline work to the orchestrator instead of doing any itself?</summary>
+<p>The Service manages lifecycle; it is not the pipeline (§6.2). Keeping the two apart means a pipeline upgrade, such as a new phase, needs no change to the Service.</p>
+</details>
+<details class="qc"><summary>2. What happens to in-flight operations when the Service enters STOPPING, and how does that differ from FAILED?</summary>
+<p>STOPPING is a cooperative shutdown: in-flight operations get a grace period to complete before they are cancelled, and the Service then returns to INACTIVE. FAILED is a terminal state that prevents any further operations (§6.1).</p>
+</details>
+<details class="qc"><summary>3. The Oracle's symbol index is more than 300 seconds old. What does context expansion do, and why?</summary>
+<p>It emits a warning and continues instead of blocking. The index is rebuilt continuously by a background coroutine, so slightly stale structural data is preferred over stalling the operation while waiting for a fresh index.</p>
+</details>
+</div>
+<!-- END -->
+
+<!-- QUICKCHECK after: ## §7. Multi-Repo Operation — The Saga Pattern -->
+<div class="quick-check" id="qc-7">
+<p class="qc-label">Quick check · §7</p>
+<details class="qc"><summary>1. When a Saga compensates, why does it revert the already-applied patches in reverse order?</summary>
+<p>Patches are applied in dependency order, each recording an undo descriptor. Walking back in reverse undoes dependents before the things they depend on, via <code>ChangeEngine.rollback()</code>. The guaranteed end state is fully applied or fully reverted, never partial (§7.2).</p>
+</details>
+<details class="qc"><summary>2. Every <code>RepoPatch</code> validated on its own. Why can the <code>CrossRepoVerifier</code> still force compensation?</summary>
+<p>Each patch being valid in isolation does not mean their union is consistent: for example, a contract both sides must agree on. The verifier runs cross-repo tests after all patches are applied and before commit. If they fail, the Saga compensates anyway.</p>
+</details>
+<details class="qc"><summary>3. What does schema <code>2b.1-noop</code> signal, and what does the pipeline do with it?</summary>
+<p>It means the target change is already present. The operation takes a fast path to COMPLETE instead of applying a redundant patch (§7.2 table).</p>
+</details>
+</div>
+<!-- END -->

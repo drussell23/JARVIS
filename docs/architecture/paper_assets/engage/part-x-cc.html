@@ -1,0 +1,50 @@
+<!-- QUICKCHECK after: ## §57. The Iron Gate Philosophy -->
+<div class="quick-check" id="qc-57">
+<p class="qc-label">Quick check · §57</p>
+<details class="qc"><summary>1. §57 calls the gate "structural": code paths in the governance layer, not policy documents. What does that difference buy?</summary>
+<p>A policy document has to be read and obeyed, so it can be misread, ignored or argued with. A code path runs whatever the model writes. That is what lets the paper say no prompt can convince the gate to allow a forbidden action. See §57.</p>
+</details>
+<details class="qc"><summary>2. How does the Iron Gate make default-allow tools possible?</summary>
+<p>It is the containment surface around the tools. If the gate reliably refuses forbidden paths, commands and edits, a tool can be enabled by default without trusting the model to use it well. Without the gate, each tool would need its own restriction or an approval. See §57 and §18.3.</p>
+</details>
+<details class="qc"><summary>3. The gate is deterministic, so the same input always gives the same verdict. Why must every decision also be logged?</summary>
+<p>Determinism means a verdict can be repeated. The log means it can be audited: someone can see afterwards what was refused or allowed, and why. "Auditable" is listed as a separate property in §57.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §58. Iron Gate Inventory -->
+<div class="quick-check" id="qc-58">
+<p class="qc-label">Quick check · §58</p>
+<details class="qc"><summary>1. Gate 1 rejects paths containing <code>..</code>, yet it also checks that the resolved path is still within the repo root. Why have the final check?</summary>
+<p>Rejecting certain strings only covers the patterns someone thought to list. The last rule checks where the path actually points after resolution, which is the property the gate exists to protect: no reads or writes outside the repository. See §58.1.</p>
+</details>
+<details class="qc"><summary>2. Gate 2 classifies an op that targets a protected path as <code>BLOCKED</code> at CLASSIFY. Why stop it that early, rather than at the tool call?</summary>
+<p>A <code>BLOCKED</code> op short-circuits before any exploration or generation is spent on a change that could never land. The rule is also enforced at the tool boundary through <code>GoverningToolPolicy</code> Rule 2, so both layers refuse the same paths. See §58.2.</p>
+</details>
+<details class="qc"><summary>3. Under Gate 7, an op over its per-op cost cap is aborted, but an op that meets an exhausted daily budget is queued. Why the different treatment?</summary>
+<p>An op over the per-op cap is itself too expensive, so it is aborted. An exhausted daily budget says nothing about the op, only that the day's spend is used up. Queueing keeps the work instead of discarding it. Both are hard ceilings on spend. See §58.7.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §59. What the Iron Gate Does Not Do -->
+<div class="quick-check" id="qc-59">
+<p class="qc-label">Quick check · §59</p>
+<details class="qc"><summary>1. The gate "does not reason about intent". What kind of harmful operation is it therefore blind to by design?</summary>
+<p>Any operation whose harm lies in what the change means, not in the paths, tokens or commands the gate reads. A change inside allowed paths, using no blocked command, passes no matter what it is for. Judging intent is left to other mechanisms. See §59.</p>
+</details>
+<details class="qc"><summary>2. The gate is "not an approval queue". How do the gate and approvals divide the work?</summary>
+<p>The gate enforces the operator's non-negotiable constraints structurally, with one deterministic rule per gate. Approval is a separate mechanism (§14), kept for cases the gate cannot decide, the <code>APPROVAL_REQUIRED</code> tier in §60. See §59.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §60. The Safety-Autonomy Trade-Off -->
+<div class="quick-check" id="qc-60">
+<p class="qc-label">Quick check · §60</p>
+<details class="qc"><summary>1. Which operations still need a human under §60, and why can the gate not remove them?</summary>
+<p>Operations in the <code>APPROVAL_REQUIRED</code> tier. The gate replaces approval only for routine operations it can vet structurally. When the gate itself cannot decide, approval remains. See §60.</p>
+</details>
+<details class="qc"><summary>2. §60 says the Iron Gate is "not an adversarial mechanism against the model". What role does it play instead?</summary>
+<p>It is the enabling mechanism. Because the operator's non-negotiables are enforced structurally, the model can be given real autonomy inside them, including default-allow tools and auto-apply for low-risk ops. See §60.</p>
+</details>
+</div>
+<!-- END -->

@@ -1,0 +1,43 @@
+<!-- XBLOCK part-i -->
+<p class="engage-kicker engage-kicker-x">Connections</p>
+<div class="pset pset-x">
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 1 (Queueing theory).</strong> §2 says operations run in a <code>BackgroundAgentPool</code> of 3 workers and are taken from a 16-slot <code>PriorityQueue</code>. The paper gives no measured service time, so assume each operation holds a worker for 120 s, the STANDARD watchdog limit. Treat this as a worst-case planning figure, not a measurement. (a) What is the pool's maximum throughput? (b) What is utilization if signals arrive at 1 per minute? (c) Arrivals jump to 2 per minute. How long until the queue fills, starting empty? (d) Once it is full, use Little's law to estimate how long a newly admitted operation spends in the system.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Capacity is workers divided by service time. In a full, saturated system, the rate at which operations are admitted equals the rate at which they leave, so Little's law uses throughput as the arrival rate.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) Each worker finishes one operation per 120 s, so three workers finish 3 / 120 = 0.025 operations per second. That is 1.5 per minute, or 90 per hour.</p>
+<p>(b) Utilization is arrival rate over capacity: rho = 1 / 1.5 = 0.67. The system is stable. The queue empties between bursts, and a newly arriving operation usually finds a free worker or a short wait.</p>
+<p>(c) At 2 per minute, rho = 2 / 1.5 = 1.33, which is above 1. The queue grows at 2 - 1.5 = 0.5 operations per minute, so 16 slots fill in 16 / 0.5 = 32 minutes.</p>
+<p>(d) Once the queue is full, 16 operations wait and 3 are in service, so L = 19. Only 1.5 per minute leave, so only 1.5 per minute can be admitted. Little's law, W = L / lambda, gives 19 / 1.5 = 12.7 minutes. The other 0.5 per minute (30 per hour) cannot enter. §2 does not say what happens to them.</p>
+<p>What this says about the architecture: a bounded pool and a bounded queue turn overload into a bounded delay (about 13 minutes under these assumptions) instead of a backlog that grows without limit. The cost is that someone must decide what to drop or defer. That is why the queue is a priority queue keyed on source tier, urgency and confidence (§2): under saturation, the score decides who gets one of the 19 places.</p>
+</details>
+</div>
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 2 (Probability and statistics).</strong> Principle 6 (§3) graduates a capability after three consecutive successes (<code>JARVIS_GRADUATION_THRESHOLD</code>), on the grounds that "one success is a data point; three successes is a pattern." Assume attempts are independent and each succeeds with a fixed probability p. (a) What is the chance of three straight successes for p = 0.5, 0.8 and 0.95? (b) Treat three straight successes as evidence against the null hypothesis p = 0.5. What is the one-sided p-value? How many consecutive successes would push it below 0.05? (c) Ten capability classes, each a coin flip (p = 0.5), each make one run of three attempts. How many would you expect to graduate by luck?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Under independence, the probability of n straight successes is p to the power n. Expected graduations are the number of classes times the per-class probability.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) p^3 = 0.125 for p = 0.5. It is 0.512 for p = 0.8 and 0.857 for p = 0.95. So a mediocre capability graduates one time in eight, and even a 95%-reliable one fails the bar about one time in seven.</p>
+<p>(b) Under H0 (p = 0.5), three straight successes occur with probability 0.125, so the one-sided p-value is 0.125. That is not significant at the 0.05 level. Four straight gives 0.0625, still not enough. Five gives 0.5^5 = 0.03125, which clears 0.05.</p>
+<p>(c) 10 x 0.125 = 1.25 expected false graduations from ten coin-flip classes.</p>
+<p>What this says about the architecture: three in a row is "conservative" compared with one success, as §3 says. Read as a statistical test, though, it is a weak filter. It trades evidence for speed. The threshold is configurable, so the evidence bar is an operator's choice, not a fixed property of the design. Real attempts are also not independent (the same file, model and prompts recur), which makes a short streak even weaker evidence than this calculation suggests.</p>
+</details>
+</div>
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 3 (Markov chains).</strong> Connection 2 looked at a single window of three attempts. A capability that keeps trying gets many windows. Model the Principle 6 rule (§3) as a Markov chain. The state is the current streak of consecutive successes: 0, 1, 2 or 3. State 3 (graduated) is absorbing. Each attempt succeeds independently with probability p. Success moves the streak up by one, and failure resets it to 0. (a) Write the transitions. (b) Find the expected number of attempts until graduation, as a function of p. (c) Evaluate it for p = 0.5, 0.8 and 0.95. (d) What is the probability that a p = 0.5 capability eventually graduates if attempts are unlimited?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Let E_i be the expected number of attempts to reach state 3 from streak i. Each E_i equals 1 plus p times the next state's E plus (1 - p) times E_0. Solve from E_3 = 0.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) From state i (i = 0, 1, 2): go to i + 1 with probability p, and to 0 with probability 1 - p. State 3 goes only to itself.</p>
+<p>(b) E_2 = 1 + (1 - p) E_0. E_1 = 1 + p E_2 + (1 - p) E_0. E_0 = 1 + p E_1 + (1 - p) E_0. Substitute and solve. The standard result for a run of k successes is E_0 = 1/p + 1/p^2 + ... + 1/p^k. For k = 3 that is 1/p + 1/p^2 + 1/p^3.</p>
+<p>(c) p = 0.5: 2 + 4 + 8 = 14 attempts. p = 0.8: 1.25 + 1.5625 + 1.953 = about 4.8 attempts. p = 0.95: 1.053 + 1.108 + 1.166 = about 3.3 attempts.</p>
+<p>(d) From every transient state, the chain reaches the absorbing state with positive probability within three steps. So absorption is certain: probability 1. A coin-flip capability graduates after about 14 attempts on average.</p>
+<p>What this says about the architecture: a streak threshold separates good capabilities from bad ones by how fast they graduate, not by whether they graduate. Unlimited retries make graduation certain for any p above 0. For the threshold to work as a filter, it needs a companion limit: a bounded number of attempts, a time window, or a failure count that blocks graduation. The paper's Zero-Shortcut Mandate against brute-force retries without diagnosis (§3) points the same way.</p>
+</details>
+</div>
+</div>
+<!-- END -->

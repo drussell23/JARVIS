@@ -1,0 +1,30 @@
+<!-- XBLOCK part-iii -->
+<p class="engage-kicker engage-kicker-x">Connections</p>
+<div class="pset pset-x">
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 1 (Graph theory).</strong> §11.5 validates a <code>plan.1</code> before injecting it. Planned files must overlap the targets, the declared dependencies must be acyclic, and the file order must be a topological sort. An operation targets <code>service.py</code> and <code>api.py</code>. The model declares: <code>service.py</code> needs <code>models.py</code>; <code>api.py</code> needs <code>service.py</code>; <code>test_api.py</code> needs <code>api.py</code> and <code>models.py</code>. (a) Plan A orders the changes as models, api, service, test_api. Run Kahn's algorithm to find the valid order(s) and decide whether Plan A passes. (b) Plan B adds "<code>models.py</code> needs <code>test_api.py</code>". What does Kahn's algorithm report? (c) Plan C lists only <code>README.md</code> and <code>docs.md</code>. Which check fails? (d) What does the pipeline do in each failing case, and how expensive are these checks?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Draw an edge from each prerequisite to the file that needs it. Kahn's algorithm repeatedly removes a node with in-degree 0. If it gets stuck before removing every node, there is a cycle.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) The edges are models to service, service to api, api to test_api, and models to test_api. The in-degrees are models 0, service 1, api 1, test_api 2. Only models has in-degree 0, so remove it. Service drops to 0 and test_api to 1. Remove service, and api drops to 0. Remove api, and test_api drops to 0. Remove it. The queue never held more than one node, so the order is unique: models, service, api, test_api. Plan A puts api before service, but api needs service, so the ordering check fails.</p>
+<p>(b) The new edge test_api to models closes the loop models, service, api, test_api, models. Now every node has in-degree at least 1, so Kahn's algorithm cannot start: 0 of 4 nodes are removed. That proves a cycle, and the acyclicity check fails.</p>
+<p>(c) Neither target file appears, so the overlap check fails: "a plan that omits all target files is incoherent".</p>
+<p>(d) In all three cases the plan is downgraded to "default approach", and GENERATE goes ahead without it (§11.5). Kahn's algorithm runs in O(V + E) time, here 4 nodes and 4 or 5 edges, and the overlap check is a set intersection.</p>
+<p>What this says about the architecture: the model produces the plan, but deterministic graph checks decide whether it is coherent. They cost microseconds and no tokens. A model that contradicts itself (a cycle, or an order that breaks its own dependencies) is caught before its plan can mislead GENERATE, and the failure stays soft, consistent with §11.3.</p>
+</details>
+</div>
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 2 (Markov chains).</strong> Model the validation ladder of §13 as an absorbing Markov chain. An operation makes an initial validation attempt, then up to 2 VALIDATE_RETRY attempts (<code>JARVIS_MAX_VALIDATE_RETRIES</code>), then up to 5 L2 iterations (<code>JARVIS_L2_MAX_ITERS</code>). Ignore the 120 s timebox. The two absorbing states are GATE (a pass) and POSTMORTEM (the ladder is exhausted). Assume each attempt passes with probability p = 0.3. This is an illustrative figure, not a measurement. (a) If attempts are independent, what is the probability of reaching POSTMORTEM, and how many attempts are used on average? (b) Now suppose the attempts are perfectly correlated: every retry produces a candidate that fails or passes exactly as the first did. What is P(POSTMORTEM), and how many attempts are wasted when it fails? (c) Which mechanisms in §13.3 act on case (b), and which part of the ladder has none?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>With independent attempts, the chain is a line of 8 transient states, and each one either absorbs into GATE with probability p or moves to the next. The expected number of steps is a geometric series cut off at 8.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) The run ends in POSTMORTEM only if all 8 attempts fail: 0.7^8. Squaring step by step, 0.7^2 = 0.49, 0.7^4 = 0.2401 and 0.7^8 = 0.0576. So the chance of reaching GATE is about 94%. The expected number of attempts is the sum of 0.7^k for k = 0 to 7, which equals (1 - 0.7^8) / 0.3 = 0.9424 / 0.3, about 3.14. Most operations that pass do so early.</p>
+<p>(b) If the attempts are identical, the first one decides everything. P(POSTMORTEM) = 0.7 no matter how long the ladder is, and a failing operation uses all 8 attempts, 7 of them pure waste. Depth then buys nothing.</p>
+<p>(c) L2 is built for case (b). Each iteration generates a patch informed by the failure context, which aims to decorrelate it from the last attempt. It also classifies progress, and it stops on a no-progress streak of 2 or on oscillation (a matching signature hash), instead of running all 5 iterations. As §13.2 describes the two VALIDATE_RETRY regenerations, they have no progress or repetition detector, so correlated failures there are paid for in full.</p>
+<p>What this says about the architecture: a retry ladder helps only to the extent that its attempts are independent. Real gains come from changing the input between attempts and from detecting when the input has not changed. That is the Zero-Shortcut Mandate (§3) in numbers: "no brute-force retries without diagnosis".</p>
+</details>
+</div>
+</div>
+<!-- END -->

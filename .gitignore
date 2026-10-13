@@ -503,3 +503,6 @@ Derek J. Russell - Resume*.pdf
 # Tracked as an orphan gitlink until now, which broke `git submodule` and
 # any CI checkout that walks submodules.
 JARVIS-AI.wiki/
+
+# pytest basetemp left in the repo root by a misconfigured run (removed 2026-10-13)
+pytest-of-*/

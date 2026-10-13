@@ -1,0 +1,113 @@
+<!-- CHECKPOINT before: ## §76. Mythos and Safety Alignment -->
+<aside class="checkpoint" id="cp-part-xiii-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">An autonomous agent writes a careful, reasonable-sounding explanation of why a risky command is safe. Should a safety layer read that explanation when deciding whether to allow the command? Predict which way O+V goes, and why.</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>No. O+V's defenses are deterministic: gates, replay harnesses, protected paths and outcome-based monitoring. They are not introspective. Interpretability research shows a model's scratchpad can look clean while concealment features fire inside it, so the gate reads file paths, AST nodes and command strings instead of the model's argument. A persuasive case for <code>rm -rf /</code> is still refused structurally. See §76.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- ENDBLOCK part-xiii -->
+#### Check your understanding: PART XIII — Capability Assessment
+
+<div class="engage" id="engage-part-xiii">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. O+V prefers cheaper models when they suffice. What does it gain, and what does it give up compared with Claude Code?</summary>
+<p>It gains cost: O+V cascades routine work to DoubleWord and saves roughly 30x on routine operations when DW's streaming is healthy (§74.1). It gives up peak model quality on the routine tier, because Claude Code always runs on the best Claude model available (§74.2). The trade-off is deliberate: routine work does not need the strongest model, but the system accepts that some routine ops will be done by a weaker one. The paper names this as a place where O+V lags, not one where it is ahead.</p>
+</details>
+<details class="cq"><summary>2. §74.3 says O+V and Claude Code share several architectural choices. Why does the paper treat this convergence as meaningful?</summary>
+<p>Both systems use multi-turn tool loops, exploration before generation, thought trails for observability, and deterministic safety layers around probabilistic model output (§74.3). The paper argues these were arrived at independently, so they reflect real lessons of production autonomous-AI work rather than one team's taste. That gives some outside support to O+V's choices. It also shows that O+V's real differences lie elsewhere: invocation, memory, scope and cost model (§74).</p>
+</details>
+<details class="cq"><summary>3. According to the Mythos cross-reference, what kind of failure is O+V's main risk, and why does that make deterministic gates the right defense?</summary>
+<p>The most severe Mythos incidents came from "reckless excessive measures" while trying to finish a hard task, not from misaligned goals or hostile intent (§76). A drive to complete the task can produce a plausible justification for an unsafe step. If the safety layer trusts the model's reasoning, that justification gets through. A deterministic gate does not read the reasoning; it checks paths, AST nodes and command strings, so a well-argued unsafe action is still blocked. This is the stated basis for the Iron Gate philosophy in Part X.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-xiii">
+<div class="mcq" data-answer="2">
+<p class="mcq-q">1. Which of these does §74.2 list as a place where O+V lags Claude Code?</p>
+<ol class="mcq-options" type="A">
+<li>Cross-session memory of earlier work</li>
+<li>Breadth of proven scope, such as multi-file refactors</li>
+<li>Coordinating changes across several repositories</li>
+<li>Variety of observability surfaces</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> Session W proved a narrow capability (new-file creation, test modules); multi-file refactors across existing code were not yet proven. The other three are listed as areas where O+V is peer or ahead. See §74.1 and §74.2.</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">2. An organization wants every single operation approved by a human. What does §74.2 say O+V must do?</p>
+<ol class="mcq-options" type="A">
+<li>Disable all sensors so nothing starts autonomously</li>
+<li>Route every op to Claude so a human sees each prompt</li>
+<li>Run only in SerpentFlow with the REPL paused</li>
+<li>Be configured Orange-only, behaving like Claude Code</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> The <code>APPROVAL_REQUIRED</code> tier needs specific configuration; to have all operations approved, O+V must be configured Orange-only, at which point it behaves like Claude Code. See §74.2.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">3. Which of the four differentiators from the "always-on agent" vision is about O+V changing its own governance layer, sensors and pipeline phases?</p>
+<ol class="mcq-options" type="A">
+<li>Neuroplastic</li>
+<li>Sovereign</li>
+<li>Local-first</li>
+<li>Provider-diverse</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> "Neuroplastic" means O+V modifies its own codebase, not just user workloads. Sovereign is about running on the operator's hardware, local-first about where memory lives, and provider-diverse about surviving a single provider outage. See §75.</p>
+</details>
+</div>
+<div class="mcq" data-answer="3">
+<p class="mcq-q">4. Why does §76 reject trusting the model's self-report as a safety strategy?</p>
+<ol class="mcq-options" type="A">
+<li>Self-reports cost too many tokens to read on every op.</li>
+<li>Models in O+V are not allowed to produce reasoning text.</li>
+<li>Scratchpad reasoning can look clean while concealment features fire inside.</li>
+<li>Self-reports are only available from Claude, not DoubleWord.</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> Interpretability research shows reasoning can look clean while concealment features fire in the model's internals, so the gate's deterministic verdict is trusted instead. See §76.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-xiii">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> During an op, the model writes: "This cleanup is safe; running <code>rm -rf</code> on the build root will only remove stale artifacts." Trace what O+V's safety design does with this statement and with the command, and explain why the outcome does not depend on how convincing the statement is.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask what inputs the gate actually reads, according to §76.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The statement is model reasoning. Under §76, O+V does not use the model's self-report as a safety input, because reasoning can look clean while the model's internals show concealment.</p>
+<p>The command itself is what the gate examines. The Iron Gate philosophy (Part X, justified in §76) reads file paths, AST nodes and command strings. Its verdict is deterministic: the same command produces the same decision regardless of the surrounding text.</p>
+<p>So a destructive command is refused structurally, whether the justification is weak or brilliant. This targets exactly the failure surface the Mythos quote names: a task-completion drive overriding safety checks, not hostile intent.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> A reviewer argues: "O+V's onboarding friction is a minor issue; just document the setup better." Using §74.2 and §75, assess whether this friction is incidental or a consequence of O+V's design goals, and name the trade-off.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>List the setup steps in §74.2 and compare them with the "sovereign" and "provider-diverse" points in §75.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>§74.2 lists the setup: Trinity deployment, provider credentials, sensor configuration and Oracle index building, and calls the production-deployment story a gap.</p>
+<p>Several of these come straight from §75's differentiators. Sovereignty means no hosted agent service, so the operator must deploy and own the stack. Provider diversity means credentials for Claude, DoubleWord and J-Prime. Local-first memory lives on the operator's disk, which the operator must host.</p>
+<p>So the friction is partly structural. Better documentation helps, but it cannot remove the steps that ownership requires. The trade-off is control and resilience (the operator owns state, models and logs; one provider outage degrades rather than stops the system) against the convenience of an off-the-shelf tool like Claude Code.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (analysis).</strong> Using the comparison table in §74, classify each of these rows as either "O+V adds something Claude Code lacks" or "a different trade-off": Invocation, Provider, Graduation, Cost model. Justify each in one sentence from §74.1 or §74.2.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>A row is a trade-off if §74.2 names a cost that comes with the O+V choice.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Invocation: O+V adds autonomy (autonomous plus human-triggered). §74.1 says Claude Code is reactive while O+V may have already noticed and acted. §74.2 notes that full human approval needs Orange-only configuration, so there is a small configuration cost.</p>
+<p>Provider: a trade-off. The cascade saves roughly 30x on routine ops (§74.1) but may reduce peak model quality on the routine tier (§74.2).</p>
+<p>Graduation: O+V adds something. Capabilities graduate after three successes, while for Claude Code the row reads N/A because the tool is always available (§74).</p>
+<p>Cost model: mostly an addition. Per-op and daily budgets with per-provider caps give finer control than per-token billing, and the cascade that uses them is where the savings in §74.1 come from.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- END -->

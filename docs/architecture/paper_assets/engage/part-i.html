@@ -1,0 +1,114 @@
+<!-- CHECKPOINT before: ## §4. Why This Was Built -->
+<aside class="checkpoint" id="cp-part-i-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">The paper insists O+V is not meant to replace human engineers. What kind of work do you predict it is built to take over, and what do you think is the single hardest requirement for an agent doing that work unsupervised?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>It targets maintenance: the roughly thirty-two of forty weekly hours a senior engineer spends on flaky tests, drifted docs, lint, dependency bumps, renames and small refactors. That work is prescriptive, so a disciplined agent can do it while the engineer sleeps. The hard requirement is discipline: humans are kept careful by fear of breaking things, an agent has no fear, so discipline must be built into the structure. See §4.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- ENDBLOCK part-i -->
+#### Check your understanding: PART I — Vision and Context
+
+<div class="engage" id="engage-part-i">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Principle 5 says decisions should be "semantic, not regex", yet the router that picks a provider is plain deterministic code. Why is that not a contradiction?</summary>
+<p>The paper splits the work in two. The model reasons about what the change should be, which is the semantic part. Deterministic code decides which provider does that reasoning, using lookup tables derived from the intelligence layer's offline analysis. Routing runs for every operation, so making it a model call would add cost and latency and would make the route non-reproducible. Keeping routing deterministic preserves the ledger's ability to replay a signal and get the same route. See §2 and §3 (Principle 5).</p>
+</details>
+<details class="cq"><summary>2. Why does the paper stress that the Iron Gate "is not an AI"? What would be lost if the safety checks were themselves model calls?</summary>
+<p>The Iron Gate is a set of hard-coded rules: AST parsers, command blocklists, path protectors, cost ceilings. Because it reads file paths, token types and exit codes rather than language, a model cannot talk its way past it. If the safety layer were another model, it could be persuaded, could disagree with itself across runs, and could fail in the same ways as the generator it is meant to check. The design pairs flexible agentic intelligence with a skeleton the intelligence cannot negotiate with. See §1.2.</p>
+</details>
+<details class="cq"><summary>3. How do the three distinguishing traits in §1.2 (proactive, governed, accountable) depend on each other? What happens if you keep proactivity but drop the other two?</summary>
+<p>Proactivity means O+V decides for itself what to work on, with no prompt box. That is only acceptable if the actions are bounded (governed) and reconstructable afterwards (accountable). Without governance, a self-initiating agent could edit files outside the repo or run destructive commands. Without accountability, nobody could trace a bad change months later through the ledger and structured commits. The closing invariant in §4 states the bargain directly: procedural autonomy is granted only in exchange for structural discipline, with work that is sanctioned, auditable and reversible. See §1.2 and §4.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-i">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. According to §1.1, how many autonomous sensors and how many pipeline phases does O+V have?</p>
+<ol class="mcq-options" type="A">
+<li>7 sensors and 6 phases</li>
+<li>12 sensors and 5 phases</li>
+<li>16 sensors and 11 phases</li>
+<li>24 sensors and 8 phases</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> §1.1 describes a set of 16 event-driven sensors feeding a pipeline of eleven phases. The six figure is the number of architectural layers in §2, and seven is the number of Manifesto principles.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. Why does the paper say a model cannot deceive the Iron Gate?</p>
+<ol class="mcq-options" type="A">
+<li>It checks file paths, token types and exit codes, not language.</li>
+<li>It asks a second, larger model to audit every response.</li>
+<li>It only runs after a human has approved the change.</li>
+<li>It keeps the model's output hidden until tests pass.</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> §1.2 says the skeleton "is not listening to language"; its rules are deterministic checks on paths, tokens and exit codes, so persuasive text has nothing to act on.</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">3. Under Principle 6, what is the default threshold before a capability graduates into a permanent part of the organism?</p>
+<ol class="mcq-options" type="A">
+<li>One successful operation with passing tests</li>
+<li>Five successes within a 120-second timebox</li>
+<li>Human sign-off on a review pull request</li>
+<li>Three consecutive successes for that capability class</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> §3 sets the graduation threshold at three consecutive successes, configurable via <code>JARVIS_GRADUATION_THRESHOLD</code>: "One success is a data point. Three successes is a pattern."</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. A provider call keeps failing. What response does the Zero-Shortcut Mandate require?</p>
+<ol class="mcq-options" type="A">
+<li>Retry with exponential backoff until the call succeeds</li>
+<li>Diagnose the failure and fix its structural cause</li>
+<li>Add a special case that skips the failing input</li>
+<li>Escalate the operation to a human immediately</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> §3 quotes the mandate: "No brute-force retries without diagnosis... Structural repair, not bypasses." The fix is to understand the failure and make sure it cannot recur for the same reason.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-i">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> A unit test starts failing on a quiet Sunday. Using only §1.1 and §2, follow this event from detection to a git commit. Name each of the six layers it touches, in the order it touches them, and say what each layer contributes.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Start with the layer that answers "when to act?", and remember that two layers feed the pipeline with context rather than sitting in the signal's direct path.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The Event Spine (layer 3) sees the failure through the pytest plugin's test-result JSON; a sensor turns it into a signal with target files, a goal and an urgency. The signal enters the Ouroboros Pipeline (layer 4), the deterministic 11-phase FSM that logs every transition to the ledger.</p>
+<p>During generation, Strategic Direction (layer 1) has already injected its roughly 2,500-character Manifesto digest into the prompt, and Trinity Consciousness (layer 2) supplies memory and regression predictions between phases.</p>
+<p>At GENERATE, the Venom Agentic Loop (layer 5) lets the provider read files, search code and run tests over several turns; if validation fails, L2 Self-Repair gets up to five iterations in 120 seconds.</p>
+<p>Finally the ChangeEngine (layer 6) writes the patch with pre-APPLY snapshots, and once VERIFY passes the AutoCommitter creates a commit carrying the Ouroboros+Venom signature, operation id, risk tier and integrity hash. See §1.1 and §2.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> A contributor proposes replacing the <code>UrgencyRouter</code> with a small LLM that reads each signal's description and picks the provider, arguing this is more "semantic". Using §2 and §3, write a short critique: what would the change cost, and which guarantees would it weaken?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>§9's reasons are previewed in Principle 5 and in §2's description of the router's speed and cost.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Today the router maps (urgency, source, complexity) to a route in under a millisecond with zero LLM calls (§2). An LLM router would add a model call to every operation, which costs money and eats into per-phase time budgets.</p>
+<p>It would also make routing non-deterministic. Principle 5 says the model should reason about what the change is, while deterministic code decides which provider does the reasoning; this keeps the route reproducible from the signal alone.</p>
+<p>The contributor might cite the mandate's "No hardcoded routing tables". The paper's answer is that the router's tables are derived from the intelligence layer's offline analysis, not hand-typed guesses. So the better fix, per Principle 5, is to improve that offline analysis while keeping the online decision deterministic. See §2 and §3.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (analysis).</strong> §4 says a senior engineer spends about 8 of 40 weekly hours on novel code. (a) What share of the week is maintenance, and does it match the "grinding 80%" in the section's summary? (b) The invariant at the end of §4 forbids three kinds of work. For each, name one mechanism from Part I that enforces it.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The three forbidden kinds are work that is unsanctioned, unauditable, or not reversible. Look at §1.1, §1.2 and §2 for matching mechanisms.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) Maintenance is 32 of 40 hours, which is 80 percent, matching the summary's figure.</p>
+<p>(b) Unsanctioned work: the risk tiers and approval step in the pipeline; low-risk work is autonomous but higher-risk work goes to a human, as the "senior engineer reviews when stakes are high" analogy in §1 describes, and the Iron Gate blocks forbidden actions outright (§1.2).</p>
+<p>Unauditable work: every phase transition is written to an append-only ledger and every change becomes a structured git commit naming the operation id, risk tier and provider (§1.2).</p>
+<p>Irreversible work: the ChangeEngine takes pre-APPLY snapshots for rollback before writing a patch (§2). Together these let the organism act "at any hour, under its own budget" without violating the invariant. See §4.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- END -->

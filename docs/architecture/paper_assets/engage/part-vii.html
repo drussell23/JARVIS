@@ -1,0 +1,112 @@
+<!-- CHECKPOINT before: ## §47. Capability 4 — Exploration-First Enforcement -->
+<aside class="checkpoint" id="cp-part-vii-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">You want the model to read the target file before it writes a patch. Is a strong instruction in the prompt enough? If not, where would you enforce the rule, and how would you stop the model from faking exploration?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>A prompt is not enough, because a model can ignore instructions. O+V does both. The prompt states the protocol, and the Iron Gate checks the tool records after GENERATE and before VALIDATE. A violation goes back through <code>GENERATE_RETRY</code> with targeted feedback. The newer <code>ExplorationLedger</code> gives repeated calls no credit. Failed calls add to the score but not to category coverage, so flooding the gate with junk calls cannot pass it. See §47.1, §47.2, §47.3 and §47.4.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- ENDBLOCK part-vii -->
+#### Check your understanding: PART VII — Autonomous Developer Intelligence (Seven Capabilities)
+
+<div class="engage" id="engage-part-vii">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. In the ExplorationLedger, failed tool calls add to the score but not to category coverage. Why split them this way?</summary>
+<p>A failed call is still information. A grep that finds nothing tells the model something, so it is fair for the call to add to the score (§47.4). Coverage is the property the gate is really after: did the model look at the code from different angles? Examples are comprehension, call graph and history (§47.3). If failed calls counted toward coverage, a model could fire off cheap failing calls, reach the floors and pass without having read anything. Duplicate calls get zero credit for the same reason: progress means new files and new queries, not repeated fetches (§47.3). The gate needs all three conditions together: the score, the number of categories and the required categories.</p>
+</details>
+<details class="cq"><summary>2. VALIDATE has already passed. Why does O+V run tests again in VERIFY, and what did the Refinement 10 bug show about this?</summary>
+<p>VALIDATE tests a sandbox copy of the candidate. VERIFY tests the files actually written to disk. The two can disagree. Some tests read from the filesystem, import order can differ, and state such as database connections is real only in VERIFY (§48.3). VERIFY runs only the tests that cover the changed files, so the check stays affordable, and failures go to L2 repair (§48.1). The Refinement 10 bug shows why "on disk" matters. L2 produced a fix that was never written to disk. It was re-checked against the sandbox, which passed, and the operation "completed" without the fix landing. Writing the fix with <code>change_engine.execute()</code> before VERIFY re-runs closed that gap (§48.2).</p>
+</details>
+<details class="cq"><summary>3. Session lessons have two separate safeguards: the infra-poisoning guard and the convergence metric. What failure does each one prevent, and why are both needed?</summary>
+<p>The infra guard works before injection. It tags failures such as DoubleWord timeouts as "infra" and keeps them out of the prompt. Otherwise the model might learn a false lesson such as "avoid calling DW", when the right response was simply to retry (§49.3). The convergence metric works after injection. Every 10 operations after the first lesson, it compares the success rate before and after lessons existed. If the rate has gone down, it clears the buffer (§49.4). The guard filters out one known kind of bad lesson. The metric catches any lessons that turn out to hurt, including code lessons that looked valid. Together they mean the lessons buffer is only kept while it helps.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-vii">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. An operation adds a new file in a non-core directory and changes nothing security-sensitive. Under the four-tier escalator, which tier applies?</p>
+<ol class="mcq-options" type="A">
+<li><code>SAFE_AUTO</code>, since it touches a single file</li>
+<li><code>APPROVAL_REQUIRED</code>, since new code is risky</li>
+<li><code>NOTIFY_APPLY</code>, because of the new-file rule</li>
+<li><code>BLOCKED</code>, since it creates files</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> Rule 10 places new files in the yellow <code>NOTIFY_APPLY</code> tier. The change applies automatically after a visible notice with a 5-second window to cancel (§45, §45.1).</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. Which exploration categories must an <code>architectural</code> operation cover before the ledger lets it pass?</p>
+<ol class="mcq-options" type="A">
+<li><code>call_graph</code> and <code>history</code></li>
+<li><code>comprehension</code> and <code>discovery</code></li>
+<li><code>structure</code> and <code>call_graph</code></li>
+<li>None; architectural operations bypass the gate</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> The architectural floor is a score of 14.0, at least 4 categories, and <code>{call_graph, history}</code> as required categories. You cannot rewrite core code without knowing who calls it and why it was written that way (§47.3).</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">3. Operation A is active on <code>foo.py</code>. A new signal targets <code>[foo.py, bar.py]</code>. What does the intake router do?</p>
+<ol class="mcq-options" type="A">
+<li>Runs the new signal now, on <code>bar.py</code> only</li>
+<li>Merges the new signal into operation A</li>
+<li>Drops the new signal as a duplicate</li>
+<li>Queues it behind A until A completes</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> Any overlap queues the whole signal behind A, even though <code>bar.py</code> is free. When A is released, the signal is re-ingested and re-planned from the new state, which includes A's patch (§46.1, §46.2).</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. With the §50.1 formula: source <code>opportunity_miner</code> (base 5), urgency critical, 1 file, confidence 0.95, and 3 envelopes queued behind its files. What is its priority?</p>
+<ol class="mcq-options" type="A">
+<li>0</li>
+<li>-2</li>
+<li>2</li>
+<li>4</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> 5 - 3 (critical) + 0 (one file) - 1 (confidence of at least 0.9) - 3 (dependency credit, capped at 3) = -2. A lower number means higher priority (§50.1).</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-vii">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> Start from the three pending signals in the §50.2 table (A at -2, C at 4, B at 6). Add signal D: source <code>test_failure</code> (base 2), urgency high, 3 files, confidence 0.92, no dependency credit. Compute D's priority and the new dispatch order. Then suppose D and A both target <code>foo.py</code>. What actually happens to D at dispatch time?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>High urgency is worth 1, and 2 to 4 files cost 1. Then apply §46 to the shared file.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>D = 2 - 1 (high urgency) + 1 (3 files is within 2 to 4) - 1 (0.92 is at least 0.9) - 0 = 1 (§50.1). The order is A (-2), D (1), C (4), B (6).</p>
+<p>Priority decides only who is dispatched next. It does not override file locks. A dispatches first and registers <code>foo.py</code> in <code>_active_file_ops</code>. When D comes up, <code>_find_file_conflict</code> returns A's op id, so D is parked in <code>_queued_behind[A]</code> (§46.1). C can be dispatched in the meantime if its files do not overlap.</p>
+<p>When A completes, <code>release_op</code> frees <code>foo.py</code> and re-ingests D automatically. The retry path computes D's priority again (§50.3). D is then planned against a file that now includes A's patch (§46.2). If A crashed instead, the 300s TTL would force-release the lock so D is not stuck forever (§46.3).</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> An operator finds the 5-second <code>NOTIFY_APPLY</code> window annoying and suggests moving every yellow-tier change to <code>SAFE_AUTO</code> (silent). Another operator suggests moving every yellow-tier change to <code>APPROVAL_REQUIRED</code>. Using §45 and §51, explain what each change would cost.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The paper calls the yellow tier a "trust-building mechanism". Ask what each extreme does to that trust.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The yellow tier covers new files, multi-file changes and core orchestration paths (§45). These are riskier than a single non-core file, but not risky enough to need a sign-off. The 5-second window tells the human before the change lands and lets them cancel, without requiring them to act (§45.1).</p>
+<p>Making the tier silent removes the moment where a problem can be caught. The paper's improvement loop depends on that moment: when a bad yellow change slips through, the operator steps in and the rules are refined. Silent changes would also undercut intent visibility (§44), because multi-file changes would land without the operator watching.</p>
+<p>Making the tier blocking would turn every multi-file change into a wait on a human, which is the outcome the yellow tier was invented to avoid. It would also clog the priority queue: §51 pairs severity with cost-aware priority so valuable work moves under suitable oversight, not under a blanket wait. A better answer keeps the window and tunes its length (Refinement 17 makes the delay configurable through <code>JARVIS_NOTIFY_APPLY_DELAY_S</code>, §52.10), or adjusts which rules put a change in yellow.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> §46 cites <code>unified_intake_router.py</code>. Today the file is <code>backend/core/ouroboros/governance/intake/unified_intake_router.py</code>. Find <code>_find_file_conflict</code> and the place where <code>_file_lock_ttl_s</code> is read from the environment. What is the default TTL? What does the current code check before it deletes a stale lock, and why would a plain "if older than TTL, delete" be unsafe?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Look for a comment that mentions "CAS" and for <code>_active_file_ops_lock</code>.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The TTL is read as <code>float(os.environ.get("JARVIS_FILE_LOCK_TTL_S", "300"))</code>, so the default is 300 seconds. This matches §46.3 and Refinement 11 (§52.4).</p>
+<p>Inside <code>_find_file_conflict</code>, the code takes <code>_active_file_ops_lock</code> for each target file. It reads the <code>(op_id, registered_at)</code> entry and computes its age. If the age is over the TTL, it reads the entry again and deletes it only if both the op id and the timestamp are unchanged. This is a compare-and-swap (CAS). On deletion it logs the "Force-releasing stale file lock" warning that §46.3 describes. If the entry changed in the meantime, the code aborts the delete and logs at debug level.</p>
+<p>A plain age check followed by a delete has a race. Between reading the stale entry and deleting it, another <code>register_active_op</code> could write a fresh lock for the same file. A blind delete would remove that live lock, and two operations could then edit the file at once, which is the self-conflict the DAG exists to prevent (§46). The paper describes the TTL. The code adds a later hardening so that the TTL fix cannot itself remove a lock that is still in use.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- END -->

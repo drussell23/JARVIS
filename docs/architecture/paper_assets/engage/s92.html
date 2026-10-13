@@ -1,0 +1,121 @@
+<!-- CHECKPOINT before: ### §92.4 Battle-Test Harness Hardening + Adversarial Cage (2026-04-23 / 2026-04-27) -->
+<aside class="checkpoint" id="cp-s92-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">One battle-test session hung in GENERATE for over an hour because provider retry storms kept resetting the per-op idle counter. What kind of guard would stop this, and what signal must that guard refuse to listen to?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>A hard wall-clock ceiling, <code>--max-wall-seconds</code>, which fires <code>stop_reason=wall_clock_cap</code> when the session runs too long. It is deliberately opaque to any activity signal, so a retry storm that looks like activity cannot keep resetting it. That is exactly how session #7 GENERATE S2 hung for 67+ minutes. Graduation soaks now set it, typically to 2400 s, about twice the 850–1300 s happy path. See §92.4.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- CHECKPOINT before: ### §92.17 The Reverse Russian Doll — From Architectural Pattern Toward Formal Sketch -->
+<aside class="checkpoint" id="cp-s92-2">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">§92.16 says the autonomy actually demonstrated so far is 23 graduation-ledger commits, not governance self-modification. Will the next section present the bounded-RSI claim as a proven theorem, a proof outline, or something weaker?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>Something weaker: a conjecture sketch. The section states three properties: shell deterministic-entropy never decreases, core semantic-entropy conditioned on the shell never increases, and net agentic entropy stays bounded. It then says plainly that none of them is a theorem yet. Turning them into a precise statement and a proof outline is named as the next milestone. See §92.17.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- ENDBLOCK s92 -->
+#### Check your understanding: §92 — Recent Developments (April 17 – May 13, 2026)
+
+<div class="engage" id="engage-s92">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why do Treefinement L2 and the SWE-Bench-Pro harness ship with default-FALSE master flags and a clean-soak graduation criterion, instead of being switched on once their tests pass?</summary>
+<p>Passing tests shows that the code does what it was written to do. It does not show that the capability helps the live organism. The graduation contract in §92.15 says no capability graduates without empirical proof, and that proof comes from a clean-soak ladder, not from hand-tuning. Treefinement must show at least a 10% L2 success-rate lift, or at least a 20% wall-clock reduction at the same success rate, over at least two consecutive soaks (§92.13). Keeping the flag off also keeps rollback byte-identical: the legacy <code>_run_inner</code> is sha256-pinned, so turning the flag off restores exactly the old behaviour. The trade-off is speed. Capability sits dormant for weeks, as the 36-day minimum calendar in §92.9 shows.</p>
+</details>
+<details class="cq"><summary>2. The Adversarial Cage reported 0/38 escapes. What does this result support, and what does the paper itself say it cannot establish?</summary>
+<p>It supports the claim that the Iron Gate, Semantic Guardian and recursion bound stopped every one of 38 hand-authored attacks, with 12 detection gaps documented as predicted, not active (§92.4). It is a curated, hand-written set, so it is evidence about those inputs, not a measured escape rate across all possible attacks. §92.12 calls the cage "empirically zero-escape" and lists proving this as a formal property as an open question. §92.18 makes the limit explicit. Before Neurosurgeon, adversarial soaking can stand in for proof. Once the system modifies its own governance, only a formal proof can rule out a trajectory that escapes the bound.</p>
+</details>
+<details class="cq"><summary>3. IDE-native ReviewBranch builds preview branches with git plumbing and auto-rejects after 300 s. Why these two choices?</summary>
+<p>The plumbing commands <code>hash-object</code>, <code>commit-tree</code> and <code>branch</code> create a reviewable branch without touching the working tree, HEAD or the operator's index (§92.5). An autonomous proposal therefore never disturbs the human's own work in progress, yet VS Code's source-control panel still shows it natively. The 300 s default timeout ends in auto-REJECT, not auto-apply. If nobody looks, nothing lands. That replaces the old path, where a 5 s Rich overlay was followed by an automatic apply. The old behaviour is still available by setting <code>JARVIS_REVIEW_TIMEOUT_S=0</code>, so the safer default does not remove the operator's choice.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-s92">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. According to §92.16, what autonomous commits had been empirically demonstrated as of 2026-05-14?</p>
+<ol class="mcq-options" type="A">
+<li>Autonomous edits to <code>iron_gate.py</code> that survived the full cycle</li>
+<li>Production-code repairs landed under signed roadmap goals</li>
+<li>23 commits appending soak verdicts to the graduation ledger</li>
+<li>Resolved SWE-Bench-Pro instances committed without review</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> The demonstrated regime is autonomous ledger writes: 23 commits against <code>passb_graduation_ledger.jsonl</code>. Fully autonomous governance self-modification is listed explicitly as not yet demonstrated (§92.16, §92.18).</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. In the 2026-05-10 debug arc, <code>httpx</code> needed <code>socksio</code> behind a <code>socks5h://</code> tunnel. What was the structural fix?</p>
+<ol class="mcq-options" type="A">
+<li>Install and pin <code>socksio==1.0.0</code>, keeping the proxy</li>
+<li>Strip the proxy from the environment before each call</li>
+<li>Downgrade <code>httpx</code> below 0.28 to avoid the dependency</li>
+<li>Route DoubleWord calls through a separate DNS resolver</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> The first attempt stripped the proxy and broke DNS. The structural fix was to install the missing package, pinned in <code>requirements.txt</code> (§92.10, Layer 4).</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">3. Why was UX Gap #5 re-diagnosed as a phantom during the Live Status Line work?</p>
+<ol class="mcq-options" type="A">
+<li>The REPL had been running headless in every session</li>
+<li>The op block buffer already pruned stale entries on eviction</li>
+<li>The SSE stream already rendered status in the IDE extensions</li>
+<li><code>patch_stdout(raw=True)</code> already handled interleaved output</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> Async output interleaving during typing was already handled. What was really missing was the status line itself (§92.5, item 4).</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. What does the SWE-Bench-Pro Phase C scorer do with a patch that modifies a test file, and why is that flag special?</p>
+<ol class="mcq-options" type="A">
+<li>Scores it as inconclusive; it is the only flag set per instance</li>
+<li>Fails it outright; it is the only Phase C flag defaulting TRUE</li>
+<li>Reverts the test edit and rescores; it is AST-pinned to the scorer</li>
+<li>Sends it to operator review; it mirrors the Orange PR lane</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> Test-file modification is treated as a cheat under the upstream rubric. Rubric integrity depends on catching it, so it is the one Phase C flag that defaults TRUE (§92.14).</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-s92">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> A Yellow-tier (<code>NOTIFY_APPLY</code>) operation produces a two-file diff at 14:00, and the operator is away from the keyboard until 14:10. Using §92.5, trace what happens to the diff, what the operator could see in their editor, and what state the repository is in at 14:10.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Look at which git objects ReviewBranch creates, what it never touches, and what its default timeout does.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>ReviewBranch replaces the old 5 s overlay-then-apply path. It writes the candidate as git objects with <code>hash-object</code> and <code>commit-tree</code>, then creates a preview branch with <code>branch</code>. The working tree, HEAD and the operator's index are never touched.</p>
+<p>The diff is recorded in the <code>DiffArchive</code> ring with a monotonic <code>d-N</code> reference, so it can be expanded later. VS Code's source-control panel shows the preview branch natively, and the SSE events reach the IDE.</p>
+<p>The default <code>JARVIS_REVIEW_TIMEOUT_S</code> is 300 s. With no decision by about 14:05 the review auto-REJECTs. At 14:10 the working tree is unchanged, the candidate was never applied, and its audit record remains in the archive. Only with the timeout set to 0 would the legacy auto-apply have landed it (§92.5).</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> A contributor proposes that <code>--max-wall-seconds</code> extend itself automatically whenever an operation is making progress, for example when the provider is still returning events, so that slow but healthy sessions are not cut off. Using §92.4, critique the proposal and suggest what to do about slow sessions instead.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Ask which failure the wall-clock cap was built for, and what that failure looked like from the inside.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The cap exists because an activity-based guard was already defeated once. Provider retry storms reset the per-op liveness counter, and session #7 GENERATE S2 hung for 67+ minutes while looking busy (§92.4).</p>
+<p>A cap that extends on "progress" brings back the same weakness. A retry storm emits events, so it looks like progress and the cap never fires. The paper says the cap is "opaque to any activity signal" precisely so that it cannot be defeated this way.</p>
+<p>The answer for slow but healthy sessions is a larger fixed margin. Graduation soaks use about 2400 s, roughly twice the 850–1300 s happy path. The ceiling stays a pure function of elapsed time, so no state inside the system it guards can hold it open.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> §92.1 describes the mutation cage as a "structural COUNT gate (second-rejection after the type gate)". Open <code>backend/core/ouroboros/governance/scoped_tool_backend.py</code> and find the count gate. Answer three questions: in what order the two gates run, at what moment a mutation slot is consumed, and what happens to the slot if the inner backend then fails.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Search for <code>mutation_budget_exhausted</code> and read the lines just after the refusal block.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Layer 1 is the type gate. A tool outside the dispatched <code>allowed_tools</code> set is refused as <code>POLICY_DENIED</code> before anything else runs. Layer 2, marked "count gate (mutation budget)", runs only for mutation tools. If <code>_mutations_count</code> has reached <code>_max_mutations</code>, it logs <code>reason=mutation_budget_exhausted</code> and returns <code>POLICY_DENIED</code>, noting that the budget is set at dispatch and cannot be extended mid-op.</p>
+<p>Otherwise the slot is consumed <em>before</em> the call is delegated: <code>self._mutations_count += 1</code>. The comment explains that a failure inside the inner backend still burns the slot on purpose. This stops a model from retrying a failing mutation until it exceeds the budget.</p>
+<p>The call is also recorded and <code>_sync_state_mirror()</code> is updated before delegation. That is the <code>state_mirror</code> behaviour §92.1 credits with keeping the audit trail intact across a hard kill.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- END -->

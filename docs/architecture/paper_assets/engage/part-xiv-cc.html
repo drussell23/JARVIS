@@ -1,0 +1,64 @@
+<!-- QUICKCHECK after: ## §77. Functions, Not Agents — The DoubleWord Reseating Roadmap -->
+<div class="quick-check" id="qc-77">
+<p class="qc-label">Quick check · §77</p>
+<details class="qc"><summary>1. What does the Gemma compaction caller fall back to, and on which failures?</summary>
+<p>It falls back to the existing deterministic summarizer (type counting plus a phase histogram). This happens on any failure: timeout, <code>schema_invalid</code>, a hallucinated reference, or an open circuit. The rejection reason is logged. See §77.3.</p>
+</details>
+<details class="qc"><summary>2. What has to happen before Phase 3 (the Qwen 397B heavy analyst) is mounted?</summary>
+<p>Phase 0 must produce 24 hours or more of clean shadow telemetry. Until then Phase 3 stays planned. See §77.4.</p>
+</details>
+<details class="qc"><summary>3. Why is episodic failure clustering listed as a gap, given that Trinity Consciousness already stores history?</summary>
+<p>The storage substrate exists, but session lessons reset each session and failed ops are logged without ever being clustered across sessions. No component looks over past failures and says that three rejections are "the same problem wearing different hats". See §77.4, item 3.2.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §78. Manifesto §6 Graduation — The Durability Gap -->
+<div class="quick-check" id="qc-78">
+<p class="qc-label">Quick check · §78</p>
+<details class="qc"><summary>1. Where does Session W stand against the durability bar, and what is still outstanding?</summary>
+<p>Session W is one data point. Two more consecutive successes, Sessions X and Y, are needed under comparable conditions before multi-file autonomy moves from "proven in one session" to "capability".</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §79. Deferred Latent Bugs (Load-Bearing Workarounds) -->
+<div class="quick-check" id="qc-79">
+<p class="qc-label">Quick check · §79</p>
+<details class="qc"><summary>1. Why does an <code>'infra'</code> classification on iter=1 kill the op, rather than trigger another retry?</summary>
+<p>The <code>'infra'</code> class is non-retryable by design, and it triggers <code>_early_return_ctx</code> escalation. So a transient sandbox or pytest flake ends the op. See §79.1.</p>
+</details>
+<details class="qc"><summary>2. What does the workaround <code>JARVIS_MAX_VALIDATE_RETRIES=0</code> give up?</summary>
+<p>It skips iter=1 completely. That avoids the flake, but it also removes the retry iteration for every op, not only the ones that would have flaked.</p>
+</details>
+<details class="qc"><summary>3. §79.3 has no workaround. Why is it still on the list?</summary>
+<p>The hardcoded 90-second <code>asyncio.wait_for</code> is itself the emergency fix, but it is not parameterized. The proper fix is an env-driven timeout consistent with the rest of the pipeline's budget allocation.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §80. What the Next Battle Tests Should Prove -->
+<div class="quick-check" id="qc-80">
+<p class="qc-label">Quick check · §80</p>
+<details class="qc"><summary>1. Which milestone exercises rollback semantics that Session W did not, and why didn't W?</summary>
+<p>Milestone 1, a coordinated refactor that modifies two or more existing files. Session W only created new files, so it never had to undo changes to files that already existed.</p>
+</details>
+<details class="qc"><summary>2. Which milestone exercises the multi-file coverage gate's topological ordering?</summary>
+<p>Milestone 2, cross-file dependency-aware edits: file B imports from file A, and the edit to A needs a matching edit to B.</p>
+</details>
+<details class="qc"><summary>3. What exactly must be achieved before claiming "production-hardened multi-file autonomous development"?</summary>
+<p>All five milestones, each with three consecutive successes.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §81. The Longer Arc — Graduation -->
+<div class="quick-check" id="qc-81">
+<p class="qc-label">Quick check · §81</p>
+<details class="qc"><summary>1. How does <code>EphemeralUsageTracker</code> decide that two goals belong to the same capability class?</summary>
+<p>It normalizes each goal, removes stop words and hashes the canonical form. Goals with the same hash count towards the same class, and the threshold (<code>JARVIS_GRADUATION_THRESHOLD=3</code>) fires exactly once per class. See §81.3.</p>
+</details>
+<details class="qc"><summary>2. What happens if a graduation sits in AWAITING_APPROVAL too long?</summary>
+<p>Hardening requirement H4: after the approval timeout (30 minutes by default) the worktree is discarded and the event is logged.</p>
+</details>
+<details class="qc"><summary>3. What does a graduated capability become, and has multi-file APPLY graduated?</summary>
+<p>It becomes a permanent agent: a durable code path that future operations call directly instead of regenerating it. Multi-file APPLY has not graduated yet. Simpler capabilities, such as individual test-generation patterns and single-file refactors, have. See §81.4.</p>
+</details>
+</div>
+<!-- END -->

@@ -1,0 +1,17 @@
+<!-- XBLOCK part-xiii -->
+<p class="engage-kicker engage-kicker-x">Connections</p>
+<div class="pset pset-x">
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 1 (Probability).</strong> §75 says O+V is provider-diverse: it uses Claude, DoubleWord and J-Prime, and "an outage of any single provider degrades the system; it does not stop it." Model each provider as unavailable with probability q at a given moment. The paper gives no outage figures, so use q = 0.01 as an illustrative input. (a) If outages are independent, what is the probability that all three are down, so the system stops? (b) What is the probability that at least one is down, so the system is degraded? Compare both with a single-provider system. (c) Now suppose a common cause, with probability c = 0.005, takes out all three providers at once, on top of the independent outages. Recompute (a) and explain what this does to the claim.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>All down: q^3. At least one down: 1 - (1 - q)^3. With a common cause, the system stops if the common cause happens, or if it does not and all three fail independently.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) With independence, P(all down) = q^3 = 0.01^3 = 0.000001, one in a million. A single-provider system stops with probability q = 0.01, so diversity cuts the stop probability by a factor of 10,000.</p>
+<p>(b) P(at least one down) = 1 - 0.99^3 = 1 - 0.970299 = 0.029701, about 3%. That is about three times the single-provider figure of 1%. Diversity makes stopping very rare, but it makes some degradation more frequent, because there are three things that can fail. "Degraded" also has a cost: §74.2 notes that routing to a different model can lower quality.</p>
+<p>(c) P(stop) = c + (1 - c) x q^3 = 0.005 + 0.995 x 0.000001 = about 0.005001. The common cause now accounts for almost all of the risk. The gain over one provider drops from 10,000x to 0.01 / 0.005 = 2x.</p>
+<p>The lesson is the standard one from reliability engineering. Redundancy multiplies only the independent part of the failure probability. A shared dependency, such as a shared network path, a shared billing account or shared credentials (illustrative examples, not ones the paper lists), sets a floor that no number of extra providers can push below. So §75's claim is only as strong as the providers' independence. To test it, one would record outages for each provider and check whether they coincide more often than the product of their separate rates predicts.</p>
+</details>
+</div>
+</div>
+<!-- END -->

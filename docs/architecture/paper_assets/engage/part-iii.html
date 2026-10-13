@@ -1,0 +1,125 @@
+<!-- CHECKPOINT before: ## §9. CLASSIFY & ROUTE — Risk and Urgency -->
+<aside class="checkpoint" id="cp-part-iii-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">The first two phases decide how dangerous a change is and which model provider should handle it. Would you use a language model to make these two decisions? Predict what the paper chose and why.</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>Neither phase calls a model. CLASSIFY runs a twelve-rule ladder where the first matching rule assigns the risk tier, and ROUTE is a pure-code router that finishes in under a millisecond using lookup tables. The reasons are determinism (replaying a signal gives the same route), cost (routing runs for every operation) and latency (generation needs the time budget). See §9.1 and §9.2.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- CHECKPOINT before: ## §15. APPLY — Writing Changes to Disk -->
+<aside class="checkpoint" id="cp-part-iii-2">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">A validated, approved candidate changes four files. The first two write to disk fine, then the third write fails. What state should the repository be left in, and how could the system make that possible?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>The repository should be left exactly as it was before APPLY. Before each file is written, <code>RollbackArtifact.capture()</code> snapshots it; on failure, the already-applied files are restored in reverse order from those snapshots and the error propagates to POSTMORTEM. Each file also gets its own <code>::NN</code> sub-op id for observability. See §15.1 and §15.2.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- ENDBLOCK part-iii -->
+#### Check your understanding: PART III — The Eleven-Phase Pipeline
+
+<div class="engage" id="engage-part-iii">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. The Part's opening says GENERATE's content is probabilistic but the decision to proceed is deterministic. Where does that boundary show up in the phases, and why does it make autonomy safe?</summary>
+<p>GENERATE is the only place the model shapes the change, through a multi-turn tool loop (§12). Everything that decides whether that output reaches disk is deterministic: the exploration and ASCII gates after GENERATE (§12.4), syntax, type and test checks in VALIDATE (§13.1), the tier table at GATE (§14.1), and the scoped tests at VERIFY (§16.1). A model can produce a bad patch, but it cannot argue its way through a failing test or a tier rule. Transitions follow explicit conditions enforced by the orchestrator's contract, so the system can be autonomous without trusting the model's judgement about its own work (§8, §8.2).</p>
+</details>
+<details class="cq"><summary>2. Planning failures are "soft" and the stale-exploration guard is also soft, while the Iron Gates at GENERATE are hard. What principle seems to decide which checks may fail open?</summary>
+<p>Soft checks are ones whose failure costs quality or efficiency but not safety. A failed plan just means GENERATE runs without one, and an incoherent plan is downgraded to "default approach" (§11.3, §11.5). The stale guard is soft because concurrent operations are rare and false positives are judged worse than occasional stale writes, with L2 or later sensors repairing the damage (§15.3). The Iron Gates protect against things the system has decided must never happen without exploration, or that could corrupt files (non-ASCII), so violations force regeneration (§12.4). The paper is candid that the stale guard is a trade-off "today", not a guarantee.</p>
+</details>
+<details class="cq"><summary>3. Why does VERIFY re-run tests after APPLY when VALIDATE already ran them on the candidate?</summary>
+<p>VALIDATE checks the candidate in isolation; VERIFY checks it in situ, with the patch actually on disk alongside everything else (§16). The paper's point is that "validation in isolation is not enough". Problems such as the stale-file case in §15.3, where a candidate was built on outdated file state, only show up once the real tree is involved. VERIFY keeps cost down by running only tests that exercise the changed files (§16.1). If those fail and L2 cannot repair it, the RollbackArtifact stack undoes the applied changes, so the safety net covers the write itself (§16.2).</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-iii">
+<div class="mcq" data-answer="4">
+<p class="mcq-q">1. A <code>todo_scanner</code> signal of ordinary complexity arrives marked high urgency. According to §9.2, which route does it get?</p>
+<ol class="mcq-options" type="A">
+<li>IMMEDIATE, because urgency is high</li>
+<li>STANDARD, the fall-through default</li>
+<li>SPECULATIVE, as proactive exploration</li>
+<li>BACKGROUND, regardless of urgency</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> §9.2 lists <code>todo_scanner</code> in <code>_BACKGROUND_SOURCES</code>, whose signals "always route to BACKGROUND regardless of urgency". Only the three sources in <code>_IMMEDIATE_SOURCES</code> get IMMEDIATE on high urgency.</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">2. A model emits a patch after calling only <code>list_dir</code> and one <code>read_file</code>. What happens?</p>
+<ol class="mcq-options" type="A">
+<li>The patch goes to VALIDATE with a warning attached</li>
+<li>GENERATE_RETRY with targeted feedback to explore more</li>
+<li>The operation is BLOCKED and ends at once</li>
+<li>The ASCII gate repairs the patch and lets it pass</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> §12.4 requires at least two calls to exploration tools (<code>read_file</code>, <code>search_code</code>, <code>get_callers</code>) before any patch. One <code>read_file</code> is not enough, and <code>list_dir</code> is not on that list, so the gate triggers a regeneration.</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">3. When does context auto-compaction kick in during a tool loop, and what does it keep?</p>
+<ol class="mcq-options" type="A">
+<li>Above 75% of a 98,304-character budget; it keeps the six newest tool chunks</li>
+<li>Above 50% of the budget; a model summarises all prior tool results</li>
+<li>After five tool rounds; it drops every result except the final one</li>
+<li>Above 90% of the budget; it keeps only the <code>read_file</code> results</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> §12.5 sets the threshold at 75% of a default 98,304-character budget, keeps the six most recent tool chunks, and summarises older ones by deterministic counting with no model inference.</p>
+</details>
+</div>
+<div class="mcq" data-answer="3">
+<p class="mcq-q">4. An operator types <code>cancel &lt;op-id&gt;</code> while a model call is still streaming. When does the operation become CANCELLED?</p>
+<ol class="mcq-options" type="A">
+<li>Immediately; the model call is killed mid-stream</li>
+<li>Only after VERIFY, so the change can be rolled back</li>
+<li>At the next phase boundary, after the in-flight call finishes</li>
+<li>Never; cancellation applies only to Orange-tier operations</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> §17.3 says cancellation is cooperative: the orchestrator checks the flag at phase boundaries, not mid-phase, so an in-flight model call completes before the transition. §15.4 describes the last such check, between GATE and APPLY.</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-iii">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> At 03:00 a test fails in a single, non-core, non-security file, and the signal arrives with high urgency from <code>test_failure</code>. Walk the operation through every phase to COMPLETE. For each phase, name the decision taken and one thing that could stop or divert the operation there.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Decide the risk tier and route first, then check which bracketed phases a trivial operation skips. Do not forget the consciousness bridge at CLASSIFY or the budget clause in §8.2.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>CLASSIFY: a single non-core, non-security file is <code>SAFE_AUTO</code> (§9.1). It could be diverted to BLOCKED if the file matched a protected path, or bumped to <code>NOTIFY_APPLY</code> if the consciousness bridge rates regression risk HIGH. ROUTE: <code>test_failure</code> with high urgency goes IMMEDIATE, so Claude is called directly (§9.2). If the daily budget is exhausted, the op is queued instead (§8.2).</p>
+<p>CONTEXT_EXPANSION and PLAN may be skipped for a trivial single-file op (§10, §11.2); a failed plan would be soft anyway (§11.3).</p>
+<p>GENERATE: the tool loop runs for up to five rounds; the exploration-first and ASCII gates can force GENERATE_RETRY (§12.2, §12.4).</p>
+<p>VALIDATE: syntax, type check, a 60-second test run and Iron Gate checks. Failure uses up to two VALIDATE_RETRY attempts, then L2 with five iterations in 120 seconds; if L2 fails, the op goes to POSTMORTEM (§13).</p>
+<p>GATE: <code>SAFE_AUTO</code> auto-approves silently (§14.1). A cancel flag checked before APPLY would end it as CANCELLED (§15.4).</p>
+<p>APPLY: snapshot, then an atomic temp-then-rename write; a write failure restores the snapshot and goes to POSTMORTEM (§15.1). VERIFY: scoped tests; a failure goes to L2, and if L2 fails everything is rolled back (§16.2).</p>
+<p>COMPLETE: the terminal record is written and the AutoCommitter creates the signed commit (§17.1).</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> Someone proposes making the stale-exploration guard a hard reject: if any target file's SHA-256 at APPLY differs from its GENERATE-time hash, the operation fails. Using §15.3 and the governance contract in §8.2, weigh the benefit against the cost and say what you would need to know before adopting it.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The paper states its own reasoning for keeping the guard soft. What assumption does that reasoning rest on?</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Benefit: no candidate built on outdated file state would ever be written, closing the window §15.3 admits exists ("occasional stale writes").</p>
+<p>Cost: today the guard only warns and writes a ledger entry because the paper judges concurrent operations rare and false positives worse than stale writes. A hard reject would send every mismatch to POSTMORTEM, wasting the generation and validation spend already incurred, which the cost clause of §8.2 tracks.</p>
+<p>The decision rests on an empirical question: how often hashes actually differ, and how often those cases are harmless. The ledger records every stale-guard warning, so you could measure the rate before deciding. If stale writes turned out common or damaging, the assumption behind the soft gate would fail and a hard reject would be justified. See §15.3 and §17.6.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/urgency_router.py</code>. Find <code>_IMMEDIATE_SOURCES</code>, <code>_BACKGROUND_SOURCES</code> and <code>_COMPLEX_COMPLEXITIES</code>, then the routing method that uses them. (a) List entries in each set that are not in the paper's §9.2 description. (b) Is it exactly true in code that a background source routes to BACKGROUND "regardless of urgency"?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Search for <code>source in _BACKGROUND_SOURCES</code> and read the condition on the second such check.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) <code>_IMMEDIATE_SOURCES</code> now also includes <code>operator_chat</code>, a goal typed by the operator, justified in a comment as the same class as <code>voice_human</code>. <code>_BACKGROUND_SOURCES</code> adds <code>memory_hygiene</code>, <code>cage_hygiene</code>, <code>capability_severance</code> and <code>audit_regression</code>. <code>_COMPLEX_COMPLEXITIES</code> adds <code>architectural</code>; its comment says leaving it out made architectural single-file ops fall through to STANDARD.</p>
+<p>(b) Not exactly. The code first routes a background source with low urgency (the only member of <code>_BACKGROUND_URGENCIES</code>) to BACKGROUND, and then routes any other background source to BACKGROUND only if its complexity is not in <code>_COMPLEX_COMPLEXITIES</code>. A background source with <code>heavy_code</code>, <code>complex</code> or <code>architectural</code> complexity therefore falls through to the COMPLEX check. Also note IMMEDIATE checks come first in the method, so their ordering matters.</p>
+<p>The lesson matches §9.2's core claim: routing is a fixed, ordered set of pure-code checks you can read and replay, and the paper's table is a summary of that ordering, which has grown since it was written.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- END -->

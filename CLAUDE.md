@@ -1,25 +1,44 @@
 # CLAUDE.md -- JARVIS Trinity AI Ecosystem
 
-**Repository**: [github.com/drussell23/JARVIS-AI-Agent](https://github.com/drussell23/JARVIS-AI-Agent)
+**Repository**: [github.com/drussell23/JARVIS](https://github.com/drussell23/JARVIS) (the old `JARVIS-AI-Agent` URL redirects)
+**Siblings**: [JARVIS-Prime](https://github.com/drussell23/JARVIS-Prime) (model serving) · [JARVIS-Reactor](https://github.com/drussell23/JARVIS-Reactor) (training)
 **Author**: Derek J. Russell -- RSI/AGI Researcher & Trinity Architect
+**Long-form reference**: [O+V research paper](https://drussell23.github.io/JARVIS/architecture/OV_RESEARCH_PAPER_2026-04-16.html) — §93 covers May–October 2026; `docs/architecture/OUROBOROS_VENOM_PRD.md` §33/§34 hold the 30B capability envelope and soak evidence.
 
 ## What This Is
 
-JARVIS is the Body of a tri-partite AGI OS. This repo contains the macOS integration layer (screen capture, voice, keyboard automation), the unified supervisor (102K-line monolithic kernel), and the Ouroboros self-development governance engine. All model references are resolved from `brain_selection_policy.yaml` -- zero hardcoded model names.
+JARVIS is the Body of a tri-partite AGI OS. This repo contains the macOS integration layer (screen capture, voice, keyboard automation), the unified supervisor (102K-line monolithic kernel), and the Ouroboros + Venom (O+V) self-development governance engine. All model references are resolved from `brain_selection_policy.yaml` or env vars -- zero hardcoded model names.
+
+## Current State (October 2026) — read this first
+
+Much of the detail below was written for the April–August cloud-provider era. What changed since:
+
+- **Local-first, $0 inference.** Paid lanes (DoubleWord, Claude) are switched off by declaration (`JARVIS_PAID_LANES_ENABLED=false`, single authority `governance/paid_lanes.py`). Every route runs on **J-Prime**, a local llama.cpp server on one RTX 5090 serving `qwen3-coder-ov:30b` (Qwen3-Coder-30B-A3B MoE). The DW/Claude sections below describe the paid lanes, which still exist in code and come back by configuration alone.
+- **The operator surface is the `ov` cockpit** (`backend/core/ouroboros/cli/ov.py`), not a bare battle-test run. A bare `ov` arms Autonomous Sentinel Mode and the production-soak profile. `scripts/ouroboros_battle_test.py` is still the engine underneath.
+- **O+V lands its own commits.** Signed goals → isolated worktree → accumulation branch → promotion gate → fast-forward of **local** `main`. Nothing is ever pushed by the organism (zero-push air-gap). Almost all autonomous landings so far are new test files; production-code landings are rare and are reviewed.
+- **The Trinity loop is closed.** O+V's attempts become training rows → Reactor trains a GRPO LoRA → J-Prime serves it through a versioned adapter registry. One adapter is served; no held-out gain has been shown yet, so training-derived changes are not pushed.
 
 ## Architecture at a Glance
 
 ```
-JARVIS (Body) <--HTTP/WS--> J-Prime (Mind) <--sandbox--> Reactor Core (Nerves)
-     |
+JARVIS (Body)  ── O+V governance engine, cockpit, sensors       runs in WSL2 (needs fcntl)
+   │  loopback (WSL mirrored networking)
+   ├─ J-Prime (Mind)  ── llama.cpp llama-server on 127.0.0.1:8000 (OpenAI + Ollama-compatible,
+   │                     training lease, adapter registry)       runs natively on Windows, owns the GPU
+   └─ Reactor (Soul)  ── GRPO / LoRA training, :8090             runs in WSL2
+JARVIS boot brings up J-Prime and Reactor itself (governance/trinity_siblings.py).
+
+JARVIS repo
      +-- unified_supervisor.py (102K lines, Zones 0-7)
-     +-- backend/core/ouroboros/ (autonomous self-development)
+     +-- backend/core/ouroboros/ (autonomous self-development: governance/, cli/, battle_test/, aegis/)
      +-- backend/vision/ (VLA pipeline, OCR, frame server)
      +-- backend/ghost_hands/ (focus-preserving UI automation)
      +-- backend/voice/ (voice I/O, wake word, TTS)
      +-- backend/core_contexts/ (5 execution contexts: Executor, Architect, Developer, Communicator, Observer)
      +-- backend/neural_mesh/ (22 legacy agents, Strangler Fig fallback)
 ```
+
+Setup for the split host: `docs/BRINGUP_WINDOWS_WSL2.md`.
 
 ## Key Conventions
 
@@ -28,6 +47,9 @@ JARVIS (Body) <--HTTP/WS--> J-Prime (Mind) <--sandbox--> Reactor Core (Nerves)
 - **Env-var driven config**: Every tunable parameter reads from environment variables with sensible defaults.
 - **Python 3.9+**: No `asyncio.timeout` (3.11+) -- use `asyncio.wait_for` everywhere.
 - **`from __future__ import annotations`**: Required in all files for forward reference support.
+- **Never `source .env` in a shell.** Several lines in it are unquoted commands (preflight, J-Prime/Reactor start templates) and would execute. Python reads it through `backend/core/env_bootstrap.py::load_env_once`.
+- **New test files must be tracked before they run.** `tests/conftest.py` (`_amputate_untracked`) drops untracked paths from collection, so an untracked `test_*.py` collects and runs **zero** tests. `git add` it first.
+- **Production code is offloaded, not blocking.** Event-loop starvation has been the most frequent soak killer; long file scans and AST parses go through `offload()` in `governance/cooperative_fs_io.py`, never inline on the loop.
 
 ## Ouroboros Pipeline
 
@@ -37,17 +59,41 @@ The self-development engine runs an 11-phase governance pipeline:
 CLASSIFY -> ROUTE -> [CONTEXT_EXPANSION] -> [PLAN] -> GENERATE -> VALIDATE -> GATE -> [APPROVE] -> APPLY -> VERIFY -> COMPLETE
 ```
 
-### Provider Chain (3-Tier Failback)
+`OperationPhase` (`op_context.py`) also carries GENERATE_RETRY, VALIDATE_RETRY, VISUAL_VERIFY and the terminals CANCELLED / EXPIRED / POSTMORTEM.
+
+**Inside VALIDATE** — one owner: `phase_runners/validate_runner.py` (the inline orchestrator twin was deleted). In order:
+1. **Test Reality Gate** (`70935a4bee`; `orchestrator.py` / `repair_engine.py`) rejects candidate tests that cannot execute, assert nothing, or never import their subject — before pytest runs.
+2. Traceback-guided **micro-fix** (`interactive_repair.py`, bounded by `micro_fix_governor.py`).
+3. **VALIDATE_RETRY**, which really regenerates.
+4. **L2 repair** (`repair_engine.py`).
+
+**What the local 30B needs to generate well:**
+- **Diff output** (`2b.1-diff`) for existing files instead of whole-file rewrites.
+- **AST-Signature Anchor** (`ast_signature_anchor.py`): the real module API is injected, so the model stops inventing functions.
+- **LessonMemory** (`lesson_memory.py`): module-keyed failure lessons.
+- **Stateful tool masking** (`tool_masking.py`): the decoding grammar allows only tool calls until the minimum exploration is met.
+- **The goal's declared target symbol** narrows the scope.
+
+### Provider Chain
+
+**As deployed now (local-first):**
+
+| Lane | Provider | Cost | Notes |
+|------|----------|------|-------|
+| Primary (every route) | **J-Prime**, local llama.cpp on the RTX 5090, `qwen3-coder-ov:30b` | $0 | Free-lane policy (`_free_lane_active` / `_try_local_primary` in `candidate_generator.py`, `JARVIS_FREE_LANE_POLICY_ENABLED`): with no paid lane allowed, every route goes local. Concurrency follows the engine's slot count. |
+| Paid (off) | DoubleWord, Claude | per token | `paid_lanes.py` answers three separate questions — `paid_lane_switched_on` / `paid_lane_configured` / `paid_lane_allowed` (the last also checks `economic_state.py`, which classifies a 402 or "credit balance too low" as ECONOMIC rather than an outage). With `JARVIS_PAID_LANES_ENABLED=false` neither client is constructed. |
+
+**Paid-lane topology (when `JARVIS_PAID_LANES_ENABLED=true`), 3-tier failback:**
 
 | Tier | Provider | Cost | Notes |
 |------|----------|------|-------|
 | 0 | DoubleWord 397B (3-tier: RT SSE + webhook + adaptive poll) | RT $0.39/$2.45 · async $0.29/$1.84 · batch $0.19/$1.23 /M | 16384 max_tokens, RT default, preferred. (Corrected 2026-07-21: the old $0.10/$0.40 figure was the 35B-dottxt BATCH rate — a 4-6× understatement for the 397B.) **The RT tier requires `service_tier:"priority"` in the request body** — without it DW serves the default async tier (~66s TTFT, the 0-APPLY soak class). Injected at the ONE seam `apply_rt_service_tier` (master `JARVIS_DW_SERVICE_TIER_ENABLED`, tier `JARVIS_DW_RT_SERVICE_TIER`, per-model rejection cache); batch bodies never carry it. |
 | 1 | Claude (Anthropic API) | $3/$15/M | Extended thinking + prompt caching, 60s fallback cap |
-| 2 | J-Prime (GCP self-hosted) | VM cost only | When available |
+| 2 | J-Prime (GCP self-hosted in the April design; now the local engine above) | VM cost / $0 local | When available |
 
 ### Urgency-Aware Provider Routing (Manifesto §5)
 
-Deterministic routing based on signal urgency + source + task complexity. Stamped at ROUTE phase by `UrgencyRouter` (`urgency_router.py`). No LLM calls — pure code, <1ms.
+Deterministic routing based on signal urgency + source + task complexity. Stamped at ROUTE phase by `UrgencyRouter` (`urgency_router.py`). No LLM calls — pure code, <1ms. The route still sets budgets and priority; **with the free lane active, every route is served by the local engine**, and the per-provider strategies below apply only when paid lanes are on.
 
 | Route | Strategy | Cost | When |
 |-------|----------|------|------|
@@ -58,6 +104,8 @@ Deterministic routing based on signal urgency + source + task complexity. Stampe
 | SPECULATIVE | DW batch fire-and-forget | ~$0.001/op | IntentDiscovery, DreamEngine pre-computation |
 
 ### Timeout Enforcement (Route-Aware)
+
+These are the per-route defaults. Under the production envelope (`production_envelope.py`, profiles `soak` and `cockpit`), the pipeline and generation budgets are derived from the run's wall-clock budget instead.
 
 - **IMMEDIATE generation**: 60s + 5s grace (fast reflex — accounts for Venom tool rounds)
 - **STANDARD generation**: 120s + 5s grace
@@ -113,7 +161,7 @@ All flow through `UnifiedIntakeRouter` with priority queuing, deduplication, and
 - **FlagRegistry + /help dispatcher** (`flag_registry.py` + `help_dispatcher.py`): Typed registry for 481+ `JARVIS_*` env flags (52 curated seed), each with type + category (8 slots) + source_file + example + posture-relevance (CRITICAL/RELEVANT/IGNORED). First Wave 1 #1 consumer via relevance filtering. Bounded Levenshtein typo detection (`JARVIS_POSTUR_ENABLED` → suggests `JARVIS_POSTURE_ENABLED`). Surfaces: `/help {verbs,flags,flag,unregistered,category,posture,stats}` REPL, `GET /observability/{flags,verbs}`, SSE `flag_typo_detected`/`flag_registered`. **Graduated 2026-04-21** — `JARVIS_FLAG_REGISTRY_ENABLED` default `true`; registry data structure stays alive master-off (descriptive, not authoritative). `/help help` works master-off (discoverability). Wave 1 #2. Details: `memory/project_flag_registry_graduation.md`.
 - **AuditRatchet sweep + AuditDriftSensor** (`audit_ratchet.sweep` + `intake/sensors/audit_drift_sensor.py`, 2026-08-15): closes the loop from *measured* to *acted on*. The ratchet's boot watchdog only ever logged one WARNING line; a regression against an accepted floor now becomes an `IntentEnvelope`. **One scan, N consumers**: `sweep()` is single-flight + TTL-cached (`JARVIS_AUDIT_SWEEP_TTL_S`, default 900s) over `run_registered_watchdogs()` — the boot seam and the sensor share the same reading (the two shipped instruments cost ~12s + ~29s of parsing), and a cached reading is re-stamped `fresh=False` so no consumer can report a scan it never ran. **Dedup is structural, not statistical**: findings cluster by their resolved DIRECTORY (`locate_finding`: `path::node` → path; dotted module → two stats, then the canonical `reverse_dep_resolver.build_module_to_path`) — no trace hashing, no correlation window. A drift large in *proportion* to `scanned` (`max(STORM_MIN=12, STORM_FRACTION=0.05 × scanned)`) collapses to ONE storm envelope. Subset buckets claim their keys first (evidence `flag_literal` ⊂ `source_only`), unlocatable findings never become ops (counted in `health()`), and every envelope is `urgency=low` on BACKGROUND. Event-primary via `fs.changed.*` with a settle timer (`JARVIS_AUDIT_DRIFT_SETTLE_S`, 300s) coalescing an editing session into one measurement; poll is the backstop. **The floor is not an editable target** — `.jarvis/` plus `audit_ratchet`/`surface_reachability`/`source_assertion_audit`/`audit_drift_sensor` are in `tool_executor._PROTECTED_PATH_SUBSTRINGS`, so the cheapest "fix" (re-accept the baseline, weaken the audit) is structurally refused. Master `JARVIS_AUDIT_DRIFT_SENSOR_ENABLED` default **false**. Token bucket + per-scan cap shared with the cage/liveness sensors via `intake/sensors/emission_control.py`. 31 tests.
 - **AutoCommitter** (`auto_committer.py`): Structured git commits with O+V signature after APPLY+VERIFY. Conventional commit format, risk-tier metadata, protected-branch push prevention.
-- **OrangePRReviewer** (`orange_pr_reviewer.py`): Async-review path for Orange-tier (`APPROVAL_REQUIRED`). Creates a `ouroboros/review/{op-id}` branch, commits candidate, pushes, files PR via `gh pr create` with evidence + checklist. Loop continues; human reviews async. Opt-in via `JARVIS_ORANGE_PR_ENABLED` (default `false`); falls back to CLI approval on any failure. Manifesto §7.
+- **OrangePRReviewer** (`orange_pr_reviewer.py`): Async-review path for Orange-tier (`APPROVAL_REQUIRED`). Creates a `ouroboros/review/{op-id}` branch, commits candidate, pushes, files PR via `gh pr create` with evidence + checklist. Loop continues; human reviews async. Opt-in via `JARVIS_ORANGE_PR_ENABLED` (default `false`); falls back to CLI approval on any failure. Manifesto §7. Its push goes through `remote_push_guard`, so while the zero-push air-gap is on (the default) it cannot push.
 - **IDEObservabilityRouter** (`ide_observability.py`, Gap #6 Slice 1): Read-only GETs on `EventChannelServer`: `/observability/{health,tasks,tasks/{op_id}}` (bounded projection). Loopback-only + 120/min/IP rate limit + CORS allowlist + `schema_version: "1.0"` + `Cache-Control: no-store`. Authority invariant grep-enforced (no orchestrator/policy/iron_gate imports). `JARVIS_IDE_OBSERVABILITY_ENABLED` graduated default `true` (2026-04-20). 41 tests.
 - **IDEStreamRouter + StreamEventBroker** (`ide_observability_stream.py`, Gap #6 Slice 2): SSE at `GET /observability/stream`, unidirectional. 10 event types. Bounded: 8 subs × 64 queue × 512 history × 15s heartbeat. Drop-oldest → single `stream_lag` per window. `Last-Event-ID` replay. task_tool publish hooks best-effort. `JARVIS_IDE_STREAM_ENABLED` graduated default `true` (2026-04-20). 49 tests. Details: `memory/project_gap_6_*.md`.
 - **VS Code/Cursor/Sublime/JetBrains extensions** (`extensions/{vscode,sublime,jetbrains}-jarvis/`, Gap #6 Slices 3/5/6): Read-only consumers of Slice 1 GET + Slice 2 SSE. Tree view + detail webview (CSP-hard) + status bar + command palette. Cursor zero-change (VS Code fork, `vscode-webview://` CORS matches). Native fetch SSE parser, exp-backoff+jitter reconnect, bounded LRU, poll fallback. 35 TS + 27 Sublime + 28 Kotlin tests.
@@ -158,13 +206,60 @@ O+V is **proactive** (self-initiating), not reactive (human-prompted). Key capab
 - **Multi-modal ingest** (`ctx.attachments` → Claude/DW GENERATE): Two paths (VisionSensor autonomous + SerpentFlow `/attach` human-initiated) converge at `unified_intake_router` hoist → `Attachment(kind=...)`. `providers.py::_serialize_attachments()` emits native Claude image/document blocks or OpenAI-compat `image_url` blocks for DW. Validates path + extension + mime + 10MiB cap + sha256[:8] hash. BG/SPEC routes strip attachments. Master: `JARVIS_GENERATE_ATTACHMENTS_ENABLED`.
 - **Visual VERIFY** (`visual_verify.py`, Slices 3-4): Post-APPLY pre-COMPLETE UI check. 3-tier trigger (target_files glob / plan ui_affected / risk-based fallback). Deterministic battery (first-miss-wins: app_crashed / blank_screen / hash_unchanged / hash_scrambled). TestRunner-red clamps a pass to fail (asymmetric). Model-assisted advisory via injectable VLM + AdvisoryLedger (verdict + reasoning_hash only). Auto-demotion at ≥50% post-graduation FP.
 
-## Battle Test
+## How Work Reaches `main`
+
+1. **Sources** — any of the following, each ending in a signed goal:
+   - the signed roadmap `.jarvis/roadmap.yaml` (HMAC-SHA256: `strategy_signer.py` / `roadmap_reader.py`; runtime state, not tracked);
+   - the operator's `/goal sanction <desc> --files … [--symbol …]` then `/goal inject <id>` (`operator_goal_sanction.py`);
+   - **Goal Discovery** (`autonomy/goal_discovery.py`), which turns evidence into goals — red tests rank above uncovered modules — via `synthesize_and_sign()`;
+   - `WorkOrderSensor` and the other intake sensors.
+2. **Autonomous Sentinel Mode** (`autonomy/sentinel.py`) auto-approves up to `JARVIS_SENTINEL_AUTO_APPROVE_MAX_TIER` (default APPROVAL_REQUIRED). BLOCKED operations, Order-2 self-modification and anything touching the cage always escalate.
+3. **Execution** happens in a sovereignty worktree on `ouroboros/auto/<session>-<nonce>`. AutoCommit adds `Signal:` / `Session:` trailers plus `Co-Authored-By: Ouroboros+Venom <ouroboros@jarvis.trinity>`, which is the trailer that counts a landing.
+4. **Accumulation** is a fast-forward onto `ouroboros/battle-test/<ts>`.
+5. **Promotion gate** (`accumulation_promotion_gate.py`) runs four checks: provenance, coverage (green tests matched by `test_<stem>.py` name — a same-named test for another module can satisfy it), no public symbol removed, and not cosmetic-only. Refusals go to `ouroboros/quarantine/*`.
+6. **`main_promoter.py`** fast-forwards **local** `main` (armed by `JARVIS_ACCUMULATION_PROMOTION_ENABLED`, which `ov` sets).
+7. **Zero-push air-gap** (`remote_push_guard.py`, `JARVIS_REMOTE_PUSH_AIRGAP` default true): every push site goes through one guard, and an AST test fails on any unguarded push. Publishing is an operator act.
+
+`GoalReconciliationLedger` (`goal_reconciliation_ledger.py`) binds goal to commit using state derived from git, not logs. Session `summary.json` has undercounted landings — trust git and the ledger.
+
+## Trinity Learning Loop
+
+1. `observability/trajectory_recorder.py` writes one `ExperienceEvent` per candidate. The local lane draws three or more sibling candidates per operation, each with its own VALIDATE verdict.
+2. `observability/landing_provenance.py` adds git-proven `landed` / `surviving` labels.
+3. `observability/training_handoff.py` runs one exclusive GPU cycle: lease J-Prime → Reactor GRPO trains a LoRA (attention-only, 4-bit per-expert NF4 base) → GGUF → publish to J-Prime's adapter registry → greedy comparison against the incumbent → activate, or roll back.
+4. Auto-train is off (`JARVIS_GRPO_AUTOTRAIN_ENABLED`). The 5090 holds one large model at a time, so any other GPU job must take the J-Prime lease first, never run beside the serving model.
+
+## Safety Rails Added Since April
+
+- **Test containment.** Candidate code runs in a private PID namespace (`process_session.py`); a generated test once ran `pkill -f jarvis`. A resource-aware execution lock caps test runs beside a live soak. Modules that execute on import are quarantined (`environment_integrity.py`).
+- **Capability assurance** (`capability_assurance.py`). The system refuses rather than running an operation below its declared envelope.
+- **Reachability ledger** (`reachability_ledger.py`, `/reach`). Tracks each capability through registered → invoked → effective. A scan once found 131 features that were flag-on but imported by nothing.
+- **Production envelope** (`production_envelope.py`). About 40 run budgets are derived from one wall-clock figure instead of being set independently.
+- **Economic state** (`economic_state.py`) and the rehearsal tier (`rehearsal_tier.py`, default off). When every paid lane is dry, an operation ends honestly instead of re-walking the failover cascade.
+
+## Running O+V
+
+**The operator surface is `ov`** (PEP 621 console script → `backend/core/ouroboros/cli/ov.py`):
+
+| Command | What it does |
+|---|---|
+| `ov` | Cockpit. Attaches to the running organism, or cold-boots one in the background. Arms Sentinel mode and the production-soak profile (`OUROBOROS_PRODUCTION_SOAK=1`, promotion on). Opt out with `--no-sentinel` / `--no-production-soak`; an exported falsey env value always wins. |
+| `ov run` / `ov daemon` | Headless organism. |
+| `ov attach` / `ov status` / `ov doctor [--live]` | Inspect a running organism. |
+| `ov system` / `ov hive` | Passive panels: system state, agent activity. |
+| `ov link` | Body ↔ Engine bridge (Mac front end to a WSL back end). |
+
+- **Slash commands** are auto-discovered from every `*_repl.py` exposing `dispatch_<verb>_command`, plus harness handlers. Key ones: `/goal`, `/why`, `/reach`, `/spend`, `/btw`, `/posture`.
+- **Long unattended runs** use `scripts/soak/launch_supervised_soak.sh`, which records why each soak ended and outlives the launching session.
+- **On the author's host,** O+V executes from a native-ext4 clone in WSL (`/home/jarvis_svc/jarvis`, venv `/home/jarvis_svc/.venvs/ov/bin/python`). The Windows checkout is the authoring tree; code edited there does not reach a soak until it is committed into the execution clone.
+
+### The battle-test engine
 
 ```bash
 python3 scripts/ouroboros_battle_test.py --cost-cap 0.50 --idle-timeout 600 -v
 ```
 
-Boots the full 6-layer stack: GovernedLoopService, IntakeLayer (24 sensors), TrinityConsciousness, StrategicDirection, CommProtocol, SerpentFlow CLI.
+`ov` hands off to this script, which remains the single source of truth for flags. It boots the full 6-layer stack: GovernedLoopService, IntakeLayer (24 sensors), TrinityConsciousness, StrategicDirection, CommProtocol and SerpentFlow CLI.
 
 **`--max-wall-seconds SEC`** (env `OUROBOROS_BATTLE_MAX_WALL_SECONDS`, Ticket A1 Guard 2, 2026-04-23): hard wall-clock ceiling on total session duration — fires `stop_reason=wall_clock_cap` when exceeded. Opaque to any activity signal so it cannot be defeated by provider retry storms that reset `--idle-timeout`'s per-op liveness counter (the failure mode that hung #7 GENERATE S2 for 67+ min). `0` or unset disables the cap (legacy 3-way race: shutdown / budget / idle). **Graduation soaks MUST set this** — typical value `2400` (40 min) for ~2× safety margin over the 850–1300s happy-path. Treated equivalent to `idle_timeout` for clean-bar purposes in the Wave 2 (5) graduation matrix harness-class footnote.
 
@@ -184,10 +279,38 @@ Operator-visible UX (Rich): the GENERATE token stream (`stream_renderer.py`) and
 
 ```
 backend/core/ouroboros/
+  cli/
+    ov.py                       # `ov` cockpit / daemon entry point (bare `ov` arms Sentinel + production soak)
   governance/
     governed_loop_service.py    # Main loop (Zone 6.8)
     orchestrator.py             # 11-phase FSM
-    candidate_generator.py      # 3-tier failback + route-based dispatch
+    phase_runners/validate_runner.py  # The single VALIDATE owner (micro-fix → VALIDATE_RETRY → L2)
+    candidate_generator.py      # Local-primary free lane + 3-tier paid failback + route-based dispatch
+    paid_lanes.py               # Single authority: paid lane switched on / configured / allowed
+    economic_state.py           # ECONOMIC (out of credit) vs quota vs outage
+    production_envelope.py      # ~40 run budgets derived from one wall-clock figure
+    tool_masking.py             # Grammar allows only tool calls until exploration is met
+    ast_signature_anchor.py     # Real module API injected into GENERATE
+    lesson_memory.py            # Module-keyed failure lessons
+    interactive_repair.py       # Traceback-guided micro-fix (bounded by micro_fix_governor.py)
+    operator_goal_sanction.py   # /goal sanction: author + HMAC-sign + inject a scoped goal
+    strategy_signer.py          # Roadmap signing; roadmap_reader.py verifies
+    goal_reconciliation_ledger.py  # Goal ↔ commit binding derived from git
+    accumulation_promotion_gate.py # Provenance / coverage / no-symbol-removed / not-cosmetic
+    main_promoter.py            # Fast-forward of local main on verified landings
+    remote_push_guard.py        # Zero-push air-gap (one guard on every push site)
+    trinity_siblings.py         # Boot brings up J-Prime + Reactor
+    capability_assurance.py     # Refuse rather than degrade silently
+    reachability_ledger.py      # registered → invoked → effective
+    process_session.py          # PID-namespace containment for candidate code
+    environment_integrity.py    # Boot contract; import-execution hazards
+    autonomy/
+      sentinel.py               # Autonomous Sentinel Mode (tier ceiling, safety floor)
+      goal_discovery.py         # Evidence → signed goals
+    observability/
+      trajectory_recorder.py    # Per-candidate training rows
+      landing_provenance.py     # Git-proven landed / surviving labels
+      training_handoff.py       # Exclusive GPU cycle: lease → train → publish → verify
     urgency_router.py           # Deterministic provider routing (§5 Tier 0)
     providers.py                # Claude + Prime providers
     doubleword_provider.py      # DW 397B
@@ -258,3 +381,13 @@ This is not a software refactor. It is the genesis of an autonomous, self-evolvi
 Full postmortems live in `docs/architecture/OUROBOROS.md#battle-test-breakthrough-log`. The canonical source of truth for any "did the loop work" question is the session `debug.log` under `.ouroboros/sessions/<session-id>/`, not `summary.json` (which has a known `attempted` counter bug).
 
 Per-arc graduation details and session-level findings are tracked in `memory/project_*.md` (one file per arc). MEMORY.md indexes them.
+
+**May–October 2026 milestones:**
+- **2026-09-06** — first autonomous landing, `704f98b1d5`.
+- **91 autonomous landings between 2026-09-06 and 2026-10-10:**
+  - 84 are new test files;
+  - 5 change production code (one was reverted);
+  - 2 are documentation.
+- **Longest clean soak: `bt-2026-10-05-012717`** — 6.03 h and 10 landings (6 substantive). Yield then hit the "supply wall": landable work, not the model, became the limit.
+
+The full record, including what did not work, is in the research paper (§93) and PRD §33–§34. Count landings by the O+V co-author trailer in `git log`, not by session summaries.

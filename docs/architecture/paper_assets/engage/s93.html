@@ -1,0 +1,133 @@
+<!-- CHECKPOINT before: ### §93.7 How Work Reaches `main` Today -->
+<aside class="checkpoint" id="cp-s93-1">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">A single local GPU now generates every candidate, and a candidate that passes VALIDATE sits in an isolated worktree. Before reading on, predict which stages should sit between that worktree and <code>main</code>, and whether the organism should push its own results to GitHub.</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>The candidate is committed in a sovereignty worktree with <code>Signal:</code>, <code>Session:</code> and O+V co-author trailers. It accumulates on a per-session <code>ouroboros/battle-test/&lt;ts&gt;</code> branch. A promotion gate then checks provenance, coverage and that no public symbol vanished, and failures go to <code>ouroboros/quarantine/*</code>. Survivors are fast-forwarded onto local <code>main</code> only. It never pushes: a zero-push air-gap guards every push site, so publishing to GitHub remains an operator act. See §93.7.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- CHECKPOINT before: #### §93.9.3 The Attach Protocol -->
+<aside class="checkpoint" id="cp-s93-3">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">You close the terminal while O+V is halfway through an operation, and reattach twenty minutes later. What do you predict happened to the operation, and to everything it reported while you were away?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>The operation carried on. The organism is a separate daemon process, and closing the cockpit only detaches a client. What it reported while you were away was kept in an offline backlog (200 frames, 30-minute lifetime by default). On reattach the daemon sends a fresh hydration frame, then the control-plane replay, then that backlog, before any new live output. Before <code>381f943f93</code>, those frames were simply discarded. See §93.9.3.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- CHECKPOINT before: ### §93.11 The Trinity Closes the Loop: Recorder → Reactor → J-Prime -->
+<aside class="checkpoint" id="cp-s93-2">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">Reactor has trained a LoRA adapter on O+V's own recorded attempts, and J-Prime serves it. Predict whether that adapter made the model measurably better, and what evidence would actually count as proof.</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>No improvement has been shown. The adapter beat the incumbent 4/6 to 3/6 on its gate. The project's own notes reject that as evidence of learning: three contributing answers, a gradient norm of about 1e-4, and one greedy flip. The evidence that counts is a held-out benchmark: 30 tasks drawn from human commits with hidden tests. There the adapter was accepted on 1/30 or 3/30, solved 0, and showed a mean gain of 0.03. Until a held-out gain appears, no training-derived change is pushed. See §93.11.</p>
+</details>
+</aside>
+<!-- END -->
+<!-- ENDBLOCK s93 -->
+#### Check your understanding: §93 — Developments (May 14 – October 13, 2026)
+
+<div class="engage" id="engage-s93">
+<p class="engage-kicker">Conceptual questions</p>
+<details class="cq"><summary>1. Why does §93 count autonomous landings by a commit trailer on <code>main</code>, rather than by what each soak session reports in its summary?</summary>
+<p>The summaries were measured to be wrong. PRD §34 records session summaries undercounting landings (2 against 3, and 1 against 10), so "the ledger and git, not the summary, are the source of truth" (§93.10). A trailer such as <code>Co-Authored-By: Ouroboros+Venom</code> lives in the repository itself, so anyone can recount it with <code>git log</code>. A session log can be lost, misread or simply wrong. The same thinking runs through the rest of the design. <code>GoalReconciliationLedger</code> binds goals to commits using git ancestry, not logs (§93.7), and landing provenance attaches git-proven <code>landed</code>/<code>surviving</code> labels to training rows (§93.11). The rule also forces honesty in the other direction. The four July Run-22/23 commits carry the trailer too, so they are listed separately, not quietly folded in or dropped.</p>
+</details>
+<details class="cq"><summary>2. Every landing has already passed VALIDATE and its module's tests before it reaches the promotion gate. Why does the gate's structural "no public symbol vanished" check still matter?</summary>
+<p>The local model's most common bad output is a whole-file re-emission: it rewrites the file instead of producing a diff and reproduces <em>most</em> of it. Tests rarely assert that a given export or <code>__all__</code> entry still exists, so a lost symbol can pass every test. §93.7 says the structural check is the one that caught such a whole-file re-emission. §93.10 shows the damage that reaches <code>main</code> without such checks: one landing where only a punctuation rewrite landed (reverted), and one that dropped content later restored by hand. The root fix is diff output, and that is still the leading failure mode, with 219 whole-file answers against 6 diffs in the 10-09 soak (§93.8, §93.14). Until that is fixed, a cheap mechanical check against the lane's known regression class is what keeps passing tests from approving a damaged file.</p>
+</details>
+<details class="cq"><summary>3. What does the "supply wall" imply about how to raise landed-commit yield, and why does the plan in §93.15 delay arming the Epistemic Planner?</summary>
+<p>The supply wall means that after about four hours on a diet of uncovered modules, yield is bounded by how much landable work exists, not by the model (§93.10). In the 6.03 h soak, nothing landed from 22:24 to 00:29. A bigger model or more decode slots would not fix that, because the queue of suitable work is the bottleneck. §93.15 therefore lists widening supply as step 3: evidence-ranked red tests and sanctioned model proposals. Arming the Epistemic Planner, a new source of model-invented work, comes only after diffs land, a held-out gain is measured and supply is widened. Otherwise the backlog would fill faster than it drains. Adding work the organism cannot yet land well would only grow the queue of failures.</p>
+</details>
+<p class="engage-kicker">Quiz</p>
+<div class="quiz" id="quiz-s93">
+<div class="mcq" data-answer="4">
+<p class="mcq-q">1. What did the at-scale mutation harness measure for the static cage, and what remedy does the North Star propose?</p>
+<ol class="mcq-options" type="A">
+<li>0% escapes, confirming the curated 0/38 result at scale</li>
+<li>About 21.9% escapes, to be fixed by adding more AST rules</li>
+<li>About 4.4% escapes, exactly meeting the gate after hardening</li>
+<li>About 8.8% escapes, to be fixed by OS-level runtime containment</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>D.</strong> Two large runs converged at about 8.8%, roughly twice the 4.4% gate. The residue is <code>eval</code>/<code>exec</code>/<code>subprocess</code>/<code>pickle</code> of runtime-built strings, which a static cage cannot see by construction (§93.3).</p>
+</details>
+</div>
+<div class="mcq" data-answer="1">
+<p class="mcq-q">2. <code>governance/paid_lanes.py</code> is the single authority on paid lanes. Which three questions does it answer separately?</p>
+<ol class="mcq-options" type="A">
+<li>Is the lane switched on, configured, and allowed</li>
+<li>Is the lane reachable, funded, and rate-limited</li>
+<li>Is the lane cheapest, fastest, and least loaded</li>
+<li>Is the lane attested, quarantined, and circuit-broken</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>A.</strong> Switched on, configured and allowed are three separate verdicts, and "allowed" also consults the economic ledger. With <code>JARVIS_PAID_LANES_ENABLED=false</code>, Claude and DoubleWord are never constructed (§93.6).</p>
+</details>
+</div>
+<div class="mcq" data-answer="3">
+<p class="mcq-q">3. Why was a separate ECONOMIC state needed when the paid credit ran out in August?</p>
+<ol class="mcq-options" type="A">
+<li>The liquidity panel blocked every request once runway hit zero</li>
+<li>A 429 rate limit was being retried forever instead of freezing</li>
+<li>A 402 was read as an outage, causing 125 false awaken triggers</li>
+<li>Aegis refused to reconcile calls that returned no token usage</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>C.</strong> The failover classifier treated "out of money" as an outage. A 402 now freezes the lane and emits <code>provider_funding_required</code>, while a 429 is still retried (§93.5).</p>
+</details>
+</div>
+<div class="mcq" data-answer="2">
+<p class="mcq-q">4. Stateful tool masking (lever 3) changed only the decoding grammar. What did that grammar do, and what was the result?</p>
+<ol class="mcq-options" type="A">
+<li>Banned noop answers entirely; the full union explored 3/3</li>
+<li>Allowed only tool calls until minimum exploration; 3/3 explored</li>
+<li>Forced diff output for existing files; apply failures fell to 21</li>
+<li>Capped output at the target symbol; scope fell to about 750 tokens</li>
+</ol>
+<details class="mcq-why"><summary>Show answer</summary>
+<p><strong>B.</strong> With the full union the 30B explored 0/3. With {tool, noop} it chose noop 3/3. With {tool} only it explored 3/3 (§93.6).</p>
+</details>
+</div>
+</div>
+<p class="engage-kicker">Problem set</p>
+<div class="pset" id="pset-s93">
+<div class="problem">
+<p class="problem-q"><strong>Problem 1 (trace).</strong> Goal Discovery notices that a module under <code>backend/api/</code> has no tests. Trace that observation to a commit on local <code>main</code>, using §93.7 and §93.8. Name each stage and, for at least three of them, one thing that could stop the work there.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>There are four gates after generation: inside VALIDATE, the Test Reality Gate, the promotion gate, and the push guard. Remember that the push guard stops something other than the landing.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Source: Goal Discovery turns the evidence of an uncovered module into a signed goal through <code>synthesize_and_sign()</code>. Evidence ranks above model-invented proposals, and red tests rank above uncovered modules.</p>
+<p>Approval: the Sentinel auto-approves up to its tier ceiling. BLOCKED operations, Order-2 self-modification and anything touching the cage always escalate to the operator.</p>
+<p>Execution: the work runs in a sovereignty worktree on <code>ouroboros/auto/&lt;session&gt;-&lt;nonce&gt;</code>. Inside VALIDATE a failure meets a micro-fix, then a VALIDATE_RETRY that regenerates, then L2 repair. If all three fail, the operation dies here. The Test Reality Gate rejects a test that cannot execute, asserts nothing, or never imports its subject.</p>
+<p>AutoCommit adds the trailers and the commit accumulates on <code>ouroboros/battle-test/&lt;ts&gt;</code>. The promotion gate checks provenance, coverage and that no public symbol vanished. A failure sends the landing to <code>ouroboros/quarantine/*</code>.</p>
+<p>Survivors are fast-forwarded onto local <code>main</code> by <code>main_promoter.py</code>. The zero-push air-gap does not stop the landing. It stops the commit from leaving the machine: publishing to GitHub is an operator act. <code>GoalReconciliationLedger</code> then binds the goal to the commit through git ancestry.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 2 (analysis).</strong> The <code>bt-2026-10-05-012717</code> soak ran 6.03 h with 6 substantive landings, at 1.34 substantive landings per hour over its first 2.98 h. Estimate how many substantive landings came in the first 2.98 h and what rate the remaining time achieved. Then explain what this pattern does and does not tell you about the 30B model.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Multiply the rate by the time, subtract from 6, and divide by the remaining hours. Then reread the "supply wall" lesson.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>First window: 1.34 per hour × 2.98 h ≈ 4.0, so about 4 substantive landings. Remainder: 6 − 4 = 2 landings over 6.03 − 2.98 = 3.05 h, about 0.66 per hour. The second half ran at roughly half the rate, and the session table notes that nothing landed between 22:24 and 00:29.</p>
+<p>The model did not change during the soak, so the decline is not evidence that the model got worse. PRD §34 reads it as the supply wall: after about four hours on uncovered modules, yield is bounded by the supply of landable work (§93.10).</p>
+<p>It also does not show that the model is strong in general. 84 of 91 landings are test files, and production landings at cadence are listed as not demonstrated (§93.14). The fix the pattern points to is wider supply, step 3 in §93.15, not more slots. The slot A/B was inconclusive anyway.</p>
+</details>
+</div>
+<div class="problem">
+<p class="problem-q"><strong>Problem 3 (code reading).</strong> Open <code>backend/core/ouroboros/governance/accumulation_promotion_gate.py</code> and read <code>_public_surface</code> and <code>_check_structure</code>. Work out what counts as the "public surface", which direction of change is refused, how a file that no longer parses is treated, and whether a commit that drops an export can pass if a later commit on the branch restores it.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>The module docstring calls this a "SHRINK check", and <code>_check_structure</code>'s docstring says what it is "judged across".</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p><code>_public_surface</code> parses the source and collects module-level function, async-function and class names, plus assignment targets, that do not start with an underscore. It also collects the declared <code>__all__</code> by <code>literal_eval</code>. It returns <code>None</code> if the source does not parse.</p>
+<p><code>_check_structure</code> compares the surface before and after for each touched <code>.py</code> file. It is a shrink check. New public symbols are "ordinary work". Lost names, lost <code>__all__</code> entries, or a removed <code>__all__</code> produce a failing <code>Finding</code>. Added or deleted files are skipped, because they are not a shrink.</p>
+<p>A file that does not parse after the commit fails immediately with "does not parse after the commit". A file that did not parse before is skipped.</p>
+<p>The check is judged across the range, from <code>base</code>, not commit by commit. A drop followed by a restore on the same branch is "together, no loss". The module docstring adds that the gate fails closed and that a refusal leaves the accumulation branch in place as the quarantined, reviewable artifact. This matches §93.7, where this check caught a whole-file re-emission that tests could not see.</p>
+</details>
+</div>
+</div>
+</div>
+<!-- END -->

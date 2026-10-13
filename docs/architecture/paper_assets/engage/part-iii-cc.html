@@ -1,0 +1,146 @@
+<!-- QUICKCHECK after: ## §8. The Eleven Phases — Overview -->
+<div class="quick-check" id="qc-8">
+<p class="qc-label">Quick check · §8</p>
+<details class="qc"><summary>1. An exception unwinds the stack and no phase handles it. What guarantees the operation still ends in a terminal state?</summary>
+<p>The FSM's <code>__exit__</code> handler moves the operation to POSTMORTEM before re-raising, so no operation is leaked (§8.1). That terminal transition also writes a <code>LedgerEntry</code>.</p>
+</details>
+<details class="qc"><summary>2. The daily cost budget runs out mid-session. What happens to the next operation, and which clause of the contract governs it?</summary>
+<p>Clause 5 (cost is tracked continuously): every phase transition carries a cost update, and once the daily budget is exhausted the next operation is queued rather than executed (§8.2).</p>
+</details>
+<details class="qc"><summary>3. A contributor adds a new phase but does not wire it into the governance contract. What happens, and why?</summary>
+<p>The phase cannot be reached. The orchestrator only lets a phase move to the phases its contract permits, and the five clauses are enforced by the code's structure, not by convention (§8.2).</p>
+</details>
+</div>
+<!-- END -->
+
+<!-- QUICKCHECK after: ## §9. CLASSIFY & ROUTE — Risk and Urgency -->
+<div class="quick-check" id="qc-9">
+<p class="qc-label">Quick check · §9</p>
+<details class="qc"><summary>1. The risk ladder assigns the tier from the first rule that matches. Why must protected-path detection be Rule 0?</summary>
+<p>With first-match rules, order is precedence. If a later rule such as "single-file, non-core" fired first, a change to <code>.env</code> or a supervisor core file could be classed Green. Putting protected paths first makes BLOCKED win, and the operation short-circuits immediately (§9.1).</p>
+</details>
+<details class="qc"><summary>2. What triggers consciousness-driven escalation, and how far can it move a tier?</summary>
+<p>It fires when <code>ConsciousnessBridge.assess_regression_risk()</code> returns HIGH, reflecting the MemoryEngine's file history and the ProphecyEngine's prediction. It raises the tier one step: Green to Yellow, or Yellow to Orange (§9.1).</p>
+</details>
+<details class="qc"><summary>3. A high-urgency signal arrives from <code>todo_scanner</code>. Which route does it get, and which provider will run it?</summary>
+<p>BACKGROUND. <code>todo_scanner</code> is in <code>_BACKGROUND_SOURCES</code>, which routes to BACKGROUND regardless of urgency. That route is DoubleWord only, with no Claude fallback (§9.2).</p>
+</details>
+</div>
+<!-- END -->
+
+<!-- QUICKCHECK after: ## §10. CONTEXT_EXPANSION — Bounded Exploration Before Generation -->
+<div class="quick-check" id="qc-10">
+<p class="qc-label">Quick check · §10</p>
+<details class="qc"><summary>1. Why does the expansion prompt include target filenames but not file contents?</summary>
+<p>The aim is to get expansion suggestions while spending as few input tokens as possible (§10.1, step 1). The model only has to nominate files, not reason about their code.</p>
+</details>
+<details class="qc"><summary>2. The model suggests one path outside the repository and one inside it that does not exist. How is each handled, and why the difference?</summary>
+<p>The outside path is rejected as an Iron Gate violation, because it is a boundary breach. The missing path is silently skipped, because the model may simply have hallucinated it, which is harmless (§10.1, step 4).</p>
+</details>
+<details class="qc"><summary>3. What does each of the two rounds capture, and why is there no third?</summary>
+<p>Round one captures first-order relationships (files imported by the target). Round two captures second-order ones (files imported by those files). The paper judges that a third round would be mostly noise, because the useful signal is concentrated in orders one and two (§10.2).</p>
+</details>
+</div>
+<!-- END -->
+
+<!-- QUICKCHECK after: ## §11. PLAN — Model-Reasoned Implementation Strategy -->
+<div class="quick-check" id="qc-11">
+<p class="qc-label">Quick check · §11</p>
+<details class="qc"><summary>1. Name the three coherence checks a plan must pass, and say what happens if it fails one.</summary>
+<p>The planned files must overlap the target files, the declared dependencies must be acyclic, and the file order must be a topological sort of those dependencies (§11.5). A failure downgrades the plan to "default approach"; it does not block the pipeline.</p>
+</details>
+<details class="qc"><summary>2. Why is a planning failure soft rather than fatal?</summary>
+<p>Planning is helpful but not required. If the plan call times out or returns invalid JSON, GENERATE runs without a plan, so a failed plan never blocks a routine operation (§11.3).</p>
+</details>
+<details class="qc"><summary>3. How does an injected plan help when the third file of a multi-file change is being written?</summary>
+<p>The plan's approach, ordered changes and risk factors are injected under an <code>## Implementation Plan</code> section of the GENERATE prompt. File 3 is therefore written knowing what files 1 and 2 committed to (§11.4).</p>
+</details>
+</div>
+<!-- END -->
+
+<!-- QUICKCHECK after: ## §12. GENERATE — The Agentic Heart -->
+<div class="quick-check" id="qc-12">
+<p class="qc-label">Quick check · §12</p>
+<details class="qc"><summary>1. On the STANDARD route, the primary provider fails once with TIMEOUT and, in another case, with CONNECTION_ERROR. How does the <code>FailbackStateMachine</code> react to each?</summary>
+<p>TIMEOUT puts it in <code>FALLBACK_ACTIVE</code>: the next operation prefers the fallback provider. CONNECTION_ERROR (host unreachable) puts it in <code>QUEUE_ONLY</code>: it waits for a successful health probe before retrying (§12.1).</p>
+</details>
+<details class="qc"><summary>2. What bounds the tool loop, and what happens when the Iron Gate denies a tool call?</summary>
+<p>Two limits bound it: <code>JARVIS_GOVERNED_TOOL_MAX_ROUNDS</code> (default 5) and the generation deadline. A denied call is not fatal. A <code>tool_denied</code> result goes back to the provider as part of the conversation, and the loop continues (§12.2).</p>
+</details>
+<details class="qc"><summary>3. Why does context auto-compaction build its summary by counting instead of asking a model to summarise?</summary>
+<p>The summary is deterministic counting and string manipulation, so compaction spends no extra tokens or inference. That keeps long tool loops viable at no added model cost (§12.5).</p>
+</details>
+</div>
+<!-- END -->
+
+<!-- QUICKCHECK after: ## §13. VALIDATE — Tests and Iron Gates -->
+<div class="quick-check" id="qc-13">
+<p class="qc-label">Quick check · §13</p>
+<details class="qc"><summary>1. Validation keeps failing. Trace the escalation from the first failure to a terminal state.</summary>
+<p>The operation enters VALIDATE_RETRY and regenerates, up to <code>JARVIS_MAX_VALIDATE_RETRIES</code> (default 2). Once that budget is spent it escalates to L2 Self-Repair: up to 5 iterations within a 120 s timebox. A successful L2 iteration moves to GATE; a failed L2 sequence goes to POSTMORTEM with a classified <code>root_cause</code> (§13.2 to §13.4).</p>
+</details>
+<details class="qc"><summary>2. Which L2 kill conditions detect a loop that is not making progress, as opposed to one that has run out of time or turns?</summary>
+<p>The no-progress streak (2) and oscillation detection (matching signature hashes) catch a loop that is going nowhere. Deadline exhaustion, timebox expiry and max iterations are resource limits (§13.3).</p>
+</details>
+<details class="qc"><summary>3. Why does VALIDATE sort type errors into recoverable and unrecoverable?</summary>
+<p>The class decides the remedy. A recoverable type error can be fixed by L2. An unrecoverable one is a structural problem that needs a fresh generation (§13.1).</p>
+</details>
+</div>
+<!-- END -->
+
+<!-- QUICKCHECK after: ## §14. GATE & APPROVE — The Safety Chokepoint -->
+<div class="quick-check" id="qc-14">
+<p class="qc-label">Quick check · §14</p>
+<details class="qc"><summary>1. What does the Yellow tier's five-second delay give the operator, and why is it described as trust-building?</summary>
+<p>The diff is shown, and for <code>JARVIS_NOTIFY_APPLY_DELAY_S</code> (default 5 s) the operator can type <code>cancel &lt;op-id&gt;</code> to abort. It lets a human veto a decision they disagree with without the cost of a full approval workflow (§14.1, §14.3).</p>
+</details>
+<details class="qc"><summary>2. With <code>JARVIS_ORANGE_PR_ENABLED=true</code>, how does Orange-tier handling change, and what happens if the human rejects the PR?</summary>
+<p>Instead of blocking at the REPL, the reviewer commits the candidate to <code>ouroboros/review/&lt;op-id&gt;</code>, pushes it, opens a PR, and the autonomous loop carries on at once. On rejection the branch is deleted and a <code>FEEDBACK</code> memory entry records the reason (§14.2).</p>
+</details>
+<details class="qc"><summary>3. Why does GATE have no behaviour for the BLOCKED tier?</summary>
+<p>BLOCKED operations short-circuit at CLASSIFY, so they never reach GATE (§14.1).</p>
+</details>
+</div>
+<!-- END -->
+
+<!-- QUICKCHECK after: ## §15. APPLY — Writing Changes to Disk -->
+<div class="quick-check" id="qc-15">
+<p class="qc-label">Quick check · §15</p>
+<details class="qc"><summary>1. Single-file APPLY writes to a temp file and then renames it. What property does that give, and what is captured beforehand in case the write still fails?</summary>
+<p>The write is atomic: the target is replaced in one step, never left half-written. Before writing, <code>RollbackArtifact.capture()</code> snapshots the file's pre-APPLY state ("create" semantics for a new file). On failure, <code>restore()</code> reverts it and the operation goes to POSTMORTEM (§15.1).</p>
+</details>
+<details class="qc"><summary>2. What exactly does the stale-exploration guard compare, and what does it do on a mismatch?</summary>
+<p>It recomputes the target files' SHA-256 hashes at APPLY and compares them with those snapshotted at GENERATE (<code>ctx.generate_file_hashes</code>). A mismatch today produces a warning and a ledger entry, not a rejection (§15.3).</p>
+</details>
+<details class="qc"><summary>3. What are the <code>::NN</code> sub-op identifiers in a multi-file APPLY for?</summary>
+<p>Each file gets its own identifier (<code>op-&lt;uuid&gt;::00</code>, <code>::01</code>, ...), so per-file progress and failures can be observed. The batch is still all-or-nothing: if any file fails, the files already written are restored from their snapshots in reverse order (§15.2).</p>
+</details>
+</div>
+<!-- END -->
+
+<!-- QUICKCHECK after: ## §16. VERIFY — Post-Apply Verification Loop -->
+<div class="quick-check" id="qc-16">
+<p class="qc-label">Quick check · §16</p>
+<details class="qc"><summary>1. Why does VERIFY run a scoped test run instead of the whole suite?</summary>
+<p>Running only the tests that exercise the changed files catches regressions targeted at the diff without the wall-clock cost of the full suite (§16.1).</p>
+</details>
+<details class="qc"><summary>2. Post-apply tests fail and L2 converges on a fix. What happens next, and what if L2 had failed?</summary>
+<p>The fix is applied by the ChangeEngine on top of the already-applied change, and VERIFY runs again. If L2 fails, the operation goes to POSTMORTEM and the <code>RollbackArtifact</code> stack rolls back all applied changes (§16.2).</p>
+</details>
+</div>
+<!-- END -->
+
+<!-- QUICKCHECK after: ## §17. POSTMORTEM, COMPLETE, and Terminal States -->
+<div class="quick-check" id="qc-17">
+<p class="qc-label">Quick check · §17</p>
+<details class="qc"><summary>1. An operator cancels while a model call is in flight. Why does the call finish before the operation becomes CANCELLED?</summary>
+<p>Cancellation is cooperative. The orchestrator checks the flag at phase boundaries, not mid-phase, so the in-flight call completes before the transition. The record notes the phase where cancellation took effect and the reason (default <code>user_cancelled</code>) (§17.3).</p>
+</details>
+<details class="qc"><summary>2. How does FAILED_PERMANENT differ from POSTMORTEM?</summary>
+<p>FAILED_PERMANENT is a sink for errors that point to a programmer mistake, such as invalid configuration, a missing env var, or a schema violation that should have been caught earlier. Further events for the op are no-ops. POSTMORTEM is the general failure path. It records <code>failed_phase</code>, <code>root_cause</code> and artifacts, and feeds the ConversationBridge so the organism can learn from the failure (§17.2, §17.5).</p>
+</details>
+<details class="qc"><summary>3. What does the per-operation ledger let a reader rebuild, and which later mechanisms depend on it?</summary>
+<p>From <code>&lt;op_id&gt;.jsonl</code> (append-only, deduplicated by <code>(op_id, state)</code>) a reader can rebuild the full causal chain: risk tier, route, expanded context, plan, candidate, which Iron Gates fired, test results, terminating phase and root cause. It feeds cost analysis, failure-mode classification, convergence-trend detection and capability graduation (§17.6).</p>
+</details>
+</div>
+<!-- END -->
