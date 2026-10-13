@@ -1668,8 +1668,10 @@ def get_default_store(base_dir: Optional[Path] = None) -> PostureStore:
     global _singleton_store
     with _singleton_guard:
         if _singleton_store is None:
-            root = base_dir or Path.cwd() / ".jarvis"
-            _singleton_store = PostureStore(root)
+            from backend.core.ouroboros.governance.posture_store import (  # noqa: PLC0415
+                posture_state_dir,
+            )
+            _singleton_store = PostureStore(base_dir or posture_state_dir())
         return _singleton_store
 
 
@@ -1686,7 +1688,10 @@ def get_default_observer(
     with _singleton_guard:
         if _singleton_observer is None:
             root = project_root or Path.cwd()
-            store = get_default_store(root / ".jarvis")
+            from backend.core.ouroboros.governance.posture_store import (  # noqa: PLC0415
+                posture_state_dir,
+            )
+            store = get_default_store(posture_state_dir(root))
             _singleton_observer = PostureObserver(root, store)
         return _singleton_observer
 

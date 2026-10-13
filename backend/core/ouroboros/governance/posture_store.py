@@ -74,6 +74,25 @@ def default_history_size() -> int:
     return max(16, _env_int("JARVIS_POSTURE_HISTORY_SIZE", 256, minimum=16))
 
 
+POSTURE_DIR_ENV = "JARVIS_POSTURE_DIR"
+
+
+def posture_state_dir(project_root: Optional[Path] = None) -> Path:
+    """Where the posture triplet lives -- THE one answer every reader and the
+    writer use. ``JARVIS_POSTURE_DIR`` when set, else ``<root>/.jarvis``
+    (root defaults to the working directory).
+
+    Four call sites each derived ``cwd/.jarvis`` on their own, so any process
+    started in the repo -- a test run included -- read whatever posture the
+    live daemon last wrote: the render tests saw HARDEN and collapsed tool
+    bodies. A process that must not see the organism's state (the test
+    session) points this elsewhere once, and every reader follows."""
+    raw = os.environ.get(POSTURE_DIR_ENV, "").strip()
+    if raw:
+        return Path(raw)
+    return Path(project_root or Path.cwd()) / ".jarvis"
+
+
 # ---------------------------------------------------------------------------
 # Serialization
 # ---------------------------------------------------------------------------

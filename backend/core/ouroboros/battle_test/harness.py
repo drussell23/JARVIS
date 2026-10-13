@@ -3527,10 +3527,10 @@ class BattleTestHarness:
                 def _posture_provider() -> Optional[str]:
                     try:
                         from backend.core.ouroboros.governance.posture_store import (
-                            PostureStore,
+                            PostureStore, posture_state_dir,
                         )
                         store = PostureStore(
-                            base_dir=self._config.repo_path / ".jarvis",
+                            base_dir=posture_state_dir(self._config.repo_path),
                         )
                         reading = store.load_current()
                         if reading is None:

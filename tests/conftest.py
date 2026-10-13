@@ -63,34 +63,81 @@ def temp_test_dir(tmp_path):
     return tmp_path
 
 
-def _declare_test_env_file(config) -> None:
-    """The test process loads NO operator ``.env``.
+def _empty_env_file(root: Path) -> Path:
+    f = root / ".env"
+    f.write_text("# the test process loads no operator .env\n", encoding="utf-8")
+    return f
 
-    ``scripts/ouroboros_battle_test.py`` calls ``load_env_once`` at import
-    (so ``backend.*`` modules reading ``os.environ`` at import see a
-    populated environment), and ``test_single_flight_incumbent.py`` imports
-    it at module scope -- so COLLECTING that file hydrated the operator's
-    ``.env`` into the test process before the first test ran
-    (``JARVIS_PAID_LANES_ENABLED=false`` among it), and every later test saw
-    it. Three ``test_transport_narration_and_design`` local-tier tests failed
-    only in a batch that collected it; a per-test environ restore cannot
-    help, because the leak precedes every snapshot.
 
-    Runs in ``pytest_configure``, before collection. Uses the loader's own
-    supported knob, ``JARVIS_ENV_FILE``, pointed at an empty file this
-    session owns, so every loader that honours it loads nothing. An outer
-    setting wins (a run that deliberately tests against a real file).
-    """
+def _empty_posture_dir(root: Path) -> Path:
+    return root / "posture"          # never created: an absent dir reads as "no posture"
+
+
+#: The organism's on-disk state a test process must never read, each by the
+#: knob its OWN resolver honours -- so redirecting it here redirects every
+#: reader at once, with no per-module patching.
+#:
+#: * ``JARVIS_ENV_FILE`` -- ``scripts/ouroboros_battle_test.py`` calls
+#:   ``load_env_once`` at import and ``test_single_flight_incumbent.py``
+#:   imports it at module scope, so COLLECTING that file hydrated the
+#:   operator's ``.env`` (``JARVIS_PAID_LANES_ENABLED=false`` among it) before
+#:   the first test ran; a per-test restore cannot help a leak that precedes
+#:   every snapshot.
+#: * ``JARVIS_POSTURE_DIR`` -- the posture triplet lived at ``cwd/.jarvis``
+#:   for every reader, so a run from the repo saw the live daemon's posture:
+#:   with the organism in HARDEN, eleven render tests collapsed tool bodies.
+_HERMETIC_STATE = {
+    "JARVIS_ENV_FILE": _empty_env_file,
+    "JARVIS_POSTURE_DIR": _empty_posture_dir,
+}
+#: The seams THIS session declared. An outer setting wins (a run that
+#: deliberately tests against real state) and is then left untouched.
+_OWNED_STATE: dict = {}
+
+
+def _declare_hermetic_state(config) -> None:
+    """Point every state seam at a directory this session owns. Runs in
+    ``pytest_configure``, before collection, so even an import-time read
+    sees it. NEVER blocks a session."""
     try:
-        if os.environ.get("JARVIS_ENV_FILE", "").strip():
-            return
         import tempfile
-        d = Path(tempfile.mkdtemp(prefix="jarvis-test-env-"))
-        empty = d / ".env"
-        empty.write_text("# the test process loads no operator .env\n", encoding="utf-8")
-        os.environ["JARVIS_ENV_FILE"] = str(empty)
+        root = Path(tempfile.mkdtemp(prefix="jarvis-test-state-"))
+        for knob, build in _HERMETIC_STATE.items():
+            if os.environ.get(knob, "").strip():
+                continue
+            path = build(root)
+            os.environ[knob] = str(path)
+            _OWNED_STATE[knob] = path
     except Exception:  # noqa: BLE001 — never block a session over this
         pass
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_posture(request, monkeypatch):
+    """Each test gets its OWN posture directory and a fresh posture store
+    singleton, so a test that records a posture cannot be read by the next.
+    Only when this session owns the seam."""
+    base = _OWNED_STATE.get("JARVIS_POSTURE_DIR")
+    if base is None:
+        yield
+        return
+    import hashlib
+    digest = hashlib.sha256(request.node.nodeid.encode("utf-8", "replace")).hexdigest()[:16]
+    monkeypatch.setenv("JARVIS_POSTURE_DIR", str(Path(base) / digest))
+    _reset_posture_singleton()
+    yield
+    _reset_posture_singleton()
+
+
+def _reset_posture_singleton() -> None:
+    """Only if the module is already loaded -- never import it for this."""
+    mod = sys.modules.get("backend.core.ouroboros.governance.posture_observer")
+    reset = getattr(mod, "reset_default_store", None) if mod is not None else None
+    if callable(reset):
+        try:
+            reset()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def pytest_configure(config):
@@ -98,7 +145,7 @@ def pytest_configure(config):
     # Arm the live-state tripwire ONCE, at the top of the session. An audit
     # hook cannot be removed, so it must not be installed per-test.
     _install_live_state_audit_hook(Path(__file__).resolve().parents[1])
-    _declare_test_env_file(config)
+    _declare_hermetic_state(config)
     # Register custom markers
     config.addinivalue_line(
         "markers", "unit: mark test as a unit test"

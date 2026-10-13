@@ -5873,10 +5873,9 @@ def _build_repl_prompt_html(fallback: str) -> Any:
     def _posture() -> str:
         try:
             from backend.core.ouroboros.governance.posture_store import (
-                PostureStore,
+                PostureStore, posture_state_dir,
             )
-            from pathlib import Path
-            store = PostureStore(base_dir=Path(".jarvis"))
+            store = PostureStore(base_dir=posture_state_dir())
             reading = store.load_current()
             return reading.posture.value if reading else "?"
         except Exception:

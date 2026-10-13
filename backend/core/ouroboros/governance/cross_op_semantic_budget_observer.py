@@ -265,9 +265,9 @@ class CrossOpSemanticBudgetObserver:
         NEVER raises — degrades to empty string when unavailable."""
         try:
             from backend.core.ouroboros.governance.posture_store import (
-                PostureStore,
+                PostureStore, posture_state_dir,
             )
-            store = PostureStore(base_dir=Path(".jarvis"))
+            store = PostureStore(base_dir=posture_state_dir())
             reading = store.load_current()
             if reading is None:
                 return ""
