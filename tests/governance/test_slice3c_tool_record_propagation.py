@@ -1,3 +1,6 @@
+# [Ouroboros] Modified by Ouroboros (op=op-01a1364f-) at 2026-10-13 17:52 UTC
+# Reason: [deep_analysis/latent_defect] unreachable code after raise on line 188
+
 """Slice 3C — tool-record propagation across outer-retry attempts.
 
 Closes bt-2026-05-25-033000: Iron Gate counter saw 0 tool calls despite
@@ -187,7 +190,6 @@ def test_spine_attach_tool_records_never_raises_on_weird_input() -> None:
     def _bad_gen():
         raise ValueError("intentional")
         yield  # unreachable
-
     exc = RuntimeError("test")
     # Should not propagate the ValueError
     result = _attach_tool_records(exc, _bad_gen())
