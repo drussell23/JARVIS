@@ -490,8 +490,12 @@ def build_scoped_envelope(
     repo: str = "",
     urgency: str = "",
     confidence: float = 0.95,
+    extra_evidence: Optional[Dict[str, Any]] = None,
 ) -> Optional[Any]:
     """The ``IntentEnvelope`` that injects a sanctioned goal as one scoped op.
+
+    ``extra_evidence`` rides along (a foreground session's ``seed_ref``) but
+    can never replace the provenance fields the cage verifies.
 
     Byte-identical in shape to ``WorkOrderSensor``'s: ``source="roadmap"`` plus
     an ``evidence.provenance`` claim POINTER at the signed goal. Returns None
@@ -527,11 +531,12 @@ def build_scoped_envelope(
                 gid, getattr(_v, "reason", "?"),
             )
             return None
-        evidence: Dict[str, Any] = {
+        evidence: Dict[str, Any] = dict(extra_evidence or {})
+        evidence.update({
             "operator_goal": True,
             "goal_id": gid,
             "provenance": claim,
-        }
+        })
         return make_envelope(
             source="roadmap",
             description=str(description or "")[:2000],

@@ -4167,6 +4167,40 @@ class CandidateGenerator:
             raise err from primary_exc
         raise err
 
+    def _seeded_generation(self, context: OperationContext) -> Optional[GenerationResult]:
+        """The operator-approved proposal for this op, parsed as a provider's
+        answer would be, or None. A seed that does not parse is DROPPED with
+        a warning and the op generates normally -- never half-applied."""
+        try:
+            from backend.core.ouroboros.governance.foreground_session_ops import (
+                take_seed_with_records,
+            )
+            got = take_seed_with_records(context)
+            if got is None:
+                return None
+            raw, records = got
+            from backend.core.ouroboros.governance.providers import (
+                _file_source_hash, _parse_generation_response,
+            )
+            root = Path(self._execution_root_or_none() or ".")
+            source_path = context.target_files[0] if context.target_files else ""
+            source_hash = ""
+            if source_path and (root / source_path).is_file():
+                source_hash = _file_source_hash(
+                    (root / source_path).read_text(encoding="utf-8", errors="replace"))
+            result = _parse_generation_response(
+                raw, "operator_session", 0.0, context, source_hash, source_path,
+                repo_root=root,
+            )
+            # The session's real reads: the Iron Gate judges the exploration
+            # that produced this proposal, not an empty record.
+            import dataclasses as _dc
+            return _dc.replace(result, tool_execution_records=tuple(records))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[CandidateGenerator] session seed for op=%s unusable (%s); "
+                           "generating normally", getattr(context, "op_id", "?"), exc)
+            return None
+
     async def generate(
         self,
         context: OperationContext,
@@ -4198,6 +4232,13 @@ class CandidateGenerator:
         asyncio.TimeoutError
             If the deadline is already past and no provider can be tried.
         """
+        # A change the operator approved in a foreground session arrives as
+        # this op's candidate (foreground_session_ops). It is parsed by the
+        # SAME parser model output takes, so VALIDATE onward judge it like
+        # any candidate; only the authoring differs. No live seed -> None.
+        seeded = self._seeded_generation(context)
+        if seeded is not None:
+            return seeded
         # Memory RAG hook: before ANY provider builds its prompt (and its
         # AST-Signature Anchor), stamp the cross-op lessons for this op's
         # modules onto the strategic-memory channel. Bounded, fail-soft —

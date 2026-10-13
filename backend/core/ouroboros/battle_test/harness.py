@@ -4857,6 +4857,15 @@ class BattleTestHarness:
                 )
                 self._op_input_q = q
                 q.start()
+                # /session apply turns an accepted change into a sanctioned
+                # op through the SAME injector /goal uses.
+                try:
+                    from backend.core.ouroboros.governance.foreground_session_ops import (  # noqa: E501
+                        set_injector,
+                    )
+                    set_injector(self._inject_sanctioned_goal)
+                except Exception:  # noqa: BLE001
+                    logger.debug("[Session] injector not wired", exc_info=True)
                 # Publish for read-only observers (the heartbeat), so the
                 # operator can SEE a backlog rather than infer one from
                 # silence.
@@ -5047,6 +5056,11 @@ class BattleTestHarness:
             # Auto-discovered governance verbs (/btw, /posture,
             # /governor, /decisions, ...). See _try_registry_verb for
             # why this branch has to exist here at all.
+            pass
+        elif self._try_foreground_session(command):
+            # Inside a /session, bare text is a turn of that conversation
+            # (foreground_session). Outside one this is False and the
+            # /chat routing below is unchanged.
             pass
         elif self._try_chat_text_bridge(command):
             # Heuristic Intent Multiplexer (chat_text_bridge): bare
@@ -6361,6 +6375,15 @@ class BattleTestHarness:
         except Exception:  # noqa: BLE001
             logger.debug("[AudioIPC] client mount degraded", exc_info=True)
 
+    def _try_foreground_session(self, command: str) -> bool:
+        """True iff *command* was a turn of the typing cockpit's /session.
+        Sync + O(1): the turn runs on its own task. NEVER raises."""
+        try:
+            from backend.core.ouroboros.governance.session_repl import route_plain_text
+            return route_plain_text(command)
+        except Exception:  # noqa: BLE001
+            return False
+
     # -- Chat text bridge (Heuristic Intent Multiplexer) -------------------
 
     def _try_chat_text_bridge(self, command: str) -> bool:
@@ -7242,7 +7265,9 @@ class BattleTestHarness:
                 f"unreachable; see logs[/]")
 
     def _inject_sanctioned_goal(self, *, goal_id: str, description: str,
-                                target_files) -> Optional[str]:
+                                target_files,
+                                extra_evidence: Optional[Dict[str, Any]] = None,
+                                ) -> Optional[str]:
         """Inject a signed, file-scoped goal as ONE scoped op through the
         shared intake router. The envelope carries ``source=\"roadmap\"`` +
         the provenance claim, so classify re-derives the operator's delegated
@@ -7271,6 +7296,7 @@ class BattleTestHarness:
                 target_files=tuple(target_files),
                 urgency=(os.environ.get("JARVIS_WORK_ORDER_DEFAULT_URGENCY", "")
                          or "high").strip(),
+                extra_evidence=extra_evidence,
             )
             if envelope is None:
                 return None
