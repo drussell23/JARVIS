@@ -1635,16 +1635,18 @@ class UnifiedIntakeRouter:
         # op re-admitting itself in THIS session (its old row is dead with
         # that process); the claim is idempotent for the holder.
         if str(getattr(envelope, "source", "") or "") in _GOAL_BOUND_SOURCES:
-            _gr_ev = getattr(envelope, "evidence", None) or {}
-            _gr_goal = str(_gr_ev.get("goal_id") or "")
+            from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: PLC0415
+                binding_of as _gr_binding,
+                claim_dispatch as _gr_claim,
+            )
+            # Every way a producer states its goal (top-level, or inside the
+            # provenance claim a work order carries) -- one reader.
+            _gr_goal, _gr_digest = _gr_binding(getattr(envelope, "evidence", None) or {})
             _gr_op = str(getattr(envelope, "causal_id", "") or "")
             if _gr_goal and _gr_op:
-                from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: PLC0415
-                    claim_dispatch as _gr_claim,
-                )
                 _gr_claimed = await _gr_claim(
                     goal_id=_gr_goal,
-                    goal_digest_hex=str(_gr_ev.get("goal_digest") or ""),
+                    goal_digest_hex=_gr_digest,
                     op_id=_gr_op,
                 )
                 if not _gr_claimed.claimed:

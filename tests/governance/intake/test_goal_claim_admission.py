@@ -140,6 +140,98 @@ async def test_an_ingest_exception_after_the_claim_releases_it(tmp_path, ledger,
         await router.stop()
 
 
+# ---- idempotency: a satisfied goal is never built twice (2026-10-13) --------------
+#
+# One goal landed THREE commits: the WorkOrderSensor's boot emission ran beside
+# the Sentinel's dispatch (its envelope stated the goal only inside its
+# provenance claim, so it was unbound and never claimed), and after a restart
+# the work order was admitted again although the ledger said SATISFIED.
+
+
+def _git(repo, *args):
+    import subprocess
+    return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True,
+                          text=True).stdout.strip()
+
+
+def _repo_with_commit(root):
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+         "--allow-empty", "-m", "the landing")
+    return _git(root, "rev-parse", "HEAD")
+
+
+def _work_order_env(op_id, goal_id="goal-w"):
+    """The WorkOrderSensor's shape: the goal only inside the provenance claim."""
+    return make_envelope(
+        source="roadmap", description="lift the fallback policy", target_files=("backend/w.py",),
+        repo="jarvis", confidence=0.95, urgency="normal",
+        evidence={"work_order": True, "provenance": {"goal_id": goal_id, "signature": "s"}},
+        requires_human_ack=False, causal_id=op_id,
+    )
+
+
+def test_binding_reads_the_provenance_claim_and_prefers_the_top_level():
+    assert L.binding_of({"provenance": {"goal_id": "g1"}}) == ("g1", "")
+    assert L.binding_of({"goal_id": "top", "goal_digest": "dd",
+                         "provenance": {"goal_id": "other"}}) == ("top", "dd")
+    assert L.binding_of("junk") == ("", "")
+
+
+@pytest.mark.asyncio
+async def test_a_work_order_claims_its_goal_so_a_second_producer_is_refused(tmp_path, ledger):
+    router = _router(tmp_path)
+    await router.start()
+    try:
+        assert await router.ingest(_work_order_env("op-wo")) == "enqueued"
+        assert await router.ingest(_goal_env("op-sentinel", goal_id="goal-w",
+                                             files=("backend/w2.py",))) == "deduplicated"
+    finally:
+        await router.stop()
+    assert _dispatched() == ["op-wo"]
+
+
+@pytest.mark.asyncio
+async def test_a_satisfied_goal_is_refused_while_its_landing_exists(tmp_path, ledger):
+    sha = _repo_with_commit(tmp_path)
+    await L.record_landing(goal_id="goal-w", goal_digest_hex="", commit_sha=sha, op_id="op-1")
+    await L.record_terminal(goal_id="goal-w", op_id="op-1")
+    router = _router(tmp_path)
+    await router.start()
+    try:
+        # the boot-time work order AND a resume of the very op that landed
+        assert await router.ingest(_work_order_env("op-after-restart")) == "deduplicated"
+        claim = await L.claim_dispatch(goal_id="goal-w", goal_digest_hex="", op_id="op-1")
+        assert not claim.claimed and claim.reason == "already_satisfied"
+    finally:
+        await router.stop()
+
+
+@pytest.mark.asyncio
+async def test_work_that_was_undone_is_admitted_again(tmp_path, ledger):
+    _repo_with_commit(tmp_path)
+    _git(tmp_path, "checkout", "-q", "-b", "auto")
+    _git(tmp_path, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+         "--allow-empty", "-m", "landing on an accumulation branch")
+    sha = _git(tmp_path, "rev-parse", "HEAD")
+    await L.record_landing(goal_id="goal-u", goal_digest_hex="", commit_sha=sha, op_id="op-1")
+    await L.record_terminal(goal_id="goal-u", op_id="op-1")
+    # an accumulation-branch landing counts as present -- not only main
+    assert L.landing_present(sha, cwd=tmp_path) is True
+    assert (await L.claim_dispatch(goal_id="goal-u", goal_digest_hex="", op_id="op-2")).reason \
+        == "already_satisfied"
+    # the boot reaper / a reset removes it: no branch holds the work any more
+    _git(tmp_path, "checkout", "-q", "main")
+    _git(tmp_path, "branch", "-q", "-D", "auto")
+    assert L.landing_present(sha, cwd=tmp_path) is False
+    assert (await L.claim_dispatch(goal_id="goal-u", goal_digest_hex="", op_id="op-3")).claimed
+
+
+def test_git_that_cannot_answer_leaves_the_ledger_in_charge(tmp_path):
+    assert L.landing_present("0" * 40, cwd=tmp_path / "not-a-repo") in (None, False)
+    assert L.landing_present("", cwd=tmp_path) is None
+
+
 @pytest.mark.asyncio
 async def test_unbound_sources_never_touch_the_ledger(tmp_path, ledger):
     router = _router(tmp_path)

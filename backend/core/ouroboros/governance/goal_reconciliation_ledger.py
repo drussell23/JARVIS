@@ -707,6 +707,21 @@ def _claim_locked(
                 goal_id, op_id[:12],
             )
             return DispatchClaim(True, goal_id, op_id, reason="ledger_unverifiable")
+        # Done already? Asked FIRST and under the same lock as the claim, so
+        # no producer -- a boot-time work order, a WAL replay, a checkpoint
+        # resume of the very op that landed -- builds a satisfied goal twice.
+        # The ledger names the commit; git confirms the work still exists.
+        sha = satisfying_commit(head.records, goal_id)
+        if sha:
+            present = landing_present(sha)
+            if present is False:
+                logger.warning(
+                    "[GoalReconciliation] goal=%s was satisfied by %s, which no local branch "
+                    "holds any more — the work was undone; admitting op=%s",
+                    goal_id, sha[:10], op_id[:12],
+                )
+            else:
+                return DispatchClaim(False, goal_id, op_id, reason="already_satisfied")
         live = in_flight_op(head.records, goal_id)
         if live and live != op_id:
             return DispatchClaim(False, goal_id, op_id, holder_op=live, reason="holder_live")
@@ -719,6 +734,61 @@ def _claim_locked(
         if not _append_unlocked(rec, path):
             return DispatchClaim(False, goal_id, op_id, reason="append_failed")
         return DispatchClaim(True, goal_id, op_id, recorded=True, reason="claimed_new")
+
+
+def satisfying_commit(records: Sequence[ReconciliationRecord], goal_id: str) -> str:
+    """The commit that satisfied *goal_id*, or ``""``: the newest SATISFIED
+    row, unless a later REACTIVATED row retired it -- the same ordered scan
+    :func:`satisfied_goal_ids` performs, here keeping the sha. NEVER raises."""
+    try:
+        sha = ""
+        for rec in records or ():
+            if str(getattr(rec, "goal_id", "") or "") != goal_id:
+                continue
+            event = str(getattr(rec, "event", "") or "")
+            if event == ReconciliationEvent.SATISFIED.value:
+                sha = str(getattr(rec, "commit_sha", "") or "") or "unknown"
+            elif event == ReconciliationEvent.REACTIVATED.value:
+                sha = ""
+        return sha
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def landing_present(commit_sha: str, *, cwd: Optional[Path] = None) -> Optional[bool]:
+    """Does the work of *commit_sha* still exist in this repository?
+
+    ``True`` when the commit is held by ANY local branch -- main, an
+    accumulation branch, or a worktree's branch (worktrees share the repo's
+    refs). Deliberately not "reachable from the landing ref": autonomous
+    work lives on accumulation branches until promoted, and treating it as
+    absent is the re-dispatch spin ``satisfied_goal_ids`` documents.
+    ``False`` when the object is gone or no branch holds it (a reset, a
+    rewind, the boot reaper). ``None`` when git cannot answer (no repo,
+    timeout, a sha the ledger did not record): the ledger's word stands.
+    Synchronous -- it runs inside the claim's critical section, which is
+    already off the event loop. NEVER raises."""
+    if not commit_sha or commit_sha == "unknown":
+        return None
+    import subprocess  # noqa: PLC0415
+    root = str(cwd or repo_root())
+    try:
+        exists = subprocess.run(
+            ["git", "cat-file", "-e", f"{commit_sha}^{{commit}}"], cwd=root,
+            capture_output=True, timeout=git_timeout_s(), check=False,
+        )
+        if exists.returncode != 0:
+            return False if exists.returncode in (1, 128) else None
+        held = subprocess.run(
+            ["git", "for-each-ref", "--contains", commit_sha, "--count=1",
+             "--format=%(refname)", "refs/heads/"],
+            cwd=root, capture_output=True, text=True, timeout=git_timeout_s(), check=False,
+        )
+        if held.returncode != 0:
+            return None
+        return bool(held.stdout.strip())
+    except Exception:  # noqa: BLE001 — git absent / timeout: no verdict
+        return None
 
 
 async def claim_dispatch(
@@ -1038,15 +1108,36 @@ def superseding_op(goal_id: str, op_id: str, *, path: Optional[Path] = None, sec
         return ""
 
 
+def binding_of(evidence: Any) -> Tuple[str, str]:
+    """``(goal_id, goal_digest)`` an envelope's evidence binds to.
+
+    Two producers state the binding two ways: the roadmap reader and the
+    goal injector stamp ``goal_id`` at the top level; the WorkOrderSensor
+    carries it only inside its delegated-provenance claim (``provenance.
+    goal_id``). Reading only the first left every work order UNBOUND: no
+    dispatch claim, so it ran beside the Sentinel's op for the same goal
+    and was re-admitted after the goal was satisfied (three landings of one
+    goal, 2026-10-13), and its own landing never bound the goal. The
+    top-level binding wins when both are present. NEVER raises."""
+    try:
+        if not isinstance(evidence, dict):
+            return "", ""
+        gid = str(evidence.get("goal_id") or "").strip()
+        digest = str(evidence.get("goal_digest") or "").strip()
+        if not gid:
+            claim = evidence.get("provenance")
+            if isinstance(claim, dict):
+                gid = str(claim.get("goal_id") or "").strip()
+        return gid[:128], digest[:64]
+    except Exception:  # noqa: BLE001
+        return "", ""
+
+
 def binding_from_evidence(evidence_json: str) -> Tuple[str, str]:
-    """``(goal_id, goal_digest)`` from an op's ``intake_evidence_json`` —
-    the roadmap reader stamps both into every goal envelope. ``("", "")``
+    """:func:`binding_of` for an op's ``intake_evidence_json``. ``("", "")``
     for non-roadmap ops or malformed evidence. NEVER raises."""
     try:
-        ev = json.loads(evidence_json or "{}")
-        if not isinstance(ev, dict):
-            return "", ""
-        return str(ev.get("goal_id") or "")[:128], str(ev.get("goal_digest") or "")[:64]
+        return binding_of(json.loads(evidence_json or "{}"))
     except Exception:  # noqa: BLE001
         return "", ""
 
