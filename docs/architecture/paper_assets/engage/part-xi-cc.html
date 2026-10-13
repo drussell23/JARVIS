@@ -1,0 +1,92 @@
+<!-- QUICKCHECK after: ## §61. The Battle Test Runner -->
+<div class="quick-check" id="qc-61">
+<p class="qc-label">Quick check · §61</p>
+<details class="qc"><summary>1. What two conditions end a battle-test session, and what values does the example invocation use for them?</summary>
+<p>The session ends when the cost cap is hit, or when the idle timeout passes with no operations. The example uses <code>--cost-cap 0.50</code>, which is 0.50 US dollars, and <code>--idle-timeout 600</code>, which is 600 seconds. See §61.</p>
+</details>
+<details class="qc"><summary>2. The letter labels (A, B, C...) are "post-hoc". What does a reader need in order to check a claim about, say, Session O?</summary>
+<p>The <code>bt-YYYY-MM-DD-HHMMSS</code> session ID, which this Part maps to each letter. The letters are not stamped into the session at run time. The ID names the <code>.ouroboros/sessions/bt-&lt;timestamp&gt;/</code> directory that holds <code>debug.log</code>. See §61.1 and §61.2.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §62. Sessions A–G — ExplorationLedger Enforcement -->
+<div class="quick-check" id="qc-62">
+<p class="qc-label">Quick check · §62</p>
+<details class="qc"><summary>1. Session A made four <code>read_file</code> calls and scored 3.00 in one category. Why would the legacy gate have passed it?</summary>
+<p>The legacy gate checked <code>tool_calls &gt;= 2</code>. It counted calls, and four is at least two. The ledger weights the diversity of exploration, so four reads of one kind score low. See §62 and §62.1.</p>
+</details>
+<details class="qc"><summary>2. Session C landed nothing. Why does the paper still list it?</summary>
+<p>It proved the instrumentation from commit <code>614009ec05</code>, the Track 1 and Track 2 diagnostics. The paper says that without it the wrong diagnosis would have persisted. Measurement came before further fixes. See §62.3.</p>
+</details>
+<details class="qc"><summary>3. Session G passed at 25.50, and Session O later passed at 11.00. How can such different scores both pass?</summary>
+<p>The ledger compares the score with a floor set by the complexity tier, not with a fixed target. Commit <code>4f60a584f9</code> set the complex-tier floor at 10.0. Any score above the floor passes. See §62.6, §62.5 and §63.2.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §63. Sessions H–O — The Unmasking Ladder and First APPLY -->
+<div class="quick-check" id="qc-63">
+<p class="qc-label">Quick check · §63</p>
+<details class="qc"><summary>1. Sessions I, L and M were resolved with environment overrides, not commits. What does that say about those failures?</summary>
+<p>They were limits that real load exceeded, not wrong code: a <code>too_many_files</code> risk escalation, a 900s pool ceiling and a 180s fallback cap. Raising the thresholds was enough. That is also why the arc made such thresholds tunable from the environment (commit <code>5d169266d6</code>). See §63.1.</p>
+</details>
+<details class="qc"><summary>2. Session O's first attempt scored 0.00 on the ExplorationLedger. What turned it into a pass?</summary>
+<p>The retry injected sharpened feedback, and the second attempt scored 11.00 across four categories with <code>would_pass=True</code>. See §63.2.</p>
+</details>
+<details class="qc"><summary>3. Session O recorded two <code>applied</code> DECISIONs for one operation. Why two?</summary>
+<p>The first applied the candidate. VERIFY then found test critiques, L2 Repair converged on iteration 1 of 5, and the repaired result was applied in a second DECISION. POSTMORTEM then reported <code>root_cause=none</code>. See §63.2.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §64. Sessions Q–S — Multi-File Enforcement -->
+<div class="quick-check" id="qc-64">
+<p class="qc-label">Quick check · §64</p>
+<details class="qc"><summary>1. What was the original bug that Session Q isolated?</summary>
+<p>The parser rejected multi-file candidates with <code>schema_invalid:candidate_0_missing_file_path</code>. It expected a single-file shape. Session R then verified the parser fix with a 4-file candidate. See §64.1 and §64.2.</p>
+</details>
+<details class="qc"><summary>2. Session R died at the exploration gate with 0 fresh tool calls. Why did the paper not count that as a multi-file failure?</summary>
+<p>The 4-file candidate had already passed the parser, so the multi-file path worked. The rejection came from the op running right after another and making no fresh exploration calls: a consecutive-op issue. See §64.2.</p>
+</details>
+<details class="qc"><summary>3. Why did Session S run with <code>JARVIS_EXPLORATION_GATE=false</code>?</summary>
+<p>To isolate Gate 5, multi-file coverage. Session R had just shown that the exploration gate could stop an op before coverage was ever tested. Turning it off let the session test one mechanism at a time. See §64.2 and §64.3.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §65. Sessions U–W — First End-to-End Multi-File APPLY -->
+<div class="quick-check" id="qc-65">
+<p class="qc-label">Quick check · §65</p>
+<details class="qc"><summary>1. In Session U, the same candidate was <code>'test'</code> on iteration 0 and <code>'infra'</code> on iteration 1. Why was that fatal, not just noisy?</summary>
+<p>An <code>'infra'</code> result routes through the non-retryable <code>_early_return_ctx</code> branch. A sandbox flake on the re-validation therefore ended the op, even though the real problem was a fixable LSP defect. See §65.2.</p>
+</details>
+<details class="qc"><summary>2. The fix gives L2 a fresh deadline. Why does it also reconcile <code>ctx.pipeline_deadline</code> upward?</summary>
+<p>So that phases after L2 see a consistent clock for the op. Without that, L2 would hold 600s while the op's own deadline still read 0.0s, and later phases would see two clocks that disagree. See §65.4.</p>
+</details>
+<details class="qc"><summary>3. How did the paper confirm Session W's four files landed, and what independent check of their quality followed?</summary>
+<p>Disk state was verified by mtime, and the files matched. A separate <code>pytest</code> run then passed 20 of 20 tests against the real <code>TestFailureSensor</code>, not a mock, and covered the four behaviours the backlog task asked for. See §65.4.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §66. What the Battle Tests Prove (Honest Accounting) -->
+<div class="quick-check" id="qc-66">
+<p class="qc-label">Quick check · §66</p>
+<details class="qc"><summary>1. The T→U and V→W episodes are counted as proof of what?</summary>
+<p>Of §8 Absolute Observability working as a diagnostic loop: hypothesize, instrument, falsify or confirm, fix, and verify in one session. FSM instrumentation disproved the silent-exit idea in one session, and one INFO line named the L2 budget bug. See §66.1.</p>
+</details>
+<details class="qc"><summary>2. §66.1 claims only the "enforcement half" of §6 Threshold-Triggered Neuroplasticity. What half is missing?</summary>
+<p>Durability. §6 asks for three consecutive successes before a capability graduates, and Session W is one. See §66.1 and §66.2.</p>
+</details>
+<details class="qc"><summary>3. The stale <code>phase=CLASSIFY</code> in <code>cost_governor.finish</code> only affects a log. Why is it still on the list of load-bearing items?</summary>
+<p>The paper calls it display-only, but also "a real ctx-reference inconsistency": the governor reads an outdated phase from the context. Such an inconsistency is a deferred defect, not a fix. See §66.2.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §67. The Breakthrough Log as Research Artifact -->
+<div class="quick-check" id="qc-67">
+<p class="qc-label">Quick check · §67</p>
+<details class="qc"><summary>1. What makes the breakthrough log a "falsifiability trail"?</summary>
+<p>It records each hypothesis, observed failure, added instrumentation, fix commit, cost and duration, and quotes the debug logs. A reader who disputes a claim can go to the session and read the raw evidence. See §67.</p>
+</details>
+<details class="qc"><summary>2. How does this differ from the per-operation observability of earlier Parts?</summary>
+<p>It covers the system's whole developmental history, not single operations. The paper calls this Principle 7 at the system level, a "fossil record". See §67.</p>
+</details>
+</div>
+<!-- END -->

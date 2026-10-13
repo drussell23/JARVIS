@@ -1,0 +1,31 @@
+<!-- XBLOCK part-ii -->
+<p class="engage-kicker engage-kicker-x">Connections</p>
+<div class="pset pset-x">
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 1 (Graph theory).</strong> A Saga (§7.2) carries three <code>RepoPatch</code> objects: P_prime (a J-Prime schema), P_jarvis (the Body client for that schema) and P_reactor (a Reactor runner that calls the Body client). The declared dependencies are that P_jarvis needs P_prime, and P_reactor needs P_jarvis. (a) Draw the dependency DAG and give every valid apply order. (b) Drop the second edge, so P_reactor is independent. How many valid orders are there now? (c) With the original DAG, P_reactor fails to apply. List the compensation steps. (d) All three apply, but the <code>CrossRepoVerifier</code> fails. List the compensation steps and count the total <code>ChangeEngine</code> calls. (e) Show that undoing in reverse order never leaves an applied patch without its dependency, while undoing in forward order can.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>A valid apply order is a topological sort. During compensation, look at the set of patches still applied after each step, and ask whether that set is closed under "depends on".</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) The edges are P_prime to P_jarvis to P_reactor, a chain. A chain has exactly one topological order: P_prime, P_jarvis, P_reactor.</p>
+<p>(b) With only the edge P_prime to P_jarvis, P_reactor can go in any of three positions relative to the fixed pair. That gives 3 valid orders: (R, P, J), (P, R, J) and (P, J, R).</p>
+<p>(c) P_prime and P_jarvis are already applied. Compensation walks them in reverse: roll back P_jarvis, then roll back P_prime. That is 2 rollbacks, after 2 successful applies and 1 failed apply.</p>
+<p>(d) All three are applied, so compensation rolls back P_reactor, then P_jarvis, then P_prime. That is 3 applies plus 3 rollbacks: 6 <code>ChangeEngine</code> calls, ending fully reverted, as §7.2 guarantees.</p>
+<p>(e) Applying in topological order means the applied set is always a prefix of that order. A prefix of a topological order is closed under dependencies: every applied patch has its prerequisites applied. Removing the last element of a prefix leaves a shorter prefix, so reverse-order undo keeps that invariant at every step. Forward-order undo would first remove P_prime while P_jarvis is still applied: a Body client pointing at a schema that no longer exists. That is exactly the broken-contract state §7.1 warns about.</p>
+<p>What this says about the architecture: the dependency DAG fixes the apply order, and its reverse fixes the undo order. Every intermediate state of the Saga is then internally consistent, not just the two end states.</p>
+</details>
+</div>
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 2 (Formal verification: invariants).</strong> §6 says the <code>_file_touch_cache</code> allows three O+V modifications per file per ten-minute window, after which "further modifications are hard-blocked until the window resets". Suppose the property you want is I: "no file is modified more than 3 times in any 10-minute interval." The paper does not say whether windows are fixed (aligned to boundaries) or sliding, so analyse both. (a) Under fixed windows, build a trace that satisfies the cache but violates I. What is the most touches possible within a few seconds? (b) Under each design, what is the most touches in any 60-minute interval? (c) Which design makes I an invariant?</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>A fixed-window counter forgets everything at the boundary. An arbitrary 60-minute interval that does not start on a boundary overlaps seven fixed windows.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) Fixed windows, boundaries at 10:00 and 10:10. Touch the file at 10:09:58, 10:09:59 and 10:09:59.5. That is 3 touches in window one, all allowed. At 10:10:00 the counter resets, so touches at 10:10:00, 10:10:00.5 and 10:10:01 are also allowed. That is 6 touches in about 3 seconds, violating I.</p>
+<p>(b) Sliding window: any 60-minute interval splits into six consecutive 10-minute intervals, each holding at most 3 touches. That gives at most 18. Fixed windows: an interval starting mid-window overlaps seven windows (a partial first one, five whole ones, a partial last one). Each can put 3 touches inside the overlap, so up to 21.</p>
+<p>(c) Only the sliding design, which keeps per-file timestamps and counts those in the last 600 s, makes I hold in every state. The fixed design enforces a weaker property: at most 3 per aligned window, which allows bursts of 6 across a boundary.</p>
+<p>What this says about the architecture: the cache is a concurrency guard against O+V repeatedly reworking the same file. Whether it meets that intent depends on an implementation detail the description leaves open. Writing the guard's property down as an invariant shows exactly which detail matters, and gives a test to check it against: the boundary-burst trace in (a).</p>
+</details>
+</div>
+</div>
+<!-- END -->

@@ -1,0 +1,94 @@
+<!-- QUICKCHECK after: ## §44. Capability 1 — Operation Intent Visibility -->
+<div class="quick-check" id="qc-44">
+<p class="qc-label">Quick check · §44</p>
+<details class="qc"><summary>1. Where does the <code>reasoning:</code> line in the CLI come from, and when is it captured?</summary>
+<p>It comes from <code>candidate_rationales</code> at GENERATE, stored per operation with <code>set_op_reasoning(op_id, reasoning)</code>, and rendered under each <code>Update(path)</code> block in SerpentFlow. It is the model's own explanation, captured at the moment of decision (§44).</p>
+</details>
+<details class="qc"><summary>2. What does the operator gain from the rationale that the diff alone does not give?</summary>
+<p>The diff shows what changed; the rationale shows why. That makes the autonomy legible: the operator can follow the model's thinking, which the paper ties to Principle 7, Absolute Observability (§44).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §45. Capability 2 — Severity-Based Human Escalation Protocol -->
+<div class="quick-check" id="qc-45">
+<p class="qc-label">Quick check · §45</p>
+<details class="qc"><summary>1. Why does a BLOCKED operation stop at CLASSIFY instead of being generated and then rejected later?</summary>
+<p>The refusal is structural, not advisory: the orchestrator never attempts GENERATE, writes a BLOCKED ledger entry and emits a BLOCKED POSTMORTEM. No candidate for a forbidden target (supervisor, credentials, governance engine) is ever produced (§45.2).</p>
+</details>
+<details class="qc"><summary>2. What does the operator have to do for a yellow <code>NOTIFY_APPLY</code> operation to land?</summary>
+<p>Nothing. The change auto-applies after the 5-second window unless the operator types <code>cancel op-id</code>. The human is informed and can intervene, but is not required to (§45.1).</p>
+</details>
+<details class="qc"><summary>3. Which rule numbers put an operation in the yellow tier?</summary>
+<p>Rule 10 (new files), Rule 11 (multi-file changes) and Rule 12 (core orchestration paths) (§45 table).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §46. Capability 3 — Operation Dependency Chains (DAG-Based Signal Merging) -->
+<div class="quick-check" id="qc-46">
+<p class="qc-label">Quick check · §46</p>
+<details class="qc"><summary>1. Without the file-overlap check, what would happen when two sensors target the same file at once?</summary>
+<p>Two uncoordinated operations would run, and one would trample the other's changes, so the organism would produce a merge conflict with itself (§46).</p>
+</details>
+<details class="qc"><summary>2. When operation A finishes, how does a signal queued behind it get going again?</summary>
+<p><code>release_op(op_id_A)</code> removes A's files from <code>_active_file_ops</code> and re-ingests the queued signal automatically, so it is planned against the new state that includes A's patch (§46.1, §46.2).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §47. Capability 4 — Exploration-First Enforcement -->
+<div class="quick-check" id="qc-47">
+<p class="qc-label">Quick check · §47</p>
+<details class="qc"><summary>1. A model calls <code>read_file</code> on the same file four times with the same arguments. How much diversity credit do the last three calls earn?</summary>
+<p>None. Duplicate calls (same tool and same <code>arguments_hash</code>) get zero credit, because progress is measured as new files or queries, not repeated fetches (§47.3).</p>
+</details>
+<details class="qc"><summary>2. What happens when a candidate fails the exploration gate?</summary>
+<p>The Iron Gate, at the post-GENERATE, pre-VALIDATE checkpoint, returns a <code>GENERATE_RETRY</code> with targeted feedback naming the required exploration. The paper reports the model typically explores properly on the retry (§47.2).</p>
+</details>
+<details class="qc"><summary>3. Why do <code>trivial</code> operations bypass the ledger while <code>architectural</code> ones must cover <code>call_graph</code> and <code>history</code>?</summary>
+<p>The floors scale with risk. A trivial change does not justify the exploration cost, but rewriting core code requires knowing who calls it and why it was written that way (§47.3).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §48. Capability 5 — Post-Apply Verification Loop -->
+<div class="quick-check" id="qc-48">
+<p class="qc-label">Quick check · §48</p>
+<details class="qc"><summary>1. Why does VERIFY run only the tests that exercise the changed files instead of the full suite?</summary>
+<p>The full suite would be slow. A scope targeted to the diff catches regressions in the changed code within the 60 s <code>JARVIS_VERIFY_TIMEOUT_S</code> budget (§48.1).</p>
+</details>
+<details class="qc"><summary>2. VERIFY fails and L2 repair also fails. What happens to the applied change?</summary>
+<p>The failure is combined with the benchmark result and the change is rolled back (§48.1).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §49. Capability 6 — Cumulative Session Intelligence -->
+<div class="quick-check" id="qc-49">
+<p class="qc-label">Quick check · §49</p>
+<details class="qc"><summary>1. How does a lesson from one operation reach the next one?</summary>
+<p>The orchestrator's <code>_session_lessons</code> buffer is copied into <code>OperationContext.session_lessons</code> before each GENERATE and rendered as a "Session Lessons" section in the generation prompt (§49.1, §49.2).</p>
+</details>
+<details class="qc"><summary>2. How large can the buffer get, and how long does it live?</summary>
+<p>At most 20 lessons (<code>JARVIS_SESSION_LESSONS_MAX</code>). It is ephemeral and lasts for the session, and the convergence check can clear it early (§49.1, §49.4).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §50. Capability 7 — Cost-Aware Operation Prioritization -->
+<div class="quick-check" id="qc-50">
+<p class="qc-label">Quick check · §50</p>
+<details class="qc"><summary>1. In the <code>_compute_priority</code> formula, is a larger number served sooner or later? Which terms push a signal earlier?</summary>
+<p>Later: a lower number means higher priority. Urgency boost, the confidence bonus and dependency credit are subtracted, so they move a signal earlier; the file-count cost penalty is added, so sprawling signals move later (§50.1).</p>
+</details>
+<details class="qc"><summary>2. Why is the score computed on retry enqueue and WAL replay, not only on first enqueue?</summary>
+<p>So that a signal's place in the queue does not depend on how it entered it. A deferred or recovered signal is ordered by the same rule as a fresh one (§50.3).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §51. The Seven Capabilities in Concert -->
+<div class="quick-check" id="qc-51">
+<p class="qc-label">Quick check · §51</p>
+<details class="qc"><summary>1. Which three capabilities together give "concurrent operations do not conflict, each reads before writing, and each change is verified in situ"?</summary>
+<p>The dependency DAG (§46), exploration-first enforcement (§47) and the post-apply verification loop (§48) (§51).</p>
+</details>
+<details class="qc"><summary>2. What three properties does the paper claim every one of the seven capabilities has?</summary>
+<p>Each is battle-test validated (Part XII), observable (Principle 7) and reversible through environment variables (§51).</p>
+</details>
+</div>
+<!-- END -->

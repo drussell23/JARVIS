@@ -1,0 +1,106 @@
+<!-- QUICKCHECK after: ## §18. Why Venom Exists — The Phone-Call vs Letter Analogy -->
+<div class="quick-check" id="qc-18">
+<p class="qc-label">Quick check · §18</p>
+<details class="qc"><summary>1. Which of Venom's four added capabilities targets patches written from "stale parameter-weight memory", and how?</summary>
+<p>Pre-patch exploration. Before writing code, the model reads the target files, searches related code and inspects the call graph, so the patch is based on the repository as it is now, not on what the model remembers from training (§18.1).</p>
+</details>
+<details class="qc"><summary>2. In the symbiote analogy, what does each partner lack without the other?</summary>
+<p>Without Ouroboros, Venom would be an unsupervised model making uncaged changes to disk. Without Venom, Ouroboros would be a rigid pipeline that cannot explore before acting. Together they give disciplined self-improvement (§18.2).</p>
+</details>
+<details class="qc"><summary>3. Why does the paper say O+V can enable tools by default when most frameworks require opt-in?</summary>
+<p>Because its containment is structural, not configurational: the Iron Gate (AST parser, command blocklist, path protection), the risk engine and the approval gates hold the line, not an environment flag (§18.3).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §19. The ToolLoopCoordinator -->
+<div class="quick-check" id="qc-19">
+<p class="qc-label">Quick check · §19</p>
+<details class="qc"><summary>1. When the policy denies a tool call, does the loop stop?</summary>
+<p>No. The coordinator injects a <code>tool_denied</code> result into the conversation and carries on, so the model sees the denial on its next round and can choose a different action (§19.1).</p>
+</details>
+<details class="qc"><summary>2. How does a provider switch from a single API call to the agentic loop?</summary>
+<p>Both <code>ClaudeProvider</code> and <code>PrimeProvider</code> take an optional <code>tool_loop</code>. When one is supplied, <code>generate()</code> delegates to <code>tool_loop.run()</code>; when it is absent, the provider makes one call (§19.3). <code>JARVIS_GOVERNED_TOOL_USE_ENABLED</code> is the master switch (§19.2).</p>
+</details>
+<details class="qc"><summary>3. Why does every tool call become a <code>ToolExecutionRecord</code>?</summary>
+<p>So that the loop leaves an audit trail: each call is a ledger entry that can be inspected afterwards, alongside deadline and token-budget management that the coordinator also owns (§19.3).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §20. The 16 Built-In Tools -->
+<div class="quick-check" id="qc-20">
+<p class="qc-label">Quick check · §20</p>
+<details class="qc"><summary>1. What extra check does <code>delete_file</code> get beyond the path protections it shares with the other mutation tools?</summary>
+<p>A risk-tier check: deleting on multi-file targets or core paths escalates the operation to Orange (§20.5).</p>
+</details>
+<details class="qc"><summary>2. Why can <code>ask_human</code> not stall a generation forever?</summary>
+<p>It returns <code>{"status": "timeout"}</code> after 300 seconds if the operator does not answer, so the loop gets a result either way (§20.8).</p>
+</details>
+<details class="qc"><summary>3. Why do the three git tools need almost no Iron Gate check?</summary>
+<p><code>git_log</code>, <code>git_diff</code> and <code>git_blame</code> are read-only. They report history and cannot change repository state, so there is no mutation risk to gate (§20.4).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §21. The Iron Gate at the Tool Boundary -->
+<div class="quick-check" id="qc-21">
+<p class="qc-label">Quick check · §21</p>
+<details class="qc"><summary>1. Why are governance engine internals on the protected-path list?</summary>
+<p>So that the orchestrator cannot rewrite the orchestrator. The machinery that enforces the rules is itself out of reach of the tools it governs (§21.1, Rule 2).</p>
+</details>
+<details class="qc"><summary>2. Rule 9 is "default allow". Why is ending the ladder on allow not a loophole?</summary>
+<p>A call only reaches Rule 9 if every earlier deny rule has passed it. The deny rules encode the human's non-negotiable constraints; anything that survives them is, by design, the model's to explore (§21.1, §21.3).</p>
+</details>
+<details class="qc"><summary>3. What do Rules 7 and 8 protect against that Rules 1 to 6 cannot?</summary>
+<p>Volume rather than content. A call can be individually harmless and still be part of a runaway loop; the concurrency cap (default 2) and per-tool rate limits bound how many such calls run (§21.1).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §22. MCP Tool Forwarding (Gap #7) -->
+<div class="quick-check" id="qc-22">
+<p class="qc-label">Quick check · §22</p>
+<details class="qc"><summary>1. How does the backend know which server should receive <code>mcp_github_create_issue</code>?</summary>
+<p>The name is server-qualified at discovery: <code>mcp_{server}_{tool}</code>. The backend resolves the server (<code>github</code>) from the name and sends it a <code>tools/call</code> JSON-RPC request for <code>create_issue</code> (§22.1, §22.3).</p>
+</details>
+<details class="qc"><summary>2. What does launching stdio servers with an argument array, never a shell string, prevent?</summary>
+<p>Shell injection. With <code>create_subprocess_exec</code> array form there is no shell to interpret metacharacters, so there is no injection surface at launch (§22.4).</p>
+</details>
+<details class="qc"><summary>3. What happens if a configured MCP server cannot be reached at boot?</summary>
+<p>The failure is logged but non-fatal; O+V boots without that server's tools (§22.5).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §23. L2 Self-Repair Engine — When Validation Fails -->
+<div class="quick-check" id="qc-23">
+<p class="qc-label">Quick check · §23</p>
+<details class="qc"><summary>1. When does L2 take over, relative to VALIDATE's own retries?</summary>
+<p>Only after VALIDATE has exhausted its retry budget. L2 is the last convergence loop before POSTMORTEM, not a replacement for VALIDATE's retries (§23, §25).</p>
+</details>
+<details class="qc"><summary>2. Why classify each failure as syntax, test, environment or flaky?</summary>
+<p>The classification drives the decision step: retry budgets are class-specific, and the repair prompt carries the specific failure analysis into the next iteration (§23.2).</p>
+</details>
+<details class="qc"><summary>3. What does §23.6 say L2 changes about the pipeline's character?</summary>
+<p>Without L2 every validation failure ends the operation, so the pipeline is fragile to an imperfect first draft. With L2 it is convergent: it tolerates initial imperfection and works toward a fix (§23.6).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §24. Live Context Auto-Compaction (Gap #8) -->
+<div class="quick-check" id="qc-24">
+<p class="qc-label">Quick check · §24</p>
+<details class="qc"><summary>1. Why split the prompt at <code>[TOOL RESULT]</code> and <code>[TOOL ERROR]</code> markers?</summary>
+<p>Those markers delimit individual tool results, so each chunk is one whole result. Compaction then keeps or summarizes whole results and never cuts one in half (§24.2).</p>
+</details>
+<details class="qc"><summary>2. Why keep the most recent chunks rather than, say, the largest ones?</summary>
+<p>Recent chunks carry the context most relevant to the model's next turn. Older chunks have already been read and acted on, so only their profile (which tools, how many characters) is kept (§24.4).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §25. The Venom + Ouroboros Integration -->
+<div class="quick-check" id="qc-25">
+<p class="qc-label">Quick check · §25</p>
+<details class="qc"><summary>1. Where do the Venom tool loop and the post-generation Iron Gate checks sit in the phase sequence?</summary>
+<p>The tool loop lives inside GENERATE. The Iron Gate checks (exploration-first, ASCII-strict) fire after GENERATE but before VALIDATE, so the candidate is judged structurally before any tests run on it (§25).</p>
+</details>
+<details class="qc"><summary>2. In the worked example, why does round 5 call <code>run_tests</code> after the patch is produced in round 4?</summary>
+<p>That is intra-generation verification: the model checks its own draft before submitting it, so a failing test can shape a revision before VALIDATE ever sees the candidate (§25, §18.1).</p>
+</details>
+</div>
+<!-- END -->

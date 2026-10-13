@@ -1,0 +1,152 @@
+<!-- QUICKCHECK after: ## §26. The Metacognition Layer — Zone 6.11 -->
+<div class="quick-check" id="qc-26">
+<p class="qc-label">Quick check · §26</p>
+<details class="qc"><summary>1. How does Trinity Consciousness give O+V a "senior engineer's memory" without retraining any model?</summary>
+<p>Through structured episodic records that are consulted at the right moments in the pipeline, not through parameter-weight updates (§26).</p>
+</details>
+<details class="qc"><summary>2. How does the consciousness layer reach the pipeline, and with what authority?</summary>
+<p>Through two bridges, ConsciousnessBridge and GoalMemoryBridge. Its authority is advisory only: it cannot override the Iron Gate or any safety-critical decision (§26.1, Figure 7).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §27. MemoryEngine — Episodic Outcomes -->
+<div class="quick-check" id="qc-27">
+<p class="qc-label">Quick check · §27</p>
+<details class="qc"><summary>1. What does the <code>co_failures</code> map add that a per-file success rate cannot?</summary>
+<p>It records which files tend to fail together with this one. A success rate describes one file in isolation; co-failures describe coupling between files (§27).</p>
+</details>
+<details class="qc"><summary>2. What does the 168-hour TTL do to a file's reputation?</summary>
+<p>Records older than a week, by default, decay. A file's reputation therefore reflects recent behaviour, and old failures stop counting against it (§27).</p>
+</details>
+<details class="qc"><summary>3. What is the concrete payoff of MemoryEngine at CLASSIFY?</summary>
+<p>If a target file's success rate is below 0.5 or its fragility is high, the risk tier is raised. That is how the organism avoids breaking the same file again and again (§27).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §28. ProphecyEngine — Regression Prediction -->
+<div class="quick-check" id="qc-28">
+<p class="qc-label">Quick check · §28</p>
+<details class="qc"><summary>1. A file has a perfect history, zero fragility and no dependents. What is its risk score, and why is it not zero?</summary>
+<p>0.1, which is LOW. The formula adds a fixed 0.1 baseline, so no change is scored as entirely risk-free (§28).</p>
+</details>
+<details class="qc"><summary>2. Why does escalation happen at CLASSIFY rather than after a failure?</summary>
+<p>It is preventive: a HIGH or CRITICAL file earns extra oversight before the operation runs, not after it has already broken something (§28.1).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §29. HealthCortex — System Health -->
+<div class="quick-check" id="qc-29">
+<p class="qc-label">Quick check · §29</p>
+<details class="qc"><summary>1. Which work does HealthCortex suppress when the system is under resource pressure, and why that work?</summary>
+<p>Exploration-type sensors such as OpportunityMiner and DocStaleness. Their work is optional, so suppressing them avoids adding load to a system that is already strained (§29.1).</p>
+</details>
+<details class="qc"><summary>2. O+V generally avoids polling. Why is polling accepted here?</summary>
+<p>"The system is tired" is a continuous state, not a discrete event, so there is no event to subscribe to. The 30-second interval is explicit and slow, not a tight retry loop (§29.2).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §30. DreamEngine — Idle-Time Improvement Planning -->
+<div class="quick-check" id="qc-30">
+<p class="qc-label">Quick check · §30</p>
+<details class="qc"><summary>1. Why are blueprints keyed on <code>(repo_sha, policy_hash)</code>?</summary>
+<p>A blueprint is only valid while the code and the policy it was computed against are unchanged. Keying on both means a blueprint is used only by an operation that matches that exact state (§30).</p>
+</details>
+<details class="qc"><summary>2. What does the 120-minute daily budget bound?</summary>
+<p>How much idle time can be spent dreaming. Once it is used up, dreaming is suppressed until the next daily reset, so speculative work cannot consume resources without limit (§30).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §31. Awareness Fusion — CAI, SAI, UAE -->
+<div class="quick-check" id="qc-31">
+<p class="qc-label">Quick check · §31</p>
+<details class="qc"><summary>1. How do CAI and SAI divide the work?</summary>
+<p>CAI covers what is happening in the codebase: hotspots, coupling and drift. SAI covers when and why: temporal patterns and causal chains such as post-deploy cascades. UAE fuses the two into one <code>OperationAwareness</code> object (§31).</p>
+</details>
+<details class="qc"><summary>2. Why is UAE's fused confidence bounded by the less confident of CAI and SAI?</summary>
+<p>A fusion should not claim more certainty than its weakest input supports. Taking the lower bound stops one confident component from hiding the other's uncertainty (§31.3).</p>
+</details>
+<details class="qc"><summary>3. What changes when the awareness level rises toward HYPERAWARE?</summary>
+<p>Higher levels trigger deeper context expansion and more sensitivity to human escalation (§31.3).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §32. ConsciousnessBridge — Integration Points -->
+<div class="quick-check" id="qc-32">
+<p class="qc-label">Quick check · §32</p>
+<details class="qc"><summary>1. Which of the five bridge methods writes into memory, and which only read?</summary>
+<p><code>record_operation_outcome()</code> at POST-APPLY writes outcomes back into MemoryEngine and GoalMemoryBridge. The other four consult the engines and return advice (§32.1).</p>
+</details>
+<details class="qc"><summary>2. Which method is used before any operation exists, and for what?</summary>
+<p><code>is_system_healthy_for_exploration()</code>, at intake gating. It returns <code>(healthy, reason)</code> from HealthCortex so that ProactiveDriveService can decide whether to fire exploration sensors at all (§32.1).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §33. GoalMemoryBridge — Cross-Session ChromaDB -->
+<div class="quick-check" id="qc-33">
+<p class="qc-label">Quick check · §33</p>
+<details class="qc"><summary>1. What reaches the generation prompt from GoalMemoryBridge, and how much of it?</summary>
+<p>By default the top 5 most semantically similar past operations: their outcomes, rationales and file touches, rendered as an <code>## Episodic Context</code> section (§33).</p>
+</details>
+<details class="qc"><summary>2. What can an operator do with <code>ouroboros_thoughts.jsonl</code> after a session?</summary>
+<p>Reconstruct why the organism made each decision. The log records each phase of its reasoning, from memory recall and tool choices to L2 repair progress and post-apply outcomes (§33.1).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §34. ConversationBridge — Dialogue as Context -->
+<div class="quick-check" id="qc-34">
+<p class="qc-label">Quick check · §34</p>
+<details class="qc"><summary>1. Why does secret redaction run before any model sees the content?</summary>
+<p>It is Tier -1 deterministic: a secret pasted into the REPL is removed on its way in, so it never reaches a model's prompt in the first place (§34.1).</p>
+</details>
+<details class="qc"><summary>2. Why do postmortem entries expire after 600 seconds by default?</summary>
+<p>So that stale closures from earlier operations do not pollute new sessions (§34.2).</p>
+</details>
+<details class="qc"><summary>3. Where, and only where, is ConversationBridge's output consumed?</summary>
+<p>By StrategicDirection at CONTEXT_EXPANSION. It has zero authority over the Iron Gate, UrgencyRouter, risk tier, policy engine, FORBIDDEN_PATH or approval gating (§34).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §35. LastSessionSummary — Episodic Continuity -->
+<div class="quick-check" id="qc-35">
+<p class="qc-label">Quick check · §35</p>
+<details class="qc"><summary>1. How does LastSessionSummary pick the most recent prior session?</summary>
+<p>It takes the lexically greatest <code>bt-*</code> session directory, skipping the current one. The directory names embed the timestamp, as in <code>bt-2026-04-15-230849</code>, so lexical order is time order (§35).</p>
+</details>
+<details class="qc"><summary>2. Why render each session as one dense, deterministic line?</summary>
+<p>It carries the key facts (stop reason, duration, counts, apply mode, verify result, commit) into the strategic-memory prompt in very little space, and the same session always renders the same way (§35).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §36. SemanticIndex — Recency-Weighted Centroid Inference -->
+<div class="quick-check" id="qc-36">
+<p class="qc-label">Quick check · §36</p>
+<details class="qc"><summary>1. Why is the semantic boost capped at 1 while the hard <code>goal_alignment_boost</code> is 2?</summary>
+<p>Inferred themes must stay strictly subordinate to declared goals. With the lower cap, inference can nudge priority but cannot outrank declared work, which avoids starvation (§36).</p>
+</details>
+<details class="qc"><summary>2. What does halflife decay fix about naive goal inference?</summary>
+<p>Naive inference drifts: a session focused on one bug makes later signals look like more of that bug. With decay, recent work weighs more than older work, so the inferred theme follows current priorities while still carrying durable themes (§36.1).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §37. Strategic Direction — The Manifesto Injection Service -->
+<div class="quick-check" id="qc-37">
+<p class="qc-label">Quick check · §37</p>
+<details class="qc"><summary>1. Strategic Direction injects both the principles and recent git momentum. What does each tell the model?</summary>
+<p>The principles say what the code must align with. The momentum section, built from the last 50 commits, says what the team is currently working on (§37.2, §37.3).</p>
+</details>
+<details class="qc"><summary>2. What failure does §37.4 say the injection guards against?</summary>
+<p>Generic code that works but hides the problem, such as a one-line patch that suppresses a test failure. With the mandate "structural repair, not patches" in the prompt, the model is pushed toward fixing the root cause (§37.4).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §38. The Complete Six-Layer Loop -->
+<div class="quick-check" id="qc-38">
+<p class="qc-label">Quick check · §38</p>
+<details class="qc"><summary>1. What closes the six-layer loop into a cycle?</summary>
+<p>The feedback step after Layer 6: consciousness learns from the outcome. MemoryEngine updates file reputation and GoalMemoryBridge stores the operation, so the next operation benefits (§38).</p>
+</details>
+<details class="qc"><summary>2. Match the layers to the questions the paper assigns them.</summary>
+<p>Strategic Direction: where are we going. Consciousness: why evolve. Event Spine: when to act. Pipeline: what to do, safely. Venom: how. ChangeEngine and AutoCommitter persist the result (§38).</p>
+</details>
+</div>
+<!-- END -->

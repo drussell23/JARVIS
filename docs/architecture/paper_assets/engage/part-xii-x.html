@@ -1,0 +1,30 @@
+<!-- XBLOCK part-xii -->
+<p class="engage-kicker engage-kicker-x">Connections</p>
+<div class="pset pset-x">
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 1 (Information theory).</strong> The <code>Generated-By</code> trailer in §70 always contains <code>Ouroboros</code>. It adds <code>+ Venom</code> when tool execution records exist and <code>+ Consciousness</code> when the <code>ConsciousnessBridge</code> was active. Treat the trailer as a message sent from each commit to a future reader of <code>git log</code>. (a) What is the most information, in bits, the trailer can carry? (b) Suppose, for illustration only, that over some history 90% of O+V commits carry <code>+ Venom</code> and 50% carry <code>+ Consciousness</code>, independently. How many bits does a trailer carry on average? (c) The commit body in §70 also carries an <code>op_id</code> such as <code>op-019d6633-10ed-71ae-b324-fd5d412cfc3b</code>. Compare the two channels and say what the split implies about where detail should live.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Count the distinct trailers that can occur. The average information is the entropy of the trailer's distribution; with independent parts it is the sum of two binary entropies.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>(a) <code>Ouroboros</code> is always present, so it carries no information. The other two parts are each present or absent, which gives 2 x 2 = 4 possible trailers. The maximum entropy is log2(4) = 2 bits, reached only when all four are equally likely.</p>
+<p>(b) The binary entropy is H(p) = -p log2 p - (1 - p) log2(1 - p). For p = 0.9: -0.9 x log2(0.9) - 0.1 x log2(0.1) = 0.9 x 0.152 + 0.1 x 3.322 = 0.137 + 0.332 = about 0.469 bits. For p = 0.5: exactly 1 bit. With independence the total is about 0.469 + 1 = 1.47 bits per commit. If every op used tools, the Venom part would carry 0 bits: a field that never varies tells the reader nothing.</p>
+<p>(c) The <code>op_id</code> has 32 hex digits, a nominal space of 32 x 4 = 128 bits. It does not describe the op; it names it, so it can be joined to records kept elsewhere. The thought log in §69 tags every entry with the same <code>op_id</code>.</p>
+<p>So the design splits the work. The trailer is a tiny, fixed summary that answers one question cheaply in <code>git blame</code>: human or O+V, and which subsystems took part (§70). The full story (memories recalled, tools called and why, repair iterations) lives in the thought log and telemetry, reached through the <code>op_id</code> key. Putting that detail in the commit would cost every reader of the history to serve the few who need it.</p>
+</details>
+</div>
+<div class="problem problem-x">
+<p class="problem-q"><strong>Connection 2 (Queueing theory and stochastic processes).</strong> Voice narration is debounced by <code>OUROBOROS_VOICE_DEBOUNCE_S</code>, default 60 s (§68). The paper does not say exactly how the debounce behaves, so take two models used for particle-detector dead time. Non-paralysable: after an announcement, events in the next 60 s are dropped and do not extend the quiet window. Paralysable: every event, spoken or not, restarts the 60 s window. Assume narratable events arrive as a Poisson process with rate λ. For an illustrative λ of one event per 30 s, and for one event per 10 minutes, find the spoken rate and the fraction of events spoken under each model. Then say what the result means for which layer must hold the complete record.</p>
+<details class="problem-hint"><summary>Hint</summary>
+<p>Non-paralysable: spoken rate = λ / (1 + λτ). Paralysable: spoken rate = λ e^(-λτ), because an event is spoken only if no event came in the previous τ seconds.</p>
+</details>
+<details class="problem-sol"><summary>Worked solution</summary>
+<p>Let τ = 60 s. These rates are illustrative inputs; the paper gives no event rate.</p>
+<p><strong>λ = 1/30 per second</strong> (λτ = 2). Non-paralysable: spoken rate = (1/30) / (1 + 2) = 1/90 per second, which is 40 per hour; fraction spoken = 1/3. Paralysable: spoken rate = (1/30) x e^(-2) = 0.0333 x 0.135 = about 0.0045 per second, or about 16 per hour; fraction spoken = e^(-2) = about 13.5%.</p>
+<p><strong>λ = 1/600 per second</strong> (λτ = 0.1). Non-paralysable: fraction = 1/1.1 = about 91%, so about 9% of events are dropped even at this light load. Paralysable: fraction = e^(-0.1) = about 90.5%.</p>
+<p>Limits: the non-paralysable rate approaches 1/τ = 60 per hour as λ grows. That is a hard cap on how often the operator is spoken to, whatever the load. The paralysable rate peaks at λ = 1/τ and then falls towards zero. Under a heavy burst it would go silent, which is the opposite of what an operator wants when the most is happening.</p>
+<p>The debounce is therefore a rate limiter on human attention, as §68 intends. But both models drop events without looking at what they contain, so a POSTMORTEM can be lost in a busy minute. That is why voice cannot be the record. The thought log (§69), telemetry heartbeats (§71) and commit signatures (§70) are written for every op. §73 assigns voice to presence and the other layers to the durable trace. Which dead-time model the code uses decides whether voice saturates or goes silent under load. A reader should check that in the code rather than assume it.</p>
+</details>
+</div>
+</div>
+<!-- END -->

@@ -1,0 +1,25 @@
+<!-- QUICKCHECK after: ## §52. The Twelve Refinements -->
+<div class="quick-check" id="qc-52">
+<p class="qc-label">Quick check · §52</p>
+<details class="qc"><summary>1. Refinement 19 caps exploration-only rounds at 5. Why is a cap needed when Refinement 12 already demands a minimum amount of exploration?</summary>
+<p>They bound opposite failures. Refinement 12 stops a model from writing without reading; Refinement 19 stops one from reading forever without producing an answer. After the cap a system message tells the model it has enough context and must produce its change (§52.5, §52.12).</p>
+</details>
+<details class="qc"><summary>2. Where does Refinement 14 take its file hashes, and where does it compare them?</summary>
+<p>It snapshots SHA-256 hashes of the target files at GENERATE into <code>OperationContext.generate_file_hashes</code> and recomputes them at APPLY. A mismatch means the candidate was built on stale state; today that yields a warning and a ledger entry, not a block (§52.7).</p>
+</details>
+<details class="qc"><summary>3. Refinement 16's cancellation is "cooperative." What does that mean for an operation that is in the middle of a phase?</summary>
+<p>The <code>cancel</code> command only sets a flag. The orchestrator checks it at the GENERATE and APPLY phase boundaries and then moves to <code>CANCELLED</code> with reason <code>user_cancelled</code>, so a phase already under way is not interrupted mid-step (§52.9).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ## §53. What the Refinements Teach -->
+<div class="quick-check" id="qc-53">
+<p class="qc-label">Quick check · §53</p>
+<details class="qc"><summary>1. What does the paper mean by calling the architecture "hardened, not pristine"?</summary>
+<p>None of the refinements were designed up front. Each answers a failure observed in a real run, so the design carries the marks of stress-testing, each paired with a fix (§53).</p>
+</details>
+<details class="qc"><summary>2. Which three refinements does §53 cite as structural fixes rather than configuration workarounds?</summary>
+<p>TTL on file locks (Refinement 11), the scope fix on APPLY (Refinement 10) and the convergence metric on lessons (Refinement 18). The paper presents them as the Manifesto's "structural repair, not patches" in practice (§53).</p>
+</details>
+</div>
+<!-- END -->
