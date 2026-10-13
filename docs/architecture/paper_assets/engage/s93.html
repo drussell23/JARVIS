@@ -7,6 +7,15 @@
 </details>
 </aside>
 <!-- END -->
+<!-- CHECKPOINT before: #### §93.9.3 The Attach Protocol -->
+<aside class="checkpoint" id="cp-s93-3">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">You close the terminal while O+V is halfway through an operation, and reattach twenty minutes later. What do you predict happened to the operation, and to everything it reported while you were away?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>The operation carried on. The organism is a separate daemon process, and closing the cockpit only detaches a client. What it reported while you were away was kept in an offline backlog (200 frames, 30-minute lifetime by default). On reattach the daemon sends a fresh hydration frame, then the control-plane replay, then that backlog, before any new live output. Before <code>381f943f93</code>, those frames were simply discarded. See §93.9.3.</p>
+</details>
+</aside>
+<!-- END -->
 <!-- CHECKPOINT before: ### §93.11 The Trinity Closes the Loop: Recorder → Reactor → J-Prime -->
 <aside class="checkpoint" id="cp-s93-2">
 <p class="cp-label">Pause and predict</p>

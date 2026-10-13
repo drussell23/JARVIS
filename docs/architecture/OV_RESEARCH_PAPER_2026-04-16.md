@@ -9774,26 +9774,191 @@ The phase set is unchanged since §92. `OperationPhase` still has the members it
 
 ### §93.9 The `ov` Cockpit
 
-The operator surface is now the `ov` command (`backend/core/ouroboros/cli/ov.py`, a PEP 621 console script). The battle-test runner of Part XI remains the engine underneath. A bare `ov` attaches to the running organism, or cold-boots one in the background. Other verbs include `run`/`daemon` (headless), `attach`, `status`, `doctor`, `hive` and `link`.
+> **Big Picture.** An autonomous agent that nobody can watch cannot be trusted with a repository. The cockpit is how O+V is made watchable. It is a terminal application in which the organism shows what it is about to do, what it just decided and why, before anything reaches disk, and through which the operator can intervene in the same breath. Its governing idea, written into its own style guide, is *cockpit, not chat*. The screen is an instrument panel for a process that runs whether or not anyone is looking, not a conversation that stops when the human stops typing. In April the operator surface was the battle-test runner's console (Part XI, Part XII). Since July it has been a separate program, `ov`, that attaches to a long-lived organism.
 
-The cockpit renders a Claude-Code-style transcript: intent, tool calls and results, with a live block per in-flight operation. A toolbar shows the served model, a `landed N` counter, promotion status, and a GPU-lease lock screen while training holds the card.
+Items marked † are on the author's local `main` and not yet on GitHub (see the note at the top of §93).
 
-Slash commands come from an auto-discovered registry of `*_repl.py` modules, about 70 of them, plus handlers in the harness. The ones most relevant to this section:
+#### §93.9.1 Scale and Where It Lives
 
-- `/goal sanction` and `/goal inject`
-- `/proof`: a tamper-evident SHA-256 chain of per-session evidence at `.jarvis/proof/chain.jsonl`†
-- `/reach`: a ratchet on features that are registered but never reached
-- `/why`: four bands — trigger, context, logic, action
-- `/spend`: day × provider × route
+Line counts below are from `git show origin/main:<file> | wc -l`, blank and comment lines included.
+
+| Area | Files | Lines |
+|---|---|---|
+| `backend/core/ouroboros/cli/` + `backend/core/ouroboros/ui/` (entry point, thin client, theme, crest, deck grammar) | 45 | 27,109 |
+| `backend/core/ouroboros/battle_test/` (rendering, REPL, attach bridge, and also the non-UI harness) | 125 | 88,468 |
+
+The largest single files are `battle_test/harness.py` (11,553), `battle_test/serpent_flow.py` (10,792, the REPL and the original flowing renderer), `cli/ov.py` (5,594), `battle_test/cockpit_attach.py` (2,290, the daemon side of the attach link), `governance/claude_style_transport.py` (1,668, the default renderer) and `cli/thin_client.py` (1,304).
+
+#### §93.9.2 Process Model: a Thin Client and a Daemon Organism
+
+The cockpit and the organism are **two processes**. The organism, which runs GovernedLoopService, the intake layer, the sensors and the pipeline, runs detached and keeps working when no one is attached. `ov` is a thin client that finds it, or starts it, and then attaches.
+
+```
+ ov  (thin client: stdlib + ui.* + cockpit_attach only — AST-pinned)
+  │  resolve(argv) → Invocation          pure: no side effects
+  │  apply_arming()                      bare `ov` arms Sentinel + Goal Discovery,
+  │                                      production-soak profile, promotion to local main
+  │  assert_environment()                exit 78 on a desynced environment
+  │  ensure_daemon()
+  │     probe_socket(deep=True) → live │ booting │ stale │ absent
+  │        live    → attach
+  │        stale   → unlink ghost socket, cold boot
+  │        absent  → spawn_daemon (detached) and wait for the socket
+  │  run_attach()
+  ▼
+ .jarvis/cockpit_attach.sock   Unix domain socket, mode 0600, newline-delimited JSON
+  ▲
+ organism (daemon)  ── CockpitAttachBridge → every attached client
+```
+
+Four design decisions in this path are worth naming.
+
+1. **The entry point is deliberately light.** `ov.py` and `thin_client.py` may import only the standard library, `ui.*` and the attach module. The test `tests/cli/test_thin_client.py::test_entry_surface_imports_only_tui_ipc_stdlib` parses them with `ast` to enforce this, so starting the cockpit can never accidentally boot the organism's domain code in the wrong process.
+2. **Arming is explicit and reversible.** `resolve()` is pure. `apply_arming()` sets `JARVIS_SENTINEL_MODE_ENABLED`, `JARVIS_GOAL_DISCOVERY_ENABLED`, `OUROBOROS_PRODUCTION_SOAK=1` and `JARVIS_ACCUMULATION_PROMOTION_ENABLED` (`04f2f3ade0`). A value the operator has exported as false always wins, and `--no-sentinel` / `--no-production-soak` opt out. Before this change, soaks and the cockpit had been, in the commit's words, two organisms behind one name.
+3. **A socket file is never trusted on sight.** `probe_socket(deep=True)` checks whether something actually answers. A socket left behind by a crashed organism is classified *stale*, unlinked, and replaced by a cold boot.
+4. **A cold boot ends on silence, not on a clock** (`495ca1f659`). `await_socket` waits while the daemon's log keeps growing. Each growth renews a stall window of three times the observed median boot time (never below 120 s), under a hard ceiling of four stall windows that progress cannot extend. It stops at once if the spawned child dies. The bug this replaced was that a fixed timeout declared a healthy-but-slow organism dead.
+
+Exit codes carry meaning to scripts: **78** means the pinned model or environment is unavailable, and **69** means the GPU lane is lent to training. `ov daemon --install` writes a launchd agent (`com.jarvis.ov.daemon`, `RunAtLoad`, restart on failure) on macOS.
+
+<!-- engage:begin -->
+<aside class="checkpoint" id="cp-s93-3">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">You close the terminal while O+V is halfway through an operation, and reattach twenty minutes later. What do you predict happened to the operation, and to everything it reported while you were away?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>The operation carried on. The organism is a separate daemon process, and closing the cockpit only detaches a client. What it reported while you were away was kept in an offline backlog (200 frames, 30-minute lifetime by default). On reattach the daemon sends a fresh hydration frame, then the control-plane replay, then that backlog, before any new live output. Before <code>381f943f93</code>, those frames were simply discarded. See §93.9.3.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
+#### §93.9.3 The Attach Protocol
+
+`battle_test/cockpit_attach.py` defines the link, schema `cockpit_attach.v2`, as newline-delimited JSON frames over the Unix socket.
+
+| Direction | Frames |
+|---|---|
+| Daemon → cockpit, first | `hydration`: phase, cost, active operations, liquidity, serving identity (engine, adapter, vision), audio state |
+| Daemon → cockpit | `line`, `markup` (daemon-composed tool blocks), `transcript`, `history_append`, `prompt` / `prompt_resolved`, `audio_state`, `autonomy_state`, `acoustic`, `thermal`, `telemetry`, `rewind_list`, `lane_history`, `lane_reaped` |
+| Cockpit → daemon | `input` (routed into the harness's command handler), `audio` (wake, sleep, barge, push-to-talk, flush), `caps` (terminal capabilities, re-sent on every resize), `lane`, `autonomy` |
+
+- **Several cockpits can attach at once.** A failed write drops only that client. Output a client asked for, such as a verb's reply, is addressed to that client alone. Ambient output goes to everyone (`tests/cli/test_dual_client_multiplex.py`).
+- **Detaching does not stop the work** (`381f943f93`). `detach`, `exit` and `quit` leave the client. While no one is attached, the organism keeps an offline backlog of ambient frames (200 frames, 30-minute TTL by default). On reattach the daemon writes the hydration frame, then the control-plane replay, then the backlog, and only then adds the client to the live set. The backlog is peeked and committed, so a client whose socket breaks mid-flush does not lose it. Before this fix, everything the organism said while the operator was away was simply discarded.
+
+#### §93.9.4 From Event to Screen: the Rendering Pipeline
+
+1. **Producers** — the pipeline phases, Venom's tool loop, the sensors and the Sentinel — emit structured events on CommProtocol (INTENT, PLAN, HEARTBEAT, DECISION, POSTMORTEM; §2, §44).
+2. **The default renderer** is `ClaudeStyleTransport` (`governance/claude_style_transport.py`, `JARVIS_RENDER_MODE=claude`). It turns events into blocks and mirrors them to every attached cockpit. The older flowing renderer, `SerpentTransport` in `serpent_flow.py`, remains available.
+3. **`PresentationRouter`** is the single conformance chokepoint every line passes through. `BipartiteLayout` keeps the live canvas above an anchored input prompt.
+4. **The transcript spine** (`battle_test/transcript_spine.py`) is an append-only, sequence-ordered record that unifies four reference namespaces: `o-N` operation blocks, `d-N` diffs, `t-N` tool results and `n-N` narrative frames. Any of them can be reopened with `/expand <ref>`, which also accepts permission, Q&A, repair-branch and `/btw` tickets.
+5. **The durable transcript** (`battle_test/transcript_writer.py`, `a42193c50b`, `7a006a6e00`) writes the spine to disk with group-commit `fsync` (every 32 frames or 5 s). If a write fails, it truncates back to the last good offset and *seals* rather than appending a torn record. Its health is one of DURABLE, DEGRADED or SEALED, and crash oracles in the tests check recovery.
+6. **The deck grammar** (`ui/deck_grammar.py`) fixes the visual language. ⏺ opens a block, ⎿ continues it, a blank line closes it, and every body aligns to one fixed column measured in terminal cells. Hierarchy comes from colour, not indentation.
+7. **Token streaming** (`battle_test/stream_renderer.py`). The model's tokens are queued without blocking and drawn in 16 ms batches (about 60 frames per second, `JARVIS_UI_STREAMING_BATCH_MS`), and since `2cee0d3341` they stream to attached cockpits too. Time-to-first-token and tokens per second are logged at the end of each stream.
+8. **The narrative channel** (`battle_test/narrative_channel.py`) carries the organism's own prose — intent (💭), tool preambles (🗣), plan prose, postmortems — as frames that are buffered, then committed or discarded. A frame is never drawn half-formed.
+9. **The status line** (`battle_test/status_line.py`) shows:
+   - the phase, cost and its basis, and the funding mode;
+   - the primary operation;
+   - the route, provider and model;
+   - liquidity;
+   - landed commits in total and per hour, always visible (`b8df0bf860`);
+   - promotion state as `main ← <sha> · N unpushed`.
+
+   The serving identity — which engine, which adapter, which vision model — comes from the hydration frame (`d8a0a82fd5`).
+10. **Boot.** An animated crest with an in-place progress slot covers the cold boot. Once ready, *presentation restraint* keeps the welcome screen minimal, and `/preflight` and `/organism` show detail on demand.
+
+#### §93.9.5 The Command Surface
+
+**Discovery, not registration.** `battle_test/repl_dispatch_registry.py` scans the governance packages. Any module named `X_repl.py` that exposes `dispatch_X_command` becomes the verb `/X` (with optional aliases), so a new capability gets a command by existing. On `origin/main` there are 75 `*_repl.py` modules.
+
+**Dispatch order.** A line typed into the cockpit is handled by the first of these that claims it:
+1. the harness's fixed verbs (`stop`, `cost`, `pause`, `resume`, `status`, `plan`, `goal`, `budget`, `risk`, `memory`, `rewind`, `undo` and others);
+2. plugins;
+3. the auto-discovered registry;
+4. failing all of those, the text is treated as conversation.
+
+**Client-only verbs** — `/deck`, `/tasks`, `keys`, `detach` and the audio verbs — are handled inside the cockpit process because they spend that terminal's rows or control its microphone. Anything the client does not own goes to the daemon, which fails closed.
+
+| Verb | What it does |
+|---|---|
+| `/goal sanction <desc> --files … [--symbol …]`, `/goal inject <id>` | Author, HMAC-sign and inject a scoped goal (§93.7) |
+| `/why <ref>` | The causal account of a decision in four fixed bands: TRIGGER, CONTEXT, LOGIC, ACTION |
+| `/expand <ref>` | Reopen any collapsed operation, diff, tool result or narrative frame |
+| `/plan`, `/cancel <op> [--immediate]` | Approve a plan; cancel an operation cooperatively at the next phase boundary |
+| `/reach` | Ratchet on features that are registered but never reached in production (§93.12) |
+| `/spend` | Spend by day × provider × route from the accounting ledger |
+| `/btw <question>` | Ask an aside while O+V works; returns an `s-N` ticket instead of taking the floor |
+| `/posture` | Show, explain or override the strategic posture (§92.3) |
+| `/proof`† | Hash-chained, per-session proof of work |
+
+#### §93.9.6 Design as Code
+
+The cockpit's look is specified, not improvised. `docs/OV_STYLE_GUIDE.md` (`b73ccc2b99`) is wired into a theme singleton, `ui/theme.py`, so the rules are enforced by the code that draws.
+
+- **Six principles.** Cockpit not chat. Hierarchy by glyph. Green is an outcome. Motion is the polish. Framed where it counts. Restraint by default.
+- **A fixed palette.** Dark ground `#0A0E0D`, ink `#DBE6E1` and venom green `#5EE06A`, with a severity scale of red, amber, blue, grey and green.
+- **Severity colour is derived, not picked.** Rank 3 renders bold red, 2 yellow, 1 cyan, 0 dim.
+- **One meaning per glyph,** each with an ASCII fallback for terminals that cannot draw it.
+- **Semantic roles, not colours.** Code asks for a role (`Token.SUCCESS`, `Token.WARNING`, …), and the theme resolves it for the terminal's colour depth. The migration took the codebase from **365 raw colour literals to 10** (`077ca1d71f`). A test (`test_semantic_colour_tokens.py`) now holds a per-directory ceiling that may only fall.
+- **Green is reserved for outcomes.** `chrome_color()` returns dim, not green, for decoration, so a green mark on screen always means something succeeded.
+
+#### §93.9.7 What Broke, and What It Taught
+
+Each of these defects was found in a live run, and each changed the design.
+
+| Defect | Root cause | Commit |
+|---|---|---|
+| Autonomous work never appeared in the transcript | Three separate cuts: the default transport had no mirror, tool calls were read only for their phase, and the client routed autonomous frames away | `0fb936c6f8` |
+| The cockpit sat on a frozen "loading" crest | A missing Python package was reported as "not a terminal": two different failures collapsed into one `False` | `1b05af9f9e` |
+| The boot line and crest flickered | A carriage return cannot undo a wrapped line; the crest's region changed height under itself (fixed with padding and synchronized output) | `bee02dccb3`, `23ac892e44` |
+| Every autonomous line appeared twice | A mirrored frame and a spooled relay of the same frame | `23ac892e44`, `ba9445a2cb` |
+| A healthy cold boot was declared dead | The wait ended on a clock instead of on silence | `495ca1f659` |
+| The default transport had no voice | Intent and preamble producers were unreachable from it, there was no local-tier gate, and prose was forced through the JSON grammar | `77ca9116ed` |
+| The session recap read "0 tools · 0 tokens" | The deterministic replay round-trip dropped the tool records | `c358b285a3` |
+| Work done while detached was lost | Frames emitted with no client attached were discarded | `381f943f93` |
+
+The common lesson matches the rest of §93: **a display that silently shows nothing is the most dangerous display**, because it reads as "nothing happened". Several fixes therefore make absence visible. Landings are always counted on screen, a missing package is named, and a lent GPU lane exits with its own code.
+
+#### §93.9.8 Contracts That Keep It Honest
+
+- **Import isolation.** `test_entry_surface_imports_only_tui_ipc_stdlib` parses the entry point and fails on any domain import.
+- **Colour ratchet.** `test_raw_colour_literals_only_ever_decrease` and `test_green_is_SCARCE`.
+- **Glyph ratchet.** `test_no_new_hardcoded_glyph_reaches_an_output_site`.
+- **Boot wait.** `test_a_silent_daemon_is_abandoned_at_the_stall_window` and `test_progress_can_never_outlive_the_ceiling`.
+- **Transcript durability.** Crash oracles in `test_transcript_log_oracles.py`.
+- **Scale.** About 290 test files sit in `tests/battle_test`, `tests/cli` and `tests/ui` on `origin/main`.
+
+#### §93.9.9 Other Surfaces on the Same Stream
+
+**Other terminal views.** `ov system` and `ov hive` are passive panels listening on the same attach socket.
+
+**IDE and dashboard views.** A read-only, loopback-only HTTP surface (`governance/ide_observability.py`, `governance/ide_observability_stream.py`) serves the same events to IDEs and dashboards:
+- **GET routes** for tasks, plans, sessions, posture and flags.
+- **A Server-Sent Events stream** at `/observability/stream`, which is:
+  - deny-by-default;
+  - subscriber-capped;
+  - drop-oldest under back-pressure, with an explicit `stream_lag` frame;
+  - resumable with `Last-Event-ID`.
+
+**Consumers.** Extensions for VS Code, JetBrains and Sublime, and a React dashboard. Because they are read-only and authority-free, nothing that watches the organism can steer it.
+
+#### §93.9.10 In Flight†
+
+The newest cockpit work is on the author's local `main` and was in use during the October soaks:
+- **TranscriptFlow.** One transcript sink with a block store, so each tool appears once in scrollback.
+- **A live block per in-flight operation,** showing its pipeline phase as it moves.
+- **A GPU-lease lock screen** shown while training holds the card, with the last training cycle on the toolbar.
+- **A green ● action mark** replacing ⏺.
+- **Friendlier serving names.**
 
 <!-- engage:begin -->
 <div class="quick-check" id="qc-93-9">
 <p class="qc-label">Quick check · §93.9</p>
-<details class="qc"><summary>1. What does a bare <code>ov</code> do, and how does it relate to the battle-test runner?</summary>
-<p>It attaches to the running organism, or cold-boots one in the background if none is running. The battle-test runner of Part XI is still the engine underneath, and <code>ov</code> is the operator surface on top of it.</p>
+<details class="qc"><summary>1. Why does the cold-boot wait end on silence (no log growth) rather than after a fixed timeout, and what stops it from waiting forever?</summary>
+<p>A fixed timeout declared a healthy but slow organism dead (§93.9.2). Waiting while the log keeps growing tracks real progress instead. A hard ceiling of four stall windows, which progress cannot extend, and an immediate stop if the spawned child dies keep the wait bounded.</p>
 </details>
-<details class="qc"><summary>2. Why is <code>/proof</code> a SHA-256 <em>chain</em> rather than a plain list of evidence?</summary>
-<p>Each entry is chained to the previous one by hash. Editing any earlier entry breaks every later link, which makes the record tamper-evident.</p>
+<details class="qc"><summary>2. The entry point <code>ov.py</code> may import only the standard library, <code>ui.*</code> and the attach module, and a test parses it to enforce this. What failure does that prevent?</summary>
+<p>It stops the thin client from accidentally importing domain code and booting parts of the organism inside the cockpit process. If that happened, closing a terminal could take work down with it, and two copies of the same machinery could run at once. The organism must live only in the daemon (§93.9.2).</p>
+</details>
+<details class="qc"><summary>3. Why does the style guide reserve green for outcomes and derive severity colour from a rank, rather than letting each module pick colours?</summary>
+<p>So that colour carries meaning. A green mark always means something succeeded, and a given severity always looks the same everywhere. Picked colours drift module by module until green is decoration and nothing can be read at a glance. A ratchet test now keeps raw colour literals from creeping back (§93.9.6).</p>
 </details>
 </div>
 <!-- engage:end -->
@@ -12396,10 +12561,12 @@ Model answers and worked solutions for every section quick check, *Pause and pre
 <p>Tests that cannot execute, tests that assert nothing, and tests that never import their subject. It was added after a hollow test landing (<code>c985ccaee4</code>) reached <code>main</code> and had to be reverted.</p>
 <p class="ak-q">Quick check · §93.8, 3. In the <code>2b.1-diff</code> path the source is shown with numbered lines. Why must the numbers the model copies back be stripped?</p>
 <p>The numbers help the model locate its edit, but they are not part of the code. Left in, they would be written into the file. Stripping them and applying through a single stdlib applier keeps the output clean.</p>
-<p class="ak-q">Quick check · §93.9, 1. What does a bare <code>ov</code> do, and how does it relate to the battle-test runner?</p>
-<p>It attaches to the running organism, or cold-boots one in the background if none is running. The battle-test runner of Part XI is still the engine underneath, and <code>ov</code> is the operator surface on top of it.</p>
-<p class="ak-q">Quick check · §93.9, 2. Why is <code>/proof</code> a SHA-256 <em>chain</em> rather than a plain list of evidence?</p>
-<p>Each entry is chained to the previous one by hash. Editing any earlier entry breaks every later link, which makes the record tamper-evident.</p>
+<p class="ak-q">Quick check · §93.9, 1. Why does the cold-boot wait end on silence (no log growth) rather than after a fixed timeout, and what stops it from waiting forever?</p>
+<p>A fixed timeout declared a healthy but slow organism dead (§93.9.2). Waiting while the log keeps growing tracks real progress instead. A hard ceiling of four stall windows, which progress cannot extend, and an immediate stop if the spawned child dies keep the wait bounded.</p>
+<p class="ak-q">Quick check · §93.9, 2. The entry point <code>ov.py</code> may import only the standard library, <code>ui.*</code> and the attach module, and a test parses it to enforce this. What failure does that prevent?</p>
+<p>It stops the thin client from accidentally importing domain code and booting parts of the organism inside the cockpit process. If that happened, closing a terminal could take work down with it, and two copies of the same machinery could run at once. The organism must live only in the daemon (§93.9.2).</p>
+<p class="ak-q">Quick check · §93.9, 3. Why does the style guide reserve green for outcomes and derive severity colour from a rank, rather than letting each module pick colours?</p>
+<p>So that colour carries meaning. A green mark always means something succeeded, and a given severity always looks the same everywhere. Picked colours drift module by module until green is decoration and nothing can be read at a glance. A ratchet test now keeps raw colour literals from creeping back (§93.9.6).</p>
 <p class="ak-q">Quick check · §93.10, 1. Production landing <code>f97f8195d6</code> passed validation and was still reverted. Why?</p>
 <p>Its goal was to make <code>candidate_generator.py</code> decline multi-file swarm ops, but only a punctuation rewrite landed. A commit can be valid and still carry none of its intended change. The retry, <code>e7b3bdfec2</code>, added 9 real lines and stands.</p>
 <p class="ak-q">Quick check · §93.10, 2. The session summary reported 2 landings where there were 3, and 1 where there were 10. What rule did PRD §34 draw from that?</p>
@@ -12436,7 +12603,9 @@ Model answers and worked solutions for every section quick check, *Pause and pre
 <p>No. A first-order proof is a landing that does real work for a signed goal. A landing that carried no intended change, like the punctuation-only commit in §93.10, would not qualify.</p>
 <p class="ak-q">Pause and predict 1. A single local GPU now generates every candidate, and a candidate that passes VALIDATE sits in an isolated worktree. Before reading on, predict which stages should sit between that worktree and <code>main</code>, and whether the organism should push its own results to GitHub.</p>
 <p>The candidate is committed in a sovereignty worktree with <code>Signal:</code>, <code>Session:</code> and O+V co-author trailers. It accumulates on a per-session <code>ouroboros/battle-test/&lt;ts&gt;</code> branch. A promotion gate then checks provenance, coverage and that no public symbol vanished, and failures go to <code>ouroboros/quarantine/*</code>. Survivors are fast-forwarded onto local <code>main</code> only. It never pushes: a zero-push air-gap guards every push site, so publishing to GitHub remains an operator act. See §93.7.</p>
-<p class="ak-q">Pause and predict 2. Reactor has trained a LoRA adapter on O+V's own recorded attempts, and J-Prime serves it. Predict whether that adapter made the model measurably better, and what evidence would actually count as proof.</p>
+<p class="ak-q">Pause and predict 2. You close the terminal while O+V is halfway through an operation, and reattach twenty minutes later. What do you predict happened to the operation, and to everything it reported while you were away?</p>
+<p>The operation carried on. The organism is a separate daemon process, and closing the cockpit only detaches a client. What it reported while you were away was kept in an offline backlog (200 frames, 30-minute lifetime by default). On reattach the daemon sends a fresh hydration frame, then the control-plane replay, then that backlog, before any new live output. Before <code>381f943f93</code>, those frames were simply discarded. See §93.9.3.</p>
+<p class="ak-q">Pause and predict 3. Reactor has trained a LoRA adapter on O+V's own recorded attempts, and J-Prime serves it. Predict whether that adapter made the model measurably better, and what evidence would actually count as proof.</p>
 <p>No improvement has been shown. The adapter beat the incumbent 4/6 to 3/6 on its gate. The project's own notes reject that as evidence of learning: three contributing answers, a gradient norm of about 1e-4, and one greedy flip. The evidence that counts is a held-out benchmark: 30 tasks drawn from human commits with hidden tests. There the adapter was accepted on 1/30 or 3/30, solved 0, and showed a mean gain of 0.03. Until a held-out gain appears, no training-derived change is pushed. See §93.11.</p>
 <p class="ak-q">Conceptual 1. Why does §93 count autonomous landings by a commit trailer on <code>main</code>, rather than by what each soak session reports in its summary?</p>
 <p>The summaries were measured to be wrong. PRD §34 records session summaries undercounting landings (2 against 3, and 1 against 10), so "the ledger and git, not the summary, are the source of truth" (§93.10). A trailer such as <code>Co-Authored-By: Ouroboros+Venom</code> lives in the repository itself, so anyone can recount it with <code>git log</code>. A session log can be lost, misread or simply wrong. The same thinking runs through the rest of the design. <code>GoalReconciliationLedger</code> binds goals to commits using git ancestry, not logs (§93.7), and landing provenance attaches git-proven <code>landed</code>/<code>surviving</code> labels to training rows (§93.11). The rule also forces honesty in the other direction. The four July Run-22/23 commits carry the trailer too, so they are listed separately, not quietly folded in or dropped.</p>
