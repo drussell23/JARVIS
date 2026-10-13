@@ -36,6 +36,7 @@ boot, providers look up at stream time, tests reset between cases.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
 import sys
@@ -43,6 +44,15 @@ import time
 from typing import Any, List, Optional
 
 logger = logging.getLogger("Ouroboros.StreamRenderer")
+
+#: The op whose GENERATE this context belongs to, set by ``start``. The
+#: renderer is ONE per process, but ops generate concurrently and providers
+#: deliver tokens with no op attached; a token's context is what says whose
+#: it is. Without it, every concurrent op's tokens interleaved into whichever
+#: op last called ``start`` -- character-level garbage on any surface the
+#: stream reaches.
+_STREAM_OP: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "ov_stream_op", default="")
 
 _STREAMING_ENV_VAR = "JARVIS_UI_STREAMING_ENABLED"
 _FLOW_MODE_ENV_VAR = "JARVIS_UI_STREAMING_FLOW_MODE_ENABLED"
@@ -446,6 +456,10 @@ class StreamRenderer:
         self._consumer_task: Optional[asyncio.Task] = None
         self._active: bool = False
         self._op_id: str = ""
+        #: The op holding the stream, claimed in ``start`` and released by
+        #: that op's ``end`` -- whether or not the local widget streams
+        #: (the mirror wrapped around this renderer follows it too).
+        self._owner: str = ""
         self._provider: str = ""
         self._start_mono: float = 0.0
         self._first_token_mono: Optional[float] = None
@@ -481,9 +495,23 @@ class StreamRenderer:
         is running (e.g. unit test without loop), falls back to no-op
         gracefully — this preserves the "renderer optional" contract.
         """
-        # Idempotency: if already active, close prior session first.
-        if self._active:
-            self.end()
+        # Whose context this is -- set before any early return, so a refused
+        # op's tokens are recognisably foreign rather than unattributed.
+        caller = _STREAM_OP.get()
+        if self._owner and self._owner != op_id and caller != self._owner:
+            # Another op, from ANOTHER context, while the owner's provider is
+            # still streaming. First come keeps the one renderer: taking it
+            # over would hand this op the rest of that op's tokens. Mark this
+            # context first so its own tokens read as foreign.
+            _STREAM_OP.set(str(op_id or ""))
+            logger.debug("[StreamRender] op=%s stream held by op=%s",
+                         op_id, self._owner)
+            return
+        # The owner's own context moving on (or restarting): close its prior
+        # session cleanly -- while this context still reads as the owner.
+        self.end()
+        _STREAM_OP.set(str(op_id or ""))
+        self._owner = str(op_id or "")
 
         if not streaming_enabled():
             logger.debug(
@@ -580,7 +608,7 @@ class StreamRenderer:
         render, no I/O. Drops on queue overflow (rare) rather than
         blocking the producer. Overflow count surfaces in the INFO line.
         """
-        if not self._active or not text:
+        if not self._active or not text or not self.accepts_caller():
             return
         if self._first_token_mono is None:
             self._first_token_mono = time.monotonic()
@@ -592,9 +620,20 @@ class StreamRenderer:
         except asyncio.QueueFull:
             self._dropped_count += 1
 
+    def accepts_caller(self) -> bool:
+        """Is the calling context the op that owns this stream? A context
+        no ``start`` ever marked (a direct caller) is accepted."""
+        op = _STREAM_OP.get()
+        return not op or op == self._owner
+
     def end(self) -> None:
         """Finalize the stream: cancel the consumer, flush, stop Live,
-        emit observability INFO line. Idempotent."""
+        emit observability INFO line. Idempotent. Only the owning op's
+        context ends it -- a refused op's GENERATE ending must not cut off
+        the stream it never held."""
+        if not self.accepts_caller():
+            return
+        self._owner = ""
         if not self._active:
             return
         self._active = False
@@ -702,6 +741,17 @@ class StreamRenderer:
         """
         if event is None:
             return
+        # A conductor event names its op; attribute by THAT, not by whatever
+        # context the conductor happens to dispatch from.
+        _ev_op = str(getattr(event, "op_id", None) or "")
+        _token = _STREAM_OP.set(_ev_op) if _ev_op else None
+        try:
+            self._notify(event)
+        finally:
+            if _token is not None:
+                _STREAM_OP.reset(_token)
+
+    def _notify(self, event: Any) -> None:
         try:
             kind = getattr(event, "kind", None)
             kind_value = getattr(kind, "value", None) or str(kind or "")

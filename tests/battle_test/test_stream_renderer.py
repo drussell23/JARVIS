@@ -455,3 +455,45 @@ def test_providers_wire_get_stream_renderer_into_stream_callback():
     assert called, (
         "get_stream_renderer is referenced but never invoked in providers.py"
     )
+
+
+# ---------------------------------------------------------------------------
+# One renderer, concurrent ops: whose token is it?
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_ops_do_not_interleave_into_one_stream(monkeypatch):
+    """Found live: with five ops generating at once, the singleton renderer
+    (and the mirror fanned out around it) received EVERY op's tokens, so the
+    cockpit showed two candidates' JSON interleaved token by token. The op
+    that started the stream owns it; a token is attributed by its context."""
+    import asyncio
+
+    from backend.core.ouroboros.battle_test.stream_mirror import StreamMirror, fan_out_tokens
+    from backend.core.ouroboros.battle_test.stream_renderer import StreamRenderer
+
+    monkeypatch.setenv("JARVIS_UI_STREAMING_ENABLED", "false")   # owner without the widget
+    emitted: list = []
+    fanned = fan_out_tokens(StreamRenderer(), StreamMirror(emit=emitted.append, flush_chars=10_000))
+
+    async def op(op_id: str, word: str, started: asyncio.Event, go: asyncio.Event):
+        fanned.start(op_id=op_id, provider="")
+        started.set()
+        await go.wait()
+        for _ in range(5):
+            fanned.on_token(word)
+            await asyncio.sleep(0)
+        fanned.end()
+
+    async def run():
+        a_started, b_started, go = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        ta = asyncio.create_task(op("op-a", "A", a_started, go))
+        await a_started.wait()
+        tb = asyncio.create_task(op("op-b", "B", b_started, go))
+        await b_started.wait()
+        go.set()
+        await asyncio.gather(ta, tb)
+
+    asyncio.run(run())
+    text = "".join(emitted)
+    assert text == "AAAAA", f"another op's tokens reached the stream: {text!r}"

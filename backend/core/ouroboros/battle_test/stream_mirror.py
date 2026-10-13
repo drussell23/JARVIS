@@ -305,21 +305,34 @@ def fan_out_tokens(renderer: Any, mirror: StreamMirror) -> Any:
     if renderer is None:
         return renderer
 
+    def _owner_calling() -> bool:
+        """The renderer decides whose stream this is (one renderer, many
+        concurrent ops); the mirror follows the SAME verdict, or it would
+        interleave every op's tokens the renderer refused."""
+        try:
+            return bool(getattr(renderer, "accepts_caller", lambda: True)())
+        except Exception:  # noqa: BLE001
+            return True
+
     class _FannedOut:
         def on_token(self, text: Any) -> None:
+            owner = _owner_calling()
             try:
                 renderer.on_token(text)
             except Exception:  # noqa: BLE001
                 logger.debug("[StreamMirror] inner on_token failed",
                              exc_info=True)
-            mirror.on_token(text)
+            if owner:
+                mirror.on_token(text)
 
         def end(self) -> None:
+            owner = _owner_calling()       # before end() clears the owner
             try:
                 renderer.end()
             except Exception:  # noqa: BLE001
                 logger.debug("[StreamMirror] inner end failed", exc_info=True)
-            mirror.end()
+            if owner:
+                mirror.end()
 
         def __getattr__(self, name: str) -> Any:
             # Everything else — start(), notify(), flush(), the counters —
