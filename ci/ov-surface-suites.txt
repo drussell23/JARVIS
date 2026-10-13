@@ -19,3 +19,4 @@ tests/governance/test_cognition_lanes.py
 tests/governance/test_dw_priority_tier.py
 tests/governance/test_dw_temporal_veto.py
 tests/ci/test_lint_gate.py
+tests/governance/test_strategic_direction_manifesto_extraction.py
