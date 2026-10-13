@@ -224,6 +224,26 @@ def publish_markup_global(text: str, *, session: Optional[str] = None) -> bool:
         return False
 
 
+def publish_session_mode(cockpit: str, session_id: str, owned_ops=()) -> bool:
+    """Tell ONE cockpit it entered, left or changed a /session. NEVER raises.
+
+    Addressed like the lane-history replies (``session_scope`` +
+    ``_broadcast``), so only the cockpit whose operator typed ``/session``
+    switches its transcript into session mode. ``session_id=""`` means left.
+    """
+    try:
+        bridge = _ACTIVE_BRIDGE
+        if bridge is None or not cockpit:
+            return False
+        from backend.core.ouroboros.battle_test.attach_session import session_scope
+        with session_scope(cockpit):
+            bridge._broadcast({"type": "session_mode", "session": str(session_id or ""),
+                               "owned_ops": [str(o) for o in owned_ops or ()]})
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def publish_telemetry_global(payload: dict) -> bool:
     """Emit one typed telemetry frame to attached cockpits. NEVER raises.
 
@@ -1923,8 +1943,11 @@ class CockpitAttachClient:
         on_rewind_list: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_block: Optional[Callable[[Any], None]] = None,
         path: Optional[Path] = None,
+        on_session_mode: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self._path = Path(path) if path is not None else attach_socket_path()
+        #: /session entered / left / changed (FOREGROUND_SESSION §4).
+        self._on_session_mode = on_session_mode or (lambda _p: None)
         self._on_hydration = on_hydration or (lambda _m: None)
         self._on_line = on_line or (lambda _t: None)
         # Typed styled channel: daemon-composed tool blocks / diffs. When
@@ -2391,6 +2414,11 @@ class CockpitAttachClient:
                 elif ftype == "lane_history":
                     try:
                         self._on_lane_history(dict(frame))
+                    except Exception:  # noqa: BLE001
+                        pass
+                elif ftype == "session_mode":
+                    try:
+                        self._on_session_mode(dict(frame))
                     except Exception:  # noqa: BLE001
                         pass
         except asyncio.CancelledError:

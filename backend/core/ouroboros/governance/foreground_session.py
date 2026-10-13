@@ -306,6 +306,11 @@ def _default_emit(markup: str, cockpit: str) -> Any:
     return emit_markup(markup, cockpit)
 
 
+def _default_mode_notify(cockpit: str, session_id: str, owned_ops: List[str]) -> Any:
+    from backend.core.ouroboros.battle_test.cockpit_attach import publish_session_mode  # noqa: PLC0415
+    return publish_session_mode(cockpit, session_id, owned_ops)
+
+
 def _default_coordinator(on_tool_call: Callable[..., None]) -> Any:
     from backend.core.ouroboros.governance.tool_executor import (  # noqa: PLC0415
         AsyncProcessToolBackend, GoverningToolPolicy, ToolLoopCoordinator,
@@ -327,7 +332,8 @@ class SessionManager:
     def __init__(self, *, generate: Optional[GenerateFn] = None,
                  emit: Optional[Emit] = None,
                  coordinator_factory: Optional[Callable[..., Any]] = None,
-                 log_dir: Optional[Path] = None) -> None:
+                 log_dir: Optional[Path] = None,
+                 mode_notify: Optional[Callable[[str, str, List[str]], Any]] = None) -> None:
         self._sessions: Dict[str, ForegroundSession] = {}
         self._attached: Dict[str, str] = {}          # cockpit -> session id
         self._tasks: Dict[str, asyncio.Task] = {}
@@ -335,6 +341,16 @@ class SessionManager:
         self._emit = emit or _default_emit
         self._coordinator = coordinator_factory or _default_coordinator
         self._log_dir = log_dir
+        self._mode_notify = mode_notify or _default_mode_notify
+
+    def notify_mode(self, cockpit: str, s: Optional[ForegroundSession]) -> None:
+        """Tell the cockpit its transcript mode (FOREGROUND_SESSION §4).
+        ``s=None`` means it left. NEVER raises."""
+        try:
+            self._mode_notify(cockpit or "", s.id if s is not None else "",
+                              list(s.owned_ops) if s is not None else [])
+        except Exception:  # noqa: BLE001
+            logger.debug("[Session] mode notify failed", exc_info=True)
 
     # ---- lifecycle
     def active(self, cockpit: str) -> Optional[ForegroundSession]:
@@ -354,6 +370,7 @@ class SessionManager:
         s = ForegroundSession(id=f"s-{uuid.uuid4().hex[:6]}", cockpit=cockpit or "", created=time.time())
         self._sessions[s.id] = s
         self._attached[cockpit or ""] = s.id
+        self.notify_mode(cockpit, s)
         return s
 
     def resume(self, cockpit: str, sid: str) -> Optional[ForegroundSession]:
@@ -362,6 +379,7 @@ class SessionManager:
             return None
         s.cockpit = cockpit or ""
         self._attached[cockpit or ""] = s.id
+        self.notify_mode(cockpit, s)
         return s
 
     def end(self, cockpit: str) -> Optional[ForegroundSession]:
@@ -370,6 +388,7 @@ class SessionManager:
             return None
         s.ended = True
         self._attached.pop(cockpit or "", None)
+        self.notify_mode(cockpit, None)
         task = self._tasks.pop(s.id, None)
         if task is not None and not task.done():
             task.cancel()

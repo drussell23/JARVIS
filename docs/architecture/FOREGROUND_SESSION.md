@@ -3,7 +3,15 @@
 Status (2026-10-13): §4.5 (live pipeline blocks, op selection, `?` legend,
 status counts, learning toolbar + lock screen) is BUILT (1d25bd8c26,
 519a963d89, a6e0cca7e2, c59a41228c, 860d4b8ed2). The session mode itself
-(§3, §4.1–4.4, §5, §6) is in progress. This file was recovered from the
+is built: §3 (governance/foreground_session.py, foreground_session_ops.py,
+session_repl.py, the GENERATE seed seam in candidate_generator) and §4.1–4.4
+(ui/session_router.py, the `session_mode` frame, `/bg`). Two deviations:
+session state lives in the router, not as a cockpit_fsm mode, so select and
+focus keep working inside a session; and the background row counts ops
+"finished", not "landed", because the live data cannot tell a VERIFY that
+rolled back from one that landed. §5's IMMEDIATE admission for turns is NOT
+done: turns go through rt_gate, which does not queue behind the background
+lane's semaphore today. This file was recovered from the
 2026-10-09 session transcript after its scratchpad copy was lost; it lives in
 the repo now.
 

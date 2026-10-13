@@ -135,6 +135,9 @@ def apply_last(manager: Any, cockpit: str) -> Tuple[bool, str]:
                 _SEEDS.pop(ref, None)
             return False, "the pipeline refused the change at intake (see the debug log)"
         s.owned_ops.append(str(op_id))
+        # The cockpit routes this op's blocks to the transcript from now on.
+        if hasattr(manager, "notify_mode"):
+            manager.notify_mode(cockpit, s)
         return True, (f"{op_id} · sent through the pipeline (validate → gate → apply → verify) · "
                       f"{', '.join(files)}")
     except Exception as exc:  # noqa: BLE001

@@ -2892,6 +2892,18 @@ def _route_operator_line(client: Any, ui: Any, line: Any) -> str:
             _report_local_history(client, text)
             return "handled"
 
+        # /bg is a CLIENT concern: the sidelined background lines of a
+        # /session are buffered in THIS cockpit (ui/session_router), which is
+        # what kept them off the transcript in the first place.
+        if low in ("/bg", "bg"):
+            router = getattr(ui, "session_router", None) if ui is not None else None
+            lines = router.background() if router is not None else []
+            from rich.markup import escape as _esc
+            for _l in lines or ["(nothing in the background)"]:
+                _render_markup_frame(_esc(str(_l)))
+            _report_local_history(client, text)
+            return "handled"
+
         cmd = _resolve_audio_verb(low, audio_verbs)
         if cmd is not None:
             # AUTO-SPAWN REFLEX. `ov` boots ouroboros_battle_test.py, which has
@@ -4952,10 +4964,17 @@ def run_attach(console: Any) -> int:
             CockpitAttachClient,
         )
 
+        # FOREGROUND_SESSION §4: while this cockpit is in a /session, the
+        # router decides foreground vs sidelined for every sink below.
+        from backend.core.ouroboros.ui.session_router import SIDELINE, SessionRouter
+        router = SessionRouter()
+
         def _print_line(text: str) -> None:
             # Cockpit mounted → the daemon's bridge stream auto-scrolls into
             # Zone 1 (the Proactive Canvas). Rich markup is escaped so a daemon
             # line can never inject styling into the canvas (inert DATA).
+            if router.route_line(str(text)) == SIDELINE:
+                return
             try:
                 from backend.core.ouroboros.battle_test.bipartite_layout import (
                     get_active_canvas,
@@ -5004,7 +5023,7 @@ def run_attach(console: Any) -> int:
                 pass
             hydrated.set()
 
-        def _markup_sink(text: str, addressed: bool = False) -> None:
+        def _markup_sink(text: str, addressed: bool = False, routed: bool = False) -> None:
             """THE ambient/addressed split, at the one place both arrive.
 
             Addressed — the daemon answering a command this cockpit sent —
@@ -5016,7 +5035,12 @@ def run_attach(console: Any) -> int:
             Routed on the daemon's marker rather than inferred from the text,
             because "was this answering my command?" is not a property of the
             characters. The daemon knows; it decided when it addressed the
-            frame."""
+            frame.
+
+            ``routed`` means the session router already decided this line
+            (a frozen block's lines); each frame is routed exactly once."""
+            if not routed and router.route_markup(text, addressed) == SIDELINE:
+                return
             if addressed:
                 # An addressed frame IS the answer to something this
                 # cockpit asked — the honest close signal. Ambient frames
@@ -5081,8 +5105,11 @@ def run_attach(console: Any) -> int:
         from backend.core.ouroboros.ui.block_store import BlockStore, block_lines
 
         def _freeze_block(block: Any) -> None:
-            for _line in block_lines(block):
-                _markup_sink(_line, False)
+            _lines = list(block_lines(block))
+            if router.route_block(str(getattr(block, "op_id", "") or ""), _lines) == SIDELINE:
+                return
+            for _line in _lines:
+                _markup_sink(_line, False, routed=True)
 
         def _show_live(blocks: Any) -> None:
             from backend.core.ouroboros.battle_test.bipartite_layout import (
@@ -5102,12 +5129,28 @@ def run_attach(console: Any) -> int:
                 except Exception:  # noqa: BLE001
                     _rows = None
                 _fsm = getattr(ui, "fsm", None)
+                # In a /session only the session's own ops draw here; the
+                # rest fold into ONE background row (`/bg` for the detail).
+                _shown, _bg = router.split_live(list(blocks))
                 canvas.set_live("blocks", arrange(
-                    blocks, rows=_rows,
+                    _shown, rows=_rows,
                     focused_op=str(getattr(_fsm, "focused_lane", "") or "")))
+                _row = router.summary_row(len(_bg))
+                canvas.set_live("background", [_row] if _row else [])
 
         block_store = BlockStore(on_freeze=_freeze_block, on_live=_show_live)
         ui.relayout_live = lambda: _show_live(block_store.live())
+
+        def _on_session_mode(frame: Any) -> None:
+            """Entered / left / changed a /session (daemon-addressed). Leaving
+            replays the background digest ONCE, then the live area redraws."""
+            replay = router.apply_mode(dict(frame or {}))
+            from rich.markup import escape
+            for _l in replay or []:
+                _render_markup_frame(escape(_l), console)
+            _show_live(block_store.live())
+
+        ui.session_router = router
 
         def _on_telemetry(frame: Any) -> None:
             ui.on_telemetry(frame)
@@ -5120,6 +5163,7 @@ def run_attach(console: Any) -> int:
             on_hydration=_on_hydration, on_line=_print_line,
             on_markup=_markup_sink,
             on_block=block_store.apply,
+            on_session_mode=_on_session_mode,
             on_telemetry=_on_telemetry,
             # Gates as DATA — the id + deadline the shield needs to defer one
             # safely and still answer the right op.
