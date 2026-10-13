@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # [Ouroboros] Modified by Ouroboros (op=op-01a135e8-) at 2026-10-13 15:41 UTC
+# [Ouroboros] Modified by Ouroboros (op=op-01a1365f-) at 2026-10-13 17:58 UTC
+# Reason: Replace every timezone-naive datetime.now() with datetime.now(timezone.utc) and import timezone, so emitted timestamps a
+
 # Reason: Replace every timezone-naive datetime.now() with datetime.now(timezone.utc) and import timezone, so emitted timestamps a
 
 """
@@ -39,7 +42,7 @@ class ModelStatusManager:
         status = get_loader_status()
         await websocket.send_json({
             "type": "status_update",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "data": status
         })
 
@@ -50,7 +53,7 @@ class ModelStatusManager:
         """Broadcast status update to all connected clients"""
         message = {
             "type": "status_update",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "data": status
         }
 
