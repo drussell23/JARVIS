@@ -104,11 +104,14 @@
 <!-- QUICKCHECK after: ### §93.9 The `ov` Cockpit -->
 <div class="quick-check" id="qc-93-9">
 <p class="qc-label">Quick check · §93.9</p>
-<details class="qc"><summary>1. What does a bare <code>ov</code> do, and how does it relate to the battle-test runner?</summary>
-<p>It attaches to the running organism, or cold-boots one in the background if none is running. The battle-test runner of Part XI is still the engine underneath, and <code>ov</code> is the operator surface on top of it.</p>
+<details class="qc"><summary>1. Why does the cold-boot wait end on silence (no log growth) rather than after a fixed timeout, and what stops it from waiting forever?</summary>
+<p>A fixed timeout declared a healthy but slow organism dead (§93.9.2). Waiting while the log keeps growing tracks real progress instead. A hard ceiling of four stall windows, which progress cannot extend, and an immediate stop if the spawned child dies keep the wait bounded.</p>
 </details>
-<details class="qc"><summary>2. Why is <code>/proof</code> a SHA-256 <em>chain</em> rather than a plain list of evidence?</summary>
-<p>Each entry is chained to the previous one by hash. Editing any earlier entry breaks every later link, which makes the record tamper-evident.</p>
+<details class="qc"><summary>2. The entry point <code>ov.py</code> may import only the standard library, <code>ui.*</code> and the attach module, and a test parses it to enforce this. What failure does that prevent?</summary>
+<p>It stops the thin client from accidentally importing domain code and booting parts of the organism inside the cockpit process. If that happened, closing a terminal could take work down with it, and two copies of the same machinery could run at once. The organism must live only in the daemon (§93.9.2).</p>
+</details>
+<details class="qc"><summary>3. Why does the style guide reserve green for outcomes and derive severity colour from a rank, rather than letting each module pick colours?</summary>
+<p>So that colour carries meaning. A green mark always means something succeeded, and a given severity always looks the same everywhere. Picked colours drift module by module until green is decoration and nothing can be read at a glance. A ratchet test now keeps raw colour literals from creeping back (§93.9.6).</p>
 </details>
 </div>
 <!-- END -->

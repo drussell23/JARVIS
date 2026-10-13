@@ -15708,39 +15708,492 @@ out-of-memory-killing a running soak (<code>4d43f3e5b4</code>).</li>
 <!-- engage:end -->
 
 <h3 id="939-the-ov-cockpit">§93.9 The <code>ov</code> Cockpit</h3>
-<p>The operator surface is now the <code>ov</code> command
-(<code>backend/core/ouroboros/cli/ov.py</code>, a PEP 621 console
-script). The battle-test runner of Part XI remains the engine
-underneath. A bare <code>ov</code> attaches to the running organism, or
-cold-boots one in the background. Other verbs include
-<code>run</code>/<code>daemon</code> (headless), <code>attach</code>,
-<code>status</code>, <code>doctor</code>, <code>hive</code> and
-<code>link</code>.</p>
-<p>The cockpit renders a Claude-Code-style transcript: intent, tool
-calls and results, with a live block per in-flight operation. A toolbar
-shows the served model, a <code>landed N</code> counter, promotion
-status, and a GPU-lease lock screen while training holds the card.</p>
-<p>Slash commands come from an auto-discovered registry of
-<code>*_repl.py</code> modules, about 70 of them, plus handlers in the
-harness. The ones most relevant to this section:</p>
+<blockquote>
+<p><strong>Big Picture.</strong> An autonomous agent that nobody can
+watch cannot be trusted with a repository. The cockpit is how O+V is
+made watchable. It is a terminal application in which the organism shows
+what it is about to do, what it just decided and why, before anything
+reaches disk, and through which the operator can intervene in the same
+breath. Its governing idea, written into its own style guide, is
+<em>cockpit, not chat</em>. The screen is an instrument panel for a
+process that runs whether or not anyone is looking, not a conversation
+that stops when the human stops typing. In April the operator surface
+was the battle-test runner&#39;s console (Part XI, Part XII). Since July it
+has been a separate program, <code>ov</code>, that attaches to a
+long-lived organism.</p>
+</blockquote>
+<p>Items marked † are on the author&#39;s local <code>main</code> and not
+yet on GitHub (see the note at the top of §93).</p>
+<h4 id="9391-scale-and-where-it-lives">§93.9.1 Scale and Where It
+Lives</h4>
+<p>Line counts below are from
+<code>git show origin/main:&lt;file&gt; | wc -l</code>, blank and
+comment lines included.</p>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Files</th>
+<th>Lines</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>backend/core/ouroboros/cli/</code> +
+<code>backend/core/ouroboros/ui/</code> (entry point, thin client,
+theme, crest, deck grammar)</td>
+<td>45</td>
+<td>27,109</td>
+</tr>
+<tr>
+<td><code>backend/core/ouroboros/battle_test/</code> (rendering, REPL,
+attach bridge, and also the non-UI harness)</td>
+<td>125</td>
+<td>88,468</td>
+</tr>
+</tbody>
+</table>
+<p>The largest single files are <code>battle_test/harness.py</code>
+(11,553), <code>battle_test/serpent_flow.py</code> (10,792, the REPL and
+the original flowing renderer), <code>cli/ov.py</code> (5,594),
+<code>battle_test/cockpit_attach.py</code> (2,290, the daemon side of
+the attach link), <code>governance/claude_style_transport.py</code>
+(1,668, the default renderer) and <code>cli/thin_client.py</code>
+(1,304).</p>
+<h4 id="9392-process-model-a-thin-client-and-a-daemon-organism">§93.9.2
+Process Model: a Thin Client and a Daemon Organism</h4>
+<p>The cockpit and the organism are <strong>two processes</strong>. The
+organism, which runs GovernedLoopService, the intake layer, the sensors
+and the pipeline, runs detached and keeps working when no one is
+attached. <code>ov</code> is a thin client that finds it, or starts it,
+and then attaches.</p>
+<pre><code> ov  (thin client: stdlib + ui.* + cockpit_attach only — AST-pinned)
+  │  resolve(argv) → Invocation          pure: no side effects
+  │  apply_arming()                      bare `ov` arms Sentinel + Goal Discovery,
+  │                                      production-soak profile, promotion to local main
+  │  assert_environment()                exit 78 on a desynced environment
+  │  ensure_daemon()
+  │     probe_socket(deep=True) → live │ booting │ stale │ absent
+  │        live    → attach
+  │        stale   → unlink ghost socket, cold boot
+  │        absent  → spawn_daemon (detached) and wait for the socket
+  │  run_attach()
+  ▼
+ .jarvis/cockpit_attach.sock   Unix domain socket, mode 0600, newline-delimited JSON
+  ▲
+ organism (daemon)  ── CockpitAttachBridge → every attached client</code></pre>
+<p>Four design decisions in this path are worth naming.</p>
+<ol type="1">
+<li><strong>The entry point is deliberately light.</strong>
+<code>ov.py</code> and <code>thin_client.py</code> may import only the
+standard library, <code>ui.*</code> and the attach module. The test
+<code>tests/cli/test_thin_client.py::test_entry_surface_imports_only_tui_ipc_stdlib</code>
+parses them with <code>ast</code> to enforce this, so starting the
+cockpit can never accidentally boot the organism&#39;s domain code in the
+wrong process.</li>
+<li><strong>Arming is explicit and reversible.</strong>
+<code>resolve()</code> is pure. <code>apply_arming()</code> sets
+<code>JARVIS_SENTINEL_MODE_ENABLED</code>,
+<code>JARVIS_GOAL_DISCOVERY_ENABLED</code>,
+<code>OUROBOROS_PRODUCTION_SOAK=1</code> and
+<code>JARVIS_ACCUMULATION_PROMOTION_ENABLED</code>
+(<code>04f2f3ade0</code>). A value the operator has exported as false
+always wins, and <code>--no-sentinel</code> /
+<code>--no-production-soak</code> opt out. Before this change, soaks and
+the cockpit had been, in the commit&#39;s words, two organisms behind one
+name.</li>
+<li><strong>A socket file is never trusted on sight.</strong>
+<code>probe_socket(deep=True)</code> checks whether something actually
+answers. A socket left behind by a crashed organism is classified
+<em>stale</em>, unlinked, and replaced by a cold boot.</li>
+<li><strong>A cold boot ends on silence, not on a clock</strong>
+(<code>495ca1f659</code>). <code>await_socket</code> waits while the
+daemon&#39;s log keeps growing. Each growth renews a stall window of three
+times the observed median boot time (never below 120 s), under a hard
+ceiling of four stall windows that progress cannot extend. It stops at
+once if the spawned child dies. The bug this replaced was that a fixed
+timeout declared a healthy-but-slow organism dead.</li>
+</ol>
+<p>Exit codes carry meaning to scripts: <strong>78</strong> means the
+pinned model or environment is unavailable, and <strong>69</strong>
+means the GPU lane is lent to training. <code>ov daemon --install</code>
+writes a launchd agent (<code>com.jarvis.ov.daemon</code>,
+<code>RunAtLoad</code>, restart on failure) on macOS.</p>
+<!-- engage:begin -->
+
+<aside class="checkpoint" id="cp-s93-3">
+<p class="cp-label">Pause and predict</p>
+<p class="cp-q">You close the terminal while O+V is halfway through an operation, and reattach twenty minutes later. What do you predict happened to the operation, and to everything it reported while you were away?</p>
+<details class="cp-a"><summary>Reveal the answer</summary>
+<p>The operation carried on. The organism is a separate daemon process, and closing the cockpit only detaches a client. What it reported while you were away was kept in an offline backlog (200 frames, 30-minute lifetime by default). On reattach the daemon sends a fresh hydration frame, then the control-plane replay, then that backlog, before any new live output. Before <code>381f943f93</code>, those frames were simply discarded. See §93.9.3.</p>
+</details>
+</aside>
+<!-- engage:end -->
+
+<h4 id="9393-the-attach-protocol">§93.9.3 The Attach Protocol</h4>
+<p><code>battle_test/cockpit_attach.py</code> defines the link, schema
+<code>cockpit_attach.v2</code>, as newline-delimited JSON frames over
+the Unix socket.</p>
+<table>
+<thead>
+<tr>
+<th>Direction</th>
+<th>Frames</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Daemon → cockpit, first</td>
+<td><code>hydration</code>: phase, cost, active operations, liquidity,
+serving identity (engine, adapter, vision), audio state</td>
+</tr>
+<tr>
+<td>Daemon → cockpit</td>
+<td><code>line</code>, <code>markup</code> (daemon-composed tool
+blocks), <code>transcript</code>, <code>history_append</code>,
+<code>prompt</code> / <code>prompt_resolved</code>,
+<code>audio_state</code>, <code>autonomy_state</code>,
+<code>acoustic</code>, <code>thermal</code>, <code>telemetry</code>,
+<code>rewind_list</code>, <code>lane_history</code>,
+<code>lane_reaped</code></td>
+</tr>
+<tr>
+<td>Cockpit → daemon</td>
+<td><code>input</code> (routed into the harness&#39;s command handler),
+<code>audio</code> (wake, sleep, barge, push-to-talk, flush),
+<code>caps</code> (terminal capabilities, re-sent on every resize),
+<code>lane</code>, <code>autonomy</code></td>
+</tr>
+</tbody>
+</table>
 <ul>
-<li><code>/goal sanction</code> and <code>/goal inject</code></li>
-<li><code>/proof</code>: a tamper-evident SHA-256 chain of per-session
-evidence at <code>.jarvis/proof/chain.jsonl</code>†</li>
-<li><code>/reach</code>: a ratchet on features that are registered but
-never reached</li>
-<li><code>/why</code>: four bands — trigger, context, logic, action</li>
-<li><code>/spend</code>: day × provider × route</li>
+<li><strong>Several cockpits can attach at once.</strong> A failed write
+drops only that client. Output a client asked for, such as a verb&#39;s
+reply, is addressed to that client alone. Ambient output goes to
+everyone (<code>tests/cli/test_dual_client_multiplex.py</code>).</li>
+<li><strong>Detaching does not stop the work</strong>
+(<code>381f943f93</code>). <code>detach</code>, <code>exit</code> and
+<code>quit</code> leave the client. While no one is attached, the
+organism keeps an offline backlog of ambient frames (200 frames,
+30-minute TTL by default). On reattach the daemon writes the hydration
+frame, then the control-plane replay, then the backlog, and only then
+adds the client to the live set. The backlog is peeked and committed, so
+a client whose socket breaks mid-flush does not lose it. Before this
+fix, everything the organism said while the operator was away was simply
+discarded.</li>
+</ul>
+<h4 id="9394-from-event-to-screen-the-rendering-pipeline">§93.9.4 From
+Event to Screen: the Rendering Pipeline</h4>
+<ol type="1">
+<li><p><strong>Producers</strong> — the pipeline phases, Venom&#39;s tool
+loop, the sensors and the Sentinel — emit structured events on
+CommProtocol (INTENT, PLAN, HEARTBEAT, DECISION, POSTMORTEM; §2,
+§44).</p></li>
+<li><p><strong>The default renderer</strong> is
+<code>ClaudeStyleTransport</code>
+(<code>governance/claude_style_transport.py</code>,
+<code>JARVIS_RENDER_MODE=claude</code>). It turns events into blocks and
+mirrors them to every attached cockpit. The older flowing renderer,
+<code>SerpentTransport</code> in <code>serpent_flow.py</code>, remains
+available.</p></li>
+<li><p><strong><code>PresentationRouter</code></strong> is the single
+conformance chokepoint every line passes through.
+<code>BipartiteLayout</code> keeps the live canvas above an anchored
+input prompt.</p></li>
+<li><p><strong>The transcript spine</strong>
+(<code>battle_test/transcript_spine.py</code>) is an append-only,
+sequence-ordered record that unifies four reference namespaces:
+<code>o-N</code> operation blocks, <code>d-N</code> diffs,
+<code>t-N</code> tool results and <code>n-N</code> narrative frames. Any
+of them can be reopened with <code>/expand &lt;ref&gt;</code>, which
+also accepts permission, Q&amp;A, repair-branch and <code>/btw</code>
+tickets.</p></li>
+<li><p><strong>The durable transcript</strong>
+(<code>battle_test/transcript_writer.py</code>, <code>a42193c50b</code>,
+<code>7a006a6e00</code>) writes the spine to disk with group-commit
+<code>fsync</code> (every 32 frames or 5 s). If a write fails, it
+truncates back to the last good offset and <em>seals</em> rather than
+appending a torn record. Its health is one of DURABLE, DEGRADED or
+SEALED, and crash oracles in the tests check recovery.</p></li>
+<li><p><strong>The deck grammar</strong>
+(<code>ui/deck_grammar.py</code>) fixes the visual language. ⏺ opens a
+block, ⎿ continues it, a blank line closes it, and every body aligns to
+one fixed column measured in terminal cells. Hierarchy comes from
+colour, not indentation.</p></li>
+<li><p><strong>Token streaming</strong>
+(<code>battle_test/stream_renderer.py</code>). The model&#39;s tokens are
+queued without blocking and drawn in 16 ms batches (about 60 frames per
+second, <code>JARVIS_UI_STREAMING_BATCH_MS</code>), and since
+<code>2cee0d3341</code> they stream to attached cockpits too.
+Time-to-first-token and tokens per second are logged at the end of each
+stream.</p></li>
+<li><p><strong>The narrative channel</strong>
+(<code>battle_test/narrative_channel.py</code>) carries the organism&#39;s
+own prose — intent (💭), tool preambles (🗣), plan prose, postmortems —
+as frames that are buffered, then committed or discarded. A frame is
+never drawn half-formed.</p></li>
+<li><p><strong>The status line</strong>
+(<code>battle_test/status_line.py</code>) shows:</p>
+<ul>
+<li>the phase, cost and its basis, and the funding mode;</li>
+<li>the primary operation;</li>
+<li>the route, provider and model;</li>
+<li>liquidity;</li>
+<li>landed commits in total and per hour, always visible
+(<code>b8df0bf860</code>);</li>
+<li>promotion state as
+<code>main ← &lt;sha&gt; · N unpushed</code>.</li>
+</ul>
+<p>The serving identity — which engine, which adapter, which vision
+model — comes from the hydration frame
+(<code>d8a0a82fd5</code>).</p></li>
+<li><p><strong>Boot.</strong> An animated crest with an in-place
+progress slot covers the cold boot. Once ready, <em>presentation
+restraint</em> keeps the welcome screen minimal, and
+<code>/preflight</code> and <code>/organism</code> show detail on
+demand.</p></li>
+</ol>
+<h4 id="9395-the-command-surface">§93.9.5 The Command Surface</h4>
+<p><strong>Discovery, not registration.</strong>
+<code>battle_test/repl_dispatch_registry.py</code> scans the governance
+packages. Any module named <code>X_repl.py</code> that exposes
+<code>dispatch_X_command</code> becomes the verb <code>/X</code> (with
+optional aliases), so a new capability gets a command by existing. On
+<code>origin/main</code> there are 75 <code>*_repl.py</code>
+modules.</p>
+<p><strong>Dispatch order.</strong> A line typed into the cockpit is
+handled by the first of these that claims it:</p>
+<ol type="1">
+<li>the harness&#39;s fixed verbs (<code>stop</code>, <code>cost</code>,
+<code>pause</code>, <code>resume</code>, <code>status</code>,
+<code>plan</code>, <code>goal</code>, <code>budget</code>,
+<code>risk</code>, <code>memory</code>, <code>rewind</code>,
+<code>undo</code> and others);</li>
+<li>plugins;</li>
+<li>the auto-discovered registry;</li>
+<li>failing all of those, the text is treated as conversation.</li>
+</ol>
+<p><strong>Client-only verbs</strong> — <code>/deck</code>,
+<code>/tasks</code>, <code>keys</code>, <code>detach</code> and the
+audio verbs — are handled inside the cockpit process because they spend
+that terminal&#39;s rows or control its microphone. Anything the client does
+not own goes to the daemon, which fails closed.</p>
+<table>
+<thead>
+<tr>
+<th>Verb</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/goal sanction &lt;desc&gt; --files … [--symbol …]</code>,
+<code>/goal inject &lt;id&gt;</code></td>
+<td>Author, HMAC-sign and inject a scoped goal (§93.7)</td>
+</tr>
+<tr>
+<td><code>/why &lt;ref&gt;</code></td>
+<td>The causal account of a decision in four fixed bands: TRIGGER,
+CONTEXT, LOGIC, ACTION</td>
+</tr>
+<tr>
+<td><code>/expand &lt;ref&gt;</code></td>
+<td>Reopen any collapsed operation, diff, tool result or narrative
+frame</td>
+</tr>
+<tr>
+<td><code>/plan</code>,
+<code>/cancel &lt;op&gt; [--immediate]</code></td>
+<td>Approve a plan; cancel an operation cooperatively at the next phase
+boundary</td>
+</tr>
+<tr>
+<td><code>/reach</code></td>
+<td>Ratchet on features that are registered but never reached in
+production (§93.12)</td>
+</tr>
+<tr>
+<td><code>/spend</code></td>
+<td>Spend by day × provider × route from the accounting ledger</td>
+</tr>
+<tr>
+<td><code>/btw &lt;question&gt;</code></td>
+<td>Ask an aside while O+V works; returns an <code>s-N</code> ticket
+instead of taking the floor</td>
+</tr>
+<tr>
+<td><code>/posture</code></td>
+<td>Show, explain or override the strategic posture (§92.3)</td>
+</tr>
+<tr>
+<td><code>/proof</code>†</td>
+<td>Hash-chained, per-session proof of work</td>
+</tr>
+</tbody>
+</table>
+<h4 id="9396-design-as-code">§93.9.6 Design as Code</h4>
+<p>The cockpit&#39;s look is specified, not improvised.
+<code>docs/OV_STYLE_GUIDE.md</code> (<code>b73ccc2b99</code>) is wired
+into a theme singleton, <code>ui/theme.py</code>, so the rules are
+enforced by the code that draws.</p>
+<ul>
+<li><strong>Six principles.</strong> Cockpit not chat. Hierarchy by
+glyph. Green is an outcome. Motion is the polish. Framed where it
+counts. Restraint by default.</li>
+<li><strong>A fixed palette.</strong> Dark ground <code>#0A0E0D</code>,
+ink <code>#DBE6E1</code> and venom green <code>#5EE06A</code>, with a
+severity scale of red, amber, blue, grey and green.</li>
+<li><strong>Severity colour is derived, not picked.</strong> Rank 3
+renders bold red, 2 yellow, 1 cyan, 0 dim.</li>
+<li><strong>One meaning per glyph,</strong> each with an ASCII fallback
+for terminals that cannot draw it.</li>
+<li><strong>Semantic roles, not colours.</strong> Code asks for a role
+(<code>Token.SUCCESS</code>, <code>Token.WARNING</code>, …), and the
+theme resolves it for the terminal&#39;s colour depth. The migration took
+the codebase from <strong>365 raw colour literals to 10</strong>
+(<code>077ca1d71f</code>). A test
+(<code>test_semantic_colour_tokens.py</code>) now holds a per-directory
+ceiling that may only fall.</li>
+<li><strong>Green is reserved for outcomes.</strong>
+<code>chrome_color()</code> returns dim, not green, for decoration, so a
+green mark on screen always means something succeeded.</li>
+</ul>
+<h4 id="9397-what-broke-and-what-it-taught">§93.9.7 What Broke, and What
+It Taught</h4>
+<p>Each of these defects was found in a live run, and each changed the
+design.</p>
+<table>
+<thead>
+<tr>
+<th>Defect</th>
+<th>Root cause</th>
+<th>Commit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Autonomous work never appeared in the transcript</td>
+<td>Three separate cuts: the default transport had no mirror, tool calls
+were read only for their phase, and the client routed autonomous frames
+away</td>
+<td><code>0fb936c6f8</code></td>
+</tr>
+<tr>
+<td>The cockpit sat on a frozen &quot;loading&quot; crest</td>
+<td>A missing Python package was reported as &quot;not a terminal&quot;: two
+different failures collapsed into one <code>False</code></td>
+<td><code>1b05af9f9e</code></td>
+</tr>
+<tr>
+<td>The boot line and crest flickered</td>
+<td>A carriage return cannot undo a wrapped line; the crest&#39;s region
+changed height under itself (fixed with padding and synchronized
+output)</td>
+<td><code>bee02dccb3</code>, <code>23ac892e44</code></td>
+</tr>
+<tr>
+<td>Every autonomous line appeared twice</td>
+<td>A mirrored frame and a spooled relay of the same frame</td>
+<td><code>23ac892e44</code>, <code>ba9445a2cb</code></td>
+</tr>
+<tr>
+<td>A healthy cold boot was declared dead</td>
+<td>The wait ended on a clock instead of on silence</td>
+<td><code>495ca1f659</code></td>
+</tr>
+<tr>
+<td>The default transport had no voice</td>
+<td>Intent and preamble producers were unreachable from it, there was no
+local-tier gate, and prose was forced through the JSON grammar</td>
+<td><code>77ca9116ed</code></td>
+</tr>
+<tr>
+<td>The session recap read &quot;0 tools · 0 tokens&quot;</td>
+<td>The deterministic replay round-trip dropped the tool records</td>
+<td><code>c358b285a3</code></td>
+</tr>
+<tr>
+<td>Work done while detached was lost</td>
+<td>Frames emitted with no client attached were discarded</td>
+<td><code>381f943f93</code></td>
+</tr>
+</tbody>
+</table>
+<p>The common lesson matches the rest of §93: <strong>a display that
+silently shows nothing is the most dangerous display</strong>, because
+it reads as &quot;nothing happened&quot;. Several fixes therefore make absence
+visible. Landings are always counted on screen, a missing package is
+named, and a lent GPU lane exits with its own code.</p>
+<h4 id="9398-contracts-that-keep-it-honest">§93.9.8 Contracts That Keep
+It Honest</h4>
+<ul>
+<li><strong>Import isolation.</strong>
+<code>test_entry_surface_imports_only_tui_ipc_stdlib</code> parses the
+entry point and fails on any domain import.</li>
+<li><strong>Colour ratchet.</strong>
+<code>test_raw_colour_literals_only_ever_decrease</code> and
+<code>test_green_is_SCARCE</code>.</li>
+<li><strong>Glyph ratchet.</strong>
+<code>test_no_new_hardcoded_glyph_reaches_an_output_site</code>.</li>
+<li><strong>Boot wait.</strong>
+<code>test_a_silent_daemon_is_abandoned_at_the_stall_window</code> and
+<code>test_progress_can_never_outlive_the_ceiling</code>.</li>
+<li><strong>Transcript durability.</strong> Crash oracles in
+<code>test_transcript_log_oracles.py</code>.</li>
+<li><strong>Scale.</strong> About 290 test files sit in
+<code>tests/battle_test</code>, <code>tests/cli</code> and
+<code>tests/ui</code> on <code>origin/main</code>.</li>
+</ul>
+<h4 id="9399-other-surfaces-on-the-same-stream">§93.9.9 Other Surfaces
+on the Same Stream</h4>
+<p><strong>Other terminal views.</strong> <code>ov system</code> and
+<code>ov hive</code> are passive panels listening on the same attach
+socket.</p>
+<p><strong>IDE and dashboard views.</strong> A read-only, loopback-only
+HTTP surface (<code>governance/ide_observability.py</code>,
+<code>governance/ide_observability_stream.py</code>) serves the same
+events to IDEs and dashboards:</p>
+<ul>
+<li><strong>GET routes</strong> for tasks, plans, sessions, posture and
+flags.</li>
+<li><strong>A Server-Sent Events stream</strong> at
+<code>/observability/stream</code>, which is:
+<ul>
+<li>deny-by-default;</li>
+<li>subscriber-capped;</li>
+<li>drop-oldest under back-pressure, with an explicit
+<code>stream_lag</code> frame;</li>
+<li>resumable with <code>Last-Event-ID</code>.</li>
+</ul></li>
+</ul>
+<p><strong>Consumers.</strong> Extensions for VS Code, JetBrains and
+Sublime, and a React dashboard. Because they are read-only and
+authority-free, nothing that watches the organism can steer it.</p>
+<h4 id="93910-in-flight">§93.9.10 In Flight†</h4>
+<p>The newest cockpit work is on the author&#39;s local <code>main</code>
+and was in use during the October soaks:</p>
+<ul>
+<li><strong>TranscriptFlow.</strong> One transcript sink with a block
+store, so each tool appears once in scrollback.</li>
+<li><strong>A live block per in-flight operation,</strong> showing its
+pipeline phase as it moves.</li>
+<li><strong>A GPU-lease lock screen</strong> shown while training holds
+the card, with the last training cycle on the toolbar.</li>
+<li><strong>A green ● action mark</strong> replacing ⏺.</li>
+<li><strong>Friendlier serving names.</strong></li>
 </ul>
 <!-- engage:begin -->
 
 <div class="quick-check" id="qc-93-9">
 <p class="qc-label">Quick check · §93.9</p>
-<details class="qc"><summary>1. What does a bare <code>ov</code> do, and how does it relate to the battle-test runner?</summary>
-<p>It attaches to the running organism, or cold-boots one in the background if none is running. The battle-test runner of Part XI is still the engine underneath, and <code>ov</code> is the operator surface on top of it.</p>
+<details class="qc"><summary>1. Why does the cold-boot wait end on silence (no log growth) rather than after a fixed timeout, and what stops it from waiting forever?</summary>
+<p>A fixed timeout declared a healthy but slow organism dead (§93.9.2). Waiting while the log keeps growing tracks real progress instead. A hard ceiling of four stall windows, which progress cannot extend, and an immediate stop if the spawned child dies keep the wait bounded.</p>
 </details>
-<details class="qc"><summary>2. Why is <code>/proof</code> a SHA-256 <em>chain</em> rather than a plain list of evidence?</summary>
-<p>Each entry is chained to the previous one by hash. Editing any earlier entry breaks every later link, which makes the record tamper-evident.</p>
+<details class="qc"><summary>2. The entry point <code>ov.py</code> may import only the standard library, <code>ui.*</code> and the attach module, and a test parses it to enforce this. What failure does that prevent?</summary>
+<p>It stops the thin client from accidentally importing domain code and booting parts of the organism inside the cockpit process. If that happened, closing a terminal could take work down with it, and two copies of the same machinery could run at once. The organism must live only in the daemon (§93.9.2).</p>
+</details>
+<details class="qc"><summary>3. Why does the style guide reserve green for outcomes and derive severity colour from a rank, rather than letting each module pick colours?</summary>
+<p>So that colour carries meaning. A green mark always means something succeeded, and a given severity always looks the same everywhere. Picked colours drift module by module until green is decoration and nothing can be read at a glance. A ratchet test now keeps raw colour literals from creeping back (§93.9.6).</p>
 </details>
 </div>
 <!-- engage:end -->
@@ -17175,31 +17628,31 @@ Variables&quot; for the exhaustive list.</p>
 Commands</h2>
 <p>All commands assume <code>cwd</code> is the repository root.</p>
 <h3 id="boot-the-full-battle-test">Boot the full battle test</h3>
-<div class="sourceCode" id="cb59"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb59-1"><a href="#cb59-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> scripts/ouroboros_battle_test.py <span class="at">--cost-cap</span> 0.50 <span class="at">--idle-timeout</span> 600 <span class="at">-v</span></span></code></pre></div>
+<div class="sourceCode" id="cb60"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb60-1"><a href="#cb60-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> scripts/ouroboros_battle_test.py <span class="at">--cost-cap</span> 0.50 <span class="at">--idle-timeout</span> 600 <span class="at">-v</span></span></code></pre></div>
 <h3 id="inspect-session-artifacts">Inspect session artifacts</h3>
-<div class="sourceCode" id="cb60"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb60-1"><a href="#cb60-1" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-la</span> .ouroboros/sessions/</span>
-<span id="cb60-2"><a href="#cb60-2" aria-hidden="true" tabindex="-1"></a><span class="fu">tail</span> <span class="at">-n</span> 100 .ouroboros/sessions/bt-<span class="op">&lt;</span>timestamp<span class="op">&gt;</span>/debug.log</span>
-<span id="cb60-3"><a href="#cb60-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> .ouroboros/sessions/bt-<span class="op">&lt;</span>timestamp<span class="op">&gt;</span>/summary.json <span class="kw">|</span> <span class="ex">python3</span> <span class="at">-m</span> json.tool</span></code></pre></div>
+<div class="sourceCode" id="cb61"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb61-1"><a href="#cb61-1" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-la</span> .ouroboros/sessions/</span>
+<span id="cb61-2"><a href="#cb61-2" aria-hidden="true" tabindex="-1"></a><span class="fu">tail</span> <span class="at">-n</span> 100 .ouroboros/sessions/bt-<span class="op">&lt;</span>timestamp<span class="op">&gt;</span>/debug.log</span>
+<span id="cb61-3"><a href="#cb61-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> .ouroboros/sessions/bt-<span class="op">&lt;</span>timestamp<span class="op">&gt;</span>/summary.json <span class="kw">|</span> <span class="ex">python3</span> <span class="at">-m</span> json.tool</span></code></pre></div>
 <h3 id="run-the-explorationledger-in-shadow-mode">Run the
 ExplorationLedger in shadow mode</h3>
-<div class="sourceCode" id="cb61"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb61-1"><a href="#cb61-1" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">JARVIS_EXPLORATION_SHADOW_LOG</span><span class="op">=</span>true</span>
-<span id="cb61-2"><a href="#cb61-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">JARVIS_EXPLORATION_LEDGER_ENABLED</span><span class="op">=</span>false</span>
-<span id="cb61-3"><a href="#cb61-3" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> scripts/ouroboros_battle_test.py <span class="at">--cost-cap</span> 0.50 <span class="at">--idle-timeout</span> 600 <span class="at">-v</span></span>
-<span id="cb61-4"><a href="#cb61-4" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="st">&quot;ExplorationLedger(shadow)&quot;</span> .ouroboros/sessions/bt-<span class="pp">*</span>/debug.log</span></code></pre></div>
+<div class="sourceCode" id="cb62"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb62-1"><a href="#cb62-1" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">JARVIS_EXPLORATION_SHADOW_LOG</span><span class="op">=</span>true</span>
+<span id="cb62-2"><a href="#cb62-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">JARVIS_EXPLORATION_LEDGER_ENABLED</span><span class="op">=</span>false</span>
+<span id="cb62-3"><a href="#cb62-3" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> scripts/ouroboros_battle_test.py <span class="at">--cost-cap</span> 0.50 <span class="at">--idle-timeout</span> 600 <span class="at">-v</span></span>
+<span id="cb62-4"><a href="#cb62-4" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="st">&quot;ExplorationLedger(shadow)&quot;</span> .ouroboros/sessions/bt-<span class="pp">*</span>/debug.log</span></code></pre></div>
 <h3 id="enforce-the-explorationledger">Enforce the
 ExplorationLedger</h3>
-<div class="sourceCode" id="cb62"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb62-1"><a href="#cb62-1" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">JARVIS_EXPLORATION_LEDGER_ENABLED</span><span class="op">=</span>true</span>
-<span id="cb62-2"><a href="#cb62-2" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> scripts/ouroboros_battle_test.py <span class="at">--cost-cap</span> 0.50 <span class="at">--idle-timeout</span> 600 <span class="at">-v</span></span>
-<span id="cb62-3"><a href="#cb62-3" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="st">&quot;ExplorationLedger(decision)&quot;</span> .ouroboros/sessions/bt-<span class="pp">*</span>/debug.log</span></code></pre></div>
+<div class="sourceCode" id="cb63"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb63-1"><a href="#cb63-1" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">JARVIS_EXPLORATION_LEDGER_ENABLED</span><span class="op">=</span>true</span>
+<span id="cb63-2"><a href="#cb63-2" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> scripts/ouroboros_battle_test.py <span class="at">--cost-cap</span> 0.50 <span class="at">--idle-timeout</span> 600 <span class="at">-v</span></span>
+<span id="cb63-3"><a href="#cb63-3" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="st">&quot;ExplorationLedger(decision)&quot;</span> .ouroboros/sessions/bt-<span class="pp">*</span>/debug.log</span></code></pre></div>
 <h3 id="reproduce-session-w-requires-post-53e6bd9f76-commit">Reproduce
 Session W (requires post-<code>53e6bd9f76</code> commit)</h3>
 <p>The autonomous multi-file APPLY requires the L2 deadline
 reconciliation fix (commit <code>53e6bd9f76</code>), which is on main as
 of 2026-04-15. To reproduce, check out a commit at or after
 <code>53e6bd9f76</code>:</p>
-<div class="sourceCode" id="cb63"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb63-1"><a href="#cb63-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> checkout 53e6bd9f76</span>
-<span id="cb63-2"><a href="#cb63-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Boot battle test; queue a backlog task resembling &quot;write four sensor test modules&quot;</span></span>
-<span id="cb63-3"><a href="#cb63-3" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> scripts/ouroboros_battle_test.py <span class="at">--cost-cap</span> 1.00 <span class="at">--idle-timeout</span> 3600 <span class="at">-v</span></span></code></pre></div>
+<div class="sourceCode" id="cb64"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb64-1"><a href="#cb64-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> checkout 53e6bd9f76</span>
+<span id="cb64-2"><a href="#cb64-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Boot battle test; queue a backlog task resembling &quot;write four sensor test modules&quot;</span></span>
+<span id="cb64-3"><a href="#cb64-3" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> scripts/ouroboros_battle_test.py <span class="at">--cost-cap</span> 1.00 <span class="at">--idle-timeout</span> 3600 <span class="at">-v</span></span></code></pre></div>
 <p>The harness will pick up the backlog signal through BacklogSensor and
 run the end-to-end multi-file APPLY flow.</p>
 <h2 id="appendix-e--the-zero-shortcut-mandate-verbatim">Appendix E — The
@@ -17223,29 +17676,29 @@ Generation Commands</h2>
 <p>This paper was generated on macOS 15 (Darwin 25.3.0) with pandoc 3.9
 + Chrome headless + pypdf post-processor. No LaTeX engine required.</p>
 <h3 id="html-with-clickable-toc">HTML (with clickable TOC)</h3>
-<div class="sourceCode" id="cb64"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb64-1"><a href="#cb64-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pandoc</span> docs/architecture/OV_RESEARCH_PAPER_2026-04-16.md <span class="dt">\</span></span>
-<span id="cb64-2"><a href="#cb64-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-o</span> docs/architecture/OV_RESEARCH_PAPER_2026-04-16.html <span class="dt">\</span></span>
-<span id="cb64-3"><a href="#cb64-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--from</span><span class="op">=</span>gfm <span class="at">--to</span><span class="op">=</span>html5 <span class="at">--standalone</span> <span class="dt">\</span></span>
-<span id="cb64-4"><a href="#cb64-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--toc</span> <span class="at">--toc-depth</span><span class="op">=</span>3 <span class="dt">\</span></span>
-<span id="cb64-5"><a href="#cb64-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--metadata</span> title=<span class="st">&quot;Ouroboros + Venom (O+V): A Governed Architecture for Autonomous Self-Development&quot;</span> <span class="dt">\</span></span>
-<span id="cb64-6"><a href="#cb64-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--css</span><span class="op">=</span>docs/benchmarks/_report_style.css <span class="dt">\</span></span>
-<span id="cb64-7"><a href="#cb64-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--embed-resources</span></span></code></pre></div>
+<div class="sourceCode" id="cb65"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb65-1"><a href="#cb65-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pandoc</span> docs/architecture/OV_RESEARCH_PAPER_2026-04-16.md <span class="dt">\</span></span>
+<span id="cb65-2"><a href="#cb65-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-o</span> docs/architecture/OV_RESEARCH_PAPER_2026-04-16.html <span class="dt">\</span></span>
+<span id="cb65-3"><a href="#cb65-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--from</span><span class="op">=</span>gfm <span class="at">--to</span><span class="op">=</span>html5 <span class="at">--standalone</span> <span class="dt">\</span></span>
+<span id="cb65-4"><a href="#cb65-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--toc</span> <span class="at">--toc-depth</span><span class="op">=</span>3 <span class="dt">\</span></span>
+<span id="cb65-5"><a href="#cb65-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--metadata</span> title=<span class="st">&quot;Ouroboros + Venom (O+V): A Governed Architecture for Autonomous Self-Development&quot;</span> <span class="dt">\</span></span>
+<span id="cb65-6"><a href="#cb65-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--css</span><span class="op">=</span>docs/benchmarks/_report_style.css <span class="dt">\</span></span>
+<span id="cb65-7"><a href="#cb65-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--embed-resources</span></span></code></pre></div>
 <h3 id="pdf-via-chrome-headless">PDF (via Chrome headless)</h3>
-<div class="sourceCode" id="cb65"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb65-1"><a href="#cb65-1" aria-hidden="true" tabindex="-1"></a><span class="va">TMPDIR_CHROME</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${TMPDIR</span><span class="op">:-</span>/tmp<span class="va">}</span><span class="st">/chrome-headless-</span><span class="va">$$</span><span class="st">&quot;</span></span>
-<span id="cb65-2"><a href="#cb65-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> <span class="st">&quot;</span><span class="va">$TMPDIR_CHROME</span><span class="st">&quot;</span></span>
-<span id="cb65-3"><a href="#cb65-3" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;/Applications/Google Chrome.app/Contents/MacOS/Google Chrome&quot;</span> <span class="dt">\</span></span>
-<span id="cb65-4"><a href="#cb65-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--headless</span> <span class="at">--disable-gpu</span> <span class="dt">\</span></span>
-<span id="cb65-5"><a href="#cb65-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--user-data-dir</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$TMPDIR_CHROME</span><span class="st">&quot;</span> <span class="dt">\</span></span>
-<span id="cb65-6"><a href="#cb65-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--no-pdf-header-footer</span> <span class="dt">\</span></span>
-<span id="cb65-7"><a href="#cb65-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--print-to-pdf</span><span class="op">=</span>docs/architecture/OV_RESEARCH_PAPER_2026-04-16.pdf <span class="dt">\</span></span>
-<span id="cb65-8"><a href="#cb65-8" aria-hidden="true" tabindex="-1"></a>  <span class="st">&quot;file://</span><span class="va">$(</span><span class="bu">pwd</span><span class="va">)</span><span class="st">/docs/architecture/OV_RESEARCH_PAPER_2026-04-16.html&quot;</span></span>
-<span id="cb65-9"><a href="#cb65-9" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-rf</span> <span class="st">&quot;</span><span class="va">$TMPDIR_CHROME</span><span class="st">&quot;</span></span></code></pre></div>
+<div class="sourceCode" id="cb66"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb66-1"><a href="#cb66-1" aria-hidden="true" tabindex="-1"></a><span class="va">TMPDIR_CHROME</span><span class="op">=</span><span class="st">&quot;</span><span class="va">${TMPDIR</span><span class="op">:-</span>/tmp<span class="va">}</span><span class="st">/chrome-headless-</span><span class="va">$$</span><span class="st">&quot;</span></span>
+<span id="cb66-2"><a href="#cb66-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> <span class="st">&quot;</span><span class="va">$TMPDIR_CHROME</span><span class="st">&quot;</span></span>
+<span id="cb66-3"><a href="#cb66-3" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;/Applications/Google Chrome.app/Contents/MacOS/Google Chrome&quot;</span> <span class="dt">\</span></span>
+<span id="cb66-4"><a href="#cb66-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--headless</span> <span class="at">--disable-gpu</span> <span class="dt">\</span></span>
+<span id="cb66-5"><a href="#cb66-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--user-data-dir</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$TMPDIR_CHROME</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb66-6"><a href="#cb66-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--no-pdf-header-footer</span> <span class="dt">\</span></span>
+<span id="cb66-7"><a href="#cb66-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--print-to-pdf</span><span class="op">=</span>docs/architecture/OV_RESEARCH_PAPER_2026-04-16.pdf <span class="dt">\</span></span>
+<span id="cb66-8"><a href="#cb66-8" aria-hidden="true" tabindex="-1"></a>  <span class="st">&quot;file://</span><span class="va">$(</span><span class="bu">pwd</span><span class="va">)</span><span class="st">/docs/architecture/OV_RESEARCH_PAPER_2026-04-16.html&quot;</span></span>
+<span id="cb66-9"><a href="#cb66-9" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-rf</span> <span class="st">&quot;</span><span class="va">$TMPDIR_CHROME</span><span class="st">&quot;</span></span></code></pre></div>
 <h3 id="pdf-outline-sidebar-bookmarks">PDF outline (sidebar
 bookmarks)</h3>
-<div class="sourceCode" id="cb66"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb66-1"><a href="#cb66-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> scripts/benchmarks/add_pdf_outline.py <span class="dt">\</span></span>
-<span id="cb66-2"><a href="#cb66-2" aria-hidden="true" tabindex="-1"></a>  docs/architecture/OV_RESEARCH_PAPER_2026-04-16.html <span class="dt">\</span></span>
-<span id="cb66-3"><a href="#cb66-3" aria-hidden="true" tabindex="-1"></a>  docs/architecture/OV_RESEARCH_PAPER_2026-04-16.pdf <span class="dt">\</span></span>
-<span id="cb66-4"><a href="#cb66-4" aria-hidden="true" tabindex="-1"></a>  docs/architecture/OV_RESEARCH_PAPER_2026-04-16.pdf</span></code></pre></div>
+<div class="sourceCode" id="cb67"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb67-1"><a href="#cb67-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> scripts/benchmarks/add_pdf_outline.py <span class="dt">\</span></span>
+<span id="cb67-2"><a href="#cb67-2" aria-hidden="true" tabindex="-1"></a>  docs/architecture/OV_RESEARCH_PAPER_2026-04-16.html <span class="dt">\</span></span>
+<span id="cb67-3"><a href="#cb67-3" aria-hidden="true" tabindex="-1"></a>  docs/architecture/OV_RESEARCH_PAPER_2026-04-16.pdf <span class="dt">\</span></span>
+<span id="cb67-4"><a href="#cb67-4" aria-hidden="true" tabindex="-1"></a>  docs/architecture/OV_RESEARCH_PAPER_2026-04-16.pdf</span></code></pre></div>
 <p>The outline post-processor parses the HTML TOC, maps each entry to a
 named PDF destination, and writes a sidebar-navigable outline tree.</p>
 <h3 id="reader-engagement-layer-added-2026-10-13">Reader engagement
@@ -17259,9 +17712,9 @@ statistics, information theory, control theory and the like). Each Part
 also carries <em>Pause and predict</em> checkpoints. Their styling and
 behaviour live in <code>docs/architecture/paper_assets/</code>. Add
 these flags to the HTML command above:</p>
-<div class="sourceCode" id="cb67"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb67-1"><a href="#cb67-1" aria-hidden="true" tabindex="-1"></a>  <span class="ex">--include-in-header=docs/architecture/paper_assets/engage_head.html</span> <span class="dt">\</span></span>
-<span id="cb67-2"><a href="#cb67-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--include-after-body</span><span class="op">=</span>docs/architecture/paper_assets/engage_body.html <span class="dt">\</span></span>
-<span id="cb67-3"><a href="#cb67-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--resource-path</span><span class="op">=</span>docs/architecture:.</span></code></pre></div>
+<div class="sourceCode" id="cb68"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb68-1"><a href="#cb68-1" aria-hidden="true" tabindex="-1"></a>  <span class="ex">--include-in-header=docs/architecture/paper_assets/engage_head.html</span> <span class="dt">\</span></span>
+<span id="cb68-2"><a href="#cb68-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--include-after-body</span><span class="op">=</span>docs/architecture/paper_assets/engage_body.html <span class="dt">\</span></span>
+<span id="cb68-3"><a href="#cb68-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--resource-path</span><span class="op">=</span>docs/architecture:.</span></code></pre></div>
 <p>For the PDF, render a second HTML that puts
 <code>engage_print.html</code> <em>before</em>
 <code>engage_body.html</code> (<code>--include-after-body</code> twice,
@@ -19105,10 +19558,12 @@ appear.</p>
 <p>Tests that cannot execute, tests that assert nothing, and tests that never import their subject. It was added after a hollow test landing (<code>c985ccaee4</code>) reached <code>main</code> and had to be reverted.</p>
 <p class="ak-q">Quick check · §93.8, 3. In the <code>2b.1-diff</code> path the source is shown with numbered lines. Why must the numbers the model copies back be stripped?</p>
 <p>The numbers help the model locate its edit, but they are not part of the code. Left in, they would be written into the file. Stripping them and applying through a single stdlib applier keeps the output clean.</p>
-<p class="ak-q">Quick check · §93.9, 1. What does a bare <code>ov</code> do, and how does it relate to the battle-test runner?</p>
-<p>It attaches to the running organism, or cold-boots one in the background if none is running. The battle-test runner of Part XI is still the engine underneath, and <code>ov</code> is the operator surface on top of it.</p>
-<p class="ak-q">Quick check · §93.9, 2. Why is <code>/proof</code> a SHA-256 <em>chain</em> rather than a plain list of evidence?</p>
-<p>Each entry is chained to the previous one by hash. Editing any earlier entry breaks every later link, which makes the record tamper-evident.</p>
+<p class="ak-q">Quick check · §93.9, 1. Why does the cold-boot wait end on silence (no log growth) rather than after a fixed timeout, and what stops it from waiting forever?</p>
+<p>A fixed timeout declared a healthy but slow organism dead (§93.9.2). Waiting while the log keeps growing tracks real progress instead. A hard ceiling of four stall windows, which progress cannot extend, and an immediate stop if the spawned child dies keep the wait bounded.</p>
+<p class="ak-q">Quick check · §93.9, 2. The entry point <code>ov.py</code> may import only the standard library, <code>ui.*</code> and the attach module, and a test parses it to enforce this. What failure does that prevent?</p>
+<p>It stops the thin client from accidentally importing domain code and booting parts of the organism inside the cockpit process. If that happened, closing a terminal could take work down with it, and two copies of the same machinery could run at once. The organism must live only in the daemon (§93.9.2).</p>
+<p class="ak-q">Quick check · §93.9, 3. Why does the style guide reserve green for outcomes and derive severity colour from a rank, rather than letting each module pick colours?</p>
+<p>So that colour carries meaning. A green mark always means something succeeded, and a given severity always looks the same everywhere. Picked colours drift module by module until green is decoration and nothing can be read at a glance. A ratchet test now keeps raw colour literals from creeping back (§93.9.6).</p>
 <p class="ak-q">Quick check · §93.10, 1. Production landing <code>f97f8195d6</code> passed validation and was still reverted. Why?</p>
 <p>Its goal was to make <code>candidate_generator.py</code> decline multi-file swarm ops, but only a punctuation rewrite landed. A commit can be valid and still carry none of its intended change. The retry, <code>e7b3bdfec2</code>, added 9 real lines and stands.</p>
 <p class="ak-q">Quick check · §93.10, 2. The session summary reported 2 landings where there were 3, and 1 where there were 10. What rule did PRD §34 draw from that?</p>
@@ -19145,7 +19600,9 @@ appear.</p>
 <p>No. A first-order proof is a landing that does real work for a signed goal. A landing that carried no intended change, like the punctuation-only commit in §93.10, would not qualify.</p>
 <p class="ak-q">Pause and predict 1. A single local GPU now generates every candidate, and a candidate that passes VALIDATE sits in an isolated worktree. Before reading on, predict which stages should sit between that worktree and <code>main</code>, and whether the organism should push its own results to GitHub.</p>
 <p>The candidate is committed in a sovereignty worktree with <code>Signal:</code>, <code>Session:</code> and O+V co-author trailers. It accumulates on a per-session <code>ouroboros/battle-test/&lt;ts&gt;</code> branch. A promotion gate then checks provenance, coverage and that no public symbol vanished, and failures go to <code>ouroboros/quarantine/*</code>. Survivors are fast-forwarded onto local <code>main</code> only. It never pushes: a zero-push air-gap guards every push site, so publishing to GitHub remains an operator act. See §93.7.</p>
-<p class="ak-q">Pause and predict 2. Reactor has trained a LoRA adapter on O+V&#39;s own recorded attempts, and J-Prime serves it. Predict whether that adapter made the model measurably better, and what evidence would actually count as proof.</p>
+<p class="ak-q">Pause and predict 2. You close the terminal while O+V is halfway through an operation, and reattach twenty minutes later. What do you predict happened to the operation, and to everything it reported while you were away?</p>
+<p>The operation carried on. The organism is a separate daemon process, and closing the cockpit only detaches a client. What it reported while you were away was kept in an offline backlog (200 frames, 30-minute lifetime by default). On reattach the daemon sends a fresh hydration frame, then the control-plane replay, then that backlog, before any new live output. Before <code>381f943f93</code>, those frames were simply discarded. See §93.9.3.</p>
+<p class="ak-q">Pause and predict 3. Reactor has trained a LoRA adapter on O+V&#39;s own recorded attempts, and J-Prime serves it. Predict whether that adapter made the model measurably better, and what evidence would actually count as proof.</p>
 <p>No improvement has been shown. The adapter beat the incumbent 4/6 to 3/6 on its gate. The project&#39;s own notes reject that as evidence of learning: three contributing answers, a gradient norm of about 1e-4, and one greedy flip. The evidence that counts is a held-out benchmark: 30 tasks drawn from human commits with hidden tests. There the adapter was accepted on 1/30 or 3/30, solved 0, and showed a mean gain of 0.03. Until a held-out gain appears, no training-derived change is pushed. See §93.11.</p>
 <p class="ak-q">Conceptual 1. Why does §93 count autonomous landings by a commit trailer on <code>main</code>, rather than by what each soak session reports in its summary?</p>
 <p>The summaries were measured to be wrong. PRD §34 records session summaries undercounting landings (2 against 3, and 1 against 10), so &quot;the ledger and git, not the summary, are the source of truth&quot; (§93.10). A trailer such as <code>Co-Authored-By: Ouroboros+Venom</code> lives in the repository itself, so anyone can recount it with <code>git log</code>. A session log can be lost, misread or simply wrong. The same thinking runs through the rest of the design. <code>GoalReconciliationLedger</code> binds goals to commits using git ancestry, not logs (§93.7), and landing provenance attaches git-proven <code>landed</code>/<code>surviving</code> labels to training rows (§93.11). The rule also forces honesty in the other direction. The four July Run-22/23 commits carry the trailer too, so they are listed separately, not quietly folded in or dropped.</p>
