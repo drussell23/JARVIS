@@ -1507,6 +1507,16 @@ class CockpitAttachBridge:
             target = current_session()
         except Exception:  # noqa: BLE001 — routing must never eat output
             target = None
+        # A producer that NAMED its cockpit (``publish_markup(session=)``)
+        # is addressed too. Its frame often crosses here via
+        # call_soon_threadsafe, where the emitter's ContextVar is gone; the
+        # name used to ride along as a mere field while the frame went to
+        # EVERY cockpit marked ambient -- a /session's own answers were
+        # sidelined as background and painted in other terminals. (Only a
+        # markup frame's "session" names a cockpit; session_mode's names the
+        # foreground conversation and is always sent inside session_scope.)
+        if target is None and msg.get("type") == "markup" and msg.get("session"):
+            target = str(msg["session"])
 
         if target is not None:
             w = self._sessions.get(target)

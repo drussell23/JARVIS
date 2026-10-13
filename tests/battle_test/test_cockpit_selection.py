@@ -289,6 +289,31 @@ async def test_a_vanished_lane_answers_found_false_not_silence() -> None:
     assert w.frames[0]["lines"] == []
 
 
+async def test_markup_that_names_its_cockpit_is_addressed_to_it_alone() -> None:
+    """Found live: a /session's answers were published with
+    ``publish_markup(session=<cockpit>)`` from a context with no session
+    scope, and went to EVERY cockpit marked ambient -- sidelined as
+    background in the asker's own transcript, painted in everyone else's."""
+    from backend.core.ouroboros.battle_test.cockpit_attach import (
+        CockpitAttachBridge,
+    )
+    a, b = _Writer(), _Writer()
+    bridge = CockpitAttachBridge()
+    bridge._loop = asyncio.get_running_loop()   # type: ignore[attr-defined]
+    for w, sid in ((a, "sess-A"), (b, "sess-B")):
+        bridge._clients.add(w)                  # type: ignore[arg-type]
+        bridge.bind_session(sid, w)             # type: ignore[arg-type]
+
+    bridge.publish_markup("the answer", session="sess-A")   # no session_scope here
+    await asyncio.sleep(0)
+
+    mine = [f for f in a.frames if f.get("type") == "markup"]
+    assert [f["text"] for f in mine] == ["the answer"]
+    assert mine[0]["addressed"] is True
+    assert not [f for f in b.frames if f.get("type") == "markup"], \
+        "another cockpit saw terminal A's answer"
+
+
 # --------------------------------------------------------------------------
 # 4. the client renders each mode into the one toolbar region
 # --------------------------------------------------------------------------
