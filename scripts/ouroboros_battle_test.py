@@ -354,7 +354,14 @@ def _load_env_files() -> None:
         from dotenv import dotenv_values  # noqa: PLC0415
     except Exception:  # noqa: BLE001 — dependency optional, as upstream
         return
-    for env_path in (_PROJECT_ROOT / ".env", _PROJECT_ROOT / "backend" / ".env"):
+    # The SAME file the canonical loader chose (JARVIS_ENV_FILE, else
+    # <repo>/.env). When an explicit file is named it is the whole
+    # environment, so the backend/.env overlay does not apply either; the two
+    # loaders used to disagree about which file was in force.
+    from backend.core.env_bootstrap import env_file_path  # noqa: PLC0415
+    _explicit = bool(os.environ.get("JARVIS_ENV_FILE", "").strip())
+    _paths = (env_file_path(),) if _explicit else (env_file_path(), _PROJECT_ROOT / "backend" / ".env")
+    for env_path in _paths:
         try:
             if not env_path.exists():
                 continue

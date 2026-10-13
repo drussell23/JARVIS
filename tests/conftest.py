@@ -63,11 +63,42 @@ def temp_test_dir(tmp_path):
     return tmp_path
 
 
+def _declare_test_env_file(config) -> None:
+    """The test process loads NO operator ``.env``.
+
+    ``scripts/ouroboros_battle_test.py`` calls ``load_env_once`` at import
+    (so ``backend.*`` modules reading ``os.environ`` at import see a
+    populated environment), and ``test_single_flight_incumbent.py`` imports
+    it at module scope -- so COLLECTING that file hydrated the operator's
+    ``.env`` into the test process before the first test ran
+    (``JARVIS_PAID_LANES_ENABLED=false`` among it), and every later test saw
+    it. Three ``test_transport_narration_and_design`` local-tier tests failed
+    only in a batch that collected it; a per-test environ restore cannot
+    help, because the leak precedes every snapshot.
+
+    Runs in ``pytest_configure``, before collection. Uses the loader's own
+    supported knob, ``JARVIS_ENV_FILE``, pointed at an empty file this
+    session owns, so every loader that honours it loads nothing. An outer
+    setting wins (a run that deliberately tests against a real file).
+    """
+    try:
+        if os.environ.get("JARVIS_ENV_FILE", "").strip():
+            return
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="jarvis-test-env-"))
+        empty = d / ".env"
+        empty.write_text("# the test process loads no operator .env\n", encoding="utf-8")
+        os.environ["JARVIS_ENV_FILE"] = str(empty)
+    except Exception:  # noqa: BLE001 — never block a session over this
+        pass
+
+
 def pytest_configure(config):
     """Configure pytest with custom settings."""
     # Arm the live-state tripwire ONCE, at the top of the session. An audit
     # hook cannot be removed, so it must not be installed per-test.
     _install_live_state_audit_hook(Path(__file__).resolve().parents[1])
+    _declare_test_env_file(config)
     # Register custom markers
     config.addinivalue_line(
         "markers", "unit: mark test as a unit test"
@@ -185,6 +216,21 @@ def _report_live_state_writes(terminalreporter) -> None:
         pass
 
 
+def _report_env_leaks(terminalreporter) -> None:
+    """Name every test that changed ``os.environ`` outside ``monkeypatch``.
+    The change was undone by ``_hermetic_environ``; this says who made it, so
+    the writer can be fixed rather than merely contained. NEVER raises."""
+    try:
+        if not _ENV_LEAKS:
+            return
+        terminalreporter.write_sep("=", "ENVIRONMENT CHANGED BY TESTS (restored)")
+        for nodeid, keys in sorted(_ENV_LEAKS.items()):
+            terminalreporter.write_line(f"  {nodeid}: {', '.join(sorted(keys)[:8])}"
+                                        + (" …" if len(keys) > 8 else ""))
+    except Exception:  # noqa: BLE001 — a report must never break the summary
+        pass
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     """Say out loud when the terminal-dependent suite did not run.
 
@@ -204,6 +250,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     # leak report that only prints when a terminal was missing is a leak
     # report nobody reads.
     _report_live_state_writes(terminalreporter)
+    _report_env_leaks(terminalreporter)
     _report_isolation_events(terminalreporter)
 
     try:
@@ -497,6 +544,49 @@ def _install_live_state_audit_hook(repo_root: Path) -> None:
         sys.addaudithook(_hook)
     except Exception:  # noqa: BLE001 — hook is diagnostic, never load-bearing
         pass
+
+
+#: nodeid -> the env keys it added, changed or removed outside monkeypatch.
+_ENV_LEAKS: dict = {}
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_environ(request):
+    """Every test starts from, and leaves, the same ``os.environ``.
+
+    ``monkeypatch`` undoes only what a test sets THROUGH it. Production code
+    under test can write ``os.environ`` directly -- ``.env`` loading with
+    ``override=True`` is the case that bit: one test hydrated the operator's
+    ``.env`` (``JARVIS_PAID_LANES_ENABLED=false``) and three
+    ``test_transport_narration_and_design`` local-tier tests failed only when
+    run after it. ``patch.dict`` snapshots the whole mapping and restores it
+    exactly on exit (added keys removed, changed and removed keys put back),
+    whatever wrote them.
+
+    A change made THROUGH ``monkeypatch`` is legitimate and is not reported
+    (monkeypatch is torn down after this fixture, so its keys are still set
+    here; they are excluded by the record monkeypatch keeps). Anything else
+    that changed is a direct write: recorded in ``_ENV_LEAKS`` and named in
+    the terminal summary so the writer can be fixed, not merely contained.
+    """
+    from unittest import mock
+    before = dict(os.environ)
+    with mock.patch.dict(os.environ):
+        yield
+        try:
+            after = dict(os.environ)
+            # PYTEST_CURRENT_TEST is pytest's own per-phase marker, not a leak.
+            changed = {k for k in before.keys() | after.keys()
+                       if before.get(k) != after.get(k) and not k.startswith("PYTEST_")}
+            mp = request.node.funcargs.get("monkeypatch")
+            # monkeypatch's per-key record: (mapping, key, previous value).
+            via_mp = {key for (mapping, key, _old) in getattr(mp, "_setitem", ())
+                      if mapping is os.environ}
+            leaked = changed - via_mp
+            if leaked:
+                _ENV_LEAKS[request.node.nodeid] = leaked
+        except Exception:  # noqa: BLE001 — the restore (patch.dict exit) is what matters
+            pass
 
 
 @pytest.fixture(autouse=True)
