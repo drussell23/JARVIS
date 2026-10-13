@@ -396,6 +396,36 @@ class TestCritiqueEngineGating:
         assert result.rating == 5
 
     @pytest.mark.asyncio
+    async def test_the_enum_the_orchestrator_passes_is_critiqued(self, tmp_git_repo: Path):
+        """Both COMPLETE seams pass ``ctx.risk_tier`` — a RiskTier, not a str.
+        Every test above passes a str, which is how a critique that died on
+        100% of live ops (`'RiskTier' object has no attribute 'lower'`) stayed
+        green here."""
+        from backend.core.ouroboros.governance.risk_engine import RiskTier
+
+        (tmp_git_repo / "foo.py").write_text("def foo():\n    return 42\n")
+        provider = _FakeProvider(
+            response=json.dumps({"rating": 4, "rationale": "ok"})
+        )
+        engine = CritiqueEngine(provider=provider, repo_root=tmp_git_repo)
+        result = await engine.critique_op(
+            op_id="op-1", description="fix bug", target_files=("foo.py",),
+            risk_tier=RiskTier.NOTIFY_APPLY,
+        )
+        assert result.skip_reason is None
+        assert result.rating == 4
+        assert "notify_apply" in str(provider.calls[0])
+
+    def test_tier_name_is_strict(self):
+        from backend.core.ouroboros.governance.risk_engine import RiskTier, tier_name
+
+        assert tier_name(RiskTier.SAFE_AUTO) == "safe_auto"
+        assert tier_name(" Notify_Apply ") == "notify_apply"
+        assert tier_name(None) == "unknown"
+        with pytest.raises(TypeError):
+            tier_name(2)
+
+    @pytest.mark.asyncio
     async def test_empty_description_skipped(self, tmp_git_repo: Path):
         provider = _FakeProvider()
         engine = CritiqueEngine(provider=provider, repo_root=tmp_git_repo)

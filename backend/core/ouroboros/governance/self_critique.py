@@ -69,8 +69,11 @@ from typing import (
     Protocol,
     Sequence,
     Tuple,
+    Union,
     runtime_checkable,
 )
+
+from backend.core.ouroboros.governance.risk_engine import RiskTier, tier_name
 
 logger = logging.getLogger("Ouroboros.SelfCritique")
 
@@ -615,7 +618,7 @@ class CritiqueEngine:
         op_id: str,
         description: str,
         target_files: Sequence[str],
-        risk_tier: str,
+        risk_tier: Union[RiskTier, str, None],
         commit_hash: Optional[str] = None,
         test_summary: Optional[str] = None,
     ) -> CritiqueResult:
@@ -625,6 +628,7 @@ class CritiqueEngine:
         env gating, budget, provider fallback, schema validation,
         memory writeback, and telemetry tracking in one place.
         """
+        risk_tier = tier_name(risk_tier)
         files_tuple = tuple(p for p in target_files if p)
 
         # ---------- Gating ----------
@@ -652,7 +656,7 @@ class CritiqueEngine:
             op_id=op_id,
             goal=description.strip(),
             diff=diff,
-            risk_tier=(risk_tier or "unknown").lower(),
+            risk_tier=risk_tier,
             target_files=files_tuple,
             test_summary=(test_summary or "(no test summary)").strip(),
             deadline_s=timeout_s,
@@ -766,10 +770,10 @@ class CritiqueEngine:
         return _skipped_result(op_id, reason)
 
     def _should_skip_tier(self, risk_tier: str) -> bool:
+        """*risk_tier* is already :func:`tier_name`-normalised."""
         if not _env_bool("JARVIS_CRITIQUE_SKIP_TRIVIAL", True):
             return False
-        tier_lc = (risk_tier or "").lower().strip()
-        return tier_lc in _DEFAULT_SKIP_TIERS
+        return risk_tier in _DEFAULT_SKIP_TIERS
 
     # ------------------------------------------------------------------
     # Internal: cost estimation

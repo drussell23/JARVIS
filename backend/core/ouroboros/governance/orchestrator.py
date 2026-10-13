@@ -11402,7 +11402,9 @@ class GovernedOrchestrator:
                         ctx.op_id,
                     )
                 except Exception as exc:
-                    logger.debug(
+                    # WARNING, not DEBUG: at DEBUG this hid a critique that
+                    # failed on 100% of ops for two soaks.
+                    logger.warning(
                         "[Orchestrator] Self-critique failed for op=%s: %s",
                         ctx.op_id, exc,
                     )
