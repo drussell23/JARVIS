@@ -134,6 +134,10 @@ def _make_active_renderer(monkeypatch, flow: str) -> "tuple[sr.StreamRenderer, _
     # start() under pytest is non-TTY → _live is None; install the fake and
     # keep session state (this isolates the render path from real Rich).
     r._live = fake
+    # In production start() and end() run in the SAME task (GENERATE's
+    # finally), so end() comes from the owning op's context. start() ran in
+    # asyncio.run's context, which does not flow back here; mark this one.
+    sr._STREAM_OP.set("op-flow-test")
     return r, fake
 
 

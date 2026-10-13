@@ -621,10 +621,13 @@ class StreamRenderer:
             self._dropped_count += 1
 
     def accepts_caller(self) -> bool:
-        """Is the calling context the op that owns this stream? A context
-        no ``start`` ever marked (a direct caller) is accepted."""
-        op = _STREAM_OP.get()
-        return not op or op == self._owner
+        """Is the calling context the op that owns this stream? Strictly:
+        a context no ``start`` marked is NOT the owner. GENERATE starts the
+        stream only for operator-visible routes, so background ops never
+        mark their context -- yet their providers still feed this renderer;
+        accepting "unattributed" let every background op interleave into
+        the owner's stream."""
+        return bool(self._owner) and _STREAM_OP.get() == self._owner
 
     def end(self) -> None:
         """Finalize the stream: cancel the consumer, flush, stop Live,
@@ -744,6 +747,10 @@ class StreamRenderer:
         # A conductor event names its op; attribute by THAT, not by whatever
         # context the conductor happens to dispatch from.
         _ev_op = str(getattr(event, "op_id", None) or "")
+        _kind = getattr(getattr(event, "kind", None), "value", None) or str(
+            getattr(event, "kind", "") or "")
+        if not _ev_op and _kind == "BACKEND_RESET":
+            _ev_op = self._owner        # the global finalizer ends whoever holds it
         _token = _STREAM_OP.set(_ev_op) if _ev_op else None
         try:
             self._notify(event)

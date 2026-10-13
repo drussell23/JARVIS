@@ -485,14 +485,23 @@ def test_concurrent_ops_do_not_interleave_into_one_stream(monkeypatch):
             await asyncio.sleep(0)
         fanned.end()
 
+    async def background_op(go: asyncio.Event):
+        """A BACKGROUND-route op: GENERATE never calls start() for it, but
+        its provider still feeds the registered renderer."""
+        await go.wait()
+        for _ in range(5):
+            fanned.on_token("C")
+            await asyncio.sleep(0)
+
     async def run():
         a_started, b_started, go = asyncio.Event(), asyncio.Event(), asyncio.Event()
         ta = asyncio.create_task(op("op-a", "A", a_started, go))
         await a_started.wait()
         tb = asyncio.create_task(op("op-b", "B", b_started, go))
         await b_started.wait()
+        tc = asyncio.create_task(background_op(go))
         go.set()
-        await asyncio.gather(ta, tb)
+        await asyncio.gather(ta, tb, tc)
 
     asyncio.run(run())
     text = "".join(emitted)
