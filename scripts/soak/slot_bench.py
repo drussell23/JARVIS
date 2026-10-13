@@ -161,19 +161,32 @@ def freeze_tasks(base: str, count: int, seed: str) -> List[Dict[str, Any]]:
     import yaml  # noqa: PLC0415
     sys.path.insert(0, str(SOURCE_REPO))
     from backend.core.ouroboros.governance.goal_reconciliation_ledger import (  # noqa: PLC0415
-        satisfied_goal_ids,
+        read_records, satisfied_goal_ids,
     )
     doc = yaml.safe_load((SOURCE_REPO / ".jarvis/roadmap.yaml").read_text(encoding="utf-8"))
     goals = [g for g in doc.get("goals") or [] if isinstance(g, dict) and g.get("id")]
-    done = satisfied_goal_ids([g["id"] for g in goals])
+    # Without the secret the ledger's MACs fail and its tail is dropped,
+    # which would hide recent satisfactions.
+    secret = env_file_value("JARVIS_ROADMAP_READER_HMAC_SECRET", SOURCE_REPO / ".env")
+    recs = read_records(SOURCE_REPO / ".jarvis/goal_reconciliation_ledger.jsonl",
+                        secret=secret or None)
+    done = satisfied_goal_ids([g["id"] for g in goals], records=recs)
     tracked = set(git("ls-tree", "-r", "--name-only", base).splitlines())
 
+    def is_test(f: str) -> bool:
+        return Path(f).name.startswith("test_")
+
     def eligible(g: Dict[str, Any]) -> bool:
+        """Work must remain at the base: a test target the goal CREATES must
+        still be absent (812 of the roadmap's goals are test synthesis, and
+        many were since written by other means; those would no-op and pad
+        throughput), and a source target it EDITS must exist."""
         if g["id"] in done or g.get("depends_on"):
             return False
         files = g.get("target_files") or g.get("files") or []
-        # A goal may create its test file; at least one target must exist.
-        return bool(files) and any(f in tracked for f in files)
+        return bool(files) and all(
+            (f not in tracked) if is_test(f) else (f in tracked) for f in files
+        )
 
     pool = [g for g in goals if eligible(g)]
     pool.sort(key=lambda g: hashlib.sha256(f"{seed}:{g['id']}".encode()).hexdigest())
@@ -183,8 +196,12 @@ def freeze_tasks(base: str, count: int, seed: str) -> List[Dict[str, Any]]:
 def snapshot_seed(dst: Path) -> None:
     src = SOURCE_REPO / ".jarvis"
 
-    def ignore(_dir: str, names: List[str]) -> List[str]:
-        return [n for n in names if any(x in n for x in SEED_EXCLUDE)]
+    def ignore(d: str, names: List[str]) -> List[str]:
+        # Sockets and fifos (cockpit_attach.sock) belong to a live process.
+        def special(n: str) -> bool:
+            p = Path(d) / n
+            return not (p.is_symlink() or p.is_file() or p.is_dir())
+        return [n for n in names if special(n) or any(x in n for x in SEED_EXCLUDE)]
 
     shutil.copytree(src, dst, ignore=ignore, symlinks=True)
 
@@ -227,9 +244,14 @@ def ensure_worktree(state: Dict[str, Any], arm: Dict[str, Any]) -> Path:
     wt = Path(arm["worktree"])
     if not wt.exists():
         git("worktree", "add", "-q", "-b", arm["branch"], str(wt), state["base"])
-        shutil.copytree(run_dir(state["run"]) / "jarvis_seed", wt / ".jarvis", symlinks=True)
+    marker = wt / ".jarvis" / ".slot_bench_seeded"
+    if not marker.exists():
+        # Overlay: the repo tracks some .jarvis files, so the dir exists.
+        shutil.copytree(run_dir(state["run"]) / "jarvis_seed", wt / ".jarvis",
+                        symlinks=True, dirs_exist_ok=True)
         shutil.copy2(SOURCE_REPO / ".env", wt / ".env")
-        log(state, f"arm {arm['index']}: worktree {wt} at {state['base'][:10]}")
+        marker.write_text(state["base"], encoding="utf-8")
+        log(state, f"arm {arm['index']}: worktree {wt} seeded at {state['base'][:10]}")
     return wt
 
 
@@ -250,6 +272,9 @@ def write_roadmap(state: Dict[str, Any], wt: Path, ids: List[str]) -> None:
     secret = env_file_value("JARVIS_ROADMAP_READER_HMAC_SECRET", wt / ".env")
     if not secret:
         raise RuntimeError("JARVIS_ROADMAP_READER_HMAC_SECRET missing from .env")
+    # The reader that verifies the window takes the secret from the process
+    # environment, as the organism does after loading the same .env.
+    os.environ["JARVIS_ROADMAP_READER_HMAC_SECRET"] = secret
     doc = {
         "version": 1, "operator_id": "drussell23",
         "source": "operator_directed_agent_signed", "authority": "operator_directed",
