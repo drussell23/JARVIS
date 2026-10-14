@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import fcntl
+from backend.core import portable_fcntl as fcntl
 import functools
 import gc
 import hashlib

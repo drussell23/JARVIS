@@ -173,7 +173,7 @@ def _check_llvmlite_compatibility() -> tuple:
 # simultaneously. We use a file-based lock to serialize imports across all
 # threads and even across multiple processes.
 # ═══════════════════════════════════════════════════════════════════════════════
-import fcntl as _fcntl
+from backend.core import portable_fcntl as _fcntl
 import tempfile as _tempfile
 
 _NUMBA_LOCK_FILE = None

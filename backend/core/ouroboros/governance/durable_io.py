@@ -109,7 +109,7 @@ def _resolve_full_fsync():
     if sys.platform != "darwin":
         return None
     try:
-        import fcntl  # noqa: PLC0415 — platform-conditional by nature
+        from backend.core import portable_fcntl as fcntl  # noqa: PLC0415 — platform-conditional by nature
 
         return getattr(fcntl, "F_FULLFSYNC", None)
     except ImportError:
@@ -141,7 +141,7 @@ def fsync_file(fd: int) -> None:
     is real data loss and the caller must see it."""
     if _F_FULLFSYNC is not None:
         try:
-            import fcntl  # noqa: PLC0415
+            from backend.core import portable_fcntl as fcntl  # noqa: PLC0415
 
             fcntl.fcntl(fd, _F_FULLFSYNC)
             return

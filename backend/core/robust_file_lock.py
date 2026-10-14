@@ -11,7 +11,7 @@ Guarantees:
 - REENTRANT (v214.0): Same async task can re-acquire same lock safely
 
 Limitations:
-- POSIX-ONLY: Does not work on Windows
+- WINDOWS: flock is emulated by backend.core.portable_fcntl (msvcrt byte-range lock)
 - LOCAL FILESYSTEM: LOCK_DIR must be on a local filesystem (not NFS)
 - NO FORK: Do not fork while holding the lock
 """
@@ -19,7 +19,7 @@ Limitations:
 from __future__ import annotations
 
 import asyncio
-import fcntl
+from backend.core import portable_fcntl as fcntl
 import json
 import logging
 import os
@@ -30,16 +30,6 @@ from pathlib import Path
 from typing import Optional, Set, Dict, Tuple
 
 logger = logging.getLogger(__name__)
-
-# =============================================================================
-# Platform check
-# =============================================================================
-
-if sys.platform == "win32":
-    raise RuntimeError(
-        "RobustFileLock is POSIX-only (Linux, macOS). "
-        "Windows requires a different implementation using msvcrt.locking."
-    )
 
 # =============================================================================
 # Configuration (expansion deferred to runtime)

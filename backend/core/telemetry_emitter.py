@@ -661,7 +661,7 @@ class TelemetryEmitter:
             line = json.dumps(line_data) + "\n"
             # v242.1: Atomic append with file locking to prevent interleaved
             # writes from multiple processes (JARVIS Body + J-Prime both write here)
-            import fcntl
+            from backend.core import portable_fcntl as fcntl
             with open(jsonl_path, "a") as f:
                 fcntl.flock(f.fileno(), fcntl.LOCK_EX)
                 try:

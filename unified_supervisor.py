@@ -77,6 +77,29 @@ import sys as _early_sys
 import signal as _early_signal
 import os as _early_os
 
+# Windows consoles and redirected streams default to the ANSI code page
+# (cp1252), which cannot encode the emoji the kernel and its loggers print:
+# the first one raised UnicodeEncodeError inside logging. UTF-8 for this
+# process, and for every child through the env.
+if _early_sys.platform == 'win32':
+    _early_os.environ.setdefault('PYTHONUTF8', '1')
+    _early_os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
+    for _early_stream in (_early_sys.stdout, _early_sys.stderr):
+        try:
+            _early_stream.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError):
+            pass
+
+# Before ANY cleanup can run: os.kill(pid, 0) terminates on Windows, and
+# "jarvis" in a command line is not identity on a host whose account is named
+# Jarvis. See backend/core/process_identity.py.
+try:
+    from backend.core.process_identity import install_kill_guard as _install_kill_guard
+    _install_kill_guard()
+except Exception as _kg_exc:  # noqa: BLE001
+    if _early_sys.platform == 'win32':
+        raise SystemExit(f"[Kernel] refusing to start without the kill guard: {_kg_exc}")
+
 # =============================================================================
 # CRITICAL: BLAS THREADING GUARDS — MUST SET BEFORE ANY NUMPY/SCIPY/TORCH IMPORT
 # =============================================================================
@@ -21509,6 +21532,21 @@ class ParallelProcessCleaner:
         discovered.update(scanned_procs)
         discovered.update(port_procs)
         discovered.update(pid_file_procs)
+
+        # The patterns are substrings ("jarvis"), which every process under a
+        # home directory named Jarvis matches. Identity is structural: keep
+        # only what process_identity says this kernel owns.
+        try:
+            from backend.core.process_identity import owned_by_trinity
+        except ImportError:
+            return discovered
+        foreign = [pid for pid in discovered if not owned_by_trinity(pid)]
+        for pid in foreign:
+            discovered.pop(pid, None)
+        if foreign:
+            self.logger.debug(
+                f"[ProcessCleaner] ignored {len(foreign)} pattern match(es) not owned by Trinity"
+            )
 
         return discovered
 
@@ -98137,8 +98175,13 @@ def main() -> int:
             thread_names = [t.name for t in remaining_threads]
             print(f"[Kernel] Warning: {len(remaining_threads)} non-daemon threads still alive: {thread_names}")
             print(f"[Kernel] Using os._exit({exit_code}) for guaranteed exit")
-            # Give a brief moment for any final I/O
-            time.sleep(0.1)
+            # os._exit skips the stdio flush; redirected (block-buffered)
+            # output would otherwise be lost wholesale.
+            for _stream in (sys.stdout, sys.stderr):
+                try:
+                    _stream.flush()
+                except Exception:
+                    pass
             os._exit(exit_code)
     except Exception:
         pass  # If we can't enumerate threads, just return normally

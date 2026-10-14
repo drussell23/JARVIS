@@ -60,7 +60,7 @@ v93.0 Changes:
 """
 
 import asyncio
-import fcntl
+from backend.core import portable_fcntl as fcntl
 import json
 import logging
 import os

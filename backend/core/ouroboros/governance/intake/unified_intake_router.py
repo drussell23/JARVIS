@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import threading
-import fcntl
+from backend.core import portable_fcntl as fcntl
 import logging
 import os
 import time

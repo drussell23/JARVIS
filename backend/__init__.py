@@ -25,6 +25,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Every process that imports backend gets the Windows-safe os.kill and the
+# ownership guard (no-op off Windows unless JARVIS_KILL_GUARD is set).
+from .core.process_identity import install_kill_guard as _install_kill_guard
+
+_install_kill_guard()
+
 # Version info
 __version__ = "13.4.0"
 __author__ = "JARVIS Team"

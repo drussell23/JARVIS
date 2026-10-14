@@ -56,7 +56,7 @@ Version: 3.0.0 (Trinity Integration + Sheets)
 from __future__ import annotations
 
 import asyncio
-import fcntl
+from backend.core import portable_fcntl as fcntl
 import hashlib
 import importlib
 import json

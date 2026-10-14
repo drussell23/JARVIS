@@ -3840,7 +3840,7 @@ class UnifiedStateCoordinator:
         Returns:
             (acquired: bool, previous_owner: Optional[ProcessOwnership])
         """
-        import fcntl
+        from backend.core import portable_fcntl as fcntl
 
         lock_file = self.lock_dir / f"{component}.lock"
         previous_owner = None
@@ -6348,7 +6348,7 @@ import socket
 import mmap
 import struct
 import select
-import fcntl
+from backend.core import portable_fcntl as fcntl
 import errno
 import resource
 import stat

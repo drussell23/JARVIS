@@ -51,7 +51,7 @@ from typing import (
 )
 
 try:
-    import fcntl
+    from backend.core import portable_fcntl as fcntl
     HAS_FCNTL = True
 except ImportError:
     HAS_FCNTL = False

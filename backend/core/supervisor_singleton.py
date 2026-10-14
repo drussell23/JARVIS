@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import fcntl
+from backend.core import portable_fcntl as fcntl
 import json
 import logging
 import os

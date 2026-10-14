@@ -60,7 +60,7 @@ from __future__ import annotations
 
 import asyncio
 import ast
-import fcntl
+from backend.core import portable_fcntl as fcntl
 import functools
 import hashlib
 import heapq

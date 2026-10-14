@@ -35,7 +35,7 @@ Author: JARVIS Trinity v95.3 - Atomic Service Coordination
 from __future__ import annotations
 
 import asyncio
-import fcntl
+from backend.core import portable_fcntl as fcntl
 import hashlib
 import json
 import logging

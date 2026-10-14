@@ -94,7 +94,7 @@ CROSS_PROCESS_JSONL_SCHEMA_VERSION: str = "cross_process_jsonl.1"
 
 
 try:
-    import fcntl as _fcntl  # type: ignore[import]
+    from backend.core import portable_fcntl as _fcntl  # type: ignore[import]
     _HAS_FCNTL: bool = True
 except ImportError:
     _fcntl = None  # type: ignore[assignment]

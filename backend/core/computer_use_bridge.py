@@ -32,7 +32,7 @@ Version: 7.0.0 - Production-Grade Cross-Repo Bridge
 from __future__ import annotations
 
 import asyncio
-import fcntl
+from backend.core import portable_fcntl as fcntl
 import hashlib
 import json
 import logging

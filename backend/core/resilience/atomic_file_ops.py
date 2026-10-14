@@ -18,7 +18,7 @@ Author: JARVIS Cross-Repo Resilience
 from __future__ import annotations
 
 import asyncio
-import fcntl
+from backend.core import portable_fcntl as fcntl
 import hashlib
 import json
 import logging

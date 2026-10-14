@@ -10,7 +10,7 @@ Thread-safe. Uses O_APPEND + fcntl for cross-process safety.
 
 from __future__ import annotations
 
-import fcntl
+from backend.core import portable_fcntl as fcntl
 import json
 import logging
 import os

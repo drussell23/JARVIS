@@ -845,7 +845,7 @@ def _minimal_sync_cleanup(reason: str) -> Dict[str, Any]:
         # Just try to release if it exists
         from backend.core.supervisor_singleton import _singleton
         if _singleton and _singleton._lock_fd is not None:
-            import fcntl
+            from backend.core import portable_fcntl as fcntl
             try:
                 fcntl.flock(_singleton._lock_fd, fcntl.LOCK_UN)
                 _singleton._lock_fd = None

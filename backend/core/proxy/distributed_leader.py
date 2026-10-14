@@ -35,7 +35,7 @@ Version: 1.0.0
 from __future__ import annotations
 
 import asyncio
-import fcntl
+from backend.core import portable_fcntl as fcntl
 import hashlib
 import json
 import logging

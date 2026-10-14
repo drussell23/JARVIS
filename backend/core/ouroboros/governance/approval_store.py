@@ -9,7 +9,7 @@ Design ref: docs/plans/2026-03-07-vertical-integration-design.md
 from __future__ import annotations
 
 import enum
-import fcntl
+from backend.core import portable_fcntl as fcntl
 import json
 import logging
 import os

@@ -9,7 +9,7 @@ Depends on: v297.0 (gcp_readiness_lease, startup_routing_policy)
 from __future__ import annotations
 
 import asyncio
-import fcntl
+from backend.core import portable_fcntl as fcntl
 import json
 import logging
 import os

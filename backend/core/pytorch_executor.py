@@ -759,7 +759,7 @@ class ModelLoadCoordinator:
 
         while (time.time() - start_time) < timeout:
             try:
-                import fcntl
+                from backend.core import portable_fcntl as fcntl
 
                 # Try to acquire lock
                 fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR)
@@ -791,7 +791,7 @@ class ModelLoadCoordinator:
             return
 
         try:
-            import fcntl
+            from backend.core import portable_fcntl as fcntl
             fd = self._held_locks[model_name]
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)

@@ -267,7 +267,7 @@ def last_session_decision() -> Optional[Dict[str, Any]]:
 @contextlib.contextmanager
 def _single_flight():
     """Non-blocking exclusive lock; yields False when another cycle holds it."""
-    import fcntl
+    from backend.core import portable_fcntl as fcntl
     d = state_dir()
     d.mkdir(parents=True, exist_ok=True)
     fh = open(d / "cycle.lock", "w")  # noqa: SIM115

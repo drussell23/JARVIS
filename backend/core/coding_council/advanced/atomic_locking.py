@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 # Platform-specific imports
 if sys.platform != "win32":
-    import fcntl
+    from backend.core import portable_fcntl as fcntl
 else:
     import msvcrt
 

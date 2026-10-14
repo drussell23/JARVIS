@@ -128,7 +128,7 @@ class FileLock:
     
     def acquire(self, timeout: float = 5.0) -> bool:
         """Acquire the file lock with timeout."""
-        import fcntl
+        from backend.core import portable_fcntl as fcntl
         
         start = time.time()
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -151,7 +151,7 @@ class FileLock:
     
     def release(self) -> None:
         """Release the file lock."""
-        import fcntl
+        from backend.core import portable_fcntl as fcntl
         
         if self._fd:
             try:

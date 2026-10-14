@@ -67,7 +67,7 @@ def _try_import_fcntl() -> Optional[object]:
     silently (a log line is emitted on first attempt; no
     repeated noise)."""
     try:
-        import fcntl as _fcntl
+        from backend.core import portable_fcntl as _fcntl
         return _fcntl
     except ImportError:
         return None

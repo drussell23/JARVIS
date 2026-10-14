@@ -15,7 +15,7 @@ Author: JARVIS v77.0
 from __future__ import annotations
 
 import asyncio
-import fcntl
+from backend.core import portable_fcntl as fcntl
 import json
 import logging
 import os

@@ -35,7 +35,7 @@ except ImportError:
     def register_executor_for_cleanup(*args, **kwargs):
         pass  # No-op fallback
 
-import fcntl
+from backend.core import portable_fcntl as fcntl
 import aiofiles
 
 logger = logging.getLogger(__name__)

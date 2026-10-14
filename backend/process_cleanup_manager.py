@@ -37,7 +37,7 @@ v4.0.0 NEW - Zero-Touch & Supervisor Integration:
 from __future__ import annotations
 
 import asyncio
-import fcntl
+from backend.core import portable_fcntl as fcntl
 import hashlib
 import json
 import logging

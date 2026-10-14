@@ -1318,7 +1318,7 @@ def _atomic_append(path: Path, line: str) -> None:
         # (Windows — no-op fallback). We use fcntl since Trinity is
         # macOS/Linux only.
         try:
-            import fcntl
+            from backend.core import portable_fcntl as fcntl
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
             try:
                 fh.write(line.encode("utf-8"))
