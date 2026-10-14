@@ -3056,13 +3056,31 @@ def _discover_repo(names: List[str]) -> Optional[Path]:
             return path
     return None
 
+def _discover_trinity_repo(key: str, names: List[str]) -> Optional[Path]:
+    """
+    A sibling repo's checkout, wherever it lives and whatever its folder is
+    called: the declared path (JARVIS_PRIME_PATH, REACTOR_CORE_PATH, ...)
+    first, then sibling folders recognised by their package contents --
+    the Trinity discovery coding_council already owns. A checkout named
+    "prime" or "reactor" read as "repo not found" here because this
+    function only tried the folder names below.
+    """
+    try:
+        from backend.core.coding_council.config import ConfigDiscovery
+        found = ConfigDiscovery().discover_trinity_repos().get(key)
+        if found is not None:
+            return Path(found)
+    except Exception as exc:  # discovery is advisory; fall back to names
+        logging.getLogger(__name__).debug("[Trinity] repo discovery for %s failed: %s", key, exc)
+    return _discover_repo(names)
+
 def _discover_prime_repo() -> Optional[Path]:
     """Discover JARVIS-Prime repository."""
-    return _discover_repo(["JARVIS-Prime", "jarvis-prime"])
+    return _discover_trinity_repo("j_prime", ["JARVIS-Prime", "jarvis-prime"])
 
 def _discover_reactor_repo() -> Optional[Path]:
     """Discover Reactor-Core repository."""
-    return _discover_repo(["Reactor-Core", "reactor-core"])
+    return _discover_trinity_repo("reactor_core", ["Reactor-Core", "reactor-core"])
 
 def _detect_gcp_credentials() -> bool:
     """Check if GCP credentials are available."""
@@ -7261,6 +7279,7 @@ class LiveProgressDashboard:
         # v197.3: Display mode configuration
         # "overlay" = overwrites (clean), "passthrough" = logs flow, "compact" = minimal
         self._display_mode = os.getenv("JARVIS_DASHBOARD_MODE", "passthrough").lower()
+        self._terminal_owner: Optional[str] = None  # see yield_terminal()
         self._max_log_lines = int(os.getenv("JARVIS_DASHBOARD_LOG_LINES", "8"))
         self._log_buffer: List[str] = []
         self._render_count = 0
@@ -7333,9 +7352,19 @@ class LiveProgressDashboard:
         self._event_buffer: deque = deque(maxlen=200)
         self._fault_buffer: deque = deque(maxlen=100)
 
+    def yield_terminal(self, owner: str) -> None:
+        """Stop drawing: *owner* renders the terminal's live status.
+
+        Every update method keeps working -- this dashboard stays the state
+        its feeders write to -- it just no longer prints. Two live surfaces
+        on one terminal was the problem this ends: this dashboard reprinted
+        its block into the scrollback while another redrew below it.
+        """
+        self._terminal_owner = owner
+
     def start(self) -> None:
         """Start the live dashboard."""
-        if not self.enabled:
+        if not self.enabled or self._terminal_owner:
             return
         self._running = True
         self._start_time = time.time()
@@ -7901,7 +7930,7 @@ class LiveProgressDashboard:
         - "passthrough": Prints periodically, lets logs flow through
         - "compact": Single-line status only
         """
-        if not self.enabled:
+        if not self.enabled or self._terminal_owner:
             return
         
         self._render_count += 1
@@ -9065,28 +9094,55 @@ class CliRenderer(ABC):
 
 class RichCliRenderer(CliRenderer):
     """
-    Wraps existing LiveProgressDashboard + adds phase timeline tracking.
+    The terminal's one live surface in rich mode, plus the phase timeline.
 
-    This renderer does NOT replace the dashboard — it coexists with it.
-    The dashboard is still managed by ``_startup_impl()``. This renderer
-    augments it by feeding events into the dashboard's log buffer and
-    maintaining a phase timeline for post-startup summary.
+    The kernel's output scrolls by as ordinary scrollback; beneath it the
+    EliteDashboard's inline status region (boot progress from the
+    BootTimeline, measured component health, the newest events) is pinned
+    and redrawn in place for the whole boot and afterwards -- the split
+    Claude Code uses between finished output and its live region. Before,
+    three renderers shared the terminal: LiveProgressDashboard reprinted its
+    status block into the scrollback every few seconds, and the dashboard
+    took the whole screen once the boot was done. LiveProgressDashboard
+    now yields the terminal to this renderer and stays a state holder.
+
+    With ``--no-animation`` or the full-screen dashboard layout there is no
+    pinned region; the dashboard then activates after boot as before.
     """
 
     def __init__(self, verbosity: str = "ops", no_animation: bool = False):
         super().__init__(verbosity)
         self._no_animation = no_animation
-        self._dashboard: Optional[LiveProgressDashboard] = None
+        self._dashboard: Optional[Any] = None
         self._phase_timeline: collections.deque = collections.deque(maxlen=200)
+
+    @property
+    def owns_terminal(self) -> bool:
+        """True when this renderer's pinned region draws the live status."""
+        return self._dashboard is not None
 
     def start(self) -> None:
         super().start()
-        if not self._no_animation:
-            self._dashboard = get_live_dashboard(enabled=True)
+        if self._no_animation:
+            return
+        try:
+            from backend.core.supervisor.elite_dashboard import get_elite_dashboard
+            dashboard = get_elite_dashboard()
+        except Exception as exc:
+            logging.getLogger(__name__).debug("[CLI] status region unavailable: %s", exc)
+            return
+        if dashboard.health().get("enabled") and dashboard.inline:
+            dashboard.activate_display()
+            self._dashboard = dashboard
+
+    def attach_to_supervisor(self, kernel: Any) -> None:
+        """Give the status region the kernel's measures (timeline, health)."""
+        if self._dashboard is not None:
+            kernel._attach_dashboard_sources(self._dashboard)
 
     def stop(self) -> None:
         super().stop()
-        # Don't stop dashboard here — it's managed by _startup_impl
+        # The region is stopped with the dashboard, at kernel shutdown.
 
     def handle_event(self, event: SupervisorEvent) -> None:
         if not self._running or not self.should_display(event):
@@ -9119,20 +9175,24 @@ class RichCliRenderer(CliRenderer):
                 # the event handler caused dual-update races where raw (un-
                 # normalized) status overwrote the canonical value.
                 pass
-            # Feed to dashboard log buffer + event/fault buffers
-            if self._dashboard and self._dashboard.enabled:
-                self._dashboard.add_log(
-                    event.message[:80], event.severity.value.upper()
-                )
+            # The region's event lines carry what needs attention; phase
+            # progress already shows on its boot line.
+            severity = self._REGION_SEVERITIES.get(event.severity)
+            if self._dashboard is not None and severity is not None:
                 self._dashboard.add_event(
-                    event_type=event.event_type.value if hasattr(event.event_type, "value") else str(event.event_type),
+                    category=event.phase or event.event_type.value,
                     message=event.message,
-                    severity=event.severity.value if hasattr(event.severity, "value") else str(event.severity),
-                    component=getattr(event, "component", ""),
-                    phase=getattr(event, "phase", ""),
+                    severity=severity,
+                    key=f"{event.event_type.value}:{event.phase}:{event.component}",
                 )
         except Exception:
             pass
+
+    _REGION_SEVERITIES = {
+        SupervisorEventSeverity.WARNING: "warn",
+        SupervisorEventSeverity.ERROR: "error",
+        SupervisorEventSeverity.CRITICAL: "error",
+    }
 
     @property
     def phase_timeline(self) -> List[Dict[str, Any]]:
@@ -67092,11 +67152,6 @@ class JarvisSystemKernel:
             self.logger.debug(f"[Kernel] State machine init failed (non-fatal): {_ssm_err}")
             self._startup_state_machine = None
 
-        # v197.1: Initialize live progress dashboard for real-time CLI feedback
-        # v197.3: Now supports display modes - set JARVIS_DASHBOARD_MODE=passthrough to see logs
-        dashboard = get_live_dashboard(enabled=sys.stdout.isatty())
-        dashboard.start()
-
         # v249.0: Initialize event bus and CLI renderer
         # v265.0: Add timeout — bare await could hang if event bus has I/O issues
         _event_bus = get_event_bus()
@@ -67125,6 +67180,14 @@ class JarvisSystemKernel:
         _event_bus.subscribe(_renderer.handle_event)
         self._event_bus = _event_bus
         self._cli_renderer = _renderer
+
+        # v197.1: live progress dashboard -- state for the components that
+        # feed it, and the terminal's status display only where no renderer
+        # owns the terminal (one live surface; see RichCliRenderer).
+        dashboard = get_live_dashboard(enabled=sys.stdout.isatty())
+        if getattr(_renderer, "owns_terminal", False):
+            dashboard.yield_terminal(type(_renderer).__name__)
+        dashboard.start()
 
         # The boot timeline: the loading page's percentage, measured from the
         # phase boundaries announced on this bus against previous boots
@@ -71808,7 +71871,8 @@ class JarvisSystemKernel:
                     pass
             if getattr(self, "_elite_dashboard", None) is not None:
                 try:
-                    self._elite_dashboard.boot_tracker.mark_boot_complete()
+                    # Completion reaches the dashboard through the boot
+                    # timeline it renders (fed by STARTUP_COMPLETE).
                     self._elite_dashboard.activate_display()
                 except Exception:
                     pass
@@ -83817,6 +83881,24 @@ class JarvisSystemKernel:
                                     )
 
                             # ---- Zone 6.14: Lifecycle Voice Narrator + Elite Dashboard ----
+                            # Both consume the TelemetryBus, whose consumer loop
+                            # nothing started: every envelope (J-Prime lifecycle
+                            # transitions, agent graph state, faults) sat in its
+                            # queue, so the dashboard showed J-Prime OFFLINE while
+                            # it served and "Events: 0". The kernel owns the bus.
+                            try:
+                                from backend.core.telemetry_contract import get_telemetry_bus
+                                await get_telemetry_bus().start()
+                                self.logger.info(
+                                    "[Kernel] Zone 6.14 telemetry bus running: %s",
+                                    get_telemetry_bus().get_metrics(),
+                                )
+                            except (asyncio.CancelledError, KeyboardInterrupt):
+                                raise
+                            except BaseException as exc:
+                                self.logger.warning(
+                                    "[Kernel] Zone 6.14 telemetry bus did not start: %s", exc,
+                                )
                             try:
                                 from backend.core.supervisor.lifecycle_narrator import (
                                     get_lifecycle_narrator,
@@ -83842,6 +83924,7 @@ class JarvisSystemKernel:
                                 )
                                 _dashboard = get_elite_dashboard()
                                 await _dashboard.start()
+                                self._attach_dashboard_sources(_dashboard)
                                 # Wire narrator hook so spoken text appears in ticker
                                 if getattr(self, "_lifecycle_narrator", None) is not None:
                                     _dashboard.install_narrator_hook(self._lifecycle_narrator)
@@ -84473,12 +84556,18 @@ class JarvisSystemKernel:
                     return required_results[internal_name]
                 if internal_name in optional_results:
                     return optional_results[internal_name]
+                # Still running past the optional barrier, by design: it
+                # continues in the background (its task was adopted above).
+                # Not an error -- reporting it under "error" logged a ⚠ and
+                # counted a service that later finished as failed.
                 return {
                     "deferred": True,
                     "optional": True,
-                    "error": (
-                        f"Optional barrier timeout after "
-                        f"{optional_barrier_timeout:.1f}s"
+                    "timed_out": True,
+                    "background_continuation": True,
+                    "detail": (
+                        f"past the optional barrier "
+                        f"({optional_barrier_timeout:.1f}s)"
                     ),
                 }
 
@@ -88176,43 +88265,51 @@ class JarvisSystemKernel:
         except Exception:
             pass
 
+    def _attach_dashboard_sources(self, dashboard: Any) -> None:
+        """Give the EliteDashboard the kernel's measures: the boot timeline
+        and the health targets. Idempotent -- the rich CLI renderer calls it
+        at boot start for its pinned region, Zone 6.14 again for the
+        dashboard it starts."""
+        dashboard.attach_boot_timeline(getattr(self, "_boot_timeline", None))
+        dashboard.watch_health(self._dashboard_health_targets())
+
+    def _dashboard_health_targets(self) -> List[Any]:
+        """What the EliteDashboard's health matrix measures: this kernel's
+        backend at the port it actually chose, and each Trinity sibling at
+        the URL trinity_siblings (the sibling authority) declares."""
+        from backend.core.supervisor.elite_dashboard import HealthTarget
+
+        def _body_url() -> str:
+            port = getattr(self.config, "backend_port", 0)
+            if not port:
+                return ""
+            host = getattr(self.config, "backend_host", "") or "127.0.0.1"
+            if host in ("0.0.0.0", "::", ""):
+                host = "127.0.0.1"   # a wildcard bind answers on loopback
+            return f"http://{host}:{port}/health"
+
+        targets = [HealthTarget("jarvis", "JARVIS (Body)", _body_url)]
+        try:
+            from backend.core.ouroboros.governance.trinity_siblings import siblings
+            for sib in siblings():
+                targets.append(HealthTarget(
+                    sib.key, sib.title,
+                    lambda sib=sib: (sib.base_url() or "").rstrip("/") + sib.probe_path
+                    if sib.base_url() else "",
+                ))
+        except Exception as exc:
+            self.logger.debug(f"[Kernel] sibling health targets unavailable: {exc}")
+        return targets
+
     def _notify_boot_phase(
         self, component: str, status: str, message: str = "",
     ) -> None:
-        """Feed boot phase transitions to LifecycleNarrator + EliteDashboard.
+        """Feed boot phase transitions to the LifecycleNarrator.
 
         Non-blocking, fault-isolated. Called from _update_component_status.
+        The EliteDashboard is not fed from here: it renders the boot from the
+        BootTimeline and component health from its own probes.
         """
-        # EliteDashboard boot tracker
-        _dashboard = getattr(self, "_elite_dashboard", None)
-        if _dashboard is not None:
-            try:
-                bt = _dashboard.boot_tracker
-                if status in ("running", "starting"):
-                    bt.begin_phase(component)
-                elif status in ("complete", "ready"):
-                    bt.end_phase(component, success=True)
-                elif status in ("error", "failed"):
-                    bt.end_phase(component, success=False, detail=message[:60])
-                elif status == "skipped":
-                    bt.skip_phase(component, reason=message[:40])
-
-                # Also push repo health for Trinity components
-                repo_map = {
-                    "backend": "jarvis",
-                    "jarvis_body": "jarvis",
-                    "jarvis_prime": "prime",
-                    "reactor_core": "reactor",
-                }
-                repo_key = repo_map.get(component)
-                if repo_key:
-                    _dashboard.update_repo_status(
-                        repo_key,
-                        status.upper() if status in ("complete", "ready") else status.upper(),
-                    )
-            except Exception:
-                pass
-
         # LifecycleNarrator zone narration
         _narrator = getattr(self, "_lifecycle_narrator", None)
         if _narrator is not None:
@@ -90310,6 +90407,12 @@ class JarvisSystemKernel:
                     await asyncio.wait_for(self._lifecycle_narrator.stop(), timeout=3.0)
                 except Exception as exc:
                     self.logger.debug("[Kernel] Lifecycle narrator stop: %s", exc)
+            # ...then the TelemetryBus they consumed (started in Zone 6.14).
+            try:
+                from backend.core.telemetry_contract import get_telemetry_bus
+                await asyncio.wait_for(get_telemetry_bus().stop(), timeout=3.0)
+            except Exception as exc:
+                self.logger.debug("[Kernel] Telemetry bus stop: %s", exc)
 
             # v305.0: Stop proactive drive first (reverse start order)
             if getattr(self, "_proactive_drive", None) is not None:

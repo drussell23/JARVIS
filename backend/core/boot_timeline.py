@@ -150,6 +150,29 @@ class BootTimeline:
         with self._lock:
             return self._open_phases[-1][0] if self._open_phases else None
 
+    def phases(self) -> List[Tuple[str, float, Optional[float]]]:
+        """This boot's phases in the order they began: (name, started,
+        ended or None while running), offsets in seconds from the origin."""
+        with self._lock:
+            seen = dict(self._seen)
+        rows = []
+        for key, started in seen.items():
+            name, _, edge = key.rpartition(":")
+            if edge == "start":
+                rows.append((name, started, seen.get(f"{name}:end")))
+        return sorted(rows, key=lambda row: row[1])
+
+    def elapsed(self, now: Optional[float] = None) -> float:
+        """Seconds since the boot began; frozen at completion."""
+        with self._lock:
+            end = self._completed_at
+        end = end if end is not None else (time.time() if now is None else now)
+        return max(0.0, end - self._origin)
+
+    @property
+    def complete(self) -> bool:
+        return self._completed_at is not None
+
     def remaining_seconds(self, now: Optional[float] = None) -> Optional[float]:
         """Learned seconds left, or None while there is nothing to learn from."""
         now = time.time() if now is None else now

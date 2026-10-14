@@ -1,233 +1,190 @@
-"""Tests for EliteDashboard."""
+"""EliteDashboard: measured health, the boot timeline, and the inline region.
+
+The dashboard used to show defaults (J-Prime OFFLINE, JARVIS "BOOTING" on a
+port that was a WSL relay) because its rows were written by whatever events
+happened to arrive. Rows are now probe readings only; the boot comes from the
+kernel's BootTimeline; and the inline layout pins a short region below the
+scrollback instead of taking the whole screen.
+"""
+import io
+import json
+import logging
+import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 import pytest
 
+from backend.core.boot_timeline import BootTimeline
+from backend.core.supervisor import elite_dashboard as ed
 from backend.core.supervisor.elite_dashboard import (
-    EliteDashboard,
     DashboardState,
-    BootPhase,
-    BootTracker,
-    RepoHealth,
+    EliteDashboard,
+    HealthTarget,
     TickerEvent,
-    _render_health_matrix,
-    _render_event_ticker,
-    _render_boot_tree,
-    _render_stats_bar,
+    _append_event,
     _build_layout,
+    _build_status_region,
     _process_envelope,
+    probe_health,
 )
 
 
-class TestDashboardState:
-    def test_default_repos(self):
-        state = DashboardState()
-        assert "jarvis" in state.repos
-        assert "prime" in state.repos
-        assert "reactor" in state.repos
-
-    def test_default_counters(self):
-        state = DashboardState()
-        assert state.total_envelopes == 0
-        assert state.total_faults == 0
-        assert state.boot_complete is False
+def _render(renderable, width=100) -> str:
+    from rich.console import Console
+    console = Console(file=io.StringIO(), width=width, color_system=None, force_terminal=False)
+    console.print(renderable)
+    return console.file.getvalue()
 
 
-class TestBootPhase:
-    def test_default_pending(self):
-        p = BootPhase(name="test")
-        assert p.status == "pending"
-        assert p.started_at == 0.0
+# -- measured health ------------------------------------------------------------
+class _Health(BaseHTTPRequestHandler):
+    replies = {}
+
+    def do_GET(self):  # noqa: N802
+        code, body = self.replies[self.path]
+        self.send_response(code)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_a):
+        pass
 
 
-class TestBootTracker:
-    def test_begin_end_phase(self):
-        state = DashboardState()
-        bt = BootTracker(state, None)
-        bt.begin_phase("Preflight")
-        assert len(state.boot_phases) == 1
-        assert state.boot_phases[0].status == "running"
-        bt.end_phase("Preflight", success=True)
-        assert state.boot_phases[0].status == "done"
-
-    def test_failed_phase(self):
-        state = DashboardState()
-        bt = BootTracker(state, None)
-        bt.begin_phase("Backend")
-        bt.end_phase("Backend", success=False, detail="timeout")
-        assert state.boot_phases[0].status == "failed"
-        assert state.boot_phases[0].detail == "timeout"
-
-    def test_skip_phase(self):
-        state = DashboardState()
-        bt = BootTracker(state, None)
-        bt.skip_phase("Reactor", reason="not found")
-        assert state.boot_phases[0].status == "skipped"
-        assert state.boot_phases[0].detail == "not found"
-
-    def test_mark_boot_complete(self):
-        state = DashboardState()
-        bt = BootTracker(state, None)
-        bt.mark_boot_complete()
-        assert state.boot_complete is True
-        assert state.boot_elapsed_s > 0
+@pytest.fixture
+def health_server():
+    server = HTTPServer(("127.0.0.1", 0), _Health)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
 
 
-class TestRenderFunctions:
-    def _make_state(self):
-        state = DashboardState()
-        state.boot_phases.append(BootPhase(name="Preflight", status="done", started_at=0, finished_at=1.2))
-        state.boot_phases.append(BootPhase(name="Backend", status="running", started_at=1.2))
-        state.boot_phases.append(BootPhase(name="Trinity", status="pending"))
-        state.events.append(TickerEvent(
-            timestamp=time.time(), category="lifecycle",
-            message="Test event", severity="info",
-        ))
-        state.repos["prime"].status = "READY"
-        state.repos["prime"].last_heartbeat = time.monotonic()
-        state.repos["prime"].latency_ms = 12.5
-        return state
-
-    def test_render_health_matrix(self):
-        state = self._make_state()
-        result = _render_health_matrix(state)
-        assert result is not None
-
-    def test_render_event_ticker(self):
-        state = self._make_state()
-        result = _render_event_ticker(state)
-        assert result is not None
-
-    def test_render_boot_tree(self):
-        state = self._make_state()
-        result = _render_boot_tree(state)
-        assert result is not None
-
-    def test_render_boot_tree_complete(self):
-        state = self._make_state()
-        state.boot_complete = True
-        state.boot_elapsed_s = 22.5
-        result = _render_boot_tree(state)
-        assert result is not None
-
-    def test_render_stats_bar(self):
-        state = self._make_state()
-        result = _render_stats_bar(state)
-        assert result is not None
-
-    def test_build_layout(self):
-        state = self._make_state()
-        result = _build_layout(state)
-        assert result is not None
-
-    def test_render_empty_state(self):
-        state = DashboardState()
-        result = _build_layout(state)
-        assert result is not None
+@pytest.mark.parametrize("path,code,body,status", [
+    ("/healthy", 200, b'{"status": "healthy"}', "ONLINE"),
+    ("/degraded", 200, b'{"status": "degraded"}', "DEGRADED"),
+    ("/plain", 200, b"ok", "ONLINE"),
+    ("/broken", 500, b"", "ERROR"),
+])
+def test_a_row_is_what_the_component_reports(health_server, path, code, body, status):
+    _Health.replies[path] = (code, body)
+    reading = probe_health(HealthTarget("x", "X", lambda: health_server + path), timeout=2)
+    assert reading.status == status
+    assert reading.port == int(health_server.rsplit(":", 1)[1])
 
 
-class TestProcessEnvelope:
-    def _make_envelope(self, schema, payload, source="test"):
-        class E:
-            pass
-        e = E()
-        e.event_schema = schema
-        e.payload = payload
-        e.source = source
-        return e
-
-    def test_lifecycle_transition(self):
-        state = DashboardState()
-        env = self._make_envelope(
-            "lifecycle.transition@1.0.0",
-            {"from_state": "PROBING", "to_state": "READY"},
-            source="jprime_lifecycle_controller",
-        )
-        _process_envelope(state, env)
-        assert state.total_envelopes == 1
-        assert state.repos["prime"].status == "READY"
-        assert len(state.events) == 1
-        assert state.events[0].category == "lifecycle"
-
-    def test_fault_raised(self):
-        state = DashboardState()
-        env = self._make_envelope(
-            "fault.raised@1.0.0",
-            {"fault_class": "connection_refused"},
-        )
-        _process_envelope(state, env)
-        assert state.total_faults == 1
-        assert len(state.events) == 1
-        assert state.events[0].severity == "error"
-
-    def test_fault_resolved(self):
-        state = DashboardState()
-        env = self._make_envelope(
-            "fault.resolved@1.0.0",
-            {"fault_class": "connection_refused"},
-        )
-        _process_envelope(state, env)
-        assert state.total_recoveries == 1
-
-    def test_scheduler_graph_state(self):
-        state = DashboardState()
-        env = self._make_envelope(
-            "scheduler.graph_state@1.0.0",
-            {"total_agents": 15, "initialized": 15},
-        )
-        _process_envelope(state, env)
-        assert state.total_agents == 15
-        assert state.initialized_agents == 15
-        assert state.repos["jarvis"].status == "ONLINE"
-
-    def test_reasoning_decision(self):
-        state = DashboardState()
-        env = self._make_envelope(
-            "reasoning.decision@1.0.0",
-            {"command": "search YouTube for NBA"},
-        )
-        _process_envelope(state, env)
-        assert len(state.events) == 1
-        assert state.events[0].category == "reasoning"
-
-    def test_proactive_drive_eligible(self):
-        state = DashboardState()
-        env = self._make_envelope(
-            "reasoning.proactive_drive@1.0.0",
-            {"state": "ELIGIBLE"},
-        )
-        _process_envelope(state, env)
-        assert state.proactive_explorations == 1
-
-    def test_unknown_schema_increments_count_only(self):
-        state = DashboardState()
-        env = self._make_envelope("unknown.schema@1.0.0", {})
-        _process_envelope(state, env)
-        assert state.total_envelopes == 1
-        assert len(state.events) == 0
+def test_nothing_listening_is_offline_and_no_url_is_unconfigured():
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    assert probe_health(HealthTarget("x", "X", lambda: f"http://127.0.0.1:{port}/h"), 1).status == "OFFLINE"
+    assert probe_health(HealthTarget("x", "X", lambda: "")).status == "UNCONFIGURED"
 
 
-class TestEliteDashboard:
-    def test_disabled_no_thread(self):
-        d = EliteDashboard(enabled=False)
-        assert d._thread is None
-        assert d.health()["enabled"] is False
+def test_every_row_shows_at_once_and_a_dead_target_does_not_hold_back_the_others(health_server, monkeypatch):
+    _Health.replies["/ok"] = (200, b'{"status": "ok"}')
+    slow = threading.Event()
 
-    def test_update_repo_status(self):
-        d = EliteDashboard(enabled=False)
-        d.update_repo_status("prime", "READY", latency_ms=10.0)
-        assert d._state.repos["prime"].status == "READY"
-        assert d._state.repos["prime"].latency_ms == 10.0
+    def blocked():
+        slow.wait(5)
+        return ""
 
-    def test_add_event(self):
-        d = EliteDashboard(enabled=False)
-        d.add_event("test", "hello world", severity="warn")
-        assert len(d._state.events) == 1
-        assert d._state.events[0].message == "hello world"
+    d = EliteDashboard(enabled=False)
+    d.watch_health([HealthTarget("fast", "Fast", lambda: health_server + "/ok"),
+                    HealthTarget("slow", "Slow", blocked)])
+    deadline = time.time() + 5
+    while d._state.repos.get("fast", None) is None or d._state.repos["fast"].status != "ONLINE":
+        assert time.time() < deadline
+        time.sleep(0.05)
+    assert d._state.repos["slow"].status == "MEASURING"
+    slow.set()
+    d._prober_stop.set()
 
-    def test_health_snapshot(self):
-        d = EliteDashboard(enabled=False)
-        h = d.health()
-        assert "enabled" in h
-        assert "running" in h
-        assert "total_envelopes" in h
-        assert "boot_complete" in h
+
+def test_telemetry_never_writes_a_health_row():
+    class E:
+        event_schema = "lifecycle.transition@1.0.0"
+        payload = {"from_state": "PROBING", "to_state": "READY"}
+        source = "jprime_lifecycle_controller"
+
+    state = DashboardState()
+    _process_envelope(state, E())
+    assert state.repos == {} and state.total_envelopes == 1
+    assert "READY" in state.events[-1].message
+
+
+# -- the ticker -------------------------------------------------------------------
+def test_a_repeating_event_folds_into_one_row():
+    state = DashboardState()
+    for i in range(9):
+        _append_event(state, TickerEvent(time.time(), "lifecycle", f"stall {i}", "warn", key="stall"))
+    _append_event(state, TickerEvent(time.time(), "voice", "Morning, Derek."))
+    assert len(state.events) == 2
+    assert state.events[0].count == 9 and state.events[0].message == "stall 8"
+
+
+# -- the boot comes from the timeline -----------------------------------------------
+def test_boot_panel_reads_the_timeline(tmp_path):
+    tl = BootTimeline(origin=time.time() - 30, store=tmp_path / "t.json")
+    tl.phase_started("clean_slate", tl._origin + 1)
+    tl.phase_ended("clean_slate", tl._origin + 13)
+    tl.phase_started("agi_os", tl._origin + 13)
+    tl.phase_started("agi_os", tl._origin + 14)            # announced twice: one row
+    state = DashboardState(timeline=tl)
+    text = _render(_build_layout(state), width=160)
+    assert "clean_slate (12.0s)" in text and text.count("agi_os") == 1
+    tl.completed(tl._origin + 125)
+    assert "COMPLETE (125.0s)" in _render(_build_layout(state), width=160)
+
+
+# -- the inline region ---------------------------------------------------------------
+def test_region_is_a_few_lines_whatever_happens(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_STATUS_REGION_EVENTS", "3")
+    tl = BootTimeline(origin=time.time(), store=tmp_path / "t.json")
+    tl.phase_started("backend", time.time())
+    state = DashboardState(timeline=tl)
+    state.repos["jarvis"] = ed.RepoHealth("jarvis", "JARVIS (Body)", "DEGRADED", "http://127.0.0.1:8010/health", 188)
+    for i in range(40):
+        _append_event(state, TickerEvent(time.time(), "fault", f"problem {i}", "error", key=f"k{i}"))
+    lines = [l for l in _render(_build_status_region(state), width=80).splitlines() if l.strip()]
+    assert len(lines) == 1 + 1 + 1 + 3 + 1            # rule, boot, health, events, counters
+    assert "DEGRADED :8010 188ms" in lines[2]
+    assert all(len(l) <= 80 for l in lines)
+
+
+def test_inline_routing_puts_lines_above_and_restores_everything():
+    from rich.console import Console
+    sink = io.StringIO()
+    console = Console(file=sink, width=120, color_system=None, force_terminal=False)
+    stream_before = io.StringIO()
+    handler = logging.StreamHandler(sys.stderr)
+    logger = logging.getLogger("test.routing")
+    logger.addHandler(handler)
+    out, err = sys.stdout, sys.stderr
+    try:
+        with ed._terminal_routed_above(console):
+            assert handler.stream is not err
+            sys.stdout.write("half ")
+            sys.stdout.write("a line\n")
+            logger.warning("from a handler bound before the region")
+        assert sys.stdout is out and sys.stderr is err and handler.stream is err
+    finally:
+        logger.removeHandler(handler)
+    printed = sink.getvalue()
+    assert "half a line" in printed and "from a handler bound before the region" in printed
+    assert stream_before.getvalue() == ""
+
+
+def test_layout_defaults_to_inline(monkeypatch):
+    monkeypatch.delenv("JARVIS_DASHBOARD_LAYOUT", raising=False)
+    assert EliteDashboard(enabled=False).inline
+    monkeypatch.setenv("JARVIS_DASHBOARD_LAYOUT", "fullscreen")
+    assert not EliteDashboard(enabled=False).inline
+
+
+def test_disabled_dashboard_starts_nothing():
+    d = EliteDashboard(enabled=False)
+    d.activate_display()
+    assert d._thread is None and d.health()["enabled"] is False

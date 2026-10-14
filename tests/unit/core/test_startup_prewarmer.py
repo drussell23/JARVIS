@@ -300,3 +300,38 @@ class TestPreWarmTasks:
         assert r is not None
         assert r.status == PreWarmStatus.OK
         assert set(r.value) == {"json", "os", "sys"}
+
+
+class TestDockerProbeTransports:
+    """The ping goes over the daemon's own transport (it knew only the Unix
+    socket, so it reported FAILED on Windows while Docker Desktop ran)."""
+
+    def test_endpoint_follows_docker_host_then_platform(self, monkeypatch):
+        from backend.core import startup_prewarmer as sp
+        monkeypatch.setenv("DOCKER_HOST", "tcp://127.0.0.1:2375")
+        assert sp._docker_endpoint() == "tcp://127.0.0.1:2375"
+        monkeypatch.delenv("DOCKER_HOST")
+        monkeypatch.setattr(sp.os, "name", "nt")
+        assert sp._docker_endpoint() == "npipe:////./pipe/docker_engine"
+
+    def test_ping_over_tcp_reads_the_status_line(self, monkeypatch):
+        import socket
+        import threading
+        from backend.core import startup_prewarmer as sp
+
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+
+        def answer():
+            conn, _ = server.accept()
+            conn.recv(1024)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+            conn.close()
+
+        threading.Thread(target=answer, daemon=True).start()
+        monkeypatch.setenv("DOCKER_HOST", f"tcp://127.0.0.1:{server.getsockname()[1]}")
+        try:
+            assert sp._docker_ping() is True
+        finally:
+            server.close()

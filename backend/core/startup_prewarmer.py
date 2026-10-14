@@ -25,6 +25,50 @@ from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+_DOCKER_PING = b"GET /_ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+
+def _docker_endpoint() -> str:
+    """The daemon endpoint the Docker CLI itself would use, as a URL."""
+    declared = os.environ.get("DOCKER_HOST", "").strip()
+    if declared:
+        return declared
+    if os.name == "nt":
+        return "npipe:////./pipe/docker_engine"
+    for path in ("/var/run/docker.sock", os.path.expanduser("~/.docker/run/docker.sock")):
+        if os.path.exists(path):
+            return "unix://" + path
+    return "unix:///var/run/docker.sock"
+
+
+def _docker_ping() -> bool:
+    """True when the daemon answers ``/_ping`` with 200, over its transport."""
+    import socket
+
+    timeout = float(os.environ.get("JARVIS_PREWARM_DOCKER_TIMEOUT_S", "") or 15.0)
+    endpoint = _docker_endpoint()
+    scheme, _, rest = endpoint.partition("://")
+    if scheme == "npipe":
+        # A Windows named pipe is a file: write the request, read the reply.
+        pipe = rest.replace("/", "\\")
+        with open(pipe, "r+b", buffering=0) as stream:
+            stream.write(_DOCKER_PING)
+            return b" 200 " in stream.read(256)
+    if scheme == "unix":
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        address: Any = rest
+    elif scheme == "tcp":
+        host, _, port = rest.rstrip("/").rpartition(":")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        address = (host, int(port))
+    else:
+        raise ValueError(f"unsupported DOCKER_HOST scheme: {endpoint}")
+    with sock:
+        sock.settimeout(timeout)
+        sock.connect(address)
+        sock.sendall(_DOCKER_PING)
+        return b" 200 " in sock.recv(256)
+
 # Lazy-imported at module level so tests can patch the name on this module.
 # The actual import is deferred until the function runs to avoid heavy
 # startup cost when gcp_enabled is False.
@@ -257,28 +301,15 @@ class StartupPreWarmer:
     # ------------------------------------------------------------------ #
 
     def _start_docker_probe(self) -> None:
-        """Task #1: Probe Docker daemon via socket ping."""
-        import socket as _module_socket
+        """Task #1: Probe the Docker daemon with an API ping.
 
-        def probe():
-            import os as _os
-            docker_host = _os.environ.get("DOCKER_HOST", "")
-            if docker_host.startswith("unix://"):
-                sock_path = docker_host[len("unix://"):]
-            elif _os.path.exists("/var/run/docker.sock"):
-                sock_path = "/var/run/docker.sock"
-            else:
-                sock_path = _os.path.expanduser("~/.docker/run/docker.sock")
-            with _module_socket.socket(
-                _module_socket.AF_UNIX, _module_socket.SOCK_STREAM
-            ) as sock:
-                sock.settimeout(15.0)
-                sock.connect(sock_path)
-                sock.sendall(b"GET /_ping HTTP/1.1\r\nHost: localhost\r\n\r\n")
-                resp = sock.recv(256)
-                return b"200" in resp
-
-        self._submit_thread("docker_probe", probe)
+        The ping goes over the daemon's own transport: DOCKER_HOST when set
+        (unix://, npipe:// or tcp://), else the platform's default endpoint
+        -- the named pipe on Windows, the socket elsewhere. The probe used to
+        know only the Unix socket, so on Windows it reported FAILED while
+        Docker Desktop was running and DockerDaemonManager found it healthy.
+        """
+        self._submit_thread("docker_probe", _docker_ping)
 
     def _start_gcp_creds(self) -> None:
         """Task #2: Validate GCP credentials and create API client."""

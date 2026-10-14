@@ -166,18 +166,24 @@ class ConfigDiscovery:
         repos: Dict[str, Path] = {"jarvis": jarvis_root}
 
         # Check environment variables first
+        # Every name the ecosystem declares a repo path under, first wins.
+        # The kernel and .env use <REPO>_PATH (JARVIS_PRIME_PATH,
+        # REACTOR_CORE_PATH); this discovery only knew *_REPO, so a
+        # declared path was ignored and sibling folders not named after the
+        # repo ("prime", "reactor") read as "repo not found".
         env_mappings = {
-            "jarvis": "JARVIS_REPO",
-            "j_prime": "J_PRIME_REPO",
-            "reactor_core": "REACTOR_CORE_REPO",
+            "jarvis": ("JARVIS_REPO",),
+            "j_prime": ("J_PRIME_REPO", "JARVIS_PRIME_PATH", "JARVIS_PRIME_REPO_PATH"),
+            "reactor_core": ("REACTOR_CORE_REPO", "REACTOR_CORE_PATH", "REACTOR_CORE_REPO_PATH",
+                             "JARVIS_REACTOR_REPO_PATH"),
         }
 
-        for repo_name, env_var in env_mappings.items():
-            env_path = os.getenv(env_var)
-            if env_path:
-                path = Path(env_path)
-                if path.exists():
-                    repos[repo_name] = path.resolve()
+        for repo_name, env_vars in env_mappings.items():
+            for env_var in env_vars:
+                env_path = os.getenv(env_var)
+                if env_path and Path(env_path).exists():
+                    repos[repo_name] = Path(env_path).resolve()
+                    break
 
         # Discover sibling repos if not found via env
         if len(repos) < 3:
