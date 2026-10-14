@@ -58,6 +58,7 @@ import logging
 import os
 import threading
 import time
+import weakref
 from collections import deque
 from pathlib import Path
 from typing import (
@@ -216,10 +217,12 @@ def publish_markup_global(text: str, *, session: Optional[str] = None) -> bool:
     """
     try:
         bridge = _ACTIVE_BRIDGE
-        if bridge is None or attached_cockpits() <= 0:
+        # An ADDRESSED line reaches the bridge with nobody attached: it is
+        # held for its cockpit's return. Ambient output to nobody stays here.
+        if bridge is None or (attached_cockpits() <= 0 and not session):
             return False
         bridge.publish_markup(str(text), session=session)
-        return True
+        return attached_cockpits() > 0
     except Exception:  # noqa: BLE001
         return False
 
@@ -384,6 +387,23 @@ def _backlog_ttl_s() -> float:
         return 1800.0
 
 
+def _cockpit_backlogs_cap() -> int:
+    """How many ABSENT cockpits keep a replay ring at once. Env
+    ``JARVIS_ATTACH_COCKPIT_BACKLOGS``. Least-recently-addressed is evicted;
+    an evicted cockpit that returns is told its history was truncated."""
+    try:
+        return max(1, int(os.environ.get("JARVIS_ATTACH_COCKPIT_BACKLOGS", "16")))
+    except Exception:  # noqa: BLE001
+        return 16
+
+
+#: Addressed frame types a detached cockpit gets back on re-attach: its
+#: render output and its /session mode changes. Control-plane frames stay
+#: excluded for the reason `_OfflineBacklog` gives -- a replayed prompt offers
+#: a decision that no longer exists.
+_REPLAYED_ADDRESSED_TYPES = frozenset({"line", "markup", "session_mode"})
+
+
 class _OfflineBacklog:
     """Render frames emitted while nobody was listening.
 
@@ -432,7 +452,7 @@ class _OfflineBacklog:
     """
 
     __slots__ = ("_frames", "_lock", "retained", "overflowed",
-                 "replayed", "dropped_stale")
+                 "replayed", "dropped_stale", "_loss_reported")
 
     def __init__(self) -> None:
         self._frames: Deque[Tuple[float, Dict[str, Any]]] = deque(
@@ -443,6 +463,22 @@ class _OfflineBacklog:
         self.overflowed = 0
         self.replayed = 0
         self.dropped_stale = 0
+        self._loss_reported = 0
+
+    def unreported_loss(self) -> int:
+        """Frames lost (aged out or overflowed) since the last
+        :meth:`mark_loss_reported` -- what a replay must admit it is missing
+        rather than present a gapped history as whole. NEVER raises."""
+        try:
+            with self._lock:
+                self._evict_stale(time.time())
+                return max(0, self.dropped_stale + self.overflowed - self._loss_reported)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def mark_loss_reported(self) -> None:
+        with self._lock:
+            self._loss_reported = self.dropped_stale + self.overflowed
 
     def _evict_stale(self, now: float) -> None:
         """Drop aged frames from the front. Caller holds the lock."""
@@ -471,8 +507,12 @@ class _OfflineBacklog:
         except Exception:  # noqa: BLE001 — retention must never break a publish
             pass
 
-    def peek(self) -> List[Dict[str, Any]]:
-        """Frames to replay, oldest first. Does NOT consume. NEVER raises."""
+    def peek(self, *, addressed: bool = False) -> List[Dict[str, Any]]:
+        """Frames to replay, oldest first. Does NOT consume. NEVER raises.
+
+        *addressed* is the replay's provenance on the wire: True for one
+        cockpit's own retained answers (they belong in its scrollback, as
+        they would have live), False for the ambient ring."""
         try:
             now = time.time()
             with self._lock:
@@ -486,7 +526,7 @@ class _OfflineBacklog:
                     # date an hour-old diff to now.
                     frame["backlogged"] = True
                     frame["ts"] = ts
-                    frame["addressed"] = False
+                    frame["addressed"] = addressed
                     out.append(frame)
                 return out
         except Exception:  # noqa: BLE001
@@ -618,6 +658,16 @@ class CockpitAttachBridge:
         #: does not stop working when the operator closes a terminal; before
         #: this, everything it rendered in that window was discarded.
         self._backlog = _OfflineBacklog()
+        #: Per-cockpit replay rings: output ADDRESSED to a cockpit that was
+        #: not attached (a /session answer that finished after its operator
+        #: detached). Keyed by the cockpit's stable terminal identity
+        #: (`attach_session.cockpit_identity`), flushed when that identity
+        #: binds again. Same ring, same TTL, same two-phase drain as the
+        #: ambient backlog; LRU-bounded across cockpits.
+        self._cockpit_backlogs: "_OD[str, _OfflineBacklog]" = _OD()
+        self._cockpit_lock = threading.Lock()
+        #: Cockpits whose ring was evicted unflushed -- they are told so.
+        self._evicted_cockpits: Deque[str] = deque(maxlen=64)
         #: session_id → that cockpit's writer. Populated from the session
         #: field on inbound frames; entries are removed by _drop so a
         #: detached cockpit can never be addressed.
@@ -763,7 +813,13 @@ class CockpitAttachBridge:
         by the ring and include a LIVE gauge (`backlog_pending`) that would be
         wrong the moment it were copied into a totals dict."""
         try:
-            return self._backlog.snapshot()
+            out = self._backlog.snapshot()
+            with self._cockpit_lock:
+                rings = list(self._cockpit_backlogs.values())
+            out["cockpit_backlogs"] = len(rings)
+            out["cockpit_backlog_pending"] = sum(
+                r.snapshot()["backlog_pending"] for r in rings)
+            return out
         except Exception:  # noqa: BLE001
             return {}
 
@@ -873,14 +929,38 @@ class CockpitAttachBridge:
             from backend.core.ouroboros.battle_test.attach_session import (
                 current_session,
             )
-            if current_session() is not None:
-                # Addressed output: it belongs to a cockpit that has gone, and
-                # session ids do not survive a reattach. Replaying it would
-                # put one operator's verb answer in another's scrollback.
-                return
+            owner = current_session()
         except Exception:  # noqa: BLE001 — unresolvable ownership -> do not retain
             return
+        if owner is not None:
+            # Addressed output belongs to ITS cockpit, never the shared ring
+            # (that would paint one operator's answer in another's
+            # scrollback). It waits for that cockpit's identity to return.
+            self._retain_for_cockpit(owner, msg)
+            return
         self._backlog.retain(msg)
+
+    def _retain_for_cockpit(self, cockpit: str, msg: Dict[str, Any]) -> None:
+        """Hold one frame addressed to an ABSENT cockpit until its identity
+        re-binds (:meth:`_attach_cockpit`). NEVER raises."""
+        try:
+            if (not cockpit or not offline_backlog_enabled()
+                    or msg.get("type") not in _REPLAYED_ADDRESSED_TYPES):
+                return
+            frame = {k: v for k, v in msg.items() if k != "addressed"}
+            with self._cockpit_lock:
+                ring = self._cockpit_backlogs.get(cockpit)
+                if ring is None:
+                    ring = self._cockpit_backlogs[cockpit] = _OfflineBacklog()
+                self._cockpit_backlogs.move_to_end(cockpit)
+                while len(self._cockpit_backlogs) > _cockpit_backlogs_cap():
+                    gone, _ = self._cockpit_backlogs.popitem(last=False)
+                    self._evicted_cockpits.append(gone)
+                    self.stats["cockpit_backlogs_evicted"] = (
+                        self.stats.get("cockpit_backlogs_evicted", 0) + 1)
+            ring.retain(frame)
+        except Exception:  # noqa: BLE001
+            pass
 
     def publish_line(self, text: str) -> None:
         """Broadcast one (already router-conformed) line to every
@@ -949,7 +1029,9 @@ class CockpitAttachBridge:
             if session:
                 msg["session"] = session
             if not self._clients:
-                if not session:
+                if session:
+                    self._retain_for_cockpit(session, msg)
+                else:
                     self._retain_unheard(msg)
                 return
             self.stats["markup_published"] = (
@@ -1524,6 +1606,8 @@ class CockpitAttachBridge:
                 self.stats["addressed_undeliverable"] = (
                     self.stats.get("addressed_undeliverable", 0) + 1
                 )
+                # Still never broadcast -- held for THAT cockpit instead.
+                self._retain_for_cockpit(target, msg)
                 return
             writers = [w]
             self.stats["addressed"] = self.stats.get("addressed", 0) + 1
@@ -1678,6 +1762,87 @@ class CockpitAttachBridge:
         self._sessions[session_id] = w
         self.stats["sessions_bound"] = self.stats.get("sessions_bound", 0) + 1
 
+    async def _attach_cockpit(self, cockpit: str, w: asyncio.StreamWriter) -> bool:
+        """A cockpit identity binds (first frame, or a re-attach): give it
+        back what was addressed to it while it was away, THEN bind it, then
+        restore its /session mode. Returns False when the socket died during
+        the replay (the caller ends the session). NEVER raises.
+
+        Ordering is the ambient flush's contract applied per cockpit: history
+        precedes live. The ring is flushed and drained while the identity is
+        still unbound (so new addressed output keeps landing in the ring),
+        then -- with no await between them -- the identity is bound and any
+        frame retained during the drain is written behind the history. Nothing
+        is committed before it is on the wire, so a cockpit that drops
+        mid-replay loses nothing.
+        """
+        with self._cockpit_lock:
+            ring = self._cockpit_backlogs.get(cockpit)
+            evicted = cockpit in self._evicted_cockpits
+        if ring is not None or evicted:
+            try:
+                frames = ring.peek(addressed=True) if ring is not None else []
+                lost = ring.unreported_loss() if ring is not None else 0
+                head = []
+                if lost or evicted:
+                    # The TTL (or the cross-cockpit cap) expired part of this
+                    # cockpit's history. Said, before what survived -- never a
+                    # gapped transcript presented as whole.
+                    what = f"{lost} earlier line(s)" if lost else "earlier output"
+                    head = [{"type": "markup", "addressed": True, "backlogged": True,
+                             "ts": time.time(),
+                             "text": f"[dim]⋯ history truncated: {what} expired "
+                                     f"while this cockpit was detached[/dim]"}]
+                for frame in head + frames:
+                    w.write((json.dumps(frame, separators=(",", ":")) + "\n").encode())
+                await w.drain()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                self._drop(w)
+                return False
+            except Exception:  # noqa: BLE001
+                logger.debug("[CockpitAttach] cockpit replay degraded", exc_info=True)
+                frames, head = [], []
+            self.bind_session(cockpit, w)
+            try:
+                if ring is not None:
+                    ring.commit(len(frames))
+                    ring.mark_loss_reported()
+                    late = ring.peek(addressed=True)
+                    for frame in late:
+                        w.write((json.dumps(frame, separators=(",", ":")) + "\n").encode())
+                    ring.commit(len(late))
+                    frames = frames + late
+                with self._cockpit_lock:
+                    if self._cockpit_backlogs.get(cockpit) is ring:
+                        self._cockpit_backlogs.pop(cockpit, None)
+                    try:
+                        self._evicted_cockpits.remove(cockpit)
+                    except ValueError:
+                        pass
+            except Exception:  # noqa: BLE001
+                logger.debug("[CockpitAttach] cockpit replay commit degraded",
+                             exc_info=True)
+            if frames or head:
+                self.stats["cockpit_replays"] = self.stats.get("cockpit_replays", 0) + 1
+                logger.info("[CockpitAttach] replayed %d addressed frame(s) to "
+                            "re-attached cockpit %s%s", len(frames), cockpit,
+                            " (history truncated)" if head else "")
+        else:
+            self.bind_session(cockpit, w)
+        # A /session outlives its terminal: a re-attaching cockpit is put
+        # back into its conversation's transcript mode (FOREGROUND_SESSION).
+        try:
+            from backend.core.ouroboros.governance.foreground_session import (  # noqa: PLC0415
+                get_manager,
+            )
+            mgr = get_manager()
+            live = mgr.active(cockpit)
+            if live is not None:
+                mgr.notify_mode(cockpit, live)
+        except Exception:  # noqa: BLE001
+            logger.debug("[CockpitAttach] session mode restore skipped", exc_info=True)
+        return True
+
     def _drop(self, w: asyncio.StreamWriter) -> None:
         if w in self._clients:
             self.stats["dropped"] += 1
@@ -1815,7 +1980,10 @@ class CockpitAttachBridge:
                 # frame is acted on, so the very first command a cockpit
                 # sends is already addressable when its output returns.
                 _sid = str(frame.get("session", "")).strip()
-                if _sid:
+                if _sid and self._sessions.get(_sid) is not writer:
+                    if not await self._attach_cockpit(_sid, writer):
+                        break
+                elif _sid:
                     self.bind_session(_sid, writer)
                 if ftype == "caps":
                     # The display describing itself. Handled BEFORE `input`
@@ -1989,14 +2157,15 @@ class CockpitAttachClient:
         #: protocol only when it can render it; without a handler the daemon
         #: keeps sending this cockpit plain lines.
         self._on_block = on_block
-        #: This cockpit's identity for the life of the attachment. Declared
-        #: on every outbound frame so the daemon can address answers back to
-        #: the terminal that asked, instead of to all of them.
+        #: This cockpit's identity -- its TERMINAL's, stable across
+        #: re-attaches. Declared on every outbound frame so the daemon can
+        #: address answers back to the terminal that asked, and hold them
+        #: for it while it is detached (`_attach_cockpit`).
         try:
             from backend.core.ouroboros.battle_test.attach_session import (
-                new_session_id,
+                cockpit_identity,
             )
-            self.session_id: str = new_session_id()
+            self.session_id: str = self._claim_identity(cockpit_identity())
         except Exception:  # noqa: BLE001 — an unidentified client still works
             self.session_id = ""
         self._reader: Optional[asyncio.StreamReader] = None
@@ -2438,8 +2607,38 @@ class CockpitAttachClient:
         finally:
             self.connected = False
 
+    #: identity -> the live client holding it in this process. The terminal
+    #: names a cockpit, but one process can hold several clients on that
+    #: terminal at once (a probe beside the cockpit); sharing the id would
+    #: make the bridge re-point the first client's address at the second.
+    _LIVE_IDENTITIES: "weakref.WeakValueDictionary[str, CockpitAttachClient]" = (
+        weakref.WeakValueDictionary()
+    )
+    _IDENTITY_LOCK = threading.Lock()
+
+    def _claim_identity(self, base: str) -> str:
+        """The terminal's id for the first live client; ``<id>-<k>`` (the
+        lowest free slot, so still stable across re-attaches) for the k-th
+        concurrent one."""
+        if not base:
+            return base
+        with CockpitAttachClient._IDENTITY_LOCK:
+            k = 0
+            while True:
+                cand = base if k == 0 else f"{base}-{k}"
+                if CockpitAttachClient._LIVE_IDENTITIES.get(cand) is None:
+                    CockpitAttachClient._LIVE_IDENTITIES[cand] = self
+                    return cand
+                k += 1
+
+    def _release_identity(self) -> None:
+        with CockpitAttachClient._IDENTITY_LOCK:
+            if CockpitAttachClient._LIVE_IDENTITIES.get(self.session_id) is self:
+                del CockpitAttachClient._LIVE_IDENTITIES[self.session_id]
+
     async def close(self) -> None:
         self.connected = False
+        self._release_identity()
         task = self._read_task
         self._read_task = None
         if task is not None and not task.done():

@@ -148,7 +148,8 @@ async def test_backpressure_signal_when_queue_full(tmp_path):
         r1 = await router.ingest(_env())
         assert r1 == "enqueued"
         # Second enqueue from low-priority source should be back-pressured
-        r2 = await router.ingest(_env(source="backlog"))
+        # A different file: the same file would (correctly) queue behind r1.
+        r2 = await router.ingest(_env(source="backlog", target_files=("backend/core/other.py",)))
         assert r2 in ("enqueued", "backpressure")
     finally:
         await router.stop()

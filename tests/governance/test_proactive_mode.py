@@ -520,8 +520,9 @@ def test_the_veto_precedes_the_value_gate():
     body = fn.body[1:] if isinstance(fn.body[0], ast.Expr) else fn.body
     code = "\n".join(ast.unparse(stmt) for stmt in body)
     assert "mutation_permitted" in code
-    assert code.index("mutation_permitted") < code.index(
-        "JARVIS_CANDIDATE_VALUE_GATE_ENABLED")
+    # The value gate's applicability (master flag + operator-seed bypass)
+    # is one method, _value_gate_applies, shared by both cosmetic passes.
+    assert code.index("mutation_permitted") < code.index("_value_gate_applies")
 
 
 # ---------------------------------------------------------------------------

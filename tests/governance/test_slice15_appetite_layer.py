@@ -358,6 +358,7 @@ class _StubOrch:
     )
     _candidate_value_verdicts = Orchestrator._candidate_value_verdicts
     _prune_cosmetic_siblings = Orchestrator._prune_cosmetic_siblings
+    _value_gate_applies = Orchestrator._value_gate_applies
 
     def __init__(self, tmp_path):
         self._config = OrchestratorConfig(project_root=tmp_path)

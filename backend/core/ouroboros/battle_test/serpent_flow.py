@@ -1115,11 +1115,19 @@ class SerpentFlow:
             # The mirror is resolved per frame, not captured here: SerpentFlow
             # is constructed before the bridge attaches, so a handle taken now
             # would be None forever — the wired-but-inert shape.
+            #
+            # ONE owner of the cockpit's copy. The renderer now mirrors its
+            # own completed lines (StreamRenderer._mirror_completed_lines,
+            # same flag), so fanning tokens out to a StreamMirror as well sent
+            # every generation to attached cockpits TWICE. The StreamMirror is
+            # armed only when the renderer cannot mirror by itself.
             try:
                 from backend.core.ouroboros.battle_test.stream_mirror import (
                     StreamMirror, fan_out_tokens, stream_mirror_enabled,
                 )
-                if stream_mirror_enabled():
+                if stream_mirror_enabled() and not hasattr(
+                    self._stream_renderer, "_mirror_completed_lines",
+                ):
                     self._stream_mirror = StreamMirror(
                         lambda text: self._mirror_markup(text),
                     )

@@ -105,6 +105,13 @@ class StreamMirror:
         self.chars_dropped = 0
         #: Watermark for the coalesced drop notice — see backpressure_notice.
         self._drops_reported = 0
+        #: The same interpreter the renderer's mirror uses (generation_view),
+        #: fed whole lines: frames are cut at arbitrary points, so a partial
+        #: last line waits in ``_carry`` for its newline.
+        self._view: Any = None
+        self._carry = ""
+        #: The current line began as prose and has been shown in part.
+        self._prose_open = False
 
     # -- token side --------------------------------------------------------
 
@@ -218,8 +225,11 @@ class StreamMirror:
                 # this is exactly the quantity the policy needs — how long
                 # this surface takes to absorb one frame, including whatever
                 # backpressure the socket is applying right now.
+                frame = self._present(head)
+                if not frame:
+                    return
                 started = self._clock()
-                sink(head)
+                sink(frame)
                 elapsed = self._clock() - started
                 self._self_time_s += elapsed
                 if self._policy is not None:
@@ -274,16 +284,68 @@ class StreamMirror:
     def end(self) -> None:
         """Stream finished — emit whatever is left, boundary or not."""
         try:
-            if self._buf:
-                text = "".join(self._buf)
-                self._buf, self._size = [], 0
-                self._last_flush = self._clock()
-                sink = self._emit
-                if sink is not None and text.strip():
-                    sink(text)
-                    self.frames_emitted += 1
+            text = "".join(self._buf)
+            self._buf, self._size = [], 0
+            self._last_flush = self._clock()
+            frame = self._present(text, final=True)
+            sink = self._emit
+            if sink is not None and frame:
+                sink(frame)
+                self.frames_emitted += 1
         except Exception:  # noqa: BLE001
             logger.debug("[StreamMirror] end degraded", exc_info=True)
+        finally:
+            self._view, self._carry, self._prose_open = None, "", False
+
+    def _present(self, text: str, *, final: bool = False) -> str:
+        """What of *text* the transcript shows, escaped -- model output is
+        untrusted and this frame travels the styled markup channel. ``""``
+        when nothing is shown. NEVER raises.
+
+        Whole lines go through the generation view (raw JSON never passes).
+        A line that has visibly begun as PROSE is not held for its newline:
+        the operator watches a slow stream trickle, and only a line that
+        could open JSON (``{``, ``[``, a fence) needs the whole line to
+        judge. Its remainder then streams straight through too."""
+        try:
+            from rich.markup import escape
+            from backend.core.ouroboros.battle_test.generation_view import (
+                GenerationView,
+            )
+            if self._view is None:
+                self._view = GenerationView()
+            s = str(text or "")
+            parts: List[str] = []
+            if self._prose_open:
+                cut = s.find("\n")
+                if cut < 0:
+                    return escape(s)
+                parts.append(escape(s[:cut + 1]))
+                s, self._prose_open = s[cut + 1:], False
+            pending = self._carry + s
+            if final:
+                complete, self._carry = pending, ""
+            else:
+                cut = pending.rfind("\n")
+                complete, self._carry = (pending[:cut], pending[cut + 1:]) if cut >= 0 \
+                    else ("", pending)
+            shown: List[str] = []
+            for line in complete.split("\n") if complete else ():
+                shown.extend(self._view.feed_line(line))
+            if final:
+                shown.extend(self._view.finish())
+            if shown:
+                parts.append("\n".join(escape(x) for x in shown) + ("" if final else "\n"))
+            head = self._carry.lstrip()[:1]
+            if (not final and head and head not in "{[`"
+                    and not self._view.buffering):
+                parts.append(escape(self._carry))
+                self._carry, self._prose_open = "", True
+            body = "".join(parts)
+            return body if body.strip() else ""
+        except Exception:  # noqa: BLE001
+            logger.debug("[StreamMirror] present degraded", exc_info=True)
+            return ""
 
     @property
     def pending_chars(self) -> int:

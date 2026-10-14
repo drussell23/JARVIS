@@ -346,9 +346,29 @@ class ProactiveExplorationSensor:
                     and bool(rep_paths_raw)
                 )
                 if use_paths:
-                    cap = _representative_path_envelope_cap()
+                    # Not files whose work already landed: GoalDiscovery
+                    # declines those as SATISFIED, and this path re-picked
+                    # one two minutes later (measured live, 2026-10-13).
+                    # The same verdict, via goal_discovery.settled_files.
+                    from backend.core.ouroboros.governance.autonomy.goal_discovery import (  # noqa: E501
+                        settled_files as _settled_files,
+                    )
+                    _settled = await _settled_files(rep_paths_raw)
+                    if _settled:
+                        rep_paths_raw = tuple(
+                            p for p in rep_paths_raw if p not in _settled
+                        )
+                        logger.info(
+                            "[ProactiveExploration] cluster %s: %d representative "
+                            "file(s) already landed, not re-explored",
+                            cluster.centroid_hash8, len(_settled),
+                        )
+                    if not rep_paths_raw:
+                        continue    # every representative file is settled work
+                    # (Was `cap`, which overwrote the loop's emission cap above.)
+                    path_cap = _representative_path_envelope_cap()
                     target_files: Tuple[str, ...] = tuple(
-                        rep_paths_raw[:cap],
+                        rep_paths_raw[:path_cap],
                     )
                     description_path_hint = (
                         f" Representative files: "

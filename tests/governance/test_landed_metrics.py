@@ -128,7 +128,7 @@ async def test_only_an_applied_decision_is_a_landing(tmp_path):
     await comm.emit_decision(op_id="op-c", outcome="escalated", reason_code="x")
     assert metrics.snapshot().total == 0
 
-    await comm.emit_decision(op_id="op-d", outcome="applied", reason_code="safe_auto_passed",
+    await comm.emit_decision(op_id="op-d", outcome="applied", reason_code="safe_auto_passed", commit_sha="abc1234",
                              diff_summary="Applied change to backend/api/sse_contract.py")
     snap = metrics.snapshot()
     assert snap.total == 1 and "sse_contract.py" in snap.recent[0]
@@ -170,7 +170,7 @@ async def test_a_broken_ledger_still_counts_the_landing():
     metrics = lm.LandedMetrics()
     transport = lm.LandedMetricsTransport(metrics, ledger=_Boom())
     await CommProtocol(transports=[transport]).emit_decision(
-        op_id="op-1", outcome="applied", reason_code="safe_auto_passed",
+        op_id="op-1", outcome="applied", reason_code="safe_auto_passed", commit_sha="abc1234",
     )
     await _drain(transport)
     assert metrics.snapshot().total == 1

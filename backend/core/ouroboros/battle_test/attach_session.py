@@ -69,12 +69,53 @@ def session_routing_enabled() -> bool:
 
 
 def new_session_id() -> str:
-    """A cockpit's identity for the life of one attachment.
+    """A random identity for one attachment -- used when the cockpit has no
+    stable terminal to be identified by (see :func:`cockpit_identity`).
 
-    Random rather than derived from pid or socket fd: a client may reconnect,
-    and a reused identity would deliver the previous attachment's pending
-    output to whoever inherited the descriptor."""
+    Random rather than derived from pid or socket fd: a reused fd would
+    deliver the previous attachment's pending output to whoever inherited
+    the descriptor."""
     return uuid.uuid4().hex[:12]
+
+
+def cockpit_identity() -> str:
+    """The cockpit's identity ACROSS attachments: the same operator terminal
+    gets the same id, so output addressed to it while it was away (a /session
+    answer that finished after the operator detached) and its /session itself
+    find it again when `ov` re-attaches (FOREGROUND_SESSION, replay buffer).
+
+    The identity is the terminal, not a descriptor -- the trust boundary the
+    random id was guarding stays drawn: ``JARVIS_COCKPIT_ID`` when the
+    operator names it; else a digest of the uid and the facts that identify
+    THIS terminal window: the Windows Terminal / macOS terminal session ids,
+    the tmux server + pane, and the controlling tty WITH its allocation time
+    (a recycled /dev/pts/N is a different terminal and gets a different id).
+    No terminal facts at all (piped, a service) -> random, as before.
+    ``JARVIS_COCKPIT_STABLE_ID=false`` restores per-attachment random ids.
+    NEVER raises."""
+    try:
+        explicit = os.environ.get("JARVIS_COCKPIT_ID", "").strip()
+        if explicit:
+            return "".join(c for c in explicit if c.isalnum() or c in "-_")[:32] or new_session_id()
+        if os.environ.get("JARVIS_COCKPIT_STABLE_ID", "1").strip().lower() not in _TRUTHY:
+            return new_session_id()
+        facts = []
+        for var in ("WT_SESSION", "TERM_SESSION_ID", "TMUX", "TMUX_PANE"):
+            val = os.environ.get(var, "").strip()
+            if val:
+                facts.append(f"{var}={val}")
+        try:
+            tty = os.ttyname(0)
+            facts.append(f"tty={tty}@{int(os.stat(tty).st_ctime)}")
+        except OSError:
+            pass
+        if not facts:
+            return new_session_id()
+        import hashlib  # noqa: PLC0415
+        uid = str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("USERNAME", "")
+        return hashlib.sha256("|".join([uid, *facts]).encode()).hexdigest()[:12]
+    except Exception:  # noqa: BLE001
+        return new_session_id()
 
 
 def current_session() -> Optional[str]:
@@ -193,6 +234,7 @@ def lane_scope(lane: Optional[str]) -> Iterator[None]:
 __all__ = [
     "AMBIENT_LANE",
     "as_ambient",
+    "cockpit_identity",
     "current_lane",
     "current_session",
     "lane_scope",

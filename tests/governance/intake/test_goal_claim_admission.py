@@ -131,7 +131,7 @@ async def test_an_ingest_exception_after_the_claim_releases_it(tmp_path, ledger,
     router = _router(tmp_path)
     await router.start()
     try:
-        monkeypatch.setattr(router, "_find_file_conflict", MagicMock(side_effect=RuntimeError("boom")))
+        monkeypatch.setattr(router, "_claim_target_files", MagicMock(side_effect=RuntimeError("boom")))
         with pytest.raises(RuntimeError):
             await router.ingest(_goal_env("op-boom", goal_id="goal-e"))
         assert "op-boom" in _terminal()

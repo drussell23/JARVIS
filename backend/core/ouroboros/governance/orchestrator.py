@@ -10524,6 +10524,7 @@ class GovernedOrchestrator:
             _verify_test_total = 0
             _verify_test_failures = 0
             _verify_timed_out = False
+            _verify_crash = ""
             _verify_failed_names: Tuple[str, ...] = ()
             # Slice 11: resolve the judgment tree ONCE per VERIFY pass —
             # the tree APPLY wrote (workspace when Ledger Sovereignty is
@@ -10591,7 +10592,12 @@ class GovernedOrchestrator:
                 except BlockedPathError:
                     pass  # security gate — skip scoped verify, let benchmark handle
                 except Exception as exc:
-                    logger.debug("[Orchestrator] Verify scoped test error: %s", exc)
+                    # A run that could not complete proved nothing (mirrors
+                    # slice4b_runner): never leave the True default standing.
+                    _verify_test_passed = False
+                    _verify_crash = f"{type(exc).__name__}: {exc}"[:200]
+                    logger.warning("[Orchestrator] Verify scoped test run failed to complete "
+                                   "[%s]: %s", ctx.op_id, _verify_crash)
 
                 # Heartbeat: scoped verify result (drives ⏺ Verify result in CLI)
                 try:
@@ -10954,6 +10960,8 @@ class GovernedOrchestrator:
                         "scoped verify timed out after "
                         f"{_verify_budget_s:.0f}s"
                     )
+                elif _verify_crash:
+                    _verify_error = f"scoped verify could not run: {_verify_crash}"
                 else:
                     _verify_error = f"scoped verify: {_verify_test_failures}/{_verify_test_total} tests failing"
 
@@ -11273,6 +11281,8 @@ class GovernedOrchestrator:
                     ctx, OperationState.FAILED, "promotion_failed",
                 )
                 return ctx
+            # Phase two of the applied announcement (mirrors slice4b_runner).
+            await self._announce_verified_outcome(ctx, _committed_hash, _promo)
             if _promo.promoted:
                 try:
                     await self._stack.comm.emit_heartbeat(
@@ -12164,6 +12174,37 @@ class GovernedOrchestrator:
             detail.extend(d)
         return verdicts, detail
 
+    def _value_gate_applies(self, ctx: "OperationContext", generation: Any) -> bool:
+        """Does the semantic value gate judge this generation at all? The one
+        answer for both of its passes (the all-cosmetic terminal and the
+        sibling prune).
+
+        No when its master is off. No for the change the operator approved in
+        a /session: the gate exists to stop the MODEL spending a landing on a
+        change that alters nothing executable, and an operator who asked for a
+        docstring or comment and approved the diff has already made the value
+        judgement -- terminating it as no_op_cosmetic meant such a change could
+        never land (measured live: a session-approved comment). It still faces
+        VALIDATE, the Iron Gate, GATE, APPLY and VERIFY like any candidate.
+        NEVER raises."""
+        if os.environ.get(
+            "JARVIS_CANDIDATE_VALUE_GATE_ENABLED", "true",
+        ).strip().lower() not in ("1", "true", "yes", "on"):
+            return False
+        try:
+            from backend.core.ouroboros.governance.foreground_session_ops import (  # noqa: E501
+                is_operator_seed,
+            )
+            if is_operator_seed(ctx, generation):
+                logger.info(
+                    "[ValueGate] op=%s is the operator's approved session change "
+                    "— the cosmetic gate does not apply", getattr(ctx, "op_id", "?"),
+                )
+                return False
+        except Exception:  # noqa: BLE001 — an unreadable seed is judged normally
+            pass
+        return True
+
     async def _prune_cosmetic_siblings(
         self, ctx: "OperationContext", generation: Any,
     ) -> Any:
@@ -12182,9 +12223,7 @@ class GovernedOrchestrator:
         substantive would remain (the terminal owns that case), when the gate
         is off, or on any error. Indeterminate candidates are kept.
         """
-        if os.environ.get(
-            "JARVIS_CANDIDATE_VALUE_GATE_ENABLED", "true",
-        ).strip().lower() not in ("1", "true", "yes", "on"):
+        if not self._value_gate_applies(ctx, generation):
             return generation
         try:
             from backend.core.ouroboros.governance.candidate_value_gate import (  # noqa: E501
@@ -12289,9 +12328,7 @@ class GovernedOrchestrator:
                 )
             return _v_ctx
 
-        if os.environ.get(
-            "JARVIS_CANDIDATE_VALUE_GATE_ENABLED", "true",
-        ).strip().lower() not in ("1", "true", "yes", "on"):
+        if not self._value_gate_applies(ctx, generation):
             return None
         try:
             from backend.core.ouroboros.governance.candidate_value_gate import (  # noqa: E501
@@ -12398,6 +12435,41 @@ class GovernedOrchestrator:
             )
         except Exception:  # noqa: BLE001 — probe must never break 8b
             logger.debug("[Slice74Probe] re-emit failed", exc_info=True)
+
+    async def _announce_verified_outcome(
+        self, ctx: Any, committed_hash: Optional[str], promo: Any,
+    ) -> None:
+        """Phase two of the applied announcement: the VERDICT.
+
+        ChangeEngine announces ``written`` (landed_metrics.WRITTEN_OUTCOME)
+        when it writes the bytes, before scoped VERIFY. This is the one point
+        that knows VERIFY passed AND whether a durable commit exists, so it is
+        the only place that announces ``applied`` and closes the op with its
+        success POSTMORTEM. The commit sha rides the announcement; with no
+        durable commit (auto-commit off, a pending promotion) the op still
+        completes, but nothing claims a landing
+        (``landed_metrics.decision_landed``). NEVER raises."""
+        op_id = getattr(ctx, "op_id", "")
+        try:
+            from backend.core.ouroboros.governance.landed_metrics import (  # noqa: PLC0415
+                COMMIT_KEY,
+            )
+            durable = self._terminal_durability(committed_hash, promo)
+            await self._stack.comm.emit_decision(
+                op_id=op_id,
+                outcome="applied",
+                reason_code="verified_landed" if durable else "verified_uncommitted",
+                diff_summary=", ".join(getattr(ctx, "target_files", ()) or ())[:200] or None,
+                **{COMMIT_KEY: str(committed_hash or "") if durable else ""},
+            )
+        except Exception:  # noqa: BLE001 — an announcement must never break 8b
+            logger.debug("[Orchestrator] verified-outcome announcement failed", exc_info=True)
+        try:
+            await self._stack.comm.emit_postmortem(
+                op_id=op_id, root_cause="none", failed_phase=None, next_safe_action="none",
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("[Orchestrator] closing postmortem failed", exc_info=True)
 
     def _scoped_verify_runner(
         self, exec_root: Path,

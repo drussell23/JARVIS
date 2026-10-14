@@ -348,6 +348,9 @@ def test_the_edges_are_read_from_the_ROADMAP():
     unattested copy."""
     from backend.core.ouroboros.governance.autonomy import goal_discovery as GD
 
-    src = inspect.getsource(GD._dag_index)
+    # _dag_index reads through _roadmap_goals, the one verified-roadmap reader
+    # it shares with settled_files.
+    assert "_roadmap_goals" in inspect.getsource(GD._dag_index)
+    src = inspect.getsource(GD._roadmap_goals)
     assert "roadmap_reader" in src
     assert "depends_on" in src

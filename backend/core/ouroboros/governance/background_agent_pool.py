@@ -1113,6 +1113,18 @@ class BackgroundAgentPool:
         except Exception:  # noqa: BLE001
             pass
 
+    def holds_op(self, ctx_op_id: str) -> bool:
+        """Is the op with this context id queued or running in the pool?
+        NEVER raises."""
+        try:
+            return any(
+                op.status in ("queued", "running")
+                and str(getattr(op.context, "op_id", "") or "") == ctx_op_id
+                for op in list(self._ops.values())
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
     def running_resurrected_op_ids(self) -> List[str]:
         """Slice 246 — ctx.op_id of every currently-RUNNING resurrected survivor.
         These are the only ops a human override needs to preempt (queued ones are

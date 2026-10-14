@@ -63,10 +63,10 @@ class TestRetention:
         assert frame["ts"] <= time.time()
 
     def test_addressed_output_is_never_retained(self, bridge):
-        """Session-addressed output belongs to a cockpit that has gone.
-
-        Session ids do not survive a reattach, so replaying this would paint
-        one operator's `/posture status` into another's scrollback."""
+        """Session-addressed output never enters the SHARED ring: replaying
+        it to whoever attaches would paint one operator's `/posture status`
+        into another's scrollback. It waits in its own cockpit's ring
+        (test_cockpit_replay_buffer.py)."""
         bridge.publish_markup("private verb answer", session="sess-A")
         assert bridge.backlog_stats()["backlog_pending"] == 0
 

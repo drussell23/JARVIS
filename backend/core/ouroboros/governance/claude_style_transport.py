@@ -93,7 +93,7 @@ import textwrap
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from backend.core.ouroboros.ui import theme as _theme
 from backend.core.ouroboros.ui.semantic_tokens import (  # noqa: E402
@@ -797,10 +797,17 @@ class ClaudeStyleTransport:
     ) -> None:
         """DECISION — op outcome. Render the closing line."""
         outcome = str(payload.get("outcome", "") or "").lower()
-        if outcome in ("notify_apply", "escalated"):
-            # The gate spoke and the op continues: the verdict joins its block.
+        from backend.core.ouroboros.governance.landed_metrics import (
+            WRITTEN_OUTCOME, decision_landed,
+        )
+        if outcome in ("notify_apply", "escalated", WRITTEN_OUTCOME):
+            # The gate spoke, or the change is written and VERIFY is next: the
+            # op continues, and the word joins its block. `written` is never
+            # an outcome -- the op stays open (it falls through to the
+            # unknown-outcome branch below, which keeps its state).
             def _verdict(p: Any) -> bool:
-                p.verdict = _humanise(outcome)
+                p.verdict = (f"{_humanise(outcome)} {_theme.mark('dot')} verifying"
+                             if outcome == WRITTEN_OUTCOME else _humanise(outcome))
                 return True
             self._pipeline_update(op_id, _verdict)
         elif outcome in ("completed", "applied", "auto_approved", "failed",
@@ -830,15 +837,20 @@ class ClaudeStyleTransport:
             files = sorted(self._file_updates.changed(op_id)) or list(
                 payload.get("files_changed") or payload.get("affected_files") or [])
             self._file_updates.close(op_id)
+            landed = decision_landed(payload)
             tail = f" [dim]{sep} {elapsed}"
             if files:
                 tail += f" {sep} {_escape(_short_path(files[0], path_budget))}"
                 if len(files) > 1:
                     tail += f" +{len(files) - 1}"
+            if outcome == "applied" and not landed:
+                # Verified, but no durable commit holds it: say so, rather
+                # than let a completion read as a landing.
+                tail += f" {sep} not committed"
             tail += "[/dim]"
             self._safe_print(self._lead(OpStatusGlyph.DONE, state, tail=tail))
             self._print_detail(words)
-            self._emit_recap(state, elapsed, payload)
+            self._emit_recap(state, elapsed, payload, landed=landed)
             self._done_count += 1
             self._feed_composer()
             return
@@ -974,6 +986,31 @@ class ClaudeStyleTransport:
         """One line of the op's goal, cut at a word to the line budget."""
         return _clip_words(payload.get("goal", ""), line_chars())
 
+    def _context_named(self, op_id: str) -> Tuple[str, str]:
+        """``(sensor, summary)`` for an op that has not announced itself, from
+        the context the in-flight registry holds for it -- built into the
+        INTENT payload shape so the SAME naming rules apply. Falls back to the
+        op's first target, then its short id: never an empty title.
+        NEVER raises."""
+        ctx = None
+        try:
+            from backend.core.ouroboros.governance.in_flight_registry import (
+                get_default_registry,
+            )
+            entry = get_default_registry().lookup(op_id)
+            ctx = getattr(entry, "ctx_ref", None) if entry is not None else None
+        except Exception:  # noqa: BLE001
+            ctx = None
+        targets = tuple(getattr(ctx, "target_files", ()) or ()) if ctx is not None else ()
+        payload = {
+            "outcome_source": _humanise(str(getattr(ctx, "signal_source", "") or "")).title()
+            .replace(" ", "") if ctx is not None else "",
+            "goal": str(getattr(ctx, "description", "") or "") if ctx is not None else "",
+        }
+        summary = self._summarize(payload) or (
+            _short_path(targets[0], line_chars() // 2) if targets else _short_id(op_id))
+        return self._infer_sensor(payload), summary
+
     def _state_for_unannounced(
         self, op_id: str, payload: Dict[str, Any],
     ) -> Optional[_OpState]:
@@ -1036,7 +1073,8 @@ class ClaudeStyleTransport:
         return _format_elapsed(getattr(state, "started_monotonic", 0.0))
 
     def _emit_recap(self, state: "_OpState", elapsed: str, payload: Dict[str, Any],
-                    *, aborted: bool = False, failed: bool = False) -> None:
+                    *, aborted: bool = False, failed: bool = False,
+                    landed: bool = False) -> None:
         """The one-line op recap beneath the outcome — Claude Code's
         ``✻ Crunched for 2m 14s · 3 tools used · done 11:40 PM``. Synthesised
         from the terminal decision's counts. Dim, so the outcome color leads.
@@ -1053,7 +1091,7 @@ class ClaudeStyleTransport:
                 except (TypeError, ValueError):
                     return 0
             line = compose_recap(
-                elapsed=elapsed, verb=recap_verb(state.op_id),
+                elapsed=elapsed, verb=recap_verb(state.op_id, landed=landed),
                 tools=_int("tools_used"), tokens=_int("tokens"),
                 aborted=aborted, failed=failed,
             )
@@ -1256,6 +1294,12 @@ class ClaudeStyleTransport:
                     known = self._op_state.get(op_id)
                     if known is not None:
                         held[0].sensor, held[0].summary = known.sensor, known.summary
+                    else:
+                        # No INTENT yet -- and for a checkpoint resume there
+                        # will be none (it re-enters past CLASSIFY). Named
+                        # from the op's own context instead of a bare
+                        # "○ Operation"; a later INTENT still renames it.
+                        held[0].sensor, held[0].summary = self._context_named(op_id)
                 if not change(held[0]) and held[1] is not None:
                     return
                 state = held[0]

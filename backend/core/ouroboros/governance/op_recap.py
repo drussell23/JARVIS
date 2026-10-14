@@ -47,9 +47,19 @@ def recap_verbs() -> tuple:
     return _RECAP_VERBS
 
 
-def recap_verb(op_id: object) -> str:
-    """A stable-per-op past-tense verb. NEVER raises."""
-    words = recap_verbs()
+#: The one verb that is a CLAIM, not decoration: it is said only of an op
+#: whose change landed in a commit (landed_metrics.decision_landed). Drawn at
+#: random from the vocabulary, it once recapped a rolled-back op "Landed".
+LANDED_VERB = "Landed"
+
+
+def recap_verb(op_id: object, *, landed: bool = False) -> str:
+    """The recap's past-tense verb: :data:`LANDED_VERB` for a landing, else a
+    stable-per-op word from the vocabulary with the claim removed -- so no
+    operator-supplied ``JARVIS_RECAP_VERBS`` can reintroduce it. NEVER raises."""
+    if landed:
+        return LANDED_VERB
+    words = tuple(w for w in recap_verbs() if w.lower() != LANDED_VERB.lower()) or ("Done",)
     try:
         h = int(hashlib.sha1(str(op_id or "op").encode()).hexdigest()[:8], 16)
         return words[h % len(words)]

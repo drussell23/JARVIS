@@ -49,18 +49,25 @@ from backend.core.ouroboros.governance.risk_engine import (
 
 
 def _make_router_skeleton(tmp_path: Path):
-    """The minimal attribute surface ``_replay_wal`` touches — the real
-    router's boot is out of scope for a replay-boundary unit test."""
+    """An unstarted router: replay re-admits through ``ingest`` (dedup, goal
+    claim, file lock), so it needs the real attribute surface -- but the
+    router's boot (dispatch loop, sensors) stays out of scope."""
+    from unittest.mock import AsyncMock, MagicMock
+
     from backend.core.ouroboros.governance.intake.unified_intake_router import (
+        IntakeRouterConfig,
         UnifiedIntakeRouter,
     )
     from backend.core.ouroboros.governance.intake.wal import WAL
 
-    router = UnifiedIntakeRouter.__new__(UnifiedIntakeRouter)
+    gls = MagicMock()
+    gls.submit = AsyncMock()
+    gls.op_is_live = lambda op_id: True
+    router = UnifiedIntakeRouter(
+        gls=gls, config=IntakeRouterConfig(project_root=tmp_path),
+    )
     router._wal = WAL(path=tmp_path / "intake.wal")
-    router._queue = asyncio.Queue()
     router._priority_queue = None
-    router._config = SimpleNamespace(project_root=tmp_path)
     return router
 
 

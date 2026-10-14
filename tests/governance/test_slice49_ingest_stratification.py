@@ -404,6 +404,9 @@ async def test_warm_index_restores_penalty_with_evidence(
     while not ts.coverage_index_ready(tmp_path) and time.monotonic() < deadline:
         await asyncio.sleep(0.02)
     assert ts.coverage_index_ready(tmp_path)
+    # One op per file: the first op's admission claimed the file, so it is
+    # released (its terminal) before a second op on the same file enters.
+    await router.release_op(env1.causal_id)
 
     # Second ingest: warm → penalty computed (off-loop) + evidence stashed,
     # numerically identical to the legacy inline computation.
@@ -433,8 +436,10 @@ async def test_index_build_failure_is_fail_soft(
     seen: dict = {}
     _patch_inproc_offload(monkeypatch, seen)
 
-    assert await router.ingest(_mk_env(rel, n=1)) == "enqueued"
+    env1 = _mk_env(rel, n=1)
+    assert await router.ingest(env1) == "enqueued"
     await asyncio.sleep(0.3)  # let the failed build task settle
+    await router.release_op(env1.causal_id)  # one op per file (admission claims it)
     # Still degraded forever (never inline-scans on the loop), still enqueues.
     env2 = _mk_env(rel, n=2)
     assert await router.ingest(env2) == "enqueued"

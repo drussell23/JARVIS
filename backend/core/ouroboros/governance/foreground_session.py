@@ -81,6 +81,52 @@ def max_sessions() -> int:
     return _envi("JARVIS_SESSION_MAX_SESSIONS", 16)
 
 
+def sessions_dir() -> Path:
+    """Where each session's append-only log lives (``<id>.jsonl``) -- the
+    record ``/session resume`` rebuilds from after a restart. Env
+    ``JARVIS_SESSION_LOG_DIR``; default ``.jarvis/sessions`` under the cwd
+    (the repo, for the daemon)."""
+    raw = os.environ.get("JARVIS_SESSION_LOG_DIR", "").strip()
+    return Path(raw) if raw else Path(".jarvis/sessions")
+
+
+_SESSION_ID_RE = re.compile(r"^s-[0-9a-f]{4,32}$")
+
+
+def record_to_dict(record: Any) -> Optional[Dict[str, Any]]:
+    """A ToolExecutionRecord as plain JSON (its status enum is a str), or
+    None for anything that is not one. The record is metadata -- names,
+    hashes, timings -- never tool output. NEVER raises."""
+    try:
+        from dataclasses import is_dataclass  # noqa: PLC0415
+        if not is_dataclass(record) or isinstance(record, type):
+            return None
+        d = asdict(record)
+        status = d.get("status")
+        d["status"] = getattr(status, "value", status)
+        return d
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def record_from_dict(d: Dict[str, Any]) -> Optional[Any]:
+    """Inverse of :func:`record_to_dict`; None for a row this build cannot
+    read (a renamed field, a status it does not know). NEVER raises."""
+    try:
+        from dataclasses import fields  # noqa: PLC0415
+        from backend.core.ouroboros.governance.tool_executor import (  # noqa: PLC0415
+            ToolExecStatus, ToolExecutionRecord,
+        )
+        names = {f.name for f in fields(ToolExecutionRecord)}
+        if not names.issubset(d):
+            return None
+        kw = {k: d[k] for k in names}
+        kw["status"] = ToolExecStatus(kw["status"])
+        return ToolExecutionRecord(**kw)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def auto_apply() -> bool:
     """FOREGROUND_SESSION §7 default: a change always waits for Enter."""
     return os.environ.get("JARVIS_SESSION_AUTO_APPLY", "").strip().lower() in ("1", "true", "yes", "on")
@@ -129,13 +175,27 @@ class SessionTurn:
     ended: float = 0.0
     #: The coordinator's ToolExecutionRecords: the session's REAL reads. An
     #: accepted proposal carries them to GENERATE, so the Iron Gate judges
-    #: the exploration that actually produced it. Not logged.
+    #: the exploration that actually produced it. Logged as metadata (no
+    #: tool output) so a session resumed after a restart can still apply.
     records: List[Any] = field(default_factory=list, repr=False)
 
     def log_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
-        d.pop("records", None)
+        d = {k: v for k, v in asdict(
+            SessionTurn(self.user, self.answer, self.tools, self.proposal,
+                        self.error, self.started, self.ended)).items() if k != "records"}
+        d["records"] = [x for x in (record_to_dict(r) for r in self.records) if x is not None]
         return d
+
+    @classmethod
+    def from_log(cls, d: Dict[str, Any]) -> "SessionTurn":
+        tools = [ToolDigest(**{k: t.get(k, "") for k in ("tool", "target", "status", "preview")})
+                 for t in d.get("tools") or [] if isinstance(t, dict)]
+        records = [r for r in (record_from_dict(x) for x in d.get("records") or []
+                               if isinstance(x, dict)) if r is not None]
+        return cls(user=str(d.get("user", "")), answer=str(d.get("answer", "")),
+                   tools=tools, proposal=d.get("proposal") if isinstance(d.get("proposal"), dict) else None,
+                   error=str(d.get("error", "")), started=float(d.get("started") or 0.0),
+                   ended=float(d.get("ended") or 0.0), records=records)
 
 
 @dataclass
@@ -404,11 +464,20 @@ class SessionManager:
         s = ForegroundSession(id=f"s-{uuid.uuid4().hex[:6]}", cockpit=cockpit or "", created=time.time())
         self._sessions[s.id] = s
         self._attached[cockpit or ""] = s.id
+        self._append(s, {"event": "open", "id": s.id, "cockpit": s.cockpit, "created": s.created})
         self.notify_mode(cockpit, s)
         return s
 
     def resume(self, cockpit: str, sid: str) -> Optional[ForegroundSession]:
+        """Re-enter a session -- from memory, or rebuilt from its log when
+        the daemon restarted since (:func:`load_session`)."""
         s = self._sessions.get(sid)
+        if s is None:
+            s = load_session(sid, self._log_dir or sessions_dir())
+            if s is not None and not s.ended:
+                self._sessions[s.id] = s
+                logger.info("[Session] %s rebuilt from its log (%d turn(s), %d op(s))",
+                            s.id, len(s.turns), len(s.owned_ops))
         if s is None or s.ended:
             return None
         s.cockpit = cockpit or ""
@@ -416,11 +485,18 @@ class SessionManager:
         self.notify_mode(cockpit, s)
         return s
 
+    def record_owned_op(self, s: ForegroundSession, op_id: str) -> None:
+        """An op this session started (``/session apply``) -- kept and logged,
+        so a rebuilt session still routes that op's blocks to its transcript."""
+        s.owned_ops.append(str(op_id))
+        self._append(s, {"event": "owned_op", "op_id": str(op_id)})
+
     def end(self, cockpit: str) -> Optional[ForegroundSession]:
         s = self.active(cockpit)
         if s is None:
             return None
         s.ended = True
+        self._append(s, {"event": "end", "at": time.time()})
         self._attached.pop(cockpit or "", None)
         self.notify_mode(cockpit, None)
         task = self._tasks.pop(s.id, None)
@@ -536,14 +612,56 @@ class SessionManager:
         return turn
 
     def _log(self, s: ForegroundSession, turn: SessionTurn) -> None:
-        """Append-only record under .jarvis/sessions/<id>.jsonl."""
+        self._append(s, turn.log_dict())
+
+    def _append(self, s: ForegroundSession, row: Dict[str, Any]) -> None:
+        """Append-only record under <sessions_dir>/<id>.jsonl: a turn per
+        line (no ``event`` key -- the original shape) or a lifecycle event
+        (open / owned_op / end). NEVER raises."""
         try:
-            d = self._log_dir or Path(".jarvis/sessions")
+            d = self._log_dir or sessions_dir()
             d.mkdir(parents=True, exist_ok=True)
             with open(d / f"{s.id}.jsonl", "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(turn.log_dict(), default=str) + "\n")
+                fh.write(json.dumps(row, default=str) + "\n")
         except Exception:  # noqa: BLE001
             logger.debug("[Session] log write failed", exc_info=True)
+
+
+def load_session(sid: str, log_dir: Path) -> Optional[ForegroundSession]:
+    """Rebuild a session from its log, or None (unknown id, unreadable
+    file). Torn or foreign lines are skipped, never fatal: the log is
+    append-only and a crash can cut its last line. NEVER raises."""
+    try:
+        if not _SESSION_ID_RE.match(sid or ""):
+            return None
+        path = Path(log_dir) / f"{sid}.jsonl"
+        if not path.is_file():
+            return None
+        s = ForegroundSession(id=sid, cockpit="", created=0.0)
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            event = row.get("event")
+            if event == "open":
+                s.created = float(row.get("created") or 0.0)
+            elif event == "owned_op":
+                s.owned_ops.append(str(row.get("op_id", "")))
+            elif event == "end":
+                s.ended = True
+            elif event is None and "user" in row:
+                turn = SessionTurn.from_log(row)
+                s.turns.append(turn)
+                note_focus(s, turn.user, *(t.target for t in turn.tools))
+                if not s.created:
+                    s.created = turn.started
+        return s
+    except Exception:  # noqa: BLE001
+        logger.debug("[Session] log rebuild failed for %s", sid, exc_info=True)
+        return None
 
 
 _MANAGER: Optional[SessionManager] = None
@@ -563,6 +681,7 @@ def reset_for_tests(manager: Optional[SessionManager] = None) -> None:
 
 __all__ = [
     "ForegroundSession", "SessionManager", "SessionTurn", "ToolDigest",
-    "build_prompt", "get_manager", "note_focus", "parse_proposal",
-    "render_proposal", "reset_for_tests", "served_window_tokens", "summarize_turn",
+    "build_prompt", "get_manager", "load_session", "note_focus", "parse_proposal",
+    "record_from_dict", "record_to_dict", "render_proposal", "reset_for_tests",
+    "served_window_tokens", "sessions_dir", "summarize_turn",
 ]

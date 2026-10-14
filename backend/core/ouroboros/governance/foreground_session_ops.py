@@ -9,16 +9,21 @@ the last proposal and:
 2. injects it through the harness's ``_inject_sanctioned_goal`` (registered
    at boot via :func:`set_injector`), the same router path every signal
    takes, carrying ``foreground_session.seed_ref`` in its evidence;
-3. holds the proposal under that one-shot ref IN THIS PROCESS.
+3. holds the proposal under that one-shot ref -- in this process, AND
+   sealed on disk (HMAC-SHA256 under the roadmap secret, the same key that
+   signs the goal) so the approval survives a daemon restart.
 
 GENERATE (``candidate_generator.generate``) asks :func:`take_seed` first:
 when the op's evidence names a live ref, the operator-approved proposal is
 parsed by the SAME ``_parse_generation_response`` model output goes through,
 and VALIDATE / Iron Gate / GATE / APPLY / VERIFY run unchanged -- the op
 lands the diff the operator saw, not a regeneration of it. The ref is
-random, consumed once and never written down, so an envelope replayed from
-the intake WAL after a restart finds nothing and simply generates normally:
-a seed cannot be forged from disk.
+random and consumed once. After a restart the op (replayed from the intake
+WAL or a checkpoint) finds its seed only through the seal: a file whose MAC
+does not verify -- altered, or written under a secret since rotated -- is
+dropped with a CRYPTO warning and the op generates normally. A seed cannot
+be forged from disk without the roadmap secret; with no secret configured
+nothing is written and a restart simply loses the seed, as before.
 
 Risk tier is computed exactly as for any op (invariant 2); the operator's
 presence lowers nothing.
@@ -29,9 +34,12 @@ import asyncio
 import functools
 import json
 import logging
+import os
+import re
 import secrets
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
 logger = logging.getLogger("Ouroboros.ForegroundSessionOps")
@@ -44,6 +52,27 @@ _SEEDS: Dict[str, Tuple[str, str, float, Tuple[Any, ...]]] = {}
 _READ_TOOLS = ("read_file", "list_symbols", "search_code", "get_callers")
 _LOCK = threading.Lock()
 SEED_TTL_S = 3600.0
+_REF_RE = re.compile(r"^[0-9a-f]{32}$")
+SEAL_SCHEMA = "session_seed.v1"
+
+
+def seed_ttl_s() -> float:
+    """How long an approved seed stays takeable. Env
+    ``JARVIS_SESSION_SEED_TTL_S`` (default :data:`SEED_TTL_S`)."""
+    try:
+        return max(0.0, float(os.environ.get("JARVIS_SESSION_SEED_TTL_S", "") or SEED_TTL_S))
+    except ValueError:
+        return SEED_TTL_S
+
+
+def seed_dir() -> Path:
+    """Sealed seeds: env ``JARVIS_SESSION_SEED_DIR``, else ``seeds/`` beside
+    the session logs."""
+    raw = os.environ.get("JARVIS_SESSION_SEED_DIR", "").strip()
+    if raw:
+        return Path(raw)
+    from backend.core.ouroboros.governance.foreground_session import sessions_dir  # noqa: PLC0415
+    return sessions_dir() / "seeds"
 
 
 def set_injector(fn: Optional[Injector]) -> None:
@@ -55,10 +84,162 @@ def _put_seed(raw: str, session_id: str, records: Tuple[Any, ...] = ()) -> str:
     ref = secrets.token_hex(16)
     now = time.time()
     with _LOCK:
-        for k in [k for k, v in _SEEDS.items() if now - v[2] > SEED_TTL_S]:
+        for k in [k for k, v in _SEEDS.items() if now - v[2] > seed_ttl_s()]:
             _SEEDS.pop(k, None)
         _SEEDS[ref] = (raw, session_id, now, tuple(records))
+    _sweep_expired_seals(now)
+    _seal(ref, raw, session_id, now, records)
     return ref
+
+
+def _sweep_expired_seals(now: float) -> None:
+    """Seals no op came back for (refused later, op abandoned) age out with
+    the same TTL as the in-memory seed. NEVER raises."""
+    try:
+        d = seed_dir()
+        if not d.is_dir():
+            return
+        for p in d.glob("*.json"):
+            try:
+                if now - p.stat().st_mtime > seed_ttl_s():
+                    _unlink(p)
+            except OSError:
+                continue
+    except Exception:  # noqa: BLE001
+        logger.debug("[Session] seal sweep skipped", exc_info=True)
+
+
+def _seal(ref: str, raw: str, session_id: str, created: float,
+          records: Tuple[Any, ...]) -> bool:
+    """Persist one approved seed, MAC'd with the roadmap secret, atomically.
+    No secret -> nothing written (an unsealed seed on disk would be one any
+    writer could forge). NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.roadmap_reader import (  # noqa: PLC0415
+            compute_signature, hmac_secret,
+        )
+        secret = hmac_secret()
+        if not secret:
+            logger.debug("[Session] no roadmap secret: seed %s is held in memory only", ref[:8])
+            return False
+        from backend.core.ouroboros.governance.foreground_session import (  # noqa: PLC0415
+            record_to_dict,
+        )
+        body = {"schema": SEAL_SCHEMA, "ref": ref, "session_id": session_id,
+                "created": created, "proposal": raw,
+                "records": [x for x in (record_to_dict(r) for r in records) if x is not None]}
+        sig = compute_signature(body, secret)
+        if not sig:
+            return False
+        d = seed_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        from backend.core.ouroboros.governance.durable_io import atomic_replace  # noqa: PLC0415
+        tmp = d / f".{ref}.tmp"
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"body": body, "sig": sig}, fh)
+        atomic_replace(tmp, d / f"{ref}.json")
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning("[Session] seed %s could not be sealed to disk -- it will not "
+                       "survive a restart", ref[:8], exc_info=True)
+        return False
+
+
+def _unseal(ref: str, op_id: str) -> Optional[Tuple[str, str, float, Tuple[Any, ...]]]:
+    """The sealed seed for *ref*, verified, or None. Consumes the file either
+    way: a verified seed is used once; a bad one is never retried. A MAC that
+    does not verify is a CRYPTO warning, never silent. NEVER raises."""
+    try:
+        if not _REF_RE.match(ref or ""):
+            return None
+        path = seed_dir() / f"{ref}.json"
+        if not path.is_file():
+            return None
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        finally:
+            _unlink(path)
+        from backend.core.ouroboros.governance.roadmap_reader import (  # noqa: PLC0415
+            hmac_secret, verify_signature,
+        )
+        body = doc.get("body") if isinstance(doc, dict) else None
+        secret = hmac_secret()
+        if (not isinstance(body, dict) or not secret
+                or not verify_signature(body, str(doc.get("sig", "")), secret)
+                or body.get("ref") != ref or body.get("schema") != SEAL_SCHEMA):
+            logger.warning(
+                "[Session] CRYPTO: sealed seed %s for op=%s failed verification (%s) -- "
+                "dropped; the op generates normally", ref[:8], op_id,
+                "no roadmap secret configured" if not secret
+                else "the roadmap secret was rotated or the file was altered")
+            return None
+        created = float(body.get("created") or 0.0)
+        if time.time() - created > seed_ttl_s():
+            logger.info("[Session] sealed seed %s expired (> %.0fs) -- op=%s generates "
+                        "normally", ref[:8], seed_ttl_s(), op_id)
+            return None
+        from backend.core.ouroboros.governance.foreground_session import (  # noqa: PLC0415
+            record_from_dict,
+        )
+        records = tuple(r for r in (record_from_dict(x) for x in body.get("records") or []
+                                    if isinstance(x, dict)) if r is not None)
+        return str(body.get("proposal", "")), str(body.get("session_id", "")), created, records
+    except Exception:  # noqa: BLE001
+        logger.warning("[Session] sealed seed %s unreadable -- op=%s generates normally",
+                       (ref or "")[:8], op_id, exc_info=True)
+        return None
+
+
+def _unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.debug("[Session] could not remove %s", path, exc_info=True)
+
+
+def _drop_seed(ref: str) -> None:
+    """Release a seed everywhere it is held (memory and disk)."""
+    with _LOCK:
+        _SEEDS.pop(ref, None)
+    if _REF_RE.match(ref or ""):
+        try:
+            _unlink(seed_dir() / f"{ref}.json")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+#: The provider name a seeded generation carries (candidate_generator parses
+#: the operator-approved proposal under it). One spelling, read by
+#: :func:`is_operator_seed`.
+SEED_PROVIDER = "operator_session"
+
+
+def _seed_ref(ctx: Any) -> str:
+    """The session seed ref an op's evidence names, or ``""``. Non-consuming.
+    NEVER raises."""
+    try:
+        ev = json.loads(getattr(ctx, "intake_evidence_json", "") or "{}")
+        return str(((ev.get("foreground_session") or {}).get("seed_ref")) or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def is_operator_seed(ctx: Any, generation: Any) -> bool:
+    """Is *generation* the change the operator approved in a /session?
+
+    Both halves must hold: the op was injected by ``/session apply`` (its
+    evidence names a seed ref) AND this generation was parsed from that seed
+    (``SEED_PROVIDER``) rather than generated after the seed was gone. Either
+    alone proves nothing -- a regenerated candidate on a session op, or a
+    provider name with no session behind it. NEVER raises."""
+    try:
+        return (str(getattr(generation, "provider_name", "") or "") == SEED_PROVIDER
+                and bool(_seed_ref(ctx)))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def take_seed(ctx: Any) -> Optional[str]:
@@ -72,19 +253,25 @@ def take_seed_with_records(ctx: Any) -> Optional[Tuple[str, Tuple[Any, ...]]]:
     """:func:`take_seed`, plus the session's real tool records -- the
     exploration that produced the proposal, which the Iron Gate judges."""
     try:
-        ev = json.loads(getattr(ctx, "intake_evidence_json", "") or "{}")
-        ref = str(((ev.get("foreground_session") or {}).get("seed_ref")) or "")
+        ref = _seed_ref(ctx)
         if not ref:
             return None
+        op_id = str(getattr(ctx, "op_id", "?"))
         with _LOCK:
             hit = _SEEDS.pop(ref, None)
-        if hit is None:
-            return None
+        sealed = hit is None
+        if not sealed:
+            _drop_seed(ref)                      # its sealed copy is spent too
+        else:
+            # Not in this process: the daemon restarted since the approval.
+            hit = _unseal(ref, op_id)
+            if hit is None:
+                return None
         raw, sid, created, records = hit
-        if time.time() - created > SEED_TTL_S:
+        if time.time() - created > seed_ttl_s():
             return None
-        logger.info("[Session] op=%s takes the proposal approved in session %s",
-                    getattr(ctx, "op_id", "?"), sid)
+        logger.info("[Session] op=%s takes the proposal approved in session %s%s",
+                    op_id, sid, " (from its verified seal)" if sealed else "")
         return raw, records
     except Exception:  # noqa: BLE001
         return None
@@ -167,10 +354,12 @@ def _settle(manager: Any, cockpit: str, s: Any, ref: str, files: Tuple[str, ...]
     """Intake answered. A refusal releases the seed; an accepted op becomes
     the session's own, so the cockpit routes its blocks to the transcript."""
     if not op_id:
-        with _LOCK:
-            _SEEDS.pop(ref, None)
+        _drop_seed(ref)
         return False, "the pipeline refused the change at intake (see the debug log)"
-    s.owned_ops.append(str(op_id))
+    if hasattr(manager, "record_owned_op"):
+        manager.record_owned_op(s, str(op_id))
+    else:
+        s.owned_ops.append(str(op_id))
     if hasattr(manager, "notify_mode"):
         manager.notify_mode(cockpit, s)
     return True, (f"{op_id} · sent through the pipeline (validate → gate → apply → verify) · "
@@ -185,8 +374,7 @@ async def _inject_off_loop(manager: Any, cockpit: str, s: Any, ref: str,
         ok, text = _settle(manager, cockpit, s, ref, files, op_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning("[Session] apply injection failed", exc_info=True)
-        with _LOCK:
-            _SEEDS.pop(ref, None)
+        _drop_seed(ref)
         ok, text = False, f"apply failed: {type(exc).__name__}: {exc}"
     try:
         from backend.core.ouroboros.ui.theme import mark  # noqa: PLC0415
@@ -205,5 +393,5 @@ def reset_for_tests() -> None:
         _SEEDS.clear()
 
 
-__all__ = ["apply_last", "reset_for_tests", "set_injector", "take_seed",
-           "take_seed_with_records"]
+__all__ = ["apply_last", "reset_for_tests", "seed_dir", "seed_ttl_s", "set_injector",
+           "take_seed", "take_seed_with_records"]

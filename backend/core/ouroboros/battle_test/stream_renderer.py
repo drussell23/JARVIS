@@ -479,6 +479,9 @@ class StreamRenderer:
         self._mirrored_offset: int = 0
         #: Has this stream announced itself to the deck yet?
         self._mirror_opened: bool = False
+        #: This stream's interpreter (generation_view): one per op's stream,
+        #: created on first mirrored line, dropped with the stream's state.
+        self._view: Optional[Any] = None
         #: Last tail published, so an idle frame costs nothing.
         self._last_inflight: str = ""
 
@@ -709,6 +712,7 @@ class StreamRenderer:
         self._committed_offset = 0
         self._mirrored_offset = 0
         self._mirror_opened = False
+        self._view = None
         self._last_inflight = ""
         self._flow_mode = False
         self._op_id = ""
@@ -977,7 +981,16 @@ class StreamRenderer:
             from rich.markup import escape
             from backend.core.ouroboros.ui import deck_grammar as _deck
 
-            lines = chunk.splitlines()
+            # Through the generation view: prose passes, a JSON tool-call or
+            # candidate envelope is swallowed and reduced to the prose no
+            # other block shows (generation_view). Mirrored verbatim it was
+            # raw brackets and escaped diff strings in the transcript.
+            view = self._generation_view()
+            lines: List[str] = []
+            for raw in chunk.splitlines():
+                lines.extend(view.feed_line(raw))
+            if final:
+                lines.extend(view.finish())
             sent_any = False
             for raw in lines:
                 text = raw.rstrip()
@@ -1003,6 +1016,15 @@ class StreamRenderer:
                 "[StreamRender] op=%s mirror degraded", self._op_id,
                 exc_info=True,
             )
+
+    def _generation_view(self) -> Any:
+        """This stream's generation_view.GenerationView, created lazily."""
+        if getattr(self, "_view", None) is None:
+            from backend.core.ouroboros.battle_test.generation_view import (
+                GenerationView,
+            )
+            self._view = GenerationView()
+        return self._view
 
     def _emit_deck_line(self, lead: str) -> bool:
         """One composed deck line to whoever can actually see it.

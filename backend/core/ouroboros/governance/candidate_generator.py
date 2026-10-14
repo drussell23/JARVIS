@@ -4173,7 +4173,7 @@ class CandidateGenerator:
         a warning and the op generates normally -- never half-applied."""
         try:
             from backend.core.ouroboros.governance.foreground_session_ops import (
-                take_seed_with_records,
+                SEED_PROVIDER, take_seed_with_records,
             )
             got = take_seed_with_records(context)
             if got is None:
@@ -4189,7 +4189,7 @@ class CandidateGenerator:
                 source_hash = _file_source_hash(
                     (root / source_path).read_text(encoding="utf-8", errors="replace"))
             result = _parse_generation_response(
-                raw, "operator_session", 0.0, context, source_hash, source_path,
+                raw, SEED_PROVIDER, 0.0, context, source_hash, source_path,
                 repo_root=root,
             )
             # The session's real reads: the Iron Gate judges the exploration

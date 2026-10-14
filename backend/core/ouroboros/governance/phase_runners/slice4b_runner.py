@@ -1049,6 +1049,7 @@ class Slice4bRunner(PhaseRunner):
             _verify_test_total = 0
             _verify_test_failures = 0
             _verify_timed_out = False
+            _verify_crash = ""
             _verify_failed_names: Tuple[str, ...] = ()
             # Slice 11: resolve the judgment tree ONCE per VERIFY pass —
             # the tree APPLY wrote. All VERIFY-side consumers below anchor
@@ -1111,7 +1112,13 @@ class Slice4bRunner(PhaseRunner):
                 except BlockedPathError:
                     pass
                 except Exception as exc:
-                    logger.debug("[Orchestrator] Verify scoped test error: %s", exc)
+                    # A run that could not complete proved nothing. This once
+                    # logged at DEBUG and left _verify_test_passed at its True
+                    # default, so a crashed test run landed the change.
+                    _verify_test_passed = False
+                    _verify_crash = f"{type(exc).__name__}: {exc}"[:200]
+                    logger.warning("[Orchestrator] Verify scoped test run failed to complete "
+                                   "[%s]: %s", ctx.op_id, _verify_crash)
 
                 try:
                     await orch._stack.comm.emit_heartbeat(
@@ -1231,6 +1238,8 @@ class Slice4bRunner(PhaseRunner):
                         "scoped verify timed out after "
                         f"{_verify_budget_s:.0f}s"
                     )
+                elif _verify_crash:
+                    _verify_error = f"scoped verify could not run: {_verify_crash}"
                 else:
                     _verify_error = f"scoped verify: {_verify_test_failures}/{_verify_test_total} tests failing"
 
@@ -1616,6 +1625,11 @@ class Slice4bRunner(PhaseRunner):
                     reason="promotion_failed:%s" % _promo.state,
                     artifacts={"t_apply": _t_apply},
                 )
+            # Phase two of the applied announcement: VERIFY passed, the
+            # promotion did not fail, and the commit (if any) exists -- only
+            # now may anything say "landed". A PENDING promotion is not
+            # durable yet, so it completes without claiming a landing.
+            await orch._announce_verified_outcome(ctx, _committed_hash, _promo)
             if _promo.promoted:
                 try:
                     await orch._stack.comm.emit_heartbeat(

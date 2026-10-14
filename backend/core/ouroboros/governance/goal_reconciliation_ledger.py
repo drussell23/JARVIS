@@ -755,6 +755,30 @@ def satisfying_commit(records: Sequence[ReconciliationRecord], goal_id: str) -> 
         return ""
 
 
+def settled_goal_ids(
+    goal_ids: Sequence[str], *, path: Optional[Path] = None, secret: Optional[str] = None,
+) -> FrozenSet[str]:
+    """Which of *goal_ids* are done AND still done: satisfied in the ledger,
+    with the satisfying commit still held by a local branch (or git unable
+    to say otherwise). The same verdict the dispatch claim enforces
+    (``_claim_locked``), for work-finders that pick files before any claim.
+    One ledger read. NEVER raises; an unreadable ledger settles nothing."""
+    try:
+        wanted = [str(g).strip() for g in (goal_ids or ()) if str(g or "").strip()]
+        if not wanted or not enabled():
+            return frozenset()
+        records = read_records(path or ledger_path(), secret=secret)
+        out = set()
+        for gid in dict.fromkeys(wanted):
+            sha = satisfying_commit(records, gid)
+            if sha and landing_present(sha) is not False:
+                out.add(gid)
+        return frozenset(out)
+    except Exception:  # noqa: BLE001
+        logger.debug("[GoalReconciliation] settled_goal_ids degraded", exc_info=True)
+        return frozenset()
+
+
 def landing_present(commit_sha: str, *, cwd: Optional[Path] = None) -> Optional[bool]:
     """Does the work of *commit_sha* still exist in this repository?
 

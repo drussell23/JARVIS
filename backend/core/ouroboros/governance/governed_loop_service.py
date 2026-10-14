@@ -3800,30 +3800,6 @@ class GovernedLoopService:
 
         Falls back to synchronous submit() if BackgroundAgentPool is not available.
         """
-        # Built-but-no-caller fix — route clean single-file ops through the
-        # Meta-Goal aggregator's intake (when JARVIS_META_GOAL_AGGREGATOR_
-        # ENABLED). The drain loop owns their dispatch: it bundles disjoint
-        # siblings into ONE fan-outable Meta-Goal (swarm fan-out) or flushes
-        # an aged-out single to _bg_pool.submit. OFF / non-single-file / any
-        # error -> offer_ctx returns False and the legacy submit below runs,
-        # byte-identical. The op is never lost.
-        try:
-            from backend.core.ouroboros.governance.meta_goal_wiring import (
-                offer_ctx as _mg_offer_ctx,
-            )
-            if _mg_offer_ctx(self, ctx):
-                _pooled_id = str(getattr(ctx, "op_id", "") or "")
-                logger.info(
-                    "[GovernedLoop] op %s pooled for Meta-Goal aggregation "
-                    "(trigger=%s)", _pooled_id, trigger_source,
-                )
-                return _pooled_id
-        except Exception:  # noqa: BLE001 -- never block the legacy dispatch
-            logger.debug(
-                "[GovernedLoop] meta-goal intake skipped (non-fatal)",
-                exc_info=True,
-            )
-
         if self._bg_pool is not None:
             # Import the capacity-rejection class locally to keep the module
             # import graph flat (background_agent_pool imports op_context; a
@@ -3840,6 +3816,29 @@ class GovernedLoopService:
             if isinstance(_admitted, OperationResult):
                 return _admitted.op_id
             ctx = _admitted
+            # Route clean single-file ops through the Meta-Goal aggregator
+            # (JARVIS_META_GOAL_AGGREGATOR_ENABLED): its drain loop bundles
+            # disjoint siblings into one fan-out or flushes an aged single to
+            # the pool. Offered AFTER admission, so a pooled op -- and the
+            # ctx an aged flush hands the pool -- is admitted like every
+            # other; it used to be pooled raw, skipping admission entirely.
+            # OFF / not single-file / any error -> the pool submit below.
+            try:
+                from backend.core.ouroboros.governance.meta_goal_wiring import (
+                    offer_ctx as _mg_offer_ctx,
+                )
+                if _mg_offer_ctx(self, ctx):
+                    _pooled_id = str(getattr(ctx, "op_id", "") or "")
+                    logger.info(
+                        "[GovernedLoop] op %s pooled for Meta-Goal aggregation "
+                        "(trigger=%s)", _pooled_id, trigger_source,
+                    )
+                    return _pooled_id
+            except Exception:  # noqa: BLE001 -- never block the legacy dispatch
+                logger.debug(
+                    "[GovernedLoop] meta-goal intake skipped (non-fatal)",
+                    exc_info=True,
+                )
             try:
                 op_id = await self._bg_pool.submit(ctx)
                 logger.info(
@@ -3944,6 +3943,25 @@ class GovernedLoopService:
             return out
         except Exception:  # noqa: BLE001
             return []
+
+    def op_is_live(self, op_id: str) -> bool:
+        """Is *op_id* running here, or waiting in the background pool to run?
+        The liveness intake's file locks expire on: a held file stays held
+        while its op lives and is released once it has died (a crashed worker
+        removes its op from the pool). NEVER raises."""
+        try:
+            if not op_id:
+                return False
+            if op_id in self._active_ops:
+                return True
+            # Pooled for Meta-Goal aggregation: admitted, waiting to dispatch.
+            if op_id in (getattr(self, "_meta_goal_pending_ctx", None) or {}):
+                return True
+            pool = getattr(self, "_bg_pool", None)
+            holds = getattr(pool, "holds_op", None) if pool is not None else None
+            return bool(holds(op_id)) if callable(holds) else False
+        except Exception:  # noqa: BLE001
+            return False
 
     def request_cancel(self, op_id: str) -> bool:
         """Request cooperative cancellation of an in-flight operation.
@@ -4323,6 +4341,20 @@ class GovernedLoopService:
         # yield between evaluation and mutation. All-or-nothing: on conflict
         # nothing is claimed; on success the finally below releases the claim.
         _locked_files, _lock_conflict = self._try_claim_file_ops(ctx.target_files)
+        # ...and the ROUTER's registry, the one every intake admission and
+        # background op holds. The set above only ever saw other submit()
+        # calls: a CLI / MCP / scheduled / intent-engine op went straight here
+        # and ran beside a background op on the same file. Same op id as the
+        # holder (an op intake already admitted) is idempotent; the claim is
+        # released by the release_op in this method's finally.
+        if _locked_files is not None:
+            _router = getattr(self, "_intake_router", None)
+            _claim = getattr(_router, "claim_files", None) if _router is not None else None
+            _holder = _claim(ctx.op_id, ctx.target_files) if callable(_claim) else None
+            if isinstance(_holder, str) and _holder:
+                for _canonical in _locked_files:
+                    self._active_file_ops.discard(_canonical)
+                _locked_files, _lock_conflict = None, f"held by {_holder}"
         if _locked_files is None:
             logger.warning(
                 "[GovernedLoop] File-scope lock: %r already in-flight — "
@@ -6928,6 +6960,20 @@ class GovernedLoopService:
                 self._fsm_contexts.pop(op_id, None)
                 # P2 Slice 3 — registry parity (master-gated).
                 _unregister_op_in_flight_safely(op_id)
+                # Intake's file locks, for the background path: submit()
+                # releases them in its finally; a BG op never crosses submit,
+                # so its files stayed claimed until the TTL. Released only if
+                # the op is not live again -- a preempted op is re-queued
+                # before this runs, and must keep its files while it waits.
+                try:
+                    _intake = getattr(self, "_intake_router", None)
+                    if _intake is not None and not self.op_is_live(op_id):
+                        asyncio.get_running_loop().create_task(
+                            _intake.release_op(op_id),
+                            name=f"release-files-{op_id[:16]}",
+                        )
+                except Exception:  # noqa: BLE001 — cleanup path must not crash
+                    pass
                 # ── ConsciousnessBridge outcome hook, BG seam (Hive Step 2).
                 # BG-pool ops NEVER cross _emit_terminal_events (the twin-path
                 # class), so the MemoryEngine ingest fires from this absolute

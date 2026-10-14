@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from backend.core.ouroboros.governance.operation_id import generate_operation_id
 
@@ -762,6 +762,26 @@ def _all_targets_missing(
         return False
 
 
+def _rearbitration_key(envelope: "IntentEnvelope") -> Tuple[int, int, float]:
+    """Order for signals competing for the same freed files: human first
+    (``intent_envelope.is_sovereign``, the predicate intake / pool /
+    preemption share), then the source tier and urgency boost
+    ``_compute_priority`` starts from, then age. Deliberately NOT the full
+    ``_compute_priority``: its inline path embeds on the loop, and this runs
+    for every waiter. NEVER raises."""
+    try:
+        from backend.core.ouroboros.governance.intake.intent_envelope import (  # noqa: PLC0415
+            is_sovereign,
+        )
+        source = str(getattr(envelope, "source", "") or "")
+        human = 0 if is_sovereign(source, getattr(envelope, "evidence", None)) else 1
+        tier = _PRIORITY_MAP.get(source, 99) - _URGENCY_BOOST.get(
+            str(getattr(envelope, "urgency", "") or ""), 0)
+        return human, tier, float(getattr(envelope, "submitted_at", 0.0) or 0.0)
+    except Exception:  # noqa: BLE001
+        return 1, 99, 0.0
+
+
 def _compute_priority(
     envelope: "IntentEnvelope",
     dependency_credit: int = 0,
@@ -1155,6 +1175,7 @@ class UnifiedIntakeRouter:
             asyncio.PriorityQueue(maxsize=config.max_queue_size)
         )
         self._dedup: Dict[str, float] = {}
+        self._dedup_owner: Dict[str, str] = {}   # dedup_key -> WAL lease that registered it
         self._retry_count: Dict[str, int] = {}
         # No-loss submit boundary: set True whenever a dispatch is deferred by
         # a background-pool QueueFullError (the envelope stays a pending WAL
@@ -1229,6 +1250,9 @@ class UnifiedIntakeRouter:
         # (causal_id); released by ``ingest`` when the envelope is NOT
         # admitted so a rejected op never holds its goal until the TTL.
         self._goal_claims: Dict[str, Any] = {}
+        # File claims taken during an ingest (op ids), settled by ``ingest``
+        # exactly as goal claims are: an op not enqueued releases them.
+        self._file_claims_taken: Set[str] = set()
         self._file_lock_ttl_s: float = float(os.environ.get("JARVIS_FILE_LOCK_TTL_S", "300"))
 
         # ── Signal coalescing buffer ──
@@ -1536,7 +1560,7 @@ class UnifiedIntakeRouter:
     # Public interface
     # ------------------------------------------------------------------
 
-    async def ingest(self, envelope: IntentEnvelope) -> str:
+    async def ingest(self, envelope: IntentEnvelope, *, replayed_lease: str = "") -> str:
         """Route an envelope through the intake pipeline.
 
         Returns one of:
@@ -1544,6 +1568,15 @@ class UnifiedIntakeRouter:
         - ``"deduplicated"``   — duplicate within the dedup window, dropped
         - ``"pending_ack"``    — parked awaiting human acknowledgement
         - ``"backpressure"``   — queue is full; non-exempt source rejected
+
+        ``replayed_lease`` -- THE re-admission path for a signal already
+        durable in the WAL (crash replay, capacity-deferred drain, an op
+        queued behind a holder): it keeps that lease (no second WAL row) and
+        skips the load gates it passed when first admitted (backpressure,
+        governor, cognitive shed), but meets every IDENTITY gate a fresh
+        signal meets -- dedup against other leases, the goal claim, the file
+        lock. Replay used to put entries straight on the queue, past all of
+        them.
         """
         # Slice 33 Arc 1+ widening — intake routing is on the hot path
         # for every sensor signal; if it's slow, the loop notices.
@@ -1555,10 +1588,11 @@ class UnifiedIntakeRouter:
         status = ""
         try:
             async with _ls_sink_async("intake.UnifiedIntakeRouter.ingest"):
-                status = await self._ingest_impl(envelope)
+                status = await self._ingest_impl(envelope, replayed_lease=replayed_lease)
                 return status
         finally:
             await self._release_goal_claim(_op, status)
+            self._settle_file_claims(_op, status)
 
     async def _release_goal_claim(self, op_id: str, status: str) -> None:
         """An op the router did not admit must not hold its goal: close the
@@ -1585,7 +1619,7 @@ class UnifiedIntakeRouter:
         except Exception:  # noqa: BLE001 -- bookkeeping is additive, never fatal
             logger.debug("[Intake] goal claim release degraded", exc_info=True)
 
-    async def _ingest_impl(self, envelope: IntentEnvelope) -> str:
+    async def _ingest_impl(self, envelope: IntentEnvelope, *, replayed_lease: str = "") -> str:
         # A1-T4 — hop 2/5 (ingest): the live router accepts the envelope.
         try:
             from backend.core.ouroboros.governance.a1_trace import (  # noqa: PLC0415
@@ -1624,7 +1658,8 @@ class UnifiedIntakeRouter:
         self._maybe_pump_qos_starvation()
 
         # 1. Dedup check
-        if self._is_duplicate(envelope):
+        if (self._is_replay_duplicate(envelope, replayed_lease) if replayed_lease
+                else self._is_duplicate(envelope)):
             return "deduplicated"
         # Goal reconciliation: ONE live op per signed roadmap goal, decided
         # and recorded in ONE locked step (``claim_dispatch``). A goal whose
@@ -1667,7 +1702,7 @@ class UnifiedIntakeRouter:
         # If another op is already active on any of this envelope's target files,
         # queue behind it instead of spawning a conflicting concurrent patch.
         if envelope.target_files:
-            blocking_op = self._find_file_conflict(envelope)
+            blocking_op = self._claim_target_files(envelope)
             if blocking_op is not None:
                 self._queued_behind.setdefault(blocking_op, []).append(envelope)
                 logger.info(
@@ -1677,9 +1712,10 @@ class UnifiedIntakeRouter:
                 )
                 return "queued_behind"
 
-        # 4. Backpressure check
+        # 4. Backpressure check (a replayed lease passed it when first admitted)
         if (
-            envelope.source not in _BACKPRESSURE_EXEMPT
+            not replayed_lease
+            and envelope.source not in _BACKPRESSURE_EXEMPT
             and self.intake_queue_depth() >= self._config.backpressure_threshold
         ):
             return "backpressure"
@@ -1689,7 +1725,7 @@ class UnifiedIntakeRouter:
         # let the SSE bridge publish, but pass through. Enforce mode: honor.
         # Off mode: skip entirely (pre-Arc-A behavior).
         gov_mode = _intake_governor_mode()
-        if gov_mode != "off":
+        if gov_mode != "off" and not replayed_lease:
             # QoS Escalation (Aging) — one-shot grant pre-empts the
             # weighted cap for a starved envelope whose aged weight
             # breached the threshold under healthy liquidity. The grant
@@ -1765,6 +1801,7 @@ class UnifiedIntakeRouter:
         shed_mode = _intake_cognitive_shed_mode()
         if (
             shed_mode != "off"
+            and not replayed_lease
             and str(
                 getattr(envelope, "urgency", ""),
             )
@@ -1858,18 +1895,22 @@ class UnifiedIntakeRouter:
         except Exception:  # noqa: BLE001 — a yield fault never breaks intake
             pass
 
-        # 4. WAL enqueue — durable before placing on in-memory queue
-        lease_id = generate_operation_id("lse")
-        envelope = envelope.with_lease(lease_id)
-        await self._wal.append_async(
-            WALEntry(
-                lease_id=lease_id,
-                envelope_dict=envelope.to_dict(),
-                status="pending",
-                ts_monotonic=time.monotonic(),
-                ts_utc=datetime.now(timezone.utc).isoformat(),
+        # 4. WAL enqueue — durable before placing on in-memory queue. A
+        # replayed lease is ALREADY durable: same row, no second one.
+        if replayed_lease:
+            envelope = envelope.with_lease(replayed_lease)
+        else:
+            lease_id = generate_operation_id("lse")
+            envelope = envelope.with_lease(lease_id)
+            await self._wal.append_async(
+                WALEntry(
+                    lease_id=lease_id,
+                    envelope_dict=envelope.to_dict(),
+                    status="pending",
+                    ts_monotonic=time.monotonic(),
+                    ts_utc=datetime.now(timezone.utc).isoformat(),
+                )
             )
-        )
 
         # 5. Register dedup key now so subsequent duplicates are caught
         self._register_dedup(envelope)
@@ -1880,7 +1921,7 @@ class UnifiedIntakeRouter:
         # this op would touch — completing it unblocks them.
         _dep_credit = 0
         for _fpath in envelope.target_files or ():
-            _blocking_entry = self._active_file_ops.get(_fpath)
+            _blocking_entry = self._active_file_ops.get(self._file_key(_fpath))
             if _blocking_entry is not None:
                 _blocking_id, _ = _blocking_entry
                 _dep_credit += len(self._queued_behind.get(_blocking_id, []))
@@ -3015,9 +3056,20 @@ class UnifiedIntakeRouter:
         logger.info("Router: replaying %d pending WAL entries", len(pending))
         from .intent_envelope import IntentEnvelope as IE
 
+        # Arbitrated, not file order: each replay now takes its files at
+        # admission, so whichever is admitted first works a contested file
+        # and the rest queue behind it. Human work first (_rearbitration_key).
+        decoded = []
         for entry in pending:
             try:
-                envelope = IE.from_dict(entry.envelope_dict)
+                decoded.append((IE.from_dict(entry.envelope_dict), entry))
+            except Exception:
+                logger.exception("Router: WAL replay could not decode lease_id=%s",
+                                 entry.lease_id)
+        decoded.sort(key=lambda pair: _rearbitration_key(pair[0]))
+
+        for envelope, entry in decoded:
+            try:
                 # ── WAL Signal Liveness Tombstoning (2026-07-22) ──
                 # A replayed signal was recorded in a PREVIOUS session; by
                 # replay time its target files may have vanished (e.g. the
@@ -3057,32 +3109,16 @@ class UnifiedIntakeRouter:
                             ",".join(envelope.target_files or ()),
                         )
                         continue
-                # WAL replay preserves whatever alignment metadata was
-                # already stashed in envelope.evidence from the original
-                # ingest — no need to re-score and pollute the replay path
-                # with a second round of scorer failures if the tracker
-                # happens to be broken at replay time.
-                priority, _alignment = _compute_priority(envelope)
-                await self._queue.put(
-                    (
-                        priority,
-                        envelope.submitted_at,
-                        next(_HEAP_TIE_SEQ),
-                        envelope,
-                    )
-                )
-                # F1 mirror — same guard as the ingest site: in primary mode
-                # the IntakePriorityQueue is the dispatch source of truth, so
-                # a replayed row that only lands on the legacy _queue would
-                # never dequeue. Mirror-enqueue exactly like ingest step 6.
-                # None when both F1 flags are off → default-off behavior is
-                # byte-identical.
-                if self._priority_queue is not None:
-                    self._priority_queue.enqueue(envelope)
+                # THE ingestion seam, with the lease kept: dedup against
+                # other leases, the goal claim (a goal satisfied or held
+                # since is refused here) and the file lock all apply. Replay
+                # used to put the entry straight on the queue past every one
+                # of them, which is how a replayed op re-ran a satisfied goal
+                # or worked a file beside its holder.
+                status = await self._readmit(envelope, entry.lease_id)
                 logger.debug(
-                    "Router: replayed lease_id=%s source=%s",
-                    entry.lease_id,
-                    envelope.source,
+                    "Router: replayed lease_id=%s source=%s (%s)",
+                    entry.lease_id, envelope.source, status,
                 )
             except Exception:
                 logger.exception("Router: WAL replay failed for lease_id=%s", entry.lease_id)
@@ -3091,52 +3127,142 @@ class UnifiedIntakeRouter:
     # Operation dependency tracking (DAG-based signal merging)
     # ------------------------------------------------------------------
 
-    def _find_file_conflict(self, envelope: IntentEnvelope) -> Optional[str]:
-        """Return the op_id of an active operation that overlaps this envelope's files.
+    def _holder_live(self, op_id: str) -> bool:
+        """Is the op holding a file still alive -- queued or running in the
+        governed loop (``GovernedLoopService.op_is_live``)? This is the lock's
+        heartbeat: the op's own lifecycle, renewed by nothing extra. A crashed
+        worker's op leaves the pool, and its lock expires at the TTL. Unknown
+        (no loop service attached) reads as not live, so only the TTL rules.
+        NEVER raises."""
+        try:
+            probe = getattr(self._gls, "op_is_live", None)
+            return bool(probe(op_id)) if callable(probe) else False
+        except Exception:  # noqa: BLE001
+            return False
 
-        Returns None if no conflict exists (safe to dispatch concurrently).
-        Stale locks (older than ``_file_lock_ttl_s``) are force-released
-        via a CAS pattern (Q3 Slice 1) — re-verifying the captured
-        entry under ``_active_file_ops_lock`` before delete so a
-        concurrent ``register_active_op`` overwriting the same key
-        is never silently clobbered.
-        """
-        _now = time.monotonic()
-        for fpath in envelope.target_files or []:
-            with self._active_file_ops_lock:
-                entry = self._active_file_ops.get(fpath)
-                if entry is None:
-                    continue
-                _op_id, _registered_at = entry
-                age = _now - _registered_at
-                if age > self._file_lock_ttl_s:
-                    # CAS: confirm the entry is still the stale tuple
-                    # before deleting. If a concurrent register_active_op
-                    # has already written a fresh tuple for this fpath,
-                    # the identity check fails and we abort the delete.
-                    current = self._active_file_ops.get(fpath)
-                    if current is not None and (
-                        current[0] == _op_id and current[1] == _registered_at
-                    ):
-                        logger.warning(
-                            "[Router] Force-releasing stale file lock: %s held by %s for %.0fs (TTL %ds)",
-                            fpath,
-                            _op_id[:12],
-                            age,
-                            self._file_lock_ttl_s,
-                        )
-                        del self._active_file_ops[fpath]
-                    else:
-                        logger.debug(
-                            "[Router] CAS aborted stale-release on %s: "
-                            "entry mutated under us (was %s, now %s)",
-                            fpath,
-                            _op_id[:12],
-                            current[0][:12] if current else "(absent)",
-                        )
-                    continue
-                return _op_id
+    def _live_holder_locked(self, fpath: str, now: float) -> Optional[str]:
+        """The op holding *fpath*, or None. Caller holds
+        ``_active_file_ops_lock``. An entry past its TTL whose holder is no
+        longer live is released here -- under the same lock as the read, so
+        there is no window for a concurrent claim to be clobbered."""
+        entry = self._active_file_ops.get(fpath)
+        if entry is None:
+            return None
+        holder, registered_at = entry
+        age = now - registered_at
+        if age > self._file_lock_ttl_s and not self._holder_live(holder):
+            # Compare-and-delete: only the entry judged expired is removed.
+            # Every writer holds the lock, so this re-read should always
+            # match -- it is what keeps a writer that ever slips the lock
+            # from having its fresh claim deleted as the stale one.
+            current = self._active_file_ops.get(fpath)
+            if current != entry:
+                return current[0] if current is not None else None
+            logger.warning(
+                "[Router] Releasing expired file lock: %s held by %s for %.0fs "
+                "(TTL %ds, holder no longer live)",
+                fpath, holder[:12], age, self._file_lock_ttl_s,
+            )
+            del self._active_file_ops[fpath]
+            return None
+        return holder
+
+    def _file_key(self, path: Any) -> str:
+        """ONE spelling per file for the lock registry: repo-relative and
+        normalised. Envelopes carry repo-relative paths, direct submitters
+        (CLI, MCP) may pass absolute ones -- keyed raw, ``a.py`` and
+        ``/repo/a.py`` were two files and both ops ran. NEVER raises."""
+        try:
+            s = str(path or "").strip()
+            if not s:
+                return ""
+            p = Path(s)
+            if p.is_absolute():
+                try:
+                    root = Path(str(self._config.project_root)).resolve()
+                    return str(p.resolve().relative_to(root))
+                except (ValueError, OSError):
+                    return str(p.resolve())
+            return os.path.normpath(s)
+        except Exception:  # noqa: BLE001
+            return str(path or "")
+
+    def _find_file_conflict(self, envelope: IntentEnvelope) -> Optional[str]:
+        """Return the op_id of a live operation holding any of this envelope's
+        files, or None (safe to dispatch concurrently). Read-only: see
+        :meth:`_claim_target_files` for the admission path."""
+        now = time.monotonic()
+        own = str(getattr(envelope, "causal_id", "") or "")
+        with self._active_file_ops_lock:
+            for fpath in envelope.target_files or []:
+                holder = self._live_holder_locked(self._file_key(fpath), now)
+                if holder is not None and holder != own:
+                    return holder
         return None
+
+    def claim_files(self, op_id: str, target_files: Any) -> Optional[str]:
+        """THE file lock -- every admission path takes it here: intake (via
+        :meth:`_claim_target_files`) and ``GovernedLoopService.submit`` for
+        callers that bypass intake (CLI, MCP, scheduled agents, the intent
+        engine). In ONE critical section, either every file is free (or
+        already *op_id*'s) and all are claimed for it, or the first live
+        holder is returned and nothing is claimed. Released by
+        :meth:`release_op` at the op's terminal. NEVER raises."""
+        try:
+            keys = [k for k in (self._file_key(f) for f in (target_files or ())) if k]
+            if not op_id or not keys:
+                return None
+            now = time.monotonic()
+            with self._active_file_ops_lock:
+                for fpath in keys:
+                    holder = self._live_holder_locked(fpath, now)
+                    if holder is not None and holder != op_id:
+                        return holder
+                for fpath in keys:
+                    self._active_file_ops[fpath] = (op_id, now)
+            return None
+        except Exception:  # noqa: BLE001
+            logger.debug("[Router] file claim degraded", exc_info=True)
+            return None
+
+    def _claim_target_files(self, envelope: IntentEnvelope) -> Optional[str]:
+        """Admission's file lock (:meth:`claim_files`), recorded per ingest so
+        an ingest that does not enqueue releases only what IT took.
+
+        ``register_active_op`` -- the registry's only writer -- was never
+        called, so the conflict check read an always-empty map and two
+        checkpoint resumes plus a fresh work order worked one file at once
+        (measured live, 2026-10-13). Claiming at admission, not at GENERATE,
+        is what closes the window between two ops admitted back to back."""
+        op_id = str(getattr(envelope, "causal_id", "") or "")
+        if not op_id or not envelope.target_files:
+            return None
+        holder = self.claim_files(op_id, envelope.target_files)
+        if holder is None:
+            self._file_claims_taken.add(op_id)
+        return holder
+
+    def _drop_file_claims(self, op_id: str) -> None:
+        """Remove every file entry *op_id* holds, atomically. NEVER raises."""
+        if not op_id:
+            return
+        with self._active_file_ops_lock:
+            for fpath in [k for k, v in self._active_file_ops.items() if v[0] == op_id]:
+                current = self._active_file_ops.get(fpath)
+                if current is not None and current[0] == op_id:
+                    del self._active_file_ops[fpath]
+
+    def _settle_file_claims(self, op_id: str, status: str) -> None:
+        """An ingest that did not ENQUEUE the op releases the file claims IT
+        took (never ones a live op with the same id already held -- the
+        per-ingest record, as goal claims are). NEVER raises."""
+        try:
+            if op_id in self._file_claims_taken:
+                self._file_claims_taken.discard(op_id)
+                if status != "enqueued":
+                    self._drop_file_claims(op_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("[Router] file claim settle degraded", exc_info=True)
 
     def register_active_op(self, op_id: str, target_files: List[str]) -> None:
         """Mark files as actively being modified by an operation.
@@ -3148,7 +3274,7 @@ class UnifiedIntakeRouter:
         _now = time.monotonic()
         with self._active_file_ops_lock:
             for fpath in target_files:
-                self._active_file_ops[fpath] = (op_id, _now)
+                self._active_file_ops[self._file_key(fpath)] = (op_id, _now)
 
     async def release_op(self, op_id: str) -> None:
         """Release file locks for a completed/failed operation.
@@ -3161,29 +3287,43 @@ class UnifiedIntakeRouter:
         for the SAME op_id (e.g., a retry path that re-registers) can't
         be clobbered between scan and delete.
         """
-        # Clear file reservations atomically — also filters by op_id
-        # under the lock so we never delete a key that was already
-        # rewritten to a different op_id by a concurrent registrant.
-        with self._active_file_ops_lock:
-            stale_keys = [k for k, v in self._active_file_ops.items() if v[0] == op_id]
-            for k in stale_keys:
-                # Re-verify identity under the same lock — defends
-                # against a concurrent register_active_op that
-                # rewrote this exact key between the scan and the
-                # delete (would change v[0] to a different op_id).
-                current = self._active_file_ops.get(k)
-                if current is not None and current[0] == op_id:
-                    del self._active_file_ops[k]
+        # Clear file reservations atomically (identity re-verified under the
+        # lock, so a key rewritten to another op is never deleted).
+        self._drop_file_claims(op_id)
 
-        # Re-ingest queued signals (outside the lock — ingest is async + I/O)
+        # Re-ingest queued signals (outside the lock — ingest is async + I/O),
+        # in ARBITRATED order, not arrival order: the first one admitted
+        # takes the freed files and the rest queue behind IT, so the order is
+        # who works the file next. Human work first (the sovereign predicate
+        # intake and the pool already use), then intake priority. A signal
+        # that already holds a WAL lease (a replayed one) keeps it.
         queued = self._queued_behind.pop(op_id, [])
-        for envelope in queued:
+        for envelope in sorted(queued, key=_rearbitration_key):
             logger.info(
                 "[Router] Re-ingesting signal queued behind completed op %s: %s",
                 op_id[:12],
                 envelope.description[:50],
             )
-            await self.ingest(envelope)
+            await self._readmit(envelope, str(getattr(envelope, "lease_id", "") or ""))
+
+    async def _readmit(self, envelope: IntentEnvelope, lease: str) -> str:
+        """Re-admit a signal through :meth:`ingest`, keeping its WAL lease if
+        it has one. A durable signal refused on IDENTITY (its goal satisfied
+        or held, a different lease already live for it) is resolved, not
+        lost: the WAL's closed vocabulary calls that row 'acked', so it does
+        not replay on every boot. Load refusals cannot happen here -- a
+        replayed lease skips the load gates."""
+        status = await self.ingest(envelope, replayed_lease=lease)
+        if lease and status not in _ADMITTED_STATUSES:
+            try:
+                self._wal.update_status(lease, "acked")
+                logger.info(
+                    "Router: lease_id=%s source=%s resolved at re-admission (%s) "
+                    "— not re-run", lease, envelope.source, status,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("[Router] re-admission ack degraded", exc_info=True)
+        return status
 
     # ------------------------------------------------------------------
     # Deduplication
@@ -3245,9 +3385,23 @@ class UnifiedIntakeRouter:
             return None
 
     def _register_dedup(self, envelope: IntentEnvelope) -> None:
-        """Record the current monotonic time for the envelope's dedup_key."""
+        """Record the current monotonic time for the envelope's dedup_key,
+        and which WAL lease registered it (a replay of THAT lease is the same
+        signal, not a duplicate of it)."""
         self._dedup[envelope.dedup_key] = time.monotonic()
+        self._dedup_owner[envelope.dedup_key] = str(getattr(envelope, "lease_id", "") or "")
         self._prune_dedup()
+        if len(self._dedup_owner) > len(self._dedup):
+            for _k in [k for k in self._dedup_owner if k not in self._dedup]:
+                self._dedup_owner.pop(_k, None)
+
+    def _is_replay_duplicate(self, envelope: IntentEnvelope, lease: str) -> bool:
+        """Dedup for a replayed WAL lease: a duplicate only of a key a
+        DIFFERENT lease registered in its window. The lease's own earlier
+        registration (a capacity-parked signal re-drained in the same
+        process) is itself, and must not be acked away as its own copy."""
+        return (self._is_duplicate(envelope)
+                and self._dedup_owner.get(envelope.dedup_key, "") != lease)
 
     def _prune_dedup(self) -> None:
         """Drop entries no window can still consider a duplicate.
@@ -3618,6 +3772,27 @@ _GOAL_BOUND_SOURCES = frozenset({"roadmap", "fsm_resume"})
 _ADMITTED_STATUSES = frozenset({"enqueued", "queued_behind", "pending_ack"})
 
 
+def _operator_identity_from_evidence(prior: "Dict[str, Any]") -> "Dict[str, Any]":
+    """The operator keys a checkpointed op's evidence carried -- origin flag
+    and the /session seed ref -- normalised, or ``{}``. NEVER raises."""
+    out: "Dict[str, Any]" = {}
+    try:
+        from backend.core.ouroboros.governance.intake.intent_envelope import (  # noqa: PLC0415
+            OPERATOR_ORIGIN_KEY,
+        )
+        if prior.get(OPERATOR_ORIGIN_KEY) is True:
+            out[OPERATOR_ORIGIN_KEY] = True
+        fs = prior.get("foreground_session")
+        if isinstance(fs, dict) and fs.get("seed_ref"):
+            out["foreground_session"] = {
+                "session_id": str(fs.get("session_id", ""))[:64],
+                "seed_ref": str(fs["seed_ref"])[:64],
+            }
+    except Exception:  # noqa: BLE001
+        logger.debug("[IntakeRouter] resume operator identity unreadable", exc_info=True)
+    return out
+
+
 def _resume_envelope_kwargs(env: "Dict[str, Any]") -> "Dict[str, Any]":
     """Build the ``make_envelope`` kwargs for an FSM-resume re-injection.
 
@@ -3678,6 +3853,12 @@ def _resume_envelope_kwargs(env: "Dict[str, Any]") -> "Dict[str, Any]":
     _resume_decl = (
         {_DECLARED_SYMBOLS_KEY: list(_resume_symbols)} if _resume_symbols else {}
     )
+    # The operator survives a suspension too: a resumed /session apply is
+    # still the operator's op (sovereign priority) and still names its
+    # approved seed. The ref proves nothing by itself -- GENERATE honours it
+    # only when the sealed seed it names verifies under the roadmap secret
+    # (foreground_session_ops) -- so carrying it trusts nothing new.
+    _resume_decl.update(_operator_identity_from_evidence(_prior))
     _ev_json = _rj.dumps(
         {
             "resume": True,

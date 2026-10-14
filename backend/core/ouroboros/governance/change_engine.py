@@ -1446,18 +1446,20 @@ class ChangeEngine:
                     },
                 )
             )
+            # WRITTEN, not landed: the pipeline's scoped VERIFY has not run,
+            # and a regression there rolls this back. The verdict -- and the
+            # op's closing POSTMORTEM -- come from the pipeline once VERIFY
+            # passed (Orchestrator._announce_verified_outcome). Announcing
+            # "applied" + POSTMORTEM "none" here ticked a later-rolled-back op
+            # as landed on every surface that listens.
+            from backend.core.ouroboros.governance.landed_metrics import (  # noqa: PLC0415
+                WRITTEN_OUTCOME,
+            )
             await self._comm.emit_decision(
                 op_id=op_id,
-                outcome="applied",
+                outcome=WRITTEN_OUTCOME,
                 reason_code="safe_auto_passed",
                 diff_summary=f"Applied change to {target}",
-            )
-
-            await self._comm.emit_postmortem(
-                op_id=op_id,
-                root_cause="none",
-                failed_phase=None,
-                next_safe_action="none",
             )
 
             # Atomic Flush & Freeze (2026-07-21) — the SUCCESS seam: the

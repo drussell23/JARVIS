@@ -11,11 +11,18 @@ test-validated changes landed, and per soak hour.
 
 ## Where it is counted
 
-Every engine that applies a change announces it the same way: a ``DECISION``
-with ``outcome="applied"`` on the CommProtocol, emitted AFTER post-apply VERIFY
-(a verify failure rolls back and never emits it). Observing that one stream
-counts a landing no matter which engine produced it, including ones written
-after this module. Nothing is added to any engine.
+A landing is a ``DECISION`` with ``outcome="applied"`` on the CommProtocol that
+names the commit: :func:`decision_landed` is the one test, read by this counter
+and by the cockpit's closing line alike.
+
+This docstring once said the applied DECISION came "AFTER post-apply VERIFY".
+It did not: ChangeEngine emitted it when the bytes were written, before the
+pipeline's scoped VERIFY. An op whose VERIFY regressed and rolled back had
+already been counted, ticked ``✓``, recapped "Landed" and narrated "Operation
+complete" (measured live, 2026-10-13). ChangeEngine now announces
+:data:`WRITTEN_OUTCOME` -- a progress word no consumer reads as an outcome --
+and the pipeline announces ``applied`` only once VERIFY passed, carrying the
+commit's sha: a content hash of exactly what landed, the only proof there is.
 
 ## The rate does not extrapolate
 
@@ -59,6 +66,26 @@ _SECONDS_PER_HOUR = 3600.0
 #: How many recent landings to remember for display. Bounded: a long soak must
 #: not grow a list for ever to draw a one-line status.
 _RECENT = 8
+
+
+#: The two-phase applied announcement.
+#: Phase one -- ChangeEngine wrote the bytes; scoped VERIFY has not run, and a
+#: regression there rolls them back. Progress, never an outcome.
+WRITTEN_OUTCOME = "written"
+#: Phase two -- the DECISION key naming the landed commit; absent or empty
+#: means the op completed but nothing landed (no durable commit).
+COMMIT_KEY = "commit_sha"
+
+
+def decision_landed(payload: Any) -> bool:
+    """Did this DECISION report a landing: ``applied`` with a commit?
+    NEVER raises."""
+    try:
+        p = payload or {}
+        return (str(p.get("outcome") or "").lower() == "applied"
+                and bool(str(p.get(COMMIT_KEY) or "").strip()))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def render_landed(total: int, per_hour: float, settled: bool, uptime_s: float) -> str:
@@ -197,7 +224,7 @@ class LandedMetricsTransport:
             op_id = str(getattr(msg, "op_id", "") or "")
             outcome = str(payload.get("outcome") or "")
             self._file(lambda led: led.invoked(CAPABILITY, op_id=op_id, detail=outcome))
-            if outcome != "applied":
+            if not decision_landed(payload):
                 return
             summary = str(payload.get("diff_summary") or payload.get("reason_code") or "")
             if self._m().record(op_id, summary):
@@ -213,6 +240,9 @@ class LandedMetricsTransport:
 
 __all__ = [
     "CAPABILITY",
+    "COMMIT_KEY",
+    "WRITTEN_OUTCOME",
+    "decision_landed",
     "LandedMetrics",
     "LandedMetricsTransport",
     "LandedSnapshot",

@@ -694,29 +694,82 @@ async def _dag_index() -> Dict[str, Dict[str, Any]]:
     NEVER raises; an unreadable roadmap yields an empty index, i.e. no gating.
     """
     def _read() -> Dict[str, Dict[str, Any]]:
-        out: Dict[str, Dict[str, Any]] = {}
-        try:
-            from backend.core.ouroboros.governance import (  # noqa: PLC0415
-                roadmap_reader as rr,
-            )
-            _verdict, doc, _diag = rr.read_roadmap()
-            for goal in list(getattr(doc, "goals", ()) or ()):
-                gid = str(getattr(goal, "goal_id", "") or getattr(goal, "id", "") or "")
-                if not gid:
-                    continue
-                files = tuple(getattr(goal, "target_files", ()) or ())
-                out[gid] = {
-                    "depends_on": tuple(getattr(goal, "depends_on", ()) or ()),
-                    "target": str(files[0]) if files else "",
-                }
-        except Exception:  # noqa: BLE001
-            logger.debug("[GoalDiscovery] roadmap DAG index degraded", exc_info=True)
-        return out
+        return {
+            gid: {"depends_on": deps, "target": files[0] if files else ""}
+            for gid, files, deps in _roadmap_goals()
+        }
 
     try:
         return await asyncio.to_thread(_read)
     except Exception:  # noqa: BLE001
         return {}
+
+
+def _roadmap_goals() -> List[Tuple[str, Tuple[str, ...], Tuple[str, ...]]]:
+    """``[(goal_id, target_files, depends_on)]`` from the VERIFIED roadmap --
+    the one read the DAG index and :func:`settled_files` share. Blocking
+    (file I/O); call off the loop. NEVER raises; unreadable -> ``[]``."""
+    out: List[Tuple[str, Tuple[str, ...], Tuple[str, ...]]] = []
+    try:
+        from backend.core.ouroboros.governance import (  # noqa: PLC0415
+            roadmap_reader as rr,
+        )
+        _verdict, doc, _diag = rr.read_roadmap()
+        for goal in list(getattr(doc, "goals", ()) or ()):
+            gid = str(getattr(goal, "goal_id", "") or getattr(goal, "id", "") or "")
+            if gid:
+                out.append((
+                    gid,
+                    tuple(str(f) for f in (getattr(goal, "target_files", ()) or ())),
+                    tuple(getattr(goal, "depends_on", ()) or ()),
+                ))
+    except Exception:  # noqa: BLE001
+        logger.debug("[GoalDiscovery] roadmap read degraded", exc_info=True)
+    return out
+
+
+#: The DiscoveredWork kinds whose goal id derives from the file alone (a
+#: roadmap goal declares its id; a model proposal's id carries its content key).
+_FILE_DERIVED_KINDS: Tuple[str, ...] = ("uncovered_module", "ambient_red")
+
+
+async def settled_files(paths: Sequence[str]) -> frozenset:
+    """Which of *paths* are the subject of work already landed and still
+    present -- for work-finders that pick FILES (the exploration sensor),
+    which carry no goal id of their own.
+
+    A file maps to goal ids two ways, the same two GoalDiscovery files work
+    under: every signed roadmap goal that targets it, and the id discovery
+    would derive for it (``DiscoveredWork.goal_id``). The verdict is the
+    ledger's ``settled_goal_ids`` -- the one the dispatch claim enforces --
+    so a file GoalDiscovery declines as SATISFIED is declined here too.
+    NEVER raises; on any fault nothing is settled (work proceeds)."""
+    try:
+        wanted = [str(p) for p in (paths or ()) if str(p or "").strip() and str(p) != "."]
+        if not wanted:
+            return frozenset()
+
+        def _resolve() -> frozenset:
+            from backend.core.ouroboros.governance import (  # noqa: PLC0415
+                goal_reconciliation_ledger as grl,
+            )
+            ids_by_path: Dict[str, List[str]] = {p: [] for p in wanted}
+            for gid, files, _deps in _roadmap_goals():
+                for f in files:
+                    if f in ids_by_path:
+                        ids_by_path[f].append(gid)
+            for p in wanted:
+                for kind in _FILE_DERIVED_KINDS:
+                    ids_by_path[p].append(DiscoveredWork(
+                        target_file=p, subject_file=p, kind=kind, evidence="", weight=0.0,
+                    ).goal_id)
+            settled = grl.settled_goal_ids([g for ids in ids_by_path.values() for g in ids])
+            return frozenset(p for p, ids in ids_by_path.items() if settled & set(ids))
+
+        return await asyncio.to_thread(_resolve)
+    except Exception:  # noqa: BLE001
+        logger.debug("[GoalDiscovery] settled_files degraded", exc_info=True)
+        return frozenset()
 
 
 def _dependency_state(

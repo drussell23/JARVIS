@@ -73,6 +73,10 @@ def _empty_posture_dir(root: Path) -> Path:
     return root / "posture"          # never created: an absent dir reads as "no posture"
 
 
+def _empty_sessions_dir(root: Path) -> Path:
+    return root / "sessions"         # created on first write, by the session log
+
+
 #: The organism's on-disk state a test process must never read, each by the
 #: knob its OWN resolver honours -- so redirecting it here redirects every
 #: reader at once, with no per-module patching.
@@ -86,9 +90,13 @@ def _empty_posture_dir(root: Path) -> Path:
 #: * ``JARVIS_POSTURE_DIR`` -- the posture triplet lived at ``cwd/.jarvis``
 #:   for every reader, so a run from the repo saw the live daemon's posture:
 #:   with the organism in HARDEN, eleven render tests collapsed tool bodies.
+#: * ``JARVIS_SESSION_LOG_DIR`` -- /session logs and their sealed seeds; a
+#:   test must neither write into the live repo's ``.jarvis/sessions`` nor
+#:   rebuild a real operator session from it.
 _HERMETIC_STATE = {
     "JARVIS_ENV_FILE": _empty_env_file,
     "JARVIS_POSTURE_DIR": _empty_posture_dir,
+    "JARVIS_SESSION_LOG_DIR": _empty_sessions_dir,
 }
 #: The seams THIS session declared. An outer setting wins (a run that
 #: deliberately tests against real state) and is then left untouched.
