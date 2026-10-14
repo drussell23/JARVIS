@@ -19,8 +19,15 @@ every soak, so the two cannot drift.
 
 * Each sibling is DATA (a :class:`Sibling` row), not a code path: its health
   URL, how to start it, and whether the organism can live without it.
-* A sibling that already answers is left alone -- the operator (or another
-  session) owns it. Nothing here ever stops a sibling.
+* A sibling that already answers is adopted -- the operator (or another
+  session) owns it -- unless it runs code its checkout no longer has: then
+  it is handed over (stopped and started again from the checkout), the same
+  judgment a launch applies to a kernel running older code
+  (``daemon_handover``). A handover never interrupts work: a sibling lent to
+  training, or still serving a request when its drain window ends, is
+  adopted as it is and the boot says so. Policy
+  ``JARVIS_STALE_SIBLING_POLICY`` (``replace`` | ``attach``), defaulting to
+  the kernel's ``JARVIS_STALE_DAEMON_POLICY``.
 * How to start one is the operator's declaration in ``.env``
   (``JARVIS_JPRIME_START_CMD``, ``JARVIS_REACTOR_START_CMD``), never a path
   hardcoded here. Templates may use ``{model}``, ``{port}`` and ``{ctx}``,
@@ -33,10 +40,12 @@ Master switch ``JARVIS_TRINITY_AUTOSTART`` (default on).
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shlex
 import subprocess
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -76,6 +85,12 @@ class Sibling:
     start_env: str
     required: Callable[[], bool]
     ready_budget_s: Callable[[], float]
+    #: The Trinity repository it runs from (trinity_repos name).
+    repo: str = ""
+    #: Where it reports its code identity in JSON ("code"), if it does.
+    identity_path: str = ""
+    #: Where it reports in-flight work (a "resident" list of {"inflight": n}).
+    work_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -117,6 +132,7 @@ def siblings() -> List[Sibling]:
             probe_path="/api/version", start_env="JARVIS_JPRIME_START_CMD",
             required=_local_lane_on,
             ready_budget_s=jprime_ready_budget_s,
+            repo="prime", identity_path="/api/version", work_path="/health",
         ),
         Sibling(
             key="reactor", title="Reactor-Core (Nerves)",
@@ -124,6 +140,7 @@ def siblings() -> List[Sibling]:
             probe_path="/health", start_env="JARVIS_REACTOR_START_CMD",
             required=lambda: False,
             ready_budget_s=lambda: _float_env("JARVIS_REACTOR_START_BUDGET_S", 120.0),
+            repo="reactor",
         ),
     ]
 
@@ -152,6 +169,30 @@ def serving_siblings(probe: Callable[[str, float], bool] = _answers) -> List[str
     return urls
 
 
+def _get_json(url: str, timeout: float) -> Optional[dict]:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            body = json.loads(r.read().decode("utf-8", "replace"))
+            return body if isinstance(body, dict) else None
+    except Exception:  # noqa: BLE001 -- unreachable/refused/not JSON: no answer
+        return None
+
+
+def _listener_pids(ports: Set[int]) -> Set[int]:
+    """PIDs listening on *ports* on this host."""
+    import psutil
+
+    pids: Set[int] = set()
+    try:
+        for conn in psutil.net_connections(kind="inet"):
+            if conn.status == psutil.CONN_LISTEN and conn.pid and conn.laddr \
+                    and conn.laddr.port in ports:
+                pids.add(conn.pid)
+    except (psutil.Error, OSError) as exc:
+        logger.debug("[TrinitySiblings] listener scan failed: %s", exc)
+    return pids
+
+
 def serving_sibling_pids(probe: Callable[[str, float], bool] = _answers) -> Set[int]:
     """PIDs every cleanup must spare: each serving sibling's listener and its
     descendants (J-Prime's llama-server engines).
@@ -165,14 +206,7 @@ def serving_sibling_pids(probe: Callable[[str, float], bool] = _answers) -> Set[
     ports = {urlparse(u).port for u in serving_siblings(probe)} - {None}
     if not ports:
         return set()
-    pids: Set[int] = set()
-    try:
-        for conn in psutil.net_connections(kind="inet"):
-            if conn.status == psutil.CONN_LISTEN and conn.pid and conn.laddr \
-                    and conn.laddr.port in ports:
-                pids.add(conn.pid)
-    except (psutil.Error, OSError) as exc:
-        logger.debug("[TrinitySiblings] listener scan failed: %s", exc)
+    pids = _listener_pids(ports)
     for pid in list(pids):
         try:
             pids.update(child.pid for child in psutil.Process(pid).children(recursive=True))
@@ -221,6 +255,143 @@ def _lent_detail(sib: Sibling, base: str) -> str:
         return ""
 
 
+# -- a sibling running older code is handed over ----------------------------------
+def stale_sibling_policy() -> str:
+    policy = _env("JARVIS_STALE_SIBLING_POLICY").lower()
+    if policy in ("replace", "attach"):
+        return policy
+    from backend.core.daemon_handover import stale_policy
+    return stale_policy()
+
+
+def _drain_s() -> float:
+    """How long a handover waits for a sibling's in-flight work to finish."""
+    return max(0.0, _float_env("JARVIS_SIBLING_HANDOVER_DRAIN_S", 30.0))
+
+
+def _runs_from(pid: int, root: Path) -> bool:
+    """Does process *pid* run from checkout *root* (its working directory, or
+    a path on its command line)? A listener that cannot be tied to the
+    sibling's checkout -- a port relay, another program -- is never judged."""
+    import psutil
+
+    try:
+        proc = psutil.Process(pid)
+        candidates = [proc.cwd()] + [a for a in proc.cmdline() if os.sep in a or "/" in a]
+    except (psutil.Error, OSError):
+        return False
+    for raw in candidates:
+        try:
+            Path(raw).resolve().relative_to(root.resolve())
+            return True
+        except (ValueError, OSError):
+            continue
+    return False
+
+
+def sibling_staleness(sib: Sibling, base: str):
+    """The answering sibling's :class:`~backend.core.daemon_handover.Staleness`,
+    or None when it runs its checkout's code or cannot be judged."""
+    from backend.core.daemon_handover import judge_staleness
+    from backend.core.trinity_repos import repo_path
+
+    reported = None
+    if sib.identity_path:
+        reported = (_get_json(base + sib.identity_path, probe_timeout_s()) or {}).get("code")
+    if isinstance(reported, dict) and reported.get("pid") and reported.get("root"):
+        # Judged only from the sibling's own host: across a WSL/Windows
+        # loopback its PID and checkout path name nothing on this side.
+        pid, root = int(reported["pid"]), Path(reported["root"])
+        if not _runs_from(pid, root):
+            return None
+        return judge_staleness(pid, reported, root, what=sib.title)
+    # From before the code-identity protocol: the process listening on its
+    # port, judged against its checkout's tracked sources -- only when that
+    # process demonstrably runs from the checkout.
+    root = repo_path(sib.repo) if sib.repo else None
+    port = urlparse(base).port
+    if root is None or port is None:
+        return None
+    pids = [pid for pid in _listener_pids({port}) if _runs_from(pid, root)]
+    if len(pids) != 1:
+        return None
+    return judge_staleness(pids[0], {}, root, what=sib.title)
+
+
+def _in_flight(sib: Sibling, base: str) -> Optional[int]:
+    """Requests the sibling is serving right now; None when it cannot say."""
+    if not sib.work_path:
+        return 0
+    report = _get_json(base + sib.work_path, probe_timeout_s())
+    if report is None:
+        return None
+    return sum(int(r.get("inflight") or 0)
+               for r in report.get("resident") or [] if isinstance(r, dict))
+
+
+def _hand_over(sib: Sibling, base: str, stale, *, say: Callable[[str], None],
+               probe: Callable[[str, float], bool], sleep: Callable[[float], None],
+               clock: Callable[[], float]) -> str:
+    """Stop the stale sibling once it is idle: "" when it is gone, else why
+    it was kept."""
+    from backend.core.daemon_handover import _silence_s
+    from backend.core.process_identity import kill_process_tree
+
+    deadline = clock() + _drain_s()
+    busy = _in_flight(sib, base)
+    while busy and clock() < deadline:
+        sleep(1.0)
+        busy = _in_flight(sib, base)
+    if busy is None:
+        return "it did not report its in-flight work"
+    if busy:
+        return f"it was still serving {busy} request(s) after {_drain_s():.0f}s"
+    say(f"  {sib.title}: {stale.describe()} -- restarting it")
+    grace = _silence_s()
+    if not kill_process_tree(stale.pid, grace):
+        return f"PID {stale.pid} could not be stopped"
+    url = base + sib.probe_path
+    deadline = clock() + grace
+    while probe(url, probe_timeout_s()) and clock() < deadline:
+        sleep(0.25)
+    if probe(url, probe_timeout_s()):
+        return f"{base} still answers after PID {stale.pid} stopped"
+    return ""
+
+
+def _replace_if_stale(sib: Sibling, base: str, *, say: Callable[[str], None],
+                      probe: Callable[[str, float], bool], sleep: Callable[[float], None],
+                      clock: Callable[[], float]) -> bool:
+    """True when the answering sibling ran older code and is now stopped, so
+    the caller starts it again from its checkout."""
+    if stale_sibling_policy() != "replace" or not _env(sib.start_env):
+        return False                 # nothing here could start it again
+    try:
+        stale = sibling_staleness(sib, base)
+    except Exception as exc:  # noqa: BLE001 -- a judgment that fails adopts
+        logger.debug("[TrinitySiblings] %s staleness unavailable: %s", sib.key, exc)
+        return False
+    if stale is None:
+        return False
+    kept = _hand_over(sib, base, stale, say=say, probe=probe, sleep=sleep, clock=clock)
+    if kept:
+        say(f"  {sib.title}: {stale.describe()}; kept running because {kept}")
+        return False
+    return True
+
+
+#: One bring-up per sibling at a time: the early pre-warm and the Trinity
+#: layer both ensure J-Prime, and the second must find the replacement the
+#: first started -- not judge it, or stop it, mid-start.
+_BRING_UP_LOCKS: Dict[str, threading.Lock] = {}
+_BRING_UP_LOCKS_GUARD = threading.Lock()
+
+
+def _bring_up_lock(key: str) -> threading.Lock:
+    with _BRING_UP_LOCKS_GUARD:
+        return _BRING_UP_LOCKS.setdefault(key, threading.Lock())
+
+
 def ensure_siblings(*, say: Callable[[str], None] = print,
                     probe: Callable[[str, float], bool] = _answers,
                     spawn: Callable[[str, Dict[str, str]], object] = _spawn,
@@ -263,6 +434,17 @@ def _ensure_one(sib: Sibling, *, say: Callable[[str], None],
                 sleep: Callable[[float], None],
                 clock: Callable[[], float],
                 lent: Callable[[Sibling, str], str]) -> SiblingStatus:
+    with _bring_up_lock(sib.key):
+        return _ensure_one_locked(sib, say=say, probe=probe, spawn=spawn, sleep=sleep,
+                                  clock=clock, lent=lent)
+
+
+def _ensure_one_locked(sib: Sibling, *, say: Callable[[str], None],
+                       probe: Callable[[str, float], bool],
+                       spawn: Callable[[str, Dict[str, str]], object],
+                       sleep: Callable[[float], None],
+                       clock: Callable[[], float],
+                       lent: Callable[[Sibling, str], str]) -> SiblingStatus:
     probe_timeout = probe_timeout_s()
     try:
         base = sib.base_url().rstrip("/")
@@ -277,8 +459,9 @@ def _ensure_one(sib: Sibling, *, say: Callable[[str], None],
                 # gate owns what that means for this boot.
                 say(f"  {sib.title}: up at {base}, lent -- {why}")
                 return SiblingStatus(sib.key, sib.title, base, "lent", why)
-            say(f"  {sib.title}: serving at {base}")
-            return SiblingStatus(sib.key, sib.title, base, "serving")
+            if not _replace_if_stale(sib, base, say=say, probe=probe, sleep=sleep, clock=clock):
+                say(f"  {sib.title}: serving at {base}")
+                return SiblingStatus(sib.key, sib.title, base, "serving")
         cmd = _env(sib.start_env)
         if not cmd:
             detail = f"not serving at {base} and {sib.start_env} is unset"

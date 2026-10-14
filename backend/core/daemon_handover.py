@@ -221,15 +221,44 @@ class Staleness:
     started_at: float
     changed: List[str] = field(default_factory=list)
     other_root: Optional[str] = None
+    what: str = "kernel"
 
     def describe(self, shown: int = 3) -> str:
         when = time.strftime("%H:%M:%S", time.localtime(self.started_at))
         if self.other_root:
-            return f"the running kernel (PID {self.pid}, started {when}) runs from {self.other_root}"
+            return f"the running {self.what} (PID {self.pid}, started {when}) runs from {self.other_root}"
         names = ", ".join(self.changed[:shown])
         more = f" and {len(self.changed) - shown} more" if len(self.changed) > shown else ""
-        return (f"the running kernel (PID {self.pid}, started {when}) predates "
+        return (f"the running {self.what} (PID {self.pid}, started {when}) predates "
                 f"{len(self.changed)} changed source file(s): {names}{more}")
+
+
+def judge_staleness(pid: int, code: dict, root: Path, *, expected_root: Optional[Path] = None,
+                    what: str = "kernel") -> Optional[Staleness]:
+    """Is process *pid* running code the checkout *root* no longer has?
+
+    *code* is the process's own code identity (``code_identity``: started_at,
+    root, sources), possibly empty for a process from before the protocol;
+    its sources are then *root*'s tracked files. None when it runs this
+    checkout's code -- or cannot say when it started (then adopting it is
+    the only safe answer). With *expected_root*, a process running from
+    another checkout is stale too.
+    """
+    started = code.get("started_at") or _process_started_at(pid)
+    if not started:
+        return None
+    if expected_root is not None and code.get("root")             and Path(code["root"]).resolve() != expected_root.resolve():
+        return Staleness(pid, started, other_root=code["root"], what=what)
+    sources = code.get("sources") or _tracked_sources(root)
+    changed = []
+    for rel in sources:
+        try:
+            if (root / rel).stat().st_mtime > started:
+                changed.append(rel)
+        except OSError:
+            changed.append(rel)          # gone from the checkout
+    changed.sort(key=lambda rel: _mtime(root / rel), reverse=True)
+    return Staleness(pid, started, changed, what=what) if changed else None
 
 
 def daemon_status(stream_sock: Path) -> Optional[dict]:
@@ -244,23 +273,7 @@ def running_daemon_staleness(stream_sock: Path, root: Path = REPO_ROOT) -> Optio
     status = daemon_status(stream_sock)
     if not status or not status.get("pid"):
         return None
-    pid = int(status["pid"])
-    code = status.get("code") or {}
-    started = code.get("started_at") or _process_started_at(pid)
-    if not started:
-        return None
-    if code.get("root") and Path(code["root"]).resolve() != root.resolve():
-        return Staleness(pid, started, other_root=code["root"])
-    sources = code.get("sources") or _tracked_sources(root)
-    changed = []
-    for rel in sources:
-        try:
-            if (root / rel).stat().st_mtime > started:
-                changed.append(rel)
-        except OSError:
-            changed.append(rel)          # gone from the checkout
-    changed.sort(key=lambda rel: _mtime(root / rel), reverse=True)
-    return Staleness(pid, started, changed) if changed else None
+    return judge_staleness(int(status["pid"]), status.get("code") or {}, root, expected_root=root)
 
 
 def _mtime(path: Path) -> float:
@@ -313,6 +326,6 @@ async def hand_over(
 
 
 __all__ = [
-    "REPO_ROOT", "Staleness", "code_identity", "daemon_status", "hand_over", "loaded_sources",
-    "running_daemon_staleness", "stale_policy",
+    "REPO_ROOT", "Staleness", "code_identity", "daemon_status", "hand_over", "judge_staleness",
+    "loaded_sources", "running_daemon_staleness", "stale_policy",
 ]

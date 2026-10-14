@@ -21,6 +21,12 @@ def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_VISION_MODEL_NAME", "jarvis-vision:8b")
 
 
+@pytest.fixture(autouse=True)
+def _no_live_judgment(monkeypatch):
+    # The network is simulated, so is the code judgment: never the live engine.
+    monkeypatch.setattr(ts, "sibling_staleness", lambda sib, base: None)
+
+
 class Clock:
     def __init__(self):
         self.t = 0.0
@@ -148,3 +154,140 @@ def test_serving_sibling_pids_spares_the_listener_and_its_engines(monkeypatch):
     probe = lambda url, timeout: url.startswith("http://127.0.0.1:8000")
     assert ts.serving_sibling_pids(probe=probe) == {100, 101, 102}
     assert ts.serving_sibling_pids(probe=lambda u, t: False) == set()
+
+
+# -- a sibling running older code is handed over ------------------------------------
+JP = "http://127.0.0.1:8000/api/version"
+RC = "http://127.0.0.1:8090/health"
+
+
+def _stale_world(monkeypatch, *, inflight=(0,), killed=None, kill_ok=True):
+    """J-Prime answers with older code until it is stopped, then comes up again
+    once spawned."""
+    from backend.core import daemon_handover as dh
+    from backend.core import process_identity as pi
+    state = {"alive": True, "spawned": False, "polls": list(inflight)}
+    killed = killed if killed is not None else []
+    stale = dh.Staleness(pid=4242, started_at=1.0, changed=["jarvis_prime/engine/engine_pool.py"],
+                         what="J-Prime (Mind)")
+    monkeypatch.setattr(ts, "sibling_staleness", lambda sib, base: stale if sib.key == "jprime" else None)
+
+    def in_flight(sib, base):
+        return state["polls"].pop(0) if len(state["polls"]) > 1 else state["polls"][0]
+    monkeypatch.setattr(ts, "_in_flight", in_flight)
+
+    def kill(pid, timeout):
+        killed.append(pid)
+        state["alive"] = not kill_ok
+        return kill_ok
+    monkeypatch.setattr(pi, "kill_process_tree", kill)
+
+    def probe(url, _t):
+        if url == JP:
+            return state["alive"] or state["spawned"]
+        return url == RC
+
+    def spawn(cmd, values):
+        state["spawned"] = True
+
+    clock = Clock()
+    lines = []
+    out = ts.ensure_siblings(say=lines.append, probe=probe, spawn=spawn, sleep=clock.sleep,
+                             clock=clock, lent=lambda sib, base: "")
+    return {s.key: s for s in out}, state, killed, lines
+
+
+def test_a_mind_running_older_code_is_restarted_from_its_checkout(monkeypatch):
+    monkeypatch.setenv("JARVIS_JPRIME_START_CMD", "pwsh -File x.ps1 -Port {port}")
+    st, state, killed, lines = _stale_world(monkeypatch)
+    assert killed == [4242] and state["spawned"]
+    assert st["jprime"].state == "started"
+    assert any("predates 1 changed source file(s): jarvis_prime/engine/engine_pool.py" in ln
+               for ln in lines)
+
+
+def test_a_busy_mind_finishes_its_requests_first(monkeypatch):
+    monkeypatch.setenv("JARVIS_JPRIME_START_CMD", "x")
+    st, state, killed, _ = _stale_world(monkeypatch, inflight=(2, 1, 0))
+    assert killed == [4242] and st["jprime"].state == "started"
+
+
+def test_a_mind_still_serving_after_the_drain_window_is_kept(monkeypatch):
+    monkeypatch.setenv("JARVIS_JPRIME_START_CMD", "x")
+    monkeypatch.setenv("JARVIS_SIBLING_HANDOVER_DRAIN_S", "3")
+    st, state, killed, lines = _stale_world(monkeypatch, inflight=(1,))
+    assert killed == [] and not state["spawned"]
+    assert st["jprime"].state == "serving"
+    assert any("kept running because it was still serving 1 request(s)" in ln for ln in lines)
+
+
+def test_a_mind_that_cannot_say_what_it_serves_is_kept(monkeypatch):
+    monkeypatch.setenv("JARVIS_JPRIME_START_CMD", "x")
+    st, _, killed, _ = _stale_world(monkeypatch, inflight=(None,))
+    assert killed == [] and st["jprime"].state == "serving"
+
+
+def test_without_a_start_command_a_stale_mind_is_never_stopped(monkeypatch):
+    st, state, killed, _ = _stale_world(monkeypatch)
+    assert killed == [] and st["jprime"].state == "serving"
+
+
+def test_attach_policy_keeps_the_running_mind(monkeypatch):
+    monkeypatch.setenv("JARVIS_JPRIME_START_CMD", "x")
+    monkeypatch.setenv("JARVIS_STALE_SIBLING_POLICY", "attach")
+    st, _, killed, _ = _stale_world(monkeypatch)
+    assert killed == [] and st["jprime"].state == "serving"
+
+
+def test_the_sibling_policy_follows_the_kernels_unless_set(monkeypatch):
+    monkeypatch.delenv("JARVIS_STALE_SIBLING_POLICY", raising=False)
+    monkeypatch.setenv("JARVIS_STALE_DAEMON_POLICY", "attach")
+    assert ts.stale_sibling_policy() == "attach"
+    monkeypatch.setenv("JARVIS_STALE_SIBLING_POLICY", "replace")
+    assert ts.stale_sibling_policy() == "replace"
+
+
+def test_a_mind_that_will_not_stop_is_reported_and_kept(monkeypatch):
+    monkeypatch.setenv("JARVIS_JPRIME_START_CMD", "x")
+    st, state, killed, lines = _stale_world(monkeypatch, kill_ok=False)
+    assert killed == [4242] and not state["spawned"] and st["jprime"].state == "serving"
+    assert any("could not be stopped" in ln for ln in lines)
+
+
+# -- the judgment itself, against a real checkout and a real process ---------------
+def _reporting(monkeypatch, code, cwd=None):
+    monkeypatch.undo()   # drop the autouse stub for these
+    if cwd is not None:
+        monkeypatch.chdir(cwd)                      # this process "runs from" the checkout
+    monkeypatch.setattr(ts, "_get_json", lambda url, t: {"code": code})
+    sib = [s for s in ts.siblings() if s.key == "jprime"][0]
+    return ts.sibling_staleness(sib, "http://127.0.0.1:8000")
+
+
+def test_a_source_changed_after_the_engine_started_is_stale(monkeypatch, tmp_path):
+    import os
+    import time
+    (tmp_path / "jarvis_prime").mkdir()
+    src = tmp_path / "jarvis_prime" / "engine.py"
+    src.write_text("x = 1\n")
+    started = time.time() - 60
+    os.utime(src, (started + 30, started + 30))
+    stale = _reporting(monkeypatch, {"pid": os.getpid(), "root": str(tmp_path), "started_at": started,
+                                     "sources": ["jarvis_prime/engine.py"]}, cwd=tmp_path)
+    assert stale is not None and stale.changed == ["jarvis_prime/engine.py"]
+    os.utime(src, (started - 30, started - 30))
+    assert _reporting(monkeypatch, {"pid": os.getpid(), "root": str(tmp_path), "started_at": started,
+                                    "sources": ["jarvis_prime/engine.py"]}, cwd=tmp_path) is None
+
+
+def test_an_engine_on_another_host_is_never_judged(monkeypatch, tmp_path):
+    # Across the WSL/Windows loopback the reported PID and path name nothing here.
+    import os
+    assert _reporting(monkeypatch, {"pid": os.getpid(), "root": r"C:\Users\x\prime" if os.sep == "/"
+                                    else "/home/x/prime", "started_at": 1.0,
+                                    "sources": ["jarvis_prime/engine.py"]}) is None
+
+
+def test_bring_up_is_one_at_a_time_per_sibling():
+    assert ts._bring_up_lock("jprime") is ts._bring_up_lock("jprime")
+    assert ts._bring_up_lock("jprime") is not ts._bring_up_lock("reactor")
