@@ -215,6 +215,23 @@ class HealthProbe:
         _endpoint = os.environ.get("JARVIS_PRIME_HEALTH_ENDPOINT", "/v1/models")
         self._url = f"http://{host}:{port}{_endpoint}"
 
+    @staticmethod
+    def ready_from(data: Any) -> bool:
+        """Readiness from whichever health shape the endpoint speaks.
+
+        A Trinity ``/health`` states ``ready_for_inference``. The default
+        endpoint is OpenAI-compatible ``/v1/models``, which has no such field:
+        there a listing with at least one model is the readiness signal (the
+        server will load it on demand). Reading only the Trinity field made
+        every probe of the default endpoint ALIVE_NOT_READY, forever.
+        """
+        if not isinstance(data, dict):
+            return False
+        if "ready_for_inference" in data:
+            return bool(data["ready_for_inference"])
+        listing = data.get("data")
+        return isinstance(listing, list) and len(listing) > 0
+
     async def _http_get(self, url: str, timeout: float) -> Dict[str, Any]:
         """HTTP GET returning parsed JSON. Raises on failure."""
         import aiohttp
@@ -229,8 +246,8 @@ class HealthProbe:
             data = await self._http_get(self._url, self._timeout_s)
             elapsed_ms = (time.monotonic() - start) * 1000
 
-            ready = bool(data.get("ready_for_inference", False))
-            apars = data.get("apars", {})
+            ready = self.ready_from(data)
+            apars = data.get("apars", {}) if isinstance(data, dict) else {}
             progress = apars.get("total_progress") if apars else None
 
             verdict = HealthVerdict.READY if ready else HealthVerdict.ALIVE_NOT_READY
@@ -525,13 +542,15 @@ class JprimeLifecycleController:
 
     # -- Health evaluation ---------------------------------------------------
 
-    async def _do_probe(self) -> HealthResult:
+    async def _do_probe(self, result: Optional[HealthResult] = None) -> HealthResult:
         """Execute a single health probe and transition state accordingly.
 
         Used during boot sequence and in the continuous health loop.
-        Maps HealthVerdict -> LifecycleState for initial probing.
+        Maps HealthVerdict -> LifecycleState for initial probing. A caller
+        that already holds a fresh ``result`` passes it instead of re-probing.
         """
-        result = await self._probe.check()
+        if result is None:
+            result = await self._probe.check()
 
         if result.verdict == HealthVerdict.READY:
             await self._transition(
@@ -788,7 +807,22 @@ class JprimeLifecycleController:
                     await self._do_probe()
 
                 elif self._state == LifecycleState.TERMINAL:
-                    # In TERMINAL, wait for cooldown then optionally retry
+                    # TERMINAL means the recovery budget is spent, not that
+                    # observation stops: this controller restarts nothing, and
+                    # J-Prime is often brought up by the sibling launcher
+                    # after the boot probes gave up. An answering service is
+                    # evidence that outranks the bookkeeping.
+                    result = await self._probe.check()
+                    if result.verdict in (HealthVerdict.READY, HealthVerdict.ALIVE_NOT_READY):
+                        self._restart_timestamps.clear()
+                        self._restart_attempt = 0
+                        await self._transition(
+                            LifecycleState.UNKNOWN,
+                            "probe",
+                            "service_answered_in_terminal",
+                        )
+                        await self._do_probe(result)
+                        continue
                     elapsed = time.monotonic() - self._state_entered_at
                     if elapsed >= self._policy.terminal_cooldown_s:
                         logger.info(

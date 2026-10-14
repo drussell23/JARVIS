@@ -589,3 +589,66 @@ class TestBootGateIntegration:
         ctrl._mind_client_update = AsyncMock()
         level = await ctrl.ensure_ready(timeout=1.0)
         assert level == "LEVEL_2"
+
+
+class TestObservedReadiness:
+    """The default endpoint is /v1/models, which has no `ready_for_inference`;
+    and TERMINAL must not blind an observer that restarts nothing."""
+
+    @pytest.mark.asyncio
+    async def test_openai_listing_with_a_model_reads_ready(self):
+        probe = HealthProbe(host="127.0.0.1", port=8000)
+        listing = {"object": "list", "data": [{"id": "qwen3-coder-ov:30b", "loaded": False}]}
+        with patch.object(probe, "_http_get", return_value=listing):
+            result = await probe.check()
+        assert result.verdict == HealthVerdict.READY
+
+    @pytest.mark.asyncio
+    async def test_empty_listing_reads_alive_not_ready(self):
+        probe = HealthProbe(host="127.0.0.1", port=8000)
+        with patch.object(probe, "_http_get", return_value={"object": "list", "data": []}):
+            result = await probe.check()
+        assert result.verdict == HealthVerdict.ALIVE_NOT_READY
+
+    @pytest.mark.asyncio
+    async def test_terminal_recovers_when_the_service_answers(self, monkeypatch):
+        import asyncio
+        import time as _time
+        import backend.core.jprime_lifecycle_controller as mod
+
+        monkeypatch.setattr(mod, "_HEALTH_POLL_INTERVAL_S", 0.01)
+        ctrl = TestControllerStateMachine()._make_controller()
+        ctrl._state = LifecycleState.TERMINAL
+        ctrl._state_entered_at = _time.monotonic()        # cooldown far from expiry
+        ctrl._restart_timestamps = [_time.monotonic()] * 3
+        ctrl._probe.check.return_value = HealthResult(
+            verdict=HealthVerdict.READY, ready_for_inference=True,
+        )
+        task = asyncio.ensure_future(ctrl._health_loop())
+        try:
+            for _ in range(200):
+                if ctrl.state == LifecycleState.READY:
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            task.cancel()
+        assert ctrl.state == LifecycleState.READY
+        assert ctrl._restart_timestamps == []
+
+    @pytest.mark.asyncio
+    async def test_terminal_stays_terminal_while_unreachable(self, monkeypatch):
+        import asyncio
+        import time as _time
+        import backend.core.jprime_lifecycle_controller as mod
+
+        monkeypatch.setattr(mod, "_HEALTH_POLL_INTERVAL_S", 0.01)
+        ctrl = TestControllerStateMachine()._make_controller()
+        ctrl._state = LifecycleState.TERMINAL
+        ctrl._state_entered_at = _time.monotonic()
+        ctrl._probe.check.return_value = HealthResult(
+            verdict=HealthVerdict.UNREACHABLE, error="connection_refused",
+        )
+        task = asyncio.ensure_future(ctrl._health_loop())
+        await asyncio.sleep(0.1)
+        task.cancel()
+        assert ctrl.state == LifecycleState.TERMINAL
