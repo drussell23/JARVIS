@@ -30,11 +30,31 @@ def test_budget_adds_the_reload_only_when_the_text_model_is_out(monkeypatch):
         assert _run(IntentClassifier._classify_budget_s()) == 8.0
 
 
+def _classify_reply(content):
+    clf = IntentClassifier()
+    router = SimpleNamespace(generate=AsyncMock(return_value=SimpleNamespace(
+        content=content, source="local_prime", latency_ms=5.0)))
+    with patch("backend.core.prime_router.get_prime_router", AsyncMock(return_value=router)),          patch("backend.core.agent_bindings.capability_catalogue", return_value="- x"),          patch.object(IntentClassifier, "_classify_budget_s", AsyncMock(return_value=5.0)):
+        return _run(clf.classify_async("q"))
+
+
+def test_the_minds_own_decision_is_authoritative():
+    """A filled-in capability never overrides "I can answer this myself"."""
+    r = _classify_reply('{"reasoning": "arithmetic, answer directly", '
+                        '"answer_from_own_knowledge": true, "capability": "web_search_agent"}')
+    assert r.intent == CommandIntent.QUERY and r.capability == ""
+    r = _classify_reply('{"reasoning": "TOLD; needs finding out", '
+                        '"answer_from_own_knowledge": false, "capability": "web_research"}')
+    assert r.intent == CommandIntent.ACTION and r.capability == "web_research"
+    r = _classify_reply('{"intent": "action", "capability": "web_research"}')  # older schema
+    assert r.intent == CommandIntent.ACTION
+
+
 def test_a_named_capability_makes_the_request_an_action():
     clf = IntentClassifier()
     router = SimpleNamespace(generate=AsyncMock(return_value=SimpleNamespace(
-        content='{"intent": "query", "confidence": 0.9, "capability": "web_research", '
-                '"search_query": "nvidia news"}',
+        content='{"answer_from_own_knowledge": false, "confidence": 0.9, '
+                '"capability": "web_research", "search_query": "nvidia news"}',
         source="local_prime", latency_ms=5.0)))
     with patch("backend.core.prime_router.get_prime_router", AsyncMock(return_value=router)), \
          patch("backend.core.agent_bindings.capability_catalogue", return_value="- x"), \

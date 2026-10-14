@@ -1,5 +1,6 @@
 """
-host_platform - how prompts and user-facing text name the machine JARVIS runs on.
+host_platform - how prompts and user-facing text name the machine JARVIS runs on
+(and the day it runs on).
 
 Model prompts said "a macOS desktop assistant" / "native macOS application"
 on every host, so a model on Windows resolved Spotify to a ``.app`` bundle
@@ -21,4 +22,12 @@ def native_app_noun() -> str:
         sys.platform, "Linux desktop application")
 
 
-__all__ = ["native_app_noun", "os_display_name"]
+def today_display() -> str:
+    """Today's date as prompts state it: a model knows nothing newer than its
+    training, so "this year" / "latest" mean nothing to it without this."""
+    from datetime import datetime
+
+    return datetime.now().strftime("%A, %B %d, %Y")
+
+
+__all__ = ["native_app_noun", "os_display_name", "today_display"]

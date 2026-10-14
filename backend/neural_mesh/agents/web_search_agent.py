@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from ..base.base_neural_mesh_agent import BaseNeuralMeshAgent
 from ..data_models import AgentMessage, KnowledgeType, MessagePriority, MessageType
 
+from backend.core.host_platform import today_display
 from backend.intelligence.web_research_service import get_web_research_service
 
 logger = logging.getLogger(__name__)
@@ -237,7 +238,7 @@ class WebSearchAgent(BaseNeuralMeshAgent):
                 client.generate(
                     prompt=f"Question: {goal}\n\nSources:\n{context}",
                     system_prompt=(
-                        f"Today is {datetime.now().strftime('%A, %B %d, %Y')}. "
+                        f"Today is {today_display()}. "
                         "Answer the question using ONLY the numbered sources. Cite them "
                         "inline as [n]. Be concise (a short paragraph). Questions about "
                         "\"this year\", \"latest\" or \"now\" mean relative to today: if the "

@@ -496,37 +496,45 @@ class IntentClassifier:
     def _classify_system_prompt(catalogue: str) -> str:
         """Built per call: the host OS and the live agent catalogue are facts
         of THIS run, so neither is written into the prompt ahead of time."""
-        from backend.core.host_platform import os_display_name
+        from backend.core.host_platform import os_display_name, today_display
 
         return (
             f"You are the intent classifier of JARVIS, an AI assistant on a {os_display_name()} desktop. "
+            f"Today is {today_display()}. "
             "Given a voice command, decide what it asks for and extract structured fields.\n\n"
             "What can carry out a request on this machine right now -- JARVIS's own routes "
             "and its agents (id — what it does [capabilities]):\n"
             f"{catalogue or '- (none)'}\n\n"
-            "Respond ONLY with valid JSON, no markdown:\n"
+            "Respond ONLY with valid JSON, no markdown, fields in this order -- reason first, "
+            "then decide:\n"
             "{\n"
-            '  "intent": "action" or "query",\n'
-            '  "confidence": 0.0-1.0,\n'
-            '  "capability": one capability token from the catalogue, a new snake_case name for '
+            '  "reasoning": "one line: does the user want to be SHOWN something, TOLD something, '
+            'or neither -- and what carries it out",\n'
+            '  "answer_from_own_knowledge": true or false,\n'
+            '  "capability": an id or capability from the list above, a new snake_case name for '
             'a capability JARVIS would need but lacks, or "",\n'
+            '  "confidence": 0.0-1.0,\n'
             '  "provider": the web service named or implied, or "",\n'
             '  "search_query": the thing to search for or look up, or "",\n'
             '  "target_app": the application named, or "",\n'
             '  "requires_vision": true or false,\n'
-            '  "needs_screen": true or false,\n'
-            '  "reasoning": "one-line explanation"\n'
+            '  "needs_screen": true or false\n'
             "}\n\n"
             "Field meanings:\n"
-            '- intent "action": the user wants JARVIS to DO something or to go and find something '
-            'out. intent "query": you can answer it yourself from what you already know.\n'
-            "- capability: the capability (as listed above) of whatever carries the request out. "
-            "Empty only when you answer it yourself from what you already know; information "
-            "newer than your own knowledge is not something you know.\n"
+            "- SHOWN: the user will look at or use something put on their screen (a page, a "
+            "site's search results, a video, an app). TOLD: they want an answer reported back.\n"
+            "- answer_from_own_knowledge: true only when you can reply yourself, right now, from "
+            "what you already know (settled facts, arithmetic, explanations, conversation). "
+            "False when something must be shown, done, looked at or found out. Whatever depends "
+            "on the current state of the world (news, results, scores, weather, prices, anything "
+            "about today or this year) is NOT something you know: false.\n"
+            '- capability: "" when answer_from_own_knowledge is true. Otherwise the entry above '
+            "whose description does what the reasoning says.\n"
             "- requires_vision: the task needs seeing and operating the UI AFTER something is open "
             "(finding and clicking an item, filling a form). Opening something alone does not.\n"
             "- needs_screen: the ANSWER requires looking at the user's screen right now.\n"
-            "- If uncertain, prefer query (safe, non-destructive)."
+            "- Never choose to act on the desktop unless the user asked for something to be "
+            "shown or done."
         )
 
     @staticmethod
@@ -582,14 +590,22 @@ class IntentClassifier:
             result = parse_json_object(response.content)
             if result is None:
                 raise ValueError(f"no JSON object in {str(response.content)[:120]!r}")
-            capability = str(result.get("capability") or "").strip().lower()
-            # A capability names something an agent must DO; it outranks a
-            # contradicting intent label ("look up the news" came back
-            # intent=query with a research capability and was never researched).
-            intent = (
-                CommandIntent.ACTION
-                if result.get("intent") == "action" or capability
-                else CommandIntent.QUERY
+            # The Mind's intent is the decision, reasoned before it is stated;
+            # a capability only applies to an action. Letting a filled-in
+            # capability outrank the intent turned "what's 17 times 23"
+            # (reasoned "answer directly", intent query) into a web search.
+            # Stated as the decision itself: an "intent: query" label read as
+            # "is a question" ("who won the World Series this year" reasoned
+            # "requires finding out" and was labelled query anyway).
+            own = result.get("answer_from_own_knowledge")
+            if isinstance(own, str):
+                own = own.strip().lower() == "true"
+            if own is None:  # a reply in the older schema
+                own = result.get("intent") != "action"
+            intent = CommandIntent.QUERY if own else CommandIntent.ACTION
+            capability = (
+                str(result.get("capability") or "").strip().lower()
+                if intent == CommandIntent.ACTION else ""
             )
 
             logger.info(
