@@ -14,8 +14,17 @@ Each entry:
         "backend":       "local",
         "platforms":     ["darwin"],      # optional: sys.platform prefixes it runs on
         "requires":      ["playwright"],  # optional: importable packages it needs
-        "route":         ""               # set for JARVIS's own routes (no class)
+        "route":         "",              # set for JARVIS's own routes (no class)
+        "delivers":      "shown"          # what the USER gets: "shown" | "told" | ""
     }
+
+``delivers`` is the one fact the Mind decides a request on -- does the user
+want something SHOWN (put on their screen: a page, a site's results, an app)
+or TOLD (an answer reported back)? Each entry states which it gives, in the
+catalogue line, so the choice is made on that and not on a word the request
+and a capability name happen to share: "search for dogs on firefox" was
+reasoned "SHOWN ... in Firefox" and still routed to web_search_agent, whose
+capabilities include "search" and which can only report an answer back.
 
 A ``route`` entry is one of JARVIS's built-in ways of carrying out a request
 (``open``: open something for the user; ``look``: answer by looking at the
@@ -54,6 +63,7 @@ class AgentBinding:
     platforms: List[str] = field(default_factory=list)
     requires: List[str] = field(default_factory=list)
     route: str = ""
+    delivers: str = ""   # "shown" | "told" | "" (internal: neither)
 
     def unavailable_reason(self) -> str:
         """Why this binding cannot serve on this host, "" when it can."""
@@ -89,6 +99,7 @@ _DEFAULT_BINDINGS: List[Dict[str, Any]] = [
         "class_name": "",
         "agent_type": "route",
         "route": "open",
+        "delivers": "shown",
         "capabilities": ["open_for_user"],
     },
     {
@@ -97,6 +108,7 @@ _DEFAULT_BINDINGS: List[Dict[str, Any]] = [
         "class_name": "",
         "agent_type": "route",
         "route": "look",
+        "delivers": "told",
         "capabilities": ["look_at_screen"],
     },
     {
@@ -104,6 +116,7 @@ _DEFAULT_BINDINGS: List[Dict[str, Any]] = [
         "module": "backend.neural_mesh.agents.visual_browser_agent",
         "class_name": "VisualBrowserAgent",
         "agent_type": "vision",
+        "delivers": "shown",
         "capabilities": ["visual_browser", "web_browsing", "browser", "browse_and_interact"],
         "requires": ["playwright"],
     },
@@ -112,6 +125,7 @@ _DEFAULT_BINDINGS: List[Dict[str, Any]] = [
         "module": "backend.neural_mesh.agents.web_search_agent",
         "class_name": "WebSearchAgent",
         "agent_type": "intelligence",
+        "delivers": "told",
         "capabilities": ["web_search", "web_research", "read_web_page", "search"],
     },
     {
@@ -119,6 +133,7 @@ _DEFAULT_BINDINGS: List[Dict[str, Any]] = [
         "module": "backend.neural_mesh.agents.native_app_control_agent",
         "class_name": "NativeAppControlAgent",
         "agent_type": "control",
+        "delivers": "shown",
         "capabilities": ["native_app_control", "interact_with_app", "app_control", "open_app"],
         "platforms": ["darwin"],   # drives apps through osascript
     },
@@ -127,6 +142,7 @@ _DEFAULT_BINDINGS: List[Dict[str, Any]] = [
         "module": "backend.neural_mesh.agents.google_workspace_agent",
         "class_name": "GoogleWorkspaceAgent",
         "agent_type": "workspace",
+        "delivers": "told",
         "capabilities": ["handle_workspace_query", "read_email", "check_calendar",
                          "send_email", "create_event", "email", "calendar"],
         "requires": ["googleapiclient", "google_auth_oauthlib"],
@@ -270,6 +286,7 @@ def load_bindings() -> Dict[str, AgentBinding]:
                 platforms=list(entry.get("platforms", [])),
                 requires=list(entry.get("requires", [])),
                 route=entry.get("route", ""),
+                delivers=str(entry.get("delivers", "") or "").strip().lower(),
             )
         except KeyError as exc:
             logger.warning("[AgentBindings] Skipping %s: missing field %s", aid, exc)
@@ -325,6 +342,12 @@ def route_for_capability(capability: str) -> str:
 
 _catalogue: Optional[str] = None
 
+# How a delivery reads in the catalogue: the words the classifier reasons in.
+_DELIVERY_PHRASE = {
+    "shown": "SHOWN: puts it on the user's screen",
+    "told": "TOLD: reports an answer back, shows nothing",
+}
+
 
 def capability_catalogue() -> str:
     """What each dispatchable agent does, for the Mind to choose from.
@@ -348,7 +371,9 @@ def capability_catalogue() -> str:
             except Exception as exc:  # noqa: BLE001 -- unimportable = undispatchable
                 logger.debug("[AgentBindings] %s not offered: %s", agent_id, exc)
                 continue
-            lines.append(f"- {agent_id} — {summary} [{', '.join(sorted(binding.capabilities))}]")
+            gives = _DELIVERY_PHRASE.get(binding.delivers, "")
+            lines.append(f"- {agent_id} — {summary} [{', '.join(sorted(binding.capabilities))}]"
+                         + (f" -> {gives}" if gives else ""))
         _catalogue = "\n".join(lines)
     return _catalogue
 

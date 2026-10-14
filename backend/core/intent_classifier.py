@@ -529,7 +529,9 @@ class IntentClassifier:
             "on the current state of the world (news, results, scores, weather, prices, anything "
             "about today or this year) is NOT something you know: false.\n"
             '- capability: "" when answer_from_own_knowledge is true. Otherwise the entry above '
-            "whose description does what the reasoning says.\n"
+            "that gives the user what the reasoning decided (an entry marked SHOWN for SHOWN, "
+            "TOLD for TOLD) and whose description does it. A word the command shares with a "
+            "capability name is not a reason to choose it.\n"
             "- requires_vision: the task needs seeing and operating the UI AFTER something is open "
             "(finding and clicking an item, filling a form). Opening something alone does not.\n"
             "- needs_screen: the ANSWER requires looking at the user's screen right now.\n"

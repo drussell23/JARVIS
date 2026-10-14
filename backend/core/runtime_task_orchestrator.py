@@ -1171,7 +1171,14 @@ class RuntimeTaskOrchestrator:
 
         opened = None
         if decision.get("open") == "url":
-            opened = await open_url(decision["url"], browser=preferred_browser())
+            # In the browser the user named ("... on firefox"), else the
+            # preferred one. open_url resolves the name against the browsers
+            # the OS has registered and falls back to the default when the
+            # named app is not a browser. The named app used to be dropped:
+            # every URL opened in the default browser.
+            opened = await open_url(
+                decision["url"], browser=step.get("target_app") or preferred_browser(),
+            )
         elif decision.get("open") == "app":
             opened = await open_app(decision["app"])
         if opened is not None:
