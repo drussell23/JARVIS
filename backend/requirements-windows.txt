@@ -49,3 +49,8 @@ anthropic
 
 # Clipboard for the computer-use loop's typing (Win32 API on Windows).
 pyperclip
+
+# File watching: FileWatchGuard and the Trinity bridge's event watcher. Without
+# it the Trinity bridge never started (/health: trinity_bridge error, overall
+# "degraded"). Same pin as requirements.txt and requirements-brain.txt.
+watchdog==6.0.0

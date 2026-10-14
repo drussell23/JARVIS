@@ -80,6 +80,13 @@ try:
 except ImportError:
     WATCHDOG_AVAILABLE = False
     Observer = None
+    # The module must still load: without watchdog it polls instead
+    # (_start_fallback_watchers), and AsyncEventHandler -- defined below on
+    # this base -- is only instantiated when WATCHDOG_AVAILABLE. Undefined
+    # here, the class definition raised NameError at import, the bridge
+    # never loaded, and /health reported trinity_bridge "error".
+    FileSystemEventHandler = object  # type: ignore[assignment,misc]
+    FileCreatedEvent = Any  # type: ignore[assignment,misc]
 
 logger = logging.getLogger("TrinityBridgeAdapter")
 

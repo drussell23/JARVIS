@@ -2812,6 +2812,24 @@ async def parallel_lifespan(app: FastAPI):
                 logger.warning("[HUD] Governance boot failed (CU still operational): %s", exc)
                 app.state.hud_gov_ctx = None
 
+        # The progress bridge belongs to startup. It was attached after the
+        # yield above -- the shutdown half of this lifespan -- so it was
+        # attached only as JARVIS shut down, and /health reported
+        # supervisor_progress uninitialized (overall "degraded") for the
+        # whole run.
+        # =================================================================
+        # SUPERVISOR COORDINATION: Attach progress bridge for /health/startup
+        # =================================================================
+        try:
+            from core.supervisor.supervisor_integration import get_progress_bridge
+            bridge = get_progress_bridge()
+            bridge.attach_app(app)
+            logger.info("📊 Progress bridge attached for supervisor coordination")
+        except ImportError:
+            logger.debug("Supervisor integration not available")
+        except Exception as e:
+            logger.debug(f"Could not attach progress bridge: {e}")
+
         yield
 
         # ── SHUTDOWN BEGINS HERE (this is the LIVE lifespan) ─────────────
@@ -2880,18 +2898,6 @@ async def parallel_lifespan(app: FastAPI):
         # Start deferred tasks without awaiting
         create_safe_task(run_deferred_tasks())
         
-        # =================================================================
-        # SUPERVISOR COORDINATION: Attach progress bridge for /health/startup
-        # =================================================================
-        try:
-            from core.supervisor.supervisor_integration import get_progress_bridge
-            bridge = get_progress_bridge()
-            bridge.attach_app(app)
-            logger.info("📊 Progress bridge attached for supervisor coordination")
-        except ImportError:
-            logger.debug("Supervisor integration not available")
-        except Exception as e:
-            logger.debug(f"Could not attach progress bridge: {e}")
         
     finally:
         # Shutdown
