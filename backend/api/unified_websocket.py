@@ -3253,36 +3253,11 @@ async def local_stream_token(request: Request):
     return build_stream_token_response(payload)
 
 
-@router.post("/api/command")
-async def local_command(request: Request):
-    """Local-first command endpoint (Swift CommandSender contract). Bridges
-    to the EXISTING es.handle_post_command — no duplicate command logic.
-    Loopback only."""
-    from fastapi.responses import JSONResponse
-    from backend.api.hud_local_bridge import (
-        is_loopback_host, translate_hud_command, shape_command_response,
-        broadcast_command_response,
-    )
-    host = request.client.host if request.client else ""
-    if not is_loopback_host(host):
-        return JSONResponse({"error": "loopback_only"}, status_code=403)
-    from backend.core.event_stream import (
-        get_event_stream, set_event_stream_ws_manager,
-    )
-    es = get_event_stream()
-    if es._ws_manager is None:
-        set_event_stream_ws_manager(get_ws_manager())
-    try:
-        payload = await request.json()
-    except Exception:
-        return {"status": "error", "success": False, "error": "invalid_json"}
-    frame = translate_hud_command(payload)
-    command_id = frame.get("command_id")
-    response = await es.handle_post_command(frame)
-    # Stream the answer back over SSE (token + complete) so the HUD speaks
-    # it — the POST only acknowledges; the response rides the event channel.
-    await broadcast_command_response(es, command_id, response)
-    return shape_command_response(response, command_id)
+# POST /api/command has ONE owner: backend/main.py::process_command. It reads
+# the HUD wire contract ("text" or "command"), stays loopback-only, returns
+# the answer in the body (web UI) AND streams it over the event channel with
+# the status/command_id acknowledgement (Swift HUD). This module's copy was
+# registered second and never served a request.
 
 
 # ============================================================================

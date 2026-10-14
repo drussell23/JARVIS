@@ -9467,10 +9467,43 @@ def mount_routers():
 # Note: Startup tasks are now handled in the lifespan handler above
 
 
-# Simple command endpoint for testing
+async def _acknowledge_and_broadcast(result: "Any", command_id: Optional[str]) -> "Any":
+    """Complete one /api/command answer for every client of the contract.
+
+    The web UI reads the answer from this body; the Swift HUD reads
+    ``status`` + ``command_id`` here and the answer from the event stream.
+    Both used to have their own route (this one won, the HUD's was
+    shadowed). One route now does both. NEVER raises.
+    """
+    try:
+        from backend.api.hud_local_bridge import broadcast_command_response, shape_command_response
+        from backend.core.event_stream import get_event_stream
+
+        await broadcast_command_response(get_event_stream(), command_id, result)
+        if isinstance(result, dict):
+            ack = shape_command_response(result, command_id)
+            result = {**ack, **result, "command_id": command_id}
+    except Exception as e:  # noqa: BLE001 -- the answer itself must still return
+        logger.debug(f"/api/command broadcast skipped: {e}")
+    return result
+
+
+def _command_api_allows(http_request: Request) -> bool:
+    """The command route drives the desktop; it is loopback-only (the HUD
+    bridge's rule) unless JARVIS_COMMAND_API_ALLOW_REMOTE is set."""
+    if os.environ.get("JARVIS_COMMAND_API_ALLOW_REMOTE", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    from backend.api.hud_local_bridge import is_loopback_host
+    return is_loopback_host(http_request.client.host if http_request.client else "")
+
+
+# The one command endpoint (web UI REST path + Swift HUD contract).
 @app.post("/api/command")
-async def process_command(request: dict):
-    """Simple command endpoint for testing"""
+async def process_command(request: dict, http_request: Request):
+    """Run one command: answer in the body, and over the event stream."""
+    if not _command_api_allows(http_request):
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": "loopback_only"}, status_code=403)
     if not isinstance(request, dict):
         logger.warning(
             f"Command endpoint received non-object payload: {type(request).__name__}"
@@ -9535,10 +9568,12 @@ async def process_command(request: dict):
         else:
             # Use standard processor
             result = await processor.process_command(command, request_id=request_id)
-        return result
+        return await _acknowledge_and_broadcast(result, request_id)
     except Exception as e:
         logger.error(f"Command processing error: {e}")
-        return {"error": str(e), "command": command}
+        return await _acknowledge_and_broadcast(
+            {"success": False, "error": str(e), "command": command}, request_id,
+        )
 
 
 # Basic test endpoint

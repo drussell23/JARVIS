@@ -3253,6 +3253,16 @@ def _get_env_int(key: str, default: int) -> int:
     except (ValueError, TypeError):
         return default
 
+def _resolve_tool(name: str) -> str:
+    """Executable path for a command-line tool, as the platform resolves it.
+
+    create_subprocess_exec does not consult PATHEXT: on Windows ``npm`` is
+    ``npm.cmd``, so exec("npm") failed with WinError 2 and the frontend never
+    started. shutil.which applies PATHEXT; elsewhere it returns the same tool.
+    """
+    return shutil.which(name) or name
+
+
 def _get_env_float(key: str, default: float) -> float:
     """Get float from environment variable."""
     try:
@@ -56447,7 +56457,7 @@ class HotReloadWatcher:
         try:
             # Run npm run build in frontend directory
             process = await asyncio.create_subprocess_exec(
-                "npm", "run", "build",
+                _resolve_tool("npm"), "run", "build",
                 cwd=str(self.frontend_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -87362,7 +87372,7 @@ class JarvisSystemKernel:
             if not node_modules.exists():
                 self.logger.info("[Frontend] Installing dependencies (first run)...")
                 npm_install = await asyncio.create_subprocess_exec(
-                    "npm", "install",
+                    _resolve_tool("npm"), "install",
                     cwd=str(frontend_dir),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -87383,6 +87393,11 @@ class JarvisSystemKernel:
             env["PORT"] = str(frontend_port)
             env["BROWSER"] = "none"  # Don't auto-open browser
             env["REACT_APP_BACKEND_URL"] = f"http://localhost:{self.config.backend_port}"
+            # The UI reads these (frontend/src/config.js, App.js, ...), not
+            # REACT_APP_BACKEND_URL; without them it assumes 8010 and misses a
+            # backend the port manager placed elsewhere.
+            env["REACT_APP_BACKEND_PORT"] = str(self.config.backend_port)
+            env["REACT_APP_API_URL"] = f"http://localhost:{self.config.backend_port}"
             
             # v211.0: DO NOT set CI=true - it causes React dev server issues
             # CI mode is for build processes, not the development server
@@ -87414,7 +87429,7 @@ class JarvisSystemKernel:
             # - Use file descriptor directly for more reliable output handling
             if self._frontend_log_fd is not None:
                 self._frontend_process = await asyncio.create_subprocess_exec(
-                    "npm", "start",
+                    _resolve_tool("npm"), "start",
                     cwd=str(frontend_dir),
                     env=env,
                     stdout=self._frontend_log_fd,
@@ -87424,7 +87439,7 @@ class JarvisSystemKernel:
             else:
                 # Fallback: use DEVNULL to prevent blocking (lose output but process won't hang)
                 self._frontend_process = await asyncio.create_subprocess_exec(
-                    "npm", "start",
+                    _resolve_tool("npm"), "start",
                     cwd=str(frontend_dir),
                     env=env,
                     stdout=asyncio.subprocess.DEVNULL,
@@ -92650,7 +92665,7 @@ class JarvisSystemKernel:
             self.logger.info("[WSRouter] Installing npm dependencies...")
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    "npm", "install",
+                    _resolve_tool("npm"), "install",
                     cwd=str(ws_dir),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -92670,7 +92685,7 @@ class JarvisSystemKernel:
         # Step 2: Build TypeScript
         try:
             proc = await asyncio.create_subprocess_exec(
-                "npm", "run", "build",
+                _resolve_tool("npm"), "run", "build",
                 cwd=str(ws_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -92731,7 +92746,7 @@ class JarvisSystemKernel:
 
         try:
             process = await asyncio.create_subprocess_exec(
-                "npm", "start",
+                _resolve_tool("npm"), "start",
                 cwd=str(ws_dir),
                 stdout=log_file,
                 stderr=asyncio.subprocess.STDOUT,
@@ -93729,7 +93744,7 @@ class JarvisSystemKernel:
             if ws_dir.exists():
                 try:
                     proc = await asyncio.create_subprocess_exec(
-                        "npm", "run", "build",
+                        _resolve_tool("npm"), "run", "build",
                         cwd=str(ws_dir),
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
@@ -98096,6 +98111,38 @@ def create_heartbeat_projection(
     return HeartbeatProjection(stale_timeout_s=stale_timeout_s)
 
 
+class _BoundedShutdownExecutor(ThreadPoolExecutor):
+    """The loop's default executor, with a teardown that cannot hang.
+
+    asyncio.run() ends by joining every default-executor thread with no
+    timeout (3.11). One worker blocked in a sync call (an audio play, a
+    socket read, a subprocess wait) held a clean --shutdown at that join
+    until the launcher killed the kernel 90 s later. Here shutdown cancels
+    queued work, gives running threads JARVIS_SHUTDOWN_EXECUTOR_GRACE_S, and
+    returns; main()'s guaranteed-exit path disposes of any thread still alive.
+    """
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        super().shutdown(wait=False, cancel_futures=True if wait else cancel_futures)
+        if not wait:
+            return
+        grace = _get_env_float("JARVIS_SHUTDOWN_EXECUTOR_GRACE_S", 10.0)
+        deadline = time.monotonic() + grace
+        for t in list(getattr(self, "_threads", ())):
+            t.join(max(0.0, deadline - time.monotonic()))
+        stuck = [t.name for t in getattr(self, "_threads", ()) if t.is_alive()]
+        if stuck:
+            print(f"[Kernel] {len(stuck)} executor thread(s) still busy after {grace:.0f}s "
+                  f"teardown grace; not waiting: {stuck[:5]}")
+
+
+async def _run_kernel_with_bounded_teardown(args: argparse.Namespace) -> int:
+    asyncio.get_running_loop().set_default_executor(
+        _BoundedShutdownExecutor(thread_name_prefix="jarvis-default")
+    )
+    return await async_main(args)
+
+
 def main() -> int:
     """
     Main entry point for JARVIS Unified System Kernel.
@@ -98208,7 +98255,7 @@ def main() -> int:
     # Run async main
     exit_code = 1  # Default to failure
     try:
-        exit_code = asyncio.run(async_main(args))
+        exit_code = asyncio.run(_run_kernel_with_bounded_teardown(args))
     except KeyboardInterrupt:
         print("\n[Kernel] Interrupted by user")
         exit_code = 130  # 128 + SIGINT(2)
