@@ -41,7 +41,7 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 from urllib.parse import urlparse
 
 logger = logging.getLogger("Ouroboros.TrinitySiblings")
@@ -150,6 +150,35 @@ def serving_siblings(probe: Callable[[str, float], bool] = _answers) -> List[str
         if base and probe(base + sib.probe_path, timeout):
             urls.append(base)
     return urls
+
+
+def serving_sibling_pids(probe: Callable[[str, float], bool] = _answers) -> Set[int]:
+    """PIDs every cleanup must spare: each serving sibling's listener and its
+    descendants (J-Prime's llama-server engines).
+
+    Boot has two process sweeps (takeover orphans, heuristic zombies); both
+    pattern-match ``jarvis.*prime`` and both killed a serving J-Prime with its
+    loaded model. One answer, consulted by both.
+    """
+    import psutil
+
+    ports = {urlparse(u).port for u in serving_siblings(probe)} - {None}
+    if not ports:
+        return set()
+    pids: Set[int] = set()
+    try:
+        for conn in psutil.net_connections(kind="inet"):
+            if conn.status == psutil.CONN_LISTEN and conn.pid and conn.laddr \
+                    and conn.laddr.port in ports:
+                pids.add(conn.pid)
+    except (psutil.Error, OSError) as exc:
+        logger.debug("[TrinitySiblings] listener scan failed: %s", exc)
+    for pid in list(pids):
+        try:
+            pids.update(child.pid for child in psutil.Process(pid).children(recursive=True))
+        except psutil.Error:
+            pass
+    return pids
 
 
 def _template_values(base_url: str) -> Dict[str, str]:

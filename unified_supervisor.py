@@ -6407,7 +6407,7 @@ class IntelligentKernelTakeover:
         # A sibling that is serving is adopted by this boot (trinity_siblings
         # .ensure_sibling), not orphaned: killing it discarded a loaded model
         # only for the same boot to start it again a minute later.
-        adopted = await self._serving_sibling_pids()
+        adopted = await _serving_sibling_pids()
         orphans = [o for o in orphans if o.pid not in adopted]
 
         for orphan in orphans:
@@ -6445,29 +6445,6 @@ class IntelligentKernelTakeover:
             )
         except (asyncio.TimeoutError, Exception):
             return None
-
-    async def _serving_sibling_pids(self) -> Set[int]:
-        """PIDs of serving Trinity siblings: each listener and its descendants."""
-        from urllib.parse import urlparse
-        try:
-            from backend.core.ouroboros.governance.trinity_siblings import serving_siblings
-            import psutil
-            urls = await asyncio.to_thread(serving_siblings)
-        except Exception as e:
-            self.logger.debug(f"[Takeover] sibling probe unavailable: {e}")
-            return set()
-        pids: Set[int] = set()
-        for url in urls:
-            port = urlparse(url).port
-            pid = await self._find_process_on_port(port) if port else None
-            if not pid:
-                continue
-            pids.add(pid)
-            try:
-                pids.update(c.pid for c in psutil.Process(pid).children(recursive=True))
-            except Exception:
-                pass
-        return pids
 
     def _detect_repo_origin(self, cmdline: str) -> str:
         """Detect which repo a process belongs to based on command line."""
@@ -55819,6 +55796,9 @@ class ComprehensiveZombieCleanup:
         try:
             from backend.core.process_identity import owned_by_trinity
             zombies = {pid: info for pid, info in zombies.items() if owned_by_trinity(pid)}
+            # A serving sibling is adopted by this boot, not a zombie.
+            adopted = await _serving_sibling_pids()
+            zombies = {pid: info for pid, info in zombies.items() if pid not in adopted}
         except ImportError:
             pass
         if not zombies:
@@ -62522,6 +62502,17 @@ class _ProgressBroadcastWorker(threading.Thread):
             except Exception:
                 pass
             self._conn = None
+
+
+async def _serving_sibling_pids() -> Set[int]:
+    """PIDs of serving Trinity siblings (and their engines): never orphans or
+    zombies -- this boot adopts them (trinity_siblings.serving_sibling_pids)."""
+    try:
+        from backend.core.ouroboros.governance.trinity_siblings import serving_sibling_pids
+        return await asyncio.to_thread(serving_sibling_pids)
+    except Exception as e:  # noqa: BLE001 -- no answer spares nothing extra
+        logging.getLogger(__name__).debug(f"[Kernel] sibling probe unavailable: {e}")
+        return set()
 
 
 class JarvisSystemKernel:

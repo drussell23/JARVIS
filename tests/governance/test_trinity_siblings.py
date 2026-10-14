@@ -133,3 +133,18 @@ def test_serving_siblings_names_only_the_ones_that_answer():
 
     assert ts.serving_siblings(probe=probe) == ["http://127.0.0.1:8000"]
     assert any(u.endswith("/api/version") for u in answered)
+
+
+def test_serving_sibling_pids_spares_the_listener_and_its_engines(monkeypatch):
+    """Both boot sweeps (takeover orphans, heuristic zombies) consult this."""
+    import psutil
+    from types import SimpleNamespace as NS
+
+    listen = NS(status=psutil.CONN_LISTEN, pid=100, laddr=NS(port=8000))
+    other = NS(status=psutil.CONN_LISTEN, pid=200, laddr=NS(port=9999))
+    monkeypatch.setattr(psutil, "net_connections", lambda kind: [listen, other])
+    monkeypatch.setattr(psutil, "Process",
+                        lambda pid: NS(children=lambda recursive: [NS(pid=101), NS(pid=102)]))
+    probe = lambda url, timeout: url.startswith("http://127.0.0.1:8000")
+    assert ts.serving_sibling_pids(probe=probe) == {100, 101, 102}
+    assert ts.serving_sibling_pids(probe=lambda u, t: False) == set()
