@@ -29,6 +29,79 @@
 }
 
 /* =========================================================================
+   Minimize control and minimized pill
+   ========================================================================= */
+.microphone-permission-helper {
+  position: relative;
+}
+
+.mic-helper-minimize {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  width: 28px;
+  height: 28px;
+  border: 1px solid rgba(0, 212, 255, 0.4);
+  border-radius: 6px;
+  background: transparent;
+  color: #00d4ff;
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.mic-helper-minimize:hover,
+.mic-helper-minimize:focus-visible {
+  border-color: #00d4ff;
+  box-shadow: 0 0 10px rgba(0, 212, 255, 0.3);
+}
+
+.microphone-permission-helper.minimized {
+  padding: 0;
+  margin: 12px auto;
+  border: none;
+  background: none;
+  box-shadow: none;
+  display: flex;
+  justify-content: center;
+}
+
+.mic-helper-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 6px 14px;
+  background: rgba(0, 0, 0, 0.85);
+  border: 1px solid rgba(0, 212, 255, 0.35);
+  border-radius: 20px;
+  color: #cfefff;
+  font-family: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.mic-helper-pill:hover,
+.mic-helper-pill:focus-visible {
+  border-color: #00d4ff;
+  box-shadow: 0 0 12px rgba(0, 212, 255, 0.25);
+}
+
+.mic-helper-pill-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mic-helper-pill-action {
+  color: #00d4ff;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* =========================================================================
    Status States
    ========================================================================= */
 .status-checking,

@@ -3666,20 +3666,22 @@ class JARVISLearningDatabase:
             from intelligence.hybrid_database_sync import HybridDatabaseSync
             import json
 
-            # Load CloudSQL config
+            # Load CloudSQL config, from where this host declares it (the shared
+            # answer); a host that declares none syncs nothing, by design.
             # v124.0: Wrap file I/O in asyncio.to_thread to prevent blocking event loop
-            config_path = Path.home() / ".jarvis" / "gcp" / "database_config.json"
+            from intelligence.cloud_sql_connection_manager import database_config_path
 
             def _load_gcp_config_sync():
                 """Sync file I/O - runs in thread pool."""
-                if not config_path.exists():
+                config_path = database_config_path()
+                if config_path is None:
                     return None
                 with open(config_path, 'r') as f:
                     return json.load(f)
 
             gcp_config = await asyncio.to_thread(_load_gcp_config_sync)
             if gcp_config is None:
-                logger.warning("⚠️  CloudSQL config not found - hybrid sync disabled")
+                logger.info("Cloud SQL is not configured on this host — hybrid sync off, SQLite only")
                 self._sync_enabled = False
                 return
 

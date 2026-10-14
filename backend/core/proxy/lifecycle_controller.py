@@ -139,13 +139,20 @@ class ProxyConfig:
         """Build the Cloud SQL connection string."""
         if cls.GCP_PROJECT and cls.GCP_INSTANCE:
             return f"{cls.GCP_PROJECT}:{cls.GCP_REGION}:{cls.GCP_INSTANCE}"
-        # Try loading from database config
-        config_path = cls.STATE_DIR / "gcp" / "database_config.json"
-        if config_path.exists():
+        # Try loading from database config, where this host declares it
+        try:
+            from intelligence.cloud_sql_connection_manager import database_config_path
+        except ImportError:
+            from backend.intelligence.cloud_sql_connection_manager import database_config_path
+        config_path = database_config_path()
+        if config_path is not None:
             try:
                 with open(config_path) as f:
                     config = json.load(f)
-                return config.get("connection_name", "")
+                # The file nests it under "cloud_sql", as every other reader
+                # of it expects; the top level is the older shape.
+                return (config.get("cloud_sql") or {}).get("connection_name") \
+                    or config.get("connection_name", "")
             except (json.JSONDecodeError, OSError):
                 pass
         return ""

@@ -846,11 +846,15 @@ class ReadinessTimeoutError(Exception):
 # Configuration Discovery (Edge Cases #9, #10, #24, #25)
 # -----------------------------------------------------------------------------
 
-def _discover_database_config_path() -> Optional[Path]:
+def database_config_path() -> Optional[Path]:
     """
-    Discover database_config.json path using same paths as CloudSQLProxyManager.
+    Where this host declares its Cloud SQL database (database_config.json),
+    or None when it declares none -- then Cloud SQL is not part of this
+    deployment and SQLite is the learning store by design, not by failure.
 
-    Edge Case #9: Reuses exact same search paths as proxy manager.
+    The one answer to "is Cloud SQL configured here?": the proxy manager, the
+    database adapter, the Learning DB and the supervisor each searched for
+    the file themselves (some in one place only) and each warned on its own.
 
     Returns:
         Path to config file, or None if not found.
@@ -1097,7 +1101,7 @@ class IntelligentCredentialResolver:
         """
         try:
             # Load base config from file
-            config_path = _discover_database_config_path()
+            config_path = database_config_path()
             if not config_path:
                 logger.debug("[CredentialResolver v114.0] No database_config.json found")
                 # Try to build config from environment only
@@ -2023,7 +2027,7 @@ class IntelligentCredentialResolver:
             }
 
         # 5. Config file
-        config_path = _discover_database_config_path()
+        config_path = database_config_path()
         if config_path:
             try:
                 with open(config_path) as f:

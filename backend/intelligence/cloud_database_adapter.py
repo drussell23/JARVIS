@@ -410,8 +410,12 @@ class DatabaseConfig:
 
     def _load_from_config(self):
         """Load config from JSON file"""
-        config_path = Path.home() / ".jarvis" / "gcp" / "database_config.json"
-        if config_path.exists():
+        try:
+            from intelligence.cloud_sql_connection_manager import database_config_path
+        except ImportError:
+            from backend.intelligence.cloud_sql_connection_manager import database_config_path
+        config_path = database_config_path()
+        if config_path is not None:
             self._config_file_exists = True
             try:
                 with open(config_path, "r") as f:

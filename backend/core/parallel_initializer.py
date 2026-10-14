@@ -2924,6 +2924,7 @@ class ParallelInitializer:
 
             from intelligence.cloud_sql_proxy_manager import get_proxy_manager
             from intelligence.cloud_sql_connection_manager import (
+                database_config_path,
                 get_connection_manager,
                 get_readiness_gate,
                 ReadinessState
@@ -2932,6 +2933,15 @@ class ParallelInitializer:
             # Get connection manager and readiness gate
             conn_mgr = get_connection_manager()
             readiness_gate = get_readiness_gate()
+
+            # A host that declares no Cloud SQL database uses SQLite by design.
+            # Said once, here, and recorded on the gate every later phase
+            # consults -- not discovered as a "failure" by each in turn.
+            if await asyncio.to_thread(database_config_path) is None:
+                conn_mgr.set_proxy_ready(False)
+                readiness_gate.mark_degraded_sqlite()
+                logger.info("   Cloud SQL is not configured on this host — SQLite is the learning store")
+                return
 
             # Signal we're in startup mode (suppress connection errors during startup)
             conn_mgr.set_proxy_ready(False)

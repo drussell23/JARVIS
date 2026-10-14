@@ -12,7 +12,46 @@ import configService from '../services/DynamicConfigService';
  * - Intelligent error recovery
  * - Live device enumeration display
  * - macOS System Settings guidance
+ * - Minimizable to a one-line pill, remembered per problem state
  */
+
+// One label per problem state: the panel's heading and its minimized pill.
+const STATUS_SUMMARY = {
+  prompt: { icon: '🎤', title: 'Microphone Permission Required' },
+  denied: { icon: '❌', title: 'Microphone Access Denied' },
+  'no-device': { icon: '🎤', title: 'No Microphone Found' },
+  'device-busy': { icon: '🔒', title: 'Microphone In Use' },
+  'security-error': { icon: '🔐', title: 'Security Error' },
+  unsupported: { icon: '❌', title: 'Browser Not Supported' },
+  error: { icon: '⚠️', title: 'Error Accessing Microphone' },
+};
+
+// The problem state the user minimized the panel for. Kept per state, not as
+// a flag: a different problem carries new information and opens expanded.
+// Browser storage can be unavailable (private window, blocked site data);
+// the panel then simply starts expanded.
+const MINIMIZED_KEY = 'jarvis.microphoneHelper.minimizedFor';
+
+const readMinimizedFor = () => {
+  try {
+    return window.localStorage.getItem(MINIMIZED_KEY);
+  } catch {
+    return null;
+  }
+};
+
+const writeMinimizedFor = (status) => {
+  try {
+    if (status) {
+      window.localStorage.setItem(MINIMIZED_KEY, status);
+    } else {
+      window.localStorage.removeItem(MINIMIZED_KEY);
+    }
+  } catch {
+    // Not remembered across reloads; this session still honours it.
+  }
+};
+
 const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
   // =========================================================================
   // State
@@ -27,6 +66,17 @@ const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
   // over Remote Desktop the microphone is the CLIENT's, so "no microphone"
   // means the client is not redirecting one.
   const [hostSession, setHostSession] = useState(null);
+  const [minimizedFor, setMinimizedFor] = useState(readMinimizedFor);
+
+  const minimize = useCallback(() => {
+    setMinimizedFor(permissionStatus);
+    writeMinimizedFor(permissionStatus);
+  }, [permissionStatus]);
+
+  const expand = useCallback(() => {
+    setMinimizedFor(null);
+    writeMinimizedFor(null);
+  }, []);
 
   // Track if we've already notified parent of permission grant
   const hasNotifiedParent = useRef(false);
@@ -46,6 +96,8 @@ const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
 
         if (event === 'granted') {
           setPermissionStatus('granted');
+          // Solved: a later problem is news again, shown in full.
+          writeMinimizedFor(null);
           notifyParent();
         } else if (event === 'denied') {
           setPermissionStatus('denied');
@@ -373,11 +425,44 @@ const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
     return null;
   }
 
+  const summary = STATUS_SUMMARY[permissionStatus];
+
+  // =========================================================================
+  // Minimized Render - one line; click to see the full help again
+  // =========================================================================
+  if (summary && minimizedFor === permissionStatus) {
+    return (
+      <div className="microphone-permission-helper minimized">
+        <button
+          type="button"
+          className="mic-helper-pill"
+          onClick={expand}
+          title="Show microphone help"
+        >
+          <span className="mic-helper-pill-icon">{summary.icon}</span>
+          <span className="mic-helper-pill-title">{summary.title}</span>
+          <span className="mic-helper-pill-action">Details</span>
+        </button>
+      </div>
+    );
+  }
+
   // =========================================================================
   // Main Render
   // =========================================================================
   return (
     <div className="microphone-permission-helper">
+      {summary && (
+        <button
+          type="button"
+          className="mic-helper-minimize"
+          onClick={minimize}
+          title="Minimize"
+          aria-label="Minimize microphone help"
+        >
+          –
+        </button>
+      )}
       <div className="permission-status">
 
         {/* Checking State */}
@@ -391,8 +476,8 @@ const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
         {/* Prompt State - Ready to Request */}
         {permissionStatus === 'prompt' && (
           <div className="status-prompt">
-            <div className="icon">🎤</div>
-            <h3>Microphone Permission Required</h3>
+            <div className="icon">{summary.icon}</div>
+            <h3>{summary.title}</h3>
             <p>JARVIS needs microphone access for voice commands.</p>
             <button
               onClick={requestMicrophoneAccess}
@@ -412,8 +497,8 @@ const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
         {/* Denied State */}
         {permissionStatus === 'denied' && (
           <div className="status-denied">
-            <div className="icon error">❌</div>
-            <h3>Microphone Access Denied</h3>
+            <div className="icon error">{summary.icon}</div>
+            <h3>{summary.title}</h3>
             <p>Permission was blocked. Please enable microphone access to use voice commands.</p>
 
             {renderPlatformHelp()}
@@ -449,8 +534,8 @@ const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
         {/* No Device State */}
         {permissionStatus === 'no-device' && (
           <div className="status-no-device">
-            <div className="icon warning">🎤</div>
-            <h3>No Microphone Found</h3>
+            <div className="icon warning">{summary.icon}</div>
+            <h3>{summary.title}</h3>
             <p>No microphone device was detected on your system.</p>
 
             <div className="device-info">
@@ -500,8 +585,8 @@ const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
         {/* Device Busy State */}
         {permissionStatus === 'device-busy' && (
           <div className="status-device-busy">
-            <div className="icon warning">🔒</div>
-            <h3>Microphone In Use</h3>
+            <div className="icon warning">{summary.icon}</div>
+            <h3>{summary.title}</h3>
             <p>Your microphone is being used by another application.</p>
 
             <div className="suggestions">
@@ -527,8 +612,8 @@ const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
         {/* Security Error State */}
         {permissionStatus === 'security-error' && (
           <div className="status-security-error">
-            <div className="icon error">🔐</div>
-            <h3>Security Error</h3>
+            <div className="icon error">{summary.icon}</div>
+            <h3>{summary.title}</h3>
             <p>Microphone access requires a secure connection (HTTPS).</p>
 
             {!deviceStatus?.isSecureContext && (
@@ -555,8 +640,8 @@ const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
         {/* Unsupported Browser State */}
         {permissionStatus === 'unsupported' && (
           <div className="status-unsupported">
-            <div className="icon error">❌</div>
-            <h3>Browser Not Supported</h3>
+            <div className="icon error">{summary.icon}</div>
+            <h3>{summary.title}</h3>
             <p>Your browser doesn't support microphone access.</p>
             <p>Please use a modern browser:</p>
             <ul className="browser-list">
@@ -571,8 +656,8 @@ const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
         {/* Generic Error State */}
         {permissionStatus === 'error' && (
           <div className="status-error">
-            <div className="icon error">⚠️</div>
-            <h3>Error Accessing Microphone</h3>
+            <div className="icon error">{summary.icon}</div>
+            <h3>{summary.title}</h3>
             <p>Something went wrong while trying to access the microphone.</p>
 
             {lastError && (

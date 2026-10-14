@@ -403,18 +403,15 @@ class CloudSQLProxyManager:
         2. $JARVIS_HOME/gcp/database_config.json
         3. ./database_config.json
         """
-        search_paths = [
-            Path.home() / ".jarvis" / "gcp" / "database_config.json",
-            Path(os.getenv("JARVIS_HOME", ".")) / "gcp" / "database_config.json",
-            Path("database_config.json"),
-        ]
-
-        for path in search_paths:
-            if path.exists():
-                logger.info(f"📂 Found database config: {path}")
-                return path
-
-        raise FileNotFoundError(f"Could not find database_config.json in any of: {search_paths}")
+        try:
+            from intelligence.cloud_sql_connection_manager import database_config_path
+        except ImportError:
+            from backend.intelligence.cloud_sql_connection_manager import database_config_path
+        path = database_config_path()
+        if path is None:
+            raise FileNotFoundError("Cloud SQL is not configured on this host (no database_config.json)")
+        logger.info(f"📂 Found database config: {path}")
+        return path
 
     def _load_config(self) -> Dict:
         """Load and validate database configuration."""

@@ -92583,17 +92583,30 @@ class JarvisSystemKernel:
         except Exception as _gate_pre_err:
             self.logger.debug(f"[CloudSQL] Gate pre-check error: {_gate_pre_err}")
 
-        self.logger.info("[CloudSQL] Initializing Cloud SQL proxy...")
-
         try:
-            # Load database config (async - doesn't block event loop)
-            config_path = self.config.jarvis_home / "gcp" / "database_config.json"
-            if not config_path.exists():
-                self.logger.warning("[CloudSQL] Config not found, falling back to SQLite")
+            # The one answer to "does this host declare Cloud SQL?" (shared with
+            # the proxy manager, the adapter and the Learning DB). None is this
+            # deployment's design -- SQLite -- not a failure to warn about.
+            try:
+                from intelligence.cloud_sql_connection_manager import (
+                    database_config_path, get_readiness_gate,
+                )
+            except ImportError:
+                from backend.intelligence.cloud_sql_connection_manager import (
+                    database_config_path, get_readiness_gate,
+                )
+            config_path = await asyncio.to_thread(database_config_path)
+            if config_path is None:
+                get_readiness_gate().mark_degraded_sqlite()
+                self.logger.info("[CloudSQL] Not configured on this host — SQLite is the learning store")
                 result["fallback_to_sqlite"] = True
+                result["gate_state"] = "degraded_sqlite"
+                result["gate_reason"] = "not_configured"
                 if signal_proxy_failed:
                     signal_proxy_failed()
                 return result
+
+            self.logger.info("[CloudSQL] Initializing Cloud SQL proxy...")
 
             import json
 

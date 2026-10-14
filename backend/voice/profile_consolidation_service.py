@@ -92,8 +92,12 @@ class ProfileConsolidationService:
             }
         except Exception as e:
             logger.warning(f"Failed to load from secret manager: {e}, using config file")
-            config_path = Path.home() / ".jarvis" / "gcp" / "database_config.json"
-            if config_path.exists():
+            try:
+                from intelligence.cloud_sql_connection_manager import database_config_path
+            except ImportError:
+                from backend.intelligence.cloud_sql_connection_manager import database_config_path
+            config_path = database_config_path()
+            if config_path is not None:
                 with open(config_path) as f:
                     config = json.load(f)
                     cloud_sql = config.get("cloud_sql", {})
