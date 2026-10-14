@@ -99,7 +99,7 @@ def test_a_program_name_closes_all_its_windows_a_title_closes_one():
 
 
 def test_jarvis_never_closes_the_window_it_runs_in():
-    from backend.core.desktop_close import _is_jarvis, _protected_pids
+    from backend.core.desktop_close import _is_jarvis
     window = _windows()[1]
     assert _is_jarvis(window, {window.pid}) is True
 

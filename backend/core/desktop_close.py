@@ -34,7 +34,7 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Sequence, Set, Tuple
 
 from backend.core.desktop_open import _env_float, _norm, _run, best_match
 
