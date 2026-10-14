@@ -58,3 +58,36 @@ def test_startup_watchdog_invalid_env_values_fall_back_to_defaults(monkeypatch):
     assert watchdog._escalation_cooldown == 60.0
     assert watchdog._stall_escalation_cooldown == 15.0
     assert watchdog._progress_advancing_window == 120.0
+
+
+def test_startup_watchdog_reads_the_measured_percentage_not_the_callers_guess():
+    # Live boot 2026-10-14 08:04: phase call sites passed literals (86 at
+    # agi_os) while the broadcast passed the measured value (57), and the
+    # watchdog logged "Progress regression: 84% -> 57%" three times.
+    import unified_supervisor as us
+
+    warnings = []
+
+    class _Logger:
+        def info(self, *_a, **_k):
+            pass
+
+        def debug(self, *_a, **_k):
+            pass
+
+        def warning(self, msg, *_a, **_k):
+            warnings.append(msg)
+
+    measured = [57]
+    watchdog = us.StartupWatchdog(logger=_Logger(), progress_source=lambda: measured[0])
+    watchdog.update_phase("agi_os", 86)        # a call site's literal
+    watchdog.update_phase("agi_os", 57)        # the broadcast
+    measured[0] = 58
+    watchdog.update_phase("agi_os", 89)
+    assert watchdog._last_progress == 58
+    assert not [w for w in warnings if "regression" in w or "jump" in w]
+
+    # No measure (no timeline, or after completion): the caller's value stands.
+    bare = us.StartupWatchdog(logger=_Logger(), progress_source=lambda: None)
+    bare.update_phase("frontend", 93)
+    assert bare._last_progress == 93

@@ -57052,20 +57052,28 @@ class StartupWatchdog:
         diagnostic_callback: Optional[Callable[[], Awaitable[None]]] = None,
         restart_callback: Optional[Callable[[str], Awaitable[bool]]] = None,
         rollback_callback: Optional[Callable[[], Awaitable[None]]] = None,
+        progress_source: Optional[Callable[[], Optional[int]]] = None,
     ):
         """
         Initialize the startup watchdog.
-        
+
         Args:
             logger: Logger instance for output
             diagnostic_callback: Async function to dump diagnostics
             restart_callback: Async function to restart a component (name -> success)
             rollback_callback: Async function to trigger full rollback
+            progress_source: The boot's measured percentage (None when there
+                is no measure). When it answers, it is the progress value:
+                the number an update_phase() caller passes is then only a
+                heartbeat. Phase call sites pass literal guesses (86 at
+                agi_os) while the broadcast passes the measured value, and
+                mixing them read as "Progress regression 84% -> 57%".
         """
         self._logger = logger
         self._diagnostic_callback = diagnostic_callback
         self._restart_callback = restart_callback
         self._rollback_callback = rollback_callback
+        self._progress_source = progress_source
         
         # Configuration from environment
         self._enabled = _get_env_bool("JARVIS_DMS_ENABLED", True)
@@ -57555,6 +57563,17 @@ class StartupWatchdog:
             self._last_progress_time_mono = _dms_mono_up()
         except ImportError:
             pass
+
+        # The measured boot percentage, when there is one, is the value;
+        # the caller's number stays a heartbeat (above).
+        if self._progress_source is not None:
+            try:
+                _measured = self._progress_source()
+            except Exception as _src_exc:  # a watchdog never dies of its gauge
+                self._logger.debug(f"[DMS] progress source failed: {_src_exc}")
+                _measured = None
+            if _measured is not None:
+                progress = _measured
 
         # v232.2: Progress sanity checks — validate data is plausible
         _sanitized_progress = progress
@@ -68025,6 +68044,7 @@ class JarvisSystemKernel:
                 diagnostic_callback=self._dms_diagnostic_callback,
                 restart_callback=self._dms_restart_callback,
                 rollback_callback=self._dms_rollback_callback,
+                progress_source=self._measured_boot_percent,
             )
             # v265.0: Add timeout — DMS is the timeout mechanism but can't protect itself.
             # If StartupWatchdog.start() hangs, the entire supervisor bootstrap hangs.
@@ -78977,6 +78997,7 @@ class JarvisSystemKernel:
                     diagnostic_callback=self._dms_diagnostic_callback,
                     restart_callback=self._dms_restart_callback,
                     rollback_callback=self._dms_rollback_callback,
+                    progress_source=self._measured_boot_percent,
                 )
                 await asyncio.wait_for(_cand.start(), timeout=_eff_timeout)
                 if _cand.enabled:
@@ -89361,6 +89382,21 @@ class JarvisSystemKernel:
                 metadata=pending.get("metadata"),
             )
 
+    def _measured_boot_percent(self) -> Optional[int]:
+        """
+        The boot's percentage while startup is in progress, else None.
+
+        The boot timeline (backend/core/boot_timeline) is the one measure:
+        the position on the learned timeline of this boot, 100 only at the
+        kernel's completion, never below what was already shown. Both the
+        loading-page broadcast and the Dead Man's Switch read it, so the
+        page and the stall watchdog see the same number.
+        """
+        timeline = getattr(self, "_boot_timeline", None)
+        if timeline is None or timeline.fraction() >= 1:
+            return None
+        return max(getattr(self, "_current_progress", 0) or 0, timeline.percent())
+
     async def _broadcast_startup_progress(
         self,
         stage: str,
@@ -89420,16 +89456,14 @@ class JarvisSystemKernel:
             "visual_pipeline", "frontend", "finalizing",
         }
         current = getattr(self, '_current_progress', 0) or 0
-        timeline = getattr(self, "_boot_timeline", None)
+        measured = self._measured_boot_percent()
         # While the boot is in progress EVERY broadcast's percentage is the
         # timeline's -- a stage missing from the set below (e.g.
         # "integration_parallel") used to pass its literal straight through.
-        if timeline is not None and stage != "complete" and timeline.fraction() < 1:
-            # The boot timeline (backend/core/boot_timeline) is the measure:
-            # the position on the learned timeline of this boot, 100 only at
-            # the kernel's completion. The number a call site passes is that
-            # site's guess; the ceilings below existed to tame those guesses.
-            progress = max(current, timeline.percent())
+        if measured is not None and stage != "complete":
+            # The number a call site passes is that site's guess; the
+            # ceilings below existed to tame those guesses.
+            progress = measured
             self._current_progress = progress
         elif stage in _STARTUP_STAGES or is_heartbeat:
             # Startup phase or heartbeat: monotonic guard prevents regression
