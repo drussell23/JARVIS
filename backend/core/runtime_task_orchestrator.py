@@ -53,6 +53,7 @@ class TaskResolution(str, Enum):
     """How a step was resolved."""
     EXISTING_AGENT = "existing_agent"      # found in AgentRegistry
     VISION_ACTION = "vision_action"        # v305.0: browser/UI task → VisionActionLoop
+    DESKTOP_ACTION = "desktop_action"      # a JARVIS route run by its own handler (close, look)
     EPHEMERAL_TOOL = "ephemeral_tool"      # synthesized on-the-fly, discarded after
     GOVERNANCE_OP = "governance_op"        # routed to Ouroboros for code change
     PERSISTENT_PROPOSAL = "persistent"     # synthesized + proposed for permanent add
@@ -265,6 +266,15 @@ class RuntimeTaskOrchestrator:
         the facade uses to determine if this is an executor/vision task.
         No hardcoded app lists.
         """
+        # A chain the Mind split into requests of their own ("close notepad and
+        # open my downloads folder"): each is classified on its own -- its own
+        # capability, app, query -- and runs after the one before it. Before
+        # this, a command with one capability ran as one step and every
+        # request after the first was dropped.
+        chain = [s for s in (ctx.get("steps") or []) if isinstance(s, str) and s.strip()]
+        if len(chain) >= 2:
+            return await self._chain_steps(chain), f"chain of {len(chain)} requests"
+
         # Agentic check: ask the facade classifier if this is a vision/UI task.
         # If so, skip decomposition — the lean loop handles multi-step goals.
         if await self._is_vision_goal_agentic(query, ctx):
@@ -297,6 +307,22 @@ class RuntimeTaskOrchestrator:
                 logger.warning("[RuntimeTask] PredictivePlanner failed: %s — using single step", exc)
 
         return self._single_step(query, ctx), "single-step fallback"
+
+    async def _chain_steps(self, chain: List[str]) -> List[Dict[str, Any]]:
+        """One step per request of a chain, each classified by the Mind on its
+        own, each depending on the one before (they run in the order said)."""
+        from backend.core.intent_classifier import get_intent_classifier
+
+        classifier = get_intent_classifier()
+        steps: List[Dict[str, Any]] = []
+        for i, request in enumerate(chain):
+            decision = await classifier.classify_async(request)
+            step = self._single_step(request, decision.to_task_context())[0]
+            step["dependencies"] = [str(i - 1)] if i else []
+            steps.append(step)
+            logger.info("[RuntimeTask] chain step %d/%d %r -> %s", i + 1, len(chain),
+                        request[:60], step.get("capability") or "-")
+        return steps
 
     @staticmethod
     def _single_step(query: str, ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -585,7 +611,18 @@ class RuntimeTaskOrchestrator:
             return None
         from backend.core.agent_bindings import agent_for_capability, route_for_capability
 
-        if route_for_capability(capability):
+        route = route_for_capability(capability)
+        if route in self._DESKTOP_ROUTES:
+            # A route run by its own handler (close something, look and answer).
+            return StepResolution(
+                step_goal=goal,
+                resolution=TaskResolution.DESKTOP_ACTION,
+                agent_name=route,
+                capability_used=capability,
+                synthesized=False,
+                elapsed_s=time.monotonic() - start,
+            )
+        if route:
             # JARVIS's own route (open something / look and act): open what
             # the goal starts with, then the eyes for whatever remains.
             return StepResolution(
@@ -801,6 +838,10 @@ class RuntimeTaskOrchestrator:
                 )
             elif resolution.resolution == TaskResolution.VISION_ACTION:
                 return await orchestrator._dispatch_to_vision(node.goal, step)
+            elif resolution.resolution == TaskResolution.DESKTOP_ACTION:
+                return await orchestrator._dispatch_desktop_route(
+                    resolution.agent_name or "", node.goal, step,
+                )
             elif resolution.resolution == TaskResolution.GOVERNANCE_OP:
                 return await orchestrator._dispatch_to_governance(node.goal, step)
             elif resolution.resolution in (
@@ -946,6 +987,19 @@ class RuntimeTaskOrchestrator:
                     elapsed_s=time.monotonic() - start,
                 )
 
+            elif resolution.resolution == TaskResolution.DESKTOP_ACTION:
+                result = await self._dispatch_desktop_route(resolution.agent_name or "", goal, step)
+                return StepResolution(
+                    step_goal=goal,
+                    resolution=resolution.resolution,
+                    agent_name=resolution.agent_name,
+                    capability_used=resolution.capability_used,
+                    synthesized=False,
+                    result=result,
+                    error=None if result.get("success") else result.get("result"),
+                    elapsed_s=time.monotonic() - start,
+                )
+
             elif resolution.resolution == TaskResolution.VISION_ACTION:
                 # If the facade already executed (result is set), skip re-execution
                 if resolution.result is not None:
@@ -1069,32 +1123,48 @@ class RuntimeTaskOrchestrator:
         """Ask J-Prime how this goal starts, and whether starting it finishes it.
 
         One agentic decision, no URL templates or app tables: what to open
-        (a URL or an application, or nothing) and ``completes_goal`` -- e.g. a
+        (a URL, an application, or a file/folder -- decided against the
+        user's real folders, from the OS -- or nothing) and ``completes_goal`` -- e.g. a
         search is finished by opening its results page, while "play the first
         video" still needs the screen afterwards. Returns {} when the Mind is
         unavailable or answers unusably; the caller then opens nothing itself.
         """
         if self._prime is None:
             return {}
-        from backend.core.desktop_open import looks_like_url, normalize_url
-        from backend.core.host_platform import os_display_name
+        from backend.core.desktop_open import (
+            installed_browsers, looks_like_url, normalize_url, resolve_path,
+        )
+        from backend.core.host_platform import os_display_name, user_folders
         from backend.core.llm_json import parse_json_object
 
         fields = {k: step.get(k) for k in ("provider", "search_query", "target_app") if step.get(k)}
+        folders = "\n".join(f"- {f}" for f in await asyncio.to_thread(user_folders))
+        # Facts of this machine, so a request that names "a browser" or "my
+        # documents" is decided against what really exists here.
+        browsers = "\n".join(f"- {name}" + (" (the default)" if default else "")
+                             for name, default in await installed_browsers())
         prompt = (
             f"Goal of a user at a {os_display_name()} computer: {goal}\n"
-            f"Fields extracted from the request: {json.dumps(fields)}\n\n"
-            "The assistant opens URLs directly in the user's browser and launches "
-            "installed applications. Decide what to open so the user LANDS ON THE RESULT, "
-            "and whether opening it IS the whole goal. Respond ONLY with JSON:\n"
-            '{"open": "url" | "app" | "none", "url": "https://...", "app": "application name", '
+            f"Fields extracted from the request: {json.dumps(fields)}\n"
+            f"The user's folders on this computer:\n{folders or '- (unknown)'}\n"
+            f"The web browsers on this computer:\n{browsers or '- (unknown)'}\n\n"
+            "The assistant opens URLs directly in the user's browser, opens files and "
+            "folders, and launches installed applications. Decide what to open so the user "
+            "LANDS ON THE RESULT, and whether opening it IS the whole goal. Respond ONLY with JSON:\n"
+            '{"open": "url" | "path" | "app" | "none", "url": "https://...", '
+            '"path": "absolute path of the file or folder", "app": "application name", '
             '"completes_goal": true | false, "remaining": "what is left after opening, if anything"}\n'
             "Decision rules:\n"
+            "- A folder or a file of the user's (\"my documents\", \"the report on my desktop\"): "
+            "open=path, built from the folders listed above -- never open a file manager app "
+            "and navigate.\n"
             "- Web content (a search, a site, a video, a page): open=url with the most direct "
             "URL, e.g. the search-results page for the query. Never open a browser app and "
             "then type into it: the URL already does that.\n"
             "- open=app only when the goal is about an installed application itself "
-            "(\"open Spotify\", \"launch Notepad\"), or names an app to use.\n"
+            "(\"open Spotify\", \"launch Notepad\"), or names an app to use. When the "
+            "application named is a web browser and the goal is web content, the content is "
+            "still open=url: the URL opens in the browser named.\n"
             "- completes_goal=true when landing there is what the user asked for (a search "
             "shows its results). completes_goal=false only when something must still be "
             "clicked, typed or read on screen afterwards (\"play the first video\").\n"
@@ -1120,15 +1190,20 @@ class RuntimeTaskOrchestrator:
         kind = str(decision.get("open") or "").lower()
         url = str(decision.get("url") or "").strip()
         app = str(decision.get("app") or "").strip()
+        path = resolve_path(str(decision.get("path") or "")) if kind == "path" else None
         if kind == "url" and not looks_like_url(url):
             kind = "app" if app else "none"
+        if kind == "path" and path is None:
+            # Named a file or folder that is not there (nor anything like it).
+            kind = "none"
         if kind == "app" and not app:
             kind = "none"
         resolved = {
-            "open": kind if kind in ("url", "app") else "none",
+            "open": kind if kind in ("url", "path", "app") else "none",
             "url": normalize_url(url) if kind == "url" else "",
+            "path": str(path) if kind == "path" else "",
             "app": app if kind == "app" else "",
-            "completes_goal": bool(decision.get("completes_goal")) and kind in ("url", "app"),
+            "completes_goal": bool(decision.get("completes_goal")) and kind in ("url", "path", "app"),
             "remaining": str(decision.get("remaining") or "").strip(),
         }
         logger.info("[RuntimeTask] open decision for %r: %s", goal[:60], resolved)
@@ -1150,6 +1225,91 @@ class RuntimeTaskOrchestrator:
         result["opened"] = opened.resolved
         return result
 
+    # JARVIS's routes run by a handler of their own, by route name
+    # (agent_bindings). "look" is here because a screen question can now be a
+    # step of a chain; alone it is answered before the orchestrator.
+    _DESKTOP_ROUTES = {"close": "_dispatch_to_close", "look": "_dispatch_to_look"}
+
+    async def _dispatch_desktop_route(self, route: str, goal: str, step: Dict[str, Any]) -> Dict[str, Any]:
+        handler = getattr(self, self._DESKTOP_ROUTES.get(route, ""), None)
+        if handler is None:
+            return {"success": False, "result": f"no desktop route {route!r}"}
+        return await handler(goal, step)
+
+    async def _resolve_close_target(
+        self, goal: str, step: Dict[str, Any], windows: List[Tuple[str, str]],
+    ) -> str:
+        """Ask J-Prime which open program or window the goal means to close.
+
+        Decided against what is actually open (program and window title, from
+        the desktop), so "close the dogs search", "close that file" and
+        "close firefox" each resolve to something real. "" when nothing open
+        matches or the Mind is unavailable.
+        """
+        if self._prime is None or not windows:
+            return ""
+        from backend.core.llm_json import parse_json_object
+
+        listing = "\n".join(f"- program: {program} | window: {title}" for program, title in windows)
+        fields = {k: step.get(k) for k in ("target_app", "search_query") if step.get(k)}
+        prompt = (
+            f"Request: {goal}\nFields extracted from it: {json.dumps(fields)}\n\n"
+            f"Open on the user's desktop right now, front-most first:\n{listing}\n\n"
+            "What does the request ask to close? Respond ONLY with JSON:\n"
+            '{"close": "a program name or a window title copied exactly from the list, or \"\""}\n'
+            "- A program name closes all of that program's windows: use it when the request "
+            "names an application.\n"
+            "- A window title closes only that window: use it when the request names a "
+            "document, file, folder, page or one particular window.\n"
+            '- "" when nothing in the list is what the request names.'
+        )
+        try:
+            response = await asyncio.wait_for(
+                self._prime.generate(
+                    prompt=prompt,
+                    system_prompt="You decide what a desktop assistant closes. Return only JSON.",
+                    max_tokens=128,
+                    temperature=0.0,
+                ),
+                timeout=float(os.getenv("JARVIS_OPEN_RESOLVE_TIMEOUT_S", "15")),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[RuntimeTask] close-target resolution failed: %s", exc)
+            return ""
+        decision = parse_json_object(getattr(response, "content", None)) or {}
+        target = str(decision.get("close") or "").strip()
+        logger.info("[RuntimeTask] close decision for %r: %r", goal[:60], target)
+        return target
+
+    async def _dispatch_to_look(self, goal: str, step: Dict[str, Any]) -> Dict[str, Any]:
+        """Answer a question about the screen by looking at it."""
+        from backend.vision.screen_question import answer_about_screen
+
+        reply = await answer_about_screen(goal)
+        return {"success": bool(reply.get("success")), "result": reply.get("response", "")}
+
+    async def _dispatch_to_close(self, goal: str, step: Dict[str, Any]) -> Dict[str, Any]:
+        """Close what the goal names, gracefully (backend.core.desktop_close)."""
+        from backend.core.desktop_close import close_target, open_windows
+
+        windows = await open_windows()
+        target = await self._resolve_close_target(goal, step, windows)
+        if not target and not windows:
+            # Platforms without a window listing: the request's own words.
+            target = step.get("target_app") or ""
+        if not target:
+            return {"success": False, "result": "nothing open matches what you asked me to close"}
+        outcome = await close_target(target)
+        logger.info("[RuntimeTask] %s (method=%s)", outcome.describe(), outcome.method)
+        return {
+            "success": outcome.ok,
+            "result": outcome.describe(),
+            "closed": list(outcome.closed),
+            "still_open": list(outcome.still_open),
+        }
+
     async def _dispatch_to_vision(self, goal: str, step: Dict[str, Any]) -> Any:
         """Route a browser/UI task: open what it starts with, then the vision loop.
 
@@ -1159,7 +1319,7 @@ class RuntimeTaskOrchestrator:
         screen work. Otherwise the vision loop continues from the opened
         state; if it cannot, the reply still says what was opened.
         """
-        from backend.core.desktop_open import open_app, open_url, preferred_browser
+        from backend.core.desktop_open import open_app, open_path, open_url, preferred_browser
 
         if step.get("url"):
             decision: Dict[str, Any] = {"open": "url", "url": step["url"], "completes_goal": False}
@@ -1179,6 +1339,8 @@ class RuntimeTaskOrchestrator:
             opened = await open_url(
                 decision["url"], browser=step.get("target_app") or preferred_browser(),
             )
+        elif decision.get("open") == "path":
+            opened = await open_path(decision["path"])
         elif decision.get("open") == "app":
             opened = await open_app(decision["app"])
         if opened is not None:

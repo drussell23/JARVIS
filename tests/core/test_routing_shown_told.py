@@ -46,8 +46,8 @@ def test_a_user_binding_declares_its_own_delivery(monkeypatch, tmp_path):
 def test_the_classifier_is_told_to_choose_by_delivery_not_shared_words():
     from backend.core.intent_classifier import IntentClassifier
     prompt = IntentClassifier._classify_system_prompt("- x")
-    assert "an entry marked SHOWN for SHOWN" in prompt
-    assert "A word the command shares with a capability name is not a reason" in prompt
+    assert "the entry above that delivers what \"wants\" says" in prompt
+    assert "A word the command shares with a capability name is" in prompt
 
 
 def test_a_url_opens_in_the_browser_the_user_named(monkeypatch):

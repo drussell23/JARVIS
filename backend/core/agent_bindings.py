@@ -15,7 +15,7 @@ Each entry:
         "platforms":     ["darwin"],      # optional: sys.platform prefixes it runs on
         "requires":      ["playwright"],  # optional: importable packages it needs
         "route":         "",              # set for JARVIS's own routes (no class)
-        "delivers":      "shown"          # what the USER gets: "shown" | "told" | ""
+        "delivers":      "shown"          # what the USER gets: "shown" | "told" | "done" | ""
     }
 
 ``delivers`` is the one fact the Mind decides a request on -- does the user
@@ -63,7 +63,7 @@ class AgentBinding:
     platforms: List[str] = field(default_factory=list)
     requires: List[str] = field(default_factory=list)
     route: str = ""
-    delivers: str = ""   # "shown" | "told" | "" (internal: neither)
+    delivers: str = ""   # "shown" | "told" | "done" | "" (internal: none of them)
 
     def unavailable_reason(self) -> str:
         """Why this binding cannot serve on this host, "" when it can."""
@@ -112,6 +112,15 @@ _DEFAULT_BINDINGS: List[Dict[str, Any]] = [
         "capabilities": ["look_at_screen"],
     },
     {
+        "agent_id": "desktop_close",
+        "module": "backend.core.desktop_close",
+        "class_name": "",
+        "agent_type": "route",
+        "route": "close",
+        "delivers": "done",
+        "capabilities": ["close_for_user"],
+    },
+    {
         "agent_id": "visual_browser_agent",
         "module": "backend.neural_mesh.agents.visual_browser_agent",
         "class_name": "VisualBrowserAgent",
@@ -126,7 +135,10 @@ _DEFAULT_BINDINGS: List[Dict[str, Any]] = [
         "class_name": "WebSearchAgent",
         "agent_type": "intelligence",
         "delivers": "told",
-        "capabilities": ["web_search", "web_research", "read_web_page", "search"],
+        # What it delivers -- researched answers -- not the verb a request
+        # uses: tagged "search"/"web_search", it drew every "search for X"
+        # (the user asking for a search to be RUN) to a summary.
+        "capabilities": ["web_research", "read_web_page"],
     },
     {
         "agent_id": "native_app_control_agent",
@@ -334,6 +346,22 @@ def agent_for_capability(capability: str) -> Optional[str]:
     return binding.agent_id if binding is not None and not binding.route else None
 
 
+def delivery_of(capability: str) -> str:
+    """What the binding serving *capability* gives the user ("shown", "told",
+    "done"), "" when unknown."""
+    binding = binding_for_capability(capability)
+    return binding.delivers if binding is not None else ""
+
+
+def route_delivering(delivery: str) -> str:
+    """A capability of JARVIS's own available route that gives *delivery*
+    ("shown" -> the open route, "done" -> close), "" when there is none."""
+    for binding in get_agent_bindings().values():
+        if binding.route and binding.delivers == delivery and not binding.unavailable_reason():
+            return next(iter(sorted(binding.capabilities)), binding.agent_id)
+    return ""
+
+
 def route_for_capability(capability: str) -> str:
     """The built-in route ("open", "look") serving *capability*, else ""."""
     binding = binding_for_capability(capability)
@@ -346,6 +374,7 @@ _catalogue: Optional[str] = None
 _DELIVERY_PHRASE = {
     "shown": "SHOWN: puts it on the user's screen",
     "told": "TOLD: reports an answer back, shows nothing",
+    "done": "DONE: does it on the user's desktop (nothing new to show or tell)",
 }
 
 

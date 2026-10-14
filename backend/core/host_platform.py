@@ -133,5 +133,69 @@ def log_dir() -> Path:
     return Path(base) / "jarvis" / "logs"
 
 
+def user_folders() -> list:
+    """The user's own folders on this machine, as existing absolute paths.
+
+    What "my documents", "the desktop" or "downloads" mean here is a fact of
+    this machine -- Documents is often redirected to OneDrive on Windows --
+    so it is read from the OS, never assumed: on Windows the shell's
+    registered user folders (where redirections are recorded), and on every
+    OS the visible folders directly in the home directory (XDG's and macOS's
+    standard folders live there). A model told these paths names the right
+    one by its leaf; nothing maps "documents" to a path in code.
+    """
+    found: list = []
+    if sys.platform == "win32":
+        try:
+            import winreg
+
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Explorer"
+                                r"\User Shell Folders") as key:
+                for i in range(winreg.QueryInfoKey(key)[1]):
+                    _name, value, _kind = winreg.EnumValue(key, i)
+                    if isinstance(value, str) and value.strip():
+                        found.append(Path(os.path.expandvars(value)))
+        except OSError:
+            pass
+    home = Path.home()
+    try:
+        found.extend(p for p in home.iterdir() if p.is_dir() and not p.name.startswith("."))
+    except OSError:
+        pass
+    seen: set = set()
+    folders: list = []
+    home = home.resolve()
+    for path in found:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        key = str(resolved).casefold()
+        # Only the user's own: inside the home folder (where redirections
+        # such as OneDrive also land), existing, and visible to the user --
+        # the registry also lists AppData's caches, cookies and history.
+        if key in seen or not resolved.is_dir() or home not in resolved.parents \
+                or not _visible_below(resolved, home):
+            continue
+        seen.add(key)
+        folders.append(resolved)
+    return folders
+
+
+def _visible_below(path: Path, home: Path) -> bool:
+    """No folder from *home* down to *path* is hidden from the user: a dot
+    name, or (Windows) the hidden or system attribute."""
+    for part in (path, *path.parents):
+        if part == home:
+            return True
+        if part.name.startswith("."):
+            return False
+        attributes = getattr(part.stat(), "st_file_attributes", 0)
+        if attributes & 0x6:   # FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM
+            return False
+    return True
+
+
 __all__ = ["account_full_name", "log_dir", "native_app_noun", "os_display_name", "remote_session",
-           "today_display"]
+           "today_display", "user_folders"]

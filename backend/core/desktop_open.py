@@ -286,6 +286,27 @@ def _command_argv(command: str) -> List[str]:
 # Public API
 # ---------------------------------------------------------------------------
 
+async def installed_browsers() -> List[Tuple[str, bool]]:
+    """(name, is_default) of the web browsers this machine has registered --
+    facts for a decision that names one ("open a web browser"). The default
+    is the one the OS opens links in. Empty where browsers are not
+    enumerated."""
+    if not _IS_WINDOWS:
+        return []
+    try:
+        browsers = await _browsers.get(_load_browsers)
+        handler = await asyncio.to_thread(_win_url_handler_exe)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[DesktopOpen] browsers unreadable: %s", exc)
+        return []
+    out: List[Tuple[str, bool]] = []
+    for name, command in browsers.items():
+        argv = _command_argv(command)
+        exe = os.path.basename(argv[0]).lower() if argv else ""
+        out.append((name, bool(handler) and exe == handler))
+    return out
+
+
 def preferred_browser() -> Optional[str]:
     """The browser URLs open in: JARVIS_DEFAULT_BROWSER when set; otherwise
     Google Chrome on macOS (v283.3: JARVIS's own UI runs there) and the
@@ -335,6 +356,30 @@ async def open_url(url: str, *, browser: Optional[str] = None) -> OpenOutcome:
         return OpenOutcome(rc == 0, "url", url, url, "xdg-open", "" if rc == 0 else out.strip())
     except Exception as exc:  # noqa: BLE001
         return OpenOutcome(False, "url", url, error=f"{type(exc).__name__}: {exc}")
+
+
+def resolve_path(candidate: str) -> Optional[Path]:
+    """The existing file or folder *candidate* means, or None.
+
+    As given when it exists; otherwise the entry of its parent folder that
+    best_match says the user meant -- a model asked for "notes" on the
+    desktop names ``Desktop\\notes`` while the file is ``notes.txt``. Only the
+    last component is matched, against what that folder really holds.
+    """
+    if not (candidate or "").strip():
+        return None
+    path = Path(os.path.expandvars(candidate.strip())).expanduser()
+    if path.exists():
+        return path
+    parent = path.parent
+    if not parent.is_dir():
+        return None
+    try:
+        entries = {child.name: child for child in parent.iterdir()}
+    except OSError:
+        return None
+    name = best_match(path.name, list(entries)) or best_match(path.stem, list(entries))
+    return entries[name] if name else None
 
 
 async def open_path(path: str) -> OpenOutcome:

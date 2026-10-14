@@ -64,6 +64,10 @@ class ClassificationResult:
     # The agent capability the Mind chose from the live catalogue
     # (agent_bindings.capability_catalogue), or a capability JARVIS lacks.
     capability: str = ""
+    # When the command asks for several things one after another, each of
+    # them in order, worded as a command of its own -- the orchestrator
+    # classifies and runs each. Empty for a single request.
+    steps: Tuple[str, ...] = ()
 
     @property
     def decided_by_mind(self) -> bool:
@@ -99,6 +103,7 @@ class ClassificationResult:
             "target_app": self.target_app,
             "requires_vision": self.requires_vision,
             "classification_source": self.classification_source,
+            "steps": list(self.steps),
         }
         ctx.update(extra)
         return ctx
@@ -508,8 +513,12 @@ class IntentClassifier:
             "Respond ONLY with valid JSON, no markdown, fields in this order -- reason first, "
             "then decide:\n"
             "{\n"
-            '  "reasoning": "one line: does the user want to be SHOWN something, TOLD something, '
-            'or neither -- and what carries it out",\n'
+            '  "reasoning": "one line: is the user asking you to DO something on their computer, '
+            'or to KNOW something -- and so what they want, and what carries it out",\n'
+            '  "form": "instruction" | "question" | "conversation",\n'
+            '  "wants": "shown" | "told" | "done" | "none",\n'
+            '  "steps": [] for one request, else ["the first request", "the next request", ...] '
+            '-- plain strings, the requests themselves, in order,\n'
             '  "answer_from_own_knowledge": true or false,\n'
             '  "capability": an id or capability from the list above, a new snake_case name for '
             'a capability JARVIS would need but lacks, or "",\n'
@@ -521,17 +530,30 @@ class IntentClassifier:
             '  "needs_screen": true or false\n'
             "}\n\n"
             "Field meanings:\n"
-            "- SHOWN: the user will look at or use something put on their screen (a page, a "
-            "site's search results, a video, an app). TOLD: they want an answer reported back.\n"
+            "- form: how the command is put -- an instruction tells you to do something, a "
+            "question asks something, conversation is neither.\n"
+            "- wants: an instruction to DO something the user could do themselves on this "
+            "computer (an imperative -- they are asking you to act, not to inform them) wants "
+            "its result where they would see it themselves: \"shown\" on their screen, in the "
+            "application they name when they name one; or \"done\" when it leaves nothing new "
+            "to look at (closing something). A request to KNOW something (a question, or asking "
+            "to be told) wants the answer reported back: \"told\". \"none\" for anything else. "
+            "Never turn an instruction into a question: when the user tells you to carry out an "
+            "activity, carrying it out is the request -- reporting what it would find is not "
+            "doing it.\n"
             "- answer_from_own_knowledge: true only when you can reply yourself, right now, from "
             "what you already know (settled facts, arithmetic, explanations, conversation). "
             "False when something must be shown, done, looked at or found out. Whatever depends "
             "on the current state of the world (news, results, scores, weather, prices, anything "
             "about today or this year) is NOT something you know: false.\n"
             '- capability: "" when answer_from_own_knowledge is true. Otherwise the entry above '
-            "that gives the user what the reasoning decided (an entry marked SHOWN for SHOWN, "
-            "TOLD for TOLD) and whose description does it. A word the command shares with a "
-            "capability name is not a reason to choose it.\n"
+            "that delivers what \"wants\" says (each entry is marked SHOWN, TOLD or DONE) and "
+            "whose description does it. A word the command shares with a capability name is "
+            "not a reason to choose it.\n"
+            "- steps: when the command asks for separate things one after another, each of them "
+            "in order as a request of its own -- complete without the others' words (it names "
+            "what it acts on). Acting on something that another step opens is part of that same "
+            "step, not a separate one. The other fields describe the first request.\n"
             "- requires_vision: the task needs seeing and operating the UI AFTER something is open "
             "(finding and clicking an item, filling a form). Opening something alone does not.\n"
             "- needs_screen: the ANSWER requires looking at the user's screen right now.\n"
@@ -576,22 +598,45 @@ class IntentClassifier:
             deadline = loop.time() + budget
             catalogue = await asyncio.to_thread(capability_catalogue)
             router = await get_prime_router()
-            response = await asyncio.wait_for(
-                router.generate(
-                    prompt=f'Classify this voice command: "{command}"',
-                    system_prompt=self._classify_system_prompt(catalogue),
-                    max_tokens=256,
-                    temperature=0.0,
-                    deadline=deadline,
-                ),
-                timeout=max(0.0, deadline - loop.time()),
-            )
-
+            system_prompt = self._classify_system_prompt(catalogue)
             from backend.core.llm_json import parse_json_object
 
-            result = parse_json_object(response.content)
-            if result is None:
-                raise ValueError(f"no JSON object in {str(response.content)[:120]!r}")
+            async def ask(prompt: str) -> Tuple[Dict[str, Any], Any]:
+                response = await asyncio.wait_for(
+                    router.generate(
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        max_tokens=256,
+                        temperature=0.0,
+                        deadline=deadline,
+                    ),
+                    timeout=max(0.0, deadline - loop.time()),
+                )
+                parsed = parse_json_object(response.content)
+                if parsed is None:
+                    raise ValueError(f"no JSON object in {str(response.content)[:120]!r}")
+                return parsed, response
+
+            question = f'Classify this voice command: "{command}"'
+            result, response = await ask(question)
+            # The Mind checks its own answer: the entry it chose must deliver
+            # what it decided the user wants. When it does not -- reasoned
+            # "shown", then chose an entry that only reports back -- it is
+            # shown the contradiction and decides again. Nothing here picks a
+            # capability for it.
+            mismatch = _delivery_mismatch(result)
+            if mismatch and deadline - loop.time() > 0:
+                try:
+                    second, response2 = await ask(
+                        f"{question}\n\nYour previous answer: {json.dumps(result)}\n"
+                        f"{mismatch} Reconsider, and answer again with the full JSON."
+                    )
+                    logger.info("IntentClassifier: reconsidered %r (%s): %s -> %s", command,
+                                mismatch, result.get("capability"), second.get("capability"))
+                    result, response = second, response2
+                except Exception as exc:  # noqa: BLE001 -- the first answer stands
+                    logger.debug("IntentClassifier: reconsideration unavailable: %s", exc)
+            result = _serve_stated_goal(result)
             # The Mind's intent is the decision, reasoned before it is stated;
             # a capability only applies to an action. Letting a filled-in
             # capability outrank the intent turned "what's 17 times 23"
@@ -629,6 +674,7 @@ class IntentClassifier:
                 needs_screen=bool(result.get("needs_screen", False)),
                 classification_source="jprime",
                 capability=capability,
+                steps=_chain(result.get("steps")),
             )
 
         except Exception as e:
@@ -642,6 +688,71 @@ class IntentClassifier:
 # ---------------------------------------------------------------------------
 # Module-level singleton
 # ---------------------------------------------------------------------------
+
+def _delivery_mismatch(result: Dict[str, Any]) -> str:
+    """The contradiction in a classification, stated for the Mind, or "".
+
+    Its "wants" (what the user wants: shown / told / done) against what the
+    entry it chose delivers, as the bindings declare it. Seen live with the
+    local 30B: "look up pictures of puppies" reasoned "SHOWN" and chose
+    web_search_agent, which only reports an answer back.
+    """
+    wants = str(result.get("wants") or "").strip().lower()
+    capability = str(result.get("capability") or "").strip().lower()
+    if str(result.get("form") or "").strip().lower() == "instruction" and wants == "told":
+        # Its own reading of the command against its own decision: an
+        # instruction carried out is the request ("search for dogs" read as
+        # "look up and report back" handed the user a summary).
+        return ("It calls the command an instruction, but wants it TOLD -- an answer "
+                "reported back does not carry an instruction out.")
+    if wants not in ("shown", "told", "done") or not capability:
+        return ""
+    from backend.core.agent_bindings import delivery_of
+
+    delivered = delivery_of(capability)
+    if not delivered or delivered == wants:
+        return ""
+    return (f'It says the user wants it {wants.upper()}, but "{capability}" is marked '
+            f"{delivered.upper()}.")
+
+
+def _serve_stated_goal(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Hold the Mind's chosen means to the goal it stated, after it has had
+    the chance to reconcile them itself.
+
+    "wants" is the Mind's own decision about the user; the capability is its
+    choice of means. When the means still cannot deliver that goal after a
+    reconsideration (live, local 30B: "search for dogs" -> wants "shown",
+    then web_search_agent, marked TOLD, twice -- anchored on the word
+    "search" in the agent's id), the goal stands and the means follows it:
+    JARVIS's own route that delivers what the Mind said the user wants. The
+    goal is never chosen here; only an entry the bindings declare as
+    delivering it.
+    """
+    wants = str(result.get("wants") or "").strip().lower()
+    capability = str(result.get("capability") or "").strip().lower()
+    if not capability or wants not in ("shown", "done"):
+        return result
+    from backend.core.agent_bindings import delivery_of, route_delivering
+
+    delivered = delivery_of(capability)
+    if not delivered or delivered == wants:
+        return result
+    serving = route_delivering(wants)
+    if not serving:
+        return result
+    logger.info("IntentClassifier: the Mind wants it %s; %s delivers %s -> %s",
+                wants.upper(), capability, delivered.upper(), serving)
+    return {**result, "capability": serving}
+
+
+def _chain(raw: Any) -> Tuple[str, ...]:
+    """The sub-requests of a chained command: two or more non-empty strings."""
+    if not isinstance(raw, list):
+        return ()
+    steps = tuple(str(s).strip() for s in raw if isinstance(s, str) and s.strip())
+    return steps if len(steps) >= 2 else ()
+
 
 _instance: IntentClassifier | None = None
 
