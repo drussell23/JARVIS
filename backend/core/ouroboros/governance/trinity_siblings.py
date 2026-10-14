@@ -136,6 +136,22 @@ def _answers(url: str, timeout: float) -> bool:
         return False
 
 
+def serving_siblings(probe: Callable[[str, float], bool] = _answers) -> List[str]:
+    """Base URLs of the siblings answering their readiness probe right now.
+
+    A serving sibling is adopted by ``ensure_sibling``, so boot-time orphan
+    cleanup must leave it (and the engines under it) alone: killing it throws
+    away a loaded model only for the same boot to start it again.
+    """
+    timeout = probe_timeout_s()
+    urls: List[str] = []
+    for sib in siblings():
+        base = (sib.base_url() or "").rstrip("/")
+        if base and probe(base + sib.probe_path, timeout):
+            urls.append(base)
+    return urls
+
+
 def _template_values(base_url: str) -> Dict[str, str]:
     port = urlparse(base_url).port
     return {

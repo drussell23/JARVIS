@@ -18,6 +18,7 @@ def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("JARVIS_TRINITY_LOG_DIR", str(tmp_path))
     monkeypatch.setenv("JARVIS_JPRIME_START_BUDGET_S", "5")
     monkeypatch.setenv("JARVIS_REACTOR_START_BUDGET_S", "5")
+    monkeypatch.setenv("JARVIS_VISION_MODEL_NAME", "jarvis-vision:8b")
 
 
 class Clock:
@@ -57,12 +58,13 @@ def test_serving_siblings_are_left_alone():
 
 
 def test_down_sibling_is_started_with_template_filled_from_the_organisms_config(monkeypatch):
-    monkeypatch.setenv("JARVIS_JPRIME_START_CMD", "pwsh -File x.ps1 -Preload {model} -Port {port} -Ctx {ctx}")
+    monkeypatch.setenv("JARVIS_JPRIME_START_CMD", "pwsh -File x.ps1 -Preload {model} -Port {port} -Ctx {ctx} -Coresident {vision_model}")
     st, spawned, _ = _run({"http://127.0.0.1:8090/health"},
                           comes_up_after={"http://127.0.0.1:8000/api/version": 3.0})
     assert st["jprime"].state == "started"
     cmd, values = spawned[0]
-    assert values == {"model": "qwen3-coder-ov:30b", "port": "8000", "ctx": "32768"}
+    assert values == {"model": "qwen3-coder-ov:30b", "port": "8000", "ctx": "32768",
+                      "vision_model": "jarvis-vision:8b"}
 
 
 def test_sibling_that_never_answers_is_reported_not_raised(monkeypatch):
@@ -119,3 +121,15 @@ def test_a_lent_mind_is_reported_lent_and_never_restarted():
                               lent={"jprime": "training cycle handoff-1 in TRAINING"})
     assert st["jprime"].state == "lent" and "handoff-1" in st["jprime"].detail
     assert spawned == [] and any("lent" in ln for ln in lines)
+
+
+def test_serving_siblings_names_only_the_ones_that_answer():
+    """Orphan cleanup spares exactly these; a down sibling is not protected."""
+    answered = []
+
+    def probe(url, timeout):
+        answered.append(url)
+        return url.startswith("http://127.0.0.1:8000")
+
+    assert ts.serving_siblings(probe=probe) == ["http://127.0.0.1:8000"]
+    assert any(u.endswith("/api/version") for u in answered)

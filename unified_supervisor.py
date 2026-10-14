@@ -6404,6 +6404,11 @@ class IntelligentKernelTakeover:
             orphans = [o for o in orphans if owned_by_trinity(o.pid)]
         except ImportError:
             pass
+        # A sibling that is serving is adopted by this boot (trinity_siblings
+        # .ensure_sibling), not orphaned: killing it discarded a loaded model
+        # only for the same boot to start it again a minute later.
+        adopted = await self._serving_sibling_pids()
+        orphans = [o for o in orphans if o.pid not in adopted]
 
         for orphan in orphans:
             try:
@@ -6440,6 +6445,29 @@ class IntelligentKernelTakeover:
             )
         except (asyncio.TimeoutError, Exception):
             return None
+
+    async def _serving_sibling_pids(self) -> Set[int]:
+        """PIDs of serving Trinity siblings: each listener and its descendants."""
+        from urllib.parse import urlparse
+        try:
+            from backend.core.ouroboros.governance.trinity_siblings import serving_siblings
+            import psutil
+            urls = await asyncio.to_thread(serving_siblings)
+        except Exception as e:
+            self.logger.debug(f"[Takeover] sibling probe unavailable: {e}")
+            return set()
+        pids: Set[int] = set()
+        for url in urls:
+            port = urlparse(url).port
+            pid = await self._find_process_on_port(port) if port else None
+            if not pid:
+                continue
+            pids.add(pid)
+            try:
+                pids.update(c.pid for c in psutil.Process(pid).children(recursive=True))
+            except Exception:
+                pass
+        return pids
 
     def _detect_repo_origin(self, cmdline: str) -> str:
         """Detect which repo a process belongs to based on command line."""
