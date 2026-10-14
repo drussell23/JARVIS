@@ -67,6 +67,7 @@ class BootTimeline:
         self._seen: Dict[str, float] = {}          # milestone -> offset this boot
         self._open_phases: List[Tuple[str, float]] = []  # (phase, started at)
         self._completed_at: Optional[float] = None
+        self._shown = 0.0                          # highest fraction reported
         self._load()
 
     # -- learning ----------------------------------------------------------
@@ -132,16 +133,33 @@ class BootTimeline:
                 n = len(self._seen)
                 return min(ceiling, n / (n + 1)) if n else 0.0
             total = self._learned_total
-            reached = [(self._learned[k], self._seen[k]) for k in self._seen if k in self._learned]
-            # The furthest point on the learned timeline this boot has reached.
-            last_learned, last_actual = max(reached, default=(0.0, 0.0))
+            # Phases run in parallel, so they do not finish in the order the
+            # timeline learned. A phase that is visibly still running caps the
+            # position at its learned end: one finishing early elsewhere (the
+            # 08:51 boot went 33% -> 57% in two seconds, then sat at 57% for
+            # 27) must not carry the bar past it. A phase that never started
+            # does not cap -- this boot may skip it.
+            running = {phase for phase, _ in self._open_phases}
+            cap = min((v for k, v in self._learned.items()
+                       if k not in self._seen and k.rpartition(":")[2] == "end"
+                       and k.rpartition(":")[0] in running), default=total)
+            reached = [(self._learned[k], self._seen[k]) for k in self._seen
+                       if k in self._learned and self._learned[k] <= cap]
+            # The furthest point reached short of the cap, and when the boot
+            # got there (the latest of those arrivals).
+            last_learned = max((lv for lv, _ in reached), default=0.0)
+            last_actual = max((av for _, av in reached), default=0.0)
             ahead = sorted(v for k, v in self._learned.items()
                            if k not in self._seen and v > last_learned)
-            next_learned = ahead[0] if ahead else total
-            gap = max(next_learned - last_learned, 1e-9)
+            next_learned = min(ahead[0] if ahead else total, cap)
+            gap = max(next_learned - last_learned, 0.0)
             elapsed_since = max(0.0, (now - self._origin) - last_actual)
             position = last_learned + min(gap, elapsed_since)
-            return min(ceiling, position / total) if total > 0 else 0.0
+            fraction = min(ceiling, position / total) if total > 0 else 0.0
+            # A phase starting late lowers the cap; the bar then holds -- it
+            # never goes back on what it already showed.
+            self._shown = max(self._shown, fraction)
+            return self._shown
 
     def percent(self, now: Optional[float] = None) -> int:
         return int(self.fraction(now) * PERCENT)
