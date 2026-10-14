@@ -72,10 +72,17 @@ def test_an_old_daemon_is_judged_by_the_tracked_sources(tmp_path, monkeypatch):
     assert dh.running_daemon_staleness(Path("unused"), root).changed  # a.py is newer
 
 
-def test_tracked_sources_leave_out_the_test_suite():
+@pytest.mark.parametrize("git_on_path", [True, False])
+def test_tracked_sources_leave_out_the_test_suite(monkeypatch, git_on_path):
+    # A plain Windows PowerShell has no git on PATH: the 07:51 launch then saw
+    # no sources at all and attached to the 04:52 kernel.
+    if not git_on_path:
+        monkeypatch.setattr(dh.shutil, "which", lambda _name: None)
     names = dh._tracked_sources(REPO)
-    assert "unified_supervisor.py" in names
+    assert "unified_supervisor.py" in names and "backend/core/daemon_handover.py" in names
     assert not any(Path(n).name.startswith("test_") or Path(n).name == "conftest.py" for n in names)
+    assert not any(part.startswith(".") or part in ("node_modules", "__pycache__")
+                   for n in names for part in Path(n).parts[:-1])
 
 
 # -- the handover, against real daemons in child processes ---------------------

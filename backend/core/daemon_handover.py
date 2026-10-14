@@ -35,6 +35,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -106,23 +107,60 @@ def code_identity(root: Path = REPO_ROOT) -> dict:
 
 
 # -- the launcher side ----------------------------------------------------------
-def _tracked_sources(root: Path) -> List[str]:
-    """Sources a daemon without a code identity can have loaded: tracked .py
-    files that are not pytest's (a kernel never imports its test suite)."""
+def _is_test_file(rel: str) -> bool:
+    name = Path(rel).name
+    return name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py"
+
+
+def _never_imported_dir(name: str) -> bool:
+    """Directories that are never import roots for the kernel: hidden ones
+    (.git, .github, .venv ...), bytecode caches and npm trees."""
+    return name.startswith(".") or name in ("__pycache__", "node_modules")
+
+
+def _git_sources(root: Path) -> Optional[List[str]]:
+    """Tracked .py files, or None when git cannot answer (not on PATH -- the
+    usual case in a plain Windows PowerShell -- or not a checkout)."""
+    git = shutil.which("git")
+    if not git:
+        return None
     try:
         out = subprocess.run(
-            ["git", "ls-files", "-z", "--", "*.py"], cwd=str(root),
+            [git, "ls-files", "-z", "--", "*.py"], cwd=str(root),
             capture_output=True, timeout=_query_timeout_s() * 4,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        logger.debug("[Handover] git ls-files unavailable: %s", exc)
-        return []
+        logger.debug("[Handover] git ls-files failed: %s", exc)
+        return None
     if out.returncode != 0:
-        return []
-    names = [n for n in out.stdout.decode("utf-8", "replace").split("\0") if n]
+        return None
+    return [n for n in out.stdout.decode("utf-8", "replace").split("\0") if n]
+
+
+def _walked_sources(root: Path) -> List[str]:
+    """Every .py file in the checkout, without git, never entering a
+    directory the kernel cannot import from (nor a virtualenv, marked by
+    its pyvenv.cfg)."""
+    found = []
+    for here, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs
+                   if not _never_imported_dir(d)
+                   and not os.path.exists(os.path.join(here, d, "pyvenv.cfg"))]
+        rel_here = Path(here).relative_to(root)
+        found.extend((rel_here / f).as_posix() for f in files if f.endswith(".py"))
+    return found
+
+
+def _tracked_sources(root: Path) -> List[str]:
+    """Sources a daemon without a code identity can have loaded: the
+    checkout's .py files (git's list when git can answer, else the tree
+    itself) that are not pytest's -- a kernel never imports its test suite."""
+    names = _git_sources(root)
+    if names is None:
+        names = _walked_sources(root)
     return [n for n in names
-            if not (Path(n).name.startswith("test_") or Path(n).name.endswith("_test.py")
-                    or Path(n).name == "conftest.py")]
+            if not _is_test_file(n)
+            and not any(_never_imported_dir(part) for part in Path(n).parts[:-1])]
 
 
 def _query(sock_path: Path, request: dict, answer_type: Optional[str] = None) -> Optional[dict]:
