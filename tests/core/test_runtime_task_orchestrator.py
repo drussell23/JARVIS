@@ -85,14 +85,20 @@ class TestRuntimeTaskOrchestrator:
     async def test_resolve_existing_agent(self):
         registry = AsyncMock()
         agent_info = MagicMock()
-        agent_info.agent_name = "visual_browser_agent"
+        agent_info.agent_name = "synthesized_booking_agent"
         agent_info.load = 0.1
         registry.find_by_capability = AsyncMock(return_value=[agent_info])
         registry.get_agent = AsyncMock(return_value=agent_info)
 
+        # A capability no binding declares resolves through the registry,
+        # where synthesized and graduated agents register.
         orch = RuntimeTaskOrchestrator(registry=registry)
-        result = await orch.execute("browse youtube.com")
-        assert any(s.resolution == TaskResolution.EXISTING_AGENT for s in result.steps)
+        step = {"goal": "book a table", "capability": "restaurant_booking",
+                "classification_source": "jprime"}
+        res = await orch._resolve_step(step, {})
+        assert res.resolution == TaskResolution.EXISTING_AGENT
+        assert res.agent_name == "synthesized_booking_agent"
+        registry.find_by_capability.assert_awaited_with("restaurant_booking")
 
     @pytest.mark.asyncio
     async def test_resolve_code_change_to_governance(self):
@@ -152,8 +158,7 @@ class TestRuntimeTaskOrchestrator:
             StepResolution("step2", TaskResolution.EPHEMERAL_TOOL, None, None, True, error="failed"),
         ]
         summary = RuntimeTaskOrchestrator._build_summary("test", steps)
-        assert "1/2" in summary
-        assert "synthesized" in summary
+        assert "1 of 2" in summary and "failed" in summary
 
 
 # ---------------------------------------------------------------------------
@@ -166,8 +171,8 @@ class TestStructuredDispatch:
 
     @pytest.mark.asyncio
     async def test_dispatch_calls_execute_task(self):
-        """A research step reaches the agent bound to the web_research
-        capability through its real execute_task, with the structured goal
+        """A step the Mind assigned the web_research capability reaches the
+        agent bound to it through its real execute_task, with the structured goal
         (no agent verb needed: a goal means "answer it")."""
         from backend.core.agent_bindings import agent_for_capability
 
@@ -185,7 +190,8 @@ class TestStructuredDispatch:
 
         result = await orch.execute(
             query="find out who won the world series",
-            context={"action_category": "research", "search_query": "world series winner"},
+            context={"capability": "web_research", "classification_source": "jprime",
+                     "search_query": "world series winner"},
         )
 
         mock_agent_instance.execute_task.assert_called_once()
@@ -219,6 +225,37 @@ class TestStructuredDispatch:
         keyword_agent.execute_task.assert_not_called()
         assert result.steps[0].resolution == TaskResolution.VISION_ACTION
         assert result.summary.startswith("Opened")
+
+    @pytest.mark.asyncio
+    async def test_unserved_capability_is_reported_as_a_gap_and_routing_continues(self):
+        """A capability nothing serves goes to the GapSignalBus (synthesis)
+        and the remaining routes still run."""
+        registry = AsyncMock()
+        registry.find_by_capability = AsyncMock(return_value=[])
+        orch = RuntimeTaskOrchestrator(registry=registry)
+        bus = MagicMock()
+        with patch("backend.neural_mesh.synthesis.gap_signal_bus.get_gap_signal_bus",
+                   return_value=bus):
+            step = {"goal": "book a table", "capability": "restaurant_booking",
+                    "classification_source": "jprime"}
+            assert await orch._resolve_named_capability(step, step["goal"], 0.0) is None
+        event = bus.emit.call_args[0][0]
+        assert event.task_type == "restaurant_booking" and event.goal == "book a table"
+
+    @pytest.mark.asyncio
+    async def test_mind_decided_step_is_not_redecided_by_keyword(self):
+        """No capability from the Mind is a decision: the goal's words
+        ("look up", "news") must not pull a keyword-matched agent in."""
+        registry = AsyncMock()
+        registry.find_by_capability = AsyncMock(return_value=[
+            MagicMock(agent_name="web_search_agent", load=0.0),
+        ])
+        orch = RuntimeTaskOrchestrator(registry=registry)
+        step = {"goal": "look up the news", "classification_source": "jprime"}
+        with patch("backend.core_contexts.facade.dispatch", AsyncMock(return_value=None)):
+            res = await orch._resolve_step(step, {})
+        assert res.agent_name != "web_search_agent"
+        registry.find_by_capability.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_unknown_agent_raises_not_fallthrough(self):

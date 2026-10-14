@@ -1086,6 +1086,22 @@ class JarvisPrimeClient:
                        for m in data["data"])
         return bool(isinstance(data, dict) and data.get("model_loaded", False))
 
+    async def cold_load_allowance_s(self) -> float:
+        """Extra time the next text request needs because no text model is resident.
+
+        Every timeout and deadline JARVIS sets for the Mind assumes a resident
+        model. When the server has swapped it out (to admit vision for a
+        foreground request), the next call also pays the reload, so any budget
+        set without this evidence expires mid-load ("can you see my screen?"
+        followed by a question timed out at the classifier and the command was
+        routed by keyword instead). Read fresh, not from the TTL cache: the
+        swap is seconds old. Unknown health grants nothing extra.
+        """
+        health = await self._check_local_health()
+        if health.available and not health.model_loaded:
+            return float(os.getenv("JARVIS_PRIME_COLD_LOAD_BUDGET_S", "90"))
+        return 0.0
+
     async def _check_local_health(self) -> HealthStatus:
         """Check local JARVIS-Prime health."""
         client = await self._get_http_client()
@@ -1941,15 +1957,7 @@ class JarvisPrimeClient:
 
         url = f"http://{self.config.local_host}:{self.config.local_port}/v1/chat/completions"
         # v278.0: Budget-aware timeout
-        config_timeout = self.config.local_timeout_ms / 1000.0
-        # The configured timeout assumes a resident model. When none is (the
-        # server swapped the text model out to admit vision for a foreground
-        # request), this request also pays the reload: allow it, or the next
-        # question after "can you see my screen?" times out at 5 s mid-load.
-        # Read fresh, not from the TTL cache: the swap is seconds old.
-        health = await self._check_local_health()
-        if health.available and not health.model_loaded:
-            config_timeout += float(os.getenv("JARVIS_PRIME_COLD_LOAD_BUDGET_S", "90"))
+        config_timeout = (self.config.local_timeout_ms / 1000.0) + await self.cold_load_allowance_s()
         timeout = self._compute_effective_timeout(config_timeout, deadline)
         if timeout is None:
             return CompletionResponse(

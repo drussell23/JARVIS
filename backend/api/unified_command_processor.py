@@ -1989,20 +1989,6 @@ class UnifiedCommandProcessor:
         return result
 
     @staticmethod
-    def _runtime_task_context(classification: Any) -> Dict[str, Any]:
-        """The classifier's structured decision, as the RuntimeTaskOrchestrator reads it."""
-        return {
-            "intent": "action",
-            "action_category": getattr(classification, "action_category", ""),
-            "provider": getattr(classification, "provider", ""),
-            "search_query": getattr(classification, "search_query", ""),
-            "target_app": getattr(classification, "target_app", ""),
-            "requires_vision": getattr(classification, "requires_vision", False),
-            "classification_source": getattr(classification, "classification_source", ""),
-            "source": "pillar5_preroute",
-        }
-
-    @staticmethod
     def _runtime_task_response(rto_result: Any) -> Optional[Dict[str, Any]]:
         """The reply for a RuntimeTaskOrchestrator result, or None to try the next route.
 
@@ -2140,20 +2126,23 @@ class UnifiedCommandProcessor:
         # the second pre-route below used to re-run a task the first had
         # already acted on (the browser opened twice).
         _rto_attempted = False
+        # The ONE classification of this command, made by the Mind. Every
+        # routing decision below reads it; none re-derives intent by keyword.
+        _mind_classification = None
 
         try:
             from backend.core.intent_classifier import get_intent_classifier, CommandIntent
             _ic = get_intent_classifier()
-            # Primary: agentic classification via J-Prime (Manifesto §5)
-            # Fallback: sync heuristic (degraded mode, §2 Progressive Awakening)
-            try:
-                _classification = await asyncio.wait_for(
-                    _ic.classify_async(command_text),
-                    timeout=5.0,
-                )
-            except (asyncio.TimeoutError, Exception) as _ce:
-                _p5log(f"classify_async failed ({_ce}), degraded to sync heuristic")
-                _classification = _ic.classify(command_text)
+            # classify_async bounds itself from evidence (resident model or a
+            # reload in progress); a caller-side timer would cut it short.
+            _classification = await _ic.classify_async(command_text)
+            if _classification.decided_by_mind:
+                _mind_classification = _classification
+            else:
+                # The reflex-arc heuristic only stands in while the Mind is
+                # unavailable; acting on a keyword guess (opening sites,
+                # driving the screen) is never its call.
+                _p5log("Mind did not classify — no action is dispatched on a keyword guess")
             _p5log(f"classify: {_classification.intent.value} conf={_classification.confidence} "
                    f"cat={_classification.action_category} provider={_classification.provider} "
                    f"target_app={_classification.target_app} "
@@ -2170,7 +2159,8 @@ class UnifiedCommandProcessor:
                 from backend.vision.screen_question import answer_about_screen
                 return await answer_about_screen(command_text)
 
-            if _classification.intent == CommandIntent.ACTION and _classification.confidence >= 0.7:
+            if _mind_classification is not None and \
+                    _classification.intent == CommandIntent.ACTION and _classification.confidence >= 0.7:
                 _p5log("ACTION detected — dispatching to RTO (agentic resolution)")
 
                 # Directive 3: Transparent latency — narrate synthesis to user
@@ -2202,7 +2192,7 @@ class UnifiedCommandProcessor:
                     _rto_result = await asyncio.wait_for(
                         _rto.execute(
                             query=command_text,
-                            context=self._runtime_task_context(_classification),
+                            context=_classification.to_task_context(source="pillar5_preroute"),
                         ),
                         timeout=float(os.environ.get("JARVIS_RTO_TIMEOUT", "120.0")),
                     )
@@ -2456,141 +2446,10 @@ class UnifiedCommandProcessor:
             except Exception as exc:
                 logger.warning("[v295] Remote reasoning failed: %s — using local fallback", exc)
 
-        # Pillar 5 + Pillar 2: Reflex-arc pre-route.
-        # File-traced for debugging (TUI swallows logger output).
-        _p5_trace = "/tmp/jarvis_pillar5_trace.log"
-        def _p5log(msg):
-            try:
-                with open(_p5_trace, "a") as _f:
-                    _f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
-            except Exception:
-                pass
-
-        try:
-            from backend.core.intent_classifier import get_intent_classifier, CommandIntent
-
-            _ic = get_intent_classifier()
-            _classification = _ic.classify(command_text)
-            _p5log(f"classify: intent={_classification.intent.value} conf={_classification.confidence} "
-                   f"cat={_classification.action_category} provider={_classification.provider} "
-                   f"query={_classification.search_query}")
-
-            if _classification.intent == CommandIntent.ACTION and _classification.confidence >= 0.7:
-                _p5log("ACTION detected — entering pre-route")
-
-                # Try RTO
-                try:
-                    from backend.core.runtime_task_orchestrator import (
-                        get_runtime_task_orchestrator, set_runtime_task_orchestrator,
-                        RuntimeTaskOrchestrator,
-                    )
-                    _rto = get_runtime_task_orchestrator()
-                    _p5log(f"RTO singleton: {_rto is not None}")
-
-                    if _rto is None:
-                        try:
-                            from backend.core.prime_client import get_prime_client
-                            _lazy_pc = await get_prime_client()
-                            _rto = RuntimeTaskOrchestrator(prime_client=_lazy_pc)
-                            set_runtime_task_orchestrator(_rto)
-                            _p5log("Lazy-created minimal RTO")
-                        except Exception as _lazy_exc:
-                            _p5log(f"Lazy RTO FAILED: {_lazy_exc}")
-
-                    if _rto is not None and not _rto_attempted:
-                        _p5log("Dispatching to RTO.execute()")
-                        try:
-                            _rto_attempted = True
-                            _rto_result = await asyncio.wait_for(
-                                _rto.execute(
-                                    query=command_text,
-                                    context=self._runtime_task_context(_classification),
-                                ),
-                                timeout=float(os.environ.get("JARVIS_RTO_TIMEOUT", "120.0")),
-                            )
-                            _p5log(f"RTO result: {_rto_result}")
-                            _rto_response = self._runtime_task_response(_rto_result)
-                            if _rto_response is not None:
-                                return _rto_response
-                            _p5log("RTO did nothing — falling through to direct execution")
-                        except asyncio.TimeoutError:
-                            _p5log("RTO TIMEOUT after 60s")
-                        except Exception as _rto_exec_exc:
-                            _p5log(f"RTO execute FAILED: {type(_rto_exec_exc).__name__}: {_rto_exec_exc}")
-                except Exception as _rto_exc:
-                    _p5log(f"RTO unavailable: {_rto_exc}")
-
-                # Direct execution fallback — browser search actions
-                _p5log(f"Direct execution check: cat={_classification.action_category} "
-                       f"query={_classification.search_query} provider={_classification.provider}")
-                logger.info(
-                    "[Pillar5] Direct execution check: category=%s search_query=%s provider=%s",
-                    _classification.action_category, _classification.search_query, _classification.provider,
-                )
-                if _classification.action_category == "browser" and _classification.search_query:
-                    try:
-                        from backend.api.action_executors import ApplicationLauncherExecutor
-                        from backend.api.workflow_engine import ExecutionContext
-                        from datetime import datetime as _dt
-
-                        _launcher = ApplicationLauncherExecutor()
-                        _ctx = ExecutionContext(
-                            workflow_id="pillar5_direct",
-                            start_time=_dt.now(),
-                            user_id="voice",
-                        )
-                        _provider = _classification.provider or "google"
-                        _query = _classification.search_query
-
-                        # Resolve search URL via AI or construct directly
-                        _search_url = await _launcher.resolve_search_url(_provider, _query)
-                        if _search_url:
-                            await _launcher._open_url_in_browser(
-                                _search_url, _provider, _ctx,
-                                message=f"Searching {_provider} for {_query}",
-                            )
-                            logger.info(
-                                "[Pillar5] Direct execution: opened %s", _search_url
-                            )
-                            return {
-                                "success": True,
-                                "response": f"Searching {_provider} for {_query}",
-                                "command_type": "ACTION",
-                                "source": "pillar5_direct_browser",
-                            }
-                    except Exception as _direct_exc:
-                        logger.warning("[Pillar5] Direct browser execution failed: %s", _direct_exc)
-
-                # Direct execution fallback — app control
-                if _classification.action_category == "app_control" and _classification.target_app:
-                    try:
-                        from backend.api.action_executors import ApplicationLauncherExecutor
-                        from backend.api.workflow_parser import WorkflowAction, ActionType
-                        from backend.api.workflow_engine import ExecutionContext
-                        from datetime import datetime as _dt
-
-                        _launcher = ApplicationLauncherExecutor()
-                        _ctx = ExecutionContext(
-                            workflow_id="pillar5_direct",
-                            start_time=_dt.now(),
-                            user_id="voice",
-                        )
-                        _action = WorkflowAction(ActionType.OPEN_APP, _classification.target_app)
-                        _result = await _launcher.execute(_action, _ctx)
-                        logger.info("[Pillar5] Direct execution: %s", _result)
-                        return {
-                            "success": True,
-                            "response": _result.get("message", f"Opened {_classification.target_app}"),
-                            "command_type": "ACTION",
-                            "source": "pillar5_direct_app",
-                        }
-                    except Exception as _direct_exc:
-                        logger.warning("[Pillar5] Direct app execution failed: %s", _direct_exc)
-
-        except ImportError:
-            pass
-        except Exception as _ic_exc:
-            logger.debug("[Pillar5] Pre-route failed: %s", _ic_exc)
+        # (A second, keyword-classified pre-route used to run here. The one
+        # Mind classification above already dispatched every action; this
+        # path could only re-decide by keyword and override the Mind's
+        # "query" verdict, so it was removed.)
 
         response = await self._call_jprime(
             command_text, deadline=deadline, source_context=_jprime_ctx or None,

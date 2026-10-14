@@ -253,8 +253,36 @@ def agent_for_capability(capability: str) -> Optional[str]:
     return None
 
 
+_catalogue: Optional[str] = None
+
+
+def capability_catalogue() -> str:
+    """What each dispatchable agent does, for the Mind to choose from.
+
+    One line per binding: ``agent_id — <its own docstring summary>
+    [capabilities]``. Descriptions come from the agent classes themselves, so
+    a user binding or a synthesized agent describes itself. A binding whose
+    class cannot be imported cannot be dispatched and is not offered.
+    Cached per bindings load (imports are not free); call from a thread.
+    """
+    global _catalogue
+    if _catalogue is None:
+        lines: List[str] = []
+        for agent_id, binding in get_agent_bindings().items():
+            try:
+                cls = getattr(importlib.import_module(binding.module), binding.class_name)
+            except Exception as exc:  # noqa: BLE001 -- unimportable = undispatchable
+                logger.debug("[AgentBindings] %s not offered: %s", agent_id, exc)
+                continue
+            summary = next((ln.strip() for ln in (cls.__doc__ or "").splitlines() if ln.strip()), "")
+            lines.append(f"- {agent_id} — {summary} [{', '.join(sorted(binding.capabilities))}]")
+        _catalogue = "\n".join(lines)
+    return _catalogue
+
+
 def reload_bindings() -> Dict[str, AgentBinding]:
     """Force-reload bindings (e.g. after user edits the JSON)."""
-    global _bindings
+    global _bindings, _catalogue
     _bindings = load_bindings()
+    _catalogue = None
     return _bindings

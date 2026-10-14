@@ -2464,9 +2464,9 @@ class UnifiedWebSocketManager:
             logger.info(f"[WS] Processing voice command: {command_text}")
 
             # ============== E1 BRIDGE: Intent Classification ==============
-            # Deterministic classifier routes ACTION commands to RuntimeTaskOrchestrator
-            # (Neural Mesh agents, browser, apps, tools) and QUERY commands to
-            # HybridOrchestrator (J-Prime text Q&A). Zero LLM dependency.
+            # The Mind's classification routes ACTION commands to the
+            # RuntimeTaskOrchestrator (Neural Mesh agents, browser, apps, tools)
+            # and everything else to HybridOrchestrator (J-Prime text Q&A).
             try:
                 from backend.core.intent_classifier import get_intent_classifier, CommandIntent
                 from backend.core.runtime_task_orchestrator import get_runtime_task_orchestrator
@@ -2475,7 +2475,7 @@ class UnifiedWebSocketManager:
                 # Pillar 5: Agentic classification via J-Prime (falls back to reflex arc)
                 _classification = await _classifier.classify_async(command_text)
 
-                if _classification.intent == CommandIntent.ACTION:
+                if _classification.decided_by_mind and _classification.intent == CommandIntent.ACTION:
                     # Directive 2: Check Progressive Readiness before dispatching ACTION
                     _action_ready = True
                     try:
@@ -2517,16 +2517,11 @@ class UnifiedWebSocketManager:
                             # orchestrator never needs to scrape goal strings.
                             _task_result = await _rto.execute(
                                 query=command_text,
-                                context={
-                                    "client_id": client_id,
-                                    "source": "voice_command",
-                                    "action_category": _classification.action_category,
-                                    "provider": getattr(_classification, "provider", ""),
-                                    "search_query": getattr(_classification, "search_query", ""),
-                                    "url": getattr(_classification, "url", ""),
-                                    "target_app": getattr(_classification, "target_app", ""),
-                                    "timestamp": datetime.now().isoformat(),
-                                },
+                                context=_classification.to_task_context(
+                                    client_id=client_id,
+                                    source="voice_command",
+                                    timestamp=datetime.now().isoformat(),
+                                ),
                             )
 
                             # Build response from TaskResult

@@ -32,7 +32,7 @@ import os
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,33 @@ class ClassificationResult:
     requires_vision: bool = False  # True when subsequent steps need screen/UI automation
     classification_source: str = "sync_heuristic"  # "sync_heuristic" or "jprime" — telemetry
     needs_screen: bool = False     # the ANSWER needs a look at the user's screen ("what's on my screen?")
+    # The agent capability the Mind chose from the live catalogue
+    # (agent_bindings.capability_catalogue), or a capability JARVIS lacks.
+    capability: str = ""
+
+    @property
+    def decided_by_mind(self) -> bool:
+        """Only the Mind's classification may dispatch an action; the
+        reflex-arc heuristic stands in for routing to an answer, never for
+        acting on the desktop."""
+        return self.classification_source == "jprime"
+
+    def to_task_context(self, **extra: Any) -> Dict[str, Any]:
+        """This decision as the RuntimeTaskOrchestrator reads it (one mapping
+        for every surface: HTTP command, WebSocket, voice)."""
+        ctx: Dict[str, Any] = {
+            "intent": self.intent.value,
+            "action_category": self.action_category,
+            "capability": self.capability,
+            "provider": self.provider,
+            "search_query": self.search_query,
+            "url": self.url,
+            "target_app": self.target_app,
+            "requires_vision": self.requires_vision,
+            "classification_source": self.classification_source,
+        }
+        ctx.update(extra)
+        return ctx
 
 
 # ---------------------------------------------------------------------------
@@ -452,69 +479,89 @@ class IntentClassifier:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _classify_system_prompt() -> str:
-        """Built per call: it names the OS JARVIS is actually running on."""
+    def _classify_system_prompt(catalogue: str) -> str:
+        """Built per call: the host OS and the live agent catalogue are facts
+        of THIS run, so neither is written into the prompt ahead of time."""
         from backend.core.host_platform import os_display_name
 
         return (
-            f"You are an intent classifier for a {os_display_name()} desktop AI assistant. "
-            "Given a voice command, classify it and extract structured fields.\n\n"
+            f"You are the intent classifier of JARVIS, an AI assistant on a {os_display_name()} desktop. "
+            "Given a voice command, decide what it asks for and extract structured fields.\n\n"
+            "Agents JARVIS can dispatch right now (id — what it does [capabilities]):\n"
+            f"{catalogue or '- (none)'}\n\n"
             "Respond ONLY with valid JSON, no markdown:\n"
             "{\n"
             '  "intent": "action" or "query",\n'
             '  "confidence": 0.0-1.0,\n'
-            '  "action_category": "browser"|"research"|"app_control"|"system"|"communication"|"media"|"file"|"",\n'
-            '  "provider": "youtube"|"google"|"spotify"|etc or "",\n'
-            '  "search_query": "extracted search term" or "",\n'
-            '  "target_app": "app name mentioned" or "",\n'
+            '  "capability": one capability token from the catalogue, a new snake_case name for '
+            'a capability JARVIS would need but lacks, or "",\n'
+            '  "provider": the web service named or implied, or "",\n'
+            '  "search_query": the thing to search for or look up, or "",\n'
+            '  "target_app": the application named, or "",\n'
             '  "requires_vision": true or false,\n'
             '  "needs_screen": true or false,\n'
             '  "reasoning": "one-line explanation"\n'
             "}\n\n"
-            "Rules:\n"
-            '- "action" = the user wants to DO something (open, search, play, look up, create, send, etc.)\n'
-            '- "query" = the user wants to KNOW something you can answer from general knowledge '
-            "(question, explanation, conversation)\n"
-            '- action_category "browser" = open a web page or a search for the user to see '
-            "(\"search for dogs\", \"search YouTube for NBA\", \"go to github\")\n"
-            '- action_category "research" (intent "action") = the user wants an ANSWER found '
-            "on the live web: current events, prices, scores, anything to look up and report "
-            "back (\"look up the latest news on X\", \"find out who won last night\"). Use it "
-            "whenever the answer depends on information newer than your own knowledge\n"
-            "- Extract provider if a specific service is mentioned\n"
-            "- Extract search_query if the user is searching for or researching something\n"
-            "- Extract target_app if ANY app is mentioned (WhatsApp, Slack, Chrome, etc.) — "
-            "do NOT limit to a fixed list, extract whatever app the user names\n"
-            "- Set requires_vision=true only when the command needs screen/UI interaction AFTER "
-            "an app or page is open — e.g. 'message Zach on WhatsApp' (find and click a contact), "
-            "'play the first video', 'fill out the form'. Opening an app, a page or a search's "
-            "results page needs no vision = false\n"
-            "- Set needs_screen=true when answering requires LOOKING at the user's screen right "
-            "now: \"can you see my screen?\", \"what's on my screen\", \"read this error\", "
-            "\"what am I looking at\", \"describe this window\". Otherwise false\n"
-            "- If uncertain, prefer query (safe — non-destructive)"
+            "Field meanings:\n"
+            '- intent "action": the user wants JARVIS to DO something or to go and find something '
+            'out. intent "query": you can answer it yourself from what you already know.\n'
+            "- capability: set it only when the request is carried out by one of the agents above "
+            "(name the capability that agent declares). Leave it empty when the request is "
+            "answered directly, done by opening a page, a search's results or an app, or answered "
+            "by looking at the screen. A request needing information newer than your own "
+            "knowledge is not answerable directly: route it to the agent that finds it out.\n"
+            "- requires_vision: the task needs seeing and operating the UI AFTER something is open "
+            "(finding and clicking an item, filling a form). Opening something alone does not.\n"
+            "- needs_screen: the ANSWER requires looking at the user's screen right now.\n"
+            "- If uncertain, prefer query (safe, non-destructive)."
         )
+
+    @staticmethod
+    async def _classify_budget_s() -> float:
+        """How long the Mind may take to classify, from evidence.
+
+        The base (JARVIS_CLASSIFY_DEADLINE_S) assumes a resident text model;
+        when J-Prime has swapped it out the reload is added, measured by the
+        same client evidence every other Mind call uses. Without it a command
+        right after a screen question expired mid-reload and was routed by
+        keyword instead of by the model.
+        """
+        base = float(os.environ.get("JARVIS_CLASSIFY_DEADLINE_S", "8.0"))
+        try:
+            from backend.core.jarvis_prime_client import get_jarvis_prime_client
+            return base + await get_jarvis_prime_client().cold_load_allowance_s()
+        except Exception as exc:  # noqa: BLE001 -- no evidence grants nothing extra
+            logger.debug("IntentClassifier: residency evidence unavailable: %s", exc)
+            return base
 
     async def classify_async(self, command: str) -> ClassificationResult:
         """Agentic intent classification via J-Prime (Pillar 5).
 
-        Falls back to reflex-arc classify() if the Mind is unavailable.
+        Self-bounded by _classify_budget_s, so callers add no timer of their
+        own. Falls back to the reflex-arc classify() only when the Mind does
+        not answer within that budget (classification_source tells callers).
         """
         if not command or not command.strip():
             return self.classify(command)
 
         try:
+            from backend.core.agent_bindings import capability_catalogue
             from backend.core.prime_router import get_prime_router
-            router = await get_prime_router()
 
-            response = await router.generate(
-                prompt=f'Classify this voice command: "{command}"',
-                system_prompt=self._classify_system_prompt(),
-                max_tokens=256,
-                temperature=0.0,
-                deadline=asyncio.get_event_loop().time() + float(
-                    os.environ.get("JARVIS_CLASSIFY_DEADLINE_S", "8.0")
+            budget = await self._classify_budget_s()
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + budget
+            catalogue = await asyncio.to_thread(capability_catalogue)
+            router = await get_prime_router()
+            response = await asyncio.wait_for(
+                router.generate(
+                    prompt=f'Classify this voice command: "{command}"',
+                    system_prompt=self._classify_system_prompt(catalogue),
+                    max_tokens=256,
+                    temperature=0.0,
+                    deadline=deadline,
                 ),
+                timeout=max(0.0, deadline - loop.time()),
             )
 
             from backend.core.llm_json import parse_json_object
@@ -522,38 +569,41 @@ class IntentClassifier:
             result = parse_json_object(response.content)
             if result is None:
                 raise ValueError(f"no JSON object in {str(response.content)[:120]!r}")
-            # A category names something JARVIS must DO; it outranks a
+            capability = str(result.get("capability") or "").strip().lower()
+            # A capability names something an agent must DO; it outranks a
             # contradicting intent label ("look up the news" came back
-            # intent=query, category=research and was never researched).
-            _category = str(result.get("action_category") or "").strip().lower()
+            # intent=query with a research capability and was never researched).
             intent = (
                 CommandIntent.ACTION
-                if result.get("intent") == "action" or _category == "research"
+                if result.get("intent") == "action" or capability
                 else CommandIntent.QUERY
             )
 
             logger.info(
-                "IntentClassifier.classify_async: '%s' → %s/%s (confidence=%.2f, source=%s, latency=%.0fms)",
-                command, intent.value, _category or "-", result.get("confidence", 0),
-                response.source, response.latency_ms,
+                "IntentClassifier.classify_async: '%s' → %s/%s (confidence=%.2f, source=%s, "
+                "latency=%.0fms, budget=%.0fs)",
+                command, intent.value, capability or "-", result.get("confidence", 0),
+                response.source, response.latency_ms, budget,
             )
 
             return ClassificationResult(
                 intent=intent,
                 confidence=float(result.get("confidence", 0.85)),
                 matched_signal=f"ai:{response.source}",
-                action_category=result.get("action_category", ""),
+                action_category=capability,
                 provider=result.get("provider", ""),
                 search_query=result.get("search_query", ""),
                 target_app=result.get("target_app", ""),
                 requires_vision=bool(result.get("requires_vision", False)),
                 needs_screen=bool(result.get("needs_screen", False)),
                 classification_source="jprime",
+                capability=capability,
             )
 
         except Exception as e:
             logger.warning(
-                "IntentClassifier.classify_async failed, falling back to sync heuristic: %s", e
+                "IntentClassifier.classify_async: the Mind did not classify (%s: %s); "
+                "reflex-arc heuristic only", type(e).__name__, e,
             )
             return self.classify(command)
 

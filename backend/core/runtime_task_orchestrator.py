@@ -49,12 +49,6 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
-#: IntentClassifier action_category for "find this out on the web and answer",
-#: and the agent capability that serves it (agent_bindings decides WHICH agent).
-_RESEARCH_CATEGORY = "research"
-_RESEARCH_CAPABILITY = "web_research"
-
-
 class TaskResolution(str, Enum):
     """How a step was resolved."""
     EXISTING_AGENT = "existing_agent"      # found in AgentRegistry
@@ -280,10 +274,10 @@ class RuntimeTaskOrchestrator:
             )
             return self._single_step(query, ctx), "single-step (vision goal)"
 
-        # A research question is one goal: the agent searches, reads and
-        # answers it whole. Splitting it would also drop action_category.
-        if self._is_research_task(ctx):
-            return self._single_step(query, ctx), "single-step (research)"
+        # A request the Mind assigned to one agent capability is one goal for
+        # that agent; splitting it would also drop the capability.
+        if self._named_capability(ctx):
+            return self._single_step(query, ctx), f"single-step ({self._named_capability(ctx)})"
 
         if self._planner is not None:
             try:
@@ -316,7 +310,8 @@ class RuntimeTaskOrchestrator:
         # (_is_browser_or_ui_task); it was dropped here, so only the
         # structural fallbacks ever saw a step.
         for field_name in ("provider", "url", "search_query", "target_app",
-                           "workspace_service", "action_category", "requires_vision"):
+                           "workspace_service", "action_category", "requires_vision",
+                           "capability", "classification_source"):
             val = ctx.get(field_name)
             if val:
                 step[field_name] = val
@@ -360,23 +355,12 @@ class RuntimeTaskOrchestrator:
         goal = step["goal"]
         start = time.monotonic()
 
-        # Check -1: the IntentClassifier's STRUCTURAL decision (J-Prime's, not a
-        # keyword's) outranks the facade's keyword routing below, which sent
-        # anything containing "search" to the research agent and anything with
-        # "app" to a macOS-only controller, whatever the classifier decided.
-        if self._is_research_task(step):
-            from backend.core.agent_bindings import agent_for_capability
-
-            researcher = agent_for_capability(_RESEARCH_CAPABILITY)
-            if researcher:
-                return StepResolution(
-                    step_goal=goal,
-                    resolution=TaskResolution.EXISTING_AGENT,
-                    agent_name=researcher,
-                    capability_used=_RESEARCH_CAPABILITY,
-                    synthesized=False,
-                    elapsed_s=time.monotonic() - start,
-                )
+        # Check -1: the capability the Mind chose (intent_classifier, from the
+        # live agent catalogue) outranks every keyword route below.
+        resolved = await self._resolve_named_capability(step, goal, start)
+        if resolved is not None:
+            return resolved
+        mind_decided = step.get("classification_source") == "jprime"
 
         # Browser/UI task: open what it starts with, then the perception-action
         # loop (vision only when opening did not already accomplish the goal).
@@ -415,8 +399,11 @@ class RuntimeTaskOrchestrator:
         except Exception as _ctx_exc:
             logger.debug("[RuntimeTask] Core Context facade error: %s", _ctx_exc)
 
-        # Check 1: AgentRegistry — does an existing agent handle this? (LEGACY)
-        agent_name, capability = await self._find_agent(goal, step)
+        # Check 1: AgentRegistry by goal keywords (LEGACY) -- only for steps
+        # the Mind did not decide (planner sub-steps, degraded mode). For a
+        # Mind-decided step, "no capability" IS the decision; re-deciding by
+        # keyword is what routed "look up the news" to the wrong place.
+        agent_name, capability = (None, None) if mind_decided else await self._find_agent(goal, step)
         if agent_name:
             return StepResolution(
                 step_goal=goal,
@@ -430,7 +417,7 @@ class RuntimeTaskOrchestrator:
         # (Browser/UI tasks are routed at Check -1, ahead of keyword matching.)
 
         # Check 2: Is this a code change? Route to Ouroboros governance.
-        if self._is_code_change(goal):
+        if not mind_decided and self._is_code_change(goal):
             return StepResolution(
                 step_goal=goal,
                 resolution=TaskResolution.GOVERNANCE_OP,
@@ -579,10 +566,56 @@ class RuntimeTaskOrchestrator:
         return any(signal in goal_lower for signal in code_signals)
 
     @staticmethod
-    def _is_research_task(step: Dict[str, Any]) -> bool:
-        """The classifier decided the user wants an ANSWER gathered from the
-        web (action_category "research"), not a page opened for them."""
-        return (step.get("action_category") or "").lower() == _RESEARCH_CATEGORY
+    def _named_capability(step: Dict[str, Any]) -> str:
+        """The agent capability the Mind assigned to this request, if any."""
+        return (step.get("capability") or "").strip().lower()
+
+    async def _resolve_named_capability(
+        self, step: Dict[str, Any], goal: str, start: float,
+    ) -> Optional[StepResolution]:
+        """Route to whatever serves the Mind's capability, or report the gap.
+
+        Bindings first (what this orchestrator can instantiate), then the
+        AgentRegistry, where synthesized and graduated agents register. When
+        nothing serves it the gap goes to the GapSignalBus, whose consumers
+        synthesize an agent for it, and the remaining routes still try.
+        """
+        capability = self._named_capability(step)
+        if not capability:
+            return None
+        from backend.core.agent_bindings import agent_for_capability
+
+        agent_name = agent_for_capability(capability)
+        if agent_name is None and self._registry is not None:
+            try:
+                agents = await self._registry.find_by_capability(capability)
+                if agents:
+                    agent_name = min(agents, key=lambda a: getattr(a, "load", 0)).agent_name
+            except Exception as exc:  # noqa: BLE001 -- registry absence is a gap, not a crash
+                logger.debug("[RuntimeTask] registry lookup for %s failed: %s", capability, exc)
+        if agent_name:
+            return StepResolution(
+                step_goal=goal,
+                resolution=TaskResolution.EXISTING_AGENT,
+                agent_name=agent_name,
+                capability_used=capability,
+                synthesized=False,
+                elapsed_s=time.monotonic() - start,
+            )
+        try:
+            from backend.neural_mesh.synthesis.gap_signal_bus import (
+                CapabilityGapEvent, get_gap_signal_bus,
+            )
+            get_gap_signal_bus().emit(CapabilityGapEvent(
+                goal=goal,
+                task_type=capability,
+                target_app=step.get("target_app") or "",
+                source="runtime_task_orchestrator",
+            ))
+            logger.info("[RuntimeTask] capability gap reported for synthesis: %s", capability)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[RuntimeTask] gap report failed for %s: %s", capability, exc)
+        return None
 
     @staticmethod
     def _is_browser_or_ui_task(goal: str, step: Dict[str, Any]) -> bool:
