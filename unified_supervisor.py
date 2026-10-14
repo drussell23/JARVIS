@@ -12298,6 +12298,20 @@ class DynamicPortManager(ResourceManagerBase):
         status_lower = status.lower()
         return any(ind.lower() in status_lower for ind in self.UE_STATE_INDICATORS)
 
+    def _port_is_bindable(self, port: int) -> bool:
+        """True iff the backend could bind ``port`` right now (nothing holds it).
+
+        Binds the backend's own host without SO_REUSEADDR (on Windows that
+        option would let the probe share a port another process holds).
+        """
+        host = getattr(self.config, "backend_host", "0.0.0.0") or "0.0.0.0"
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind((host, port))
+            return True
+        except OSError:
+            return False
+
     def _get_process_on_port(self, port: int) -> Optional[Dict[str, Any]]:
         """Get process information for a process listening on the given port."""
         if not self._psutil:
@@ -12353,6 +12367,15 @@ class DynamicPortManager(ResourceManagerBase):
                 result['error'] = f"Process PID {proc_info['pid']} in unkillable state: {status}"
                 self.blacklisted_ports.add(port)
                 return result
+
+        # Nothing bound there = free. Answered by the socket layer, not by a
+        # refused connect: on Windows a connect to a closed localhost port is
+        # retried for ~2 s per address (::1 then 127.0.0.1), so the HTTP probe
+        # below timed out on FREE ports and the backend moved to a random
+        # port every boot, which the web UI could not find.
+        if not proc_info and await asyncio.to_thread(self._port_is_bindable, port):
+            result['error'] = 'connection_refused'
+            return result
 
         # Try HTTP health check
         try:

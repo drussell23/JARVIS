@@ -535,6 +535,9 @@ class DynamicConfigService {
     // v281.0: Reject loading server — it responds to /health but doesn't process commands.
     // Its WebSocket handler only streams startup progress, silently ignoring command frames.
     if (data.service === 'loading_server') return false;
+    // Trinity siblings answer /health with "jarvis" + "healthy" too: J-Prime (the
+    // model server, port 8000, second in the probe order) was taken for the backend.
+    if (['jarvis_prime', 'reactor_core', 'reactor-core'].includes(data.service)) return false;
 
     const dataStr = JSON.stringify(data).toLowerCase();
     return this.servicePatterns.backend.identifiers.some(id => dataStr.includes(id));
@@ -601,6 +604,9 @@ class DynamicConfigService {
       try {
         const data = await response.json();
         if (data.service === 'loading_server') return false;
+        // Trinity siblings answer /health with "jarvis" + "healthy" too: J-Prime (the
+        // model server, port 8000, second in the probe order) was taken for the backend.
+        if (['jarvis_prime', 'reactor_core', 'reactor-core'].includes(data.service)) return false;
       } catch {
         // If we can't parse JSON, still consider it valid (some backends return plain text)
       }

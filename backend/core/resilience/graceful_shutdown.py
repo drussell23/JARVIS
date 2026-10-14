@@ -1717,6 +1717,15 @@ class GlobalShutdownSignal:
                     initiated_at = data.get("initiated_at", 0)
                     if time.time() - initiated_at > 300:
                         return False
+                    # A signal is "in progress" only while its writer lives. A
+                    # kernel restarted inside the 5-minute window read its
+                    # predecessor's file and rejected every WebSocket client
+                    # ("global shutdown in progress"), so the UI never came up.
+                    writer = data.get("pid")
+                    if isinstance(writer, int) and writer != os.getpid():
+                        from backend.core.process_identity import pid_alive
+                        if not pid_alive(writer):
+                            return False
 
                     if check_completed:
                         return data.get("completed", False)

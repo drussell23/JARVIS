@@ -46,7 +46,11 @@ async function checkBackendReady(hostname) {
       const data = await resp.json();
 
       if (endpoint.type === 'backend') {
-        return data.status === 'healthy' || data.status === 'ok';
+        // "degraded" = serving with an optional component missing (no GCP,
+        // no voice-unlock model, ...). It is up; treating it as not-ready
+        // redirected every such session to a loading page that had already
+        // shut down.
+        return ['healthy', 'ok', 'degraded'].includes(data.status);
       }
       if (endpoint.type === 'loading_server') {
         return data.progress >= 100 || data.stage === 'complete';
