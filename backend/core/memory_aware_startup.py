@@ -31,6 +31,7 @@ import asyncio
 import logging
 import os
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -182,13 +183,37 @@ class MemoryAwareStartup:
         logger.info(f"  Cloud-first threshold: {self.cloud_first_threshold}GB (equals full local - no gap!)")
         logger.info(f"  Cloud-only threshold: {self.cloud_only_threshold}GB")
 
+    @staticmethod
+    def _memory_status_psutil() -> MemoryStatus:
+        """The same MemoryStatus from the OS's own counters via psutil."""
+        import psutil
+
+        gib = 1024 ** 3
+        vm = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        return MemoryStatus(
+            total_gb=vm.total / gib,
+            used_gb=(vm.total - vm.available) / gib,
+            free_gb=getattr(vm, "free", vm.available) / gib,
+            available_gb=vm.available / gib,
+            compressed_gb=0.0,   # not reported by these OSes' counters
+            wired_gb=getattr(vm, "wired", 0) / gib,
+            page_outs=int(getattr(swap, "sout", 0) or 0),
+            memory_pressure=float(vm.percent),
+        )
+
     async def get_memory_status(self) -> MemoryStatus:
         """
-        Get current memory status using macOS vm_stat.
+        Get current memory status (macOS: vm_stat; elsewhere: psutil).
 
         Returns:
             MemoryStatus: Current memory status
         """
+        if sys.platform != "darwin":
+            # vm_stat/sysctl do not exist here; the failure returned the
+            # "conservative defaults" every boot, so startup decisions were
+            # made on a fabricated memory picture.
+            return await asyncio.to_thread(self._memory_status_psutil)
         try:
             # Get vm_stat output
             result = await asyncio.create_subprocess_exec(

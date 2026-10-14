@@ -81,6 +81,14 @@ class CalendarBridge:
     
     def _compile_if_needed(self):
         """Compile Swift calendar provider if needed"""
+        import shutil
+
+        if shutil.which("swiftc") is None:
+            # EventKit's Swift provider exists only where Swift does (macOS);
+            # elsewhere the calendar comes from the workspace API instead.
+            logger.debug("Swift toolchain not present; native calendar provider unavailable")
+            self._compiled_path = None
+            return
         try:
             # Check if already compiled
             compiled_name = self.swift_path.stem

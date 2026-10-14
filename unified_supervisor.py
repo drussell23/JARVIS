@@ -71316,12 +71316,12 @@ class JarvisSystemKernel:
                         try:
                             _awakening = await _daemon.awaken()
                             if _awakening.vital_status.value == "fail":
-                                logger.critical("[Zone 7.0] Vital scan FAILED — self-evolution offline")
+                                self.logger.critical("[Zone 7.0] Vital scan FAILED — self-evolution offline")
                             elif _awakening.vital_status.value == "warn":
                                 _warn_count = len(_awakening.vital_report.warnings)
-                                logger.warning("[Zone 7.0] OuroborosDaemon online with %d warnings", _warn_count)
+                                self.logger.warning("[Zone 7.0] OuroborosDaemon online with %d warnings", _warn_count)
                             else:
-                                logger.info("[Zone 7.0] OuroborosDaemon fully online")
+                                self.logger.info("[Zone 7.0] OuroborosDaemon fully online")
                                 try:
                                     from backend.core.supervisor.unified_voice_orchestrator import safe_say as _z70_say
                                     await _z70_say("Ouroboros online. Organism fully awakened.")
@@ -71331,7 +71331,7 @@ class JarvisSystemKernel:
                             raise
                         except Exception:
                             import traceback as _tb
-                            logger.warning("[Zone 7.0] OuroborosDaemon awakening failed:\n%s", _tb.format_exc())
+                            self.logger.warning("[Zone 7.0] OuroborosDaemon awakening failed:\n%s", _tb.format_exc())
 
                     _z7_task = create_safe_task(_zone7_awaken_bg(), name="zone7-ouroboros-awaken")
                     self._background_tasks.append(_z7_task)
@@ -88350,8 +88350,13 @@ class JarvisSystemKernel:
             prime_endpoint = self._resolve_cross_repo_contract_endpoint(
                 component_name="jarvis_prime",
                 fallback_port=self.config.prime_api_port,
+                # Same precedence as the sibling bring-up that started it
+                # (trinity_siblings._jprime_url): JARVIS_PRIME_URL, else the
+                # local lane's base URL. Without the latter a local J-Prime on
+                # :8000 was contract-checked at the fallback :8001 and failed.
                 env_url_keys=(
                     "JARVIS_PRIME_URL",
+                    "JARVIS_LOCAL_MODEL_BASE_URL",
                     "GCP_PRIME_ENDPOINT",
                     "JARVIS_PRIME_CLOUD_RUN_URL",
                 ),

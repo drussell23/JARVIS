@@ -2692,131 +2692,20 @@ class JARVISLearningDatabase:
 
         self._initialized = True
 
-    async def _ensure_schema_created(self):
-        """Ensure database schema exists (fast, local SQLite only)."""
-        db = self._ensure_db_initialized()
-        is_cloud = isinstance(db, DatabaseConnectionWrapper) and db.is_cloud
+    async def _create_full_schema(self, db=None, reconcile: bool = True) -> None:
+        """Create every table and index (CREATE ... IF NOT EXISTS: idempotent).
 
-        # Helper function to generate auto-increment syntax
-        def auto_increment(column_name: str, col_type: str = "INTEGER") -> str:
-            if is_cloud:
-                serial_type = "BIGSERIAL" if col_type == "BIGINT" else "SERIAL"
-                return f"{column_name} {serial_type} PRIMARY KEY"
-            else:
-                return f"{column_name} {col_type} PRIMARY KEY AUTOINCREMENT"
+        One schema for both init modes. Fast mode used to create only
+        `goals`, so on a fresh install every other table (conversation
+        memory, preferences, action metrics, display patterns) was missing
+        until a Cloud SQL upgrade that never comes on a local-first host.
 
-        def bool_default(value: int) -> str:
-            if is_cloud:
-                return "TRUE" if value else "FALSE"
-            else:
-                return str(value)
-
-        def blob_type() -> str:
-            return "BYTEA" if is_cloud else "BLOB"
-
-        async with db.cursor() as cursor:
-            # Core tables needed for voice biometrics (minimal set for fast startup)
-            await cursor.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS goals (
-                    goal_id TEXT PRIMARY KEY,
-                    goal_type TEXT NOT NULL,
-                    goal_level TEXT NOT NULL,
-                    description TEXT,
-                    confidence REAL,
-                    progress REAL DEFAULT 0.0,
-                    is_completed BOOLEAN DEFAULT {bool_default(0)},
-                    created_at TIMESTAMP,
-                    completed_at TIMESTAMP,
-                    predicted_duration REAL,
-                    actual_duration REAL,
-                    evidence JSON,
-                    context_hash TEXT,
-                    embedding_id TEXT,
-                    metadata JSON
-                )
-            """
-            )
-            await db.commit()
-
-    async def _background_cloud_sql_upgrade(self):
+        ``db`` defaults to this instance's connection; the reconciler passes
+        an in-memory connection to obtain the canonical shape of each table.
         """
-        v118.0: Background task to upgrade from SQLite to Cloud SQL.
-
-        This runs after fast startup is complete, attempting to connect to
-        Cloud SQL and sync data. If successful, future operations use Cloud SQL.
-        """
-        try:
-            logger.info("☁️  Background: Attempting Cloud SQL connection upgrade...")
-
-            # Try to get Cloud SQL adapter with timeout
-            adapter = await asyncio.wait_for(
-                get_database_adapter(),
-                timeout=30.0  # Longer timeout OK since we're in background
-            )
-
-            if adapter.is_cloud:
-                # Store reference to cloud adapter for dual-write
-                self.cloud_adapter = adapter
-                logger.info("☁️  Background: Cloud SQL upgrade successful - dual-write enabled")
-
-                # Optionally sync recent SQLite data to Cloud SQL here
-                # await self._sync_sqlite_to_cloud()
-            else:
-                logger.debug("☁️  Background: Cloud SQL not configured, staying on SQLite")
-
-        except asyncio.TimeoutError:
-            logger.debug("☁️  Background: Cloud SQL connection timed out - continuing with SQLite")
-        except Exception as e:
-            logger.debug(f"☁️  Background: Cloud SQL upgrade failed: {e}")
-
-    def _ensure_db_initialized(self) -> Union[aiosqlite.Connection, "DatabaseConnectionWrapper"]:
-        """Assert that database is initialized and return it with proper type."""
-        assert self.db is not None, "Database not initialized. Call initialize() first."
-        return self.db
-
-    async def _init_sqlite(self, allow_cloud: bool = True):
-        """Initialize async database (SQLite or Cloud SQL) with enhanced schema and timeout protection"""
-        # Try to use Cloud SQL if available (with timeout protection)
-        if allow_cloud and CLOUD_ADAPTER_AVAILABLE:
-            try:
-                # CRITICAL FIX: Add timeout protection to prevent infinite hangs
-                # If Cloud SQL proxy isn't running, this will timeout and fallback to SQLite
-                adapter = await asyncio.wait_for(
-                    get_database_adapter(),
-                    timeout=15.0  # 15 second timeout for database adapter initialization
-                )
-
-                if adapter.is_cloud:
-                    logger.info("☁️  Using Cloud SQL (PostgreSQL)")
-                    self.db = DatabaseConnectionWrapper(adapter)
-                else:
-                    logger.info("📂 Using SQLite (Cloud SQL not configured)")
-                    # Use centralized connection factory with proper concurrency settings
-                    self.db = await create_sqlite_connection(str(self.sqlite_path))
-
-            except asyncio.TimeoutError:
-                # v109.2: Timeout during startup is expected - use INFO not WARNING
-                logger.info(
-                    "⏱️  Cloud SQL adapter initialization timeout (15s exceeded)\n"
-                    "   → Falling back to local SQLite (proxy may still be starting)"
-                )
-                # Use centralized connection factory with proper concurrency settings
-                self.db = await create_sqlite_connection(str(self.sqlite_path))
-
-            except Exception as e:
-                # v109.2: Cloud SQL failures during startup are expected
-                logger.info(f"ℹ️  Cloud SQL adapter not ready: {e}")
-                logger.info("📂 Falling back to SQLite")
-                # Use centralized connection factory with proper concurrency settings
-                self.db = await create_sqlite_connection(str(self.sqlite_path))
-        else:
-            logger.info("📂 Using SQLite (Cloud adapter not available)")
-            # Use centralized connection factory with proper concurrency settings
-            self.db = await create_sqlite_connection(str(self.sqlite_path))
-
+        db = db if db is not None else self._ensure_db_initialized()
         # Check if using Cloud SQL (PostgreSQL) or SQLite
-        is_cloud = isinstance(self.db, DatabaseConnectionWrapper) and self.db.is_cloud
+        is_cloud = isinstance(db, DatabaseConnectionWrapper) and db.is_cloud
 
         # Helper function to generate auto-increment syntax
         def auto_increment(column_name: str, col_type: str = "INTEGER") -> str:
@@ -2849,7 +2738,6 @@ class JARVISLearningDatabase:
                 # SQLite uses BLOB
                 return "BLOB"
 
-        db = self._ensure_db_initialized()
         async with db.cursor() as cursor:
             # NOTE: WAL mode and other PRAGMA settings are now configured in
             # create_sqlite_connection() for consistent concurrency handling.
@@ -3615,7 +3503,151 @@ class JARVISLearningDatabase:
             )
 
         await db.commit()
+        if reconcile and not is_cloud:
+            await self._reconcile_sqlite_columns(db)
         logger.info("SQLite database initialized with enhanced async schema")
+
+    @staticmethod
+    async def _sqlite_columns(db, table: str) -> Dict[str, tuple]:
+        """``{name: (type, notnull, default, pk)}`` for one table, from PRAGMA."""
+        cursor = await db.execute(f'PRAGMA table_info("{table}")')
+        rows = await cursor.fetchall()
+        return {row[1]: (row[2], row[3], row[4], row[5]) for row in rows}
+
+    async def _reconcile_sqlite_columns(self, db) -> None:
+        """Add the canonical columns an existing table lacks.
+
+        ``CREATE TABLE IF NOT EXISTS`` never changes a table that is already
+        there, and this file is shared: ``HybridDatabaseSync`` defaults to the
+        same path and creates a narrower ``speaker_profiles`` first when it
+        boots first, after which every profile read fails on a missing column.
+        The canonical shape is not restated here; it is read back from the
+        schema above, built once in memory, so the two cannot drift.
+
+        Only additive: rows and existing columns are never touched. A column
+        SQLite cannot add in place (primary key, NOT NULL with no default,
+        non-constant default) is reported, not forced.
+        """
+        canonical = await create_sqlite_connection(":memory:")
+        try:
+            await self._create_full_schema(canonical, reconcile=False)
+            cursor = await canonical.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+            tables = [row[0] for row in await cursor.fetchall()]
+            added = 0
+            for table in tables:
+                have = await self._sqlite_columns(db, table)
+                if not have:
+                    continue
+                for name, (col_type, notnull, default, pk) in (
+                    await self._sqlite_columns(canonical, table)
+                ).items():
+                    if name in have:
+                        continue
+                    clause = f'"{name}" {col_type}'.rstrip()
+                    if notnull:
+                        clause += " NOT NULL"
+                    if default is not None:
+                        clause += f" DEFAULT {default}"
+                    if pk:
+                        logger.warning(
+                            f"[LearningDB] {table}.{name} is a key column and cannot be added in place"
+                        )
+                        continue
+                    try:
+                        await db.execute(f'ALTER TABLE "{table}" ADD COLUMN {clause}')
+                        added += 1
+                    except Exception as e:
+                        logger.warning(f"[LearningDB] Cannot add {table}.{name} in place: {e}")
+            if added:
+                await db.commit()
+                logger.info(f"[LearningDB] Reconciled {added} missing column(s) into existing tables")
+        finally:
+            await canonical.close()
+
+    async def _ensure_schema_created(self):
+        """Ensure the database schema exists (fast mode: local SQLite)."""
+        await self._create_full_schema()
+
+    async def _background_cloud_sql_upgrade(self):
+        """
+        v118.0: Background task to upgrade from SQLite to Cloud SQL.
+
+        This runs after fast startup is complete, attempting to connect to
+        Cloud SQL and sync data. If successful, future operations use Cloud SQL.
+        """
+        try:
+            logger.info("☁️  Background: Attempting Cloud SQL connection upgrade...")
+
+            # Try to get Cloud SQL adapter with timeout
+            adapter = await asyncio.wait_for(
+                get_database_adapter(),
+                timeout=30.0  # Longer timeout OK since we're in background
+            )
+
+            if adapter.is_cloud:
+                # Store reference to cloud adapter for dual-write
+                self.cloud_adapter = adapter
+                logger.info("☁️  Background: Cloud SQL upgrade successful - dual-write enabled")
+
+                # Optionally sync recent SQLite data to Cloud SQL here
+                # await self._sync_sqlite_to_cloud()
+            else:
+                logger.debug("☁️  Background: Cloud SQL not configured, staying on SQLite")
+
+        except asyncio.TimeoutError:
+            logger.debug("☁️  Background: Cloud SQL connection timed out - continuing with SQLite")
+        except Exception as e:
+            logger.debug(f"☁️  Background: Cloud SQL upgrade failed: {e}")
+
+    def _ensure_db_initialized(self) -> Union[aiosqlite.Connection, "DatabaseConnectionWrapper"]:
+        """Assert that database is initialized and return it with proper type."""
+        assert self.db is not None, "Database not initialized. Call initialize() first."
+        return self.db
+
+    async def _init_sqlite(self, allow_cloud: bool = True):
+        """Initialize async database (SQLite or Cloud SQL) with enhanced schema and timeout protection"""
+        # Try to use Cloud SQL if available (with timeout protection)
+        if allow_cloud and CLOUD_ADAPTER_AVAILABLE:
+            try:
+                # CRITICAL FIX: Add timeout protection to prevent infinite hangs
+                # If Cloud SQL proxy isn't running, this will timeout and fallback to SQLite
+                adapter = await asyncio.wait_for(
+                    get_database_adapter(),
+                    timeout=15.0  # 15 second timeout for database adapter initialization
+                )
+
+                if adapter.is_cloud:
+                    logger.info("☁️  Using Cloud SQL (PostgreSQL)")
+                    self.db = DatabaseConnectionWrapper(adapter)
+                else:
+                    logger.info("📂 Using SQLite (Cloud SQL not configured)")
+                    # Use centralized connection factory with proper concurrency settings
+                    self.db = await create_sqlite_connection(str(self.sqlite_path))
+
+            except asyncio.TimeoutError:
+                # v109.2: Timeout during startup is expected - use INFO not WARNING
+                logger.info(
+                    "⏱️  Cloud SQL adapter initialization timeout (15s exceeded)\n"
+                    "   → Falling back to local SQLite (proxy may still be starting)"
+                )
+                # Use centralized connection factory with proper concurrency settings
+                self.db = await create_sqlite_connection(str(self.sqlite_path))
+
+            except Exception as e:
+                # v109.2: Cloud SQL failures during startup are expected
+                logger.info(f"ℹ️  Cloud SQL adapter not ready: {e}")
+                logger.info("📂 Falling back to SQLite")
+                # Use centralized connection factory with proper concurrency settings
+                self.db = await create_sqlite_connection(str(self.sqlite_path))
+        else:
+            logger.info("📂 Using SQLite (Cloud adapter not available)")
+            # Use centralized connection factory with proper concurrency settings
+            self.db = await create_sqlite_connection(str(self.sqlite_path))
+
+        await self._create_full_schema()
+
 
     async def _init_hybrid_sync(self):
         """

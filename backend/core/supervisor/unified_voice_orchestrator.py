@@ -1032,7 +1032,11 @@ class UnifiedVoiceOrchestrator:
                     pass
 
         # Optional Trinity fallback for non-macOS or direct say failures.
-        if _env_flag("JARVIS_VOICE_ENABLE_TRINITY_FALLBACK", "false"):
+        # Opt-in on macOS (`say` above is the path there); where there is no
+        # `say`, the Trinity coordinator (edge-tts + the OS player) IS the
+        # working voice, so it is on unless explicitly disabled.
+        if _env_flag("JARVIS_VOICE_ENABLE_TRINITY_FALLBACK",
+                     "false" if self._is_macos else "true"):
             try:
                 from backend.core.trinity_voice_coordinator import (
                     get_voice_coordinator,

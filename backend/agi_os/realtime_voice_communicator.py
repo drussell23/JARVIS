@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import sys
 import subprocess
 import logging
 import time
@@ -748,6 +749,16 @@ class RealTimeVoiceCommunicator:
                 logger.exception("Speech processor error: %s", e)
                 await asyncio.sleep(0.5)
 
+    async def _speak_through_orchestrator(self, text: str, timeout: float = 30.0) -> None:
+        """Speak where macOS `say`/`afplay` do not exist: through the process's
+        one speech owner (unified_voice_orchestrator.safe_say), which picks
+        the platform's working engine. The caller already holds this
+        communicator's speech lock and has de-duplicated the text."""
+        from backend.core.supervisor.unified_voice_orchestrator import safe_say
+
+        await safe_say(text, wait=True, skip_dedup=True, skip_gate=True,
+                       timeout=timeout, source="agi_os_communicator")
+
     async def _speak_message(self, message: SpeechMessage) -> None:
         """
         Speak a single message — AudioBus path or macOS say fallback.
@@ -796,6 +807,10 @@ class RealTimeVoiceCommunicator:
                         logger.warning("[SpeakMessage] TTS failed while device held: %s — skipping", e)
                         return
                     logger.debug("AudioBus speak failed, falling back: %s", e)
+
+            if sys.platform != "darwin":
+                await self._speak_through_orchestrator(message.text)
+                return
 
             # v275.2: Safe legacy — always say -o tempfile
             import tempfile as _tmpmod
@@ -1583,7 +1598,9 @@ class RealTimeVoiceCommunicator:
                     # (GIL-dependent → static during GIL-heavy ops). The AEC
                     # reference signal it provided is secondary to clean audio,
                     # and the say-o+afplay fallback never had AEC either.
-                    if True:
+                    if sys.platform != "darwin":
+                        await self._speak_through_orchestrator(text, timeout=timeout)
+                    else:
                         # v275.2: SAFE fallback — always use say -o tempfile
                         # to avoid opening audio device (causes static when
                         # FullDuplexDevice holds the device).
