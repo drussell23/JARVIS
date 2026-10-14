@@ -9480,7 +9480,10 @@ async def process_command(request: dict):
             "message": "Request body must be a JSON object with a 'command' field.",
         }
 
-    raw_command = request.get("command", "")
+    # The HUD wire contract (hud_local_bridge.translate_hud_command) sends
+    # "text"; this route is registered first and shadows the HUD's own
+    # /api/command, so it must read the same keys or the query arrives empty.
+    raw_command = request.get("command") or request.get("text") or ""
     if raw_command is None:
         command = ""
     elif isinstance(raw_command, str):

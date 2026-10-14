@@ -990,6 +990,25 @@ class JarvisPrimeClient:
             mode = RoutingMode(self.config.force_mode)
             return mode, f"Forced mode: {mode.value}"
 
+        # Priority 0: a local J-Prime that ANSWERS. The RAM gate below dates
+        # from when "local" meant loading the model into this host's memory;
+        # a J-Prime server owns its own memory (a GPU's, on a GPU host), so
+        # the Body's free RAM says nothing about whether it can serve. Low
+        # Body RAM otherwise routed every query to Cloud Run, whose fallback
+        # chain never returns to LOCAL. Evidence = a fresh health answer
+        # (refreshed by complete() before each decision).
+        local_health = self._health_cache.get(RoutingMode.LOCAL)
+        if (
+            local_health is not None
+            and local_health.available
+            and (time.time() - local_health.last_check) < self._health_cache_ttl
+        ):
+            cb = self._circuit_breakers[RoutingMode.LOCAL]
+            if cb.allow_request():
+                return RoutingMode.LOCAL, (
+                    f"local J-Prime answering ({local_health.latency_ms:.0f}ms)"
+                )
+
         available_gb = self._memory_monitor.get_available_gb()
 
         # Decision logic
@@ -1297,7 +1316,9 @@ class JarvisPrimeClient:
                     "[JarvisPrimeClient] DoubleWord failover failed: %s — "
                     "continuing to legacy routing", _dwe)
 
-        # Legacy routing: Decide initial mode
+        # Legacy routing: Decide initial mode, on fresh evidence of whether a
+        # local J-Prime answers (cached for _health_cache_ttl).
+        await self.check_health(RoutingMode.LOCAL)
         mode, reason = self.decide_mode()
         logger.info(f"[JarvisPrimeClient] Mode: {mode.value} ({reason})")
 
