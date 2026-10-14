@@ -38,6 +38,7 @@ import asyncio
 import logging
 import os
 import subprocess
+import sys
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -332,6 +333,15 @@ class FocusGuard:
 class ActuatorBackend(ABC):
     """Abstract interface for actuator backends."""
 
+    #: sys.platform prefixes this backend can exist on; empty = every OS.
+    #: A backend for another OS is never started, rather than started and
+    #: failing as an ERROR on every boot (osascript and Quartz on Windows).
+    platforms: Tuple[str, ...] = ()
+
+    @classmethod
+    def available_here(cls) -> bool:
+        return not cls.platforms or any(sys.platform.startswith(p) for p in cls.platforms)
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -378,6 +388,8 @@ class AppleScriptBackend(ActuatorBackend):
     - Any app with AppleScript support
     - System events (keystroke, click)
     """
+
+    platforms = ("darwin",)
 
     def __init__(self, config: ActuatorConfig):
         self.config = config
@@ -1439,6 +1451,8 @@ class CGEventBackend(ActuatorBackend):
     Note: Requires Accessibility permissions.
     """
 
+    platforms = ("darwin",)  # Quartz CGEvent
+
     def __init__(self, config: ActuatorConfig):
         self.config = config
         self._initialized = False
@@ -1623,21 +1637,22 @@ class BackgroundActuator:
 
     async def start(self) -> bool:
         """Initialize all backends."""
-        # Initialize backends in priority order
+        # Initialize backends in priority order (CGEvent is the fallback);
+        # one for another OS is not attempted.
+        candidates = []
         if self.config.playwright_enabled:
-            backend = PlaywrightBackend(self.config)
-            if await backend.initialize():
-                self._backends.append(backend)
-
+            candidates.append(PlaywrightBackend)
         if self.config.applescript_enabled:
-            backend = AppleScriptBackend(self.config)
+            candidates.append(AppleScriptBackend)
+        candidates.append(CGEventBackend)
+        for backend_cls in candidates:
+            if not backend_cls.available_here():
+                logger.debug("[GHOST-HANDS] %s backend is for %s; not on %s",
+                             backend_cls.__name__, "/".join(backend_cls.platforms), sys.platform)
+                continue
+            backend = backend_cls(self.config)
             if await backend.initialize():
                 self._backends.append(backend)
-
-        # Always try CGEvent as fallback
-        backend = CGEventBackend(self.config)
-        if await backend.initialize():
-            self._backends.append(backend)
 
         logger.info(f"[GHOST-HANDS] Started with {len(self._backends)} backends")
         return len(self._backends) > 0

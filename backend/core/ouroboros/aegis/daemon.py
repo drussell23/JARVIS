@@ -38,6 +38,7 @@ Run modes:
 """
 from __future__ import annotations
 
+from backend.core.portable_sockets import allow_time_wait_rebind
 import argparse
 import asyncio
 import logging
@@ -600,7 +601,7 @@ def bind_ephemeral_socket(host: str) -> socket.socket:
     aiohttp ``_run_app(..., sock=...)`` or closing it.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    allow_time_wait_rebind(sock)
     sock.bind((host, 0))
     sock.setblocking(False)
     return sock

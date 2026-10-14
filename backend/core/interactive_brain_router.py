@@ -223,9 +223,9 @@ class InteractiveBrainRouter:
         )
 
     def get_vision_model(self) -> str:
-        """Get the current vision model name (for direct vision requests)."""
+        """The declared vision model name ("" when none is declared)."""
         self._maybe_reload()
-        return self._vision_model or "llava-v1.5-7b"
+        return self._vision_model or ""
 
     def get_claude_model(self, complexity: str = "light") -> str:
         """Get the Claude model for a given complexity level."""
@@ -298,12 +298,13 @@ class InteractiveBrainRouter:
             routing = self._policy.get("routing", {})
             self._fallback_chains = routing.get("fallback_chain", {})
 
-            # Discover vision model — check if any brain has vision capabilities
-            # Default to querying J-Prime's /v1/models on port 8001
-            self._vision_model = os.getenv(
-                "JARVIS_VISION_MODEL_NAME",
-                self._discover_vision_model(),
-            )
+            # The vision model is declared once (JARVIS_VISION_MODEL_NAME, read
+            # by the one local vision client). It used to be "discovered" by a
+            # blocking HTTP probe of a fixed port -- evaluated eagerly as
+            # os.getenv's default even when declared, stalling the event loop
+            # ~2 s per construction on a host where nothing listens there.
+            from backend.vision.local_vision_client import get_local_vision_client
+            self._vision_model = get_local_vision_client().model or None
 
             logger.info(
                 "[InteractiveBrainRouter] Loaded %d brains from policy. "
@@ -314,31 +315,6 @@ class InteractiveBrainRouter:
 
         except Exception as e:
             logger.warning("[InteractiveBrainRouter] Policy load failed: %s", e)
-
-    def _discover_vision_model(self) -> str:
-        """Discover the vision model name from J-Prime's vision server."""
-        # Try to query /v1/models on the vision port
-        import urllib.request
-        import json
-
-        host = os.getenv("JARVIS_PRIME_HOST", "localhost")
-        port = os.getenv("JARVIS_PRIME_VISION_PORT", "8001")
-        url = f"http://{host}:{port}/v1/models"
-
-        try:
-            req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                data = json.loads(resp.read().decode())
-                models = data.get("data", [])
-                if models:
-                    model_id = models[0].get("id", "")
-                    # Extract just the filename from the path
-                    name = Path(model_id).stem if "/" in model_id else model_id
-                    return name
-        except Exception:
-            pass
-
-        return "llava-v1.5-7b"  # safe default
 
     def _maybe_reload(self) -> None:
         """Hot-reload policy if the YAML file changed."""

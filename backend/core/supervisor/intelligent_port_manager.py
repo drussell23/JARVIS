@@ -22,6 +22,7 @@ Author: JARVIS v11.1 - Intelligent Port Management
 
 from __future__ import annotations
 
+from backend.core.portable_sockets import allow_time_wait_rebind
 import asyncio
 import enum
 import logging
@@ -899,7 +900,7 @@ class IntelligentPortManager:
         """Verify port is available by attempting to bind."""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            allow_time_wait_rebind(sock)
             sock.settimeout(1.0)
             sock.bind((self.host, port))
             sock.close()

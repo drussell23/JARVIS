@@ -155,6 +155,10 @@ def _get_pool(kind: str) -> Optional[ThreadPoolExecutor]:
         if existing is not None:
             return existing
         try:
+            # Managed: registered for the kernel's executor shutdown and run on
+            # daemon threads, so idle workers never hold the process open
+            # (they were force-terminated one second each at every stop).
+            from backend.core.thread_manager import ManagedThreadPoolExecutor as ThreadPoolExecutor
             if kind == "import":
                 pool = ThreadPoolExecutor(
                     max_workers=_positive_int(ENV_IMPORT_WORKERS, _DEFAULT_IMPORT_WORKERS),

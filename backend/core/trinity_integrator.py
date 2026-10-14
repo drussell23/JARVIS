@@ -78,6 +78,7 @@ Author: JARVIS Trinity v86.0 - Startup Performance Optimization
 
 from __future__ import annotations
 
+from backend.core.portable_sockets import allow_time_wait_rebind
 import asyncio
 import contextlib
 import contextvars
@@ -1900,7 +1901,7 @@ class ResourceCoordinator:
 
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            allow_time_wait_rebind(sock)
             sock.settimeout(0.1)
             sock.bind(("127.0.0.1", port))
             sock.close()

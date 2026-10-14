@@ -1260,33 +1260,12 @@ def setup_signal_handlers(
     # NOTE: Do NOT add SIGHUP here - it's handled by supervisor_singleton._handle_sighup
     # for clean restart via os.execv() (fixes EXC_GUARD crash)
 
-    # Register handlers with proper error handling
-    for sig in signals_to_handle:
-        try:
-            # Use functools.partial to properly capture the signal value
-            loop.add_signal_handler(
-                sig,
-                functools.partial(handle_signal, sig),
-            )
-            logger.debug(f"[ShutdownManager] Registered handler for {sig.name}")
-        except NotImplementedError:
-            # Windows doesn't support add_signal_handler for all signals
-            # Fall back to signal.signal() but note this blocks the event loop
-            try:
-                def windows_handler(signum, frame, captured_sig=sig):
-                    handle_signal(captured_sig)
-                signal.signal(sig, windows_handler)
-                logger.debug(
-                    f"[ShutdownManager] Registered Windows handler for {sig.name}"
-                )
-            except (ValueError, OSError) as e:
-                logger.warning(
-                    f"[ShutdownManager] Could not register handler for {sig.name}: {e}"
-                )
-        except Exception as e:
-            logger.warning(
-                f"[ShutdownManager] Failed to register handler for {sig.name}: {e}"
-            )
+    # One portable installer (backend/core/portable_signals.py): on Windows
+    # the handler only schedules handle_signal on the loop instead of running
+    # it from signal context.
+    from backend.core.portable_signals import install_loop_signal_handlers
+    for sig in install_loop_signal_handlers(loop, signals_to_handle, handle_signal):
+        logger.debug(f"[ShutdownManager] Registered handler for {sig.name}")
 
 
 # =============================================================================

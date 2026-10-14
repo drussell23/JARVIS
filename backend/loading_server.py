@@ -3510,12 +3510,14 @@ async def run_server():
     # Handle shutdown signals
     loop = asyncio.get_event_loop()
 
-    def signal_handler():
+    def signal_handler(_sig=None):
         # v210.0: Use safe task to prevent "Future exception was never retrieved"
         create_safe_task(server.stop(), name="signal_handler_stop")
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, signal_handler)
+    # add_signal_handler does not exist on Windows loops: it raised here and
+    # the server died at startup (backend/core/portable_signals.py).
+    from backend.core.portable_signals import install_loop_signal_handlers
+    install_loop_signal_handlers(loop, (signal.SIGINT, signal.SIGTERM), signal_handler)
 
     try:
         await server.start()

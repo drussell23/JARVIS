@@ -18,6 +18,7 @@ import subprocess
 import logging
 import os
 import ctypes
+import sys
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -364,9 +365,53 @@ def _check_lockscreen_process() -> Optional[bool]:
         return None
 
 
+def _check_windows_session_locked() -> Optional[bool]:
+    """Windows: the session's own lock state (WTSSessionInfoEx.SessionFlags).
+
+    None of the macOS signals below exist on Windows, so every check came
+    back "insufficient data" and the screen was assumed LOCKED -- on an
+    unlocked desktop. Windows states it directly: SessionFlags is
+    WTS_SESSIONSTATE_LOCK (0) or WTS_SESSIONSTATE_UNLOCK (1); anything else
+    (-1, or the query failing) is unknown -> None.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class _Level1(ctypes.Structure):
+        _fields_ = [
+            ("SessionId", wintypes.ULONG), ("SessionState", ctypes.c_int),
+            ("SessionFlags", wintypes.LONG), ("WinStationName", ctypes.c_wchar * 33),
+            ("UserName", ctypes.c_wchar * 21), ("DomainName", ctypes.c_wchar * 18),
+            ("LogonTime", ctypes.c_longlong), ("ConnectTime", ctypes.c_longlong),
+            ("DisconnectTime", ctypes.c_longlong), ("LastInputTime", ctypes.c_longlong),
+            ("CurrentTime", ctypes.c_longlong),
+            ("IncomingBytes", wintypes.DWORD), ("OutgoingBytes", wintypes.DWORD),
+            ("IncomingFrames", wintypes.DWORD), ("OutgoingFrames", wintypes.DWORD),
+            ("IncomingCompressedBytes", wintypes.DWORD), ("OutgoingCompressedBytes", wintypes.DWORD),
+        ]
+
+    class _InfoEx(ctypes.Structure):
+        _fields_ = [("Level", wintypes.DWORD), ("Level1", _Level1)]
+
+    wts = ctypes.windll.wtsapi32
+    buf, size = ctypes.c_void_p(), wintypes.DWORD()
+    WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSSessionInfoEx = 0, 0xFFFFFFFF, 25
+    if not wts.WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION,
+                                           WTSSessionInfoEx, ctypes.byref(buf), ctypes.byref(size)):
+        return None
+    try:
+        flags = ctypes.cast(buf, ctypes.POINTER(_InfoEx)).contents.Level1.SessionFlags
+    finally:
+        wts.WTSFreeMemory(buf)
+    return {0: True, 1: False}.get(flags)
+
+
 def is_screen_locked() -> bool:
     """
-    Check if the macOS screen is currently locked.
+    Check if the screen is currently locked.
+
+    Windows answers from the session itself (_check_windows_session_locked).
+    On macOS:
 
     Uses MULTIPLE detection methods in order of reliability:
     1. Pure ctypes CGSessionCopyCurrentDictionary (most reliable, CoreAudio-safe)
@@ -388,6 +433,18 @@ def is_screen_locked() -> bool:
     Returns:
         bool: True if screen is locked, False otherwise
     """
+    if sys.platform == "win32":
+        try:
+            locked = _check_windows_session_locked()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[SCREEN-DETECT] WTS session query failed: %s", exc)
+            locked = None
+        if locked is None:
+            # Same policy as below: when the OS cannot say, assume locked.
+            logger.warning("🔒 [SCREEN-DETECT] session lock state unknown - assuming LOCKED for safety")
+            return True
+        return locked
+
     detection_results = []
 
     try:

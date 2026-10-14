@@ -74,6 +74,7 @@ Author: JARVIS Trinity v1.0 - Production-Grade Process Coordination
 
 from __future__ import annotations
 
+from backend.core.portable_sockets import allow_time_wait_rebind
 import asyncio
 from backend.core import portable_fcntl as fcntl
 import hashlib
@@ -764,7 +765,7 @@ class AtomicPortCoordinator:
         sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            allow_time_wait_rebind(sock)
             sock.setblocking(False)
             sock.bind(("127.0.0.1", port))
             return True

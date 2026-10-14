@@ -197,6 +197,19 @@ def _structurally_owned(proc, roots: List[Path]) -> bool:
     return False
 
 
+def is_trinity_process(proc, roots: Optional[List[Path]] = None) -> bool:
+    """Is *proc* itself running Trinity's code (no ancestry walk)?
+
+    For sweeps that look across every process: pass ``trinity_roots()`` once.
+    Command-line words cannot answer this -- "jarvis" matched every program
+    on a machine whose Windows user is named Jarvis.
+    """
+    try:
+        return _structurally_owned(proc, roots if roots is not None else trinity_roots())
+    except Exception:  # noqa: BLE001 -- gone / access denied: not provably ours
+        return False
+
+
 def owned_by_trinity(pid: int) -> bool:
     """Structural answer to "may JARVIS signal this process?" (see module doc).
 
@@ -393,6 +406,7 @@ def install_kill_guard() -> bool:
 
 __all__ = [
     "install_kill_guard",
+    "is_trinity_process",
     "kill_process_tree",
     "kill_guard_enabled",
     "owned_by_trinity",

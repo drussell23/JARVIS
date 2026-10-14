@@ -509,6 +509,10 @@ class SecretManager:
         self._retry_base_delay = retry_base_delay
 
         # Initialize backends (lazy - actual clients initialized on first use)
+        # Secrets already reported missing: said once per name, not on every
+        # ask (six components asking produced six warnings a boot). The
+        # lookup itself still runs every time, so one added later is found.
+        self._reported_missing: set = set()
         self._backends: List[SecretBackend] = [
             GCPSecretManagerBackend(self._project_id),
             KeychainBackend(),
@@ -653,10 +657,15 @@ class SecretManager:
 
             if result is not None:
                 self._cache.set(cache_key, result)
+                self._reported_missing.discard(normalized_id)
                 logger.info(f"✅ Retrieved '{normalized_id}' from {backend.name}")
                 return result
 
-        logger.warning(f"❌ Secret '{normalized_id}' not found in any backend")
+        if normalized_id in self._reported_missing:
+            logger.debug(f"Secret '{normalized_id}' still not found in any backend")
+        else:
+            self._reported_missing.add(normalized_id)
+            logger.warning(f"❌ Secret '{normalized_id}' not found in any backend")
         return None
 
     async def get_secret_async(

@@ -195,6 +195,7 @@ Changelog:
 
 from __future__ import annotations
 
+from backend.core.portable_sockets import allow_time_wait_rebind
 import asyncio
 import json
 import logging
@@ -9698,7 +9699,7 @@ class ProcessOrchestrator:
         # v132.4: Primary method - try to actually BIND (catches TIME_WAIT)
         if use_bind_check:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            allow_time_wait_rebind(sock)
             try:
                 sock.bind(('0.0.0.0', port))
                 sock.close()
@@ -19158,7 +19159,7 @@ echo "=== JARVIS Prime started ==="
             # Try to bind with SO_REUSEADDR
             try:
                 test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                allow_time_wait_rebind(test_sock)
                 test_sock.settimeout(1.0)
                 test_sock.bind(('0.0.0.0', port))
                 test_sock.close()
@@ -19949,7 +19950,7 @@ echo "=== JARVIS Prime started ==="
                             # v109.3: Check if port is now free (conflict may have resolved)
                             try:
                                 test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                                test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                                allow_time_wait_rebind(test_sock)
                                 test_sock.settimeout(1)
                                 test_sock.bind(('0.0.0.0', definition.default_port))
                                 test_sock.close()
@@ -20381,7 +20382,7 @@ echo "=== JARVIS Prime started ==="
 
             # Test if port is actually available using socket bind
             test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            allow_time_wait_rebind(test_sock)
             test_sock.settimeout(1.0)
 
             try:

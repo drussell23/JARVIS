@@ -72,6 +72,7 @@ Usage:
 
 from __future__ import annotations
 
+from backend.core.portable_sockets import allow_time_wait_rebind
 import asyncio
 import gzip
 import hashlib
@@ -595,7 +596,7 @@ class CrossRepoTransport:
     async def _setup_multicast(self) -> None:
         """Setup UDP multicast socket."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        allow_time_wait_rebind(sock)
 
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)

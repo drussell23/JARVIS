@@ -202,130 +202,100 @@ class MLConfig:
             import subprocess
             import gc
 
-            # Get available RAM using macOS vm_stat
-            result = subprocess.run(
-                ["vm_stat"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
+            # Available RAM from the OS's own accounting (psutil: on macOS the
+            # free + inactive + speculative pages vm_stat was parsed for, with
+            # the real page size; on Windows and Linux their equivalents).
+            # Parsing vm_stat failed outright off macOS (WinError 2).
+            def _available_gb() -> float:
+                import psutil
+                return psutil.virtual_memory().available / (1024 ** 3)
 
-            if result.returncode == 0:
-                output = result.stdout
-                page_size = 16384  # macOS page size
+            available_gb = _available_gb()
+            initial_available_gb = available_gb
 
-                # Parse vm_stat output
-                free_pages = 0
-                inactive_pages = 0
-                speculative_pages = 0
+            # v95.0: Attempt memory relief if close to threshold
+            if attempt_relief and available_gb < cls.RAM_THRESHOLD_LOCAL and available_gb >= cls.RAM_THRESHOLD_CRITICAL * 0.8:
+                logger.debug(f"[MLConfig] Attempting memory relief (have {available_gb:.1f}GB, need {cls.RAM_THRESHOLD_LOCAL:.1f}GB)")
 
-                for line in output.split('\n'):
-                    if 'Pages free:' in line:
-                        free_pages = int(line.split(':')[1].strip().rstrip('.'))
-                    elif 'Pages inactive:' in line:
-                        inactive_pages = int(line.split(':')[1].strip().rstrip('.'))
-                    elif 'Pages speculative:' in line:
-                        speculative_pages = int(line.split(':')[1].strip().rstrip('.'))
+                # Try garbage collection first
+                gc.collect()
 
-                # Calculate available RAM (free + inactive + speculative)
-                available_bytes = (free_pages + inactive_pages + speculative_pages) * page_size
-                available_gb = available_bytes / (1024 ** 3)
-                initial_available_gb = available_gb
-
-                # v95.0: Attempt memory relief if close to threshold
-                if attempt_relief and available_gb < cls.RAM_THRESHOLD_LOCAL and available_gb >= cls.RAM_THRESHOLD_CRITICAL * 0.8:
-                    logger.debug(f"[MLConfig] Attempting memory relief (have {available_gb:.1f}GB, need {cls.RAM_THRESHOLD_LOCAL:.1f}GB)")
-
-                    # Try garbage collection first
-                    gc.collect()
-
-                    # Try LocalMemoryFallback if available
-                    try:
-                        from backend.core.gcp_vm_manager import get_local_memory_fallback
-                        import asyncio
-
-                        fallback = get_local_memory_fallback()
-
-                        # Run async relief in sync context
-                        try:
-                            loop = asyncio.get_running_loop()
-                            # We're already in async context - can't run another event loop
-                            # Just trigger GC which was already done above
-                        except RuntimeError:
-                            # Not in async context - can run relief
-                            loop = asyncio.new_event_loop()
-                            try:
-                                loop.run_until_complete(
-                                    fallback.attempt_local_relief(target_free_mb=cls.RAM_THRESHOLD_LOCAL * 1024)
-                                )
-                            finally:
-                                loop.close()
-
-                    except Exception as relief_error:
-                        logger.debug(f"[MLConfig] Memory relief failed: {relief_error}")
-
-                    # Re-check memory after relief
-                    result2 = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5)
-                    if result2.returncode == 0:
-                        for line in result2.stdout.split('\n'):
-                            if 'Pages free:' in line:
-                                free_pages = int(line.split(':')[1].strip().rstrip('.'))
-                            elif 'Pages inactive:' in line:
-                                inactive_pages = int(line.split(':')[1].strip().rstrip('.'))
-                            elif 'Pages speculative:' in line:
-                                speculative_pages = int(line.split(':')[1].strip().rstrip('.'))
-
-                        available_bytes = (free_pages + inactive_pages + speculative_pages) * page_size
-                        available_gb = available_bytes / (1024 ** 3)
-
-                        if available_gb > initial_available_gb:
-                            logger.info(f"[MLConfig] Memory relief freed {(available_gb - initial_available_gb):.2f}GB")
-
-                # v95.0: Adaptive thresholds based on system total RAM
+                # Try LocalMemoryFallback if available
                 try:
-                    import psutil
-                    total_gb = psutil.virtual_memory().total / (1024 ** 3)
+                    from backend.core.gcp_vm_manager import get_local_memory_fallback
+                    import asyncio
 
-                    # Scale thresholds for smaller systems
-                    if total_gb < 8:
-                        effective_local_threshold = max(cls.RAM_THRESHOLD_LOCAL * 0.5, 1.5)
-                        effective_critical_threshold = max(cls.RAM_THRESHOLD_CRITICAL * 0.5, 0.8)
-                    elif total_gb < 16:
-                        effective_local_threshold = max(cls.RAM_THRESHOLD_LOCAL * 0.75, 2.0)
-                        effective_critical_threshold = max(cls.RAM_THRESHOLD_CRITICAL * 0.75, 1.2)
-                    else:
-                        effective_local_threshold = cls.RAM_THRESHOLD_LOCAL
-                        effective_critical_threshold = cls.RAM_THRESHOLD_CRITICAL
-                except Exception:
+                    fallback = get_local_memory_fallback()
+
+                    # Run async relief in sync context
+                    try:
+                        loop = asyncio.get_running_loop()
+                        # We're already in async context - can't run another event loop
+                        # Just trigger GC which was already done above
+                    except RuntimeError:
+                        # Not in async context - can run relief
+                        loop = asyncio.new_event_loop()
+                        try:
+                            loop.run_until_complete(
+                                fallback.attempt_local_relief(target_free_mb=cls.RAM_THRESHOLD_LOCAL * 1024)
+                            )
+                        finally:
+                            loop.close()
+
+                except Exception as relief_error:
+                    logger.debug(f"[MLConfig] Memory relief failed: {relief_error}")
+
+                # Re-check memory after relief
+                available_gb = _available_gb()
+
+                if available_gb > initial_available_gb:
+                    logger.info(f"[MLConfig] Memory relief freed {(available_gb - initial_available_gb):.2f}GB")
+
+            # v95.0: Adaptive thresholds based on system total RAM
+            try:
+                import psutil
+                total_gb = psutil.virtual_memory().total / (1024 ** 3)
+
+                # Scale thresholds for smaller systems
+                if total_gb < 8:
+                    effective_local_threshold = max(cls.RAM_THRESHOLD_LOCAL * 0.5, 1.5)
+                    effective_critical_threshold = max(cls.RAM_THRESHOLD_CRITICAL * 0.5, 0.8)
+                elif total_gb < 16:
+                    effective_local_threshold = max(cls.RAM_THRESHOLD_LOCAL * 0.75, 2.0)
+                    effective_critical_threshold = max(cls.RAM_THRESHOLD_CRITICAL * 0.75, 1.2)
+                else:
                     effective_local_threshold = cls.RAM_THRESHOLD_LOCAL
                     effective_critical_threshold = cls.RAM_THRESHOLD_CRITICAL
+            except Exception:
+                effective_local_threshold = cls.RAM_THRESHOLD_LOCAL
+                effective_critical_threshold = cls.RAM_THRESHOLD_CRITICAL
 
-                # Decision logic with adaptive thresholds
-                if available_gb < effective_critical_threshold:
-                    return (True, available_gb, f"Critical RAM: {available_gb:.1f}GB < {effective_critical_threshold:.1f}GB")
-                elif available_gb < effective_local_threshold:
-                    return (True, available_gb, f"Low RAM: {available_gb:.1f}GB < {effective_local_threshold:.1f}GB")
-                else:
-                    # v271.0: Even with "sufficient" vm_stat RAM, thrash state
-                    # overrides. Active memory thrashing indicates the system
-                    # is page-faulting faster than it can reclaim, regardless
-                    # of what vm_stat reports as "free/inactive" pages. This
-                    # bridges MLConfig to MemoryQuantizer's real-time pagein
-                    # tracking, which is the authoritative memory health signal.
-                    try:
-                        import backend.core.memory_quantizer as _mq_mod
-                        _mq_inst = _mq_mod._memory_quantizer_instance
-                        if _mq_inst is not None and _mq_inst._thrash_state == "emergency":
-                            return (
-                                True,
-                                available_gb,
-                                f"Memory thrash EMERGENCY override "
-                                f"(pageins/sec: {_mq_inst._pagein_rate:.0f}, "
-                                f"RAM={available_gb:.1f}GB appears sufficient but system is thrashing)"
-                            )
-                    except Exception:
-                        pass
-                    return (False, available_gb, f"Sufficient RAM: {available_gb:.1f}GB >= {effective_local_threshold:.1f}GB")
+            # Decision logic with adaptive thresholds
+            if available_gb < effective_critical_threshold:
+                return (True, available_gb, f"Critical RAM: {available_gb:.1f}GB < {effective_critical_threshold:.1f}GB")
+            elif available_gb < effective_local_threshold:
+                return (True, available_gb, f"Low RAM: {available_gb:.1f}GB < {effective_local_threshold:.1f}GB")
+            else:
+                # v271.0: Even with "sufficient" vm_stat RAM, thrash state
+                # overrides. Active memory thrashing indicates the system
+                # is page-faulting faster than it can reclaim, regardless
+                # of what vm_stat reports as "free/inactive" pages. This
+                # bridges MLConfig to MemoryQuantizer's real-time pagein
+                # tracking, which is the authoritative memory health signal.
+                try:
+                    import backend.core.memory_quantizer as _mq_mod
+                    _mq_inst = _mq_mod._memory_quantizer_instance
+                    if _mq_inst is not None and _mq_inst._thrash_state == "emergency":
+                        return (
+                            True,
+                            available_gb,
+                            f"Memory thrash EMERGENCY override "
+                            f"(pageins/sec: {_mq_inst._pagein_rate:.0f}, "
+                            f"RAM={available_gb:.1f}GB appears sufficient but system is thrashing)"
+                        )
+                except Exception:
+                    pass
+                return (False, available_gb, f"Sufficient RAM: {available_gb:.1f}GB >= {effective_local_threshold:.1f}GB")
 
         except Exception as e:
             logger.warning(f"Failed to check memory pressure: {e}")

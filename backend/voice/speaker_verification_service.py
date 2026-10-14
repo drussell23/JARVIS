@@ -143,6 +143,8 @@ _ModelConfig = None
 _STTEngine = None
 _audio_converter_funcs = None
 _ML_INITIALIZED = False
+# Why the ML stack cannot load in this process (a missing package), once known.
+_ML_INIT_FAILURE: Optional[str] = None
 _ML_INIT_LOCK = threading.Lock()
 
 
@@ -152,14 +154,18 @@ def _init_ml_components():
     This moves 12+ seconds of import time from startup to first request.
     """
     global _torch, _torchaudio, _JARVISLearningDatabase, _SpeechBrainEngine
-    global _ModelConfig, _STTEngine, _audio_converter_funcs, _ML_INITIALIZED
+    global _ModelConfig, _STTEngine, _audio_converter_funcs, _ML_INITIALIZED, _ML_INIT_FAILURE
 
     if _ML_INITIALIZED:
         return True
+    if _ML_INIT_FAILURE:
+        return False
 
     with _ML_INIT_LOCK:
         if _ML_INITIALIZED:
             return True
+        if _ML_INIT_FAILURE:
+            return False
 
         logger.info("🔄 Lazy-loading ML components for speaker verification...")
         start_time = time.time()
@@ -227,6 +233,12 @@ def _init_ml_components():
             logger.info(f"✅ ML components loaded in {elapsed:.0f}ms")
             return True
 
+        except ModuleNotFoundError as e:
+            # Not installed is permanent for this process: recorded once, never
+            # retried, never re-logged on every caller (it was five ERRORs a boot).
+            _ML_INIT_FAILURE = f"{e.name} is not installed"
+            logger.warning("Speaker-verification ML stack unavailable: %s", _ML_INIT_FAILURE)
+            return False
         except Exception as e:
             logger.error(f"❌ Failed to load ML components: {e}")
             return False
@@ -3506,6 +3518,11 @@ class SpeakerVerificationService:
             self._local_db_available = await self._check_local_db_available()
             if self._local_db_available:
                 logger.info(f"📂 Local SQLite database ready: {self._local_db_path}")
+            elif os.path.exists(self._local_db_path):
+                # Present but holding no voiceprint: nobody has enrolled yet,
+                # which is a state, not a fault ("not found" sent readers
+                # hunting for a file that was there).
+                logger.info(f"📂 No enrolled voice profiles yet in {self._local_db_path}")
             else:
                 logger.warning(f"⚠️ Local SQLite database not found: {self._local_db_path}")
 
@@ -3933,20 +3950,7 @@ class SpeakerVerificationService:
             self.learning_db = await get_learning_database()
             self._owns_learning_db = False
 
-        # Initialize SpeechBrain engine for embeddings
-        # Lazy load the ML components
-        _init_ml_components()
-        model_config = _ModelConfig(
-            name="speechbrain-wav2vec2",
-            engine=_STTEngine.SPEECHBRAIN,
-            disk_size_mb=380,
-            ram_required_gb=2.0,
-            vram_required_gb=1.8,
-            expected_accuracy=0.96,
-            avg_latency_ms=150,
-            supports_fine_tuning=True,
-            model_path="speechbrain/asr-wav2vec2-commonvoice-en",
-        )
+        # The SpeechBrain engine is built in one place, _ensure_speechbrain_engine.
 
         # =====================================================================
         # ML ENGINE REGISTRY INTEGRATION (v3.0 - Proactive ECAPA Loading)
@@ -6059,8 +6063,16 @@ class SpeakerVerificationService:
             logger.info("SpeechBrain SKIPPED (SLIM mode — cloud ECAPA verifies)")
             return
 
+        if not _init_ml_components():
+            # A missing ML stack is a fact of this install, not a crash: say
+            # which package, once (_init_ml_components remembers the reason).
+            self.speechbrain_engine = None
+            logger.info(
+                "SpeechBrain unavailable on this install (%s) — verification will "
+                "report no_scoring_engine", _ML_INIT_FAILURE,
+            )
+            return
         try:
-            _init_ml_components()
             model_config = _ModelConfig(
                 name="speechbrain-wav2vec2",
                 engine=_STTEngine.SPEECHBRAIN,

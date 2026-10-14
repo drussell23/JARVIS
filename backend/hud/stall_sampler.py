@@ -148,7 +148,8 @@ def _dump_path():
         raw = (os.environ.get(ENV_DUMP_PATH, "") or "").strip()
         if raw:
             return _Path(raw).expanduser()
-        return _Path.home() / "Library" / "Logs" / "JARVIS" / "loop-stalls.log"
+        from backend.core.host_platform import log_dir
+        return log_dir() / "loop-stalls.log"
     except Exception:  # noqa: BLE001
         return None
 

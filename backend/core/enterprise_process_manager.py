@@ -23,6 +23,7 @@ Version: 108.0.0 (January 2026)
 
 from __future__ import annotations
 
+from backend.core.portable_sockets import allow_time_wait_rebind
 import asyncio
 import logging
 import os
@@ -314,7 +315,7 @@ class EnterpriseProcessManager:
             # v112.0: CRITICAL - Use SO_REUSEADDR for accurate bind test
             # Without this, TIME_WAIT/CLOSED client sockets incorrectly block bind
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            allow_time_wait_rebind(sock)
             sock.settimeout(1.0)
             try:
                 sock.bind(("0.0.0.0", port))

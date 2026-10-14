@@ -29,6 +29,7 @@ Version: 1.0.0
 
 from __future__ import annotations
 
+from backend.core.portable_sockets import allow_time_wait_rebind
 import asyncio
 import logging
 import os
@@ -1069,7 +1070,7 @@ class JarvisPrimeOrchestrator:
                 # Double-check with socket bind
                 try:
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    allow_time_wait_rebind(sock)
                     sock.bind((self.config.host, port))
                     sock.close()
                     logger.info(f"[JarvisPrime] ✅ Found available fallback port: {port}")
@@ -1462,7 +1463,7 @@ class JarvisPrimeOrchestrator:
                 try:
                     import socket
                     temp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    temp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    allow_time_wait_rebind(temp_sock)
                     try:
                         temp_sock.bind(('', port))
                         logger.debug(f"[JarvisPrime] Bound temporary socket to port {port}")

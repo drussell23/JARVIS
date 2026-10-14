@@ -133,6 +133,23 @@ from backend.core.app_lifecycle import spawn_managed_task  # managed: dies with 
 
 logger = logging.getLogger(__name__)
 
+#: Attempts for one lock-file operation under contention (write or remove).
+_LOCK_FS_ATTEMPTS = max(1, int(os.environ.get("JARVIS_LOCK_FS_ATTEMPTS", "3") or 3))
+
+
+def _lock_fs_backoff(attempt: int) -> float:
+    """Exponential backoff with jitter between lock-file attempts."""
+    base = 0.01 * (2 ** attempt)  # 0.01, 0.02, 0.04 ...
+    return base + random.uniform(0, base * 0.5)
+
+
+def _is_transient_sharing_violation(exc: OSError) -> bool:
+    """Windows refuses to delete or replace a file another process has open
+    (ERROR_SHARING_VIOLATION 32, ERROR_ACCESS_DENIED 5 during a pending
+    delete): a reader holds it for a moment, so it passes. POSIX unlinks open
+    files freely and never reports this."""
+    return getattr(exc, "winerror", None) in (5, 32)
+
 
 # =============================================================================
 # v3.5: Env-var helpers + async executor bridge for blocking syscalls
@@ -1610,7 +1627,7 @@ class DistributedLockManager:
         v96.1: Added content verification after write to detect silent corruption.
         v2.0: Per-lock semaphore + unique temp file path per write attempt.
         """
-        max_retries = 3
+        max_retries = _LOCK_FS_ATTEMPTS
         last_error: Optional[Exception] = None
 
         # v2.0: Get semaphore for this specific lock to serialize writes
@@ -1694,9 +1711,7 @@ class DistributedLockManager:
                     last_error = e
                     if attempt < max_retries - 1:
                         # v2.0: Exponential backoff with jitter to reduce contention
-                        base_delay = 0.01 * (2 ** attempt)  # 0.01, 0.02, 0.04
-                        jitter = random.uniform(0, base_delay * 0.5)  # Up to 50% jitter
-                        delay = base_delay + jitter
+                        delay = _lock_fs_backoff(attempt)
                         missing_path = (
                             isinstance(e, FileNotFoundError)
                             or (isinstance(e, OSError) and e.errno == errno.ENOENT)
@@ -1728,18 +1743,28 @@ class DistributedLockManager:
         v1.1: Made robust against TOCTOU race conditions - if file disappears
         between exists check and remove, we treat it as successful removal.
         """
-        try:
-            await aiofiles.os.remove(lock_file)
-        except FileNotFoundError:
-            # File already gone - treat as successful removal (race condition handled)
-            logger.debug(f"Lock file already removed (race condition OK): {lock_file}")
-        except OSError as e:
-            # Check if it's "No such file or directory" error
-            import errno
-            if e.errno == errno.ENOENT:
-                logger.debug(f"Lock file already removed: {lock_file}")
-            else:
+        for attempt in range(_LOCK_FS_ATTEMPTS):
+            try:
+                await aiofiles.os.remove(lock_file)
+                return
+            except FileNotFoundError:
+                # File already gone - treat as successful removal (race condition handled)
+                logger.debug(f"Lock file already removed (race condition OK): {lock_file}")
+                return
+            except OSError as e:
+                if e.errno == errno.ENOENT:
+                    logger.debug(f"Lock file already removed: {lock_file}")
+                    return
+                if _is_transient_sharing_violation(e) and attempt < _LOCK_FS_ATTEMPTS - 1:
+                    await asyncio.sleep(_lock_fs_backoff(attempt))
+                    continue
+                if _is_transient_sharing_violation(e):
+                    # Still held open by a reader after every attempt: the
+                    # holder is alive and the next cleanup pass will remove it.
+                    logger.debug(f"Lock file {lock_file} held open by a reader; left for the next pass")
+                    return
                 logger.error(f"Error removing lock file {lock_file}: {e}")
+                return
 
     # =========================================================================
     # v96.0: Advanced Cleanup with PID Reuse Detection

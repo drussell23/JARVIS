@@ -575,6 +575,14 @@ class GhostHandsOrchestrator:
 
     async def _init_actuator(self) -> None:
         """Initialize Yabai-Aware Actuator for cross-space capabilities."""
+        import sys
+        if sys.platform != "darwin":
+            # yabai and its Accessibility backend are macOS; elsewhere the
+            # portable actuator IS the actuator, not a fallback after an ERROR.
+            from ghost_hands.background_actuator import get_background_actuator
+            self._actuator = await get_background_actuator()
+            logger.info("[GHOST-HANDS] Background Actuator connected (%s)", sys.platform)
+            return
         try:
             # Use Yabai-Aware Actuator for cross-space window targeting
             from ghost_hands.yabai_aware_actuator import get_yabai_actuator

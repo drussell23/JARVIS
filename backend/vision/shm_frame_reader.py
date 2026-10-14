@@ -27,12 +27,35 @@ SHM_NAME = b"/jarvis_frame_bridge"
 HEADER_SIZE = 128
 RING_SIZE = 5
 
-# libc for shm_open/shm_unlink only (no mmap via ctypes!)
-_libc = ctypes.CDLL("libc.dylib", use_errno=True)
-_libc.shm_open.restype = ctypes.c_int
-_libc.shm_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_uint16]
-_libc.shm_unlink.restype = ctypes.c_int
-_libc.shm_unlink.argtypes = [ctypes.c_char_p]
+# libc for shm_open/shm_unlink only (no mmap via ctypes!). Resolved on first
+# use, per OS: the frame ring is POSIX shared memory written by the macOS
+# capture helper. Loading "libc.dylib" at import made the module -- and every
+# importer, JarvisCU among them -- fail on any other OS; where there is no
+# POSIX shared memory (Windows) the reader simply has no frames to offer.
+_LIBC_UNRESOLVED = object()
+_libc_handle: object = _LIBC_UNRESOLVED
+
+
+def _posix_libc() -> Optional[ctypes.CDLL]:
+    """The C library providing shm_open/shm_unlink, or None on this OS."""
+    global _libc_handle
+    if _libc_handle is _LIBC_UNRESOLVED:
+        import ctypes.util
+
+        name = ctypes.util.find_library("c") if os.name == "posix" else None
+        lib = None
+        if name:
+            try:
+                lib = ctypes.CDLL(name, use_errno=True)
+                lib.shm_open.restype = ctypes.c_int
+                lib.shm_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_uint16]
+                lib.shm_unlink.restype = ctypes.c_int
+                lib.shm_unlink.argtypes = [ctypes.c_char_p]
+            except (OSError, AttributeError) as exc:
+                logger.debug("[ShmRing] POSIX shared memory unavailable: %s", exc)
+                lib = None
+        _libc_handle = lib
+    return _libc_handle  # type: ignore[return-value]
 
 
 class ShmFrameReader:
@@ -54,6 +77,9 @@ class ShmFrameReader:
         Call BEFORE starting the SCK writer so it creates a fresh segment.
         Safe to call even if no stale segment exists.
         """
+        _libc = _posix_libc()
+        if _libc is None:
+            return  # no POSIX shared memory on this OS: nothing can be stale
         fd = _libc.shm_open(SHM_NAME, os.O_RDWR, 0o666)
         if fd < 0:
             return  # No segment exists — nothing to clean
@@ -87,6 +113,9 @@ class ShmFrameReader:
             return True
 
         # Open shm fd via libc (Python has no shm_open)
+        _libc = _posix_libc()
+        if _libc is None:
+            return False  # no POSIX shared memory on this OS
         fd = _libc.shm_open(SHM_NAME, os.O_RDWR, 0o666)
         if fd < 0:
             return False

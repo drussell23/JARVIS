@@ -127,6 +127,11 @@ class AgentInitializer:
         self.coordinator = coordinator
         self._registered_agents: Dict[str, BaseNeuralMeshAgent] = {}
         self._initialization_order: List[str] = []
+        # One initialization per agent class, whoever asks first. AGI OS and
+        # the kernel's Zone 6.55 both ask; a second pass re-instantiated
+        # every agent and registered duplicates.
+        self._initialized_classes: set = set()
+        self._init_lock = asyncio.Lock()
 
     @property
     def registered_agents(self) -> Dict[str, BaseNeuralMeshAgent]:
@@ -153,13 +158,24 @@ class AgentInitializer:
         Returns:
             Dictionary of registered agents by name
         """
-        exclude = exclude or []
+        async with self._init_lock:
+            return await self._initialize_agents_once(exclude, include_only)
 
-        logger.info(f"Initializing {len(PRODUCTION_AGENTS)} production agents...")
+    async def _initialize_agents_once(
+        self,
+        exclude: Optional[List[str]],
+        include_only: Optional[List[str]],
+    ) -> Dict[str, BaseNeuralMeshAgent]:
+        exclude = exclude or []
+        pending = [c for c in PRODUCTION_AGENTS if c.__name__ not in self._initialized_classes]
+        if not pending:
+            return self._registered_agents.copy()
+
+        logger.info(f"Initializing {len(pending)} production agents...")
 
         # Determine which agents to initialize
         agents_to_init = []
-        for agent_class in PRODUCTION_AGENTS:
+        for agent_class in pending:
             agent_name = agent_class.__name__
 
             if include_only:
@@ -190,6 +206,7 @@ class AgentInitializer:
                 logger.warning(
                     f"Skipping {agent_class.__name__}: cannot instantiate ({e})"
                 )
+                self._initialized_classes.add(agent_class.__name__)  # attempted; not retried
             except Exception as e:
                 logger.debug(
                     f"Could not peek agent_type for {agent_class.__name__}: {e}"
@@ -202,6 +219,7 @@ class AgentInitializer:
         for agent_class in ordered_agents:
             try:
                 agent = await self._initialize_agent(agent_class)
+                self._initialized_classes.add(agent_class.__name__)
                 if agent:
                     self._registered_agents[agent.agent_name] = agent
                     self._initialization_order.append(agent.agent_name)

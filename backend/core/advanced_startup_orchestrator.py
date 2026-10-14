@@ -435,62 +435,16 @@ class DynamicConfigDiscovery:
         return config
 
     async def _discover_repo_paths(self) -> Dict[TrinityRepo, Path]:
-        """Discover repository paths using multiple strategies."""
+        """Repository paths, from the one resolver (backend/core/trinity_repos)."""
+        from backend.core.trinity_repos import repo_path
+
         paths = {}
-
-        # Strategy 1: Environment variables
-        env_mappings = {
-            TrinityRepo.JARVIS: "JARVIS_REPO_PATH",
-            TrinityRepo.JARVIS_PRIME: "JARVIS_PRIME_REPO_PATH",
-            TrinityRepo.REACTOR_CORE: "REACTOR_CORE_PATH",
-        }
-
-        for repo, env_var in env_mappings.items():
-            env_path = os.getenv(env_var)
-            if env_path:
-                path = Path(env_path)
-                if path.exists():
-                    paths[repo] = path
-                    continue
-
-        # Strategy 2: Find from current file location
-        if TrinityRepo.JARVIS not in paths:
-            # Walk up to find .git directory
-            current = Path(__file__).resolve()
-            for _ in range(10):
-                if (current / ".git").exists():
-                    paths[TrinityRepo.JARVIS] = current
-                    break
-                if current.parent == current:
-                    break
-                current = current.parent
-
-        # Strategy 3: Check sibling directories for JARVIS-Prime and Reactor-Core
-        if TrinityRepo.JARVIS in paths:
-            parent = paths[TrinityRepo.JARVIS].parent
-
-            # JARVIS-Prime detection patterns
-            jprime_patterns = [
-                "JARVIS-Prime", "jarvis-prime", "jarvis_prime",
-                "j-prime", "jprime"
-            ]
-            for pattern in jprime_patterns:
-                jprime_path = parent / pattern
-                if jprime_path.exists() and (jprime_path / ".git").exists():
-                    paths[TrinityRepo.JARVIS_PRIME] = jprime_path
-                    break
-
-            # Reactor-Core detection patterns
-            reactor_patterns = [
-                "reactor-core", "Reactor-Core", "reactor_core",
-                "reactorcore", "ReactorCore"
-            ]
-            for pattern in reactor_patterns:
-                reactor_path = parent / pattern
-                if reactor_path.exists() and (reactor_path / ".git").exists():
-                    paths[TrinityRepo.REACTOR_CORE] = reactor_path
-                    break
-
+        for repo, name in ((TrinityRepo.JARVIS, "jarvis"),
+                           (TrinityRepo.JARVIS_PRIME, "prime"),
+                           (TrinityRepo.REACTOR_CORE, "reactor")):
+            found = repo_path(name)
+            if found is not None:
+                paths[repo] = found
         return paths
 
     def _discover_trinity_dir(self) -> Path:

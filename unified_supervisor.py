@@ -425,6 +425,24 @@ def _ensure_venv_python() -> None:
 # Execute venv check immediately
 _ensure_venv_python()
 
+# Invocations that answer and exit instead of running the kernel.
+_ANSWER_AND_EXIT_FLAGS = frozenset({
+    "--status", "--shutdown", "--monitor", "--monitor-logs",
+    "--monitor-prime", "--monitor-reactor", "--monitor-trinity",
+    "--cleanup", "--check-only", "--dashboard", "--install-watchdog",
+    "--uninstall-watchdog", "--version", "--help", "-h",
+})
+
+# A kernel run leaves its whole output in a file, before any logger binds a
+# stream (backend/core/session_log.py). Run directly, it used to reach the
+# console only.
+if not (_ANSWER_AND_EXIT_FLAGS & set(_sys.argv[1:])):
+    try:
+        from backend.core.session_log import start_session_log
+        start_session_log("supervisor")
+    except Exception as _sl_err:  # a missing log never stops the kernel
+        print(f"[KERNEL] session log unavailable: {_sl_err}")
+
 # Clean up temporary imports
 del _os, _sys, _Path, _ensure_venv_python, _venv_python_candidates
 
@@ -737,6 +755,7 @@ import shlex
 import shutil
 import signal
 import socket
+from backend.core.portable_sockets import allow_time_wait_rebind
 import sqlite3
 import ssl
 import stat
@@ -2353,38 +2372,6 @@ def _calculate_effective_startup_timeout(
 
 
 # =============================================================================
-# SUPERVISOR BLOCKING EXECUTOR & RATE-LIMITED LOGGER
-# =============================================================================
-# Dedicated executor for supervisor blocking ops — bounded to prevent
-# threadpool starvation when 30-40 to_thread calls run concurrently.
-# Rate-limited logger prevents log storms in hot loops.
-# =============================================================================
-
-_SUPERVISOR_BLOCKING_EXECUTOR = ThreadPoolExecutor(
-    max_workers=4, thread_name_prefix="supervisor-blocking"
-)
-
-
-def _run_in_supervisor_thread(fn, *args, timeout: float = 10.0):
-    """Run blocking fn in dedicated executor with deadline. Returns awaitable."""
-    loop = asyncio.get_running_loop()
-    fut = loop.run_in_executor(_SUPERVISOR_BLOCKING_EXECUTOR, fn, *args)
-    return asyncio.wait_for(fut, timeout=timeout)
-
-
-_RATE_LIMIT_CACHE: Dict[str, float] = {}
-
-
-def _rate_limited_log(logger, level: str, key: str, msg: str, interval: float = 30.0):
-    """Log at most once per interval seconds per key."""
-    now = time.time()
-    last = _RATE_LIMIT_CACHE.get(key, 0.0)
-    if now - last >= interval:
-        _RATE_LIMIT_CACHE[key] = now
-        getattr(logger, level)(msg)
-
-
-# =============================================================================
 # DEDICATED SUPERVISOR BLOCKING EXECUTOR + RATE-LIMITED LOGGER
 # =============================================================================
 # Infrastructure used by all subsequent to_thread replacements and loop error
@@ -2400,60 +2387,19 @@ def _rate_limited_log(logger, level: str, key: str, msg: str, interval: float = 
 # Bounded to prevent threadpool starvation — 4 workers is enough for the
 # handful of concurrent blocking ops the supervisor may issue (psutil,
 # socket, file I/O).
-_SUPERVISOR_BLOCKING_EXECUTOR = ThreadPoolExecutor(
-    max_workers=4, thread_name_prefix="supervisor-blocking"
-)
+def _managed_pool_base() -> type:
+    """The managed executor class (registered for the kernel's executor
+    shutdown, daemon workers), or the plain one where the thread manager
+    cannot load. Unmanaged pools' idle workers were force-terminated one
+    second each at every stop."""
+    try:
+        from backend.core.thread_manager import ManagedThreadPoolExecutor
+        return ManagedThreadPoolExecutor
+    except Exception:
+        return ThreadPoolExecutor
 
 
-def _run_in_supervisor_thread(fn, *args, timeout: float = 10.0):
-    """Run a blocking *fn* in the dedicated supervisor executor with a deadline.
-
-    Returns an awaitable.  The caller must ``await`` the result::
-
-        result = await _run_in_supervisor_thread(os.path.exists, "/tmp/x")
-
-    If *fn* does not complete within *timeout* seconds an
-    ``asyncio.TimeoutError`` is raised **without** cancelling the underlying
-    future (the thread will finish on its own; we just stop waiting).
-    """
-    loop = asyncio.get_running_loop()
-    fut = loop.run_in_executor(_SUPERVISOR_BLOCKING_EXECUTOR, fn, *args)
-    return asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
-
-
-# Per-key timestamp cache for rate-limited logging.
-_RATE_LIMIT_CACHE: Dict[str, float] = {}
-
-
-def _rate_limited_log(logger, level: str, key: str, msg: str, interval: float = 30.0):
-    """Emit *msg* at most once per *interval* seconds for a given *key*.
-
-    Useful inside tight loops (health checks, memory broker) where the same
-    warning would otherwise repeat thousands of times.
-    """
-    now = time.time()
-    last = _RATE_LIMIT_CACHE.get(key, 0.0)
-    if now - last >= interval:
-        _RATE_LIMIT_CACHE[key] = now
-        getattr(logger, level)(msg)
-
-# =============================================================================
-# DEDICATED SUPERVISOR BLOCKING EXECUTOR + RATE-LIMITED LOGGER
-# =============================================================================
-# Infrastructure used by all subsequent to_thread replacements and loop error
-# handlers.  Every blocking call in the supervisor goes through
-# _run_in_supervisor_thread (never bare asyncio.to_thread) so we have bounded
-# concurrency and a hard deadline on every offloaded call.
-#
-# _rate_limited_log prevents log storms in hot loops (e.g. health-check
-# polling, memory broker ticks) by suppressing duplicate messages within a
-# configurable interval.
-# =============================================================================
-
-# Bounded to prevent threadpool starvation — 4 workers is enough for the
-# handful of concurrent blocking ops the supervisor may issue (psutil,
-# socket, file I/O).
-_SUPERVISOR_BLOCKING_EXECUTOR = ThreadPoolExecutor(
+_SUPERVISOR_BLOCKING_EXECUTOR = _managed_pool_base()(
     max_workers=4, thread_name_prefix="supervisor-blocking"
 )
 
@@ -3334,7 +3280,7 @@ def _allocate_ephemeral_port(host: str = "127.0.0.1") -> Optional[int]:
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            allow_time_wait_rebind(sock)
             sock.bind((host, 0))
             port = int(sock.getsockname()[1])
             return port if port > 0 else None
@@ -12505,7 +12451,7 @@ class DynamicPortManager(ResourceManagerBase):
             try:
                 # Try to bind to the port
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                allow_time_wait_rebind(sock)
                 sock.settimeout(1.0)
                 sock.bind(('127.0.0.1', port))
                 sock.close()
@@ -12657,7 +12603,7 @@ def _sync_assign_all_ports(
         """Check if a port is available for binding."""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            allow_time_wait_rebind(sock)
             sock.settimeout(1.0)
             sock.bind(('127.0.0.1', port))
             sock.close()
@@ -55407,16 +55353,6 @@ class ComprehensiveZombieCleanup:
         self._service_ports = self._discover_service_ports()
 
         # Process patterns for detection
-        self._process_patterns = [
-            "unified_supervisor.py",
-            "run_supervisor.py",
-            "start_system.py",
-            "jarvis",
-            "uvicorn.*8010",
-            "trinity_orchestrator",
-            "jarvis_prime",
-            "reactor_core",
-        ]
 
     def _discover_service_ports(self) -> Dict[str, List[int]]:
         """Discover service ports from config and environment."""
@@ -55653,7 +55589,8 @@ class ComprehensiveZombieCleanup:
             return {}
 
         discovered: Dict[int, ZombieProcessInfo] = {}
-        import re
+        from backend.core.process_identity import is_trinity_process, trinity_roots
+        roots = trinity_roots()
 
         try:
             for proc in psutil.process_iter(['pid', 'cmdline', 'create_time', 'memory_info', 'status']):
@@ -55666,22 +55603,19 @@ class ComprehensiveZombieCleanup:
                     if not cmdline:
                         continue
 
-                    cmdline_lower = cmdline.lower()
-
-                    # Check against patterns
-                    for pattern in self._process_patterns:
-                        if re.search(pattern, cmdline_lower):
-                            mem_info = proc.info.get('memory_info')
-                            discovered[pid] = ZombieProcessInfo(
-                                pid=pid,
-                                cmdline=cmdline[:200],
-                                age_seconds=time.time() - proc.info['create_time'],
-                                memory_mb=mem_info.rss / (1024 * 1024) if mem_info else 0,
-                                status=proc.info.get('status', 'unknown'),
-                                repo_origin="jarvis",
-                                detection_source="pattern_scan",
-                            )
-                            break
+                    # Trinity's own code, judged structurally (one rule:
+                    # backend/core/process_identity.is_trinity_process).
+                    if is_trinity_process(proc, roots):
+                        mem_info = proc.info.get('memory_info')
+                        discovered[pid] = ZombieProcessInfo(
+                            pid=pid,
+                            cmdline=cmdline[:200],
+                            age_seconds=time.time() - proc.info['create_time'],
+                            memory_mb=mem_info.rss / (1024 * 1024) if mem_info else 0,
+                            status=proc.info.get('status', 'unknown'),
+                            repo_origin="jarvis",
+                            detection_source="pattern_scan",
+                        )
 
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
@@ -55705,7 +55639,8 @@ class ComprehensiveZombieCleanup:
             return {}
 
         discovered: Dict[int, ZombieProcessInfo] = {}
-        import re
+        from backend.core.process_identity import is_trinity_process, trinity_roots
+        roots = trinity_roots()
 
         try:
             for proc in psutil.process_iter(['pid', 'ppid', 'cmdline', 'create_time', 'status']):
@@ -55715,15 +55650,10 @@ class ComprehensiveZombieCleanup:
                         continue
 
                     cmdline = " ".join(proc.info.get('cmdline') or [])
-                    cmdline_lower = cmdline.lower()
 
-                    # Only check JARVIS-related processes
-                    is_jarvis_related = any(
-                        re.search(pattern, cmdline_lower)
-                        for pattern in self._process_patterns
-                    )
-
-                    if not is_jarvis_related:
+                    # Only Trinity's own processes (structural, not words in
+                    # the command line) get the costly probes below.
+                    if not is_trinity_process(proc, roots):
                         continue
 
                     # Get process details
@@ -58976,7 +58906,7 @@ class TrinityIntegrator:
             # Phase 2: Verify we can actually bind
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    allow_time_wait_rebind(sock)
                     sock.settimeout(0.5)
                     sock.bind(('127.0.0.1', port))
                     return True
@@ -68772,12 +68702,27 @@ class JarvisSystemKernel:
                 v220.2.1: Enhanced startup script detection for JARVIS-Prime repo structure.
                 """
                 try:
+                    # One way J-Prime starts: the sibling registry, where this
+                    # deployment declares it (JARVIS_JPRIME_START_CMD). Pre-warm
+                    # just asks earlier; the later bring-up adopts what serves.
+                    # The legacy path below guessed a repo location and ran its
+                    # run_server.py with "python3" on the inference port.
+                    from backend.core.ouroboros.governance import trinity_siblings as _siblings
+                    if _siblings.autostart_enabled() and os.environ.get("JARVIS_JPRIME_START_CMD", "").strip():
+                        _status = await asyncio.to_thread(
+                            _siblings.ensure_sibling, "jprime",
+                            say=lambda _m: self.logger.info(f"[EarlyPrime] {_m.strip()}"),
+                        )
+                        self.logger.info(f"[EarlyPrime] J-Prime {_status.state} at {_status.url or '-'}")
+                        return
+
                     # Import TrinityIntegrator to start Prime
-                    prime_repo = os.getenv("JARVIS_PRIME_REPO_PATH", os.path.expanduser("~/Documents/repos/JARVIS-Prime"))
+                    from backend.core.trinity_repos import repo_path as _repo_path
+                    prime_repo = str(_repo_path("prime") or "")
                     prime_port = int(os.getenv("TRINITY_JPRIME_PORT", os.getenv("JARVIS_PRIME_PORT", str(DEFAULT_PRIME_INFERENCE_PORT))))
                     
-                    if not os.path.exists(prime_repo):
-                        self.logger.warning(f"[EarlyPrime] Prime repo not found: {prime_repo}")
+                    if not prime_repo:
+                        self.logger.info("[EarlyPrime] No J-Prime repository on this host; nothing to pre-warm")
                         return
                     
                     # Update dashboard to show early model loading started
@@ -70938,14 +70883,16 @@ class JarvisSystemKernel:
             self._current_startup_progress = 85
             _neural_mesh_agents_ok = False
             try:
-                from backend.neural_mesh.coordinator import NeuralMeshCoordinator
+                # The process's one mesh (and one agent initializer): AGI OS
+                # starts the same singleton, and whichever runs first does the
+                # work. A coordinator built here was a second mesh, from a
+                # module path that does not exist (neural_mesh.coordinator).
+                from backend.neural_mesh.neural_mesh_coordinator import start_neural_mesh
                 from backend.neural_mesh.agents.agent_initializer import (
                     initialize_production_agents,
                 )
 
-                _mesh_coordinator = NeuralMeshCoordinator()
-                await _mesh_coordinator.initialize()
-                await _mesh_coordinator.start()
+                _mesh_coordinator = await start_neural_mesh()
 
                 _agent_statuses = await initialize_production_agents(_mesh_coordinator)
                 _num_agents = len(_agent_statuses)
@@ -71310,6 +71257,18 @@ class JarvisSystemKernel:
             # + REM Sleep — too slow to block boot. Daemon constructs instantly;
             # only the awakening sequence runs in background.
             _ouroboros_daemon_enabled = os.environ.get("OUROBOROS_DAEMON_ENABLED", "true").lower() in ("true", "1", "yes")
+            # The daemon IS governance (REM sleep drives the governed loop's
+            # oracle, fleet and proactive drive). Where another process owns
+            # governance those are None here, and REM sleep crashed on
+            # proactive_drive.on_eligible -- a second, crippled daemon beside
+            # the owner's real one. One ownership predicate decides both.
+            try:
+                from backend.core.ouroboros.governance.lifecycle_ownership import (
+                    supervisor_owns_governance,
+                )
+                _ouroboros_daemon_enabled = _ouroboros_daemon_enabled and supervisor_owns_governance()
+            except Exception:  # noqa: BLE001 -- ownership unknowable: keep the declared flag
+                pass
             if _ouroboros_daemon_enabled:
                 try:
                     from backend.core.ouroboros.daemon import OuroborosDaemon
@@ -86857,16 +86816,28 @@ class JarvisSystemKernel:
 
             try:
                 # v238.1: Pre-clear stale listeners on target port
+                # Only OUR stale listener may be cleared; another program's
+                # port is theirs (it was a WSL relay), so move to the next.
+                _foreign_listener = False
                 try:
                     pid_on_port = await self._find_process_on_port(loading_port)
                     if pid_on_port and pid_on_port not in self._protected_pids:
-                        self.logger.warning(
-                            f"[LoadingServer] Port {loading_port} occupied by PID {pid_on_port}, clearing..."
-                        )
-                        await self._force_kill_process(pid_on_port)
-                        await asyncio.sleep(0.5)
+                        from backend.core.process_identity import owned_by_trinity
+                        if owned_by_trinity(pid_on_port):
+                            self.logger.warning(
+                                f"[LoadingServer] Port {loading_port} held by stale PID {pid_on_port}, clearing..."
+                            )
+                            await self._force_kill_process(pid_on_port)
+                            await asyncio.sleep(0.5)
+                        else:
+                            _foreign_listener = True
                 except Exception:
                     pass  # Best-effort port clearing
+                if _foreign_listener:
+                    self.logger.info(
+                        f"[LoadingServer] Port {loading_port} belongs to another program (PID {pid_on_port}); trying the next"
+                    )
+                    continue
 
                 # Set port for this attempt
                 env["LOADING_SERVER_PORT"] = str(loading_port)
@@ -87025,7 +86996,14 @@ class JarvisSystemKernel:
                         timeout=aiohttp.ClientTimeout(total=timeout_per_request)
                     ) as session:
                         async with session.get(health_url) as resp:
-                            if resp.status == 200:
+                            # Healthy means OUR server answered: it names itself
+                            # ("service": "loading_server"). Any 200 used to
+                            # count, and a WSL relay on the same port passed.
+                            try:
+                                _svc = (await resp.json(content_type=None)).get("service")
+                            except Exception:  # noqa: BLE001 -- not JSON: not ours
+                                _svc = None
+                            if resp.status == 200 and _svc == "loading_server":
                                 elapsed = time.time() - start_time
                                 self.logger.info(
                                     f"[LoadingServer] Healthy after {attempt} attempts ({elapsed:.2f}s)"
@@ -98179,7 +98157,7 @@ def create_heartbeat_projection(
     return HeartbeatProjection(stale_timeout_s=stale_timeout_s)
 
 
-class _BoundedShutdownExecutor(ThreadPoolExecutor):
+class _BoundedShutdownExecutor(_managed_pool_base()):
     """The loop's default executor, with a teardown that cannot hang.
 
     asyncio.run() ends by joining every default-executor thread with no
@@ -98236,13 +98214,16 @@ def main() -> int:
         except OSError:
             pass
         if _sentinel_age < 300:  # Only honor if written within the last 5 minutes
-            import subprocess as _sp_sentinel
-            _plist_sentinel = Path.home() / "Library" / "LaunchAgents" / "com.jarvis.supervisor.plist"
-            _uid_sentinel = os.getuid()
-            _sp_sentinel.run(
-                ["launchctl", "bootout", f"gui/{_uid_sentinel}", str(_plist_sentinel)],
-                capture_output=True, timeout=5,
-            )
+            # Unloading the restart agent is launchd's business: macOS only
+            # (os.getuid / launchctl do not exist on Windows). Exiting
+            # without starting is the sentinel's meaning on every OS.
+            if sys.platform == "darwin":
+                import subprocess as _sp_sentinel
+                _plist_sentinel = Path.home() / "Library" / "LaunchAgents" / "com.jarvis.supervisor.plist"
+                _sp_sentinel.run(
+                    ["launchctl", "bootout", f"gui/{os.getuid()}", str(_plist_sentinel)],
+                    capture_output=True, timeout=5,
+                )
             print("[Kernel] v293.0: User-requested shutdown sentinel found — exiting without restart.")
             return 0
 
@@ -98251,15 +98232,10 @@ def main() -> int:
     # of starting a second instance. Eliminates the split-brain --force pattern.
     # Control commands (status, shutdown, monitor, etc.) skip this check and
     # run directly against the daemon via their own IPC paths.
-    _CONTROL_FLAGS = {
-        "--status", "--shutdown", "--monitor", "--monitor-logs",
-        "--monitor-prime", "--monitor-reactor", "--monitor-trinity",
-        "--cleanup", "--check-only", "--dashboard", "--install-watchdog",
-        "--uninstall-watchdog", "--force", "--restart",
-        # argparse's informational flags answer and exit; they must never
-        # attach to a running daemon's log stream (--version streamed pings).
-        "--version", "--help", "-h",
-    }
+    # argparse's informational flags answer and exit; they must never attach
+    # to a running daemon's log stream (--version streamed pings). --force and
+    # --restart run a kernel of their own instead of attaching.
+    _CONTROL_FLAGS = _ANSWER_AND_EXIT_FLAGS | {"--force", "--restart"}
     _is_control_invocation = bool(_CONTROL_FLAGS & set(sys.argv[1:]))
     if not _is_control_invocation:
         try:

@@ -64,7 +64,10 @@ def _try_bind(port: int, host: str = "127.0.0.1") -> Optional[int]:
     the caller can retry the whole scan."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # TIME_WAIT may be rebound; a live listener never (Windows' own
+            # SO_REUSEADDR allowed it -- backend/core/portable_sockets.py).
+            from backend.core.portable_sockets import allow_time_wait_rebind
+            allow_time_wait_rebind(s)
             s.bind((host, port))
         return port
     except OSError as exc:

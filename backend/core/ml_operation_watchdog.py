@@ -43,6 +43,7 @@ Usage:
         ...
 """
 
+from backend.core.portable_sockets import allow_time_wait_rebind
 import asyncio
 import logging
 import os
@@ -283,7 +284,7 @@ def check_port_available(port: int) -> Tuple[bool, Optional[int]]:
     try:
         # Try to bind to the port
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            allow_time_wait_rebind(s)
             s.bind(('localhost', port))
             return True, None
     except OSError:

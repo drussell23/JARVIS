@@ -69,6 +69,7 @@ Author: JARVIS Trinity v1.0 - Race Condition Prevention
 
 from __future__ import annotations
 
+from backend.core.portable_sockets import allow_time_wait_rebind
 import asyncio
 import errno
 import hashlib
@@ -1059,7 +1060,7 @@ class AtomicPortReservation:
         sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            allow_time_wait_rebind(sock)
             sock.settimeout(self.config.port_socket_timeout)
             sock.bind((host, port))
             return True

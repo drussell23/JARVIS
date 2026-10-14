@@ -38,10 +38,18 @@ $Repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $Venv = if ($env:JARVIS_BODY_VENV) { $env:JARVIS_BODY_VENV } else { Join-Path $env:LOCALAPPDATA 'JARVIS\venvs\body' }
 $Py = Join-Path $Venv 'Scripts\python.exe'
 $State = Join-Path $env:LOCALAPPDATA 'JARVIS\body'
-$Logs = Join-Path $env:LOCALAPPDATA 'JARVIS\logs'
+# Same rule as backend/core/host_platform.log_dir(): JARVIS_LOG_DIR, else %LOCALAPPDATA%\JARVIS\logs.
+$Logs = if ($env:JARVIS_LOG_DIR) { $env:JARVIS_LOG_DIR } else { Join-Path $env:LOCALAPPDATA 'JARVIS\logs' }
 $PidFile = Join-Path $State 'supervisor.pid'
-$LogPointer = Join-Path $State 'supervisor.logpath'
 New-Item -ItemType Directory -Force $State, $Logs | Out-Null
+
+function Get-LatestLog {
+  # The newest kernel log, however the kernel was started: this launcher
+  # redirects into supervisor-*.log, and a direct run tees into the same
+  # name (backend/core/session_log.py).
+  Get-ChildItem $Logs -Filter 'supervisor-*.log' -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+}
 
 $KernelLock = Join-Path $env:USERPROFILE '.jarvis\locks\kernel.lock'
 
@@ -84,12 +92,12 @@ switch ($Action) {
   'status' {
     $p = Get-KernelPid
     if (-not $p) { "JARVIS is not running"; exit 3 }
-    "JARVIS kernel pid $p  log: $(Get-Content $LogPointer -ErrorAction SilentlyContinue)"
+    "JARVIS kernel pid $p  log: $(Get-LatestLog)"
     Invoke-Supervisor '--status' | Where-Object { $_ -match '^\s+(State|PID|Uptime|Mode|Port|Tier):|RUNNING|NOT' }
     exit 0
   }
   'logs' {
-    $log = Get-Content $LogPointer -ErrorAction SilentlyContinue
+    $log = Get-LatestLog
     if (-not $log -or -not (Test-Path $log)) { "no supervisor log recorded"; exit 3 }
     Get-Content $log -Tail 40 -Wait
   }
@@ -120,7 +128,6 @@ switch ($Action) {
     if ($p) { "JARVIS is already running (pid $p)"; exit 0 }
     Initialize-Venv
     $log = Join-Path $Logs ("supervisor-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
-    Set-Content -Path $LogPointer -Value $log
     $cmd = "cmd.exe /d /c `"`"$Py`" -X utf8 -u unified_supervisor.py $SupervisorArgs --ui plain --no-ansi > `"$log`" 2>&1`""
     # Win32_Process.Create, not Start-Process: the kernel must share NO handles
     # with this shell (see prime\scripts\engine\jprime_engine.ps1).

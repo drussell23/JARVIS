@@ -530,7 +530,10 @@ def capture_system_state() -> Dict[str, Any]:
                 {"id": t.ident, "name": t.name, "daemon": t.daemon}
                 for t in threading.enumerate()
             ],
-            "open_files": len(process.open_files()),
+            # A count, from each OS's O(1) call: open_files() walks every
+            # handle on Windows (seconds) and this runs on the shutdown path,
+            # where it was the top event-loop stall in the stall sampler.
+            "open_files": (process.num_handles() if os.name == "nt" else process.num_fds()),
             "connections": len(process.net_connections()),
             "children": [
                 {"pid": c.pid, "name": c.name()}

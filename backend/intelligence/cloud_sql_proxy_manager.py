@@ -19,6 +19,7 @@ v218.0 CRITICAL FIX:
 - This fixes the "exit code 1" crash when using gcloud auth credentials
 """
 
+from backend.core.portable_sockets import allow_time_wait_rebind
 import asyncio
 import json
 import logging
@@ -1684,7 +1685,7 @@ class CloudSQLProxyManager:
         """
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                allow_time_wait_rebind(s)
                 s.bind(("127.0.0.1", port))
                 return True
         except OSError:

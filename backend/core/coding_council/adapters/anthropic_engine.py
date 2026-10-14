@@ -1422,6 +1422,13 @@ class AnthropicUnifiedEngine:
     async def initialize(self) -> bool:
         """Initialize the engine and verify API access."""
         try:
+            # The one authority on paid lanes first: switched off (or unfunded)
+            # is the operator's configuration, not an error to fix.
+            from backend.core.ouroboros.governance.paid_lanes import configured_verdict
+            _verdict = configured_verdict("claude")
+            if not _verdict.allowed:
+                logger.info("[AnthropicEngine] not started: %s", _verdict.reason)
+                return False
             # Verify API key is set with detailed error message
             if not AnthropicEngineConfig.API_KEY:
                 logger.error(

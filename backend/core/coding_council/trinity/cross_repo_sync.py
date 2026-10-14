@@ -102,10 +102,11 @@ class CrossRepoSync:
     """
 
     # Default repo paths (can be overridden via environment)
-    DEFAULT_PATHS = {
-        RepoType.JARVIS: Path.home() / "Documents/repos/JARVIS-AI-Agent",
-        RepoType.J_PRIME: Path.home() / "Documents/repos/jarvis-prime",
-        RepoType.REACTOR_CORE: Path.home() / "Documents/repos/reactor-core",
+    #: RepoType -> backend/core/trinity_repos name (the one repo resolver).
+    _REPO_NAMES = {
+        RepoType.JARVIS: "jarvis",
+        RepoType.J_PRIME: "prime",
+        RepoType.REACTOR_CORE: "reactor",
     }
 
     def __init__(self):
@@ -137,14 +138,15 @@ class CrossRepoSync:
 
     def _init_repos(self) -> None:
         """Initialize repository states."""
+        from backend.core.trinity_repos import repo_path
+
         for repo_type in RepoType:
-            env_var = f"{repo_type.value.upper()}_REPO"
-            path = Path(os.getenv(env_var, str(self.DEFAULT_PATHS[repo_type])))
+            path = repo_path(self._REPO_NAMES[repo_type])
 
             self._repos[repo_type] = RepoState(
                 repo_type=repo_type,
-                repo_path=path,
-                online=path.exists(),
+                repo_path=path or Path(),
+                online=path is not None,
             )
 
     async def start(self) -> None:
