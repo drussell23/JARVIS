@@ -187,16 +187,19 @@ _is_cli_mode = any(flag in _early_sys.argv for flag in _cli_flags)
 
 if _is_cli_mode:
     # FIRST: Ignore ALL signals to protect this process
-    for _sig in (
-        _early_signal.SIGINT,   # 2 - Ctrl+C
-        _early_signal.SIGTERM,  # 15 - Termination
-        _early_signal.SIGHUP,   # 1 - Hangup
-        _early_signal.SIGURG,   # 16 - Urgent data (exit 144!)
-        _early_signal.SIGPIPE,  # 13 - Broken pipe
-        _early_signal.SIGALRM,  # 14 - Alarm
-        _early_signal.SIGUSR1,  # 30 - User signal 1
-        _early_signal.SIGUSR2,  # 31 - User signal 2
+    for _sig_name in (
+        'SIGINT',   # 2 - Ctrl+C
+        'SIGTERM',  # 15 - Termination
+        'SIGHUP',   # 1 - Hangup
+        'SIGURG',   # 16 - Urgent data (exit 144!)
+        'SIGPIPE',  # 13 - Broken pipe
+        'SIGALRM',  # 14 - Alarm
+        'SIGUSR1',  # 30 - User signal 1
+        'SIGUSR2',  # 31 - User signal 2
     ):
+        _sig = getattr(_early_signal, _sig_name, None)  # Windows defines only a few
+        if _sig is None:
+            continue
         try:
             _early_signal.signal(_sig, _early_signal.SIG_IGN)
         except (OSError, ValueError):
@@ -215,7 +218,9 @@ if _is_cli_mode:
         _is_shutdown = '--shutdown' in _early_sys.argv
         _cmd_name = 'shutdown' if _is_shutdown else 'restart'
         _reexec_marker = '_JARVIS_SHUTDOWN_REEXEC' if _is_shutdown else '_JARVIS_RESTART_REEXEC'
-        _result_path = f"/tmp/jarvis_{_cmd_name}_{_early_os.getpid()}.result"
+        _result_path = _early_os.path.join(
+            _tmp.gettempdir(), f"jarvis_{_cmd_name}_{_early_os.getpid()}.result"
+        )
 
         # Write standalone command script with full signal immunity
         _script_content = f'''#!/usr/bin/env python3
@@ -287,7 +292,7 @@ with open({_result_path!r}, "w") as f:
     # Try to create own process group for additional isolation
     try:
         _early_os.setpgrp()
-    except (OSError, PermissionError):
+    except (OSError, PermissionError, AttributeError):  # no setpgrp on Windows
         pass
 
     _early_os.environ['_JARVIS_CLI_PROTECTED'] = '1'
@@ -6376,6 +6381,14 @@ class IntelligentKernelTakeover:
     async def _cleanup_orphaned_processes(self, orphans: List[KernelProcessInfo]) -> int:
         """Clean up orphaned processes."""
         cleaned = 0
+        # Pattern / port matches are candidates; an "orphan" on a Trinity port
+        # may be a sibling owned elsewhere (J-Prime's llama-server on :8000, a
+        # WSL relay on :8080). Only structurally-owned processes are cleaned.
+        try:
+            from backend.core.process_identity import owned_by_trinity
+            orphans = [o for o in orphans if owned_by_trinity(o.pid)]
+        except ImportError:
+            pass
 
         for orphan in orphans:
             try:
@@ -55735,6 +55748,13 @@ class ComprehensiveZombieCleanup:
 
         Uses cascade strategy: SIGINT → SIGTERM → SIGKILL
         """
+        # Heuristic "zombies" are only candidates; terminate only what this
+        # kernel structurally owns (backend/core/process_identity.py).
+        try:
+            from backend.core.process_identity import owned_by_trinity
+            zombies = {pid: info for pid, info in zombies.items() if owned_by_trinity(pid)}
+        except ImportError:
+            pass
         if not zombies:
             return 0
 

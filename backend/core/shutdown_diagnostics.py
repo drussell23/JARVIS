@@ -98,7 +98,7 @@ _forensics_file = _diag_log_dir / "shutdown_forensics.json"
 
 # File handler with detailed format
 try:
-    _file_handler = logging.FileHandler(_diag_log_file, mode='a')
+    _file_handler = logging.FileHandler(_diag_log_file, mode='a', encoding='utf-8')
     _file_handler.setLevel(logging.DEBUG)
     _file_handler.setFormatter(logging.Formatter(
         '%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s | %(message)s',

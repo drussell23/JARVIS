@@ -1,0 +1,48 @@
+# The Body (unified_supervisor.py) on native Windows.
+#
+# backend/requirements.txt cannot install here: pyobjc-* and coremltools carry
+# no platform markers, and it pins duplicate/conflicting versions. This is the
+# set the supervisor was brought up with on Windows 11 / Python 3.11 (uv),
+# 2026-10-13. Venv: %LOCALAPPDATA%\JARVIS\venvs\body (scripts\windows\jarvis.ps1
+# creates it from this file).
+#
+# Deliberately absent: torch / speechbrain (voice-unlock speaker model; a
+# multi-GB CUDA install, add with the cu128 index when wanted), google-cloud-*
+# (GCP lanes off), chromadb.
+
+# The governance import closure O+V already declares.
+-r core/ouroboros/governance/sandbox_profiles/requirements-governance.txt
+
+python-dotenv
+fastapi
+uvicorn[standard]
+httpx
+requests
+websockets
+rich
+pydantic
+python-multipart
+aiofiles
+aiosqlite
+apscheduler
+pytz
+jsonschema
+
+numpy
+scipy
+scikit-learn
+Pillow
+opencv-python
+
+# Voice: capture, VAD, recognition, synthesis.
+sounddevice
+soundfile
+librosa
+webrtcvad-wheels
+SpeechRecognition
+pyttsx3
+edge-tts
+
+# Desktop control + the (off-by-default) Claude lanes' client.
+pyautogui
+anthropic
