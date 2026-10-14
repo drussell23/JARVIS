@@ -46,10 +46,16 @@ _MAX_IMAGE_DIM = int(os.environ.get("VISION_LEAN_MAX_IMAGE_DIM", "1024"))
 _JPEG_QUALITY = int(os.environ.get("VISION_LEAN_JPEG_QUALITY", "70"))
 
 # --- Vision model routing (3-tier cascade) ---
-# TIER 0: Doubleword API (direct, always available, 30x cheaper)
-# TIER 1: Claude API (fallback when Doubleword fails)
-# TIER 2: J-Prime GCP (last resort, only when VM is running)
-_DOUBLEWORD_API_KEY = os.environ.get("DOUBLEWORD_API_KEY", "")
+# TIER 0: Doubleword Qwen3-VL-235B (far cheaper than Claude)
+# TIER 1: Claude (paid fallback)
+# TIER 2: local vision model on J-Prime ($0)
+# Paid tiers run only when paid_lanes.paid_lane_allowed() says so.
+def _doubleword_api_key() -> str:
+    """Read at call time: a key added to .env reaches the next boot's calls
+    the same way the paid-lane authority sees it."""
+    return os.environ.get("DOUBLEWORD_API_KEY", "")
+
+
 _DOUBLEWORD_BASE_URL = os.environ.get("DOUBLEWORD_BASE_URL", "https://api.doubleword.ai/v1")
 _DOUBLEWORD_VISION_MODEL = os.environ.get("DOUBLEWORD_VISION_MODEL", "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8")
 _DOUBLEWORD_TIMEOUT_S = float(os.environ.get("VISION_DOUBLEWORD_TIMEOUT_S", "30"))
@@ -238,9 +244,21 @@ class LeanVisionLoop:
     # ------------------------------------------------------------------
 
     async def _loop(self, goal: str) -> Dict[str, Any]:
-        """Cascade: CU native API → Agentic fallback (reverse-engineered CU arch)."""
-        # PRIMARY: Claude Computer Use native API (best accuracy)
-        if _CU_ENABLED and os.environ.get("ANTHROPIC_API_KEY"):
+        """Cascade, cheapest first: the agentic loop (DoubleWord → Claude →
+        local, per turn) → Claude Computer Use only when no model answered.
+
+        Claude CU used to run first whenever an Anthropic key existed, ahead
+        of the far cheaper DoubleWord lane. It now runs only when the agentic
+        loop could not start (None) -- never after a task that already acted,
+        so nothing on the desktop is done twice.
+        """
+        result = await self._loop_agentic(goal)
+        if result is not None:
+            return result
+
+        from backend.core.ouroboros.governance.paid_lanes import paid_lane_allowed
+
+        if _CU_ENABLED and paid_lane_allowed("claude"):
             try:
                 result = await self._loop_computer_use(goal)
                 if result is not None:
@@ -248,14 +266,7 @@ class LeanVisionLoop:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning(
-                    "[LeanVision] CU API failed: %s — trying agentic fallback", exc,
-                )
-
-        # FALLBACK: Reverse-engineered CU architecture (any vision model)
-        result = await self._loop_agentic(goal)
-        if result is not None:
-            return result
+                logger.warning("[LeanVision] CU API failed: %s", exc)
 
         return {
             "success": False,
@@ -534,23 +545,24 @@ class LeanVisionLoop:
             goal, frames, action_log, turn, scene_context=scene_context,
         )
 
-        # --- Provider cascade ---
-        # 1. Claude Vision (standard API, multi-image)
-        client = self._get_client()
-        if client:
-            result = await self._agentic_ask_claude(system_prompt, content)
+        # --- Provider cascade: strongest-per-dollar first ---
+        # DoubleWord's Qwen3-VL-235B costs a fraction of Claude, so it leads;
+        # Claude is the paid fallback; the local model (J-Prime, $0) closes.
+        # Each paid lane asks the one authority (paid_lanes) at call time --
+        # the operator's JARVIS_PAID_LANES_ENABLED, per-provider switches, a
+        # key, and the economic ledger -- instead of "a key is in .env".
+        from backend.core.ouroboros.governance.paid_lanes import paid_lane_allowed
+
+        for lane, ask in (
+            ("doubleword", self._agentic_ask_doubleword),
+            ("claude", self._agentic_ask_claude),
+        ):
+            if not paid_lane_allowed(lane):
+                continue
+            result = await ask(system_prompt, content)
             if result is not None:
                 return result
 
-        # 2. Doubleword VL-235B
-        if _DOUBLEWORD_API_KEY:
-            result = await self._agentic_ask_doubleword(
-                system_prompt, content,
-            )
-            if result is not None:
-                return result
-
-        # 3. J-Prime LLaVA (GCP GPU — zero API cost)
         result = await self._agentic_ask_jprime(system_prompt, content)
         if result is not None:
             return result
@@ -797,7 +809,7 @@ class LeanVisionLoop:
         self, system_prompt: str, content: list,
     ) -> Optional[Dict[str, Any]]:
         """Doubleword VL-235B with multi-image content (OpenAI-compat API)."""
-        if not _DOUBLEWORD_API_KEY:
+        if not _doubleword_api_key():
             return None
 
         if not hasattr(self, "_dw_session") or self._dw_session is None:
@@ -833,6 +845,13 @@ class LeanVisionLoop:
             "max_tokens": 2048,
             "temperature": 0.1,
         }
+        # A person is watching the screen: the realtime plane, through the one
+        # seam that stamps it. Without service_tier DoubleWord serves the
+        # default async tier (~66 s to first token) -- per vision turn.
+        from backend.core.ouroboros.governance.doubleword_provider import (
+            _dw_note_tier_param_rejection, apply_rt_service_tier,
+        )
+        payload = apply_rt_service_tier(payload, _DOUBLEWORD_VISION_MODEL)
 
         try:
             import aiohttp
@@ -840,13 +859,14 @@ class LeanVisionLoop:
                 f"{_DOUBLEWORD_BASE_URL}/chat/completions",
                 json=payload,
                 headers={
-                    "Authorization": f"Bearer {_DOUBLEWORD_API_KEY}",
+                    "Authorization": f"Bearer {_doubleword_api_key()}",
                     "Content-Type": "application/json",
                 },
                 timeout=aiohttp.ClientTimeout(total=_DOUBLEWORD_TIMEOUT_S),
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
+                    _dw_note_tier_param_rejection(_DOUBLEWORD_VISION_MODEL, resp.status, body)
                     logger.warning(
                         "[LeanVision:AG] Doubleword HTTP %d: %s",
                         resp.status, body[:200],
@@ -2466,7 +2486,7 @@ class LeanVisionLoop:
         logger.warning("[LeanVision] Claude Vision failed/errored: %s", claude_reason[:120])
 
         # FALLBACK: Doubleword VL-235B (if Claude fails/unavailable)
-        if _DOUBLEWORD_API_KEY:
+        if _doubleword_api_key():
             logger.info("[LeanVision] Claude failed, trying Doubleword VL-235B")
             result = await self._ask_doubleword_vision(
                 system_prompt, user_text, screenshot_b64,
@@ -2585,6 +2605,13 @@ class LeanVisionLoop:
             "max_tokens": 2048,
             "temperature": 0.1,
         }
+        # A person is watching the screen: the realtime plane, through the one
+        # seam that stamps it. Without service_tier DoubleWord serves the
+        # default async tier (~66 s to first token) -- per vision turn.
+        from backend.core.ouroboros.governance.doubleword_provider import (
+            _dw_note_tier_param_rejection, apply_rt_service_tier,
+        )
+        payload = apply_rt_service_tier(payload, _DOUBLEWORD_VISION_MODEL)
 
         try:
             import aiohttp
@@ -2592,13 +2619,14 @@ class LeanVisionLoop:
                 f"{_DOUBLEWORD_BASE_URL}/chat/completions",
                 json=payload,
                 headers={
-                    "Authorization": f"Bearer {_DOUBLEWORD_API_KEY}",
+                    "Authorization": f"Bearer {_doubleword_api_key()}",
                     "Content-Type": "application/json",
                 },
                 timeout=aiohttp.ClientTimeout(total=_DOUBLEWORD_TIMEOUT_S),
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
+                    _dw_note_tier_param_rejection(_DOUBLEWORD_VISION_MODEL, resp.status, body)
                     logger.warning("[LeanVision] Doubleword HTTP %d: %s", resp.status, body[:200])
                     return None
 
