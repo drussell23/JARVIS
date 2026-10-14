@@ -29,7 +29,12 @@ param(
     [int]$ReadySeconds = 90,
     [string]$FailureLogCommand = "",
     [string]$Distro = "Ubuntu",
-    [string]$User = "jarvis_svc"
+    [string]$User = "jarvis_svc",
+    # Interactive dies with the user's session (a sign-out, or a Hello
+    # re-sign-in that replaced it, took soak bt-2026-09-25-004828 at 2.45 h).
+    # S4U runs outside it but needs an elevated shell to register. See
+    # install_wsl_keeper.ps1 for holding the VM itself.
+    [ValidateSet("Interactive", "S4U")] [string]$LogonType = "Interactive"
 )
 $ErrorActionPreference = "Stop"
 $wsl = Join-Path $env:WINDIR "System32\wsl.exe"
@@ -45,7 +50,7 @@ $action = New-ScheduledTaskAction -Execute (Join-Path $env:WINDIR "System32\conh
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit (New-TimeSpan -Seconds $TimeLimitSeconds) -MultipleInstances IgnoreNew
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
-    -LogonType Interactive -RunLevel Limited
+    -LogonType $LogonType -RunLevel Limited
 Register-ScheduledTask -TaskName $TaskName -Action $action -Settings $settings `
     -Principal $principal -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName

@@ -25,6 +25,9 @@ param(
     [string]$User = "jarvis_svc",
     [string]$Script = "/home/jarvis_svc/jarvis/scripts/soak/launch_supervised_soak.sh",
     [string]$TaskName = "OV-Soak",
+    # S4U (elevated shell) survives sign-out / a Hello re-sign-in, which
+    # took bt-2026-09-25-004828. The VM itself is held by install_wsl_keeper.ps1.
+    [ValidateSet("Interactive", "S4U")] [string]$LogonType = "Interactive",
     [switch]$Stop
 )
 $ErrorActionPreference = "Stop"
@@ -42,4 +45,4 @@ if ($Stop) {
     -Arguments "$MaxWallSeconds" -TimeLimitSeconds ($MaxWallSeconds + 3600) `
     -ReadyPattern "scripts/ouroboros_battle_test.py --production-soak" `
     -FailureLogCommand 'tail -20 "$(ls -t ~/soak_logs/soak-*.log | head -1)"' `
-    -Distro $Distro -User $User
+    -Distro $Distro -User $User -LogonType $LogonType
