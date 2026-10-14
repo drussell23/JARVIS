@@ -19,10 +19,10 @@ jobs:
     name: Validate Environment Variables
 
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
 
     - name: Set up Python
-      uses: actions/setup-python@v6
+      uses: actions/setup-python@v7
       with:
         python-version: '3.10'
 
@@ -48,10 +48,10 @@ jobs:
     name: Validate Startup Flow
 
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
 
     - name: Set up Python
-      uses: actions/setup-python@v6
+      uses: actions/setup-python@v7
       with:
         python-version: '3.10'
 
@@ -68,7 +68,7 @@ jobs:
     name: Security Configuration Check
 
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
 
     - name: Check for hardcoded credentials
       run: |
