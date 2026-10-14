@@ -1174,8 +1174,23 @@ class RuntimeTaskOrchestrator:
                 "opened": opened.resolved,
             }
         if opened is not None and opened.ok:
-            # Let the opened window paint before the screen is read.
-            await asyncio.sleep(float(os.getenv("JARVIS_OPEN_SETTLE_S", "2.0")))
+            if opened.in_front is False:
+                # Everything below clicks and types into the foreground window;
+                # with the opened one not in front that is whatever the user
+                # had there (once, the terminal received a typed search).
+                return self._report_open({
+                    "success": False,
+                    "result": "it did not come to the front, so I did not act on the screen",
+                    "stop_reason": StopReason.ERROR.value,
+                }, opened)
+            if opened.in_front is None:
+                # Not observable on this platform: let the window paint.
+                await asyncio.sleep(float(os.getenv("JARVIS_OPEN_SETTLE_S", "2.0")))
+            # The eyes continue from where opening left off, told what is in front.
+            remaining = str(decision.get("remaining") or "").strip()
+            goal = remaining or goal
+            if opened.window:
+                goal = f'{goal} (the window in front is "{opened.window}", opened for this)'
 
         # Phase 0.5: JARVIS-CU (local Computer Use — 3-layer cascade)
         # Accessibility API (<5ms) → Doubleword 235B (~2s) → Claude Vision (fallback)

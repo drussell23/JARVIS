@@ -348,3 +348,24 @@ class TestAgentBindings:
         vba = bindings["visual_browser_agent"]
         assert vba.module == "backend.neural_mesh.agents.visual_browser_agent"
         assert vba.class_name == "VisualBrowserAgent"
+
+
+class TestActsOnlyOnTheOpenedWindow:
+    @pytest.mark.asyncio
+    async def test_no_screen_action_when_the_opened_window_is_not_in_front(self):
+        """Screen work after an open clicks and types into the foreground
+        window; if the opened one is not there, nothing may be typed."""
+        from backend.core.desktop_open import OpenOutcome
+
+        orch = RuntimeTaskOrchestrator()
+        opened = OpenOutcome(True, "url", "https://news.example", "https://news.example",
+                             "shell", in_front=False)
+        lean = MagicMock()
+        with patch.object(orch, "_resolve_open_target", AsyncMock(return_value={
+                "open": "url", "url": "https://news.example", "completes_goal": False,
+                "remaining": "click the top story"})), \
+             patch("backend.core.desktop_open.open_url", AsyncMock(return_value=opened)), \
+             patch("backend.vision.lean_loop.LeanVisionLoop.get_instance", return_value=lean):
+            result = await orch._dispatch_to_vision("open the news and click the top story", {})
+        lean.run.assert_not_called()
+        assert result["success"] is False and "front" in result["result"]

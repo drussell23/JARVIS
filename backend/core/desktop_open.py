@@ -26,6 +26,12 @@ a similarity cutoff (``JARVIS_APP_MATCH_CUTOFF``). The app index is cached
 (``JARVIS_APP_INDEX_TTL_S``) and refreshed once on a miss, so an app
 installed a minute ago is found. Every entry point is async and never raises:
 the outcome says what happened and how.
+
+What was opened is also brought IN FRONT, and the outcome names its window:
+everything after an open (the vision loop's look, its clicks and typing)
+acts on the foreground window, and on Windows a program started by a
+background process does not get the foreground -- the vision loop once
+typed a search into the terminal that was still in front.
 """
 from __future__ import annotations
 
@@ -39,7 +45,7 @@ import shlex
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
@@ -65,6 +71,12 @@ class OpenOutcome:
     resolved: str = ""   # what was actually opened (app display name, URL, path)
     method: str = ""     # how (shell_execute, apps_folder, browser_command, open, xdg-open, ...)
     error: str = ""
+    # Title of the window the open produced, once it is in front.
+    window: str = ""
+    # True: that window holds the foreground. False: it could not be found or
+    # brought forward -- callers must not act on the screen. None: this
+    # platform's open activates the target itself and is not observed.
+    in_front: Optional[bool] = None
 
     def describe(self) -> str:
         if self.ok:
@@ -294,15 +306,23 @@ async def open_url(url: str, *, browser: Optional[str] = None) -> OpenOutcome:
                     name, command = hit
                     argv = _command_argv(command)
                     if argv:
-                        rc, out = await _shell_start(argv[0], url)
-                        if rc == 0:
-                            return OpenOutcome(True, "url", url, f"{url} in {name}", "browser_command")
+                        async def _named() -> OpenOutcome:
+                            rc, out = await _shell_start(argv[0], url)
+                            if rc == 0:
+                                return OpenOutcome(True, "url", url, f"{url} in {name}", "browser_command")
+                            return OpenOutcome(False, "url", url, error=out.strip()[:120])
+                        named = await _opened_in_front(_named(), os.path.basename(argv[0]))
+                        if named.ok:
+                            return named
                         logger.info("[DesktopOpen] %s did not start (%s); using the default",
-                                    name, out.strip()[:120])
+                                    name, named.error)
                 else:
                     logger.info("[DesktopOpen] browser %r not registered; using the default", browser)
-            await _shell_open(url)
-            return OpenOutcome(True, "url", url, url, "shell")
+
+            async def _default() -> OpenOutcome:
+                await _shell_open(url)
+                return OpenOutcome(True, "url", url, url, "shell")
+            return await _opened_in_front(_default(), await asyncio.to_thread(_win_url_handler_exe))
         if _IS_MACOS:
             if browser:
                 rc, _ = await _run(["open", "-a", browser, url], _launch_timeout())
@@ -323,8 +343,10 @@ async def open_path(path: str) -> OpenOutcome:
         if not Path(p).exists():
             return OpenOutcome(False, "path", p, error="no such file or folder")
         if _IS_WINDOWS:
-            await _shell_open(p)
-            return OpenOutcome(True, "path", p, p, "shell")
+            async def _shell() -> OpenOutcome:
+                await _shell_open(p)
+                return OpenOutcome(True, "path", p, p, "shell")
+            return await _opened_in_front(_shell())
         argv = ["open", p] if _IS_MACOS else ["xdg-open", p]
         rc, out = await _run(argv, _launch_timeout())
         return OpenOutcome(rc == 0, "path", p, p, argv[0], "" if rc == 0 else out.strip())
@@ -339,12 +361,155 @@ async def open_app(name: str) -> OpenOutcome:
         return OpenOutcome(False, "app", name, error="no application named")
     try:
         if _IS_WINDOWS:
-            return await _open_app_windows(name)
+            return await _opened_in_front(_open_app_windows(name))
         if _IS_MACOS:
             return await _open_app_macos(name)
         return await _open_app_linux(name)
     except Exception as exc:  # noqa: BLE001
         return OpenOutcome(False, "app", name, error=f"{type(exc).__name__}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Bringing what was opened to the front
+# ---------------------------------------------------------------------------
+
+def _open_wait_s() -> float:
+    """How long an opened program may take to show (or retitle) its window."""
+    return _env_float("JARVIS_OPEN_WINDOW_WAIT_S", 10.0)
+
+
+def _open_poll_s() -> float:
+    return _env_float("JARVIS_OPEN_WINDOW_POLL_S", 0.1)
+
+
+def _win_exe_of(pid: int) -> str:
+    """Lower-case executable basename of *pid*, "" when it cannot be read."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+    h = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ""
+    try:
+        size = wintypes.DWORD(1024)
+        buf = ctypes.create_unicode_buffer(size.value)
+        if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return os.path.basename(buf.value).lower()
+        return ""
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def _win_top_windows() -> List[Tuple[int, str, str]]:
+    """(hwnd, title, owner exe) of visible, unowned, titled top-level windows,
+    top of the z-order first."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    found: List[Tuple[int, str, str]] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _visit(hwnd, _):
+        if user32.IsWindowVisible(hwnd) and not user32.GetWindow(hwnd, 4):  # GW_OWNER
+            n = user32.GetWindowTextLengthW(hwnd)
+            if n:
+                buf = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(hwnd, buf, n + 1)
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                found.append((int(hwnd), buf.value, _win_exe_of(pid.value)))
+        return True
+
+    user32.EnumWindows(_visit, 0)
+    return found
+
+
+def _win_url_handler_exe() -> str:
+    """Executable the user's default browser runs as (UserChoice for https)."""
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations"
+                            r"\https\UserChoice") as k:
+            prog_id = winreg.QueryValueEx(k, "ProgId")[0]
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, rf"{prog_id}\shell\open\command") as k:
+            command = winreg.QueryValueEx(k, "")[0]
+    except OSError:
+        return ""
+    argv = _command_argv(command)
+    return os.path.basename(argv[0]).lower() if argv else ""
+
+
+def _win_foreground() -> int:
+    import ctypes
+    return int(ctypes.windll.user32.GetForegroundWindow() or 0)
+
+
+def _win_bring_forward(hwnd: int) -> bool:
+    """Give *hwnd* the foreground and report whether it holds it.
+
+    Windows grants the foreground only to the thread that owns the current
+    input state; attaching to the foreground thread's input for the call is
+    how a process that is about to drive the UI acquires that state.
+    """
+    import ctypes
+
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    me = kernel32.GetCurrentThreadId()
+    fg_thread = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
+    attached = bool(fg_thread and fg_thread != me and user32.AttachThreadInput(me, fg_thread, True))
+    try:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        if attached:
+            user32.AttachThreadInput(me, fg_thread, False)
+    return _win_foreground() == hwnd
+
+
+async def _opened_in_front(open_coro, handler_exe: str = "") -> OpenOutcome:
+    """Run an open, then find the window it produced and bring it forward.
+
+    The produced window is the topmost one that is new or retitled since the
+    open began (a URL in a running browser retitles its window). When the
+    handler is known (*handler_exe*: the browser a URL goes to) only its
+    windows qualify -- the browser the user typed the command into may be
+    the very window that changes. When it is not, the window in front before
+    the open is excluded: a terminal's spinner retitles itself constantly
+    and is never what was opened. Waits on evidence, bounded by
+    JARVIS_OPEN_WINDOW_WAIT_S.
+    """
+    if not _IS_WINDOWS:
+        return await open_coro
+    before = {h: t for h, t, _ in await asyncio.to_thread(_win_top_windows)}
+    was_front = await asyncio.to_thread(_win_foreground)
+    outcome = await open_coro
+    if not outcome.ok:
+        return outcome
+    handler_exe = handler_exe.lower()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _open_wait_s()
+    while loop.time() < deadline:
+        now = await asyncio.to_thread(_win_top_windows)
+        changed = [
+            (h, t) for h, t, exe in now
+            if before.get(h) != t and (exe == handler_exe if handler_exe else h != was_front)
+        ]
+        if changed:
+            hwnd, title = changed[0]
+            if await asyncio.to_thread(_win_bring_forward, hwnd):
+                return replace(outcome, window=title, in_front=True)
+            logger.info("[DesktopOpen] %r appeared but could not take the foreground", title)
+            return replace(outcome, window=title, in_front=False)
+        await asyncio.sleep(_open_poll_s())
+    logger.info("[DesktopOpen] no window appeared for %s within %.0fs",
+                outcome.resolved or outcome.target, _open_wait_s())
+    return replace(outcome, in_front=False)
 
 
 async def open_target(target: str, *, browser: Optional[str] = None) -> OpenOutcome:
