@@ -558,10 +558,9 @@ except ImportError:
     GOOGLE_API_AVAILABLE = False
     GOOGLE_AUTH_AVAILABLE = False
     RefreshError = None
-    logger.warning(
-        "Google API libraries not available. Install: "
-        "pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client"
-    )
+    from backend.core.optional_dependencies import note_missing
+    note_missing("google-api-python-client", "Gmail / Google Calendar / Workspace",
+                 install="google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client")
 
 
 # =============================================================================

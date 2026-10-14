@@ -474,6 +474,7 @@ class PressurePolicy:
 
     enter_thresholds: Dict[PressureTier, float] = dataclasses.field(
         default_factory=lambda: {
+            PressureTier.OPTIMAL: 55.0,
             PressureTier.ELEVATED: 70.0,
             PressureTier.CONSTRAINED: 80.0,
             PressureTier.CRITICAL: 90.0,
@@ -483,6 +484,7 @@ class PressurePolicy:
 
     exit_thresholds: Dict[PressureTier, float] = dataclasses.field(
         default_factory=lambda: {
+            PressureTier.OPTIMAL: 50.0,
             PressureTier.ELEVATED: 65.0,
             PressureTier.CONSTRAINED: 75.0,
             PressureTier.CRITICAL: 85.0,
@@ -534,12 +536,14 @@ class PressurePolicy:
         if total_gb < 12.0:
             version = "v1.0-constrained"
             enter = {
+                PressureTier.OPTIMAL: 70.0,
                 PressureTier.ELEVATED: 85.0,
                 PressureTier.CONSTRAINED: 90.0,
                 PressureTier.CRITICAL: 95.0,
                 PressureTier.EMERGENCY: 97.0,
             }
             exit_ = {
+                PressureTier.OPTIMAL: 65.0,
                 PressureTier.ELEVATED: 80.0,
                 PressureTier.CONSTRAINED: 87.0,
                 PressureTier.CRITICAL: 92.0,
@@ -548,12 +552,14 @@ class PressurePolicy:
         elif total_gb < 20.0:
             version = "v1.0-consumer"
             enter = {
+                PressureTier.OPTIMAL: 65.0,
                 PressureTier.ELEVATED: 80.0,
                 PressureTier.CONSTRAINED: 88.0,
                 PressureTier.CRITICAL: 93.0,
                 PressureTier.EMERGENCY: 96.0,
             }
             exit_ = {
+                PressureTier.OPTIMAL: 60.0,
                 PressureTier.ELEVATED: 75.0,
                 PressureTier.CONSTRAINED: 84.0,
                 PressureTier.CRITICAL: 90.0,
@@ -562,12 +568,14 @@ class PressurePolicy:
         elif total_gb < 48.0:
             version = "v1.0-prosumer"
             enter = {
+                PressureTier.OPTIMAL: 50.0,
                 PressureTier.ELEVATED: 65.0,
                 PressureTier.CONSTRAINED: 75.0,
                 PressureTier.CRITICAL: 85.0,
                 PressureTier.EMERGENCY: 93.0,
             }
             exit_ = {
+                PressureTier.OPTIMAL: 45.0,
                 PressureTier.ELEVATED: 60.0,
                 PressureTier.CONSTRAINED: 70.0,
                 PressureTier.CRITICAL: 80.0,
@@ -576,12 +584,14 @@ class PressurePolicy:
         else:
             version = "v1.0-server"
             enter = {
+                PressureTier.OPTIMAL: 40.0,
                 PressureTier.ELEVATED: 55.0,
                 PressureTier.CONSTRAINED: 65.0,
                 PressureTier.CRITICAL: 80.0,
                 PressureTier.EMERGENCY: 90.0,
             }
             exit_ = {
+                PressureTier.OPTIMAL: 35.0,
                 PressureTier.ELEVATED: 50.0,
                 PressureTier.CONSTRAINED: 60.0,
                 PressureTier.CRITICAL: 75.0,
@@ -623,6 +633,37 @@ class PressurePolicy:
             cooldown_seconds=base.cooldown_seconds,
             max_actions_per_hour=base.max_actions_per_hour,
         )
+
+    def classify(self, percent: float, previous: Optional[PressureTier] = None) -> PressureTier:
+        """The tier a reading of *percent* is in, honouring the deadbands.
+
+        A reading enters a tier at its enter threshold and leaves it only
+        below its exit threshold, so memory resting on a boundary holds the
+        tier it is in (the quantizer, which ignored the exit thresholds,
+        logged optimal <-> elevated at every tick around 70%). Without a
+        *previous* tier the enter thresholds alone decide.
+        """
+        tier = PressureTier.ABUNDANT
+        for t in sorted(self.enter_thresholds):
+            if percent >= self.enter_thresholds[t]:
+                tier = t
+        if previous is not None and previous > tier:
+            for t in sorted(self.enter_thresholds, reverse=True):
+                if tier < t <= previous and percent >= self.exit_thresholds[t]:
+                    return t
+        return tier
+
+
+def host_pressure_policy(total_gb: float) -> PressurePolicy:
+    """The one pressure policy for this host: :meth:`PressurePolicy.for_host`
+    beside the memory Trinity's serving siblings hold on purpose (J-Prime's
+    pinned model), re-measured as that residency changes."""
+    try:
+        from backend.core.ouroboros.governance.trinity_siblings import planned_resident_gb
+        planned = planned_resident_gb()
+    except Exception:  # noqa: BLE001 -- unknown: nothing counted as planned
+        planned = 0.0
+    return PressurePolicy.for_host(total_gb, planned)
 
 
 # ===================================================================

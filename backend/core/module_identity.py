@@ -13,6 +13,7 @@ object.
 """
 from __future__ import annotations
 
+import importlib
 import sys
 
 _PREFIX = "backend."
@@ -26,9 +27,17 @@ def unify(name: str) -> None:
     other = name[len(_PREFIX):] if name.startswith(_PREFIX) else _PREFIX + name
     sys.modules.setdefault(other, module)
     # A loaded parent package also exposes it as an attribute, so the
-    # `import a.b.c` form resolves it too (an unloaded parent binds it itself
-    # when it is imported).
+    # `import a.b.c` form resolves it too. That form reaches the module
+    # THROUGH its parent, and a name answered from sys.modules never loads
+    # the parent itself: `import voice.speaker_verification_service as sv`
+    # raised "cannot import name 'voice'" when only `backend.voice` had been
+    # loaded. So an unloaded parent package is loaded here (they are lazy).
     parent, _, child = other.rpartition(".")
+    if parent and parent not in sys.modules:
+        try:
+            importlib.import_module(parent)
+        except Exception:  # noqa: BLE001 -- the alias still serves `from a.b.c import x`
+            return
     if parent in sys.modules and not hasattr(sys.modules[parent], child):
         setattr(sys.modules[parent], child, sys.modules[other])
 

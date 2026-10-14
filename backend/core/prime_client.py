@@ -39,9 +39,11 @@ USAGE:
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
+import socket
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -52,6 +54,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Set,
     TypeVar,
 )
 from contextlib import asynccontextmanager
@@ -902,6 +905,64 @@ class PrimeClient:
     # v232.0: GCP VM endpoint hot-swap
     # -----------------------------------------------------------------
 
+    @staticmethod
+    async def _same_host(a: str, b: str) -> bool:
+        """True when two host names reach the same address."""
+        if a == b:
+            return True
+        loop = asyncio.get_running_loop()
+        try:
+            infos = await asyncio.gather(
+                loop.getaddrinfo(a, None, type=socket.SOCK_STREAM),
+                loop.getaddrinfo(b, None, type=socket.SOCK_STREAM),
+            )
+        except (OSError, UnicodeError):
+            return False
+        addrs_a, addrs_b = ({info[4][0] for info in i} for i in infos)
+        if addrs_a & addrs_b:
+            return True
+        # localhost may resolve to ::1 alone while 127.0.0.1 is v4:
+        # both are this host's loopback.
+        def _loopback(addrs: Set[str]) -> bool:
+            try:
+                return bool(addrs) and all(ipaddress.ip_address(x.split("%")[0]).is_loopback
+                                           for x in addrs)
+            except ValueError:
+                return False
+        return _loopback(addrs_a) and _loopback(addrs_b)
+
+    async def _contract_body(self, endpoint: str) -> Dict[str, Any]:
+        """The JSON body of the endpoint a startup contract describes.
+
+        ``endpoint`` is a HEALTH_SCHEMAS key ("prime:/health"). The liveness
+        probe (``health_url``, /v1/models by default) answers a different
+        question, and validating its body against the /health schema is what
+        blocked every swap with "missing required field 'ready_for_inference'".
+        """
+        path = endpoint.split(":", 1)[-1]
+        url = f"http://{self._config.prime_host}:{self._config.prime_port}{path}"
+        if url == self._config.health_url:
+            return dict(getattr(self, "_last_health_data", {}) or {})
+        try:
+            async with self._pool.get_session() as session:
+                if hasattr(session, "get") and not hasattr(session, "build_request"):
+                    import aiohttp
+                    async with session.get(
+                        url, timeout=aiohttp.ClientTimeout(total=self._config.health_check_timeout),
+                    ) as resp:
+                        if resp.status != 200:
+                            return {}
+                        body = await resp.json()
+                else:
+                    resp = await session.get(url, timeout=self._config.health_check_timeout)
+                    if resp.status_code != 200:
+                        return {}
+                    body = resp.json()
+        except Exception as exc:  # noqa: BLE001 -- unreachable/not JSON: no contract body
+            logger.debug("[PrimeClient] %s unreadable at %s: %s", endpoint, url, exc)
+            return {}
+        return body if isinstance(body, dict) else {}
+
     async def update_endpoint(self, host: str, port: int) -> bool:
         """
         v232.0: Hot-swap the Prime endpoint to a new host:port.
@@ -915,10 +976,17 @@ class PrimeClient:
             old_host = self._config.prime_host
             old_port = self._config.prime_port
 
-            # Skip if already pointing there
-            if old_host == host and old_port == port:
+            # Skip if already pointing there -- by address, not by spelling:
+            # "localhost" -> "127.0.0.1" is the endpoint this client already
+            # serves from, and treating it as a promotion re-ran the swap.
+            if old_port == port and await self._same_host(old_host, host):
                 logger.debug(f"[PrimeClient] Endpoint already at {host}:{port}, skipping")
-                return self._status in (PrimeStatus.AVAILABLE, PrimeStatus.DEGRADED)
+                # A client that has not probed yet (status unknown) answers
+                # by probing, not by reporting the unknown as a failure.
+                status = self._status
+                if status not in (PrimeStatus.AVAILABLE, PrimeStatus.DEGRADED):
+                    status = await self._check_health()
+                return status in (PrimeStatus.AVAILABLE, PrimeStatus.DEGRADED)
 
             logger.info(
                 f"[PrimeClient] v232.0: Endpoint promotion: {old_host}:{old_port} -> {host}:{port}"
@@ -959,7 +1027,7 @@ class PrimeClient:
                     # ready_for_inference/model_loaded when update_apars() is
                     # called without explicit args.  Coerce None → False so
                     # the schema check passes instead of rejecting NoneType.
-                    _health = getattr(self, "_last_health_data", {}) or {}
+                    _health = await self._contract_body("prime:/health")
                     for _bf in ("ready_for_inference", "model_loaded"):
                         if _bf in _health and not isinstance(_health[_bf], bool):
                             _health[_bf] = bool(_health[_bf]) if _health[_bf] is not None else False

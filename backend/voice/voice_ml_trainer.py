@@ -36,7 +36,8 @@ try:
     DEEP_LEARNING_AVAILABLE = True
 except (ImportError, OSError, RuntimeError):
     DEEP_LEARNING_AVAILABLE = False
-    print("Deep learning libraries not available. Install torch and transformers for advanced features.")
+    from backend.core.optional_dependencies import note_missing
+    note_missing("torch", "voice embedding training", install="torch transformers")
 
 # Anthropic
 from anthropic import Anthropic

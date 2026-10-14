@@ -1391,7 +1391,9 @@ class DynamicComponentManager:
                         )
                         logger.info("✅ AdvancedMLPredictor initialized with CoreML")
                     else:
-                        logger.warning("⚠️ CoreML classifier not available, AdvancedMLPredictor disabled")
+                        from backend.core.optional_dependencies import note_missing
+                        note_missing("coremltools", "AdvancedMLPredictor (CoreML intent model)",
+                                     install="coremltools", platforms=("darwin",))
 
                 # Initialize DependencyResolver with component configurations
                 self.dependency_resolver = DependencyResolver(self.components)

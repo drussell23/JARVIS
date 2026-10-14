@@ -61,7 +61,8 @@ try:
 except ImportError:
     DEEP_LEARNING_AVAILABLE = False
     TORCHAUDIO_AVAILABLE = False
-    print("Deep learning not available. Install PyTorch for advanced wake word detection.")
+    from backend.core.optional_dependencies import note_missing
+    note_missing("torch", "deep-learning wake word detection", install="torch")
 
 # Anthropic integration
 from anthropic import Anthropic

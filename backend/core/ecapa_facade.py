@@ -38,7 +38,15 @@ from backend.core.ecapa_types import (
     VoiceCapability,
 )
 
+from backend.core.module_identity import unify as _unify_module_identity
+
+# One module object under both import names: one facade singleton.
+_unify_module_identity(__name__)
+
 logger = logging.getLogger(__name__)
+
+#: States that are a conclusion rather than a step toward one.
+_SETTLED_STATES = frozenset({EcapaState.READY, EcapaState.DEGRADED, EcapaState.UNAVAILABLE})
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +227,9 @@ class EcapaFacade:
         self._active_backend: Optional[str] = None
         self._state_lock = asyncio.Lock()
         self._ready_event = asyncio.Event()
+        # Set while the state is a conclusion (READY, DEGRADED, UNAVAILABLE),
+        # clear while one is being reached (probing, loading, recovering).
+        self._settled_event = asyncio.Event()
 
         # Background lifecycle
         self._bg_tasks: List[asyncio.Task] = []
@@ -296,6 +307,7 @@ class EcapaFacade:
         self._state = EcapaState.UNINITIALIZED
         self._active_backend = None
         self._ready_event.clear()
+        self._settled_event.clear()
         self._consecutive_failures = 0
         self._consecutive_successes = 0
         self._inflight_count = 0
@@ -317,21 +329,29 @@ class EcapaFacade:
                 )
             )
 
-    async def ensure_ready(self, timeout: float = 30.0) -> bool:
-        """Wait until the facade reaches a usable tier.
+    @property
+    def settled(self) -> bool:
+        """True while the state is a conclusion: READY, DEGRADED, or
+        UNAVAILABLE (no backend could serve) -- not a probe in flight."""
+        return self._state in _SETTLED_STATES
 
-        Returns True if the tier is READY or DEGRADED within *timeout*
-        seconds.  Returns False if timeout elapses or the facade is stuck
-        in UNAVAILABLE.
+    async def ensure_ready(self, timeout: float = 30.0) -> bool:
+        """Wait until the facade reaches a conclusion, at most *timeout* s.
+
+        Returns True if the tier is READY or DEGRADED. Returns False when the
+        probe concluded UNAVAILABLE -- at once, not after *timeout*: waiting
+        only for READY held every caller for its full timeout on a host where
+        no backend can serve (no torch, no cloud; 60 s at boot, 2026-10-14) --
+        or when *timeout* elapses first.
         """
         if self.tier in (EcapaTier.READY, EcapaTier.DEGRADED):
             return True
 
         try:
-            await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
-            return self.tier in (EcapaTier.READY, EcapaTier.DEGRADED)
+            await asyncio.wait_for(self._settled_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
-            return self.tier in (EcapaTier.READY, EcapaTier.DEGRADED)
+            pass
+        return self.tier in (EcapaTier.READY, EcapaTier.DEGRADED)
 
     async def extract_embedding(self, audio: Any) -> EmbeddingResult:
         """Extract a speaker embedding from raw audio.
@@ -528,6 +548,10 @@ class EcapaFacade:
                 self._ready_event.set()
             else:
                 self._ready_event.clear()
+            if new_state in _SETTLED_STATES:
+                self._settled_event.set()
+            else:
+                self._settled_event.clear()
 
             # Root cause ID: new transitions generate a new root cause,
             # derived events reuse the provided one.

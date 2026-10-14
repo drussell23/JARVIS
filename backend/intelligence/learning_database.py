@@ -59,7 +59,8 @@ try:
     CHROMADB_AVAILABLE = True
 except ImportError:
     CHROMADB_AVAILABLE = False
-    logging.warning("ChromaDB not available - install with: pip install chromadb")
+    from backend.core.optional_dependencies import note_missing
+    note_missing("chromadb", "Learning DB vector search", install="chromadb")
 
 from backend.core.async_safety import LazyAsyncLock, LazyAsyncEvent
 
@@ -9533,26 +9534,24 @@ async def get_learning_database(
     # when the account is in good standing.
     if not fast_mode:
         if local_first_enabled():
-            # WARNING, not INFO, and the reason is not severity.
-            #
-            # This line was INFO. The brainstem console filters this module to
-            # WARNING and above, so the one line that says WHICH database is
-            # authoritative for boot never reached the operator — and on
-            # 2026-08-06 its absence was read as evidence the promotion had not
-            # fired, when nothing in the log could have shown either way.
-            #
-            # A decision that changes which store a boot depends on has to be
-            # visible at the level the operator actually sees, or it is not
-            # auditable. This fires once per process (every caller of the
-            # getter passes through here; it used to say it twelve times).
+            # Said once per process (every caller of the getter passes through
+            # here; it used to say it twelve times), and only where there is
+            # a Cloud SQL to defer: on a host that declares none, SQLite is the
+            # store by design and database_config_path's finder has said so.
+            # A stated decision is INFO; it was a WARNING on every boot.
             global _LOCAL_FIRST_ANNOUNCED
             if not _LOCAL_FIRST_ANNOUNCED:
                 _LOCAL_FIRST_ANNOUNCED = True
-                logger.warning(
-                    "[LearningDB] LOCAL-FIRST — SQLite is authoritative for startup; "
-                    "Cloud SQL deferred to background (set "
-                    "JARVIS_LEARNING_DB_LOCAL_FIRST=false to restore cloud-first init)"
-                )
+                try:
+                    from intelligence.cloud_sql_connection_manager import database_config_path
+                except ImportError:
+                    from backend.intelligence.cloud_sql_connection_manager import database_config_path
+                if database_config_path() is not None:
+                    logger.info(
+                        "[LearningDB] LOCAL-FIRST — SQLite is authoritative for startup; "
+                        "Cloud SQL deferred to background (set "
+                        "JARVIS_LEARNING_DB_LOCAL_FIRST=false to restore cloud-first init)"
+                    )
             fast_mode = True
 
     # ── v265.1→v286.0: Gate-aware + mode-aware fast_mode promotion ────

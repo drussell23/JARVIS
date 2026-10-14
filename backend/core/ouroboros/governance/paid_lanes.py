@@ -174,6 +174,24 @@ def paid_lane_configured(provider: str) -> bool:
     return configured_verdict(provider).allowed
 
 
+def declared_absent(credential_env: str) -> Optional[str]:
+    """Why an unset *credential_env* is the operator's declaration, or None.
+
+    A site that finds ``ANTHROPIC_API_KEY`` unset used to warn that its
+    feature "will not work" -- four of them per boot -- on a host where the
+    operator switched that lane off. When the credential funds a paid lane
+    the switches have turned off, its absence is the configuration, and the
+    reason (``JARVIS_PAID_LANES_ENABLED=false``) is returned for the site to
+    say at INFO, if at all. None means the lane is switched on and the
+    missing credential is a real gap. NEVER raises.
+    """
+    for lane in PAID_LANES:
+        if lane.credential_env == credential_env:
+            verdict = switch_verdict(lane.name)
+            return None if verdict.allowed else verdict.reason
+    return None
+
+
 # -- the adaptive half: observed economic death ------------------------------
 
 _verdict_cache: Dict[str, Tuple[float, LaneVerdict]] = {}
@@ -271,6 +289,7 @@ def reset_for_tests() -> None:
 __all__ = [
     "LaneVerdict", "MASTER_ENV", "PAID_LANES", "PaidLane", "PaidLaneDisabled",
     "allowed_verdict", "any_paid_lane_configured", "configured_verdict",
+    "declared_absent",
     "lane_for", "paid_lane_allowed", "paid_lane_configured",
     "paid_lane_switched_on", "paid_lanes_enabled", "posture",
     "require_paid_lane", "reset_for_tests", "switch_verdict",

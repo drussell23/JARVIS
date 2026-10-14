@@ -687,7 +687,15 @@ class JARVISVoiceAPI:
 
         # We'll initialize on first use
         if not self.jarvis_available:
-            logger.warning("JARVIS Voice System not available - ANTHROPIC_API_KEY not set")
+            try:
+                from backend.core.ouroboros.governance.paid_lanes import declared_absent
+                declared = declared_absent("ANTHROPIC_API_KEY")
+            except Exception:  # noqa: BLE001 -- no authority: judge as before
+                declared = None
+            if declared:
+                logger.info("JARVIS Voice System (Claude) off: %s", declared)
+            else:
+                logger.warning("JARVIS Voice System not available - ANTHROPIC_API_KEY not set")
 
         self._register_routes()
 

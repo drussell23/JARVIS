@@ -2565,6 +2565,21 @@ class GhostDisplayManager:
             True if Ghost Display is available (or fallback activated)
         """
         async with self._lock:
+            # A space backend without yabai's window-moving surface (the
+            # Windows desktop agent: query + capture only) cannot place
+            # windows on a hidden space, and needs none -- it captures a
+            # window where it is. Ghost Display does not apply there; the
+            # fallback would only claim the user's own screen for it.
+            if not callable(getattr(yabai_detector, "get_ghost_display_space", None)):
+                self._status = GhostDisplayStatus.UNAVAILABLE
+                await self._notify_state_change("status_changed", {"new_status": "unavailable"})
+                logger.info(
+                    "[GhostManager] Ghost Display not used: the %s space backend "
+                    "captures windows in place and does not move them",
+                    type(yabai_detector).__name__,
+                )
+                return False
+
             # Detect Ghost Display
             ghost_space = yabai_detector.get_ghost_display_space()
 

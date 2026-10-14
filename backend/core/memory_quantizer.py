@@ -44,6 +44,8 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Callable, Set
 from enum import Enum
 from collections import deque, defaultdict
+
+from backend.core.memory_types import PressurePolicy, PressureTier, host_pressure_policy
 import json
 
 # NumPy for ML features
@@ -562,7 +564,8 @@ class MemoryQuantizer:
             )
 
         # Calculate tier based on macOS kernel pressure, not psutil percent
-        tier = self._calculate_tier_macos(pressure, macos_pressure_percent, swap)
+        policy = host_pressure_policy(mem.total / (1024 ** 3))
+        tier = self._calculate_tier_macos(pressure, macos_pressure_percent, swap, policy)
 
         metrics = MemoryMetrics(
             timestamp=time.time(),
@@ -628,8 +631,10 @@ class MemoryQuantizer:
                 f"(+{reserved_gb:.2f}GB reserved)"
             )
 
-        # Calculate tier based on macOS kernel pressure, not psutil percent
-        tier = self._calculate_tier_macos(pressure, macos_pressure_percent, swap)
+        # Calculate tier based on macOS kernel pressure, not psutil percent.
+        # The policy may probe the siblings (first reading, then on a TTL).
+        policy = await asyncio.to_thread(host_pressure_policy, mem.total / (1024 ** 3))
+        tier = self._calculate_tier_macos(pressure, macos_pressure_percent, swap, policy)
 
         metrics = MemoryMetrics(
             timestamp=time.time(),
@@ -791,52 +796,41 @@ class MemoryQuantizer:
         self,
         kernel_pressure: MemoryPressure,
         pressure_percent: float,
-        swap
+        swap,
+        policy: Optional["PressurePolicy"] = None,
     ) -> MemoryTier:
-        """
-        Calculate memory tier for macOS using kernel pressure as PRIMARY signal
+        """The memory tier, from the host's one pressure policy plus the
+        signals only this reading has (kernel pressure, swap).
 
-        macOS tier philosophy (different from Linux):
-        - <50% pressure is ABUNDANT (underutilized)
-        - 50-70% pressure is OPTIMAL (healthy file cache)
-        - 70-80% is ELEVATED (normal for macOS if pressure is "normal")
-        - >80% with "warn" is CONSTRAINED
-        - >85% with "critical" OR heavy swap (>80%) is CRITICAL
-        - >95% is EMERGENCY
+        The percentage boundaries and their deadbands are the policy's
+        (``host_pressure_policy``: the same thresholds the cleanup controller
+        and the budget broker act on, rebased for J-Prime's planned model).
+        The previous tier is passed so a reading resting on a boundary holds
+        its tier instead of flapping across it at every tick.
 
-        KEY: Trust kernel's memory_pressure command over percentages!
-        Swap usage on macOS is NORMAL - only worry if >80% swap AND kernel warns
+        On top of that:
+        - the kernel saying CRITICAL is an EMERGENCY;
+        - a kernel that says memory is NORMAL (macOS, where a full file cache
+          is healthy) does not let the percentage alone reach CONSTRAINED;
+        - extreme swap (>90%) is at least CONSTRAINED, and heavy swap (>80%)
+          while already constrained is CRITICAL.
         """
-        swap_gb = swap.used / (1024 ** 3)
+        if policy is None:
+            policy = host_pressure_policy(psutil.virtual_memory().total / (1024 ** 3))
         swap_percent = swap.percent if swap.total > 0 else 0
 
-        # EMERGENCY: Kernel says critical OR >95% pressure
-        if kernel_pressure == MemoryPressure.CRITICAL or pressure_percent >= 95:
+        previous = PressureTier[self.current_tier.name] if self._tier_measured else None
+        tier = MemoryTier[policy.classify(pressure_percent, previous).name]
+
+        if kernel_pressure == MemoryPressure.CRITICAL:
             return MemoryTier.EMERGENCY
-
-        # CRITICAL: >90% pressure OR (>85% pressure + heavy swap >80%)
-        if pressure_percent >= 90:
-            return MemoryTier.CRITICAL
-        if pressure_percent >= 85 and swap_percent > 80:
-            return MemoryTier.CRITICAL
-
-        # CONSTRAINED: >80% pressure with kernel "warn" OR extreme swap (>90%)
-        if pressure_percent >= 80 and kernel_pressure == MemoryPressure.WARN:
-            return MemoryTier.CONSTRAINED
-        if swap_percent > 90:
-            return MemoryTier.CONSTRAINED
-
-        # ELEVATED: >70% pressure (normal for macOS with good file cache)
-        # This is HEALTHY on macOS! Not a problem unless kernel warns.
-        if pressure_percent >= 70:
-            return MemoryTier.ELEVATED
-
-        # OPTIMAL: 50-70% pressure (sweet spot for macOS)
-        if pressure_percent >= 50:
-            return MemoryTier.OPTIMAL
-
-        # ABUNDANT: <50% pressure (RAM underutilized, but fine)
-        return MemoryTier.ABUNDANT
+        if kernel_pressure == MemoryPressure.NORMAL and tier == MemoryTier.CONSTRAINED:
+            tier = MemoryTier.ELEVATED
+        if swap_percent > 90 and tier.severity < MemoryTier.CONSTRAINED.severity:
+            tier = MemoryTier.CONSTRAINED
+        if swap_percent > 80 and tier == MemoryTier.CONSTRAINED:
+            tier = MemoryTier.CRITICAL
+        return tier
 
     def _calculate_tier(self, usage_percent: float) -> MemoryTier:
         """

@@ -60,7 +60,8 @@ try:
     PYOBJC_AVAILABLE = True
 except ImportError:
     PYOBJC_AVAILABLE = False
-    logger.warning("PyObjC not available - menu bar will use fallback mode")
+    from backend.core.optional_dependencies import note_missing
+    note_missing("pyobjc", "macOS menu bar indicator", install="pyobjc", platforms=("darwin",))
 
 
 # =============================================================================

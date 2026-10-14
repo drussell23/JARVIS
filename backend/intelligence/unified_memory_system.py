@@ -477,7 +477,8 @@ class ArchivalMemory:
                     )
                     logger.info(f"Archival memory initialized with ChromaDB: {self._collection.count()} entries")
                 except ImportError:
-                    logger.warning("ChromaDB not available, using in-memory storage")
+                    from backend.core.optional_dependencies import note_missing
+                    note_missing("chromadb", "archival memory (in-memory used)", install="chromadb")
                 except Exception as e:
                     logger.warning(f"Failed to initialize ChromaDB: {e}")
 

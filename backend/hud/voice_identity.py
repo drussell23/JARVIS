@@ -264,7 +264,7 @@ class VoiceIdentity:
         t0 = time.monotonic()
         try:
             from backend.voice.speaker_verification_service import (
-                SpeakerVerificationService, _init_ml_components,
+                speaker_verification_service_instance, _init_ml_components,
             )
 
             # THE 14 SECONDS, TAKEN OFF THE LOOP.
@@ -293,7 +293,7 @@ class VoiceIdentity:
             logger.info("[VoiceIdentity] ML imports resolved off-loop in %.1fs",
                         time.monotonic() - _t_imp)
 
-            svc = SpeakerVerificationService()
+            svc = speaker_verification_service_instance()
             await asyncio.wait_for(svc.initialize(), timeout=warm_timeout_s())
             self._service = svc
             self._readiness = Readiness.READY

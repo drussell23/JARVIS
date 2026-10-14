@@ -1005,13 +1005,13 @@ async def create_speaker_verification_adapter(
             # Try to import the service
             from voice.speaker_verification_service import (
                 get_speaker_verification_service,
-                SpeakerVerificationService,
+                speaker_verification_service_instance,
             )
             
             if lazy_init:
-                # Create service without full initialization
+                # The process's one service, not initialised here
                 # (initialization will happen on first use)
-                service = SpeakerVerificationService()
+                service = speaker_verification_service_instance()
                 # Mark as lazy-initialized so adapter knows to initialize on first use
                 service._lazy_initialized = True
                 logger.debug(

@@ -254,7 +254,8 @@ class OCREngine:
             return True
 
         except ImportError:
-            logger.warning("pytesseract not installed, OCR disabled")
+            from backend.core.optional_dependencies import note_missing
+            note_missing("pytesseract", "OCR (reading text on screen)", install="pytesseract")
             return False
         except Exception as e:
             logger.warning(f"OCR initialization failed: {e}")

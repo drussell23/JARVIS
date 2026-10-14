@@ -2026,9 +2026,9 @@ class AGIOSCoordinator:
             try:
                 from vision.yabai_space_detector import get_yabai_detector
                 yabai_detector = get_yabai_detector(auto_start=False)
-                if yabai_detector:
-                    await self._ghost_display.initialize(yabai_detector)
-                    logger.info("Ghost Display Manager initialized with YabaiSpaceDetector")
+                if yabai_detector and await self._ghost_display.initialize(yabai_detector):
+                    logger.info("Ghost Display Manager initialized with %s",
+                                type(yabai_detector).__name__)
             except Exception as e:
                 logger.warning("Ghost Display initialization failed: %s", e)
 

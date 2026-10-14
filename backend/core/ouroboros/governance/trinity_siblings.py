@@ -193,6 +193,24 @@ def _listener_pids(ports: Set[int]) -> Set[int]:
     return pids
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0", "::"}
+
+
+def reserved_ports() -> Set[int]:
+    """Ports on this host that belong to a configured sibling, serving or not.
+
+    The port is the sibling's by configuration, so no other component of the
+    Body may choose it (the backend's fallback ports once listed J-Prime's
+    8000, and the boot then judged the serving Mind a stuck process).
+    """
+    ports: Set[int] = set()
+    for sib in siblings():
+        parsed = urlparse(sib.base_url() or "")
+        if parsed.port and (parsed.hostname or "") in _LOOPBACK_HOSTS:
+            ports.add(parsed.port)
+    return ports
+
+
 def serving_sibling_pids(probe: Callable[[str, float], bool] = _answers) -> Set[int]:
     """PIDs every cleanup must spare: each serving sibling's listener and its
     descendants (J-Prime's llama-server engines).

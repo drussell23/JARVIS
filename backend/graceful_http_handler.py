@@ -37,7 +37,8 @@ def _ensure_torch():
         logger.info("PyTorch loaded successfully for graceful handler")
         return True
     except ImportError:
-        logger.warning("PyTorch not available - using fallback graceful handling")
+        from backend.core.optional_dependencies import note_missing
+        note_missing("torch", "ML graceful HTTP handling (fallback used)", install="torch")
         return False
 
 class MLResponseGenerator:

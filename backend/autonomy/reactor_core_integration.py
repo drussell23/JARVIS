@@ -426,7 +426,12 @@ class ReactorCoreIntegration:
             logger.info("[ReactorCore] ✓ JARVISConnector initialized")
 
         except ImportError as e:
-            logger.warning(f"[ReactorCore] JARVISConnector not available: {e}")
+            if isinstance(e, ModuleNotFoundError) and e.name and not e.name.startswith("reactor_core"):
+                # Reactor-Core is importable; a package it needs is not.
+                from backend.core.optional_dependencies import note_missing
+                note_missing(e.name, "Reactor-Core JARVISConnector", install=e.name)
+            else:
+                logger.warning(f"[ReactorCore] JARVISConnector not available: {e}")
         except Exception as e:
             logger.error(f"[ReactorCore] JARVISConnector init failed: {e}")
 
@@ -450,7 +455,12 @@ class ReactorCoreIntegration:
             logger.info("[ReactorCore] ✓ SafeScoutOrchestrator initialized")
 
         except ImportError as e:
-            logger.warning(f"[ReactorCore] SafeScout not available: {e}")
+            if isinstance(e, ModuleNotFoundError) and e.name and not e.name.startswith("reactor_core"):
+                # Reactor-Core is importable; a package it needs is not.
+                from backend.core.optional_dependencies import note_missing
+                note_missing(e.name, "Reactor-Core SafeScout", install=e.name)
+            else:
+                logger.warning(f"[ReactorCore] SafeScout not available: {e}")
         except Exception as e:
             logger.error(f"[ReactorCore] SafeScout init failed: {e}")
 
@@ -480,7 +490,12 @@ class ReactorCoreIntegration:
             logger.info("[ReactorCore] ✓ PrimeConnector initialized")
 
         except ImportError as e:
-            logger.warning(f"[ReactorCore] PrimeConnector not available: {e}")
+            if isinstance(e, ModuleNotFoundError) and e.name and not e.name.startswith("reactor_core"):
+                # Reactor-Core is importable; a package it needs is not.
+                from backend.core.optional_dependencies import note_missing
+                note_missing(e.name, "Reactor-Core PrimeConnector", install=e.name)
+            else:
+                logger.warning(f"[ReactorCore] PrimeConnector not available: {e}")
         except Exception as e:
             logger.error(f"[ReactorCore] PrimeConnector init failed: {e}")
 

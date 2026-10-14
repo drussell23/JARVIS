@@ -2436,9 +2436,9 @@ class ParallelInitializer:
             def load_speaker_verification():
                 """Heavy loader for speaker verification service."""
                 try:
-                    from voice.speaker_verification_service import SpeakerVerificationService
+                    from voice.speaker_verification_service import speaker_verification_service_instance
                     if learning_db:
-                        service = SpeakerVerificationService(learning_db)
+                        service = speaker_verification_service_instance(learning_db)
                         # Can't call async from sync, but service will init on first use
                         logger.info("   [BACKGROUND] Speaker verification service loaded")
                         return service
@@ -3802,11 +3802,11 @@ class ParallelInitializer:
 
         # Fallback: Load directly if AI Loader not available
         try:
-            from voice.speaker_verification_service import SpeakerVerificationService
+            from voice.speaker_verification_service import speaker_verification_service_instance
 
             learning_db = getattr(self.app.state, 'learning_db', None)
             if learning_db:
-                service = SpeakerVerificationService(learning_db)
+                service = speaker_verification_service_instance(learning_db)
                 await service.initialize_fast()
 
                 # Store globally

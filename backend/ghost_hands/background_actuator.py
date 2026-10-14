@@ -1195,7 +1195,8 @@ class PlaywrightBackend(ActuatorBackend):
             return True
 
         except ImportError:
-            logger.warning("[GHOST-HANDS] Playwright not installed")
+            from backend.core.optional_dependencies import note_missing
+            note_missing("playwright", "background browser automation", install="playwright")
             return False
         except Exception as e:
             logger.warning(f"[GHOST-HANDS] Playwright init failed: {e}")

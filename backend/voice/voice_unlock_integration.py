@@ -22,7 +22,7 @@ from typing import Optional, Tuple
 sys.path.append(str(Path(__file__).parent.parent))
 
 from intelligence.learning_database import JARVISLearningDatabase
-from voice.speaker_verification_service import SpeakerVerificationService
+from voice.speaker_verification_service import SpeakerVerificationService, speaker_verification_service_instance
 from voice_unlock.services.keychain_service import KeychainService
 
 # Fix for potential circular import or missing module in some environments
@@ -100,7 +100,7 @@ class VoiceUnlockIntegration:
 
         try:
             # Initialize speaker verification with Cloud SQL
-            self.speaker_verification = SpeakerVerificationService()
+            self.speaker_verification = speaker_verification_service_instance()
             await self.speaker_verification.initialize()
             logger.info("✅ Speaker verification initialized")
 

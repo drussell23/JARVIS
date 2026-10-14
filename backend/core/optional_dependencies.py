@@ -523,6 +523,91 @@ class OptionalDependencyManager:
 
 
 # =============================================================================
+# Observed missing extras: one report, not one warning per importer
+# =============================================================================
+#
+# Every module that imports an optional package used to warn on its own when
+# it was absent: ~25 WARNING lines per boot (torch four ways, Google's client
+# libraries three times, LangGraph four), most of them repeats from a module
+# loaded under two names, none of them a fault -- an extra that is not
+# installed is a fact of this install. Sites report here instead; the boot
+# says it once, as one line, naming what each absence turns off.
+
+@dataclass
+class _MissingExtra:
+    features: List[str] = field(default_factory=list)
+    install: Optional[str] = None
+    error: Optional[str] = None
+
+
+_missing_lock = threading.Lock()
+_missing_extras: Dict[str, _MissingExtra] = {}
+_missing_summarised = False
+
+
+def note_missing(
+    package: str,
+    feature: str,
+    *,
+    install: Optional[str] = None,
+    error: Optional[BaseException | str] = None,
+    platforms: Optional[Tuple[str, ...]] = None,
+) -> None:
+    """Record that optional *package* is absent and *feature* goes without it.
+
+    *install* is the pip requirement(s) that would bring it; *platforms*
+    (``sys.platform`` prefixes) limits where the package is an extra at all
+    -- PyObjC missing on Windows is not something to install. Logged at
+    DEBUG here; :func:`log_missing_summary` reports the set once. A package
+    first noted after that summary is reported on its own, once.
+    """
+    if platforms and not sys.platform.startswith(tuple(platforms)):
+        logger.debug("[OptionalDeps] %s: not applicable on %s (%s)", package, sys.platform, feature)
+        return
+    with _missing_lock:
+        entry = _missing_extras.get(package)
+        late = entry is None and _missing_summarised
+        if entry is None:
+            entry = _missing_extras[package] = _MissingExtra()
+        if feature not in entry.features:
+            entry.features.append(feature)
+        entry.install = entry.install or install
+        if error is not None and entry.error is None:
+            entry.error = str(error)
+    logger.debug("[OptionalDeps] %s not installed: %s unavailable%s", package, feature,
+                 f" ({error})" if error is not None else "")
+    if late:
+        logger.info("Optional extra not installed: %s (%s)%s", package, feature,
+                    f" -- pip install {install}" if install else "")
+
+
+def missing_extras() -> Dict[str, Dict[str, Any]]:
+    """The extras reported missing so far: package -> features/install/error."""
+    with _missing_lock:
+        return {name: {"features": list(e.features), "install": e.install, "error": e.error}
+                for name, e in _missing_extras.items()}
+
+
+def log_missing_summary() -> None:
+    """Say, once, which optional extras this install lacks and what they turn off."""
+    global _missing_summarised
+    with _missing_lock:
+        if _missing_summarised:
+            return
+        _missing_summarised = True
+        extras = sorted(_missing_extras.items())
+    if not extras:
+        return
+    parts = [f"{name} ({', '.join(e.features)})" for name, e in extras]
+    installs = " ".join(dict.fromkeys(e.install for _, e in extras if e.install))
+    logger.info(
+        "Optional extras not installed (%d): %s%s",
+        len(extras), "; ".join(parts),
+        f" -- to add them: pip install {installs}" if installs else "",
+    )
+
+
+# =============================================================================
 # Global singleton instance and convenience functions
 # =============================================================================
 
@@ -1059,4 +1144,8 @@ __all__ = [
     # Cross-repo coordination
     "CrossRepoDependencyCoordinator",
     "get_dependency_coordinator",
+    # Observed missing extras
+    "note_missing",
+    "missing_extras",
+    "log_missing_summary",
 ]

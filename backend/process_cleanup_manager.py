@@ -68,6 +68,7 @@ from backend.core.memory_types import (
     MemorySnapshot as BrokerMemorySnapshot,
     PressurePolicy,
     PressureTier,
+    host_pressure_policy,
 )
 
 if TYPE_CHECKING:
@@ -280,7 +281,7 @@ class IntelligentMemoryController:
 
     def _host_policy(self) -> PressurePolicy:
         """The shared pressure policy (the broker's own), for this host."""
-        return PressurePolicy.for_host(self._total_ram_gb, self._planned_gb())
+        return host_pressure_policy(self._total_ram_gb)
 
     def _detect_hardware_profile(self) -> str:
         """The policy profile this host falls in: chosen from the RAM left

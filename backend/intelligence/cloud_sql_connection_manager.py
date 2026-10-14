@@ -2724,7 +2724,7 @@ class ProxyReadinessGate:
             for event in self._degraded_events.values():
                 event.set()
             self._degraded_before_event = True  # Edge Case #21
-            logger.info(f"[ReadinessGate] ⚠️ State: DEGRADED_SQLITE")
+            logger.info("[ReadinessGate] State: DEGRADED_SQLITE (SQLite serves)")
 
         # Notify subscribers (Edge Case #8, #23)
         await self._notify_subscribers(new_state)
@@ -3078,7 +3078,7 @@ class ProxyReadinessGate:
         except RuntimeError:
             pass  # No loop, subscribers will see state on next check
 
-        logger.info("[ReadinessGate] ⚠️ Marked DEGRADED_SQLITE")
+        logger.info("[ReadinessGate] Marked DEGRADED_SQLITE (SQLite serves)")
 
     # -------------------------------------------------------------------------
     # Subscribers (Edge Cases #8, #14, #15, #23)

@@ -1448,7 +1448,13 @@ class HybridDatabaseSync:
         - Uses gate as primary check, proxy_detector as fallback
         """
         if not CONNECTION_MANAGER_AVAILABLE or not ASYNCPG_AVAILABLE:
-            logger.warning("⚠️  asyncpg or connection manager not available - CloudSQL disabled")
+            # Missing asyncpg is an absent extra (reported once, with the
+            # others); a missing connection manager is a broken install.
+            if not CONNECTION_MANAGER_AVAILABLE:
+                logger.warning("Cloud SQL connection manager could not be imported - CloudSQL disabled")
+            else:
+                from backend.core.optional_dependencies import note_missing
+                note_missing("asyncpg", "Cloud SQL sync", install="asyncpg")
             self.circuit_breaker.record_failure()
             return
 

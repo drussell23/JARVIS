@@ -25,7 +25,8 @@ try:
     GOOGLE_API_AVAILABLE = True
 except ImportError:
     GOOGLE_API_AVAILABLE = False
-    logger.warning("Google API libraries not available. Install: pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client")
+    from backend.core.optional_dependencies import note_missing
+    note_missing("google-api-python-client", "Google Docs", install="google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client")
 
 # OAuth 2.0 scopes for Google Docs
 SCOPES = [

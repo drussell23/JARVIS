@@ -1328,7 +1328,8 @@ class LangGraphReasoningEngine:
     def _build_graph(self) -> Optional[StateGraph]:
         """Build the LangGraph state graph."""
         if not LANGGRAPH_AVAILABLE:
-            self.logger.warning("LangGraph not available, using fallback execution")
+            from backend.core.optional_dependencies import note_missing
+            note_missing("langgraph", "LangGraph reasoning engine (fallback execution)", install="langgraph")
             return None
 
         # Create state graph

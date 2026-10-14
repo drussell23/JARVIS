@@ -62,6 +62,12 @@ from uuid import uuid4
 
 import numpy as np
 
+from backend.core.module_identity import unify as _unify_module_identity
+
+# One module object under both import names (voice.* and backend.voice.*):
+# the service singleton below must not exist twice.
+_unify_module_identity(__name__)
+
 # Phase 6: EcapaFacade is the sole ECAPA lifecycle owner (flag removed)
 
 # Import managed executor for clean shutdown
@@ -146,6 +152,18 @@ _ML_INITIALIZED = False
 # Why the ML stack cannot load in this process (a missing package), once known.
 _ML_INIT_FAILURE: Optional[str] = None
 _ML_INIT_LOCK = threading.Lock()
+
+
+def _log_facade_not_ready(facade, phase: str, waited_s: float) -> None:
+    """Say why ECAPA is not serving: a concluded probe (no backend can serve
+    on this install) is a stated condition; still probing after the wait is
+    a fault worth a WARNING."""
+    if getattr(facade, "settled", False):
+        logger.info("[%s] ECAPA unavailable (%s) - using the local engine",
+                    phase, getattr(getattr(facade, "state", None), "value", "unknown"))
+    else:
+        logger.warning("⚠️ [%s] EcapaFacade not ready after %.0fs - falling back to local engine",
+                       phase, waited_s)
 
 
 def _init_ml_components():
@@ -237,7 +255,8 @@ def _init_ml_components():
             # Not installed is permanent for this process: recorded once, never
             # retried, never re-logged on every caller (it was five ERRORs a boot).
             _ML_INIT_FAILURE = f"{e.name} is not installed"
-            logger.warning("Speaker-verification ML stack unavailable: %s", _ML_INIT_FAILURE)
+            from backend.core.optional_dependencies import note_missing
+            note_missing(e.name or "torch", "speaker verification scoring", install=e.name)
             return False
         except Exception as e:
             logger.error(f"❌ Failed to load ML components: {e}")
@@ -3414,7 +3433,29 @@ class SpeakerVerificationService:
             func = partial(func, **kwargs)
         return await loop.run_in_executor(self._executor, func, *args)
 
+    async def _initialize_single_flight(self, run) -> None:
+        """Run *run* (an initialiser body) at most once at a time.
+
+        Three boot paths initialised this service concurrently (two neural
+        mesh adapters and VoiceBio); each loaded the profiles, tried a Cloud
+        SQL bootstrap and created an owner profile of its own, and each said
+        "ready" -- 2026-10-14 12:21:56. Callers that arrive while one is in
+        flight wait for it instead; a caller cancelled while waiting does not
+        cancel the initialisation the others are waiting on.
+        """
+        if self.initialized:
+            return
+        flight = getattr(self, "_init_flight", None)
+        if flight is None or flight.done():
+            flight = asyncio.ensure_future(run())
+            self._init_flight = flight
+        await asyncio.shield(flight)
+
     async def initialize_fast(self):
+        """Fast initialization (see :meth:`_initialize_fast_once`)."""
+        await self._initialize_single_flight(self._initialize_fast_once)
+
+    async def _initialize_fast_once(self):
         """
         Fast initialization with background encoder pre-loading.
 
@@ -3451,7 +3492,7 @@ class SpeakerVerificationService:
                 self._ecapa_load_source = "facade"
                 logger.info("✅ [FAST-INIT] ECAPA ready via EcapaFacade")
             else:
-                logger.warning("⚠️ [FAST-INIT] EcapaFacade not ready - will use SpeechBrain fallback")
+                _log_facade_not_ready(facade, "FAST-INIT", ecapa_phase6_timeout)
         except Exception as e:
             logger.warning(f"⚠️ [FAST-INIT] EcapaFacade error: {e} - will use SpeechBrain fallback")
 
@@ -3478,19 +3519,7 @@ class SpeakerVerificationService:
         await self._load_speaker_profiles()
 
         self.initialized = True
-        ecapa_status = "ECAPA ready" if self._use_registry_encoder else (
-            "cloud ECAPA (SLIM)" if _slim_skip_speechbrain else "SpeechBrain fallback"
-        )
-        # WARNING, not INFO. This module is filtered to WARNING+ in the
-        # brainstem console, so the ONE line that answers "did the
-        # voiceprint load?" has been invisible for this entire
-        # investigation. Four separate fixes were made without ever
-        # being able to read whether the profile count was 0 or 1 --
-        # which is not debugging, it is guessing with extra steps.
-        # A readiness line nobody can see is not a readiness line.
-        logger.warning(
-            f"✅ Speaker Verification Service ready - {len(self.speaker_profiles)} profiles loaded ({ecapa_status})"
-        )
+        self._log_readiness()
 
         # Start background initialization of SpeechBrain engine (as fallback)
         if self.speechbrain_engine is not None:
@@ -3931,6 +3960,11 @@ class SpeakerVerificationService:
         return self.processing_cache.get_stats()
 
     async def initialize(self, preload_encoder: bool = True):
+        """Initialize the service (see :meth:`_initialize_once`)."""
+        await self._initialize_single_flight(
+            lambda: self._initialize_once(preload_encoder=preload_encoder))
+
+    async def _initialize_once(self, preload_encoder: bool = True):
         """
         Initialize service and load speaker profiles
 
@@ -3977,7 +4011,7 @@ class SpeakerVerificationService:
                 self._ecapa_load_source = "facade"
                 logger.info("✅ [INIT] ECAPA ready via EcapaFacade")
             else:
-                logger.warning("⚠️ [INIT] EcapaFacade not ready - falling back to local engine")
+                _log_facade_not_ready(facade, "INIT", ecapa_load_timeout)
         except Exception as e:
             logger.warning(f"⚠️ [INIT] EcapaFacade error: {e} - falling back to local engine")
 
@@ -4026,16 +4060,7 @@ class SpeakerVerificationService:
             )
 
         self.initialized = True
-        # WARNING, not INFO. This module is filtered to WARNING+ in the
-        # brainstem console, so the ONE line that answers "did the
-        # voiceprint load?" has been invisible for this entire
-        # investigation. Four separate fixes were made without ever
-        # being able to read whether the profile count was 0 or 1 --
-        # which is not debugging, it is guessing with extra steps.
-        # A readiness line nobody can see is not a readiness line.
-        logger.warning(
-            f"✅ Speaker Verification Service ready ({len(self.speaker_profiles)} profiles loaded)"
-        )
+        self._log_readiness()
         if self._use_registry_encoder:
             logger.info("   → Using ML Engine Registry singleton (no duplicate models)")
 
@@ -4080,10 +4105,15 @@ class SpeakerVerificationService:
         # If called before _start_background_preload completes, fall through
         # to the except block which applies the 192D fallback.
         if self.speechbrain_engine is None:
-            logger.warning(
-                "SpeechBrain engine not initialized — cannot detect dimension, "
-                "using 192D fallback. Dimension will be re-detected when engine is ready."
-            )
+            if _ML_INIT_FAILURE:
+                # No engine is coming on this install: a stated condition.
+                logger.info("No local scoring engine (%s): embedding dimension "
+                            "taken as 192D", _ML_INIT_FAILURE)
+            else:
+                logger.warning(
+                    "SpeechBrain engine not initialized — cannot detect dimension, "
+                    "using 192D fallback. Dimension will be re-detected when engine is ready."
+                )
             self.current_model_dimension = 192
             return self.current_model_dimension
 
@@ -5467,10 +5497,11 @@ class SpeakerVerificationService:
 
             # If no profiles found, try to bootstrap from Cloud SQL first
             if len(profiles) == 0:
-                logger.warning("⚠️ No speaker profiles found in local database!")
-                logger.info("🔄 Attempting to bootstrap voice profiles from Cloud SQL...")
+                # An empty store on a host that has not enrolled a voice is a
+                # state, not a fault: the bootstrap below says what it found.
+                logger.info("No speaker profiles in the local database")
 
-                # Try to sync from Cloud SQL
+                # Try to sync from Cloud SQL (only where it is configured)
                 cloud_bootstrap_success = await self._try_bootstrap_from_cloudsql()
 
                 if cloud_bootstrap_success:
@@ -5478,14 +5509,13 @@ class SpeakerVerificationService:
                     profiles = await self.learning_db.get_all_speaker_profiles()
                     logger.info(f"📊 After Cloud SQL bootstrap: {len(profiles)} profile(s) available")
                 else:
-                    # Fallback: Auto-create owner profile from macOS
-                    logger.info("🔄 Cloud SQL unavailable, creating owner profile from macOS system user...")
+                    # Fallback: the owner's profile from the signed-in account
                     await self._auto_create_owner_profile_from_macos()
 
-            # Summary
-            # WARNING for the same reason: this is the decisive count.
-            logger.warning(
-                f"✅ Speaker profile loading complete: {loaded_count} loaded, {skipped_count} skipped"
+            # Summary (the decisive count is the readiness line's)
+            logger.info(
+                f"Speaker profile loading complete: {loaded_count} voiceprint(s) loaded, "
+                f"{skipped_count} skipped"
             )
 
             if loaded_count == 0 and len(profiles) == 0 and not self.speaker_profiles:
@@ -5647,27 +5677,19 @@ class SpeakerVerificationService:
         from uuid import uuid4
 
         try:
-            # Get macOS username
-            username = os.environ.get('USER') or os.getlogin()
+            import getpass
 
-            # Get full name from macOS directory services
-            try:
-                result = subprocess.run(
-                    ['dscl', '.', '-read', f'/Users/{username}', 'RealName'],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                if result.returncode == 0:
-                    lines = result.stdout.strip().split('\n')
-                    if len(lines) > 1:
-                        full_name = lines[1].strip()
-                    else:
-                        full_name = username.replace('.', ' ').title()
-                else:
-                    full_name = username.replace('.', ' ').title()
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                full_name = username.replace('.', ' ').title()
+            from backend.core.host_platform import account_full_name
+            from backend.core.owner import declared_owner_name
+
+            # The signed-in account, on every platform ($USER is absent on
+            # Windows; dscl exists only on macOS).
+            username = getpass.getuser()
+            # The operator's name by the one owner answer: declared, else the
+            # account's full name; the login name names an account, so it is
+            # only the last resort.
+            full_name = (declared_owner_name() or account_full_name()
+                         or username.replace('.', ' ').title())
 
             # Extract first name for speaker profile
             first_name = full_name.split()[0] if full_name else username.title()
@@ -5700,12 +5722,11 @@ class SpeakerVerificationService:
                 "samples": 0,
             }
 
-            logger.info(f"✅ Auto-created owner profile for macOS user: {first_name}")
-            logger.info(f"   macOS username: {username}")
-            logger.info(f"   macOS full name: {full_name}")
-            logger.info(f"   Profile marked as is_primary_user=True")
-            logger.info("   ⚠️  Note: Voiceprint enrollment required for full voice authentication")
-            logger.info("   💡 Say 'JARVIS, learn my voice' to complete enrollment")
+            logger.info(
+                "Created the owner's profile for %s (account %s, full name %s); "
+                "voice authentication needs a voiceprint -- say 'JARVIS, learn my voice'",
+                first_name, username, full_name,
+            )
 
         except Exception as e:
             logger.error(f"❌ Failed to auto-create owner profile from macOS: {e}")
@@ -5726,6 +5747,14 @@ class SpeakerVerificationService:
             False if Cloud SQL unavailable or sync failed
         """
         hybrid_sync = None
+        # The one answer to "is Cloud SQL configured here?" -- without it the
+        # bootstrap built a HybridDatabaseSync only to warn it was unavailable.
+        try:
+            from intelligence.cloud_sql_connection_manager import database_config_path
+        except ImportError:
+            from backend.intelligence.cloud_sql_connection_manager import database_config_path
+        if database_config_path() is None:
+            return False
         try:
             # Import the hybrid database sync class
             from intelligence.hybrid_database_sync import HybridDatabaseSync
@@ -6174,6 +6203,38 @@ class SpeakerVerificationService:
             # No running loop (sync construction path). The lazy load still
             # works; a pre-warm that cannot be scheduled is not a failure.
             logger.debug("[EncoderPrewarm] no running loop — skipping pre-warm")
+
+    def _enrolled_voiceprints(self) -> int:
+        """Loaded profiles that hold a voiceprint (an owner profile created
+        from the account holds none until enrollment)."""
+        return sum(1 for p in (self.speaker_profiles or {}).values()
+                   if p.get("embedding") is not None)
+
+    def _log_readiness(self) -> None:
+        """The one readiness line both initialisers report.
+
+        It answers "can a voice be verified?" from the same facts
+        :meth:`verification_capability` uses. It used to count every loaded
+        profile ("ready - 1 profiles loaded") right after "0 loaded" -- the
+        one was an owner profile with no voiceprint -- and it was a WARNING
+        on every boot whatever it said. A fault is a WARNING; a host that
+        has not enrolled a voice, or has no scoring engine installed, is in
+        a stated condition, said once.
+        """
+        voiceprints = self._enrolled_voiceprints()
+        awaiting = len(self.speaker_profiles or {}) - voiceprints
+        if getattr(self, "_use_registry_encoder", False):
+            engine = "ECAPA"
+        elif getattr(self, "speechbrain_engine", None) is not None:
+            engine = "SpeechBrain"
+        else:
+            engine = f"none ({_ML_INIT_FAILURE or 'no engine on this install'})"
+        logger.info(
+            "Speaker verification ready: %d voiceprint(s) enrolled%s; scoring engine: %s",
+            voiceprints,
+            f", {awaiting} profile(s) awaiting enrollment" if awaiting else "",
+            engine,
+        )
 
     def verification_capability(self, speaker_name: Optional[str] = None) -> Tuple[bool, str]:
         """
@@ -8276,21 +8337,32 @@ async def get_speaker_verification_service(
     Returns:
         SpeakerVerificationService instance
     """
+    service = speaker_verification_service_instance(learning_db)
+    # Fast initialization (encoder loads in background); single-flight, so
+    # concurrent callers share one run and a ready service returns at once.
+    await service.initialize_fast()
+    return service
+
+
+def speaker_verification_service_instance(
+    learning_db: Optional[JARVISLearningDatabase] = None,
+) -> SpeakerVerificationService:
+    """The process's one speaker verification service, created if absent and
+    NOT initialised (callers initialise it; initialisation is single-flight).
+
+    Every boot path used to construct its own -- AI Loader, VoiceBio, two
+    neural-mesh adapters, main.py, VoiceIdentity -- and each loaded the
+    voiceprints, bootstrapped and created an owner profile of its own.
+    """
     global _speaker_verification_service, _global_speaker_service
 
-    # First check if there's a pre-loaded service from start_system.py
+    # A pre-loaded service (start_system.py / the AI Loader proxy) is the one.
     if _global_speaker_service is not None:
-        logger.info("✅ Using pre-loaded speaker verification service")
         _speaker_verification_service = _global_speaker_service
         return _global_speaker_service
 
-    # Otherwise use the singleton pattern
     if _speaker_verification_service is None:
-        logger.info("🔐 Creating new speaker verification service...")
         _speaker_verification_service = SpeakerVerificationService(learning_db)
-        # Use fast initialization to avoid blocking (encoder loads in background)
-        await _speaker_verification_service.initialize_fast()
-
     return _speaker_verification_service
 
 

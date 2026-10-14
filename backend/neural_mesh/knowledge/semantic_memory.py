@@ -570,7 +570,9 @@ class SemanticMemory:
             if SENTENCE_TRANSFORMERS_AVAILABLE:
                 self._embedding_provider = SentenceTransformerProvider()
             else:
-                logger.warning("sentence-transformers not available, using mock embeddings")
+                from backend.core.optional_dependencies import note_missing
+                note_missing("sentence-transformers", "semantic memory embeddings (mock used)",
+                             install="sentence-transformers")
                 self._embedding_provider = MockEmbeddingProvider()
 
         self._stats.embedding_model = self._embedding_provider.model_name
@@ -615,7 +617,8 @@ class SemanticMemory:
                 self._client = None
                 self._collection = None
         else:
-            logger.warning("ChromaDB not available, using in-memory storage only")
+            from backend.core.optional_dependencies import note_missing
+            note_missing("chromadb", "persistent semantic memory (in-memory used)", install="chromadb")
 
         # Start background tasks
         if self._enable_consolidation:

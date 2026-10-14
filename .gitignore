@@ -237,10 +237,14 @@ test-results/
 *.perf
 *.trace
 
-# Core dumps (but allow backend/core/ and backend/voice_unlock/core/ directories)
+# Core dumps are FILES named core / core.<pid>. A directory named core is
+# source: the bare "core" pattern also matched backend/wake_word/core, and the
+# wake-word detector was never committed. "!core/" re-includes every directory
+# of that name (a trailing slash matches directories only).
 # Note: Negation must come AFTER to override
 core
 core.*
+!core/
 # Exception: Allow backend/core directory and its contents
 !backend/core/
 !backend/core/**

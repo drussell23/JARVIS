@@ -58,6 +58,7 @@ from backend.core.memory_types import (
     MemorySnapshot,
     PressurePolicy,
     PressureTier,
+    host_pressure_policy,
     SignalQuality,
     StartupPhase,
 )
@@ -462,12 +463,7 @@ class MemoryBudgetBroker:
         """The active pressure policy: this host's, beside the memory Trinity's
         own siblings hold on purpose (PressurePolicy.for_host), followed as
         that residency changes."""
-        try:
-            from backend.core.ouroboros.governance.trinity_siblings import planned_resident_gb
-            planned = planned_resident_gb()
-        except Exception:  # noqa: BLE001 -- unknown: nothing counted as planned
-            planned = 0.0
-        current = PressurePolicy.for_host(self._detect_total_ram_gb(), planned)
+        current = host_pressure_policy(self._detect_total_ram_gb())
         if current.version != self._policy.version:
             self._policy = current
         return self._policy

@@ -410,6 +410,22 @@ class EnvironmentChecker:
         degradation_impact = config.get("degradation_impact", "")
 
         if not value:
+            # A credential for a paid lane the operator switched off is unset
+            # by declaration: the configuration, not a degradation.
+            try:
+                from backend.core.ouroboros.governance.paid_lanes import declared_absent
+                declared = declared_absent(name)
+            except Exception:  # noqa: BLE001 -- no authority: judge as before
+                declared = None
+            if declared:
+                return CheckResult(
+                    name=f"Env: {name}",
+                    category=CheckCategory.ENVIRONMENT,
+                    status=CheckStatus.PASS,
+                    message=f"{name} not set: paid lane off ({declared})",
+                    details=description,
+                    duration_ms=(time.time() - start) * 1000,
+                )
             # Check if this is a degradable requirement
             if degradable and _allows_graceful_degradation():
                 # Not a failure - graceful degradation allows this

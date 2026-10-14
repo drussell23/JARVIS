@@ -4812,7 +4812,7 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
     try:
         logger.info("🔐 Initializing Cloud SQL Proxy + Voice Verification...")
         from intelligence.cloud_database_adapter import get_database_adapter
-        from voice.speaker_verification_service import SpeakerVerificationService
+        from voice.speaker_verification_service import speaker_verification_service_instance
 
         # Initialize database (will auto-start Cloud SQL proxy if needed)
         db_adapter = await get_database_adapter()
@@ -4828,7 +4828,7 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
             logger.info(f"   • Path: {db_adapter.config.sqlite_path}")
 
         # Initialize voice verification service
-        voice_verification = SpeakerVerificationService()
+        voice_verification = speaker_verification_service_instance()
         await voice_verification.initialize()
         app.state.voice_verification = voice_verification
 

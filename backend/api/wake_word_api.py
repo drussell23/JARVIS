@@ -30,7 +30,13 @@ try:
     WAKE_WORD_AVAILABLE = True
     logger.info("Wake word module imported successfully")
 except ImportError as e:
-    logger.warning(f"Wake word module not available, using stub API: {e}")
+    # backend/wake_word/core (the detector and audio processor) was never
+    # committed: .gitignore's crash-dump rule "core" matched the directory.
+    # Missing source, not a missing extra.
+    logger.warning(
+        "Wake word detector unavailable, using stub API: %s "
+        "(backend/wake_word/core is absent from this checkout)", e,
+    )
     WAKE_WORD_AVAILABLE = False
 
 

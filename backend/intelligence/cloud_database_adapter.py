@@ -24,7 +24,8 @@ try:
     ASYNCPG_AVAILABLE = True
 except ImportError:
     ASYNCPG_AVAILABLE = False
-    logging.warning("asyncpg not available - install with: pip install asyncpg")
+    from backend.core.optional_dependencies import note_missing
+    note_missing("asyncpg", "Cloud SQL (PostgreSQL) connections", install="asyncpg")
 
 
 # =============================================================================
@@ -327,8 +328,15 @@ class DatabaseConfig:
         # Track connection name availability
         self._has_connection_name = bool(self.connection_name)
 
-        # Get password with fallback chain: Secret Manager -> environment -> config file
-        if SECRET_MANAGER_AVAILABLE:
+        # Get password with fallback chain: Secret Manager -> environment -> config file.
+        # Only where Cloud SQL is part of this deployment (a config file, a
+        # connection name, or an explicit request): elsewhere SQLite is the
+        # store by design, and the secret search across every backend ended
+        # in "Secret 'jarvis-db-password' not found" on every boot.
+        if not (self._config_file_exists or self._has_connection_name
+                or self._explicit_cloudsql_request):
+            pass
+        elif SECRET_MANAGER_AVAILABLE:
             self.db_password = get_db_password() or self.db_password
         else:
             self.db_password = os.getenv("JARVIS_DB_PASSWORD", self.db_password)

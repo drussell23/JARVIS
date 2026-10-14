@@ -12238,7 +12238,8 @@ class DynamicPortManager(ResourceManagerBase):
 
     Environment Configuration:
     - JARVIS_PORT: Primary API port (default: 8010)
-    - JARVIS_FALLBACK_PORTS: Comma-separated fallback ports (default: 8001,8002,8003)
+    - JARVIS_FALLBACK_PORTS: Comma-separated fallback ports (default: 8011,8012,8013;
+      a configured sibling's port is always excluded)
     - JARVIS_WEBSOCKET_PORT: WebSocket port (default: 8765)
     - JARVIS_DYNAMIC_PORT_ENABLED: Enable dynamic range (default: true)
     - JARVIS_DYNAMIC_PORT_START: Dynamic range start (default: 49152)
@@ -12263,8 +12264,14 @@ class DynamicPortManager(ResourceManagerBase):
         except ImportError:
             self.primary_port = int(os.getenv("JARVIS_PORT", os.getenv("BACKEND_PORT", os.getenv("JARVIS_BACKEND_PORT", "8010"))))
 
-        fallback_str = os.getenv("JARVIS_FALLBACK_PORTS", "8000,8011,8012")
-        self.fallback_ports = [int(p.strip()) for p in fallback_str.split(",") if p.strip()]
+        fallback_str = os.getenv("JARVIS_FALLBACK_PORTS", "8011,8012,8013")
+        # A sibling's port is never the backend's to take: choosing it made
+        # the boot judge the serving Mind (J-Prime, :8000) a stuck process.
+        reserved = self._sibling_ports()
+        self.fallback_ports = [
+            port for port in (int(p.strip()) for p in fallback_str.split(",") if p.strip())
+            if port not in reserved
+        ]
 
         self.websocket_port = int(os.getenv("JARVIS_WEBSOCKET_PORT", "8765"))
         self.dynamic_port_enabled = os.getenv("JARVIS_DYNAMIC_PORT_ENABLED", "true").lower() == "true"
@@ -12310,12 +12317,23 @@ class DynamicPortManager(ResourceManagerBase):
         self.port_health_cache.clear()
         self._initialized = False
 
+    @staticmethod
+    def _sibling_ports() -> Set[int]:
+        try:
+            from backend.core.ouroboros.governance.trinity_siblings import reserved_ports
+            return reserved_ports()
+        except Exception:  # noqa: BLE001 -- no sibling authority: nothing reserved
+            return set()
+
     def _is_unkillable_state(self, status: str) -> bool:
-        """Check if process status indicates an unkillable (UE) state."""
+        """Check if process status indicates an unkillable (UE) state.
+
+        Whole-token match: a substring test of the one-letter ps codes
+        judged every "running" process (it contains 'u') unkillable.
+        """
         if not status:
             return False
-        status_lower = status.lower()
-        return any(ind.lower() in status_lower for ind in self.UE_STATE_INDICATORS)
+        return status.strip().lower() in {ind.lower() for ind in self.UE_STATE_INDICATORS}
 
     def _port_is_bindable(self, port: int) -> bool:
         """True iff the backend could bind ``port`` right now (nothing holds it).
@@ -69836,27 +69854,25 @@ class JarvisSystemKernel:
                 # v300.0: Start EcapaFacade (sole ECAPA lifecycle owner)
                 if self._ecapa_facade is None:
                     try:
-                        from backend.core.ecapa_facade import EcapaFacade
-                        from backend.core.ecapa_types import EcapaFacadeConfig
-                        _registry = None
+                        # The process's one facade (get_ecapa_facade's
+                        # singleton), not a private instance: a second
+                        # EcapaFacade in this process took the cross-process
+                        # fence first, and the singleton every voice caller
+                        # uses then failed it ("DualAuthorityError: another
+                        # LIVE process" -- this one) and stayed not-ready.
+                        from backend.core.ecapa_facade import get_ecapa_facade
+                        from backend.core.ecapa_types import EcapaFacadeConfig, EcapaState
+                        _cloud = None
                         try:
-                            from backend.voice_unlock.ml_engine_registry import get_ml_registry_sync
-                            _registry = get_ml_registry_sync(auto_create=True)
+                            from backend.voice_unlock.cloud_ecapa_client import get_cloud_ecapa_client
+                            _cloud = await get_cloud_ecapa_client()
                         except Exception:
                             pass
-                        if _registry is not None:
-                            _cloud = None
-                            try:
-                                from backend.voice_unlock.cloud_ecapa_client import get_cloud_ecapa_client
-                                _cloud = await get_cloud_ecapa_client()
-                            except Exception:
-                                pass
-                            self._ecapa_facade = EcapaFacade(
-                                registry=_registry,
-                                cloud_client=_cloud,
-                                config=EcapaFacadeConfig.from_env(),
-                            )
-                            await self._ecapa_facade.start()
+                        self._ecapa_facade = await get_ecapa_facade(
+                            cloud_client=_cloud,
+                            config=EcapaFacadeConfig.from_env(),
+                        )
+                        if self._ecapa_facade.state != EcapaState.UNINITIALIZED:
                             self.logger.info("[Kernel] EcapaFacade started (primary)")
                     except Exception as _facade_err:
                         self.logger.debug(f"[Kernel] EcapaFacade init skipped: {_facade_err}")
@@ -72030,6 +72046,12 @@ class JarvisSystemKernel:
                 f"[Kernel] ✅ Startup complete in {startup_duration:.1f}s "
                 f"(total process: {_total_s:.1f}s)"
             )
+            # The optional extras the boot's modules found absent, said once.
+            try:
+                from backend.core.optional_dependencies import log_missing_summary
+                log_missing_summary()
+            except Exception as _extras_exc:  # noqa: BLE001 -- a report, never a boot blocker
+                self.logger.debug(f"[Kernel] optional-extras summary skipped: {_extras_exc}")
 
             # v249.0: Emit startup complete event
             self._emit_event(

@@ -32,6 +32,12 @@ from enum import Enum
 
 logger = logging.getLogger(__name__)
 
+from backend.core.module_identity import unify as _unify_module_identity
+
+# One module object under both import names (core.* / backend.core.*): one
+# _config singleton, validated and reported once.
+_unify_module_identity(__name__)
+
 
 def _resolve_anthropic_api_key() -> Optional[str]:
     """
@@ -984,9 +990,18 @@ class AgenticConfig:
 
         # === Core Subsystem Validation ===
 
-        # Check API key
+        # Check API key -- a gap only where the Claude lane is switched on;
+        # switched off, the unset key is the operator's declaration.
         if not self.computer_use.api_key:
-            issues.append("ANTHROPIC_API_KEY not set - Computer Use will not work")
+            try:
+                from backend.core.ouroboros.governance.paid_lanes import declared_absent
+                declared = declared_absent("ANTHROPIC_API_KEY")
+            except Exception:  # noqa: BLE001 -- no authority: judge as before
+                declared = None
+            if declared:
+                logger.debug("Computer Use off: %s", declared)
+            else:
+                issues.append("ANTHROPIC_API_KEY not set - Computer Use will not work")
 
         # Check paths
         if not self.data_dir.exists():

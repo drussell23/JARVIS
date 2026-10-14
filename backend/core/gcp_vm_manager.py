@@ -55,8 +55,9 @@ try:
     from google.cloud import compute_v1 as _compute_v1
     compute_v1 = _compute_v1
     COMPUTE_AVAILABLE = True
-except ImportError:
-    logging.warning("google-cloud-compute not installed. VM creation disabled.")
+except ImportError as _e:
+    from backend.core.optional_dependencies import note_missing
+    note_missing("google-cloud-compute", "GCP VM creation", install="google-cloud-compute", error=_e)
 
 # Type aliases for when compute_v1 is not available
 if TYPE_CHECKING:

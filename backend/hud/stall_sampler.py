@@ -113,8 +113,20 @@ def trigger_s() -> float:
     frame was `importlib._bootstrap_external._write_atomic`: a .pyc being
     written on the event loop while a FastAPI health request waited on a
     first-time import of `coding_council.orchestrator`.
+
+    The default is no longer a number: it is the staleness at which the
+    sentinel itself will report a stall (its probe interval plus its stall
+    threshold). A fixed 1.0s went blind exactly as forecast above -- by
+    2026-10-14 every boot stall was 0.25-0.38s, each a WARNING, none with a
+    stack. A stall worth a warning is worth a stack; the gap and the cap
+    still bound the spend. ``JARVIS_STALL_SAMPLER_TRIGGER_S`` overrides.
     """
-    return _f(ENV_TRIGGER_S, 1.0, 0.25)
+    try:
+        from backend.hud import loop_sentinel as ls
+        derived = ls.probe_interval_s() + ls.stall_threshold_s()
+    except Exception:  # noqa: BLE001 -- no sentinel: the historical default
+        derived = 1.0
+    return _f(ENV_TRIGGER_S, derived, 0.25)
 
 
 def min_gap_s() -> float:
