@@ -97615,9 +97615,14 @@ async def async_main(args: argparse.Namespace) -> int:
         )
 
     if args.restart:
-        # Shutdown first, then continue to startup
-        await handle_shutdown()
-        await asyncio.sleep(2.0)  # Wait for shutdown
+        # Shut the running kernel down and wait until it has exited (however
+        # long its shutdown takes), then continue to startup.
+        from backend.core.daemon_handover import daemon_status, hand_over
+        from backend.core.supervisor_ipc import SOCKET_PATH as _STREAM_SOCKET
+        _pid = ((await asyncio.to_thread(daemon_status, _STREAM_SOCKET)) or {}).get("pid")
+        if _pid and not await hand_over(int(_pid), KERNEL_SOCKET_PATH, _STREAM_SOCKET):
+            print(f"\n❌ Kernel PID {_pid} did not exit; not starting a second one.")
+            return 1
 
     # v220.3: Handle --force flag for forceful takeover
     if getattr(args, 'force', False) or getattr(args, 'takeover', False):
@@ -98421,15 +98426,37 @@ def main() -> int:
     _is_control_invocation = bool(_CONTROL_FLAGS & set(sys.argv[1:]))
     if not _is_control_invocation:
         try:
-            from backend.core.supervisor_ipc import SupervisorIPC, configure_context_logging
+            from backend.core.supervisor_ipc import (
+                SOCKET_PATH as _STREAM_SOCKET, SupervisorIPC, configure_context_logging,
+            )
             _ipc_probe = SupervisorIPC()
-            if not _ipc_probe.try_bind_sync():
-                # Daemon already running → attach as streaming client
+            _daemon_live = not _ipc_probe.try_bind_sync()
+        except Exception:
+            _daemon_live = False  # IPC module unavailable — fall through to normal start
+        if _daemon_live:
+            # A daemon running code this checkout no longer has is handed
+            # over, not attached to (backend/core/daemon_handover.py).
+            try:
+                from backend.core.daemon_handover import (
+                    hand_over, running_daemon_staleness, stale_policy,
+                )
+                _stale = running_daemon_staleness(_STREAM_SOCKET)
+            except Exception as _stale_exc:
+                print(f"[JARVIS] Could not read the running kernel's code identity: {_stale_exc}")
+                _stale = None
+            if _stale is not None and stale_policy() == "replace":
+                print(f"[JARVIS] {_stale.describe()} — handing over to this checkout.")
+                if not asyncio.run(hand_over(_stale.pid, KERNEL_SOCKET_PATH, _STREAM_SOCKET)):
+                    print(f"[JARVIS] Kernel PID {_stale.pid} is still running; not starting a second one.")
+                    return 1
+                print("[JARVIS] Previous kernel exited — starting this checkout.")
+            else:
+                if _stale is not None:
+                    print(f"[JARVIS] {_stale.describe()} — attaching anyway "
+                          f"(JARVIS_STALE_DAEMON_POLICY=attach).")
                 configure_context_logging()
                 asyncio.run(_ipc_probe.attach_as_client())
                 return 0
-        except Exception:
-            pass  # IPC module unavailable — fall through to normal start
 
     # v239.0: Watchdog install/uninstall (runs before full init)
     if "--install-watchdog" in sys.argv:

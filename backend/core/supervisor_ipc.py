@@ -37,7 +37,7 @@ import socket as _socket_mod
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Set
+from typing import Callable, Optional, Set
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -276,10 +276,14 @@ class SupervisorIPC:
         if action == "ping":
             await self._write_event(writer, {"type": "pong", "ts": time.time()})
         elif action == "status":
+            from backend.core.daemon_handover import code_identity
             await self._write_event(writer, {
                 "type": "status_response",
                 "ts":   time.time(),
                 "pid":  os.getpid(),
+                # What this daemon runs, so a launch from a newer checkout
+                # replaces it instead of attaching (daemon_handover).
+                "code": await asyncio.to_thread(code_identity),
             })
         elif action == "shutdown":
             # Route shutdown command to the supervisor via shutdown event
@@ -343,36 +347,68 @@ class SupervisorIPC:
         Connect to the running daemon and stream events to stdout.
         Blocks until the daemon exits or the user presses Ctrl+C.
         """
-        color = self._is_tty
-
-        if color:
+        if self._is_tty:
             print(f"{_CYAN}[JARVIS]{_RESET} Daemon already running — attaching to live stream. "
                   f"Press {_BOLD}Ctrl+C{_RESET} to detach (daemon keeps running).")
+        if await self.relay() == "closed" and self._is_tty:
+            print(f"\n{_DIM}[JARVIS] Daemon connection closed.{_RESET}")
 
+    async def relay(
+        self,
+        stop_when: Optional[Callable[[], bool]] = None,
+        silence_s: Optional[float] = None,
+    ) -> str:
+        """
+        Render the daemon's event stream until it ends. Returns why:
+        ``shutdown`` (the daemon announced its exit), ``closed`` (the stream
+        ended or could not be opened), ``stopped`` (``stop_when()`` became
+        true) or ``silent`` (no event other than keepalive pings for
+        ``silence_s`` seconds).
+        """
+        color = self._is_tty
         try:
             reader, writer = await asyncio.open_unix_connection(str(SOCKET_PATH))
-        except (FileNotFoundError, ConnectionRefusedError) as exc:
+        except (FileNotFoundError, ConnectionRefusedError, OSError) as exc:
             print(f"[JARVIS] Could not connect to daemon socket: {exc}", file=sys.stderr)
-            return
+            return "closed"
 
+        # Poll often enough to notice stop_when, never longer than the silence window.
+        tick = min(1.0, silence_s) if silence_s else (1.0 if stop_when else None)
+        quiet_since = time.monotonic()
         try:
-            async for raw in reader:
-                line = raw.decode().strip()
+            while True:
+                if stop_when is not None and stop_when():
+                    return "stopped"
+                try:
+                    raw = await (asyncio.wait_for(reader.readline(), timeout=tick)
+                                 if tick else reader.readline())
+                except asyncio.TimeoutError:
+                    if silence_s and time.monotonic() - quiet_since >= silence_s:
+                        return "silent"
+                    continue
+                if not raw:
+                    return "closed"
+                line = raw.decode(errors="replace").strip()
                 if not line:
                     continue
                 try:
                     event = json.loads(line)
-                    _render_event(event, color=color)
-                    if event.get("type") == "shutdown":
-                        break
-                except (json.JSONDecodeError, UnicodeDecodeError):
+                except json.JSONDecodeError:
                     print(line, flush=True)
-
+                    quiet_since = time.monotonic()
+                    continue
+                if event.get("type") == "ping":
+                    if silence_s and time.monotonic() - quiet_since >= silence_s:
+                        return "silent"
+                    continue
+                quiet_since = time.monotonic()
+                _render_event(event, color=color)
+                if event.get("type") == "shutdown":
+                    return "shutdown"
         except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
-            if color:
-                print(f"\n{_DIM}[JARVIS] Daemon connection closed.{_RESET}")
+            return "closed"
         except asyncio.CancelledError:
-            pass
+            return "stopped"
         finally:
             try:
                 writer.close()
