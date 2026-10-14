@@ -1830,6 +1830,12 @@ const JarvisVoice = () => {
 
   const handleWebSocketMessage = (data) => {
     switch (data.type) {
+      case 'command_ack':
+        // The backend has the command and is working on it: the socket is
+        // alive, so a slow answer is not a dead connection (see sendCommand's
+        // zombie check).
+        acknowledgedRequestIdRef.current = data.requestId || null;
+        break;
       case 'connected':
         setJarvisStatus('online');
         break;
@@ -5022,9 +5028,12 @@ const JarvisVoice = () => {
         // The first response to arrive clears activeRequestIdRef; the second is dropped.
         const zombieRequestId = requestId;
         setTimeout(() => {
-          // v241.0: Only fire if this request is still active AND no retry is already in flight
-          if (activeRequestIdRef.current === zombieRequestId && !zombieRetryInFlightRef.current) {
-            console.warn('[WS] No response after 10s - trying parallel REST fallback (WS still open)');
+          // v241.0: Only fire if this request is still active AND no retry is already in flight.
+          // A request the backend acknowledged is being worked on, however long
+          // it takes: sending it again by REST ran the command twice.
+          if (activeRequestIdRef.current === zombieRequestId && !zombieRetryInFlightRef.current
+              && acknowledgedRequestIdRef.current !== zombieRequestId) {
+            console.warn('[WS] No acknowledgement after 10s - trying parallel REST fallback (WS still open)');
             zombieRetryInFlightRef.current = true;
             sendTextCommand(command).finally(() => {
               zombieRetryInFlightRef.current = false;
@@ -6055,6 +6064,8 @@ const JarvisVoice = () => {
   const SPEECH_QUEUE_TTL_MS = 45000;       // 45s matches WS timeout budget
   // v241.0: Zombie retry dedup
   const zombieRetryInFlightRef = useRef(false);
+  // The request the backend last acknowledged over the socket (command_ack).
+  const acknowledgedRequestIdRef = useRef(null);
 
   // ============================================================
   // 🔇 SELF-VOICE SUPPRESSION SYSTEM

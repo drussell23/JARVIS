@@ -1102,6 +1102,39 @@ class JarvisPrimeClient:
             return float(os.getenv("JARVIS_PRIME_COLD_LOAD_BUDGET_S", "90"))
         return 0.0
 
+    async def ensure_text_model_resident(self) -> bool:
+        """Make J-Prime's default text model resident now, if none is.
+
+        The engine loads a model on its first request, so the user's first
+        command after a boot paid the whole load -- the classifier call took
+        ~15 s while every later one took ~0.6 s (2026-10-14 10:29), after JARVIS
+        had already announced it was ready. Called while the boot is still
+        running, the load overlaps the boot instead. The engine's load is
+        Ollama's: a generate with no prompt loads the (default) model and
+        returns when it is resident. True when a text model is resident.
+        """
+        health = await self._check_local_health()
+        if not health.available:
+            return False
+        if health.model_loaded:
+            return True
+        client = await self._get_http_client()
+        if client is None:
+            return False
+        url = f"http://{self.config.local_host}:{self.config.local_port}/api/generate"
+        try:
+            resp = await client.post(
+                url, json={},
+                timeout=float(os.getenv("JARVIS_PRIME_COLD_LOAD_BUDGET_S", "90")),
+            )
+        except Exception as exc:  # noqa: BLE001 -- the first request will load it instead
+            logger.info("[JarvisPrimeClient] text model preload failed: %s", exc)
+            return False
+        if resp.status_code != 200:
+            logger.info("[JarvisPrimeClient] text model preload refused: HTTP %s", resp.status_code)
+            return False
+        return (await self._check_local_health()).model_loaded
+
     async def _check_local_health(self) -> HealthStatus:
         """Check local JARVIS-Prime health."""
         client = await self._get_http_client()

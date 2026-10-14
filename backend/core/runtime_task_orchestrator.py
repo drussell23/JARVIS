@@ -110,6 +110,9 @@ class TaskResult:
     summary: str
     total_elapsed_s: float
     plan_reasoning: str
+    # JARVIS's own voice is delivering the summary (set where it is scheduled),
+    # so a client showing this result must not speak it a second time.
+    spoken: bool = False
 
     @property
     def acted(self) -> bool:
@@ -208,6 +211,11 @@ class RuntimeTaskOrchestrator:
         elapsed = time.monotonic() - start
 
         summary = self._build_summary(query, executed)
+        if self._worked_on_desktop(executed):
+            # What JARVIS did, said the way a person would say it, from the
+            # facts of what happened -- not the outcome's log line ("Opened
+            # https://www.google.com/search?q=dogs", read out URL and all).
+            summary = await self._phrase_for_user(query, summary)
         logger.info("[RuntimeTask] %s: %s (%.1fs)", task_id, "SUCCESS" if success else "PARTIAL", elapsed)
 
         result = TaskResult(
@@ -228,6 +236,7 @@ class RuntimeTaskOrchestrator:
         # v305.0: Fire-and-forget voice announcement on success so the user
         # gets audible confirmation that JARVIS completed their request.
         if result.success:
+            result.spoken = True
             asyncio.create_task(
                 self._speak_completion(result),
                 name=f"voice_completion_{task_id}",
@@ -1891,6 +1900,55 @@ class RuntimeTaskOrchestrator:
     # Step 5.5: Voice completion feedback
     # -----------------------------------------------------------------------
 
+    @staticmethod
+    def _worked_on_desktop(executed: List[StepResolution]) -> bool:
+        """Whether the task acted on the desktop (opened, closed, looked) rather
+        than answering -- an answer is already words for the user."""
+        return any(s.resolution in (TaskResolution.VISION_ACTION, TaskResolution.DESKTOP_ACTION)
+                   for s in executed)
+
+    async def _phrase_for_user(self, query: str, outcome: str) -> str:
+        """The outcome of a desktop task as JARVIS would say it to the user.
+
+        One short sentence from the Mind, told only the request and the facts
+        of what happened (successes and failures alike), bounded by
+        JARVIS_REPLY_PHRASE_TIMEOUT_S. The factual outcome stands when the
+        Mind is unavailable or slow: a plain true sentence beats a late one.
+        """
+        if self._prime is None or not outcome.strip():
+            return outcome
+        try:
+            from backend.core.owner import owner_name
+            name = owner_name()
+        except Exception:  # noqa: BLE001 -- unnamed: speak without a name
+            name = ""
+        prompt = (
+            f"The user{f' ({name})' if name else ''} asked: {query}\n"
+            f"What you did, as it happened:\n{outcome}\n\n"
+            "Tell them what you did in one short spoken sentence, the way a capable assistant "
+            "talks to the person it works for. Say what they will now see or what changed; "
+            "say plainly if something did not work. Claim nothing the lines above do not say "
+            "happened -- what is \"still open\" was not closed. No URLs, file paths or technical "
+            "detail. Reply with the sentence only."
+        )
+        try:
+            response = await asyncio.wait_for(
+                self._prime.generate(
+                    prompt=prompt,
+                    system_prompt="You are JARVIS, a personal AI assistant, speaking to its user.",
+                    max_tokens=80,
+                    temperature=0.3,
+                ),
+                timeout=float(os.getenv("JARVIS_REPLY_PHRASE_TIMEOUT_S", "4")),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- the factual outcome stands
+            logger.debug("[RuntimeTask] reply phrasing unavailable: %s", exc)
+            return outcome
+        said = str(getattr(response, "content", "") or "").strip().strip('"').strip()
+        return said or outcome
+
     async def _speak_completion(self, result: TaskResult) -> None:
         """Speak a brief completion message so the user gets audible feedback.
 
@@ -1898,16 +1956,10 @@ class RuntimeTaskOrchestrator:
         which routes through say -o tempfile → afplay (no GIL, no device contention).
         """
         try:
-            from backend.core.supervisor.unified_voice_orchestrator import safe_say
-
-            # Speak the summary the user is shown: its first paragraph (a
-            # research answer's source list is for reading, not listening).
-            limit = int(os.getenv("JARVIS_SPOKEN_SUMMARY_MAX_CHARS", "300"))
-            first = (result.summary or "Done.").strip().split("\n\n", 1)[0]
-            msg = first if len(first) <= limit else first[:limit].rsplit(" ", 1)[0] + "…"
+            from backend.core.supervisor.unified_voice_orchestrator import safe_say, spoken_form
 
             await safe_say(
-                msg,
+                spoken_form(result.summary or "Done."),
                 source="runtime_task_completion",
                 skip_dedup=False,  # v307: dedup enabled — prevents "Done" repeating 3-4x
             )

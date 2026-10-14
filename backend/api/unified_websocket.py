@@ -81,6 +81,45 @@ connection_safeguards: Dict[str, StreamingSafeguard] = {}
 # ============================================================================
 
 
+
+# ---------------------------------------------------------------------------
+# One voice for command replies
+# ---------------------------------------------------------------------------
+# JARVIS speaks through ONE voice: the persona's, behind the process-wide
+# speaker lock, so lines never overlap. A reply was being said twice at once
+# -- by JARVIS's voice and by the browser, from the same response -- and an
+# acknowledgement was said before every command, over the answer.
+
+_ACKNOWLEDGEMENTS = (
+    "On it.", "Give me a moment.", "Let me check.",
+    "Sure thing.", "Working on that.", "Just a moment.",
+)
+
+
+async def _acknowledge_if_slow() -> None:
+    """Say a short acknowledgement only if the command is still running
+    after ``JARVIS_ACK_AFTER_S`` -- a person acknowledges a request that takes
+    a while, not one answered at once. Cancelled when the reply is ready."""
+    import random
+
+    await asyncio.sleep(float(os.getenv("JARVIS_ACK_AFTER_S", "2.5")))
+    from backend.core.supervisor.unified_voice_orchestrator import safe_say
+    await safe_say(random.choice(_ACKNOWLEDGEMENTS), wait=False, source="command_acknowledgement")
+
+
+async def _say_reply(text: str) -> bool:
+    """Say *text* in JARVIS's voice; True when it is being said (the client
+    then shows it without speaking it)."""
+    try:
+        from backend.core.supervisor.unified_voice_orchestrator import safe_say, spoken_form
+        asyncio.create_task(
+            safe_say(spoken_form(text), source="command_reply"), name="command_reply_voice",
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 -- the client speaks it instead
+        logger.debug("[WS] reply voice unavailable: %s", exc)
+        return False
+
 class ConnectionState(Enum):
     """WebSocket connection states"""
 
@@ -1597,6 +1636,15 @@ class UnifiedWebSocketManager:
                         logger.info("[WS-APPROVAL] Pending approval handled via voice response")
                         return approval_response
 
+                    # Tell the client its command is here and being worked on. A
+                    # client that hears nothing assumes the socket died and sends
+                    # the command again by another route -- "search for dogs" ran
+                    # twice when the first run took 20 s. Liveness, not a clock.
+                    await self._safe_send_json(client_id, {
+                        "type": "command_ack",
+                        "requestId": message.get("requestId"),
+                        "timestamp": time.time(),
+                    })
                     logger.info("=" * 70)
                     logger.info(f"[WS-VBI] COMMAND RECEIVED")
                     logger.info("=" * 70)
@@ -2010,6 +2058,9 @@ class UnifiedWebSocketManager:
                             # ===========================================================
                             # v32.0: PROCESS COMMAND WITH DYNAMIC TIMEOUT
                             # ===========================================================
+                            acknowledgement = asyncio.create_task(
+                                _acknowledge_if_slow(), name="command_acknowledgement",
+                            )
                             try:
                                 # v241.0: Inner layers use command_obj.deadline to self-terminate.
                                 # This wait_for is a safety net 3s past the deadline, not the primary timeout.
@@ -2032,6 +2083,7 @@ class UnifiedWebSocketManager:
                                     "command_type": "surveillance" if is_surveillance_command else "unknown",
                                 }
                             finally:
+                                acknowledgement.cancel()
                                 # Cancel progress updates
                                 progress_cancelled.set()
                                 progress_task.cancel()
@@ -2045,6 +2097,7 @@ class UnifiedWebSocketManager:
                                 "success": jarvis_result.get("success", jarvis_result.get("status") == "success"),
                                 "command_type": jarvis_result.get("command_type", "unknown"),
                                 "metadata": jarvis_result,
+                                "spoken": bool(jarvis_result.get("spoken")),
                             }
 
                             logger.info(f"[WS] JARVIS response: {result.get('response', '')[:100]}")
@@ -2138,11 +2191,15 @@ class UnifiedWebSocketManager:
                     else:
                         # Standard command response
                         # v238.0: Echo requestId for frontend dedup.
+                        if result.get("response") and not result.get("spoken"):
+                            result["spoken"] = await _say_reply(result["response"])
                         response_dict = {
                             "type": "command_response",
                             "response": result.get("response"),
                             "success": result.get("success", True),
-                            "speak": True,  # Enable text-to-speech for all responses
+                            # Speak it here only when JARVIS's own voice is not
+                            # already saying it -- one voice, never two.
+                            "speak": not result.get("spoken", False),
                             "requestId": message.get("requestId"),
                         }
 

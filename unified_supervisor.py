@@ -68886,6 +68886,10 @@ class JarvisSystemKernel:
                             say=lambda _m: self.logger.info(f"[EarlyPrime] {_m.strip()}"),
                         )
                         self.logger.info(f"[EarlyPrime] J-Prime {_status.state} at {_status.url or '-'}")
+                        if _status.state in ("serving", "started"):
+                            # Its text model loads on the first request; load it
+                            # while the boot runs, not on the user's first command.
+                            create_safe_task(self._make_mind_resident(), name="jprime-text-residency")
                         return
 
                     # Import TrinityIntegrator to start Prime
@@ -87373,6 +87377,20 @@ class JarvisSystemKernel:
             self.logger.info(f"[Kernel] Loading page presence unknown on :{port} "
                              f"({type(exc).__name__}: {exc}); opening the app")
         return await self._open_page_portable(url)
+
+    async def _make_mind_resident(self) -> None:
+        """Load J-Prime's text model during the boot (JarvisPrimeClient)."""
+        try:
+            from backend.core.jarvis_prime_client import get_jarvis_prime_client
+            started = time.monotonic()
+            resident = await get_jarvis_prime_client().ensure_text_model_resident()
+            self.logger.info(
+                "[EarlyPrime] J-Prime text model %s (%.1fs)",
+                "resident" if resident else "not resident -- the first command will load it",
+                time.monotonic() - started,
+            )
+        except Exception as exc:  # noqa: BLE001 -- the first request loads it instead
+            self.logger.debug(f"[EarlyPrime] text model residency: {exc}")
 
     async def _retire_loading_server_after_handoff(self) -> None:
         """Stop the loading server once its page has handed over to the app.

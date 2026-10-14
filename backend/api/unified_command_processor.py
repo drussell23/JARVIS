@@ -1999,11 +1999,14 @@ class UnifiedCommandProcessor:
         if rto_result is None:
             return None
         summary = getattr(rto_result, "summary", None) or str(rto_result)
+        # Whether JARVIS's voice is already saying it: the client then shows
+        # it without speaking it again (two voices at once, 2026-10-14).
+        spoken = bool(getattr(rto_result, "spoken", False))
         if getattr(rto_result, "success", False):
-            return {"success": True, "response": summary,
+            return {"success": True, "response": summary, "spoken": spoken,
                     "command_type": "ACTION", "source": "rto_pillar5"}
         if getattr(rto_result, "acted", False):
-            return {"success": False, "response": summary,
+            return {"success": False, "response": summary, "spoken": spoken,
                     "command_type": "ACTION", "source": "rto_pillar5"}
         return None
 
@@ -2162,15 +2165,9 @@ class UnifiedCommandProcessor:
                     _classification.intent == CommandIntent.ACTION and _classification.confidence >= 0.7:
                 _p5log("ACTION detected — dispatching to RTO (agentic resolution)")
 
-                # Directive 3: Transparent latency — narrate synthesis to user
-                try:
-                    from backend.core.supervisor.unified_voice_orchestrator import safe_say
-                    asyncio.create_task(safe_say(
-                        f"On it, Sir. Synthesizing a solution now.",
-                        wait=False, source="pillar5_preroute",
-                    ))
-                except Exception:
-                    pass  # Voice narration is best-effort
+                # (No spoken pre-announcement: "On it, Sir. Synthesizing a
+                # solution now." was said for every action, synthesis or not,
+                # and played over the result. The result is what is said.)
 
                 try:
                     from backend.core.runtime_task_orchestrator import (
@@ -2299,22 +2296,9 @@ class UnifiedCommandProcessor:
         # === Step 3: J-Prime call (the brain) ===
         logger.info(f"[v242] Sending to J-Prime: '{command_text[:80]}'")
 
-        # v284.0: Early auditory acknowledgment — fires before the J-Prime
-        # round-trip (~5-19s) so the user gets immediate feedback that JARVIS
-        # heard them. Fire-and-forget: never blocks processing or response.
-        try:
-            from backend.core.supervisor.unified_voice_orchestrator import safe_say
-            import random as _rnd
-            _THINKING_CUES = [
-                "On it.", "Give me a moment.", "Let me check.",
-                "Sure thing.", "Working on that.", "Just a moment.",
-            ]
-            asyncio.create_task(
-                safe_say(_rnd.choice(_THINKING_CUES), source="thinking_cue"),
-                name="jprime_thinking_cue",
-            )
-        except Exception:
-            pass  # Never let a missing TTS import delay the actual call
+        # (The "thinking" acknowledgement is the WebSocket layer's: it is said
+        # only when a command is still running after JARVIS_ACK_AFTER_S, in the
+        # one voice that also says the reply -- never over it.)
 
         # v242.1: Build lightweight context for J-Prime classification
         _jprime_ctx: Dict[str, Any] = {}

@@ -1378,6 +1378,15 @@ def _voice_muted() -> bool:
         return False
 
 
+def spoken_form(text: str) -> str:
+    """What of a reply is said aloud: its first paragraph (a research
+    answer's source list is for reading, not listening), cut at a word
+    boundary at ``JARVIS_SPOKEN_SUMMARY_MAX_CHARS``."""
+    limit = int(os.getenv("JARVIS_SPOKEN_SUMMARY_MAX_CHARS", "300"))
+    first = (text or "").strip().split("\n\n", 1)[0]
+    return first if len(first) <= limit else first[:limit].rsplit(" ", 1)[0] + "…"
+
+
 async def safe_say(
     text: str,
     voice: Optional[str] = None,
