@@ -1,5 +1,5 @@
 """
-desktop_open - the one way JARVIS opens a URL, a file or an application.
+desktop_open - put a web page, a search's results, a file or an app on the user's screen for them to see.
 
 Five call sites used to shell out to macOS ``open`` / ``open -a`` / osascript
 (runtime_task_orchestrator, ApplicationLauncherExecutor x2,
