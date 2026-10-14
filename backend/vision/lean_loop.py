@@ -859,7 +859,9 @@ class LeanVisionLoop:
                 elif item.get("type") == "text":
                     parts.append({"type": "text", "text": item["text"]})
             messages.append({"role": "user", "content": parts})
-            answer = await local.chat(messages, max_tokens=2048)
+            # The loop acts on the user's desktop because the user asked: a person
+            # is waiting, so J-Prime may swap an idle primary out to admit vision.
+            answer = await local.chat(messages, max_tokens=2048, priority="foreground")
             if not answer.ok:
                 logger.warning("[LeanVision:AG] local vision (%s) failed: %s", local.model, answer.error)
                 return None
@@ -1597,6 +1599,11 @@ class LeanVisionLoop:
     # ------------------------------------------------------------------
     # Computer Use — screenshot capture (PNG at CU display resolution)
     # ------------------------------------------------------------------
+
+    async def capture_screen(self) -> Optional[str]:
+        """The current screen as base64 PNG (CU display size), through the
+        same platform capture cascade the loop sees with; None if it failed."""
+        return await self._capture_cu_screenshot()
 
     async def _capture_cu_screenshot(self) -> Optional[str]:
         """Capture screen as PNG at CU display resolution.

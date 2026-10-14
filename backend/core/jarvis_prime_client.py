@@ -1074,6 +1074,18 @@ class JarvisPrimeClient:
         self._health_cache[mode] = status
         return status
 
+    @staticmethod
+    def _text_model_loaded(data: Any) -> bool:
+        """Whether the server has a text-generation model resident right now.
+
+        J-Prime's OpenAI listing marks each model ``loaded`` (and ``vision``);
+        a server that reports a single ``model_loaded`` flag is read as such.
+        """
+        if isinstance(data, dict) and isinstance(data.get("data"), list):
+            return any(isinstance(m, dict) and m.get("loaded") and not m.get("vision")
+                       for m in data["data"])
+        return bool(isinstance(data, dict) and data.get("model_loaded", False))
+
     async def _check_local_health(self) -> HealthStatus:
         """Check local JARVIS-Prime health."""
         client = await self._get_http_client()
@@ -1094,7 +1106,7 @@ class JarvisPrimeClient:
                 return HealthStatus(
                     available=True,
                     latency_ms=latency,
-                    model_loaded=data.get("model_loaded", False),
+                    model_loaded=self._text_model_loaded(data),
                 )
             else:
                 return HealthStatus(
@@ -1916,6 +1928,14 @@ class JarvisPrimeClient:
         url = f"http://{self.config.local_host}:{self.config.local_port}/v1/chat/completions"
         # v278.0: Budget-aware timeout
         config_timeout = self.config.local_timeout_ms / 1000.0
+        # The configured timeout assumes a resident model. When none is (the
+        # server swapped the text model out to admit vision for a foreground
+        # request), this request also pays the reload: allow it, or the next
+        # question after "can you see my screen?" times out at 5 s mid-load.
+        # Read fresh, not from the TTL cache: the swap is seconds old.
+        health = await self._check_local_health()
+        if health.available and not health.model_loaded:
+            config_timeout += float(os.getenv("JARVIS_PRIME_COLD_LOAD_BUDGET_S", "90"))
         timeout = self._compute_effective_timeout(config_timeout, deadline)
         if timeout is None:
             return CompletionResponse(

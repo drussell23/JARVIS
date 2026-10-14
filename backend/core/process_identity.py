@@ -42,7 +42,8 @@ import os
 import sys
 import threading
 from pathlib import Path
-from typing import Iterable, List, Optional, Set
+from contextvars import ContextVar
+from typing import FrozenSet, Iterable, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -177,8 +178,34 @@ def _script_of(cmdline: List[str]) -> tuple:
     return None, None
 
 
+def _structurally_owned(proc, roots: List[Path]) -> bool:
+    """An interpreter whose script (or, for -m, working directory) lies in a
+    Trinity root, or any other executable that lives in one."""
+    exe = proc.exe()
+    stem = Path(exe).stem.lower() if exe else ""
+    if not stem.startswith(_INTERPRETER_STEMS):
+        return bool(exe) and _within(Path(exe), roots)
+    script, module = _script_of(proc.cmdline())
+    cwd = Path(proc.cwd())
+    if script:
+        path = Path(script)
+        if not path.is_absolute():
+            path = cwd / path
+        return _within(path, roots)
+    if module:
+        return _within(cwd, roots)
+    return False
+
+
 def owned_by_trinity(pid: int) -> bool:
-    """Structural answer to "may JARVIS signal this process?" (see module doc)."""
+    """Structural answer to "may JARVIS signal this process?" (see module doc).
+
+    Ownership is inherited: a process descended from a Trinity-owned one
+    belongs to it (npm.cmd -> node -> react-scripts). Without that, a tree
+    killed from the top lost the link mid-way -- the orphaned cmd.exe under
+    the dev server was refused, and the UI's port stayed held. The walk up
+    stops at this process's own lineage, so a launcher is never claimed.
+    """
     if pid == os.getpid():
         return True
     try:
@@ -187,25 +214,25 @@ def owned_by_trinity(pid: int) -> bool:
         return False
     try:
         me = psutil.Process(os.getpid())
-        if any(p.pid == pid for p in me.parents()):
+        my_lineage = {p.pid for p in me.parents()}
+        if pid in my_lineage:
             return False
         if any(c.pid == pid for c in me.children(recursive=True)):
             return True
         proc = psutil.Process(pid)
         roots = trinity_roots()
-        exe = proc.exe()
-        stem = Path(exe).stem.lower() if exe else ""
-        if not stem.startswith(_INTERPRETER_STEMS):
-            return bool(exe) and _within(Path(exe), roots)
-        script, module = _script_of(proc.cmdline())
-        cwd = Path(proc.cwd())
-        if script:
-            path = Path(script)
-            if not path.is_absolute():
-                path = cwd / path
-            return _within(path, roots)
-        if module:
-            return _within(cwd, roots)
+        if _structurally_owned(proc, roots):
+            return True
+        for ancestor in proc.parents():
+            if ancestor.pid in my_lineage:
+                return False
+            if ancestor.pid == me.pid:
+                return True
+            try:
+                if _structurally_owned(ancestor, roots):
+                    return True
+            except (psutil.Error, OSError, ValueError):
+                continue
         return False
     except (psutil.Error, OSError, ValueError):
         return False
@@ -219,6 +246,79 @@ def _describe(pid: int) -> str:
         return f"pid={pid} name={proc.name()!r}"
     except Exception:  # noqa: BLE001
         return f"pid={pid}"
+
+
+#: Pids a kill_process_tree call has authorized as one unit (see below).
+_authorized_tree: ContextVar[FrozenSet[int]] = ContextVar("jarvis_authorized_tree", default=frozenset())
+
+
+def kill_process_tree(pid: int, timeout: float = 5.0) -> bool:
+    """Terminate *pid* and every descendant: deepest first, then force-kill
+    survivors after *timeout*. True if the tree is gone.
+
+    Where there are no process groups (Windows), this is the only way to stop
+    what a launcher started: terminating ``npm.cmd`` left its ``node``
+    dev server holding the UI's port after JARVIS had stopped.
+
+    Ownership is judged ONCE, on the intact tree, at its root: a tree falls
+    apart while it is being killed (npm's parents exit as soon as their child
+    does), so re-judging each member mid-kill refused live, now-orphaned
+    members. When the guard is active and the root is not Trinity's, nothing
+    is touched.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return False
+    try:
+        parent = psutil.Process(pid)
+        if kill_guard_enabled() and not owned_by_trinity(pid):
+            logger.warning("[KillGuard] refused to stop the tree of %s: not Trinity-owned",
+                           _describe(pid))
+            return False
+        children = parent.children(recursive=True)
+        token = _authorized_tree.set(frozenset([pid] + [c.pid for c in children]))
+        try:
+            # Deepest first: a child never outlives the parent that would reap it.
+            for child in reversed(children):
+                try:
+                    child.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+            try:
+                parent.terminate()
+            except psutil.NoSuchProcess:
+                pass
+            gone, alive = psutil.wait_procs([parent] + children, timeout=timeout)
+            for proc in alive:
+                try:
+                    logger.warning("Force killing stuck process PID %s", proc.pid)
+                    proc.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            psutil.wait_procs(alive, timeout=2.0)
+        finally:
+            _authorized_tree.reset(token)
+        return True
+    except psutil.NoSuchProcess:
+        return True  # Already gone
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Error killing process tree %s: %s", pid, exc)
+        return False
+
+
+def _may_signal(pid: int) -> bool:
+    """The kill guard's one rule for both os.kill and psutil.Process.
+
+    A member of a tree being stopped as a unit; a process that no longer
+    exists (the real call reports that, the guard must not call it foreign);
+    otherwise structural ownership.
+    """
+    if pid in _authorized_tree.get():
+        return True
+    if not pid_alive(pid):
+        return True
+    return owned_by_trinity(pid)
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +352,7 @@ def install_kill_guard() -> bool:
                         raise ProcessLookupError(3, "No such process")
                     return None
                 return real_kill(pid, sig)
-            if not owned_by_trinity(pid):
+            if not _may_signal(pid):
                 logger.warning(
                     "[KillGuard] refused signal %s to %s: not a Trinity-owned process",
                     sig, _describe(pid),
@@ -270,7 +370,7 @@ def install_kill_guard() -> bool:
                 real = getattr(psutil.Process, method_name)
 
                 def guarded(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-                    if not owned_by_trinity(self.pid):
+                    if not _may_signal(self.pid):
                         logger.warning(
                             "[KillGuard] refused %s on %s: not a Trinity-owned process",
                             method_name, _describe(self.pid),
@@ -293,6 +393,7 @@ def install_kill_guard() -> bool:
 
 __all__ = [
     "install_kill_guard",
+    "kill_process_tree",
     "kill_guard_enabled",
     "owned_by_trinity",
     "pid_alive",

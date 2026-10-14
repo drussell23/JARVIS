@@ -790,48 +790,8 @@ def find_stuck_ml_processes(marker: str = "JARVIS_ML_LOADER") -> List[Dict[str, 
     return stuck_processes
 
 
-def kill_process_tree(pid: int, timeout: float = 5.0) -> bool:
-    """
-    Kill a process and all its children.
-
-    Uses SIGTERM first, then SIGKILL if needed.
-    Returns True if process was killed successfully.
-    """
-    try:
-        parent = psutil.Process(pid)
-        children = parent.children(recursive=True)
-
-        # Kill children first
-        for child in children:
-            try:
-                child.terminate()
-            except psutil.NoSuchProcess:
-                pass
-
-        # Terminate parent
-        parent.terminate()
-
-        # Wait for graceful termination
-        gone, alive = psutil.wait_procs([parent] + children, timeout=timeout)
-
-        # Force kill any survivors
-        for proc in alive:
-            try:
-                logger.warning(f"Force killing stuck process PID {proc.pid}")
-                proc.kill()
-            except psutil.NoSuchProcess:
-                pass
-
-        # Final wait
-        psutil.wait_procs(alive, timeout=2.0)
-
-        return True
-
-    except psutil.NoSuchProcess:
-        return True  # Already dead
-    except Exception as e:
-        logger.error(f"Error killing process tree {pid}: {e}")
-        return False
+# The one implementation lives with process ownership (backend.core.process_identity).
+from backend.core.process_identity import kill_process_tree  # noqa: E402
 
 
 async def cleanup_stuck_ml_processes(

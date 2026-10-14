@@ -311,117 +311,122 @@ import os as _os
 import sys as _sys
 from pathlib import Path as _Path
 
-# This is a function that ensures we're running with the venv Python.
-def _ensure_venv_python() -> None: 
-    """
-    Ensure we're running with the venv Python.
-    Re-executes script with venv Python if necessary.
+def _venv_python_candidates(script_dir: "_Path") -> list:
+    """Interpreters of the project venv, in preference order, for this OS.
 
-    Uses interpreter-prefix checks first (sys.prefix/base_prefix) and only
-    uses executable/path hints as secondary signals.
+    JARVIS_BODY_VENV names the Body's venv explicitly; scripts/windows/jarvis.ps1
+    honours the same variable and the same default, so `python
+    unified_supervisor.py` and the launcher always run the same environment.
+    Repo-local venv/.venv follow, in the platform's layout (bin/ vs Scripts\\).
+    """
+    roots = []
+    explicit = _os.environ.get("JARVIS_BODY_VENV", "").strip()
+    if explicit:
+        roots.append(_Path(explicit).expanduser())
+    roots += [script_dir / "venv", script_dir / ".venv"]
+    if _sys.platform == "win32":
+        local_app_data = _os.environ.get("LOCALAPPDATA", "")
+        if local_app_data and not explicit:
+            roots.append(_Path(local_app_data) / "JARVIS" / "venvs" / "body")
+        names = [("Scripts", "python.exe")]
+    else:
+        names = [("bin", "python3"), ("bin", "python")]
+    return [root / folder / exe for root in roots for folder, exe in names]
+
+
+# This is a function that ensures we're running with the venv Python.
+def _ensure_venv_python() -> None:
+    """
+    Ensure the kernel runs in the project venv, and on Windows in UTF-8 mode.
+
+    One relaunch decides both: the interpreter (sys.prefix identity first,
+    then VIRTUAL_ENV, then the executable path), and Python's UTF-8 mode on
+    Windows, which can only be chosen when the interpreter starts (the ANSI
+    code page cannot encode the emoji every log file handler writes).
+
+    POSIX replaces this process (execv). Windows has no exec -- os.execv
+    starts a new process and ends this one, so the shell's prompt returned
+    while the kernel kept writing to the console and Ctrl+C reached a
+    detached child. There this process becomes a transparent parent: it
+    waits, leaves console Ctrl+C to the kernel, and exits with its code.
 
     Root cause fixed (v279.0):
     A prior site-packages substring heuristic could return a false positive
     ("venv in sys.path") while still running system Python, which produced
     mixed interpreter/package state and downstream import instability.
     """
-    # Skip if explicitly disabled
     if _os.environ.get('JARVIS_SKIP_VENV_CHECK') == '1':
         return
-
-    # Skip if already re-executed (prevent infinite loop)
+    # Already relaunched once: never loop, whatever the checks below say.
     if _os.environ.get('_JARVIS_VENV_REEXEC') == '1':
         return
 
-    script_dir = _Path(__file__).parent.resolve() # This is the script directory.
+    script_dir = _Path(__file__).parent.resolve()
+    venv_python = next((c for c in _venv_python_candidates(script_dir) if c.exists()), None)
+    venv_root = None
+    if venv_python is not None:
+        try:
+            venv_root = venv_python.parent.parent.resolve()
+        except Exception:
+            venv_root = venv_python.parent.parent
 
-    # Find venv Python (try multiple locations)
-    venv_candidates = [ # This is a list of potential venv Python executables.
-        script_dir / "venv" / "bin" / "python3", # This is the venv Python executable.
-        script_dir / "venv" / "bin" / "python", # This is the venv Python executable.
-        script_dir / ".venv" / "bin" / "python3", # This is the venv Python executable.
-        script_dir / ".venv" / "bin" / "python", # This is the venv Python executable.
-    ]
+    def _inside_venv() -> bool:
+        if venv_root is None:
+            return True  # No project venv: the current interpreter is the one to use.
+        # Interpreter identity: a venv interpreter's sys.prefix IS the venv
+        # root (on Windows too, through the venv's python.exe launcher).
+        try:
+            return _Path(getattr(_sys, "prefix", "")).resolve() == venv_root
+        except Exception:
+            return False
 
-    venv_python = None # This is the venv Python executable.
-    venv_roots = set()
-    for candidate in venv_candidates: # This is a list of potential venv Python executables.
-        if candidate.exists(): # This is a check to see if the candidate exists.
-            try:
-                venv_roots.add(candidate.parent.parent.resolve())
-            except Exception:
-                pass
-            venv_python = candidate # This is the venv Python executable.
-            break # This is a break statement to exit the loop.
-
-    if not venv_python: # This is a check to see if the venv Python executable was found.  
-        return  # No venv found, continue with current Python. This is a return statement to exit the function.
-
-    # Primary: prefix-based interpreter identity (robust with symlinked binaries)
-    current_prefix = None
-    base_prefix = None
-    try:
-        current_prefix = _Path(getattr(_sys, "prefix", "")).resolve()
-    except Exception:
-        current_prefix = None
-    try:
-        base_prefix = _Path(getattr(_sys, "base_prefix", getattr(_sys, "prefix", ""))).resolve()
-    except Exception:
-        base_prefix = None
-
-    if current_prefix and base_prefix and current_prefix != base_prefix:
-        if current_prefix in venv_roots:
-            return  # Already running inside the expected project venv.
-
-    # Secondary: explicit VIRTUAL_ENV ownership
-    active_virtual_env = None
-    try:
-        raw_virtual_env = _os.environ.get("VIRTUAL_ENV", "")
-        if raw_virtual_env:
-            active_virtual_env = _Path(raw_virtual_env).resolve()
-    except Exception:
-        active_virtual_env = None
-    if active_virtual_env and active_virtual_env in venv_roots:
+    wrong_interpreter = not _inside_venv()
+    needs_utf8 = _sys.platform == "win32" and not _sys.flags.utf8_mode
+    if not wrong_interpreter and not needs_utf8:
         return
 
-    # Tertiary: executable path hint (without resolving symlink target)
-    current_exe = _Path(_sys.executable)
-    if any(str(root / "bin") in str(current_exe) for root in venv_roots):
-        return
+    target = venv_python if wrong_interpreter else _Path(_sys.executable)
+    if wrong_interpreter:
+        print(f"[KERNEL] Detected system Python without venv packages")
+        print(f"[KERNEL] Current: {_sys.executable}")
+        print(f"[KERNEL] Switching to: {target}")
+        _os.environ['VIRTUAL_ENV'] = str(venv_root)
+        _os.environ['PYTHONNOUSERSITE'] = '1'
+        venv_bin = str(target.parent)
+        existing_path = _os.environ.get('PATH', '')
+        _os.environ['PATH'] = f"{venv_bin}{_os.pathsep}{existing_path}" if existing_path else venv_bin
+        _os.environ['PYTHONPATH'] = _os.pathsep.join(
+            p for p in (str(script_dir), str(script_dir / "backend"),
+                        _os.environ.get('PYTHONPATH', '')) if p
+        )
+    _os.environ['_JARVIS_VENV_REEXEC'] = '1'
 
-    # NOT running with venv - need to re-exec
-    print(f"[KERNEL] Detected system Python without venv packages") # This is a print statement to print the message.
-    print(f"[KERNEL] Current: {_sys.executable}") # This is a print statement to print the current executable.
-    print(f"[KERNEL] Switching to: {venv_python}") # This is a print statement to print the venv Python executable.
+    flags = ["-X", "utf8"] if _sys.platform == "win32" else []
+    argv = [str(target)] + flags + [_os.path.abspath(_sys.argv[0])] + _sys.argv[1:]
 
-    _os.environ['_JARVIS_VENV_REEXEC'] = '1' # This is a setting to indicate that we have re-executed with the venv Python.
-    _os.environ['VIRTUAL_ENV'] = str(venv_python.parent.parent)
-    _os.environ['PYTHONNOUSERSITE'] = '1'
+    if _sys.platform != "win32":
+        _os.execv(str(target), argv)
 
-    # Ensure venv executables dominate subprocess resolution.
-    venv_bin = str(venv_python.parent)
-    existing_path = _os.environ.get('PATH', '')
-    if existing_path:
-        _os.environ['PATH'] = f"{venv_bin}{_os.pathsep}{existing_path}"
-    else:
-        _os.environ['PATH'] = venv_bin
+    import signal as _sig
+    import subprocess as _sp
 
-    # Set PYTHONPATH to include project directories
-    pythonpath = _os.pathsep.join([ # This is the PYTHONPATH environment variable.
-        str(script_dir), # This is the script directory.
-        str(script_dir / "backend"), # This is the backend directory.
-        _os.environ.get('PYTHONPATH', '') # This is the PYTHONPATH environment variable.
-    ])
-    _os.environ['PYTHONPATH'] = pythonpath # This is the PYTHONPATH environment variable.
+    # Console Ctrl+C is delivered to every process on the console: the kernel
+    # handles it (graceful shutdown); this waiter must not die before it.
+    _sig.signal(_sig.SIGINT, _sig.SIG_IGN)
+    try:
+        _sys.stdout.flush()
+        _sys.stderr.flush()
+    except Exception:
+        pass
+    _code = _sp.call(argv)
+    _os._exit(_code if isinstance(_code, int) and _code >= 0 else 1)
 
-    # Re-execute with venv Python
-    _os.execv(str(venv_python), [str(venv_python)] + _sys.argv) # This is the execv function to re-execute with the venv Python.
 
 # Execute venv check immediately
 _ensure_venv_python()
 
 # Clean up temporary imports
-del _os, _sys, _Path, _ensure_venv_python
+del _os, _sys, _Path, _ensure_venv_python, _venv_python_candidates
 
 # =============================================================================
 # FAST EARLY-EXIT FOR RUNNING KERNEL
@@ -87580,38 +87585,18 @@ class JarvisSystemKernel:
         if hasattr(self, '_frontend_process') and self._frontend_process:
             if self._frontend_process.returncode is None:
                 self.logger.info("[Frontend] Stopping...")
-                try:
-                    # v211.0: Try to terminate the process group (includes npm children)
-                    pid = self._frontend_process.pid
-                    try:
-                        # Send SIGTERM to the entire process group
-                        import signal
-                        os.killpg(os.getpgid(pid), signal.SIGTERM)
-                    except (ProcessLookupError, PermissionError, OSError):
-                        # Fallback to just terminating the main process
-                        self._frontend_process.terminate()
-                    
-                    await asyncio.wait_for(
-                        self._frontend_process.wait(),
-                        timeout=_get_env_float("JARVIS_FRONTEND_GRACEFUL_TIMEOUT", 10.0),
+                if hasattr(os, "killpg"):
+                    await self._stop_frontend_process_group()
+                else:
+                    # No process groups (Windows): npm.cmd -> node -> react-scripts
+                    # is a TREE, and terminating the launcher left the dev server
+                    # holding the UI's port after JARVIS stopped.
+                    from backend.core.process_identity import kill_process_tree
+
+                    await asyncio.to_thread(
+                        kill_process_tree, self._frontend_process.pid,
+                        _get_env_float("JARVIS_FRONTEND_GRACEFUL_TIMEOUT", 10.0),
                     )
-                except asyncio.TimeoutError:
-                    # Force kill if graceful shutdown fails
-                    try:
-                        import signal
-                        os.killpg(os.getpgid(self._frontend_process.pid), signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError, OSError):
-                        try:
-                            self._frontend_process.kill()
-                        except ProcessLookupError:
-                            pass  # v253.2: Already exited
-                    try:
-                        await asyncio.wait_for(
-                            self._frontend_process.wait(),
-                            timeout=_get_env_float("JARVIS_FRONTEND_KILL_TIMEOUT", 5.0),
-                        )
-                    except asyncio.TimeoutError:
-                        pass  # v253.2: Bounded wait
                 self.logger.info("[Frontend] Stopped")
             self._frontend_process = None
         
@@ -87623,6 +87608,37 @@ class JarvisSystemKernel:
                 pass
             self._frontend_log_file = None
             self._frontend_log_fd = None
+
+    async def _stop_frontend_process_group(self) -> None:
+        """v211.0: SIGTERM the frontend's process group (npm and its children),
+        SIGKILL it if it outlives the graceful timeout."""
+        import signal
+
+        try:
+            pid = self._frontend_process.pid
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                self._frontend_process.terminate()
+            await asyncio.wait_for(
+                self._frontend_process.wait(),
+                timeout=_get_env_float("JARVIS_FRONTEND_GRACEFUL_TIMEOUT", 10.0),
+            )
+        except asyncio.TimeoutError:
+            try:
+                os.killpg(os.getpgid(self._frontend_process.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    self._frontend_process.kill()
+                except ProcessLookupError:
+                    pass  # v253.2: Already exited
+            try:
+                await asyncio.wait_for(
+                    self._frontend_process.wait(),
+                    timeout=_get_env_float("JARVIS_FRONTEND_KILL_TIMEOUT", 5.0),
+                )
+            except asyncio.TimeoutError:
+                pass  # v253.2: Bounded wait
 
     async def _cleanup_stale_port_process(self, port: int, label: str) -> None:
         """
@@ -98211,6 +98227,9 @@ def main() -> int:
         "--monitor-prime", "--monitor-reactor", "--monitor-trinity",
         "--cleanup", "--check-only", "--dashboard", "--install-watchdog",
         "--uninstall-watchdog", "--force", "--restart",
+        # argparse's informational flags answer and exit; they must never
+        # attach to a running daemon's log stream (--version streamed pings).
+        "--version", "--help", "-h",
     }
     _is_control_invocation = bool(_CONTROL_FLAGS & set(sys.argv[1:]))
     if not _is_control_invocation:

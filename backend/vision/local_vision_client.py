@@ -89,7 +89,8 @@ class LocalVisionClient:
         return {"type": "image_url",
                 "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()}}
 
-    async def describe(self, image: Any, prompt: str, *, max_tokens: int = 300) -> VisionAnswer:
+    async def describe(self, image: Any, prompt: str, *, max_tokens: int = 300,
+                       priority: Optional[str] = None) -> VisionAnswer:
         """Ask the model about one image. Never raises; failures come back as ``ok=False``."""
         if not self.enabled:
             return VisionAnswer(ok=False, error="disabled")
@@ -99,16 +100,24 @@ class LocalVisionClient:
             return VisionAnswer(ok=False, model=self.model, error=f"bad_image: {e}")
         return await self.chat(
             [{"role": "user", "content": [part, {"type": "text", "text": prompt}]}],
-            max_tokens=max_tokens,
+            max_tokens=max_tokens, priority=priority,
         )
 
     async def chat(self, messages: list, *, max_tokens: int = 300,
-                   temperature: float = 0.1) -> VisionAnswer:
+                   temperature: float = 0.1, priority: Optional[str] = None) -> VisionAnswer:
         """OpenAI-format conversation (system prompt, multi-image turns) to the
-        vision model. Never raises; failures come back as ``ok=False``."""
+        vision model. Never raises; failures come back as ``ok=False``.
+
+        ``priority``: "foreground" when a person is waiting on this answer
+        (their own question, a task they gave). J-Prime may then swap out an
+        idle primary model to admit the vision model; background reads
+        (monitoring, sensors) never cost the primary a reload.
+        """
         if not self.enabled:
             return VisionAnswer(ok=False, error="disabled")
         import aiohttp
+
+        headers = {"X-JPrime-Priority": priority} if priority else {}
 
         payload = {
             "model": self.model,
@@ -119,7 +128,7 @@ class LocalVisionClient:
         started = time.monotonic()
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout_s)) as s:
-                async with s.post(f"{self.base_url}/chat/completions", json=payload) as r:
+                async with s.post(f"{self.base_url}/chat/completions", json=payload, headers=headers) as r:
                     if r.status != 200:
                         body = (await r.text())[:200]
                         return VisionAnswer(ok=False, model=self.model, error=f"http_{r.status}: {body}",

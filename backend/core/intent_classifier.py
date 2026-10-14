@@ -60,6 +60,7 @@ class ClassificationResult:
     target_app: str = ""    # native app name (e.g. "apple music")
     requires_vision: bool = False  # True when subsequent steps need screen/UI automation
     classification_source: str = "sync_heuristic"  # "sync_heuristic" or "jprime" — telemetry
+    needs_screen: bool = False     # the ANSWER needs a look at the user's screen ("what's on my screen?")
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +468,7 @@ class IntentClassifier:
             '  "search_query": "extracted search term" or "",\n'
             '  "target_app": "app name mentioned" or "",\n'
             '  "requires_vision": true or false,\n'
+            '  "needs_screen": true or false,\n'
             '  "reasoning": "one-line explanation"\n'
             "}\n\n"
             "Rules:\n"
@@ -487,6 +489,9 @@ class IntentClassifier:
             "an app or page is open — e.g. 'message Zach on WhatsApp' (find and click a contact), "
             "'play the first video', 'fill out the form'. Opening an app, a page or a search's "
             "results page needs no vision = false\n"
+            "- Set needs_screen=true when answering requires LOOKING at the user's screen right "
+            "now: \"can you see my screen?\", \"what's on my screen\", \"read this error\", "
+            "\"what am I looking at\", \"describe this window\". Otherwise false\n"
             "- If uncertain, prefer query (safe — non-destructive)"
         )
 
@@ -542,6 +547,7 @@ class IntentClassifier:
                 search_query=result.get("search_query", ""),
                 target_app=result.get("target_app", ""),
                 requires_vision=bool(result.get("requires_vision", False)),
+                needs_screen=bool(result.get("needs_screen", False)),
                 classification_source="jprime",
             )
 

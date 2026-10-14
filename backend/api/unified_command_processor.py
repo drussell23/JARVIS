@@ -2161,6 +2161,15 @@ class UnifiedCommandProcessor:
                    f"source={_classification.classification_source} "
                    f"query={_classification.search_query}")
 
+            # A question whose ANSWER needs a look at the screen goes to the
+            # eyes, not to the text-only Mind ("can you see my screen?" was
+            # answered without looking). Screen ACTIONS stay with the RTO.
+            if getattr(_classification, "needs_screen", False) and \
+                    _classification.intent != CommandIntent.ACTION:
+                _p5log("needs_screen — answering from a look at the screen")
+                from backend.vision.screen_question import answer_about_screen
+                return await answer_about_screen(command_text)
+
             if _classification.intent == CommandIntent.ACTION and _classification.confidence >= 0.7:
                 _p5log("ACTION detected — dispatching to RTO (agentic resolution)")
 

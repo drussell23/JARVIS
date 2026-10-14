@@ -142,6 +142,9 @@ def _template_values(base_url: str) -> Dict[str, str]:
         "model": _env("JARVIS_LOCAL_MODEL_NAME"),
         "port": str(port or ""),
         "ctx": _env("JARVIS_LOCAL_NUM_CTX") or _env("JARVIS_NUM_CTX_CEILING") or "32768",
+        # The vision model J-Prime must keep room for beside {model}
+        # (its --coresident declaration); the same name the vision client asks for.
+        "vision_model": _env("JARVIS_VISION_MODEL_NAME"),
     }
 
 
