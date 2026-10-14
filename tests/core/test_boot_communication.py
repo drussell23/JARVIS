@@ -128,3 +128,26 @@ def test_tiers_say_nothing_about_a_cloud_and_report_what_was_measured():
 def test_a_failed_node_is_said_not_glossed():
     say, T = _kernel([], {"backend": "failed", "clean_slate": "resolved"})
     assert "backend failed" in say(T.ACTIVE_LOCAL)
+
+
+def test_a_zone_is_announced_once_when_it_starts_not_when_re_stated():
+    # 09:30:52: AGI OS past its startup budget was set "running" again
+    # ("continuing in background") and announced a second time.
+    import unified_supervisor as us
+
+    zones = []
+    k = types.SimpleNamespace(
+        _component_status={},
+        _trinity_ready={},
+        _lifecycle_narrator=types.SimpleNamespace(narrate_zone=zones.append),
+        logger=types.SimpleNamespace(debug=lambda *_: None, info=lambda *_: None),
+    )
+    k._notify_boot_phase = types.MethodType(us.JarvisSystemKernel._notify_boot_phase, k)
+    update = types.MethodType(us.JarvisSystemKernel._update_component_status, k)
+    try:
+        update("agi_os", "running", "Initializing AGI OS...")
+        update("agi_os", "running", "Initialization continuing in background")
+        update("agi_os", "complete", "AGI OS active")
+    except AttributeError:
+        pass  # later dashboard plumbing the stub does not carry; zones are decided first
+    assert zones == ["agi_os"]

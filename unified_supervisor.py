@@ -88339,6 +88339,7 @@ class JarvisSystemKernel:
 
     def _notify_boot_phase(
         self, component: str, status: str, message: str = "",
+        previous_status: Optional[str] = None,
     ) -> None:
         """Feed boot phase transitions to the LifecycleNarrator.
 
@@ -88359,7 +88360,13 @@ class JarvisSystemKernel:
                     "governance": "governance",
                 }
                 zone_key = zone_map.get(component)
-                if zone_key and status in ("running", "starting"):
+                # A zone is announced as it STARTS: on the transition into
+                # running, not on a later "running" that re-states it (AGI OS
+                # past its startup budget is set running "continuing in
+                # background", which re-announced it four seconds before
+                # completion, 2026-10-14 09:30:52).
+                _active = ("running", "starting")
+                if zone_key and status in _active and previous_status not in _active:
                     _narrator.narrate_zone(zone_key)
             except Exception:
                 pass
@@ -88385,6 +88392,7 @@ class JarvisSystemKernel:
         """
         if component not in self._component_status:
             self._component_status[component] = {}
+        previous_status = self._component_status[component].get("status")
 
         self._component_status[component] = {
             "status": status,
@@ -88410,7 +88418,7 @@ class JarvisSystemKernel:
             self._trinity_ready["reactor_core"] = True
 
         # v350.0: Feed LifecycleNarrator + EliteDashboard boot tracker
-        self._notify_boot_phase(component, status, message)
+        self._notify_boot_phase(component, status, message, previous_status)
 
         # v213.0: Map internal names to dashboard names
         # Dashboard uses hyphenated names, internal uses underscores
