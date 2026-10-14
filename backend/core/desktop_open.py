@@ -473,6 +473,46 @@ def _win_bring_forward(hwnd: int) -> bool:
     return _win_foreground() == hwnd
 
 
+def _open_settle_s() -> float:
+    """How long a window's title must hold still to count as loaded."""
+    return _env_float("JARVIS_OPEN_TITLE_SETTLE_S", 0.6)
+
+
+def _win_title(hwnd: int) -> str:
+    return next((t for h, t, _ in _win_top_windows() if h == hwnd), "")
+
+
+def _names_address(title: str, url: str) -> bool:
+    """True while a browser's title is still the address it was given: a
+    page that has loaded has a title of its own."""
+    if not url:
+        return False
+    parsed = urlparse(url)
+    address = (parsed.netloc + parsed.path).lower().removeprefix("www.").rstrip("/")
+    return bool(address) and address in title.lower()
+
+
+async def _settled_title(hwnd: int, title: str, deadline: float, url: str = "") -> str:
+    """Wait until *hwnd* shows a loaded page: its title has its own name (not
+    the address it was given) and holds still; return that title.
+
+    The first changes a browser shows are "Untitled - Google Chrome", then the
+    bare address: the page has not loaded. Handing that moment over put a
+    half-drawn page in front of the eyes, which clicked what they imagined --
+    a bookmark -- and went looking for a tab called "Untitled".
+    """
+    loop = asyncio.get_running_loop()
+    stable_since = loop.time()
+    while loop.time() < deadline:
+        await asyncio.sleep(_open_poll_s())
+        now = await asyncio.to_thread(_win_title, hwnd)
+        if now != title:
+            title, stable_since = now, loop.time()
+        elif loop.time() - stable_since >= _open_settle_s() and not _names_address(title, url):
+            return title
+    return title
+
+
 async def _opened_in_front(open_coro, handler_exe: str = "") -> OpenOutcome:
     """Run an open, then find the window it produced and bring it forward.
 
@@ -503,10 +543,12 @@ async def _opened_in_front(open_coro, handler_exe: str = "") -> OpenOutcome:
         ]
         if changed:
             hwnd, title = changed[0]
-            if await asyncio.to_thread(_win_bring_forward, hwnd):
-                return replace(outcome, window=title, in_front=True)
-            logger.info("[DesktopOpen] %r appeared but could not take the foreground", title)
-            return replace(outcome, window=title, in_front=False)
+            if not await asyncio.to_thread(_win_bring_forward, hwnd):
+                logger.info("[DesktopOpen] %r appeared but could not take the foreground", title)
+                return replace(outcome, window=title, in_front=False)
+            title = await _settled_title(
+                hwnd, title, deadline, outcome.target if outcome.kind == "url" else "")
+            return replace(outcome, window=title, in_front=True)
         await asyncio.sleep(_open_poll_s())
     logger.info("[DesktopOpen] no window appeared for %s within %.0fs",
                 outcome.resolved or outcome.target, _open_wait_s())

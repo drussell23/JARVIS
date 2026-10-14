@@ -87,3 +87,23 @@ def test_unobserved_platform_leaves_in_front_unknown(monkeypatch, plat):
     monkeypatch.setattr(d, "_IS_WINDOWS", plat)
     out = asyncio.run(d._opened_in_front(_ok()))
     assert out.in_front is None
+
+
+def test_the_reported_window_is_the_loaded_page_not_the_first_flash(monkeypatch):
+    """Chrome first shows "Untitled"; the eyes must start on the loaded page."""
+    before = [(TERMINAL, "claude", "windowsterminal.exe"), (BROWSER, "JARVIS", "chrome.exe")]
+    flash = [(TERMINAL, "claude", "windowsterminal.exe"), (BROWSER, "Untitled - Google Chrome", "chrome.exe")]
+    loaded = [(TERMINAL, "claude", "windowsterminal.exe"),
+              (BROWSER, "cat videos - YouTube - Google Chrome", "chrome.exe")]
+    _scripted(monkeypatch, [before, flash, flash, loaded], front=BROWSER)
+    monkeypatch.setenv("JARVIS_OPEN_WINDOW_WAIT_S", "2")
+    monkeypatch.setenv("JARVIS_OPEN_TITLE_SETTLE_S", "0.05")
+    out = asyncio.run(d._opened_in_front(_ok(), "chrome.exe"))
+    assert out.in_front is True and out.window == "cat videos - YouTube - Google Chrome"
+
+
+def test_a_title_that_is_still_the_address_is_not_loaded():
+    url = "https://www.youtube.com/results?search_query=cat+videos"
+    assert d._names_address("youtube.com/results?search_query=cat+videos - Google Chrome", url)
+    assert not d._names_address("(178) cat videos - YouTube - Google Chrome", url)
+    assert not d._names_address("Untitled - Notepad", "")
