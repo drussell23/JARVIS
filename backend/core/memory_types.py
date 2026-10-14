@@ -594,6 +594,36 @@ class PressurePolicy:
             exit_thresholds=exit_,
         )
 
+    @classmethod
+    def for_host(cls, total_gb: float, planned_gb: float = 0.0) -> PressurePolicy:
+        """:meth:`for_ram_gb` for a host where *planned_gb* is committed on
+        purpose -- Trinity's own resident siblings (J-Prime holding its model).
+
+        The profile is chosen from the RAM left for everything else, and its
+        thresholds are expressed as percentages of the WHOLE machine (what
+        every reading reports): ``planned + t * (1 - planned)``. A 62 GB host
+        with 17.6 GB of model was judged as an idle 64 GB "server" (pressure
+        from 65%) and relieved -- freeing nothing -- at every boot. 100% stays
+        100%, so a machine that is really full still escalates.
+        """
+        planned_gb = max(0.0, min(planned_gb, total_gb))
+        base = cls.for_ram_gb(max(total_gb - planned_gb, 0.0))
+        if planned_gb <= 0.0 or total_gb <= 0.0:
+            return base
+        share = planned_gb / total_gb * 100.0
+
+        def rebase(table: Dict[PressureTier, float]) -> Dict[PressureTier, float]:
+            return {tier: share + pct * (100.0 - share) / 100.0 for tier, pct in table.items()}
+
+        return cls(
+            version=f"{base.version}+planned{planned_gb:.1f}gb",
+            enter_thresholds=rebase(base.enter_thresholds),
+            exit_thresholds=rebase(base.exit_thresholds),
+            min_dwell_seconds=base.min_dwell_seconds,
+            cooldown_seconds=base.cooldown_seconds,
+            max_actions_per_hour=base.max_actions_per_hour,
+        )
+
 
 # ===================================================================
 # DecisionEnvelope (provenance wrapper for actuator decisions)

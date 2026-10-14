@@ -1092,14 +1092,13 @@ class GCPHybridPrimeRouter:
             """MemoryQuantizer authoritative tier change callback."""
             if not self._running or not self._vm_provisioning_enabled or self._gcp_permanently_unavailable:
                 return
-            tier_severity = {
-                "abundant": 0, "optimal": 1,
-                "elevated": 2, "constrained": 3,
-                "critical": 4, "emergency": 5,
-            }
+            from backend.core.memory_quantizer import MemoryTier
             old_name = old_tier.value if hasattr(old_tier, 'value') else str(old_tier)
             new_name = new_tier.value if hasattr(new_tier, 'value') else str(new_tier)
-            new_sev = tier_severity.get(new_name.lower(), 0)
+            try:
+                new_sev = MemoryTier(new_name.lower()).severity
+            except ValueError:
+                new_sev = 0
 
             # v304.0: On constrained hardware (<= 16GB), trigger at sev >= 3
             # (constrained). On larger machines, trigger at sev >= 4 (critical).

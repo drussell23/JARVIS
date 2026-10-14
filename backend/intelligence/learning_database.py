@@ -6387,6 +6387,16 @@ class JARVISLearningDatabase:
         finally:
             logger.debug("Auto-flush task exiting")
 
+    async def flush_pending(self) -> None:
+        """Write every pending batch (goals, actions, patterns) now: for
+        shutdown, and for a caller that needs the buffers' memory back."""
+        await asyncio.gather(
+            self._flush_goal_batch(),
+            self._flush_action_batch(),
+            self._flush_pattern_batch(),
+            return_exceptions=True,
+        )
+
     async def _flush_goal_batch(self):
         """Flush pending goals"""
         if not self.pending_goals:
@@ -9002,15 +9012,7 @@ class JARVISLearningDatabase:
 
         # Flush pending batches (with timeout)
         try:
-            await asyncio.wait_for(
-                asyncio.gather(
-                    self._flush_goal_batch(),
-                    self._flush_action_batch(),
-                    self._flush_pattern_batch(),
-                    return_exceptions=True
-                ),
-                timeout=5.0
-            )
+            await asyncio.wait_for(self.flush_pending(), timeout=5.0)
             logger.debug("   ✓ Pending batches flushed")
         except asyncio.TimeoutError:
             logger.warning("   ⚠ Batch flush timeout - some data may not be saved")

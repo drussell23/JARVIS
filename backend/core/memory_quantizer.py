@@ -95,6 +95,11 @@ class MemoryTier(Enum):
     CRITICAL = "critical"     # 85-95% - Emergency mode
     EMERGENCY = "emergency"   # > 95% - Survival mode
 
+    @property
+    def severity(self) -> int:
+        """0 (abundant) .. 5 (emergency): the declaration order above."""
+        return list(MemoryTier).index(self)
+
 
 class MemoryPressure(Enum):
     """System memory pressure states (macOS specific)"""
@@ -338,17 +343,17 @@ class MemoryPatternLearner:
         # Store to Learning Database if available
         if self.learning_db:
             try:
-                await self.learning_db.store_pattern(
-                    pattern_type="memory_usage",
-                    pattern_data={
+                await self.learning_db.store_pattern({
+                    "pattern_type": "memory_usage",
+                    "pattern_data": {
                         'component': component,
                         'average_memory_mb': avg_memory,
                         'peak_memory_mb': peak_memory,
                         'growth_rate': growth_rate
                     },
-                    confidence=pattern.confidence,
-                    metadata=metadata or {}
-                )
+                    "confidence": pattern.confidence,
+                    "metadata": metadata or {},
+                })
             except Exception as e:
                 logger.warning(f"Failed to store pattern to Learning DB: {e}")
 
@@ -417,8 +422,10 @@ class MemoryQuantizer:
         if self.learning_db:
             self.pattern_learner.set_learning_db(self.learning_db)
 
-        # State management
+        # State management. OPTIMAL until the monitor's first reading -- an
+        # assumption, so that reading is the starting tier, not a "change".
         self.current_tier = MemoryTier.OPTIMAL
+        self._tier_measured = False
         self.current_metrics: Optional[MemoryMetrics] = None
         self.metrics_history: deque = deque(maxlen=1000)
         self.optimization_history: deque = deque(maxlen=100)
@@ -464,9 +471,42 @@ class MemoryQuantizer:
 
         logger.info("Advanced Memory Quantizer initialized")
         logger.info(f"  Config: {self.config}")
-        logger.info(f"  UAE: {'✅' if uae_engine else '❌'}")
-        logger.info(f"  SAI: {'✅' if sai_engine else '❌'}")
-        logger.info(f"  Learning DB: {'✅' if learning_db else '❌'}")
+        # The quantizer is created early in boot, before these engines exist;
+        # each is connected when it comes up (_attach_collaborators).
+        self._attach_collaborators()
+
+    #: attribute -> (module path under backend/, the module's singleton global)
+    _COLLABORATORS = {
+        "uae_engine": ("intelligence.unified_awareness_engine", "_uae_instance"),
+        "sai_engine": ("vision.situational_awareness.core_engine", "_sai_engine"),
+        "learning_db": ("intelligence.learning_database", "_db_instance"),
+    }
+
+    def _attach_collaborators(self) -> None:
+        """Connect the engines this quantizer works with once they exist.
+
+        Every caller asks for the quantizer without them (the process-wide
+        singleton is created before any of them), so it ran unconnected for
+        the whole session: patterns never reached the Learning DB and UAE's
+        predictions were never consulted. Each is found as its own module's
+        singleton -- never imported or created here (that is the boot's job)
+        -- under either import name the tree loads it by.
+        """
+        for attr, (module_path, global_name) in self._COLLABORATORS.items():
+            if getattr(self, attr, None) is not None:
+                continue
+            instance = None
+            for name in (f"backend.{module_path}", module_path):
+                module = sys.modules.get(name)
+                instance = getattr(module, global_name, None) if module else None
+                if instance is not None:
+                    break
+            if instance is None or getattr(instance, "_initialized", True) is False:
+                continue
+            setattr(self, attr, instance)
+            if attr == "learning_db":
+                self.pattern_learner.set_learning_db(instance)
+            logger.info(f"[MemoryQuantizer] connected to {module_path.rsplit('.', 1)[-1]}")
 
     @property
     def thrash_state(self) -> str:
@@ -478,9 +518,8 @@ class MemoryQuantizer:
         if self.learning_db:
             try:
                 # Load historical memory patterns
-                patterns = await self.learning_db.get_patterns(
-                    pattern_type="memory_usage",
-                    limit=100
+                patterns = await self.learning_db.get_pattern_by_type(
+                    "memory_usage", min_confidence=0.0, limit=100,
                 )
                 logger.info(f"Loaded {len(patterns)} memory patterns from Learning DB")
             except Exception as e:
@@ -515,10 +554,7 @@ class MemoryQuantizer:
         if reserved_gb > 0:
             reserved_bytes = reserved_gb * 1024 * 1024 * 1024
             # Recalculate pressure including reservations as "used"
-            wired = getattr(mem, 'wired', 0)
-            active = getattr(mem, 'active', 0)
-            compressed = getattr(mem, 'compressed', 0) if hasattr(mem, 'compressed') else 0
-            effective_used = (wired + active + compressed) + reserved_bytes
+            effective_used = self._true_used_bytes(mem) + reserved_bytes
             macos_pressure_percent = min(100.0, (effective_used / mem.total) * 100)
             logger.debug(
                 f"[MemReserve] Adjusted pressure: {macos_pressure_percent:.1f}% "
@@ -585,10 +621,7 @@ class MemoryQuantizer:
         if reserved_gb > 0:
             reserved_bytes = reserved_gb * 1024 * 1024 * 1024
             # Recalculate pressure including reservations as "used"
-            wired = getattr(mem, 'wired', 0)
-            active = getattr(mem, 'active', 0)
-            compressed = getattr(mem, 'compressed', 0) if hasattr(mem, 'compressed') else 0
-            effective_used = (wired + active + compressed) + reserved_bytes
+            effective_used = self._true_used_bytes(mem) + reserved_bytes
             macos_pressure_percent = min(100.0, (effective_used / mem.total) * 100)
             logger.debug(
                 f"[MemReserve] Adjusted pressure: {macos_pressure_percent:.1f}% "
@@ -737,24 +770,22 @@ class MemoryQuantizer:
 
         Real pressure = (Wired + Active + Compressed) / Total
         """
-        total = mem.total
+        return min(100.0, (self._true_used_bytes(mem) / mem.total) * 100)
 
-        # macOS-specific fields (available via psutil on macOS)
-        wired = getattr(mem, 'wired', 0)
-        active = getattr(mem, 'active', 0)
+    @staticmethod
+    def _true_used_bytes(mem) -> float:
+        """Memory that cannot be reclaimed on demand, in the platform's own terms.
 
-        # Compressed memory (if available - macOS 10.9+)
-        # Note: psutil may not expose this, use vm_stat parsing if needed
-        compressed = 0
-        if hasattr(mem, 'compressed'):
-            compressed = mem.compressed
-
-        # Calculate TRUE memory pressure (what's actually locked in RAM)
-        true_used = wired + active + compressed
-        pressure_percent = (true_used / total) * 100
-
-        # Cap at 100%
-        return min(100.0, pressure_percent)
+        macOS reports wired/active/compressed pages, and its "used" counts the
+        file cache it reclaims instantly. Windows and Linux report neither
+        wired nor compressed; their kernels already exclude reclaimable cache
+        from ``available``, so total - available is the same quantity. Reading
+        the macOS fields where they do not exist measured 0 bytes in use: a
+        Windows host at 79% was "abundant", and only reservations moved it.
+        """
+        if hasattr(mem, "wired"):
+            return getattr(mem, "wired", 0) + getattr(mem, "active", 0) + getattr(mem, "compressed", 0)
+        return max(0, mem.total - mem.available)
 
     def _calculate_tier_macos(
         self,
@@ -1080,14 +1111,14 @@ class MemoryQuantizer:
         # Learn from this optimization
         if self.learning_db:
             try:
-                await self.learning_db.store_action(
-                    action_type="memory_optimization",
-                    target=f"tier_{before_metrics.tier.value}",
-                    success=result.success,
-                    execution_time=duration_ms / 1000,
-                    params={'strategies': applied_strategies},
-                    result={'memory_freed_mb': memory_freed_mb}
-                )
+                await self.learning_db.store_action({
+                    "action_type": "memory_optimization",
+                    "target": f"tier_{before_metrics.tier.value}",
+                    "success": result.success,
+                    "execution_time": duration_ms / 1000,
+                    "params": {'strategies': applied_strategies},
+                    "result": {'memory_freed_mb': memory_freed_mb},
+                })
             except Exception as e:
                 logger.warning(f"Failed to store optimization to Learning DB: {e}")
 
@@ -1137,7 +1168,7 @@ class MemoryQuantizer:
             # Emergency cleanup
             gc.collect(2)
             if self.learning_db:
-                await self.learning_db.flush_all()
+                await self.learning_db.flush_pending()
 
         elif strategy == OptimizationStrategy.PREDICTIVE_PREEMPT:
             # Preemptive optimization
@@ -1175,11 +1206,19 @@ class MemoryQuantizer:
                 # v266.0: use async variant to avoid blocking event loop
                 # with subprocess.run(['memory_pressure']) for up to 2s
                 metrics = await self.get_current_metrics_async()
+                self._attach_collaborators()
                 self.metrics_history.append(metrics)
                 self.planner.add_metrics(metrics)
 
                 # Check for tier change
-                if metrics.tier != self.current_tier:
+                if not self._tier_measured:
+                    self._tier_measured = True
+                    self.current_tier = metrics.tier
+                    logger.info(
+                        f"Memory tier: {metrics.tier.value} "
+                        f"({metrics.system_memory_percent:.0f}% in use)"
+                    )
+                elif metrics.tier != self.current_tier:
                     await self._handle_tier_change(self.current_tier, metrics.tier)
                     self.current_tier = metrics.tier
 
@@ -1220,7 +1259,11 @@ class MemoryQuantizer:
 
     async def _handle_tier_change(self, old_tier: MemoryTier, new_tier: MemoryTier):
         """Handle memory tier changes"""
-        logger.warning(f"🔄 Memory tier changed: {old_tier.value} → {new_tier.value}")
+        # Worse is a warning; better is news, not a fault.
+        logger.log(
+            logging.WARNING if new_tier.severity > old_tier.severity else logging.INFO,
+            f"🔄 Memory tier changed: {old_tier.value} → {new_tier.value}",
+        )
 
         # Notify callbacks
         for callback in self.tier_change_callbacks:
@@ -1251,13 +1294,13 @@ class MemoryQuantizer:
         # Store to Learning DB
         if self.learning_db:
             try:
-                await self.learning_db.store_action(
-                    action_type="memory_tier_change",
-                    target=f"{old_tier.value}_to_{new_tier.value}",
-                    success=True,
-                    execution_time=0,
-                    params={'old_tier': old_tier.value, 'new_tier': new_tier.value}
-                )
+                await self.learning_db.store_action({
+                    "action_type": "memory_tier_change",
+                    "target": f"{old_tier.value}_to_{new_tier.value}",
+                    "success": True,
+                    "execution_time": 0,
+                    "params": {'old_tier': old_tier.value, 'new_tier': new_tier.value},
+                })
             except Exception as e:
                 logger.warning(f"Failed to store tier change: {e}")
 

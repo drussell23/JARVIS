@@ -459,7 +459,17 @@ class MemoryBudgetBroker:
 
     @property
     def policy(self) -> PressurePolicy:
-        """The active pressure policy."""
+        """The active pressure policy: this host's, beside the memory Trinity's
+        own siblings hold on purpose (PressurePolicy.for_host), followed as
+        that residency changes."""
+        try:
+            from backend.core.ouroboros.governance.trinity_siblings import planned_resident_gb
+            planned = planned_resident_gb()
+        except Exception:  # noqa: BLE001 -- unknown: nothing counted as planned
+            planned = 0.0
+        current = PressurePolicy.for_host(self._detect_total_ram_gb(), planned)
+        if current.version != self._policy.version:
+            self._policy = current
         return self._policy
 
     @property

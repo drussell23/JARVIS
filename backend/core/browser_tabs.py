@@ -200,6 +200,14 @@ def _reuse_tab_com(url: str, titles: List[str], ports: List[int], browser_exe: s
             break
         time.sleep(poll)
     if not committed:
+        # The page may be slow to take its title (a busy boot) while the
+        # navigation has already happened: focus has left the address bar and
+        # the bar shows the new page's origin. Typed-but-unsubmitted text keeps
+        # the focus, so it never counts. Reporting "not reused" here made the
+        # caller open a second tab beside the one just navigated.
+        _bar, shown = address_of(window)
+        committed = not bar.CurrentHasKeyboardFocus and is_own_address(shown, [urlsplit(url).port])
+    if not committed:
         return TabReuse(False, detail="navigation in the existing tab was not confirmed")
 
     closed = 0

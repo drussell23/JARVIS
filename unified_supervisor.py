@@ -87310,7 +87310,9 @@ class JarvisSystemKernel:
         if reused.reused:
             return {"success": True, "action": "reused_tab", "error": None,
                     "duplicates_closed": reused.closed}
-        self.logger.debug(f"[Kernel] No JARVIS tab reused ({reused.detail}); opening one")
+        # Visible: a new tab beside an old JARVIS tab is a duplicate, and this
+        # names why it was opened.
+        self.logger.info(f"[Kernel] No JARVIS tab reused ({reused.detail}); opening one")
         opened = await open_url(url, browser=preferred_browser())
         return {"success": opened.ok, "action": opened.method or "opened", "error": opened.error}
 

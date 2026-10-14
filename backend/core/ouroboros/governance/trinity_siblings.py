@@ -215,6 +215,44 @@ def serving_sibling_pids(probe: Callable[[str, float], bool] = _answers) -> Set[
     return pids
 
 
+def serving_siblings_resident_bytes(probe: Callable[[str, float], bool] = _answers) -> int:
+    """Memory held on this host by the serving siblings' process trees --
+    J-Prime with its pinned model above all. Trinity commits it on purpose,
+    so memory-pressure policy treats it as planned (PressurePolicy.for_host)
+    rather than as load to relieve. 0 when no sibling serves from this host."""
+    import psutil
+
+    total = 0
+    for pid in serving_sibling_pids(probe):
+        try:
+            total += psutil.Process(pid).memory_info().rss
+        except psutil.Error:
+            continue
+    return total
+
+
+_planned_lock = threading.Lock()
+_planned: tuple = (float("-inf"), 0.0)
+
+
+def planned_resident_gb() -> float:
+    """:func:`serving_siblings_resident_bytes` in GB, re-measured at most every
+    ``JARVIS_MEMORY_PLANNED_TTL_S`` (it changes when a model loads) -- one
+    reading shared by every memory-pressure consumer. NEVER raises."""
+    global _planned
+    with _planned_lock:
+        taken, gb = _planned
+        if time.monotonic() - taken < _float_env("JARVIS_MEMORY_PLANNED_TTL_S", 60.0):
+            return gb
+        try:
+            gb = serving_siblings_resident_bytes() / (1024 ** 3)
+        except Exception as exc:  # noqa: BLE001 -- unknown: nothing counted as planned
+            logger.debug("[TrinitySiblings] planned residency unavailable: %s", exc)
+            gb = 0.0
+        _planned = (time.monotonic(), gb)
+        return gb
+
+
 def _template_values(base_url: str) -> Dict[str, str]:
     port = urlparse(base_url).port
     return {

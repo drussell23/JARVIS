@@ -206,9 +206,12 @@ class IntelligentMemoryController:
         self._total_events_suppressed = 0
         self._total_relief_attempts = 0
 
+        planned = self._planned_gb()
         logger.info(
             f"🧠 Intelligent Memory Controller initialized "
-            f"(RAM: {self._total_ram_gb:.0f}GB, profile: {self._hardware_profile}, "
+            f"(RAM: {self._total_ram_gb:.0f}GB"
+            + (f", {planned:.1f}GB held by Trinity's siblings" if planned else "")
+            + f", profile: {self._hardware_profile}, "
             f"thresholds: {self._moderate_threshold:.0f}/{self._high_threshold:.0f}/{self._critical_threshold:.0f}%)"
         )
 
@@ -265,22 +268,24 @@ class IntelligentMemoryController:
         except Exception:
             return 16.0  # Conservative default
     
+    @staticmethod
+    def _planned_gb() -> float:
+        """Memory Trinity's serving siblings hold on this host on purpose
+        (J-Prime's pinned model)."""
+        try:
+            from backend.core.ouroboros.governance.trinity_siblings import planned_resident_gb
+            return planned_resident_gb()
+        except Exception:  # noqa: BLE001 -- unknown: nothing counted as planned
+            return 0.0
+
+    def _host_policy(self) -> PressurePolicy:
+        """The shared pressure policy (the broker's own), for this host."""
+        return PressurePolicy.for_host(self._total_ram_gb, self._planned_gb())
+
     def _detect_hardware_profile(self) -> str:
-        """
-        Detect hardware profile based on RAM.
-        
-        v210.0: Different hardware profiles need different thresholds.
-        A 16GB MacBook running JARVIS + Chrome is expected to be at 75-85%.
-        A 64GB workstation at 80% has a memory leak.
-        """
-        if self._total_ram_gb < 12:
-            return "constrained"  # 8GB or less - very tight
-        elif self._total_ram_gb < 20:
-            return "consumer"  # 16GB - typical dev MacBook
-        elif self._total_ram_gb < 48:
-            return "prosumer"  # 32GB - developer workstation
-        else:
-            return "server"  # 64GB+ - should have lots of headroom
+        """The policy profile this host falls in: chosen from the RAM left
+        beside Trinity's planned residency (PressurePolicy.for_host)."""
+        return self._host_policy().version.split("-", 1)[-1]
     
     def _get_hardware_aware_thresholds(self) -> Dict[str, float]:
         """
@@ -311,31 +316,17 @@ class IntelligentMemoryController:
                 "critical": float(env_critical),
             }
 
-        # MCP broker path: derive from PressurePolicy
+        # One policy: the broker's when registered, else the same policy for
+        # this host. (A private per-profile table here had drifted from it.)
         if self._mcp_active and self._broker is not None:
             policy = self._broker.policy
-            return {
-                "moderate": policy.enter_thresholds[PressureTier.CONSTRAINED],
-                "high": policy.enter_thresholds[PressureTier.CRITICAL],
-                "critical": policy.enter_thresholds[PressureTier.EMERGENCY],
-            }
-        
-        # Hardware-aware defaults
-        # v210.0: ROOT CAUSE FIX - thresholds must account for actual baseline usage
-        # A 16GB Mac running JARVIS + Chrome typically sits at 75-85% normally
-        if self._hardware_profile == "constrained":
-            # 8GB systems: expect to run at 85-95% - very little headroom
-            return {"moderate": 88.0, "high": 93.0, "critical": 97.0}
-        elif self._hardware_profile == "consumer":
-            # 16GB systems: expect to run at 75-88% normally
-            # Only trigger relief when ACTUALLY constrained, not at normal usage
-            return {"moderate": 88.0, "high": 93.0, "critical": 96.0}
-        elif self._hardware_profile == "prosumer":
-            # 32GB systems: expect 50-70% baseline
-            return {"moderate": 78.0, "high": 88.0, "critical": 94.0}
         else:
-            # Server/workstation (64GB+): expect lots of headroom
-            return {"moderate": 72.0, "high": 82.0, "critical": 92.0}
+            policy = self._host_policy()
+        return {
+            "moderate": policy.enter_thresholds[PressureTier.CONSTRAINED],
+            "high": policy.enter_thresholds[PressureTier.CRITICAL],
+            "critical": policy.enter_thresholds[PressureTier.EMERGENCY],
+        }
     
     def record_memory_sample(self, percent_used: float) -> None:
         """Record a memory sample for baseline calculation."""
@@ -5932,6 +5923,11 @@ class ProcessCleanupManager:
     def _is_jarvis_process(self, proc: psutil.Process) -> bool:
         """Intelligently determine if a process is JARVIS-related"""
         try:
+            # Only what JARVIS may stop is JARVIS's to clean up: the kill
+            # guard's ownership rule decides, before any word on a command line.
+            from backend.core.process_identity import may_signal
+            if not may_signal(proc.pid):
+                return False
             # Check process name
             proc_name = proc.name().lower()
 

@@ -230,29 +230,127 @@ def owned_by_trinity(pid: int) -> bool:
     except ImportError:
         return False
     try:
-        me = psutil.Process(os.getpid())
-        my_lineage = {p.pid for p in me.parents()}
-        if pid in my_lineage:
-            return False
-        if any(c.pid == pid for c in me.children(recursive=True)):
-            return True
-        proc = psutil.Process(pid)
+        me = os.getpid()
         roots = trinity_roots()
-        if _structurally_owned(proc, roots):
-            return True
-        for ancestor in proc.parents():
-            if ancestor.pid in my_lineage:
-                return False
-            if ancestor.pid == me.pid:
-                return True
+
+        def structural(p: int) -> bool:
             try:
-                if _structurally_owned(ancestor, roots):
-                    return True
+                return _structurally_owned(psutil.Process(p), roots)
             except (psutil.Error, OSError, ValueError):
-                continue
-        return False
+                return False
+
+        parent = _parent_map(psutil, {p: psutil.Process(p) for p in (me, pid)})
+        return _owned(pid, me, set(_ancestors(me, parent)), _ancestors(pid, parent), structural)
     except (psutil.Error, OSError, ValueError):
         return False
+
+
+def _ancestors(pid: int, parent: dict) -> List[int]:
+    """*pid*'s ancestors, nearest first, from a pid -> parent map."""
+    chain: List[int] = []
+    seen = {pid}
+    nxt = parent.get(pid)
+    while nxt and nxt not in seen:   # pid reuse can make a cycle
+        chain.append(nxt)
+        seen.add(nxt)
+        nxt = parent.get(nxt)
+    return chain
+
+
+def _owned(pid: int, me: int, my_lineage: Set[int], ancestors: List[int],
+           structural) -> bool:
+    """The ownership rule, given *pid*'s ancestors (nearest first) and a
+    structural test: never this process's lineage; a descendant of this
+    process; structurally Trinity's; or below an ancestor that is, the walk
+    stopping at this process's lineage."""
+    if pid == me:
+        return True
+    if pid in my_lineage:
+        return False
+    if me in ancestors:
+        return True
+    if structural(pid):
+        return True
+    for ancestor in ancestors:
+        if ancestor in my_lineage:
+            return False
+        if structural(ancestor):
+            return True
+    return False
+
+
+def _parent_map(psutil, procs: dict) -> dict:
+    """pid -> parent pid for the whole table, built once.
+
+    On Windows ``Process.ppid()`` builds this very map from a full system
+    snapshot (~22 ms) on every call, so asking 500 processes for their parent
+    took 11 s. psutil keeps the one-shot builder ``Process.children`` uses on
+    every platform; the per-process answer is the fallback where it is gone.
+    """
+    builder = getattr(psutil, "_ppid_map", None)
+    if callable(builder):
+        try:
+            return dict(builder())
+        except Exception:  # noqa: BLE001 -- fall through to per-process
+            pass
+    parent = {}
+    for pid, proc in procs.items():
+        try:
+            parent[pid] = proc.ppid()
+        except psutil.Error:
+            continue
+    return parent
+
+
+_SNAPSHOT_LOCK = threading.Lock()
+_snapshot: tuple = (0.0, frozenset())
+
+
+def _snapshot_ttl_s() -> float:
+    try:
+        return max(0.0, float(os.environ.get("JARVIS_OWNERSHIP_SNAPSHOT_TTL_S", "") or 2.0))
+    except ValueError:
+        return 2.0
+
+
+def trinity_owned_pids() -> FrozenSet[int]:
+    """Every PID :func:`owned_by_trinity` would accept, from ONE pass over the
+    process table -- for sweeps that ask about every process. Asked process by
+    process, each answer re-walked the whole table (minutes of CPU for one
+    boot sweep). Shared for ``JARVIS_OWNERSHIP_SNAPSHOT_TTL_S`` so the sweeps
+    of one cleanup reuse it; a process newer than the snapshot is simply not
+    in it, which only ever spares it."""
+    global _snapshot
+    import time as _time
+
+    with _SNAPSHOT_LOCK:
+        taken, owned = _snapshot
+        if _time.monotonic() - taken < _snapshot_ttl_s():
+            return owned
+        try:
+            import psutil
+        except ImportError:
+            return frozenset()
+        procs = {proc.pid: proc for proc in psutil.process_iter()}
+        parent = _parent_map(psutil, procs)
+        roots = trinity_roots()
+        verdicts: dict = {}
+
+        def structural(p: int) -> bool:
+            if p not in verdicts:
+                proc = procs.get(p)
+                try:
+                    verdicts[p] = proc is not None and _structurally_owned(proc, roots)
+                except (psutil.Error, OSError, ValueError):
+                    verdicts[p] = False
+            return verdicts[p]
+
+        me = os.getpid()
+        lineage = set(_ancestors(me, parent))
+        owned = frozenset(p for p in procs
+                          if _owned(p, me, lineage, _ancestors(p, parent), structural))
+        _snapshot = (_time.monotonic(), owned)
+        return owned
 
 
 def _describe(pid: int) -> str:
@@ -375,6 +473,18 @@ def _may_signal(pid: int) -> bool:
     return owned_by_trinity(pid)
 
 
+def may_signal(pid: int) -> bool:
+    """Would the kill guard let JARVIS signal *pid*? For sweeps choosing what
+    to stop: a sweep that selects by command-line words and lets the guard
+    refuse at the last step picked the operator's own shells (their command
+    lines mentioned "jarvis") and logged a refusal for each at every boot.
+    Answered from :func:`trinity_owned_pids`, so a sweep costs one pass over
+    the process table. Always True where the guard is off."""
+    if not kill_guard_enabled() or pid in _authorized_tree.get():
+        return True
+    return pid in trinity_owned_pids()
+
+
 # ---------------------------------------------------------------------------
 # Guard
 # ---------------------------------------------------------------------------
@@ -451,7 +561,9 @@ __all__ = [
     "is_trinity_process",
     "kill_process_tree",
     "kill_guard_enabled",
+    "may_signal",
     "owned_by_trinity",
+    "trinity_owned_pids",
     "pid_alive",
     "trinity_roots",
 ]
