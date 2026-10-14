@@ -69860,8 +69860,8 @@ class JarvisSystemKernel:
             # v286.0: Advance stage past intelligence — prevents post-phase
             # _mark_startup_activity calls from keeping the intelligence activity
             # marker fresh, which suppresses ProgressController stall detection.
+            # (The percentage is the boot timeline's, not a literal set here.)
             self._current_startup_phase = "post_intelligence"
-            self._current_progress = 57
 
             # =====================================================================
             # UNIFIED AGENT RUNTIME INITIALIZATION
@@ -89536,7 +89536,12 @@ class JarvisSystemKernel:
         timeline = getattr(self, "_boot_timeline", None)
         if timeline is None or timeline.fraction() >= 1:
             return None
-        return max(getattr(self, "_current_progress", 0) or 0, timeline.percent())
+        # The timeline alone: it never goes back on what it showed. It used
+        # to be max()-ed with _current_progress, which other code still sets
+        # to literals (57 when intelligence ends, Trinity heartbeat
+        # estimates) -- the page then jumped 37% -> 57% the instant
+        # intelligence ended and sat there 27 s (boot of 2026-10-14 09:35).
+        return timeline.percent()
 
     async def _broadcast_startup_progress(
         self,

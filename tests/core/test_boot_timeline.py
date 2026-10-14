@@ -98,3 +98,22 @@ def test_a_late_starting_phase_holds_the_bar_instead_of_rolling_it_back(tmp_path
     shown = t.percent(now=61)
     t.phase_started("late", 62)                # caps at 30 now, but never goes back
     assert t.percent(now=63) == shown
+
+
+def test_the_page_shows_the_timeline_not_a_literal_written_elsewhere(tmp_path):
+    # Boot of 2026-10-14 09:35: _current_progress was set to 57 when
+    # intelligence ended and the page showed max(that, timeline): 37% -> 57%
+    # in an instant, then flat for 27 s.
+    import types
+    import unified_supervisor as us
+
+    store = tmp_path / "t.json"
+    _learn(store, {"a:start": 0, "a:end": 37, "b:start": 37, "b:end": 100}, total=100)
+    import time
+    origin = time.time() - 37                      # 37 s into a boot, right now
+    timeline = BootTimeline(origin=origin, store=store)
+    timeline.phase_started("a", origin)
+    timeline.phase_ended("a", origin + 37)
+    k = types.SimpleNamespace(_boot_timeline=timeline, _current_progress=57)
+    measured = us.JarvisSystemKernel._measured_boot_percent(k)
+    assert measured == timeline.percent() and measured < 57
