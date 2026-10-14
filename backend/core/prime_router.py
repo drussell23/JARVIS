@@ -521,6 +521,27 @@ class PrimeRouter:
                 logger.warning("[PrimeRouter] anthropic package not available")
         return self._cloud_client
 
+    async def _resolve_unknown_prime_status(self, deadline: Optional[float]) -> None:
+        """Probe J-Prime once if its availability has never been established.
+
+        Bounded by JARVIS_PRIME_STATUS_PROBE_S (default 2 s) and by the
+        request's own deadline; any failure leaves the status as it was.
+        """
+        client = self._prime_client
+        if client is None or getattr(client, "_status", None) is None:
+            return
+        if getattr(client._status, "name", "") != "UNKNOWN":
+            return
+        budget = float(os.environ.get("JARVIS_PRIME_STATUS_PROBE_S", "2.0"))
+        if deadline is not None:
+            budget = min(budget, max(0.0, deadline - asyncio.get_event_loop().time()))
+        if budget <= 0:
+            return
+        try:
+            await asyncio.wait_for(client._check_health(), timeout=budget)
+        except Exception as exc:  # noqa: BLE001 -- the route decision handles "unknown"
+            logger.debug("[PrimeRouter] status probe failed: %s", exc)
+
     def _decide_route(self) -> RoutingDecision:
         """Pillar 5: Route to J-Prime (the Mind). Always.
 
@@ -926,6 +947,11 @@ class PrimeRouter:
         start_time = time.time()
         self._metrics.total_requests += 1
 
+        # A local J-Prime is routed to only when the client KNOWS it is
+        # available; a router created moments before its first request had
+        # never checked, so "unknown" read as "down" and the first query of
+        # every process (the intent classifier's) degraded in 2 ms. Ask once.
+        await self._resolve_unknown_prime_status(deadline)
         routing = self._decide_route()
         logger.debug(f"[PrimeRouter] Routing decision: {routing.value}")
 

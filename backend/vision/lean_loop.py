@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -55,7 +56,10 @@ _DOUBLEWORD_TIMEOUT_S = float(os.environ.get("VISION_DOUBLEWORD_TIMEOUT_S", "30"
 _CLAUDE_MODEL = os.environ.get("JARVIS_CLAUDE_VISION_MODEL", "claude-sonnet-4-20250514")
 
 _STAGNATION_WINDOW = int(os.environ.get("VISION_LEAN_STAGNATION_WINDOW", "3"))
-_TMP_DIR = os.environ.get("VISION_LEAN_TMP_DIR", "/tmp/claude")
+_TMP_DIR = os.environ.get(
+    "VISION_LEAN_TMP_DIR",
+    os.path.join(__import__("tempfile").gettempdir(), "claude") if sys.platform == "win32" else "/tmp/claude",
+)
 
 # --- Visual Telemetry (Principle 7: Absolute Observability) ---
 # Every perception carries its frame artifact so the operator can verify
@@ -70,6 +74,44 @@ _TELEMETRY_MAX_ARTIFACTS = int(os.environ.get("VISION_TELEMETRY_MAX_ARTIFACTS", 
 _CU_ENABLED = os.environ.get("VISION_CU_ENABLED", "true").lower() in ("true", "1", "yes")
 _CU_DISPLAY_W = int(os.environ.get("VISION_CU_DISPLAY_W", "1280"))
 _CU_DISPLAY_H = int(os.environ.get("VISION_CU_DISPLAY_H", "800"))
+
+
+def _os_display_name() -> str:
+    return {"darwin": "macOS", "win32": "Windows"}.get(sys.platform, "Linux")
+
+
+def _vision_coord_frame() -> str:
+    """The local vision model's native coordinate space, as DECLARED.
+
+    Vision models disagree: Claude Computer Use answers in the image's pixels,
+    Qwen3-VL in a 0-1000 grid over the image. Read as pixels, a Qwen3-VL click
+    on the taskbar (y=978) landed off a 1080-row screen. The convention belongs
+    to the model, so it is configuration beside its name:
+    JARVIS_VISION_COORD_FRAME = pixels (default) | normalized_1000.
+    """
+    frame = os.environ.get("JARVIS_VISION_COORD_FRAME", "pixels").strip().lower()
+    return frame if frame in ("pixels", "normalized_1000") else "pixels"
+
+
+def _to_cu_pixels(response: Dict[str, Any], frame: str) -> Dict[str, Any]:
+    """Convert a model response's coordinate into CU-display pixels, once,
+    so verification and execution downstream keep one coordinate space."""
+    if frame != "normalized_1000" or not isinstance(response, dict):
+        return response
+    action = response.get("next_action")
+    if not isinstance(action, dict):
+        return response
+    for key in ("coordinate", "coords"):
+        coord = action.get(key)
+        if isinstance(coord, (list, tuple)) and len(coord) >= 2:
+            try:
+                action[key] = [
+                    round(float(coord[0]) * _CU_DISPLAY_W / 1000.0),
+                    round(float(coord[1]) * _CU_DISPLAY_H / 1000.0),
+                ]
+            except (TypeError, ValueError):
+                pass
+    return response
 _CU_MAX_TOKENS = int(os.environ.get("VISION_CU_MAX_TOKENS", "4096"))
 _CU_THINKING_BUDGET = int(os.environ.get("VISION_CU_THINKING_BUDGET", "1024"))
 _CU_SETTLE_S = float(os.environ.get("VISION_CU_SETTLE_S", "0.5"))
@@ -514,18 +556,27 @@ class LeanVisionLoop:
 
         return None
 
-    def _build_agentic_system_prompt(self) -> str:
-        """System prompt that teaches CU-compatible action vocabulary."""
+    def _build_agentic_system_prompt(self, coord_frame: str = "pixels") -> str:
+        """System prompt that teaches CU-compatible action vocabulary.
+
+        ``coord_frame`` is the answering model's native coordinate space
+        (see _vision_coord_frame); the prompt describes the one it will use.
+        """
+        if coord_frame == "normalized_1000":
+            coords = ("Coordinates are [x, y] on a 0-1000 grid over the image: "
+                      "[0, 0] is the top-left corner, [1000, 1000] the bottom-right.")
+        else:
+            coords = "Coordinates are [x, y] in this image's pixel space."
+        mod = "command" if sys.platform == "darwin" else "ctrl"
         return (
-            "You are JARVIS, a precise UI automation agent on macOS.\n\n"
-            f"Screenshots are {_CU_DISPLAY_W}x{_CU_DISPLAY_H} px. "
-            "Coordinates are [x, y] in this image's pixel space.\n\n"
+            f"You are JARVIS, a precise UI automation agent on {_os_display_name()}.\n\n"
+            f"Screenshots are {_CU_DISPLAY_W}x{_CU_DISPLAY_H} px. {coords}\n\n"
             "AVAILABLE ACTIONS:\n"
             "- left_click: click at [x, y]\n"
             "- double_click: double-click at [x, y]\n"
             "- right_click: right-click at [x, y]\n"
-            "- type: type text (uses clipboard paste)\n"
-            "- key: press key or combo (e.g., 'return', 'command+v')\n"
+            "- type: type text into the focused field (uses clipboard paste)\n"
+            f"- key: press key or combo (e.g., 'return', '{mod}+l', 'super' for the OS menu)\n"
             "- scroll: scroll at [x, y], set scroll_direction + scroll_amount\n"
             "- mouse_move: move cursor to [x, y]\n"
             "- wait: pause N seconds\n\n"
@@ -782,11 +833,39 @@ class LeanVisionLoop:
     async def _agentic_ask_jprime(
         self, system_prompt: str, content: list,
     ) -> Optional[Dict[str, Any]]:
-        """J-Prime LLaVA/32B on GCP GPU (zero API cost fallback)."""
+        """J-Prime vision (zero API cost).
+
+        With a local vision model declared (JARVIS_VISION_MODEL_NAME), this
+        goes through the one local vision client -- J-Prime's own endpoint,
+        resolved like the generation lane's, never a literal address. The
+        legacy remote path below remains for JARVIS_JPRIME_VISION_URL.
+        """
+        from backend.vision.local_vision_client import get_local_vision_client
+
+        local = get_local_vision_client()
         endpoint = os.environ.get("JARVIS_JPRIME_VISION_URL", "")
+        if local.enabled and not endpoint:
+            frame = _vision_coord_frame()
+            if frame != "pixels":
+                system_prompt = self._build_agentic_system_prompt(coord_frame=frame)
+            messages: list = [{"role": "system", "content": system_prompt}]
+            parts: list = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "image":
+                    parts.append(local.image_part(base64.b64decode(item["source"]["data"])))
+                elif item.get("type") == "text":
+                    parts.append({"type": "text", "text": item["text"]})
+            messages.append({"role": "user", "content": parts})
+            answer = await local.chat(messages, max_tokens=2048)
+            if not answer.ok:
+                logger.warning("[LeanVision:AG] local vision (%s) failed: %s", local.model, answer.error)
+                return None
+            logger.info("[LeanVision:AG] THINK via local %s (%.0fms)", local.model, answer.latency_ms)
+            return _to_cu_pixels(self._parse_response(answer.text), frame)
         if not endpoint:
-            # Try default GCP VM
-            endpoint = "http://136.113.252.164:8000"
+            return None
 
         # Quick reachability check — don't burn 30s on a dead endpoint
         if not hasattr(self, "_jprime_reachable"):
@@ -1533,7 +1612,16 @@ class LeanVisionLoop:
         that lacks Screen Recording permission.  SHM is in-process — it
         reads from the ScreenCaptureKit pipeline that VisionActivator
         starts, which has the correct TCC grant.
+
+        Windows has none of the macOS tiers (SCK shared memory, Quartz,
+        screencapture); it captures in-process with ImageGrab.
         """
+        if sys.platform == "win32":
+            result = await self._imagegrab_capture()
+            if result is not None:
+                self._emit_perception_artifact(result, "imagegrab")
+            return result
+
         # --- Tier 0: VisionActionLoop FramePipeline (sub-10ms) ---
         result = await self._try_val_frame_pipeline()
         if result is not None:
@@ -1736,6 +1824,48 @@ class LeanVisionLoop:
         except Exception as exc:
             logger.debug("[Ferrari] Could not start frame_server: %s", exc)
 
+    def _encode_cu_frame(self, img: Any) -> str:
+        """Resize a full-screen capture to the CU display and set ``_cu_scale``.
+
+        The model reasons in CU pixels; ``_cu_scale`` maps them back to the
+        coordinate space the input layer (pyautogui) clicks in.
+        """
+        from PIL import Image
+
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        logical_w, logical_h = self._get_logical_screen_size()
+        if logical_w > 0 and logical_h > 0:
+            self._cu_scale = (logical_w / _CU_DISPLAY_W, logical_h / _CU_DISPLAY_H)
+        else:
+            cap_w, cap_h = img.size
+            self._cu_scale = (cap_w / _CU_DISPLAY_W, cap_h / _CU_DISPLAY_H)
+        img = img.resize((_CU_DISPLAY_W, _CU_DISPLAY_H), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    async def _imagegrab_capture(self) -> Optional[str]:
+        """Windows: capture the primary display in-process via PIL ImageGrab.
+
+        GDI capture of the interactive session (under Remote Desktop, the
+        RDP session's desktop). pyautogui makes the process DPI-aware, so the
+        grab and the click space are both physical pixels of the primary
+        monitor -- the space ``_cu_scale`` maps into.
+        """
+        try:
+            from PIL import ImageGrab
+
+            img = await asyncio.wait_for(
+                asyncio.to_thread(ImageGrab.grab), timeout=_CAPTURE_TIMEOUT_S,
+            )
+            return self._encode_cu_frame(img)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("[LeanVision:CU] ImageGrab capture error: %s", exc)
+            return None
+
     async def _screencapture_fallback(self) -> Optional[str]:
         """Fallback: capture via screencapture subprocess (~200ms)."""
         os.makedirs(_TMP_DIR, exist_ok=True)
@@ -1753,29 +1883,7 @@ class LeanVisionLoop:
                 return None
 
             from PIL import Image
-            img = Image.open(tmp_path)
-            if img.mode == "RGBA":
-                img = img.convert("RGB")
-
-            logical_w, logical_h = self._get_logical_screen_size()
-            if logical_w > 0 and logical_h > 0:
-                self._cu_scale = (
-                    logical_w / _CU_DISPLAY_W,
-                    logical_h / _CU_DISPLAY_H,
-                )
-            else:
-                cap_w, cap_h = img.size
-                self._cu_scale = (
-                    cap_w / _CU_DISPLAY_W, cap_h / _CU_DISPLAY_H,
-                )
-
-            img = img.resize(
-                (_CU_DISPLAY_W, _CU_DISPLAY_H), Image.Resampling.LANCZOS,
-            )
-
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            return base64.b64encode(buf.getvalue()).decode("ascii")
+            return self._encode_cu_frame(Image.open(tmp_path))
 
         except asyncio.TimeoutError:
             logger.error("[LeanVision:CU] screencapture timed out")
@@ -1970,6 +2078,16 @@ class LeanVisionLoop:
         """Type text via clipboard paste (reliable for special chars)."""
         if not text:
             return True, None
+        if sys.platform != "darwin":
+            # pyperclip owns the platform clipboard (Win32 API on Windows,
+            # xclip/xsel on Linux); paste is the platform's Ctrl+V.
+            import pyautogui
+            import pyperclip
+
+            await asyncio.to_thread(pyperclip.copy, text)
+            await asyncio.to_thread(pyautogui.hotkey, "ctrl", "v")
+            logger.info("[LeanVision:CU] type '%s'", text[:50])
+            return True, None
         proc = await asyncio.create_subprocess_exec(
             "pbcopy",
             stdin=asyncio.subprocess.PIPE,
@@ -2070,10 +2188,12 @@ class LeanVisionLoop:
     @staticmethod
     def _map_cu_key(key: str) -> str:
         """Map Claude Computer Use key names to pyautogui key names."""
+        # The platform's "super" key: Command on macOS, the Windows key elsewhere.
+        sup = "command" if sys.platform == "darwin" else "win"
         m = {
             "return": "return", "enter": "return",
-            "super": "command", "meta": "command", "cmd": "command",
-            "command": "command",
+            "super": sup, "meta": sup, "cmd": sup, "win": sup, "windows": sup,
+            "command": sup,
             "ctrl": "ctrl", "control": "ctrl",
             "alt": "alt", "option": "alt",
             "shift": "shift", "space": "space", "tab": "tab",

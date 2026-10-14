@@ -83,25 +83,38 @@ class LocalVisionClient:
         flag = os.environ.get("JARVIS_LOCAL_VISION_ENABLED", "true").strip().lower()
         return bool(self.model) and flag != "false"
 
+    def image_part(self, image: Any) -> dict:
+        """One OpenAI ``image_url`` content part (JPEG, longest side <= max_dim)."""
+        jpeg = _to_jpeg(image, self.max_dim)
+        return {"type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()}}
+
     async def describe(self, image: Any, prompt: str, *, max_tokens: int = 300) -> VisionAnswer:
         """Ask the model about one image. Never raises; failures come back as ``ok=False``."""
         if not self.enabled:
             return VisionAnswer(ok=False, error="disabled")
-        import aiohttp
-
         try:
-            jpeg = _to_jpeg(image, self.max_dim)
+            part = self.image_part(image)
         except Exception as e:  # noqa: BLE001 -- undecodable input
             return VisionAnswer(ok=False, model=self.model, error=f"bad_image: {e}")
+        return await self.chat(
+            [{"role": "user", "content": [part, {"type": "text", "text": prompt}]}],
+            max_tokens=max_tokens,
+        )
+
+    async def chat(self, messages: list, *, max_tokens: int = 300,
+                   temperature: float = 0.1) -> VisionAnswer:
+        """OpenAI-format conversation (system prompt, multi-image turns) to the
+        vision model. Never raises; failures come back as ``ok=False``."""
+        if not self.enabled:
+            return VisionAnswer(ok=False, error="disabled")
+        import aiohttp
+
         payload = {
             "model": self.model,
-            "temperature": 0.1,
+            "temperature": temperature,
             "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": [
-                {"type": "image_url",
-                 "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()}},
-                {"type": "text", "text": prompt},
-            ]}],
+            "messages": messages,
         }
         started = time.monotonic()
         try:

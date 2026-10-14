@@ -211,8 +211,10 @@ class WorkspaceIntentDetector:
         self._patterns.append(IntentPattern(
             intent=WorkspaceIntent.SEARCH_EMAIL,
             triggers=[
+                # Every trigger names the mailbox: a bare "search for" made
+                # "open a browser and search for dogs" a Gmail search.
                 "search email", "search my email", "find email",
-                "find my email", "look for email", "search for",
+                "find my email", "look for email", "search my inbox",
                 "find message from", "search inbox",
             ],
             entity_patterns={

@@ -46,3 +46,6 @@ edge-tts
 # Desktop control + the (off-by-default) Claude lanes' client.
 pyautogui
 anthropic
+
+# Clipboard for the computer-use loop's typing (Win32 API on Windows).
+pyperclip
