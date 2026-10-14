@@ -23,6 +23,7 @@ import functools
 import json
 import logging
 import os
+import platform
 import threading
 import time
 import uuid
@@ -67,7 +68,7 @@ def _get_envelope_factory() -> Optional["TraceEnvelopeFactory"]:
             repo="jarvis",
             boot_id=os.environ.get("JARVIS_BOOT_ID", uuid.uuid4().hex[:16]),
             runtime_epoch_id=os.environ.get("JARVIS_RUNTIME_EPOCH_ID", uuid.uuid4().hex[:16]),
-            node_id=os.environ.get("JARVIS_NODE_ID", os.uname().nodename),
+            node_id=os.environ.get("JARVIS_NODE_ID", platform.node()),
             producer_version=os.environ.get("JARVIS_VERSION", "dev"),
         )
         return _envelope_factory

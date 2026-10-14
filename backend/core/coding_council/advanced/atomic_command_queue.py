@@ -542,7 +542,7 @@ class AtomicCommandQueue:
                     os.fsync(f.fileno())
 
                 # Atomic rename
-                temp_file.rename(self.sequence_file)
+                temp_file.replace(self.sequence_file)
 
                 # Update in-memory cache
                 self._sequence_counter = new_value
@@ -880,7 +880,7 @@ class AtomicCommandQueue:
         temp_file.write_text(json.dumps(data, indent=2))
 
         # Atomic rename
-        temp_file.rename(self.queue_file)
+        temp_file.replace(self.queue_file)
 
     async def _move_to_dead_letter(self, entry: AtomicQueueEntry):
         """Move entry to dead letter queue."""
@@ -897,7 +897,7 @@ class AtomicCommandQueue:
             # Write atomically
             temp_file = self.dead_letter_file.with_suffix(".tmp")
             temp_file.write_text(json.dumps(dead_letters, indent=2))
-            temp_file.rename(self.dead_letter_file)
+            temp_file.replace(self.dead_letter_file)
 
         except Exception as e:
             self.log.error(f"[AtomicQueue] Failed to write dead letter: {e}")

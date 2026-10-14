@@ -416,11 +416,11 @@ class EventStore:
             old_path = self._log_path.with_suffix(f".{i}.jsonl")
             new_path = self._log_path.with_suffix(f".{i + 1}.jsonl")
             if old_path.exists():
-                old_path.rename(new_path)
+                old_path.replace(new_path)
 
         # Move current to .1
         if self._log_path.exists():
-            self._log_path.rename(self._log_path.with_suffix(".1.jsonl"))
+            self._log_path.replace(self._log_path.with_suffix(".1.jsonl"))
 
         logger.info(f"[EventStore] Rotated log files")
 

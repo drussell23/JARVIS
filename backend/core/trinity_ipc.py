@@ -33,6 +33,7 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import sys
 import tempfile
 import time
@@ -840,7 +841,7 @@ class TrinityIPCBus:
             component_id=f"{component.value}_{pid}",
             timestamp=time.time(),
             pid=pid,
-            host=os.uname().nodename,
+            host=platform.node(),
             status=status,
             uptime_seconds=time.time() - self._start_time,
             metrics=metrics or {},
@@ -1691,7 +1692,7 @@ class ResilientTrinityIPCBus(TrinityIPCBus):
                 component_id=f"{component.value}_{pid}",
                 timestamp=time.time(),
                 pid=pid,
-                host=os.uname().nodename,
+                host=platform.node(),
                 status=status,
                 uptime_seconds=time.time() - self._start_time,
                 metrics=metrics or {},
@@ -1718,7 +1719,7 @@ class ResilientTrinityIPCBus(TrinityIPCBus):
                 component_id=f"{component.value}_{pid}",
                 timestamp=time.time(),
                 pid=pid,
-                host=os.uname().nodename,
+                host=platform.node(),
                 status=status,
                 uptime_seconds=time.time() - self._start_time,
                 metrics=metrics or {},
@@ -1736,7 +1737,7 @@ class ResilientTrinityIPCBus(TrinityIPCBus):
                 component_id=f"{component.value}_{pid}",
                 timestamp=time.time(),
                 pid=pid,
-                host=os.uname().nodename,
+                host=platform.node(),
                 status=status,
                 uptime_seconds=time.time() - self._start_time,
                 metrics=metrics or {},

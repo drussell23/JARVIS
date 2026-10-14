@@ -3448,7 +3448,7 @@ class MetaLearner:
                 }
                 temp_file = stats_file.with_suffix(".tmp")
                 temp_file.write_text(json.dumps(stats_data, indent=2))
-                temp_file.rename(stats_file)
+                temp_file.replace(stats_file)
 
                 # Save metadata
                 meta_file = self._persistence_dir / "metadata.json"

@@ -680,7 +680,7 @@ class MemoryEngine:
             # Rotate if over size limit
             if path.exists() and path.stat().st_size >= _INSIGHTS_ROTATION_BYTES:
                 rotated = path.with_suffix(f".{int(time.time())}.jsonl")
-                path.rename(rotated)
+                path.replace(rotated)
                 logger.info("MemoryEngine: rotated insights file to %s", rotated)
             line = json.dumps(_insight_to_dict(insight), sort_keys=True) + "\n"
             with open(path, "a", encoding="utf-8") as fh:

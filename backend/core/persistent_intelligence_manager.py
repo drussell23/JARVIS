@@ -819,7 +819,7 @@ class PersistentIntelligenceManager:
             async with aiofiles.open(temp_path, "w") as f:
                 await f.write(json.dumps(existing, indent=2, default=str))
 
-            temp_path.rename(filepath)
+            temp_path.replace(filepath)
 
         except Exception as e:
             logger.warning(f"[PERSISTENT-INTELLIGENCE] Cross-repo write failed: {e}")

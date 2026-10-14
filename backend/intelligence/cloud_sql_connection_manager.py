@@ -1686,7 +1686,7 @@ class IntelligentCredentialResolver:
                 json.dump(signal_data, f)
                 f.flush()
                 os.fsync(f.fileno())
-            temp_file.rename(signal_file)
+            temp_file.replace(signal_file)
 
             logger.debug("[CredentialResolver v115.0] Pool invalidation signaled via file")
 
@@ -1819,7 +1819,7 @@ class IntelligentCredentialResolver:
                 os.fsync(f.fileno())
 
             # Atomic rename
-            temp_file.rename(signal_file)
+            temp_file.replace(signal_file)
 
             logger.debug(
                 f"[CredentialResolver v114.0] Credential invalidation signaled via file: {signal_file}"
@@ -6918,7 +6918,7 @@ class ProxyWatchdog:
             temp_path = self._cross_repo_health_path.with_suffix('.tmp')
             with open(temp_path, 'w') as f:
                 json.dump(health_data, f, indent=2)
-            temp_path.rename(self._cross_repo_health_path)
+            temp_path.replace(self._cross_repo_health_path)
 
         except Exception as e:
             logger.debug(f"[ProxyWatchdog] Cross-repo health update failed: {e}")

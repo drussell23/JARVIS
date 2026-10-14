@@ -391,7 +391,7 @@ class EvolutionStateMachine:
         tmp_file = checkpoint_file.with_suffix(".tmp")
 
         tmp_file.write_text(json.dumps(checkpoint.to_dict(), indent=2, default=str))
-        tmp_file.rename(checkpoint_file)
+        tmp_file.replace(checkpoint_file)
 
         logger.debug(f"[StateMachine:{self.evolution_id}] Checkpoint saved")
         return str(checkpoint_file)

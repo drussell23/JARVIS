@@ -4146,7 +4146,7 @@ class MLEngineRegistry:
 
                 tmp_file = lease_file.with_suffix(".tmp")
                 tmp_file.write_text(json.dumps(lease_payload, indent=2))
-                tmp_file.rename(lease_file)
+                tmp_file.replace(lease_file)
 
                 observed = json.loads(lease_file.read_text())
                 if (
@@ -4228,7 +4228,7 @@ class MLEngineRegistry:
 
             tmp_file = state_file.with_suffix(".tmp")
             tmp_file.write_text(json.dumps(state, indent=2))
-            tmp_file.rename(state_file)
+            tmp_file.replace(state_file)
 
             logger.debug(
                 "[v277.0] Cross-repo ECAPA state written: ready=%s epoch=%s seq=%s",
@@ -4510,7 +4510,7 @@ class MLEngineRegistry:
             }
             tmp = fence_file.with_suffix(".tmp")
             tmp.write_text(json.dumps(fence))
-            tmp.rename(fence_file)
+            tmp.replace(fence_file)
             return True
 
         except Exception as e:

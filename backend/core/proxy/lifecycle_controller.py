@@ -1033,7 +1033,7 @@ class ProxyLifecycleController:
             tmp_file = ProxyConfig.STATE_FILE.with_suffix(".tmp")
             with open(tmp_file, "w") as f:
                 json.dump(state_data, f, indent=2)
-            tmp_file.rename(ProxyConfig.STATE_FILE)
+            tmp_file.replace(ProxyConfig.STATE_FILE)
 
         except Exception as e:
             logger.warning(f"[LifecycleController] Failed to persist state: {e}")

@@ -6,6 +6,7 @@ Implements individual action executors for workflow steps
 import asyncio
 import subprocess
 import os
+import platform
 import json
 import uuid
 import time
@@ -166,7 +167,7 @@ class SystemUnlockExecutor(BaseActionExecutor):
                 return {"status": "already_unlocked", "message": "Screen is already unlocked"}
                 
             # Platform-specific unlock
-            if os.uname().sysname == "Darwin":  # macOS
+            if platform.system() == "Darwin":  # macOS
                 # Use TouchID or password
                 result = await self._unlock_macos(context)
             else:
@@ -413,7 +414,7 @@ class ApplicationLauncherExecutor(BaseActionExecutor):
 
         # Try native app launch (known native OR unknown — try system first)
         try:
-            if os.uname().sysname == "Darwin":
+            if platform.system() == "Darwin":
                 return await self._launch_macos_app(resolved_name, context)
             else:
                 return await self._launch_generic_app(resolved_name, context)
@@ -1303,7 +1304,7 @@ class NotificationMuterExecutor(BaseActionExecutor):
         try:
             target = action.target.lower() if action.target else 'all'
             
-            if os.uname().sysname == "Darwin":  # macOS
+            if platform.system() == "Darwin":  # macOS
                 result = await self._mute_macos_notifications(target, context)
             else:
                 result = {"status": "unsupported", "message": "Platform not supported"}

@@ -303,7 +303,7 @@ class CrashRecovery:
         # Atomic write
         tmp_path = filepath.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(data, indent=2, default=str))
-        tmp_path.rename(filepath)
+        tmp_path.replace(filepath)
 
     async def _load_latest_checkpoint(self) -> Optional[RecoveryPoint]:
         """Load the most recent valid checkpoint."""

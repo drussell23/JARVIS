@@ -23,6 +23,7 @@ from backend.core import portable_fcntl as fcntl
 import json
 import logging
 import os
+import platform
 from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
@@ -619,7 +620,7 @@ class IntelligentGCPOptimizer:
             lock_info = {
                 "pid": os.getpid(),
                 "timestamp": datetime.now().isoformat(),
-                "hostname": os.uname().nodename,
+                "hostname": platform.node(),
             }
             os.ftruncate(self.lock_fd, 0)  # Clear file first
             os.write(self.lock_fd, json.dumps(lock_info).encode())

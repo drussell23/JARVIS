@@ -406,7 +406,7 @@ class ComponentHealthRegistry:
             tmp_file = self._state_file.with_suffix(".tmp")
             with open(tmp_file, "w") as f:
                 json.dump(data, f, indent=2)
-            tmp_file.rename(self._state_file)
+            tmp_file.replace(self._state_file)
         except Exception as e:
             logger.debug(f"[HealthRegistry] Persist error: {e}")
 

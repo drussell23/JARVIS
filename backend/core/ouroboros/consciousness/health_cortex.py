@@ -523,7 +523,7 @@ class HealthCortex:
             # Rotate if over size limit
             if path.exists() and path.stat().st_size >= _ROTATION_BYTES:
                 rotated = path.with_suffix(f".{int(time.time())}.jsonl")
-                path.rename(rotated)
+                path.replace(rotated)
                 logger.info("[HealthCortex] Rotated trend file -> %s", rotated)
 
             snapshots = list(self._trend._entries)  # noqa: SLF001

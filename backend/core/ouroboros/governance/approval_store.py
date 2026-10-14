@@ -313,7 +313,7 @@ class ApprovalStore:
             f.flush()
             os.fsync(f.fileno())
             tmp = Path(f.name)
-        tmp.rename(self._path)
+        tmp.replace(self._path)
 
     @staticmethod
     def _to_record(op_id: str, entry: Dict[str, Any]) -> ApprovalRecord:

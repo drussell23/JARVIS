@@ -1488,7 +1488,7 @@ def _save_cloud_lock(
         temp_file.write_text(json.dumps(lock_state, indent=2))
 
         # Atomic rename (on POSIX systems, rename is atomic)
-        temp_file.rename(_CLOUD_LOCK_FILE)
+        temp_file.replace(_CLOUD_LOCK_FILE)
 
         logger.info(f"[v147.0] ☁️ Cloud lock {'SET' if locked else 'CLEARED'}: {reason}")
         return True

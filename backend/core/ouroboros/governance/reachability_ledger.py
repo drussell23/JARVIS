@@ -472,10 +472,10 @@ class ReachabilityLedger:
             for gen in range(keep - 1, 0, -1):
                 src = self._path.with_suffix(self._path.suffix + f".{gen}")
                 if src.exists():
-                    src.rename(
+                    src.replace(
                         self._path.with_suffix(self._path.suffix + f".{gen + 1}")
                     )
-            self._path.rename(self._path.with_suffix(self._path.suffix + ".1"))
+            self._path.replace(self._path.with_suffix(self._path.suffix + ".1"))
             self._rotations += 1
             logger.info(
                 "[Reachability] ledger rotated at %d bytes (generation %d, "

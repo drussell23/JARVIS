@@ -765,7 +765,7 @@ class TrinityBridgeAdapter:
             self.logger.warning(f"Invalid JSON in {file_path.name}")
             # Move to .failed
             try:
-                file_path.rename(file_path.with_suffix(".json.failed"))
+                file_path.replace(file_path.with_suffix(".json.failed"))
             except Exception:
                 pass
         except FileNotFoundError:

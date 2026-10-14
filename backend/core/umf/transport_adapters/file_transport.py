@@ -101,7 +101,7 @@ class FileTransport:
     def _write_atomic(tmp_path: Path, final_path: Path, data: str) -> None:
         """Blocking helper: write data to *tmp_path*, then rename to *final_path*."""
         tmp_path.write_text(data, encoding="utf-8")
-        os.rename(str(tmp_path), str(final_path))
+        os.replace(str(tmp_path), str(final_path))
 
     # ── receive ──────────────────────────────────────────────────────
 

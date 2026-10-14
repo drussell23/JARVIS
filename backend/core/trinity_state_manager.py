@@ -63,6 +63,7 @@ import hmac
 import json
 import logging
 import os
+import platform
 import secrets
 import struct
 import time
@@ -1634,7 +1635,7 @@ class TrinityStateManager:
         node_id: Optional[str] = None
     ):
         self.config = config or StateManagerConfig()
-        self.node_id = node_id or f"{os.uname().nodename}-{os.getpid()}"
+        self.node_id = node_id or f"{platform.node()}-{os.getpid()}"
 
         # Initialize components for each gap
         self.compression = CompressionEngine(self.config)  # Gap 7

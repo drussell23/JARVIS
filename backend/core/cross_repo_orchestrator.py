@@ -1230,7 +1230,7 @@ class CrossRepoOrchestrator:
             # Atomic write
             temp_file = heartbeat_file.with_suffix(".tmp")
             temp_file.write_text(json.dumps(heartbeat_data, indent=2))
-            temp_file.rename(heartbeat_file)
+            temp_file.replace(heartbeat_file)
 
         except Exception as e:
             logger.warning(f"Failed to write heartbeat: {e}")
@@ -1257,7 +1257,7 @@ class CrossRepoOrchestrator:
             # Atomic write
             temp_file = repo_info.state_file.with_suffix(".tmp")
             temp_file.write_text(json.dumps(state_data, indent=2))
-            temp_file.rename(repo_info.state_file)
+            temp_file.replace(repo_info.state_file)
 
         except Exception as e:
             logger.warning(f"Failed to write state for {repo_id}: {e}")

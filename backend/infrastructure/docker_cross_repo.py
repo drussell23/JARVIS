@@ -614,7 +614,7 @@ class DockerCrossRepoCoordinator:
         temp_path = path.with_suffix('.tmp')
         try:
             temp_path.write_text(json.dumps(data, indent=2, default=str))
-            temp_path.rename(path)
+            temp_path.replace(path)
         except Exception as e:
             logger.debug(f"Atomic write failed: {e}")
             try:

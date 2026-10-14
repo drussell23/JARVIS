@@ -1164,7 +1164,7 @@ class UnifiedAwarenessEngine:
                     file_size = self._journal_path.stat().st_size
                     if file_size >= _JOURNAL_MAX_BYTES:
                         rotated = self._journal_path.with_suffix(".jsonl.old")
-                        self._journal_path.rename(rotated)
+                        self._journal_path.replace(rotated)
                         logger.info(
                             "[UAE] Journal rotated (%.1f MB -> %s)",
                             file_size / (1024 * 1024),

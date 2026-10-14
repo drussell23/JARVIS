@@ -28,8 +28,11 @@ logger = logging.getLogger(__name__)
 # Every process that imports backend gets the Windows-safe os.kill and the
 # ownership guard (no-op off Windows unless JARVIS_KILL_GUARD is set).
 from .core.process_identity import install_kill_guard as _install_kill_guard
+from .core.portable_ipc import install as _install_portable_ipc
 
 _install_kill_guard()
+# Path-addressed asyncio IPC on platforms without Unix sockets (no-op on POSIX).
+_install_portable_ipc()
 
 # Version info
 __version__ = "13.4.0"

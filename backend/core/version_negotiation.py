@@ -867,7 +867,7 @@ class VersionNegotiator:
         # Atomic write
         temp_file = announcement_file.with_suffix('.tmp')
         temp_file.write_text(json.dumps(message.to_dict(), indent=2))
-        temp_file.rename(announcement_file)
+        temp_file.replace(announcement_file)
 
         logger.debug(f"[VersionNegotiator] Announced presence at {announcement_file}")
 
@@ -1076,7 +1076,7 @@ class VersionNegotiator:
         agreement_file = agreements_dir / f"{agreement_id}.json"
         temp_file = agreement_file.with_suffix('.tmp')
         temp_file.write_text(json.dumps(agreement, indent=2))
-        temp_file.rename(agreement_file)
+        temp_file.replace(agreement_file)
 
     async def negotiate_with_all_peers(self) -> Dict[str, NegotiationResult]:
         """

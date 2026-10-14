@@ -240,7 +240,7 @@ class AdaptiveThresholdCalculator:
                 json.dump(self._history, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
-            tmp_path.rename(_THRESHOLD_HISTORY_PATH)
+            tmp_path.replace(_THRESHOLD_HISTORY_PATH)
         except OSError as e:
             logger.debug(f"[AdaptiveThreshold] Failed to save history: {e}")
 

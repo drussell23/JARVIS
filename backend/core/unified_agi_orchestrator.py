@@ -736,7 +736,7 @@ class PersistentStateManager:
             # Create backup before saving
             if self._state_file.exists():
                 backup_file = self._state_file.with_suffix(f".json.{int(time.time())}")
-                self._state_file.rename(backup_file)
+                self._state_file.replace(backup_file)
 
                 # Clean old backups
                 backups = sorted(

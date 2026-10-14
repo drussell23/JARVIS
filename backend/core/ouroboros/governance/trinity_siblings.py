@@ -46,7 +46,7 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger("Ouroboros.TrinitySiblings")
 
-__all__ = ["Sibling", "SiblingStatus", "siblings", "ensure_siblings", "autostart_enabled",
+__all__ = ["Sibling", "SiblingStatus", "siblings", "ensure_siblings", "ensure_sibling", "autostart_enabled",
            "probe_timeout_s", "jprime_ready_budget_s"]
 
 _TRUTHY = ("1", "true", "yes", "on")
@@ -180,50 +180,75 @@ def ensure_siblings(*, say: Callable[[str], None] = print,
                     clock: Callable[[], float] = time.monotonic,
                     lent: Callable[[Sibling, str], str] = _lent_detail) -> List[SiblingStatus]:
     """Bring up every configured sibling that is not already serving. NEVER raises."""
-    out: List[SiblingStatus] = []
     if not autostart_enabled():
-        return out
-    probe_timeout = probe_timeout_s()
+        return []
+    return [
+        _ensure_one(sib, say=say, probe=probe, spawn=spawn, sleep=sleep, clock=clock, lent=lent)
+        for sib in siblings()
+    ]
+
+
+def ensure_sibling(key: str, *, say: Callable[[str], None] = print,
+                   probe: Callable[[str, float], bool] = _answers,
+                   spawn: Callable[[str, Dict[str, str]], object] = _spawn,
+                   sleep: Callable[[float], None] = time.sleep,
+                   clock: Callable[[], float] = time.monotonic,
+                   lent: Callable[[Sibling, str], str] = _lent_detail) -> SiblingStatus:
+    """Bring up ONE sibling by key ("jprime" | "reactor"). NEVER raises.
+
+    The same contract as :func:`ensure_siblings`, for a caller that owns one
+    sibling's lifecycle (the unified supervisor's Trinity layer), so both
+    launchers honour one declaration of how a sibling starts.
+    """
     for sib in siblings():
-        try:
-            base = sib.base_url().rstrip("/")
-            url = base + sib.probe_path
-            if sib.key == "jprime" and not sib.required():
-                out.append(SiblingStatus(sib.key, sib.title, base, "skipped", "local lane off"))
-                continue
+        if sib.key == key:
+            if not autostart_enabled():
+                return SiblingStatus(sib.key, sib.title, "", "skipped", "JARVIS_TRINITY_AUTOSTART off")
+            return _ensure_one(sib, say=say, probe=probe, spawn=spawn, sleep=sleep,
+                               clock=clock, lent=lent)
+    return SiblingStatus(key, key, "", "not_configured", f"unknown sibling {key!r}")
+
+
+def _ensure_one(sib: Sibling, *, say: Callable[[str], None],
+                probe: Callable[[str, float], bool],
+                spawn: Callable[[str, Dict[str, str]], object],
+                sleep: Callable[[float], None],
+                clock: Callable[[], float],
+                lent: Callable[[Sibling, str], str]) -> SiblingStatus:
+    probe_timeout = probe_timeout_s()
+    try:
+        base = sib.base_url().rstrip("/")
+        url = base + sib.probe_path
+        if sib.key == "jprime" and not sib.required():
+            return SiblingStatus(sib.key, sib.title, base, "skipped", "local lane off")
+        if probe(url, probe_timeout):
+            why = lent(sib, base)
+            if why:
+                # Up, but lent out: not started over (it is not down),
+                # not called "serving" (it will refuse us). The lane
+                # gate owns what that means for this boot.
+                say(f"  {sib.title}: up at {base}, lent -- {why}")
+                return SiblingStatus(sib.key, sib.title, base, "lent", why)
+            say(f"  {sib.title}: serving at {base}")
+            return SiblingStatus(sib.key, sib.title, base, "serving")
+        cmd = _env(sib.start_env)
+        if not cmd:
+            detail = f"not serving at {base} and {sib.start_env} is unset"
+            say(f"  {sib.title}: {detail}" + (" (required)" if sib.required() else ""))
+            return SiblingStatus(sib.key, sib.title, base, "not_configured", detail)
+        say(f"  {sib.title}: not serving at {base} -- starting it")
+        spawn(cmd, _template_values(base))
+        deadline = clock() + sib.ready_budget_s()
+        while clock() < deadline:
             if probe(url, probe_timeout):
-                why = lent(sib, base)
-                if why:
-                    # Up, but lent out: not started over (it is not down),
-                    # not called "serving" (it will refuse us). The lane
-                    # gate owns what that means for this boot.
-                    say(f"  {sib.title}: up at {base}, lent -- {why}")
-                    out.append(SiblingStatus(sib.key, sib.title, base, "lent", why))
-                    continue
-                say(f"  {sib.title}: serving at {base}")
-                out.append(SiblingStatus(sib.key, sib.title, base, "serving"))
-                continue
-            cmd = _env(sib.start_env)
-            if not cmd:
-                detail = f"not serving at {base} and {sib.start_env} is unset"
-                say(f"  {sib.title}: {detail}" + (" (required)" if sib.required() else ""))
-                out.append(SiblingStatus(sib.key, sib.title, base, "not_configured", detail))
-                continue
-            say(f"  {sib.title}: not serving at {base} -- starting it")
-            spawn(cmd, _template_values(base))
-            deadline = clock() + sib.ready_budget_s()
-            while clock() < deadline:
-                if probe(url, probe_timeout):
-                    break
-                sleep(1.0)
-            if probe(url, probe_timeout):
-                say(f"  {sib.title}: started, serving at {base}")
-                out.append(SiblingStatus(sib.key, sib.title, base, "started"))
-            else:
-                detail = f"did not answer at {url} within {sib.ready_budget_s():.0f}s; see {_launch_log()}"
-                say(f"  {sib.title}: {detail}")
-                out.append(SiblingStatus(sib.key, sib.title, base, "failed", detail))
-        except Exception as exc:  # noqa: BLE001 -- bring-up must never take the boot down
-            logger.warning("[TrinitySiblings] %s bring-up error: %s", sib.key, exc, exc_info=True)
-            out.append(SiblingStatus(sib.key, sib.title, "", "failed", str(exc)))
-    return out
+                break
+            sleep(1.0)
+        if probe(url, probe_timeout):
+            say(f"  {sib.title}: started, serving at {base}")
+            return SiblingStatus(sib.key, sib.title, base, "started")
+        detail = f"did not answer at {url} within {sib.ready_budget_s():.0f}s; see {_launch_log()}"
+        say(f"  {sib.title}: {detail}")
+        return SiblingStatus(sib.key, sib.title, base, "failed", detail)
+    except Exception as exc:  # noqa: BLE001 -- bring-up must never take the boot down
+        logger.warning("[TrinitySiblings] %s bring-up error: %s", sib.key, exc, exc_info=True)
+        return SiblingStatus(sib.key, sib.title, "", "failed", str(exc))

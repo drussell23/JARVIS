@@ -391,10 +391,9 @@ def _blocking_check_unix_socket(socket_path: str, timeout: float) -> bool:
     Returns True if connection succeeds, False otherwise.
     """
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
-            result = sock.connect_ex(socket_path)
-            return result == 0
+        from backend.core.portable_ipc import connect_unix_sync
+        connect_unix_sync(socket_path, timeout=timeout).close()
+        return True
     except Exception:
         return False
 

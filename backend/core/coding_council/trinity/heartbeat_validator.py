@@ -30,6 +30,7 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import threading
 import time
 from dataclasses import dataclass, field
@@ -101,7 +102,7 @@ class Heartbeat:
     component_type: str
     timestamp: float = field(default_factory=time.time)
     pid: int = field(default_factory=os.getpid)
-    host: str = field(default_factory=lambda: os.uname().nodename)
+    host: str = field(default_factory=lambda: platform.node())
     version: str = "77.0"
     status: str = "running"
     metrics: Dict[str, Any] = field(default_factory=dict)
@@ -402,7 +403,7 @@ class HeartbeatValidator:
         component_id = heartbeat.component_id
 
         # Validate PID (Gap #3)
-        if heartbeat.host == os.uname().nodename:
+        if heartbeat.host == platform.node():
             if not self._validate_pid(heartbeat.pid):
                 logger.warning(f"[HeartbeatValidator] Invalid PID {heartbeat.pid} for {component_id}")
                 return False
@@ -555,7 +556,7 @@ class HeartbeatValidator:
         # recovery cascades that shut down the backend.
         # ═══════════════════════════════════════════════════════════════════
         current_pid = os.getpid()
-        if health.pid == current_pid and health.host == os.uname().nodename:
+        if health.pid == current_pid and health.host == platform.node():
             # In-process component - always healthy (same process = same fate)
             if health.status != HeartbeatStatus.HEALTHY:
                 old_status = health.status
@@ -596,7 +597,7 @@ class HeartbeatValidator:
 
         # If marked healthy, verify PID
         if new_status == HeartbeatStatus.HEALTHY:
-            if health.host == os.uname().nodename and health.pid:
+            if health.host == platform.node() and health.pid:
                 if not self._validate_pid(health.pid):
                     new_status = HeartbeatStatus.ZOMBIE
 
@@ -666,7 +667,7 @@ class HeartbeatValidator:
             filepath = self.heartbeat_dir / f"{heartbeat.component_id}.json"
             tmp_path = filepath.with_suffix(".tmp")
             tmp_path.write_text(heartbeat_data)
-            tmp_path.rename(filepath)
+            tmp_path.replace(filepath)
         except Exception as e:
             logger.warning(f"[HeartbeatValidator] Failed to write heartbeat to primary: {e}")
 
@@ -678,7 +679,7 @@ class HeartbeatValidator:
                 filepath = cross_repo_dir / f"{heartbeat.component_id}.json"
                 tmp_path = filepath.with_suffix(".tmp")
                 tmp_path.write_text(heartbeat_data)
-                tmp_path.rename(filepath)
+                tmp_path.replace(filepath)
             except Exception as e:
                 logger.debug(f"[HeartbeatValidator] Failed to write heartbeat to cross-repo: {e}")
 

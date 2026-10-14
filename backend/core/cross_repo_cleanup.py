@@ -206,7 +206,7 @@ class ResourceRegistry:
         temp_path = self.registry_path.with_suffix('.tmp')
         with open(temp_path, 'w') as f:
             json.dump(data, f, indent=2)
-        temp_path.rename(self.registry_path)
+        temp_path.replace(self.registry_path)
     
     def register(self, entry: ResourceEntry) -> bool:
         """Register a resource in the cross-repo registry."""

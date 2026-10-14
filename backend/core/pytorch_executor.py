@@ -723,7 +723,7 @@ class OperationProgressTracker:
             temp_path = path.with_suffix(".tmp")
             with open(temp_path, "w") as f:
                 json.dump(data, f)
-            temp_path.rename(path)
+            temp_path.replace(path)
         except Exception:
             pass
 

@@ -9314,7 +9314,7 @@ class CrossRepoSync:
             # Atomic write
             tmp_file = recovery_request_file.with_suffix(".tmp")
             tmp_file.write_text(json.dumps(existing_requests, indent=2))
-            tmp_file.rename(recovery_request_file)
+            tmp_file.replace(recovery_request_file)
 
             self.logger.info(f"[CrossRepoSync] Recovery request written for {component}")
 

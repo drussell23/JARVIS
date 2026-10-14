@@ -377,7 +377,7 @@ class DiskBackedQueue:
             # Write atomically
             tmp_path = file_path.with_suffix(".tmp")
             tmp_path.write_text(data)
-            tmp_path.rename(file_path)
+            tmp_path.replace(file_path)
 
     async def pop_batch(self, batch_size: int) -> List[TelemetryEvent]:
         """Pop a batch of events from disk queue."""
@@ -393,7 +393,7 @@ class DiskBackedQueue:
                 except Exception as e:
                     logger.warning(f"[Telemetry] Failed to read queue file {file_path}: {e}")
                     # Move corrupted file
-                    file_path.rename(file_path.with_suffix(".corrupted"))
+                    file_path.replace(file_path.with_suffix(".corrupted"))
 
             return events
 

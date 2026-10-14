@@ -460,7 +460,7 @@ class FileTransport(BaseTransport):
             # Atomic write
             tmp_file = msg_file.with_suffix(".tmp")
             tmp_file.write_text(message.to_json())
-            tmp_file.rename(msg_file)
+            tmp_file.replace(msg_file)
 
             return True
         except Exception as e:

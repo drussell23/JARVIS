@@ -152,7 +152,7 @@ class LockCanary:
 
         try:
             tmp_path.write_text(token, encoding="utf-8")
-            os.rename(str(tmp_path), str(canary_path))
+            os.replace(str(tmp_path), str(canary_path))
         except OSError:
             # Best-effort cleanup of temp file on failure
             try:
@@ -352,7 +352,7 @@ class KeepaliveBreachSignal:
             try:
                 tmp = breach_file.with_suffix(".breach.tmp")
                 tmp.write_text(payload, encoding="utf-8")
-                os.rename(str(tmp), str(breach_file))
+                os.replace(str(tmp), str(breach_file))
                 logger.warning(
                     "split-brain-guard: keepalive breach signalled for '%s'",
                     lock_name,

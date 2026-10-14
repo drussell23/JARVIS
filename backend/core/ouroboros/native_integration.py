@@ -25544,7 +25544,7 @@ class AtomicFileManager:
                         raise IOError(f"Content verification failed for {path}")
 
                 # Atomic rename
-                temp_path.rename(path)
+                temp_path.replace(path)
 
                 # Remove from pending
                 del self._pending_writes[str(path)]
@@ -25565,7 +25565,7 @@ class AtomicFileManager:
                 # Restore backup if write failed
                 if backup_path and backup_path.exists():
                     try:
-                        backup_path.rename(path)
+                        backup_path.replace(path)
                         logger.info(f"Restored backup for {path}")
                     except Exception as restore_err:
                         logger.error(f"Failed to restore backup: {restore_err}")
@@ -25671,7 +25671,7 @@ class AtomicFileManager:
                         # If temp is newer than target (or target missing), recover
                         if not target_path.exists() or \
                            temp_file.stat().st_mtime > target_path.stat().st_mtime:
-                            temp_file.rename(target_path)
+                            temp_file.replace(target_path)
                             recovered += 1
                             logger.info(f"Recovered incomplete write: {target_path}")
 

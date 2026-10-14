@@ -2067,7 +2067,7 @@ class AtomicFileIPC:
             # Write atomically using temp file
             temp_path = queue_path.with_suffix(".tmp")
             temp_path.write_text(content)
-            temp_path.rename(queue_path)
+            temp_path.replace(queue_path)
 
             return True
 
@@ -2140,7 +2140,7 @@ class AtomicFileIPC:
         # Write atomically
         temp_path = heartbeat_path.with_suffix(".tmp")
         temp_path.write_text(json.dumps(heartbeat))
-        temp_path.rename(heartbeat_path)
+        temp_path.replace(heartbeat_path)
 
         return True
 
@@ -2500,7 +2500,7 @@ class DistributedCommandLock:
             })
             temp_meta = lock_meta.with_suffix(".tmp")
             temp_meta.write_text(meta_content)
-            temp_meta.rename(lock_meta)
+            temp_meta.replace(lock_meta)
 
             self._active_locks[command_id] = fd
 
@@ -2634,7 +2634,7 @@ class ProcessCookieValidator:
         # Write atomically
         temp_path = cookie_path.with_suffix(".tmp")
         temp_path.write_text(json.dumps(cookie_data))
-        temp_path.rename(cookie_path)
+        temp_path.replace(cookie_path)
 
         self._registered = True
         logger.debug(f"Registered process cookie for PID {pid}")
@@ -2816,7 +2816,7 @@ class StartupBarrier:
         # Write atomically
         temp_file = ready_file.with_suffix(".tmp")
         temp_file.write_text(json.dumps(data))
-        temp_file.rename(ready_file)
+        temp_file.replace(ready_file)
 
         logger.info(f"[StartupBarrier] {component_name} signaled ready")
 

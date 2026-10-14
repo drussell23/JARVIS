@@ -4464,7 +4464,7 @@ class UnifiedStateCoordinator:
                         )
                         backup = lock_file.with_suffix(".lock.corrupted")
                         try:
-                            lock_file.rename(backup)
+                            lock_file.replace(backup)
                         except Exception:
                             lock_file.unlink(missing_ok=True)
                         logger.info(f"[StateCoord] Recovered corrupted lock file")
@@ -4672,7 +4672,7 @@ class UnifiedStateCoordinator:
                         )
                         # Backup and recreate
                         backup = self.state_file.with_suffix(".json.corrupted")
-                        self.state_file.rename(backup)
+                        self.state_file.replace(backup)
                         return True
 
                 return True
@@ -4681,7 +4681,7 @@ class UnifiedStateCoordinator:
                 logger.warning(f"[StateCoord] State file JSON invalid: {e}, recovering...")
                 backup = self.state_file.with_suffix(".json.corrupted")
                 try:
-                    self.state_file.rename(backup)
+                    self.state_file.replace(backup)
                 except Exception:
                     self.state_file.unlink(missing_ok=True)
                 return True

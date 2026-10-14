@@ -159,8 +159,8 @@ def _rotate_if_needed(path: Path) -> None:
         for gen in range(keep - 1, 0, -1):
             src = path.with_suffix(path.suffix + f".{gen}")
             if src.exists():
-                src.rename(path.with_suffix(path.suffix + f".{gen + 1}"))
-        path.rename(path.with_suffix(path.suffix + ".1"))
+                src.replace(path.with_suffix(path.suffix + f".{gen + 1}"))
+        path.replace(path.with_suffix(path.suffix + ".1"))
         logger.info("[LocalTrajectorySink] corpus rotated at %d bytes", ceiling)
     except OSError:
         logger.debug("[LocalTrajectorySink] rotation degraded", exc_info=True)

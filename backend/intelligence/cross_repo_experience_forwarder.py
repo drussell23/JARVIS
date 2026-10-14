@@ -968,7 +968,7 @@ class CrossRepoExperienceForwarder:
         # Move corrupted files to .failed suffix
         for failed_path in failed_files:
             try:
-                failed_path.rename(failed_path.with_suffix(".json.failed"))
+                failed_path.replace(failed_path.with_suffix(".json.failed"))
             except Exception:
                 pass
 

@@ -474,7 +474,7 @@ class CrossRepoComponentRegistry:
         except json.JSONDecodeError:
             self.logger.warning(f"Invalid JSON in request {request_file}")
             try:
-                request_file.rename(request_file.with_suffix(".json.failed"))
+                request_file.replace(request_file.with_suffix(".json.failed"))
             except Exception:
                 pass
         except Exception as e:

@@ -694,7 +694,7 @@ class MultiFileRefactorEngine:
                 )
             dest = self._project_root / change.rename_to
             dest.parent.mkdir(parents=True, exist_ok=True)
-            abs_path.rename(dest)
+            abs_path.replace(dest)
 
     def _apply_simple_patch(self, file_path: Path, patch: str) -> None:
         """Apply a simple unified-diff-style patch.

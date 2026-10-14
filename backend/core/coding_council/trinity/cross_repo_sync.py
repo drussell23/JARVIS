@@ -272,7 +272,7 @@ class CrossRepoSync:
                 # Atomic write
                 tmp = state_file.with_suffix(".tmp")
                 tmp.write_text(json.dumps(state, indent=2, default=str))
-                tmp.rename(state_file)
+                tmp.replace(state_file)
 
                 # Notify targets
                 for target in targets:
@@ -492,7 +492,7 @@ class CrossRepoSync:
             def _persist() -> None:
                 tmp = state_file.with_suffix(".tmp")
                 tmp.write_text(json.dumps(state, indent=2))
-                tmp.rename(state_file)
+                tmp.replace(state_file)
 
             # Off the loop: a small write is still a write, and this one
             # happens on the thread that must answer everything else.

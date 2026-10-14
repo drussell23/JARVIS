@@ -64,7 +64,7 @@ class AutonomyState:
         ) as f:
             f.write(json.dumps(data, indent=2))
             tmp = Path(f.name)
-        tmp.rename(self._path)
+        tmp.replace(self._path)
         logger.debug("Autonomy state saved: %d configs to %s", len(data), self._path)
 
     def load(self) -> Tuple[SignalAutonomyConfig, ...]:

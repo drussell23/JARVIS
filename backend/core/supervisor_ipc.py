@@ -202,11 +202,9 @@ class SupervisorIPC:
 
         if SOCKET_PATH.exists():
             # Try connecting — if it succeeds the daemon is live
-            probe = _socket_mod.socket(_socket_mod.AF_UNIX, _socket_mod.SOCK_STREAM)
-            probe.settimeout(1.0)
+            from backend.core.portable_ipc import connect_unix_sync
             try:
-                probe.connect(sock_path)
-                probe.close()
+                connect_unix_sync(sock_path, timeout=1.0).close()
                 return False  # Live daemon found
             except (ConnectionRefusedError, OSError):
                 # Stale socket — remove it so we can bind

@@ -1216,7 +1216,7 @@ class AutoRecovery:
             archive_path = archive_dir / f"{heartbeat_path.stem}_{timestamp}.json"
 
             # Move to archive
-            heartbeat_path.rename(archive_path)
+            heartbeat_path.replace(archive_path)
 
             return f"Archived stale heartbeat: {heartbeat_path.name}"
 
@@ -1283,7 +1283,7 @@ class AutoRecovery:
                     timestamp = int(time.time())
                     archive_path = archive_dir / f"{heartbeat_file.stem}_{timestamp}.json"
 
-                    heartbeat_file.rename(archive_path)
+                    heartbeat_file.replace(archive_path)
                     actions.append(f"Archived stale heartbeat: {heartbeat_file.name} (age: {age:.0f}s)")
 
             except json.JSONDecodeError:

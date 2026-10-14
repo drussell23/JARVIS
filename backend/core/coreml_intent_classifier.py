@@ -377,7 +377,7 @@ class CoreMLIntentClassifier:
             # Atomic write
             tmp_file = _CROSS_REPO_ML_STATE_FILE.with_suffix('.tmp')
             tmp_file.write_text(json.dumps(state, indent=2))
-            tmp_file.rename(_CROSS_REPO_ML_STATE_FILE)
+            tmp_file.replace(_CROSS_REPO_ML_STATE_FILE)
 
             logger.debug(f"[v117.0] Cross-repo CoreML state written: neural_engine={neural_engine}")
         except Exception as e:

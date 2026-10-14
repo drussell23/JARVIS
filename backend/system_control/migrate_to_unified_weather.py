@@ -133,7 +133,7 @@ def cleanup_old_files():
         filepath = Path(filename)
         if filepath.exists():
             # Rename instead of delete (safer)
-            filepath.rename(f"{filename}.old")
+            filepath.replace(f"{filename}.old")
             print(f"📦 Archived {filename} -> {filename}.old")
 
 

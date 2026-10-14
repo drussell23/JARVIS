@@ -2614,7 +2614,7 @@ class DynamicComponentManager:
         temp_file = cloud_state_file.with_suffix(".tmp")
         with open(temp_file, "w") as f:
             json.dump(state, f, indent=2)
-        temp_file.rename(cloud_state_file)
+        temp_file.replace(cloud_state_file)
 
         logger.info(
             f"☁️ Published cloud state to Trinity: {cloud_state_file} "

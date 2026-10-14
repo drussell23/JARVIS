@@ -44,6 +44,7 @@ import json
 import logging
 import logging.handlers
 import os
+import platform
 import sys
 import traceback
 from collections import defaultdict, deque
@@ -151,7 +152,7 @@ class StructuredJSONFormatter(logging.Formatter):
     def __init__(self, config: LoggingConfig):
         super().__init__()
         self.config = config
-        self.hostname = os.uname().nodename if config.include_hostname else None
+        self.hostname = platform.node() if config.include_hostname else None
 
     def format(self, record: logging.LogRecord) -> str:
         """Format log record as JSON."""

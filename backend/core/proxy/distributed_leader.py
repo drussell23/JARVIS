@@ -756,7 +756,7 @@ class DistributedProxyLeader:
         # Atomic write: write to temp, then rename
         temp_path = self._config.heartbeat_file_path.with_suffix('.tmp')
         temp_path.write_text(json.dumps(heartbeat.to_dict(), indent=2))
-        temp_path.rename(self._config.heartbeat_file_path)
+        temp_path.replace(self._config.heartbeat_file_path)
 
         logger.debug(f"[Leader] Heartbeat written (term={self._current_term})")
 

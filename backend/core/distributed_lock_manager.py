@@ -114,6 +114,7 @@ import errno
 import json
 import logging
 import os
+import platform
 import random
 import socket
 import sys
@@ -899,7 +900,7 @@ class DistributedLockManager:
                 future = pool.submit(_resolve)
                 return future.result(timeout=2.0)
         except (concurrent.futures.TimeoutError, Exception):
-            return f"{os.uname().sysname.lower()}-unknown" if hasattr(os, "uname") else "unknown"
+            return f"{platform.system().lower()}-unknown" if hasattr(os, "uname") else "unknown"
 
     async def _get_lock_semaphore(self, lock_name: str) -> asyncio.Semaphore:
         """
@@ -1657,7 +1658,7 @@ class DistributedLockManager:
                             raise IOError(f"Temp file disappeared: {temp_file}")
 
                         # Atomic rename
-                        await aiofiles.os.rename(temp_file, lock_file)
+                        await aiofiles.os.replace(temp_file, lock_file)
 
                     except Exception:
                         # Clean up temp file on failure

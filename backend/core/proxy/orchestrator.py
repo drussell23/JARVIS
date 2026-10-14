@@ -703,7 +703,7 @@ class UnifiedProxyOrchestrator:
             tmp_file = OrchestratorConfig.CROSS_REPO_STATE_FILE.with_suffix(".tmp")
             with open(tmp_file, "w") as f:
                 json.dump(state_data, f, indent=2)
-            tmp_file.rename(OrchestratorConfig.CROSS_REPO_STATE_FILE)
+            tmp_file.replace(OrchestratorConfig.CROSS_REPO_STATE_FILE)
 
         except Exception as e:
             logger.warning(f"[Orchestrator] Failed to persist state: {e}")

@@ -1568,17 +1568,9 @@ class EdgeTTSEngine(TTSEngine):
                 # of AudioBus.play_audio(). PortAudio callback is GIL-dependent
                 # → static during GIL-heavy ops. afplay is native, no GIL.
                 # (device_held branch previously routed through AudioBus)
-                if os.path.exists("/usr/bin/afplay"):
-                    play_cmd = ["afplay", temp_path]
-                else:
-                    play_cmd = ["mpg123", "-q", temp_path]
-
-                process = await asyncio.create_subprocess_exec(
-                    *play_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                await asyncio.wait_for(process.wait(), timeout=timeout)
+                # afplay on macOS, winmm MCI on Windows, mpg123 elsewhere.
+                from backend.core.native_audio_player import play_audio_file
+                await play_audio_file(temp_path, timeout=timeout)
                 return True
 
             finally:

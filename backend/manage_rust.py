@@ -5,6 +5,7 @@ Can be run standalone or imported by other modules.
 """
 
 import os
+import platform
 import sys
 import argparse
 import asyncio
@@ -98,7 +99,7 @@ class RustManager:
                 'platform': sys.platform,
                 'cpu_count': psutil.cpu_count(),
                 'ram_gb': psutil.virtual_memory().total / (1024**3),
-                'is_m1': sys.platform == 'darwin' and os.uname().machine == 'arm64'
+                'is_m1': sys.platform == 'darwin' and platform.machine() == 'arm64'
             }
         }
         

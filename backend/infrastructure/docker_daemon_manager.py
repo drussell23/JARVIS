@@ -1418,7 +1418,7 @@ class DockerEventEmitter:
                 # Atomic write
                 temp_file = self.events_file.with_suffix('.tmp')
                 temp_file.write_text(json.dumps(events, indent=2))
-                temp_file.rename(self.events_file)
+                temp_file.replace(self.events_file)
 
             except Exception as e:
                 logger.debug(f"Failed to persist Docker event: {e}")
@@ -1441,7 +1441,7 @@ class DockerEventEmitter:
             try:
                 temp_file = self.state_file.with_suffix('.tmp')
                 temp_file.write_text(json.dumps(state, indent=2))
-                temp_file.rename(self.state_file)
+                temp_file.replace(self.state_file)
             except Exception as e:
                 logger.debug(f"Failed to update Docker state: {e}")
 

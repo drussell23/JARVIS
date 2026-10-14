@@ -380,7 +380,7 @@ class FileLocker:
             # Atomic write via temp file
             tmp_file = lock_file.with_suffix(".tmp")
             tmp_file.write_text(json.dumps(lock.to_dict(), indent=2))
-            tmp_file.rename(lock_file)
+            tmp_file.replace(lock_file)
         except Exception as e:
             logger.error(f"[FileLocker] Failed to write lock file: {e}")
             raise

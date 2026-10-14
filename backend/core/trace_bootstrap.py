@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import threading
 import uuid
 from pathlib import Path
@@ -73,7 +74,7 @@ def initialize(
         _epoch_id = runtime_epoch_id or os.environ.get(
             "JARVIS_RUNTIME_EPOCH_ID", uuid.uuid4().hex[:16]
         )
-        _node_id = node_id or os.environ.get("JARVIS_NODE_ID", os.uname().nodename)
+        _node_id = node_id or os.environ.get("JARVIS_NODE_ID", platform.node())
         _version = producer_version or os.environ.get("JARVIS_VERSION", "dev")
 
         _factory = TraceEnvelopeFactory(

@@ -48,6 +48,7 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import shutil
 import signal
 import subprocess
@@ -988,7 +989,7 @@ class GCPReconciler:
                 "session_id": self._session_id,
                 "pid": os.getpid(),
                 "started_at": time.time(),
-                "hostname": os.uname().nodename,
+                "hostname": platform.node(),
             }
 
             with open(self._lock_file, "w") as f:

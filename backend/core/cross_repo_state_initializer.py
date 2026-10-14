@@ -1860,7 +1860,7 @@ class CrossRepoStateInitializer:
         tmp_path = path + ".tmp"
         with open(tmp_path, 'w') as f:
             f.write(data)
-        os.rename(tmp_path, path)  # Atomic on POSIX same-filesystem
+        os.replace(tmp_path, path)  # Atomic on POSIX same-filesystem
 
     async def _write_json_file(self, file_path: Path, data: Any) -> None:
         """Write JSON file asynchronously."""

@@ -915,7 +915,7 @@ class RestartMarker:
                 LOCK_DIR.mkdir(parents=True, exist_ok=True)
                 temp_file = RESTART_MARKER_FILE.with_suffix('.tmp')
                 temp_file.write_text(json.dumps(marker_data, indent=2))
-                temp_file.rename(RESTART_MARKER_FILE)
+                temp_file.replace(RESTART_MARKER_FILE)
 
                 logger.info(f"[RestartMarker] v120.0: Created restart marker for PID {pid}")
                 return True
@@ -938,7 +938,7 @@ class RestartMarker:
 
                 temp_file = RESTART_MARKER_FILE.with_suffix('.tmp')
                 temp_file.write_text(json.dumps(data, indent=2))
-                temp_file.rename(RESTART_MARKER_FILE)
+                temp_file.replace(RESTART_MARKER_FILE)
 
                 logger.debug(f"[RestartMarker] Phase updated to: {phase}")
                 return True
@@ -961,7 +961,7 @@ class RestartMarker:
                     data["cross_repo_notified"] = list(notified)
                     temp_file = RESTART_MARKER_FILE.with_suffix('.tmp')
                     temp_file.write_text(json.dumps(data, indent=2))
-                    temp_file.rename(RESTART_MARKER_FILE)
+                    temp_file.replace(RESTART_MARKER_FILE)
             except Exception:
                 pass
 
@@ -2381,7 +2381,7 @@ class SupervisorSingleton:
         try:
             temp_file = SUPERVISOR_STATE_FILE.with_suffix('.tmp')
             temp_file.write_text(json.dumps(state.to_dict(), indent=2))
-            temp_file.rename(SUPERVISOR_STATE_FILE)
+            temp_file.replace(SUPERVISOR_STATE_FILE)
         except Exception as e:
             logger.warning(f"Could not write state file: {e}")
 
@@ -2462,9 +2462,8 @@ class SupervisorSingleton:
         if SUPERVISOR_IPC_SOCKET.exists():
             try:
                 # Synchronous socket check
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.settimeout(IPC_TIMEOUT)
-                sock.connect(str(SUPERVISOR_IPC_SOCKET))
+                from backend.core.portable_ipc import connect_unix_sync
+                sock = connect_unix_sync(SUPERVISOR_IPC_SOCKET, timeout=IPC_TIMEOUT)
 
                 request = json.dumps({"command": "ping", "args": {}}).encode()
                 sock.sendall(request)

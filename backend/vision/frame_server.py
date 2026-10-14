@@ -199,7 +199,7 @@ def capture_loop(fps: int = 15, quality: float = 0.7, max_dim: int = 1280) -> No
                 CGImageDestinationFinalize(dest)
 
             # Atomic rename
-            os.rename(tmp_path, _FRAME_PATH)
+            os.replace(tmp_path, _FRAME_PATH)
 
             # Write metadata. dhash MUST be a 16-char lowercase hex string to
             # satisfy VisionSignalEvidence schema v1 validation (enforced
@@ -216,7 +216,7 @@ def capture_loop(fps: int = 15, quality: float = 0.7, max_dim: int = 1280) -> No
             meta_tmp = _META_PATH + ".tmp"
             with open(meta_tmp, "w") as f:
                 json.dump(meta, f)
-            os.rename(meta_tmp, _META_PATH)
+            os.replace(meta_tmp, _META_PATH)
 
             frame_number += 1
 

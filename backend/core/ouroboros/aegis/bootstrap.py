@@ -177,7 +177,7 @@ def atomic_write_payload(payload: BootstrapPayload, path: Path) -> None:
     # Atomic flip — the final path becomes visible to readers as a
     # fully-written file in one syscall.
     try:
-        os.rename(str(tmp_path), str(target))
+        os.replace(str(tmp_path), str(target))
     except OSError:
         # Best-effort cleanup of the temp file if rename failed.
         try:

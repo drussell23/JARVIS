@@ -599,7 +599,7 @@ class MemoryFaultGuard:
             
             temp_file = cloud_lock_file.with_suffix('.json.tmp')
             temp_file.write_text(json.dumps(lock_data, indent=2))
-            temp_file.rename(cloud_lock_file)
+            temp_file.replace(cloud_lock_file)
             logger.critical("   ☁️ Cloud lock set - next restart forces cloud mode")
         except Exception as e:
             logger.debug(f"   Could not write cloud lock: {e}")

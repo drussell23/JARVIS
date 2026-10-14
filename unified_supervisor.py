@@ -95,7 +95,9 @@ if _early_sys.platform == 'win32':
 # Jarvis. See backend/core/process_identity.py.
 try:
     from backend.core.process_identity import install_kill_guard as _install_kill_guard
+    from backend.core.portable_ipc import install as _install_portable_ipc
     _install_kill_guard()
+    _install_portable_ipc()
 except Exception as _kg_exc:  # noqa: BLE001
     if _early_sys.platform == 'win32':
         raise SystemExit(f"[Kernel] refusing to start without the kill guard: {_kg_exc}")
@@ -460,9 +462,8 @@ def _fast_kernel_check() -> bool:
 
     for attempt in range(max_retries):
         try:
-            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-            sock.settimeout(sock_timeout)
-            sock.connect(str(sock_path))
+            from backend.core.portable_ipc import connect_unix_sync
+            sock = connect_unix_sync(sock_path, timeout=sock_timeout)
 
             # Send health command
             msg = _json.dumps({'command': 'health'}) + '\n'
@@ -3277,7 +3278,7 @@ def _atomic_write_json(path: Path, data: Any, *, schema_version: str = "1.0") ->
         os.fsync(tmp_fd)
     finally:
         os.close(tmp_fd)
-    os.rename(tmp_path, str(path))
+    os.replace(tmp_path, str(path))
 
 
 def _load_json_state(path: Path) -> Optional[Dict[str, Any]]:
@@ -10278,8 +10279,17 @@ class DockerDaemonManager(ResourceManagerBase):
         self.platform = platform.system().lower()
 
         # Configuration from environment (zero hardcoding)
-        self.enabled = os.getenv("DOCKER_ENABLED", "true").lower() == "true"
-        self.auto_start = os.getenv("DOCKER_AUTO_START", "true").lower() == "true"
+        # The kernel config carries --skip-docker / --no-docker-auto-start
+        # (and JARVIS_DOCKER_*); reading only DOCKER_* here meant the CLI flag
+        # never reached the one component that starts Docker Desktop.
+        self.enabled = (
+            bool(getattr(config, "docker_enabled", True))
+            and os.getenv("DOCKER_ENABLED", "true").lower() == "true"
+        )
+        self.auto_start = (
+            bool(getattr(config, "docker_auto_start", True))
+            and os.getenv("DOCKER_AUTO_START", "true").lower() == "true"
+        )
         self.health_check_timeout = float(os.getenv("DOCKER_HEALTH_CHECK_TIMEOUT", "5.0"))
         self.max_startup_wait = float(os.getenv("DOCKER_MAX_STARTUP_WAIT", "120"))
         self.max_retry_attempts = int(os.getenv("DOCKER_MAX_RETRY_ATTEMPTS", "3"))
@@ -21949,11 +21959,9 @@ class ParallelProcessCleaner:
         try:
             ipc_socket = Path.home() / ".jarvis" / "ipc" / "supervisor.sock"
             if ipc_socket.exists():
-                import socket
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.settimeout(2.0)
+                from backend.core.portable_ipc import connect_unix_sync
+                sock = connect_unix_sync(ipc_socket, timeout=2.0)
                 try:
-                    sock.connect(str(ipc_socket))
                     sock.sendall(b'{"type": "ping"}\n')
                     response = sock.recv(1024)
                     if response:
@@ -31113,7 +31121,7 @@ class DistributedLockManager(SystemService):
         """Sync helper: atomic temp+rename write for lock file."""
         temp_file = lock_file.with_suffix(".tmp")
         temp_file.write_text(lock_data_json)
-        temp_file.rename(lock_file)
+        temp_file.replace(lock_file)
 
     async def _try_acquire(
         self,
@@ -59152,6 +59160,35 @@ class TrinityIntegrator:
         3. Start subprocess with Trinity environment
         4. Wait for health check
         """
+        # One declaration of how a sibling runs, shared with O+V's boot
+        # (trinity_siblings): an answering sibling is adopted, never relaunched
+        # or evicted from its port; a declared JARVIS_*_START_CMD starts it.
+        # Only when neither applies does the legacy script discovery below run
+        # (it knows run_server.py, not e.g. the J-Prime Engine on a GPU host).
+        _sibling_key = {"jarvis-prime": "jprime", "reactor-core": "reactor"}.get(component.name)
+        if _sibling_key:
+            try:
+                from backend.core.ouroboros.governance.trinity_siblings import ensure_sibling
+                _status = await asyncio.to_thread(
+                    ensure_sibling, _sibling_key,
+                    say=lambda m: self.logger.info(f"[Trinity] {m.strip()}"),
+                )
+            except Exception as _sib_exc:  # noqa: BLE001
+                self.logger.debug(f"[Trinity] sibling declaration unavailable: {_sib_exc}")
+                _status = None
+            if _status is not None and _status.state in ("serving", "started", "lent"):
+                component.state = "healthy"
+                component.start_time = time.time()
+                component.health_failure_streak = 0
+                self.logger.success(
+                    f"[Trinity] ✓ {component.name} {_status.state} at {_status.url} (externally owned)"
+                )
+                return True
+            if _status is not None and _status.state == "failed":
+                component.state = "failed"
+                self.logger.error(f"[Trinity] ✗ {component.name}: {_status.detail}")
+                return False
+
         if component.repo_path is None:
             self.logger.warning(f"[Trinity] Cannot start {component.name}: no repo path")
             return False
@@ -61556,10 +61593,10 @@ class UnifiedTrinityConnector:
                 # Backup existing file
                 if target.exists():
                     backup = target.with_suffix(target.suffix + ".2pc_backup")
-                    target.rename(backup)
+                    target.replace(backup)
 
                 # Move staging to target
-                staging.rename(target)
+                staging.replace(target)
                 committed.append(f"{p['repo']}/{p['file']}")
                 self.logger.info(f"[Trinity.Connector] 2PC Committed: {p['repo']}/{p['file']}")
 
@@ -61577,7 +61614,7 @@ class UnifiedTrinityConnector:
                     if backup.exists():
                         if target.exists():
                             target.unlink()
-                        backup.rename(target)
+                        backup.replace(target)
                 except Exception:
                     pass
 
@@ -76944,7 +76981,7 @@ class JarvisSystemKernel:
                 os.fsync(tmp_fd)
             finally:
                 os.close(tmp_fd)
-            os.rename(tmp_path, str(state_file))
+            os.replace(tmp_path, str(state_file))
 
         except Exception as e:
             self.logger.debug(f"[GhostDisplay] Failed to publish state: {e}")
@@ -77660,7 +77697,7 @@ class JarvisSystemKernel:
                     os.fsync(tmp_fd)
                 finally:
                     os.close(tmp_fd)
-                os.rename(tmp_path, str(signal_file))
+                os.replace(tmp_path, str(signal_file))
                 self.logger.info("[VisualPipeline] Readiness signal published")
             except Exception as e:
                 self.logger.warning(f"[VisualPipeline] Failed to write readiness signal: {e}")
@@ -77923,7 +77960,7 @@ class JarvisSystemKernel:
                 os.fsync(tmp_fd)
             finally:
                 os.close(tmp_fd)
-            os.rename(tmp_path, str(state_file))
+            os.replace(tmp_path, str(state_file))
 
         except Exception as e:
             self.logger.debug(f"[VisualPipeline] Failed to publish state: {e}")
