@@ -847,7 +847,14 @@ class NarrationEngine:
     # =========================================================================
 
     async def narrate_greeting(self) -> None:
-        """Narrate a greeting."""
+        """Narrate a greeting -- unless another system owns this process's
+        startup announcement (one greeting per boot)."""
+        try:
+            from backend.core.startup_announcement_coordinator import may_announce
+        except ImportError:  # backend/ on the path, not the repo root
+            from core.startup_announcement_coordinator import may_announce  # type: ignore
+        if not await may_announce("ghost_hands"):
+            return
         text = self._phrase_generator.greeting()
         await self._queue_narration(
             text=text,

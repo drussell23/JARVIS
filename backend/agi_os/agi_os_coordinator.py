@@ -579,9 +579,15 @@ class AGIOSCoordinator:
         # Determine final state
         self._state = self._determine_health_state()
 
-        # Voice greeting
+        # Voice greeting -- unless another system owns this process's startup
+        # announcement (the unified supervisor's boot, when it runs us).
         if self._config['voice_greeting'] and self._voice:
-            await self._announce_startup()
+            try:
+                from backend.core.startup_announcement_coordinator import may_announce
+            except ImportError:  # backend/ on the path, not the repo root
+                from core.startup_announcement_coordinator import may_announce  # type: ignore
+            if await may_announce("agi_os_coordinator"):
+                await self._announce_startup()
 
         logger.info("AGI OS started (state=%s)", self._state.value)
 

@@ -21,6 +21,21 @@ Solution:
 - Zero hardcoding - fully configurable
 """
 
+import sys as _sys
+
+# One coordinator per process. This module is reachable as both
+# ``backend.core.startup_announcement_coordinator`` and (with backend/ on the
+# path) ``core.startup_announcement_coordinator``; loaded under both names it
+# was two modules with two "singletons", and a system asking one never saw
+# the other's announcement. The bare name resolves to the canonical module.
+_CANONICAL = "backend.core.startup_announcement_coordinator"
+if __name__ != _CANONICAL:
+    try:
+        import importlib as _importlib
+        _sys.modules[__name__] = _importlib.import_module(_CANONICAL)
+    except ImportError:  # no repo root on the path: this copy is the only one
+        pass
+
 import asyncio
 import json
 import logging
@@ -537,3 +552,23 @@ async def should_announce_startup(
     """
     coordinator = get_startup_coordinator()
     return await coordinator.announce_if_first(system_name, priority=priority)
+
+
+async def may_announce(
+    system_name: str, priority: AnnouncementPriority = AnnouncementPriority.NORMAL
+) -> bool:
+    """Whether *system_name* may make the startup announcement (greet, say
+    JARVIS is online/ready). One system per process does: when the unified
+    supervisor boots JARVIS it claims the announcement first, its lifecycle
+    narrator greets and announces completion, and every other subsystem
+    stays quiet -- they had greeted three times and declared JARVIS "ready"
+    up to a minute before it was (boot of 2026-10-14 08:11). Without a
+    supervisor the first system to ask announces, as before.
+
+    Fails open: if the coordinator itself cannot answer, the caller speaks.
+    """
+    try:
+        return await should_announce_startup(system_name, priority)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[STARTUP COORDINATOR] %s: decision unavailable (%s)", system_name, exc)
+        return True

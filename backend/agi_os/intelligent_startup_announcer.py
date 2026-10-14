@@ -1088,6 +1088,14 @@ class IntelligentStartupAnnouncer:
         Returns:
             Tuple of (message, was_spoken)
         """
+        # One startup announcement per process (see may_announce).
+        try:
+            from backend.core.startup_announcement_coordinator import may_announce
+        except ImportError:  # backend/ on the path, not the repo root
+            from core.startup_announcement_coordinator import may_announce  # type: ignore
+        if not await may_announce("intelligent_startup_announcer"):
+            return "", False
+
         # Ensure initialized
         if not self._initialized:
             await self.initialize()

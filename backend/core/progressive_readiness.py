@@ -220,6 +220,15 @@ class ProgressiveReadiness:
 
     # -- Listeners (Directive 3: Live UI Transparency) ------------------------
 
+    def tier_outcomes(self, tier: ReadinessTier) -> Dict[str, str]:
+        """How each node *tier* requires actually ended: resolved, failed or
+        skipped. A tier advances on all three, so a listener that wants to
+        say what the tier means must read this, not just the tier."""
+        return {
+            name: (self._nodes[name].status if name in self._nodes else "pending")
+            for name in sorted(_TIER_REQUIREMENTS.get(tier, set()))
+        }
+
     def on_tier_change(self, callback: Callable) -> None:
         """Register a listener for tier transitions."""
         self._listeners.append(callback)

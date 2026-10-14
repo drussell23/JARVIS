@@ -328,8 +328,13 @@ class IntelligentActionOrchestrator:
                 self._state = OrchestratorState.STOPPED
                 raise
 
-        # Announce startup with dynamic JARVIS online message
-        if self._voice:
+        # Announce startup with dynamic JARVIS online message -- unless another
+        # system owns this process's startup announcement.
+        try:
+            from backend.core.startup_announcement_coordinator import may_announce
+        except ImportError:  # backend/ on the path, not the repo root
+            from core.startup_announcement_coordinator import may_announce  # type: ignore
+        if self._voice and await may_announce("intelligent_action_orchestrator"):
             try:
                 import random
                 startup_messages = [

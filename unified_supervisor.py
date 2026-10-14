@@ -66928,6 +66928,55 @@ class JarvisSystemKernel:
             await self._readiness_phase_end(phase_name, success=False, detail=str(exc)[:200])
             return False
 
+    async def _measure_component_health(self) -> List[Any]:
+        """One fresh, concurrent health reading of every component the
+        dashboard measures (same targets, same probe) -- what voice claims
+        about health are allowed to stand on."""
+        from backend.core.supervisor.elite_dashboard import probe_health
+        targets = self._dashboard_health_targets()
+        return list(await asyncio.gather(
+            *(asyncio.to_thread(probe_health, t) for t in targets)
+        ))
+
+    @staticmethod
+    def _spoken_component(reading: Any) -> str:
+        return reading.display_name.split(" (")[0]
+
+    def _health_issues(self, readings: List[Any]) -> List[str]:
+        """What a set of readings found wrong, phrased to be spoken."""
+        return [f"{self._spoken_component(r)} is {r.status.lower()}"
+                for r in readings if r.status != "ONLINE"]
+
+    async def _describe_tier_change(self, readiness: Any, tier: Any, tiers: Any) -> Optional[str]:
+        """What a readiness tier really means this boot, or None to stay quiet.
+
+        The tiers used to be voiced as fixed lines about cloud intelligence
+        ("Cloud intelligence fully synchronized.") whatever was deployed, and
+        a tier advances on failed and skipped nodes too. The last tier is
+        governance resolving, mid-boot: "fully operational" is the
+        completion announcement's to make, so it is not voiced here.
+        """
+        outcomes = readiness.tier_outcomes(tier)
+        failed = [name.replace("_", " ") for name, status in outcomes.items() if status == "failed"]
+        if tier == tiers.ACTIVE_LOCAL:
+            if failed:
+                return f"Core startup finished, but {', '.join(failed)} failed. Continuing."
+            return "Core systems are up. Still starting the rest."
+        if tier == tiers.ACTIVE_FULL:
+            try:
+                siblings = [r for r in await self._measure_component_health() if r.name != "jarvis"]
+            except Exception as exc:  # noqa: BLE001 -- no measurement, no claim
+                self.logger.debug(f"[ProgressiveReadiness] sibling health unreadable: {exc}")
+                return None
+            up = [self._spoken_component(r) for r in siblings if r.status == "ONLINE"]
+            down = self._health_issues(siblings)
+            parts = []
+            if up:
+                parts.append(" and ".join(up) + (" are" if len(up) > 1 else " is") + " connected")
+            parts.extend(down)
+            return ("; ".join(parts) + ".") if parts else None
+        return None
+
     async def _narrate_tier_change(self, message: str) -> None:
         """Announce a Progressive Readiness tier change via voice + log."""
         self.logger.info("[ProgressiveReadiness] %s", message)
@@ -67067,6 +67116,17 @@ class JarvisSystemKernel:
             "startup_begin",
             caller="_startup_impl",
         )
+        # This boot owns the process's startup announcement: its lifecycle
+        # narrator greets once and announces completion when it is real.
+        # Subsystems that used to greet or declare "JARVIS is ready" on their
+        # own ask the coordinator first (may_announce) and stay quiet.
+        try:
+            from backend.core.startup_announcement_coordinator import (
+                AnnouncementPriority, should_announce_startup,
+            )
+            await should_announce_startup("unified_supervisor", AnnouncementPriority.CRITICAL)
+        except Exception as _ann_err:
+            self.logger.debug(f"[Kernel] startup announcement claim unavailable: {_ann_err}")
         self._set_asr_startup_admission(
             False,
             "startup_initialization",
@@ -67427,18 +67487,7 @@ class JarvisSystemKernel:
             _pr = get_readiness()
 
             async def _on_tier_change(old_tier, new_tier):
-                _messages = {
-                    PRTier.ACTIVE_LOCAL: (
-                        "Local systems online. Cloud intelligence warming up in the background."
-                    ),
-                    PRTier.ACTIVE_FULL: (
-                        "Cloud intelligence fully synchronized."
-                    ),
-                    PRTier.FULLY_OPERATIONAL: (
-                        "All systems fully operational."
-                    ),
-                }
-                msg = _messages.get(new_tier)
+                msg = await self._describe_tier_change(_pr, new_tier, PRTier)
                 if msg:
                     await self._narrate_tier_change(msg)
 
@@ -71874,7 +71923,16 @@ class JarvisSystemKernel:
             # so the user sees a clean dashboard only when JARVIS is fully online.
             if getattr(self, "_lifecycle_narrator", None) is not None:
                 try:
-                    self._lifecycle_narrator.narrate_startup_complete(startup_duration)
+                    try:
+                        _issues = self._health_issues(await self._measure_component_health())
+                    except Exception as _hc_err:  # noqa: BLE001 -- unmeasured: no "all systems"
+                        self.logger.debug(f"[Kernel] completion health unreadable: {_hc_err}")
+                        _issues = None
+                    _timeline = getattr(self, "_boot_timeline", None)
+                    self._lifecycle_narrator.narrate_startup_complete(
+                        _timeline.elapsed() if _timeline is not None else startup_duration,
+                        _issues,
+                    )
                 except Exception:
                     pass
             if getattr(self, "_elite_dashboard", None) is not None:

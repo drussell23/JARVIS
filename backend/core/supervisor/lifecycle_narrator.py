@@ -38,7 +38,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Callable, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,10 @@ class NarrationItem:
 # Message templates -- human-like, not robotic
 # ---------------------------------------------------------------------------
 
+# Spoken when a zone STARTS (narrate_zone is called on a phase's start), so
+# every line says it is starting -- never that it is online or ready. The
+# table used to mix both, and a random pick said "A.G.I. operating system
+# online." at the moment it began.
 _BOOT_ZONE_MESSAGES: Dict[str, List[str]] = {
     "preflight": [
         "Running preflight checks.",
@@ -81,7 +85,7 @@ _BOOT_ZONE_MESSAGES: Dict[str, List[str]] = {
     ],
     "backend": [
         "Backend systems loading.",
-        "Core services coming online.",
+        "Core services starting.",
     ],
     "integration": [
         "Integration components connecting.",
@@ -89,7 +93,7 @@ _BOOT_ZONE_MESSAGES: Dict[str, List[str]] = {
     ],
     "trinity": [
         "Trinity pipeline activating. Mind, Body, Soul.",
-        "Bringing the Trinity ecosystem online.",
+        "Starting the Trinity ecosystem.",
     ],
     "neural_mesh_agents": [
         "Neural mesh agents initializing.",
@@ -97,33 +101,15 @@ _BOOT_ZONE_MESSAGES: Dict[str, List[str]] = {
     ],
     "agi_os": [
         "Intelligence layer activating.",
-        "A.G.I. operating system online.",
+        "Starting the A.G.I. operating system.",
     ],
     "governance": [
-        "Governance pipeline starting. Ouroboros is awake.",
+        "Governance pipeline starting.",
         "Self-programming governance loop activating.",
     ],
     "proactive_drive": [
-        "Proactive drive engaged. Curiosity engine online.",
-        "Autonomous exploration system ready.",
-    ],
-}
-
-_LIFECYCLE_MESSAGES: Dict[str, List[str]] = {
-    "PROBING": [
-        "Checking J-Prime health.",
-    ],
-    "READY": [
-        "J-Prime is online and ready for inference.",
-        "J-Prime connected. Full intelligence available.",
-    ],
-    "DEGRADED": [
-        "J-Prime is degraded. Falling back to cloud.",
-        "Local inference degraded. Routing through cloud A.P.I.",
-    ],
-    "DEAD": [
-        "J-Prime is offline. Cloud fallback active.",
-        "Lost connection to J-Prime. Switching to backup.",
+        "Proactive drive starting.",
+        "Starting the autonomous exploration system.",
     ],
 }
 
@@ -133,17 +119,31 @@ _FAULT_MESSAGES: List[str] = [
     "{detail}. I'm handling it.",
 ]
 
-_RECOVERY_MESSAGES: List[str] = [
-    "Recovery successful. Systems nominal.",
-    "Issue resolved. Back to full capacity.",
-    "Recovered. All clear.",
-]
-
+# Completion lines, chosen by what was MEASURED at completion: "all systems"
+# only when every probed component answered healthy.
 _STARTUP_COMPLETE: List[str] = [
     "All systems operational, {name}. Ready for your command.",
     "Boot complete. {name}, I'm at your service.",
     "Systems fully online, {name}. What would you like to do?",
 ]
+
+_STARTUP_COMPLETE_WITH_ISSUES: List[str] = [
+    "Boot complete, {name}, with exceptions: {issues}.",
+    "I'm up, {name}, but {issues}.",
+]
+
+# Completion without a measurement to stand on: say only what is known.
+_STARTUP_COMPLETE_UNMEASURED: List[str] = [
+    "Boot complete, {name}. Ready for your command.",
+]
+
+
+def _spoken_list(items: Sequence[str]) -> str:
+    """'a', 'a and b', 'a, b and c'."""
+    items = [i for i in items if i]
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
 
 
 def _time_greeting(name: str) -> str:
@@ -295,12 +295,26 @@ class LifecycleVoiceNarrator:
         if templates:
             self.enqueue(random.choice(templates), NarrationPriority.NORMAL, category=f"zone:{zone_name}")
 
-    def narrate_startup_complete(self, duration_s: float) -> None:
-        """Narrate that startup is fully complete."""
+    def narrate_startup_complete(
+        self, duration_s: float, issues: Optional[Sequence[str]] = None,
+    ) -> None:
+        """Narrate that startup is complete -- as it was measured.
+
+        ``issues``: what the completion-time health measurement found wrong
+        (empty = every component healthy; None = nothing was measured, so no
+        claim about "all systems" is made). ``duration_s`` is the boot's
+        measured length, the same figure the loading page and terminal show.
+        """
         if self._startup_complete_narrated:
             return
         self._startup_complete_narrated = True
-        msg = random.choice(_STARTUP_COMPLETE).format(name=self._owner)
+        if issues is None:
+            msg = random.choice(_STARTUP_COMPLETE_UNMEASURED).format(name=self._owner)
+        elif issues:
+            msg = random.choice(_STARTUP_COMPLETE_WITH_ISSUES).format(
+                name=self._owner, issues=_spoken_list(issues))
+        else:
+            msg = random.choice(_STARTUP_COMPLETE).format(name=self._owner)
         if duration_s > 0:
             msg += f" Boot took {duration_s:.0f} seconds."
         self.enqueue(msg, NarrationPriority.HIGH, category="startup_complete")
