@@ -98446,7 +98446,17 @@ def main() -> int:
                 _stale = None
             if _stale is not None and stale_policy() == "replace":
                 print(f"[JARVIS] {_stale.describe()} — handing over to this checkout.")
-                if not asyncio.run(hand_over(_stale.pid, KERNEL_SOCKET_PATH, _STREAM_SOCKET)):
+                # Until the old kernel is gone this process only waits on it.
+                from backend.core.supervisor_ipc import viewer_signals
+                with viewer_signals():
+                    try:
+                        _gone = asyncio.run(hand_over(_stale.pid, KERNEL_SOCKET_PATH, _STREAM_SOCKET))
+                    except KeyboardInterrupt:
+                        set_cli_only_mode(True)
+                        print(f"\n[JARVIS] Interrupted. Kernel PID {_stale.pid} was already asked "
+                              f"to shut down and finishes on its own; nothing was started.")
+                        return 130
+                if not _gone:
                     print(f"[JARVIS] Kernel PID {_stale.pid} is still running; not starting a second one.")
                     return 1
                 print("[JARVIS] Previous kernel exited — starting this checkout.")
@@ -98455,8 +98465,7 @@ def main() -> int:
                     print(f"[JARVIS] {_stale.describe()} — attaching anyway "
                           f"(JARVIS_STALE_DAEMON_POLICY=attach).")
                 configure_context_logging()
-                asyncio.run(_ipc_probe.attach_as_client())
-                return 0
+                return _ipc_probe.attach()
 
     # v239.0: Watchdog install/uninstall (runs before full init)
     if "--install-watchdog" in sys.argv:

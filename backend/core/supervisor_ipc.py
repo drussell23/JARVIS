@@ -30,14 +30,16 @@ Usage (called from unified_supervisor.py main()):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import signal
 import socket as _socket_mod
 import sys
 import time
 from pathlib import Path
-from typing import Callable, Optional, Set
+from typing import Callable, Iterator, Optional, Set
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -155,6 +157,45 @@ class _IPCLogHandler(logging.Handler):
                 asyncio.run_coroutine_threadsafe(self._ipc.broadcast(event), loop)
         except Exception:
             pass  # Never let a log handler crash the supervisor
+
+
+# ---------------------------------------------------------------------------
+# Viewer role
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def viewer_signals() -> Iterator[None]:
+    """
+    Give Ctrl+C back to the Python default while this process only watches
+    or waits on a daemon.
+
+    Importing the kernel installs its shutdown machinery on SIGINT (the
+    central SignalDispatcher, with shutdown_hook's forensic handler on it)
+    before main() knows whether this process will BE the kernel. In a
+    process that is only watching, that machinery swallowed Ctrl+C: asyncio
+    never saw the interrupt, the watch could not be detached, and each press
+    dumped kernel shutdown diagnostics. With the default handler restored,
+    ``asyncio.run`` takes Ctrl+C as a cancellation of the watch. The
+    previous handlers come back on exit, so a launch that goes on to become
+    the kernel (after a handover) still has them.
+    """
+    saved = {}
+    for name in ("SIGINT", "SIGBREAK"):          # SIGBREAK: Ctrl+Break on Windows
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            saved[sig] = signal.signal(sig, signal.default_int_handler)
+        except (ValueError, OSError):
+            pass                                  # not the main thread: nothing to own
+    try:
+        yield
+    finally:
+        for sig, handler in saved.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError, TypeError):
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -342,16 +383,39 @@ class SupervisorIPC:
     # Client path: connect and stream events to terminal
     # ------------------------------------------------------------------
 
-    async def attach_as_client(self) -> None:
+    def attach(self) -> int:
+        """
+        Watch the running daemon from this process until it exits or the
+        user presses Ctrl+C. The blocking entry point for a launch that found
+        a daemon: it declares the process a viewer first (``viewer_signals``,
+        CLI-only mode), so Ctrl+C detaches instead of running the kernel's
+        shutdown machinery, and exiting cleans up nothing it does not own.
+        """
+        from backend.core.resilience.graceful_shutdown import set_cli_only_mode
+        set_cli_only_mode(True)   # a viewer started nothing, so it cleans up nothing
+        with viewer_signals():
+            try:
+                outcome = asyncio.run(self.attach_as_client())
+            except KeyboardInterrupt:
+                outcome = "stopped"
+        if outcome == "stopped":
+            print(f"\n{_DIM}[JARVIS] Detached — the daemon keeps running.{_RESET}"
+                  if self._is_tty else "[JARVIS] Detached — the daemon keeps running.")
+        return 0
+
+    async def attach_as_client(self) -> str:
         """
         Connect to the running daemon and stream events to stdout.
-        Blocks until the daemon exits or the user presses Ctrl+C.
+        Blocks until the daemon exits or the user presses Ctrl+C; returns
+        how the watch ended (see ``relay``).
         """
         if self._is_tty:
             print(f"{_CYAN}[JARVIS]{_RESET} Daemon already running — attaching to live stream. "
                   f"Press {_BOLD}Ctrl+C{_RESET} to detach (daemon keeps running).")
-        if await self.relay() == "closed" and self._is_tty:
+        outcome = await self.relay()
+        if outcome == "closed" and self._is_tty:
             print(f"\n{_DIM}[JARVIS] Daemon connection closed.{_RESET}")
+        return outcome
 
     async def relay(
         self,

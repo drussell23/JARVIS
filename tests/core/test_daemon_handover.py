@@ -123,6 +123,9 @@ _FAKE_DAEMON = textwrap.dedent("""
 """)
 
 
+_posix_sockets = pytest.mark.skipif(not hasattr(asyncio, "start_unix_server"), reason="POSIX sockets")
+
+
 def _spawn(tmp_path, obeys):
     stream, kernel = tmp_path / "s.sock", tmp_path / "k.sock"
     src = _FAKE_DAEMON.format(repo=str(REPO), stream=str(stream), kernel=str(kernel), obeys=obeys)
@@ -131,7 +134,7 @@ def _spawn(tmp_path, obeys):
     return proc, stream, kernel
 
 
-@pytest.mark.skipif(not hasattr(asyncio, "start_unix_server"), reason="POSIX sockets")
+@_posix_sockets
 def test_a_daemon_that_obeys_is_streamed_until_it_exits(tmp_path, monkeypatch, capsys):
     proc, stream, kernel = _spawn(tmp_path, obeys=True)
     monkeypatch.setattr(supervisor_ipc, "SOCKET_PATH", stream)
@@ -144,7 +147,7 @@ def test_a_daemon_that_obeys_is_streamed_until_it_exits(tmp_path, monkeypatch, c
         proc.kill()
 
 
-@pytest.mark.skipif(not hasattr(asyncio, "start_unix_server"), reason="POSIX sockets")
+@_posix_sockets
 def test_a_daemon_that_goes_silent_is_terminated(tmp_path, monkeypatch):
     proc, stream, kernel = _spawn(tmp_path, obeys=False)
     monkeypatch.setattr(supervisor_ipc, "SOCKET_PATH", stream)
@@ -160,7 +163,7 @@ def test_a_daemon_that_goes_silent_is_terminated(tmp_path, monkeypatch):
         proc.kill()
 
 
-@pytest.mark.skipif(not hasattr(asyncio, "start_unix_server"), reason="POSIX sockets")
+@_posix_sockets
 def test_relay_ignores_keepalives_when_judging_silence(tmp_path, monkeypatch):
     stream = tmp_path / "s.sock"
     monkeypatch.setattr(supervisor_ipc, "SOCKET_PATH", stream)
@@ -181,3 +184,38 @@ def test_relay_ignores_keepalives_when_judging_silence(tmp_path, monkeypatch):
             await ipc.close()
 
     assert asyncio.run(scenario()) == "silent"
+
+
+# -- Ctrl+C in a viewer detaches ------------------------------------------------
+_VIEWER = textwrap.dedent("""
+    import signal, sys, threading
+    sys.path.insert(0, {repo!r})
+    from pathlib import Path
+    from backend.core import portable_ipc; portable_ipc.install()
+    from backend.scripts import shutdown_hook          # installs the kernel's SIGINT machinery
+    shutdown_hook.register_handlers()
+    ran = []
+    from backend.kernel.signals import get_signal_dispatcher
+    get_signal_dispatcher().register(signal.SIGINT, lambda *a: ran.append(1), name="spy")
+    from backend.core import supervisor_ipc
+    supervisor_ipc.SOCKET_PATH = Path({stream!r})
+    threading.Timer(1.0, signal.raise_signal, (signal.SIGINT,)).start()
+    rc = supervisor_ipc.SupervisorIPC().attach()
+    print("rc", rc, "kernel-handlers-ran", len(ran), flush=True)
+""")
+
+
+@_posix_sockets
+def test_ctrl_c_detaches_a_viewer_without_the_kernel_shutdown_machinery(tmp_path):
+    daemon, stream, _kernel = _spawn(tmp_path, obeys=False)
+    try:
+        out = subprocess.run(
+            [sys.executable, "-c", _VIEWER.format(repo=str(REPO), stream=str(stream))],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert "rc 0 kernel-handlers-ran 0" in out.stdout, out.stdout + out.stderr
+        assert "Detached" in out.stdout
+        assert "SIGNAL RECEIVED" not in out.stdout + out.stderr
+    finally:
+        daemon.kill()
+        daemon.wait()
