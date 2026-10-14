@@ -166,40 +166,59 @@ class TestStructuredDispatch:
 
     @pytest.mark.asyncio
     async def test_dispatch_calls_execute_task(self):
-        """Register agent → dispatch step → assert real execute_task called."""
-        registry = AsyncMock()
-        registry.find_by_capability = AsyncMock(return_value=[
-            MagicMock(agent_name="visual_browser_agent", load=0.0),
-        ])
-        registry.get_agent = AsyncMock(return_value=MagicMock(agent_name="visual_browser_agent"))
+        """A research step reaches the agent bound to the web_research
+        capability through its real execute_task, with the structured goal
+        (no agent verb needed: a goal means "answer it")."""
+        from backend.core.agent_bindings import agent_for_capability
 
-        # Create a mock agent class that returns from execute_task
+        researcher = agent_for_capability("web_research")
+        assert researcher, "a bound agent must declare web_research"
+
         mock_agent_instance = AsyncMock()
         mock_agent_instance.execute_task = AsyncMock(return_value={
             "success": True,
-            "result": "searched youtube for nba",
+            "result": "The Dodgers won [1].",
         })
 
-        orch = RuntimeTaskOrchestrator(registry=registry)
-        # Inject the live agent directly into the cache
-        orch._live_agents["visual_browser_agent"] = mock_agent_instance
+        orch = RuntimeTaskOrchestrator()
+        orch._live_agents[researcher] = mock_agent_instance
 
         result = await orch.execute(
-            query="search youtube for nba",
-            context={
-                "provider": "youtube",
-                "search_query": "nba",
-                "url": "https://www.youtube.com/results?search_query=nba",
-                "action_category": "browser",
-            },
+            query="find out who won the world series",
+            context={"action_category": "research", "search_query": "world series winner"},
         )
 
         mock_agent_instance.execute_task.assert_called_once()
         call_payload = mock_agent_instance.execute_task.call_args[0][0]
-        assert call_payload["goal"] == "search youtube for nba"
-        assert call_payload["search_query"] == "nba"
-        assert call_payload["provider"] == "youtube"
+        assert call_payload["goal"] == "find out who won the world series"
+        assert call_payload["search_query"] == "world series winner"
         assert result.success is True
+        assert "Dodgers" in result.summary  # the agent's answer IS the reply
+
+    @pytest.mark.asyncio
+    async def test_classifier_browser_decision_outranks_keyword_agents(self):
+        """A step the classifier marked as a browser task takes the
+        open-then-see path even when a registry agent matches its keywords."""
+        registry = AsyncMock()
+        registry.find_by_capability = AsyncMock(return_value=[
+            MagicMock(agent_name="visual_browser_agent", load=0.0),
+        ])
+        keyword_agent = AsyncMock()
+        orch = RuntimeTaskOrchestrator(registry=registry)
+        orch._live_agents["visual_browser_agent"] = keyword_agent
+
+        with patch.object(orch, "_dispatch_to_vision", AsyncMock(return_value={
+            "success": True, "result": "Opened https://www.youtube.com/results?search_query=nba",
+        })) as vision:
+            result = await orch.execute(
+                query="search youtube for nba",
+                context={"provider": "youtube", "search_query": "nba", "action_category": "browser"},
+            )
+
+        vision.assert_awaited_once()
+        keyword_agent.execute_task.assert_not_called()
+        assert result.steps[0].resolution == TaskResolution.VISION_ACTION
+        assert result.summary.startswith("Opened")
 
     @pytest.mark.asyncio
     async def test_unknown_agent_raises_not_fallthrough(self):

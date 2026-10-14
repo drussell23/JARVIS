@@ -240,26 +240,30 @@ class ApplicationLauncherExecutor(BaseActionExecutor):
     Pillar 7: Every AI resolution emits telemetry to TelemetryBus.
 
     Resolution chain:
-      1. Native macOS app name normalization (config-driven, instant)
-      2. In-memory AI resolution cache (instant after first resolve)
-      3. Attempt native macOS app launch (system call)
-      4. If native launch fails → J-Prime/Claude resolves dynamically
+      1. In-memory AI resolution cache (instant after first resolve)
+      2. The OS's own application registry (backend.core.desktop_open)
+      3. If the OS has no such app -> J-Prime/Claude resolves dynamically
+         (native app under another name, or a web service and its URLs)
     """
 
-    _RESOLVE_SYSTEM_PROMPT = (
-        "You are a target resolver for a macOS desktop assistant. "
-        "Given a target name the user wants to open, determine:\n"
-        "1. Is it a native macOS application (.app) or a web service/website?\n"
-        "2. If native app: what is the exact macOS application name?\n"
-        "3. If web service: what is the URL, and the search URL template "
-        "(use {query} as placeholder)?\n\n"
-        "Respond ONLY with valid JSON, no markdown, no explanation:\n"
-        '{"type": "native_app", "app_name": "Google Chrome"}\n'
-        "OR\n"
-        '{"type": "web_service", "url": "https://www.youtube.com", '
-        '"search_url_template": "https://www.youtube.com/results?search_query={query}"}\n\n'
-        "If uncertain, prefer web_service with the most likely URL."
-    )
+    @staticmethod
+    def _resolve_system_prompt() -> str:
+        from backend.core.host_platform import native_app_noun, os_display_name
+
+        return (
+            f"You are a target resolver for a {os_display_name()} desktop assistant. "
+            "Given a target name the user wants to open, determine:\n"
+            f"1. Is it an installed {native_app_noun()} or a web service/website?\n"
+            "2. If native app: what is the application's display name on this OS?\n"
+            "3. If web service: what is the URL, and the search URL template "
+            "(use {query} as placeholder)?\n\n"
+            "Respond ONLY with valid JSON, no markdown, no explanation:\n"
+            '{"type": "native_app", "app_name": "Google Chrome"}\n'
+            "OR\n"
+            '{"type": "web_service", "url": "https://www.youtube.com", '
+            '"search_url_template": "https://www.youtube.com/results?search_query={query}"}\n\n'
+            "If uncertain, prefer web_service with the most likely URL."
+        )
 
     def __init__(self, config: Dict[str, Any] = None):
         super().__init__(config)
@@ -303,13 +307,17 @@ class ApplicationLauncherExecutor(BaseActionExecutor):
 
             response = await router.generate(
                 prompt=f'Resolve this target: "{raw_target}"',
-                system_prompt=self._RESOLVE_SYSTEM_PROMPT,
+                system_prompt=self._resolve_system_prompt(),
                 max_tokens=256,
                 temperature=0.0,
                 deadline=asyncio.get_event_loop().time() + 5.0,
             )
 
-            result = json.loads(response.content)
+            from backend.core.llm_json import parse_json_object
+
+            result = parse_json_object(response.content)
+            if not result or result.get("type") not in ("native_app", "web_service"):
+                raise ValueError(f"unusable resolution: {str(response.content)[:120]!r}")
             logger.info(
                 f"AI resolved '{raw_target}' -> {result} "
                 f"(source={response.source}, latency={response.latency_ms:.0f}ms)"
@@ -412,17 +420,16 @@ class ApplicationLauncherExecutor(BaseActionExecutor):
                 message=f"Opened {raw_target} in browser"
             )
 
-        # Try native app launch (known native OR unknown — try system first)
-        try:
-            if platform.system() == "Darwin":
-                return await self._launch_macos_app(resolved_name, context)
-            else:
-                return await self._launch_generic_app(resolved_name, context)
-        except Exception:
-            logger.info(
-                f"Native app '{resolved_name}' not found. "
-                f"Asking AI to resolve '{raw_target}' dynamically..."
-            )
+        # The OS's own application registry first (Start menu / .app / PATH).
+        from backend.core.desktop_open import open_app
+
+        outcome = await open_app(resolved_name)
+        if outcome.ok:
+            return self._launched(outcome, context)
+        logger.info(
+            f"'{resolved_name}' is not an installed application ({outcome.error}). "
+            f"Asking AI to resolve '{raw_target}' dynamically..."
+        )
 
         # Agentic resolution: J-Prime/Claude determines what this target is
         ai_result = await self._resolve_via_ai(raw_target)
@@ -430,10 +437,10 @@ class ApplicationLauncherExecutor(BaseActionExecutor):
 
         if res_type == "native_app":
             app_name = ai_result.get("app_name", raw_target)
-            try:
-                return await self._launch_macos_app(app_name, context)
-            except Exception:
-                logger.warning(f"AI suggested native app '{app_name}' but launch failed")
+            outcome = await open_app(app_name)
+            if outcome.ok:
+                return self._launched(outcome, context)
+            logger.warning(f"AI suggested native app '{app_name}' but launch failed: {outcome.error}")
 
         if res_type == "web_service":
             url = ai_result.get("url", f"https://www.{raw_target.lower()}.com")
@@ -458,111 +465,30 @@ class ApplicationLauncherExecutor(BaseActionExecutor):
         self, url: str, label: str, context: ExecutionContext,
         message: str = ""
     ) -> Dict[str, Any]:
-        """Open a URL in the user's preferred browser."""
-        browser = context.get_variable(
-            "preferred_browser",
-            os.getenv("JARVIS_DEFAULT_BROWSER", "Google Chrome")
-        )
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "open", "-a", browser, url,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
-        except Exception:
-            proc = await asyncio.create_subprocess_exec(
-                "open", url,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
+        """Open a URL in the user's preferred browser (else the OS default)."""
+        from backend.core.desktop_open import open_url, preferred_browser
 
+        outcome = await open_url(
+            url, browser=context.get_variable("preferred_browser", preferred_browser()),
+        )
+        if not outcome.ok:
+            return {"status": "failed", "type": "web_service", "url": url,
+                    "message": outcome.describe(), "error": outcome.error}
         context.set_variable(f"app_{label.lower()}_pid", "running")
         context.set_variable("last_navigation_url", url)
         return {
             "status": "launched",
             "type": "web_service",
-            "message": message or f"Opened {url}",
+            "message": message or outcome.describe(),
             "url": url,
         }
 
-    # ------------------------------------------------------------------
-    # Native macOS app launch
-    # ------------------------------------------------------------------
-
-    async def _launch_macos_app(self, app_name: str, context: ExecutionContext) -> Dict[str, Any]:
-        """Launch macOS application using async subprocess."""
-        check = await asyncio.create_subprocess_exec(
-            "pgrep", "-f", app_name,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await check.wait()
-
-        if check.returncode == 0:
-            script = f'tell application "{app_name}" to activate'
-            await asyncio.create_subprocess_exec(
-                "osascript", "-e", script,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            return {"status": "activated", "message": f"{app_name} brought to front"}
-
-        proc = await asyncio.create_subprocess_exec(
-            "open", "-a", app_name,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
-
-        if proc.returncode == 0:
-            await self._wait_for_app_start(app_name, timeout=5)
-            context.set_variable(f"app_{app_name.lower()}_pid", "running")
-            return {"status": "launched", "message": f"{app_name} launched successfully"}
-
-        app_path = f"/Applications/{app_name}.app"
-        if os.path.exists(app_path):
-            proc2 = await asyncio.create_subprocess_exec(
-                "open", app_path,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc2.wait()
-            if proc2.returncode == 0:
-                context.set_variable(f"app_{app_name.lower()}_pid", "running")
-                return {"status": "launched", "message": f"{app_name} launched via direct path"}
-
-        raise Exception(f"Could not launch native app: {app_name}")
-
-    async def _launch_generic_app(self, app_name: str, context: ExecutionContext) -> Dict[str, Any]:
-        """Launch application on generic (non-macOS) platform."""
-        launch_commands = [
-            app_name.lower(),
-            app_name.lower().replace(' ', '-'),
-            app_name.lower().replace(' ', '_'),
-        ]
-        for cmd in launch_commands:
-            try:
-                subprocess.Popen([cmd])
-                return {"status": "launched", "message": f"{app_name} launched"}
-            except Exception:
-                continue
-        raise Exception(f"Could not find launch command for {app_name}")
-
-    async def _wait_for_app_start(self, app_name: str, timeout: int = 5):
-        """Wait for application process to appear."""
-        start_time = datetime.now()
-        while (datetime.now() - start_time).total_seconds() < timeout:
-            check = await asyncio.create_subprocess_exec(
-                "pgrep", "-f", app_name,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await check.wait()
-            if check.returncode == 0:
-                return
-            await asyncio.sleep(0.5)
+    @staticmethod
+    def _launched(outcome: Any, context: ExecutionContext) -> Dict[str, Any]:
+        """Result of an application the OS registry launched."""
+        context.set_variable(f"app_{outcome.target.lower()}_pid", "running")
+        return {"status": "launched", "type": "native_app",
+                "message": outcome.describe(), "app": outcome.resolved, "method": outcome.method}
 
     # ------------------------------------------------------------------
     # Public helpers for cross-executor use
@@ -649,42 +575,36 @@ class NavigationExecutor(BaseActionExecutor):
         }
 
     def _looks_like_url(self, target: str) -> bool:
-        lower_target = target.strip().lower()
-        if lower_target.startswith(("http://", "https://")):
-            return True
-
-        # Accept domain-like targets (e.g., github.com/drussell23/JARVIS-AI-Agent).
-        return "." in lower_target and " " not in lower_target
+        from backend.core.desktop_open import looks_like_url
+        return looks_like_url(target)
 
     def _normalize_url(self, target: str) -> str:
-        stripped = target.strip()
-        if stripped.lower().startswith(("http://", "https://")):
-            return stripped
-        return f"https://{stripped}"
+        from backend.core.desktop_open import normalize_url
+        return normalize_url(target)
 
     async def _open_url(self, url: str, context: ExecutionContext) -> Dict[str, Any]:
-        # v283.3: Default to Chrome (was Safari). JARVIS uses Chrome for its UI.
-        browser = context.get_variable("preferred_browser", os.getenv("JARVIS_DEFAULT_BROWSER", "Google Chrome"))
+        from backend.core.desktop_open import open_url, preferred_browser
 
-        try:
-            subprocess.run(["open", "-a", browser, url], check=True)
-        except Exception:
-            # Fallback to system default browser if requested browser is unavailable.
-            subprocess.run(["open", url], check=True)
-
-        context.set_variable("last_navigation_url", url)
+        outcome = await open_url(
+            url, browser=context.get_variable("preferred_browser", preferred_browser()),
+        )
+        if outcome.ok:
+            context.set_variable("last_navigation_url", url)
         return {
-            "status": "success",
-            "message": f"Opened {url}",
+            "status": "success" if outcome.ok else "failed",
+            "message": outcome.describe(),
             "destination": url,
         }
 
     async def _open_path(self, path: Path, context: ExecutionContext) -> Dict[str, Any]:
-        subprocess.run(["open", str(path)], check=True)
-        context.set_variable("last_navigation_path", str(path))
+        from backend.core.desktop_open import open_path
+
+        outcome = await open_path(str(path))
+        if outcome.ok:
+            context.set_variable("last_navigation_path", str(path))
         return {
-            "status": "success",
-            "message": f"Opened {path}",
+            "status": "success" if outcome.ok else "failed",
+            "message": outcome.describe(),
             "destination": str(path),
         }
 

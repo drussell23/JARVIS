@@ -1988,6 +1988,39 @@ class UnifiedCommandProcessor:
 
         return result
 
+    @staticmethod
+    def _runtime_task_context(classification: Any) -> Dict[str, Any]:
+        """The classifier's structured decision, as the RuntimeTaskOrchestrator reads it."""
+        return {
+            "intent": "action",
+            "action_category": getattr(classification, "action_category", ""),
+            "provider": getattr(classification, "provider", ""),
+            "search_query": getattr(classification, "search_query", ""),
+            "target_app": getattr(classification, "target_app", ""),
+            "requires_vision": getattr(classification, "requires_vision", False),
+            "classification_source": getattr(classification, "classification_source", ""),
+            "source": "pillar5_preroute",
+        }
+
+    @staticmethod
+    def _runtime_task_response(rto_result: Any) -> Optional[Dict[str, Any]]:
+        """The reply for a RuntimeTaskOrchestrator result, or None to try the next route.
+
+        Success answers. A failure that already ACTED on the desktop (opened
+        something) also answers, honestly, instead of falling through to a
+        route that would act again. Only a task that did nothing falls through.
+        """
+        if rto_result is None:
+            return None
+        summary = getattr(rto_result, "summary", None) or str(rto_result)
+        if getattr(rto_result, "success", False):
+            return {"success": True, "response": summary,
+                    "command_type": "ACTION", "source": "rto_pillar5"}
+        if getattr(rto_result, "acted", False):
+            return {"success": False, "response": summary,
+                    "command_type": "ACTION", "source": "rto_pillar5"}
+        return None
+
     async def _execute_command_pipeline(
         self, command_text: str, websocket=None, audio_data: bytes = None,
         speaker_name: str = None, deadline: Optional[float] = None,
@@ -2103,6 +2136,11 @@ class UnifiedCommandProcessor:
             except Exception:
                 pass
 
+        # One command runs through the RuntimeTaskOrchestrator at most once:
+        # the second pre-route below used to re-run a task the first had
+        # already acted on (the browser opened twice).
+        _rto_attempted = False
+
         try:
             from backend.core.intent_classifier import get_intent_classifier, CommandIntent
             _ic = get_intent_classifier()
@@ -2151,45 +2189,19 @@ class UnifiedCommandProcessor:
                         _p5log("Lazy-created minimal RTO")
 
                     _p5log("Dispatching to RTO.execute()")
+                    _rto_attempted = True
                     _rto_result = await asyncio.wait_for(
                         _rto.execute(
                             query=command_text,
-                            context={
-                                "intent": "action",
-                                "action_category": _classification.action_category,
-                                "provider": _classification.provider,
-                                "search_query": _classification.search_query,
-                                "target_app": _classification.target_app,
-                                "requires_vision": _classification.requires_vision,
-                                "classification_source": _classification.classification_source,
-                                "source": "pillar5_preroute",
-                            },
+                            context=self._runtime_task_context(_classification),
                         ),
                         timeout=float(os.environ.get("JARVIS_RTO_TIMEOUT", "120.0")),
                     )
                     _p5log(f"RTO result: {_rto_result}")
-
-                    if _rto_result is not None:
-                        # v305.0: Use TaskResult.success (checks StepResolution.error
-                        # field) instead of drilling into step.result dicts. The old
-                        # check falsely flagged steps as errored when their result dict
-                        # had an 'error' key set to None/empty, causing the pipeline to
-                        # fall through to J-Prime even on successful RTO execution.
-                        _has_error = not getattr(_rto_result, 'success', False)
-                        if _has_error:
-                            _p5log(f"RTO reported failure: {_rto_result.summary if hasattr(_rto_result, 'summary') else _rto_result}")
-
-                        if not _has_error:
-                            _summary = _rto_result.summary if hasattr(_rto_result, 'summary') else str(_rto_result)
-                            _p5log(f"SUCCESS: {_summary[:100]}")
-                            return {
-                                "success": True,
-                                "response": _summary,
-                                "command_type": "ACTION",
-                                "source": "rto_pillar5",
-                            }
-                        else:
-                            _p5log("RTO tool had error — falling through to legacy")
+                    _rto_response = self._runtime_task_response(_rto_result)
+                    if _rto_response is not None:
+                        return _rto_response
+                    _p5log("RTO did nothing — falling through to legacy")
 
                 except asyncio.TimeoutError:
                     _p5log("RTO timeout 60s — falling through")
@@ -2476,46 +2488,22 @@ class UnifiedCommandProcessor:
                         except Exception as _lazy_exc:
                             _p5log(f"Lazy RTO FAILED: {_lazy_exc}")
 
-                    if _rto is not None:
+                    if _rto is not None and not _rto_attempted:
                         _p5log("Dispatching to RTO.execute()")
                         try:
+                            _rto_attempted = True
                             _rto_result = await asyncio.wait_for(
                                 _rto.execute(
                                     query=command_text,
-                                    context={
-                                        "intent": "action",
-                                        "action_category": _classification.action_category,
-                                        "provider": _classification.provider,
-                                        "search_query": _classification.search_query,
-                                        "target_app": _classification.target_app,
-                                        "source": "pillar5_preroute",
-                                    },
+                                    context=self._runtime_task_context(_classification),
                                 ),
-                                timeout=60.0,
+                                timeout=float(os.environ.get("JARVIS_RTO_TIMEOUT", "120.0")),
                             )
                             _p5log(f"RTO result: {_rto_result}")
-                            if _rto_result is not None:
-                                # Check if the ephemeral tool actually succeeded
-                                _has_error = False
-                                if hasattr(_rto_result, 'steps'):
-                                    for _step in _rto_result.steps:
-                                        _step_result = getattr(_step, 'result', {}) or {}
-                                        if isinstance(_step_result, dict) and _step_result.get('error'):
-                                            _has_error = True
-                                            _p5log(f"RTO step error: {_step_result['error']}")
-
-                                if not _has_error:
-                                    _summary = _rto_result.summary if hasattr(_rto_result, 'summary') else str(_rto_result)
-                                    _p5log(f"RTO SUCCESS: {_summary[:100]}")
-                                    return {
-                                        "success": True,
-                                        "response": _summary,
-                                        "command_type": "ACTION",
-                                        "source": "rto_pillar5",
-                                    }
-                                else:
-                                    _p5log("RTO tool had runtime error — falling through to direct execution")
-                            _p5log("RTO returned None or failed — falling through")
+                            _rto_response = self._runtime_task_response(_rto_result)
+                            if _rto_response is not None:
+                                return _rto_response
+                            _p5log("RTO did nothing — falling through to direct execution")
                         except asyncio.TimeoutError:
                             _p5log("RTO TIMEOUT after 60s")
                         except Exception as _rto_exec_exc:
@@ -9465,15 +9453,12 @@ class UnifiedCommandProcessor:
         try:
             from urllib.parse import quote
 
-            url = f"https://www.google.com/search?q={quote(query)}"
-            process = await asyncio.create_subprocess_exec(
-                "open", url,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(process.wait(), timeout=5.0)
+            from backend.core.desktop_open import open_url, preferred_browser
 
-            if process.returncode == 0:
+            url = f"https://www.google.com/search?q={quote(query)}"
+            outcome = await open_url(url, browser=preferred_browser())
+
+            if outcome.ok:
                 logger.info(f"[SEARCH] Opened browser for '{query}'")
                 return {
                     "success": True,
@@ -9482,7 +9467,7 @@ class UnifiedCommandProcessor:
                     "fast_path": "browser_open",
                 }
             else:
-                logger.warning(f"[SEARCH] open returned code {process.returncode}")
+                logger.warning(f"[SEARCH] {outcome.describe()}")
         except asyncio.TimeoutError:
             logger.warning(f"[SEARCH] Browser open timed out for '{query}'")
         except Exception as e:

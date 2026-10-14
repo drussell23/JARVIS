@@ -240,6 +240,19 @@ def get_agent_bindings() -> Dict[str, AgentBinding]:
     return _bindings
 
 
+def agent_for_capability(capability: str) -> Optional[str]:
+    """The agent_id of the bound agent that declares *capability*, if any.
+
+    Callers route by what an agent can do, never by its name, so a user
+    override that rebinds a capability to another agent is honoured.
+    """
+    wanted = (capability or "").strip().lower()
+    for agent_id, binding in get_agent_bindings().items():
+        if wanted in {c.lower() for c in binding.capabilities}:
+            return agent_id
+    return None
+
+
 def reload_bindings() -> Dict[str, AgentBinding]:
     """Force-reload bindings (e.g. after user edits the JSON)."""
     global _bindings

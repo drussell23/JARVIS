@@ -79,11 +79,22 @@ def test_stagnation_no_false_positive_on_short_log():
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _legacy_loop_only(monkeypatch):
+    """These tests drive the legacy VisionActionLoop + MindClient loop. The
+    newer phases _dispatch_to_vision tries first (JARVIS-CU, the Lean Vision
+    Loop) are switched off by their own flags, or they run REAL screen capture
+    under a mocked asyncio.sleep and spin."""
+    monkeypatch.setenv("JARVIS_CU_ENABLED", "false")
+    monkeypatch.setenv("VISION_LEAN_ENABLED", "false")
+
+
 def _make_mock_rto():
     """Create a RuntimeTaskOrchestrator with mocked dependencies."""
     rto = RuntimeTaskOrchestrator.__new__(RuntimeTaskOrchestrator)
     rto._prime = MagicMock()
-    rto._resolve_url_via_prime = AsyncMock(return_value="https://example.com")
+    # Phase 0 (open what the goal starts with) is not under test here: nothing to open.
+    rto._resolve_open_target = AsyncMock(return_value={})
     rto.logger = MagicMock()
 
     # Mock VisionActionLoop

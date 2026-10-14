@@ -301,9 +301,15 @@ class WebResearchService:
                     })
                     continue
 
+                # A page the server refused (403 bot wall, 429, 5xx) came back
+                # with its error page as "content"; that is not a read.
+                status_code = result.get("status_code")
+                read_ok = not isinstance(status_code, int) or 200 <= status_code < 300
+                if not read_ok:
+                    warnings.append(f"{source_meta['url']} answered HTTP {status_code}")
                 source_documents.append({
                     **source_meta,
-                    "read_success": True,
+                    "read_success": read_ok,
                     "title": result.get("title") or source_meta.get("title") or "",
                     "content": result.get("content", ""),
                     "final_url": result.get("final_url") or source_meta["url"],

@@ -35,6 +35,7 @@ it figures out how to do it.
 from __future__ import annotations
 
 import asyncio
+import json
 import hashlib
 import logging
 import os
@@ -46,6 +47,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+#: IntentClassifier action_category for "find this out on the web and answer",
+#: and the agent capability that serves it (agent_bindings decides WHICH agent).
+_RESEARCH_CATEGORY = "research"
+_RESEARCH_CAPABILITY = "web_research"
 
 
 class TaskResolution(str, Enum):
@@ -108,6 +115,15 @@ class TaskResult:
     summary: str
     total_elapsed_s: float
     plan_reasoning: str
+
+    @property
+    def acted(self) -> bool:
+        """Whether any step already changed the user's desktop (opened something).
+
+        A caller must not re-run such a task through another route: the
+        side effect would happen twice (the same browser opened twice).
+        """
+        return any(isinstance(s.result, dict) and s.result.get("opened") for s in self.steps)
 
 
 class RuntimeTaskOrchestrator:
@@ -264,6 +280,11 @@ class RuntimeTaskOrchestrator:
             )
             return self._single_step(query, ctx), "single-step (vision goal)"
 
+        # A research question is one goal: the agent searches, reads and
+        # answers it whole. Splitting it would also drop action_category.
+        if self._is_research_task(ctx):
+            return self._single_step(query, ctx), "single-step (research)"
+
         if self._planner is not None:
             try:
                 prediction = await self._planner.expand_intent(query)
@@ -291,8 +312,11 @@ class RuntimeTaskOrchestrator:
             "priority": 1,
             "dependencies": [],
         }
+        # requires_vision is the classifier's PRIMARY browser/UI signal
+        # (_is_browser_or_ui_task); it was dropped here, so only the
+        # structural fallbacks ever saw a step.
         for field_name in ("provider", "url", "search_query", "target_app",
-                           "workspace_service", "action_category"):
+                           "workspace_service", "action_category", "requires_vision"):
             val = ctx.get(field_name)
             if val:
                 step[field_name] = val
@@ -336,6 +360,36 @@ class RuntimeTaskOrchestrator:
         goal = step["goal"]
         start = time.monotonic()
 
+        # Check -1: the IntentClassifier's STRUCTURAL decision (J-Prime's, not a
+        # keyword's) outranks the facade's keyword routing below, which sent
+        # anything containing "search" to the research agent and anything with
+        # "app" to a macOS-only controller, whatever the classifier decided.
+        if self._is_research_task(step):
+            from backend.core.agent_bindings import agent_for_capability
+
+            researcher = agent_for_capability(_RESEARCH_CAPABILITY)
+            if researcher:
+                return StepResolution(
+                    step_goal=goal,
+                    resolution=TaskResolution.EXISTING_AGENT,
+                    agent_name=researcher,
+                    capability_used=_RESEARCH_CAPABILITY,
+                    synthesized=False,
+                    elapsed_s=time.monotonic() - start,
+                )
+
+        # Browser/UI task: open what it starts with, then the perception-action
+        # loop (vision only when opening did not already accomplish the goal).
+        if self._is_browser_or_ui_task(goal, step):
+            return StepResolution(
+                step_goal=goal,
+                resolution=TaskResolution.VISION_ACTION,
+                agent_name="vision_action_loop",
+                capability_used="browser_navigation",
+                synthesized=False,
+                elapsed_s=time.monotonic() - start,
+            )
+
         # Check 0: Core Context facade — new architecture (per-vertical flags)
         try:
             from backend.core_contexts.facade import dispatch as ctx_dispatch
@@ -373,20 +427,7 @@ class RuntimeTaskOrchestrator:
                 elapsed_s=time.monotonic() - start,
             )
 
-        # Check 1.5: Browser/UI task? Route to VisionActionLoop (perception-action loop).
-        # v305.0: Instead of synthesizing blind subprocess code, use the full
-        # vision stack: Ferrari Engine capture → Claude Vision analysis →
-        # Ghost Hands actuator → ActionVerifier. This gives JARVIS eyes and
-        # hands — it can see if the page loaded correctly and self-correct.
-        if self._is_browser_or_ui_task(goal, step):
-            return StepResolution(
-                step_goal=goal,
-                resolution=TaskResolution.VISION_ACTION,
-                agent_name="vision_action_loop",
-                capability_used="browser_navigation",
-                synthesized=False,
-                elapsed_s=time.monotonic() - start,
-            )
+        # (Browser/UI tasks are routed at Check -1, ahead of keyword matching.)
 
         # Check 2: Is this a code change? Route to Ouroboros governance.
         if self._is_code_change(goal):
@@ -536,6 +577,12 @@ class RuntimeTaskOrchestrator:
         ]
         goal_lower = goal.lower()
         return any(signal in goal_lower for signal in code_signals)
+
+    @staticmethod
+    def _is_research_task(step: Dict[str, Any]) -> bool:
+        """The classifier decided the user wants an ANSWER gathered from the
+        web (action_category "research"), not a page opened for them."""
+        return (step.get("action_category") or "").lower() == _RESEARCH_CATEGORY
 
     @staticmethod
     def _is_browser_or_ui_task(goal: str, step: Dict[str, Any]) -> bool:
@@ -974,78 +1021,128 @@ class RuntimeTaskOrchestrator:
         except Exception as exc:
             return {"status": "error", "error": str(exc)}
 
-    async def _resolve_url_via_prime(self, goal: str, step: Dict[str, Any]) -> str:
-        """Ask J-Prime to resolve the correct URL for a navigation goal.
+    async def _resolve_open_target(self, goal: str, step: Dict[str, Any]) -> Dict[str, Any]:
+        """Ask J-Prime how this goal starts, and whether starting it finishes it.
 
-        No hardcoded URL templates — the model figures out the right URL
-        based on the goal semantics. Falls back to empty string on failure.
+        One agentic decision, no URL templates or app tables: what to open
+        (a URL or an application, or nothing) and ``completes_goal`` -- e.g. a
+        search is finished by opening its results page, while "play the first
+        video" still needs the screen afterwards. Returns {} when the Mind is
+        unavailable or answers unusably; the caller then opens nothing itself.
         """
-        provider = step.get("provider") or ""
-        search_query = step.get("search_query") or ""
+        if self._prime is None:
+            return {}
+        from backend.core.desktop_open import looks_like_url, normalize_url
+        from backend.core.host_platform import os_display_name
+        from backend.core.llm_json import parse_json_object
 
+        fields = {k: step.get(k) for k in ("provider", "search_query", "target_app") if step.get(k)}
         prompt = (
-            f"What is the exact URL to accomplish this goal?\n"
-            f"Goal: {goal}\n"
-            f"Provider: {provider}\n"
-            f"Search query: {search_query}\n\n"
-            f"Return ONLY the URL, nothing else. No markdown, no explanation.\n"
-            f"Example: https://www.youtube.com/results?search_query=neural+networks"
+            f"Goal of a user at a {os_display_name()} computer: {goal}\n"
+            f"Fields extracted from the request: {json.dumps(fields)}\n\n"
+            "The assistant opens URLs directly in the user's browser and launches "
+            "installed applications. Decide what to open so the user LANDS ON THE RESULT, "
+            "and whether opening it IS the whole goal. Respond ONLY with JSON:\n"
+            '{"open": "url" | "app" | "none", "url": "https://...", "app": "application name", '
+            '"completes_goal": true | false, "remaining": "what is left after opening, if anything"}\n'
+            "Decision rules:\n"
+            "- Web content (a search, a site, a video, a page): open=url with the most direct "
+            "URL, e.g. the search-results page for the query. Never open a browser app and "
+            "then type into it: the URL already does that.\n"
+            "- open=app only when the goal is about an installed application itself "
+            "(\"open Spotify\", \"launch Notepad\"), or names an app to use.\n"
+            "- completes_goal=true when landing there is what the user asked for (a search "
+            "shows its results). completes_goal=false only when something must still be "
+            "clicked, typed or read on screen afterwards (\"play the first video\").\n"
+            "- open=none when nothing needs to be opened."
         )
         try:
             response = await asyncio.wait_for(
                 self._prime.generate(
                     prompt=prompt,
-                    system_prompt="You are a URL resolver. Return only the URL.",
-                    max_tokens=200,
+                    system_prompt="You decide how a desktop assistant starts a task. Return only JSON.",
+                    max_tokens=256,
+                    temperature=0.0,
                 ),
-                timeout=8.0,
+                timeout=float(os.getenv("JARVIS_OPEN_RESOLVE_TIMEOUT_S", "15")),
             )
-            url = (response.text if hasattr(response, "text") else str(response)).strip()
-            # Validate — must look like a URL
-            if url.startswith("http://") or url.startswith("https://"):
-                logger.info("[RuntimeTask] J-Prime resolved URL: %s", url[:80])
-                return url
-            logger.debug("[RuntimeTask] J-Prime URL invalid: %s", url[:80])
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            logger.debug("[RuntimeTask] J-Prime URL resolution failed: %s", exc)
-        return ""
+            logger.warning("[RuntimeTask] open-target resolution failed: %s", exc)
+            return {}
+
+        decision = parse_json_object(getattr(response, "content", None)) or {}
+        kind = str(decision.get("open") or "").lower()
+        url = str(decision.get("url") or "").strip()
+        app = str(decision.get("app") or "").strip()
+        if kind == "url" and not looks_like_url(url):
+            kind = "app" if app else "none"
+        if kind == "app" and not app:
+            kind = "none"
+        resolved = {
+            "open": kind if kind in ("url", "app") else "none",
+            "url": normalize_url(url) if kind == "url" else "",
+            "app": app if kind == "app" else "",
+            "completes_goal": bool(decision.get("completes_goal")) and kind in ("url", "app"),
+            "remaining": str(decision.get("remaining") or "").strip(),
+        }
+        logger.info("[RuntimeTask] open decision for %r: %s", goal[:60], resolved)
+        return resolved
+
+    @staticmethod
+    def _report_open(result: Any, opened: Any) -> Any:
+        """Say what WAS done when the screen work after opening could not finish."""
+        if opened is None or not getattr(opened, "ok", False) or not isinstance(result, dict):
+            return result
+        if result.get("success"):
+            return result
+        why = str(result.get("result") or result.get("error") or "").strip()
+        result = dict(result)
+        result["result"] = (
+            f"{opened.describe()}, but I couldn't finish the rest on screen"
+            + (f": {why}" if why else ".")
+        )
+        result["opened"] = opened.resolved
+        return result
 
     async def _dispatch_to_vision(self, goal: str, step: Dict[str, Any]) -> Any:
-        """Route a browser/UI task through the vision loop.
+        """Route a browser/UI task: open what it starts with, then the vision loop.
 
-        v307.0: Lean Vision Loop (Path A) -- stripped-down 3-step loop
-        that replaces the 12-hop pipeline.  CAPTURE -> THINK -> ACT.
-        Set VISION_LEAN_ENABLED=false to fall back to legacy pipeline.
+        Phase 0 opens through backend.core.desktop_open (every OS) whatever
+        J-Prime decided the goal starts with. When opening IS the goal (a
+        search answered by its results page) the task ends there, with no
+        screen work. Otherwise the vision loop continues from the opened
+        state; if it cannot, the reply still says what was opened.
         """
-        search_query = step.get("search_query") or ""
-        target_app = (step.get("target_app") or "").lower()
+        from backend.core.desktop_open import open_app, open_url, preferred_browser
 
-        # Phase 0: Open app/URL
-        url = step.get("url") or ""
-        if not url and self._prime is not None:
-            url = await self._resolve_url_via_prime(goal, step)
-        elif not url and search_query:
-            import urllib.parse as _urlparse
-            url = "https://www.google.com/search?q=" + _urlparse.quote_plus(search_query)
+        if step.get("url"):
+            decision: Dict[str, Any] = {"open": "url", "url": step["url"], "completes_goal": False}
+        else:
+            decision = await self._resolve_open_target(goal, step)
+        if not decision and step.get("target_app"):
+            # The Mind is unreachable: the classifier's own extraction still names the app.
+            decision = {"open": "app", "app": step["target_app"], "completes_goal": False}
 
-        if url:
-            proc = await asyncio.create_subprocess_exec(
-                "open", url,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
-            logger.info("[RuntimeTask] Opened URL: %s", url[:80])
-        elif target_app:
-            proc = await asyncio.create_subprocess_exec(
-                "open", "-a", target_app,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
-            logger.info("[RuntimeTask] Opened app: %s", target_app)
+        opened = None
+        if decision.get("open") == "url":
+            opened = await open_url(decision["url"], browser=preferred_browser())
+        elif decision.get("open") == "app":
+            opened = await open_app(decision["app"])
+        if opened is not None:
+            logger.info("[RuntimeTask] %s (method=%s)", opened.describe(), opened.method)
 
-        await asyncio.sleep(2.0)  # Allow page load
+        if opened is not None and opened.ok and decision.get("completes_goal"):
+            return {
+                "success": True,
+                "result": opened.describe(),
+                "stop_reason": StopReason.GOAL_SATISFIED.value,
+                "opened": opened.resolved,
+            }
+        if opened is not None and opened.ok:
+            # Let the opened window paint before the screen is read.
+            await asyncio.sleep(float(os.getenv("JARVIS_OPEN_SETTLE_S", "2.0")))
 
         # Phase 0.5: JARVIS-CU (local Computer Use — 3-layer cascade)
         # Accessibility API (<5ms) → Doubleword 235B (~2s) → Claude Vision (fallback)
@@ -1097,7 +1194,7 @@ class RuntimeTaskOrchestrator:
                     result = await lean.run(goal)
                     logger.info("[RuntimeTask] === LEAN VISION LOOP END === success=%s turns=%s",
                                result.get("success"), result.get("turns"))
-                    return result
+                    return self._report_open(result, opened)
                 except Exception as lean_exc:
                     logger.error("[RuntimeTask] LEAN VISION LOOP CRASHED: %s", lean_exc, exc_info=True)
             else:
@@ -1112,17 +1209,16 @@ class RuntimeTaskOrchestrator:
         import hashlib as _hashlib
         _val = await self._get_vision_action_loop()
         if _val is None:
-            opened = f"URL: {url}" if url else f"app: {target_app}" if target_app else goal
             logger.error(
-                "[RuntimeTask] VISION UNAVAILABLE — opened %s but cannot "
-                "perform screen actions. Both lean loop and legacy pipeline failed.",
-                opened,
+                "[RuntimeTask] VISION UNAVAILABLE — %s, but cannot perform screen "
+                "actions. Both lean loop and legacy pipeline failed.",
+                opened.describe() if opened is not None else "nothing was opened",
             )
-            return {
+            return self._report_open({
                 "success": False,
-                "result": f"I opened {opened} but my vision system isn't working — I can't see or interact with the screen right now.",
+                "result": "my vision system isn't working, so I can't see or interact with the screen right now",
                 "stop_reason": StopReason.ERROR.value,
-            }
+            }, opened)
 
         pipeline = _val.frame_pipeline
         mind = self._get_mind_client()
@@ -1337,6 +1433,8 @@ class RuntimeTaskOrchestrator:
         # J-Prime was generating aiohttp.get() for "search X on youtube/wikipedia"
         # instead of opening the browser — the user expects to SEE the page, not
         # receive raw HTML in a dict.
+        from backend.core.host_platform import os_display_name
+
         prompt = (
             f"Generate a Python async function that accomplishes this goal:\n"
             f"Goal: {goal}\n\n"
@@ -1344,13 +1442,13 @@ class RuntimeTaskOrchestrator:
             f"- Single async function: async def execute(context: dict) -> dict\n"
             f"- The function MUST accept exactly one argument: context (a dict)\n"
             f"- Returns a dict with 'success' (bool) and 'result' (str) keys\n"
-            f"- This runs on macOS for a DESKTOP AI assistant with a screen\n"
+            f"- This runs on {os_display_name()} for a DESKTOP AI assistant with a screen\n"
             f"- For ANY task involving websites, search, or browsing:\n"
-            f"  USE subprocess.run(['open', url]) to open the URL in Chrome/Safari\n"
+            f"  USE webbrowser.open(url) to open the URL in the user's browser\n"
             f"  The user wants to SEE the page, NOT receive raw HTML\n"
             f"  NEVER use aiohttp/requests/urllib to fetch web pages — open them in the browser\n"
-            f"- For app tasks: subprocess.run(['open', '-a', 'AppName'])\n"
-            f"- For web search: build the URL (e.g. youtube.com/results?search_query=X) and open it\n"
+            f"- For app tasks: launch the application the way {os_display_name()} does\n"
+            f"- For web search: build the site's search-results URL and open it\n"
             f"- Available imports: subprocess, webbrowser, os, json, re, urllib, asyncio\n"
             f"- Output ONLY the function code, no markdown, no explanation\n"
         )
@@ -1359,7 +1457,7 @@ class RuntimeTaskOrchestrator:
             response = await self._prime.generate(
                 prompt=prompt,
                 system_prompt=(
-                    "You are a code generator for a macOS desktop AI assistant. "
+                    f"You are a code generator for a {os_display_name()} desktop AI assistant. "
                     "Generate ONLY a single Python async function. No markdown fences. "
                     "No explanation. Just the raw Python code starting with 'async def execute(context: dict) -> dict:'"
                 ),
@@ -1508,6 +1606,17 @@ class RuntimeTaskOrchestrator:
             pass
 
     @staticmethod
+    def _step_message(step: StepResolution) -> str:
+        """The human-readable outcome a step's own result reported, if any."""
+        result = step.result
+        if isinstance(result, dict):
+            for key in ("result", "response", "answer", "message", "final_message"):
+                value = result.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ""
+
+    @staticmethod
     def _build_summary(query: str, steps: List[StepResolution]) -> str:
         """Build a natural, speakable summary of what happened.
 
@@ -1521,12 +1630,13 @@ class RuntimeTaskOrchestrator:
         synthesized = sum(1 for s in steps if s.synthesized)
 
         if failed == 0:
-            # All good — natural completion message
-            agents = [s.agent_name for s in steps if s.agent_name]
-            if total == 1 and agents:
-                summary = f"Done. Handled via {agents[0]}."
+            # All good — say what each step reported doing (what it opened,
+            # the answer it found); internal agent names are not news to a user.
+            reported = [m for m in (RuntimeTaskOrchestrator._step_message(s) for s in steps) if m]
+            if reported:
+                summary = "\n\n".join(reported)
             elif total == 1:
-                summary = f"Done."
+                summary = "Done."
             else:
                 summary = f"Done. All {total} steps completed."
 
@@ -1562,18 +1672,11 @@ class RuntimeTaskOrchestrator:
         try:
             from backend.core.supervisor.unified_voice_orchestrator import safe_say
 
-            # Build a natural, concise spoken summary
-            query_short = result.original_query[:60]
-            n_steps = len(result.steps)
-            agents = [s.agent_name for s in result.steps if s.agent_name]
-            synthesized = sum(1 for s in result.steps if s.synthesized)
-
-            if n_steps == 1 and agents:
-                msg = f"Done. Handled via {agents[0]}."
-            elif synthesized > 0:
-                msg = f"Done. Completed {n_steps} steps, {synthesized} synthesized on the fly."
-            else:
-                msg = f"Done. {n_steps} steps completed for: {query_short}."
+            # Speak the summary the user is shown: its first paragraph (a
+            # research answer's source list is for reading, not listening).
+            limit = int(os.getenv("JARVIS_SPOKEN_SUMMARY_MAX_CHARS", "300"))
+            first = (result.summary or "Done.").strip().split("\n\n", 1)[0]
+            msg = first if len(first) <= limit else first[:limit].rsplit(" ", 1)[0] + "…"
 
             await safe_say(
                 msg,

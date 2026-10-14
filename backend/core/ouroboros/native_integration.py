@@ -9462,22 +9462,37 @@ class WebSearchExtractor:
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(html, "html.parser")
         except ImportError:
-            # Fallback to regex parsing
+            # Fallback to regex parsing. Attribute quoting is the page's
+            # choice (DDG Lite now writes class='result-link'; the old
+            # double-quote-only pattern matched nothing and every search
+            # returned 0 results), and titles/snippets carry inline markup
+            # (<b>query</b>), so match either quote and span inner tags.
+            import html as _html
             import re
 
-            # Extract links from HTML
-            link_pattern = r'<a[^>]+href="([^"]+)"[^>]*class="result-link"[^>]*>([^<]+)</a>'
-            snippet_pattern = r'<td[^>]+class="result-snippet"[^>]*>([^<]+)</td>'
+            def _text(fragment: str) -> str:
+                return _html.unescape(re.sub(r"<[^>]+>", "", fragment)).strip()
 
-            links = re.findall(link_pattern, html)
-            snippets = re.findall(snippet_pattern, html)
+            link_pattern = re.compile(
+                r"<a\b[^>]*?href=([\"'])(?P<href>.*?)\1[^>]*?class=([\"'])result-link\3[^>]*>"
+                r"(?P<title>.*?)</a>",
+                re.IGNORECASE | re.DOTALL,
+            )
+            snippet_pattern = re.compile(
+                r"<td\b[^>]*?class=([\"'])result-snippet\1[^>]*>(?P<body>.*?)</td>",
+                re.IGNORECASE | re.DOTALL,
+            )
+
+            links = [(_html.unescape(m.group("href")), _text(m.group("title")))
+                     for m in link_pattern.finditer(html)]
+            snippets = [_text(m.group("body")) for m in snippet_pattern.finditer(html)]
 
             for i, (link_url, title) in enumerate(links[:max_results]):
                 snippet = snippets[i] if i < len(snippets) else ""
                 results.append(SearchResult(
-                    title=title.strip(),
+                    title=title,
                     url=link_url,
-                    snippet=snippet.strip(),
+                    snippet=snippet,
                     provider=SearchProvider.DUCKDUCKGO,
                     result_type=self._classify_result_type(link_url, title),
                     relevance_score=1.0 - (i * 0.05),

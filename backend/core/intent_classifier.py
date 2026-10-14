@@ -450,34 +450,45 @@ class IntentClassifier:
     # Agentic classification (Pillar 5)
     # ------------------------------------------------------------------
 
-    _CLASSIFY_SYSTEM_PROMPT = (
-        "You are an intent classifier for a macOS desktop AI assistant. "
-        "Given a voice command, classify it and extract structured fields.\n\n"
-        "Respond ONLY with valid JSON, no markdown:\n"
-        "{\n"
-        '  "intent": "action" or "query",\n'
-        '  "confidence": 0.0-1.0,\n'
-        '  "action_category": "browser"|"app_control"|"system"|"communication"|"media"|"file"|"",\n'
-        '  "provider": "youtube"|"google"|"spotify"|etc or "",\n'
-        '  "search_query": "extracted search term" or "",\n'
-        '  "target_app": "app name mentioned" or "",\n'
-        '  "requires_vision": true or false,\n'
-        '  "reasoning": "one-line explanation"\n'
-        "}\n\n"
-        "Rules:\n"
-        '- "action" = the user wants to DO something (open, search, play, create, send, etc.)\n'
-        '- "query" = the user wants to KNOW something (question, explanation, conversation)\n'
-        "- Extract provider if a specific service is mentioned\n"
-        "- Extract search_query if the user is searching for something\n"
-        "- Extract target_app if ANY app is mentioned (WhatsApp, Slack, Chrome, etc.) — "
-        "do NOT limit to a fixed list, extract whatever app the user names\n"
-        '- Set requires_vision=true when the command needs screen/UI interaction BEYOND '
-        "just opening an app — e.g. 'message Zach on WhatsApp' (needs to find and click "
-        "a contact), 'search YouTube for NBA' (needs to interact with search), "
-        "'fill out the form' (needs to see and click fields). "
-        "Pure 'open X' with no follow-on interaction = false\n"
-        "- If uncertain, prefer query (safe — non-destructive)"
-    )
+    @staticmethod
+    def _classify_system_prompt() -> str:
+        """Built per call: it names the OS JARVIS is actually running on."""
+        from backend.core.host_platform import os_display_name
+
+        return (
+            f"You are an intent classifier for a {os_display_name()} desktop AI assistant. "
+            "Given a voice command, classify it and extract structured fields.\n\n"
+            "Respond ONLY with valid JSON, no markdown:\n"
+            "{\n"
+            '  "intent": "action" or "query",\n'
+            '  "confidence": 0.0-1.0,\n'
+            '  "action_category": "browser"|"research"|"app_control"|"system"|"communication"|"media"|"file"|"",\n'
+            '  "provider": "youtube"|"google"|"spotify"|etc or "",\n'
+            '  "search_query": "extracted search term" or "",\n'
+            '  "target_app": "app name mentioned" or "",\n'
+            '  "requires_vision": true or false,\n'
+            '  "reasoning": "one-line explanation"\n'
+            "}\n\n"
+            "Rules:\n"
+            '- "action" = the user wants to DO something (open, search, play, look up, create, send, etc.)\n'
+            '- "query" = the user wants to KNOW something you can answer from general knowledge '
+            "(question, explanation, conversation)\n"
+            '- action_category "browser" = open a web page or a search for the user to see '
+            "(\"search for dogs\", \"search YouTube for NBA\", \"go to github\")\n"
+            '- action_category "research" (intent "action") = the user wants an ANSWER found '
+            "on the live web: current events, prices, scores, anything to look up and report "
+            "back (\"look up the latest news on X\", \"find out who won last night\"). Use it "
+            "whenever the answer depends on information newer than your own knowledge\n"
+            "- Extract provider if a specific service is mentioned\n"
+            "- Extract search_query if the user is searching for or researching something\n"
+            "- Extract target_app if ANY app is mentioned (WhatsApp, Slack, Chrome, etc.) — "
+            "do NOT limit to a fixed list, extract whatever app the user names\n"
+            "- Set requires_vision=true only when the command needs screen/UI interaction AFTER "
+            "an app or page is open — e.g. 'message Zach on WhatsApp' (find and click a contact), "
+            "'play the first video', 'fill out the form'. Opening an app, a page or a search's "
+            "results page needs no vision = false\n"
+            "- If uncertain, prefer query (safe — non-destructive)"
+        )
 
     async def classify_async(self, command: str) -> ClassificationResult:
         """Agentic intent classification via J-Prime (Pillar 5).
@@ -493,7 +504,7 @@ class IntentClassifier:
 
             response = await router.generate(
                 prompt=f'Classify this voice command: "{command}"',
-                system_prompt=self._CLASSIFY_SYSTEM_PROMPT,
+                system_prompt=self._classify_system_prompt(),
                 max_tokens=256,
                 temperature=0.0,
                 deadline=asyncio.get_event_loop().time() + float(
@@ -501,12 +512,24 @@ class IntentClassifier:
                 ),
             )
 
-            result = json.loads(response.content)
-            intent = CommandIntent.ACTION if result.get("intent") == "action" else CommandIntent.QUERY
+            from backend.core.llm_json import parse_json_object
+
+            result = parse_json_object(response.content)
+            if result is None:
+                raise ValueError(f"no JSON object in {str(response.content)[:120]!r}")
+            # A category names something JARVIS must DO; it outranks a
+            # contradicting intent label ("look up the news" came back
+            # intent=query, category=research and was never researched).
+            _category = str(result.get("action_category") or "").strip().lower()
+            intent = (
+                CommandIntent.ACTION
+                if result.get("intent") == "action" or _category == "research"
+                else CommandIntent.QUERY
+            )
 
             logger.info(
-                "IntentClassifier.classify_async: '%s' → %s (confidence=%.2f, source=%s, latency=%.0fms)",
-                command, intent.value, result.get("confidence", 0),
+                "IntentClassifier.classify_async: '%s' → %s/%s (confidence=%.2f, source=%s, latency=%.0fms)",
+                command, intent.value, _category or "-", result.get("confidence", 0),
                 response.source, response.latency_ms,
             )
 
