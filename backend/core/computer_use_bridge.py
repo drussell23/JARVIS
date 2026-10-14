@@ -565,8 +565,11 @@ class SpatialAwarenessManager:
             from vision.yabai_space_detector import get_yabai_detector
             self._yabai_detector = get_yabai_detector()
 
-            if not self._yabai_detector.is_available():
-                logger.warning("[SPATIAL] Yabai not available - spatial awareness limited")
+            # The detector's availability check is a blocking probe (a CLI on
+            # macOS, an HTTP round trip on Windows): off the event loop, where
+            # a refused connect to an absent desktop agent stalled it ~1 s.
+            if not await asyncio.to_thread(self._yabai_detector.is_available):
+                logger.info("[SPATIAL] No space backend running on this host - spatial awareness limited")
                 return False
 
             # Load cached app locations

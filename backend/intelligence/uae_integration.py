@@ -200,6 +200,20 @@ async def initialize_uae(
         # Step 2: Initialize Yabai Spatial Intelligence (if enabled)
         yabai = None
         if enable_yabai:
+            # The one place a space backend is chosen (vision/windows_desktop):
+            # yabai's event engine exists only where yabai does.
+            try:
+                from vision.windows_desktop import space_backend
+                _space_backend = space_backend()
+            except Exception:  # noqa: BLE001
+                _space_backend = "yabai"
+            if _space_backend != "yabai":
+                logger.info(
+                    "[UAE-INIT] Step 2/7: spaces come from the %s backend on this host; "
+                    "yabai event engine not used", _space_backend,
+                )
+                enable_yabai = False
+        if enable_yabai:
             logger.info("[UAE-INIT] Step 2/7: Initializing Yabai Spatial Intelligence (Event-Driven)...")
             try:
                 yabai = await get_yabai_intelligence(

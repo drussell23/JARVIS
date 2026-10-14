@@ -1439,7 +1439,9 @@ class Pyttsx3Engine(TTSEngine):
                 return True
 
         except Exception as e:
-            self.last_error = str(e)
+            # The type is the diagnosis when the message is empty (a timeout's
+            # str() is "", which logged as "pyttsx3 failed:  - trying next").
+            self.last_error = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
             return False
 
     async def _speak_via_audiobus(

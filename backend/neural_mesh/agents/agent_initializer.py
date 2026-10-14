@@ -168,6 +168,21 @@ class AgentInitializer:
     ) -> Dict[str, BaseNeuralMeshAgent]:
         exclude = exclude or []
         pending = [c for c in PRODUCTION_AGENTS if c.__name__ not in self._initialized_classes]
+        # An agent declared for another OS or missing its packages (the
+        # bindings manifest, backend/core/agent_bindings) is not started here
+        # to fail on every boot -- the same facts decide what the Mind is offered.
+        try:
+            from backend.core.agent_bindings import get_agent_bindings
+            by_class = {b.class_name: b for b in get_agent_bindings().values() if b.class_name}
+        except Exception:  # noqa: BLE001
+            by_class = {}
+        for agent_class in list(pending):
+            binding = by_class.get(agent_class.__name__)
+            why = binding.unavailable_reason() if binding is not None else ""
+            if why:
+                logger.info(f"  Not starting {agent_class.__name__}: {why}")
+                self._initialized_classes.add(agent_class.__name__)
+                pending.remove(agent_class)
         if not pending:
             return self._registered_agents.copy()
 

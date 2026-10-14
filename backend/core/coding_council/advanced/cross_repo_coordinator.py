@@ -412,116 +412,30 @@ class CrossRepoTransactionCoordinator:
         self._discover_repos()
 
     def _discover_repos(self):
-        """
-        Discover repository paths dynamically with robust fallback chain.
+        """Repository paths from the one resolver (backend/core/trinity_repos):
+        explicit env vars under every historical name, else the running repo
+        and its siblings by content. Guessed folder names under guessed parent
+        directories missed a layout as plain as TrinityAi/{jarvis,prime,reactor}."""
+        from backend.core.trinity_repos import repo_path
 
-        v78.1: Fixed hardcoded paths issue. Now uses:
-        1. Environment variables (JARVIS_REPO_PATH, JPRIME_REPO_PATH, REACTOR_REPO_PATH)
-        2. JARVIS_REPOS_BASE for common parent directory
-        3. Dynamic home-based discovery
-        4. Relative path discovery from current working directory
-        """
-        # Environment variable overrides (highest priority)
-        env_overrides = {
-            RepoScope.JARVIS: os.getenv("JARVIS_REPO_PATH"),
-            RepoScope.JPRIME: os.getenv("JPRIME_REPO_PATH"),
-            RepoScope.REACTOR: os.getenv("REACTOR_REPO_PATH"),
-        }
+        for scope, name in ((RepoScope.JARVIS, "jarvis"),
+                            (RepoScope.JPRIME, "prime"),
+                            (RepoScope.REACTOR, "reactor")):
+            path = repo_path(name)
+            if path is not None and self._validate_repo(path):
+                self._repo_paths[scope] = path
+                self._git_ops[scope] = GitOperations(path, self.log)
 
-        # Apply environment overrides first
-        for scope, env_path in env_overrides.items():
-            if env_path:
-                path = Path(env_path).expanduser().resolve()
-                if self._validate_repo(path):
-                    self._repo_paths[scope] = path
-                    self._git_ops[scope] = GitOperations(path, self.log)
-                    self.log.info(f"[CrossRepo] {scope.value} from env: {path}")
-
-        # Base paths for discovery (no hardcoded user paths)
-        repos_base = os.getenv("JARVIS_REPOS_BASE")
-        base_paths = []
-
-        if repos_base:
-            base_paths.append(Path(repos_base).expanduser().resolve())
-
-        base_paths.extend([
-            Path.home() / "Documents" / "repos",
-            Path.home() / "repos",
-            Path.home() / "Projects",
-            Path.home() / "dev",
-            Path.cwd().parent,
-            Path.cwd().parent.parent,
-        ])
-
-        # Remove duplicates while preserving order
-        seen = set()
-        unique_base_paths = []
-        for p in base_paths:
-            if p not in seen and p.exists():
-                seen.add(p)
-                unique_base_paths.append(p)
-
-        repo_names = {
-            RepoScope.JARVIS: ["JARVIS-AI-Agent", "jarvis-ai-agent", "jarvis"],
-            RepoScope.JPRIME: ["jarvis-prime", "JARVIS-Prime", "j-prime", "jprime"],
-            RepoScope.REACTOR: ["reactor-core", "Reactor-Core", "reactor"],
-        }
-
-        # Discover repos not already set via environment
-        discovered_paths = {}  # Track all discovered paths for logging
-
-        for scope, names in repo_names.items():
-            if scope in self._repo_paths:
-                continue  # Already set via environment
-
-            # v78.2: Track resolved paths to avoid case-sensitivity duplicates
-            # (macOS APFS is case-insensitive but case-preserving)
-            seen_resolved = set()
-
-            for base in unique_base_paths:
-                for name in names:
-                    path = base / name
-                    if self._validate_repo(path):
-                        # Use resolved real path for deduplication
-                        resolved = path.resolve()
-                        resolved_lower = str(resolved).lower()
-
-                        if resolved_lower in seen_resolved:
-                            continue  # Skip case-variant duplicate
-                        seen_resolved.add(resolved_lower)
-
-                        if scope not in discovered_paths:
-                            discovered_paths[scope] = []
-                        discovered_paths[scope].append(path)
-
-                        # Use first valid match
-                        if scope not in self._repo_paths:
-                            self._repo_paths[scope] = path
-                            self._git_ops[scope] = GitOperations(path, self.log)
-                            self.log.debug(f"[CrossRepo] Discovered {scope.value} at {path}")
-
-        # Log discovery summary with diagnostic info
         self.log.info(
             f"[CrossRepo] Discovered {len(self._repo_paths)}/3 repos: "
             f"{[r.value for r in self._repo_paths.keys()]}"
         )
-
-        # Warn about missing repos (exclude ALL since it's not a real repo)
-        actual_repos = {RepoScope.JARVIS, RepoScope.JPRIME, RepoScope.REACTOR}
-        missing = actual_repos - set(self._repo_paths.keys())
+        missing = {RepoScope.JARVIS, RepoScope.JPRIME, RepoScope.REACTOR} - set(self._repo_paths)
         if missing:
-            self.log.warning(
-                f"[CrossRepo] Missing repos: {[r.value for r in missing]}. "
-                f"Set JARVIS_REPOS_BASE or individual *_REPO_PATH env vars."
+            self.log.info(
+                f"[CrossRepo] Not on this host: {[r.value for r in missing]} "
+                f"(set JARVIS_PRIME_PATH / REACTOR_CORE_PATH to point at them)"
             )
-
-        # Warn about multiple discoveries (potential version conflicts)
-        for scope, paths in discovered_paths.items():
-            if len(paths) > 1:
-                self.log.warning(
-                    f"[CrossRepo] Multiple {scope.value} repos found: {paths}. "
-                    f"Using: {self._repo_paths.get(scope)}"
-                )
 
     def _validate_repo(self, path: Path) -> bool:
         """

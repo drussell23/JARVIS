@@ -125,12 +125,12 @@ def _sanitize_profile_acoustics(profile: Dict[str, Any]) -> List[str]:
 
 # Canonicalize module identity so `intelligence.learning_database` and
 # `backend.intelligence.learning_database` share one singleton state.
-_this_module = sys.modules.get(__name__)
-if _this_module is not None:
-    if __name__.startswith("backend."):
-        sys.modules.setdefault("intelligence.learning_database", _this_module)
-    elif __name__ == "intelligence.learning_database":
-        sys.modules.setdefault("backend.intelligence.learning_database", _this_module)
+from backend.core.module_identity import unify as _unify_module_identity
+
+_unify_module_identity(__name__)
+
+# The LOCAL-FIRST decision is announced once per process.
+_LOCAL_FIRST_ANNOUNCED = False
 
 # v18.0: Database operation configuration
 DB_QUERY_TIMEOUT = float(os.getenv("DB_QUERY_TIMEOUT_SECONDS", "30.0"))
@@ -9539,12 +9539,16 @@ async def get_learning_database(
             #
             # A decision that changes which store a boot depends on has to be
             # visible at the level the operator actually sees, or it is not
-            # auditable. This fires once per process.
-            logger.warning(
-                "[LearningDB] LOCAL-FIRST — SQLite is authoritative for startup; "
-                "Cloud SQL deferred to background (set "
-                "JARVIS_LEARNING_DB_LOCAL_FIRST=false to restore cloud-first init)"
-            )
+            # auditable. This fires once per process (every caller of the
+            # getter passes through here; it used to say it twelve times).
+            global _LOCAL_FIRST_ANNOUNCED
+            if not _LOCAL_FIRST_ANNOUNCED:
+                _LOCAL_FIRST_ANNOUNCED = True
+                logger.warning(
+                    "[LearningDB] LOCAL-FIRST — SQLite is authoritative for startup; "
+                    "Cloud SQL deferred to background (set "
+                    "JARVIS_LEARNING_DB_LOCAL_FIRST=false to restore cloud-first init)"
+                )
             fast_mode = True
 
     # ── v265.1→v286.0: Gate-aware + mode-aware fast_mode promotion ────

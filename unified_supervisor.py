@@ -756,6 +756,7 @@ import shutil
 import signal
 import socket
 from backend.core.portable_sockets import allow_time_wait_rebind
+from backend.core.process_identity import HARD_KILL_SIGNAL
 import sqlite3
 import ssl
 import stat
@@ -6245,7 +6246,7 @@ class IntelligentKernelTakeover:
             try:
                 os.kill(pid, signal.SIGTERM)
                 await asyncio.sleep(2)
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, HARD_KILL_SIGNAL)
                 return True
             except ProcessLookupError:
                 return True
@@ -21798,7 +21799,7 @@ class ParallelProcessCleaner:
                     pass
 
             # Phase 3: SIGKILL (force)
-            if _safe_kill(pid, signal.SIGKILL):
+            if _safe_kill(pid, HARD_KILL_SIGNAL):
                 try:
                     proc = psutil.Process(pid)
                     await _async_wait(proc, self.cleanup_timeout_sigkill)
@@ -21898,7 +21899,7 @@ class ParallelProcessCleaner:
                             await asyncio.sleep(0.5)
 
                             if psutil.pid_exists(holder_pid):
-                                os.kill(holder_pid, signal.SIGKILL)
+                                os.kill(holder_pid, HARD_KILL_SIGNAL)
                                 await asyncio.sleep(0.2)
 
                             killed_count += 1
@@ -55593,7 +55594,10 @@ class ComprehensiveZombieCleanup:
         roots = trinity_roots()
 
         try:
-            for proc in psutil.process_iter(['pid', 'cmdline', 'create_time', 'memory_info', 'status']):
+            # Decide on cheap data only (pid + cmdline, structural check); the
+            # costly reads (create_time/memory_info/status take 6-10 s across
+            # every process on Windows) are made for candidates alone.
+            for proc in psutil.process_iter(['pid', 'cmdline']):
                 try:
                     pid = proc.info['pid']
                     if pid in (self._my_pid, self._my_parent):
@@ -55606,13 +55610,13 @@ class ComprehensiveZombieCleanup:
                     # Trinity's own code, judged structurally (one rule:
                     # backend/core/process_identity.is_trinity_process).
                     if is_trinity_process(proc, roots):
-                        mem_info = proc.info.get('memory_info')
+                        mem_info = proc.memory_info()
                         discovered[pid] = ZombieProcessInfo(
                             pid=pid,
                             cmdline=cmdline[:200],
-                            age_seconds=time.time() - proc.info['create_time'],
+                            age_seconds=time.time() - proc.create_time(),
                             memory_mb=mem_info.rss / (1024 * 1024) if mem_info else 0,
-                            status=proc.info.get('status', 'unknown'),
+                            status=proc.status(),
                             repo_origin="jarvis",
                             detection_source="pattern_scan",
                         )
@@ -55643,7 +55647,8 @@ class ComprehensiveZombieCleanup:
         roots = trinity_roots()
 
         try:
-            for proc in psutil.process_iter(['pid', 'ppid', 'cmdline', 'create_time', 'status']):
+            # Cheap data to decide; costly reads for candidates only (see above).
+            for proc in psutil.process_iter(['pid', 'cmdline']):
                 try:
                     pid = proc.info['pid']
                     if pid in (self._my_pid, self._my_parent):
@@ -55657,8 +55662,8 @@ class ComprehensiveZombieCleanup:
                         continue
 
                     # Get process details
-                    ppid = proc.info.get('ppid', 0)
-                    status = proc.info.get('status', '')
+                    ppid = proc.ppid()
+                    status = proc.status()
                     is_orphaned = ppid == 1
                     is_sleeping = status in ('sleeping', 'idle')
                     is_zombie_state = status in ('zombie', 'dead')
@@ -55696,7 +55701,7 @@ class ComprehensiveZombieCleanup:
                         discovered[pid] = ZombieProcessInfo(
                             pid=pid,
                             cmdline=cmdline[:200],
-                            age_seconds=time.time() - proc.info['create_time'],
+                            age_seconds=time.time() - proc.create_time(),
                             memory_mb=memory_mb,
                             cpu_percent=cpu_percent,
                             status=status,
@@ -55782,7 +55787,7 @@ class ComprehensiveZombieCleanup:
 
             # Phase 3: SIGKILL (force)
             try:
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, HARD_KILL_SIGNAL)
                 await asyncio.sleep(0.3)
             except (ProcessLookupError, OSError):
                 pass
@@ -55807,6 +55812,12 @@ class ComprehensiveZombieCleanup:
         for ports in self._service_ports.values():
             all_ports.extend(ports)
 
+        # The same two rules as every other sweep: a serving sibling is adopted
+        # by this boot (this phase used to kill J-Prime's listener on :8000),
+        # and a process Trinity does not own is never JARVIS's to free.
+        from backend.core.process_identity import owned_by_trinity
+        adopted = await _serving_sibling_pids()
+
         for port in all_ports:
             try:
                 for conn in psutil.net_connections(kind='inet'):
@@ -55814,13 +55825,15 @@ class ComprehensiveZombieCleanup:
                         pid = conn.pid
                         if pid in (self._my_pid, self._my_parent):
                             continue
+                        if pid in adopted or not owned_by_trinity(pid):
+                            continue
 
                         self.logger.warning(
                             f"[Kernel] Port {port} still held by PID {pid}, force-freeing..."
                         )
 
                         try:
-                            os.kill(pid, signal.SIGKILL)
+                            os.kill(pid, HARD_KILL_SIGNAL)
                             freed_ports.append(port)
                             await asyncio.sleep(0.2)
                         except (ProcessLookupError, OSError):
@@ -58975,7 +58988,7 @@ class TrinityIntegrator:
                 still_on_port = await asyncio.to_thread(_get_pid_on_port, port)
                 if still_on_port == pid:
                     self.logger.warning(f"[Trinity]   SIGTERM didn't work, using SIGKILL...")
-                    os.kill(pid, signal.SIGKILL)
+                    os.kill(pid, HARD_KILL_SIGNAL)
                     await asyncio.sleep(0.3)
 
                 return await asyncio.to_thread(_is_port_free, port)
@@ -76568,6 +76581,13 @@ class JarvisSystemKernel:
             self.logger.info("[GhostDisplay] Ghost Display disabled via JARVIS_GHOST_DISPLAY_ENABLED")
             self._update_component_status("ghost_display", "skipped", "Disabled via config")
             return True
+        # BetterDisplay virtual screens exist on macOS only; elsewhere the
+        # off-screen work surface is the host's own spaces (virtual desktops
+        # on Windows), so there is no ghost inventory to reconcile.
+        if sys.platform != "darwin":
+            self.logger.info("[GhostDisplay] BetterDisplay virtual displays are macOS-only — not used on %s", sys.platform)
+            self._update_component_status("ghost_display", "skipped", f"macOS-only ({sys.platform})")
+            return True
 
         self._update_component_status("ghost_display", "running", "Initializing Ghost Display...")
         timeout = _get_env_float("JARVIS_GHOST_DISPLAY_TIMEOUT", 30.0)
@@ -87121,6 +87141,7 @@ class JarvisSystemKernel:
         Also cleans up the log file handle.
         """
         self._loading_server_stopping = True
+        self._update_component_status("loading_server", "retired", "Loading page handed over")
         await self._stop_loading_server_heartbeat()
         await self._stop_startup_progress_heartbeat()
 
@@ -87623,7 +87644,7 @@ class JarvisSystemKernel:
             )
         except asyncio.TimeoutError:
             try:
-                os.killpg(os.getpgid(self._frontend_process.pid), signal.SIGKILL)
+                os.killpg(os.getpgid(self._frontend_process.pid), HARD_KILL_SIGNAL)
             except (ProcessLookupError, PermissionError, OSError):
                 try:
                     self._frontend_process.kill()
@@ -87781,7 +87802,7 @@ class JarvisSystemKernel:
                 f"escalating to SIGKILL"
             )
             try:
-                os.kill(pid, _signal.SIGKILL)
+                os.kill(pid, HARD_KILL_SIGNAL)
                 # Brief wait for kernel to reap
                 await asyncio.sleep(0.5)
                 self.logger.info(
@@ -89320,6 +89341,10 @@ class JarvisSystemKernel:
             if not getattr(self, '_broadcast_gate_port_warned', False):
                 self.logger.warning("[Broadcast] GATE: loading_server_port=0 — no broadcasts will be sent")
                 self._broadcast_gate_port_warned = True
+            return False
+
+        # Retired on purpose: there is no loading page left to update.
+        if getattr(self, "_loading_server_stopping", False):
             return False
 
         # v274.0: Unified process-alive contract — single method handles both
@@ -97457,7 +97482,7 @@ async def async_main(args: argparse.Namespace) -> int:
                 # Force kill if still alive
                 try:
                     os.kill(holder_pid, 0)  # Check if still alive
-                    os.kill(holder_pid, signal.SIGKILL)
+                    os.kill(holder_pid, HARD_KILL_SIGNAL)
                     await asyncio.sleep(0.5)
                 except (OSError, ProcessLookupError):
                     pass  # Already dead

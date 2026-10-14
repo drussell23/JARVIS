@@ -456,9 +456,14 @@ class PredictivePlanningAgent(BaseNeuralMeshAgent):
         """Initialize agent resources."""
         logger.info("Initializing PredictivePlanningAgent v1.0.0 (Psychic Brain)")
 
-        # Initialize Claude client
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if api_key:
+        # Initialize Claude client -- only where the paid-lane authority
+        # allows Claude (operator switch, key, funding), said once at INFO.
+        from backend.core.ouroboros.governance.paid_lanes import configured_verdict
+        _verdict = configured_verdict("claude")
+        api_key = os.getenv("ANTHROPIC_API_KEY") if _verdict.allowed else None
+        if not _verdict.allowed:
+            logger.info("Claude expansion off (%s) - using fallback expansions", _verdict.reason)
+        elif api_key:
             try:
                 import anthropic
                 self._claude_client = anthropic.AsyncAnthropic(api_key=api_key)
@@ -466,7 +471,7 @@ class PredictivePlanningAgent(BaseNeuralMeshAgent):
             except ImportError:
                 logger.warning("anthropic package not available")
         else:
-            logger.warning("ANTHROPIC_API_KEY not set - using fallback expansions")
+            logger.info("ANTHROPIC_API_KEY not set - using fallback expansions")
 
         # Initialize spatial awareness connection
         if self.config.use_spatial_context:

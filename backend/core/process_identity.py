@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import sys
 import threading
 from pathlib import Path
@@ -46,6 +47,11 @@ from contextvars import ContextVar
 from typing import FrozenSet, Iterable, List, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+#: The signal that ends a process outright. POSIX: SIGKILL. Windows has no
+#: SIGKILL (referencing it raised AttributeError mid-cleanup); there
+#: os.kill(pid, SIGTERM) is TerminateProcess, which is already unconditional.
+HARD_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -129,12 +135,10 @@ def trinity_roots() -> List[Path]:
         for raw in (os.environ.get(var) or "").split(os.pathsep):
             if raw.strip():
                 roots.append(Path(raw.strip()).expanduser())
-    try:
-        for sibling in _REPO_ROOT.parent.iterdir():
-            if sibling != _REPO_ROOT and (sibling / "pyproject.toml").is_file():
-                roots.append(sibling)
-    except OSError:
-        pass
+    # The sibling repositories, recognised by content (backend/core/trinity_repos);
+    # "any neighbour with a pyproject.toml" also claimed unrelated projects.
+    from backend.core.trinity_repos import repo_path
+    roots.extend(p for p in (repo_path("prime"), repo_path("reactor")) if p is not None)
     seen: Set[str] = set()
     out: List[Path] = []
     for root in roots:
@@ -405,6 +409,7 @@ def install_kill_guard() -> bool:
 
 
 __all__ = [
+    "HARD_KILL_SIGNAL",
     "install_kill_guard",
     "is_trinity_process",
     "kill_process_tree",

@@ -55,6 +55,9 @@ HEALTHY_STATUSES: FrozenSet[str] = frozenset({
     "complete",
     "ready",
     "running",
+    # Did its job and was stopped on purpose (the loading page, once the UI
+    # took over): not a component that failed to come up.
+    "retired",
 })
 
 # Statuses that indicate a component is skipped/unavailable (acceptable for optional)

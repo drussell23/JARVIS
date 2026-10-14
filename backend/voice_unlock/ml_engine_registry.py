@@ -885,6 +885,14 @@ class MLEngineWrapper(ABC):
                 logger.error(f"⏱️ [{self.name}] Load timeout after {timeout}s")
                 return False
 
+            except ModuleNotFoundError as e:
+                # Not installed is this host's configuration, not a failure:
+                # DISABLED with the reason, said once at INFO.
+                self.metrics.state = EngineState.DISABLED
+                self.metrics.last_error = f"{e.name} is not installed"
+                logger.info(f"[{self.name}] unavailable: {self.metrics.last_error}")
+                return False
+
             except Exception as e:
                 self.metrics.state = EngineState.ERROR
                 self.metrics.last_error = str(e)
@@ -2240,8 +2248,14 @@ class MLEngineRegistry:
             logger.info(f"   Duration: {self._status.prewarm_duration_ms:.0f}ms")
             logger.info("   → Voice unlock will be INSTANT!")
         else:
-            logger.warning(f"⚠️ ML PREWARM PARTIAL - {self._status.ready_count}/{self._status.total_count} engines ready")
-            logger.warning(f"   Errors: {self._status.errors}")
+            _absent = {n: e.metrics.last_error for n, e in self._engines.items()
+                       if e.metrics.state == EngineState.DISABLED}
+            _failed = [n for n, e in self._engines.items() if e.metrics.state == EngineState.ERROR]
+            if _absent and not _failed:
+                logger.info(f"ML engines not installed on this host: {_absent}")
+            else:
+                logger.warning(f"⚠️ ML PREWARM PARTIAL - {self._status.ready_count}/{self._status.total_count} engines ready")
+                logger.warning(f"   Errors: {self._status.errors}")
 
         for name, engine in self._engines.items():
             status_icon = "✅" if engine.is_loaded else "❌"

@@ -28,6 +28,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+
+# One coordinator singleton whichever name imports this module first
+# (backend.neural_mesh.* and neural_mesh.* -- backend/core/module_identity).
+from backend.core.module_identity import unify as _unify_module_identity
+
+_unify_module_identity(__name__)
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -943,8 +949,8 @@ async def get_neural_mesh() -> NeuralMeshCoordinator:
     Get the global Neural Mesh coordinator.
 
     Creates and initializes the coordinator if not already done.
-    Uses env-var guard to prevent dual-module aliasing from creating
-    duplicate singletons (backend.neural_mesh vs neural_mesh).
+    One coordinator per process: the module is the same object under both
+    of its import names (backend.neural_mesh vs neural_mesh).
 
     Returns:
         The global NeuralMeshCoordinator instance
@@ -954,12 +960,9 @@ async def get_neural_mesh() -> NeuralMeshCoordinator:
     if _coordinator is None:
         _coordinator = NeuralMeshCoordinator()
     if not _coordinator._initialized:
-        # v253.6: Env-var guard against dual-module aliasing
-        _env_flag = "_JARVIS_NEURAL_MESH_COORD_INITIALIZED"
-        if os.environ.get(_env_flag):
-            logger.debug("Coordinator initialized by other module namespace — skipping")
-            return _coordinator
-        os.environ[_env_flag] = "1"
+        # One module object under both import names (top of this file), so
+        # there is one coordinator: the env-var guard that stood in for that
+        # returned an uninitialized twin, and leaked into child processes.
         await _coordinator.initialize()
 
     return _coordinator

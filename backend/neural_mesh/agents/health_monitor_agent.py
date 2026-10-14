@@ -72,6 +72,7 @@ class HealthMonitorAgent(BaseNeuralMeshAgent):
         # v258.0: Sustained CPU tracking + throttle state
         self._cpu_high_consecutive: int = 0
         self._cpu_high_threshold = float(os.getenv("HEALTH_MONITOR_CPU_HIGH_THRESHOLD", "90.0"))
+        self._low_disk_free_gb = float(os.getenv("HEALTH_MONITOR_LOW_DISK_FREE_GB", "10.0"))
         self._cpu_high_sustained_checks = int(os.getenv("HEALTH_MONITOR_CPU_SUSTAINED_CHECKS", "3"))
         self._cpu_relief_emitted: bool = False
         self._throttle_cache_time: float = 0.0
@@ -245,8 +246,11 @@ class HealthMonitorAgent(BaseNeuralMeshAgent):
             _memory_threshold = 95.0 if _in_startup else 90.0
             if memory.percent > _memory_threshold:
                 health["issues"].append("High memory usage")
-            if disk.percent > 90:
-                health["issues"].append("Low disk space")
+            # Free space is what runs out, not a percentage: 91% used on a
+            # 3.7 TB drive is 345 GB free and was reported as critical.
+            _free_gb = disk.free / (1024 ** 3)
+            if _free_gb < self._low_disk_free_gb:
+                health["issues"].append(f"Low disk space ({_free_gb:.1f} GB free)")
         except Exception as e:
             health["system"] = {"error": str(e)}
             health["issues"].append(f"System metrics error: {e}")

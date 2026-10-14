@@ -27,8 +27,8 @@ from typing import Dict, Optional, Tuple
 #: name -> (marker inside the repo, environment variables that may name it)
 _REPOS: Dict[str, Tuple[str, Tuple[str, ...]]] = {
     "jarvis": ("unified_supervisor.py", ("JARVIS_REPO_PATH", "JARVIS_REPO", "JARVIS_PATH")),
-    "prime": ("jarvis_prime", ("JARVIS_PRIME_PATH", "JARVIS_PRIME_REPO_PATH", "J_PRIME_REPO")),
-    "reactor": ("reactor_core", ("REACTOR_CORE_PATH", "REACTOR_CORE_REPO_PATH", "REACTOR_CORE_REPO")),
+    "prime": ("jarvis_prime", ("JARVIS_PRIME_PATH", "JARVIS_PRIME_REPO_PATH", "JPRIME_REPO_PATH", "J_PRIME_REPO")),
+    "reactor": ("reactor_core", ("REACTOR_CORE_PATH", "REACTOR_CORE_REPO_PATH", "REACTOR_REPO_PATH", "REACTOR_CORE_REPO")),
 }
 
 
