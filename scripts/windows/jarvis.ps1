@@ -28,9 +28,9 @@
 #>
 param(
   [ValidateSet('start', 'stop', 'status', 'logs', 'foreground')] [string]$Action = 'status',
-  # Docker and GCP are opt-in on this host: the local-first organism needs
-  # neither, and starting Docker Desktop costs ~30 s and several GB.
-  [string]$SupervisorArgs = '--skip-docker --skip-gcp',
+  # Empty = the full kernel, exactly as `python unified_supervisor.py` boots
+  # it. A lighter boot is an explicit choice: -SupervisorArgs '--skip-docker --skip-gcp'.
+  [string]$SupervisorArgs = '',
   [int]$WaitSeconds = 300
 )
 $ErrorActionPreference = 'Stop'
@@ -43,11 +43,19 @@ $PidFile = Join-Path $State 'supervisor.pid'
 $LogPointer = Join-Path $State 'supervisor.logpath'
 New-Item -ItemType Directory -Force $State, $Logs | Out-Null
 
+$KernelLock = Join-Path $env:USERPROFILE '.jarvis\locks\kernel.lock'
+
 function Get-KernelPid {
-  if (-not (Test-Path $PidFile)) { return $null }
-  $p = [int](Get-Content $PidFile -Raw)
-  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue
-  if ($proc -and $proc.CommandLine -match 'unified_supervisor\.py') { return $p }
+  # The kernel's own lock is the authority, so a kernel started any way
+  # (this launcher, `python unified_supervisor.py`, an IDE) is found. The
+  # launcher's pid file covers the seconds before the kernel takes its lock.
+  $candidates = @()
+  try { $candidates += [int]((Get-Content $KernelLock -Raw | ConvertFrom-Json).pid) } catch {}
+  if (Test-Path $PidFile) { try { $candidates += [int](Get-Content $PidFile -Raw) } catch {} }
+  foreach ($p in $candidates) {
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -ErrorAction SilentlyContinue
+    if ($proc -and $proc.CommandLine -match 'unified_supervisor\.py') { return $p }
+  }
   return $null
 }
 

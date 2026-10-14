@@ -1477,8 +1477,12 @@ class JarvisPrimeClient:
         """
         start_time = time.time()
 
-        # v242.1: Enrich query with context metadata for better classification
-        _enriched_query = query
+        # v242.1: Context metadata informs classification. It is situational
+        # grounding, not something the user said: it travels in the system
+        # turn and the user turn is the user's words alone. Merged into the
+        # user turn ("[Context: User focus: deep_work]" + query) the model
+        # answered the label as if it had been asked about it.
+        _grounding = ""
         if context_metadata:
             _ctx_parts: list[str] = []
             if context_metadata.get("active_app"):
@@ -1520,16 +1524,26 @@ class JarvisPrimeClient:
             if _not_workspace:
                 _ctx_parts.append("NOT workspace — do not suggest workspace actions")
             if _ctx_parts:
-                _enriched_query = f"[Context: {', '.join(_ctx_parts)}]\n{query}"
+                _grounding = (
+                    "Background about the user's situation, for routing and "
+                    "disambiguation only. Use it when the request depends on "
+                    "it; never comment on it otherwise.\n- " + "\n- ".join(_ctx_parts)
+                )
+        system_prompt = "\n\n".join(p for p in (system_prompt, _grounding) if p) or None
+        _turns = ([ChatMessage(role="system", content=system_prompt)] if system_prompt else []) + [
+            ChatMessage(role="user", content=query)
+        ]
 
         # Try J-Prime first (normal path via complete())
         try:
             response = await self.complete(
-                prompt=_enriched_query,
-                system_prompt=system_prompt,
+                prompt=query,
+                # Carried by the system turn in `_turns`; passing it as well
+                # would duplicate it on paths that prepend system_prompt.
+                system_prompt=None,
                 max_tokens=max_tokens,
                 temperature=temperature,
-                messages=[ChatMessage(role="user", content=_enriched_query)],
+                messages=_turns,
                 enrich_with_repo_map=False,  # Body handles its own enrichment
                 deadline=deadline,
             )

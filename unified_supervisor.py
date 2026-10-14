@@ -88314,6 +88314,26 @@ class JarvisSystemKernel:
 
         return f"http://localhost:{resolved_port}"
 
+    def _resolve_prime_contract_endpoint(self) -> str:
+        """J-Prime's endpoint for every contract check (one precedence).
+
+        Same order as the sibling bring-up that started it
+        (trinity_siblings._jprime_url): an explicit Prime URL, else the local
+        lane's base URL. Without the latter a local J-Prime on :8000 was
+        checked at the fallback :8001, or reported as having no endpoint.
+        """
+        return self._resolve_cross_repo_contract_endpoint(
+            component_name="jarvis_prime",
+            fallback_port=self.config.prime_api_port,
+            env_url_keys=(
+                "PRIME_API_URL",
+                "JARVIS_PRIME_URL",
+                "JARVIS_LOCAL_MODEL_BASE_URL",
+                "GCP_PRIME_ENDPOINT",
+                "JARVIS_PRIME_CLOUD_RUN_URL",
+            ),
+        )
+
     def _build_cross_repo_contract_targets(
         self,
         *,
@@ -88347,20 +88367,7 @@ class JarvisSystemKernel:
                 ).split(",")
                 if c.strip()
             )
-            prime_endpoint = self._resolve_cross_repo_contract_endpoint(
-                component_name="jarvis_prime",
-                fallback_port=self.config.prime_api_port,
-                # Same precedence as the sibling bring-up that started it
-                # (trinity_siblings._jprime_url): JARVIS_PRIME_URL, else the
-                # local lane's base URL. Without the latter a local J-Prime on
-                # :8000 was contract-checked at the fallback :8001 and failed.
-                env_url_keys=(
-                    "JARVIS_PRIME_URL",
-                    "JARVIS_LOCAL_MODEL_BASE_URL",
-                    "GCP_PRIME_ENDPOINT",
-                    "JARVIS_PRIME_CLOUD_RUN_URL",
-                ),
-            )
+            prime_endpoint = self._resolve_prime_contract_endpoint()
             targets.append(
                 ContractTarget(
                     name="jarvis_prime",
@@ -91009,11 +91016,9 @@ class JarvisSystemKernel:
         # (local Prime), fall back to /health (GCP inference node). Both prove
         # the endpoint is alive and serving; /capabilities also validates schema.
         try:
-            prime_url = None
             prime_url = (
-                os.environ.get("PRIME_API_URL")
-                or os.environ.get("JARVIS_PRIME_URL")
-                or os.environ.get("JARVIS_PRIME_CLOUD_RUN_URL")
+                self._resolve_prime_contract_endpoint()
+                if self.config.prime_enabled else None
             )
             if prime_url:
                 import aiohttp
