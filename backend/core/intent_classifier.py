@@ -79,7 +79,12 @@ class ClassificationResult:
         screen-question route whatever capability or intent label rode along:
         "can you see my screen?" came back tagged visual_monitor/action and
         was answered blind by the text model."""
-        return self.decided_by_mind and self.needs_screen and not self.requires_vision
+        if not self.decided_by_mind or self.requires_vision:
+            return False
+        if self.needs_screen:
+            return True
+        from backend.core.agent_bindings import route_for_capability
+        return route_for_capability(self.capability) == "look"
 
     def to_task_context(self, **extra: Any) -> Dict[str, Any]:
         """This decision as the RuntimeTaskOrchestrator reads it (one mapping
@@ -496,7 +501,8 @@ class IntentClassifier:
         return (
             f"You are the intent classifier of JARVIS, an AI assistant on a {os_display_name()} desktop. "
             "Given a voice command, decide what it asks for and extract structured fields.\n\n"
-            "Agents JARVIS can dispatch right now (id — what it does [capabilities]):\n"
+            "What can carry out a request on this machine right now -- JARVIS's own routes "
+            "and its agents (id — what it does [capabilities]):\n"
             f"{catalogue or '- (none)'}\n\n"
             "Respond ONLY with valid JSON, no markdown:\n"
             "{\n"
@@ -514,11 +520,9 @@ class IntentClassifier:
             "Field meanings:\n"
             '- intent "action": the user wants JARVIS to DO something or to go and find something '
             'out. intent "query": you can answer it yourself from what you already know.\n'
-            "- capability: set it only when the request is carried out by one of the agents above "
-            "(name the capability that agent declares). Leave it empty when the request is "
-            "answered directly, done by opening a page, a search's results or an app, or answered "
-            "by looking at the screen. A request needing information newer than your own "
-            "knowledge is not answerable directly: route it to the agent that finds it out.\n"
+            "- capability: the capability (as listed above) of whatever carries the request out. "
+            "Empty only when you answer it yourself from what you already know; information "
+            "newer than your own knowledge is not something you know.\n"
             "- requires_vision: the task needs seeing and operating the UI AFTER something is open "
             "(finding and clicking an item, filling a form). Opening something alone does not.\n"
             "- needs_screen: the ANSWER requires looking at the user's screen right now.\n"

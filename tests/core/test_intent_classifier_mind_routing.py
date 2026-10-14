@@ -75,3 +75,30 @@ def test_a_question_answered_by_looking_wins_over_a_capability_tag():
     assert not r(needs_screen=True, requires_vision=True).answers_by_looking  # operate the UI
     assert not r(needs_screen=False).answers_by_looking
     assert not r(needs_screen=True, classification_source="sync_heuristic").answers_by_looking
+
+
+def test_bindings_unavailable_here_are_neither_offered_nor_resolved(monkeypatch):
+    import backend.core.agent_bindings as ab
+
+    mac_only = ab.AgentBinding("mac_agent", "json", "JSONDecoder", "control", {"drive_app"},
+                               platforms=["darwin"])
+    missing = ab.AgentBinding("needs_pkg", "json", "JSONDecoder", "x", {"browse"},
+                              requires=["no_such_package_xyz"])
+    opener = ab.AgentBinding("desktop_open", "json", "", "route", {"open_for_user"}, route="open")
+    monkeypatch.setattr(ab, "_bindings", {b.agent_id: b for b in (mac_only, missing, opener)})
+    monkeypatch.setattr(ab, "_catalogue", None)
+    monkeypatch.setattr(ab.sys, "platform", "win32")
+    catalogue = ab.capability_catalogue()
+    assert "desktop_open" in catalogue
+    assert "mac_agent" not in catalogue and "needs_pkg" not in catalogue
+    assert ab.agent_for_capability("drive_app") is None
+    assert ab.route_for_capability("open_for_user") == "open"
+    assert ab.agent_for_capability("open_for_user") is None   # a route is not an agent
+    monkeypatch.setattr(ab, "_catalogue", None)
+
+
+def test_the_look_route_is_answered_by_looking():
+    r = ClassificationResult(intent=CommandIntent.ACTION, confidence=0.9, matched_signal="ai",
+                             action_category="look_at_screen", capability="look_at_screen",
+                             classification_source="jprime")
+    assert r.answers_by_looking

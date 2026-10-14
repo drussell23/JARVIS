@@ -11,15 +11,26 @@ Each entry:
         "class_name":    "VisualBrowserAgent",
         "agent_type":    "vision",
         "capabilities":  ["visual_browser", "web_browsing", "browser", "browse_and_interact"],
-        "backend":       "local"
+        "backend":       "local",
+        "platforms":     ["darwin"],      # optional: sys.platform prefixes it runs on
+        "requires":      ["playwright"],  # optional: importable packages it needs
+        "route":         ""               # set for JARVIS's own routes (no class)
     }
+
+A ``route`` entry is one of JARVIS's built-in ways of carrying out a request
+(``open``: open something for the user; ``look``: answer by looking at the
+screen). It sits in the same catalogue as the agents so the Mind chooses
+between them on equal terms; without it the Mind mapped "open notepad" onto
+the nearest agent capability name.
 """
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -40,6 +51,25 @@ class AgentBinding:
     agent_type: str
     capabilities: Set[str]
     backend: str = "local"
+    platforms: List[str] = field(default_factory=list)
+    requires: List[str] = field(default_factory=list)
+    route: str = ""
+
+    def unavailable_reason(self) -> str:
+        """Why this binding cannot serve on this host, "" when it can."""
+        if self.platforms and not any(sys.platform.startswith(p) for p in self.platforms):
+            return f"runs on {', '.join(self.platforms)}, not {sys.platform}"
+        missing = [r for r in self.requires if importlib.util.find_spec(r) is None]
+        if missing:
+            return f"needs {', '.join(missing)}"
+        return ""
+
+    def describe(self) -> str:
+        """First docstring line of what serves it (the class, or a route's module)."""
+        target = importlib.import_module(self.module)
+        if self.class_name:
+            target = getattr(target, self.class_name)
+        return next((ln.strip() for ln in (target.__doc__ or "").splitlines() if ln.strip()), "")
 
     def instantiate(self) -> Any:
         """Import the module and create an instance of class_name."""
@@ -54,11 +84,28 @@ class AgentBinding:
 
 _DEFAULT_BINDINGS: List[Dict[str, Any]] = [
     {
+        "agent_id": "desktop_open",
+        "module": "backend.core.desktop_open",
+        "class_name": "",
+        "agent_type": "route",
+        "route": "open",
+        "capabilities": ["open_for_user"],
+    },
+    {
+        "agent_id": "screen_question",
+        "module": "backend.vision.screen_question",
+        "class_name": "",
+        "agent_type": "route",
+        "route": "look",
+        "capabilities": ["look_at_screen"],
+    },
+    {
         "agent_id": "visual_browser_agent",
         "module": "backend.neural_mesh.agents.visual_browser_agent",
         "class_name": "VisualBrowserAgent",
         "agent_type": "vision",
         "capabilities": ["visual_browser", "web_browsing", "browser", "browse_and_interact"],
+        "requires": ["playwright"],
     },
     {
         "agent_id": "web_search_agent",
@@ -73,6 +120,7 @@ _DEFAULT_BINDINGS: List[Dict[str, Any]] = [
         "class_name": "NativeAppControlAgent",
         "agent_type": "control",
         "capabilities": ["native_app_control", "interact_with_app", "app_control", "open_app"],
+        "platforms": ["darwin"],   # drives apps through osascript
     },
     {
         "agent_id": "google_workspace_agent",
@@ -81,6 +129,7 @@ _DEFAULT_BINDINGS: List[Dict[str, Any]] = [
         "agent_type": "workspace",
         "capabilities": ["handle_workspace_query", "read_email", "check_calendar",
                          "send_email", "create_event", "email", "calendar"],
+        "requires": ["googleapiclient", "google_auth_oauthlib"],
     },
     {
         "agent_id": "spatial_awareness_agent",
@@ -158,6 +207,7 @@ _DEFAULT_BINDINGS: List[Dict[str, Any]] = [
         "class_name": "VisualMonitorAgent",
         "agent_type": "monitoring",
         "capabilities": ["watch_and_alert", "watch_multiple", "visual_monitor", "vision"],
+        "platforms": ["darwin"],   # Quartz / macOS video capture
     },
     {
         "agent_id": "app_inventory_service",
@@ -213,10 +263,13 @@ def load_bindings() -> Dict[str, AgentBinding]:
             bindings[aid] = AgentBinding(
                 agent_id=aid,
                 module=entry["module"],
-                class_name=entry["class_name"],
+                class_name=entry.get("class_name", ""),
                 agent_type=entry.get("agent_type", "general"),
                 capabilities=set(entry.get("capabilities", [])),
                 backend=entry.get("backend", "local"),
+                platforms=list(entry.get("platforms", [])),
+                requires=list(entry.get("requires", [])),
+                route=entry.get("route", ""),
             )
         except KeyError as exc:
             logger.warning("[AgentBindings] Skipping %s: missing field %s", aid, exc)
@@ -240,17 +293,29 @@ def get_agent_bindings() -> Dict[str, AgentBinding]:
     return _bindings
 
 
-def agent_for_capability(capability: str) -> Optional[str]:
-    """The agent_id of the bound agent that declares *capability*, if any.
+def binding_for_capability(capability: str) -> Optional[AgentBinding]:
+    """The binding that declares *capability* and can serve on this host.
 
-    Callers route by what an agent can do, never by its name, so a user
+    Callers route by what a binding can do, never by its name, so a user
     override that rebinds a capability to another agent is honoured.
     """
     wanted = (capability or "").strip().lower()
-    for agent_id, binding in get_agent_bindings().items():
-        if wanted in {c.lower() for c in binding.capabilities}:
-            return agent_id
+    for binding in get_agent_bindings().values():
+        if wanted in {c.lower() for c in binding.capabilities} and not binding.unavailable_reason():
+            return binding
     return None
+
+
+def agent_for_capability(capability: str) -> Optional[str]:
+    """The agent_id of the available AGENT (not a route) declaring *capability*."""
+    binding = binding_for_capability(capability)
+    return binding.agent_id if binding is not None and not binding.route else None
+
+
+def route_for_capability(capability: str) -> str:
+    """The built-in route ("open", "look") serving *capability*, else ""."""
+    binding = binding_for_capability(capability)
+    return binding.route if binding is not None else ""
 
 
 _catalogue: Optional[str] = None
@@ -269,12 +334,15 @@ def capability_catalogue() -> str:
     if _catalogue is None:
         lines: List[str] = []
         for agent_id, binding in get_agent_bindings().items():
+            why = binding.unavailable_reason()
+            if why:
+                logger.debug("[AgentBindings] %s not offered: %s", agent_id, why)
+                continue
             try:
-                cls = getattr(importlib.import_module(binding.module), binding.class_name)
+                summary = binding.describe()
             except Exception as exc:  # noqa: BLE001 -- unimportable = undispatchable
                 logger.debug("[AgentBindings] %s not offered: %s", agent_id, exc)
                 continue
-            summary = next((ln.strip() for ln in (cls.__doc__ or "").splitlines() if ln.strip()), "")
             lines.append(f"- {agent_id} — {summary} [{', '.join(sorted(binding.capabilities))}]")
         _catalogue = "\n".join(lines)
     return _catalogue

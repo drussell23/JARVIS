@@ -369,3 +369,14 @@ class TestActsOnlyOnTheOpenedWindow:
             result = await orch._dispatch_to_vision("open the news and click the top story", {})
         lean.run.assert_not_called()
         assert result["success"] is False and "front" in result["result"]
+
+
+class TestBuiltInRoutes:
+    @pytest.mark.asyncio
+    async def test_open_route_capability_goes_to_open_then_see(self):
+        orch = RuntimeTaskOrchestrator()
+        step = {"goal": "open notepad", "capability": "open_for_user",
+                "classification_source": "jprime"}
+        res = await orch._resolve_step(step, {})
+        assert res.resolution == TaskResolution.VISION_ACTION
+        assert res.capability_used == "open_for_user"

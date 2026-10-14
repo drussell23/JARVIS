@@ -583,8 +583,19 @@ class RuntimeTaskOrchestrator:
         capability = self._named_capability(step)
         if not capability:
             return None
-        from backend.core.agent_bindings import agent_for_capability
+        from backend.core.agent_bindings import agent_for_capability, route_for_capability
 
+        if route_for_capability(capability):
+            # JARVIS's own route (open something / look and act): open what
+            # the goal starts with, then the eyes for whatever remains.
+            return StepResolution(
+                step_goal=goal,
+                resolution=TaskResolution.VISION_ACTION,
+                agent_name="vision_action_loop",
+                capability_used=capability,
+                synthesized=False,
+                elapsed_s=time.monotonic() - start,
+            )
         agent_name = agent_for_capability(capability)
         if agent_name is None and self._registry is not None:
             try:
