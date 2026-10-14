@@ -300,8 +300,13 @@ def binding_for_capability(capability: str) -> Optional[AgentBinding]:
     override that rebinds a capability to another agent is honoured.
     """
     wanted = (capability or "").strip().lower()
+    if not wanted:
+        return None
     for binding in get_agent_bindings().values():
-        if wanted in {c.lower() for c in binding.capabilities} and not binding.unavailable_reason():
+        # The catalogue shows each entry's id and its capabilities; the Mind
+        # names either ("web_search_agent" as often as "web_research").
+        names = {c.lower() for c in binding.capabilities} | {binding.agent_id.lower()}
+        if wanted in names and not binding.unavailable_reason():
             return binding
     return None
 

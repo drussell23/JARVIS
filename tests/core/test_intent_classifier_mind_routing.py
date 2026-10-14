@@ -102,3 +102,12 @@ def test_the_look_route_is_answered_by_looking():
                              action_category="look_at_screen", capability="look_at_screen",
                              classification_source="jprime")
     assert r.answers_by_looking
+
+
+def test_an_entry_resolves_by_its_id_as_well_as_its_capabilities():
+    from backend.core.agent_bindings import agent_for_capability, route_for_capability
+
+    assert agent_for_capability("web_search_agent") == agent_for_capability("web_research")
+    assert route_for_capability("desktop_open") == "open"
+    assert route_for_capability("screen_question") == "look"
+    assert agent_for_capability("") is None

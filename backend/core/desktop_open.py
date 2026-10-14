@@ -8,8 +8,9 @@ ever opened. Each platform now answers with its OWN registry of what exists,
 never a table of names in code:
 
 * Windows
-    - URL / file: handed to the shell (explorer.exe) -> the user's default
-      browser / the file's associated app, parented by the shell, not JARVIS.
+    - URL / file: handed to the shell (ShellExecute via a short-lived
+      PowerShell) -> the user's default browser / the file's associated app,
+      not a descendant of JARVIS.
     - URL in a named browser: the browsers Windows has registered under
       ``StartMenuInternet`` (each carries its own command line).
     - App: the Start-menu app index (``Get-StartApps``: classic and Store
@@ -164,16 +165,16 @@ async def _spawn_detached(argv: List[str]) -> None:
     )
 
 
-async def _shell_open(target: str) -> None:
+async def _shell_open(target: str) -> Tuple[int, str]:
     """Windows: hand *target* (URL, file, folder, shell:AppsFolder\\ID) to the shell.
 
-    What JARVIS opens FOR THE USER must not be JARVIS's: ShellExecute from
-    this process (os.startfile) made a freshly started browser a child of the
-    kernel, and descendants of the kernel are what its cleanups may stop. The
-    short-lived explorer.exe hands the target to the running shell and exits,
-    so the app's parent is the user's shell.
+    ShellExecute through the short-lived PowerShell of ``_shell_start``, so
+    what JARVIS opens FOR THE USER is not JARVIS's descendant (its cleanups
+    stop descendants). ``explorer.exe <target>`` was used for that before; run
+    from a non-shell process it ALSO opened a stray "Documents - File
+    Explorer" window per call, and a URL did not reliably reach the browser.
     """
-    await _spawn_detached(["explorer.exe", target])
+    return await _shell_start(target)
 
 
 async def _shell_start(file_path: str, argument: Optional[str] = None) -> Tuple[int, str]:
@@ -320,8 +321,8 @@ async def open_url(url: str, *, browser: Optional[str] = None) -> OpenOutcome:
                     logger.info("[DesktopOpen] browser %r not registered; using the default", browser)
 
             async def _default() -> OpenOutcome:
-                await _shell_open(url)
-                return OpenOutcome(True, "url", url, url, "shell")
+                rc, out = await _shell_open(url)
+                return OpenOutcome(rc == 0, "url", url, url, "shell", "" if rc == 0 else out.strip()[:160])
             return await _opened_in_front(_default(), await asyncio.to_thread(_win_url_handler_exe))
         if _IS_MACOS:
             if browser:
@@ -344,8 +345,8 @@ async def open_path(path: str) -> OpenOutcome:
             return OpenOutcome(False, "path", p, error="no such file or folder")
         if _IS_WINDOWS:
             async def _shell() -> OpenOutcome:
-                await _shell_open(p)
-                return OpenOutcome(True, "path", p, p, "shell")
+                rc, out = await _shell_open(p)
+                return OpenOutcome(rc == 0, "path", p, p, "shell", "" if rc == 0 else out.strip()[:160])
             return await _opened_in_front(_shell())
         argv = ["open", p] if _IS_MACOS else ["xdg-open", p]
         rc, out = await _run(argv, _launch_timeout())
@@ -530,8 +531,10 @@ async def _open_app_windows(name: str) -> OpenOutcome:
     hit = await _resolve_indexed(_start_apps, _load_start_apps, name)
     if hit:
         display, app_id = hit
-        await _shell_open(f"shell:AppsFolder\\{app_id}")
-        return OpenOutcome(True, "app", name, display, "apps_folder")
+        rc, out = await _shell_open(f"shell:AppsFolder\\{app_id}")
+        if rc == 0:
+            return OpenOutcome(True, "app", name, display, "apps_folder")
+        logger.info("[DesktopOpen] %s did not start from the Start menu (%s)", display, out.strip()[:120])
     # Not in the Start menu: an executable on PATH or registered under App Paths.
     rc, out = await _shell_start(shutil.which(name) or name)
     if rc == 0:
