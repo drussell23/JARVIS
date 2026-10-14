@@ -71623,10 +71623,14 @@ class JarvisSystemKernel:
             if _TRACE_HOOKS_AVAILABLE:
                 _safe_trace(_trace_phase_exit, "frontend", progress=100, success=True, duration_s=time.time() - _t0_fe)
 
+            # Interface up is not completion -- finalization (services,
+            # readiness, completion hooks) follows. Only the kernel's completion
+            # broadcast says "complete"; sending it here made the page leave
+            # before JARVIS could take commands.
             await self._safe_broadcast(
-                stage="complete",
-                message="JARVIS is ready!",
-                progress=100,
+                stage="finalizing",
+                message="Interface ready -- finalizing startup...",
+                progress=self._current_startup_progress,
                 metadata={
                     "icon": "check-circle",
                     "phase": 7,
@@ -71848,6 +71852,10 @@ class JarvisSystemKernel:
                 )
             except Exception:
                 pass
+            create_safe_task(
+                self._retire_loading_server_after_handoff(),
+                name="loading-server-handoff",
+            )
 
             # =====================================================================
             # v180.0: READINESS TIER ANNOUNCEMENT
@@ -86473,7 +86481,6 @@ class JarvisSystemKernel:
 
         # Step 3: Redirect Chrome to the main frontend
         # v119.0: Use browser lock for cross-process safety
-        _chrome_redirect_ok = False  # Track success for loading server lifetime
         if frontend_started:
             browser_lock_acquired = False
             try:
@@ -86557,7 +86564,6 @@ class JarvisSystemKernel:
                     if result.get("success"):
                         action = result.get("action", "unknown")
                         self.logger.success(f"[Kernel] Browser on the app ({action}) → {frontend_url}")
-                        _chrome_redirect_ok = True
                     else:
                         self.logger.info(
                             f"[Kernel] Browser redirect skipped: {result.get('error', 'unknown')}"
@@ -86624,62 +86630,9 @@ class JarvisSystemKernel:
             # and completion hooks. The frontend redirect gets its signal from the
             # loading server broadcast above; the env var is for external consumers.
 
-            # Step 5: Gracefully stop the loading server (AFTER 100% is sent)
-            # v198.1: Wait briefly for Chrome redirect to stabilize before stopping
-            # v278.2: Increased from 1.0s to 3.0s. The loading page fast-path runs
-            # quickBackendCheck() + checkFrontendReady() in parallel (each with 2s
-            # timeout) before redirecting. At 1.0s the server was killed mid-check,
-            # causing the loading page to freeze at 99% "FINALIZING" forever.
-            #
-            # When Chrome redirect failed, extend delay to let background recovery
-            # open a new window to the frontend before killing the loading server.
-            # Without this, the loading page stays visible on a dead server.
-            if _chrome_redirect_ok:
-                redirect_stabilization_delay = float(
-                    os.environ.get("JARVIS_REDIRECT_STABILIZATION_DELAY", "3.0")
-                )
-            else:
-                redirect_stabilization_delay = float(
-                    os.environ.get("JARVIS_REDIRECT_STABILIZATION_DELAY_FAILED", "10.0")
-                )
-                self.logger.info(
-                    "[Kernel] Chrome redirect failed — extending loading server lifetime to %.0fs",
-                    redirect_stabilization_delay,
-                )
-            redirect_stabilization_delay = _phase_step_timeout(
-                redirect_stabilization_delay,
-                floor=0.0,
-            )
-            if redirect_stabilization_delay > 0:
-                await asyncio.sleep(redirect_stabilization_delay)
-
-            _stop_budget = _phase_step_timeout(
-                _get_env_float("JARVIS_LOADING_SERVER_STOP_PHASE_BUDGET", 25.0),
-                floor=1.0,
-            )
-            if _stop_budget <= 0:
-                self.logger.info(
-                    "[Kernel] Frontend phase budget exhausted before loading-server stop; stopping in background"
-                )
-                create_safe_task(
-                    self._stop_loading_server(),
-                    name="loading-server-stop-background",
-                )
-            else:
-                try:
-                    await asyncio.wait_for(
-                        self._stop_loading_server(),
-                        timeout=_stop_budget,
-                    )
-                except asyncio.TimeoutError:
-                    self.logger.info(
-                        "[Kernel] Loading-server stop exceeded phase budget (%.1fs); continuing in background",
-                        _stop_budget,
-                    )
-                    create_safe_task(
-                        self._stop_loading_server(),
-                        name="loading-server-stop-background-timeout",
-                    )
+            # The loading server stays: the page is on "finalizing" and waits
+            # for the kernel's completion broadcast, after which the server is
+            # retired once the page has handed over to the app.
 
             # Voice narration for transition
             if self._narrator:
@@ -87323,6 +87276,22 @@ class JarvisSystemKernel:
                 titles[port] = html.unescape(found.group(1))
         return titles
 
+    async def _loading_page_presence(self) -> Dict[str, Any]:
+        """The loading server's own account of its pages: ``websocket_clients``
+        (connected now) and ``pages_ever_connected``. Raises when it cannot
+        be read -- the caller decides what an unknown means."""
+        port = self.config.loading_server_port
+        if not (port and AIOHTTP_AVAILABLE and aiohttp is not None):
+            raise RuntimeError("no loading server to ask")
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(
+            total=_get_env_float("JARVIS_LOADING_HEALTH_TIMEOUT", 2.0),
+        )) as session:
+            async with session.get(f"http://127.0.0.1:{port}/health") as resp:
+                data = await resp.json(content_type=None)
+        if data.get("service") != "loading_server":
+            raise RuntimeError(f"port {port} answers as {data.get('service')!r}")
+        return data.get("loading_server") or {}
+
     async def _redirect_page_portable(self, url: str) -> Dict[str, Any]:
         """Bring the browser to the app at *url* once startup completes.
 
@@ -87332,29 +87301,50 @@ class JarvisSystemKernel:
         or closed by the user) the app is opened directly.
         """
         port = self.config.loading_server_port
-        if port and AIOHTTP_AVAILABLE and aiohttp is not None:
-            try:
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(
-                    total=_get_env_float("JARVIS_LOADING_HEALTH_TIMEOUT", 2.0),
-                )) as session:
-                    async with session.get(f"http://127.0.0.1:{port}/health") as resp:
-                        data = await resp.json(content_type=None)
-                ls = data.get("loading_server") or {}
-                # A page that connected owns the redirect: it navigates itself
-                # on completion -- possibly already (it left), possibly on the
-                # final broadcast (it is still here). Only a session where no
-                # page ever connected needs the app opened for it.
-                pages = int(ls.get("pages_ever_connected", ls.get("websocket_clients")) or 0)
-                if data.get("service") == "loading_server" and pages > 0:
-                    return {"success": True, "action": "loading_page_self_redirect"}
-                self.logger.info(
-                    f"[Kernel] No loading page ever connected on :{port} "
-                    f"(service={data.get('service')!r}); opening the app"
-                )
-            except Exception as exc:  # noqa: BLE001 -- unknown: open the app directly
-                self.logger.info(f"[Kernel] Loading page presence unknown on :{port} "
-                                 f"({type(exc).__name__}: {exc}); opening the app")
+        try:
+            ls = await self._loading_page_presence()
+            # A page that connected owns the redirect: it navigates itself on
+            # completion -- possibly already (it left), possibly on the final
+            # broadcast (it is still here). Only a session where no page ever
+            # connected needs the app opened for it.
+            pages = int(ls.get("pages_ever_connected", ls.get("websocket_clients")) or 0)
+            if pages > 0:
+                return {"success": True, "action": "loading_page_self_redirect"}
+            self.logger.info(f"[Kernel] No loading page ever connected on :{port}; opening the app")
+        except Exception as exc:  # noqa: BLE001 -- unknown: open the app directly
+            self.logger.info(f"[Kernel] Loading page presence unknown on :{port} "
+                             f"({type(exc).__name__}: {exc}); opening the app")
         return await self._open_page_portable(url)
+
+    async def _retire_loading_server_after_handoff(self) -> None:
+        """Stop the loading server once its page has handed over to the app.
+
+        The page navigates itself on the kernel's completion broadcast, so the
+        server must outlive that broadcast until the page has gone: retiring it
+        earlier (it used to be stopped three seconds into "finalizing", about
+        twenty seconds before completion) left the page frozen at 95% with the
+        completion sent to nobody. Gone means the server counts no connected
+        page; the wait is bounded by ``JARVIS_LOADING_HANDOFF_BUDGET_S`` for a
+        page that never leaves (a second tab the user kept open).
+        """
+        budget = _get_env_float("JARVIS_LOADING_HANDOFF_BUDGET_S", 30.0)
+        poll = max(0.05, _get_env_float("JARVIS_LOADING_HANDOFF_POLL_S", 0.5))
+        deadline = time.monotonic() + budget
+        connected: Optional[int] = None
+        while self._is_loading_server_alive() and time.monotonic() < deadline:
+            try:
+                connected = int((await self._loading_page_presence()).get("websocket_clients") or 0)
+            except Exception as exc:  # noqa: BLE001 -- cannot ask: nothing to wait for
+                self.logger.debug(f"[LoadingServer] page presence unreadable: {exc}")
+                break
+            if connected == 0:
+                break
+            await asyncio.sleep(poll)
+        if connected:
+            self.logger.info(
+                f"[LoadingServer] {connected} page(s) still open after {budget:.0f}s; retiring the server"
+            )
+        await self._stop_loading_server()
 
     async def _stop_loading_server(self) -> None:
         """
@@ -87363,7 +87353,10 @@ class JarvisSystemKernel:
         This method implements the graceful shutdown protocol that prevents
         the "window terminated unexpectedly (reason: 'killed', code: '15')" error:
 
-        1. v205.0: Send final progress (100%) to signal completion
+        1. Completion is NOT announced here: the kernel broadcasts it once, at
+           real completion, and the server is retired after its page has
+           handed over (_retire_loading_server_after_handoff). This method is
+           also the shutdown path, where "startup complete" would be false.
         2. v258.2: Request graceful shutdown via HTTP POST /api/shutdown
         3. v258.3: Server schedules stop() internally on HTTP shutdown
         4. Poll process exit (server closes WebSockets, drains requests, exits)
@@ -87391,21 +87384,6 @@ class JarvisSystemKernel:
         # Wrong paths caused silent 404 → HTTP shutdown always failed → fallback
         # to signal-based kill → "[LoadingServer] Force killed (timeout)".
         shutdown_url = f"http://localhost:{loading_port}/api/shutdown"
-
-        # v205.0: Send final 100% progress before stopping
-        # This allows the loading page to show completion before being terminated
-        try:
-            await self._broadcast_startup_progress(
-                stage="complete",
-                message="JARVIS startup complete",
-                progress=100,
-                metadata={"final": True}
-            )
-            # Brief wait for the progress update to be received and processed
-            await asyncio.sleep(1.0)
-            self.logger.debug("[LoadingServer] Sent final 100% progress before shutdown")
-        except Exception as e:
-            self.logger.debug(f"[LoadingServer] Could not send final progress: {e}")
 
         # Try HTTP graceful shutdown first
         http_shutdown_success = False

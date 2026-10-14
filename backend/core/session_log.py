@@ -37,11 +37,20 @@ class _Tee(io.TextIOBase):
 
     def write(self, text: str) -> int:
         n = self._console.write(text)
+        self.record(text)
+        return n if isinstance(n, int) else len(text)
+
+    def record(self, text: str) -> None:
+        """Append *text* to the log only (the console already has it)."""
         try:
             self._log.write(_ANSI.sub("", text))
         except (OSError, ValueError):  # log closed or disk full: the console still works
             pass
-        return n if isinstance(n, int) else len(text)
+
+    @property
+    def console(self) -> TextIO:
+        """The console stream underneath the tee."""
+        return self._console
 
     def flush(self) -> None:
         self._console.flush()
@@ -88,6 +97,25 @@ def _prune(directory: Path, name: str) -> None:
             pass
 
 
+def console_of(stream: TextIO) -> TextIO:
+    """The terminal under *stream*: a session-log tee's console, else itself.
+
+    A writer that draws on the terminal itself -- a live region redrawn in
+    place -- must not have every frame copied into the log.
+    """
+    return stream.console if isinstance(stream, _Tee) else stream
+
+
+def record(stream: TextIO, text: str) -> None:
+    """Append *text* to the session log behind *stream*, if it has one.
+
+    For output that reaches the console another way (through a live region's
+    console) but belongs in the log like any other line.
+    """
+    if isinstance(stream, _Tee):
+        stream.record(text)
+
+
 def start_session_log(name: str) -> Optional[Path]:
     """Tee this process's console output to a new session log; return its path.
 
@@ -114,4 +142,4 @@ def start_session_log(name: str) -> Optional[Path]:
     return path
 
 
-__all__ = ["start_session_log"]
+__all__ = ["console_of", "record", "start_session_log"]

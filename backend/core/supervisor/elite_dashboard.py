@@ -46,6 +46,8 @@ from datetime import datetime
 from typing import Any, Callable, Deque, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from backend.core.session_log import console_of, record
+
 logger = logging.getLogger(__name__)
 
 _ENABLED = os.environ.get("JARVIS_ELITE_DASHBOARD", "true").lower() in ("true", "1", "yes")
@@ -81,7 +83,12 @@ class _Scrollback(io.TextIOBase):
             self._partial += text
             *complete, self._partial = self._partial.split("\n")
             for line in complete:
-                self._console.print(Text.from_ansi(line.rsplit("\r", 1)[-1]), soft_wrap=True)
+                shown = line.rsplit("\r", 1)[-1]
+                self._console.print(Text.from_ansi(shown), soft_wrap=True)
+                # The console write went around the session-log tee (the
+                # region draws on the bare terminal); the line still belongs
+                # in the log, exactly as it would have gone there before.
+                record(self._original, shown + "\n")
         return len(text)
 
     def flush(self) -> None:
@@ -974,7 +981,9 @@ class EliteDashboard:
             if self.inline:
                 # The region is redrawn in place below ordinary scrollback:
                 # every terminal writer is routed above it while it lives.
-                console = Console(file=sys.__stdout__ or sys.stdout)
+                # The bare terminal: region frames are redrawn several times a
+                # second and must not be copied into the session log.
+                console = Console(file=console_of(sys.stdout))
                 with _terminal_routed_above(console), Live(
                     get_renderable=lambda: _build_status_region(self._state),
                     console=console,
