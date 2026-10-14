@@ -1,0 +1,156 @@
+<!-- QUICKCHECK after: ### §94.1 The Ultimate Goal, in the Project's Own Words -->
+<div class="quick-check" id="qc-94-1">
+<p class="qc-label">Quick check · §94.1</p>
+<details class="qc"><summary>1. Why did the operator bind the North Star as <em>the</em> goal rather than <em>a</em> goal?</summary>
+<p>Because otherwise the operator "becomes the bottleneck on every Trinity expansion arc". A one-person project cannot add new subsystems and also hand-write every test and fix in the existing ones.</p>
+</details>
+<details class="qc"><summary>2. What does "migration of authority" mean, and what does it rule out?</summary>
+<p>The human's role moves from per-PR reviewer to batch approver to roadmap signer. It rules out reading the goal as removing the human, removing safety gates, or unbounded autonomy: the top tier is "earned, not flipped" and still works inside an operator-signed roadmap, budget and scope.</p>
+</details>
+<details class="qc"><summary>3. Which half of "done" is still undefined, and why does that matter?</summary>
+<p>The assistant's. PRD §33.8, the day-one acceptance checks ("say X, it does Y"), is marked "Open — operator input required". The engine's done-criteria exist in PRD §6, so the system has a target for O+V but not yet for the JARVIS it is meant to build.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §94.2 The Four Subsystems at a Glance -->
+<div class="quick-check" id="qc-94-2">
+<p class="qc-label">Quick check · §94.2</p>
+<details class="qc"><summary>1. The sibling repositories are about 119,000 and 96,000 lines. Why does the paper call the last column of its scale table "the honest one"?</summary>
+<p>Because the code that actually runs is a small recent slice: J-Prime's engine is 11 files and about 2,350 lines, all from 2026-10-07, and Reactor's GRPO path dates from 2026-08-30 onward. Most of each repository was written for the April design and is not imported by anything that runs.</p>
+</details>
+<details class="qc"><summary>2. Reactor is called the Soul, the Nerves, and the Immune system / Sandbox. Why does the naming matter to a reader of the repositories?</summary>
+<p>A reader will meet all three names in different files, and the older "Sandbox" label describes a role Reactor does not have in code. The paper fixes one vocabulary (Body, Mind, Soul) so its descriptions are not confused with the stale ones.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §94.3 JARVIS — the Body -->
+<div class="quick-check" id="qc-94-3">
+<p class="qc-label">Quick check · §94.3</p>
+<details class="qc"><summary>1. Why is the Body's assistant half effectively dormant on the current host?</summary>
+<p>Most assistant surfaces depend on macOS frameworks (Quartz, AppKit, CoreAudio, ScreenCaptureKit), and inside WSL2 on Windows they have nothing to bind to. The paper notes this is inferred from the imports, not from a live probe.</p>
+</details>
+<details class="qc"><summary>2. "Can the assistant hand work to O+V? In code, yes; in practice, not yet." What is the code path, and what works instead?</summary>
+<p>The voice bridge routes code tasks to a <code>VoiceCommandSensor</code> that intake maps to the <code>voice_human</code> source, but the voice loop has never completed a full production cycle. What works is typed: <code>/goal sanction</code>, <code>/goal inject</code>, and cockpit conversation, which becomes an <code>operator_chat</code> envelope.</p>
+</details>
+<details class="qc"><summary>3. How does O+V boot today, compared with the supervisor's zone 6?</summary>
+<p>It is started by <code>ov</code>, which hands off to <code>scripts/ouroboros_battle_test.py</code> and boots a six-layer stack directly. The supervisor's zones 6.8–6.12 describe the designed boot, not the path used on this host.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §94.4 O+V — the Engine Inside the Body -->
+<div class="quick-check" id="qc-94-4">
+<p class="qc-label">Quick check · §94.4</p>
+<details class="qc"><summary>1. Why does O+V live in the JARVIS repository rather than in its own?</summary>
+<p>Because it develops that repository: self-development happens on the Body's own code (§5.1). Its commits land on JARVIS's local <code>main</code>.</p>
+</details>
+<details class="qc"><summary>2. The PID namespace was added after a generated test ran <code>pkill -f jarvis</code>. What does it prevent, and what is its weak point?</summary>
+<p>Candidate processes run under <code>unshare --user --pid --fork</code>, so a generated test cannot see or signal the organism. If the kernel refuses, it degrades to running uncontained unless the <code>..._REQUIRED</code> flag is set.</p>
+</details>
+<details class="qc"><summary>3. Why are the Iron Gate and Semantic Guardian not enough on their own?</summary>
+<p>They are static checks in front of execution. The containment layers bound the damage when a candidate actually <em>runs</em>, which a static check cannot fully predict.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §94.5 J-Prime — the Mind -->
+<div class="quick-check" id="qc-94-5">
+<p class="qc-label">Quick check · §94.5</p>
+<details class="qc"><summary>1. Why is RELEASED declared only when <code>nvidia-smi</code> shows the memory free?</summary>
+<p>Because asking a process to stop does not prove its memory is gone: "'We sent terminate' is not evidence; the card is." Training starting into memory still held would OOM.</p>
+</details>
+<details class="qc"><summary>2. <code>qwen3-coder-ov:30b</code> "is not a single file". What is it, and why does that matter for rollback?</summary>
+<p>It is the 30B base weights plus a Reactor-trained LoRA plus the sampling defaults it was published with. The adapter can be changed, rejected or rolled back to a kept version (or <code>origin</code>) while the base stays fixed.</p>
+</details>
+<details class="qc"><summary>3. Why does reproducible evaluation switch off prompt-cache reuse?</summary>
+<p>Cold-cache and warm-cache greedy runs had been measured to differ. With the cache off, three of three outputs were byte-identical, which makes a before/after adapter comparison meaningful.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §94.6 Reactor — the Soul -->
+<div class="quick-check" id="qc-94-6">
+<p class="qc-label">Quick check · §94.6</p>
+<details class="qc"><summary>1. Why does Reactor's launch script bind :8090 to <code>127.0.0.1</code>?</summary>
+<p>The server's own default is <code>0.0.0.0</code>, which under WSL's mirrored networking would expose the training API to the LAN.</p>
+</details>
+<details class="qc"><summary>2. Why is the adapter converted to a GGUF LoRA without merging it into the base?</summary>
+<p>Merging needs the bf16 base, about 57 GiB, and the WSL guest is capped at 47 GiB. An unmerged adapter can also be published and swapped in J-Prime's registry on its own.</p>
+</details>
+<details class="qc"><summary>3. What makes a row a success example, and what stops a bad one from becoming one?</summary>
+<p>A join with the hash-chained landing-label ledger: the candidate must have landed and survived. A landed-then-reverted row is never promoted, and the join stops at the first ledger row that does not chain to its predecessor.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §94.7 How the Four Work Together -->
+<div class="quick-check" id="qc-94-7">
+<p class="qc-label">Quick check · §94.7</p>
+<details class="qc"><summary>1. O+V and Reactor share a file contract, not an HTTP call. What does that buy when Reactor is down?</summary>
+<p>The organism is not blocked: the recorder keeps writing to disk, and the receiver catches up from saved offsets when it returns. "Without it the organism still works; it just stops learning."</p>
+</details>
+<details class="qc"><summary>2. Which two calls the April design assumed are absent?</summary>
+<p>Reactor never calls J-Prime (JARVIS's handoff does the leasing and publishing), and J-Prime calls no one; it is a passive server.</p>
+</details>
+<details class="qc"><summary>3. Where is the human in the three loops?</summary>
+<p>Only in Loop 3, governance: the operator reviews what landed and alone publishes it, and no training-derived change is pushed without a held-out gain. (Today the operator also starts training cycles, because automatic triggering is off.)</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §94.8 The North Star: the Document, the Criteria and the Ladders -->
+<div class="quick-check" id="qc-94-8">
+<p class="qc-label">Quick check · §94.8</p>
+<details class="qc"><summary>1. What is the difference between the operating tiers A–D and the Galaxy roadmap tiers 1–5?</summary>
+<p>Operating tiers measure how much oversight the operator gives (per-PR reviewer up to roadmap signer). Galaxy tiers are the critical path of work to get there: learning loop, cage, second-order driver, the Layer-4 decision, evidence.</p>
+</details>
+<details class="qc"><summary>2. A1 was closed on 2026-09-08. Why was it not an A-level criterion, and what replaced it as the gate?</summary>
+<p>A1 was item A1 of the North Star's Tier A blocker list (trace a signed sub-goal from enqueued to dispatched), not one of PRD §6's seven dimensions. Its successor gate is cadence: "the LANDING RATE".</p>
+</details>
+<details class="qc"><summary>3. Why does the North Star say engineering is "the easy ~15%"?</summary>
+<p>Because the remaining 85% is the safety substrate, the evidence (for example 90 unsupervised days) and the operator's Layer-4 decision, none of which more code alone produces.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §94.9 From North Star to Running Code -->
+<div class="quick-check" id="qc-94-9">
+<p class="qc-label">Quick check · §94.9</p>
+<details class="qc"><summary>1. Both <code>JARVIS_EPISTEMIC_PLANNER_ENABLED</code> and <code>JARVIS_CONCEPTION_BRIDGE_ENABLED</code> must be on before self-filed work reaches intake. Even then, what stops it acting alone?</summary>
+<p>Every envelope the bridge creates carries <code>requires_human_ack=True</code>, so the armed planner <em>proposes</em> rather than acts. Self-filed work needs both switches AND a human acknowledgement.</p>
+</details>
+<details class="qc"><summary>2. Why does the planner's step "never point at fiction"?</summary>
+<p>Each step may name only existing files that the human's recent commits touched, at most two per step. The planner cannot invent a module to work on.</p>
+</details>
+<details class="qc"><summary>3. <code>north_star_context.py</code> is on by default. Why does it not steer what O+V builds?</summary>
+<p>Its consumer is the DreamEngine's speculative prompt, not GENERATE. The prompts that do shape generation get the strategic-direction digest, which reads neither the North Star file nor the PRD.</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §94.10 The Reverse Russian Doll, Traced Through the Code -->
+<div class="quick-check" id="qc-94-10">
+<p class="qc-label">Quick check · §94.10</p>
+<details class="qc"><summary>1. What are the doll's two invariants, and how does the adaptation ledger enforce the first?</summary>
+<p>Adaptive gates may only tighten, and no adaptation is autonomous. The ledger "refuses to persist loosening proposals"; any loosening must go through the Order-2 amendment path, which always needs the operator.</p>
+</details>
+<details class="qc"><summary>2. Map C, S<sub>n</sub>, M and "a growing core" onto the four subsystems.</summary>
+<p>C is the model J-Prime serves; S<sub>n</sub> is O+V's gates and containment in the Body; M is O+V's pipeline proposing a patch; Reactor is how the core itself changes, each committed adapter being a new C.</p>
+</details>
+<details class="qc"><summary>3. "We have the doll's outer wall but not the doll's hand." What is missing?</summary>
+<p>The driver that would use the Order-2 cage. M10, the ArchitectureProposer, has no reference in the orchestrator, so Order 2 has never been exercised. Only the recursion-depth specification is machine-checked (in Z3).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §94.11 Where the Goal Stands -->
+<div class="quick-check" id="qc-94-11">
+<p class="qc-label">Quick check · §94.11</p>
+<details class="qc"><summary>1. Why is "Is the human out of the loop? No" listed as the intended end state rather than a gap?</summary>
+<p>Because the North Star's goal is a human who signs scope and alone publishes, not no human at all. The zero-push air-gap and the operator's publication key are the design working.</p>
+</details>
+<details class="qc"><summary>2. Why are the next steps ordered with "let the planner read the definition of done" last?</summary>
+<p>Diffs must land, a held-out gain must be shown and supply widened first; otherwise the planner fills the backlog faster than the loop drains it, producing a longer queue rather than more landings (§94.9).</p>
+</details>
+</div>
+<!-- END -->
+<!-- QUICKCHECK after: ### §94.12 Glossary Additions -->
+<div class="quick-check" id="qc-94-12">
+<p class="qc-label">Quick check · §94.12</p>
+<details class="qc"><summary>1. Using the glossary, explain why "Mechanic" and "Order 1" name the same thing, and why the Neurosurgeon Order is not reached by changing governance files under signed goals.</summary>
+<p>Mechanic is the North Star's name for Order 1, O+V changing the codebase around it. Neurosurgeon is Order 2, O+V changing its own cognitive architecture; it is "caged, no driver", and §93.10 adds that it means doing so on the organism's own initiative, which has not happened.</p>
+</details>
+</div>
+<!-- END -->

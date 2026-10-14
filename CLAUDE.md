@@ -7,7 +7,7 @@
 
 ## What This Is
 
-JARVIS is the Body of a tri-partite AGI OS. This repo contains the macOS integration layer (screen capture, voice, keyboard automation), the unified supervisor (102K-line monolithic kernel), and the Ouroboros + Venom (O+V) self-development governance engine. All model references are resolved from `brain_selection_policy.yaml` or env vars -- zero hardcoded model names.
+JARVIS is the Body of a tri-partite AGI OS. This repo contains the macOS integration layer (screen capture, voice, keyboard automation), the unified supervisor (~98K-line monolithic kernel), and the Ouroboros + Venom (O+V) self-development governance engine. All model references are resolved from `brain_selection_policy.yaml` or env vars -- zero hardcoded model names.
 
 ## Current State (October 2026) — read this first
 
@@ -29,7 +29,7 @@ JARVIS (Body)  ── O+V governance engine, cockpit, sensors       runs in WSL2
 JARVIS boot brings up J-Prime and Reactor itself (governance/trinity_siblings.py).
 
 JARVIS repo
-     +-- unified_supervisor.py (102K lines, Zones 0-7)
+     +-- unified_supervisor.py (~98K lines, Zones 0-7)
      +-- backend/core/ouroboros/ (autonomous self-development: governance/, cli/, battle_test/, aegis/)
      +-- backend/vision/ (VLA pipeline, OCR, frame server)
      +-- backend/ghost_hands/ (focus-preserving UI automation)
