@@ -4475,7 +4475,8 @@ def _get_io_thread_pool() -> concurrent.futures.ThreadPoolExecutor:
     if _IO_THREAD_POOL is None:
         with _IO_POOL_LOCK:
             if _IO_THREAD_POOL is None:
-                _IO_THREAD_POOL = concurrent.futures.ThreadPoolExecutor(
+                from backend.core.async_offload import managed_pool_class
+                _IO_THREAD_POOL = managed_pool_class()(
                     max_workers=4,
                     thread_name_prefix="io_airlock_",
                 )

@@ -131,6 +131,20 @@ def offload_enabled() -> bool:
 
 
 # ── Pools ────────────────────────────────────────────────────────────────────
+def managed_pool_class() -> type:
+    """The executor class every long-lived pool should use: registered for the
+    kernel's executor shutdown and run on daemon workers, so idle workers never
+    hold the process open (each unmanaged pool's idle workers were
+    force-terminated one second apiece at every stop, and left the kernel
+    exiting through ``os._exit``). The plain class where the thread manager
+    cannot load."""
+    try:
+        from backend.core.thread_manager import ManagedThreadPoolExecutor
+        return ManagedThreadPoolExecutor
+    except Exception:  # noqa: BLE001 - a broken thread manager must not break pools
+        return ThreadPoolExecutor
+
+
 def _mark_owned() -> None:
     _local.owned = True
 
@@ -155,19 +169,16 @@ def _get_pool(kind: str) -> Optional[ThreadPoolExecutor]:
         if existing is not None:
             return existing
         try:
-            # Managed: registered for the kernel's executor shutdown and run on
-            # daemon threads, so idle workers never hold the process open
-            # (they were force-terminated one second each at every stop).
-            from backend.core.thread_manager import ManagedThreadPoolExecutor as ThreadPoolExecutor
+            pool_class = managed_pool_class()
             if kind == "import":
-                pool = ThreadPoolExecutor(
+                pool = pool_class(
                     max_workers=_positive_int(ENV_IMPORT_WORKERS, _DEFAULT_IMPORT_WORKERS),
                     thread_name_prefix="jarvis-import",
                     initializer=_mark_owned,
                 )
                 _IMPORT_POOL = pool
             else:
-                pool = ThreadPoolExecutor(
+                pool = pool_class(
                     max_workers=_positive_int(ENV_CALL_WORKERS, _DEFAULT_CALL_WORKERS),
                     thread_name_prefix="jarvis-offload",
                     initializer=_mark_owned,

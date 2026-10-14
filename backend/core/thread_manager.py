@@ -2014,17 +2014,33 @@ async def final_thread_cleanup_async(
     """
     v124.0: Async version of final_thread_cleanup.
 
-    Runs the cleanup in a thread pool to avoid blocking the event loop.
+    Runs the cleanup off the event loop, on a thread of its own: the cleanup
+    shuts down every registered executor -- the loop's default one included --
+    so running it inside one of them would have it join its own worker. Run
+    on the loop instead, it held the loop for the whole cleanup (9 s at a
+    2026-10-14 stop) and the stall sampler dumped every thread's stack.
     """
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None,
-        lambda: final_thread_cleanup(
-            timeout=timeout,
-            force_terminate=force_terminate,
-            allow_daemon_conversion=allow_daemon_conversion
-        )
-    )
+    done: asyncio.Future = loop.create_future()
+
+    def settle(setter, value) -> None:
+        if not done.done():
+            setter(value)
+
+    def run() -> None:
+        try:
+            stats = final_thread_cleanup(
+                timeout=timeout,
+                force_terminate=force_terminate,
+                allow_daemon_conversion=allow_daemon_conversion,
+            )
+        except BaseException as exc:  # noqa: BLE001 -- handed to the awaiting coroutine
+            loop.call_soon_threadsafe(settle, done.set_exception, exc)
+        else:
+            loop.call_soon_threadsafe(settle, done.set_result, stats)
+
+    threading.Thread(target=run, name="final-thread-cleanup", daemon=True).start()
+    return await done
 
 
 # =============================================================================

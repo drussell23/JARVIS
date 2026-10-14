@@ -410,7 +410,8 @@ class CrossRepoStateInitializer:
     @staticmethod
     def _create_state_write_executor(workers: int) -> ThreadPoolExecutor:
         """Create dedicated executor for cross-repo state writes."""
-        return ThreadPoolExecutor(
+        from backend.core.async_offload import managed_pool_class
+        return managed_pool_class()(
             max_workers=workers,
             thread_name_prefix="jarvis_state_io",
         )

@@ -2396,8 +2396,8 @@ def _managed_pool_base() -> type:
     cannot load. Unmanaged pools' idle workers were force-terminated one
     second each at every stop."""
     try:
-        from backend.core.thread_manager import ManagedThreadPoolExecutor
-        return ManagedThreadPoolExecutor
+        from backend.core.async_offload import managed_pool_class
+        return managed_pool_class()
     except Exception:
         return ThreadPoolExecutor
 
@@ -98379,8 +98379,8 @@ async def async_main(args: argparse.Namespace) -> int:
 
             # Step 3: Final thread cleanup (import dynamically to avoid circular imports)
             try:
-                from backend.core.thread_manager import final_thread_cleanup
-                cleanup_stats = final_thread_cleanup(
+                from backend.core.thread_manager import final_thread_cleanup_async
+                cleanup_stats = await final_thread_cleanup_async(
                     timeout=5.0,
                     force_terminate=True,
                     allow_daemon_conversion=False,  # Don't convert to daemon, we're exiting

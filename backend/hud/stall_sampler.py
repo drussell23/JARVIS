@@ -263,8 +263,11 @@ class StallSampler:
         # the Swift side, and as the four other observability findings in this
         # arc — a measurement that cannot be recovered is not a measurement.
         #
-        # The dump goes to a file that outlives the process. stderr is kept as
-        # well: a developer watching live should not lose what they had.
+        # The dump goes to a file that outlives the process, and the warning
+        # above names it. The terminal gets the frames only when no file could
+        # be written: hundreds of lines of idle worker stacks scrolled through
+        # the operator's console at every stall (2026-10-14, at a Ctrl+C), and
+        # a copy that is already on disk is not something they could lose.
         dump_target = None
         try:
             path = _dump_path()
@@ -285,12 +288,10 @@ class StallSampler:
             from backend.core.ouroboros.battle_test.oob_diagnostics import (
                 dump_all_threads,
             )
-            # The file first: it is the copy that survives. stderr second, for
-            # whoever is attached right now.
-            wrote = False
-            if dump_target is not None:
-                wrote = bool(dump_all_threads(file=dump_target))
-            if dump_all_threads() or wrote:
+            # The file is the record; stderr only when there is no file.
+            if dump_target is not None and dump_all_threads(file=dump_target):
+                return
+            if dump_all_threads():
                 return
         except Exception:  # noqa: BLE001
             logger.debug("[StallSampler] oob dump unavailable", exc_info=True)

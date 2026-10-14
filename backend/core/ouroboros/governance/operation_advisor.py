@@ -496,7 +496,8 @@ def _get_advisor_blast_executor() -> "_futures.ThreadPoolExecutor":
     if _ADVISOR_BLAST_EXECUTOR is None:
         with _ADVISOR_BLAST_EXECUTOR_INIT_LOCK:
             if _ADVISOR_BLAST_EXECUTOR is None:
-                _ADVISOR_BLAST_EXECUTOR = _futures.ThreadPoolExecutor(
+                from backend.core.async_offload import managed_pool_class
+                _ADVISOR_BLAST_EXECUTOR = managed_pool_class()(
                     max_workers=_ADVISOR_BLAST_EXECUTOR_MAX_WORKERS,
                     thread_name_prefix="advisor-blast",
                 )
