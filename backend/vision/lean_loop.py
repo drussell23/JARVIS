@@ -673,11 +673,21 @@ class LeanVisionLoop:
         if scene_context:
             context_line = f"SCENE CONTEXT: {scene_context}\n\n"
 
+        # Said plainly, not left to a "[verify: fail]" tag the model skims past.
+        no_effect = LeanVisionLoop._no_effect_streak(action_log)
+        no_effect_line = (
+            f"NO EFFECT: your last {no_effect} action(s) changed nothing on the screen, so "
+            "what you acted on is not what you took it for. Choose a different element "
+            "or a different kind of action.\n\n"
+            if no_effect else ""
+        )
+
         user_text = (
             f"GOAL: {goal}\n\n"
             f"{context_line}"
             f"TURN: {turn}/{_CU_MAX_TURNS}\n\n"
             f"ACTION HISTORY:\n{history}\n\n"
+            f"{no_effect_line}"
             "The screenshots above show your screen. The LAST is current.\n"
             "Analyze what you see and return the next action as JSON."
         )
@@ -704,11 +714,30 @@ class LeanVisionLoop:
         return params
 
     @staticmethod
+    def _no_effect_streak(action_log: List[Dict[str, Any]]) -> int:
+        """How many of the most recent actions changed nothing on screen."""
+        streak = 0
+        for entry in reversed(action_log):
+            if entry.get("verification") != "fail":
+                break
+            streak += 1
+        return streak
+
+    @staticmethod
     def _is_stagnant_agentic(
         action_log: List[Dict[str, Any]],
         next_action: Dict[str, Any],
     ) -> bool:
-        """Stagnation detection for agentic loop (handles both key formats)."""
+        """Stagnation detection for agentic loop (handles both key formats).
+
+        Stuck is measured, not inferred from coordinates: when the last
+        _STAGNATION_WINDOW actions all changed nothing on screen (pixel
+        verification), the loop is spending turns, not making progress. Exact
+        coordinate repeats alone missed a model nudging the same no-op click
+        a few pixels each turn for all 20 turns.
+        """
+        if LeanVisionLoop._no_effect_streak(action_log) >= _STAGNATION_WINDOW:
+            return True
         if len(action_log) < _STAGNATION_WINDOW:
             return False
 
