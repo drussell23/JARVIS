@@ -61,3 +61,17 @@ def test_task_context_is_one_mapping():
                              classification_source="jprime")
     ctx = r.to_task_context(client_id="c1")
     assert ctx["intent"] == "action" and ctx["search_query"] == "dogs" and ctx["client_id"] == "c1"
+
+
+def test_a_question_answered_by_looking_wins_over_a_capability_tag():
+    def r(**kw):
+        base = dict(intent=CommandIntent.ACTION, confidence=0.9, matched_signal="ai",
+                    action_category="visual_monitor", capability="visual_monitor",
+                    classification_source="jprime")
+        base.update(kw)
+        return ClassificationResult(**base)
+
+    assert r(needs_screen=True).answers_by_looking                       # "can you see my screen?"
+    assert not r(needs_screen=True, requires_vision=True).answers_by_looking  # operate the UI
+    assert not r(needs_screen=False).answers_by_looking
+    assert not r(needs_screen=True, classification_source="sync_heuristic").answers_by_looking

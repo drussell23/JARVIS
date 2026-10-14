@@ -72,6 +72,15 @@ class ClassificationResult:
         acting on the desktop."""
         return self.classification_source == "jprime"
 
+    @property
+    def answers_by_looking(self) -> bool:
+        """The Mind said the ANSWER needs a look at the screen (needs_screen)
+        and nothing on it is to be operated (requires_vision). That is the
+        screen-question route whatever capability or intent label rode along:
+        "can you see my screen?" came back tagged visual_monitor/action and
+        was answered blind by the text model."""
+        return self.decided_by_mind and self.needs_screen and not self.requires_vision
+
     def to_task_context(self, **extra: Any) -> Dict[str, Any]:
         """This decision as the RuntimeTaskOrchestrator reads it (one mapping
         for every surface: HTTP command, WebSocket, voice)."""

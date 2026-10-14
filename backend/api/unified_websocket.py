@@ -2475,6 +2475,18 @@ class UnifiedWebSocketManager:
                 # Pillar 5: Agentic classification via J-Prime (falls back to reflex arc)
                 _classification = await _classifier.classify_async(command_text)
 
+                if _classification.answers_by_looking:
+                    from backend.vision.screen_question import answer_about_screen
+                    _seen = await answer_about_screen(command_text)
+                    return {
+                        "type": "response",
+                        "text": _seen.get("response", ""),
+                        "status": "success" if _seen.get("success") else "error",
+                        "command_type": "vision",
+                        "speak": True,
+                        "routing": {"routed_to": "screen_question", "intent": "query"},
+                    }
+
                 if _classification.decided_by_mind and _classification.intent == CommandIntent.ACTION:
                     # Directive 2: Check Progressive Readiness before dispatching ACTION
                     _action_ready = True

@@ -2153,8 +2153,7 @@ class UnifiedCommandProcessor:
             # A question whose ANSWER needs a look at the screen goes to the
             # eyes, not to the text-only Mind ("can you see my screen?" was
             # answered without looking). Screen ACTIONS stay with the RTO.
-            if getattr(_classification, "needs_screen", False) and \
-                    _classification.intent != CommandIntent.ACTION:
+            if _classification.answers_by_looking:
                 _p5log("needs_screen — answering from a look at the screen")
                 from backend.vision.screen_question import answer_about_screen
                 return await answer_about_screen(command_text)
