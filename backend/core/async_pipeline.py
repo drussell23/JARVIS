@@ -2564,7 +2564,7 @@ class AdvancedAsyncPipeline:
             # Fallback to safe_say (AudioBus-aware, no raw device access)
             try:
                 from backend.core.supervisor.unified_voice_orchestrator import safe_say
-                await safe_say(message, voice="Daniel", timeout=10.0, source="async_pipeline_ack")
+                await safe_say(message, timeout=10.0, source="async_pipeline_ack")
             except ImportError:
                 pass
 
@@ -2862,7 +2862,7 @@ class AdvancedAsyncPipeline:
 
             try:
                 from backend.core.supervisor.unified_voice_orchestrator import safe_say
-                await safe_say(message, voice="Daniel", rate=180, timeout=5.0, source="async_pipeline_cont")
+                await safe_say(message, rate=180, timeout=5.0, source="async_pipeline_cont")
             except ImportError:
                 pass
         except Exception:

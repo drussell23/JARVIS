@@ -743,6 +743,7 @@ import errno
 import functools
 import hashlib
 import heapq
+import html
 import importlib.util
 import inspect
 import json
@@ -755,6 +756,7 @@ import shlex
 import shutil
 import signal
 import socket
+import urllib.parse
 from backend.core.portable_sockets import allow_time_wait_rebind
 from backend.core.process_identity import HARD_KILL_SIGNAL
 import sqlite3
@@ -16219,13 +16221,13 @@ class AsyncVoiceNarrator:
     - Dynamic user name resolution
     - Priority-based queue management
     - Concurrent speech prevention with priority override
-    - Platform-aware (macOS only, graceful fallback)
+    - Platform-agnostic: speaks through the UnifiedVoiceOrchestrator
 
     Environment Variables:
     - JARVIS_VOICE_ENABLED: Enable/disable voice (default: true)
-    - JARVIS_VOICE_NAME: Voice name (default: Daniel)
+    - JARVIS_VOICE_NAME: Voice name (backend/core/voice_persona)
     - JARVIS_VOICE_RATE: Speech rate 90-300 (default: 175)
-    - JARVIS_OWNER_NAME: Owner name for personalization (default: auto-detect)
+    - JARVIS_OWNER_NAME: Owner name for personalization (backend/core/owner)
     """
 
     # Zone completion messages with personality
@@ -16271,26 +16273,13 @@ class AsyncVoiceNarrator:
 
     @classmethod
     def _resolve_voice_name(cls, requested: Optional[str] = None) -> str:
-        """
-        Resolve narrator voice with canonical enforcement.
+        """The narrator's voice: JARVIS's declared persona, or *requested*
+        when canonical enforcement is switched off (backend/core/voice_persona)."""
+        from backend.core.voice_persona import enforce_persona, persona
 
-        Default behavior is deterministic Daniel voice unless explicit
-        canonical enforcement is disabled.
-        """
-        force_daniel = cls._env_flag("JARVIS_FORCE_DANIEL_VOICE", "true")
-        if force_daniel:
-            canonical = "Daniel"
-        else:
-            canonical = os.getenv("JARVIS_CANONICAL_VOICE_NAME", "Daniel").strip() or "Daniel"
-
-        if cls._env_flag("JARVIS_ENFORCE_CANONICAL_VOICE", "true"):
-            return canonical
-
-        if requested and requested.strip():
+        if requested and requested.strip() and not enforce_persona():
             return requested.strip()
-
-        env_voice = os.getenv("JARVIS_VOICE_NAME", "").strip()
-        return env_voice or canonical
+        return persona().name
 
     def __init__(
         self,
@@ -16302,16 +16291,16 @@ class AsyncVoiceNarrator:
         # Configuration from environment with overrides
         if enabled is None:
             enabled = os.getenv("JARVIS_VOICE_ENABLED", "true").lower() == "true"
-        self.enabled = enabled and platform.system() == "Darwin"
+        # Every OS: speech goes through the UnifiedVoiceOrchestrator, which
+        # renders JARVIS's persona wherever an engine can.
+        self.enabled = enabled
 
-        # Enforce canonical startup voice identity.
-        os.environ["JARVIS_FORCE_DANIEL_VOICE"] = "true"
-        os.environ["JARVIS_ENFORCE_CANONICAL_VOICE"] = "true"
-        os.environ["JARVIS_CANONICAL_VOICE_NAME"] = "Daniel"
-        os.environ["JARVIS_VOICE_NAME"] = "Daniel"
+        # The voice is the declared persona (backend/core/voice_persona). This
+        # used to WRITE "Daniel" into JARVIS_VOICE_NAME and the canonical-voice
+        # flags, overriding the operator's own declaration process-wide.
         self.voice = self._resolve_voice_name(voice)
         self.rate = rate or int(os.getenv("JARVIS_VOICE_RATE", "175"))
-        self._owner_name = owner_name or os.getenv("JARVIS_OWNER_NAME", "")
+        self._owner_name = owner_name or ""
 
         # Process management
         self._process: Optional[asyncio.subprocess.Process] = None
@@ -16675,10 +16664,9 @@ class AsyncVoiceNarrator:
         """Get owner name for personalization."""
         if self._owner_name:
             return self._owner_name
-        # Try to get from environment or default
-        name = os.getenv("JARVIS_OWNER_NAME") or os.getenv("USER", "")
-        # Capitalize first letter
-        return name.capitalize() if name else "there"
+        from backend.core.owner import owner_name
+
+        return owner_name()
 
     def _get_time_period(self) -> str:
         """Get current time period for greeting selection."""
@@ -62878,8 +62866,10 @@ class JarvisSystemKernel:
         self._startup_narrator: Optional["IntelligentStartupNarrator"] = None
         if self.config.voice_enabled and STARTUP_NARRATOR_AVAILABLE:
             try:
+                from backend.core.owner import owner_name as _owner_name
+
                 self._startup_narrator = _get_backend_startup_narrator(
-                    user_name=os.environ.get("JARVIS_USER_NAME", "Sir")
+                    user_name=_owner_name()
                 )
             except Exception:
                 pass
@@ -67116,6 +67106,25 @@ class JarvisSystemKernel:
         _event_bus.subscribe(_renderer.handle_event)
         self._event_bus = _event_bus
         self._cli_renderer = _renderer
+
+        # The boot timeline: the loading page's percentage, measured from the
+        # phase boundaries announced on this bus against previous boots
+        # (backend/core/boot_timeline). Its origin is this moment: where the
+        # boot's events begin (the CLI renderer's clock starts here too).
+        from backend.core.boot_timeline import BootTimeline
+
+        self._boot_timeline = BootTimeline(origin=time.time())
+
+        def _feed_boot_timeline(event: SupervisorEvent) -> None:
+            timeline = self._boot_timeline
+            if event.event_type == SupervisorEventType.PHASE_START and event.phase:
+                timeline.phase_started(event.phase, event.timestamp)
+            elif event.event_type == SupervisorEventType.PHASE_END and event.phase:
+                timeline.phase_ended(event.phase, event.timestamp)
+            elif event.event_type == SupervisorEventType.STARTUP_COMPLETE:
+                timeline.completed(event.timestamp)
+
+        _event_bus.subscribe(_feed_boot_timeline)
 
         # Wire TUI to supervisor data sources (read-only)
         if hasattr(_renderer, 'attach_to_supervisor'):
@@ -87160,10 +87169,49 @@ class JarvisSystemKernel:
         """Open *url* in the user's browser on any OS (backend/core/desktop_open:
         JARVIS_DEFAULT_BROWSER or the OS default, brought to the front). macOS
         keeps its AppleScript incognito manager; this is every other host."""
+        from backend.core.browser_tabs import reuse_tab
         from backend.core.desktop_open import open_url, preferred_browser
 
+        # JARVIS's tab, when one is open, is pointed at *url* (as the macOS
+        # manager redirects its window); a new tab only when there is none.
+        titles = self._jarvis_page_titles()
+        port = urllib.parse.urlsplit(url).port
+        reused = await reuse_tab(
+            url,
+            page_titles=list(titles.values()),
+            ports=self._jarvis_page_ports(),
+            expected_title=titles.get(port, ""),
+        )
+        if reused.reused:
+            return {"success": True, "action": "reused_tab", "error": None,
+                    "duplicates_closed": reused.closed}
+        self.logger.debug(f"[Kernel] No JARVIS tab reused ({reused.detail}); opening one")
         opened = await open_url(url, browser=preferred_browser())
         return {"success": opened.ok, "action": opened.method or "opened", "error": opened.error}
+
+    def _jarvis_page_ports(self) -> List[int]:
+        """The ports JARVIS's own pages are served on (loading page, UI, API)."""
+        frontend_port = int(os.environ.get("JARVIS_FRONTEND_PORT", "3000"))
+        return [p for p in (self.config.loading_server_port, frontend_port,
+                            self.config.backend_port) if p]
+
+    def _jarvis_page_titles(self) -> Dict[int, str]:
+        """Port -> the <title> JARVIS's page on that port declares, read from
+        the pages themselves (frontend/public), so a renamed page is still
+        recognised as JARVIS's own tab."""
+        public = self.config.project_root / "frontend" / "public"
+        frontend_port = int(os.environ.get("JARVIS_FRONTEND_PORT", "3000"))
+        titles: Dict[int, str] = {}
+        for port, page in ((self.config.loading_server_port, "loading.html"),
+                           (frontend_port, "index.html")):
+            try:
+                found = re.search(r"<title>\s*(.*?)\s*</title>",
+                                  (public / page).read_text(encoding="utf-8"), re.S | re.I)
+            except OSError:
+                continue
+            if found and found.group(1):
+                titles[port] = html.unescape(found.group(1))
+        return titles
 
     async def _redirect_page_portable(self, url: str) -> Dict[str, Any]:
         """Bring the browser to the app at *url* once startup completes.
@@ -89372,7 +89420,18 @@ class JarvisSystemKernel:
             "visual_pipeline", "frontend", "finalizing",
         }
         current = getattr(self, '_current_progress', 0) or 0
-        if stage in _STARTUP_STAGES or is_heartbeat:
+        timeline = getattr(self, "_boot_timeline", None)
+        # While the boot is in progress EVERY broadcast's percentage is the
+        # timeline's -- a stage missing from the set below (e.g.
+        # "integration_parallel") used to pass its literal straight through.
+        if timeline is not None and stage != "complete" and timeline.fraction() < 1:
+            # The boot timeline (backend/core/boot_timeline) is the measure:
+            # the position on the learned timeline of this boot, 100 only at
+            # the kernel's completion. The number a call site passes is that
+            # site's guess; the ceilings below existed to tame those guesses.
+            progress = max(current, timeline.percent())
+            self._current_progress = progress
+        elif stage in _STARTUP_STAGES or is_heartbeat:
             # Startup phase or heartbeat: monotonic guard prevents regression
             # Also cap at the phase ceiling (_current_startup_progress + buffer)
             # to prevent dynamic progress overshoot from poisoning the value.
@@ -89909,23 +89968,27 @@ class JarvisSystemKernel:
                 elapsed = time.monotonic() - start_time
                 current_phase = getattr(self, '_current_startup_phase', 'unknown')
 
-                # v360.0: Heartbeat relay — reads _current_startup_phase and _current_startup_progress
-                # and may apply smoothing/interpolation for loading page UX. This is the ONLY
-                # progress publisher. Pre-warmer does NOT advance progress.
-                #
-                # v226.0: Use dynamic progress as primary baseline for accuracy
-                dynamic_progress = self._calculate_dynamic_progress()
-                milestone_progress = getattr(self, '_current_startup_progress', last_sent_progress)
-                base_progress = max(dynamic_progress, milestone_progress)
-
-                # Reduced increment since dynamic progress now tracks actual work
-                increment = min(1, max(0.3, 0.05 * elapsed / 10))
-                # v233.1: Allow heartbeat up to 99% (100% reserved for explicit completion broadcast)
-                _heartbeat_cap = int(os.environ.get("JARVIS_HEARTBEAT_PROGRESS_CAP", "99"))
-                effective_progress = min(_heartbeat_cap, base_progress + increment)
-
-                # Enforce monotonic: never send lower than previous
-                progress_to_send = max(last_sent_progress, int(effective_progress))
+                # The heartbeat reports the boot timeline (backend/core/
+                # boot_timeline): position on the learned timeline, never
+                # past a milestone that has not happened, 100 only at
+                # completion. It used to add an elapsed-time "increment" to
+                # a guessed baseline -- motion, not measurement.
+                timeline = getattr(self, "_boot_timeline", None)
+                if timeline is not None:
+                    current_phase = timeline.current_phase() or current_phase
+                    progress_to_send = max(last_sent_progress, timeline.percent())
+                    remaining = timeline.remaining_seconds()
+                    if timeline.learning:
+                        tail = "first measured boot, learning its timeline"
+                    elif remaining:
+                        tail = f"about {remaining:.0f}s left by previous boots"
+                    else:
+                        tail = "longer than previous boots"
+                    heartbeat_message = f"{current_phase} · {elapsed:.0f}s · {tail}"
+                else:
+                    progress_to_send = max(last_sent_progress,
+                                           getattr(self, '_current_startup_progress', last_sent_progress))
+                    heartbeat_message = f"Phase: {current_phase} (elapsed: {elapsed:.1f}s)..."
 
                 # Build component status from dashboard
                 components = {}
@@ -89939,7 +90002,7 @@ class JarvisSystemKernel:
                 # Broadcast heartbeat
                 await self._broadcast_startup_progress(
                     stage=current_phase,
-                    message=f"Phase: {current_phase} (elapsed: {elapsed:.1f}s)...",
+                    message=heartbeat_message,
                     progress=progress_to_send,
                     metadata={
                         "icon": "spinner",

@@ -885,7 +885,9 @@ class RealTimeVoiceCommunicator:
         # (the persona voice elsewhere) would read the brackets aloud.
         if sys.platform == "darwin":
             processed = processed.replace('JARVIS', '[[rate -15]]JARVIS[[rate +15]]')
-            processed = processed.replace('Derek', '[[rate -10]]Derek[[rate +10]]')
+            from backend.core.owner import owner_name
+            _owner = owner_name()
+            processed = processed.replace(_owner, f'[[rate -10]]{_owner}[[rate +10]]')
 
         return processed
 
@@ -1410,8 +1412,9 @@ class RealTimeVoiceCommunicator:
 
     # ============== Convenience Methods for AGI OS ==============
 
-    async def greet(self, name: str = "Derek") -> str:
-        """Contextual greeting based on time of day."""
+    async def greet(self, name: Optional[str] = None) -> str:
+        """Contextual greeting based on time of day (the owner by default)."""
+        name = name or await self.get_owner_name()
         hour = datetime.now().hour
 
         if 5 <= hour < 12:
@@ -1467,24 +1470,21 @@ class RealTimeVoiceCommunicator:
         """
         Get the current owner's name dynamically via OwnerIdentityService.
 
-        Falls back to macOS system user or "there" if unavailable.
+        Falls back to backend/core/owner (declaration, OS account full name,
+        form of address) if the service is unavailable.
 
         Returns:
             Owner's first name for personalized greetings
         """
+        from backend.core.owner import owner_name
+
         try:
             from agi_os.owner_identity_service import get_owner_name
             name = await asyncio.wait_for(get_owner_name(), timeout=1.0)
-            return name if name else "there"
+            return name or owner_name()
         except Exception as e:
             logger.debug(f"Failed to get owner name: {e}")
-            # Fallback to macOS username
-            try:
-                import os
-                username = os.environ.get('USER', 'there')
-                return username.split('.')[0].title()
-            except Exception:
-                return "there"
+            return owner_name()
 
     async def speak_immediate(
         self,

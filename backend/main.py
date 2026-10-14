@@ -10634,6 +10634,16 @@ async def audio_persona():
     return {**asdict(persona()), "enforce": enforce_persona()}
 
 
+@app.get("/host/session")
+async def host_session():
+    """Facts about the desktop JARVIS runs on that a page cannot see from the
+    browser -- e.g. a Remote Desktop session, where "no microphone" means the
+    client is not redirecting one (backend/core/host_platform)."""
+    from backend.core.host_platform import os_display_name, remote_session
+
+    return {"os": os_display_name(), "remote_session": remote_session()}
+
+
 @app.get("/audio/speak/{text}")
 async def audio_speak_get(text: str):
     """GET endpoint for audio speak - decodes URL-encoded text and processes"""

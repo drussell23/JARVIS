@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import './MicrophonePermissionHelper.css';
 import microphonePermissionManager from '../services/MicrophonePermissionManager';
+import configService from '../services/DynamicConfigService';
 
 /**
  * MicrophonePermissionHelper v4.0
@@ -22,6 +23,10 @@ const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
   const [showInstructions, setShowInstructions] = useState(false);
   const [isRetrying, setIsRetrying] = useState(false);
   const [lastError, setLastError] = useState(null);
+  // The desktop the browser runs on, as the backend sees it (/host/session):
+  // over Remote Desktop the microphone is the CLIENT's, so "no microphone"
+  // means the client is not redirecting one.
+  const [hostSession, setHostSession] = useState(null);
 
   // Track if we've already notified parent of permission grant
   const hasNotifiedParent = useRef(false);
@@ -44,7 +49,10 @@ const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
           notifyParent();
         } else if (event === 'denied') {
           setPermissionStatus('denied');
-        } else if (event === 'device_change' || event === 'device_availability_change') {
+        } else if (event === 'device_availability_change') {
+          // A microphone arrived or left: re-judge, not just re-list
+          checkMicrophonePermission();
+        } else if (event === 'device_change') {
           // Refresh device status on change
           refreshDeviceStatus();
         } else if (event === 'reset') {
@@ -52,6 +60,14 @@ const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
           checkMicrophonePermission();
         }
       });
+
+      const apiUrl = configService.getApiUrl();
+      if (apiUrl) {
+        fetch(`${apiUrl}/host/session`)
+          .then((r) => (r.ok ? r.json() : null))
+          .then((session) => setHostSession(session))
+          .catch(() => {});
+      }
 
       // Initial permission check
       await checkMicrophonePermission();
@@ -119,22 +135,22 @@ const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
         try {
           const permission = await navigator.permissions.query({ name: 'microphone' });
 
+          // Permission to use a microphone is not a microphone: granted
+          // with no input device is 'no-device', or the page would start
+          // recognition, fail capture, and come straight back here.
+          const usable = (state, deviceState) =>
+            (state === 'granted' && deviceState?.devices && deviceState.devices.count === 0)
+              ? 'no-device' : state;
+
           console.log(`[MicrophonePermissionHelper] Permission API state: ${permission.state}`);
-          setPermissionStatus(permission.state);
+          setPermissionStatus(usable(permission.state, status));
 
           // Listen for permission changes
-          permission.addEventListener('change', () => {
+          permission.addEventListener('change', async () => {
             console.log(`[MicrophonePermissionHelper] Permission changed: ${permission.state}`);
-            setPermissionStatus(permission.state);
-            if (permission.state === 'granted') {
-              notifyParent();
-            }
+            const latest = await refreshDeviceStatus();
+            setPermissionStatus(usable(permission.state, latest));
           });
-
-          // If already granted, notify parent
-          if (permission.state === 'granted') {
-            notifyParent();
-          }
 
         } catch (e) {
           // Safari doesn't support 'microphone' permission query
@@ -442,15 +458,30 @@ const MicrophonePermissionHelper = ({ onPermissionGranted }) => {
               {renderDeviceList()}
             </div>
 
-            <div className="suggestions">
-              <h4>Things to Try:</h4>
-              <ul>
-                <li>Connect a USB microphone or headset</li>
-                <li>Check your headphone/microphone jack connection</li>
-                <li>Ensure your built-in microphone is enabled in System Settings</li>
-                <li>Close other apps that might be using the microphone</li>
-              </ul>
-            </div>
+            {hostSession?.remote_session ? (
+              <div className="suggestions">
+                <h4>This {hostSession.os} desktop is in a Remote Desktop session</h4>
+                <p>The microphone is the one on the computer you are connecting from, and
+                  your Remote Desktop client is not sending it to this session.</p>
+                <ul>
+                  <li>In your Remote Desktop client, edit this PC's connection and turn on
+                    <strong> microphone redirection</strong> (Devices &amp; Audio → Microphone).</li>
+                  <li>Allow the Remote Desktop client to use the microphone in the client
+                    computer's privacy settings.</li>
+                  <li>Reconnect to the session; JARVIS picks the microphone up automatically.</li>
+                </ul>
+              </div>
+            ) : (
+              <div className="suggestions">
+                <h4>Things to Try:</h4>
+                <ul>
+                  <li>Connect a USB microphone or headset</li>
+                  <li>Check your headphone/microphone jack connection</li>
+                  <li>Ensure your built-in microphone is enabled in System Settings</li>
+                  <li>Close other apps that might be using the microphone</li>
+                </ul>
+              </div>
+            )}
 
             <button
               onClick={requestMicrophoneAccess}

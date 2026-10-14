@@ -349,8 +349,9 @@ class VisionCommandHandler:
         try:
             logger.info(f"[VISION] Initializing IntelligentCommandHandler (timeout: {handler_init_timeout}s)...")
 
-            # Get user name from environment or use default
-            user_name = os.getenv("USER_NAME", "Derek")
+            # The operator's name (backend/core/owner)
+            from backend.core.owner import owner_name
+            user_name = owner_name()
 
             # Wrap synchronous initialization in executor with timeout
             loop = asyncio.get_event_loop()

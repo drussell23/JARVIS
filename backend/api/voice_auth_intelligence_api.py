@@ -230,7 +230,8 @@ async def get_feedback_generator():
     if _feedback_generator is None:
         try:
             from voice.speaker_verification_service import VoiceFeedbackGenerator
-            _feedback_generator = VoiceFeedbackGenerator(user_name="Derek")
+            from backend.core.owner import owner_name
+            _feedback_generator = VoiceFeedbackGenerator(user_name=owner_name())
             logger.info("✅ Voice feedback generator initialized")
         except Exception as e:
             logger.warning(f"Feedback generator unavailable: {e}")

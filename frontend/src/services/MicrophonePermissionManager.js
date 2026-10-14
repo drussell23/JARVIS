@@ -423,6 +423,58 @@ class MicrophonePermissionManager {
   }
 
   /**
+   * A thrown getUserMedia / MediaRecorder error in this manager's result
+   * vocabulary ({success, error, reason}), classified once (_classifyError).
+   * A denial is recorded; nothing else is.
+   */
+  resultForError(error) {
+    const { category, suggestedAction } = this._classifyError(error || {});
+    const reason = error?.message || suggestedAction;
+    if (category === 'browser_permission_denied' || category === 'os_permission_denied') {
+      this._handleDenial(category);
+      return { success: false, error: 'permission_denied', reason, instructions: this.getPermissionInstructions() };
+    }
+    if (category === 'no_device' || category === 'device_busy' || category === 'security') {
+      return { success: false, error: category, reason };
+    }
+    return { success: false, error: 'unknown', reason };
+  }
+
+  /**
+   * What a Web Speech recognition error means for the microphone, in this
+   * manager's result vocabulary ({success, error, reason}), or null when it
+   * says nothing about the microphone (no-speech, network, aborted...).
+   *
+   * Only 'not-allowed' / 'service-not-allowed' are denials. 'audio-capture'
+   * means capture FAILED: with no input device at all (a Remote Desktop
+   * session whose client is not redirecting a microphone) it was recorded as
+   * a denial, and every later request reported "permission denied".
+   */
+  async noteRecognitionError(errorCode) {
+    if (errorCode === 'not-allowed' || errorCode === 'service-not-allowed') {
+      this._handleDenial(errorCode);
+      return {
+        success: false,
+        error: 'permission_denied',
+        reason: 'Microphone permission denied',
+        instructions: this.getPermissionInstructions(),
+      };
+    }
+    if (errorCode === 'audio-capture') {
+      const devices = await this._checkDevices();
+      if (!devices || devices.count === 0) {
+        return { success: false, error: 'no_device', reason: 'No microphone is available to this browser' };
+      }
+      return {
+        success: false,
+        error: 'device_busy',
+        reason: 'The microphone could not be captured (in use by another application?)',
+      };
+    }
+    return null;
+  }
+
+  /**
    * Reset denial state (for user-initiated retry).
    */
   resetDenialState() {

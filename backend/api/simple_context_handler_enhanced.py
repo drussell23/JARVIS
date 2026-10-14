@@ -72,13 +72,20 @@ _owner_name_cache: Optional[str] = None
 
 
 async def _get_owner_name() -> str:
-    """Get the device owner's first name from the speaker profile database.
+    """The device owner's first name: declared, else the enrolled primary
+    speaker, else backend/core/owner's evidence (OS account, form of address).
 
     Uses a module-level cache so the DB is only queried once per process lifetime.
-    Falls back to env var JARVIS_OWNER_NAME, then to "Derek".
     """
     global _owner_name_cache
     if _owner_name_cache is not None:
+        return _owner_name_cache
+
+    from backend.core.owner import declared_owner_name, owner_name
+
+    declared = declared_owner_name()
+    if declared:
+        _owner_name_cache = declared.split()[0]
         return _owner_name_cache
 
     # Try database first (v253.1: timeout to prevent infinite stall)
@@ -98,9 +105,8 @@ async def _get_owner_name() -> str:
     except Exception as e:
         logger.debug(f"[ENHANCED CONTEXT] DB owner lookup failed: {e}")
 
-    # Fallback: env var → default
-    _owner_name_cache = os.getenv("JARVIS_OWNER_NAME", "Derek")
-    logger.info(f"[ENHANCED CONTEXT] Owner from env/default: {_owner_name_cache}")
+    _owner_name_cache = owner_name()
+    logger.info(f"[ENHANCED CONTEXT] Owner: {_owner_name_cache}")
     return _owner_name_cache
 
 

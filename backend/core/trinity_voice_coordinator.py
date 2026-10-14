@@ -52,6 +52,7 @@ import queue as thread_queue
 import json
 
 from backend.core.async_safety import LazyAsyncLock
+from backend.core.native_audio_player import SpeakerBusy
 
 # Optional TTS engines (graceful degradation if not available)
 try:
@@ -926,6 +927,8 @@ class TTSEngine(ABC):
 
             return success
 
+        except SpeakerBusy:
+            raise  # the line is stale, the engine is fine: the caller drops it
         except Exception as e:
             self.last_error = str(e)
             self.failure_count += 1
@@ -1505,8 +1508,11 @@ class EdgeTTSEngine(TTSEngine):
                 # → static during GIL-heavy ops. afplay is native, no GIL.
                 # (device_held branch previously routed through AudioBus)
                 # afplay on macOS, winmm MCI on Windows, mpg123 elsewhere.
+                # One speaker: waits for any line already playing, and drops
+                # this one if it would start after it has gone stale.
                 from backend.core.native_audio_player import play_audio_file
-                await play_audio_file(temp_path, timeout=timeout)
+                await play_audio_file(temp_path, timeout=timeout,
+                                      wait_s=self.config.stale_threshold)
                 return True
 
             finally:
@@ -1516,6 +1522,8 @@ class EdgeTTSEngine(TTSEngine):
                 except Exception:
                     pass
 
+        except SpeakerBusy:
+            raise
         except Exception as e:
             self.last_error = str(e)
             return False
@@ -2297,11 +2305,18 @@ class TrinityVoiceCoordinator:
                 continue
 
             try:
-                success = await engine.speak(
-                    announcement.message,
-                    personality,
-                    timeout=timeout
-                )
+                try:
+                    success = await engine.speak(
+                        announcement.message,
+                        personality,
+                        timeout=timeout
+                    )
+                except SpeakerBusy:
+                    # Another line held the speaker until this one went stale.
+                    logger.info(f"[TrinityVoice] {worker_id}: dropped stale line "
+                                f"(speaker busy): {announcement.message[:50]}")
+                    self._metrics.dropped_announcements += 1
+                    return
 
                 if success:
                     latency_ms = (time.time() - start_time) * 1000

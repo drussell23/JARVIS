@@ -36,7 +36,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import subprocess
 import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -186,49 +185,25 @@ class OwnerIdentityService:
         )
 
     async def _load_macos_user_info(self) -> None:
-        """Load macOS system user information as fallback."""
+        """Load the OS account's identity (any OS) as the fallback.
+
+        The full name comes from the OS directory (backend/core/host_platform);
+        the login name is kept as the account, never offered as a person's
+        name -- on Windows it greeted the operator as "Jarvis"."""
         try:
-            # Get current macOS username
-            username = os.environ.get('USER') or os.getlogin()
+            from backend.core.host_platform import account_full_name
 
-            # Get full name from macOS directory services
-            try:
-                result = subprocess.run(
-                    ['dscl', '.', '-read', f'/Users/{username}', 'RealName'],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                if result.returncode == 0:
-                    # Parse output: "RealName:\n Full Name"
-                    lines = result.stdout.strip().split('\n')
-                    if len(lines) > 1:
-                        full_name = lines[1].strip()
-                    else:
-                        full_name = username.replace('.', ' ').title()
-                else:
-                    full_name = username.replace('.', ' ').title()
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                full_name = username.replace('.', ' ').title()
-
-            # Get home directory
-            home_dir = os.path.expanduser('~')
-
+            username = os.environ.get('USER') or os.environ.get('USERNAME') or os.getlogin()
+            full_name = await asyncio.to_thread(account_full_name)
             self._macos_user_info = {
                 'username': username,
                 'full_name': full_name,
-                'home_directory': home_dir,
+                'home_directory': os.path.expanduser('~'),
             }
-
-            # Extract first name for casual greeting
-            first_name = full_name.split()[0] if full_name else username.title()
-
-            logger.info(
-                f"📱 macOS user info loaded: {full_name} ({username})"
-            )
+            logger.info(f"📱 OS account loaded: {username} (full name: {full_name or 'none recorded'})")
 
         except Exception as e:
-            logger.warning(f"Failed to load macOS user info: {e}")
+            logger.warning(f"Failed to load OS account info: {e}")
             self._macos_user_info = None
 
     async def _load_primary_owner_from_profiles(self) -> None:
@@ -293,33 +268,32 @@ class OwnerIdentityService:
             await self._set_fallback_owner()
 
     async def _set_fallback_owner(self) -> None:
-        """Set fallback owner from macOS system user."""
-        if self._macos_user_info:
-            full_name = self._macos_user_info.get('full_name', 'User')
-            first_name = full_name.split()[0] if full_name else 'User'
+        """Owner from the operator's declaration or the OS account's full name
+        (backend/core/owner), else unnamed and addressed by the declared form."""
+        from backend.core.owner import declared_owner_name, form_of_address
 
+        info = self._macos_user_info or {}
+        full_name = declared_owner_name() or info.get('full_name', '')
+        if full_name:
+            first_name = full_name.split()[0]
             self._current_owner = OwnerProfile(
                 name=first_name,
                 identity_confidence=IdentityConfidence.LOW,
                 identity_source=IdentitySource.MACOS_SYSTEM,
-                macos_username=self._macos_user_info.get('username'),
+                macos_username=info.get('username'),
                 macos_full_name=full_name,
-                home_directory=self._macos_user_info.get('home_directory'),
+                home_directory=info.get('home_directory'),
                 session_start=datetime.now(),
             )
-
             self._stats['fallback_used'] += 1
-            logger.info(f"📱 Fallback owner set: {first_name} (from macOS)")
+            logger.info(f"📱 Fallback owner set: {first_name}")
         else:
-            # Ultimate fallback
             self._current_owner = OwnerProfile(
-                name="there",  # "Hello there" sounds natural
+                name=form_of_address(),
                 identity_confidence=IdentityConfidence.UNKNOWN,
                 identity_source=IdentitySource.FALLBACK,
                 session_start=datetime.now(),
             )
-            self._stats['fallback_used'] += 1
-            logger.warning("⚠️ No user info available - using generic greeting")
 
     async def get_current_owner(
         self,
@@ -529,8 +503,9 @@ class OwnerIdentityService:
         if owner.macos_full_name:
             return owner.macos_full_name.split()[0]
 
-        # Ultimate fallback
-        return "there"
+        # Ultimate fallback: the declared form of address
+        from backend.core.owner import form_of_address
+        return form_of_address()
 
     async def is_owner_verified(self) -> bool:
         """Check if current owner has been voice-verified recently."""

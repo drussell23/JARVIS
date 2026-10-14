@@ -57,17 +57,35 @@ def _norm_gender(value: str) -> str:
     return {"m": "male", "f": "female"}.get(v, v)
 
 
-def _catalogue_locale(name: str) -> str:
-    """The locale the OS voice catalogue (macOS `say -v ?`) lists for *name*."""
+def say_voice_options() -> List[VoiceOption]:
+    """The voices macOS `say` has (`say -v ?`, cached by system_voices);
+    empty where there is no `say`."""
     try:
         from backend.core.system_voices import voice_catalog_raw
         raw = voice_catalog_raw() or ""
     except Exception:  # noqa: BLE001
-        return ""
+        return []
+    options = []
     for line in raw.splitlines():
         m = re.match(r"^(.+?)\s{2,}([a-z]{2}[_-][A-Z]{2})\b", line)
-        if m and m.group(1).strip().lower() == name.lower():
-            return m.group(2)
+        if m:
+            name = m.group(1).strip()
+            options.append(VoiceOption(id=name, name=name, locale=m.group(2)))
+    return options
+
+
+def say_voice(who: Optional["Persona"] = None) -> Optional[str]:
+    """The `say` voice that renders *who* (default: JARVIS's persona), or None
+    -- never "the first voice installed"."""
+    choice = choose(say_voice_options(), who)
+    return choice.id if choice else None
+
+
+def _catalogue_locale(name: str) -> str:
+    """The locale the OS voice catalogue (macOS `say -v ?`) lists for *name*."""
+    for option in say_voice_options():
+        if option.name.lower() == name.lower():
+            return option.locale
     return ""
 
 
@@ -173,5 +191,5 @@ async def edge_tts_voice(who: Optional[Persona] = None) -> Optional[str]:
     return choice.id if choice else None
 
 
-__all__ = ["Persona", "VoiceOption", "choose", "edge_tts_voice", "enforce_persona", "persona",
+__all__ = ["Persona", "VoiceOption", "choose", "edge_tts_voice", "enforce_persona", "persona", "say_voice", "say_voice_options",
            "pyttsx3_persona_engine"]

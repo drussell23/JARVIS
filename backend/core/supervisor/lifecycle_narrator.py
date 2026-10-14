@@ -25,7 +25,7 @@ Design constraints:
     - Debounce: max 1 narration per 4 seconds (configurable)
     - Batch: rapid lifecycle transitions are collapsed into one sentence
     - Queue depth: 32 max, oldest dropped on overflow (never OOM)
-    - Personalized: time-of-day greetings, owner name from env
+    - Personalized: time-of-day greetings, owner name from backend/core/owner
     - Intelligent: different cadence for startup vs runtime vs recovery
 """
 from __future__ import annotations
@@ -51,7 +51,6 @@ _MAX_QUEUE = int(os.environ.get("JARVIS_NARRATOR_MAX_QUEUE", "32"))
 _ENABLED = os.environ.get("JARVIS_LIFECYCLE_NARRATOR_ENABLED", "true").lower() in (
     "true", "1", "yes",
 )
-_OWNER = os.environ.get("JARVIS_OWNER_NAME", "Sir")
 
 
 class NarrationPriority(Enum):
@@ -200,11 +199,14 @@ class LifecycleVoiceNarrator:
         self,
         debounce_s: float = _DEBOUNCE_S,
         max_queue: int = _MAX_QUEUE,
-        owner_name: str = _OWNER,
+        owner_name: Optional[str] = None,
         enabled: bool = _ENABLED,
     ) -> None:
         self._debounce_s = debounce_s
         self._max_queue = max_queue
+        if owner_name is None:
+            from backend.core.owner import owner_name as _resolve_owner
+            owner_name = _resolve_owner()
         self._owner = owner_name
         self._enabled = enabled
 

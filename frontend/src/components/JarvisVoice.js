@@ -1669,6 +1669,31 @@ const JarvisVoice = () => {
     }
   };
 
+  // One mapping from a microphone failure (the permission manager's result
+  // vocabulary) to what the page shows. "No microphone" and "busy" are not
+  // denials: over Remote Desktop with no microphone redirected, a capture
+  // failure was reported as "permission denied".
+  const applyMicFailure = (result) => {
+    const reason = result?.reason;
+    if (result?.error === 'permission_denied') {
+      setMicrophonePermission('denied');
+      setMicStatus('permission_denied');
+      setError(`🎤 ${reason || 'Microphone access denied'}. Allow it with the microphone icon in the address bar.`);
+    } else if (result?.error === 'no_device') {
+      setMicrophonePermission('no-device');
+      setMicStatus('error');
+      setError(`🎤 ${reason || 'No microphone found'}.`);
+    } else if (result?.error === 'device_busy') {
+      setMicrophonePermission('device-busy');
+      setMicStatus('error');
+      setError(`🎤 ${reason || 'The microphone is in use by another application'}.`);
+    } else {
+      setMicrophonePermission('error');
+      setMicStatus('error');
+      setError('🎤 Error accessing microphone: ' + (reason || 'Unknown error'));
+    }
+  };
+
   const checkMicrophonePermission = async () => {
     try {
       // Check if browser supports speech recognition
@@ -1691,39 +1716,13 @@ const JarvisVoice = () => {
         initializeSpeechRecognition();
       } else {
         console.error('Microphone permission error:', result);
-
-        if (result.error === 'permission_denied') {
-          setMicrophonePermission('denied');
-          setMicStatus('permission_denied');
-          setError('Microphone access denied. Please grant permission to use JARVIS.');
-        } else if (result.error === 'no_device') {
-          setMicrophonePermission('no-device');
-          setMicStatus('error');
-          setError('No microphone found. Please connect a microphone.');
-        } else {
-          setMicrophonePermission('error');
-          setMicStatus('error');
-          setError('Error accessing microphone: ' + (result.reason || 'Unknown error'));
-        }
+        applyMicFailure(result);
       }
     } catch (error) {
       console.error('Microphone permission error:', error);
 
-      // Inform the permission manager
-      if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
-        microphonePermissionManager.markAsDenied('checkMicrophonePermission_catch');
-        setMicrophonePermission('denied');
-        setMicStatus('permission_denied');
-        setError('Microphone access denied. Please grant permission to use JARVIS.');
-      } else if (error.name === 'NotFoundError') {
-        setMicrophonePermission('no-device');
-        setMicStatus('error');
-        setError('No microphone found. Please connect a microphone.');
-      } else {
-        setMicrophonePermission('error');
-        setMicStatus('error');
-        setError('Error accessing microphone: ' + error.message);
-      }
+      // The permission manager classifies (and records a denial)
+      applyMicFailure(microphonePermissionManager.resultForError(error));
     }
   };
 
@@ -4097,24 +4096,22 @@ const JarvisVoice = () => {
         // skipNextRestartRef IMMEDIATELY (before any await), onend will try to
         // restart recognition and cause an infinite loop.
         // =====================================================================
-        if (event.error === 'not-allowed' || event.error === 'audio-capture') {
+        if (event.error === 'not-allowed' || event.error === 'service-not-allowed' || event.error === 'audio-capture') {
           // IMMEDIATELY set flags to prevent restart loop - DO THIS BEFORE ANY AWAIT
           skipNextRestartRef.current = true;
           continuousListeningRef.current = false;
-
-          // Inform the unified permission manager
-          microphonePermissionManager.markAsDenied(event.error);
+          setContinuousListening(false);
 
           console.warn(`⛔ [JarvisVoice] ${event.error} error - immediate restart prevention set`);
 
-          // Update UI state synchronously
-          setError(`🎤 Microphone ${event.error === 'not-allowed' ? 'permission denied' : 'access issue'}. Check browser permissions.`);
-          setMicStatus('permission_denied');
-          setMicrophonePermission('denied');
-          setContinuousListening(false);
-
           // Still call ML handler for logging/analytics but don't await blocking
           mlAudioHandler.handleAudioError(event, recognitionRef.current).catch(() => {});
+
+          // What the error means -- a denial, no microphone at all, or a busy
+          // one -- is the permission manager's call (it records only denials).
+          microphonePermissionManager.noteRecognitionError(event.error)
+            .then((result) => { if (result) applyMicFailure(result); })
+            .catch(() => applyMicFailure(null));
 
           return; // Exit early - don't process further
         }
@@ -5736,10 +5733,8 @@ const JarvisVoice = () => {
       const state = microphonePermissionManager.getState();
       console.warn('[JarvisVoice] startListening blocked - microphone not available:', state);
 
-      // Update UI to reflect permission issue
-      setError('🎤 Microphone permission required. Click the lock icon to enable.');
-      setMicStatus('permission_denied');
-      setMicrophonePermission('denied');
+      // canUseMicrophone() is false only after a recorded denial
+      applyMicFailure({ error: 'permission_denied' });
 
       // Show instructions
       const instructions = microphonePermissionManager.getPermissionInstructions();
@@ -5756,9 +5751,7 @@ const JarvisVoice = () => {
 
       if (!result.success) {
         console.warn('[JarvisVoice] Permission request failed:', result);
-        setError(`🎤 ${result.reason || 'Microphone access denied'}`);
-        setMicStatus('permission_denied');
-        setMicrophonePermission('denied');
+        applyMicFailure(result);
         return;
       }
 
@@ -5787,14 +5780,7 @@ const JarvisVoice = () => {
       }, 5000);
     } catch (err) {
       console.error('Failed to start recording:', err);
-
-      // Inform the permission manager
-      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        microphonePermissionManager.markAsDenied('startListening_catch');
-      }
-
-      setError('Microphone access denied');
-      setMicStatus('permission_denied');
+      applyMicFailure(microphonePermissionManager.resultForError(err));
     }
   };
 

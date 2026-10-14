@@ -82,6 +82,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import shutil
 import platform
 import threading
 import time
@@ -1338,54 +1339,29 @@ _validated_voices: Dict[str, str] = {}
 
 
 async def _resolve_voice(preferred: str) -> str:
-    """Validate voice availability with cached fallback.
+    """The installed `say` voice that renders *preferred*, or "" when none
+    does (backend/core/voice_persona: exact name, else the persona's locale
+    and gender for JARVIS's own voice). Cached per voice name.
 
-    Enumerates installed voices via ``say -v ?`` and selects the preferred
-    voice if available, otherwise falls back through a preference list.
-    Caches per voice name for the session lifetime.
+    It used to fall back through Daniel, Samantha, Alex, Fred and then the
+    first installed voice: a missing voice became a different person.
     """
     if preferred in _validated_voices:
         return _validated_voices[preferred]
 
-    fallback_preferences = ["Daniel", "Samantha", "Alex", "Fred"]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "say", "-v", "?",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-        if proc.returncode == 0 and stdout:
-            available = set()
-            for line in stdout.decode("utf-8", errors="replace").splitlines():
-                parts = line.split()
-                if parts:
-                    available.add(parts[0])
+    from backend.core.voice_persona import Persona, enforce_persona, persona, say_voice
 
-            if preferred in available:
-                _validated_voices[preferred] = preferred
-                return preferred
-
-            for voice in fallback_preferences:
-                if voice in available:
-                    logger.info(
-                        "[safe_say] Voice '%s' unavailable, using '%s' (%d voices installed)",
-                        preferred, voice, len(available),
-                    )
-                    _validated_voices[preferred] = voice
-                    return voice
-
-            if available:
-                first = sorted(available)[0]
-                logger.warning("[safe_say] No preferred voice found, using '%s'", first)
-                _validated_voices[preferred] = first
-                return first
-    except (asyncio.TimeoutError, OSError) as exc:
-        logger.debug("[safe_say] Voice enumeration failed: %s", exc)
-
-    logger.warning("[safe_say] Could not enumerate voices, using '%s' as-is", preferred)
-    _validated_voices[preferred] = preferred
-    return preferred
+    jarvis = persona()
+    who = jarvis if preferred.lower() == jarvis.name.lower() else Persona(preferred)
+    resolved = await asyncio.to_thread(say_voice, who) or ""
+    if not resolved and not enforce_persona():
+        resolved = preferred  # let `say` pick, as the operator allowed
+    if resolved and resolved != preferred:
+        logger.info("[safe_say] Voice '%s' renders as '%s'", preferred, resolved)
+    elif not resolved:
+        logger.info("[safe_say] No installed voice renders %s; not speaking it", who.describe())
+    _validated_voices[preferred] = resolved
+    return resolved
 
 
 def _voice_muted() -> bool:
@@ -1404,7 +1380,7 @@ def _voice_muted() -> bool:
 
 async def safe_say(
     text: str,
-    voice: str = "Daniel",
+    voice: Optional[str] = None,
     rate: int = 175,
     wait: bool = True,
     skip_dedup: bool = False,
@@ -1420,7 +1396,7 @@ async def safe_say(
 
     Args:
         text:        The text to speak.
-        voice:       macOS voice name (default "Daniel").
+        voice:       voice name (default: JARVIS's persona, voice_persona).
         rate:        Words per minute (default 175).
         wait:        If False, playback is fire-and-forget via a background task.
         skip_dedup:  True for urgent/critical messages that MUST be spoken
@@ -1485,6 +1461,28 @@ async def safe_say(
         except Exception:  # noqa: BLE001 — presence is a courtesy, not a gate
             pass
 
+    from backend.core.voice_persona import persona as _persona
+    voice = voice or _persona().name
+
+    # No `say` on this host: the line goes to the Trinity voice coordinator,
+    # whose engines render the persona and share the one speaker
+    # (native_audio_player). It used to fail here silently.
+    if shutil.which("say") is None:
+        if not skip_dedup and global_speech_dedup_check(text):
+            return False
+        try:
+            from backend.core.trinity_voice_coordinator import (
+                VoicePriority as _TrinityPriority, announce as _trinity_announce,
+            )
+            queued, _reason = await _trinity_announce(
+                text, priority=_TrinityPriority.HIGH if skip_dedup else _TrinityPriority.NORMAL,
+                source=f"safe_say:{source}",
+            )
+            return bool(queued)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[safe_say:%s] coordinator unavailable: %s", source, exc)
+            return False
+
     # 1. Dedup check (broker-level, across all subsystems)
     if not skip_dedup:
         if global_speech_dedup_check(text):
@@ -1496,6 +1494,8 @@ async def safe_say(
         try:
             # v304.0: Resolve voice with fallback (cached after first call)
             resolved_voice = await _resolve_voice(voice)
+            if not resolved_voice:
+                return False  # no installed voice renders it: silent, not someone else
 
             # 2. Synthesize to tempfile (NEVER opens audio device).
             #
