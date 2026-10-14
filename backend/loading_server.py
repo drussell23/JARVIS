@@ -267,6 +267,12 @@ except ImportError as e:
 # v125.0: CONFIGURATION MANAGEMENT (Zero Hardcoding)
 # =============================================================================
 
+
+
+def _trinity_repo(name: str) -> Optional[Path]:
+    from backend.core.trinity_repos import repo_path
+    return repo_path(name)
+
 @dataclass(frozen=True)
 class LoadingServerConfig:
     """
@@ -288,9 +294,12 @@ class LoadingServerConfig:
 
     # Paths
     jarvis_home: Path = field(default_factory=lambda: Path(os.getenv("JARVIS_HOME", str(Path.home() / ".jarvis"))))
-    jarvis_repo: Path = field(default_factory=lambda: Path(os.getenv("JARVIS_PATH", str(Path.home() / "Documents/repos/JARVIS-AI-Agent"))))
-    prime_repo: Path = field(default_factory=lambda: Path(os.getenv("JARVIS_PRIME_PATH", str(Path.home() / "Documents/repos/jarvis-prime"))))
-    reactor_repo: Path = field(default_factory=lambda: Path(os.getenv("REACTOR_CORE_PATH", str(Path.home() / "Documents/repos/reactor-core"))))
+    # The one repo resolver (backend/core/trinity_repos): env vars under every
+    # historical name, else found by content. A fixed macOS folder here meant
+    # the themed loading page was never found on any other layout.
+    jarvis_repo: Path = field(default_factory=lambda: _trinity_repo("jarvis") or Path(__file__).resolve().parent.parent)
+    prime_repo: Optional[Path] = field(default_factory=lambda: _trinity_repo("prime"))
+    reactor_repo: Optional[Path] = field(default_factory=lambda: _trinity_repo("reactor"))
 
     # Timeouts (seconds)
     health_check_timeout: float = field(default_factory=lambda: float(os.getenv("HEALTH_CHECK_TIMEOUT", "5.0")))
@@ -793,6 +802,10 @@ class WebSocketManager:
 
     def __init__(self):
         self._connections: Dict[str, WebSocketConnection] = {}
+        # Pages that have ever connected this session: a page that connected
+        # owns the redirect to the app (it navigates itself on completion),
+        # even after it has left -- so the supervisor never opens a second tab.
+        self.pages_ever_connected = 0
         self._lock = asyncio.Lock()
         self._message_buffer: Deque[str] = collections.deque(maxlen=100)
 
@@ -802,6 +815,7 @@ class WebSocketManager:
         async with self._lock:
             conn = WebSocketConnection(writer, conn_id)
             self._connections[conn_id] = conn
+            self.pages_ever_connected += 1
 
             # Send buffered messages to new connection
             for msg in self._message_buffer:
@@ -2012,6 +2026,7 @@ class LoadingServer:
                 "progress": self._progress,
                 "phase": self._phase,
                 "websocket_clients": self._ws_manager.connection_count,
+                "pages_ever_connected": self._ws_manager.pages_ever_connected,
             },
             "timestamp": datetime.now().isoformat(),
         }
@@ -2162,6 +2177,7 @@ class LoadingServer:
                 "phase": self._phase,
                 "message": self._message,
                 "websocket_clients": self._ws_manager.connection_count,
+                "pages_ever_connected": self._ws_manager.pages_ever_connected,
                 "session_id": self._session_id,
                 "advanced_features": ADVANCED_FEATURES_AVAILABLE,
             },
@@ -3385,7 +3401,10 @@ console.log('[v186.0] Port config injected by loading_server.py:', {{
                 self.handle_request,
                 host=self.config.host,
                 port=self.config.port,
-                reuse_address=True,
+                # asyncio's per-platform default: SO_REUSEADDR on POSIX (rebind
+                # through TIME_WAIT), and on Windows nothing, where the same flag
+                # lets a second server bind over a LIVE listener and silently
+                # never receive a connection.
             )
         except OSError as e:
             # Cancel background tasks started above before dying
@@ -3462,12 +3481,13 @@ console.log('[v186.0] Port config injected by loading_server.py:', {{
                     )
             self._background_tasks.clear()
 
-            # Save ETA history
-            self._eta_engine.finish_tracking()
+            # Save ETA history: file and SQLite writes, so off the loop that
+            # is still answering the page and the supervisor.
+            await asyncio.to_thread(self._eta_engine.finish_tracking)
 
             # v212.0: Save enhanced ETA history if available
             if self._enhanced_eta:
-                self._enhanced_eta.finish_session()
+                await asyncio.to_thread(self._enhanced_eta.finish_session)
 
             # v212.0: Log shutdown event
             if self._event_log:

@@ -80,7 +80,9 @@ class JARVISLoadingManager {
         
         // Priority 2: Window location (may be stale if page is cached)
         const currentPort = parseInt(window.location.port) || (window.location.protocol === 'https:' ? 443 : 80);
-        const isUnifiedSupervisor = currentPort === 8080 || window.location.pathname.includes('unified');
+        // Served by the supervisor's loading server = it injected its port (the
+        // server picks a free port; a fixed 8080 was wrong whenever it moved).
+        const isUnifiedSupervisor = Boolean(injectedLoadingPort) || window.location.pathname.includes('unified');
 
         // v210.0: Define all possible loading server ports to try
         // This enables dynamic discovery when injected ports fail

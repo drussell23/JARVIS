@@ -98,7 +98,10 @@ class PredictiveETACalculator:
         default_factory=lambda: Path.home() / ".jarvis" / "cache" / "eta_history.json"
     )
     ema_alpha: float = 0.3
-    _lock: threading.Lock = field(init=False, default_factory=threading.Lock)
+    # Re-entrant: the public methods compose (finish_session records the
+    # "total" stage through record_stage_completion while holding it), and a
+    # plain Lock deadlocked the loading server's loop at shutdown.
+    _lock: threading.RLock = field(init=False, default_factory=threading.RLock)
 
     # Current session tracking
     _session_id: Optional[str] = field(init=False, default=None)

@@ -102,6 +102,9 @@ STATUS_NORMALIZE: Dict[str, str] = {
     # Legacy aliases
     "complete": "healthy",
     "completed": "healthy",
+    # Did its job and was stopped on purpose (the loading page after the UI
+    # took over) -- done, not failed.
+    "retired": "healthy",
     "initialized": "healthy",
     "failed": "error",
     "cancelled": "stopped",

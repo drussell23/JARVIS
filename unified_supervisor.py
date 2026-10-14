@@ -55479,6 +55479,20 @@ class ComprehensiveZombieCleanup:
 
         return results
 
+    def _own_lineage_pids(self) -> Set[int]:
+        """This kernel, every ancestor (the relaunch chain behind a direct
+        `python3.11 unified_supervisor.py`) and every descendant (the loading
+        server, frontend, workers it started): never a cleanup's target."""
+        pids: Set[int] = {self._my_pid, self._my_parent}
+        try:
+            import psutil
+            me = psutil.Process(self._my_pid)
+            pids |= {p.pid for p in me.children(recursive=True)}
+            pids |= {p.pid for p in me.parents()}
+        except Exception:  # noqa: BLE001 -- psutil absent / race: the two pids above
+            pass
+        return pids
+
     async def _parallel_zombie_discovery(self) -> Dict[int, ZombieProcessInfo]:
         """
         Parallel zombie discovery using multiple detection sources.
@@ -55525,8 +55539,12 @@ class ComprehensiveZombieCleanup:
             if isinstance(result, dict):
                 discovered.update(result)
 
-        # v183.0: Filter out ourselves, our parent, AND protected PIDs
-        all_protected = {self._my_pid, self._my_parent} | self._protected_pids
+        # v183.0: Filter out ourselves, our parent, AND protected PIDs -- and
+        # this kernel's whole lineage: its descendants (the loading server it
+        # just started was "discovered" here and sent SIGINT, exit code 2, so
+        # no loading page and no app ever appeared) and every ancestor (the
+        # relaunch chain behind a `python3.11 unified_supervisor.py`).
+        all_protected = self._own_lineage_pids() | self._protected_pids
         discovered = {
             pid: info for pid, info in discovered.items()
             if pid not in all_protected
@@ -55816,7 +55834,7 @@ class ComprehensiveZombieCleanup:
         # by this boot (this phase used to kill J-Prime's listener on :8000),
         # and a process Trinity does not own is never JARVIS's to free.
         from backend.core.process_identity import owned_by_trinity
-        adopted = await _serving_sibling_pids()
+        adopted = await _serving_sibling_pids() | self._own_lineage_pids()
 
         for port in all_ports:
             try:
@@ -85954,29 +85972,32 @@ class JarvisSystemKernel:
                                 f"after {_chrome_load_timeout:.0f}s"
                             )
                             result = {"success": False, "error": "timeout"}
-                        if result.get("success"):
-                            action = result.get("action", "unknown")
-                            self.logger.success(f"[Kernel] Chrome Incognito opened ({action})")
-
-                            # Step 3: Set environment variable to signal other processes
-                            os.environ["JARVIS_SUPERVISOR_LOADING"] = "1"
-                            self.logger.debug("[Kernel] Set JARVIS_SUPERVISOR_LOADING=1")
-
-                            # v182.0: Send initial progress with REAL component status
-                            self._update_component_status("loading_server", "complete", "Loading server ready")
-                            # v226.0: Guard against overwriting "complete" with "running"
-                            if self._component_status.get("preflight", {}).get("status") != "complete":
-                                self._update_component_status("preflight", "running", "Preflight checks in progress")
-                            await self._broadcast_component_update(
-                                stage="initializing",
-                                message="JARVIS kernel starting...",
-                            )
-                        else:
-                            error = result.get("error", "unknown")
-                            self.logger.info(f"[Kernel] Chrome not opened: {error}")
-                            self.logger.info(f"[Kernel] Open manually: {loading_url_with_params}")
                     else:
-                        self.logger.info(f"[Kernel] Non-macOS platform - open manually: {loading_url_with_params}")
+                        # Every other OS: the one cross-platform opener (default
+                        # or JARVIS_DEFAULT_BROWSER, brought to the front). The
+                        # page redirects itself to the app on the final broadcast.
+                        result = await self._open_page_portable(loading_url_with_params)
+                    if result.get("success"):
+                        action = result.get("action", "unknown")
+                        self.logger.success(f"[Kernel] Loading page opened ({action})")
+
+                        # Step 3: Set environment variable to signal other processes
+                        os.environ["JARVIS_SUPERVISOR_LOADING"] = "1"
+                        self.logger.debug("[Kernel] Set JARVIS_SUPERVISOR_LOADING=1")
+
+                        # v182.0: Send initial progress with REAL component status
+                        self._update_component_status("loading_server", "complete", "Loading server ready")
+                        # v226.0: Guard against overwriting "complete" with "running"
+                        if self._component_status.get("preflight", {}).get("status") != "complete":
+                            self._update_component_status("preflight", "running", "Preflight checks in progress")
+                        await self._broadcast_component_update(
+                            stage="initializing",
+                            message="JARVIS kernel starting...",
+                        )
+                    else:
+                        error = result.get("error", "unknown")
+                        self.logger.info(f"[Kernel] Loading page not opened: {error}")
+                        self.logger.info(f"[Kernel] Open manually: {loading_url_with_params}")
 
             except Exception as e:
                 self.logger.debug(f"[Kernel] Chrome Incognito error (non-fatal): {e}")
@@ -86412,17 +86433,17 @@ class JarvisSystemKernel:
                                 _background_chrome_recovery(),
                                 name="chrome-redirect-background",
                             )
-                        if result.get("success"):
-                            action = result.get("action", "unknown")
-                            self.logger.success(f"[Kernel] Chrome redirected ({action}) → {frontend_url}")
-                            _chrome_redirect_ok = True
-                        else:
-                            self.logger.info(
-                                f"[Kernel] Chrome redirect skipped: {result.get('error', 'unknown')}"
-                            )
-                            self.logger.info(f"[Kernel] Open manually: {frontend_url}")
                     else:
-                        self.logger.info(f"[Kernel] Non-macOS - open manually: {frontend_url}")
+                        result = await self._redirect_page_portable(frontend_url)
+                    if result.get("success"):
+                        action = result.get("action", "unknown")
+                        self.logger.success(f"[Kernel] Browser on the app ({action}) → {frontend_url}")
+                        _chrome_redirect_ok = True
+                    else:
+                        self.logger.info(
+                            f"[Kernel] Browser redirect skipped: {result.get('error', 'unknown')}"
+                        )
+                        self.logger.info(f"[Kernel] Open manually: {frontend_url}")
 
             except Exception as e:
                 self.logger.debug(f"[Kernel] Chrome redirect error (non-fatal): {e}")
@@ -86737,13 +86758,22 @@ class JarvisSystemKernel:
         Avoids false "force kill timeout" reports when the subprocess watcher
         is stale but the OS process is already gone.
         """
+        listener_pid = await self._find_process_on_port(port)
+        if expected_pid and listener_pid:
+            # The port is the decisive evidence, judged by lineage: where the
+            # interpreter is a launcher (a venv's python.exe on Windows) the
+            # listener is the launcher's CHILD, and outlives it.
+            from backend.core.process_identity import descends_from
+
+            if descends_from(listener_pid, expected_pid):
+                return False
+
         if not self._is_loading_server_alive():
             return True
 
         if expected_pid and not self._is_process_alive_basic(expected_pid):
             return True
 
-        listener_pid = await self._find_process_on_port(port)
         if expected_pid:
             return listener_pid is None or listener_pid != expected_pid
         return listener_pid is None
@@ -86781,6 +86811,7 @@ class JarvisSystemKernel:
         Returns:
             True if loading server started and is healthy
         """
+        self._loading_server_retired = False
         if self.config.loading_server_port == 0:
             self.logger.info("[LoadingServer] Port not configured - skipping")
             return False
@@ -87125,6 +87156,48 @@ class JarvisSystemKernel:
         except Exception as e:
             self.logger.debug(f"[LoadingServer] Could not read log file: {e}")
 
+    async def _open_page_portable(self, url: str) -> Dict[str, Any]:
+        """Open *url* in the user's browser on any OS (backend/core/desktop_open:
+        JARVIS_DEFAULT_BROWSER or the OS default, brought to the front). macOS
+        keeps its AppleScript incognito manager; this is every other host."""
+        from backend.core.desktop_open import open_url, preferred_browser
+
+        opened = await open_url(url, browser=preferred_browser())
+        return {"success": opened.ok, "action": opened.method or "opened", "error": opened.error}
+
+    async def _redirect_page_portable(self, url: str) -> Dict[str, Any]:
+        """Bring the browser to the app at *url* once startup completes.
+
+        A loading page that is still connected navigates itself on the final
+        broadcast, so nothing more is needed -- evidence, not assumption: the
+        loading server counts its connected pages. With none (never opened,
+        or closed by the user) the app is opened directly.
+        """
+        port = self.config.loading_server_port
+        if port and AIOHTTP_AVAILABLE and aiohttp is not None:
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(
+                    total=_get_env_float("JARVIS_LOADING_HEALTH_TIMEOUT", 2.0),
+                )) as session:
+                    async with session.get(f"http://127.0.0.1:{port}/health") as resp:
+                        data = await resp.json(content_type=None)
+                ls = data.get("loading_server") or {}
+                # A page that connected owns the redirect: it navigates itself
+                # on completion -- possibly already (it left), possibly on the
+                # final broadcast (it is still here). Only a session where no
+                # page ever connected needs the app opened for it.
+                pages = int(ls.get("pages_ever_connected", ls.get("websocket_clients")) or 0)
+                if data.get("service") == "loading_server" and pages > 0:
+                    return {"success": True, "action": "loading_page_self_redirect"}
+                self.logger.info(
+                    f"[Kernel] No loading page ever connected on :{port} "
+                    f"(service={data.get('service')!r}); opening the app"
+                )
+            except Exception as exc:  # noqa: BLE001 -- unknown: open the app directly
+                self.logger.info(f"[Kernel] Loading page presence unknown on :{port} "
+                                 f"({type(exc).__name__}: {exc}); opening the app")
+        return await self._open_page_portable(url)
+
     async def _stop_loading_server(self) -> None:
         """
         Gracefully shutdown the loading server (v118.0 robust).
@@ -87141,6 +87214,7 @@ class JarvisSystemKernel:
         Also cleans up the log file handle.
         """
         self._loading_server_stopping = True
+        self._loading_server_retired = True  # lasting: until a new one starts
         self._update_component_status("loading_server", "retired", "Loading page handed over")
         await self._stop_loading_server_heartbeat()
         await self._stop_startup_progress_heartbeat()
@@ -87296,6 +87370,26 @@ class JarvisSystemKernel:
             if startup_complete:
                 self.logger.debug("[LoadingServer] Waiting for Chrome to complete redirect...")
                 await asyncio.sleep(2.0)
+
+            if not hasattr(os, "killpg"):
+                # No console signals to a detached child on Windows (Popen
+                # rejects SIGINT), and the venv's python.exe is a launcher whose
+                # real interpreter is its CHILD: stopping the launcher alone left
+                # the retired server holding the port into the next boot.
+                from backend.core.process_identity import kill_process_tree
+
+                self.logger.info("[LoadingServer] Stopping process tree...")
+                await asyncio.to_thread(
+                    kill_process_tree, expected_pid,
+                    float(os.getenv('LOADING_SERVER_STOP_TIMEOUT', '6.0')),
+                )
+                if await self._is_loading_server_stopped(
+                    expected_pid=expected_pid, port=loading_port,
+                ):
+                    self.logger.info("[LoadingServer] Terminated (process tree)")
+                else:
+                    self.logger.warning("[LoadingServer] Process tree outlived the stop")
+                return
 
             self.logger.info("[LoadingServer] Stopping via signal...")
 
@@ -89344,7 +89438,7 @@ class JarvisSystemKernel:
             return False
 
         # Retired on purpose: there is no loading page left to update.
-        if getattr(self, "_loading_server_stopping", False):
+        if getattr(self, "_loading_server_retired", False):
             return False
 
         # v274.0: Unified process-alive contract — single method handles both

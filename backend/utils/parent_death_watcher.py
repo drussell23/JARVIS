@@ -121,19 +121,12 @@ class ParentDeathWatcher:
         Returns:
             True if parent is alive, False otherwise.
         """
-        try:
-            # os.kill with signal 0 checks if process exists
-            os.kill(self._parent_pid, 0)
-            return True
-        except ProcessLookupError:
-            # Parent process doesn't exist
-            return False
-        except PermissionError:
-            # Process exists but we can't signal it (still alive)
-            return True
-        except OSError:
-            # Other OS error - assume dead
-            return False
+        # The OS-correct liveness probe (backend/core/process_identity): on
+        # Windows os.kill(pid, 0) is TerminateProcess, not a probe -- refused
+        # by the kill guard, its OSError read as "parent dead", and the loading
+        # server exited ~15 s into every boot.
+        from backend.core.process_identity import pid_alive
+        return pid_alive(self._parent_pid)
 
     def _is_orphaned(self) -> bool:
         """

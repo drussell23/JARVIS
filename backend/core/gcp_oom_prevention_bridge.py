@@ -615,12 +615,19 @@ class GCPOOMPreventionBridge:
 
                 # Initialize GCPVMManager for cloud offloading
                 try:
-                    from core.gcp_vm_manager import get_gcp_vm_manager
-                    self._gcp_vm_manager = await get_gcp_vm_manager()
-                    if self._gcp_vm_manager.enabled:
-                        logger.info("[OOMBridge] GCPVMManager connected (enabled)")
+                    from core.gcp_vm_manager import COMPUTE_AVAILABLE, get_gcp_vm_manager
+                    if not COMPUTE_AVAILABLE:
+                        # No cloud SDK on this host: there is nothing to offload
+                        # to, and the local guards above still protect it. The
+                        # manager raises for this, which failed the whole bridge.
+                        logger.info("[OOMBridge] Cloud offload unavailable "
+                                    "(google-cloud-compute not installed); local guards only")
                     else:
-                        logger.info("[OOMBridge] GCPVMManager connected (disabled)")
+                        self._gcp_vm_manager = await get_gcp_vm_manager()
+                        if self._gcp_vm_manager.enabled:
+                            logger.info("[OOMBridge] GCPVMManager connected (enabled)")
+                        else:
+                            logger.info("[OOMBridge] GCPVMManager connected (disabled)")
                 except ImportError:
                     logger.warning("[OOMBridge] GCPVMManager not available")
 

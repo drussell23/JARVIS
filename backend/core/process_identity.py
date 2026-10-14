@@ -265,6 +265,43 @@ def _describe(pid: int) -> str:
         return f"pid={pid}"
 
 
+def descends_from(pid: Optional[int], ancestor: Optional[int], max_depth: int = 16) -> bool:
+    """True iff *pid* is *ancestor* or was started, directly or not, by it.
+
+    Walks parent pid NUMBERS, so a child whose launcher has already exited
+    still counts as that launcher's (a venv's python.exe on Windows is a
+    launcher, and the server it runs is its child). A link is only followed
+    to a parent that is older than its child, so a recycled pid is not an
+    ancestor.
+    """
+    if not pid or not ancestor:
+        return False
+    if pid == ancestor:
+        return True
+    try:
+        import psutil
+    except ImportError:
+        return False
+    try:
+        proc = psutil.Process(pid)
+        for _ in range(max_depth):
+            parent_pid = proc.ppid()
+            if not parent_pid or parent_pid == proc.pid:
+                return False
+            if parent_pid == ancestor:
+                try:
+                    return psutil.Process(parent_pid).create_time() <= proc.create_time()
+                except psutil.NoSuchProcess:
+                    return True  # the launcher has exited; its child is still its own
+            parent = psutil.Process(parent_pid)
+            if parent.create_time() > proc.create_time():
+                return False
+            proc = parent
+    except (psutil.Error, OSError):
+        return False
+    return False
+
+
 #: Pids a kill_process_tree call has authorized as one unit (see below).
 _authorized_tree: ContextVar[FrozenSet[int]] = ContextVar("jarvis_authorized_tree", default=frozenset())
 
