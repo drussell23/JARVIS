@@ -1566,7 +1566,12 @@ class EnhancedVoiceEngine:
         elif USE_MACOS_VOICE:
             self.tts_engine = MacOSVoice()
         else:
-            self.tts_engine = pyttsx3.init()
+            # Set to JARVIS's persona, or None when no installed voice renders
+            # it (on Windows SAPI would otherwise speak as David).
+            from backend.core.voice_persona import pyttsx3_persona_engine
+            self.tts_engine, _voices, _declined = pyttsx3_persona_engine()
+            if self.tts_engine is None:
+                logger.info(f"[TTS] pyttsx3 declined: {_declined}")
         if self.tts_engine is not None:
             self._setup_voice()
 
@@ -1695,27 +1700,8 @@ class EnhancedVoiceEngine:
             # macOS voice - use config-driven rate
             self.tts_engine.setProperty("rate", self.config.tts_rate)
         else:
-            voices = self.tts_engine.getProperty("voices")
-
-            # Try to find voice matching preference from config
-            preferred_voice = None
-            voice_preference = self.config.tts_voice_preference.lower()
-
-            if voices:
-                for voice in voices:
-                    voice_name_lower = voice.name.lower()
-                    # Check if voice matches preference
-                    if voice_preference in voice_name_lower:
-                        if "male" in voice_name_lower or not any(
-                            word in voice_name_lower for word in ["female", "woman"]
-                        ):
-                            preferred_voice = voice.id
-                            break
-
-            if preferred_voice:
-                self.tts_engine.setProperty("voice", preferred_voice)
-                logger.info(f"[TTS] Using preferred voice: {preferred_voice}")
-
+            # The voice itself was chosen when the engine was made
+            # (voice_persona.pyttsx3_persona_engine).
             # Set speech rate and volume from config
             self.tts_engine.setProperty("rate", self.config.tts_rate)
             self.tts_engine.setProperty("volume", self.config.tts_volume)

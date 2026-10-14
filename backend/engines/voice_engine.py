@@ -318,14 +318,15 @@ class NaturalTTS:
         engines = {}
         
         # Initialize pyttsx3 (offline)
-        try:
-            engines[TTSEngine.PYTTSX3] = pyttsx3.init()
-            # Configure pyttsx3
-            engine = engines[TTSEngine.PYTTSX3]
+        # Set to JARVIS's persona; absent when no installed voice renders it.
+        from backend.core.voice_persona import pyttsx3_persona_engine
+        engine, _voices, declined = pyttsx3_persona_engine()
+        if engine is not None:
             engine.setProperty('rate', int(200 * self.config.speech_rate))
             engine.setProperty('volume', self.config.volume)
-        except Exception:
-            print("Warning: pyttsx3 not available")
+            engines[TTSEngine.PYTTSX3] = engine
+        else:
+            _logger.info("pyttsx3 unavailable: %s", declined)
             
         # gTTS is initialized on-demand
         engines[TTSEngine.GTTS] = None
@@ -359,16 +360,21 @@ class NaturalTTS:
     
     async def _synthesize_edge_tts(self, text: str) -> TTSResult:
         """Synthesize using Microsoft Edge TTS (high quality)"""
-        # Get available voices
-        voices = await edge_tts.list_voices()
-        
-        # Select voice based on config
-        if self.config.voice_name:
-            voice = self.config.voice_name
+        # The voice: an explicit edge-tts voice id as configured, otherwise
+        # JARVIS's persona rendered by backend/core/voice_persona (this
+        # defaulted to a US female voice -- a different person from JARVIS).
+        from backend.core.voice_persona import Persona, edge_tts_voice, persona
+
+        configured = (self.config.voice_name or "").strip()
+        if configured and "Neural" in configured:
+            voice = configured
         else:
-            # Default to a natural English voice
-            english_voices = [v for v in voices if v["Locale"].startswith("en-")]
-            voice = "en-US-JennyNeural" if english_voices else voices[0]["ShortName"]
+            who = persona()
+            if configured and configured.lower() != who.name.lower():
+                who = Persona(configured, who.locale, who.gender)
+            voice = await edge_tts_voice(who)
+            if voice is None:
+                raise RuntimeError(f"no edge-tts voice renders {who.describe()}")
         
         # Create communication object
         communicate = edge_tts.Communicate(
@@ -427,7 +433,9 @@ class NaturalTTS:
     
     def _synthesize_pyttsx3(self, text: str) -> TTSResult:
         """Synthesize using pyttsx3 (offline)"""
-        engine = self.engines[TTSEngine.PYTTSX3]
+        engine = self.engines.get(TTSEngine.PYTTSX3)
+        if engine is None:
+            raise RuntimeError("pyttsx3 has no voice that renders JARVIS's persona")
         
         # Save to temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:

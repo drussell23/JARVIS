@@ -25,6 +25,7 @@ import { getJarvisConnectionService, ConnectionState, connectionStateToJarvisSta
 import TrainingStatus from './TrainingStatus'; // 🆕 Real-time training progress display (Feedback Loop)
 import { getContinuousAudioBuffer } from '../utils/ContinuousAudioBuffer'; // 🆕 Continuous audio pre-buffer for first-attempt recognition
 import { initDynamicFavicon, setFaviconState } from '../utils/DynamicFavicon'; // 🆕 Dynamic JARVIS favicon
+import { getVoicePersona, choosePersonaVoice } from '../utils/voicePersona'; // one declared voice, browser fallback included
 
 // Inline styles to ensure button visibility
 const buttonVisibilityStyle = `
@@ -1244,7 +1245,7 @@ const JarvisVoice = () => {
   }, [isProcessing, isWaitingForCommand, isListening]);
 
   useEffect(() => {
-    // Preload voices to ensure Daniel is available
+    // Preload voices so the persona's browser voice is known before it is needed
     if ('speechSynthesis' in window) {
       // Force load voices
       window.speechSynthesis.getVoices();
@@ -1252,10 +1253,14 @@ const JarvisVoice = () => {
       // Listen for voices to be loaded
       window.speechSynthesis.onvoiceschanged = () => {
         const voices = window.speechSynthesis.getVoices();
-        const danielVoice = voices.find(v => v.name.includes('Daniel'));
-        if (danielVoice) {
-          console.log('✅ Daniel voice preloaded:', danielVoice.name);
-        }
+        getVoicePersona(API_URL || configService.getApiUrl() || inferUrls().API_BASE_URL)
+          .then((persona) => {
+            const voice = choosePersonaVoice(voices, persona);
+            console.log(voice
+              ? `✅ Browser voice for ${persona.name}: ${voice.name}`
+              : `[JARVIS Audio] No browser voice renders ${persona.name}; the backend speaks`);
+          })
+          .catch(() => {});
       };
     }
 
@@ -6436,34 +6441,28 @@ const JarvisVoice = () => {
         utterance.pitch = 0.95; // Slightly lower pitch for more authoritative tone
         utterance.volume = 0.9; // Slightly lower volume for more natural sound
 
-        // Try to find Daniel or other British male voice
+        // JARVIS's declared voice, chosen by the backend's own rule
+        // (utils/voicePersona). No voice that renders it: the text is shown
+        // and not spoken, rather than spoken by someone else.
         const voices = window.speechSynthesis.getVoices();
         console.log(`[JARVIS Audio] Available voices: ${voices.length}`);
-
-        // First try to find Daniel
-        let selectedVoice = voices.find(voice => voice.name.includes('Daniel'));
-
-        if (!selectedVoice) {
-          // Try other British male voices
-          selectedVoice = voices.find(voice =>
-            (voice.lang.includes('en-GB') || voice.lang.includes('en_GB')) &&
-            (voice.name.includes('Oliver') || voice.name.includes('James') ||
-              voice.name.toLowerCase().includes('male'))
-          );
+        let persona = null;
+        try {
+          persona = await getVoicePersona(API_URL || configService.getApiUrl() || inferUrls().API_BASE_URL);
+        } catch (personaError) {
+          console.warn('[JARVIS Audio] Voice persona unavailable:', personaError.message);
         }
-
-        if (!selectedVoice) {
-          // Try any British voice
-          selectedVoice = voices.find(voice =>
-            voice.lang.includes('en-GB') || voice.lang.includes('en_GB')
-          );
-        }
+        const selectedVoice = choosePersonaVoice(voices, persona);
 
         if (selectedVoice) {
           utterance.voice = selectedVoice;
           console.log(`[JARVIS Audio] Using voice: ${selectedVoice.name}`);
-        } else {
-          console.log('[JARVIS Audio] No British voice found, using default');
+        } else if (!persona || persona.enforce !== false) {
+          console.warn("[JARVIS Audio] No browser voice renders JARVIS's persona; showing text only");
+          if (onStartCallback && typeof onStartCallback === 'function') {
+            onStartCallback();
+          }
+          return;
         }
 
         utterance.onstart = () => {

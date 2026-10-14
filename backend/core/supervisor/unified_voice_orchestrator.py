@@ -882,6 +882,12 @@ class UnifiedVoiceOrchestrator:
                     await self._execute_say_via_afplay(message.text)
                 else:
                     await self._execute_say(message.text)
+            elif self.config.enabled:
+                # Elsewhere there is no `say`: _execute_say routes to the
+                # engines that exist (the Trinity coordinator's persona voice).
+                # This branch used to be missing, so every line was logged as
+                # spoken and nothing was heard.
+                await self._execute_say(message.text)
 
             # Update metrics
             duration = time.time() - start_time
@@ -971,15 +977,21 @@ class UnifiedVoiceOrchestrator:
                 logger.debug("[UnifiedVoice v266.0] Spoke via UnifiedTTSEngine")
                 return
             except Exception as e:
-                if not allow_direct_say_fallback:
+                # The guard keeps macOS from mixing `say` into a failed
+                # UnifiedTTS line; where there is no `say` the next path is
+                # the persona voice, not a second stack.
+                if not allow_direct_say_fallback and self._is_macos:
                     logger.warning(
                         f"[UnifiedVoice] UnifiedTTSEngine failed: {e} "
                         f"— skipping direct say fallback to keep audio deterministic"
                     )
                     return
-                logger.warning(
+                # Off macOS this is the expected route (no engine there renders
+                # the persona except the coordinator's), not a fault per line.
+                (logger.warning if self._is_macos else logger.debug)(
                     f"[UnifiedVoice] UnifiedTTSEngine failed on free device: {e} "
-                    f"— falling back to direct say"
+                    f"— falling back to "
+                    f"{'direct say' if self._is_macos else 'the Trinity voice coordinator'}"
                 )
 
         # Device free on macOS: safe say fallback (say -o tempfile → afplay).

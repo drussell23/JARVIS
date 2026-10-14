@@ -3,11 +3,29 @@ STT Engine Implementations
 Each engine is self-contained and implements the base interface
 """
 
+import importlib
+
 from .base_engine import BaseSTTEngine, STTResult
-from .vosk_engine import VoskEngine
-from .wav2vec_engine import Wav2VecEngine
-from .whisper_gcp_engine import WhisperGCPEngine
-from .whisper_local_engine import WhisperLocalEngine
+
+# Each STT engine pulls a heavy optional stack (torch, vosk, whisper). Loaded
+# when named, not when the package is: importing ANY module here -- the TTS
+# engine included -- used to require torch, so a host without it had no
+# UnifiedTTSEngine at all.
+_LAZY_ENGINES = {
+    "VoskEngine": ".vosk_engine",
+    "Wav2VecEngine": ".wav2vec_engine",
+    "WhisperGCPEngine": ".whisper_gcp_engine",
+    "WhisperLocalEngine": ".whisper_local_engine",
+}
+
+
+def __getattr__(name):
+    module = _LAZY_ENGINES.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(module, __name__), name)
+    globals()[name] = value
+    return value
 
 __all__ = [
     "BaseSTTEngine",

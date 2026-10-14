@@ -133,10 +133,7 @@ class PiperTTSEngine(BaseTTSEngine):
             )
 
         except ImportError:
-            logger.error(
-                "[PiperTTS] piper-tts not installed. "
-                "Install with: pip install piper-tts"
-            )
+            logger.info("[PiperTTS] piper-tts not installed (pip install piper-tts)")
             raise
         except Exception as e:
             logger.error(f"[PiperTTS] Initialization failed: {e}")

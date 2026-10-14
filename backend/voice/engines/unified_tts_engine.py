@@ -95,6 +95,8 @@ def _allow_pyttsx3_on_darwin() -> bool:
 # =============================================================================
 
 _tts_instance: Optional["UnifiedTTSEngine"] = None
+# Why no engine could start, once that is known (see get_tts_engine).
+_tts_unavailable: Optional[str] = None
 _tts_lock: Optional[asyncio.Lock] = None
 _tts_playback_lock: Optional[asyncio.Lock] = None
 
@@ -132,21 +134,31 @@ async def get_tts_engine(
     Returns:
         Initialized UnifiedTTSEngine singleton.
     """
-    global _tts_instance
+    global _tts_instance, _tts_unavailable
 
     if _tts_instance is not None:
         return _tts_instance
+    if _tts_unavailable is not None:
+        raise RuntimeError(_tts_unavailable)
 
     async with _get_tts_lock():
         # Double-checked locking
         if _tts_instance is not None:
             return _tts_instance
+        if _tts_unavailable is not None:
+            raise RuntimeError(_tts_unavailable)
 
         engine = UnifiedTTSEngine(
             preferred_engine=preferred_engine,
             config=config,
         )
-        await engine.initialize()
+        try:
+            await engine.initialize()
+        except RuntimeError as exc:
+            # Which engines exist, and which render the persona, is fixed for
+            # the life of the process: probe once, not on every spoken line.
+            _tts_unavailable = str(exc)
+            raise
         _tts_instance = engine
         logger.info("[TTS] Singleton engine initialized")
         return _tts_instance
@@ -206,12 +218,22 @@ class GoogleTTSEngine(BaseTTSEngine):
 
         try:
             from gtts import gTTS
+            from backend.core.voice_persona import (
+                VoiceOption, choose, enforce_persona, persona,
+            )
+
+            # Google Translate offers one (female) voice per language: it
+            # renders the persona only if that is who the persona is.
+            offered = VoiceOption(id="gtts", name="Google Translate",
+                                  locale=self.config.language, gender="female")
+            if enforce_persona() and choose([offered]) is None:
+                raise RuntimeError(f"gTTS cannot render {persona().describe()}")
 
             self.gtts = gTTS
             self.initialized = True
             logger.info("✅ Google TTS (gTTS) initialized")
         except ImportError:
-            logger.error("gTTS not installed. Install with: pip install gTTS")
+            logger.info("gTTS not installed (pip install gTTS)")
             raise
 
     async def synthesize(self, text: str) -> TTSResult:
@@ -284,17 +306,16 @@ class MacOSTTSEngine(BaseTTSEngine):
         if self.initialized:
             return
 
-        # Check if 'say' command is available
-        try:
-            result = subprocess.run(["which", "say"], capture_output=True, text=True)
-            if result.returncode == 0:
-                self.initialized = True
-                logger.info("✅ macOS TTS (say) initialized")
-            else:
-                raise RuntimeError("'say' command not found (not running on macOS?)")
-        except Exception as e:
-            logger.error(f"macOS TTS initialization failed: {e}")
-            raise
+        # Is 'say' on PATH? A lookup, not a `which` subprocess: there is no
+        # `which` on Windows, and this ran on the event loop.
+        import shutil
+
+        if shutil.which("say") is None:
+            # Absent off macOS by design: the next engine is tried.
+            logger.info("macOS TTS unavailable: no 'say' on this host")
+            raise RuntimeError("'say' command not found (not running on macOS?)")
+        self.initialized = True
+        logger.info("✅ macOS TTS (say) initialized")
 
     async def synthesize(self, text: str) -> TTSResult:
         """Synthesize speech using macOS 'say' command"""
@@ -433,10 +454,15 @@ class Pyttsx3TTSEngine(BaseTTSEngine):
             return
 
         try:
-            import pyttsx3
+            import pyttsx3  # noqa: F401 -- ImportError below names the missing package
+            from backend.core.voice_persona import pyttsx3_persona_engine
 
             loop = asyncio.get_event_loop()
-            self.engine = await loop.run_in_executor(None, pyttsx3.init)
+            engine, _options, error = await loop.run_in_executor(None, pyttsx3_persona_engine)
+            if engine is None:
+                # Declined: speaking in another voice is not a fallback.
+                raise RuntimeError(error)
+            self.engine = engine
 
             # Set properties
             if self.config.speed != 1.0:
@@ -446,17 +472,14 @@ class Pyttsx3TTSEngine(BaseTTSEngine):
             if self.config.volume != 1.0:
                 self.engine.setProperty("volume", self.config.volume)
 
-            if self.config.voice:
-                self.engine.setProperty("voice", self.config.voice)
-
             self.initialized = True
             logger.info("✅ pyttsx3 TTS initialized")
 
         except ImportError:
-            logger.error("pyttsx3 not installed. Install with: pip install pyttsx3")
+            logger.info("pyttsx3 not installed (pip install pyttsx3)")
             raise
         except Exception as e:
-            logger.error(f"pyttsx3 initialization failed: {e}")
+            logger.info(f"pyttsx3 unavailable: {e}")
             raise
 
     async def synthesize(self, text: str) -> TTSResult:
@@ -1336,35 +1359,10 @@ async def test_tts():
     print("\n✅ Test complete!")
 
 
-# ============================================================================
-# Singleton Factory
-# ============================================================================
-
-_tts_singleton: Optional[UnifiedTTSEngine] = None
-_tts_singleton_lock = asyncio.Lock()
-
-
-async def get_unified_tts_engine() -> UnifiedTTSEngine:
-    """Get or create the singleton UnifiedTTSEngine.
-
-    Thread-safe, double-checked locking. Returns an initialized engine
-    that can be shared across all callers (WebSocket endpoints,
-    ConversationPipeline, macOS voice bridge, etc.).
-    """
-    global _tts_singleton
-    if _tts_singleton is not None and _tts_singleton.active_engine is not None:
-        return _tts_singleton
-    async with _tts_singleton_lock:
-        if _tts_singleton is not None and _tts_singleton.active_engine is not None:
-            return _tts_singleton
-        engine = UnifiedTTSEngine()
-        await engine.initialize()
-        _tts_singleton = engine
-        return _tts_singleton
-
-
-# Alias for shorter imports
-get_tts_engine = get_unified_tts_engine
+# One singleton: get_tts_engine (top of module). A second factory used to be
+# defined here and rebound get_tts_engine to itself, so the module held two
+# engines and the first factory's memory of an unavailable engine never ran.
+get_unified_tts_engine = get_tts_engine
 
 
 if __name__ == "__main__":

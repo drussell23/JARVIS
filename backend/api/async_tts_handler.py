@@ -66,7 +66,7 @@ class AsyncTTSHandler:
         # Start background cache warming
         asyncio.create_task(self._warm_cache())
         
-    def _get_cache_key(self, text: str, voice: str = "Daniel") -> str:
+    def _get_cache_key(self, text: str, voice: Optional[str] = None) -> str:
         """Generate a cache key for the given text and voice"""
         content = f"{voice}:{text}".encode('utf-8')
         return hashlib.sha256(content).hexdigest()[:16]
@@ -117,13 +117,35 @@ class AsyncTTSHandler:
             lambda: subprocess.run(cmd, capture_output=True, check=True)
         )
     
-    async def _generate_audio_file(self, text: str, voice: str = "Daniel") -> Tuple[Path, str]:
+    async def _generate_audio_file(self, text: str, voice: Optional[str] = None) -> Tuple[Path, str]:
         """
         Generate audio file using macOS say command
         Returns tuple of (file_path, content_type)
         """
+        import shutil
         import tempfile
-        
+
+        from backend.core.voice_persona import persona as _persona
+        voice = voice or _persona().name
+
+        if shutil.which("say") is None:
+            # No `say` (anything but macOS): the persona's voice from edge-tts,
+            # chosen by backend/core/voice_persona. This endpoint returned
+            # silence here, so the browser spoke in a voice of its own.
+            from backend.core.voice_persona import Persona, edge_tts_voice
+            import edge_tts
+
+            who = _persona()
+            if voice and voice.lower() != who.name.lower():
+                who = Persona(voice, who.locale, who.gender)
+            edge_voice = await edge_tts_voice(who)
+            if edge_voice is None:
+                raise RuntimeError(f"no available voice renders {who.describe()}")
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                mp3_path = Path(tmp.name)
+            await edge_tts.Communicate(text, edge_voice).save(str(mp3_path))
+            return mp3_path, "audio/mpeg"
+
         # Create temp file for AIFF output
         with tempfile.NamedTemporaryFile(suffix=".aiff", delete=False) as tmp:
             aiff_path = Path(tmp.name)
@@ -212,7 +234,7 @@ class AsyncTTSHandler:
     async def generate_speech(
         self,
         text: str,
-        voice: str = "Daniel",
+        voice: Optional[str] = None,
         use_cache: bool = True
     ) -> Tuple[Path, str]:
         """
@@ -220,12 +242,15 @@ class AsyncTTSHandler:
         
         Args:
             text: Text to convert to speech
-            voice: Voice to use (default: Daniel)
+            voice: Voice to use (default: JARVIS's persona, voice_persona)
             use_cache: Whether to use caching
             
         Returns:
             Tuple of (file_path, content_type)
         """
+        if not voice:
+            from backend.core.voice_persona import persona
+            voice = persona().name
         cache_key = self._get_cache_key(text, voice)
         
         # Check cache first
@@ -263,7 +288,7 @@ class AsyncTTSHandler:
         
         return final_path, content_type
     
-    async def preload_text(self, text: str, voice: str = "Daniel"):
+    async def preload_text(self, text: str, voice: Optional[str] = None):
         """Preload text into cache for instant playback later"""
         await self.generate_speech(text, voice, use_cache=True)
     
@@ -307,7 +332,7 @@ def get_tts_handler() -> AsyncTTSHandler:
     return _tts_handler
 
 
-async def generate_speech_async(text: str, voice: str = "Daniel") -> Tuple[Path, str]:
+async def generate_speech_async(text: str, voice: Optional[str] = None) -> Tuple[Path, str]:
     """Convenience function to generate speech using the global handler"""
     handler = get_tts_handler()
     return await handler.generate_speech(text, voice)

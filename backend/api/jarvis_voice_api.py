@@ -2473,7 +2473,7 @@ class JARVISVoiceAPI:
             from .async_tts_handler import generate_speech_async
 
             # Generate speech with caching and async processing
-            audio_path, content_type = await generate_speech_async(text, voice="Daniel")
+            audio_path, content_type = await generate_speech_async(text)
 
             # Read the audio file
             with open(audio_path, "rb") as f:
@@ -2505,11 +2505,13 @@ class JARVISVoiceAPI:
                 tmp_path = tmp.name
 
             # Use macOS say command to generate audio with British voice
+            from backend.core.voice_persona import persona as _voice_persona
+
             stdout, stderr, returncode = await async_subprocess_run(
                 [
                     "say",
                     "-v",
-                    "Daniel",  # British voice for JARVIS
+                    _voice_persona().name,  # JARVIS's declared voice (voice_persona)
                     "-r",
                     "160",  # Much slower speech rate for natural delivery (words per minute)
                     "-o",

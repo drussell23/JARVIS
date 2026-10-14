@@ -1285,17 +1285,16 @@ class Pyttsx3Engine(TTSEngine):
 
         try:
             loop = asyncio.get_running_loop()
+            from backend.core.voice_persona import pyttsx3_persona_engine
 
-            def _init():
-                try:
-                    return pyttsx3.init()
-                except Exception as e:
-                    return str(e)
+            result, self._voice_options, error = await loop.run_in_executor(
+                None, pyttsx3_persona_engine)
 
-            result = await loop.run_in_executor(None, _init)
-
-            if isinstance(result, str):
-                self.last_error = result
+            if result is None:
+                # pyttsx3 failed, or no installed voice renders JARVIS's
+                # persona: this engine stays silent instead of speaking as
+                # someone else.
+                self.last_error = error
                 return False
 
             self._engine = result
@@ -1353,81 +1352,15 @@ class Pyttsx3Engine(TTSEngine):
                     with self._lock:
                         self._engine.setProperty('rate', personality.rate)
                         self._engine.setProperty('volume', personality.volume)
-                        # Deterministically resolve a voice instead of silently
-                        # falling back to pyttsx3/system defaults.
-                        try:
-                            voices = self._engine.getProperty('voices') or []
-
-                            fallback_chain = [
-                                voice.strip()
-                                for voice in os.getenv(
-                                    "JARVIS_VOICE_FALLBACK_ORDER",
-                                    "Daniel,Alex,Tom,Karen,Samantha",
-                                ).split(",")
-                                if voice.strip()
-                            ]
-
-                            candidate_chain = [
-                                personality.voice_name,
-                                os.getenv("JARVIS_NARRATOR_VOICE_NAME", ""),
-                                os.getenv("JARVIS_VOICE_NAME", ""),
-                                *fallback_chain,
-                            ]
-
-                            selected_voice = None
-                            seen = set()
-                            for candidate in candidate_chain:
-                                normalized = (candidate or "").strip().lower()
-                                if not normalized or normalized in seen:
-                                    continue
-                                seen.add(normalized)
-                                for voice in voices:
-                                    voice_name = getattr(voice, "name", "") or ""
-                                    voice_id = getattr(voice, "id", "") or ""
-                                    voice_name_l = voice_name.lower()
-                                    voice_id_l = voice_id.lower()
-                                    if (
-                                        normalized in voice_name_l
-                                        or normalized in voice_id_l
-                                        or voice_name_l in normalized
-                                        or voice_id_l in normalized
-                                    ):
-                                        selected_voice = voice
-                                        break
-                                if selected_voice:
-                                    break
-
-                            if selected_voice:
-                                self._engine.setProperty('voice', selected_voice.id)
-                                requested = (personality.voice_name or "").strip().lower()
-                                selected_name = (getattr(selected_voice, "name", "") or "").strip().lower()
-                                selected_id = (getattr(selected_voice, "id", "") or "").strip().lower()
-                                if requested and requested not in (selected_name, selected_id):
-                                    logger.warning(
-                                        "[Pyttsx3] Voice '%s' unavailable, using '%s'",
-                                        personality.voice_name,
-                                        getattr(selected_voice, "name", selected_voice.id),
-                                    )
-                            elif voices:
-                                # Explicit deterministic fallback if no preference matched.
-                                self._engine.setProperty('voice', voices[0].id)
-                                logger.warning(
-                                    "[Pyttsx3] Voice '%s' not found among %d voices, "
-                                    "using first installed voice '%s'",
-                                    personality.voice_name,
-                                    len(voices),
-                                    getattr(voices[0], "name", voices[0].id),
-                                )
-                            else:
-                                logger.warning(
-                                    "[Pyttsx3] No voices reported by engine, "
-                                    "system default voice will be used",
-                                )
-                        except Exception as e:
-                            logger.warning(
-                                "[Pyttsx3] Voice enumeration failed: %s — "
-                                "system default voice will be used", e,
-                            )
+                        # The persona's voice among this engine's own (chosen once
+                        # per personality by backend/core/voice_persona).
+                        from backend.core.voice_persona import Persona, choose, persona
+                        _who = persona()
+                        if personality.voice_name and personality.voice_name.lower() != _who.name.lower():
+                            _who = Persona(personality.voice_name, _who.locale, _who.gender)
+                        _choice = choose(getattr(self, "_voice_options", []), _who)
+                        if _choice is not None:
+                            self._engine.setProperty('voice', _choice.id)
 
                         self._engine.say(message)
                         self._engine.runAndWait()
@@ -1541,16 +1474,17 @@ class EdgeTTSEngine(TTSEngine):
         device_held = _is_audio_device_held()
 
         try:
-            # Map personality voice to Edge TTS voice
-            voice_map = {
-                "daniel": "en-GB-RyanNeural",
-                "samantha": "en-US-AriaNeural",
-                "alex": "en-US-ChristopherNeural",
-            }
-            edge_voice = voice_map.get(
-                personality.voice_name.lower(),
-                "en-GB-RyanNeural"
-            )
+            # The edge-tts voice that renders this personality's voice, chosen
+            # from edge-tts's own catalogue by backend/core/voice_persona
+            # (exact name, else the declared locale and gender).
+            from backend.core.voice_persona import Persona, edge_tts_voice, persona
+            _who = persona()
+            if personality.voice_name and personality.voice_name.lower() != _who.name.lower():
+                _who = Persona(personality.voice_name, _who.locale, _who.gender)
+            edge_voice = await edge_tts_voice(_who)
+            if edge_voice is None:
+                self.last_error = f"no edge-tts voice renders {_who.describe()}"
+                return False
 
             # Generate and play audio
             communicate = edge_tts.Communicate(message, edge_voice)

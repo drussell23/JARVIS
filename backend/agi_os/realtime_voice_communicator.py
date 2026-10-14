@@ -880,9 +880,12 @@ class RealTimeVoiceCommunicator:
         for old, new in replacements.items():
             processed = processed.replace(old, new)
 
-        # Handle special terms
-        processed = processed.replace('JARVIS', '[[rate -15]]JARVIS[[rate +15]]')
-        processed = processed.replace('Derek', '[[rate -10]]Derek[[rate +10]]')
+        # Handle special terms: `[[rate]]` is macOS `say` embedded-command
+        # syntax, and only `say` renders this text on macOS. Any other engine
+        # (the persona voice elsewhere) would read the brackets aloud.
+        if sys.platform == "darwin":
+            processed = processed.replace('JARVIS', '[[rate -15]]JARVIS[[rate +15]]')
+            processed = processed.replace('Derek', '[[rate -10]]Derek[[rate +10]]')
 
         return processed
 

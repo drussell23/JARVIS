@@ -11,6 +11,7 @@
  */
 
 import configService from '../services/DynamicConfigService';
+import { getVoicePersona, choosePersonaVoice } from '../utils/voicePersona';
 
 // Connection states
 const CONNECTION_STATE = {
@@ -306,9 +307,18 @@ class VisionConnection {
     const summary = notifications.slice(0, 3).join(', ');
     const message = `I've detected ${notifications.length} notification${notifications.length > 1 ? 's' : ''}: ${summary}`;
 
-    const utterance = new SpeechSynthesisUtterance(message);
-    utterance.volume = 0.7;
-    window.speechSynthesis.speak(utterance);
+    // In JARVIS's declared voice or not at all (utils/voicePersona): the
+    // browser default here is whoever the OS ships (David, Samantha).
+    getVoicePersona(configService.getApiUrl())
+      .then((persona) => {
+        const voice = choosePersonaVoice(window.speechSynthesis.getVoices(), persona);
+        if (!voice && persona.enforce !== false) return;
+        const utterance = new SpeechSynthesisUtterance(message);
+        if (voice) utterance.voice = voice;
+        utterance.volume = 0.7;
+        window.speechSynthesis.speak(utterance);
+      })
+      .catch((err) => console.warn('[Vision] Voice persona unavailable:', err.message));
   }
 
   /**

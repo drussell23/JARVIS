@@ -10623,6 +10623,17 @@ def _generate_silent_audio_response():
     )
 
 
+@app.get("/audio/persona")
+async def audio_persona():
+    """JARVIS's declared voice (backend/core/voice_persona), so a client that
+    must speak by itself -- the browser's speechSynthesis fallback -- picks
+    by the same rule as every server-side engine instead of its own list."""
+    from dataclasses import asdict
+    from backend.core.voice_persona import enforce_persona, persona
+
+    return {**asdict(persona()), "enforce": enforce_persona()}
+
+
 @app.get("/audio/speak/{text}")
 async def audio_speak_get(text: str):
     """GET endpoint for audio speak - decodes URL-encoded text and processes"""

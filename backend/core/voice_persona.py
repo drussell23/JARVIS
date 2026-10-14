@@ -106,6 +106,45 @@ def choose(options: Iterable[VoiceOption], who: Optional[Persona] = None) -> Opt
     return same_locale[0] if same_locale else None
 
 
+# --- pyttsx3: the OS speech engine (SAPI5 / NSSpeech / eSpeak) ---------------
+
+def pyttsx3_persona_engine():
+    """``(engine, options, error)`` for a pyttsx3 engine set to the persona.
+
+    BLOCKING -- call it in a worker thread, and keep that engine's COM work
+    there: on Windows the engine and its voices are COM objects, and one
+    released on another thread (the event loop, by the garbage collector)
+    blocks forever in comtypes -- it wedged boot. Only plain data, and the
+    engine when it is kept, leave this function.
+
+    ``engine`` is None when pyttsx3 failed (``error`` says why) or when no
+    installed voice renders the persona under :func:`enforce_persona` -- told
+    to use "Daniel", Windows SAPI silently speaks as David.
+    """
+    try:
+        import pyttsx3
+
+        engine = pyttsx3.init()
+        options = [
+            VoiceOption(id=str(v.id), name=str(getattr(v, "name", "") or v.id),
+                        locale=str((list(getattr(v, "languages", None) or [""])[0]) or ""),
+                        gender=str(getattr(v, "gender", "") or ""))
+            for v in (engine.getProperty("voices") or [])
+        ]
+        choice = choose(options)
+        if choice is None and enforce_persona():
+            engine.stop()
+            del engine
+            import gc
+            gc.collect()  # release the declined engine here, on its own thread
+            return None, options, f"no installed voice renders {persona().describe()}"
+        if choice is not None:
+            engine.setProperty("voice", choice.id)
+        return engine, options, ""
+    except Exception as exc:  # noqa: BLE001 -- not installed / no audio stack
+        return None, [], str(exc) or type(exc).__name__
+
+
 # --- edge-tts: the cross-platform neural voices -------------------------------
 
 _edge_options: Optional[List[VoiceOption]] = None
@@ -134,4 +173,5 @@ async def edge_tts_voice(who: Optional[Persona] = None) -> Optional[str]:
     return choice.id if choice else None
 
 
-__all__ = ["Persona", "VoiceOption", "choose", "edge_tts_voice", "enforce_persona", "persona"]
+__all__ = ["Persona", "VoiceOption", "choose", "edge_tts_voice", "enforce_persona", "persona",
+           "pyttsx3_persona_engine"]
