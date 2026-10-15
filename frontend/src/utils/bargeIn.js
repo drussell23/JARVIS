@@ -32,15 +32,78 @@ export function resetBargeInPolicy() {
   policyPromise = null;
 }
 
-/** The words of *text*, lower-cased, letters and digits only. */
+// Number words, so "eight thirty" said and "8:30" transcribed are the same
+// words (2026-10-15: JARVIS said "from eight thirty to nine AM", heard its
+// own echo as "8:30 to 9 a.m." -- two words in six matched -- took it for
+// the user and stopped itself mid-answer).
+const UNITS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine',
+  'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen',
+  'eighteen', 'nineteen'];
+const TENS = ['', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'];
+const NUMBER_WORDS = new Map([
+  ...UNITS.map((word, value) => [word, value]),
+  ...TENS.map((word, index) => [word, index * 10]).filter(([word]) => word),
+]);
+const SCALES = new Map([['hundred', 100], ['thousand', 1000]]);
+
+/** Runs of number words as the digits they say: "twenty five" -> "25",
+ *  "two hundred and five" -> "205"; "eight thirty" stays two numbers (a
+ *  time), as "8:30" is two once split. */
+function numbersAsDigits(tokens) {
+  const out = [];
+  let value = null;     // the number being read
+  let lastUnit = null;  // the last word's own value, to tell "twenty five" from "five twenty"
+  const flush = () => {
+    if (value !== null) out.push(String(value));
+    value = null;
+    lastUnit = null;
+  };
+  tokens.forEach((token, i) => {
+    if (NUMBER_WORDS.has(token)) {
+      const n = NUMBER_WORDS.get(token);
+      // A unit after a tens word joins it ("twenty five"); anything else
+      // after a number starts a new one ("eight thirty", "five twenty").
+      const joins = value !== null && lastUnit !== null && lastUnit % 10 === 0 && lastUnit >= 20
+        && n < 10 && value % 10 === 0;
+      if (joins) {
+        value += n;
+      } else if (value !== null && lastUnit === null) {
+        value += n; // after "hundred": "two hundred five"
+      } else {
+        flush();
+        value = n;
+      }
+      lastUnit = n;
+    } else if (SCALES.has(token) && value !== null) {
+      value *= SCALES.get(token);
+      lastUnit = null;
+    } else if (token === 'and' && value !== null && lastUnit === null && NUMBER_WORDS.has(tokens[i + 1])) {
+      // "two hundred AND five": part of the number
+    } else {
+      flush();
+      out.push(token);
+    }
+  });
+  flush();
+  return out;
+}
+
+/** The words of *text* in one canonical form, whoever wrote them: lower case,
+ *  no accents, letters and digits only, "a.m."/"AM" -> "am", number words as
+ *  digits, "8:30" as "8" "30". What JARVIS said and what the recogniser
+ *  transcribed of it compare word for word. */
 export function wordsOf(text) {
-  return (text || '')
+  const tokens = (text || '')
     .toLowerCase()
     .normalize('NFKD')
-    .replace(/[̀-ͯ]/g, '')
+    .replace(/\p{M}/gu, '') // accents: the combining marks NFKD separated out
+    // Single letters each followed by a dot are one word: "a.m." -> "am",
+    // "u.s." -> "us" ("Dr." is not a run of single letters and stays).
+    .replace(/\b(?:\p{L}\.)+\p{L}?\.?/gu, (run) => run.replace(/\./g, ''))
     .split(/[^\p{L}\p{N}']+/u)
     .map((w) => w.replace(/^'+|'+$/g, ''))
     .filter(Boolean);
+  return numbersAsDigits(tokens);
 }
 
 /**

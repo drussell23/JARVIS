@@ -18,8 +18,8 @@ export function sanitizeForSpeech(rawText) {
   cleaned = cleaned.replace(/\.\s*$/g, '');          // trailing "." -> ""
   try {
     cleaned = cleaned.replace(/\p{Extended_Pictographic}/gu, '');
-    cleaned = cleaned.replace(/‍/g, '');
-    cleaned = cleaned.replace(/[︀-️]/g, '');
+    cleaned = cleaned.replace(/\u{200D}/gu, '');              // zero-width joiners
+    cleaned = cleaned.replace(/[\u{FE00}-\u{FE0F}]/gu, '');   // variation selectors
   } catch (_e) {
     cleaned = cleaned.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}]/gu, '');
   }

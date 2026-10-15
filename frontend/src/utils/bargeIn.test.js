@@ -83,3 +83,34 @@ describe('decideHeard', () => {
       .toBe('pass');
   });
 });
+
+// JARVIS speaks numbers as words; the recogniser writes what it hears as
+// digits (2026-10-15: "from eight thirty to nine AM" came back as
+// "8:30 to 9 a.m.", matched 2 words in 6, and JARVIS stopped itself).
+describe('one canonical form for what was said and what was heard', () => {
+  const said = 'First up is a Babel Audio onboarding session in Google Meet from eight thirty to nine AM.';
+  const lunch = 'Then you have lunch with Derek from one to two PM.';
+
+  test('number words become the digits a recogniser writes', () => {
+    expect(wordsOf('eight thirty to nine AM')).toEqual(['8', '30', 'to', '9', 'am']);
+    expect(wordsOf('from 8:30 to 9 a.m.')).toEqual(['from', '8', '30', 'to', '9', 'am']);
+    expect(wordsOf('twenty five')).toEqual(['25']);
+    expect(wordsOf('two hundred and five')).toEqual(['205']);
+    expect(wordsOf('five twenty')).toEqual(['5', '20']);
+    expect(wordsOf('at 3 p.m')).toEqual(['at', '3', 'pm']);
+    expect(wordsOf('Dr. Smith')).toEqual(['dr', 'smith']);
+    expect(wordsOf('café')).toEqual(['cafe']);
+  });
+
+  test('the live echo is recognised as JARVIS, not the user', () => {
+    expect(echoOverlap('in google meet from 8:30 to 9 a.m.', said)).toBe(1);
+    expect(echoOverlap('lunch with Derek from 1 to 2 p.m.', lunch)).toBe(1);
+    const moment = { speaking: true, msSinceSpoke: null, msSinceBargeIn: null, utteranceJudged: false };
+    expect(decideHeard('from 8:30 to 9 a.m.', [said, lunch], policy, moment).action).toBe('ignore');
+  });
+
+  test('the user still interrupts', () => {
+    const moment = { speaking: true, msSinceSpoke: null, msSinceBargeIn: null, utteranceJudged: false };
+    expect(decideHeard('what about friday at 3', [said, lunch], policy, moment).action).toBe('interrupt');
+  });
+});
