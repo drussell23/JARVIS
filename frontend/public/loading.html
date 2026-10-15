@@ -287,7 +287,8 @@
             stroke-linecap: round;
             stroke-dasharray: 597;
             stroke-dashoffset: 597;
-            transition: stroke-dashoffset 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+            /* No transition: the page eases progress itself (loading-manager.js);
+               a CSS easing restarted on every frame left the ring behind the number. */
             filter: drop-shadow(0 0 6px var(--jarvis-green-glow));
         }
 
@@ -640,7 +641,7 @@
             background-size: 200% 100%;
             animation: shimmer 3s infinite linear;
             width: 0%;
-            transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+            /* Eased by the page, like the ring (no CSS transition on width). */
             position: relative;
             border-radius: 3px;
             box-shadow: 0 0 8px var(--jarvis-green-glow);

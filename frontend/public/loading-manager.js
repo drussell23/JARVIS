@@ -4278,9 +4278,11 @@ class JARVISLoadingManager {
         // v225.0: Update SVG circular progress ring around arc reactor
         const ring = document.getElementById('progress-ring-fill');
         if (ring) {
-            const circumference = 597; // 2 * Math.PI * 95 ≈ 597
-            const offset = circumference - (displayProgress / 100) * circumference;
-            ring.style.strokeDashoffset = offset;
+            // Measured from the ring's own geometry (the stylesheet's 597 is
+            // only its starting value, before the first update).
+            const circumference = 2 * Math.PI * ring.r.baseVal.value;
+            ring.style.strokeDasharray = `${circumference}`;
+            ring.style.strokeDashoffset = `${circumference * (1 - displayProgress / 100)}`;
 
             // Intensify glow as progress increases
             const glowIntensity = 4 + (displayProgress / 100) * 12;
