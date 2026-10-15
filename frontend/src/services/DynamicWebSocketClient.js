@@ -834,17 +834,43 @@ class DynamicWebSocketClient {
     }
 
     try {
-      // v360.2: Wrap with event stream envelope if applicable
-      const url = this._getConnectionUrl(ws);
-      if (url && this._esUrls.has(url)) {
-        ws.send(this._esCodec.wrapOutbound(message));
-      } else {
-        ws.send(JSON.stringify(message));
-      }
+      this._transmit(ws, message);
       return true;
     } catch (error) {
       console.error('Send failed:', error);
       return this._queueMessage(message, capability, 'normal');
+    }
+  }
+
+  /**
+   * One frame on one socket, in that socket's protocol (v360.2: the event
+   * stream envelope on /ws/stream, plain JSON elsewhere).
+   */
+  _transmit(ws, message) {
+    const url = this._getConnectionUrl(ws);
+    if (url && this._esUrls.has(url)) {
+      ws.send(this._esCodec.wrapOutbound(message));
+    } else {
+      ws.send(JSON.stringify(message));
+    }
+  }
+
+  /**
+   * Send *message* on the connection to *url* only -- for what describes that
+   * connection itself (e.g. the capabilities declared on it). False when that
+   * connection is not open; it is declared again when it (re)connects.
+   */
+  sendTo(url, message) {
+    const ws = this.connections.get(url);
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    try {
+      this._transmit(ws, message);
+      return true;
+    } catch (error) {
+      console.warn(`[WS-CLIENT] send to ${url} failed:`, error);
+      return false;
     }
   }
 

@@ -865,8 +865,46 @@ class BoundedPriorityQueue(Generic[T]):
 # TTS Engine Interface with Circuit Breaker
 # =============================================================================
 
+@dataclass(frozen=True)
+class RenderedSpeech:
+    """A line rendered in JARVIS's voice, for a listener who plays it
+    themselves (a client of the web app) instead of hearing this host."""
+    audio: bytes
+    media_type: str
+    engine: str
+
+
+async def _read_and_remove(path: str) -> bytes:
+    """A rendered file's bytes, read off the loop; the file is removed."""
+    def _read() -> bytes:
+        try:
+            with open(path, "rb") as handle:
+                return handle.read()
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    return await asyncio.to_thread(_read)
+
+
+def _temp_audio_path(suffix: str) -> str:
+    """A fresh temp file for one rendered line (closed, ready to be written)."""
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix="jarvis_render_")
+    os.close(fd)
+    return path
+
+
 class TTSEngine(ABC):
-    """Abstract base for TTS engines with circuit breaker."""
+    """Abstract base for TTS engines with circuit breaker.
+
+    An engine both speaks a line on this host (``speak``) and, when it can
+    write its voice to a file, renders it for a listener elsewhere
+    (``render``) -- the same voice, the same personality, either way."""
+
+    #: The media type of a file this engine renders ("" when it cannot).
+    render_media_type: str = ""
 
     def __init__(self, name: str, config: VoiceConfig):
         self.name = name
@@ -936,6 +974,51 @@ class TTSEngine(ABC):
             logger.error(f"[{self.name}] Speak error: {e}")
             return False
 
+    async def _render_file(
+        self, message: str, personality: VoicePersonality, timeout: float, path: str,
+    ) -> bool:
+        """Write *message* in this engine's voice to *path*; False when it
+        cannot. Engines that only play out loud keep this default."""
+        return False
+
+    async def render(
+        self,
+        message: str,
+        personality: VoicePersonality,
+        timeout: Optional[float] = None,
+    ) -> Optional[RenderedSpeech]:
+        """*message* as audio for a listener who plays it themselves, or None.
+        Behind the same mute and circuit breaker as ``speak``."""
+        from backend.core.voice_mute import voice_muted
+        if not self.render_media_type or voice_muted():
+            return None
+        if not await self._circuit_breaker.can_execute():
+            return None
+        suffix = {"audio/mpeg": ".mp3", "audio/wav": ".wav"}.get(self.render_media_type, "")
+        path = _temp_audio_path(suffix)
+        try:
+            written = await self._render_file(message, personality,
+                                              timeout or self.config.engine_timeout, path)
+            audio = await _read_and_remove(path) if written else b""
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 -- the next engine renders it
+            self.last_error = f"render: {type(e).__name__}: {e}"
+            audio = b""
+        finally:
+            if os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        if not audio:
+            self.failure_count += 1
+            await self._circuit_breaker.record_failure()
+            return None
+        self.success_count += 1
+        await self._circuit_breaker.record_success()
+        return RenderedSpeech(audio=audio, media_type=self.render_media_type, engine=self.name)
+
     def get_health_score(self) -> float:
         """Get health score 0.0-1.0 based on success/failure ratio."""
         total = self.success_count + self.failure_count
@@ -986,6 +1069,35 @@ def _is_audio_device_held() -> bool:
 
 class MacOSSayEngine(TTSEngine):
     """macOS 'say' command engine (fastest, most reliable on macOS)."""
+
+    render_media_type = "audio/wav"
+
+    async def _render_file(
+        self, message: str, personality: VoicePersonality, timeout: float, path: str,
+    ) -> bool:
+        """*message* as a WAV file (every browser plays WAV; `say`'s own AIFF
+        only some), in the voice ``safe_say`` speaks this host's lines in --
+        so a listener elsewhere hears the voice the speakers here would."""
+        from backend.core.supervisor.unified_voice_orchestrator import _resolve_voice
+        from backend.core.voice_persona import persona
+        voice = await _resolve_voice(personality.voice_name or persona().name)
+        if not voice:
+            self.last_error = "no installed voice renders the persona"
+            return False
+        proc = await asyncio.create_subprocess_exec(
+            "say", "-v", voice, "-r", str(personality.rate), "-o", path,
+            "--file-format=WAVE", "--data-format=LEI16", message,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise
+        if proc.returncode != 0:
+            self.last_error = f"say -o failed: {(err or b'').decode(errors='replace').strip()[:200]}"
+            return False
+        return True
 
     def __init__(self, config: VoiceConfig):
         super().__init__("macos_say", config)
@@ -1263,6 +1375,41 @@ class MacOSSayEngine(TTSEngine):
 class Pyttsx3Engine(TTSEngine):
     """Pyttsx3 engine (cross-platform, offline)."""
 
+    render_media_type = "audio/wav"
+
+    def _apply_personality(self, personality: VoicePersonality) -> None:
+        """Rate, volume and the persona's voice among this engine's own
+        (chosen once per personality by backend/core/voice_persona). Called
+        under ``self._lock``: the driver is one object."""
+        self._engine.setProperty('rate', personality.rate)
+        self._engine.setProperty('volume', personality.volume)
+        from backend.core.voice_persona import Persona, choose, persona
+        _who = persona()
+        if personality.voice_name and personality.voice_name.lower() != _who.name.lower():
+            _who = Persona(personality.voice_name, _who.locale, _who.gender)
+        _choice = choose(getattr(self, "_voice_options", []), _who)
+        if _choice is not None:
+            self._engine.setProperty('voice', _choice.id)
+
+    async def _render_file(
+        self, message: str, personality: VoicePersonality, timeout: float, path: str,
+    ) -> bool:
+        """*message* written to *path* (WAV) by the same driver and voice
+        that speak it. Only when an installed voice renders the persona
+        (``initialize`` leaves the engine unset otherwise)."""
+        if not self._engine:
+            return False
+
+        def _write() -> None:
+            with self._lock:
+                self._apply_personality(personality)
+                self._engine.save_to_file(message, path)
+                self._engine.runAndWait()
+
+        async with self._executor_lock:
+            await asyncio.wait_for(asyncio.to_thread(_write), timeout=timeout)
+        return os.path.getsize(path) > 0
+
     def __init__(self, config: VoiceConfig):
         super().__init__("pyttsx3", config)
         self._engine: Optional[Any] = None
@@ -1353,18 +1500,7 @@ class Pyttsx3Engine(TTSEngine):
 
                 def _speak():
                     with self._lock:
-                        self._engine.setProperty('rate', personality.rate)
-                        self._engine.setProperty('volume', personality.volume)
-                        # The persona's voice among this engine's own (chosen once
-                        # per personality by backend/core/voice_persona).
-                        from backend.core.voice_persona import Persona, choose, persona
-                        _who = persona()
-                        if personality.voice_name and personality.voice_name.lower() != _who.name.lower():
-                            _who = Persona(personality.voice_name, _who.locale, _who.gender)
-                        _choice = choose(getattr(self, "_voice_options", []), _who)
-                        if _choice is not None:
-                            self._engine.setProperty('voice', _choice.id)
-
+                        self._apply_personality(personality)
                         self._engine.say(message)
                         self._engine.runAndWait()
 
@@ -1444,8 +1580,29 @@ class Pyttsx3Engine(TTSEngine):
 class EdgeTTSEngine(TTSEngine):
     """Edge TTS engine (cloud-based, high quality)."""
 
+    render_media_type = "audio/mpeg"
+
     def __init__(self, config: VoiceConfig):
         super().__init__("edge_tts", config)
+
+    async def _render_file(
+        self, message: str, personality: VoicePersonality, timeout: float, path: str,
+    ) -> bool:
+        """*message* in the edge-tts voice that renders this personality's
+        voice, chosen from edge-tts's own catalogue by backend/core/
+        voice_persona (exact name, else the declared locale and gender)."""
+        if not EDGE_TTS_AVAILABLE:
+            return False
+        from backend.core.voice_persona import Persona, edge_tts_voice, persona
+        _who = persona()
+        if personality.voice_name and personality.voice_name.lower() != _who.name.lower():
+            _who = Persona(personality.voice_name, _who.locale, _who.gender)
+        edge_voice = await edge_tts_voice(_who)
+        if edge_voice is None:
+            self.last_error = f"no edge-tts voice renders {_who.describe()}"
+            return False
+        await asyncio.wait_for(edge_tts.Communicate(message, edge_voice).save(path), timeout=timeout)
+        return True
 
     async def initialize(self) -> bool:
         """Check if edge-tts is available."""
@@ -1474,34 +1631,11 @@ class EdgeTTSEngine(TTSEngine):
         if not EDGE_TTS_AVAILABLE:
             return False
 
-        device_held = _is_audio_device_held()
-
         try:
-            # The edge-tts voice that renders this personality's voice, chosen
-            # from edge-tts's own catalogue by backend/core/voice_persona
-            # (exact name, else the declared locale and gender).
-            from backend.core.voice_persona import Persona, edge_tts_voice, persona
-            _who = persona()
-            if personality.voice_name and personality.voice_name.lower() != _who.name.lower():
-                _who = Persona(personality.voice_name, _who.locale, _who.gender)
-            edge_voice = await edge_tts_voice(_who)
-            if edge_voice is None:
-                self.last_error = f"no edge-tts voice renders {_who.describe()}"
-                return False
-
-            # Generate and play audio
-            communicate = edge_tts.Communicate(message, edge_voice)
-
-            # Save to temp file and play
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                temp_path = f.name
-
+            temp_path = _temp_audio_path(".mp3")
             try:
-                await asyncio.wait_for(
-                    communicate.save(temp_path),
-                    timeout=timeout
-                )
+                if not await self._render_file(message, personality, timeout, temp_path):
+                    return False
 
                 # v283.0: Always use native playback (afplay/mpg123) instead
                 # of AudioBus.play_audio(). PortAudio callback is GIL-dependent
@@ -2253,6 +2387,51 @@ class TrinityVoiceCoordinator:
 
         logger.info(f"[TrinityVoice] Worker {worker_id} stopped")
 
+    def _ordered_engines(self, context: "VoiceContext") -> List[TTSEngine]:
+        """The engines to try for *context*, in order -- one rule for a line
+        spoken here and a line rendered for a client, so both are the same
+        voice. Context-aware and environment-driven: for startup/narrator
+        contexts macOS `say` comes first to keep the timbre consistent and
+        avoid noisy fallback engines during boot; ties go to the healthier."""
+        if platform.system() == "Darwin" and not _allow_pyttsx3_on_darwin():
+            default_engine_order = "macos_say,edge_tts"
+        else:
+            default_engine_order = "macos_say,pyttsx3,edge_tts"
+        if context in (VoiceContext.STARTUP, VoiceContext.NARRATOR):
+            order_raw = os.getenv("JARVIS_STARTUP_TTS_ENGINE_ORDER", default_engine_order)
+        else:
+            order_raw = os.getenv("JARVIS_TTS_ENGINE_ORDER", default_engine_order)
+
+        engine_order = [name.strip().lower() for name in order_raw.split(",") if name.strip()]
+        order_index = {name: idx for idx, name in enumerate(engine_order)}
+        return sorted(
+            self._engines,
+            key=lambda e: (order_index.get(e.name.lower(), len(engine_order)), -e.get_health_score()),
+        )
+
+    async def render(
+        self,
+        message: str,
+        context: "VoiceContext" = None,
+        timeout: Optional[float] = None,
+    ) -> Optional[RenderedSpeech]:
+        """*message* rendered in JARVIS's voice for a client that plays it
+        itself: the first engine, in speaking order, that can write it to a
+        file. None when none can -- the client then shows the text."""
+        if not message or not message.strip():
+            return None
+        context = context or VoiceContext.RUNTIME
+        personality = self._personality_profiles.get(
+            context, self._personality_profiles[VoiceContext.RUNTIME])
+        for engine in self._ordered_engines(context):
+            if not engine.available:
+                continue
+            rendered = await engine.render(message, personality, timeout)
+            if rendered is not None:
+                return rendered
+            logger.debug("[TrinityVoice] render via %s unavailable: %s", engine.name, engine.last_error)
+        return None
+
     async def _process_announcement(
         self,
         announcement: VoiceAnnouncement,
@@ -2273,34 +2452,7 @@ class TrinityVoiceCoordinator:
             f"{announcement.message[:80]} [corr={announcement.correlation_id}]"
         )
 
-        # Engine ordering is context-aware and environment-driven.
-        # For startup/narrator contexts we prefer macOS `say` first to keep voice
-        # timbre consistent and avoid noisy fallback engines during boot.
-        if platform.system() == "Darwin" and not _allow_pyttsx3_on_darwin():
-            default_engine_order = "macos_say,edge_tts"
-        else:
-            default_engine_order = "macos_say,pyttsx3,edge_tts"
-        if announcement.context in (VoiceContext.STARTUP, VoiceContext.NARRATOR):
-            order_raw = os.getenv("JARVIS_STARTUP_TTS_ENGINE_ORDER", default_engine_order)
-        else:
-            order_raw = os.getenv("JARVIS_TTS_ENGINE_ORDER", default_engine_order)
-
-        engine_order = [
-            engine_name.strip().lower()
-            for engine_name in order_raw.split(",")
-            if engine_name.strip()
-        ]
-        order_index = {name: idx for idx, name in enumerate(engine_order)}
-
-        engines = sorted(
-            self._engines,
-            key=lambda e: (
-                order_index.get(e.name.lower(), len(engine_order)),
-                -e.get_health_score(),
-            ),
-        )
-
-        for engine in engines:
+        for engine in self._ordered_engines(announcement.context):
             if not engine.available:
                 continue
 
@@ -2806,6 +2958,17 @@ async def announce(
     return await coordinator.announce(
         message, context, priority, source, metadata, correlation_id
     )
+
+
+async def render_speech(
+    message: str,
+    context: VoiceContext = VoiceContext.RUNTIME,
+    timeout: Optional[float] = None,
+) -> Optional[RenderedSpeech]:
+    """*message* in JARVIS's voice, as audio for a client to play
+    (TrinityVoiceCoordinator.render)."""
+    coordinator = await get_voice_coordinator()
+    return await coordinator.render(message, context, timeout)
 
 
 async def shutdown_voice_coordinator():

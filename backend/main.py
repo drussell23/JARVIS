@@ -10385,213 +10385,58 @@ def _get_tts_timeout_seconds(env_var: str, default: float) -> float:
     return default
 
 
-_TTS_JARVIS_TIMEOUT_SECONDS = _get_tts_timeout_seconds(
-    "JARVIS_TTS_JARVIS_TIMEOUT_SECONDS",
-    5.0,
-)
-_TTS_ASYNC_TIMEOUT_SECONDS = _get_tts_timeout_seconds(
-    "JARVIS_TTS_ASYNC_TIMEOUT_SECONDS",
-    7.5,
-)
-_TTS_GLOBAL_TIMEOUT_SECONDS = _get_tts_timeout_seconds(
+#: How long a line may take to render before the client is told to show it
+#: instead (an edge-tts round trip; a local engine is faster).
+_TTS_RENDER_TIMEOUT_SECONDS = _get_tts_timeout_seconds(
     "JARVIS_TTS_GLOBAL_TIMEOUT_SECONDS",
     8.0,
 )
-# Global timeout must cover the slowest candidate timeout plus small scheduling slack.
-_TTS_GLOBAL_TIMEOUT_SECONDS = max(
-    _TTS_GLOBAL_TIMEOUT_SECONDS,
-    _TTS_JARVIS_TIMEOUT_SECONDS + 0.5,
-    _TTS_ASYNC_TIMEOUT_SECONDS + 0.5,
-)
-
-
-async def _try_jarvis_api_tts(jarvis_api, request):
-    """v241.0: TTS Strategy 1 — JARVIS Voice API."""
-    try:
-        result = await asyncio.wait_for(
-            jarvis_api.speak(request), timeout=_TTS_JARVIS_TIMEOUT_SECONDS
-        )
-        # v242.0: Inject X-TTS-Status header into response from jarvis_api.speak()
-        if result is not None and hasattr(result, 'headers'):
-            result.headers["X-TTS-Status"] = "ok"
-            result.headers["Access-Control-Expose-Headers"] = "X-TTS-Status"
-        return result
-    except asyncio.TimeoutError:
-        logger.warning(
-            f"[TTS] JARVIS Voice API timed out after {_TTS_JARVIS_TIMEOUT_SECONDS:.1f}s"
-        )
-        return None
-    except asyncio.CancelledError:
-        logger.debug("[TTS] JARVIS Voice API cancelled (race lost)")
-        raise  # Re-raise so asyncio.wait() handles it
-    except Exception as e:
-        logger.warning(
-            f"[TTS] JARVIS Voice API failed: {type(e).__name__}: {e}"
-        )
-        return None
-
-
-async def _try_async_tts(text):
-    """v241.0: TTS Strategy 2 — Async TTS Handler (cached macOS say)."""
-    _tmp_path = None
-    try:
-        from api.async_tts_handler import generate_speech_async
-        from fastapi.responses import Response
-
-        audio_path, content_type = await asyncio.wait_for(
-            generate_speech_async(text, voice="Daniel"),
-            timeout=_TTS_ASYNC_TIMEOUT_SECONDS,
-        )
-        _tmp_path = audio_path
-        with open(audio_path, "rb") as f:
-            audio_data = f.read()
-        return Response(
-            content=audio_data,
-            media_type=content_type,
-            headers={
-                "Content-Disposition": "inline; filename=jarvis_speech.mp3",
-                "Cache-Control": "public, max-age=3600",
-                "Access-Control-Allow-Origin": "*",
-                "X-TTS-Status": "ok",  # v242.0: Signal successful TTS to frontend
-                "Access-Control-Expose-Headers": "X-TTS-Status",
-            },
-        )
-    except asyncio.TimeoutError:
-        logger.warning(
-            f"[TTS] Async TTS timed out after {_TTS_ASYNC_TIMEOUT_SECONDS:.1f}s"
-        )
-        return None
-    except asyncio.CancelledError:
-        # Clean up temp file if subprocess spawned before cancellation
-        if _tmp_path:
-            try:
-                os.unlink(_tmp_path)
-            except OSError:
-                pass
-        logger.debug("[TTS] Async TTS cancelled (race lost)")
-        raise
-    except Exception as e:
-        logger.warning(
-            f"[TTS] Async TTS failed: {type(e).__name__}: {e}"
-        )
-        return None
-
-
-async def _await_first_tts_success(
-    tasks: dict[str, "asyncio.Task"],
-    timeout_seconds: Optional[float] = None,
-    timeout: Optional[float] = None,
-    **kwargs,
-):
-    """
-    Wait for the first non-None TTS result within a global timeout.
-
-    Root-cause fix:
-    FIRST_COMPLETED alone is incorrect for multi-strategy races because a fast
-    failure can arrive before a slower success. This helper keeps waiting until
-    we either get a successful result or exhaust all candidates/timeout.
-    """
-    if not tasks:
-        return None
-
-    # Backward-compatible timeout contract:
-    # accept timeout_seconds, timeout, and legacy aliases.
-    if timeout_seconds is None:
-        timeout_seconds = timeout
-    if timeout_seconds is None:
-        timeout_seconds = kwargs.get("global_timeout")
-    if timeout_seconds is None:
-        timeout_seconds = kwargs.get("timeout_s")
-    if timeout_seconds is None:
-        timeout_seconds = 5.0
-
-    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
-    pending = set(tasks.values())
-
-    try:
-        while pending:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-
-            done, pending = await asyncio.wait(
-                pending,
-                timeout=remaining,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            if not done:
-                break
-
-            for task in done:
-                try:
-                    result = task.result()
-                except asyncio.CancelledError:
-                    continue
-                except Exception:
-                    continue
-
-                if result is not None:
-                    for other in pending:
-                        other.cancel()
-                    if pending:
-                        await asyncio.gather(*pending, return_exceptions=True)
-                    return result
-    finally:
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-
-    return None
 
 
 @app.post("/audio/speak")
 async def audio_speak_post(request: dict):
-    """
-    v241.0: Robust audio speak endpoint with PARALLEL strategy race.
-    Never returns 503 - always provides audio response.
+    """The line in JARVIS's voice, for a client that plays it itself.
 
-    Strategies 1 (JARVIS Voice API) and 2 (Async TTS Handler) race
-    concurrently with a configurable global timeout budget. On failure, returns silent
-    audio immediately — frontend falls back to browser speechSynthesis.
+    Rendered by the engines that speak on this host, in the same order and
+    persona (trinity_voice_coordinator.render_speech), so a browser hears the
+    voice the speakers here would. Two strategies raced here before, both
+    through macOS ``say`` with a voice named in code: on Windows both failed
+    and the browser spoke in a voice of its own choosing. When nothing can
+    render it, a silent clip marked ``X-TTS-Status: silent`` tells the client
+    -- which then uses its own persona-matched voice, or shows the text.
     """
     from fastapi.responses import Response
 
-    text = request.get("text", "")
-    if not text:
+    text = str(request.get("text", "") or "")
+    if not text.strip():
         return _generate_silent_audio_response()
-
-    # Build candidate tasks for parallel race
-    tasks = {}
-
-    voice = components.get("voice", {})
-    jarvis_api_inst = voice.get("jarvis_api")
-    if jarvis_api_inst:
-        tasks["jarvis_api"] = asyncio.create_task(_try_jarvis_api_tts(jarvis_api_inst, request))
-
     try:
-        from api.async_tts_handler import generate_speech_async  # noqa: F401
-        tasks["async_tts"] = asyncio.create_task(_try_async_tts(text))
-    except ImportError:
-        logger.debug("[TTS] Async TTS Handler not available")
+        from backend.core.supervisor.unified_voice_orchestrator import spoken_form
+        from backend.core.trinity_voice_coordinator import render_speech
 
-    if not tasks:
-        logger.warning("[TTS] No TTS strategies available, returning silent audio")
+        rendered = await asyncio.wait_for(
+            render_speech(spoken_form(text), timeout=_TTS_RENDER_TIMEOUT_SECONDS),
+            timeout=_TTS_RENDER_TIMEOUT_SECONDS + 0.5,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("[TTS] render timed out after %.1fs", _TTS_RENDER_TIMEOUT_SECONDS)
+        rendered = None
+    except Exception as exc:  # noqa: BLE001 -- the client still has the text
+        logger.warning("[TTS] render unavailable: %s: %s", type(exc).__name__, exc)
+        rendered = None
+    if rendered is None:
         return _generate_silent_audio_response()
-
-    # Race strategies by first SUCCESS with a global timeout budget.
-    result = await _await_first_tts_success(
-        tasks=tasks,
-        timeout_seconds=_TTS_GLOBAL_TIMEOUT_SECONDS,
+    return Response(
+        content=rendered.audio,
+        media_type=rendered.media_type,
+        headers={
+            "Cache-Control": "no-store",
+            "Access-Control-Allow-Origin": "*",
+            "X-TTS-Status": "ok",
+            "X-TTS-Engine": rendered.engine,
+            "Access-Control-Expose-Headers": "X-TTS-Status, X-TTS-Engine",
+        },
     )
-    if result is not None:
-        return result
-
-    # All failed or timed out — return silent audio.
-    # Frontend will use browser speechSynthesis as final fallback.
-    logger.warning("[TTS] All TTS strategies failed/timed out, returning silent audio")
-    return _generate_silent_audio_response()
 
 
 def _generate_silent_audio_response():

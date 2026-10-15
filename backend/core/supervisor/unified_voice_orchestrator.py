@@ -1453,6 +1453,29 @@ async def safe_say(
                      source, text[:60])
         return False
 
+    # WHERE IT IS HEARD. A line said for a command from a client that plays
+    # JARVIS's voice itself goes to that client (backend.core.command_identity):
+    # the user is there, not necessarily at this machine's speakers, and only
+    # the client can stop a line it is playing. Its presence is the answer to
+    # "is anybody there", so the presence check below does not apply. A line
+    # the client cannot take (it went away mid-command) is said here instead.
+    from backend.core.command_identity import command_voice
+    sink = command_voice.get()
+    counted = False  # this line has been through the dedup check
+    if sink is not None:
+        if not skip_dedup and global_speech_dedup_check(text):
+            logger.debug("[safe_say:%s] Dedup skipped: %s", source, text[:60])
+            return False
+        try:
+            if await sink(text, source):
+                return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- the host's speakers still say it
+            logger.debug("[safe_say:%s] client voice unavailable: %s", source, exc)
+        logger.info("[safe_say:%s] the client did not take the line; saying it here", source)
+        counted = True
+
     # `skip_gate` is the deliberate carve-out and it already existed for
     # exactly this class of message: something urgent enough to say whether
     # or not the room is ready for it. Emergencies still speak.
@@ -1477,7 +1500,7 @@ async def safe_say(
     # whose engines render the persona and share the one speaker
     # (native_audio_player). It used to fail here silently.
     if shutil.which("say") is None:
-        if not skip_dedup and global_speech_dedup_check(text):
+        if not (skip_dedup or counted) and global_speech_dedup_check(text):
             return False
         try:
             from backend.core.trinity_voice_coordinator import (
@@ -1493,7 +1516,7 @@ async def safe_say(
             return False
 
     # 1. Dedup check (broker-level, across all subsystems)
-    if not skip_dedup:
+    if not (skip_dedup or counted):
         if global_speech_dedup_check(text):
             logger.debug("[safe_say:%s] Dedup skipped: %s", source, text[:60])
             return False

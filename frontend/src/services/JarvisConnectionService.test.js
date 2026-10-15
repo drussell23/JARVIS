@@ -1,4 +1,4 @@
-import JarvisConnectionService, { ConnectionState } from './JarvisConnectionService';
+import JarvisConnectionService, { ConnectionState, VOICE_PLAYBACK_CAPABILITY } from './JarvisConnectionService';
 import DynamicWebSocketClient from './DynamicWebSocketClient';
 
 describe('JarvisConnectionService control-plane recovery discovery', () => {
@@ -120,5 +120,75 @@ describe('DynamicWebSocketClient reconnect policy', () => {
 
     expect(reconnectSpy).not.toHaveBeenCalled();
     client.destroy();
+  });
+});
+
+describe('JarvisConnectionService declared capabilities', () => {
+  let initSpy;
+
+  beforeEach(() => {
+    initSpy = jest
+      .spyOn(JarvisConnectionService.prototype, '_initializeAsync')
+      .mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    initSpy.mockRestore();
+  });
+
+  const fakeClient = (openUrls) => {
+    const handlers = {};
+    return {
+      endpoints: [
+        { path: 'ws://h/ws', capabilities: ['voice', 'command', 'jarvis', 'general'] },
+        { path: 'ws://h/vision/ws/vision', capabilities: ['vision', 'monitoring'] },
+      ],
+      connections: new Map(openUrls.map((url) => [url, {}])),
+      sent: [],
+      sendTo(url, message) { this.sent.push([url, message]); return true; },
+      on(event, handler) { handlers[event] = handler; },
+      fire(event, data) { handlers[event](data); },
+    };
+  };
+
+  test('a declaration reaches the command connection, not the vision one', () => {
+    const service = new JarvisConnectionService();
+    service.wsClient = fakeClient(['ws://h/ws', 'ws://h/vision/ws/vision']);
+
+    service.declareCapability(VOICE_PLAYBACK_CAPABILITY);
+
+    expect(service.wsClient.sent).toEqual([
+      ['ws://h/ws', { type: 'subscribe', capabilities: ['voice_playback'] }],
+    ]);
+  });
+
+  test('every new connection is told again, so a reconnect keeps the voice', () => {
+    const service = new JarvisConnectionService();
+    service.wsClient = fakeClient([]);
+    service._setupWebSocketHandlers();
+    service.declareCapability(VOICE_PLAYBACK_CAPABILITY);   // nothing open yet
+
+    service.wsClient.fire('connected', { endpoint: 'ws://h/ws' });
+
+    expect(service.wsClient.sent).toEqual([
+      ['ws://h/ws', { type: 'subscribe', capabilities: ['voice_playback'] }],
+    ]);
+  });
+
+  test('withdrawn once by its last declarer, and only once', () => {
+    const service = new JarvisConnectionService();
+    service.wsClient = fakeClient(['ws://h/ws']);
+    const first = service.declareCapability(VOICE_PLAYBACK_CAPABILITY);
+    const second = service.declareCapability(VOICE_PLAYBACK_CAPABILITY);
+    service.wsClient.sent = [];
+
+    first();
+    first();
+    expect(service.wsClient.sent).toEqual([]);
+    second();
+    expect(service.wsClient.sent).toEqual([
+      ['ws://h/ws', { type: 'unsubscribe', capabilities: ['voice_playback'] }],
+    ]);
+    expect(service.declaredCapabilities.size).toBe(0);
   });
 });

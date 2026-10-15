@@ -109,7 +109,10 @@ async def _acknowledge_if_slow() -> None:
 
 async def _say_reply(text: str) -> bool:
     """Say *text* in JARVIS's voice; True when it is being said (the client
-    then shows it without speaking it)."""
+    then shows it without speaking it). Heard where the command came from:
+    a page that plays the voice itself gets it as a ``voice_line`` (safe_say
+    reads the command's voice, backend.core.command_identity); otherwise the
+    host's speakers say it."""
     try:
         from backend.core.supervisor.unified_voice_orchestrator import safe_say, spoken_form
         asyncio.create_task(
@@ -347,6 +350,25 @@ class UnifiedWebSocketManager:
                 pass
 
         return True
+
+    def voice_sink(self, client_id: str):
+        """Where the lines said for this client's commands are heard: the
+        client itself when it declared that it plays JARVIS's voice
+        (``subscribe`` with VOICE_PLAYBACK_CAPABILITY), else None -- the
+        host speaks them. Read per message, so a client that withdraws the
+        declaration (``unsubscribe``) is heard on the host from then on."""
+        from backend.core.command_identity import VOICE_PLAYBACK_CAPABILITY, command_request_id
+
+        if VOICE_PLAYBACK_CAPABILITY not in connection_capabilities.get(client_id, set()):
+            return None
+        request_id = command_request_id.get()
+
+        async def deliver(text: str, source: str) -> bool:
+            return await self._safe_send_json(client_id, {
+                "type": "voice_line", "text": text, "source": source, "requestId": request_id,
+            })
+
+        return deliver
 
     async def _safe_send_json(
         self,
@@ -3082,8 +3104,8 @@ async def unified_websocket_endpoint(websocket: WebSocket):
 
             # Handle message -- as the command it carries, so a REST resend
             # of the same command joins this run instead of repeating it.
-            from backend.core.command_identity import command_scope, request_id_of
-            with command_scope(request_id_of(data)):
+            from backend.core.command_identity import command_scope, request_id_of, voice_scope
+            with command_scope(request_id_of(data)), voice_scope(manager.voice_sink(client_id)):
                 response = await manager.handle_message(client_id, data)
 
             # Update health metrics for sent message

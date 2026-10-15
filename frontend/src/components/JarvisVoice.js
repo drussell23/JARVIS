@@ -21,7 +21,7 @@ import VoiceStatsDisplay from './VoiceStatsDisplay'; // Adaptive voice stats dis
 import EnvironmentalStatsDisplay from './EnvironmentalStatsDisplay'; // Environmental stats display
 import AudioQualityStatsDisplay from './AudioQualityStatsDisplay'; // Audio quality stats display
 import CommandDetectionBanner from './CommandDetectionBanner'; // 🆕 Command detection banner for streaming safeguard
-import { getJarvisConnectionService, ConnectionState, connectionStateToJarvisStatus } from '../services/JarvisConnectionService'; // 🆕 Unified connection service
+import { getJarvisConnectionService, ConnectionState, connectionStateToJarvisStatus, VOICE_PLAYBACK_CAPABILITY } from '../services/JarvisConnectionService'; // 🆕 Unified connection service
 import TrainingStatus from './TrainingStatus'; // 🆕 Real-time training progress display (Feedback Loop)
 import { getContinuousAudioBuffer } from '../utils/ContinuousAudioBuffer'; // 🆕 Continuous audio pre-buffer for first-attempt recognition
 import { initDynamicFavicon, setFaviconState } from '../utils/DynamicFavicon'; // 🆕 Dynamic JARVIS favicon
@@ -1076,6 +1076,12 @@ const JarvisVoice = () => {
     const connectionService = getJarvisConnectionService();
     jarvisConnectionServiceRef.current = connectionService;
 
+    // This page plays JARVIS's voice itself (speakResponse): the backend sends
+    // the lines said for its commands here (`voice_line`) -- where the user is
+    // listening, and where a line can be stopped -- instead of saying them on
+    // the host's speakers.
+    const withdrawVoicePlayback = connectionService.declareCapability(VOICE_PLAYBACK_CAPABILITY);
+
     // Subscribe to connection state changes
     const unsubscribeState = connectionService.on('stateChange', ({ state: newState }) => {
       console.log('[JarvisVoice] Connection state changed:', newState);
@@ -1159,6 +1165,7 @@ const JarvisVoice = () => {
       unsubscribeMode();
       unsubscribeMessage();
       unsubscribeWsReconnect();
+      withdrawVoicePlayback();
       clearInterval(wsSyncInterval);
     };
   }, []);
@@ -1830,6 +1837,14 @@ const JarvisVoice = () => {
 
   const handleWebSocketMessage = (data) => {
     switch (data.type) {
+      case 'voice_line':
+        // A line JARVIS says for this page's command (the reply, an
+        // acknowledgement while it works): played here, in turn, in JARVIS's
+        // voice. The reply's text is shown by its command_response.
+        if (data.text) {
+          speakResponse(data.text, false);
+        }
+        break;
       case 'command_ack':
         // The backend has the command and is working on it: the socket is
         // alive, so a slow answer is not a dead connection (see sendCommand's

@@ -249,6 +249,9 @@ def test_the_websocket_acknowledges_a_reliable_send_before_working(monkeypatch):
         async def disconnect(self, client_id):
             pass
 
+        def voice_sink(self, client_id):
+            return None  # the host speaks
+
     monkeypatch.setattr(uw, "get_ws_manager", lambda: _Manager())
     app = FastAPI()
     app.add_api_websocket_route("/ws", uw.unified_websocket_endpoint)

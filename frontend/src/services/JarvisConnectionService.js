@@ -17,6 +17,13 @@ import configService from './DynamicConfigService';
 // CONNECTION STATES
 // ============================================================================
 
+/**
+ * Declared by a page that plays JARVIS's voice itself: the backend then sends
+ * every line said for its commands to it (`voice_line`) instead of saying
+ * them on the host's speakers (backend/core/command_identity.py).
+ */
+export const VOICE_PLAYBACK_CAPABILITY = 'voice_playback';
+
 export const ConnectionState = {
   INITIALIZING: 'initializing',
   DISCOVERING: 'discovering',
@@ -120,7 +127,12 @@ class JarvisConnectionService {
     
     // WebSocket client
     this.wsClient = null;
-    
+
+    // What this page can do, told to the backend on every connection it
+    // opens (declareCapability): a socket that reconnects is a new client
+    // to the backend, so a declaration made once would be lost with it.
+    this.declaredCapabilities = new Map(); // name -> number of declarers
+
     // Event listeners
     this.listeners = new Map();
     
@@ -1045,6 +1057,7 @@ class JarvisConnectionService {
     // Connection events
     this.wsClient.on('connected', (data) => {
       console.log('[JarvisConnection] WebSocket connected:', data.endpoint);
+      this._announceCapabilities('subscribe', [...this.declaredCapabilities.keys()], data.endpoint);
       this._resetWebSocketRetryState();
       if (this.connectionState !== ConnectionState.ONLINE) {
         this._setState(ConnectionState.ONLINE);
@@ -1433,6 +1446,47 @@ class JarvisConnectionService {
       setTimeout(() => { this._restAvailable = true; }, 2000);
       throw error;
     }
+  }
+
+  /**
+   * Declare that this page can do *name* (e.g. VOICE_PLAYBACK_CAPABILITY:
+   * it plays JARVIS's voice itself). Told to the backend now and on every
+   * connection opened later; returns the withdrawal, which tells it the page
+   * no longer can once its last declarer withdraws.
+   */
+  declareCapability(name) {
+    const count = this.declaredCapabilities.get(name) || 0;
+    this.declaredCapabilities.set(name, count + 1);
+    if (count === 0) {
+      this._announceCapabilities('subscribe', [name]);
+    }
+    let withdrawn = false;
+    return () => {
+      if (withdrawn) return;
+      withdrawn = true;
+      const remaining = (this.declaredCapabilities.get(name) || 1) - 1;
+      if (remaining > 0) {
+        this.declaredCapabilities.set(name, remaining);
+        return;
+      }
+      this.declaredCapabilities.delete(name);
+      this._announceCapabilities('unsubscribe', [name]);
+    };
+  }
+
+  /**
+   * Tell the backend (`subscribe` / `unsubscribe`) about *capabilities* on
+   * the connection to *endpoint*, or on every open connection -- only those
+   * that carry commands (the endpoint table's own 'command' capability):
+   * what a page can do concerns the commands it sends.
+   */
+  _announceCapabilities(type, capabilities, endpoint = null) {
+    if (!this.wsClient || capabilities.length === 0) return;
+    const carriesCommands = (url) => (this.wsClient.endpoints || []).some(
+      (ep) => ep.path === url && (ep.capabilities || []).includes('command'));
+    const endpoints = endpoint ? [endpoint] : [...this.wsClient.connections.keys()];
+    endpoints.filter(carriesCommands)
+      .forEach((url) => this.wsClient.sendTo(url, { type, capabilities }));
   }
 
   async send(message, options = {}) {

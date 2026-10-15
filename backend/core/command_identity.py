@@ -19,12 +19,20 @@ The conversation a command follows on from travels the same way
 decided, fetched and answered by layers that each saw only its words, so it
 was classified alone, read the wrong day and was answered from the screen.
 Every layer that decides something reads the exchange from here.
+
+And where the command's answer is heard (:data:`command_voice`): JARVIS spoke
+every line on the speakers of the machine it runs on, so a user on another
+device -- a browser across the network, a Remote Desktop client -- heard it
+late or not at all, and nothing could stop a line once it started. A client
+that plays JARVIS's voice itself declares it; its transport sets the voice
+here, and the one speech primitive (``safe_say``) delivers every line said
+for that command -- the reply, an acknowledgement, a description -- to it.
 """
 from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Iterator, Mapping, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Iterator, Mapping, Optional, Sequence, Tuple
 
 from backend.core.module_identity import unify as _unify_module_identity
 
@@ -37,6 +45,16 @@ command_request_id: ContextVar[Optional[str]] = ContextVar("jarvis_command_reque
 #: ``content`` turns, oldest first); empty when it starts a conversation.
 command_conversation: ContextVar[Tuple[Mapping[str, Any], ...]] = ContextVar(
     "jarvis_command_conversation", default=())
+
+#: Delivers one spoken line -- ``(text, source)`` -- to the client the command
+#: came from, True once that client has it to play. None: the host speaks.
+VoiceSink = Callable[[str, str], Awaitable[bool]]
+
+#: Where the lines said for the command in this context are heard, or None.
+command_voice: ContextVar[Optional[VoiceSink]] = ContextVar("jarvis_command_voice", default=None)
+
+#: What a client declares (``subscribe``) when it plays JARVIS's voice itself.
+VOICE_PLAYBACK_CAPABILITY = "voice_playback"
 
 
 def request_id_of(message: Mapping[str, Any]) -> Optional[str]:
@@ -57,6 +75,17 @@ def command_scope(request_id: Optional[str]) -> Iterator[None]:
         yield
     finally:
         command_request_id.reset(token)
+
+
+@contextmanager
+def voice_scope(sink: Optional[VoiceSink]) -> Iterator[None]:
+    """Run the enclosed processing with its lines heard through *sink*
+    (None: on the host's speakers)."""
+    token = command_voice.set(sink)
+    try:
+        yield
+    finally:
+        command_voice.reset(token)
 
 
 @contextmanager
@@ -95,5 +124,6 @@ def conversation_preamble() -> str:
             "request complete on its own takes nothing from it:\n" + said + "\n\n")
 
 
-__all__ = ["command_conversation", "command_request_id", "command_scope", "conversation_preamble",
-           "conversation_scope", "conversation_text", "request_id_of"]
+__all__ = ["VOICE_PLAYBACK_CAPABILITY", "VoiceSink", "command_conversation", "command_request_id",
+           "command_scope", "command_voice", "conversation_preamble", "conversation_scope",
+           "conversation_text", "request_id_of", "voice_scope"]
