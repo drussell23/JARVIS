@@ -3936,6 +3936,11 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
                 return
         except Exception:  # noqa: BLE001 — predicate unavailable ⇒ legacy
             pass
+        # Inside a user's command the composed reply speaks for this step;
+        # narrating it too was a second voice over the answer.
+        from backend.core.command_identity import in_command
+        if in_command():
+            return
         try:
             from backend.core.supervisor.unified_voice_orchestrator import safe_say
             await safe_say(text)

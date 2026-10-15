@@ -45,7 +45,6 @@ logger = logging.getLogger(__name__)
 # Configuration
 _MAX_CONTEXT_TURNS = int(os.getenv("JARVIS_CONV_MAX_TURNS", "20"))
 _SESSION_TIMEOUT_S = float(os.getenv("JARVIS_CONV_SESSION_TIMEOUT", "300"))
-_SENTENCE_DELIMITERS = re.compile(r'(?<=[.!?])\s+')
 _EXECUTE_INTENT_CONFIDENCE = float(
     os.getenv("JARVIS_CONV_EXECUTE_INTENT_CONFIDENCE", "0.62")
 )
@@ -181,56 +180,8 @@ class ConversationSession:
 # Sentence Splitter
 # ============================================================================
 
-class SentenceSplitter:
-    """
-    Accumulates LLM tokens until a sentence boundary, then yields complete
-    sentences for TTS. This lets the user hear the first word at ~300-500ms
-    instead of waiting for the full LLM response.
-    """
-
-    def __init__(self, min_sentence_len: int = 10):
-        self._min_len = min_sentence_len
-
-    async def split(
-        self, token_stream: AsyncIterator[str]
-    ) -> AsyncIterator[str]:
-        """
-        Consume an async stream of tokens and yield complete sentences.
-        Handles cases where sentence-ending punctuation arrives without
-        trailing whitespace (common with token-by-token LLM streaming).
-        """
-        buffer = ""
-
-        async for token in token_stream:
-            buffer += token
-
-            # Check for sentence boundaries
-            while True:
-                match = _SENTENCE_DELIMITERS.search(buffer)
-                if match and match.start() >= self._min_len:
-                    sentence = buffer[:match.end()].strip()
-                    buffer = buffer[match.end():]
-                    if sentence:
-                        yield sentence
-                else:
-                    # Check for punctuation at end of buffer followed by
-                    # trailing whitespace (the regex doesn't match because
-                    # there's no subsequent text yet).
-                    stripped = buffer.rstrip()
-                    if (
-                        len(stripped) >= self._min_len
-                        and stripped
-                        and stripped[-1] in '.!?'
-                        and len(buffer) != len(stripped)
-                    ):
-                        buffer = ""
-                        yield stripped
-                    break
-
-        # Flush remaining buffer
-        buffer = buffer.strip()
-        if buffer:
-            yield buffer
+# One splitter for every speaker that streams a reply (backend/core/speech_segments).
+from backend.core.speech_segments import SentenceSplitter  # noqa: E402,F401
 
 
 # ============================================================================

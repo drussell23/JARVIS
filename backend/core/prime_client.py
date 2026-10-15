@@ -1518,7 +1518,7 @@ class PrimeClient:
 
             async with self._pool.get_session() as session:
                 # Use OpenAI-compatible chat completions endpoint
-                url = f"{self._config.base_url}/chat/completions"
+                url = self._chat_completions_url()
 
                 # v242.0: Extract X-Model-Id header from J-Prime response
                 response_headers = {}
@@ -1631,18 +1631,43 @@ class PrimeClient:
             async for chunk in self._do_execute_stream_request(request):
                 yield chunk
 
+    def _chat_completions_url(self) -> str:
+        """J-Prime's OpenAI-compatible chat endpoint -- one for a whole answer
+        and for a streamed one."""
+        return f"{self._config.base_url}/chat/completions"
+
+    @staticmethod
+    def _stream_piece(event: Dict[str, Any]) -> str:
+        """The text one server-sent event carries (OpenAI chat-completion
+        chunk: ``choices[0].delta.content``; a completion chunk's ``text``).
+        An error event raises: it is not something the model said."""
+        if event.get("error"):
+            raise RuntimeError(f"Prime stream error: {event['error']}")
+        choices = event.get("choices") or []
+        if not choices:
+            return ""
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        return delta.get("content") or choice.get("text") or ""
+
     async def _do_execute_stream_request(
         self,
         request: PrimeRequest
     ) -> AsyncGenerator[str, None]:
-        """Inner streaming send — called by _execute_stream_request, wrapped by work_slot."""
+        """Inner streaming send -- called by _execute_stream_request, wrapped by work_slot.
+
+        The same endpoint and payload as a whole answer, with ``stream`` set;
+        the reply arrives as server-sent events (``data: {...}`` lines, then
+        ``data: [DONE]``). It used to post to ``/generate/stream`` (no such
+        route on J-Prime), read a ``content`` field no chunk carries, and take
+        the httpx branch for an aiohttp session -- local streaming had never
+        worked (2026-10-15)."""
         try:
             payload = self._build_payload(request)
             payload["stream"] = True
+            url = self._chat_completions_url()
 
             async with self._pool.get_session() as session:
-                url = f"{self._config.base_url}/generate/stream"
-
                 # v276.0: Inject trace context headers for cross-boundary tracing
                 _req_headers = {}
                 if _TRACE_HTTP_AVAILABLE and _merge_trace_headers:
@@ -1651,41 +1676,27 @@ class PrimeClient:
                     except Exception:
                         pass
 
-                if hasattr(session, 'post') and hasattr(session.post, '__aenter__'):
-                    # aiohttp style
+                if hasattr(session, "stream"):
+                    # httpx: streaming is its own call
+                    async with session.stream("POST", url, json=payload,
+                                              headers=_req_headers or None) as resp:
+                        status = getattr(resp, "status_code", None) or getattr(resp, "status", None)
+                        if status != 200:
+                            raise RuntimeError(f"Prime returned {status}")
+                        self._last_stream_model_id = dict(resp.headers).get("X-Model-Id", "jarvis-prime")
+                        lines = resp.aiter_lines()
+                        async for piece in self._stream_pieces(lines):
+                            yield piece
+                else:
+                    # aiohttp: the response body is read line by line
                     async with session.post(url, json=payload, headers=_req_headers or None) as resp:
                         if resp.status != 200:
                             text = await resp.text()
                             raise RuntimeError(f"Prime returned {resp.status}: {text}")
-
                         # v242.1: Extract X-Model-Id from streaming response headers
-                        self._last_stream_model_id = dict(resp.headers).get(
-                            "X-Model-Id", "jarvis-prime"
-                        )
-
-                        async for line in resp.content:
-                            if line:
-                                decoded = line.decode('utf-8').strip()
-                                if decoded.startswith("data: "):
-                                    data = json.loads(decoded[6:])
-                                    if "content" in data:
-                                        yield data["content"]
-                else:
-                    # httpx style (async streaming)
-                    async with session.stream('POST', url, json=payload, headers=_req_headers or None) as resp:
-                        if resp.status != 200:
-                            raise RuntimeError(f"Prime returned {resp.status}")
-
-                        # v242.1: Extract X-Model-Id from streaming response headers
-                        self._last_stream_model_id = dict(resp.headers).get(
-                            "X-Model-Id", "jarvis-prime"
-                        )
-
-                        async for line in resp.aiter_lines():
-                            if line.startswith("data: "):
-                                data = json.loads(line[6:])
-                                if "content" in data:
-                                    yield data["content"]
+                        self._last_stream_model_id = dict(resp.headers).get("X-Model-Id", "jarvis-prime")
+                        async for piece in self._stream_pieces(resp.content):
+                            yield piece
 
             await self._circuit.record_success()
 
@@ -1693,6 +1704,19 @@ class PrimeClient:
             await self._circuit.record_failure()
             logger.error(f"[PrimeClient] Stream request failed: {e}")
             raise
+
+    async def _stream_pieces(self, lines: Any) -> AsyncGenerator[str, None]:
+        """The text of a server-sent event stream, piece by piece, to [DONE]."""
+        async for raw in lines:
+            line = (raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)).strip()
+            if not line.startswith("data:"):
+                continue
+            body = line[len("data:"):].strip()
+            if body == "[DONE]":
+                return
+            piece = self._stream_piece(json.loads(body))
+            if piece:
+                yield piece
 
     async def _execute_cloud_fallback(self, request: PrimeRequest) -> PrimeResponse:
         """Execute fallback to cloud Claude API."""

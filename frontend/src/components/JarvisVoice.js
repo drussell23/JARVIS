@@ -22,7 +22,8 @@ import EnvironmentalStatsDisplay from './EnvironmentalStatsDisplay'; // Environm
 import AudioQualityStatsDisplay from './AudioQualityStatsDisplay'; // Audio quality stats display
 import CommandDetectionBanner from './CommandDetectionBanner'; // 🆕 Command detection banner for streaming safeguard
 import { getJarvisConnectionService, ConnectionState, connectionStateToJarvisStatus, VOICE_PLAYBACK_CAPABILITY } from '../services/JarvisConnectionService';
-import { decideHeard, getBargeInPolicy, resetBargeInPolicy } from '../utils/bargeIn'; // ✋ talk over JARVIS // 🆕 Unified connection service
+import { decideHeard, getBargeInPolicy, resetBargeInPolicy } from '../utils/bargeIn'; // ✋ talk over JARVIS
+import { createSpeechAudioFetcher, sanitizeForSpeech } from '../utils/speechAudio'; // 🔊 line audio, fetched ahead // 🆕 Unified connection service
 import TrainingStatus from './TrainingStatus'; // 🆕 Real-time training progress display (Feedback Loop)
 import { getContinuousAudioBuffer } from '../utils/ContinuousAudioBuffer'; // 🆕 Continuous audio pre-buffer for first-attempt recognition
 import { initDynamicFavicon, setFaviconState } from '../utils/DynamicFavicon'; // 🆕 Dynamic JARVIS favicon
@@ -6074,120 +6075,90 @@ const JarvisVoice = () => {
     console.log('[JARVIS Audio] POST: Attempting to play audio via POST');
     const generation = speechGenerationRef.current;
     const stale = () => generation !== speechGenerationRef.current;
-    // v241.0: 8s AbortController — backend should respond in <5s, 3s margin
-    const controller = new AbortController();
-    audioFetchAbortRef.current = controller;
-    const fetchTimeout = setTimeout(() => controller.abort(), 8000);
     try {
-      const apiUrl = API_URL || configService.getApiUrl() || inferUrls().API_BASE_URL;
-      const response = await fetch(`${apiUrl}/audio/speak`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ text }),
-        signal: controller.signal,
-      });
-      clearTimeout(fetchTimeout);
+      // Fetched ahead while the line before played, or now (utils/speechAudio).
+      // A silent render (X-TTS-Status: silent) rejects: the caller falls back.
+      const blob = await speechAudio().take(text);
+      console.log('[JARVIS Audio] POST: Received audio blob:', blob.size, 'bytes');
+      if (stale()) return; // stopped while it was being fetched
 
-      console.log('[JARVIS Audio] POST: Response status:', response.status);
-      console.log('[JARVIS Audio] POST: Content-Type:', response.headers.get('content-type'));
+      const audioUrl = URL.createObjectURL(blob);
 
-      if (response.ok) {
-        // v242.0: Detect silent WAV via X-TTS-Status header (Disease 5 root fix)
-        const ttsStatus = response.headers.get('X-TTS-Status');
-        if (ttsStatus === 'silent') {
-          console.warn('[JARVIS Audio] Backend TTS failed (X-TTS-Status: silent), '
-            + 'falling back to browser speechSynthesis');
-          throw new Error('TTS_SILENT_FALLBACK');
+      const audio2 = new Audio(audioUrl);
+      audio2.volume = 1.0;
+      currentAudioRef.current = audio2;
+
+      // 🔇 SELF-VOICE SUPPRESSION v2: PAUSE recognition (POST method)
+      pauseRecognitionForSpeech(text);
+      recordSpokenText(text);
+
+      audio2.onplay = () => {
+        if (stale()) return;
+        console.log('[JARVIS Audio] POST: Playback started');
+        // v241.0: NOW set speaking state (audio is actually playing)
+        clearTimeout(fetchTimeoutRef.current);
+        fetchingAudioRef.current = false;
+        setIsJarvisSpeaking(true);
+        isSpeakingRef.current = true;
+        // Call the callback when audio ACTUALLY starts playing (perfect sync!)
+        if (onStartCallback && typeof onStartCallback === 'function') {
+          console.log('[JARVIS Audio] Calling start callback - text will appear NOW');
+          onStartCallback();
         }
+      };
 
-        // Get audio data as blob
-        const blob = await response.blob();
-        console.log('[JARVIS Audio] POST: Received audio blob:', blob.size, 'bytes');
-        if (stale()) return; // stopped while it was being fetched
-
-        const audioUrl = URL.createObjectURL(blob);
-
-        const audio2 = new Audio(audioUrl);
-        audio2.volume = 1.0;
-        currentAudioRef.current = audio2;
-
-        // 🔇 SELF-VOICE SUPPRESSION v2: PAUSE recognition (POST method)
-        pauseRecognitionForSpeech(text);
-        recordSpokenText(text);
-
-        audio2.onplay = () => {
-          if (stale()) return;
-          console.log('[JARVIS Audio] POST: Playback started');
-          // v241.0: NOW set speaking state (audio is actually playing)
-          clearTimeout(fetchTimeoutRef.current);
-          fetchingAudioRef.current = false;
-          setIsJarvisSpeaking(true);
-          isSpeakingRef.current = true;
-          // Call the callback when audio ACTUALLY starts playing (perfect sync!)
-          if (onStartCallback && typeof onStartCallback === 'function') {
-            console.log('[JARVIS Audio] Calling start callback - text will appear NOW');
-            onStartCallback();
-          }
-        };
-
-        audio2.onended = () => {
-          if (stale()) {
-            URL.revokeObjectURL(audioUrl);
-            return;
-          }
-          currentAudioRef.current = null;
-          console.log('[JARVIS Audio] POST: Playback completed');
-          setIsJarvisSpeaking(false);
-          isSpeakingRef.current = false;
-          fetchingAudioRef.current = false;
-          stopSpeechWatchdog();
-          // 🔇 SELF-VOICE SUPPRESSION: Record when speaking ended
-          recordSpeakingEnded();
-          resumeRecognitionAfterSpeech();
-          URL.revokeObjectURL(audioUrl); // Clean up
-          // Process next in queue after a small delay
-          setTimeout(() => processNextInSpeechQueue(), 200);
-        };
-
-        audio2.onerror = (e) => {
-          if (stale()) {
-            URL.revokeObjectURL(audioUrl);
-            return;
-          }
-          currentAudioRef.current = null;
-          console.error('[JARVIS Audio] POST: Playback error:', e);
-          if (audio2.error) {
-            console.error('[JARVIS Audio] POST: Error details:', {
-              code: audio2.error.code,
-              message: audio2.error.message
-            });
-          }
-          setIsJarvisSpeaking(false);
-          isSpeakingRef.current = false;
-          fetchingAudioRef.current = false;
-          stopSpeechWatchdog();
-          // 🔇 SELF-VOICE SUPPRESSION: Record when speaking ended (even on error)
-          recordSpeakingEnded();
-          resumeRecognitionAfterSpeech();
-          URL.revokeObjectURL(audioUrl); // Clean up
-          // Process next in queue even after error
-          setTimeout(() => processNextInSpeechQueue(), 200);
-        };
-
-        try {
-          await audio2.play();
-        } catch (playError) {
-          if (stale()) return; // paused by a stop before it started
-          throw playError;
+      audio2.onended = () => {
+        if (stale()) {
+          URL.revokeObjectURL(audioUrl);
+          return;
         }
-        console.log('[JARVIS Audio] POST: Playing audio successfully');
-      } else {
-        throw new Error(`Audio generation failed: ${response.status}`);
+        currentAudioRef.current = null;
+        console.log('[JARVIS Audio] POST: Playback completed');
+        setIsJarvisSpeaking(false);
+        isSpeakingRef.current = false;
+        fetchingAudioRef.current = false;
+        stopSpeechWatchdog();
+        // 🔇 SELF-VOICE SUPPRESSION: Record when speaking ended
+        recordSpeakingEnded();
+        resumeRecognitionAfterSpeech();
+        URL.revokeObjectURL(audioUrl); // Clean up
+        // Process next in queue after a small delay
+        setTimeout(() => processNextInSpeechQueue(), 200);
+      };
+
+      audio2.onerror = (e) => {
+        if (stale()) {
+          URL.revokeObjectURL(audioUrl);
+          return;
+        }
+        currentAudioRef.current = null;
+        console.error('[JARVIS Audio] POST: Playback error:', e);
+        if (audio2.error) {
+          console.error('[JARVIS Audio] POST: Error details:', {
+            code: audio2.error.code,
+            message: audio2.error.message
+          });
+        }
+        setIsJarvisSpeaking(false);
+        isSpeakingRef.current = false;
+        fetchingAudioRef.current = false;
+        stopSpeechWatchdog();
+        // 🔇 SELF-VOICE SUPPRESSION: Record when speaking ended (even on error)
+        recordSpeakingEnded();
+        resumeRecognitionAfterSpeech();
+        URL.revokeObjectURL(audioUrl); // Clean up
+        // Process next in queue even after error
+        setTimeout(() => processNextInSpeechQueue(), 200);
+      };
+
+      try {
+        await audio2.play();
+      } catch (playError) {
+        if (stale()) return; // paused by a stop before it started
+        throw playError;
       }
+      console.log('[JARVIS Audio] POST: Playing audio successfully');
     } catch (postError) {
-      clearTimeout(fetchTimeout);
       if (stale()) return; // stopped: nothing failed, nothing to fall back to
       if (postError.name === 'AbortError') {
         console.warn('[JARVIS Audio] POST: Fetch timed out after 8s');
@@ -6211,7 +6182,23 @@ const JarvisVoice = () => {
   // fallback started under an older generation does nothing -- a stopped
   // line cannot resume, fall back to the browser's voice, or start the next.
   const currentAudioRef = useRef(null);
-  const audioFetchAbortRef = useRef(null);
+  // The audio of queued lines, fetched while the current one plays
+  // (utils/speechAudio): a reply arrives a sentence at a time, and fetched
+  // only at its turn every sentence followed a second of silence.
+  const speechAudioRef = useRef(null);
+  const speechAudio = () => {
+    if (!speechAudioRef.current) {
+      speechAudioRef.current = createSpeechAudioFetcher({
+        apiUrl: () => API_URL || configService.getApiUrl() || inferUrls().API_BASE_URL,
+        timeoutMs: 8000, // v241.0: backend should respond in <5s, 3s margin
+      });
+    }
+    return speechAudioRef.current;
+  };
+  const queuedLineText = (item) => sanitizeForSpeech(typeof item === 'string' ? item : item.text);
+  const prefetchQueuedSpeech = () => {
+    speechAudio().prefetch(speechQueueRef.current.map(queuedLineText));
+  };
   const speechGenerationRef = useRef(0);
   const currentSpeechRequestRef = useRef(null);
   // Commands the user talked over: their remaining lines are not played.
@@ -6389,6 +6376,7 @@ const JarvisVoice = () => {
     const text = typeof nextItem === 'string' ? nextItem : nextItem.text;
     const callback = typeof nextItem === 'object' ? nextItem.callback : null;
     currentSpeechRequestRef.current = typeof nextItem === 'object' ? (nextItem.requestId || null) : null;
+    prefetchQueuedSpeech(); // the lines after this one, while it plays
 
     await speakResponseInternal(text, callback);
   };
@@ -6404,10 +6392,7 @@ const JarvisVoice = () => {
     // Clear the queue
     speechQueueRef.current = [];
     currentSpeechRequestRef.current = null;
-    if (audioFetchAbortRef.current) {
-      audioFetchAbortRef.current.abort();
-      audioFetchAbortRef.current = null;
-    }
+    speechAudio().abortAll(); // the line being fetched and every line fetched ahead
     const audio = currentAudioRef.current;
     currentAudioRef.current = null;
     if (audio) {
@@ -6490,9 +6475,12 @@ const JarvisVoice = () => {
     // line belongs to: talked over, its remaining lines are not played.
     speechQueueRef.current.push({ text, callback: null, enqueuedAt: Date.now(), requestId });
 
-    // Process queue if not already speaking
-    if (!isSpeakingRef.current) {
+    // Process queue if not already speaking; otherwise fetch its audio now,
+    // so it plays as soon as the line before it ends.
+    if (!isSpeakingRef.current && !fetchingAudioRef.current) {
       await processNextInSpeechQueue();
+    } else {
+      prefetchQueuedSpeech();
     }
   };
 
@@ -6526,22 +6514,6 @@ const JarvisVoice = () => {
       // v237.0: Sanitize text for ALL TTS paths — not just browser fallback.
       // Previously sanitizeForSpeech only ran inside the catch block (browser fallback),
       // leaving "..." unsanitized for the primary backend TTS path.
-      const sanitizeForSpeech = (rawText) => {
-        let cleaned = rawText;
-        cleaned = cleaned.replace(/\.{2,}/g, ' ');        // "..." → " "
-        cleaned = cleaned.replace(/^[\s.!?,;:]+$/g, '');   // Pure punctuation → empty
-        cleaned = cleaned.replace(/\.\s*$/g, '');          // trailing "." → ""
-        try {
-          cleaned = cleaned.replace(/\p{Extended_Pictographic}/gu, '');
-          cleaned = cleaned.replace(/\u200D/g, '');
-          cleaned = cleaned.replace(/[\uFE00-\uFE0F]/g, '');
-        } catch (_e) {
-          cleaned = cleaned.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}]/gu, '');
-        }
-        cleaned = cleaned.replace(/[*_~`#]/g, '');
-        cleaned = cleaned.replace(/\s{2,}/g, ' ').trim();
-        return cleaned;
-      };
 
       const sanitizedText = sanitizeForSpeech(text);
 
@@ -6604,26 +6576,6 @@ const JarvisVoice = () => {
         // Cancel any ongoing speech first
         window.speechSynthesis.cancel();
 
-        // Sanitize text for browser TTS to prevent literal punctuation reading
-        // (e.g., "..." read as "full stop" by British English Daniel voice)
-        const sanitizeForSpeech = (rawText) => {
-          let cleaned = rawText;
-          cleaned = cleaned.replace(/\.{2,}/g, ' ');        // "..." → " "
-          cleaned = cleaned.replace(/\.\s*$/g, '');          // trailing "." → ""
-          // Unicode Extended_Pictographic for comprehensive emoji stripping
-          // (covers ZWJ sequences, flags, supplemental symbols, future additions)
-          try {
-            cleaned = cleaned.replace(/\p{Extended_Pictographic}/gu, '');
-            cleaned = cleaned.replace(/\u200D/g, '');        // Zero-width joiners
-            cleaned = cleaned.replace(/[\uFE00-\uFE0F]/g, ''); // Variation selectors
-          } catch (_e) {
-            // Fallback for browsers without Unicode property escapes
-            cleaned = cleaned.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}]/gu, '');
-          }
-          cleaned = cleaned.replace(/[*_~`#]/g, '');         // markdown
-          cleaned = cleaned.replace(/\s{2,}/g, ' ').trim();
-          return cleaned;
-        };
 
         const fallbackSpeechText = sanitizeForSpeech(text);
         const utterance = new SpeechSynthesisUtterance(fallbackSpeechText);

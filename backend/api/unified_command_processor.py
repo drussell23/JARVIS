@@ -2014,7 +2014,7 @@ class UnifiedCommandProcessor:
         # The terminal's transcript (backend/core/console_view): what was
         # asked, then what JARVIS answered and did -- once per command, here
         # where every transport's command runs (a joined resend returned above).
-        from backend.core.command_identity import conversation_scope
+        from backend.core.command_identity import conversation_scope, voiced_covers, voiced_scope
         from backend.core.console_view import narrate, seconds
         narrate(command_text, "command")
         started = time.monotonic()
@@ -2022,13 +2022,18 @@ class UnifiedCommandProcessor:
             # v277.0: Execute pipeline and cache result for dedupe. Every
             # layer that decides something about the command (classifier,
             # workspace detector, composer) reads the exchange it follows on
-            # from through this scope.
-            with conversation_scope(self.context.recent_turns()):
+            # from through this scope; a reply voiced while it was written
+            # (backend.core.speech_segments) is recorded in the voiced scope.
+            with conversation_scope(self.context.recent_turns()), voiced_scope():
                 result = await self._execute_command_pipeline(
                     command_text, websocket=websocket, audio_data=audio_data,
                     speaker_name=speaker_name, deadline=deadline,
                     source_context=source_context,
                 )
+                # Already said, sentence by sentence: the transport must not
+                # say it again.
+                if isinstance(result, dict) and voiced_covers(str(result.get("response") or "")):
+                    result["spoken"] = True
         except BaseException as exc:
             if request_id:
                 self._settle_inflight(request_id, exc=exc)
@@ -3256,20 +3261,6 @@ class UnifiedCommandProcessor:
             os.getenv("JARVIS_COMPOSE_MAX_TIMEOUT_SECONDS", "10.0")
         )
 
-        # v282.0: Fast J-Prime readiness pre-check — avoid burning budget on
-        # backends that are known-unavailable.  decide_mode() is synchronous
-        # (reads cached routing state) so this adds <1ms.
-        try:
-            from core.jarvis_prime_client import get_jarvis_prime_client, RoutingMode
-            _pre_client = get_jarvis_prime_client()
-            _mode, _reason = _pre_client.decide_mode()
-            if _mode == RoutingMode.DISABLED:
-                logger.info("[v282] Compose skipped: J-Prime routing disabled (%s)", _reason)
-                self._track_compose_fallback("jprime_disabled")
-                return None
-        except Exception:
-            pass  # Fall through to normal compose attempt
-
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining < compose_min_budget + delivery_margin:
@@ -3321,24 +3312,25 @@ class UnifiedCommandProcessor:
             f"Compose a natural spoken response."
         )
 
-        # Send to J-Prime
-        try:
-            from core.jarvis_prime_client import get_jarvis_prime_client
-            client = get_jarvis_prime_client()
-        except Exception as e:
-            logger.debug("[v281] J-Prime client unavailable for compose: %s", e)
-            self._track_compose_fallback("ums_unavailable")
-            return None
+        # Written by the Mind through the router every command uses, as a
+        # stream: each finished sentence is said while the next is written
+        # (backend.core.speech_segments). The legacy client this used tried a
+        # local GGUF model and DoubleWord before J-Prime on every call (~0.5 s).
+        from backend.core.prime_router import get_prime_router
+        from backend.core.speech_segments import voice_while_writing
 
         try:
-            response = await asyncio.wait_for(
-                client.complete(
-                    prompt=user_prompt,
-                    system_prompt=system_prompt,
-                    max_tokens=500,  # Increased for richer email summaries with category + triage
-                    temperature=0.4,
-                    enrich_with_repo_map=False,
-                    deadline=deadline,
+            router = await get_prime_router()
+            content = await asyncio.wait_for(
+                voice_while_writing(
+                    router.generate_stream(
+                        prompt=user_prompt,
+                        system_prompt=system_prompt,
+                        max_tokens=500,  # Increased for richer email summaries with category + triage
+                        temperature=0.4,
+                        deadline=time.monotonic() + compose_timeout,
+                    ),
+                    source="command_reply",
                 ),
                 timeout=compose_timeout,
             )
@@ -3346,25 +3338,20 @@ class UnifiedCommandProcessor:
             logger.info("[v281] Compose timed out after %.1fs", compose_timeout)
             self._track_compose_fallback("timeout")
             return None
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning("[v281] Compose call failed: %s", e)
-            self._track_compose_fallback("timeout")
+            self._track_compose_fallback("generation_failed")
             return None
 
         # Validate response
-        if not response or not getattr(response, "success", False):
-            self._track_compose_fallback("empty_response")
-            return None
-        content = getattr(response, "content", None)
         if not content or len(content.strip()) < 10:
             self._track_compose_fallback("empty_response")
             return None
 
         self._v242_metrics["compose_successes"] += 1
-        logger.info(
-            "[v281] Compose succeeded: %d chars, backend=%s",
-            len(content), getattr(response, "backend", "unknown"),
-        )
+        logger.info("[v281] Compose succeeded: %d chars (streamed)", len(content))
         return content.strip()
 
     # =========================================================================

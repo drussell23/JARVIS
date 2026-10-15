@@ -1283,6 +1283,12 @@ class PrimeRouter:
         if not self._initialized:
             await self.initialize()
 
+        # The same rule as generate(): a status never established is probed
+        # within the request's deadline before it is read as "down" (a stream
+        # to a fresh router otherwise fell straight to the cloud lane).
+        deadline = kwargs.pop("deadline", None)
+        await self._resolve_unknown_prime_status(deadline)
+
         # Try local Prime streaming first
         local_error = "J-Prime is not available"
         if self._prime_client and self._prime_client.is_available:

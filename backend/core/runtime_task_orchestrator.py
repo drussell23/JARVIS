@@ -2057,6 +2057,12 @@ class RuntimeTaskOrchestrator:
         v305.0: Fire-and-forget — never blocks task return. Uses safe_say
         which routes through say -o tempfile → afplay (no GIL, no device contention).
         """
+        # Inside a user's command the command's reply is what is said: "Done."
+        # before the answer was a second voice (2026-10-15). A task run
+        # outside one (proactive, background) still announces its outcome.
+        from backend.core.command_identity import in_command
+        if in_command():
+            return
         try:
             from backend.core.supervisor.unified_voice_orchestrator import safe_say, spoken_form
 

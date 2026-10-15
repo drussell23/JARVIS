@@ -361,12 +361,21 @@ class UnifiedWebSocketManager:
 
         if VOICE_PLAYBACK_CAPABILITY not in connection_capabilities.get(client_id, set()):
             return None
+        from backend.core.speech_segments import sentences
+
         request_id = command_request_id.get()
 
         async def deliver(text: str, source: str) -> bool:
-            return await self._safe_send_json(client_id, {
-                "type": "voice_line", "text": text, "source": source, "requestId": request_id,
-            })
+            # A sentence per frame: the client fetches each sentence's audio
+            # while the one before it plays (a whole reply rendered at once
+            # was seconds of silence). A streamed reply is already sentences.
+            for sentence in sentences(text) or [text]:
+                if not await self._safe_send_json(client_id, {
+                    "type": "voice_line", "text": sentence, "source": source,
+                    "requestId": request_id,
+                }):
+                    return False
+            return True
 
         return deliver
 

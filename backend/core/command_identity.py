@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Awaitable, Callable, Iterator, Mapping, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from backend.core.module_identity import unify as _unify_module_identity
 
@@ -55,6 +55,11 @@ command_voice: ContextVar[Optional[VoiceSink]] = ContextVar("jarvis_command_voic
 
 #: What a client declares (``subscribe``) when it plays JARVIS's voice itself.
 VOICE_PLAYBACK_CAPABILITY = "voice_playback"
+
+#: The reply text already said for the command in this context, sentence by
+#: sentence as it was written (backend.core.speech_segments), or None outside
+#: a command. The command's end reads it so a voiced reply is not said twice.
+command_voiced: ContextVar[Optional[List[str]]] = ContextVar("jarvis_command_voiced", default=None)
 
 
 def request_id_of(message: Mapping[str, Any]) -> Optional[str]:
@@ -86,6 +91,41 @@ def voice_scope(sink: Optional[VoiceSink]) -> Iterator[None]:
         yield
     finally:
         command_voice.reset(token)
+
+
+@contextmanager
+def voiced_scope() -> Iterator[List[str]]:
+    """Record, for the enclosed command, the reply text voiced while it was written."""
+    record: List[str] = []
+    token = command_voiced.set(record)
+    try:
+        yield record
+    finally:
+        command_voiced.reset(token)
+
+
+def note_voiced(text: str) -> None:
+    """Record *text* as said for the command in this context (no command: nothing)."""
+    record = command_voiced.get()
+    if record is not None and text:
+        record.append(text)
+
+
+def in_command() -> bool:
+    """Is a user's command being answered in this context? Its reply is then
+    what is said (plus one acknowledgement when slow): a narrator that speaks
+    for its own step -- "Let me check your calendar.", "Done." -- is a second
+    voice over the answer, heard with nothing on screen (2026-10-15)."""
+    return command_voiced.get() is not None
+
+
+def voiced_covers(reply: str) -> bool:
+    """Was *reply* already said, sentence by sentence, for this command?
+    Compared by its words: spacing and the splitter's cuts do not matter."""
+    record = command_voiced.get()
+    if not record or not reply:
+        return False
+    return " ".join(" ".join(record).split()) == " ".join(reply.split())
 
 
 @contextmanager
@@ -125,5 +165,6 @@ def conversation_preamble() -> str:
 
 
 __all__ = ["VOICE_PLAYBACK_CAPABILITY", "VoiceSink", "command_conversation", "command_request_id",
-           "command_scope", "command_voice", "conversation_preamble", "conversation_scope",
-           "conversation_text", "request_id_of", "voice_scope"]
+           "command_scope", "command_voice", "command_voiced", "conversation_preamble",
+           "conversation_scope", "conversation_text", "in_command", "note_voiced", "request_id_of",
+           "voice_scope", "voiced_covers", "voiced_scope"]

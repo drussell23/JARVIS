@@ -88,7 +88,20 @@ Checking a calendar or opening an app is a tool the model calls in the middle of
 | Judged once | `bargeInStateRef.utteranceActive` | Once an utterance is the user's, its later interim results are not re-judged. Re-judging made the user interrupt their own sentence. |
 | Interruption | `bargeIn()` | Playback stops, the rest of that command's lines are silenced by `requestId`, and the utterance becomes the next command. |
 
-### 2.5 The pre-flight checklist
+### 2.5 Speaking while writing
+
+| Piece | Where | What it does |
+|---|---|---|
+| Splitter | `backend/core/speech_segments.py` (`SentenceSplitter`, `sentences`) | Tokens or finished text become sentences. One splitter, also used by the audio pipeline. |
+| Voicing | `voice_while_writing(chunks, source=...)` | With a client voice, each finished sentence is said as soon as it is written and recorded with `note_voiced`. Without one (the host's multi-worker queue would not keep order), the text is only collected and said whole at the end. |
+| No double speech | `voiced_scope` / `voiced_covers` (in `process_command`) | A reply already voiced in full is marked `spoken`, so the transport does not say it again. |
+| One voice per command | `command_identity.in_command()` | Inside a user's command, the reply speaks (plus one acknowledgement when slow). Step narrators (the workspace agent's `_narrate`, the task orchestrator's "Done.") stay silent. |
+| Frames | `UnifiedWebSocketManager.voice_sink` | A whole line reaches the page one sentence per `voice_line`. |
+| Page | `frontend/src/utils/speechAudio.js` | `createSpeechAudioFetcher` fetches queued sentences' audio while the current one plays (`take` / `prefetch` / `abortAll`). There is one `sanitizeForSpeech`. A stop cancels every fetch in flight. |
+
+**Measured (2026-10-15, real calendar).** For "Do I have any meetings tomorrow?", the first sentence went to the voice at 3.83 s and the last at 4.05 s; before, the whole reply reached the voice at ≈4.05 s and only then rendered (2.1 s for the whole text). A follow-up ("which one is on Google Meet?") voiced its first sentence at 1.89 s. Rendering one sentence takes ≈0.7 s warm (first audio bytes at 0.5 s; streaming the audio itself would save only ≈0.2 s, so it was not done).
+
+### 2.6 The pre-flight checklist
 
 Before JARVIS declares itself ready, `backend/core/flight_check.py` *exercises* each capability the user relies on:
 - a real generation;
@@ -106,7 +119,7 @@ The supervised services count as items too. One report feeds the terminal, the l
 |---|---|---|---|
 | Conversation memory | Full history every turn | Recent turns reach the classifier, the workspace detector and the composer | The general answer path does not receive the history yet. An interrupted reply is recorded whole. |
 | Pipeline | Speech in, speech out | Browser speech recognition → text → local 30B → edge-tts | Three hops. No tone or prosody reaches the model. |
-| Streaming | First audio in hundreds of ms | Waits for the full reply, then renders it whole | **In progress** (roadmap 1). |
+| Streaming | First audio in hundreds of ms | The reply is spoken a sentence at a time while it is written; the page fetches each sentence's audio while the one before plays | Rendering still costs ≈0.7–1.1 s per request (edge-tts round trip). |
 | Turn detection | Voice activity + semantic end-of-turn | The recogniser's final result | No semantic end-of-turn, and the wake word is needed between turns. |
 | Echo cancellation | WebRTC echo canceller on the mic | Text-level echo judgement plus echo tail | The browser's speech recognition API exposes no echo-cancellation control. |
 | Interruption | Stop, and truncate the record to what was heard | Stop, and silence the rest of the command | The record is not truncated (roadmap 3). |
@@ -170,7 +183,7 @@ That exceeds the 5090's 32 GB, so the models swap. Using vision evicts the Mind.
 | 0b | Barge-in (policy, echo judgement, stop and silence) | Done, 937805cf14 |
 | 0c | Endpointing, echo tail, utterance judged once, acknowledgement shown | Done, cdf9922266 |
 | 0d | Pre-flight checklist; router status probe shares the request deadline | Done, 63523dfae1 |
-| 1 | **Stream the reply sentence by sentence.** The composer and answers come through the router's stream; each finished sentence is voiced while the next is written and rendered; the record of voiced text tells the end of the command not to say it again; the client fetches the next sentence's audio while the current one plays. | In progress |
+| 1 | **Stream the reply sentence by sentence.** The composer writes through `PrimeRouter.generate_stream`; `speech_segments.voice_while_writing` says each finished sentence to the client voice; `command_identity.voiced_scope` records it and the command's end marks the reply spoken; the page prefetches queued sentences (`utils/speechAudio`). Step narrators stay silent inside a command (`in_command`). | Done (see §2.5) |
 | 2 | **Mic through WebRTC with echo cancellation, speech-to-text on the host.** The fix for echo at its source, replacing the browser's speech recognition. | Planned |
 | 3 | **Interruption recorded in the conversation.** The client reports how much of the reply was heard, and the turn is truncated. | Planned |
 | 4 | **Conversation mode.** A listen window after every reply (setting, not constant), and the Mind instructed that it may offer the next step and act on "yes" from the exchange (wire `pending_payload` for email sends). | Planned |
@@ -193,6 +206,7 @@ That exceeds the 5090's 32 GB, so the models swap. Using vision evicts the Mind.
 | `JARVIS_BARGEIN_COOLDOWN_MS` | 500 | Ignore further interruptions for this long after one |
 | `JARVIS_BARGE_IN_ECHO_TAIL_MS` | 2500 | Echo window after JARVIS stops speaking |
 | `JARVIS_TTS_GLOBAL_TIMEOUT_SECONDS` | 8 | `/audio/speak` render limit |
+| `JARVIS_SPEECH_MIN_SENTENCE_CHARS` | 10 | Shortest piece said on its own |
 | `JARVIS_PRIME_STATUS_PROBE_S` | 2 | J-Prime status probe limit when a request has no deadline |
 | `JARVIS_FLIGHT_CHECK_*` | see `flight_check.py` | Pre-flight checklist |
 
@@ -213,3 +227,6 @@ That exceeds the 5090's 32 GB, so the models swap. Using vision evicts the Mind.
 | 10-15 | One sentence became three commands | Confident interim transcripts were sent as commands | Final results only |
 | 10-15 | "let me check your account" ran as a command | JARVIS's acknowledgement echoed back and was finalised after playback | Echo tail, judged with `decideHeard` |
 | 10-15 | A live 30B was routed as "down" during boot | The router's 2 s status probe timed out under load | The probe shares the request deadline |
+| 10-15 | Local streaming never worked | `PrimeClient` posted to `/generate/stream` (no such route), read a `content` field no chunk carries, and took the httpx branch for an aiohttp session | One chat endpoint; OpenAI SSE `choices[0].delta.content` to `[DONE]`; error events raise |
+| 10-15 | "Let me check your calendar.", "Done." and inbox statistics were heard with nothing on screen | Step narrators spoke inside the command, as a second voice over the reply | `in_command()`: the reply speaks |
+| 10-15 | The composer lost ≈0.5 s per call | The legacy client tried an absent GGUF model and DoubleWord before J-Prime | The composer streams through the router every command uses |
