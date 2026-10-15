@@ -96,7 +96,8 @@ def _render_event(event: dict, color: bool) -> None:
         if color and not shows(levelno if isinstance(levelno, int) else logging.INFO, tone):
             return
         if color and tone:
-            print(render(msg, tone, suffix=event.get("suffix", "")), flush=True)
+            print(render(msg, tone, suffix=event.get("suffix", ""), body=event.get("body", "")),
+                  flush=True)
         elif color:
             lc = _LEVEL_COLORS.get(level, _WHITE)
             print(f"{_DIM}{ts_str}{_RESET} {lc}{level:<8}{_RESET} {_DIM}{logger}{_RESET} {msg}",
@@ -153,6 +154,8 @@ class _IPCLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            if getattr(record, "console_only", False):
+                return  # a view action of this terminal, not an event of the daemon
             event: dict = {
                 "type":   "log",
                 "ts":     record.created,
@@ -166,6 +169,7 @@ class _IPCLogHandler(logging.Handler):
             if tone:
                 event["tone"] = tone
                 event["suffix"] = getattr(record, "console_suffix", "") or ""
+                event["body"] = getattr(record, "console_body", "") or ""
             # Run in the supervisor's event loop without blocking the caller
             loop = self._ipc._loop
             if loop is not None and loop.is_running():
@@ -424,10 +428,17 @@ class SupervisorIPC:
         Blocks until the daemon exits or the user presses Ctrl+C; returns
         how the watch ended (see ``relay``).
         """
+        from backend.core.console_view import ConsoleKeys, key_hint
+        keys = ConsoleKeys()
+        listening = self._is_tty and keys.start()
         if self._is_tty:
             print(f"{_CYAN}[JARVIS]{_RESET} Daemon already running — attaching to live stream. "
-                  f"Press {_BOLD}Ctrl+C{_RESET} to detach (daemon keeps running).")
-        outcome = await self.relay()
+                  f"Press {_BOLD}Ctrl+C{_RESET} to detach (daemon keeps running)."
+                  + (f" Keys: {key_hint()}." if listening else ""))
+        try:
+            outcome = await self.relay()
+        finally:
+            keys.stop()
         if outcome == "closed" and self._is_tty:
             print(f"\n{_DIM}[JARVIS] Daemon connection closed.{_RESET}")
         return outcome
@@ -565,7 +576,7 @@ def configure_context_logging(root_level: int = logging.INFO) -> None:
 
     Idempotent: a second call replaces what the first installed.
     """
-    from backend.core.console_view import ConsoleFilter
+    from backend.core.console_view import ConsoleFilter, WithheldRecorder
     from backend.core.session_log import SessionLogHandler, console_of, session_log_handler
 
     is_tty: bool = False
@@ -580,16 +591,21 @@ def configure_context_logging(root_level: int = logging.INFO) -> None:
     root.handlers = [h for h in root.handlers
                      if not (isinstance(h, logging.StreamHandler)
                              and not isinstance(h, logging.FileHandler))
-                     and not isinstance(h, SessionLogHandler)]
+                     and not isinstance(h, (SessionLogHandler, WithheldRecorder))]
 
     if is_tty:
         handler = logging.StreamHandler(console_of(sys.stdout))
         handler.setFormatter(_AnsiFormatter(_AnsiFormatter._FMT, datefmt=_AnsiFormatter._DATE))
         handler.addFilter(ConsoleFilter())
+        plain = logging.Formatter(_AnsiFormatter._FMT, datefmt=_AnsiFormatter._DATE)
         session = session_log_handler(sys.stdout, root_level)
         if session is not None:
-            session.setFormatter(logging.Formatter(_AnsiFormatter._FMT, datefmt=_AnsiFormatter._DATE))
+            session.setFormatter(plain)
             root.addHandler(session)
+        # What the view leaves out, kept for the boot phases' folds.
+        withheld = WithheldRecorder(root_level)
+        withheld.setFormatter(plain)
+        root.addHandler(withheld)
     else:
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(_JsonFormatter())

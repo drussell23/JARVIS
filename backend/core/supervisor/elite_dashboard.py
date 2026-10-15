@@ -156,84 +156,6 @@ def _terminal_routed_above(console: Any) -> Iterator[None]:
             pass
 
 
-def _view_key() -> str:
-    """The key that changes the terminal's view (``JARVIS_CONSOLE_VIEW_KEY``;
-    empty: none is listened for)."""
-    return os.environ.get("JARVIS_CONSOLE_VIEW_KEY", "v").strip()[:1]
-
-
-class _ViewKeys:
-    """Changes the terminal's view on a key while the status region lives.
-
-    Reads single keys from the terminal without echo or Enter: ``msvcrt`` on
-    Windows; cbreak mode on POSIX, which keeps Ctrl+C a signal and is put
-    back however the listener ends. Only an interactive stdin is read --
-    nothing in the kernel reads it after the boot's start -- and every other
-    key is ignored.
-    """
-
-    def __init__(self, key: str, on_key: Callable[[], None]) -> None:
-        self._key = key.lower()
-        self._on_key = on_key
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self) -> bool:
-        stdin = sys.stdin
-        try:
-            interactive = bool(self._key) and stdin is not None and stdin.isatty()
-        except (ValueError, OSError):
-            interactive = False
-        if not interactive:
-            return False
-        self._thread = threading.Thread(target=self._run, name="console_view_keys", daemon=True)
-        self._thread.start()
-        return True
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-        self._thread = None
-
-    def _handle(self, char: str) -> None:
-        if char.lower() == self._key:
-            try:
-                self._on_key()
-            except Exception:  # noqa: BLE001 -- a key never breaks the terminal
-                pass
-
-    def _run(self) -> None:
-        poll = 1.0 / _REFRESH_HZ
-        if os.name == "nt":
-            import msvcrt
-            while not self._stop.is_set():
-                if msvcrt.kbhit():
-                    self._handle(msvcrt.getwch())
-                else:
-                    self._stop.wait(poll)
-            return
-        import select
-        import termios
-        import tty
-        fd = sys.stdin.fileno()
-        saved = termios.tcgetattr(fd)
-        try:
-            tty.setcbreak(fd)
-            while not self._stop.is_set():
-                ready, _, _ = select.select([fd], [], [], poll)
-                if ready:
-                    self._handle(os.read(fd, 1).decode(errors="ignore"))
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-
-
-def _cycle_view() -> None:
-    """Move the terminal to the next view and say so in the scrollback."""
-    from backend.core.console_view import VIEW_NAMES, cycle_verbosity, narrate
-    narrate(f"Terminal view: {VIEW_NAMES[cycle_verbosity()]}", "note")
-
-
 def _layout() -> str:
     """How the dashboard occupies the terminal.
 
@@ -385,8 +307,8 @@ class DashboardState:
     governance_ops: int = 0
     proactive_explorations: int = 0
     uptime_start: float = field(default_factory=time.monotonic)
-    # The key that changes the terminal's view, while one is listened for.
-    view_key: str = ""
+    # Whether the terminal's keys (backend/core/console_view) are listened for.
+    keys_active: bool = False
 
     @property
     def boot_complete(self) -> bool:
@@ -717,10 +639,9 @@ def _build_status_region(state: DashboardState) -> Any:
     ram = _ram_markup()
     if ram:
         stats.append_text(Text.from_markup(" [dim]·[/] RAM " + ram))
-    if state.view_key:
-        from backend.core.console_view import VIEW_NAMES, verbosity
-        stats.append_text(Text.from_markup(
-            f" [dim]· view: {VIEW_NAMES[verbosity()]} ({state.view_key} to change)[/]"))
+    if state.keys_active:
+        from backend.core.console_view import key_hint
+        stats.append_text(Text(f" · {key_hint()}", style="dim"))
     lines.append(clipped(stats))
     return Group(*lines)
 
@@ -1099,8 +1020,9 @@ class EliteDashboard:
                 # every terminal writer is routed above it while it lives.
                 # The bare terminal: region frames are redrawn several times a
                 # second and must not be copied into the session log.
+                from backend.core.console_view import ConsoleKeys
                 console = Console(file=console_of(sys.stdout))
-                keys = _ViewKeys(_view_key(), _cycle_view)
+                keys = ConsoleKeys(poll_s=refresh_interval)
                 with _terminal_routed_above(console), Live(
                     get_renderable=lambda: _build_status_region(self._state),
                     console=console,
@@ -1109,14 +1031,14 @@ class EliteDashboard:
                     redirect_stderr=False,
                     transient=False,
                 ):
-                    self._state.view_key = _view_key() if keys.start() else ""
+                    self._state.keys_active = keys.start()
                     try:
                         while not self._stop_flag.is_set():
                             self._drain()
                             self._stop_flag.wait(timeout=refresh_interval)
                     finally:
                         keys.stop()
-                        self._state.view_key = ""
+                        self._state.keys_active = False
             else:
                 with Live(
                     get_renderable=lambda: _build_layout(self._state),

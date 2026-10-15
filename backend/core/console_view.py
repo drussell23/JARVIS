@@ -24,8 +24,11 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
-from typing import Dict, Optional, Tuple
+import time
+from collections import deque
+from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 #: Ordered quietest first; ``cycle_verbosity`` walks this order.
 VERBOSITIES: Tuple[str, ...] = ("summary", "ops", "debug")
@@ -53,6 +56,7 @@ _TONES: Dict[str, Tuple[str, str]] = {
     "reply": ("⏺", "\033[96m"),
     "detail": ("  ⎿", "\033[2m"),
     "note": ("·", "\033[2m"),
+    "expanded": ("▾", "\033[2m"),
 }
 _RESET = "\033[0m"
 _DIM = "\033[2m"
@@ -113,17 +117,127 @@ class ConsoleFilter(logging.Filter):
         return shows(record.levelno, tone_of(record))
 
 
-def render(text: str, tone: str, *, color: bool = True, suffix: str = "") -> str:
-    """A narrative line as the terminal shows it."""
+# ---------------------------------------------------------------------------
+# Folds: long text shows its head; the rest is one key away (Claude Code's
+# "… +N lines"). The parked text lives in the cockpit's BoundedBodyStore --
+# the substrate the ov cockpit's /expand serves -- under this view's own ref
+# family; the session log always has the whole text.
+# ---------------------------------------------------------------------------
+
+#: Tones whose text folds when long ("command" is what the user typed).
+_FOLDED_TONES = frozenset({"reply", "detail", "failed", "done", "note"})
+
+
+def _env_int(name: str, default: int, floor: int = 0) -> int:
+    try:
+        return max(floor, int(os.environ.get(name, "") or default))
+    except ValueError:
+        return default
+
+
+def fold_lines() -> int:
+    """Lines of a long text shown before its fold (``JARVIS_CONSOLE_FOLD_LINES``;
+    0 shows everything)."""
+    return _env_int("JARVIS_CONSOLE_FOLD_LINES", 4)
+
+
+_store = None
+_store_lock = threading.Lock()
+_expanded: set = set()
+
+
+def fold_store():
+    """This terminal's parked texts: a BoundedBodyStore with its own ref
+    family (``JARVIS_CONSOLE_FOLD_PREFIX``) and capacity
+    (``JARVIS_CONSOLE_FOLD_STORE_SIZE``), outside the cockpit's spine."""
+    global _store
+    with _store_lock:
+        if _store is None:
+            from backend.core.ouroboros.battle_test.tool_render_store import BoundedBodyStore
+            _store = BoundedBodyStore(
+                capacity=_env_int("JARVIS_CONSOLE_FOLD_STORE_SIZE", 50, floor=1),
+                ref_prefix=os.environ.get("JARVIS_CONSOLE_FOLD_PREFIX", "").strip() or "r-",
+                spine_kind=None)
+        return _store
+
+
+def _park(title: str, body: str) -> str:
+    return fold_store().store(op_id="console", round_index=0, tool_name=title,
+                              body=body, summary=title).ref
+
+
+# ---------------------------------------------------------------------------
+# Withheld lines: what the view leaves out, kept for a while so a finished
+# boot phase can carry the lines logged while it ran, folded under its ✓.
+# ---------------------------------------------------------------------------
+
+_withheld: Deque[Tuple[float, str]] = deque(
+    maxlen=_env_int("JARVIS_CONSOLE_WITHHELD_LINES", 5000, floor=1))
+
+
+def withhold(plain: str, at: Optional[float] = None) -> None:
+    """A line the view leaves out of the terminal: into the session log, and
+    into the window a phase's fold is cut from."""
+    from backend.core.session_log import log_only
+    log_only(plain)
+    _withheld.append((time.time() if at is None else at, plain))
+
+
+def withheld_between(start: float, end: float) -> List[str]:
+    """Withheld lines logged from *start* to *end* (wall-clock seconds)."""
+    return [line for at, line in list(_withheld) if start <= at <= end]
+
+
+class WithheldRecorder(logging.Handler):
+    """Keeps the records the view leaves out of the terminal, for the phase
+    folds (the session log has them through its own handler)."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if tone_of(record) is None and not shows(record.levelno):
+                _withheld.append((record.created, self.format(record)))
+        except Exception:  # noqa: BLE001 -- logging never raises into its caller
+            self.handleError(record)
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+def render(text: str, tone: str, *, color: bool = True, suffix: str = "",
+           body: str = "") -> str:
+    """A narrative line as the terminal shows it. A long *text* folds after
+    ``fold_lines()`` lines and a *body* (a phase's log lines) folds whole;
+    either leaves one "… +N lines" line naming its ref."""
     glyph, style = _TONES.get(tone, _TONES["note"])
-    # A multi-line text (a description of the screen) stays under its glyph.
-    text = text.replace("\n", "\n" + " " * (len(glyph) + 1))
+    lines = text.splitlines() or [text]
+    hidden, ref = 0, ""
+    limit = fold_lines()
+    if tone in _FOLDED_TONES and limit and len(lines) > limit:
+        hidden += len(lines) - limit
+        ref = _park(lines[0], text + (("\n\n" + body) if body else ""))
+        lines = lines[:limit]
+    elif body:
+        ref = _park(lines[0], body)
+    if body:
+        hidden += len(body.splitlines())
+    indent = " " * (len(glyph) + 1)
+    # The suffix (how long it took) belongs to the first line, where the
+    # eye reads what happened; the rest of the text continues under it.
+    head, rest = lines[0], lines[1:]
+    if suffix:
+        head += f"  {_DIM}{suffix}{_RESET}" if color else f"  {suffix}"
+    shown = ("\n" + indent).join([head] + rest)
     if not color:
-        return f"{glyph} {text}" + (f"  {suffix}" if suffix else "")
-    body = f"{style}{glyph}{_RESET} {text}"
-    if tone in ("detail", "note"):
-        body = f"{style}{glyph} {text}{_RESET}"
-    return body + (f"  {_DIM}{suffix}{_RESET}" if suffix else "")
+        line = f"{glyph} {shown}"
+    else:
+        line = (f"{style}{glyph} {shown}{_RESET}" if tone in ("detail", "note", "expanded")
+                else f"{style}{glyph}{_RESET} {shown}")
+    if ref:
+        key = expand_key()
+        marker = f"… +{hidden} lines ({key} to expand · {ref})" if key else f"… +{hidden} lines ({ref})"
+        line += "\n" + indent + (f"{_DIM}{marker}{_RESET}" if color else marker)
+    return line
 
 
 def render_record(record: logging.LogRecord, *, color: bool = True) -> Optional[str]:
@@ -132,21 +246,141 @@ def render_record(record: logging.LogRecord, *, color: bool = True) -> Optional[
     if tone is None:
         return None
     return render(record.getMessage(), tone, color=color,
-                  suffix=str(getattr(record, "console_suffix", "") or ""))
+                  suffix=str(getattr(record, "console_suffix", "") or ""),
+                  body=str(getattr(record, "console_body", "") or ""))
 
 
-def narrate(text: str, tone: str = "note", *, suffix: str = "") -> None:
-    """Put a line in the terminal's narrative (and, like any record, in the
-    session log and the IPC stream). Never raises."""
+def narrate(text: str, tone: str = "note", *, suffix: str = "", body: str = "",
+            console_only: bool = False) -> None:
+    """Put a line in the terminal's narrative -- and, like any record, in the
+    session log and the IPC stream, unless *console_only* (a view action,
+    such as an expansion, re-shows what the log already has). *body* is
+    folded under the line. Never raises."""
     text = (text or "").strip()
     if not text:
         return
     try:
         logging.getLogger(NARRATIVE_LOGGER).info(
             text, extra={"console_tone": tone if tone in _TONES else "note",
-                         "console_suffix": suffix})
+                         "console_suffix": suffix, "console_body": body,
+                         "console_only": console_only})
     except Exception:  # noqa: BLE001 -- narration never breaks what it narrates
         pass
+
+
+def is_console_only(record: logging.LogRecord) -> bool:
+    return bool(getattr(record, "console_only", False))
+
+
+# ---------------------------------------------------------------------------
+# Keys
+# ---------------------------------------------------------------------------
+
+def view_key() -> str:
+    """The key that changes the view (``JARVIS_CONSOLE_VIEW_KEY``; empty: none)."""
+    return os.environ.get("JARVIS_CONSOLE_VIEW_KEY", "v").strip()[:1]
+
+
+def expand_key() -> str:
+    """The key that opens a fold (``JARVIS_CONSOLE_EXPAND_KEY``; empty: none)."""
+    return os.environ.get("JARVIS_CONSOLE_EXPAND_KEY", "e").strip()[:1]
+
+
+def cycle_view() -> None:
+    """Move the terminal to the next view and say so."""
+    narrate(f"Terminal view: {VIEW_NAMES[cycle_verbosity()]}", "note", console_only=True)
+
+
+def expand_latest() -> Optional[str]:
+    """Open the newest fold not opened yet -- each press goes one further
+    back. Returns its ref, or None when every fold is open or evicted."""
+    store = fold_store()
+    for ref in reversed(store.all_refs()):
+        stored = store.lookup(ref)
+        if ref in _expanded or stored is None:
+            continue
+        _expanded.add(ref)
+        # The text heads itself when it is the line that folded (a reply);
+        # a phase's lines are headed by the phase they belong to.
+        header = ref if stored.body.startswith(stored.summary) else f"{stored.summary} · {ref}"
+        narrate(f"{header}\n{stored.body}", "expanded", console_only=True)
+        return ref
+    narrate("Nothing folded is left to expand.", "note", console_only=True)
+    return None
+
+
+def key_bindings() -> Dict[str, Callable[[], object]]:
+    """The keys this terminal answers (configured ones only)."""
+    return {key: action for key, action in ((view_key(), cycle_view),
+                                            (expand_key(), expand_latest)) if key}
+
+
+def key_hint() -> str:
+    """The keys, as the status region's footer names them."""
+    names = {view_key(): f"view: {VIEW_NAMES[verbosity()]}", expand_key(): "expand"}
+    return " · ".join(f"{key} {names[key]}" for key in key_bindings())
+
+
+class ConsoleKeys:
+    """Answers single keys from an interactive terminal: ``msvcrt`` on
+    Windows; cbreak mode on POSIX, which keeps Ctrl+C a signal and is put
+    back however the listener ends. Keys without a binding are ignored."""
+
+    def __init__(self, bindings: Optional[Dict[str, Callable[[], object]]] = None,
+                 poll_s: float = 0.25) -> None:
+        self._bindings = {k.lower(): a for k, a in (bindings or key_bindings()).items()}
+        self._poll_s = poll_s
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> bool:
+        stdin = sys.stdin
+        try:
+            interactive = bool(self._bindings) and stdin is not None and stdin.isatty()
+        except (ValueError, OSError):
+            interactive = False
+        if not interactive:
+            return False
+        self._thread = threading.Thread(target=self._run, name="console_keys", daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, 2 * self._poll_s))
+        self._thread = None
+
+    def handle(self, char: str) -> None:
+        action = self._bindings.get((char or "").lower())
+        if action is not None:
+            try:
+                action()
+            except Exception:  # noqa: BLE001 -- a key never breaks the terminal
+                pass
+
+    def _run(self) -> None:
+        if os.name == "nt":
+            import msvcrt
+            while not self._stop.is_set():
+                if msvcrt.kbhit():
+                    self.handle(msvcrt.getwch())
+                else:
+                    self._stop.wait(self._poll_s)
+            return
+        import select
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while not self._stop.is_set():
+                ready, _, _ = select.select([fd], [], [], self._poll_s)
+                if ready:
+                    self.handle(os.read(fd, 1).decode(errors="ignore"))
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
 def seconds(value: float) -> str:
@@ -165,7 +399,9 @@ def phase_title(phase: str) -> str:
 
 
 __all__ = [
-    "ConsoleFilter", "NARRATIVE_LOGGER", "VERBOSITIES", "VIEW_NAMES", "cycle_verbosity",
-    "narrate", "phase_title", "render", "render_record", "seconds", "set_verbosity",
-    "shows", "threshold", "tone_of", "verbosity",
+    "ConsoleFilter", "ConsoleKeys", "NARRATIVE_LOGGER", "VERBOSITIES", "VIEW_NAMES",
+    "WithheldRecorder", "cycle_verbosity", "cycle_view", "expand_key", "expand_latest",
+    "fold_lines", "fold_store", "is_console_only", "key_bindings", "key_hint", "narrate",
+    "phase_title", "render", "render_record", "seconds", "set_verbosity", "shows", "threshold",
+    "tone_of", "verbosity", "view_key", "withhold", "withheld_between",
 ]

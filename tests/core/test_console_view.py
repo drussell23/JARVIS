@@ -25,6 +25,9 @@ from backend.core.boot_timeline import BootTimeline
 def _fresh_view(monkeypatch):
     monkeypatch.delenv("JARVIS_UI_VERBOSITY", raising=False)
     monkeypatch.setattr(cv, "_override", None)
+    monkeypatch.setattr(cv, "_store", None)
+    monkeypatch.setattr(cv, "_expanded", set())
+    monkeypatch.setattr(cv, "_withheld", type(cv._withheld)(maxlen=cv._withheld.maxlen))
     yield
 
 
@@ -172,7 +175,7 @@ def test_a_finished_phase_becomes_one_checklist_line(monkeypatch):
     import importlib
     us = importlib.import_module("unified_supervisor")
     said = []
-    monkeypatch.setattr(cv, "narrate", lambda text, tone="note", suffix="": said.append((text, tone, suffix)))
+    monkeypatch.setattr(cv, "narrate", lambda text, tone="note", suffix="", **kw: said.append((text, tone, suffix)))
     renderer = us.RichCliRenderer(no_animation=True)
     renderer.start()
     t0 = time.time()
@@ -185,20 +188,20 @@ def test_a_finished_phase_becomes_one_checklist_line(monkeypatch):
     assert said == [("Clean slate", "done", "18s")]
 
 
-def test_the_view_key_cycles_and_other_keys_do_nothing():
-    from backend.core.supervisor import elite_dashboard as ed
+def test_keys_run_their_binding_and_other_keys_do_nothing():
     pressed = []
-    keys = ed._ViewKeys("v", lambda: pressed.append(1))
-    for ch in "xVqv":
-        keys._handle(ch)
-    assert pressed == [1, 1]
+    keys = cv.ConsoleKeys({"v": lambda: pressed.append("v"), "e": lambda: pressed.append("e")})
+    for ch in "xVqeE":
+        keys.handle(ch)
+    assert pressed == ["v", "e", "e"]
+    assert set(cv.key_bindings()) == {"v", "e"}
 
 
 # --------------------------------------------------------------- the transcript
 def test_a_command_reads_as_a_transcript(monkeypatch):
     from backend.api import unified_command_processor as ucp
     said = []
-    monkeypatch.setattr(cv, "narrate", lambda text, tone="note", suffix="": said.append((tone, text)))
+    monkeypatch.setattr(cv, "narrate", lambda text, tone="note", suffix="", **kw: said.append((tone, text)))
     proc = ucp.UnifiedCommandProcessor.__new__(ucp.UnifiedCommandProcessor)
     proc._dedup_cache, proc._dedup_inflight, proc._dedup_ttl, proc._dedup_max = {}, {}, 60.0, 10
 
@@ -220,7 +223,7 @@ def test_a_command_reads_as_a_transcript(monkeypatch):
 def test_a_failed_command_says_so(monkeypatch):
     from backend.api import unified_command_processor as ucp
     said = []
-    monkeypatch.setattr(cv, "narrate", lambda text, tone="note", suffix="": said.append((tone, text)))
+    monkeypatch.setattr(cv, "narrate", lambda text, tone="note", suffix="", **kw: said.append((tone, text)))
     ucp.UnifiedCommandProcessor._narrate_outcome(
         {"success": False, "response": "Started Firefox, but no window of it appeared"}, 12.0)
     assert said == [("failed", "Started Firefox, but no window of it appeared")]
@@ -238,3 +241,77 @@ def test_an_attached_viewer_shows_the_same_view(capsys):
     assert "›" in out and "search for dogs" in out
     _render_event({"type": "log", "level": "INFO", "logger": "x", "msg": "piped"}, color=False)
     assert "piped" in capsys.readouterr().out                # a pipe still gets every event
+
+
+def test_a_viewer_folds_a_phase_it_receives_with_its_lines(capsys):
+    from backend.core.supervisor_ipc import _render_event
+    _render_event({"type": "log", "level": "INFO", "logger": cv.NARRATIVE_LOGGER, "msg": "Preflight",
+                   "tone": "done", "suffix": "15s", "body": "line 1\nline 2"}, color=True)
+    out = capsys.readouterr().out
+    assert "Preflight" in out and "+2 lines" in out and "line 1" not in out
+
+
+# ------------------------------------------------------------------- folds
+def test_a_long_reply_folds_after_a_few_lines_and_names_its_ref(monkeypatch):
+    monkeypatch.setenv("JARVIS_CONSOLE_FOLD_LINES", "2")
+    text = "I can see your screen.\nA browser\nA terminal\nVS Code\nThe taskbar"
+    shown = cv.render(text, "reply", color=False).splitlines()
+    assert shown[:2] == ["⏺ I can see your screen.", "  A browser"]
+    assert shown[2] == "  … +3 lines (e to expand · r-1)" and len(shown) == 3
+    assert cv.fold_store().lookup("r-1").body == text            # the whole text, kept
+
+
+def test_a_short_reply_and_what_the_user_typed_never_fold(monkeypatch):
+    monkeypatch.setenv("JARVIS_CONSOLE_FOLD_LINES", "2")
+    assert "…" not in cv.render("Done.", "reply", color=False)
+    assert "…" not in cv.render("a\nb\nc\nd", "command", color=False)
+    assert len(cv.fold_store()) == 0
+
+
+def test_a_finished_phase_carries_the_lines_logged_while_it_ran():
+    cv._withheld.extend([(10.0, "before"), (11.0, "during 1"), (12.0, "during 2"), (14.0, "after")])
+    body = "\n".join(cv.withheld_between(11.0, 13.0))
+    shown = cv.render("Preflight", "done", color=False, suffix="2.0s", body=body).splitlines()
+    assert shown == ["✓ Preflight  2.0s", "  … +2 lines (e to expand · r-1)"]
+    assert cv.fold_store().lookup("r-1").body == "during 1\nduring 2"
+
+
+def test_expanding_opens_the_newest_fold_first_then_goes_back(monkeypatch):
+    opened = []
+    monkeypatch.setattr(cv, "narrate", lambda text, tone="note", **kw: opened.append((tone, text, kw)))
+    cv.render("Clean slate", "done", body="old line")
+    cv.render("Preflight", "done", body="new line")
+    assert cv.expand_latest() == "r-2" and cv.expand_latest() == "r-1"
+    assert cv.expand_latest() is None
+    assert [t for t, _, _ in opened] == ["expanded", "expanded", "note"]
+    assert "new line" in opened[0][1] and all(kw.get("console_only") for _, _, kw in opened)
+
+
+def test_an_expansion_stays_out_of_the_session_log_and_the_viewer_stream(wired):
+    from backend.core.supervisor_ipc import _IPCLogHandler
+    terminal, log = wired()
+    cv.narrate("Preflight\nline", "expanded", console_only=True)
+    assert "Preflight" in terminal.getvalue() and "Preflight" not in log.getvalue()
+
+    class _IPC:
+        def __init__(self):
+            self.touched = False
+
+        @property
+        def _loop(self):
+            self.touched = True
+            return None
+    ipc = _IPC()
+    record = logging.LogRecord(cv.NARRATIVE_LOGGER, logging.INFO, "", 0, "x", (), None)
+    record.console_only = True
+    _IPCLogHandler(ipc).emit(record)
+    assert ipc.touched is False                     # returned before reaching the stream
+
+
+def test_lines_the_view_leaves_out_are_kept_for_the_folds(wired):
+    terminal, log = wired()
+    before = time.time()
+    logging.getLogger("backend.x").info("a hidden detail")
+    assert "a hidden detail" not in terminal.getvalue() and "a hidden detail" in log.getvalue()
+    assert any("a hidden detail" in line for line in cv.withheld_between(before - 1, time.time() + 1))
+

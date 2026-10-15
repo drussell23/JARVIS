@@ -5333,13 +5333,12 @@ class UnifiedLogger:
         if self._json_mode:
             return True
         try:
-            from backend.core.console_view import shows
-            from backend.core.session_log import log_only
+            from backend.core.console_view import shows, withhold
         except Exception:  # noqa: BLE001 -- no view: show everything, as before
             return True
         if shows(self._STDLIB_LEVELS.get(level_name, logging.INFO)):
             return True
-        log_only(plain)
+        withhold(plain)
         return False
 
     def _log(self, level: LogLevel, message: str, **kwargs) -> None:
@@ -9226,13 +9225,15 @@ class RichCliRenderer(CliRenderer):
     def _narrate_phase(entry: Dict[str, Any], event: SupervisorEvent) -> None:
         """A finished phase becomes one static line of the boot checklist
         ("✓ Preflight  15.7s") above the status region, which shows the
-        phases still running (backend/core/console_view)."""
-        from backend.core.console_view import narrate, phase_title, seconds
+        phases still running (backend/core/console_view). The lines the view
+        left out while it ran are folded under it, one key away."""
+        from backend.core.console_view import narrate, phase_title, seconds, withheld_between
         took = (event.duration_ms / 1000.0 if event.duration_ms > 0
                 else max(0.0, event.timestamp - entry["start"]))
         failed = entry["status"] == "error"
         narrate(phase_title(event.phase) + (f": {event.message}" if failed and event.message else ""),
-                "failed" if failed else "done", suffix=seconds(took))
+                "failed" if failed else "done", suffix=seconds(took),
+                body="\n".join(withheld_between(entry["start"], event.timestamp)))
 
     _REGION_SEVERITIES = {
         SupervisorEventSeverity.WARNING: "warn",

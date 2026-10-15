@@ -132,6 +132,8 @@ class SessionLogHandler(logging.Handler):
         self._tee = tee
 
     def emit(self, record: logging.LogRecord) -> None:
+        if getattr(record, "console_only", False):
+            return  # a view action: an expansion re-shows what the log already has
         try:
             self._tee.record(self.format(record) + "\n")
         except Exception:  # noqa: BLE001 -- logging never raises into its caller

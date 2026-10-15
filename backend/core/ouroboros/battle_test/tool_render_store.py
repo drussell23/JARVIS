@@ -235,7 +235,14 @@ class BoundedBodyStore:
     inside a listener doesn't self-deadlock.
     """
 
-    def __init__(self, *, capacity: Optional[int] = None) -> None:
+    def __init__(self, *, capacity: Optional[int] = None, ref_prefix: str = REF_PREFIX,
+                 spine_kind: Optional[str] = "tool_body") -> None:
+        """``ref_prefix`` names this store's ref family (``t-`` for tool
+        bodies); ``spine_kind`` is the cockpit transcript-spine event a park
+        records, or None for a store outside the cockpit (the supervisor's
+        console folds, ``backend/core/console_view``)."""
+        self._ref_prefix = ref_prefix
+        self._spine_kind = spine_kind
         if capacity is None:
             cap = _read_capacity_from_env()
         else:
@@ -292,17 +299,18 @@ class BoundedBodyStore:
         lexer_safe = _safe_str(lexer) or None
 
         with self._lock:
-            ref = f"{REF_PREFIX}{self._next_seq}"
+            ref = f"{self._ref_prefix}{self._next_seq}"
             # Transcript spine: one ordered sequence across all four
             # namespaces, so "what happened next" has an answer and eviction
             # is uniform. Fail-soft — never blocks admission.
-            try:
-                from backend.core.ouroboros.battle_test.transcript_spine import (
-                    record_event,
-                )
-                record_event("tool_body", ref, op_id=op_id_safe)
-            except Exception:  # noqa: BLE001
-                pass
+            if self._spine_kind is not None:
+                try:
+                    from backend.core.ouroboros.battle_test.transcript_spine import (
+                        record_event,
+                    )
+                    record_event(self._spine_kind, ref, op_id=op_id_safe)
+                except Exception:  # noqa: BLE001
+                    pass
             self._next_seq += 1
             stored = StoredBody(
                 ref=ref,
