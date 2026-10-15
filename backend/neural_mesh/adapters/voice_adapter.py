@@ -31,6 +31,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import (
     Any,
     Callable,
@@ -1012,8 +1013,6 @@ async def create_speaker_verification_adapter(
                 # The process's one service, not initialised here
                 # (initialization will happen on first use)
                 service = speaker_verification_service_instance()
-                # Mark as lazy-initialized so adapter knows to initialize on first use
-                service._lazy_initialized = True
                 logger.debug(
                     f"[VoiceAdapter] Created speaker_verification service with lazy init"
                 )
@@ -1068,66 +1067,23 @@ async def create_voice_unlock_adapter(
         Configured VoiceSystemAdapter
     """
     if integration is None:
-        # v93.0: Try multiple import paths with better error handling
-        VoiceUnlockIntegration = None
-        import_errors = []
-
-        # Try absolute import first (most reliable)
+        # One import: the module's name is known. The four fallbacks that
+        # followed could never succeed (relative imports above the top-level
+        # package, a sys.path edit) and buried the one real reason -- a
+        # package the integration needs is not installed.
         try:
-            from backend.voice.voice_unlock_integration import VoiceUnlockIntegration as VUI
-            VoiceUnlockIntegration = VUI
-        except ImportError as e:
-            import_errors.append(f"backend.voice.voice_unlock_integration: {e}")
-
-        # Try relative import from voice directory
-        if VoiceUnlockIntegration is None:
-            try:
-                from ...voice.voice_unlock_integration import VoiceUnlockIntegration as VUI
-                VoiceUnlockIntegration = VUI
-            except ImportError as e:
-                import_errors.append(f"...voice.voice_unlock_integration: {e}")
-
-        # Try relative import from voice_unlock directory
-        if VoiceUnlockIntegration is None:
-            try:
-                from ...voice_unlock.voice_unlock_integration import VoiceUnlockIntegration as VUI
-                VoiceUnlockIntegration = VUI
-            except ImportError as e:
-                import_errors.append(f"...voice_unlock.voice_unlock_integration: {e}")
-
-        # Try direct import from sys.modules
-        if VoiceUnlockIntegration is None:
-            try:
-                import sys
-                if 'backend.voice.voice_unlock_integration' in sys.modules:
-                    VoiceUnlockIntegration = sys.modules['backend.voice.voice_unlock_integration'].VoiceUnlockIntegration
-                elif 'voice.voice_unlock_integration' in sys.modules:
-                    VoiceUnlockIntegration = sys.modules['voice.voice_unlock_integration'].VoiceUnlockIntegration
-            except (ImportError, AttributeError, KeyError) as e:
-                import_errors.append(f"sys.modules lookup: {e}")
-
-        # Try import with modified path
-        if VoiceUnlockIntegration is None:
-            try:
-                # Add backend to path if needed
-                import sys
-                from pathlib import Path
-                backend_path = str(Path(__file__).parent.parent.parent.parent)
-                if backend_path not in sys.path:
-                    sys.path.append(backend_path)
-                
-                from voice.voice_unlock_integration import VoiceUnlockIntegration as VUI
-                VoiceUnlockIntegration = VUI
-            except ImportError as e:
-                import_errors.append(f"path modification import: {e}")
-
-        if VoiceUnlockIntegration is None:
-            logger.warning(
-                f"Could not import VoiceUnlockIntegration from any path. "
-                f"Errors: {'; '.join(import_errors)}. "
-                f"Voice unlock adapter will not be available."
-            )
-            raise ImportError("VoiceUnlockIntegration not found in any import path")
+            from backend.voice.voice_unlock_integration import VoiceUnlockIntegration
+        except ModuleNotFoundError as e:
+            missing = (e.name or "").split(".")[0]
+            backend_root = Path(__file__).resolve().parents[2]
+            ours = missing == backend_root.name or (backend_root / missing).exists() \
+                or (backend_root / f"{missing}.py").exists()
+            if missing and not ours:
+                # A third-party package: one line in the boot's summary of
+                # missing extras, with how to install it.
+                from backend.core.optional_dependencies import note_missing
+                note_missing(missing, "voice unlock", install=missing, error=e)
+            raise
 
         integration = VoiceUnlockIntegration()
 

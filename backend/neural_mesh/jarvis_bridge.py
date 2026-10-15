@@ -587,6 +587,13 @@ class JARVISNeuralMeshBridge:
                 return None
 
             except Exception as e:
+                from backend.core.ai_loader import ModelUnavailable
+                if isinstance(e, ModelUnavailable):
+                    # What the agent needs is absent on this host: a retry
+                    # cannot change that (three retries and an ERROR, every
+                    # boot, for a model whose loader produced nothing).
+                    logger.info("Skipping %s: %s", name, e)
+                    return None
                 retries += 1
                 if retries <= self._config.max_retries and self._config.retry_on_failure:
                     logger.warning(

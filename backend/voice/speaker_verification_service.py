@@ -8356,8 +8356,10 @@ def speaker_verification_service_instance(
     """
     global _speaker_verification_service, _global_speaker_service
 
-    # A pre-loaded service (start_system.py / the AI Loader proxy) is the one.
-    if _global_speaker_service is not None:
+    # A pre-loaded service (optimized_startup.py injects one) is the one. Only
+    # a service is: a stand-in for one (the AI Loader's proxy was installed
+    # here) answered none of the service's attributes.
+    if isinstance(_global_speaker_service, SpeakerVerificationService):
         _speaker_verification_service = _global_speaker_service
         return _global_speaker_service
 

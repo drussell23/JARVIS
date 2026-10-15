@@ -65,6 +65,12 @@ from typing import (
     Union,
 )
 
+from backend.core.module_identity import unify as _unify_module_identity
+
+# One module under both import names (core.ai_loader / backend.core.ai_loader):
+# its manager is a process singleton and ModelUnavailable is caught by type.
+_unify_module_identity(__name__)
+
 logger = logging.getLogger("jarvis.ai_loader")
 
 T = TypeVar("T")
@@ -206,6 +212,7 @@ class ModelStatus(IntEnum):
     READY = 4       # Fully loaded and ready
     FAILED = 5      # Load failed
     UNLOADED = 6    # Explicitly unloaded
+    UNAVAILABLE = 7  # The loader produced nothing: a dependency is absent here
 
 
 class ModelMetrics:
@@ -268,6 +275,10 @@ class PendingRequest:
 # =============================================================================
 # Ghost Model Proxy - Metaprogramming Core
 # =============================================================================
+
+class ModelUnavailable(RuntimeError):
+    """A model whose loader produced nothing on this host."""
+
 
 class GhostModelProxy(Generic[ModelT]):
     """
@@ -471,6 +482,20 @@ class GhostModelProxy(Generic[ModelT]):
             f"Load time: {self._metrics.load_duration_ms:.0f}ms, "
             f"Pending requests: {len(self._pending_queue)}"
         )
+
+    def unavailable(self, reason: str) -> None:
+        """The loader ran and produced no model: what it needs is absent on
+        this host (its own message says what). Not READY -- materialising
+        ``None`` declared "ready" and every later call raised "failed to
+        load" -- and not a failure to be retried or reported as an error."""
+        error = ModelUnavailable(f"{self._name} is unavailable: {reason}")
+        with self._lock:
+            self._status = ModelStatus.UNAVAILABLE
+            self._metrics.status = ModelStatus.UNAVAILABLE
+            self._error = error
+        self._ready_event.set()
+        self._fail_pending_queue(error)
+        logger.info(f"[GHOST] {error}")
 
     def fail(self, error: Exception) -> None:
         """Mark the model as failed to load."""
@@ -1416,6 +1441,11 @@ class AsyncModelManager:
 
             # Run in thread pool (PyTorch releases GIL during heavy ops)
             model = await loop.run_in_executor(self._executor, loader_func)
+            if model is None:
+                # A loader returns None when what it needs is absent (it
+                # says why itself); that is not a model to materialise.
+                proxy.unavailable("its loader produced no model")
+                return
 
             # Estimate memory
             memory = ZeroCopyLoader.estimate_memory(model)

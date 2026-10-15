@@ -2434,15 +2434,15 @@ class ParallelInitializer:
                     )
 
             def load_speaker_verification():
-                """Heavy loader for speaker verification service."""
+                """The process's speaker verification service (initialised on
+                first use). It opens its own learning database when none is
+                attached yet: returning nothing without one made the service
+                "unavailable" on every boot where the database came later."""
                 try:
                     from voice.speaker_verification_service import speaker_verification_service_instance
-                    if learning_db:
-                        service = speaker_verification_service_instance(learning_db)
-                        # Can't call async from sync, but service will init on first use
-                        logger.info("   [BACKGROUND] Speaker verification service loaded")
-                        return service
-                    return None
+                    service = speaker_verification_service_instance(learning_db)
+                    logger.info("   [BACKGROUND] Speaker verification service loaded")
+                    return service
                 except Exception as e:
                     logger.warning(f"   [BACKGROUND] Speaker verification load failed: {e}")
                     return None
@@ -3789,15 +3789,13 @@ class ParallelInitializer:
         voice_proxies = getattr(self.app.state, 'voice_model_proxies', {})
 
         if voice_proxies.get('speaker_verification'):
-            # Already registered via AI Loader - just wait for it to be ready
+            # The AI Loader loads the process's one service
+            # (speaker_verification_service_instance) behind its proxy. The
+            # proxy is the loader's handle, not the service: installing it as
+            # the service handed every caller a different type (no service
+            # attributes; "failed to load" when its loader produced nothing).
             proxy = voice_proxies['speaker_verification']
-            logger.info(f"   Speaker verification: using Ghost Proxy ({proxy.status.name})")
-
-            # Store reference globally for compatibility
-            import voice.speaker_verification_service as sv
-            sv._global_speaker_service = proxy  # Will auto-wait when accessed
-
-            # Don't block - the proxy handles waiting
+            logger.info(f"   Speaker verification: loaded by the AI Loader ({proxy.status.name})")
             return
 
         # Fallback: Load directly if AI Loader not available
