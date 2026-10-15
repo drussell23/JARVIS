@@ -21,7 +21,8 @@ import VoiceStatsDisplay from './VoiceStatsDisplay'; // Adaptive voice stats dis
 import EnvironmentalStatsDisplay from './EnvironmentalStatsDisplay'; // Environmental stats display
 import AudioQualityStatsDisplay from './AudioQualityStatsDisplay'; // Audio quality stats display
 import CommandDetectionBanner from './CommandDetectionBanner'; // 🆕 Command detection banner for streaming safeguard
-import { getJarvisConnectionService, ConnectionState, connectionStateToJarvisStatus, VOICE_PLAYBACK_CAPABILITY } from '../services/JarvisConnectionService'; // 🆕 Unified connection service
+import { getJarvisConnectionService, ConnectionState, connectionStateToJarvisStatus, VOICE_PLAYBACK_CAPABILITY } from '../services/JarvisConnectionService';
+import { getBargeInPolicy, judgeHeardWhileSpeaking, resetBargeInPolicy } from '../utils/bargeIn'; // ✋ talk over JARVIS // 🆕 Unified connection service
 import TrainingStatus from './TrainingStatus'; // 🆕 Real-time training progress display (Feedback Loop)
 import { getContinuousAudioBuffer } from '../utils/ContinuousAudioBuffer'; // 🆕 Continuous audio pre-buffer for first-attempt recognition
 import { initDynamicFavicon, setFaviconState } from '../utils/DynamicFavicon'; // 🆕 Dynamic JARVIS favicon
@@ -858,6 +859,53 @@ const JarvisVoice = () => {
     lastPauseTime: 0,                     // When we paused recognition
   });
 
+  // ============================================================
+  // BARGE-IN: the user may talk over JARVIS (utils/bargeIn)
+  // ============================================================
+  // With the operator's policy loaded and enabled, recognition keeps running
+  // while JARVIS speaks; what it hears is judged against what JARVIS is
+  // saying -- its own echo is ignored, the user talking stops JARVIS and
+  // becomes the next command. Without it (not loaded, or disabled),
+  // recognition pauses while JARVIS speaks, as before.
+  const bargeInPolicyRef = useRef(null);
+  // The utterance that interrupted (its remaining results are the user's,
+  // not echo) and when, for the policy's cooldown.
+  const bargeInStateRef = useRef({ utteranceActive: false, lastAt: 0 });
+
+  const listensThroughSpeech = () => Boolean(bargeInPolicyRef.current?.enabled);
+
+  /** The lines JARVIS is saying, has queued, or said moments ago (its echo may lag). */
+  const linesBeingSaid = () => {
+    const suppression = selfVoiceSuppressionRef.current;
+    return [
+      suppression.lastSpokenText,
+      ...speechQueueRef.current.map((item) => (typeof item === 'string' ? item : item.text)),
+      ...suppression.recentSpokenTexts.map((recent) => recent.text),
+    ].filter(Boolean);
+  };
+
+  /** The user talked over JARVIS: stop, drop the rest of that answer, listen. */
+  const bargeIn = (heard, overlap) => {
+    const silenced = silencedRequestsRef.current;
+    const now = Date.now();
+    [currentSpeechRequestRef.current, ...speechQueueRef.current.map((item) => item && item.requestId)]
+      .filter(Boolean)
+      .forEach((requestId) => silenced.set(requestId, now));
+    // A command's lines stop arriving well within the queue's own TTL.
+    silenced.forEach((at, requestId) => {
+      if (now - at > SPEECH_QUEUE_TTL_MS) silenced.delete(requestId);
+    });
+    console.log(`✋ [Barge-in] "${heard}" (echo overlap ${(overlap * 100).toFixed(0)}%) -- JARVIS stops`);
+    stopAllSpeech();
+    const state = bargeInStateRef.current;
+    state.utteranceActive = true;
+    state.lastAt = now;
+    // No echo cooldown for what follows: the speaker is the user.
+    selfVoiceSuppressionRef.current.speakingEndTime = 0;
+    setIsWaitingForCommand(true);
+    isWaitingForCommandRef.current = true;
+  };
+
   /**
    * 🔇 PAUSE recognition when JARVIS starts speaking
    * This is the most aggressive and reliable way to prevent self-voice feedback
@@ -882,6 +930,12 @@ const JarvisVoice = () => {
       if (suppression.recentSpokenTexts.length > suppression.maxRecentTexts) {
         suppression.recentSpokenTexts = suppression.recentSpokenTexts.slice(0, suppression.maxRecentTexts);
       }
+    }
+
+    // Barge-in: keep listening -- what is heard is judged, not discarded.
+    if (listensThroughSpeech()) {
+      console.log('👂 [Barge-in] listening while JARVIS speaks');
+      return;
     }
 
     // Actually stop the recognition to prevent any input
@@ -913,10 +967,12 @@ const JarvisVoice = () => {
     setTimeout(() => {
       if (!suppression.isSpeaking) { // Only resume if not speaking again
         console.log(`🔇 [Self-Voice v2] Cooldown complete (${suppression.cooldownMs}ms), resuming recognition`);
+        // Restart only what was paused (with barge-in it never stopped).
+        const wasPaused = suppression.recognitionPausedForSpeech;
         suppression.recognitionPausedForSpeech = false;
 
         // Restart recognition
-        if (recognitionRef.current && continuousListeningRef.current) {
+        if (wasPaused && recognitionRef.current && continuousListeningRef.current) {
           try {
             recognitionRef.current.start();
             console.log('🔇 [Self-Voice v2] Recognition RESUMED');
@@ -1082,6 +1138,21 @@ const JarvisVoice = () => {
     // the host's speakers.
     const withdrawVoicePlayback = connectionService.declareCapability(VOICE_PLAYBACK_CAPABILITY);
 
+    // The operator's barge-in policy (/audio/barge-in), read again on every
+    // reconnect -- the backend may have restarted with other settings. Until
+    // it is known, recognition pauses while JARVIS speaks, as before.
+    const loadBargeInPolicy = () => {
+      resetBargeInPolicy();
+      getBargeInPolicy(API_URL || configService.getApiUrl() || inferUrls().API_BASE_URL)
+        .then((policy) => {
+          bargeInPolicyRef.current = policy;
+          console.log('✋ [Barge-in] policy:', policy);
+        })
+        .catch((err) => console.warn('[Barge-in] policy unavailable:', err.message));
+    };
+    loadBargeInPolicy();
+    const unsubscribeBargeInReload = connectionService.on('wsReconnected', loadBargeInPolicy);
+
     // Subscribe to connection state changes
     const unsubscribeState = connectionService.on('stateChange', ({ state: newState }) => {
       console.log('[JarvisVoice] Connection state changed:', newState);
@@ -1166,6 +1237,7 @@ const JarvisVoice = () => {
       unsubscribeMessage();
       unsubscribeWsReconnect();
       withdrawVoicePlayback();
+      unsubscribeBargeInReload();
       clearInterval(wsSyncInterval);
     };
   }, []);
@@ -1840,9 +1912,10 @@ const JarvisVoice = () => {
       case 'voice_line':
         // A line JARVIS says for this page's command (the reply, an
         // acknowledgement while it works): played here, in turn, in JARVIS's
-        // voice. The reply's text is shown by its command_response.
-        if (data.text) {
-          speakResponse(data.text, false);
+        // voice. The reply's text is shown by its command_response. A command
+        // the user talked over says nothing more.
+        if (data.text && !(data.requestId && silencedRequestsRef.current.has(data.requestId))) {
+          speakResponse(data.text, false, data.requestId || null);
         }
         break;
       case 'command_ack':
@@ -3882,20 +3955,42 @@ const JarvisVoice = () => {
         console.log('🎤 RAW SPEECH:', transcript, `(final: ${isFinal}, conf: ${confidence})`);
 
         // ============================================================
-        // 🔇 SELF-VOICE SUPPRESSION v2.0 - REF-BASED (No closure issues)
+        // ✋ BARGE-IN: heard while JARVIS speaks -- its echo, or the user?
         // ============================================================
-        // Check if this is JARVIS hearing its own voice using ref-based system
-        const blockCheck = shouldBlockSelfVoice(transcript);
-        if (blockCheck.block) {
-          console.log(`🔇 [Self-Voice v2] BLOCKED: "${transcript.substring(0, 50)}..." - Reason: ${blockCheck.reason}`);
-          return; // Completely ignore this speech input
+        const barge = bargeInStateRef.current;
+        if (listensThroughSpeech() && (isSpeakingRef.current || fetchingAudioRef.current)) {
+          const policy = bargeInPolicyRef.current;
+          if (Date.now() - barge.lastAt < policy.cooldown_ms) return;
+          const { verdict, overlap } = judgeHeardWhileSpeaking(transcript, linesBeingSaid(), policy);
+          if (verdict !== 'user') {
+            console.log(`👂 [Barge-in] ${verdict}: "${transcript.substring(0, 50)}" (overlap ${(overlap * 100).toFixed(0)}%)`);
+            return;
+          }
+          bargeIn(transcript, overlap);
+        }
+        // The rest of an interrupting utterance is the user's own words.
+        const interrupting = barge.utteranceActive;
+        if (interrupting && isFinal) {
+          barge.utteranceActive = false;
         }
 
-        // Also check the older system as backup
-        const echoCheck = isSelfVoiceEcho(transcript);
-        if (echoCheck.isEcho) {
-          console.log(`🔇 [Self-Voice v1] BLOCKED: "${transcript.substring(0, 50)}..." - Reason: ${echoCheck.reason}`);
-          return; // Completely ignore this speech input
+        if (!interrupting) {
+          // ============================================================
+          // 🔇 SELF-VOICE SUPPRESSION v2.0 - REF-BASED (No closure issues)
+          // ============================================================
+          // Check if this is JARVIS hearing its own voice using ref-based system
+          const blockCheck = shouldBlockSelfVoice(transcript);
+          if (blockCheck.block) {
+            console.log(`🔇 [Self-Voice v2] BLOCKED: "${transcript.substring(0, 50)}..." - Reason: ${blockCheck.reason}`);
+            return; // Completely ignore this speech input
+          }
+
+          // Also check the older system as backup
+          const echoCheck = isSelfVoiceEcho(transcript);
+          if (echoCheck.isEcho) {
+            console.log(`🔇 [Self-Voice v1] BLOCKED: "${transcript.substring(0, 50)}..." - Reason: ${echoCheck.reason}`);
+            return; // Completely ignore this speech input
+          }
         }
 
         // 🆕 ULTRA-FAST-PATH: Check for critical unlock/lock commands immediately
@@ -5960,8 +6055,11 @@ const JarvisVoice = () => {
 
   const playAudioUsingPost = async (text, onStartCallback = null) => {
     console.log('[JARVIS Audio] POST: Attempting to play audio via POST');
+    const generation = speechGenerationRef.current;
+    const stale = () => generation !== speechGenerationRef.current;
     // v241.0: 8s AbortController — backend should respond in <5s, 3s margin
     const controller = new AbortController();
+    audioFetchAbortRef.current = controller;
     const fetchTimeout = setTimeout(() => controller.abort(), 8000);
     try {
       const apiUrl = API_URL || configService.getApiUrl() || inferUrls().API_BASE_URL;
@@ -5990,17 +6088,20 @@ const JarvisVoice = () => {
         // Get audio data as blob
         const blob = await response.blob();
         console.log('[JARVIS Audio] POST: Received audio blob:', blob.size, 'bytes');
+        if (stale()) return; // stopped while it was being fetched
 
         const audioUrl = URL.createObjectURL(blob);
 
         const audio2 = new Audio(audioUrl);
         audio2.volume = 1.0;
+        currentAudioRef.current = audio2;
 
         // 🔇 SELF-VOICE SUPPRESSION v2: PAUSE recognition (POST method)
         pauseRecognitionForSpeech(text);
         recordSpokenText(text);
 
         audio2.onplay = () => {
+          if (stale()) return;
           console.log('[JARVIS Audio] POST: Playback started');
           // v241.0: NOW set speaking state (audio is actually playing)
           clearTimeout(fetchTimeoutRef.current);
@@ -6015,6 +6116,11 @@ const JarvisVoice = () => {
         };
 
         audio2.onended = () => {
+          if (stale()) {
+            URL.revokeObjectURL(audioUrl);
+            return;
+          }
+          currentAudioRef.current = null;
           console.log('[JARVIS Audio] POST: Playback completed');
           setIsJarvisSpeaking(false);
           isSpeakingRef.current = false;
@@ -6029,6 +6135,11 @@ const JarvisVoice = () => {
         };
 
         audio2.onerror = (e) => {
+          if (stale()) {
+            URL.revokeObjectURL(audioUrl);
+            return;
+          }
+          currentAudioRef.current = null;
           console.error('[JARVIS Audio] POST: Playback error:', e);
           if (audio2.error) {
             console.error('[JARVIS Audio] POST: Error details:', {
@@ -6048,13 +6159,19 @@ const JarvisVoice = () => {
           setTimeout(() => processNextInSpeechQueue(), 200);
         };
 
-        await audio2.play();
+        try {
+          await audio2.play();
+        } catch (playError) {
+          if (stale()) return; // paused by a stop before it started
+          throw playError;
+        }
         console.log('[JARVIS Audio] POST: Playing audio successfully');
       } else {
         throw new Error(`Audio generation failed: ${response.status}`);
       }
     } catch (postError) {
       clearTimeout(fetchTimeout);
+      if (stale()) return; // stopped: nothing failed, nothing to fall back to
       if (postError.name === 'AbortError') {
         console.warn('[JARVIS Audio] POST: Fetch timed out after 8s');
       } else {
@@ -6071,6 +6188,17 @@ const JarvisVoice = () => {
   // Speech queue to prevent overlapping
   const speechQueueRef = useRef([]);
   const isSpeakingRef = useRef(false);
+  // What is playing now, so it can be stopped mid-line (barge-in): the
+  // <audio> element, the request fetching its audio, and the command the line
+  // belongs to. Every stop advances the generation; a callback, fetch or
+  // fallback started under an older generation does nothing -- a stopped
+  // line cannot resume, fall back to the browser's voice, or start the next.
+  const currentAudioRef = useRef(null);
+  const audioFetchAbortRef = useRef(null);
+  const speechGenerationRef = useRef(0);
+  const currentSpeechRequestRef = useRef(null);
+  // Commands the user talked over: their remaining lines are not played.
+  const silencedRequestsRef = useRef(new Map()); // requestId -> when it was talked over
   // v241.0: Separate fetch-in-progress guard from speaking lock
   const fetchingAudioRef = useRef(false);
   const fetchTimeoutRef = useRef(null);  // 10s fetch-phase guard
@@ -6243,14 +6371,36 @@ const JarvisVoice = () => {
     // Handle both old format (string) and new format (object with text and callback)
     const text = typeof nextItem === 'string' ? nextItem : nextItem.text;
     const callback = typeof nextItem === 'object' ? nextItem.callback : null;
+    currentSpeechRequestRef.current = typeof nextItem === 'object' ? (nextItem.requestId || null) : null;
 
     await speakResponseInternal(text, callback);
   };
 
+  /**
+   * Stop JARVIS mid-line: the line playing (backend audio or the browser's
+   * own voice), the audio being fetched, and every queued line. Advancing
+   * the generation retires every callback of what was playing.
+   */
   const stopAllSpeech = () => {
     console.log('[JARVIS Audio] Stopping all speech and clearing queue');
+    speechGenerationRef.current += 1;
     // Clear the queue
     speechQueueRef.current = [];
+    currentSpeechRequestRef.current = null;
+    if (audioFetchAbortRef.current) {
+      audioFetchAbortRef.current.abort();
+      audioFetchAbortRef.current = null;
+    }
+    const audio = currentAudioRef.current;
+    currentAudioRef.current = null;
+    if (audio) {
+      audio.pause();
+      if (audio.src && audio.src.startsWith('blob:')) {
+        URL.revokeObjectURL(audio.src);
+      }
+      audio.removeAttribute('src');
+      audio.load();
+    }
     // Stop browser synthesis if active
     if ('speechSynthesis' in window) {
       window.speechSynthesis.cancel();
@@ -6262,6 +6412,8 @@ const JarvisVoice = () => {
     fetchingAudioRef.current = false;
     clearTimeout(fetchTimeoutRef.current);
     stopSpeechWatchdog();
+    const suppression = selfVoiceSuppressionRef.current;
+    suppression.isSpeaking = false;
   };
 
   // v241.0: Speech watchdog — detects stuck isSpeakingRef and force-resets
@@ -6308,7 +6460,7 @@ const JarvisVoice = () => {
     }
   };
 
-  const speakResponse = async (text, updateDisplay = true) => {
+  const speakResponse = async (text, updateDisplay = true, requestId = null) => {
     // Only set the response in state if explicitly requested (default true for backward compatibility)
     if (updateDisplay) {
       setResponse(text);
@@ -6317,8 +6469,9 @@ const JarvisVoice = () => {
     console.log('[JARVIS Audio] Speaking response:', text.substring(0, 100) + '...');
     console.log('[JARVIS Audio] Current speaking state:', isJarvisSpeaking);
 
-    // Add to speech queue instead of skipping
-    speechQueueRef.current.push({ text, callback: null, enqueuedAt: Date.now() });
+    // Add to speech queue instead of skipping. *requestId* is the command the
+    // line belongs to: talked over, its remaining lines are not played.
+    speechQueueRef.current.push({ text, callback: null, enqueuedAt: Date.now(), requestId });
 
     // Process queue if not already speaking
     if (!isSpeakingRef.current) {
@@ -6344,6 +6497,10 @@ const JarvisVoice = () => {
       console.log('[JARVIS Audio] Already speaking or fetching, adding to queue');
       return;
     }
+    // The line's generation: a stop (barge-in) retires it, and nothing below
+    // -- its error path, its browser-voice fallback -- may act after that.
+    const generation = speechGenerationRef.current;
+    const stale = () => generation !== speechGenerationRef.current;
 
     try {
       console.log('[JARVIS Audio] Setting speaking state to true');
@@ -6406,6 +6563,7 @@ const JarvisVoice = () => {
       console.log('[JARVIS Audio] Using POST method (header-aware path)');
       await playAudioUsingPost(sanitizedText, onStartCallback);
     } catch (error) {
+      if (stale()) return; // stopped mid-line: not a failure to fall back from
       console.error('[JARVIS Audio] Playback failed:', error);
       console.error('[JARVIS Audio] Error details:', {
         name: error.name,
@@ -6481,6 +6639,7 @@ const JarvisVoice = () => {
         }
 
         utterance.onstart = () => {
+          if (stale()) return;
           console.log('[JARVIS Audio] Browser speech synthesis started');
           clearTimeout(fetchTimeoutRef.current);
           fetchingAudioRef.current = false;
@@ -6496,6 +6655,7 @@ const JarvisVoice = () => {
           }
         };
         utterance.onend = () => {
+          if (stale()) return;
           console.log('[JARVIS Audio] Browser speech completed');
           setIsJarvisSpeaking(false);
           isSpeakingRef.current = false;
@@ -6508,6 +6668,7 @@ const JarvisVoice = () => {
           setTimeout(() => processNextInSpeechQueue(), 200);
         };
         utterance.onerror = (e) => {
+          if (stale()) return;
           console.error('[JARVIS Audio] Browser speech error:', e);
           setIsJarvisSpeaking(false);
           isSpeakingRef.current = false;
@@ -6520,6 +6681,7 @@ const JarvisVoice = () => {
           setTimeout(() => processNextInSpeechQueue(), 200);
         };
 
+        if (stale()) return; // stopped while the persona was looked up
         window.speechSynthesis.speak(utterance);
       }
     }

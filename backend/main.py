@@ -10493,6 +10493,15 @@ async def audio_persona():
     return {**asdict(persona()), "enforce": enforce_persona()}
 
 
+@app.get("/audio/barge-in")
+async def audio_barge_in():
+    """When the page that plays JARVIS's voice may interrupt it, and how it
+    tells the user from JARVIS's own echo (backend/core/barge_in_policy)."""
+    from backend.core.barge_in_policy import barge_in_policy
+
+    return barge_in_policy().as_dict()
+
+
 @app.get("/host/session")
 async def host_session():
     """Facts about the desktop JARVIS runs on that a page cannot see from the
