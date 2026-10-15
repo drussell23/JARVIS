@@ -121,6 +121,43 @@ else:
 
 
 # ---------------------------------------------------------------------------
+# Identity: a PID names a process only while that process lives
+# ---------------------------------------------------------------------------
+# Windows recycles PIDs quickly: a kernel's lock named PID 117732, the kernel
+# died, and within the hour 117732 was a VS Code GPU process -- so "is the PID
+# alive" said a kernel was running and refused to boot one (2026-10-14).
+# A process is identified by its PID AND its start time, recorded together.
+
+def process_started_at(pid: Optional[int]) -> Optional[float]:
+    """When the process *pid* started (the OS's own creation time, seconds
+    since the epoch), or None when it is not running or cannot be read."""
+    if not pid_alive(pid):
+        return None
+    try:
+        import psutil
+
+        return float(psutil.Process(int(pid)).create_time())
+    except Exception:  # noqa: BLE001 -- gone, access denied, or no psutil
+        return None
+
+
+def is_same_process(pid: Optional[int], started_at: Optional[float]) -> Optional[bool]:
+    """Is *pid* still the process that started at *started_at*?
+
+    True / False when that can be told; None when it cannot (no start time
+    was recorded, or this one cannot be read) -- the caller then needs other
+    evidence, such as ``is_trinity_process``."""
+    if not pid_alive(pid):
+        return False
+    if started_at is None:
+        return None
+    now = process_started_at(pid)
+    if now is None:
+        return None
+    return now == float(started_at)
+
+
+# ---------------------------------------------------------------------------
 # Ownership
 # ---------------------------------------------------------------------------
 
@@ -558,6 +595,7 @@ def install_kill_guard() -> bool:
 __all__ = [
     "HARD_KILL_SIGNAL",
     "install_kill_guard",
+    "is_same_process",
     "is_trinity_process",
     "kill_process_tree",
     "kill_guard_enabled",
@@ -565,5 +603,6 @@ __all__ = [
     "owned_by_trinity",
     "trinity_owned_pids",
     "pid_alive",
+    "process_started_at",
     "trinity_roots",
 ]

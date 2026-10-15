@@ -5514,78 +5514,49 @@ class StartupLock:
         self.pid = os.getpid()
         self._acquired = False
 
+    def _read(self) -> Optional[Dict[str, Any]]:
+        """The lock file's record, or None when there is none (or it is unreadable)."""
+        try:
+            data = json.loads(self.lock_path.read_text().strip())
+        except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _holder_alive(data: Dict[str, Any]) -> bool:
+        """Is the process that took this lock still running?
+
+        A PID alone cannot say: Windows recycles PIDs, and a dead kernel's
+        PID 117732 belonged to a VS Code GPU process within the hour, so a
+        kernel was reported running and the boot refused. The lock records
+        the holder's start time beside its PID; the same PID with another
+        start time is another process. A lock written before the start time
+        was recorded (or a holder whose start time cannot be read) is held
+        only by a process running Trinity's own code -- judged structurally
+        (backend/core/process_identity), never by words in a command line.
+        """
+        from backend.core.process_identity import is_same_process, is_trinity_process
+
+        try:
+            pid = int(data.get("pid"))
+        except (TypeError, ValueError):
+            return False
+        same = is_same_process(pid, data.get("started_at"))
+        if same is not None:
+            return same
+        try:
+            import psutil
+
+            return is_trinity_process(psutil.Process(pid))
+        except Exception:  # noqa: BLE001 -- no psutil / unreadable: alive is all we know
+            from backend.core.process_identity import pid_alive
+
+            return pid_alive(pid)
+
     def is_locked(self) -> Tuple[bool, Optional[int]]:
         """Check if lock is held. Returns (is_locked, holder_pid)."""
-        if not self.lock_path.exists():
-            return False, None
-
-        try:
-            content = self.lock_path.read_text().strip()
-            data = json.loads(content)
-            holder_pid = data.get("pid")
-
-            if holder_pid and self._is_process_alive(holder_pid):
-                return True, holder_pid
-            else:
-                # Stale lock
-                return False, None
-
-        except (json.JSONDecodeError, KeyError, OSError):
-            return False, None
-
-    def _is_process_alive(self, pid: int) -> bool:
-        """
-        Check if a process is alive AND is actually a JARVIS process.
-        
-        v220.3: Enhanced stale lock detection with process validation.
-        Previously, this only checked if a PID existed. If the original JARVIS
-        process died and the PID was reused by another process, we would
-        incorrectly think JARVIS was still running.
-        
-        Now we also verify the process is actually JARVIS by checking:
-        1. Process exists (os.kill signal 0)
-        2. Process cmdline contains 'unified_supervisor' or 'jarvis' (case-insensitive)
-        """
-        try:
-            os.kill(pid, 0)  # Check if process exists
-            
-            # v220.3: Verify it's actually a JARVIS process
-            # This prevents false positives when PID is reused
-            if platform.system() == "Darwin" or platform.system() == "Linux":
-                try:
-                    # Read process command line
-                    if platform.system() == "Darwin":
-                        # macOS: use ps command
-                        import subprocess
-                        result = subprocess.run(
-                            ["ps", "-p", str(pid), "-o", "command="],
-                            capture_output=True, text=True, timeout=2
-                        )
-                        cmdline = result.stdout.lower()
-                    else:
-                        # Linux: read /proc/{pid}/cmdline
-                        with open(f"/proc/{pid}/cmdline", "r") as f:
-                            cmdline = f.read().lower().replace("\x00", " ")
-                    
-                    # Check if it's a JARVIS-related process
-                    jarvis_markers = [
-                        "unified_supervisor",
-                        "jarvis",
-                        "kernel.lock",  # In case it's a child process
-                    ]
-                    is_jarvis = any(marker in cmdline for marker in jarvis_markers)
-                    
-                    if not is_jarvis:
-                        # PID exists but isn't JARVIS - this is a stale lock
-                        return False
-                        
-                except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, OSError):
-                    # Can't verify cmdline - assume alive to be safe
-                    pass
-            
-            return True
-        except (OSError, ProcessLookupError):
-            return False
+        holder = self.get_current_holder()
+        return (True, holder.get("pid")) if holder else (False, None)
 
     def acquire(self, force: bool = False) -> bool:
         """
@@ -5597,26 +5568,24 @@ class StartupLock:
         Returns:
             True if lock acquired, False otherwise
         """
-        is_locked, holder_pid = self.is_locked()
-
-        # Shared lock already held by a live kernel.
-        if is_locked:
-            if holder_pid == self.pid:
+        holder = self.get_current_holder()
+        if holder is not None:
+            if holder.get("pid") == self.pid:
                 self._acquired = True
                 return True
-            if not force:
-                return False
-
             # Root hardening: never steal a live lock by default.
             # Force takeover must kill/handover first (handled by takeover protocol).
-            allow_live_steal = _get_env_bool("JARVIS_STARTUP_LOCK_FORCE_STEAL", False)
-            if holder_pid and self._is_process_alive(holder_pid) and not allow_live_steal:
+            if not (force and _get_env_bool("JARVIS_STARTUP_LOCK_FORCE_STEAL", False)):
                 return False
 
         # Write new lock atomically to prevent create/unlink races when two
-        # supervisors start concurrently.
+        # supervisors start concurrently. The start time makes the holder an
+        # identity, not a reusable number (see _holder_alive).
+        from backend.core.process_identity import process_started_at
+
         lock_data = {
             "pid": self.pid,
+            "started_at": process_started_at(self.pid),
             "acquired_at": datetime.now().isoformat(),
             "kernel_version": KERNEL_VERSION,
             "hostname": platform.node(),
@@ -5638,25 +5607,11 @@ class StartupLock:
                 self._acquired = True
                 return True
             except FileExistsError:
-                current_holder = self.get_current_holder() or {}
-                current_pid_raw = current_holder.get("pid")
-                current_pid: Optional[int] = None
-                if isinstance(current_pid_raw, int):
-                    current_pid = current_pid_raw
-                else:
-                    try:
-                        current_pid = int(current_pid_raw) if current_pid_raw is not None else None
-                    except Exception:
-                        current_pid = None
-
-                allow_live_steal = _get_env_bool("JARVIS_STARTUP_LOCK_FORCE_STEAL", False)
-                holder_live = (
-                    current_pid is not None
-                    and current_pid != self.pid
-                    and self._is_process_alive(current_pid)
-                )
+                current = self.get_current_holder()
+                holder_live = current is not None and current.get("pid") != self.pid
 
                 # Live holder: deny unless explicit force-steal override.
+                allow_live_steal = _get_env_bool("JARVIS_STARTUP_LOCK_FORCE_STEAL", False)
                 if holder_live and not (force and allow_live_steal):
                     return False
 
@@ -5678,29 +5633,21 @@ class StartupLock:
 
     def release(self) -> None:
         """Release the lock."""
-        if self._acquired and self.lock_path.exists():
-            try:
-                content = self.lock_path.read_text()
-                data = json.loads(content)
-                if data.get("pid") == self.pid:
+        if self._acquired:
+            data = self._read()
+            if data and data.get("pid") == self.pid:
+                try:
                     self.lock_path.unlink()
-            except (json.JSONDecodeError, OSError):
-                pass
+                except OSError:
+                    pass
         self._acquired = False
 
     def get_current_holder(self) -> Optional[Dict[str, Any]]:
         """Get info about the current lock holder, or None if not locked."""
-        if not self.lock_path.exists():
+        data = self._read()
+        if data is None or not data.get("pid"):
             return None
-        try:
-            content = self.lock_path.read_text().strip()
-            data = json.loads(content)
-            holder_pid = data.get("pid")
-            if holder_pid and self._is_process_alive(holder_pid):
-                return data
-            return None  # Stale lock
-        except (json.JSONDecodeError, KeyError, OSError):
-            return None
+        return data if self._holder_alive(data) else None
 
     def __enter__(self) -> "StartupLock":
         if not self.acquire():
@@ -96333,15 +96280,8 @@ async def _fetch_lock_status_readonly() -> Dict[str, Any]:
         
         # v220.3: First check if lock file exists with raw PID
         # This lets us detect and report stale locks
-        raw_holder_pid = None
-        if lock.lock_path.exists():
-            try:
-                content = lock.lock_path.read_text().strip()
-                data = json.loads(content)
-                raw_holder_pid = data.get("pid")
-            except (json.JSONDecodeError, OSError):
-                pass
-        
+        raw_holder_pid = (lock._read() or {}).get("pid")
+
         # Now do the proper alive check
         is_locked, holder_pid = lock.is_locked()
         result["locked"] = is_locked
