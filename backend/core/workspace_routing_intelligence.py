@@ -236,6 +236,9 @@ class WorkspaceIntentDetector:
             ],
             entity_patterns={
                 "date": r"(?:for|on)\s+(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d+)",
+                # How many days from that date the request covers ("today and
+                # tomorrow", "this week"); only one day was ever read.
+                "number_of_days": r"(?:next|for|over the next)\s+(\d+)\s+days",
             },
             visual_keywords=[],
             weight=0.9,
@@ -462,8 +465,11 @@ class WorkspaceIntentDetector:
         days_ahead = ", ".join(
             f"{(today + timedelta(days=n)).strftime('%A')} {(today + timedelta(days=n)).isoformat()}"
             for n in range(max(1, horizon)))
+        from backend.core.command_identity import conversation_preamble
+        # The exchange the request follows on from: "and is the vals one on
+        # google meet?" after a question about tomorrow is about tomorrow.
         prompt = (
-            f'Request: "{command}"\n\n'
+            f'{conversation_preamble()}Request: "{command}"\n\n'
             f"Today is {today_display()} ({today.isoformat()}).\n"
             f"The days from today on: {days_ahead}.\n"
             f"Workspace actions: {', '.join(intents)}.\n"

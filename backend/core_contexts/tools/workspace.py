@@ -61,6 +61,9 @@ class CalendarEvent:
         attendees: List of attendee email addresses.
         is_all_day: Whether this is an all-day event.
         meeting_link: Video call link (empty if none).
+        meeting_platform: Where it is held online -- the calendar's own name
+            for the conference ("Google Meet", "Microsoft Teams Meeting"), or
+            the join link's host (empty if not online).
     """
     id: str
     title: str
@@ -71,6 +74,7 @@ class CalendarEvent:
     attendees: List[str] = field(default_factory=list)
     is_all_day: bool = False
     meeting_link: str = ""
+    meeting_platform: str = ""
 
 
 async def fetch_unread_emails(limit: int = 10) -> List[Email]:
@@ -240,6 +244,7 @@ async def get_calendar_events(
                 attendees=e.get("attendees", []),
                 is_all_day=e.get("is_all_day", False),
                 meeting_link=e.get("meeting_link", ""),
+                meeting_platform=e.get("meeting_platform", ""),
             )
             for e in result.get("events", [])
         ]

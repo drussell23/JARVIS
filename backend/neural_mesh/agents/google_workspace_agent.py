@@ -733,6 +733,34 @@ def resolve_day(value: Optional[str], today: Optional[date] = None) -> date:
     return today
 
 
+def event_meeting(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Where an event is held online: ``meeting_platform`` and
+    ``meeting_link`` (both "" when it is not).
+
+    The calendar names the platform itself when the meeting was attached as
+    a conference (``conferenceData.conferenceSolution.name``: "Google Meet",
+    "Microsoft Teams Meeting", an add-on's own name) with its video entry
+    point. An invite pasted from elsewhere carries only a link, in the
+    location; its host is then what names the platform -- the composer says
+    it in words. Only ``hangoutLink`` was kept before: a Teams event lost its
+    link, and nothing said what kind of meeting anything was.
+    """
+    import re
+    from urllib.parse import urlparse
+
+    conference = event.get("conferenceData") or {}
+    platform = str((conference.get("conferenceSolution") or {}).get("name") or "")
+    video = [p.get("uri") for p in conference.get("entryPoints") or []
+             if p.get("entryPointType") == "video" and p.get("uri")]
+    link = video[0] if video else str(event.get("hangoutLink") or "")
+    if not link:
+        found = re.search(r"https?://\S+", str(event.get("location") or ""))
+        link = found.group(0).rstrip(".,;)") if found else ""
+    if link and not platform:
+        platform = urlparse(link).hostname or ""
+    return {"meeting_platform": platform, "meeting_link": link}
+
+
 def local_day_window(day: date, days: int = 1) -> Tuple[datetime, datetime]:
     """Local midnight of *day* to local midnight *days* later, as aware
     datetimes -- each with the offset the host's zone has on that date, so a
@@ -1328,7 +1356,10 @@ class UnifiedWorkspaceExecutor:
         if ExecutionTier.GOOGLE_API in self._available_tiers and google_client:
             self._tier_stats[ExecutionTier.GOOGLE_API]["attempts"] += 1
             try:
-                result = await google_client.get_calendar_events(date_str=date_str)
+                # The whole span asked about (hours_ahead from the request's
+                # days); only the first day reached the API before.
+                result = await google_client.get_calendar_events(
+                    date_str=date_str, days=max(1, -(-int(hours_ahead) // 24)))
                 if result and "error" not in result:
                     self._tier_stats[ExecutionTier.GOOGLE_API]["successes"] += 1
                     return ExecutionResult(
@@ -3605,7 +3636,7 @@ class GoogleWorkspaceClient:
                     }
                     for a in event.get('attendees', [])
                 ],
-                "meeting_link": event.get('hangoutLink'),
+                **event_meeting(event),
                 "status": event.get('status'),
             })
 
@@ -6337,10 +6368,15 @@ EMAIL BODY:"""
             # The day as the detector gives it -- a date from the Mind, or a
             # day word from the reflex; resolve_day reads both. Only
             # today/tomorrow used to pass, so a date the Mind gave was lost.
-            requested = (metadata.get("entities") or {}).get("date")
+            entities = metadata.get("entities") or {}
+            requested = entities.get("date")
+            try:
+                span = max(1, int(str(entities.get("number_of_days") or 1).strip()))
+            except ValueError:
+                span = 1
             return await self._check_calendar({
                 "date": requested or dates.get("today") or dates.get("tomorrow"),
-                "days": 1,
+                "days": span,
                 "deadline_monotonic": payload.get("deadline_monotonic"),
             })
 

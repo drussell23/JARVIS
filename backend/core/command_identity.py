@@ -13,12 +13,18 @@ the command again (two searches, two windows, two voices, 2026-10-14).
 The transport sets :data:`command_request_id` where the command enters; the
 pipeline reads it. A ContextVar follows the command through every await and
 into the tasks it starts, without each layer in between having to pass it.
+
+The conversation a command follows on from travels the same way
+(:data:`command_conversation`): a follow-up ("which one is on teams?") was
+decided, fetched and answered by layers that each saw only its words, so it
+was classified alone, read the wrong day and was answered from the screen.
+Every layer that decides something reads the exchange from here.
 """
 from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Iterator, Mapping, Optional
+from typing import Any, Iterator, Mapping, Optional, Sequence, Tuple
 
 from backend.core.module_identity import unify as _unify_module_identity
 
@@ -26,6 +32,11 @@ _unify_module_identity(__name__)
 
 #: The id of the command being processed in this context, or None.
 command_request_id: ContextVar[Optional[str]] = ContextVar("jarvis_command_request_id", default=None)
+
+#: The exchange the command in this context follows on from (``role`` /
+#: ``content`` turns, oldest first); empty when it starts a conversation.
+command_conversation: ContextVar[Tuple[Mapping[str, Any], ...]] = ContextVar(
+    "jarvis_command_conversation", default=())
 
 
 def request_id_of(message: Mapping[str, Any]) -> Optional[str]:
@@ -48,4 +59,41 @@ def command_scope(request_id: Optional[str]) -> Iterator[None]:
         command_request_id.reset(token)
 
 
-__all__ = ["command_request_id", "command_scope", "request_id_of"]
+@contextmanager
+def conversation_scope(turns: Sequence[Mapping[str, Any]]) -> Iterator[None]:
+    """Run the enclosed processing as a command following on from *turns*."""
+    token = command_conversation.set(tuple(turns))
+    try:
+        yield
+    finally:
+        command_conversation.reset(token)
+
+
+def conversation_text(turns: Optional[Sequence[Mapping[str, Any]]] = None) -> str:
+    """The exchange as a prompt states it -- each turn as said, oldest first,
+    one per line -- or "" when there is none. *turns* defaults to the
+    conversation of the command being processed."""
+    said = command_conversation.get() if turns is None else turns
+    lines = []
+    for turn in said:
+        content = str(turn.get("content", "")).strip()
+        if content:
+            who = "User" if turn.get("role") == "user" else "JARVIS"
+            lines.append(f"- {who}: {content}")
+    return "\n".join(lines)
+
+
+def conversation_preamble() -> str:
+    """The conversation, introduced for a prompt that decides something about
+    the command, or "" when the command starts a conversation."""
+    said = conversation_text()
+    if not said:
+        return ""
+    return ("The conversation so far, oldest first -- the request may follow on from it: "
+            "a word pointing back, or a detail left out because it was already said "
+            "(the day, the event, the message), means what the conversation said; a "
+            "request complete on its own takes nothing from it:\n" + said + "\n\n")
+
+
+__all__ = ["command_conversation", "command_request_id", "command_scope", "conversation_preamble",
+           "conversation_scope", "conversation_text", "request_id_of"]

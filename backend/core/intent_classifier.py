@@ -622,7 +622,12 @@ class IntentClassifier:
                     raise ValueError(f"no JSON object in {content[:120]!r}")
                 return parsed, response
 
-            question = f'Classify this voice command: "{command}"'
+            # A follow-up is classified with the exchange it follows on from:
+            # alone, "which one is on teams?" read as a question about the
+            # screen. Restating it first was lossy -- the 30B dropped the day
+            # ("tomorrow") or wrote one into an unrelated question.
+            from backend.core.command_identity import conversation_preamble
+            question = f'{conversation_preamble()}Classify this voice command: "{command}"'
             result, response = await ask(question)
             # The Mind checks its own answer: the entry it chose must deliver
             # what it decided the user wants. When it does not -- reasoned

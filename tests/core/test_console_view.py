@@ -204,6 +204,7 @@ def test_a_command_reads_as_a_transcript(monkeypatch):
     monkeypatch.setattr(cv, "narrate", lambda text, tone="note", suffix="", **kw: said.append((tone, text)))
     proc = ucp.UnifiedCommandProcessor.__new__(ucp.UnifiedCommandProcessor)
     proc._dedup_cache, proc._dedup_inflight, proc._dedup_ttl, proc._dedup_max = {}, {}, 60.0, 10
+    proc.context = ucp.UnifiedContext(conversation_history=[])
 
     async def pipeline(text, **_kw):
         await asyncio.sleep(0.01)
