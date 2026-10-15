@@ -3880,25 +3880,29 @@ class ParallelInitializer:
         try:
             main_module = get_main_module(strict=False)
 
-            # Import voice system components
+            # Import voice system components -- off the event loop: the
+            # voice API's import chain (ml_enhanced_voice_system and on)
+            # wedged the loop at boot (2026-10-14 20:56:22 stall dump).
+            from backend.core.async_offload import import_off_loop
             voice = {}
 
             try:
-                from api.voice_api import VoiceAPI
+                VoiceAPI = await import_off_loop("api.voice_api", "VoiceAPI")
                 voice["api"] = VoiceAPI
                 voice["available"] = True
             except ImportError:
                 voice["available"] = False
 
             try:
-                from api.enhanced_voice_routes import router as enhanced_voice_router
+                enhanced_voice_router = await import_off_loop("api.enhanced_voice_routes", "router")
                 voice["enhanced_router"] = enhanced_voice_router
                 voice["enhanced_available"] = True
             except ImportError:
                 voice["enhanced_available"] = False
 
             try:
-                from api.jarvis_voice_api import get_jarvis_api, get_voice_router
+                get_jarvis_api, get_voice_router = await import_off_loop(
+                    "api.jarvis_voice_api", "get_jarvis_api", "get_voice_router")
 
                 jarvis_api = get_jarvis_api()
                 jarvis_voice_router = get_voice_router()

@@ -26,6 +26,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -50,6 +51,10 @@ def _env_float(key: str, default: float) -> float:
 def _clamp(value: float, minimum: float, maximum: float) -> float:
     """Clamp float to an inclusive range."""
     return max(minimum, min(maximum, value))
+
+
+class ToolUnavailable(RuntimeError):
+    """A command-line tool a monitor uses is not available on this host."""
 
 
 @dataclass
@@ -136,6 +141,10 @@ class SystemEventMonitor:
         # State tracking
         self._running = False
         self._tasks: List[asyncio.Task] = []
+        # Tool name -> path on this host, or None where it is absent.
+        self._tool_paths: Dict[str, Optional[str]] = {}
+        # Names of the polling loops (tasks that end when their tool is absent).
+        self._loop_task_names: Set[str] = set()
         self._start_lock = asyncio.Lock()
         self._startup_state: str = "idle"
         self._startup_error: Optional[str] = None
@@ -202,8 +211,12 @@ class SystemEventMonitor:
                 else timeout_seconds
             ),
         )
+        executable = await self._resolve_tool(command[0])
+        if executable is None:
+            self._end_loop_without(command[0])
+            raise ToolUnavailable(command[0])
         process = await asyncio.create_subprocess_exec(
-            *command,
+            executable, *command[1:],
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -241,6 +254,30 @@ class SystemEventMonitor:
         except Exception:
             await _terminate_process()
             raise
+
+    async def _resolve_tool(self, name: str) -> Optional[str]:
+        """Where *name* runs from on this host, or None when it is absent.
+
+        Looked up once per tool, off the event loop. Spawning a tool that is
+        not there failed on every poll -- each time after a PATH search and a
+        CreateProcess attempt on the loop (0.5 s; the window poller tried
+        `osascript` on Windows several times a minute, 2026-10-14).
+        """
+        if name not in self._tool_paths:
+            self._tool_paths[name] = await asyncio.to_thread(shutil.which, name)
+        return self._tool_paths[name]
+
+    def _end_loop_without(self, tool: str) -> None:
+        """A monitoring loop whose tool is absent here cannot do its work:
+        it ends (cancelled, which every loop takes as its stop), once, with
+        one line saying why. A one-off probe outside a loop only gets the
+        ToolUnavailable it raised for."""
+        task = asyncio.current_task()
+        if task is None or task.get_name() not in self._loop_task_names:
+            return
+        logger.info("[SystemEventMonitor] %s stopped: `%s` is not available on this host",
+                    task.get_name(), tool)
+        task.cancel()
 
     def _register_task(self, task: asyncio.Task) -> None:
         """Track task lifecycle so stop() can cancel deterministically."""
@@ -452,26 +489,31 @@ class SystemEventMonitor:
             self._startup_state = "stopped"
             logger.info("SystemEventMonitor stopped")
 
+    def _create_monitoring_loop(self, coro: Coroutine[Any, Any, Any], name: str) -> asyncio.Task:
+        """A monitoring loop: a task that ends itself if its tool is absent."""
+        self._loop_task_names.add(name)
+        return self._create_monitored_task(coro, name=name)
+
     async def _start_monitoring_tasks(self) -> None:
         """Start individual monitoring tasks."""
         if self.config.enable_app_monitoring:
-            self._create_monitored_task(self._app_monitoring_loop(), name="app_monitor")
+            self._create_monitoring_loop(self._app_monitoring_loop(), name="app_monitor")
 
         if self.config.enable_window_monitoring:
-            self._create_monitored_task(self._window_monitoring_loop(), name="window_monitor")
+            self._create_monitoring_loop(self._window_monitoring_loop(), name="window_monitor")
 
         if self.config.enable_space_monitoring and not self._yabai_si:
             # Only run our own space monitoring if not using Yabai SI
-            self._create_monitored_task(self._space_monitoring_loop(), name="space_monitor")
+            self._create_monitoring_loop(self._space_monitoring_loop(), name="space_monitor")
 
         if self.config.enable_system_state_monitoring:
-            self._create_monitored_task(
+            self._create_monitoring_loop(
                 self._system_state_monitoring_loop(),
                 name="system_state_monitor",
             )
 
         if self.config.enable_idle_monitoring:
-            self._create_monitored_task(self._idle_monitoring_loop(), name="idle_monitor")
+            self._create_monitoring_loop(self._idle_monitoring_loop(), name="idle_monitor")
 
         if self.config.enable_event_batching:
             self._create_monitored_task(

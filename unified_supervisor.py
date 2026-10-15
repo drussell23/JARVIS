@@ -56467,6 +56467,12 @@ class HotReloadWatcher:
         # Intelligent file type registry
         self._type_registry = IntelligentFileTypeRegistry(self.repo_root, logger)
 
+        # Change detection state: whether a path is watched is a property of
+        # its path (decided once), and a file whose size and mtime are
+        # unchanged keeps its hash (relative path -> ((mtime_ns, size), md5)).
+        self._watch_decisions: Dict[Path, bool] = {}
+        self._file_signatures: Dict[str, Tuple[Tuple[int, int], str]] = {}
+
         # Exclude patterns
         self.exclude_dirs = {
             '.git', '__pycache__', 'node_modules', 'venv', 'env',
@@ -56623,18 +56629,28 @@ class HotReloadWatcher:
         return info.requires_restart
 
     def _calculate_file_hashes_parallel(self) -> Dict[str, str]:
-        """Calculate file hashes in parallel for speed."""
+        """The content hash of every watched file, reading only files whose
+        size or mtime changed since the last check.
+
+        Every check used to read and MD5 every watched file in the repo on
+        cpu_count threads: off the loop, but those threads held the GIL
+        together and the event loop wedged for 0.6 s each round (2026-10-14
+        20:56:53 stall dump: ten threads in hash_file). An unchanged file is
+        answered from its signature; content is still what decides a change.
+        """
         import hashlib
         from concurrent.futures import as_completed
 
-        def hash_file(file_path: Path) -> Tuple[str, Optional[str]]:
+        def hash_file(file_path: Path) -> Optional[str]:
             try:
                 with open(file_path, 'rb') as f:
-                    return str(file_path.relative_to(self.repo_root)), hashlib.md5(f.read()).hexdigest()
-            except Exception:
-                return str(file_path), None
+                    return hashlib.md5(f.read()).hexdigest()
+            except OSError:
+                return None
 
-        files_to_hash: List[Path] = []
+        hashes: Dict[str, str] = {}
+        signatures: Dict[str, Tuple[Tuple[int, int], str]] = {}
+        to_hash: List[Tuple[Path, str, Tuple[int, int]]] = []
 
         # Walk directories and find watchable files
         for root, dirs, files in os.walk(self.repo_root):
@@ -56644,18 +56660,37 @@ class HotReloadWatcher:
             root_path = Path(root)
             for file in files:
                 file_path = root_path / file
-                if self._should_watch_file(file_path):
-                    files_to_hash.append(file_path)
+                watched = self._watch_decisions.get(file_path)
+                if watched is None:
+                    watched = self._watch_decisions[file_path] = self._should_watch_file(file_path)
+                if not watched:
+                    continue
+                try:
+                    st = file_path.stat()
+                except OSError:
+                    continue  # gone between the walk and the stat: a deletion
+                rel_path = str(file_path.relative_to(self.repo_root))
+                signature = (st.st_mtime_ns, st.st_size)
+                known = self._file_signatures.get(rel_path)
+                if known is not None and known[0] == signature:
+                    hashes[rel_path] = known[1]
+                    signatures[rel_path] = known
+                else:
+                    to_hash.append((file_path, rel_path, signature))
 
-        # Calculate hashes in parallel
-        hashes: Dict[str, str] = {}
-        with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
-            futures = {executor.submit(hash_file, fp): fp for fp in files_to_hash}
-            for future in as_completed(futures):
-                rel_path, file_hash = future.result()
-                if file_hash:
-                    hashes[rel_path] = file_hash
+        # Hash only what changed (all of it on the first check)
+        if to_hash:
+            workers = max(1, min(len(to_hash), os.cpu_count() or 1))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(hash_file, fp): (rel, sig) for fp, rel, sig in to_hash}
+                for future in as_completed(futures):
+                    rel_path, signature = futures[future]
+                    file_hash = future.result()
+                    if file_hash:
+                        hashes[rel_path] = file_hash
+                        signatures[rel_path] = (signature, file_hash)
 
+        self._file_signatures = signatures
         return hashes
 
     def _detect_changes(self) -> Tuple[bool, List[str], Dict[str, List[str]]]:
