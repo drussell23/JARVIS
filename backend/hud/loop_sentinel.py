@@ -185,6 +185,9 @@ class LoopSentinel:
         self._max_recent = 20
         #: One report per run. Forty stalls are one defect restated.
         self._reported = False
+        #: The in-flight hand-off to O+V, held so it is not garbage-collected
+        #: mid-flight (the loop keeps only a weak reference to its tasks).
+        self._report_task: Optional[asyncio.Task] = None
 
     def start(self) -> None:
         """Begin watching. Idempotent. NEVER raises.
@@ -277,9 +280,53 @@ class LoopSentinel:
                 "%.2fs, availability %.1f%%)",
                 lag, stall.started_wall, h.stalls, h.worst_lag_s,
                 h.availability * 100.0)
-            self._tell_ouroboros(stall)
+            self._schedule_ouroboros_report(stall)
         except Exception:  # noqa: BLE001
             pass
+
+    def _schedule_ouroboros_report(self, stall: Stall) -> None:
+        """Hand the stall to O+V WITHOUT importing on the loop. NEVER raises.
+
+        `_tell_ouroboros` imports the intake sensor and the task harvester.
+        Called inline from `_record`, the witness itself became the starver:
+        StallSampler dump 1/8 of the 2026-10-15 08:56 boot caught the loop
+        thread inside `importlib` under `_record` -> `_tell_ouroboros`, wedged
+        0.51s — the first stall of the boot made the second. The imports go
+        through the serialized import worker first; by the time the report
+        body runs, every import in it is an already-loaded module.
+        """
+        try:
+            if not report_stalls_to_ouroboros() or self._reported:
+                return
+            pending = self._report_task
+            if pending is not None and not pending.done():
+                return                  # one hand-off in flight is enough
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self._tell_ouroboros(stall)     # no loop to starve
+                return
+            self._report_task = loop.create_task(
+                self._tell_ouroboros_off_loop(stall))
+        except Exception:  # noqa: BLE001
+            logger.debug("[LoopSentinel] could not schedule O+V report",
+                         exc_info=True)
+
+    async def _tell_ouroboros_off_loop(self, stall: Stall) -> None:
+        """Pre-import `_tell_ouroboros`'s dependencies off-loop, then report."""
+        try:
+            from backend.core.async_offload import import_off_loop
+            await import_off_loop(
+                "backend.core.ouroboros.governance.intake.sensors."
+                "runtime_health_sensor")
+            await import_off_loop(
+                "backend.core.ouroboros.telemetry.task_harvester")
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001 — the report still runs; it imports inline
+            logger.debug("[LoopSentinel] off-loop pre-import degraded",
+                         exc_info=True)
+        self._tell_ouroboros(stall)
 
     def _tell_ouroboros(self, stall: Stall) -> None:
         """Hand the stall to the organism that can fix it. NEVER raises.

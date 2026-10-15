@@ -1685,6 +1685,8 @@ class GlobalShutdownSignal:
 
         # File-based coordination for cross-process signaling
         self._signal_file = Path.home() / ".jarvis" / "shutdown_signal.json"
+        # ((mtime_ns, size), parsed content) of the last read of that file.
+        self._signal_cache: Optional[Tuple[Tuple[int, int], Optional[Dict[str, Any]]]] = None
 
         self._initialized = True
         logger.debug("[v95.13] GlobalShutdownSignal initialized")
@@ -1706,30 +1708,61 @@ class GlobalShutdownSignal:
             return True
         return self._check_file_signal(check_completed=True)
 
+    def _read_signal_data(self) -> Optional[Dict[str, Any]]:
+        """The signal file's parsed content, re-read only when it changed.
+
+        `is_global_shutdown_initiated()` is documented as a fast check usable
+        anywhere, and it is polled from coroutines (the WebSocket health loop
+        among them) — but it opened, read and JSON-parsed this file on every
+        call. StallSampler dump 5/8 (2026-10-15 09:04:34) caught the loop
+        wedged 0.50s inside `read_text` here, re-reading a day-old signal that
+        the age check then discards. A stat is the only I/O left per call;
+        the content is read again only when (mtime, size) moves, which every
+        write by any process does. Freshness and writer liveness are still
+        judged per call, so caching the content never caches a verdict.
+        """
+        try:
+            st = self._signal_file.stat()
+        except OSError:
+            self._signal_cache = None
+            return None
+        signature = (st.st_mtime_ns, st.st_size)
+        cached = self._signal_cache
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        data: Optional[Dict[str, Any]] = None
+        try:
+            content = self._signal_file.read_text()
+            parsed = json.loads(content) if content else None
+            if isinstance(parsed, dict):
+                data = parsed
+        except (OSError, ValueError):
+            data = None
+        self._signal_cache = (signature, data)
+        return data
+
     def _check_file_signal(self, check_completed: bool = False) -> bool:
         """Check file-based shutdown signal for cross-process coordination."""
         try:
-            if self._signal_file.exists():
-                content = self._signal_file.read_text()
-                if content:
-                    data = json.loads(content)
-                    # Check age - ignore signals older than 5 minutes (stale)
-                    initiated_at = data.get("initiated_at", 0)
-                    if time.time() - initiated_at > 300:
+            data = self._read_signal_data()
+            if data:
+                # Check age - ignore signals older than 5 minutes (stale)
+                initiated_at = data.get("initiated_at", 0)
+                if time.time() - initiated_at > 300:
+                    return False
+                # A signal is "in progress" only while its writer lives. A
+                # kernel restarted inside the 5-minute window read its
+                # predecessor's file and rejected every WebSocket client
+                # ("global shutdown in progress"), so the UI never came up.
+                writer = data.get("pid")
+                if isinstance(writer, int) and writer != os.getpid():
+                    from backend.core.process_identity import pid_alive
+                    if not pid_alive(writer):
                         return False
-                    # A signal is "in progress" only while its writer lives. A
-                    # kernel restarted inside the 5-minute window read its
-                    # predecessor's file and rejected every WebSocket client
-                    # ("global shutdown in progress"), so the UI never came up.
-                    writer = data.get("pid")
-                    if isinstance(writer, int) and writer != os.getpid():
-                        from backend.core.process_identity import pid_alive
-                        if not pid_alive(writer):
-                            return False
 
-                    if check_completed:
-                        return data.get("completed", False)
-                    return data.get("initiated", False)
+                if check_completed:
+                    return data.get("completed", False)
+                return data.get("initiated", False)
         except Exception:
             pass
         return False

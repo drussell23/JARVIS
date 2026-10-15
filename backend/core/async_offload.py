@@ -256,16 +256,34 @@ def _already_usable(dotted: str) -> Any:
     return module
 
 
-def _timed_import(dotted: str) -> Any:
+def _timed_import(dotted: str, off_loop: bool = True) -> Any:
+    """Import *dotted*, reporting it when it was slow.
+
+    The level follows WHO paid for it. Off-loop, a slow import is a boot-time
+    fact, not a fault: this module exists so that it costs the loop nothing,
+    and the message says so — logging that success at WARNING put five
+    "the loop stayed responsive" lines among the real boot warnings
+    (2026-10-15 08:55 boot) and taught the reader to skim past the level.
+    INFO keeps the timing visible. Inline (offload disabled, or no pool), the
+    same import DID hold the loop for its whole duration, and that is the
+    defect this module guards against — so that path stays a WARNING.
+    """
     started = time.perf_counter()
     module = importlib.import_module(dotted)
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     if elapsed_ms >= _slow_threshold_ms():
-        logger.warning(
-            "[AsyncOffload] import %s took %.0fms off-loop — "
-            "the loop stayed responsive for it",
-            dotted, elapsed_ms,
-        )
+        if off_loop:
+            logger.info(
+                "[AsyncOffload] import %s took %.0fms off-loop — "
+                "the loop stayed responsive for it",
+                dotted, elapsed_ms,
+            )
+        else:
+            logger.warning(
+                "[AsyncOffload] import %s took %.0fms INLINE on the calling "
+                "thread — offload was unavailable, so the loop waited for it",
+                dotted, elapsed_ms,
+            )
     return module
 
 
@@ -285,12 +303,15 @@ async def import_off_loop(dotted: str, *names: str) -> Any:
     if ready is not None:
         return _extract(ready, names)
 
-    if not offload_enabled() or _on_offload_thread():
+    if _on_offload_thread():
+        # Already on an offload worker: inline here is still off the loop.
         return _extract(_timed_import(dotted), names)
+    if not offload_enabled():
+        return _extract(_timed_import(dotted, off_loop=False), names)
 
     pool = _get_pool("import")
     if pool is None:
-        return _extract(_timed_import(dotted), names)
+        return _extract(_timed_import(dotted, off_loop=False), names)
 
     loop = asyncio.get_running_loop()
     try:
@@ -298,7 +319,7 @@ async def import_off_loop(dotted: str, *names: str) -> Any:
     except RuntimeError:
         # Pool shut down underneath us (interpreter teardown, fork). The work
         # still has to happen; correctness outranks the loop here.
-        module = _timed_import(dotted)
+        module = _timed_import(dotted, off_loop=False)
     return _extract(module, names)
 
 

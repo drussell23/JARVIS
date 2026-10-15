@@ -36,7 +36,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Coroutine, Dict, List, Optional
+from typing import Any, Callable, Coroutine, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 # v115.0: Use fixed logger name to avoid duplicate loggers when imported
 # as "backend.core.coding_council.trinity.heartbeat_validator" vs
@@ -131,6 +131,36 @@ class Heartbeat:
             status=data.get("status", ""),
             metrics=data.get("metrics", {}),
         )
+
+
+def _read_heartbeat_files(
+    heartbeat_dirs: Sequence[Path],
+    skip_components: FrozenSet[str],
+) -> List[Tuple[Path, Optional[Dict[str, Any]], Optional[Exception]]]:
+    """Every heartbeat file under *heartbeat_dirs*, read and parsed.
+
+    Pure blocking I/O, meant to run OFF the event loop. Returns
+    ``(path, data, None)`` per readable file and ``(path, None, error)`` per
+    file that could not be read or parsed, in directory order then glob order
+    — the order the caller's precedence rule depends on.
+    """
+    results: List[Tuple[Path, Optional[Dict[str, Any]], Optional[Exception]]] = []
+    for heartbeat_dir in heartbeat_dirs:
+        try:
+            if not heartbeat_dir.exists():
+                continue
+            paths = list(heartbeat_dir.glob("*.json"))
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[HeartbeatValidator] Failed to load heartbeats from {heartbeat_dir}: {e}")
+            continue
+        for filepath in paths:
+            if filepath.stem in skip_components:
+                continue
+            try:
+                results.append((filepath, json.loads(filepath.read_text()), None))
+            except Exception as file_err:  # noqa: BLE001
+                results.append((filepath, None, file_err))
+    return results
 
 
 def _env_float(key: str, default: float) -> float:
@@ -725,69 +755,78 @@ class HeartbeatValidator:
         Priority: Files in earlier directories take precedence if timestamps are equal.
         However, NEWER timestamps from any directory always win.
         """
+        # ONE off-loop pass does the glob, the reads and the JSON parse; the
+        # loop only merges the results into in-memory state. Read inline, the
+        # monitor tick paid N directories x M files of synchronous I/O on the
+        # loop: StallSampler dump 8/8 (2026-10-15 09:09:47) caught the wedged
+        # loop thread in `read_text` here, under `_monitor_loop`.
+        heartbeat_dirs = tuple(self._cross_repo_dirs)
+        skip = frozenset(self._permanently_removed)
+        try:
+            from backend.core.async_offload import call_off_loop
+            snapshot = await call_off_loop(_read_heartbeat_files, heartbeat_dirs, skip)
+        except Exception:  # noqa: BLE001 — fail-open to inline
+            snapshot = _read_heartbeat_files(heartbeat_dirs, skip)
+
         # Track which components we've processed (with their timestamps)
         processed_components: Dict[str, float] = {}
 
-        for heartbeat_dir in self._cross_repo_dirs:
-            if not heartbeat_dir.exists():
+        for filepath, data, read_err in snapshot:
+            component_id = filepath.stem
+
+            # ═══════════════════════════════════════════════════════════
+            # v115.0: Skip permanently removed components (re-checked: one
+            # may have been removed while the files were being read)
+            # This prevents the "dead component re-appearing every cycle" issue
+            # ═══════════════════════════════════════════════════════════
+            if component_id in self._permanently_removed:
+                continue
+
+            if read_err is not None:
+                if isinstance(read_err, json.JSONDecodeError):
+                    logger.debug(f"[HeartbeatValidator] Invalid JSON in {filepath}")
+                else:
+                    logger.debug(f"[HeartbeatValidator] Error reading {filepath}: {read_err}")
                 continue
 
             try:
-                for filepath in heartbeat_dir.glob("*.json"):
-                    component_id = filepath.stem
+                file_timestamp = data.get("timestamp", 0.0)
 
-                    # ═══════════════════════════════════════════════════════════
-                    # v115.0: Skip permanently removed components
-                    # This prevents the "dead component re-appearing every cycle" issue
-                    # ═══════════════════════════════════════════════════════════
-                    if component_id in self._permanently_removed:
+                # Skip if we already processed a NEWER heartbeat for this component
+                if component_id in processed_components:
+                    if processed_components[component_id] >= file_timestamp:
                         continue
 
-                    try:
-                        # ALWAYS read the file to check timestamp
-                        data = json.loads(filepath.read_text())
-                        file_timestamp = data.get("timestamp", 0.0)
+                # v114.0 CRITICAL FIX: Update existing components if file is newer
+                if component_id in self._components:
+                    existing_timestamp = self._components[component_id].last_heartbeat
+                    if file_timestamp > existing_timestamp:
+                        # File has newer timestamp - refresh the in-memory state
+                        heartbeat = Heartbeat.from_dict(data)
+                        self._components[component_id].last_heartbeat = heartbeat.timestamp
+                        self._components[component_id].pid = heartbeat.pid
+                        self._components[component_id].host = heartbeat.host
+                        self._components[component_id].metrics = heartbeat.metrics
+                        # If it was stale/dead, reset to unknown for re-evaluation
+                        if self._components[component_id].status in (
+                            HeartbeatStatus.STALE,
+                            HeartbeatStatus.DEAD,
+                            HeartbeatStatus.ZOMBIE,
+                        ):
+                            self._components[component_id].status = HeartbeatStatus.UNKNOWN
+                            self._components[component_id].health_score = 0.5
+                        logger.debug(
+                            f"[HeartbeatValidator] Refreshed {component_id} timestamp: "
+                            f"{existing_timestamp:.1f} -> {file_timestamp:.1f}"
+                        )
+                else:
+                    # New component - load it
+                    await self._load_heartbeat_from_path(filepath)
 
-                        # Skip if we already processed a NEWER heartbeat for this component
-                        if component_id in processed_components:
-                            if processed_components[component_id] >= file_timestamp:
-                                continue
+                processed_components[component_id] = file_timestamp
 
-                        # v114.0 CRITICAL FIX: Update existing components if file is newer
-                        if component_id in self._components:
-                            existing_timestamp = self._components[component_id].last_heartbeat
-                            if file_timestamp > existing_timestamp:
-                                # File has newer timestamp - refresh the in-memory state
-                                heartbeat = Heartbeat.from_dict(data)
-                                self._components[component_id].last_heartbeat = heartbeat.timestamp
-                                self._components[component_id].pid = heartbeat.pid
-                                self._components[component_id].host = heartbeat.host
-                                self._components[component_id].metrics = heartbeat.metrics
-                                # If it was stale/dead, reset to unknown for re-evaluation
-                                if self._components[component_id].status in (
-                                    HeartbeatStatus.STALE,
-                                    HeartbeatStatus.DEAD,
-                                    HeartbeatStatus.ZOMBIE,
-                                ):
-                                    self._components[component_id].status = HeartbeatStatus.UNKNOWN
-                                    self._components[component_id].health_score = 0.5
-                                logger.debug(
-                                    f"[HeartbeatValidator] Refreshed {component_id} timestamp: "
-                                    f"{existing_timestamp:.1f} -> {file_timestamp:.1f}"
-                                )
-                        else:
-                            # New component - load it
-                            await self._load_heartbeat_from_path(filepath)
-
-                        processed_components[component_id] = file_timestamp
-
-                    except json.JSONDecodeError:
-                        logger.debug(f"[HeartbeatValidator] Invalid JSON in {filepath}")
-                    except Exception as file_err:
-                        logger.debug(f"[HeartbeatValidator] Error reading {filepath}: {file_err}")
-
-            except Exception as e:
-                logger.debug(f"[HeartbeatValidator] Failed to load heartbeats from {heartbeat_dir}: {e}")
+            except Exception as file_err:
+                logger.debug(f"[HeartbeatValidator] Error reading {filepath}: {file_err}")
 
     async def _load_heartbeat_from_path(self, filepath: Path) -> None:
         """

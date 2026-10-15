@@ -34,6 +34,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -311,6 +312,10 @@ class NotificationMonitor:
         # Learning database (lazy loaded)
         self._learning_db = None
 
+        # Resolved `osascript` path, or None where it does not exist. Looked up
+        # once in `start()` (off the loop), never per poll.
+        self._osascript: Optional[str] = None
+
         logger.info("NotificationMonitor initialized")
 
     # =========================================================================
@@ -336,13 +341,31 @@ class NotificationMonitor:
         if self.config.enable_learning and self.config.learning_db_path:
             await self._init_learning_db()
 
+        # Notification Center is read through `osascript`. Resolve it ONCE,
+        # off the loop. On a host without it (Windows) the poll spawned a
+        # process every `poll_interval_seconds` only to fail: asyncio's
+        # subprocess transport runs CreateProcess synchronously on the loop
+        # thread, and StallSampler dumps 4/8 and 7/8 (2026-10-15 08:57:31,
+        # 09:09:01) caught the loop wedged 0.55s / 0.50s inside it — for a
+        # call that can never return a notification there.
+        try:
+            from backend.core.async_offload import call_off_loop
+            self._osascript = await call_off_loop(shutil.which, "osascript")
+        except Exception:  # noqa: BLE001 — fail-open to inline
+            self._osascript = shutil.which("osascript")
+
         # Start monitoring tasks
-        self._tasks.append(
-            asyncio.create_task(
-                self._notification_polling_loop(),
-                name="notification_poll"
+        if self._osascript:
+            self._tasks.append(
+                asyncio.create_task(
+                    self._notification_polling_loop(),
+                    name="notification_poll"
+                )
             )
-        )
+        else:
+            logger.info(
+                "NotificationMonitor: osascript not available on this host — "
+                "Notification Center polling not started")
 
         if self.config.enable_summarization:
             self._tasks.append(
@@ -450,6 +473,8 @@ class NotificationMonitor:
 
     async def _get_notification_center_items(self) -> List[Dict[str, Any]]:
         """Get notification center items via AppleScript."""
+        if not self._osascript:
+            return []           # no AppleScript host: nothing to read, no spawn
         try:
             # Note: This requires Accessibility permission
             script = """
@@ -471,7 +496,7 @@ class NotificationMonitor:
             end tell
             """
             result = await asyncio.create_subprocess_exec(
-                "osascript", "-e", script,
+                self._osascript, "-e", script,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

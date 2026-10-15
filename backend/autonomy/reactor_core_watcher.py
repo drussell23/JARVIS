@@ -51,7 +51,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Awaitable
+from typing import Any, Callable, Dict, List, Optional, Awaitable, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +100,16 @@ class ReactorCoreConfig:
 
     # File patterns to watch
     watch_patterns: List[str] = field(default_factory=lambda: ["*.gguf", "*.bin"])
+
+    # How often the watch directory is scanned (seconds)
+    poll_interval_seconds: float = field(
+        default_factory=lambda: float(os.getenv("REACTOR_CORE_POLL_INTERVAL", "5.0"))
+    )
+
+    # Back-off after a failed scan (seconds)
+    error_backoff_seconds: float = field(
+        default_factory=lambda: float(os.getenv("REACTOR_CORE_ERROR_BACKOFF", "10.0"))
+    )
 
     # Debounce time (seconds) - wait for file to be fully written
     debounce_seconds: float = field(
@@ -276,26 +286,44 @@ class ReactorCoreWatcher:
         while self._running:
             try:
                 await self._scan_for_new_models()
-                await asyncio.sleep(5.0)  # Check every 5 seconds
+                await asyncio.sleep(self.config.poll_interval_seconds)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"[ReactorCoreWatcher] Watch loop error: {e}")
-                await asyncio.sleep(10.0)
+                await asyncio.sleep(self.config.error_backoff_seconds)
 
-    async def _scan_for_new_models(self) -> None:
-        """Scan for new model files."""
+    def _list_model_files(self) -> List[Tuple[Path, float]]:
+        """Every watched model file with its mtime. Blocking — run off-loop."""
+        found: List[Tuple[Path, float]] = []
         if not self.config.watch_dir.exists():
-            return
-
+            return found
         for pattern in self.config.watch_patterns:
             for model_path in self.config.watch_dir.glob(pattern):
-                await self._check_file(model_path)
+                try:
+                    found.append((model_path, model_path.stat().st_mtime))
+                except OSError:
+                    continue        # vanished between the glob and the stat
+        return found
 
-    async def _check_file(self, model_path: Path) -> None:
+    async def _scan_for_new_models(self) -> None:
+        """Scan for new model files.
+
+        The directory walk and the per-file stat run OFF the loop. Inline,
+        this poll — every `poll_interval_seconds`, forever — put a `glob`
+        on the event loop: StallSampler dump 6/8 (2026-10-15 09:05:15)
+        caught the loop wedged 0.50s in `_scandir` under this method.
+        """
+        from backend.core.async_offload import call_off_loop
+        for model_path, mtime in await call_off_loop(self._list_model_files):
+            await self._check_file(model_path, mtime)
+
+    async def _check_file(self, model_path: Path, current_mtime: Optional[float] = None) -> None:
         """Check if a file is ready for deployment."""
+        from backend.core.async_offload import call_off_loop
         path_str = str(model_path)
-        current_mtime = model_path.stat().st_mtime
+        if current_mtime is None:
+            current_mtime = (await call_off_loop(model_path.stat)).st_mtime
 
         # Track file modification time for debouncing
         if path_str in self._pending_files:
@@ -313,8 +341,9 @@ class ReactorCoreWatcher:
             logger.info(f"[ReactorCoreWatcher] New file detected: {model_path.name}")
             return
 
-        # File is stable - check if we've already deployed it
-        checksum = ModelValidator.compute_checksum(model_path)
+        # File is stable - check if we've already deployed it. A full SHA-256
+        # of a multi-GB model: never on the loop.
+        checksum = await call_off_loop(ModelValidator.compute_checksum, model_path)
         if checksum in self._deployed_checksums:
             return
 
@@ -343,10 +372,13 @@ class ReactorCoreWatcher:
         Returns:
             DeploymentResult with deployment details
         """
-        # Validate model
-        is_valid, error = ModelValidator.validate(
+        from backend.core.async_offload import call_off_loop
+
+        # Validate model (stat + header read) — off the loop
+        is_valid, error = await call_off_loop(
+            ModelValidator.validate,
             model_path,
-            min_size_bytes=self.config.min_model_size_bytes
+            min_size_bytes=self.config.min_model_size_bytes,
         )
         if not is_valid:
             logger.warning(f"[ReactorCoreWatcher] Invalid model: {error}")
@@ -359,9 +391,9 @@ class ReactorCoreWatcher:
                 error=error,
             )
 
-        # Compute checksum and size
-        checksum = ModelValidator.compute_checksum(model_path)
-        size_mb = model_path.stat().st_size / (1024 * 1024)
+        # Compute checksum and size — off the loop (full read of the model)
+        checksum = await call_off_loop(ModelValidator.compute_checksum, model_path)
+        size_mb = (await call_off_loop(model_path.stat)).st_size / (1024 * 1024)
 
         logger.info(
             f"[ReactorCoreWatcher] Deploying model: {model_path.name} "
