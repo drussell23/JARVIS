@@ -93,6 +93,7 @@ from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from backend.core.async_safety import LazyAsyncLock
+from backend.core.module_identity import unify as _unify_module_identity
 from backend.core.secure_logging import sanitize_for_log
 
 logger = logging.getLogger(__name__)
@@ -1044,6 +1045,7 @@ class UnifiedVoiceOrchestrator:
                 except OSError:
                     pass
 
+        trinity_failures: List[str] = []
         # Optional Trinity fallback for non-macOS or direct say failures.
         # Opt-in on macOS (`say` above is the path there); where there is no
         # `say`, the Trinity coordinator (edge-tts + the OS player) IS the
@@ -1082,7 +1084,9 @@ class UnifiedVoiceOrchestrator:
                                     f"[UnifiedVoice] Spoke via Trinity {engine.__class__.__name__}"
                                 )
                                 return
-                        except Exception:
+                            trinity_failures.append(f"{engine.name}: {engine.last_error}")
+                        except Exception as engine_err:  # noqa: BLE001 -- next engine
+                            trinity_failures.append(f"{engine.name}: {type(engine_err).__name__}: {engine_err}")
                             continue
             except Exception as trinity_err:
                 logger.debug(f"[UnifiedVoice] Trinity fallback unavailable: {trinity_err}")
@@ -1094,7 +1098,10 @@ class UnifiedVoiceOrchestrator:
             await tts.speak(text, play_audio=True)
             logger.debug("[UnifiedVoice] Spoke via final UnifiedTTSEngine fallback")
         except Exception as fallback_err:
-            logger.error(f"[UnifiedVoice] Final speech fallback failed: {fallback_err}")
+            # Name every reason: the last fallback's "No TTS engines available"
+            # alone hid the engine that really failed and why.
+            reasons = "; ".join(trinity_failures + [f"final fallback: {fallback_err}"])
+            logger.error(f"[UnifiedVoice] Could not speak {text[:60]!r}: {reasons}")
 
     async def _execute_say_via_afplay(self, text: str) -> None:
         """Synthesize with ``say -o`` and play with ``afplay``.
@@ -2071,3 +2078,11 @@ def get_flywheel_announcer() -> FlywheelEventAnnouncer:
     if _flywheel_announcer is None:
         _flywheel_announcer = FlywheelEventAnnouncer()
     return _flywheel_announcer
+
+
+# One module object under both import names: one orchestrator, one speech
+# gate, one dedup window -- the kernel (backend.core.supervisor.*) and the
+# backend (core.supervisor.*) each ran their own. Unified LAST, not first:
+# unify loads the other name's parent package, and the supervisor package's
+# __init__ imports names from this module, which must exist by then.
+_unify_module_identity(__name__)

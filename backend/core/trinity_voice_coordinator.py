@@ -52,7 +52,13 @@ import queue as thread_queue
 import json
 
 from backend.core.async_safety import LazyAsyncLock
+from backend.core.module_identity import unify as _unify_module_identity
 from backend.core.native_audio_player import SpeakerBusy
+
+# One module object under both import names: one coordinator, one set of
+# engines and circuit breakers. `core.trinity_voice_coordinator` (agentic
+# runner, narration) built a second coordinator with three more workers.
+_unify_module_identity(__name__)
 
 # Optional TTS engines (graceful degradation if not available)
 try:
@@ -460,8 +466,15 @@ class VoiceCircuitBreaker:
                 # Gradual recovery in CLOSED state
                 self._failure_count = max(0, self._failure_count - 1)
 
-    async def record_failure(self) -> None:
-        """Record failed operation."""
+    def retry_in(self) -> float:
+        """Seconds until an OPEN circuit lets a test request through."""
+        if self._state != CircuitState.OPEN:
+            return 0.0
+        return max(0.0, self.config.circuit_recovery_timeout
+                   - (time.time() - self._last_failure_time))
+
+    async def record_failure(self, reason: Optional[str] = None) -> None:
+        """Record failed operation; *reason* is what the engine reported."""
         async with self._lock:
             self._metrics.total_failures += 1
             self._failure_count += 1
@@ -473,7 +486,7 @@ class VoiceCircuitBreaker:
                 # Test failed - back to OPEN
                 self._state = CircuitState.OPEN
                 self._metrics.circuit_opens += 1
-                logger.warning(f"[VoiceCB:{self.name}] Circuit OPEN (test failed)")
+                logger.warning(f"[VoiceCB:{self.name}] Circuit OPEN (test failed: {reason})")
             elif (
                 self._state == CircuitState.CLOSED and
                 self._failure_count >= self.config.circuit_failure_threshold
@@ -482,7 +495,8 @@ class VoiceCircuitBreaker:
                 self._metrics.circuit_opens += 1
                 logger.warning(
                     f"[VoiceCB:{self.name}] Circuit OPEN "
-                    f"(threshold {self.config.circuit_failure_threshold} reached)"
+                    f"({self.config.circuit_failure_threshold} failures in a row; "
+                    f"last: {reason})"
                 )
 
     def get_metrics(self) -> Dict[str, Any]:
@@ -948,11 +962,16 @@ class TTSEngine(ABC):
             return False
         timeout = timeout or self.config.engine_timeout
 
-        # Check circuit breaker
+        # Check circuit breaker. last_error always describes THIS attempt: a
+        # skipped attempt used to report the failure that opened the circuit,
+        # so one failure read as sixteen.
         if not await self._circuit_breaker.can_execute():
+            self.last_error = (f"not tried: circuit open, next attempt in "
+                               f"{self._circuit_breaker.retry_in():.0f}s")
             logger.debug(f"[{self.name}] Circuit open - skipping")
             return False
 
+        self.last_error = None
         try:
             success = await self._speak_impl(message, personality, timeout)
 
@@ -960,17 +979,18 @@ class TTSEngine(ABC):
                 self.success_count += 1
                 await self._circuit_breaker.record_success()
             else:
+                self.last_error = self.last_error or "the engine declined without a reason"
                 self.failure_count += 1
-                await self._circuit_breaker.record_failure()
+                await self._circuit_breaker.record_failure(self.last_error)
 
             return success
 
         except SpeakerBusy:
             raise  # the line is stale, the engine is fine: the caller drops it
         except Exception as e:
-            self.last_error = str(e)
+            self.last_error = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
             self.failure_count += 1
-            await self._circuit_breaker.record_failure()
+            await self._circuit_breaker.record_failure(self.last_error)
             logger.error(f"[{self.name}] Speak error: {e}")
             return False
 
@@ -993,7 +1013,10 @@ class TTSEngine(ABC):
         if not self.render_media_type or voice_muted():
             return None
         if not await self._circuit_breaker.can_execute():
+            self.last_error = (f"not tried: circuit open, next attempt in "
+                               f"{self._circuit_breaker.retry_in():.0f}s")
             return None
+        self.last_error = None
         suffix = {"audio/mpeg": ".mp3", "audio/wav": ".wav"}.get(self.render_media_type, "")
         path = _temp_audio_path(suffix)
         try:
@@ -1013,7 +1036,7 @@ class TTSEngine(ABC):
                     pass
         if not audio:
             self.failure_count += 1
-            await self._circuit_breaker.record_failure()
+            await self._circuit_breaker.record_failure(self.last_error or "render: no audio")
             return None
         self.success_count += 1
         await self._circuit_breaker.record_success()
