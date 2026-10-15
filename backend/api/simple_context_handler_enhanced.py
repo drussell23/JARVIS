@@ -236,6 +236,7 @@ class EnhancedSimpleContextHandler:
         Voice deduplication: only speak the initial acknowledgment and final result.
         All intermediate updates are sent as silent WebSocket messages.
         """
+        self._command_ran = False
         try:
             # Reset steps for new command
             self.execution_steps = []
@@ -385,9 +386,7 @@ class EnhancedSimpleContextHandler:
 
                         # Execute the original command
                         logger.info("[ENHANCED CONTEXT] Executing original command...")
-                        result = await self.command_processor.process_command(
-                            command, websocket, speaker_name=speaker_name,
-                        )
+                        result = await self._run_command(command, websocket, speaker_name)
                         if not isinstance(result, dict):
                             result = {"response": str(result), "status": "error", "success": False}
 
@@ -427,18 +426,25 @@ class EnhancedSimpleContextHandler:
 
             # No special context handling needed
             self._add_step("No context handling required")
-            return await self.command_processor.process_command(
-                command, websocket, speaker_name=speaker_name,
-            )
+            return await self._run_command(command, websocket, speaker_name)
 
         except Exception as e:
             logger.error(f"[ENHANCED CONTEXT] Error: {e}", exc_info=True)
             self._add_step(f"Error occurred: {str(e)}", {"error": True})
+            if self._command_ran:
+                # The command itself failed: running it again would repeat
+                # whatever it already did on the desktop.
+                raise
 
-            # Fallback to standard processing
-            return await self.command_processor.process_command(
-                command, websocket, speaker_name=speaker_name,
-            )
+            # The context checks failed before the command ran: run it plainly.
+            return await self._run_command(command, websocket, speaker_name)
+
+    async def _run_command(self, command: str, websocket, speaker_name: Optional[str]) -> Any:
+        """Run the command itself -- once per context-handling pass."""
+        self._command_ran = True
+        return await self.command_processor.process_command(
+            command, websocket, speaker_name=speaker_name,
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     # SPEAKER VERIFICATION

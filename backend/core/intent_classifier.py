@@ -600,6 +600,7 @@ class IntentClassifier:
             router = await get_prime_router()
             system_prompt = self._classify_system_prompt(catalogue)
             from backend.core.llm_json import parse_json_object
+            from backend.core.prime_router import require_generation
 
             async def ask(prompt: str) -> Tuple[Dict[str, Any], Any]:
                 response = await asyncio.wait_for(
@@ -612,9 +613,10 @@ class IntentClassifier:
                     ),
                     timeout=max(0.0, deadline - loop.time()),
                 )
-                parsed = parse_json_object(response.content)
+                content = require_generation(response)
+                parsed = parse_json_object(content)
                 if parsed is None:
-                    raise ValueError(f"no JSON object in {str(response.content)[:120]!r}")
+                    raise ValueError(f"no JSON object in {content[:120]!r}")
                 return parsed, response
 
             question = f'Classify this voice command: "{command}"'

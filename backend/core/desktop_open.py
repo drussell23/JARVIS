@@ -79,11 +79,28 @@ class OpenOutcome:
     # platform's open activates the target itself and is not observed.
     in_front: Optional[bool] = None
 
+    @property
+    def evidenced(self) -> bool:
+        """Whether the open is known to have produced what was asked for: a
+        window was seen, or this platform does not observe windows. A launch
+        command that returned 0 with no window to show for it is not."""
+        return self.ok and (self.in_front is not False or bool(self.window))
+
     def describe(self) -> str:
-        if self.ok:
-            shown = self.resolved or self.target
+        """What happened, as far as the evidence goes -- the words a reply is
+        built from, so they never claim more than was observed."""
+        shown = self.resolved or self.target
+        if not self.ok:
+            return f"Could not open {self.target}: {self.error or 'not found'}"
+        if self.in_front is None:
             return f"Opened {shown}"
-        return f"Could not open {self.target}: {self.error or 'not found'}"
+        if self.in_front:
+            return f'Opened {shown}; its window "{self.window}" is in front' if self.window \
+                else f"Opened {shown}"
+        if self.window:
+            return f'Opened {shown}, but its window "{self.window}" could not be brought to the front'
+        return (f"Started {shown}, but no window of it appeared within {_open_wait_s():.0f}s, "
+                "so it is not confirmed open")
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +147,11 @@ def best_match(query: str, names: Sequence[str]) -> Optional[str]:
     contains = [n for n, v in normalized.items() if q_words <= set(v.split())]
     if contains:
         return min(contains, key=len)
+    # The query names more than the entry does ("Mozilla Firefox" for the
+    # Start-menu "Firefox"): the most specific entry wholly named by it.
+    named = [n for n, v in normalized.items() if v and set(v.split()) <= q_words]
+    if named:
+        return max(named, key=lambda n: len(normalized[n].split()))
     cutoff = _env_float("JARVIS_APP_MATCH_CUTOFF", 0.75)
     by_norm: Dict[str, str] = {}
     for n, v in normalized.items():
@@ -580,12 +602,19 @@ async def _opened_in_front(open_coro, handler_exe: str = "") -> OpenOutcome:
     handler_exe = handler_exe.lower()
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _open_wait_s()
+
+    def _qualifies(h: int, exe: str) -> bool:
+        return exe == handler_exe if handler_exe else h != was_front
+
     while loop.time() < deadline:
         now = await asyncio.to_thread(_win_top_windows)
-        changed = [
-            (h, t) for h, t, exe in now
-            if before.get(h) != t and (exe == handler_exe if handler_exe else h != was_front)
-        ]
+        changed = [(h, t) for h, t, exe in now if before.get(h) != t and _qualifies(h, exe)]
+        if not changed:
+            # Opening something that is already open (a folder with its
+            # window up) produces no new window: the shell brings the
+            # existing one to the front, and that is the evidence.
+            fg = await asyncio.to_thread(_win_foreground)
+            changed = [(h, t) for h, t, exe in now if h == fg != was_front and _qualifies(h, exe)]
         if changed:
             hwnd, title = changed[0]
             if not await asyncio.to_thread(_win_bring_forward, hwnd):

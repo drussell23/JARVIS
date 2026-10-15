@@ -709,6 +709,7 @@ class UnifiedCommandProcessor:
         # Process-local: if JARVIS moves to multi-process, migrate to
         # Redis/SQLite WAL with TTL.
         self._dedup_cache: Dict[str, Tuple[dict, float]] = {}
+        self._dedup_inflight: Dict[str, "asyncio.Future"] = {}
         self._dedup_ttl = float(os.getenv("JARVIS_DEDUP_WINDOW_SECONDS", "60"))
         self._dedup_max = int(os.getenv("JARVIS_DEDUP_CACHE_MAX", "500"))
 
@@ -1964,20 +1965,41 @@ class UnifiedCommandProcessor:
                      + (f" [request_id={request_id}]" if request_id else ""))
 
         # v277.0: Idempotency dedupe (Disease 4 cure).
-        # Covers both WS and REST paths — both funnel here.
+        # Covers both WS and REST paths — both funnel here. The id comes from
+        # the caller or, through every layer in between, from the transport
+        # that received the command (backend.core.command_identity).
+        from backend.core.command_identity import command_request_id
+        request_id = request_id or command_request_id.get()
         if request_id:
             now = time.time()
             cached = self._dedup_cache.get(request_id)
             if cached and now - cached[1] < self._dedup_ttl:
                 logger.info(f"[DEDUP] Returning cached result for request_id={request_id}")
                 return {**cached[0], "deduplicated": True}
+            # Single flight: a resend that arrives WHILE the command still runs
+            # (the REST retry of a slow WebSocket command) joins it. A cache
+            # filled only on completion let every such resend run it again.
+            running = self._dedup_inflight.get(request_id)
+            if running is not None:
+                logger.info(f"[DEDUP] Joining in-flight request_id={request_id}")
+                result = await asyncio.shield(running)
+                return {**result, "deduplicated": True} if isinstance(result, dict) else result
+            running = asyncio.get_running_loop().create_future()
+            # A failure nobody joined is the original caller's to report.
+            running.add_done_callback(lambda f: f.cancelled() or f.exception())
+            self._dedup_inflight[request_id] = running
 
-        # v277.0: Execute pipeline and cache result for dedupe
-        result = await self._execute_command_pipeline(
-            command_text, websocket=websocket, audio_data=audio_data,
-            speaker_name=speaker_name, deadline=deadline,
-            source_context=source_context,
-        )
+        try:
+            # v277.0: Execute pipeline and cache result for dedupe
+            result = await self._execute_command_pipeline(
+                command_text, websocket=websocket, audio_data=audio_data,
+                speaker_name=speaker_name, deadline=deadline,
+                source_context=source_context,
+            )
+        except BaseException as exc:
+            if request_id:
+                self._settle_inflight(request_id, exc=exc)
+            raise
 
         # Cache result for idempotency (bounded eviction)
         if request_id and isinstance(result, dict):
@@ -1985,8 +2007,23 @@ class UnifiedCommandProcessor:
             if len(self._dedup_cache) > self._dedup_max:
                 oldest = min(self._dedup_cache, key=lambda k: self._dedup_cache[k][1])
                 del self._dedup_cache[oldest]
+        if request_id:
+            self._settle_inflight(request_id, result=result)
 
         return result
+
+    def _settle_inflight(self, request_id: str, *, result: Any = None,
+                         exc: Optional[BaseException] = None) -> None:
+        """Hand the outcome of a running command to the resends that joined it."""
+        running = self._dedup_inflight.pop(request_id, None)
+        if running is None or running.done():
+            return
+        if isinstance(exc, asyncio.CancelledError):
+            running.cancel()
+        elif exc is not None:
+            running.set_exception(exc)
+        else:
+            running.set_result(result)
 
     @staticmethod
     def _runtime_task_response(rto_result: Any) -> Optional[Dict[str, Any]]:

@@ -3071,8 +3071,20 @@ async def unified_websocket_endpoint(websocket: WebSocket):
                     f"[WS] Received command: {data.get('text', data.get('command', 'unknown'))}"
                 )
 
-            # Handle message
-            response = await manager.handle_message(client_id, data)
+            # Receipt, before the work: a client that sent this reliably
+            # (DynamicWebSocketClient.sendReliable, every typed command) waits
+            # for {"type": "ack", "ackId": messageId} and, when none comes,
+            # re-sends the command over REST -- every command ran twice, 30 s
+            # apart, because this side never acknowledged anything.
+            if data.get("messageId"):
+                await manager._safe_send_json(
+                    client_id, {"type": "ack", "ackId": data["messageId"]})
+
+            # Handle message -- as the command it carries, so a REST resend
+            # of the same command joins this run instead of repeating it.
+            from backend.core.command_identity import command_scope, request_id_of
+            with command_scope(request_id_of(data)):
+                response = await manager.handle_message(client_id, data)
 
             # Update health metrics for sent message
             if client_id in manager.connection_health:

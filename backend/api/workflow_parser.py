@@ -228,7 +228,9 @@ class WorkflowParser:
                 deadline=asyncio.get_event_loop().time() + 5.0,
             )
 
-            raw_actions = json.loads(response.content)
+            from backend.core.prime_router import require_generation
+
+            raw_actions = json.loads(require_generation(response))
             actions = self._actions_from_ai(raw_actions)
 
             if actions:

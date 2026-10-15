@@ -303,6 +303,53 @@ class RouterResponse:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+def generation_ok(response: Any) -> bool:
+    """Whether *response* carries something a model generated.
+
+    A router response with ``source == "degraded"`` says no generation
+    happened; any other response object (a PrimeClient reply, a test double)
+    is a generation. The one question every caller of ``generate`` asks
+    before treating ``content`` as the model's words."""
+    return response is not None and getattr(response, "source", None) != "degraded"
+
+
+def generation_failure(response: Any) -> str:
+    """Why *response* carries no generation ("" when it does)."""
+    if generation_ok(response):
+        return ""
+    meta = getattr(response, "metadata", None) or {}
+    return str(meta.get("error_message") or meta.get("error_code") or "no model answered")
+
+
+class GenerationUnavailable(RuntimeError):
+    """No model answered a generate call; the message is why."""
+
+
+def require_generation(response: Any) -> str:
+    """The model's words in *response*, or :class:`GenerationUnavailable`
+    carrying the real reason (J-Prime's own error), never an empty string a
+    JSON parser would then misreport."""
+    if not generation_ok(response):
+        raise GenerationUnavailable(generation_failure(response))
+    return str(getattr(response, "content", "") or "")
+
+
+def unanswered_reply(reason: str) -> str:
+    """What JARVIS tells the user when no model answered: that, and why --
+    the one wording, so no path invents its own apology."""
+    return f"I couldn't get an answer from my language model just now ({reason})."
+
+
+def _cloud_lane_allowed() -> bool:
+    """The paid-lane authority's answer for Claude (single authority:
+    ``governance.paid_lanes``); unanswerable reads as not allowed."""
+    try:
+        from backend.core.ouroboros.governance.paid_lanes import paid_lane_allowed
+    except Exception:  # noqa: BLE001 -- no authority, no spending
+        return False
+    return paid_lane_allowed("claude")
+
+
 # =============================================================================
 # PRIME ROUTER
 # =============================================================================
@@ -399,7 +446,6 @@ class PrimeRouter:
 
     def _build_degraded_response(
         self,
-        content: str,
         *,
         error_code: str,
         error_message: str,
@@ -409,9 +455,16 @@ class PrimeRouter:
         trace_id: Optional[str] = None,
         **extra: Any,
     ) -> RouterResponse:
-        """Build a degraded router response with normalized metadata."""
+        """A response saying NO generation happened, and why.
+
+        Its content is empty: every caller reads ``content`` as what the model
+        said, and an apology written here ("I apologize, but I'm experiencing
+        technical difficulties. Error: Cloud client not available") was parsed
+        as the classifier's JSON and spoken as JARVIS's reply. Callers ask
+        :func:`generation_ok` and word a failure from :func:`generation_failure`.
+        """
         return RouterResponse(
-            content=content,
+            content="",
             source="degraded",
             latency_ms=latency_ms,
             model="none",
@@ -493,33 +546,36 @@ class PrimeRouter:
                     logger.debug(f"[PrimeRouter] Graceful degradation not available: {e}")
 
             # v307.0: Eagerly initialize cloud client so _decide_route()
-            # can fall back to Claude when J-Prime is unavailable.
-            # Without this, _cloud_client is None and routing goes to DEGRADED.
+            # can fall back to Claude when J-Prime is unavailable -- when the
+            # paid-lane authority allows that lane at all.
             self._cloud_client = None
-            try:
-                from anthropic import AsyncAnthropic
-                _api_key = os.getenv("ANTHROPIC_API_KEY")
-                if _api_key:
-                    self._cloud_client = AsyncAnthropic(api_key=_api_key)
-                    logger.info("[PrimeRouter] Cloud Claude client initialized (eager)")
-            except ImportError:
-                logger.warning("[PrimeRouter] anthropic package not available for fallback")
+            await self._get_cloud_client()
 
             self._initialized = True
             logger.info("[PrimeRouter] Initialization complete")
 
     async def _get_cloud_client(self):
-        """Get or create cloud Claude client (lazy initialization)."""
+        """The cloud Claude client, built only when the paid-lane authority
+        allows that lane (``paid_lanes``: switched on, credentialed, funded).
+
+        It used to be built from ``ANTHROPIC_API_KEY`` alone, the one paid
+        client in the process that did not ask -- and a router with no lane
+        still "fell back to cloud" on every J-Prime error.
+        """
+        if not _cloud_lane_allowed():
+            return None
         if self._cloud_client is None:
             try:
                 from anthropic import AsyncAnthropic
-                api_key = os.getenv("ANTHROPIC_API_KEY")
-                if api_key:
-                    self._cloud_client = AsyncAnthropic(api_key=api_key)
-                    logger.info("[PrimeRouter] Cloud Claude client initialized")
+                self._cloud_client = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+                logger.info("[PrimeRouter] Cloud Claude client initialized")
             except ImportError:
                 logger.warning("[PrimeRouter] anthropic package not available")
         return self._cloud_client
+
+    def _cloud_fallback_possible(self) -> bool:
+        """Whether a failed local generation has a cloud lane to fall back to."""
+        return self._config.enable_cloud_fallback and _cloud_lane_allowed()
 
     async def _resolve_unknown_prime_status(self, deadline: Optional[float]) -> None:
         """Probe J-Prime once if its availability has never been established.
@@ -576,7 +632,7 @@ class PrimeRouter:
             return RoutingDecision.GCP_PRIME
 
         # -- Priority 2: Cloud Claude (paid fallback, only if client exists) --
-        if self._config.enable_cloud_fallback and self._cloud_client is not None:
+        if self._cloud_fallback_possible() and self._cloud_client is not None:
             return RoutingDecision.CLOUD_CLAUDE
 
         # -- Priority 3: Nothing available --
@@ -912,7 +968,6 @@ class PrimeRouter:
                 error_msg = metadata.get("error_message") or metadata.get("error") or "Unknown protection error"
                 logger.warning(f"[PrimeRouter] v88.0 Protection failed: {error_msg}")
                 return self._build_degraded_response(
-                    content="I'm experiencing some difficulties. Please try again.",
                     error_code=self._classify_protection_error(metadata),
                     error_message=error_msg,
                     origin_layer=metadata.get("origin_layer", "trinity_ultra_coordinator"),
@@ -994,9 +1049,9 @@ class PrimeRouter:
                     self._local_circuit.record_failure(
                         endpoint_id=f"gcp:{self._gcp_host}:{self._gcp_port}" if self._gcp_host else None
                     )
-                    logger.warning(f"[PrimeRouter] v242.0 GCP_PRIME failed, fallback to cloud: {e}")
-                    if not self._config.enable_cloud_fallback:
+                    if not self._cloud_fallback_possible():
                         raise
+                    logger.warning(f"[PrimeRouter] v242.0 GCP_PRIME failed, fallback to cloud: {e}")
                     _cloud_eff = compute_remaining(deadline, self._config.cloud_timeout)
                     response = await asyncio.wait_for(
                         self._generate_cloud(
@@ -1045,7 +1100,6 @@ class PrimeRouter:
 
             # Return degraded response on error
             return self._build_degraded_response(
-                content=f"I apologize, but I'm experiencing technical difficulties. Error: {str(e)}",
                 error_code="dependency_unavailable",
                 error_message=str(e),
                 origin_layer="prime_router",
@@ -1084,10 +1138,9 @@ class PrimeRouter:
             self._local_circuit.record_failure(
                 endpoint_id=f"gcp:{self._gcp_host}:{self._gcp_port}" if self._gcp_promoted else "local"
             )
-            logger.warning(f"[PrimeRouter] Local generation failed, falling back to cloud: {e}")
-
-            if not self._config.enable_cloud_fallback:
+            if not self._cloud_fallback_possible():
                 raise
+            logger.warning(f"[PrimeRouter] Local generation failed, falling back to cloud: {e}")
 
             # v241.0: Cloud fallback also respects deadline
             effective_cloud = compute_remaining(deadline, self._config.cloud_timeout)
@@ -1201,7 +1254,6 @@ class PrimeRouter:
     def _generate_degraded(self, prompt: str) -> RouterResponse:
         """Return degraded response when no backend available."""
         return self._build_degraded_response(
-            content="I apologize, but both local and cloud AI services are currently unavailable. Please try again later.",
             error_code="no_backend_available",
             error_message="No backend available",
             origin_layer="prime_router",
@@ -1224,6 +1276,7 @@ class PrimeRouter:
             await self.initialize()
 
         # Try local Prime streaming first
+        local_error = "J-Prime is not available"
         if self._prime_client and self._prime_client.is_available:
             try:
                 async for chunk in self._prime_client.generate_stream(
@@ -1236,9 +1289,10 @@ class PrimeRouter:
                 return
             except Exception as e:
                 logger.warning(f"[PrimeRouter] Local streaming failed: {e}")
+                local_error = str(e)
 
         # Fall back to cloud streaming
-        if self._config.enable_cloud_fallback:
+        if self._cloud_fallback_possible():
             client = await self._get_cloud_client()
             if client:
                 # v237.0: Copy context to avoid mutating caller's list
@@ -1262,8 +1316,9 @@ class PrimeRouter:
                         yield text
                 return
 
-        # No streaming available
-        yield "Streaming not available - services are offline."
+        # No model answered. Raised, never yielded: a yielded sentence is
+        # read by the consumer as what the model said.
+        raise RuntimeError(f"no model answered: {local_error}")
 
     def get_status(self) -> Dict[str, Any]:
         """Get current router status."""

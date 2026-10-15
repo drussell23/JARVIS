@@ -315,9 +315,12 @@ class ApplicationLauncherExecutor(BaseActionExecutor):
 
             from backend.core.llm_json import parse_json_object
 
-            result = parse_json_object(response.content)
+            from backend.core.prime_router import require_generation
+
+            content = require_generation(response)
+            result = parse_json_object(content)
             if not result or result.get("type") not in ("native_app", "web_service"):
-                raise ValueError(f"unusable resolution: {str(response.content)[:120]!r}")
+                raise ValueError(f"unusable resolution: {content[:120]!r}")
             logger.info(
                 f"AI resolved '{raw_target}' -> {result} "
                 f"(source={response.source}, latency={response.latency_ms:.0f}ms)"

@@ -37,8 +37,19 @@ try:
     from backend.core.runtime_module_resolver import get_main_app
 except ImportError:
     from core.runtime_module_resolver import get_main_app
+try:
+    from backend.core.prime_router import generation_failure, generation_ok, unanswered_reply
+except ImportError:
+    from core.prime_router import generation_failure, generation_ok, unanswered_reply
 
 logger = logging.getLogger(__name__)
+
+
+def _unanswered(reason: str) -> Dict[str, Any]:
+    """The reply when no model answered: says so, and why -- never a
+    generation the model did not make."""
+    return {"success": False, "response": unanswered_reply(reason),
+            "source": "degraded", "error": reason}
 
 
 # =============================================================================
@@ -481,6 +492,8 @@ async def handle_query(
             )
 
             logger.info(f"[QUERY] Response from {response.source} (latency: {response.latency_ms:.1f}ms)")
+            if not generation_ok(response):
+                return _unanswered(generation_failure(response))
 
             # v237.0: Defensive strip of leaked few-shot patterns.
             # J-Prime handles stop sequences server-side, but cloud fallback
@@ -634,6 +647,9 @@ async def _fallback_to_cloud(command: str) -> Dict[str, Any]:
         else:
             content = str(response)
 
+        if not generation_ok(response):
+            return _unanswered(generation_failure(response))
+
         # Determine source from router
         source = getattr(response, 'source', 'prime_router_fallback')
         if isinstance(response, dict):
@@ -656,12 +672,7 @@ async def _fallback_to_cloud(command: str) -> Dict[str, Any]:
 
     except Exception as e:
         logger.error(f"[QUERY] Prime router fallback failed: {e}")
-        return {
-            "success": False,
-            "response": f"I apologize, but I'm experiencing technical difficulties: {str(e)}",
-            "source": "degraded",
-            "error": str(e),
-        }
+        return _unanswered(str(e))
 
 
 async def handle_query_stream(
@@ -722,4 +733,4 @@ async def handle_query_stream(
 
     except Exception as e:
         logger.error(f"[QUERY] Stream error: {e}")
-        yield f"Error: {str(e)}"
+        yield unanswered_reply(str(e))

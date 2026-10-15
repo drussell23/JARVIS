@@ -1308,7 +1308,9 @@ class JarvisConnectionService {
           ws.send(JSON.stringify(message));
         }
         console.log('[JarvisConnection] ✅ Command sent via WebSocket');
-        return { success: true, route: 'websocket' };
+        // The id travels back so any resend of THIS command carries it: the
+        // backend joins or replays the first run instead of running it again.
+        return { success: true, route: 'websocket', commandId };
       } catch (wsError) {
         console.warn('[JarvisConnection] WebSocket send failed:', wsError.message, '— falling back to REST');
       }
@@ -1411,7 +1413,9 @@ class JarvisConnectionService {
           text: data.response || data.result || data.text || 'Command processed.',
           status: data.success !== false ? 'success' : 'error',
           command_type: data.command_type || 'command',
-          speak: data.speak !== false,
+          // Already said: by JARVIS's own voice (spoken), or by the first
+          // run of a command this request re-sent (deduplicated).
+          speak: data.speak !== false && !data.spoken && !data.deduplicated,
           routing: { routed_to: 'rest_fallback' }
         }
       });

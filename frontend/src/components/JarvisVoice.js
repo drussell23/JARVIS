@@ -5103,7 +5103,10 @@ const JarvisVoice = () => {
                 if (prev) {
                   console.warn('[TEXT-CMD] No WebSocket response after 15s — trying REST fallback...');
                   // Try REST fallback for this specific command
-                  connectionService._sendViaREST(command, {}).then(restResult => {
+                  // The SAME command id: the backend joins the run already
+                  // in flight (or replays its answer) instead of running the
+                  // command a second time.
+                  connectionService._sendViaREST(command, { commandId: result.commandId }).then(restResult => {
                     if (restResult.success && restResult.response) {
                       setResponse(restResult.response);
                     } else {

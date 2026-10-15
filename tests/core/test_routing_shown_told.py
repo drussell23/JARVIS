@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import types
 
 from backend.core import agent_bindings as ab
 
@@ -58,8 +57,7 @@ def test_a_url_opens_in_the_browser_the_user_named(monkeypatch):
 
     async def fake_open_url(url, *, browser=None):
         used["url"], used["browser"] = url, browser
-        return types.SimpleNamespace(ok=True, in_front=True, resolved=url, method="test",
-                                     describe=lambda: f"opened {url}")
+        return desktop_open.OpenOutcome(True, "url", url, url, "test", in_front=True)
 
     monkeypatch.setattr(desktop_open, "open_url", fake_open_url)
     orch = rto.RuntimeTaskOrchestrator()

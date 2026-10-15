@@ -1356,10 +1356,14 @@ class RuntimeTaskOrchestrator:
             logger.info("[RuntimeTask] %s (method=%s)", opened.describe(), opened.method)
 
         if opened is not None and opened.ok and decision.get("completes_goal"):
+            # Satisfied only on evidence: a launch that returned 0 with no
+            # window to show for it was reported "Firefox is now open and
+            # ready" (2026-10-14 12:24, the window never came).
             return {
-                "success": True,
+                "success": opened.evidenced,
                 "result": opened.describe(),
-                "stop_reason": StopReason.GOAL_SATISFIED.value,
+                "stop_reason": (StopReason.GOAL_SATISFIED if opened.evidenced
+                                else StopReason.ERROR).value,
                 "opened": opened.resolved,
             }
         if opened is not None and opened.ok:
@@ -1926,10 +1930,11 @@ class RuntimeTaskOrchestrator:
             f"The user{f' ({name})' if name else ''} asked: {query}\n"
             f"What you did, as it happened:\n{outcome}\n\n"
             "Tell them what you did in one short spoken sentence, the way a capable assistant "
-            "talks to the person it works for. Say what they will now see or what changed; "
-            "say plainly if something did not work. Claim nothing the lines above do not say "
-            "happened -- what is \"still open\" was not closed. No URLs, file paths or technical "
-            "detail. Reply with the sentence only."
+            "talks to the person it works for. Say plainly if something did not work or is not "
+            "confirmed. State only what the lines above say happened: do not predict or describe "
+            "what is on their screen, and add no detail the lines do not contain -- what is "
+            "\"still open\" was not closed. No URLs, file paths or technical detail. Reply with "
+            "the sentence only."
         )
         try:
             response = await asyncio.wait_for(
@@ -1945,6 +1950,9 @@ class RuntimeTaskOrchestrator:
             raise
         except Exception as exc:  # noqa: BLE001 -- the factual outcome stands
             logger.debug("[RuntimeTask] reply phrasing unavailable: %s", exc)
+            return outcome
+        from backend.core.prime_router import generation_ok
+        if not generation_ok(response):
             return outcome
         said = str(getattr(response, "content", "") or "").strip().strip('"').strip()
         return said or outcome

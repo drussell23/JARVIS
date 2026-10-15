@@ -9485,7 +9485,10 @@ async def _acknowledge_and_broadcast(result: "Any", command_id: Optional[str]) -
         from backend.api.hud_local_bridge import broadcast_command_response, shape_command_response
         from backend.core.event_stream import get_event_stream
 
-        await broadcast_command_response(get_event_stream(), command_id, result)
+        # A resend of a command already answered (deduplicated) was delivered
+        # by its first run; broadcasting it again would say it twice.
+        if not (isinstance(result, dict) and result.get("deduplicated")):
+            await broadcast_command_response(get_event_stream(), command_id, result)
         if isinstance(result, dict):
             ack = shape_command_response(result, command_id)
             result = {**ack, **result, "command_id": command_id}
@@ -9533,6 +9536,11 @@ async def process_command(request: dict, http_request: Request):
     # v277.0: Extract request_id for idempotency dedupe (Disease 4 cure).
     # Frontend sends command_id; accept either field name.
     request_id = request.get("command_id") or request.get("request_id")
+    # Through the context handlers (which take only the text) to the
+    # pipeline's dedupe. A request runs in its own task context, so this
+    # setting ends with the request.
+    from backend.core.command_identity import command_request_id
+    command_request_id.set(request_id)
 
     # Trigger intelligent preloading (Phase 2) if available
     if hasattr(app.state, "component_manager") and app.state.component_manager:
