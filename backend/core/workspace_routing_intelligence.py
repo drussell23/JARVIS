@@ -347,11 +347,27 @@ class WorkspaceIntentDetector:
         """
         command_lower = command.lower().strip()
 
+        # The Mind decides which workspace action a request asks for: the
+        # trigger phrases below matched "check my email" and missed "what is
+        # on my gmail?" (2026-10-14), so a Gmail question reached the agent
+        # as "unknown". They remain the reflex when the Mind cannot answer.
+        decided = await self._ask_mind(command)
+        if decided is not None:
+            intent, entities, confidence = decided
+            if intent is WorkspaceIntent.UNKNOWN:
+                return WorkspaceIntentResult(
+                    is_workspace_command=False, intent=intent, confidence=confidence,
+                    reasoning="The Mind found no workspace action in the request")
+            best_match = next((p for p in self._patterns if p.intent is intent),
+                              IntentPattern(intent=intent, triggers=[]))
+            return await self._result_for(best_match, command_lower, entities, confidence,
+                                          "decided by the Mind")
+
         best_match: Optional[IntentPattern] = None
         best_score = 0.0
         matched_entities = {}
 
-        # Pattern matching
+        # Pattern matching (the reflex: the Mind did not answer)
         for pattern in self._patterns:
             score = 0.0
             temp_entities = {}
@@ -390,12 +406,19 @@ class WorkspaceIntentDetector:
                 reasoning="No workspace intent patterns matched",
             )
 
+        return await self._result_for(best_match, command_lower, matched_entities, best_score,
+                                      f"matched trigger phrases with confidence {best_score:.1%}")
+
+    async def _result_for(self, match: IntentPattern, command_lower: str,
+                          entities: Dict[str, Any], confidence: float,
+                          how: str) -> WorkspaceIntentResult:
+        """The detection result for *match*, however it was decided."""
         # Determine if visual execution is preferred
-        requires_visual = any(kw in command_lower for kw in best_match.visual_keywords)
+        requires_visual = any(kw in command_lower for kw in match.visual_keywords)
 
         # Determine execution mode
         execution_mode = await self._determine_execution_mode(
-            best_match.intent,
+            match.intent,
             command_lower,
             requires_visual,
         )
@@ -403,18 +426,68 @@ class WorkspaceIntentDetector:
         # Query spatial awareness for visual execution
         spatial_target = None
         if execution_mode in (ExecutionMode.VISUAL_ONLY, ExecutionMode.VISUAL_PREFERRED):
-            spatial_target = await self._find_workspace_target(best_match.intent)
+            spatial_target = await self._find_workspace_target(match.intent)
 
         return WorkspaceIntentResult(
             is_workspace_command=True,
-            intent=best_match.intent,
-            confidence=best_score,
-            entities=matched_entities,
+            intent=match.intent,
+            confidence=confidence,
+            entities=entities,
             execution_mode=execution_mode,
             requires_visual=requires_visual,
             spatial_target=spatial_target,
-            reasoning=f"Matched '{best_match.intent.value}' with confidence {best_score:.1%}",
+            reasoning=f"'{match.intent.value}' {how}",
         )
+
+    async def _ask_mind(self, command: str) -> Optional[Tuple[WorkspaceIntent, Dict[str, Any], float]]:
+        """The workspace action the Mind reads in *command*, the details it
+        names, and its confidence -- or None when the Mind does not answer
+        (the trigger phrases decide then).
+
+        The choices are this detector's own vocabulary: the intents of
+        ``WorkspaceIntent`` and the entity names its patterns extract.
+        """
+        from backend.core.llm_json import parse_json_object
+        from backend.core.prime_router import get_prime_router, require_generation
+
+        intents = [i.value for i in WorkspaceIntent if i is not WorkspaceIntent.UNKNOWN]
+        entity_names = sorted({name for p in self._patterns for name in p.entity_patterns})
+        prompt = (
+            f'Request: "{command}"\n\n'
+            f"Workspace actions: {', '.join(intents)}.\n"
+            "Which one does the request ask for -- about the user's own email, calendar, "
+            "documents or contacts? Respond ONLY with JSON:\n"
+            '{"intent": one action from the list, or "unknown" when the request asks for none '
+            'of them, "entities": {' + ", ".join(f'"{n}": "..."' for n in entity_names)
+            + '} with only the details the request states, "confidence": 0.0 to 1.0}'
+        )
+        try:
+            budget = float(os.environ.get("JARVIS_WORKSPACE_INTENT_TIMEOUT_S", "") or 8.0)
+            router = await get_prime_router()
+            response = await asyncio.wait_for(
+                router.generate(prompt=prompt, max_tokens=256, temperature=0.0,
+                                system_prompt="You classify workspace requests. Return only JSON."),
+                timeout=budget,
+            )
+            decided = parse_json_object(require_generation(response)) or {}
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- no answer (unreachable, timed out, unparsable)
+            logger.info("[WorkspaceIntent] the Mind did not classify (%s); trigger phrases decide",
+                        exc)
+            return None
+        try:
+            intent = WorkspaceIntent(str(decided.get("intent") or "unknown").strip().lower())
+        except ValueError:
+            intent = WorkspaceIntent.UNKNOWN
+        raw_entities = decided.get("entities") if isinstance(decided.get("entities"), dict) else {}
+        entities = {k: v for k, v in raw_entities.items()
+                    if k in entity_names and isinstance(v, str) and v.strip()}
+        try:
+            confidence = max(0.0, min(1.0, float(decided.get("confidence", 0.0))))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return intent, entities, confidence
 
     async def _determine_execution_mode(
         self,

@@ -517,8 +517,9 @@ class IntentClassifier:
             'or to KNOW something -- and so what they want, and what carries it out",\n'
             '  "form": "instruction" | "question" | "conversation",\n'
             '  "wants": "shown" | "told" | "done" | "none",\n'
-            '  "steps": [] for one request, else ["the first request", "the next request", ...] '
-            '-- plain strings, the requests themselves, in order,\n'
+            '  "steps": [] unless the command asks for two or more DIFFERENT things to be done, '
+            'else ["the first request", "the next request", ...] -- plain strings, the requests '
+            'themselves, in order,\n'
             '  "answer_from_own_knowledge": true or false,\n'
             '  "capability": an id or capability from the list above, a new snake_case name for '
             'a capability JARVIS would need but lacks, or "",\n'
@@ -550,10 +551,12 @@ class IntentClassifier:
             "that delivers what \"wants\" says (each entry is marked SHOWN, TOLD or DONE) and "
             "whose description does it. A word the command shares with a capability name is "
             "not a reason to choose it.\n"
-            "- steps: when the command asks for separate things one after another, each of them "
-            "in order as a request of its own -- complete without the others' words (it names "
-            "what it acts on). Acting on something that another step opens is part of that same "
-            "step, not a separate one. The other fields describe the first request.\n"
+            "- steps: empty for ONE request, however many sentences or questions it is put in: "
+            "a question and a follow-up about the same thing (what to look for in it, what "
+            "matters in it) are one request. Only when the command asks for different things one "
+            "after another is each of them a step, in order -- complete without the others' words "
+            "(it names what it acts on). Acting on something that another step opens is part of "
+            "that same step, not a separate one. The other fields describe the first request.\n"
             "- requires_vision: the task needs seeing and operating the UI AFTER something is open "
             "(finding and clicking an item, filling a form). Opening something alone does not.\n"
             "- needs_screen: the ANSWER requires looking at the user's screen right now.\n"

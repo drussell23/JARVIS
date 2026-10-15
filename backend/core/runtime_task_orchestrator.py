@@ -124,6 +124,15 @@ class TaskResult:
         return any(isinstance(s.result, dict) and s.result.get("opened") for s in self.steps)
 
     @property
+    def handled(self) -> bool:
+        """Whether something serving the request ran and reported back --
+        an answer, or why it could not ("Google Workspace email is not
+        connected"). Its report is the reply: a caller that routed such a
+        task elsewhere had a model invent one ("I don't have access to your
+        Gmail"). A task where nothing ran (no handler) is not handled."""
+        return any(s.result is not None for s in self.steps)
+
+    @property
     def facts(self) -> List[str]:
         """What each step that worked on the desktop reported doing, in its
         own evidence-worded terms ("Opened Firefox; its window ... is in
@@ -787,9 +796,8 @@ class RuntimeTaskOrchestrator:
                 if node and node.state == NodeState.COMPLETED:
                     # Check if the result dict signals a logical failure
                     # (e.g. vision loop returned success=False without raising)
-                    _node_error = None
-                    if isinstance(node.result, dict) and not node.result.get("success", True):
-                        _node_error = node.result.get("result", "Action failed")
+                    _node_error = self._result_failure(node.result)
+                    if _node_error:
                         logger.warning(
                             "[RuntimeTask] DAG node %d completed but result.success=False: %s",
                             i, _node_error[:120] if _node_error else "unknown",
@@ -924,9 +932,7 @@ class RuntimeTaskOrchestrator:
         for i, (resolution, step) in enumerate(zip(resolutions, plan_steps)):
             task = task_map.get(f"step-{i}")
             if task and task.status == "completed":
-                _task_error = None
-                if isinstance(task.result, dict) and not task.result.get("success", True):
-                    _task_error = task.result.get("result", "Action failed")
+                _task_error = self._result_failure(task.result)
                 executed.append(StepResolution(
                     step_goal=step["goal"],
                     resolution=resolution.resolution,
@@ -971,6 +977,7 @@ class RuntimeTaskOrchestrator:
                     capability_used=resolution.capability_used,
                     synthesized=False,
                     result=result,
+                    error=self._result_failure(result),
                     elapsed_s=time.monotonic() - start,
                 )
 
@@ -1030,9 +1037,7 @@ class RuntimeTaskOrchestrator:
 
                 result = await self._dispatch_to_vision(goal, step)
                 # Check the success field — vision returns {success: bool, ...}
-                vision_error = None
-                if isinstance(result, dict) and not result.get("success", True):
-                    vision_error = result.get("result", "Vision action failed")
+                vision_error = self._result_failure(result)
                 return StepResolution(
                     step_goal=goal,
                     resolution=resolution.resolution,
@@ -1072,9 +1077,26 @@ class RuntimeTaskOrchestrator:
         logger.info("[RuntimeTask] All live agents disposed (%d)", len(self._live_agents))
 
     async def _get_live_agent(self, agent_name: str) -> Any:
-        """Get or lazily create a live agent instance from AgentBindings."""
+        """The agent, ready to work: the Neural Mesh's running instance when
+        it has one, else one created from its binding AND initialised.
+
+        An instance used to be created and dispatched to uninitialised: an
+        agent builds what it works with in initialize() (the workspace agent
+        its Google client and executor), so every request through here got
+        "No execution method available".
+        """
         if agent_name in self._live_agents:
             return self._live_agents[agent_name]
+
+        try:
+            from backend.neural_mesh.integration import get_neural_mesh_coordinator
+            coordinator = get_neural_mesh_coordinator()
+            running = coordinator.get_agent(agent_name) if coordinator is not None else None
+        except Exception:  # noqa: BLE001 -- no mesh: the binding serves
+            running = None
+        if running is not None and getattr(running, "_initialized", True):
+            self._live_agents[agent_name] = running
+            return running
 
         from backend.core.agent_bindings import get_agent_bindings
         bindings = get_agent_bindings()
@@ -1084,6 +1106,8 @@ class RuntimeTaskOrchestrator:
 
         try:
             instance = binding.instantiate()
+            if callable(getattr(instance, "initialize", None)) and not getattr(instance, "_initialized", True):
+                await instance.initialize()
             self._live_agents[agent_name] = instance
             logger.info("[RuntimeTask] Lazy-instantiated live agent: %s (%s.%s)",
                         agent_name, binding.module, binding.class_name)
@@ -1100,10 +1124,36 @@ class RuntimeTaskOrchestrator:
         Builds a TaskEnvelope from the structured step dict (populated by the
         intent classifier / planner).  Never scrapes goal strings for URLs.
         """
+        from backend.core.agent_bindings import get_agent_bindings
         from backend.core.task_envelope import TaskEnvelope
+
+        binding = get_agent_bindings().get(agent_name)
+        if binding is not None:
+            missing = binding.missing_requirements()
+            if missing:
+                # Not set up here: say what it needs (and list it among the
+                # boot's missing extras) -- never a guess from elsewhere.
+                from backend.core.optional_dependencies import note_missing
+                for requirement in missing:
+                    note_missing(requirement.split(".")[0], agent_name.replace("_", " "))
+                return {"success": False,
+                        "result": f"{agent_name.replace('_', ' ')} is not set up on this machine: "
+                                  f"it needs {', '.join(missing)} installed"}
 
         envelope = TaskEnvelope.from_step(step)
         payload = envelope.to_dict()
+        # What the agent is asked to do. Agents switch on payload["action"],
+        # which the step never carried -- the Mind names a capability -- so a
+        # dispatched agent got "" ("Unknown context action: ", 2026-10-14).
+        # An agent with an entry takes the request in the user's words and
+        # works it out; otherwise the capability the Mind chose is the action.
+        if binding is not None and not payload.get("action"):
+            capability = self._named_capability(step)
+            if binding.entry:
+                payload["action"] = binding.entry
+                payload.setdefault("query", goal)
+            elif capability in {c.lower() for c in binding.capabilities}:
+                payload["action"] = capability
 
         # --- Primary: Get a live agent instance and call execute_task() ---
         live_agent = await self._get_live_agent(agent_name)
@@ -1176,7 +1226,8 @@ class RuntimeTaskOrchestrator:
             "LANDS ON THE RESULT, and whether opening it IS the whole goal. Respond ONLY with JSON:\n"
             '{"open": "url" | "path" | "app" | "none", "url": "https://...", '
             '"path": "absolute path of the file or folder", "app": "application name", '
-            '"completes_goal": true | false, "remaining": "what is left after opening, if anything"}\n'
+            '"completes_goal": true | false, "remaining": "what the assistant itself must still do '
+            'on screen after opening, as an instruction to itself; \\"\\" when nothing"}\n'
             "Decision rules:\n"
             "- A folder or a file of the user's (\"my documents\", \"the report on my desktop\"): "
             "open=path, built from the folders listed above -- never open a file manager app "
@@ -1191,7 +1242,9 @@ class RuntimeTaskOrchestrator:
             "- completes_goal=true when landing there is what the user asked for (a search "
             "shows its results). completes_goal=false only when something must still be "
             "clicked, typed or read on screen afterwards (\"play the first video\").\n"
-            "- open=none when nothing needs to be opened."
+            "- open=none when nothing needs to be opened.\n"
+            "- remaining is work for the assistant, never a remark about what the user will do: "
+            "it becomes the assistant's next goal on screen."
         )
         try:
             response = await asyncio.wait_for(
@@ -1861,6 +1914,27 @@ class RuntimeTaskOrchestrator:
             pass
 
     @staticmethod
+    def _result_failure(result: Any) -> Optional[str]:
+        """What went wrong, when a step's result says it did not work; None
+        when it worked.
+
+        A result dict fails by ``success: False`` or -- the agents' own
+        convention -- by carrying an ``error`` without a ``success: True``.
+        The latter read as success: the workspace agent's "Google Workspace
+        email is not connected" became "Done." The message keeps what the
+        agent says the user can do about it (``action_required``).
+        """
+        if not isinstance(result, dict):
+            return None
+        failed = result.get("success") is False or (
+            bool(result.get("error")) and result.get("success") is not True)
+        if not failed:
+            return None
+        message = str(result.get("error") or result.get("result") or "").strip() or "Action failed"
+        action = str(result.get("action_required") or "").strip()
+        return f"{message} ({action})" if action else message
+
+    @staticmethod
     def _step_message(step: StepResolution) -> str:
         """The human-readable outcome a step's own result reported, if any."""
         result = step.result
@@ -1901,9 +1975,15 @@ class RuntimeTaskOrchestrator:
             # Partial or complete failure — surface the actual error
             errors = [s.error for s in steps if s.error]
             if succeeded > 0:
-                summary = f"Partially done. {succeeded} of {total} steps succeeded."
+                # What the steps that worked found or did, then what did not.
+                # The counts alone ("Partially done. 1 of 2 steps succeeded.")
+                # threw away an answer the screen step had already given.
+                reported = [m for m in (RuntimeTaskOrchestrator._step_message(s)
+                                        for s in steps if s.error is None) if m]
+                summary = "\n\n".join(reported) if reported else \
+                    f"Partially done. {succeeded} of {total} steps succeeded."
                 if errors:
-                    summary += f" Issue: {errors[0]}"
+                    summary += f"\n\nI couldn't do all of it: {errors[0]}"
             else:
                 if errors:
                     # Make it conversational — trim long error messages

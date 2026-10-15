@@ -2055,7 +2055,9 @@ class UnifiedCommandProcessor:
 
         Success answers. A failure that already ACTED on the desktop (opened
         something) also answers, honestly, instead of falling through to a
-        route that would act again. Only a task that did nothing falls through.
+        route that would act again; so does one whose handler ran and said
+        why it could not -- that is the answer, where the next route had a
+        model guess one. Only a task nothing handled falls through.
         """
         if rto_result is None:
             return None
@@ -2067,7 +2069,7 @@ class UnifiedCommandProcessor:
         if getattr(rto_result, "success", False):
             return {"success": True, "response": summary, "spoken": spoken, "facts": facts,
                     "command_type": "ACTION", "source": "rto_pillar5"}
-        if getattr(rto_result, "acted", False):
+        if getattr(rto_result, "acted", False) or getattr(rto_result, "handled", False):
             return {"success": False, "response": summary, "spoken": spoken, "facts": facts,
                     "command_type": "ACTION", "source": "rto_pillar5"}
         return None
@@ -3106,10 +3108,7 @@ class UnifiedCommandProcessor:
             result_dict = outcome.get("result", {}) or {}
             error_code = result_dict.get("error_code", "")
             if error_code in ("needs_reauth", "auth_missing", "auth_error"):
-                action_required = result_dict.get(
-                    "action_required",
-                    "Run: python3 backend/scripts/google_oauth_setup.py",
-                )
+                action_required = result_dict.get("action_required") or _google_setup_action()
                 return True, (
                     f"Your Google account needs re-authorization. "
                     f"{action_required}"
@@ -5087,7 +5086,7 @@ class UnifiedCommandProcessor:
                     "response": reauth_msg,
                     "command_type": "WORKSPACE",
                     "error_code": "needs_reauth",
-                    "action_required": "Run: python3 backend/scripts/google_oauth_setup.py",
+                    "action_required": _google_setup_action(),
                     "capability": "google_workspace",
                     "lifecycle_state": "failed",
                 }
@@ -5102,8 +5101,8 @@ class UnifiedCommandProcessor:
                         "command_type": "WORKSPACE",
                         "error": last_error_dict.get("error"),
                         "error_code": error_code,
-                        "action_required": last_error_dict.get("action_required",
-                            "Run: python3 backend/scripts/google_oauth_setup.py"),
+                        "action_required": (last_error_dict.get("action_required")
+                                            or _google_setup_action()),
                         "capability": "google_workspace",
                     }
                 return {
@@ -10081,6 +10080,12 @@ class UnifiedCommandProcessor:
 
 # Singleton instance
 _unified_processor = None
+
+
+def _google_setup_action() -> str:
+    """How to connect Google, as the workspace agent words it (one definition)."""
+    from backend.neural_mesh.agents.google_workspace_agent import OAUTH_SETUP_COMMAND
+    return "Run: " + OAUTH_SETUP_COMMAND
 
 
 def get_unified_processor(api_key: Optional[str] = None, app=None) -> UnifiedCommandProcessor:

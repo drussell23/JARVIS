@@ -97,7 +97,11 @@ def test_a_question_answered_by_looking_wins_over_a_capability_tag():
     assert not r(needs_screen=True, classification_source="sync_heuristic").answers_by_looking
 
 
-def test_bindings_unavailable_here_are_neither_offered_nor_resolved(monkeypatch):
+def test_a_platform_binding_is_hidden_and_a_not_set_up_one_is_offered_as_such(monkeypatch):
+    """A binding that can never run here (another OS) is neither offered nor
+    resolved. One that is only not SET UP (a missing package) is offered,
+    marked, and resolved: its dispatch says what to install, where routing
+    the request elsewhere had a model guess (2026-10-14, the Gmail answer)."""
     import backend.core.agent_bindings as ab
 
     mac_only = ab.AgentBinding("mac_agent", "json", "JSONDecoder", "control", {"drive_app"},
@@ -110,8 +114,10 @@ def test_bindings_unavailable_here_are_neither_offered_nor_resolved(monkeypatch)
     monkeypatch.setattr(ab.sys, "platform", "win32")
     catalogue = ab.capability_catalogue()
     assert "desktop_open" in catalogue
-    assert "mac_agent" not in catalogue and "needs_pkg" not in catalogue
+    assert "mac_agent" not in catalogue
+    assert "needs_pkg" in catalogue and "not set up on this host: needs no_such_package_xyz" in catalogue
     assert ab.agent_for_capability("drive_app") is None
+    assert ab.agent_for_capability("browse") == "needs_pkg"
     assert ab.route_for_capability("open_for_user") == "open"
     assert ab.agent_for_capability("open_for_user") is None   # a route is not an agent
     monkeypatch.setattr(ab, "_catalogue", None)

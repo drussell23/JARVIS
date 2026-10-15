@@ -1,5 +1,10 @@
 """
-screen_question - answer a question that needs a look at the user's screen.
+screen_question - answer a question about what the user's screen is showing right now, by looking at it.
+
+(That first line is how the Mind sees this route. It answered "what is on my
+gmail?" by looking at the screen -- the account itself is read by the
+workspace agent, whether or not Gmail is open; this route is for what is
+displayed.)
 
 "Can you see my screen?" used to reach the text-only Mind, which can see
 nothing, so JARVIS answered without looking. When the IntentClassifier says

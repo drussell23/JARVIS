@@ -54,3 +54,11 @@ pyperclip
 # it the Trinity bridge never started (/health: trinity_bridge error, overall
 # "degraded"). Same pin as requirements.txt and requirements-brain.txt.
 watchdog==6.0.0
+
+# Google Workspace (Gmail, Calendar, Contacts): the workspace agent's API client
+# and its OAuth sign-in flow (backend/scripts/google_oauth_setup.py). Without
+# them the agent is offered as not set up. google-auth: same pin as requirements.txt.
+google-api-python-client
+google-auth==2.43.0
+google-auth-oauthlib
+google-auth-httplib2

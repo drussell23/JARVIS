@@ -1,221 +1,110 @@
 #!/usr/bin/env python3
 """
-Google Workspace OAuth Setup for JARVIS.
+Connect JARVIS to your Google account (Gmail, Calendar, Contacts, Drive files).
 
-Triggers the one-time OAuth authorization flow to create
-~/.jarvis/google_workspace_token.json with full workspace scopes.
+Usage (the interpreter JARVIS runs on; JARVIS prints this exact command when
+Google is not connected):
+    <JARVIS python> backend/scripts/google_oauth_setup.py
 
-Usage:
-    python3 backend/scripts/google_oauth_setup.py
+Opens your browser; sign in with your Google account and allow the requested
+access. The token is saved where JARVIS reads it, and the services are
+checked once with it.
 
-This will open your browser. Sign in with your Google account and
-grant the requested permissions. The token is saved automatically.
+The sign-in is the workspace agent's own (GoogleWorkspaceClient.authenticate):
+the same scopes, credential and token paths (GOOGLE_CREDENTIALS_PATH,
+GOOGLE_TOKEN_PATH), token refresh, and revoked-token handling JARVIS uses
+while it runs. This script used to carry its own copy of all of it.
 """
+from __future__ import annotations
 
-import os
+import asyncio
 import sys
-import json
-import time
 from pathlib import Path
 
-# Suppress noisy warnings
-import warnings
-warnings.filterwarnings("ignore")
-
-# Patch importlib.metadata.packages_distributions for Python 3.9
-# Must run BEFORE any google.* imports (google-api-core uses it at import time)
-from importlib import metadata as _metadata
-if not hasattr(_metadata, 'packages_distributions'):
-    def _packages_distributions_fallback():
-        try:
-            import importlib_metadata as _backport
-            if hasattr(_backport, 'packages_distributions'):
-                return _backport.packages_distributions()
-        except ImportError:
-            pass
-        return {}
-    _metadata.packages_distributions = _packages_distributions_fallback
-
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-from google.auth.exceptions import RefreshError
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-
-# Same scopes as GoogleWorkspaceAgent (google_workspace_agent.py:576-589)
-SCOPES = [
-    # Gmail
-    'https://www.googleapis.com/auth/gmail.readonly',
-    'https://www.googleapis.com/auth/gmail.send',
-    'https://www.googleapis.com/auth/gmail.compose',
-    'https://www.googleapis.com/auth/gmail.modify',
-    # Calendar
-    'https://www.googleapis.com/auth/calendar.readonly',
-    'https://www.googleapis.com/auth/calendar.events',
-    # Drive (for attachments)
-    'https://www.googleapis.com/auth/drive.file',
-    # Contacts
-    'https://www.googleapis.com/auth/contacts.readonly',
-]
-
-JARVIS_DIR = Path.home() / '.jarvis'
-CREDENTIALS_PATH = JARVIS_DIR / 'google_credentials.json'
-TOKEN_PATH = JARVIS_DIR / 'google_workspace_token.json'
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
-def main():
+def _rule(title: str = "") -> None:
     print("=" * 60)
-    print("  JARVIS Google Workspace OAuth Setup")
-    print("=" * 60)
-    print()
+    if title:
+        print(f"  {title}")
+        print("=" * 60)
 
-    # Check credentials file
-    if not CREDENTIALS_PATH.exists():
-        print(f"  ERROR: Credentials file not found at {CREDENTIALS_PATH}")
-        print("  You need a Google Cloud OAuth client credentials file.")
-        sys.exit(1)
 
-    print(f"  Credentials: {CREDENTIALS_PATH}")
-    print(f"  Token path:  {TOKEN_PATH}")
-    print(f"  Scopes:      {len(SCOPES)} (Gmail, Calendar, Drive, Contacts)")
-    print()
-
-    creds = None
-
-    # Check for existing token
-    if TOKEN_PATH.exists():
-        try:
-            creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
-            if creds and creds.valid:
-                print("  Token already exists and is valid.")
-                _verify_services(creds)
-                return
-            elif creds and creds.expired and creds.refresh_token:
-                print("  Token expired, refreshing...")
-                try:
-                    creds.refresh(Request())
-                    _save_token(creds)
-                    print("  Token refreshed successfully.")
-                    _verify_services(creds)
-                    return
-                except RefreshError as e:
-                    if any(p in str(e) for p in ("invalid_grant", "revoked")):
-                        print("  Token revoked/expired. Backing up stale token and starting fresh...")
-                        backup_path = f"{TOKEN_PATH}.backup.{int(time.time())}"
-                        try:
-                            os.replace(str(TOKEN_PATH), backup_path)
-                            print(f"  Stale token backed up to: {backup_path}")
-                        except OSError as backup_err:
-                            print(f"  Warning: backup failed ({backup_err}), removing stale token")
-                            try:
-                                os.unlink(str(TOKEN_PATH))
-                            except OSError:
-                                pass
-                        creds = None  # Force new interactive flow
-                    else:
-                        raise
-            else:
-                print("  Existing token is invalid. Starting fresh OAuth flow...")
-                creds = None
-        except Exception as e:
-            print(f"  Existing token failed to load: {e}")
-            creds = None
-
-    # Run OAuth flow
-    print("  Opening browser for Google sign-in...")
-    print("  (Sign in and grant all requested permissions)")
-    print()
-
-    flow = InstalledAppFlow.from_client_secrets_file(
-        str(CREDENTIALS_PATH), SCOPES
+async def _verify(client) -> bool:
+    """Read once through each service with the new sign-in."""
+    checks = (
+        ("Gmail", client.fetch_unread_emails(limit=5), lambda r: f"{r.get('count', len(r.get('emails', [])))} unread"),
+        ("Calendar", client.get_calendar_events(days=1), lambda r: f"{len(r.get('events', []))} event(s) today"),
+        ("Contacts", client.get_contacts(limit=5), lambda r: f"{len(r.get('contacts', []))} contact(s) read"),
     )
-    creds = flow.run_local_server(port=0)
+    ok = True
+    for name, call, describe in checks:
+        try:
+            result = await call
+        except Exception as exc:  # noqa: BLE001 -- report each service on its own
+            result = {"error": str(exc)}
+        if isinstance(result, dict) and result.get("error"):
+            ok = False
+            print(f"    {name:<9} FAILED - {result['error']}")
+        else:
+            print(f"    {name:<9} {describe(result if isinstance(result, dict) else {})}")
+    return ok
 
-    # Save token
-    _save_token(creds)
+
+async def main() -> int:
+    from backend.core.env_bootstrap import load_env_once
+    load_env_once()
+    from backend.neural_mesh.agents.google_workspace_agent import (
+        GOOGLE_API_AVAILABLE, GOOGLE_WORKSPACE_SCOPES, GoogleWorkspaceClient, GoogleWorkspaceConfig,
+    )
+
+    config = GoogleWorkspaceConfig()
+    _rule("JARVIS Google Workspace sign-in")
+    print(f"  Credentials: {config.credentials_path}")
+    print(f"  Token:       {config.token_path}")
+    print(f"  Scopes:      {len(GOOGLE_WORKSPACE_SCOPES)}")
     print()
-    print(f"  Token saved to {TOKEN_PATH}")
+
+    if not GOOGLE_API_AVAILABLE:
+        print("  The Google API packages are not installed in this Python:")
+        print(f"    {sys.executable}")
+        print("  Install them (they are in backend/requirements-windows.txt):")
+        print("    google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2")
+        return 1
+
+    if not Path(config.credentials_path).exists():
+        print("  No Google OAuth client file yet. JARVIS signs in as an app you own:")
+        print("    1. https://console.cloud.google.com -> APIs & Services -> Credentials")
+        print("    2. Create credentials -> OAuth client ID -> Application type: Desktop app")
+        print("    3. Enable the Gmail, Google Calendar, People and Google Drive APIs")
+        print("    4. Download the client's JSON and save it as:")
+        print(f"         {config.credentials_path}")
+        print("       (or copy the one you already use on another machine)")
+        print("  Then run this again.")
+        return 1
+
+    print("  Opening your browser for Google sign-in...")
+    print("  (Sign in and allow the requested access; this window waits for you.)")
     print()
+    client = GoogleWorkspaceClient(config)
+    if not await client.authenticate(interactive=True):
+        print(f"  Sign-in did not complete (state: {client.auth_state.value}).")
+        reason = getattr(client, "auth_failure_reason", None)
+        if reason:
+            print(f"  Reason: {reason}")
+        return 1
 
-    # Verify
-    _verify_services(creds)
-
-
-def _save_token(creds):
-    """Save credentials to token file."""
-    os.makedirs(str(JARVIS_DIR), exist_ok=True)
-    with open(str(TOKEN_PATH), 'w') as f:
-        f.write(creds.to_json())
-
-
-def _verify_services(creds):
-    """Verify the token works by testing each service."""
-    print("  Verifying services...")
+    print(f"  Signed in. Token saved to {config.token_path}")
     print()
-
-    # Gmail
-    try:
-        gmail = build('gmail', 'v1', credentials=creds)
-        profile = gmail.users().getProfile(userId='me').execute()
-        email = profile.get('emailAddress', 'unknown')
-        total = profile.get('messagesTotal', 0)
-        print(f"    Gmail:     {email} ({total:,} messages)")
-    except Exception as e:
-        print(f"    Gmail:     FAILED - {e}")
-
-    # Calendar
-    try:
-        cal = build('calendar', 'v3', credentials=creds)
-        from datetime import datetime, timedelta
-        now = datetime.utcnow().isoformat() + 'Z'
-        tomorrow = (datetime.utcnow() + timedelta(days=1)).isoformat() + 'Z'
-        events = cal.events().list(
-            calendarId='primary',
-            timeMin=now,
-            timeMax=tomorrow,
-            maxResults=5,
-            singleEvents=True,
-            orderBy='startTime'
-        ).execute()
-        items = events.get('items', [])
-        print(f"    Calendar:  {len(items)} event(s) in next 24h")
-        for item in items[:3]:
-            start = item.get('start', {}).get('dateTime', item.get('start', {}).get('date', ''))
-            summary = item.get('summary', '(no title)')
-            if 'T' in start:
-                start = start.split('T')[1][:5]
-            print(f"               - {start}: {summary}")
-    except Exception as e:
-        print(f"    Calendar:  FAILED - {e}")
-
-    # Contacts
-    try:
-        people = build('people', 'v1', credentials=creds)
-        results = people.people().connections().list(
-            resourceName='people/me',
-            pageSize=5,
-            personFields='names'
-        ).execute()
-        connections = results.get('connections', [])
-        total = results.get('totalPeople', len(connections))
-        print(f"    Contacts:  {total} contact(s)")
-    except Exception as e:
-        print(f"    Contacts:  FAILED - {e}")
-
-    # Drive
-    try:
-        drive = build('drive', 'v3', credentials=creds)
-        about = drive.about().get(fields='user').execute()
-        drive_email = about.get('user', {}).get('emailAddress', 'unknown')
-        print(f"    Drive:     Connected ({drive_email})")
-    except Exception as e:
-        print(f"    Drive:     FAILED - {e}")
-
+    print("  Checking the services...")
+    verified = await _verify(client)
     print()
-    print("=" * 60)
-    print("  Google Workspace Tier 1 is READY")
-    print("=" * 60)
+    _rule("Google Workspace is connected" if verified else "Signed in; some services failed (above)")
+    return 0 if verified else 2
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(asyncio.run(main()))

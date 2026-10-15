@@ -64,15 +64,37 @@ class AgentBinding:
     requires: List[str] = field(default_factory=list)
     route: str = ""
     delivers: str = ""   # "shown" | "told" | "done" | "" (internal: none of them)
+    # The action that takes a request in the user's own words (the agent
+    # works out what to do itself), "" when the agent only takes the
+    # capability it was chosen for as its action.
+    entry: str = ""
+
+    def platform_reason(self) -> str:
+        """Why this binding can never serve on this host's platform, ""."""
+        if self.platforms and not any(sys.platform.startswith(p) for p in self.platforms):
+            return f"runs on {', '.join(self.platforms)}, not {sys.platform}"
+        return ""
+
+    def missing_requirements(self) -> List[str]:
+        """Packages it needs that are not installed: it is not SET UP here,
+        which an install fixes -- unlike a platform it cannot run on."""
+        missing = []
+        for requirement in self.requires:
+            try:
+                found = importlib.util.find_spec(requirement) is not None
+            except (ImportError, ValueError):  # a dotted name whose parent is absent
+                found = False
+            if not found:
+                missing.append(requirement)
+        return missing
 
     def unavailable_reason(self) -> str:
         """Why this binding cannot serve on this host, "" when it can."""
-        if self.platforms and not any(sys.platform.startswith(p) for p in self.platforms):
-            return f"runs on {', '.join(self.platforms)}, not {sys.platform}"
-        missing = [r for r in self.requires if importlib.util.find_spec(r) is None]
-        if missing:
-            return f"needs {', '.join(missing)}"
-        return ""
+        platform = self.platform_reason()
+        if platform:
+            return platform
+        missing = self.missing_requirements()
+        return f"needs {', '.join(missing)}" if missing else ""
 
     def describe(self) -> str:
         """First docstring line of what serves it (the class, or a route's module)."""
@@ -158,6 +180,7 @@ _DEFAULT_BINDINGS: List[Dict[str, Any]] = [
         "capabilities": ["handle_workspace_query", "read_email", "check_calendar",
                          "send_email", "create_event", "email", "calendar"],
         "requires": ["googleapiclient", "google_auth_oauthlib"],
+        "entry": "handle_workspace_query",
     },
     {
         "agent_id": "spatial_awareness_agent",
@@ -299,6 +322,7 @@ def load_bindings() -> Dict[str, AgentBinding]:
                 requires=list(entry.get("requires", [])),
                 route=entry.get("route", ""),
                 delivers=str(entry.get("delivers", "") or "").strip().lower(),
+                entry=str(entry.get("entry", "") or "").strip(),
             )
         except KeyError as exc:
             logger.warning("[AgentBindings] Skipping %s: missing field %s", aid, exc)
@@ -335,7 +359,10 @@ def binding_for_capability(capability: str) -> Optional[AgentBinding]:
         # The catalogue shows each entry's id and its capabilities; the Mind
         # names either ("web_search_agent" as often as "web_research").
         names = {c.lower() for c in binding.capabilities} | {binding.agent_id.lower()}
-        if wanted in names and not binding.unavailable_reason():
+        # A binding that is only not SET UP still serves the request: its
+        # dispatch says exactly what it needs, where routing it elsewhere
+        # had a model invent an answer ("I don't have access to your Gmail").
+        if wanted in names and not binding.platform_reason():
             return binding
     return None
 
@@ -391,17 +418,23 @@ def capability_catalogue() -> str:
     if _catalogue is None:
         lines: List[str] = []
         for agent_id, binding in get_agent_bindings().items():
-            why = binding.unavailable_reason()
+            why = binding.platform_reason()
             if why:
                 logger.debug("[AgentBindings] %s not offered: %s", agent_id, why)
                 continue
+            missing = binding.missing_requirements()
             try:
                 summary = binding.describe()
             except Exception as exc:  # noqa: BLE001 -- unimportable = undispatchable
-                logger.debug("[AgentBindings] %s not offered: %s", agent_id, exc)
-                continue
+                if not missing:
+                    logger.debug("[AgentBindings] %s not offered: %s", agent_id, exc)
+                    continue
+                summary = agent_id.replace("_", " ")
             gives = _DELIVERY_PHRASE.get(binding.delivers, "")
-            lines.append(f"- {agent_id} — {summary} [{', '.join(sorted(binding.capabilities))}]"
+            # Offered when only not set up: the request reaches it, and its
+            # dispatch says what to install, instead of going elsewhere.
+            setup = f" (not set up on this host: needs {', '.join(missing)})" if missing else ""
+            lines.append(f"- {agent_id} — {summary}{setup} [{', '.join(sorted(binding.capabilities))}]"
                          + (f" -> {gives}" if gives else ""))
         _catalogue = "\n".join(lines)
     return _catalogue

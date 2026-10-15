@@ -62,6 +62,7 @@ import importlib
 import json
 import logging
 import os
+import sys
 import re
 import threading
 import tempfile
@@ -703,6 +704,21 @@ except ImportError:
 # =============================================================================
 
 # OAuth 2.0 scopes for Google Workspace
+def _oauth_setup_command() -> str:
+    """The command that connects Google: this checkout's setup script, run
+    by the interpreter JARVIS itself runs on (not a bare ``python3``, which
+    on Windows is not the JARVIS environment). One definition, used by
+    every message that tells the user how to connect."""
+    import shlex
+    script = Path(__file__).resolve().parents[2] / "scripts" / "google_oauth_setup.py"
+    if os.name == "nt":
+        return f'& "{sys.executable}" "{script}"'
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
+
+
+OAUTH_SETUP_COMMAND = _oauth_setup_command()
+
+
 GOOGLE_WORKSPACE_SCOPES = [
     # Gmail
     'https://www.googleapis.com/auth/gmail.readonly',
@@ -1224,6 +1240,16 @@ class UnifiedWorkspaceExecutor:
         """Load Computer Use only for commands that explicitly need a visual tier."""
         if self._visual_surface_refused("visual_tooling"):
             return False
+        # Computer Use drives the screen through Claude: a paid lane, which
+        # the one authority may have switched off. Asked here, before the
+        # tool is built, it failed only when it ran ("ANTHROPIC_API_KEY
+        # required") after the request had already waited for it.
+        try:
+            from backend.core.ouroboros.governance.paid_lanes import paid_lane_allowed
+            if not paid_lane_allowed("claude"):
+                return False
+        except Exception:  # noqa: BLE001 -- no authority, no spending
+            return False
         if self._computer_use is not None:
             return True
 
@@ -1398,7 +1424,7 @@ class UnifiedWorkspaceExecutor:
                         result["error_code"] = "auth_missing"
                         result.setdefault(
                             "action_required",
-                            "Run: python3 backend/scripts/google_oauth_setup.py",
+                            ("Run: " + OAUTH_SETUP_COMMAND),
                         )
                         error_code = "auth_missing"
                     if error_code in {"needs_reauth", "auth_missing", "api_unavailable"}:
@@ -1439,14 +1465,19 @@ class UnifiedWorkspaceExecutor:
                 tier_used=ExecutionTier.GOOGLE_API,
                 data={
                     "error_code": "needs_reauth",
-                    "action_required": "Re-run: python3 backend/scripts/google_oauth_setup.py",
+                    "action_required": ("Re-run: " + OAUTH_SETUP_COMMAND),
                 },
                 error=f"Google auth permanently failed: {reason}. Re-run google_oauth_setup.py",
                 execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
             )
-        if not _can_try_api and not allow_visual_fallback:
+        # Why the API tier could not serve: the answer unless a later tier
+        # actually reads the mail. It was dropped when the visual tier ran
+        # and failed -- "All execution tiers failed" instead of "Gmail is not
+        # connected; run the setup" (2026-10-14).
+        api_unavailable: Optional[ExecutionResult] = None
+        if not _can_try_api:
             if not GOOGLE_API_AVAILABLE:
-                return ExecutionResult(
+                api_unavailable = ExecutionResult(
                     success=False,
                     tier_used=ExecutionTier.GOOGLE_API,
                     data={
@@ -1459,16 +1490,19 @@ class UnifiedWorkspaceExecutor:
                     error="Google API libraries are not available",
                     execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
                 )
-            return ExecutionResult(
-                success=False,
-                tier_used=ExecutionTier.GOOGLE_API,
-                data={
-                    "error_code": "auth_missing",
-                    "action_required": "Run: python3 backend/scripts/google_oauth_setup.py",
-                },
-                error="Google Workspace email is not authenticated",
-                execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
-            )
+            else:
+                api_unavailable = ExecutionResult(
+                    success=False,
+                    tier_used=ExecutionTier.GOOGLE_API,
+                    data={
+                        "error_code": "auth_missing",
+                        "action_required": ("Run: " + OAUTH_SETUP_COMMAND),
+                    },
+                    error="Google Workspace email is not connected: no Google sign-in yet",
+                    execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
+                )
+            if not allow_visual_fallback:
+                return api_unavailable
 
         # Tier 3: Computer Use (Visual) - Skip Tier 2 for email (no macOS email bridge)
         # v6.2: First switch to browser using Spatial Awareness, then navigate
@@ -1521,6 +1555,8 @@ class UnifiedWorkspaceExecutor:
                 logger.warning(f"Computer Use error for email: {e}")
                 self._tier_stats[ExecutionTier.COMPUTER_USE]["failures"] += 1
 
+        if api_unavailable is not None:
+            return api_unavailable
         return ExecutionResult(
             success=False,
             tier_used=ExecutionTier.GOOGLE_API,
@@ -2546,7 +2582,7 @@ class GoogleWorkspaceClient:
         }:
             raise RuntimeError(
                 f"Google auth permanently failed: {self._last_auth_failure_reason}. "
-                f"Re-run: python3 backend/scripts/google_oauth_setup.py"
+                + "Re-run: " + OAUTH_SETUP_COMMAND
             )
 
         circuit_breaker = get_api_circuit_breaker()
@@ -2590,7 +2626,7 @@ class GoogleWorkspaceClient:
                 await self._mark_permanent_auth_failure_async(reason)
                 raise RuntimeError(
                     f"Google auth permanently failed: {reason}. "
-                    f"Re-run: python3 backend/scripts/google_oauth_setup.py"
+                    + "Re-run: " + OAUTH_SETUP_COMMAND
                 ) from e
 
             error_str = str(e).lower()
@@ -2678,13 +2714,16 @@ class GoogleWorkspaceClient:
                 return True
 
             try:
-                # Run OAuth in thread pool — bounded by network timeout
+                # Run OAuth in thread pool -- bounded by the network timeout,
+                # except an interactive sign-in: a person in the browser
+                # consent screen is not a network call, and the timeout cut
+                # the setup off mid-consent.
                 loop = asyncio.get_event_loop()
                 success = await asyncio.wait_for(
                     loop.run_in_executor(
                         None, lambda: self._authenticate_sync(interactive=interactive)
                     ),
-                    timeout=_AUTH_NETWORK_TIMEOUT,
+                    timeout=None if interactive else _AUTH_NETWORK_TIMEOUT,
                 )
                 self._authenticated = success
                 if success:
@@ -3072,7 +3111,7 @@ class GoogleWorkspaceClient:
             return {
                 "error": f"Google auth permanently failed: {self._last_auth_failure_reason}",
                 "error_code": "needs_reauth",
-                "action_required": "Re-run: python3 backend/scripts/google_oauth_setup.py",
+                "action_required": ("Re-run: " + OAUTH_SETUP_COMMAND),
                 "emails": [],
             }
 
@@ -3080,7 +3119,7 @@ class GoogleWorkspaceClient:
             return {
                 "error": self._last_auth_failure_reason or "Google Workspace authentication is degraded",
                 "error_code": "auth_missing",
-                "action_required": "Run: python3 backend/scripts/google_oauth_setup.py",
+                "action_required": ("Run: " + OAUTH_SETUP_COMMAND),
                 "emails": [],
             }
 
@@ -3094,7 +3133,7 @@ class GoogleWorkspaceClient:
         return {
             "error": reason,
             "error_code": "auth_missing",
-            "action_required": "Run: python3 backend/scripts/google_oauth_setup.py",
+            "action_required": ("Run: " + OAUTH_SETUP_COMMAND),
             "emails": [],
         }
 
@@ -3714,7 +3753,12 @@ class GoogleWorkspaceClient:
 
 class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
     """
-    Google Workspace Agent - "Chief of Staff" for Admin & Communication.
+    Reads the user's Gmail inbox and messages straight from their Google account (whether or not Gmail is open on screen), searches, drafts and sends email; checks and books their Google Calendar; looks up their contacts.
+
+    The first line above is how the Mind sees this agent (agent_bindings'
+    capability catalogue): it is what the agent does with the user's own
+    account. "Chief of Staff for Admin & Communication" never said it reads
+    email, and the Mind answered a Gmail question by looking at the screen.
 
     This agent handles all Google Workspace operations including:
     - Gmail (read, send, draft, search)
@@ -3855,8 +3899,7 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
                 pass
             if health == TokenHealthStatus.MISSING:
                 logger.info(
-                    "[GoogleWorkspaceAgent] No token file found. "
-                    "Run: python3 backend/scripts/google_oauth_setup.py"
+                    "[GoogleWorkspaceAgent] No token file found. Run: %s", OAUTH_SETUP_COMMAND
                 )
             elif health == TokenHealthStatus.CORRUPT:
                 logger.warning(
@@ -3870,7 +3913,7 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
             elif health == TokenHealthStatus.PERMANENTLY_INVALID:
                 logger.warning(
                     "[GoogleWorkspaceAgent] Token is permanently invalid — marking NEEDS_REAUTH. "
-                    "Run: python3 backend/scripts/google_oauth_setup.py"
+                    "Run: %s", OAUTH_SETUP_COMMAND
                 )
                 self._client._mark_permanent_auth_failure_sync(
                     "Token permanently invalid at startup",
@@ -4010,7 +4053,7 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
                 else "unknown"
             ),
             "action_required": (
-                "Run: python3 backend/scripts/google_oauth_setup.py"
+                ("Run: " + OAUTH_SETUP_COMMAND)
                 if auth_state in {
                     "unauthenticated",
                     "degraded_visual",
@@ -4769,7 +4812,7 @@ Return ONLY a JSON object with these keys (use null if not found):
                             f"Google auth degraded: {self._client.auth_failure_reason or 'reauthorization required'}"
                         ),
                         "error_code": "auth_missing",
-                        "action_required": "Re-run: python3 backend/scripts/google_oauth_setup.py",
+                        "action_required": ("Re-run: " + OAUTH_SETUP_COMMAND),
                         "response": (
                             "Google authentication needs renewal before this workspace action can use "
                             "the API."
@@ -4787,10 +4830,10 @@ Return ONLY a JSON object with these keys (use null if not found):
                     "success": False,
                     "error": f"Google auth permanently failed: {self._client.auth_failure_reason}",
                     "error_code": "needs_reauth",
-                    "action_required": "Re-run: python3 backend/scripts/google_oauth_setup.py",
+                    "action_required": ("Re-run: " + OAUTH_SETUP_COMMAND),
                     "response": (
                         "Google authentication needs renewal. Your OAuth token has expired or been revoked. "
-                        "Please run: python3 backend/scripts/google_oauth_setup.py"
+                        + "Please run: " + OAUTH_SETUP_COMMAND
                     ),
                     "workspace_action": action or "unknown",
                     "request_id": request_id,
@@ -4812,7 +4855,7 @@ Return ONLY a JSON object with these keys (use null if not found):
                         if self._client.auth_state in {AuthState.NEEDS_REAUTH, AuthState.NEEDS_REAUTH_GUIDED}
                         else "auth_missing"
                     ),
-                    "action_required": "Run: python3 backend/scripts/google_oauth_setup.py",
+                    "action_required": ("Run: " + OAUTH_SETUP_COMMAND),
                     "workspace_action": action or "unknown",
                     "request_id": request_id,
                     "correlation_id": correlation_id,
@@ -6814,8 +6857,8 @@ async def get_google_workspace_agent() -> Optional["GoogleWorkspaceAgent"]:
         _STANDALONE_REMEDIATION = {
             "no_workspace_credentials": (
                 "Google credentials not found.\n"
-                "  Run: python3 backend/scripts/google_oauth_setup.py\n"
-                "  Expected: {creds} and {token}"
+                + "  Run: " + OAUTH_SETUP_COMMAND.replace("{", "{{").replace("}", "}}") + "\n"
+                + "  Expected: {creds} and {token}"
             ),
             "supervisor_startup_incomplete": "Waiting for JARVIS_STARTUP_COMPLETE=true",
         }
