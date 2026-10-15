@@ -396,9 +396,14 @@ class IntelligentTimeoutCalculator:
         explicit_timeout: Optional[float] = None,
         model_name: Optional[str] = None,
         warm_up_factor: float = 1.0,
+        snapshot: Optional["SystemResourceSnapshot"] = None,
     ) -> Tuple[float, Dict[str, Any]]:
         """
         Calculate adaptive timeout with explanation.
+
+        *snapshot* is the resource reading to judge pressure by; async callers
+        take it off the event loop first (get_snapshot samples CPU for
+        ``interval`` seconds -- it wedged the loop 0.61 s, 2026-10-15).
 
         Returns:
             Tuple of (timeout_seconds, explanation_dict)
@@ -436,7 +441,8 @@ class IntelligentTimeoutCalculator:
                 self._loaded_models.add(model_name)
 
         # Apply resource pressure multiplier
-        snapshot = self._resource_monitor.get_snapshot()
+        if snapshot is None:
+            snapshot = self._resource_monitor.get_snapshot()
         if snapshot.is_under_pressure:
             pressure_multiplier = self._calculate_pressure_multiplier(snapshot)
             timeout *= pressure_multiplier
@@ -1230,11 +1236,13 @@ class PyTorchExecutor:
 
         # v117.0: Calculate initial timeout with intelligent system
         warm_up_factor = 2.0 if not self._warmed_up and self._warmup_operations < 3 else 1.0
+        from backend.core.async_offload import call_off_loop
         base_timeout, timeout_explanation = self._timeout_calculator.calculate(
             op_type=op_type,
             explicit_timeout=timeout,
             model_name=model_name,
             warm_up_factor=warm_up_factor,
+            snapshot=await call_off_loop(self._resource_monitor.get_snapshot),
         )
 
         # Log timeout calculation for debugging

@@ -228,8 +228,7 @@ class MemoryGuard:
     ) -> None:
         from backend.core.daemon_handover import kernel_holder
         self.journal = journal
-        self._fixed_pid = pid
-        self._holder = holder or kernel_holder
+        self._holder = holder or (kernel_holder if pid is None else self._pinned_holder(pid))
         self._stop_kernel = stop_kernel or self._hand_over
         self._siblings_fn = siblings or self._serving_siblings
         self._siblings: Set[int] = set()
@@ -247,6 +246,24 @@ class MemoryGuard:
         journal.parent.mkdir(parents=True, exist_ok=True)
 
     # -- collaborators ------------------------------------------------------
+
+    @staticmethod
+    def _pinned_holder(pid: int) -> Callable[[], Optional[int]]:
+        """The holder for a guard pinned to one process (``--pid``, the kernel
+        arming its own guard): that process while it is still the one first
+        seen -- PID and start time, as a lock record is judged
+        (process_identity.lock_holder_alive) -- then None for good. A pinned
+        guard used to report its kernel forever, so ``--once`` never ended
+        after the kernel died (2026-10-15)."""
+        from backend.core.process_identity import lock_holder_alive, process_started_at
+
+        record = {"pid": pid, "started_at": process_started_at(pid)}
+
+        def holder() -> Optional[int]:
+            if record["pid"] is not None and not lock_holder_alive(record):
+                record["pid"] = None  # gone; a recycled PID is someone else
+            return record["pid"]
+        return holder
 
     @staticmethod
     def _serving_siblings() -> Set[int]:
@@ -298,7 +315,7 @@ class MemoryGuard:
                 self._siblings = set()
             self._siblings_at = now
 
-        pid = self._fixed_pid if self._fixed_pid is not None else self._holder()
+        pid = self._holder()
         reading = Reading(
             at=datetime.now().isoformat(timespec="seconds"), mono=now,
             host_total_gb=round(total_gb, 2), host_used_pct=round(vm.percent, 1),

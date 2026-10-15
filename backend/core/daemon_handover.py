@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -191,21 +192,40 @@ def _query(sock_path: Path, request: dict, answer_type: Optional[str] = None) ->
 
     The supervisor stream interleaves log events with replies, so a reply is
     recognised by ``answer_type``; the kernel command socket answers once.
+
+    How long to wait is the daemon's to show, not a fixed guess: a peer that
+    keeps talking is alive and may be busy (a booting kernel answered status
+    in 14.7 s; the old fixed 5 s made the launch attach to a stale kernel,
+    2026-10-15). The wait ends when the peer has been SILENT for
+    ``JARVIS_DAEMON_QUERY_TIMEOUT_S``, or has talked without answering for
+    the handover's own silence window (``JARVIS_DAEMON_HANDOVER_SILENCE_S``).
     """
     from backend.core.portable_ipc import connect_unix_sync
-    deadline = time.monotonic() + _query_timeout_s()
+    quiet_limit = _query_timeout_s()
+    started = time.monotonic()
+    budget = max(quiet_limit, _silence_s())
     try:
-        sock = connect_unix_sync(str(sock_path), timeout=_query_timeout_s())
+        sock = connect_unix_sync(str(sock_path), timeout=quiet_limit)
     except (OSError, ValueError):
         return None
     try:
         sock.sendall((json.dumps(request) + "\n").encode())
         buf = b""
-        while time.monotonic() < deadline:
-            sock.settimeout(max(0.05, deadline - time.monotonic()))
-            chunk = sock.recv(65536)
+        last_heard = time.monotonic()
+        while True:
+            now = time.monotonic()
+            quiet_left = quiet_limit - (now - last_heard)
+            budget_left = budget - (now - started)
+            if quiet_left <= 0 or budget_left <= 0:
+                return None
+            sock.settimeout(max(0.05, min(quiet_left, budget_left)))
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                continue  # the loop re-checks both limits
             if not chunk:
                 return None
+            last_heard = time.monotonic()
             buf += chunk
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)

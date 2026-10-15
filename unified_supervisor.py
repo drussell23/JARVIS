@@ -221,6 +221,19 @@ if _is_cli_mode:
         _result_path = _early_os.path.join(
             _tmp.gettempdir(), f"jarvis_{_cmd_name}_{_early_os.getpid()}.result"
         )
+        # A restarted kernel runs for hours: its output goes straight into a
+        # session log (backend/core/session_log, the naming every launcher
+        # shares), readable while it runs. It used to be captured in this
+        # runner's memory and written out only when the kernel exited -- no
+        # log while JARVIS ran, and a runner that grew with every line.
+        # --shutdown is a short command: its output still comes back whole.
+        _session_log = None
+        if not _is_shutdown:
+            try:
+                from backend.core.session_log import new_session_log as _new_session_log
+                _session_log = str(_new_session_log("supervisor"))
+            except Exception as _sl_err:  # noqa: BLE001 -- the result file still records the run
+                _early_sys.stderr.write(f"[KERNEL] session log unavailable: {_sl_err}\n")
 
         # Write standalone command script with full signal immunity
         _script_content = f'''#!/usr/bin/env python3
@@ -251,18 +264,27 @@ except Exception:
 # Run the actual command
 env = dict(os.environ)
 env[{_reexec_marker!r}] = "1"
-result = subprocess.run(
-    [{_early_sys.executable!r}] + {_early_sys.argv!r},
-    cwd={_early_os.getcwd()!r},
-    capture_output=True,
-    env=env,
-)
+argv = [{_early_sys.executable!r}] + {_early_sys.argv!r}
+session_log = {_session_log!r}
+if session_log:
+    # The kernel writes into its session log as it runs (stderr too, so a
+    # fault dump lands beside the lines before it). Unbuffered: a Python
+    # child writing to a file holds its prints until a block fills.
+    env["PYTHONUNBUFFERED"] = "1"
+    with open(session_log, "ab", buffering=0) as log:
+        result = subprocess.run(argv, cwd={_early_os.getcwd()!r}, env=env,
+                                stdin=subprocess.DEVNULL, stdout=log,
+                                stderr=subprocess.STDOUT)
+    output = ("log: " + session_log + "\\n").encode()
+else:
+    result = subprocess.run(argv, cwd={_early_os.getcwd()!r}, env=env,
+                            stdin=subprocess.DEVNULL, capture_output=True)
+    output = result.stdout + result.stderr
 
 # Write result
-with open({_result_path!r}, "w") as f:
-    f.write(str(result.returncode) + "\\n")
-    f.write(result.stdout.decode())
-    f.write(result.stderr.decode())
+with open({_result_path!r}, "wb") as f:
+    f.write((str(result.returncode) + "\\n").encode())
+    f.write(output)
 '''
         _fd, _script_path = _tmp.mkstemp(suffix='.py', prefix=f'jarvis_{_cmd_name}_')
         _early_os.write(_fd, _script_content.encode())
@@ -285,6 +307,8 @@ with open({_result_path!r}, "w") as f:
         _early_sys.stdout.write(f"  Running in background.\n")
         _early_sys.stdout.write(f"  Status: python3 unified_supervisor.py --status\n")
         _early_sys.stdout.write(f"  Results: {_result_path}\n")
+        if _session_log:
+            _early_sys.stdout.write(f"  Log:     {_session_log}\n")
         _early_sys.stdout.write(f"{'='*60}\n")
         _early_sys.stdout.flush()
         _early_os._exit(0)
@@ -438,7 +462,13 @@ def _ensure_venv_python() -> None:
     except Exception:
         pass
     _code = _sp.call(argv)
-    _os._exit(_code if isinstance(_code, int) and _code >= 0 else 1)
+    # The child's status, passed through unchanged. Windows reports it as an
+    # unsigned 32-bit NTSTATUS (an access violation is 0xC0000005 =
+    # 3221225477) while os._exit takes a C int: the same 32 bits, signed.
+    # Clamping that to an int raised OverflowError over the kernel's crash.
+    _width = 1 << 32
+    _code = int(_code) % _width
+    _os._exit(_code - _width if _code >= _width >> 1 else _code)
 
 
 # Execute venv check immediately
@@ -98886,13 +98916,11 @@ def main() -> int:
             print("No watchdog installed")
         sys.exit(0)
 
-    # v253.8: Enable faulthandler for deadlock diagnosis.
-    # Send SIGUSR1 to dump all thread tracebacks: kill -SIGUSR1 <pid>
-    import faulthandler
-    import signal as _sig
-    faulthandler.enable()
-    if hasattr(_sig, "SIGUSR1"):
-        faulthandler.register(_sig.SIGUSR1, all_threads=True, chain=False)
+    # Fault reporting, armed in one place (backend/core/fault_reporting): a
+    # fatal crash dumps its thread, SIGUSR1 dumps all where the OS has it.
+    # On Windows a handled COM exception must not walk other threads' frames.
+    from backend.core.fault_reporting import enable_fault_reporting
+    enable_fault_reporting()
 
     # Parse arguments
     parser = create_argument_parser()

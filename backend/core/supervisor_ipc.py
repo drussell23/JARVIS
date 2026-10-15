@@ -336,14 +336,18 @@ class SupervisorIPC:
         if action == "ping":
             await self._write_event(writer, {"type": "pong", "ts": time.time()})
         elif action == "status":
+            from backend.core.async_offload import call_off_loop
             from backend.core.daemon_handover import code_identity
             await self._write_event(writer, {
                 "type": "status_response",
                 "ts":   time.time(),
                 "pid":  os.getpid(),
                 # What this daemon runs, so a launch from a newer checkout
-                # replaces it instead of attaching (daemon_handover).
-                "code": await asyncio.to_thread(code_identity),
+                # replaces it instead of attaching (daemon_handover). On the
+                # offload pool, not asyncio's default executor: a busy boot
+                # queued this cheap read for 14.7 s behind unrelated work and
+                # the launcher attached to the old kernel (2026-10-15).
+                "code": await call_off_loop(code_identity),
             })
         elif action == "shutdown":
             # Route shutdown command to the supervisor via shutdown event

@@ -89,9 +89,10 @@ def _keep() -> int:
         return 20
 
 
-def _prune(directory: Path, name: str) -> None:
+def _prune(directory: Path, name: str, keep: Optional[int] = None) -> None:
+    keep = _keep() if keep is None else max(0, keep)
     logs = sorted(directory.glob(f"{name}-*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for old in logs[_keep():]:
+    for old in logs[keep:]:
         try:
             old.unlink()
         except OSError:
@@ -159,6 +160,20 @@ def log_only(text: str) -> None:
         _active.record(text if text.endswith("\n") else text + "\n")
 
 
+def new_session_log(name: str) -> Path:
+    """A fresh ``<log_dir>/<name>-<timestamp>.log`` path (directory made, old
+    logs pruned to ``JARVIS_SESSION_LOG_KEEP``) -- the one naming every
+    launcher shares: the console tee below, ``jarvis.ps1 start`` (same
+    pattern), and ``--restart``'s detached runner, which sends the kernel's
+    output straight into it. Raises OSError when the directory cannot be made."""
+    from backend.core.host_platform import log_dir
+
+    directory = log_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    _prune(directory, name, keep=_keep() - 1)  # room for the one made here
+    return directory / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+
+
 def start_session_log(name: str) -> Optional[Path]:
     """Tee this process's console output to a new session log; return its path.
 
@@ -168,12 +183,8 @@ def start_session_log(name: str) -> Optional[Path]:
     """
     if isinstance(sys.stdout, _Tee) or not (sys.stdout and sys.stdout.isatty()):
         return None
-    from backend.core.host_platform import log_dir
-
-    directory = log_dir()
     try:
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+        path = new_session_log(name)
         log = open(path, "a", encoding="utf-8", errors="replace", buffering=1)  # noqa: SIM115
     except OSError as exc:
         print(f"[KERNEL] session log unavailable ({exc}); console only", file=sys.stderr)
@@ -181,10 +192,9 @@ def start_session_log(name: str) -> Optional[Path]:
     global _active
     sys.stdout = _active = _Tee(sys.stdout, log)
     sys.stderr = _Tee(sys.stderr, log)
-    _prune(directory, name)
     print(f"[KERNEL] Session log: {path}")
     return path
 
 
-__all__ = ["SessionLogHandler", "console_of", "log_only", "record", "session_log_handler",
-           "start_session_log"]
+__all__ = ["SessionLogHandler", "console_of", "log_only", "new_session_log", "record",
+           "session_log_handler", "start_session_log"]

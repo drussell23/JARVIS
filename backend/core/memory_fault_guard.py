@@ -351,7 +351,8 @@ class MemoryFaultGuard:
     def _enable_faulthandler(self) -> None:
         """Enable Python's faulthandler for debugging."""
         try:
-            faulthandler.enable()
+            from backend.core.fault_reporting import enable_fault_reporting
+            enable_fault_reporting()
             logger.debug("   Enabled faulthandler for stack traces")
         except Exception as e:
             logger.debug(f"   Could not enable faulthandler: {e}")
@@ -823,8 +824,10 @@ def install_early_protection() -> bool:
         return True
     
     try:
-        # Just install faulthandler for now (lightweight)
-        faulthandler.enable()
+        # Just install faulthandler for now (lightweight) -- through the one
+        # place that knows Windows' setting (backend/core/fault_reporting).
+        from backend.core.fault_reporting import enable_fault_reporting
+        enable_fault_reporting()
         
         # Full initialization happens later via get_memory_fault_guard().initialize()
         _early_protection_installed = True
