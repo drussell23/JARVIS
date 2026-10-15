@@ -45,6 +45,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -138,9 +139,44 @@ def _powershell() -> Optional[str]:
     return None
 
 
+def is_windows_host() -> bool:
+    """This process IS the Windows host: the numbers are one API call away."""
+    return sys.platform == "win32"
+
+
 def available() -> bool:
     """Whether the host can be read from here at all."""
-    return probe_enabled() and is_wsl() and _powershell() is not None
+    if not probe_enabled():
+        return False
+    return is_windows_host() or (is_wsl() and _powershell() is not None)
+
+
+def _read_native() -> Optional[HostCommit]:
+    """The same four numbers from the host itself (GlobalMemoryStatusEx --
+    microseconds, no PowerShell): commit limit/available are the page-file
+    totals, physical are the RAM totals. Windows-native callers (the Body's
+    kernel, the out-of-process memory guard) read here."""
+    import ctypes
+
+    class _MemoryStatusEx(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    status = _MemoryStatusEx()
+    status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return None
+    kb = 1024
+    return parse(
+        f"{status.ullAvailPageFile // kb} {status.ullTotalPageFile // kb} "
+        f"{status.ullAvailPhys // kb} {status.ullTotalPhys // kb}",
+        time.monotonic(),
+    )
 
 
 def parse(raw: str, at: float) -> Optional[HostCommit]:
@@ -155,8 +191,11 @@ def parse(raw: str, at: float) -> Optional[HostCommit]:
 
 
 def read_host_commit() -> Optional[HostCommit]:
-    """ONE synchronous read (~400 ms). Call from a worker thread only."""
+    """ONE synchronous read (~400 ms through WSL interop; microseconds on the
+    Windows host itself). Call from a worker thread only."""
     try:
+        if is_windows_host():
+            return _read_native()
         shell = _powershell()
         if shell is None or not is_wsl():
             return None

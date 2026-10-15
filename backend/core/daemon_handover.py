@@ -46,6 +46,29 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# The kernel's own lock and command socket (unified_supervisor: LOCKS_DIR /
+# "kernel.lock", KERNEL_SOCKET_PATH), for readers outside the kernel -- the
+# launcher's handover and the out-of-process memory guard.
+KERNEL_LOCKS_DIR = Path.home() / ".jarvis" / "locks"
+KERNEL_LOCK_PATH = KERNEL_LOCKS_DIR / "kernel.lock"
+KERNEL_SOCKET_PATH = KERNEL_LOCKS_DIR / "kernel.sock"
+
+
+def kernel_holder(lock_path: Path = KERNEL_LOCK_PATH) -> Optional[int]:
+    """PID of the kernel holding *lock_path*, or None when no live kernel
+    does -- a recycled PID is not a kernel (process_identity.lock_holder_alive)."""
+    from backend.core.process_identity import lock_holder_alive
+    try:
+        record = json.loads(lock_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or not lock_holder_alive(record):
+        return None
+    try:
+        return int(record["pid"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -326,6 +349,7 @@ async def hand_over(
 
 
 __all__ = [
-    "REPO_ROOT", "Staleness", "code_identity", "daemon_status", "hand_over", "judge_staleness",
+    "KERNEL_LOCK_PATH", "KERNEL_SOCKET_PATH", "REPO_ROOT", "Staleness", "code_identity",
+    "daemon_status", "hand_over", "judge_staleness", "kernel_holder",
     "loaded_sources", "running_daemon_staleness", "stale_policy",
 ]

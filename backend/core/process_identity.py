@@ -157,6 +157,33 @@ def is_same_process(pid: Optional[int], started_at: Optional[float]) -> Optional
     return now == float(started_at)
 
 
+def lock_holder_alive(record: dict) -> bool:
+    """Is the process that wrote this lock record (``pid`` + ``started_at``)
+    still running?
+
+    A PID alone cannot say: Windows recycles PIDs, and a dead kernel's
+    PID 117732 belonged to a VS Code GPU process within the hour, so a
+    kernel was reported running and the boot refused. The same PID with
+    another start time is another process. A record written before the start
+    time was recorded (or a holder whose start time cannot be read) is held
+    only by a process running Trinity's own code -- judged structurally,
+    never by words in a command line.
+    """
+    try:
+        pid = int(record.get("pid"))
+    except (TypeError, ValueError, AttributeError):
+        return False
+    same = is_same_process(pid, record.get("started_at"))
+    if same is not None:
+        return same
+    try:
+        import psutil
+
+        return is_trinity_process(psutil.Process(pid))
+    except Exception:  # noqa: BLE001 -- no psutil / unreadable: alive is all we know
+        return pid_alive(pid)
+
+
 # ---------------------------------------------------------------------------
 # Ownership
 # ---------------------------------------------------------------------------
@@ -465,7 +492,19 @@ def kill_process_tree(pid: int, timeout: float = 5.0) -> bool:
             logger.warning("[KillGuard] refused to stop the tree of %s: not Trinity-owned",
                            _describe(pid))
             return False
-        children = parent.children(recursive=True)
+        # The caller is never part of the tree it stops: a helper the root
+        # started (the out-of-process memory guard is the kernel's child, and
+        # a venv launcher stands between them) stopping its root used to
+        # terminate itself mid-stop. Spared: the caller, what it started,
+        # and the launchers between it and the root.
+        me = os.getpid()
+        spared = {me}
+        try:
+            spared.update(p.pid for p in psutil.Process(me).parents())
+            spared.update(c.pid for c in psutil.Process(me).children(recursive=True))
+        except psutil.Error:
+            pass
+        children = [c for c in parent.children(recursive=True) if c.pid not in spared]
         token = _authorized_tree.set(frozenset([pid] + [c.pid for c in children]))
         try:
             # Deepest first: a child never outlives the parent that would reap it.

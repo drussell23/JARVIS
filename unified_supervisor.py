@@ -5543,34 +5543,12 @@ class StartupLock:
 
     @staticmethod
     def _holder_alive(data: Dict[str, Any]) -> bool:
-        """Is the process that took this lock still running?
+        """Is the process that took this lock still running? One answer for
+        every reader of a lock record (the out-of-process memory guard reads
+        this same lock): backend/core/process_identity.lock_holder_alive."""
+        from backend.core.process_identity import lock_holder_alive
 
-        A PID alone cannot say: Windows recycles PIDs, and a dead kernel's
-        PID 117732 belonged to a VS Code GPU process within the hour, so a
-        kernel was reported running and the boot refused. The lock records
-        the holder's start time beside its PID; the same PID with another
-        start time is another process. A lock written before the start time
-        was recorded (or a holder whose start time cannot be read) is held
-        only by a process running Trinity's own code -- judged structurally
-        (backend/core/process_identity), never by words in a command line.
-        """
-        from backend.core.process_identity import is_same_process, is_trinity_process
-
-        try:
-            pid = int(data.get("pid"))
-        except (TypeError, ValueError):
-            return False
-        same = is_same_process(pid, data.get("started_at"))
-        if same is not None:
-            return same
-        try:
-            import psutil
-
-            return is_trinity_process(psutil.Process(pid))
-        except Exception:  # noqa: BLE001 -- no psutil / unreadable: alive is all we know
-            from backend.core.process_identity import pid_alive
-
-            return pid_alive(pid)
+        return lock_holder_alive(data)
 
     def is_locked(self) -> Tuple[bool, Optional[int]]:
         """Check if lock is held. Returns (is_locked, holder_pid)."""
@@ -72649,6 +72627,18 @@ class JarvisSystemKernel:
 
             # Log takeover success details
             self.logger.success(f"[Kernel] Startup lock acquired (method: {takeover_result.takeover_method})")
+
+            # The memory guard: an out-of-process watcher that stops this
+            # kernel before host memory takes the desktop down (a wedged
+            # kernel cannot stop itself). Armed now that this process is the
+            # kernel; it leaves when the kernel does.
+            try:
+                from backend.core.memory_guard import arm as _arm_memory_guard
+                _guard = await asyncio.to_thread(_arm_memory_guard, os.getpid())
+                if _guard is not None:
+                    self.logger.info(f"[Kernel] Memory guard armed (PID {_guard.pid})")
+            except Exception as _guard_exc:  # noqa: BLE001 -- protection, never a boot blocker
+                self.logger.warning(f"[Kernel] Memory guard not armed: {_guard_exc}")
 
             # v210.0: Log orphan cleanup at INFO level - this is routine maintenance, not an error
             if takeover_result.processes_cleaned > 0:
