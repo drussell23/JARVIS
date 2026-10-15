@@ -149,6 +149,8 @@ class RustSelfHealer:
         
         # Track whether we've already logged the stub message (to avoid spam)
         self._stub_logged: bool = False
+        # Last observed result of _is_rust_working(); None until a check ran.
+        self._last_rust_working: Optional[bool] = None
         
         # Thread pools for concurrent operations
         if _HAS_MANAGED_EXECUTOR:
@@ -417,6 +419,7 @@ class RustSelfHealer:
                     import_error or "unknown",
                 )
                 self._stub_logged = True
+            self._last_rust_working = False
             return False
 
         valid, missing = self._validate_module_symbols(module)
@@ -425,9 +428,11 @@ class RustSelfHealer:
                 "Rust module imported but missing required symbols: %s",
                 ", ".join(missing),
             )
+            self._last_rust_working = False
             return False
 
         self._stub_logged = False
+        self._last_rust_working = True
         return True
         
     async def diagnose_and_fix(self) -> bool:
@@ -1098,12 +1103,21 @@ class RustSelfHealer:
             'recent_fixes': recent_fixes,
             'total_fix_attempts': len(self._fix_history),
             'success_rate': success_rate,
-            'is_rust_working': asyncio.create_task(self._is_rust_working())
+            # Last OBSERVED result, not a fresh probe. This used to be
+            # asyncio.create_task(self._is_rust_working()) — an un-awaited task
+            # (an import on the healer pool) spawned per report call, which
+            # also made the report unusable off the loop thread.
+            'is_rust_working': self._last_rust_working,
         }
 
 
 # Global instance
 _self_healer: Optional[RustSelfHealer] = None
+
+def peek_self_healer() -> Optional[RustSelfHealer]:
+    """Return the global self-healer if it exists, without constructing it."""
+    return _self_healer
+
 
 def get_self_healer() -> RustSelfHealer:
     """Get the global self-healer instance."""

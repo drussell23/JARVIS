@@ -14596,8 +14596,9 @@ class IntelligentCacheManager(ResourceManagerBase):
 
     Environment Configuration:
     - CACHE_MANAGER_ENABLED: Enable/disable (default: true)
-    - CACHE_CLEAR_BYTECODE: Clear .pyc files (default: true)
-    - CACHE_CLEAR_PYCACHE: Remove __pycache__ dirs (default: true)
+    - CACHE_CLEAR_BYTECODE / CACHE_CLEAR_PYCACHE: prune the bytecode the import
+      system cannot validate (backend/core/bytecode_hygiene; default: true).
+      Live __pycache__ entries are never removed.
     - CACHE_MODULE_PATTERNS: Comma-separated patterns to clear
     - CACHE_PRESERVE_PATTERNS: Patterns to preserve (default: none)
     - CACHE_WARM_ON_START: Pre-load critical modules (default: false)
@@ -14746,44 +14747,21 @@ class IntelligentCacheManager(ResourceManagerBase):
         if not self.enabled or (not self.clear_bytecode and not self.clear_pycache):
             return {"cleared": False, "reason": "disabled"}
 
-        import shutil
         target = target_path or (self._project_root / "backend" if self._project_root else None)
 
         if not target or not target.exists():
             return {"cleared": False, "reason": "path_not_found"}
 
+        # Only bytecode the import system cannot validate is removed: a live
+        # __pycache__ is checked by CPython against its source on every
+        # import, and wiping it under a running interpreter raced it
+        # (WinError 145). One implementation: backend/core/bytecode_hygiene.
+        from backend.core.bytecode_hygiene import prune_unvalidatable_bytecode
+        pruned = prune_unvalidatable_bytecode(target)
         pycache_removed = 0
-        pyc_removed = 0
-        bytes_freed = 0
-        errors = []
-
-        # Remove __pycache__ directories
-        if self.clear_pycache:
-            for pycache_dir in target.rglob("__pycache__"):
-                try:
-                    dir_size = sum(f.stat().st_size for f in pycache_dir.rglob("*") if f.is_file())
-                    shutil.rmtree(pycache_dir)
-                    pycache_removed += 1
-                    bytes_freed += dir_size
-                except Exception as e:
-                    errors.append(f"Failed to remove {pycache_dir}: {e}")
-
-        # Remove individual .pyc files
-        if self.clear_bytecode:
-            for pyc_file in target.rglob("*.pyc"):
-                try:
-                    # Check age if configured
-                    if self.max_bytecode_age_hours > 0:
-                        file_age_hours = (time.time() - pyc_file.stat().st_mtime) / 3600
-                        if file_age_hours < self.max_bytecode_age_hours:
-                            continue  # Skip recent files
-
-                    file_size = pyc_file.stat().st_size
-                    pyc_file.unlink()
-                    pyc_removed += 1
-                    bytes_freed += file_size
-                except Exception as e:
-                    errors.append(f"Failed to remove {pyc_file}: {e}")
+        pyc_removed = pruned.removed
+        bytes_freed = pruned.bytes_freed
+        errors = [f"in use, skipped: {p}" for p in pruned.skipped]
 
         self._pycache_dirs_removed += pycache_removed
         self._bytecode_files_removed += pyc_removed

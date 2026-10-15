@@ -30,7 +30,9 @@ Version: 1.0.0
 """
 
 import asyncio
+import functools
 import logging
+import platform
 import hashlib
 import time
 import json
@@ -46,6 +48,21 @@ import numpy as np
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=1)
+def _os_version() -> str:
+    """Host OS version, read once from the interpreter — never a subprocess.
+
+    macOS: ``platform.mac_ver()`` reads SystemVersion.plist, the same source
+    ``sw_vers -productVersion`` prints. Elsewhere: ``platform.version()``
+    (Windows build string / Linux kernel version).
+    """
+    try:
+        version = platform.mac_ver()[0] if platform.system() == "Darwin" else ""
+        return version or platform.version() or "unknown"
+    except Exception:
+        return "unknown"
 
 
 # ============================================================================
@@ -1094,21 +1111,18 @@ class SituationalAwarenessEngine:
 
     async def _get_system_metadata(self) -> Dict[str, Any]:
         """Get current system metadata"""
-        import subprocess
-
         metadata = {}
 
-        # macOS version
-        try:
-            result = subprocess.run(
-                ['sw_vers', '-productVersion'],
-                capture_output=True,
-                text=True,
-                timeout=2
-            )
-            metadata['os_version'] = result.stdout.strip()
-        except Exception:
-            metadata['os_version'] = 'unknown'
+        # OS version is invariant for the life of the process. It used to be
+        # re-probed with a blocking ``subprocess.run(['sw_vers', ...])`` on
+        # every scan, on the loop thread — and ``sw_vers`` is macOS-only, so
+        # on Windows each scan paid a failed CreateProcess just to record
+        # 'unknown' (loop-stalls.log 2026-10-15T11:21:32, this frame).
+        # The one real read (platform may query the registry/WMI on Windows)
+        # still goes through the shared off-loop pool.
+        from backend.core.async_offload import call_off_loop
+
+        metadata['os_version'] = await call_off_loop(_os_version)
 
         # Active space (requires additional integration)
         metadata['active_space'] = None  # TODO: Integrate with multi-space detector

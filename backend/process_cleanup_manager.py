@@ -4497,7 +4497,8 @@ class ProcessCleanupManager:
 
     def _clear_python_cache(self, clear_runtime_modules: Optional[bool] = None) -> int:
         """
-        Clear Python bytecode cache, with opt-in runtime module eviction.
+        Prune stale bytecode (see _prune_unvalidatable_bytecode), with opt-in
+        runtime module eviction.
 
         Root-cause note:
             Clearing ``sys.modules`` in an active supervisor process can split
@@ -4515,7 +4516,7 @@ class ProcessCleanupManager:
         """
         cleared_count = 0
 
-        logger.info("🧹 Clearing Python bytecode cache to ensure fresh code loads...")
+        logger.info("🧹 Pruning stale Python bytecode (sourceless/orphaned .pyc)...")
 
         # STEP 1 (optional): Clear runtime module cache from sys.modules.
         # Disabled by default because in-process eviction can duplicate
@@ -4584,33 +4585,8 @@ class ProcessCleanupManager:
                 "(set JARVIS_CLEAR_RUNTIME_MODULES=true to enable in non-async contexts)"
             )
 
-        # STEP 2: Clear __pycache__ directories recursively
-        try:
-            for root, dirs, files in os.walk(self.backend_path):
-                # Clear __pycache__ directories
-                if "__pycache__" in dirs:
-                    pycache_path = Path(root) / "__pycache__"
-                    try:
-                        import shutil
-                        shutil.rmtree(pycache_path)
-                        cleared_count += 1
-                        logger.debug(f"Cleared cache: {pycache_path}")
-                    except Exception as e:
-                        logger.warning(f"Failed to remove {pycache_path}: {e}")
-
-                # Also clear any .pyc files in the directory
-                for file in files:
-                    if file.endswith(".pyc"):
-                        pyc_path = Path(root) / file
-                        try:
-                            pyc_path.unlink()
-                            cleared_count += 1
-                            logger.debug(f"Removed .pyc file: {pyc_path}")
-                        except Exception as e:
-                            logger.warning(f"Failed to remove {pyc_path}: {e}")
-
-        except Exception as e:
-            logger.error(f"Error during Python cache cleanup: {e}")
+        # STEP 2: Prune only bytecode that cannot be validated against a source.
+        cleared_count += self._prune_unvalidatable_bytecode()
 
         if cleared_count > 0:
             logger.info(f"✅ Cleared {cleared_count} total cache items (modules + files)")
@@ -4618,6 +4594,12 @@ class ProcessCleanupManager:
             logger.debug("No Python cache found to clear")
 
         return cleared_count
+
+    def _prune_unvalidatable_bytecode(self) -> int:
+        """Remove only bytecode the import system cannot check against its
+        source -- never a live ``__pycache__`` (backend/core/bytecode_hygiene)."""
+        from backend.core.bytecode_hygiene import prune_unvalidatable_bytecode
+        return prune_unvalidatable_bytecode(Path(self.backend_path)).removed
 
     def _detect_code_changes(self) -> bool:
         """Detect if JARVIS code has changed since last run"""
@@ -5283,49 +5265,18 @@ class ProcessCleanupManager:
 
                 logger.info("🔄 Code changes detected. Cleaning up old JARVIS instances...")
 
-                # Step 0: Gracefully shutdown ML Learning Engine before killing processes.
-                # Run this in an isolated subprocess so a broken ML dependency
-                # (e.g., native numpy crash) cannot take down the supervisor.
-                _shutdown_timeout = max(
-                    1.0,
-                    float(os.getenv("JARVIS_LEARNING_ENGINE_SHUTDOWN_TIMEOUT", "8.0")),
-                )
-                try:
-                    logger.info("🧠 Attempting graceful ML Learning Engine shutdown...")
-                    _shutdown_cmd = [
-                        sys.executable,
-                        "-c",
-                        (
-                            "import asyncio;"
-                            "from voice_unlock.continuous_learning_engine import shutdown_learning_engine;"
-                            "asyncio.run(shutdown_learning_engine())"
-                        ),
-                    ]
-                    _shutdown_env = os.environ.copy()
-                    _shutdown_env["PYTHONFAULTHANDLER"] = "1"
-                    _shutdown_result = subprocess.run(
-                        _shutdown_cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=_shutdown_timeout,
-                        env=_shutdown_env,
-                    )
-                    if _shutdown_result.returncode == 0:
-                        logger.info("✅ ML Learning Engine shutdown complete (models saved)")
-                    else:
-                        _stderr = (_shutdown_result.stderr or "").strip()
-                        _tail = _stderr.splitlines()[-1] if _stderr else f"rc={_shutdown_result.returncode}"
-                        logger.warning(
-                            "ML Learning Engine shutdown subprocess failed: %s",
-                            _tail,
-                        )
-                except subprocess.TimeoutExpired:
-                    logger.warning(
-                        "ML Learning Engine shutdown timed out after %.1fs",
-                        _shutdown_timeout,
-                    )
-                except Exception as e:
-                    logger.warning(f"Error during ML Learning Engine shutdown: {e}")
+                # No "ML Learning Engine shutdown" step here. The learning
+                # engine is a process-local singleton
+                # (continuous_learning_engine._learning_engine): only the
+                # process that built it can checkpoint it, and each backend
+                # does so in its own lifespan shutdown (backend/main.py,
+                # shutdown_learning_engine). This step used to spawn a fresh
+                # ``python -c`` to call shutdown_learning_engine() -- a new
+                # interpreter whose singleton is always None, so even with a
+                # correct import path it could only import numpy and return,
+                # then log "models saved". Without the path it failed outright
+                # (ModuleNotFoundError: voice_unlock, boot 2026-10-15), while
+                # blocking the caller for up to 8 s.
 
                 # Clear Python cache FIRST to ensure fresh code loads
                 # This affects the frontend process, but backend subprocesses need to be killed

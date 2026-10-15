@@ -536,7 +536,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 # v242.2: Centralized log sanitization for CWE-117 (log injection) prevention
 try:
@@ -7576,13 +7576,114 @@ async def _collect_bridge_health() -> dict:
     }
 
 
+def _loaded_rust_self_healer() -> Any:
+    """Return the Rust self-healer ONLY if something already built it.
+
+    A health probe observes; it must not construct. ``get_self_healer()``
+    builds a ``RustSelfHealer`` (two executors, one of them a process pool)
+    on first call, and importing its module pulls psutil/aiofiles. When
+    neither has happened yet there is no healer running, which is exactly
+    what the probe should report.
+    """
+    for name in ("vision.rust_self_healer", "backend.vision.rust_self_healer"):
+        module = sys.modules.get(name)
+        peek = getattr(module, "peek_self_healer", None) if module else None
+        if peek is not None:
+            healer = peek()
+            if healer is not None:
+                return healer
+    return None
+
+
+def _collect_sync_health_details(state: Any) -> dict:
+    """Synchronous half of ``/health`` — runs off the event loop.
+
+    Pure reads of already-built subsystem state; never imports or constructs
+    a subsystem (see ``_loaded_rust_self_healer``).
+    """
+    ml_audio_details: dict = {}
+    if hasattr(state, "ml_audio_state"):
+        ml_state = state.ml_audio_state
+        ml_audio_details = {
+            "enabled": True,
+            "active_streams": len(ml_state.active_streams),
+            "total_processed": ml_state.total_processed,
+            "uptime_hours": round(ml_state.get_uptime(), 2),
+            "capabilities": ml_state.system_capabilities,
+            "performance": ml_state.get_performance_metrics(),
+            "quality_insights": ml_state.get_quality_insights(),
+        }
+
+    rust_details: dict = {}
+    if hasattr(state, "rust_acceleration"):
+        rust_config = state.rust_acceleration
+        if rust_config.get("available"):
+            rust_details = {
+                "enabled": True,
+                "components": rust_config.get("components", {}),
+                "performance_boost": rust_config.get("performance_boost", {}),
+                "memory_savings": rust_config.get("memory_savings", {}),
+            }
+        else:
+            rust_details = {"enabled": False}
+
+    try:
+        healer = _loaded_rust_self_healer()
+        if healer is None:
+            self_healing_details = {"enabled": False}
+        else:
+            health_report = healer.get_health_report()
+            self_healing_details = {
+                "enabled": health_report.get("running", False),
+                "fix_attempts": health_report.get("total_fix_attempts", 0),
+                "success_rate": health_report.get("success_rate", 0.0),
+                "last_successful_build": health_report.get("last_successful_build"),
+            }
+    except Exception:
+        self_healing_details = {"enabled": False}
+
+    if hasattr(state, "voice_unlock") and state.voice_unlock.get("initialized"):
+        voice_unlock_details = {
+            "enabled": True,
+            "initialized": True,
+            "api_available": True,
+        }
+    else:
+        voice_unlock_details = {"enabled": False, "initialized": False}
+
+    if hasattr(state, "component_manager"):
+        mgr = state.component_manager
+        component_manager_details = {
+            "enabled": True,
+            "total_components": len(mgr.components),
+            "memory_pressure": mgr.memory_monitor.current_pressure().value,
+            "arm64_optimized": mgr.arm64_optimizer.is_arm64,
+            "m1_detected": mgr.arm64_optimizer.is_m1,
+            "config_loaded": (os.path.exists(mgr.config_path) if mgr.config_path else False),
+            "advanced_preloader": {
+                "predictor_active": mgr.advanced_predictor is not None,
+                "dependency_resolver_active": mgr.dependency_resolver is not None,
+                "smart_cache_active": mgr.smart_cache is not None,
+            },
+        }
+    else:
+        component_manager_details = {"enabled": False}
+
+    return {
+        "ml_audio_system": ml_audio_details,
+        "rust_acceleration": rust_details,
+        "self_healing": self_healing_details,
+        "voice_unlock": voice_unlock_details,
+        "component_manager": component_manager_details,
+    }
+
+
 # Full Health check endpoint (comprehensive but slower)
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     """Quick health check endpoint"""
     bridge_health = await _collect_bridge_health()
     vision_details = {}
-    ml_audio_details = {}
     vision_status = {}
 
     # Check vision status manager
@@ -7609,85 +7710,18 @@ async def health_check():
         except Exception:
             vision_details["orchestrator"] = {"enabled": False}
 
-    # Check ML audio system status
-    if hasattr(app.state, "ml_audio_state"):
-        ml_state = app.state.ml_audio_state
-        ml_audio_details = {
-            "enabled": True,
-            "active_streams": len(ml_state.active_streams),
-            "total_processed": ml_state.total_processed,
-            "uptime_hours": round(ml_state.get_uptime(), 2),
-            "capabilities": ml_state.system_capabilities,
-            "performance": ml_state.get_performance_metrics(),
-            "quality_insights": ml_state.get_quality_insights(),
-        }
+    # Every remaining probe is synchronous (psutil, filesystem stats, plain
+    # attribute reads on subsystem state). Run them as ONE batch off the
+    # loop: a 0.50s wedge was sampled inside this handler (loop-stalls.log,
+    # 2026-10-15T11:20:28, frame os.path.exists on the line below).
+    from backend.core.async_offload import call_off_loop
 
-    # Check Rust acceleration status
-    rust_details = {}
-    if hasattr(app.state, "rust_acceleration"):
-        rust_config = app.state.rust_acceleration
-        if rust_config.get("available"):
-            rust_details = {
-                "enabled": True,
-                "components": rust_config.get("components", {}),
-                "performance_boost": rust_config.get("performance_boost", {}),
-                "memory_savings": rust_config.get("memory_savings", {}),
-            }
-        else:
-            rust_details = {"enabled": False}
-
-    # Check self-healing status
-    self_healing_details = {}
-    try:
-        from vision.rust_self_healer import get_self_healer
-
-        healer = get_self_healer()
-        health_report = healer.get_health_report()
-        self_healing_details = {
-            "enabled": health_report.get("running", False),
-            "fix_attempts": health_report.get("total_fix_attempts", 0),
-            "success_rate": health_report.get("success_rate", 0.0),
-            "last_successful_build": health_report.get("last_successful_build"),
-        }
-    except Exception:
-        self_healing_details = {"enabled": False}
-
-    # Check voice unlock status
-    voice_unlock_details = {}
-    if hasattr(app.state, "voice_unlock") and app.state.voice_unlock.get("initialized"):
-        try:
-            pass
-
-            # Get basic status without initializing service
-            voice_unlock_details = {
-                "enabled": True,
-                "initialized": True,
-                "api_available": True,
-            }
-        except Exception:
-            voice_unlock_details = {"enabled": False, "initialized": False}
-    else:
-        voice_unlock_details = {"enabled": False, "initialized": False}
-
-    # Check dynamic component manager status
-    component_manager_details = {}
-    if hasattr(app.state, "component_manager"):
-        mgr = app.state.component_manager
-        component_manager_details = {
-            "enabled": True,
-            "total_components": len(mgr.components),
-            "memory_pressure": mgr.memory_monitor.current_pressure().value,
-            "arm64_optimized": mgr.arm64_optimizer.is_arm64,
-            "m1_detected": mgr.arm64_optimizer.is_m1,
-            "config_loaded": (os.path.exists(mgr.config_path) if mgr.config_path else False),
-            "advanced_preloader": {
-                "predictor_active": mgr.advanced_predictor is not None,
-                "dependency_resolver_active": mgr.dependency_resolver is not None,
-                "smart_cache_active": mgr.smart_cache is not None,
-            },
-        }
-    else:
-        component_manager_details = {"enabled": False}
+    sync_details = await call_off_loop(_collect_sync_health_details, app.state)
+    ml_audio_details = sync_details["ml_audio_system"]
+    rust_details = sync_details["rust_acceleration"]
+    self_healing_details = sync_details["self_healing"]
+    voice_unlock_details = sync_details["voice_unlock"]
+    component_manager_details = sync_details["component_manager"]
 
     # v77.2: Check Coding Council status for self-evolution capabilities
     coding_council_details = {}
