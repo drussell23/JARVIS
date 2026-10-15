@@ -2049,6 +2049,41 @@ class UnifiedCommandProcessor:
         else:
             running.set_result(result)
 
+    async def _workspace_reply_from_task(
+        self, command_text: str, rto_result: Any, *, deadline: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """The reply for a task whose steps ran workspace actions (the
+        workspace agent's results carry ``workspace_action``): the same
+        finishing stage the workspace DAG uses -- summary, auth checks,
+        composition from the real data. None when no step ran one.
+
+        Dispatched by the orchestrator, the agent's emails reached the user
+        as "Done.": the orchestrator speaks a step's message, and a data
+        result has none.
+        """
+        steps = getattr(rto_result, "steps", None) or []
+        outcomes = []
+        for index, step in enumerate(steps):
+            result = getattr(step, "result", None)
+            if isinstance(result, dict) and result.get("workspace_action"):
+                outcomes.append({
+                    "node_id": index,
+                    "action": result["workspace_action"],
+                    "status": "failed" if getattr(step, "error", None) else "success",
+                    "result": result,
+                })
+        if not outcomes:
+            return None
+        import time as _time
+        reply = await self._finish_workspace_outcomes(
+            command_text, outcomes, deadline=deadline, compose_with_jprime=True,
+            original_command=command_text, command_id=None, confidence=1.0,
+            started=_time.monotonic(),
+        )
+        reply.setdefault("command_type", "WORKSPACE")
+        reply.setdefault("source", "rto_workspace")
+        return reply
+
     @staticmethod
     def _runtime_task_response(rto_result: Any) -> Optional[Dict[str, Any]]:
         """The reply for a RuntimeTaskOrchestrator result, or None to try the next route.
@@ -2258,6 +2293,10 @@ class UnifiedCommandProcessor:
                     )
                     _p5log(f"RTO result: {_rto_result}")
                     _rto_response = self._runtime_task_response(_rto_result)
+                    _workspace_reply = await self._workspace_reply_from_task(
+                        command_text, _rto_result, deadline=deadline)
+                    if _workspace_reply is not None:
+                        return _workspace_reply
                     if _rto_response is not None:
                         return _rto_response
                     _p5log("RTO did nothing — falling through to legacy")
@@ -3068,9 +3107,14 @@ class UnifiedCommandProcessor:
 
     @staticmethod
     def _build_compose_system_prompt() -> str:
-        """Guardrail 8: TTS-optimized system prompt with XML boundary."""
+        """Guardrail 8: TTS-optimized system prompt with XML boundary.
+
+        Addressed to the operator by the name JARVIS knows them by
+        (backend.core.owner), not a name written into the prompt."""
+        from backend.core.owner import owner_name
+        name = owner_name()
         return (
-            "You are JARVIS, a personal AI assistant speaking to Derek. "
+            f"You are JARVIS, a personal AI assistant speaking to {name}. "
             "You are composing a spoken response from real workspace data. "
             "Rules:\n"
             "1. Written for the EAR (text-to-speech), not the eye. "
@@ -3078,7 +3122,7 @@ class UnifiedCommandProcessor:
             "2. Concise: 2-4 sentences for simple queries, up to 6-8 for summaries.\n"
             "3. Lead with the most important info — count first, then urgent items.\n"
             "4. Reference specific names, subjects, and times from the data.\n"
-            "5. Address Derek by name naturally.\n"
+            f"5. Address {name} by name naturally.\n"
             "6. NEVER fabricate data. Only reference what appears inside "
             "<workspace_data> tags.\n"
             "7. No meta-commentary like 'Based on the data' or 'Here is a summary'.\n"
@@ -4433,6 +4477,209 @@ class UnifiedCommandProcessor:
                 "error": str(e),
             }
 
+    async def _finish_workspace_outcomes(
+        self,
+        command_text: str,
+        ordered_outcomes: List[Dict[str, Any]],
+        *,
+        deadline: Optional[float],
+        compose_with_jprime: bool,
+        original_command: Optional[str],
+        command_id: Optional[str],
+        confidence: float,
+        started: float,
+    ) -> Dict[str, Any]:
+        """Workspace results -> the reply: triage enrichment, the deterministic
+        summary, the auth checks, composition by J-Prime, email dedup.
+
+        One stage for every path that runs a workspace action: the planned
+        workspace DAG here, and the Runtime Task Orchestrator dispatching to
+        the workspace agent, whose data reached the user as "Done." because
+        only this method's caller turned results into words (2026-10-14).
+        A failure returns the failure reply; success returns success=True
+        with ``composed``, ``lifecycle_state``, ``email_dedup_hit`` and
+        ``needs_confirmation``.
+        """
+        import time as _time
+        _ws_action_start = started
+        summaries: List[str] = []
+        has_error = False
+        last_error_dict: Optional[Dict[str, Any]] = None
+
+        # Triage enrichment BEFORE deterministic summary so both paths benefit
+        for outcome in ordered_outcomes:
+            result_dict = outcome.get("result", {}) or {}
+            workspace_intent = (result_dict.get("workspace_action") or outcome.get("action", ""))
+            if (
+                workspace_intent in ("fetch_unread_emails",)
+                and "emails" in result_dict
+                and outcome.get("status") not in ("failed", "timeout", "skipped")
+            ):
+                try:
+                    from autonomy.email_triage.runner import EmailTriageRunner
+                    from autonomy.email_triage.enrichment import enrich_with_triage
+                    _runner = EmailTriageRunner.get_instance_safe()
+                    _enriched, _was_enriched, _age = enrich_with_triage(
+                        result_dict.get("emails", []),
+                        _runner,
+                    )
+                    if _was_enriched:
+                        result_dict["emails"] = _enriched
+                        result_dict["triage_available"] = True
+                        result_dict["triage_age_s"] = round(_age, 1) if _age else None
+                        self._v242_metrics["email_triage_enrichments"] += 1
+                except Exception as _te:
+                    logger.debug("[v281.1] Early triage enrichment skipped: %s", _te)
+
+        for outcome in ordered_outcomes:
+            result_dict = outcome.get("result", {}) or {}
+            action = outcome["action"]
+            status = outcome["status"]
+            workspace_intent = result_dict.get("workspace_action") or action
+            if status == "duplicate":
+                summary = f"Skipped duplicate workspace action: {action}."
+            elif status == "skipped" and result_dict.get("error_code") == "auth_cascade_stop":
+                summary = f"Skipped {action} because workspace authentication requires reauthorization."
+            else:
+                summary = self._summarize_workspace_result(result_dict, workspace_intent)
+            if summary:
+                summaries.append(summary)
+            if status in {"failed", "timeout"} or result_dict.get("error"):
+                has_error = True
+                last_error_dict = result_dict
+
+        combined = "\n\n".join(summaries) if summaries else "Workspace action completed."
+
+        # Guardrail 12: Auth-state check — never compose auth failures
+        needs_reauth, reauth_msg = self._check_auth_state(ordered_outcomes)
+        if needs_reauth:
+            return {
+                "success": False,
+                "response": reauth_msg,
+                "command_type": "WORKSPACE",
+                "error_code": "needs_reauth",
+                "action_required": _google_setup_action(),
+                "capability": "google_workspace",
+                "lifecycle_state": "failed",
+            }
+
+        # Auth recovery: propagate auth errors with success=False + action_required
+        if has_error and last_error_dict:
+            error_code = last_error_dict.get("error_code", "workspace_error")
+            if error_code in ("needs_reauth", "auth_missing"):
+                return {
+                    "success": False,
+                    "response": combined,
+                    "command_type": "WORKSPACE",
+                    "error": last_error_dict.get("error"),
+                    "error_code": error_code,
+                    "action_required": (last_error_dict.get("action_required")
+                                        or _google_setup_action()),
+                    "capability": "google_workspace",
+                }
+            return {
+                "success": False,
+                "response": combined,
+                "command_type": "WORKSPACE",
+                "error": last_error_dict.get("error"),
+                "error_code": error_code,
+                "action_required": last_error_dict.get("action_required"),
+            }
+
+        # v281.0: Two-pass compose — J-Prime as response composer
+        # Guardrail 13: Only compose successful actions; errors stay deterministic
+        composed_response = None
+        lifecycle_state = "completed"
+        if compose_with_jprime and not has_error:
+            # Resolve workspace_action from first successful outcome
+            _ws_action = "unknown"
+            for _o in ordered_outcomes:
+                if _o.get("status") not in ("failed", "timeout", "skipped"):
+                    _ws_action = (_o.get("result", {}) or {}).get(
+                        "workspace_action", _o.get("action", "unknown")
+                    )
+                    break
+
+            # Collect artifacts from all outcomes for compose
+            _artifacts: Dict[str, Any] = {}
+            for _o in ordered_outcomes:
+                _r = _o.get("result", {}) or {}
+                _artifacts.update(_r)
+
+            # Note: triage enrichment already applied to ordered_outcomes above
+            # (moved earlier so deterministic fallback also benefits)
+
+            _compose_start = _time.monotonic()
+            composed_response = await self._compose_workspace_response(
+                command_text=original_command or command_text,
+                artifacts=_artifacts,
+                deterministic_fallback=combined,
+                ordered_outcomes=ordered_outcomes,
+                deadline=deadline,
+                command_id=command_id,
+                workspace_action=_ws_action,
+                confidence=confidence,
+            )
+            _compose_elapsed = _time.monotonic() - _compose_start
+            lifecycle_state = "completed" if composed_response else "fallback_completed"
+            logger.info(
+                "[v281] Compose phase: %s in %.1fs (total elapsed=%.1fs)",
+                "composed" if composed_response else "fallback",
+                _compose_elapsed,
+                _time.monotonic() - _ws_action_start,
+            )
+
+        final_response = composed_response if composed_response else combined
+
+        # Email announcement dedup: suppress duplicate summaries from rapid
+        # retries or reconnects within the cooldown window. Only for email
+        # actions — other workspace actions pass through unchanged.
+        _email_dedup_hit = False
+        _email_actions = {"fetch_unread_emails", "check_email"}
+        _executed = {o.get("action", "") for o in ordered_outcomes}
+        if _executed & _email_actions:
+            _all_emails = []
+            for _o in ordered_outcomes:
+                _all_emails.extend((_o.get("result", {}) or {}).get("emails", []))
+            if _all_emails:
+                _fp = self._email_announce_fingerprint(_all_emails)
+                _is_dup = await self._email_announce_check_and_record(_fp)
+                if _is_dup:
+                    _email_dedup_hit = True
+                    self._v242_metrics["email_announce_dedup_hits"] = (
+                        self._v242_metrics.get("email_announce_dedup_hits", 0) + 1
+                    )
+                    final_response = (
+                        "No new emails since I last checked."
+                        if not composed_response
+                        else final_response
+                    )
+
+        # Surface confirmation needs for ambiguous classifications
+        # + track observability metrics for categories and confidence
+        _needs_confirmation = []
+        for _o in ordered_outcomes:
+            for _em in (_o.get("result", {}) or {}).get("emails", []):
+                if _em.get("triage_needs_confirmation"):
+                    _needs_confirmation.append({
+                        "subject": _em.get("subject", "(no subject)")[:80],
+                        "confidence": _em.get("triage_confidence", 0.0),
+                        "tier": _em.get("triage_tier", 0),
+                    })
+                    self._v242_metrics["email_needs_confirmation_count"] += 1
+                _conf = _em.get("triage_confidence")
+                if _conf is not None and _conf < 0.5 and _em.get("triage_tier", 0) not in (1, 2):
+                    self._v242_metrics["email_low_confidence_skips"] += 1
+
+        return {
+            "success": True,
+            "response": final_response,
+            "lifecycle_state": lifecycle_state,
+            "composed": composed_response is not None,
+            "email_dedup_hit": _email_dedup_hit,
+            "needs_confirmation": _needs_confirmation if _needs_confirmation else None,
+        }
+
     async def _handle_workspace_action(
         self, command_text: str, response: Any,
         deadline: Optional[float] = None,
@@ -5029,176 +5276,19 @@ class UnifiedCommandProcessor:
                 (deadline - _time.monotonic()) if deadline else -1,
             )
 
-            summaries: List[str] = []
-            has_error = False
-            last_error_dict: Optional[Dict[str, Any]] = None
             ordered_outcomes = sorted(node_outcomes.values(), key=lambda o: o["node_id"])
-
-            # Triage enrichment BEFORE deterministic summary so both paths benefit
-            for outcome in ordered_outcomes:
-                result_dict = outcome.get("result", {}) or {}
-                workspace_intent = (result_dict.get("workspace_action") or outcome.get("action", ""))
-                if (
-                    workspace_intent in ("fetch_unread_emails",)
-                    and "emails" in result_dict
-                    and outcome.get("status") not in ("failed", "timeout", "skipped")
-                ):
-                    try:
-                        from autonomy.email_triage.runner import EmailTriageRunner
-                        from autonomy.email_triage.enrichment import enrich_with_triage
-                        _runner = EmailTriageRunner.get_instance_safe()
-                        _enriched, _was_enriched, _age = enrich_with_triage(
-                            result_dict.get("emails", []),
-                            _runner,
-                        )
-                        if _was_enriched:
-                            result_dict["emails"] = _enriched
-                            result_dict["triage_available"] = True
-                            result_dict["triage_age_s"] = round(_age, 1) if _age else None
-                            self._v242_metrics["email_triage_enrichments"] += 1
-                    except Exception as _te:
-                        logger.debug("[v281.1] Early triage enrichment skipped: %s", _te)
-
-            for outcome in ordered_outcomes:
-                result_dict = outcome.get("result", {}) or {}
-                action = outcome["action"]
-                status = outcome["status"]
-                workspace_intent = result_dict.get("workspace_action") or action
-                if status == "duplicate":
-                    summary = f"Skipped duplicate workspace action: {action}."
-                elif status == "skipped" and result_dict.get("error_code") == "auth_cascade_stop":
-                    summary = f"Skipped {action} because workspace authentication requires reauthorization."
-                else:
-                    summary = self._summarize_workspace_result(result_dict, workspace_intent)
-                if summary:
-                    summaries.append(summary)
-                if status in {"failed", "timeout"} or result_dict.get("error"):
-                    has_error = True
-                    last_error_dict = result_dict
-
-            combined = "\n\n".join(summaries) if summaries else "Workspace action completed."
-
-            # Guardrail 12: Auth-state check — never compose auth failures
-            needs_reauth, reauth_msg = self._check_auth_state(ordered_outcomes)
-            if needs_reauth:
-                return {
-                    "success": False,
-                    "response": reauth_msg,
-                    "command_type": "WORKSPACE",
-                    "error_code": "needs_reauth",
-                    "action_required": _google_setup_action(),
-                    "capability": "google_workspace",
-                    "lifecycle_state": "failed",
-                }
-
-            # Auth recovery: propagate auth errors with success=False + action_required
-            if has_error and last_error_dict:
-                error_code = last_error_dict.get("error_code", "workspace_error")
-                if error_code in ("needs_reauth", "auth_missing"):
-                    return {
-                        "success": False,
-                        "response": combined,
-                        "command_type": "WORKSPACE",
-                        "error": last_error_dict.get("error"),
-                        "error_code": error_code,
-                        "action_required": (last_error_dict.get("action_required")
-                                            or _google_setup_action()),
-                        "capability": "google_workspace",
-                    }
-                return {
-                    "success": False,
-                    "response": combined,
-                    "command_type": "WORKSPACE",
-                    "error": last_error_dict.get("error"),
-                    "error_code": error_code,
-                    "action_required": last_error_dict.get("action_required"),
-                }
-
-            # v281.0: Two-pass compose — J-Prime as response composer
-            # Guardrail 13: Only compose successful actions; errors stay deterministic
-            composed_response = None
-            lifecycle_state = "completed"
-            if compose_with_jprime and not has_error:
-                # Resolve workspace_action from first successful outcome
-                _ws_action = "unknown"
-                for _o in ordered_outcomes:
-                    if _o.get("status") not in ("failed", "timeout", "skipped"):
-                        _ws_action = (_o.get("result", {}) or {}).get(
-                            "workspace_action", _o.get("action", "unknown")
-                        )
-                        break
-
-                # Collect artifacts from all outcomes for compose
-                _artifacts: Dict[str, Any] = {}
-                for _o in ordered_outcomes:
-                    _r = _o.get("result", {}) or {}
-                    _artifacts.update(_r)
-
-                # Note: triage enrichment already applied to ordered_outcomes above
-                # (moved earlier so deterministic fallback also benefits)
-
-                _compose_start = _time.monotonic()
-                composed_response = await self._compose_workspace_response(
-                    command_text=original_command or command_text,
-                    artifacts=_artifacts,
-                    deterministic_fallback=combined,
-                    ordered_outcomes=ordered_outcomes,
-                    deadline=deadline,
-                    command_id=command_id,
-                    workspace_action=_ws_action,
-                    confidence=getattr(response, "confidence", 0.0),
-                )
-                _compose_elapsed = _time.monotonic() - _compose_start
-                lifecycle_state = "completed" if composed_response else "fallback_completed"
-                logger.info(
-                    "[v281] Compose phase: %s in %.1fs (total elapsed=%.1fs)",
-                    "composed" if composed_response else "fallback",
-                    _compose_elapsed,
-                    _time.monotonic() - _ws_action_start,
-                )
-
-            final_response = composed_response if composed_response else combined
-
-            # Email announcement dedup: suppress duplicate summaries from rapid
-            # retries or reconnects within the cooldown window. Only for email
-            # actions — other workspace actions pass through unchanged.
-            _email_dedup_hit = False
-            _email_actions = {"fetch_unread_emails", "check_email"}
-            _executed = {o.get("action", "") for o in ordered_outcomes}
-            if _executed & _email_actions:
-                _all_emails = []
-                for _o in ordered_outcomes:
-                    _all_emails.extend((_o.get("result", {}) or {}).get("emails", []))
-                if _all_emails:
-                    _fp = self._email_announce_fingerprint(_all_emails)
-                    _is_dup = await self._email_announce_check_and_record(_fp)
-                    if _is_dup:
-                        _email_dedup_hit = True
-                        self._v242_metrics["email_announce_dedup_hits"] = (
-                            self._v242_metrics.get("email_announce_dedup_hits", 0) + 1
-                        )
-                        final_response = (
-                            "No new emails since I last checked."
-                            if not composed_response
-                            else final_response
-                        )
-
-            # Surface confirmation needs for ambiguous classifications
-            # + track observability metrics for categories and confidence
-            _needs_confirmation = []
-            for _o in ordered_outcomes:
-                for _em in (_o.get("result", {}) or {}).get("emails", []):
-                    if _em.get("triage_needs_confirmation"):
-                        _needs_confirmation.append({
-                            "subject": _em.get("subject", "(no subject)")[:80],
-                            "confidence": _em.get("triage_confidence", 0.0),
-                            "tier": _em.get("triage_tier", 0),
-                        })
-                        self._v242_metrics["email_needs_confirmation_count"] += 1
-                    _conf = _em.get("triage_confidence")
-                    if _conf is not None and _conf < 0.5 and _em.get("triage_tier", 0) not in (1, 2):
-                        self._v242_metrics["email_low_confidence_skips"] += 1
-
+            finished = await self._finish_workspace_outcomes(
+                command_text, ordered_outcomes,
+                deadline=deadline, compose_with_jprime=compose_with_jprime,
+                original_command=original_command, command_id=command_id,
+                confidence=getattr(response, "confidence", 0.0), started=_ws_action_start,
+            )
+            if not finished.get("success"):
+                return finished
+            final_response = finished["response"]
+            lifecycle_state = finished["lifecycle_state"]
+            _email_dedup_hit = finished["email_dedup_hit"]
+            _needs_confirmation = finished["needs_confirmation"]
             return {
                 "success": True,
                 "response": final_response,
@@ -5207,7 +5297,7 @@ class UnifiedCommandProcessor:
                 "actions_executed": [o["action"] for o in ordered_outcomes],
                 "lifecycle_state": lifecycle_state,
                 "command_id": command_id,
-                "composed": composed_response is not None,
+                "composed": finished["composed"],
                 "email_dedup_hit": _email_dedup_hit,
                 "needs_confirmation": _needs_confirmation if _needs_confirmation else None,
                 "workspace_plan": {

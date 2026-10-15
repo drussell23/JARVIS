@@ -198,3 +198,37 @@ def test_without_a_sign_in_the_answer_is_not_connected_not_all_tiers_failed(monk
     assert result.success is False and "not connected" in result.error
     assert result.data["error_code"] == "auth_missing"
     assert g.OAUTH_SETUP_COMMAND in result.data["action_required"]
+
+
+# ------------------------------------------ the agent's data becomes the reply
+def test_a_task_that_ran_a_workspace_action_is_answered_from_its_data(monkeypatch):
+    """Dispatched by the orchestrator, the agent's emails reached the user as
+    "Done.": the data goes through the workspace finishing stage instead."""
+    from backend.api.unified_command_processor import UnifiedCommandProcessor
+    proc = UnifiedCommandProcessor.__new__(UnifiedCommandProcessor)
+    seen = {}
+
+    async def finish(command_text, outcomes, **kw):
+        seen["outcomes"] = outcomes
+        return {"success": True, "response": "You have 2 unread emails from Alex."}
+    monkeypatch.setattr(proc, "_finish_workspace_outcomes", finish)
+    task = TaskResult(task_id="t", original_query="q", success=True, total_elapsed_s=0,
+                      plan_reasoning="", summary="Done.",
+                      steps=[_step(result={"workspace_action": "fetch_unread_emails",
+                                           "emails": [{"subject": "a"}], "count": 1})])
+    reply = asyncio.run(proc._workspace_reply_from_task("what is on my gmail?", task))
+    assert reply["response"] == "You have 2 unread emails from Alex."
+    assert seen["outcomes"][0]["action"] == "fetch_unread_emails"
+    assert seen["outcomes"][0]["status"] == "success"
+    plain = TaskResult(task_id="t", original_query="q", success=True, total_elapsed_s=0,
+                       plan_reasoning="", summary="Opened Firefox",
+                       steps=[_step(result={"success": True, "result": "Opened Firefox"})])
+    assert asyncio.run(proc._workspace_reply_from_task("open firefox", plain)) is None
+
+
+def test_the_composer_addresses_the_operator_by_their_own_name(monkeypatch):
+    from backend.api.unified_command_processor import UnifiedCommandProcessor
+    from backend.core import owner
+    monkeypatch.setattr(owner, "owner_name", lambda: "Ada")
+    prompt = UnifiedCommandProcessor._build_compose_system_prompt()
+    assert "speaking to Ada" in prompt and "Address Ada by name" in prompt
