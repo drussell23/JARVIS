@@ -1989,6 +1989,12 @@ class UnifiedCommandProcessor:
             running.add_done_callback(lambda f: f.cancelled() or f.exception())
             self._dedup_inflight[request_id] = running
 
+        # The terminal's transcript (backend/core/console_view): what was
+        # asked, then what JARVIS answered and did -- once per command, here
+        # where every transport's command runs (a joined resend returned above).
+        from backend.core.console_view import narrate, seconds
+        narrate(command_text, "command")
+        started = time.monotonic()
         try:
             # v277.0: Execute pipeline and cache result for dedupe
             result = await self._execute_command_pipeline(
@@ -1999,7 +2005,10 @@ class UnifiedCommandProcessor:
         except BaseException as exc:
             if request_id:
                 self._settle_inflight(request_id, exc=exc)
+            narrate(f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__, "failed",
+                    suffix=seconds(time.monotonic() - started))
             raise
+        self._narrate_outcome(result, time.monotonic() - started)
 
         # Cache result for idempotency (bounded eviction)
         if request_id and isinstance(result, dict):
@@ -2011,6 +2020,21 @@ class UnifiedCommandProcessor:
             self._settle_inflight(request_id, result=result)
 
         return result
+
+    @staticmethod
+    def _narrate_outcome(result: Any, took: float) -> None:
+        """JARVIS's reply to a command and the facts behind it, for the transcript."""
+        from backend.core.console_view import narrate, seconds
+        if not isinstance(result, dict):
+            narrate(str(result), "reply", suffix=seconds(took))
+            return
+        reply = str(result.get("response") or result.get("error") or "").strip()
+        ok = result.get("success", True) is not False
+        narrate(reply or ("Done." if ok else "It did not work."), "reply" if ok else "failed",
+                suffix=seconds(took))
+        for fact in result.get("facts") or []:
+            if str(fact).strip() and str(fact).strip() != reply:
+                narrate(str(fact), "detail")
 
     def _settle_inflight(self, request_id: str, *, result: Any = None,
                          exc: Optional[BaseException] = None) -> None:
@@ -2039,11 +2063,12 @@ class UnifiedCommandProcessor:
         # Whether JARVIS's voice is already saying it: the client then shows
         # it without speaking it again (two voices at once, 2026-10-14).
         spoken = bool(getattr(rto_result, "spoken", False))
+        facts = list(getattr(rto_result, "facts", None) or [])
         if getattr(rto_result, "success", False):
-            return {"success": True, "response": summary, "spoken": spoken,
+            return {"success": True, "response": summary, "spoken": spoken, "facts": facts,
                     "command_type": "ACTION", "source": "rto_pillar5"}
         if getattr(rto_result, "acted", False):
-            return {"success": False, "response": summary, "spoken": spoken,
+            return {"success": False, "response": summary, "spoken": spoken, "facts": facts,
                     "command_type": "ACTION", "source": "rto_pillar5"}
         return None
 

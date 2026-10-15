@@ -18,6 +18,7 @@ terminal escape sequences removed.
 from __future__ import annotations
 
 import io
+import logging
 import os
 import re
 import sys
@@ -116,6 +117,46 @@ def record(stream: TextIO, text: str) -> None:
         stream.record(text)
 
 
+class SessionLogHandler(logging.Handler):
+    """Every log record into the session log, whatever the terminal shows.
+
+    The terminal is a VIEW (backend/core/console_view): it may show only
+    warnings and the narrative while the log keeps every record. Records
+    therefore reach the log through this handler and the terminal through
+    its own handler on the bare console -- not through the tee, which would
+    make the log only as complete as the terminal.
+    """
+
+    def __init__(self, tee: "_Tee", level: int = logging.NOTSET) -> None:
+        super().__init__(level)
+        self._tee = tee
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._tee.record(self.format(record) + "\n")
+        except Exception:  # noqa: BLE001 -- logging never raises into its caller
+            self.handleError(record)
+
+
+def session_log_handler(stream: TextIO, level: int = logging.NOTSET) -> Optional[logging.Handler]:
+    """A handler writing records to the session log behind *stream*, or None
+    when *stream* has no session log (output already goes where the caller
+    sent it)."""
+    return SessionLogHandler(stream, level) if isinstance(stream, _Tee) else None
+
+
+_active: Optional[_Tee] = None
+
+
+def log_only(text: str) -> None:
+    """Append *text* to this run's session log without showing it -- a line
+    the terminal's view leaves out. Independent of what ``sys.stdout`` is at
+    the moment (a live region routes it through a proxy); a no-op when the
+    run has no session log."""
+    if _active is not None:
+        _active.record(text if text.endswith("\n") else text + "\n")
+
+
 def start_session_log(name: str) -> Optional[Path]:
     """Tee this process's console output to a new session log; return its path.
 
@@ -135,11 +176,13 @@ def start_session_log(name: str) -> Optional[Path]:
     except OSError as exc:
         print(f"[KERNEL] session log unavailable ({exc}); console only", file=sys.stderr)
         return None
-    sys.stdout = _Tee(sys.stdout, log)
+    global _active
+    sys.stdout = _active = _Tee(sys.stdout, log)
     sys.stderr = _Tee(sys.stderr, log)
     _prune(directory, name)
     print(f"[KERNEL] Session log: {path}")
     return path
 
 
-__all__ = ["console_of", "record", "start_session_log"]
+__all__ = ["SessionLogHandler", "console_of", "log_only", "record", "session_log_handler",
+           "start_session_log"]

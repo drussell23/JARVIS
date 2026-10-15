@@ -123,6 +123,20 @@ class TaskResult:
         """
         return any(isinstance(s.result, dict) and s.result.get("opened") for s in self.steps)
 
+    @property
+    def facts(self) -> List[str]:
+        """What each step that worked on the desktop reported doing, in its
+        own evidence-worded terms ("Opened Firefox; its window ... is in
+        front") or the error it hit -- the record a reply is phrased from."""
+        facts = []
+        for step in self.steps:
+            if step.resolution not in (TaskResolution.VISION_ACTION, TaskResolution.DESKTOP_ACTION):
+                continue
+            fact = step.error or RuntimeTaskOrchestrator._step_message(step)
+            if fact:
+                facts.append(fact)
+        return facts
+
 
 class RuntimeTaskOrchestrator:
     """Universal task dispatcher — handles any user request dynamically.

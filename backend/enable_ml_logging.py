@@ -19,53 +19,32 @@ if str(backend_dir) not in sys.path:
 from ml_logging_config import setup_ml_logging, ml_logger
 
 
+_configured = None
+
+
 def configure_ml_logging():
-    """Configure ML logging for JARVIS startup"""
-    
-    # Setup enhanced logging
-    ml_logger_instance, visualizer = setup_ml_logging(
-        level=logging.INFO,
-        enable_visualization=True
-    )
-    
-    # Also configure root logger to show our custom logs
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
-    
-    # Remove default handlers that might interfere
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-    
-    print("\n" + "=" * 70)
-    print("🚀 JARVIS ML MODEL REAL-TIME LOGGING ENABLED")
-    print("=" * 70)
-    print("\nYou will see detailed information about:")
-    print("  • 🔄 Model loading start (with reason)")
-    print("  • ✅ Successful loads (with timing)")
-    print("  • ❌ Failed loads (with error)")
-    print("  • 📤 Model unloading (with freed memory)")
-    print("  • 🧠 Memory checks and decisions")
-    print("  • 🔀 Context changes")
-    print("  • 📍 Proximity-based loading")
-    print("  • ⚡ Cache hits (instant loads)")
-    print("  • 🗜️ Quantized model usage")
-    print("  • 🔮 Predictive preloading")
-    print("  • 🚨 Critical memory warnings")
-    print("\nMemory bar legend:")
-    print("  █ = System memory")
-    print("  ▓ = ML models memory")  
-    print("  | = 35% target")
-    print("  ░ = Free memory")
-    print("\n" + "=" * 70 + "\n")
-    
-    return ml_logger_instance, visualizer
+    """Configure ML logging for JARVIS startup. Idempotent.
+
+    It used to remove every handler on the ROOT logger and print a
+    twenty-line banner, on import and again when called: embedded in the
+    supervisor (backend/main imports it), that removed the kernel's terminal
+    handler, its session-log handler and the IPC handler streaming to an
+    attached viewer, halfway through every boot -- the terminal switched to
+    whatever format a leftover basicConfig installed next, and viewers went
+    silent. The root logger belongs to the process's host; when nothing
+    configured it (run standalone), a basic configuration is installed here.
+    """
+    global _configured
+    if _configured is not None:
+        return _configured
+    _configured = setup_ml_logging(level=logging.INFO, enable_visualization=True)
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO)
+    logging.getLogger(__name__).info(
+        "ML model logging enabled: loads, unloads, memory decisions and context changes")
+    return _configured
 
 
-# Auto-configure when imported
-if __name__ != "__main__":
-    configure_ml_logging()
-    
-    
 def patch_jarvis_startup():
     """Patch JARVIS startup to include enhanced logging"""
     try:

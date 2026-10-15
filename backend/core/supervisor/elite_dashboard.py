@@ -156,6 +156,84 @@ def _terminal_routed_above(console: Any) -> Iterator[None]:
             pass
 
 
+def _view_key() -> str:
+    """The key that changes the terminal's view (``JARVIS_CONSOLE_VIEW_KEY``;
+    empty: none is listened for)."""
+    return os.environ.get("JARVIS_CONSOLE_VIEW_KEY", "v").strip()[:1]
+
+
+class _ViewKeys:
+    """Changes the terminal's view on a key while the status region lives.
+
+    Reads single keys from the terminal without echo or Enter: ``msvcrt`` on
+    Windows; cbreak mode on POSIX, which keeps Ctrl+C a signal and is put
+    back however the listener ends. Only an interactive stdin is read --
+    nothing in the kernel reads it after the boot's start -- and every other
+    key is ignored.
+    """
+
+    def __init__(self, key: str, on_key: Callable[[], None]) -> None:
+        self._key = key.lower()
+        self._on_key = on_key
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> bool:
+        stdin = sys.stdin
+        try:
+            interactive = bool(self._key) and stdin is not None and stdin.isatty()
+        except (ValueError, OSError):
+            interactive = False
+        if not interactive:
+            return False
+        self._thread = threading.Thread(target=self._run, name="console_view_keys", daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _handle(self, char: str) -> None:
+        if char.lower() == self._key:
+            try:
+                self._on_key()
+            except Exception:  # noqa: BLE001 -- a key never breaks the terminal
+                pass
+
+    def _run(self) -> None:
+        poll = 1.0 / _REFRESH_HZ
+        if os.name == "nt":
+            import msvcrt
+            while not self._stop.is_set():
+                if msvcrt.kbhit():
+                    self._handle(msvcrt.getwch())
+                else:
+                    self._stop.wait(poll)
+            return
+        import select
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while not self._stop.is_set():
+                ready, _, _ = select.select([fd], [], [], poll)
+                if ready:
+                    self._handle(os.read(fd, 1).decode(errors="ignore"))
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def _cycle_view() -> None:
+    """Move the terminal to the next view and say so in the scrollback."""
+    from backend.core.console_view import VIEW_NAMES, cycle_verbosity, narrate
+    narrate(f"Terminal view: {VIEW_NAMES[cycle_verbosity()]}", "note")
+
+
 def _layout() -> str:
     """How the dashboard occupies the terminal.
 
@@ -307,6 +385,8 @@ class DashboardState:
     governance_ops: int = 0
     proactive_explorations: int = 0
     uptime_start: float = field(default_factory=time.monotonic)
+    # The key that changes the terminal's view, while one is listened for.
+    view_key: str = ""
 
     @property
     def boot_complete(self) -> bool:
@@ -598,10 +678,6 @@ def _build_status_region(state: DashboardState) -> Any:
         remaining = timeline.remaining_seconds()
         detail += (" · first measured boot" if remaining is None
                    else f" · about {remaining:.0f}s left")
-        running = [(name, started) for name, started, ended in timeline.phases() if ended is None]
-        if running:
-            name, started = running[-1]
-            detail += f" · {name} {timeline.elapsed() - started:.0f}s"
         boot = Table.grid(padding=(0, 1), expand=True)
         boot.add_column(no_wrap=True)
         boot.add_column(ratio=1)
@@ -610,6 +686,7 @@ def _build_status_region(state: DashboardState) -> Any:
         boot.add_row(Text(f"Booting {percent:>2d}%", style="bold yellow"),
                      ProgressBar(total=100, completed=percent), Text(detail, style="dim"))
         lines.append(boot)
+        lines.extend(clipped(line) for line in _boot_checklist_lines(timeline))
 
     health = Text()
     for repo in state.repos.values():
@@ -640,8 +717,47 @@ def _build_status_region(state: DashboardState) -> Any:
     ram = _ram_markup()
     if ram:
         stats.append_text(Text.from_markup(" [dim]·[/] RAM " + ram))
+    if state.view_key:
+        from backend.core.console_view import VIEW_NAMES, verbosity
+        stats.append_text(Text.from_markup(
+            f" [dim]· view: {VIEW_NAMES[verbosity()]} ({state.view_key} to change)[/]"))
     lines.append(clipped(stats))
     return Group(*lines)
+
+
+_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _region_phase_lines() -> int:
+    try:
+        return max(0, int(os.environ.get("JARVIS_STATUS_REGION_PHASES", "") or _region_event_lines()))
+    except ValueError:
+        return _region_event_lines()
+
+
+def _boot_checklist_lines(timeline: Any) -> List[Any]:
+    """The live half of the boot checklist: each phase still running, with
+    a spinner and how long it has run, then the phases previous boots ran
+    next. Finished phases are static lines in the scrollback above
+    (RichCliRenderer narrates them)."""
+    from rich.text import Text
+    from backend.core.console_view import phase_title, seconds
+
+    shown = _region_phase_lines()
+    if not shown:
+        return []
+    elapsed = timeline.elapsed()
+    frame = _SPINNER[int(time.monotonic() * _REFRESH_HZ * 2) % len(_SPINNER)]
+    running = [(name, started) for name, started, ended in timeline.phases() if ended is None]
+    lines: List[Any] = [
+        Text.assemble((f"{frame} ", "bold yellow"), (phase_title(name), "bold"),
+                      (f"  {seconds(elapsed - started)}", "dim"))
+        for name, started in running[-shown:]
+    ]
+    upcoming = [phase_title(name) for name in timeline.upcoming()]
+    if upcoming:
+        lines.append(Text("○ next: " + " · ".join(upcoming), style="dim"))
+    return lines
 
 
 def _build_layout(state: DashboardState) -> Any:
@@ -984,6 +1100,7 @@ class EliteDashboard:
                 # The bare terminal: region frames are redrawn several times a
                 # second and must not be copied into the session log.
                 console = Console(file=console_of(sys.stdout))
+                keys = _ViewKeys(_view_key(), _cycle_view)
                 with _terminal_routed_above(console), Live(
                     get_renderable=lambda: _build_status_region(self._state),
                     console=console,
@@ -992,9 +1109,14 @@ class EliteDashboard:
                     redirect_stderr=False,
                     transient=False,
                 ):
-                    while not self._stop_flag.is_set():
-                        self._drain()
-                        self._stop_flag.wait(timeout=refresh_interval)
+                    self._state.view_key = _view_key() if keys.start() else ""
+                    try:
+                        while not self._stop_flag.is_set():
+                            self._drain()
+                            self._stop_flag.wait(timeout=refresh_interval)
+                    finally:
+                        keys.stop()
+                        self._state.view_key = ""
             else:
                 with Live(
                     get_renderable=lambda: _build_layout(self._state),

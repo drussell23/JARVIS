@@ -8,107 +8,14 @@ to visualize smart lazy loading in real-time.
 """
 
 import logging
-import sys
 from datetime import datetime
 from typing import Optional, Dict, Any, List
-import colorama
 from colorama import Fore, Back, Style
 import threading
 
-# Initialize colorama for cross-platform colored output
-colorama.init(autoreset=True)
-
-
-class MLModelLogFormatter(logging.Formatter):
-    """Custom formatter with colors and icons for ML model events"""
-    
-    # Event type icons and colors
-    ICONS = {
-        'LOAD_START': '🔄',
-        'LOAD_SUCCESS': '✅', 
-        'LOAD_FAILED': '❌',
-        'UNLOAD': '📤',
-        'MEMORY_CHECK': '🧠',
-        'CONTEXT_CHANGE': '🔀',
-        'PROXIMITY': '📍',
-        'CACHE_HIT': '⚡',
-        'QUANTIZED': '🗜️',
-        'WARNING': '⚠️',
-        'CRITICAL': '🚨',
-        'CLEANUP': '🧹',
-        'PREDICT': '🔮'
-    }
-    
-    COLORS = {
-        'LOAD_START': Fore.YELLOW,
-        'LOAD_SUCCESS': Fore.GREEN,
-        'LOAD_FAILED': Fore.RED,
-        'UNLOAD': Fore.CYAN,
-        'MEMORY_CHECK': Fore.BLUE,
-        'CONTEXT_CHANGE': Fore.MAGENTA,
-        'PROXIMITY': Fore.WHITE,
-        'CACHE_HIT': Fore.GREEN + Style.BRIGHT,
-        'QUANTIZED': Fore.YELLOW + Style.BRIGHT,
-        'WARNING': Fore.YELLOW + Style.BRIGHT,
-        'CRITICAL': Fore.RED + Style.BRIGHT,
-        'CLEANUP': Fore.CYAN,
-        'PREDICT': Fore.MAGENTA + Style.DIM
-    }
-    
-    def format(self, record):
-        # Extract event type from message
-        event_type = getattr(record, 'event_type', 'INFO')
-        icon = self.ICONS.get(event_type, '📌')
-        color = self.COLORS.get(event_type, Fore.WHITE)
-        
-        # Format timestamp
-        timestamp = datetime.fromtimestamp(record.created).strftime('%H:%M:%S.%f')[:-3]
-        
-        # Extract model info
-        model_name = getattr(record, 'model_name', '')
-        memory_info = getattr(record, 'memory_info', {})
-        context = getattr(record, 'context', '')
-        
-        # Build formatted message
-        parts = [
-            f"{Fore.BLUE}{timestamp}{Style.RESET_ALL}",
-            f"{icon} {color}{record.getMessage()}{Style.RESET_ALL}"
-        ]
-        
-        # Add model name if present
-        if model_name:
-            parts.append(f"{Fore.YELLOW}[{model_name}]{Style.RESET_ALL}")
-            
-        # Add memory info if present
-        if memory_info:
-            mem_str = self._format_memory_info(memory_info)
-            parts.append(mem_str)
-            
-        # Add context if present
-        if context:
-            parts.append(f"{Fore.MAGENTA}({context}){Style.RESET_ALL}")
-            
-        return " ".join(parts)
-        
-    def _format_memory_info(self, memory_info: Dict[str, Any]) -> str:
-        """Format memory information with color coding"""
-        parts = []
-        
-        if 'system_percent' in memory_info:
-            percent = memory_info['system_percent']
-            color = Fore.GREEN if percent < 25 else Fore.YELLOW if percent < 35 else Fore.RED
-            parts.append(f"{color}Mem: {percent:.1f}%{Style.RESET_ALL}")
-            
-        if 'ml_models_mb' in memory_info:
-            mb = memory_info['ml_models_mb']
-            parts.append(f"ML: {mb:.0f}MB")
-            
-        if 'available_mb' in memory_info:
-            available = memory_info['available_mb']
-            color = Fore.GREEN if available > 5000 else Fore.YELLOW if available > 2000 else Fore.RED
-            parts.append(f"{color}Free: {available:.0f}MB{Style.RESET_ALL}")
-            
-        return f"[{' | '.join(parts)}]"
+# No colorama.init(): it replaces sys.stdout process-wide, and this module is
+# imported inside the supervisor, whose terminal streams are not its to wrap.
+# The Fore/Style codes below are plain ANSI, which current terminals render.
 
 
 class MLModelLogger:
@@ -117,14 +24,10 @@ class MLModelLogger:
     def __init__(self, name: str = "ml_models"):
         self.logger = logging.getLogger(name)
         self.logger.setLevel(logging.INFO)
-        
-        # Remove existing handlers
-        self.logger.handlers = []
-        
-        # Create console handler with custom formatter
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(MLModelLogFormatter())
-        self.logger.addHandler(console_handler)
+        # Records go to the root logger's handlers, which the host process
+        # owns (the supervisor's terminal view and session log). A private
+        # stdout handler here printed every record twice -- once itself,
+        # once through root -- and around the terminal's view.
         
         # Thread-local storage for context
         self.thread_local = threading.local()

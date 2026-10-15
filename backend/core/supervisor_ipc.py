@@ -85,10 +85,19 @@ def _render_event(event: dict, color: bool) -> None:
     ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
 
     if etype == "log":
+        from backend.core.console_view import render, shows
         level  = event.get("level", "INFO")
         logger = event.get("logger", "")
         msg    = event.get("msg", "")
-        if color:
+        tone   = event.get("tone")
+        levelno = logging.getLevelName(level)
+        # The viewer shows what the daemon's terminal shows; a pipe (no
+        # colour) still receives every event, as before.
+        if color and not shows(levelno if isinstance(levelno, int) else logging.INFO, tone):
+            return
+        if color and tone:
+            print(render(msg, tone, suffix=event.get("suffix", "")), flush=True)
+        elif color:
             lc = _LEVEL_COLORS.get(level, _WHITE)
             print(f"{_DIM}{ts_str}{_RESET} {lc}{level:<8}{_RESET} {_DIM}{logger}{_RESET} {msg}",
                   flush=True)
@@ -151,6 +160,12 @@ class _IPCLogHandler(logging.Handler):
                 "logger": record.name,
                 "msg":    record.getMessage(),
             }
+            # A narrative line (backend/core/console_view) stays one for the
+            # viewer, which applies the same view as the daemon's terminal.
+            tone = getattr(record, "console_tone", None)
+            if tone:
+                event["tone"] = tone
+                event["suffix"] = getattr(record, "console_suffix", "") or ""
             # Run in the supervisor's event loop without blocking the caller
             loop = self._ipc._loop
             if loop is not None and loop.is_running():
@@ -504,16 +519,24 @@ class SupervisorIPC:
 # ---------------------------------------------------------------------------
 
 class _AnsiFormatter(logging.Formatter):
-    """ANSI-colored log formatter for interactive TTY sessions."""
+    """ANSI-colored log formatter for interactive TTY sessions. A narrative
+    record (backend/core/console_view) is shown as its narrative line."""
 
     _FMT = "%(asctime)s.%(msecs)03d  %(levelname)-8s  %(name)s  %(message)s"
     _DATE = "%H:%M:%S"
 
     def format(self, record: logging.LogRecord) -> str:
+        from backend.core.console_view import render_record
+        narrative = render_record(record)
+        if narrative is not None:
+            return narrative
+        # Styled on a copy: every other handler formats the same record, and
+        # the session log must not receive escape codes in its names.
+        styled = logging.makeLogRecord(record.__dict__)
         color = _LEVEL_COLORS.get(record.levelname, _WHITE)
-        record.levelname = f"{color}{record.levelname}{_RESET}"
-        record.name      = f"{_DIM}{record.name}{_RESET}"
-        return super().format(record)
+        styled.levelname = f"{color}{record.levelname}{_RESET}"
+        styled.name      = f"{_DIM}{record.name}{_RESET}"
+        return super().format(styled)
 
 
 class _JsonFormatter(logging.Formatter):
@@ -533,9 +556,18 @@ def configure_context_logging(root_level: int = logging.INFO) -> None:
     """
     Configure the root logger with a context-aware formatter (Task 3).
 
-    TTY (interactive terminal) → ANSI colored human-readable output.
-    Non-TTY (launchd / file redirect) → strict JSON, one object per line.
+    TTY (interactive terminal) → the terminal VIEW (backend/core/console_view:
+    the narrative plus records at the view's threshold, ANSI colored) on the
+    bare console, and EVERY record into the session log through its own
+    handler -- so the log stays complete however quiet the terminal is.
+    Non-TTY (launchd / file redirect) → strict JSON, one object per line,
+    unfiltered: there the output IS the record.
+
+    Idempotent: a second call replaces what the first installed.
     """
+    from backend.core.console_view import ConsoleFilter
+    from backend.core.session_log import SessionLogHandler, console_of, session_log_handler
+
     is_tty: bool = False
     try:
         is_tty = os.isatty(sys.stdout.fileno())
@@ -543,17 +575,25 @@ def configure_context_logging(root_level: int = logging.INFO) -> None:
         pass
 
     root = logging.getLogger()
-    # Remove any existing StreamHandlers to avoid double-logging
-    root.handlers = [h for h in root.handlers if not isinstance(h, logging.StreamHandler)
-                     or isinstance(h, logging.FileHandler)]
+    # Remove any existing StreamHandlers (and a previous session-log handler)
+    # to avoid double-logging
+    root.handlers = [h for h in root.handlers
+                     if not (isinstance(h, logging.StreamHandler)
+                             and not isinstance(h, logging.FileHandler))
+                     and not isinstance(h, SessionLogHandler)]
 
-    handler = logging.StreamHandler(sys.stdout)
     if is_tty:
-        fmt = _AnsiFormatter(_AnsiFormatter._FMT, datefmt=_AnsiFormatter._DATE)
+        handler = logging.StreamHandler(console_of(sys.stdout))
+        handler.setFormatter(_AnsiFormatter(_AnsiFormatter._FMT, datefmt=_AnsiFormatter._DATE))
+        handler.addFilter(ConsoleFilter())
+        session = session_log_handler(sys.stdout, root_level)
+        if session is not None:
+            session.setFormatter(logging.Formatter(_AnsiFormatter._FMT, datefmt=_AnsiFormatter._DATE))
+            root.addHandler(session)
     else:
-        fmt = _JsonFormatter()
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(_JsonFormatter())
 
-    handler.setFormatter(fmt)
     handler.setLevel(root_level)
     root.addHandler(handler)
     root.setLevel(root_level)

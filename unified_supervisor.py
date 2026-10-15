@@ -5201,6 +5201,9 @@ class UnifiedLogger:
         """Render section header. v228.1: Emoji-coded sections with vibrant Rich styling."""
         elapsed = self._elapsed_ms()
         section_emoji = _SECTION_EMOJI.get(section.value, "📌")
+        # Phases are the narrative's boot checklist in the normal view.
+        if not self._in_view("PHASE", f"━━ {section.value} │ {title}  +{elapsed:.0f}ms"):
+            return
         # Section-specific Rich style key (falls back to jarvis.phase)
         section_style = f"jarvis.section.{section.value.lower()}"
         if section_style not in JARVIS_THEME_STYLES:
@@ -5227,6 +5230,8 @@ class UnifiedLogger:
     def _render_section_footer(self, section: LogSection, duration_ms: float) -> None:
         """Render section footer. v228.1: Emoji-coded with completion indicator."""
         section_emoji = _SECTION_EMOJI.get(section.value, "📌")
+        if not self._in_view("PHASE", f"── {section.value} completed in {duration_ms:.1f}ms"):
+            return
         with self._log_lock:
             if RICH_AVAILABLE and _rich_console:
                 _rich_console.print(
@@ -5312,10 +5317,38 @@ class UnifiedLogger:
         "PHASE":    "jarvis.phase",
     }
 
+    # The stdlib level each kernel level is viewed as (SUCCESS / PHASE are
+    # progress notes: INFO).
+    _STDLIB_LEVELS = {
+        "DEBUG": logging.DEBUG, "INFO": logging.INFO, "SUCCESS": logging.INFO,
+        "PHASE": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR,
+        "CRITICAL": logging.CRITICAL,
+    }
+
+    def _in_view(self, level_name: str, plain: str) -> bool:
+        """Whether the terminal's view (backend/core/console_view) shows a
+        line of *level_name*. A line it leaves out still goes to the session
+        log, as *plain*: this logger prints to the terminal itself, outside
+        the stdlib handlers the view is applied to."""
+        if self._json_mode:
+            return True
+        try:
+            from backend.core.console_view import shows
+            from backend.core.session_log import log_only
+        except Exception:  # noqa: BLE001 -- no view: show everything, as before
+            return True
+        if shows(self._STDLIB_LEVELS.get(level_name, logging.INFO)):
+            return True
+        log_only(plain)
+        return False
+
     def _log(self, level: LogLevel, message: str, **kwargs) -> None:
         """Core logging method. v228.1: Emoji-coded levels with vibrant Rich styling."""
         elapsed = self._elapsed_ms()
         indent = "  " * self._indent_level
+        if not self._in_view(level.value[0],
+                             f"[{level.value[0]:8}] +{elapsed:>7.0f}ms │ {indent}{message}"):
+            return
 
         if self._json_mode:
             self._log_json(level, message, elapsed, **kwargs)
@@ -9167,6 +9200,7 @@ class RichCliRenderer(CliRenderer):
                             if event.severity == SupervisorEventSeverity.ERROR
                             else "complete"
                         )
+                        self._narrate_phase(entry, event)
                         break
             elif event.event_type == SupervisorEventType.COMPONENT_STATUS:
                 # v278.0: Renderer is READ-ONLY.  Do NOT call update_component()
@@ -9187,6 +9221,18 @@ class RichCliRenderer(CliRenderer):
                 )
         except Exception:
             pass
+
+    @staticmethod
+    def _narrate_phase(entry: Dict[str, Any], event: SupervisorEvent) -> None:
+        """A finished phase becomes one static line of the boot checklist
+        ("✓ Preflight  15.7s") above the status region, which shows the
+        phases still running (backend/core/console_view)."""
+        from backend.core.console_view import narrate, phase_title, seconds
+        took = (event.duration_ms / 1000.0 if event.duration_ms > 0
+                else max(0.0, event.timestamp - entry["start"]))
+        failed = entry["status"] == "error"
+        narrate(phase_title(event.phase) + (f": {event.message}" if failed and event.message else ""),
+                "failed" if failed else "done", suffix=seconds(took))
 
     _REGION_SEVERITIES = {
         SupervisorEventSeverity.WARNING: "warn",
@@ -97666,6 +97712,9 @@ def apply_cli_to_config(args: argparse.Namespace, config: SystemKernelConfig) ->
         os.environ["JARVIS_UI_MODE"] = args.ui
     if hasattr(args, 'verbosity') and args.verbosity:
         os.environ["JARVIS_UI_VERBOSITY"] = args.verbosity
+    elif getattr(args, 'verbose', False):
+        # --verbose: the terminal shows the full log (backend/core/console_view).
+        os.environ["JARVIS_UI_VERBOSITY"] = "debug"
     if hasattr(args, 'no_ansi') and args.no_ansi:
         os.environ["JARVIS_UI_NO_ANSI"] = "true"
     if hasattr(args, 'no_animation') and args.no_animation:

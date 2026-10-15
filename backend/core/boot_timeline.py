@@ -180,6 +180,17 @@ class BootTimeline:
                 rows.append((name, started, seen.get(f"{name}:end")))
         return sorted(rows, key=lambda row: row[1])
 
+    def upcoming(self) -> List[str]:
+        """Phases previous boots ran that this boot has not started yet, in
+        the order they usually start. Learned, not declared: nothing is
+        listed before the first completed boot, and a phase this boot skips
+        is listed until the boot completes (it cannot know it is skipped)."""
+        with self._lock:
+            started = {k.rpartition(":")[0] for k in self._seen if k.endswith(":start")}
+            learned = sorted((offset, key.rpartition(":")[0]) for key, offset in self._learned.items()
+                             if key.endswith(":start"))
+        return [name for _, name in learned if name not in started]
+
     def elapsed(self, now: Optional[float] = None) -> float:
         """Seconds since the boot began; frozen at completion."""
         with self._lock:

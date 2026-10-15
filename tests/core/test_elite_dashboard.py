@@ -149,8 +149,10 @@ def test_region_is_a_few_lines_whatever_happens(tmp_path, monkeypatch):
     for i in range(40):
         _append_event(state, TickerEvent(time.time(), "fault", f"problem {i}", "error", key=f"k{i}"))
     lines = [l for l in _render(_build_status_region(state), width=80).splitlines() if l.strip()]
-    assert len(lines) == 1 + 1 + 1 + 3 + 1            # rule, boot, health, events, counters
-    assert "DEGRADED :8010 188ms" in lines[2]
+    # rule, boot, the running phase, health, events, counters
+    assert len(lines) == 1 + 1 + 1 + 1 + 3 + 1
+    assert "Backend" in lines[2]
+    assert "DEGRADED :8010 188ms" in lines[3]
     assert all(len(l) <= 80 for l in lines)
 
 
