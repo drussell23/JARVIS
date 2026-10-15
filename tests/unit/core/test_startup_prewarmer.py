@@ -197,7 +197,11 @@ class TestPreWarmTasks:
         assert r.status == PreWarmStatus.OK
         assert r.value is True
 
-    def test_docker_probe_failure(self):
+    def test_docker_daemon_not_running_is_a_finding_not_a_failure(self, caplog, monkeypatch):
+        # supervisor-20261015-085516.log: Docker Desktop installed but stopped
+        # at boot -> "[PreWarm] docker_probe: FAILED" at WARNING with a
+        # traceback, 28 s before DockerDaemonManager started it as designed.
+        monkeypatch.setenv("DOCKER_HOST", "tcp://127.0.0.1:2375")  # the socket path, on any host
         pw = StartupPreWarmer(config=MagicMock())
         pw._started = True
         pw._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test")
@@ -205,6 +209,35 @@ class TestPreWarmTasks:
         mock_sock = MagicMock()
         mock_sock.__enter__ = MagicMock(side_effect=ConnectionRefusedError("Docker not running"))
         mock_sock.__exit__ = MagicMock(return_value=False)
+
+        with caplog.at_level("INFO"), patch("socket.socket", return_value=mock_sock):
+            pw._start_docker_probe()
+            pw.shutdown(timeout=5.0)
+
+        r = pw._results.get("docker_probe")
+        assert r is not None
+        assert r.status == PreWarmStatus.OK and r.value is False
+        assert not [x for x in caplog.records if x.levelno >= 30 and "docker_probe" in x.getMessage()]
+
+    def test_docker_not_installed_is_said_so(self, monkeypatch):
+        from backend.core import startup_prewarmer as sp
+        import shutil
+        monkeypatch.delenv("DOCKER_HOST", raising=False)
+        monkeypatch.setattr(shutil, "which", lambda name: None)
+        assert sp._docker_absence() == "Docker not installed"
+        monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/docker")
+        assert sp._docker_absence() == "Docker daemon not running"
+
+    def test_docker_probe_timeout_is_still_a_failure(self, monkeypatch):
+        monkeypatch.setenv("DOCKER_HOST", "tcp://127.0.0.1:2375")  # the socket path, on any host
+        pw = StartupPreWarmer(config=MagicMock())
+        pw._started = True
+        pw._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test")
+
+        mock_sock = MagicMock()
+        mock_sock.__enter__ = MagicMock(return_value=mock_sock)
+        mock_sock.__exit__ = MagicMock(return_value=False)
+        mock_sock.connect = MagicMock(side_effect=TimeoutError("timed out"))
 
         with patch("socket.socket", return_value=mock_sock):
             pw._start_docker_probe()

@@ -56,6 +56,20 @@ def _resolve_anthropic_api_key() -> Optional[str]:
     if env_key:
         return env_key
 
+    # The key funds the Claude paid lane. Switched off by declaration
+    # (paid_lanes, the single authority), its absence IS the configuration:
+    # searching every secret backend for it only produced a boot WARNING
+    # ("Secret 'anthropic-api-key' not found in any backend") about a lane
+    # the operator turned off.
+    try:
+        from backend.core.ouroboros.governance.paid_lanes import declared_absent
+        declared = declared_absent("ANTHROPIC_API_KEY")
+    except Exception:  # noqa: BLE001 -- no authority: resolve as before
+        declared = None
+    if declared:
+        logger.debug("[AgenticConfig] Anthropic key not resolved: %s", declared)
+        return None
+
     # Try SecretManager for multi-backend resolution
     try:
         from backend.core.secret_manager import get_secret

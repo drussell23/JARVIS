@@ -188,8 +188,12 @@ class PredictiveMemoryPlanner:
         """Add metrics to history"""
         self.metrics_history.append(metrics)
 
-    def predict_memory_pressure(self, horizon_minutes: int = 10) -> Tuple[MemoryTier, float]:
-        """Predict memory tier in the future"""
+    def predict_memory_pressure(
+        self, horizon_minutes: int = 10, policy: Optional[PressurePolicy] = None,
+    ) -> Tuple[MemoryTier, float]:
+        """Predict memory tier in the future -- judged by *policy* (the host's
+        one pressure policy) when given, so a prediction and a reading agree
+        on what "critical" means."""
         if len(self.metrics_history) < 10 or not NUMPY_AVAILABLE:
             return MemoryTier.OPTIMAL, 0.0
 
@@ -212,7 +216,7 @@ class PredictiveMemoryPlanner:
             confidence = max(0.0, min(1.0, 1.0 - (variance / 100)))
 
             # Determine predicted tier
-            predicted_tier = self._usage_to_tier(predicted_usage)
+            predicted_tier = self._usage_to_tier(predicted_usage, policy)
 
             return predicted_tier, confidence
 
@@ -265,8 +269,12 @@ class PredictiveMemoryPlanner:
         return strategy_map.get(current_tier, [])
 
     @staticmethod
-    def _usage_to_tier(usage_percent: float) -> MemoryTier:
-        """Convert usage percentage to tier"""
+    def _usage_to_tier(usage_percent: float, policy: Optional[PressurePolicy] = None) -> MemoryTier:
+        """Convert usage percentage to tier: by the host policy when given
+        (a private table here predicted "critical" at 85% on a host whose
+        policy -- rebased for J-Prime's pinned model -- puts it at 89%)."""
+        if policy is not None:
+            return MemoryTier[policy.classify(usage_percent).name]
         if usage_percent >= 95:
             return MemoryTier.EMERGENCY
         elif usage_percent >= 85:
@@ -1237,7 +1245,10 @@ class MemoryQuantizer:
                     )
 
                 # Predictive optimization
-                predicted_tier, confidence = self.planner.predict_memory_pressure(horizon_minutes=5)
+                _policy = await asyncio.to_thread(host_pressure_policy, metrics.system_memory_gb)
+                predicted_tier, confidence = self.planner.predict_memory_pressure(
+                    horizon_minutes=5, policy=_policy,
+                )
                 if predicted_tier in [MemoryTier.CRITICAL, MemoryTier.EMERGENCY] and confidence > 0.7:
                     logger.warning(f"⚠️  Memory pressure predicted: {predicted_tier.value} (confidence: {confidence:.2f})")
                     await self.optimize_memory(strategies=[OptimizationStrategy.PREDICTIVE_PREEMPT])

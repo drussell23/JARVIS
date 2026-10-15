@@ -41,8 +41,32 @@ def _docker_endpoint() -> str:
     return "unix:///var/run/docker.sock"
 
 
+#: What a daemon that is simply not there looks like on each transport: the
+#: pipe/socket file does not exist, or nothing accepts the connection. That is
+#: a FINDING (stopped, or not installed) -- not a probe failure.
+_DOCKER_ABSENT_ERRORS = (FileNotFoundError, ConnectionRefusedError)
+
+
+def _docker_absence() -> str:
+    """Why the daemon did not answer, as a person would say it."""
+    import shutil
+
+    if not os.environ.get("DOCKER_HOST", "").strip() and shutil.which("docker") is None:
+        return "Docker not installed"
+    return "Docker daemon not running"
+
+
 def _docker_ping() -> bool:
-    """True when the daemon answers ``/_ping`` with 200, over its transport."""
+    """True when the daemon answers ``/_ping`` with 200, over its transport;
+    False when no daemon is there (not running / not installed). Raises only
+    when the probe itself could not reach a verdict (timeout, bad endpoint)."""
+    try:
+        return _docker_ping_transport()
+    except _DOCKER_ABSENT_ERRORS:
+        return False
+
+
+def _docker_ping_transport() -> bool:
     import socket
 
     timeout = float(os.environ.get("JARVIS_PREWARM_DOCKER_TIMEOUT_S", "") or 15.0)
@@ -238,8 +262,10 @@ class StartupPreWarmer:
             timestamp=time.monotonic(),
         )
 
-    def _submit_thread(self, name: str, fn: Callable) -> None:
-        """Submit a thread-pool task with exception wrapping."""
+    def _submit_thread(self, name: str, fn: Callable,
+                       describe: Optional[Callable[[Any], str]] = None) -> None:
+        """Submit a thread-pool task with exception wrapping. *describe* turns
+        a successful probe's value into its log line (default "OK")."""
         self._register_pending(name)
 
         def wrapper():
@@ -249,7 +275,7 @@ class StartupPreWarmer:
                     status=PreWarmStatus.OK, value=value,
                     timestamp=time.monotonic(),
                 )
-                self._log.info("[PreWarm] %s: OK", name)
+                self._log.info("[PreWarm] %s: %s", name, describe(value) if describe else "OK")
             except Exception as exc:
                 self._results[name] = PreWarmResult(
                     status=PreWarmStatus.FAILED, error=str(exc)[:200],
@@ -309,7 +335,12 @@ class StartupPreWarmer:
         know only the Unix socket, so on Windows it reported FAILED while
         Docker Desktop was running and DockerDaemonManager found it healthy.
         """
-        self._submit_thread("docker_probe", _docker_ping)
+        # A daemon that is not there is a finding, logged at INFO; the
+        # resources phase (DockerDaemonManager) owns starting it.
+        self._submit_thread(
+            "docker_probe", _docker_ping,
+            describe=lambda up: "OK" if up else _docker_absence(),
+        )
 
     def _start_gcp_creds(self) -> None:
         """Task #2: Validate GCP credentials and create API client."""

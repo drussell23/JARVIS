@@ -74,3 +74,28 @@ def test_a_tool_is_looked_up_once(monkeypatch):
             await monitor._run_subprocess("ioreg", "-c", "IOHIDSystem")
     asyncio.run(go())
     assert lookups == ["ioreg"]
+
+
+# -- yabai is probed only where it is the declared space backend ------------
+# supervisor-20261015-085516.log 08:56:51: "Yabai check failed:
+# /opt/homebrew/bin/yabai" at WARNING on Windows, where spaces come from the
+# Windows agent and yabai cannot exist.
+
+def test_yabai_not_probed_where_it_is_not_the_space_backend(monkeypatch, caplog):
+    monitor, lookups = _monitor(monkeypatch, present=("yabai",))
+    monkeypatch.setenv("JARVIS_SPACE_BACKEND", "windows_agent")
+    with caplog.at_level(logging.DEBUG, logger=sem.logger.name):
+        asyncio.run(monitor._check_yabai())
+    assert monitor._yabai_available is False
+    assert lookups == []
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_yabai_absent_on_a_yabai_host_is_info_not_warning(monkeypatch, caplog):
+    monitor, _ = _monitor(monkeypatch)
+    monkeypatch.setenv("JARVIS_SPACE_BACKEND", "yabai")
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger=sem.logger.name):
+        asyncio.run(monitor._check_yabai())
+    assert monitor._yabai_available is False
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.INFO] == ["Yabai not installed"]

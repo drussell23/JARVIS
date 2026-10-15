@@ -422,6 +422,33 @@ class IntelligentMemoryController:
                 f"(thresholds: {self._moderate_threshold:.0f}/{self._high_threshold:.0f}/{self._critical_threshold:.0f}%)"
             )
     
+    def _relief_level_for(self, current_memory: float) -> Optional[str]:
+        """The relief level *current_memory* calls for under the current thresholds."""
+        if current_memory >= self._critical_threshold:
+            return "CRITICAL"
+        if current_memory >= self._high_threshold:
+            return "HIGH"
+        if current_memory >= self._moderate_threshold:
+            return "MODERATE"
+        return None
+
+    def _rederive_policy_thresholds(self) -> None:
+        """Base (and, before a baseline exists, current) thresholds from the
+        host policy as it stands NOW -- it re-measures Trinity's planned
+        residency, which changes when J-Prime loads a model."""
+        try:
+            thresholds = self._get_hardware_aware_thresholds()
+        except Exception as exc:  # noqa: BLE001 -- keep the thresholds we have
+            logger.debug(f"[IntelligentMemoryController] policy re-read failed: {exc}")
+            return
+        self._base_moderate_threshold = thresholds["moderate"]
+        self._base_high_threshold = thresholds["high"]
+        self._base_critical_threshold = thresholds["critical"]
+        if not self._baseline_established:
+            self._moderate_threshold = self._base_moderate_threshold
+            self._high_threshold = self._base_high_threshold
+            self._critical_threshold = self._base_critical_threshold
+
     def should_emit_event(self, current_memory: float) -> Tuple[bool, str, Optional[str]]:
         """
         Determine if a memory pressure event should be emitted.
@@ -474,14 +501,17 @@ class IntelligentMemoryController:
                 return False, f"Event emission cooldown ({remaining:.0f}s)", None
             
             # Check 5: Determine if we should act based on thresholds
-            relief_level = None
-            if current_memory >= self._critical_threshold:
-                relief_level = "CRITICAL"
-            elif current_memory >= self._high_threshold:
-                relief_level = "HIGH"
-            elif current_memory >= self._moderate_threshold:
-                relief_level = "MODERATE"
-            
+            relief_level = self._relief_level_for(current_memory)
+            if relief_level is not None and not self._baseline_established:
+                # Pre-baseline thresholds are the construction-time snapshot
+                # of the host policy, which may predate J-Prime loading its
+                # model (2026-10-15: built 08:55:30 with nothing planned ->
+                # 65%; the 17 GB model loaded 08:55:54; "MODERATE relief" at
+                # 66.7% on 08:56:40 under a policy whose own answer by then
+                # was 82%). Re-read the live policy before acting on them.
+                self._rederive_policy_thresholds()
+                relief_level = self._relief_level_for(current_memory)
+
             if relief_level is None:
                 # Memory is within acceptable range
                 return False, "Memory within acceptable range", None

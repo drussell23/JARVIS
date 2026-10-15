@@ -57,6 +57,16 @@ class ToolUnavailable(RuntimeError):
     """A command-line tool a monitor uses is not available on this host."""
 
 
+def _declared_space_backend() -> str:
+    """This host's space backend, from its one chooser; "yabai" if unknown."""
+    for mod in ("vision.windows_desktop", "backend.vision.windows_desktop"):
+        try:
+            return __import__(mod, fromlist=["space_backend"]).space_backend()
+        except Exception:  # noqa: BLE001 -- a probe gate never takes startup down
+            continue
+    return "yabai"
+
+
 @dataclass
 class MonitorConfig:
     """Configuration for the system event monitor."""
@@ -689,7 +699,18 @@ class SystemEventMonitor:
     # =========================================================================
 
     async def _check_yabai(self) -> None:
-        """Check if Yabai is available."""
+        """Check if Yabai is available.
+
+        Only where yabai is this host's declared space backend (the one
+        chooser, ``vision.windows_desktop.space_backend``): on Windows/WSL the
+        spaces come from the Windows agent, and probing a macOS binary there
+        only produced a WARNING about a path that cannot exist.
+        """
+        backend = _declared_space_backend()
+        if backend != "yabai":
+            self._yabai_available = False
+            logger.debug("Yabai not probed: spaces come from the %s backend on this host", backend)
+            return
         try:
             return_code, stdout, _ = await self._run_subprocess(
                 self.config.yabai_path,
@@ -706,7 +727,7 @@ class SystemEventMonitor:
         except asyncio.TimeoutError:
             self._yabai_available = False
             logger.info("Yabai availability probe timed out")
-        except FileNotFoundError:
+        except (FileNotFoundError, ToolUnavailable):
             self._yabai_available = False
             logger.info("Yabai not installed")
         except Exception as e:

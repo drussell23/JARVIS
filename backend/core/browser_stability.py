@@ -177,6 +177,12 @@ CRASH_CODE_INFO: Dict[int, CrashInfo] = {
                    "Free system memory, restart with lower limits"),
     139: CrashInfo(139, "SIGSEGV (128 + 11)", CrashSeverity.HIGH, True,
                    "Restart Chrome with minimal flags"),
+    # Chromium RESULT_CODE_NORMAL_EXIT_PROCESS_NOTIFIED: NOT a crash. Another
+    # Chrome already holds this --user-data-dir (the process singleton), was
+    # handed the request, and this process exited normally.
+    21: CrashInfo(21, "Handed off to a running Chrome holding the same profile",
+                  CrashSeverity.LOW, True,
+                  "Adopt the running profile holder's CDP endpoint"),
     # macOS signal codes (negative)
     -1: CrashInfo(-1, "SIGHUP - terminal hangup", CrashSeverity.LOW, True, "Reconnect"),
     -2: CrashInfo(-2, "SIGINT - keyboard interrupt", CrashSeverity.LOW, True, "User cancel"),
@@ -193,6 +199,22 @@ CRASH_CODE_INFO: Dict[int, CrashInfo] = {
     -15: CrashInfo(-15, "SIGTERM - terminated by signal", CrashSeverity.LOW, True,
                    "Normal shutdown"),
 }
+
+
+#: Exit codes with which a launched Chrome reports that it handed its request
+#: to the instance already holding its profile (Chromium's process singleton)
+#: rather than starting a browser: Chromium's RESULT_CODE_NORMAL_EXIT_PROCESS_
+#: NOTIFIED (what Windows reports). The macOS handoff exits 0 and keeps its own
+#: path in ``launch_stabilized_chrome``.
+PROFILE_HANDOFF_EXIT_CODES: Set[int] = {21}
+
+
+def _profile_holder_stop_grace_s() -> float:
+    """How long a Chrome holding the automation profile gets to exit."""
+    try:
+        return max(0.5, float(os.getenv("BROWSER_PROFILE_HOLDER_STOP_GRACE", "5.0")))
+    except ValueError:
+        return 5.0
 
 
 def get_crash_info(code: int) -> CrashInfo:
@@ -685,6 +707,9 @@ class StabilizedChromeLauncher:
         self._config = config
         self._chrome_process: Optional[asyncio.subprocess.Process] = None
         self._chrome_pid: Optional[int] = None
+        # A running Chrome we adopted (it held the automation profile) rather
+        # than launched: we hold no process handle for it.
+        self._adopted_pid: Optional[int] = None
         self._cdp_port: Optional[int] = None
         self._lock = asyncio.Lock()
         self._flags = get_chrome_stability_flags()
@@ -716,10 +741,112 @@ class StabilizedChromeLauncher:
         return self._config.cdp_port_range_start
     
     async def is_chrome_running(self) -> bool:
-        """Check if our Chrome instance is running."""
+        """Check if our Chrome instance (launched or adopted) is running."""
         if self._chrome_process is None:
-            return False
+            if self._adopted_pid is None:
+                return False
+            try:
+                import psutil
+                # psutil, never os.kill(pid, 0): on Windows that TERMINATES.
+                return psutil.pid_exists(self._adopted_pid)
+            except Exception:  # noqa: BLE001
+                return False
         return self._chrome_process.returncode is None
+
+    def _profile_holder_sync(self, profile_dir: str) -> Optional[Tuple[int, Optional[int]]]:
+        """(pid, CDP port or None) of the Chrome BROWSER process holding
+        *profile_dir*, else None. Judged structurally -- a browser process
+        (no ``--type=``) whose ``--user-data-dir`` IS the automation profile --
+        never by user or account name. Blocking: call off the loop."""
+        try:
+            import psutil
+        except ImportError:
+            return None
+        want = os.path.normcase(os.path.abspath(profile_dir))
+        for proc in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                args = proc.info.get("cmdline") or []
+            except (psutil.Error, OSError):
+                continue
+            if not args or any(a.startswith("--type=") for a in args):
+                continue
+            user_dir: Optional[str] = None
+            port: Optional[int] = None
+            for a in args:
+                if a.startswith("--user-data-dir="):
+                    user_dir = a.split("=", 1)[1].strip().strip('"')
+                elif a.startswith("--remote-debugging-port="):
+                    try:
+                        port = int(a.split("=", 1)[1])
+                    except ValueError:
+                        port = None
+            if not user_dir:
+                continue
+            try:
+                same = os.path.normcase(os.path.abspath(user_dir)) == want
+            except (OSError, ValueError):
+                same = False
+            if same:
+                return int(proc.info["pid"]), port
+        return None
+
+    def _terminate_pid_sync(self, pid: int, grace_s: float) -> bool:
+        try:
+            import psutil
+            proc = psutil.Process(pid)
+            proc.terminate()
+            try:
+                proc.wait(timeout=grace_s)
+            except psutil.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=grace_s)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[StabilizedChromeLauncher] could not stop PID {pid}: {exc}")
+            return False
+
+    async def _adopt_profile_holder(self, profile_dir: str, *, replace_unusable: bool) -> bool:
+        """Adopt the Chrome already holding the automation profile.
+
+        A second Chrome on a held profile cannot start: Chromium's process
+        singleton hands the request to the holder and exits (code 21 on
+        Windows). Launching first and calling that a crash is the defect this
+        replaces. A holder with a live CDP endpoint IS the automation channel
+        -- adopt it. One without (no debugging port, or not answering) blocks
+        every launch on this dedicated profile, so it is replaced when
+        *replace_unusable*. True only when adopted.
+        """
+        from backend.core.async_offload import call_off_loop
+
+        holder = await call_off_loop(self._profile_holder_sync, profile_dir)
+        if holder is None:
+            return False
+        pid, port = holder
+        ready_s = max(0.5, float(os.getenv("BROWSER_PROFILE_HOLDER_CDP_TIMEOUT", "2.0")))
+        if port and await self._is_cdp_endpoint_ready(port, timeout_s=ready_s):
+            self._cdp_port = port
+            self._chrome_process = None
+            self._chrome_pid = pid
+            self._adopted_pid = pid
+            logger.info(
+                f"[StabilizedChromeLauncher] Adopted running automation Chrome "
+                f"(PID={pid}, CDP port={port}) holding {profile_dir}"
+            )
+            return True
+        if replace_unusable:
+            grace = _profile_holder_stop_grace_s()
+            logger.info(
+                f"[StabilizedChromeLauncher] Chrome PID {pid} holds the automation "
+                f"profile without a usable CDP endpoint (port={port}) -- replacing it"
+            )
+            await call_off_loop(self._terminate_pid_sync, pid, grace)
+        else:
+            logger.warning(
+                f"[StabilizedChromeLauncher] Chrome PID {pid} holds the automation "
+                f"profile without a usable CDP endpoint (port={port}); a new launch "
+                f"would only hand off to it"
+            )
+        return False
 
     async def _is_chrome_process_running(self) -> bool:
         """v3.4: Check if ANY Chrome process is running on the system.
@@ -855,8 +982,24 @@ class StabilizedChromeLauncher:
                 )
                 return False
             
-            # Find available CDP port
-            self._cdp_port = self._find_available_cdp_port()
+            # The automation profile is single-holder (Chromium's process
+            # singleton): when a Chrome already holds it -- e.g. one an earlier
+            # boot launched, which outlives the kernel by design
+            # (start_new_session) -- adopt it instead of launching a process
+            # that can only hand off to it and exit 21.
+            self._adopted_pid = None
+            profile_dir = self._get_automation_user_data_dir()
+            if await self._adopt_profile_holder(profile_dir, replace_unusable=True):
+                return True
+
+            # Find available CDP port — OFF the loop. Each probe is a blocking
+            # `connect_ex` with a socket timeout; on Windows a refused
+            # localhost connect waits out SYN retries, so the free-port case
+            # costs the whole timeout. StallSampler dump 2/8 (2026-10-15
+            # 08:56:50) caught the loop wedged 0.52s inside this probe under
+            # ghost_hands' background-actuator start.
+            from backend.core.async_offload import call_off_loop
+            self._cdp_port = await call_off_loop(self._find_available_cdp_port)
             
             # Kill existing Chrome on the port if requested
             if kill_existing:
@@ -866,7 +1009,7 @@ class StabilizedChromeLauncher:
             cmd = [self._chrome_binary]
             cmd.extend(self._flags)
             cmd.append(f"--remote-debugging-port={self._cdp_port}")
-            cmd.append(f"--user-data-dir={self._get_automation_user_data_dir()}")
+            cmd.append(f"--user-data-dir={profile_dir}")
             
             if headless:
                 cmd.append("--headless=new")
@@ -935,6 +1078,22 @@ class StabilizedChromeLauncher:
                             "automation endpoint is unavailable (running=%s, cdp_ready=%s)",
                             chrome_running,
                             cdp_ready,
+                        )
+                        return False
+
+                    if exit_code in PROFILE_HANDOFF_EXIT_CODES:
+                        # Not a crash: a holder appeared between our check and
+                        # the launch. Adopt it if it is a usable channel.
+                        self._chrome_process = None
+                        self._chrome_pid = None
+                        if await self._adopt_profile_holder(profile_dir, replace_unusable=False):
+                            return True
+                        logger.warning(
+                            "[StabilizedChromeLauncher] Chrome handed off to the "
+                            "running holder of %s (exit %s), which has no usable "
+                            "CDP endpoint",
+                            profile_dir,
+                            exit_code,
                         )
                         return False
 
@@ -1026,6 +1185,15 @@ class StabilizedChromeLauncher:
     async def shutdown(self) -> None:
         """Gracefully shutdown Chrome."""
         if self._chrome_process is None:
+            if self._adopted_pid is not None:
+                # An adopted holder is ours exactly as a launched one is: a
+                # restart must replace it, not re-adopt it.
+                from backend.core.async_offload import call_off_loop
+                await call_off_loop(
+                    self._terminate_pid_sync, self._adopted_pid, _profile_holder_stop_grace_s(),
+                )
+                self._adopted_pid = None
+                self._chrome_pid = None
             return
         
         try:

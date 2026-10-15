@@ -196,3 +196,46 @@ def test_the_controller_and_the_broker_share_one_policy(monkeypatch):
         broker.policy.enter_thresholds[PressureTier.CONSTRAINED])
     monkeypatch.setattr(ts, "planned_resident_gb", lambda: 0.0)     # J-Prime stopped
     assert "+planned" not in broker.policy.version
+
+
+# -- a policy snapshot taken before J-Prime served is not acted on -----------------
+# supervisor-20261015-085516.log: the controller was built at 08:55:30 (nothing
+# planned -> 65% moderate), J-Prime's model loaded 08:55:54, and "MODERATE
+# relief" fired at 66.7% on 08:56:40, when the policy's own answer was 82%.
+def test_the_controller_rereads_the_policy_before_acting_pre_baseline(monkeypatch):
+    from backend.core.ouroboros.governance import trinity_siblings as ts
+    from backend.process_cleanup_manager import IntelligentMemoryController
+    for k in ("JARVIS_MEMORY_MODERATE_THRESHOLD", "JARVIS_MEMORY_HIGH_THRESHOLD",
+              "JARVIS_MEMORY_CRITICAL_THRESHOLD"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(ts, "planned_resident_gb", lambda: 0.0)       # boot: not serving yet
+    controller = IntelligentMemoryController()
+    controller._total_ram_gb = 61.7
+    controller._rederive_policy_thresholds()
+    assert controller._moderate_threshold < 66.7                      # the stale snapshot
+    monkeypatch.setattr(ts, "planned_resident_gb", lambda: 17.3)      # the model loaded
+    emit, _, level = controller.should_emit_event(66.7)
+    assert (emit, level) == (False, None)
+    assert controller._moderate_threshold > 80.0
+
+
+def test_a_zero_planned_reading_is_not_held_for_the_full_ttl(monkeypatch):
+    from backend.core.ouroboros.governance import trinity_siblings as ts
+    readings = iter([0, 17 * 1024 ** 3])
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(ts, "serving_siblings_resident_bytes", lambda: next(readings))
+    monkeypatch.setattr(ts.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(ts, "_planned", (float("-inf"), 0.0))
+    monkeypatch.setenv("JARVIS_MEMORY_PLANNED_TTL_S", "60")
+    monkeypatch.setenv("JARVIS_MEMORY_PLANNED_ZERO_TTL_S", "10")
+    assert ts.planned_resident_gb() == 0.0
+    clock["t"] += 11                                                   # < 60 s, > 10 s
+    assert ts.planned_resident_gb() == pytest.approx(17.0)
+
+
+def test_the_prediction_uses_the_host_policy():
+    from backend.core.memory_quantizer import MemoryTier, PredictiveMemoryPlanner
+    from backend.core.memory_types import PressurePolicy
+    pol = PressurePolicy.for_host(61.7, 17.3)                          # critical from ~89%
+    assert PredictiveMemoryPlanner._usage_to_tier(86.0) == MemoryTier.CRITICAL   # legacy table
+    assert PredictiveMemoryPlanner._usage_to_tier(86.0, pol) == MemoryTier.CONSTRAINED

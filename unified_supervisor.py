@@ -56425,6 +56425,17 @@ class HotReloadWatcher:
         self.check_interval = self.config.reload_check_interval
         self.cooldown_seconds = int(os.getenv("JARVIS_RELOAD_COOLDOWN", "10"))
         self.verbose = os.getenv("JARVIS_RELOAD_VERBOSE", "false").lower() == "true"
+        # Width of the content-hash fan-out. It used to be cpu_count: on this
+        # 32-thread host the first (full) hash ran 32 workers at once, and
+        # StallSampler dump 3/8 (2026-10-15 08:57:13) shows 32 threads in
+        # `hash_file` while the loop wedged 0.56s — so many runnable threads
+        # that faulthandler's 100-thread cap cut the loop thread out of the
+        # dump. The loop thread competes for the GIL with every one of them;
+        # the work is disk-bound, so a few workers lose nothing.
+        try:
+            self.hash_workers = max(1, int(os.getenv("JARVIS_RELOAD_HASH_WORKERS", "4")))
+        except ValueError:
+            self.hash_workers = 1
 
         # Frontend-specific config
         self.frontend_auto_rebuild = os.getenv("JARVIS_FRONTEND_AUTO_REBUILD", "true").lower() == "true"
@@ -56646,7 +56657,8 @@ class HotReloadWatcher:
 
         # Hash only what changed (all of it on the first check)
         if to_hash:
-            workers = max(1, min(len(to_hash), os.cpu_count() or 1))
+            width = getattr(self, "hash_workers", None) or (os.cpu_count() or 1)
+            workers = max(1, min(len(to_hash), width, os.cpu_count() or 1))
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {executor.submit(hash_file, fp): (rel, sig) for fp, rel, sig in to_hash}
                 for future in as_completed(futures):
@@ -58106,6 +58118,10 @@ class TrinityComponent:
     start_time: float = 0.0
     # v280.0: Runtime health debouncing to prevent false unhealthy flips
     health_failure_streak: int = 0
+    # The trinity_siblings declaration key ("jprime" | "reactor") when the
+    # component was adopted from that declaration (externally owned): its
+    # runtime health is then judged by the SAME probe that adopted it.
+    sibling_key: str = ""
 
     @property
     def is_running(self) -> bool:
@@ -58435,6 +58451,12 @@ class SemanticReadinessChecker:
             # Handle special "status" comparison (healthy/ready are equivalent)
             if field_name == "status" and required_value == "healthy":
                 met = actual_value in ("healthy", "ready")
+            elif field_name == "phase" and actual_value is None:
+                # No phase reported: judge it the way the state above was
+                # judged (phase falls back to status), not as "not ready".
+                met = self.PHASE_STATE_MAP.get(
+                    str(phase).lower()
+                ) == ComponentReadinessState.READY
             else:
                 met = actual_value == required_value
 
@@ -59340,6 +59362,7 @@ class TrinityIntegrator:
                 component.state = "healthy"
                 component.start_time = time.time()
                 component.health_failure_streak = 0
+                component.sibling_key = _sibling_key
                 self.logger.success(
                     f"[Trinity] ✓ {component.name} {_status.state} at {_status.url} (externally owned)"
                 )
@@ -60501,13 +60524,16 @@ class TrinityIntegrator:
         """
         Decide whether a component should be checked by the runtime health loop.
 
-        Components intentionally disabled/offloaded are excluded. Everything else
-        with a health endpoint remains observable, including currently unhealthy
-        components so they can recover back to healthy without manual intervention.
+        Components intentionally offloaded are excluded. Everything else with a
+        health endpoint remains observable, including currently unhealthy
+        components so they can recover back to healthy without manual
+        intervention -- and "disabled", which only the recovery engine sets
+        after exhausting restarts: disabling stops the RESTARTS, not the
+        observation, or a component that comes back is never seen again.
         """
         if component is None:
             return False
-        if component.state in {"disabled", "hollow_client", "abandoned"}:
+        if component.state in {"hollow_client", "abandoned"}:
             return False
         return bool(component.health_url)
 
@@ -60679,6 +60705,17 @@ class TrinityIntegrator:
                 self.logger.info(f"[Trinity] {component.name} recovered to healthy")
             component.health_failure_streak = 0
             component.state = "healthy"
+            # A recovery clears the recovery engine's attempt count (its own
+            # contract: "call this when a component successfully recovers"),
+            # so separate incidents are not summed into one DISABLE verdict.
+            if _was_unhealthy and self._recovery_engine is not None:
+                try:
+                    self._recovery_engine.reset_attempts(component.name)
+                except Exception as _reset_exc:  # noqa: BLE001
+                    self.logger.debug(
+                        f"[Trinity] recovery attempt reset failed for "
+                        f"{component.name}: {_reset_exc}"
+                    )
             # v302.1: Propagate recovery to supervisor dashboard
             if _was_unhealthy:
                 _comp_key = component.name.replace("-", "_")
@@ -60688,6 +60725,11 @@ class TrinityIntegrator:
             return
 
         if self._is_within_startup_grace_period(component, grace_periods):
+            return
+
+        if component.state == "disabled":
+            # Restarts are exhausted; keep observing (a healthy probe above
+            # brings it back) without re-running recovery every poll.
             return
 
         runtime_failure_threshold = int(
@@ -60865,6 +60907,34 @@ class TrinityIntegrator:
         """
         if not component.health_url:
             return True
+
+        # An adopted (externally owned) sibling is judged by the declaration
+        # that adopted it, never by a second, stricter contract: the J-Prime
+        # Engine's /health carries no legacy "phase" and loads models on
+        # demand (model_loaded=False is normal), so the semantic checker below
+        # judged an idle, serving engine LOADING on every poll and the
+        # recovery engine disabled the Mind after four 325s cycles.
+        if component.sibling_key:
+            try:
+                from backend.core.ouroboros.governance.trinity_siblings import (
+                    sibling_runtime_state,
+                )
+                _sib_state = await asyncio.to_thread(
+                    sibling_runtime_state, component.sibling_key,
+                )
+            except Exception as _sib_exc:  # noqa: BLE001
+                self.logger.debug(
+                    f"[Trinity] sibling runtime probe unavailable for "
+                    f"{component.name}: {_sib_exc}"
+                )
+                _sib_state = "unknown"
+            if _sib_state == "lent":
+                # Up, but lent to training: not down, and not ours to restart.
+                self.logger.debug(f"[Trinity] {component.name} is up but lent")
+                return True
+            if _sib_state in ("serving", "down"):
+                return _sib_state == "serving"
+            # "unknown": no declaration answers for it -- fall through.
 
         if not AIOHTTP_AVAILABLE:
             return True  # Assume healthy if we can't check

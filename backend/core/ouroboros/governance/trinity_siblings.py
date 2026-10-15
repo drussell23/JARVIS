@@ -56,7 +56,7 @@ from urllib.parse import urlparse
 logger = logging.getLogger("Ouroboros.TrinitySiblings")
 
 __all__ = ["Sibling", "SiblingStatus", "siblings", "ensure_siblings", "ensure_sibling", "autostart_enabled",
-           "probe_timeout_s", "jprime_ready_budget_s"]
+           "probe_timeout_s", "jprime_ready_budget_s", "sibling_runtime_state"]
 
 _TRUTHY = ("1", "true", "yes", "on")
 
@@ -169,6 +169,33 @@ def serving_siblings(probe: Callable[[str, float], bool] = _answers) -> List[str
     return urls
 
 
+def sibling_runtime_state(key: str, *, probe: Callable[[str, float], bool] = _answers,
+                          lent: Optional[Callable[[Sibling, str], str]] = None) -> str:
+    """What an adopted sibling is doing RIGHT NOW, judged by the same declared
+    probe that adopted it -- so the boot's verdict and the runtime monitor's
+    can never disagree about one process. Starts and stops nothing.
+
+    ``"serving"`` -- it answers its readiness probe (busy or idle; a model
+    loading on demand is still a serving engine). ``"lent"`` -- it answers but
+    is lent out (training holds the GPU): up, not ours to restart. ``"down"``
+    -- it does not answer. ``"unknown"`` -- no such sibling is declared, so the
+    caller keeps its own judgement. NEVER raises.
+    """
+    try:
+        for sib in siblings():
+            if sib.key != key:
+                continue
+            base = (sib.base_url() or "").rstrip("/")
+            if not base:
+                return "unknown"
+            if not probe(base + sib.probe_path, probe_timeout_s()):
+                return "down"
+            return "lent" if (lent or _lent_detail)(sib, base) else "serving"
+    except Exception as exc:  # noqa: BLE001 -- a health probe never takes anything down
+        logger.debug("[TrinitySiblings] %s runtime state unavailable: %s", key, exc)
+    return "unknown"
+
+
 def _get_json(url: str, timeout: float) -> Optional[dict]:
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
@@ -256,11 +283,19 @@ _planned: tuple = (float("-inf"), 0.0)
 def planned_resident_gb() -> float:
     """:func:`serving_siblings_resident_bytes` in GB, re-measured at most every
     ``JARVIS_MEMORY_PLANNED_TTL_S`` (it changes when a model loads) -- one
-    reading shared by every memory-pressure consumer. NEVER raises."""
+    reading shared by every memory-pressure consumer. NEVER raises.
+
+    A ZERO reading is held only ``JARVIS_MEMORY_PLANNED_ZERO_TTL_S``: at boot
+    it is usually "J-Prime not serving yet", and held for the full TTL it made
+    every consumer judge a host with a freshly loaded 17 GB model as an idle
+    64 GB server for a minute (2026-10-15: quantizer optimal -> elevated at
+    08:56:02, cleanup "MODERATE relief" at 66.7%)."""
     global _planned
     with _planned_lock:
         taken, gb = _planned
-        if time.monotonic() - taken < _float_env("JARVIS_MEMORY_PLANNED_TTL_S", 60.0):
+        ttl = (_float_env("JARVIS_MEMORY_PLANNED_TTL_S", 60.0) if gb > 0.0
+               else _float_env("JARVIS_MEMORY_PLANNED_ZERO_TTL_S", 10.0))
+        if time.monotonic() - taken < ttl:
             return gb
         try:
             gb = serving_siblings_resident_bytes() / (1024 ** 3)

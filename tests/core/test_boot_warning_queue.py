@@ -406,6 +406,28 @@ def test_agentic_config_reports_no_issue_for_a_declared_absence(monkeypatch):
     assert [i for i in cfg.validate() if "ANTHROPIC_API_KEY" in i]
 
 
+def test_agentic_config_does_not_search_backends_for_a_switched_off_lane(monkeypatch):
+    # supervisor-20261015-085516.log 08:56:07: AgenticConfig's api_key
+    # default_factory asked SecretManager for 'anthropic-api-key' -> WARNING
+    # "not found in any backend" on a host with JARVIS_PAID_LANES_ENABLED=false.
+    import backend.core.secret_manager as sm
+    from backend.core import agentic_config as ac
+
+    asked = []
+    monkeypatch.setattr(sm, "get_secret", lambda sid, *a, **k: asked.append(sid))
+    # Empty, not deleted: monkeypatch then restores whatever the .env
+    # fallback below may write into os.environ.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+    monkeypatch.setenv("JARVIS_PAID_LANES_ENABLED", "false")
+    assert ac._resolve_anthropic_api_key() is None
+    assert asked == []
+
+    monkeypatch.setenv("JARVIS_PAID_LANES_ENABLED", "true")
+    monkeypatch.delenv("JARVIS_PROVIDER_CLAUDE_DISABLED", raising=False)
+    ac._resolve_anthropic_api_key()
+    assert asked[:1] == ["anthropic-api-key"]     # switched on: a real search
+
+
 # -- 10. a stall worth a warning is worth a stack ----------------------------
 def test_the_sampler_trigger_follows_the_sentinel(monkeypatch):
     from backend.hud import loop_sentinel as ls, stall_sampler as ss

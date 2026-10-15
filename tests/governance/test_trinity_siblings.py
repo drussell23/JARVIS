@@ -291,3 +291,29 @@ def test_an_engine_on_another_host_is_never_judged(monkeypatch, tmp_path):
 def test_bring_up_is_one_at_a_time_per_sibling():
     assert ts._bring_up_lock("jprime") is ts._bring_up_lock("jprime")
     assert ts._bring_up_lock("jprime") is not ts._bring_up_lock("reactor")
+
+
+# -- runtime state: the adopting probe, reused by the supervisor's monitor ----
+def test_runtime_state_serving_when_probe_answers():
+    assert ts.sibling_runtime_state("jprime", probe=lambda u, t: u.endswith("/api/version"),
+                                    lent=lambda s, b: "") == "serving"
+
+
+def test_runtime_state_lent_is_not_down():
+    assert ts.sibling_runtime_state("jprime", probe=lambda u, t: True,
+                                    lent=lambda s, b: "training holds the lease") == "lent"
+
+
+def test_runtime_state_down_when_probe_fails():
+    assert ts.sibling_runtime_state("jprime", probe=lambda u, t: False,
+                                    lent=lambda s, b: "") == "down"
+
+
+def test_runtime_state_unknown_for_undeclared_sibling():
+    assert ts.sibling_runtime_state("nope", probe=lambda u, t: True) == "unknown"
+
+
+def test_runtime_state_never_raises():
+    def _boom(u, t):
+        raise RuntimeError("x")
+    assert ts.sibling_runtime_state("jprime", probe=_boom) == "unknown"
