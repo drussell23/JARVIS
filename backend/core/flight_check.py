@@ -316,8 +316,28 @@ async def _probe_abilities(limit: float) -> Outcome:
         detail += f"; {len(elsewhere)} belong to other platforms"
     if missing:
         return Outcome(Status.LIMITED, f"{detail}; not set up: {', '.join(missing)}",
-                       "install the packages named above")
+                       await asyncio.to_thread(_setup_remedy, bindings))
     return Outcome(Status.GO, detail)
+
+
+def _setup_remedy(bindings) -> str:
+    """What sets the missing packages up: a package the requirements declare
+    is installed when the venv is synced (every launch does it; or by hand);
+    one they do not must be added to them first (backend/core/body_environment)."""
+    import sys
+    from pathlib import Path
+
+    from backend.core import body_environment as env
+
+    packages = sorted({p for b in bindings.values() if not b.platform_reason()
+                       for p in b.missing_requirements()})
+    undeclared = [p for p in packages if not env.declared(p)]
+    if undeclared:
+        target = env.requirements_file()
+        where = target.relative_to(target.parents[1]).as_posix() if target else "the requirements"
+        return f"add {', '.join(undeclared)} to {where}, then restart JARVIS"
+    return ("restart JARVIS (each launch installs what the requirements declare), or run: "
+            + env.sync_command(Path(sys.executable)))
 
 
 _builtin_registered = False

@@ -68,12 +68,17 @@ function Get-KernelPid {
 }
 
 function Initialize-Venv {
-  if (Test-Path $Py) { return }
-  $uv = (Get-Command uv -ErrorAction SilentlyContinue).Source
-  if (-not $uv) { $uv = Join-Path $env:USERPROFILE '.local\bin\uv.exe' }
-  "creating venv $Venv (first run)"
-  & $uv venv --python 3.11 $Venv | Out-Null
-  & $uv pip install --python $Py -r (Join-Path $Repo 'backend\requirements-windows.txt')
+  # Create the venv on first run; on every run, bring it in step with
+  # backend\requirements-windows.txt (backend\core\body_environment.py: a
+  # package added to the file after the venv was created never reached it).
+  if (-not (Test-Path $Py)) {
+    $uv = (Get-Command uv -ErrorAction SilentlyContinue).Source
+    if (-not $uv) { $uv = Join-Path $env:USERPROFILE '.local\bin\uv.exe' }
+    "creating venv $Venv (first run)"
+    & $uv venv --python 3.11 $Venv | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "venv creation failed" }
+  }
+  & $Py -X utf8 (Join-Path $Repo 'backend\core\body_environment.py') --sync
   if ($LASTEXITCODE -ne 0) { throw "dependency install failed" }
 }
 

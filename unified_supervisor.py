@@ -334,6 +334,23 @@ def _venv_python_candidates(script_dir: "_Path") -> list:
     return [root / folder / exe for root in roots for folder, exe in names]
 
 
+def _sync_body_environment(script_dir: "_Path", venv_python: "_Path") -> None:
+    """Bring the venv in step with its requirements file before the kernel
+    runs in it (backend/core/body_environment): a package added to the file
+    after the venv was created never reached it. Loaded by path -- nothing
+    is importable yet -- and never fatal: a missing ability is the
+    pre-flight checklist's to report."""
+    try:
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location(
+            "_jarvis_body_environment", script_dir / "backend" / "core" / "body_environment.py")
+        _module = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_module)
+        _module.sync(venv_python)
+    except Exception as _exc:  # noqa: BLE001 -- the kernel starts with the venv as it is
+        print(f"[KERNEL] venv requirements check unavailable: {_exc}")
+
+
 # This is a function that ensures we're running with the venv Python.
 def _ensure_venv_python() -> None:
     """
@@ -363,6 +380,8 @@ def _ensure_venv_python() -> None:
 
     script_dir = _Path(__file__).parent.resolve()
     venv_python = next((c for c in _venv_python_candidates(script_dir) if c.exists()), None)
+    if venv_python is not None:
+        _sync_body_environment(script_dir, venv_python)
     venv_root = None
     if venv_python is not None:
         try:

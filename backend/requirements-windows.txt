@@ -62,3 +62,10 @@ google-api-python-client
 google-auth==2.43.0
 google-auth-oauthlib
 google-auth-httplib2
+
+# Visual browser agent (backend/neural_mesh/agents/visual_browser_agent.py):
+# it drives Chromium through Playwright. Same constraint as requirements.txt.
+# The browser engine lives outside pip; the step below fetches it after
+# install (backend/core/body_environment.py runs post-install steps).
+playwright>=1.40.0
+# post-install: playwright install chromium
